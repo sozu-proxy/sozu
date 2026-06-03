@@ -33,12 +33,13 @@ pub enum RequestError {
 }
 
 impl Request {
-    /// determine to which of the three proxies (HTTP, HTTPS, TCP) a request is destined
+    /// determine to which of the four proxies (HTTP, HTTPS, TCP, UDP) a request is destined
     pub fn get_destinations(&self) -> ProxyDestinations {
         let mut proxy_destination = ProxyDestinations {
             to_http_proxy: false,
             to_https_proxy: false,
             to_tcp_proxy: false,
+            to_udp_proxy: false,
         };
         let request_type = match &self.request_type {
             Some(t) => t,
@@ -61,6 +62,10 @@ impl Request {
                 proxy_destination.to_tcp_proxy = true
             }
 
+            RequestType::AddUdpFrontend(_) | RequestType::RemoveUdpFrontend(_) => {
+                proxy_destination.to_udp_proxy = true
+            }
+
             RequestType::AddCluster(_)
             | RequestType::AddBackend(_)
             | RequestType::RemoveCluster(_)
@@ -73,6 +78,7 @@ impl Request {
                 proxy_destination.to_http_proxy = true;
                 proxy_destination.to_https_proxy = true;
                 proxy_destination.to_tcp_proxy = true;
+                proxy_destination.to_udp_proxy = true;
             }
 
             // handled at worker level prior to this call
@@ -92,9 +98,11 @@ impl Request {
             RequestType::AddHttpsListener(_)
             | RequestType::AddHttpListener(_)
             | RequestType::AddTcpListener(_)
+            | RequestType::AddUdpListener(_)
             | RequestType::UpdateHttpListener(_)
             | RequestType::UpdateHttpsListener(_)
             | RequestType::UpdateTcpListener(_)
+            | RequestType::UpdateUdpListener(_)
             | RequestType::RemoveListener(_)
             | RequestType::ActivateListener(_)
             | RequestType::DeactivateListener(_)
@@ -165,6 +173,7 @@ pub struct ProxyDestinations {
     pub to_http_proxy: bool,
     pub to_https_proxy: bool,
     pub to_tcp_proxy: bool,
+    pub to_udp_proxy: bool,
 }
 
 impl RequestHttpFrontend {
@@ -247,6 +256,8 @@ impl FromStr for LoadBalancingAlgorithms {
             "random" => Ok(LoadBalancingAlgorithms::Random),
             "power_of_two" => Ok(LoadBalancingAlgorithms::PowerOfTwo),
             "least_loaded" => Ok(LoadBalancingAlgorithms::LeastLoaded),
+            "hrw" => Ok(LoadBalancingAlgorithms::Hrw),
+            "maglev" => Ok(LoadBalancingAlgorithms::Maglev),
             _ => Err(ParseErrorLoadBalancing {}),
         }
     }

@@ -166,6 +166,7 @@ impl CommandManager {
                 FrontendCmd::Http { cmd } => self.http_frontend_command(cmd),
                 FrontendCmd::Https { cmd } => self.https_frontend_command(cmd),
                 FrontendCmd::Tcp { cmd } => self.tcp_frontend_command(cmd),
+                FrontendCmd::Udp { cmd } => self.udp_frontend_command(cmd),
                 FrontendCmd::List {
                     http,
                     https,
@@ -177,6 +178,7 @@ impl CommandManager {
                 ListenerCmd::Http { cmd } => self.http_listener_command(cmd),
                 ListenerCmd::Https { cmd } => self.https_listener_command(cmd),
                 ListenerCmd::Tcp { cmd } => self.tcp_listener_command(cmd),
+                ListenerCmd::Udp { cmd } => self.udp_listener_command(cmd),
                 ListenerCmd::List => self.list_listeners(),
             },
             SubCmd::Certificate { cmd } => match cmd {

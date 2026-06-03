@@ -616,6 +616,11 @@ pub enum FrontendCmd {
         #[clap(subcommand)]
         cmd: TcpFrontendCmd,
     },
+    #[clap(name = "udp", about = "UDP frontend management")]
+    Udp {
+        #[clap(subcommand)]
+        cmd: UdpFrontendCmd,
+    },
     #[clap(name = "list", about = "List frontends using filters")]
     List {
         #[clap(long = "http", help = "filter for http frontends")]
@@ -821,6 +826,46 @@ pub enum TcpFrontendCmd {
 }
 
 #[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
+pub enum UdpFrontendCmd {
+    #[clap(name = "add")]
+    Add {
+        #[clap(
+            short = 'i',
+            long = "id",
+            help = "the id of the cluster to which the frontend belongs"
+        )]
+        id: String,
+        #[clap(
+            short = 'a',
+            long = "address",
+            help = "frontend address, format: IP:port"
+        )]
+        address: SocketAddr,
+        #[clap(
+            long = "tags",
+            help = "Specify tag (key-value pair) to apply on front-end (example: 'key=value, other-key=other-value')",
+            value_parser = parse_tags
+        )]
+        tags: Option<BTreeMap<String, String>>,
+    },
+    #[clap(name = "remove")]
+    Remove {
+        #[clap(
+            short = 'i',
+            long = "id",
+            help = "the id of the cluster to which the frontend belongs"
+        )]
+        id: String,
+        #[clap(
+            short = 'a',
+            long = "address",
+            help = "frontend address, format: IP:port"
+        )]
+        address: SocketAddr,
+    },
+}
+
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
 pub enum ListenerCmd {
     #[clap(name = "http", about = "HTTP listener management")]
     Http {
@@ -836,6 +881,11 @@ pub enum ListenerCmd {
     Tcp {
         #[clap(subcommand)]
         cmd: TcpListenerCmd,
+    },
+    #[clap(name = "udp", about = "UDP listener management")]
+    Udp {
+        #[clap(subcommand)]
+        cmd: UdpListenerCmd,
     },
     #[clap(name = "list", about = "List all listeners")]
     List,
@@ -1477,6 +1527,106 @@ pub enum TcpListenerCmd {
         #[clap(long = "no-expect-proxy", action = ArgAction::SetTrue, overrides_with = "expect_proxy",
                help = "Disable PROXY protocol header on the client socket")]
         no_expect_proxy: bool,
+    },
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
+pub enum UdpListenerCmd {
+    #[clap(name = "add")]
+    Add {
+        #[clap(
+            short = 'a',
+            long = "address",
+            help = "listener address, format: IP:port"
+        )]
+        address: SocketAddr,
+        #[clap(
+            long = "public-address",
+            help = "a different IP than the one the socket sees, for logs and forwarded headers"
+        )]
+        public_address: Option<SocketAddr>,
+        #[clap(
+            long = "front-timeout",
+            help = "maximum time of inactivity for a client flow, in seconds (default 30)"
+        )]
+        front_timeout: Option<u32>,
+        #[clap(
+            long = "back-timeout",
+            help = "maximum time of inactivity for an upstream flow, in seconds (default 30)"
+        )]
+        back_timeout: Option<u32>,
+        #[clap(
+            long = "max-rx-datagram-size",
+            help = "maximum received datagram size in bytes, capped at buffer_size (default 1500)"
+        )]
+        max_rx_datagram_size: Option<u32>,
+        #[clap(
+            long = "max-flows",
+            help = "maximum number of concurrent flows; 0 = auto (~70% soft RLIMIT_NOFILE) (default 0)"
+        )]
+        max_flows: Option<u32>,
+    },
+    #[clap(name = "remove")]
+    Remove {
+        #[clap(
+            short = 'a',
+            long = "address",
+            help = "listener address, format: IP:port"
+        )]
+        address: SocketAddr,
+    },
+    #[clap(name = "activate")]
+    Activate {
+        #[clap(
+            short = 'a',
+            long = "address",
+            help = "listener address, format: IP:port"
+        )]
+        address: SocketAddr,
+    },
+    #[clap(name = "deactivate")]
+    Deactivate {
+        #[clap(
+            short = 'a',
+            long = "address",
+            help = "listener address, format: IP:port"
+        )]
+        address: SocketAddr,
+    },
+    #[clap(name = "update", about = "Patch a running UDP listener in place")]
+    Update {
+        #[clap(
+            short = 'a',
+            long = "address",
+            help = "listener address, format: IP:port"
+        )]
+        address: SocketAddr,
+        #[clap(
+            long = "public-address",
+            help = "a different IP than the one the socket sees, for logs and forwarded headers"
+        )]
+        public_address: Option<SocketAddr>,
+        #[clap(
+            long = "front-timeout",
+            help = "maximum time of inactivity for a client flow, in seconds"
+        )]
+        front_timeout: Option<u32>,
+        #[clap(
+            long = "back-timeout",
+            help = "maximum time of inactivity for an upstream flow, in seconds"
+        )]
+        back_timeout: Option<u32>,
+        #[clap(
+            long = "max-rx-datagram-size",
+            help = "maximum received datagram size in bytes, capped at buffer_size"
+        )]
+        max_rx_datagram_size: Option<u32>,
+        #[clap(
+            long = "max-flows",
+            help = "maximum number of concurrent flows; 0 = auto (~70% soft RLIMIT_NOFILE)"
+        )]
+        max_flows: Option<u32>,
     },
 }
 

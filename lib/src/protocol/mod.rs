@@ -11,6 +11,7 @@ pub mod mux;
 pub mod pipe;
 pub mod proxy_protocol;
 pub mod rustls;
+pub mod udp;
 
 use std::{cell::RefCell, rc::Rc};
 

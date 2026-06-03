@@ -11,10 +11,11 @@ use sozu_command_lib::{
         ListListeners, ListenerType, LoadBalancingParams, MetricsConfiguration, PathRule,
         ProxyProtocolConfig, QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes,
         QueryHealthChecks, QueryMaxConnectionsPerIp, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RulePosition,
-        SetHealthCheck, SocketAddress, SoftStop, Status, SubscribeEvents, TlsVersion,
-        UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
-        request::RequestType, response_content::ContentType,
+        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
+        RequestUdpFrontend, RulePosition, SetHealthCheck, SocketAddress, SoftStop, Status,
+        SubscribeEvents, TlsVersion, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
+        UpdateTcpListenerConfig, UpdateUdpListenerConfig, request::RequestType,
+        response_content::ContentType,
     },
 };
 
@@ -23,6 +24,7 @@ use crate::{
     cli::{
         BackendCmd, ClusterCmd, ClusterH2Cmd, ConnectionLimitCmd, HealthCheckCmd, HttpFrontendCmd,
         HttpListenerCmd, HttpsListenerCmd, MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
+        UdpFrontendCmd, UdpListenerCmd,
     },
     ctl::CommandManager,
 };
@@ -366,6 +368,27 @@ impl CommandManager {
             ),
             TcpFrontendCmd::Remove { id, address } => self.send_request(
                 RequestType::RemoveTcpFrontend(RequestTcpFrontend {
+                    cluster_id: id,
+                    address: address.into(),
+                    ..Default::default()
+                })
+                .into(),
+            ),
+        }
+    }
+
+    pub fn udp_frontend_command(&mut self, cmd: UdpFrontendCmd) -> Result<(), CtlError> {
+        match cmd {
+            UdpFrontendCmd::Add { id, address, tags } => self.send_request(
+                RequestType::AddUdpFrontend(RequestUdpFrontend {
+                    cluster_id: id,
+                    address: address.into(),
+                    tags: tags.unwrap_or(BTreeMap::new()),
+                })
+                .into(),
+            ),
+            UdpFrontendCmd::Remove { id, address } => self.send_request(
+                RequestType::RemoveUdpFrontend(RequestUdpFrontend {
                     cluster_id: id,
                     address: address.into(),
                     ..Default::default()
@@ -745,6 +768,60 @@ impl CommandManager {
         }
     }
 
+    pub fn udp_listener_command(&mut self, cmd: UdpListenerCmd) -> Result<(), CtlError> {
+        match cmd {
+            UdpListenerCmd::Add {
+                address,
+                public_address,
+                front_timeout,
+                back_timeout,
+                max_rx_datagram_size,
+                max_flows,
+            } => {
+                let mut builder = ListenerBuilder::new_udp(address.into());
+                builder
+                    .with_public_address(public_address)
+                    .with_front_timeout(front_timeout)
+                    .with_back_timeout(back_timeout);
+                // `ListenerBuilder` exposes no dedicated setters for the two
+                // UDP-only knobs; assign the public fields directly. `to_udp`
+                // applies the documented defaults (1500 / 0) when left `None`.
+                builder.max_rx_datagram_size = max_rx_datagram_size;
+                builder.max_flows = max_flows;
+
+                let listener = builder
+                    .to_udp(Some(&self.config))
+                    .map_err(CtlError::CreateListener)?;
+
+                self.send_request(RequestType::AddUdpListener(listener).into())
+            }
+            UdpListenerCmd::Remove { address } => {
+                self.remove_listener(address.into(), ListenerType::Udp)
+            }
+            UdpListenerCmd::Activate { address } => {
+                self.activate_listener(address.into(), ListenerType::Udp)
+            }
+            UdpListenerCmd::Deactivate { address } => {
+                self.deactivate_listener(address.into(), ListenerType::Udp)
+            }
+            UdpListenerCmd::Update {
+                address,
+                public_address,
+                front_timeout,
+                back_timeout,
+                max_rx_datagram_size,
+                max_flows,
+            } => self.update_udp_listener_command(
+                address,
+                public_address,
+                front_timeout,
+                back_timeout,
+                max_rx_datagram_size,
+                max_flows,
+            ),
+        }
+    }
+
     pub fn list_listeners(&mut self) -> Result<(), CtlError> {
         self.send_request(RequestType::ListListeners(ListListeners {}).into())
     }
@@ -1014,6 +1091,28 @@ impl CommandManager {
             connect_timeout,
         };
         self.send_request(RequestType::UpdateTcpListener(patch).into())
+    }
+
+    /// Patch a running UDP listener in place. Only `Some` fields in the patch
+    /// are applied; `None` fields preserve the listener's current value.
+    pub fn update_udp_listener_command(
+        &mut self,
+        address: std::net::SocketAddr,
+        public_address: Option<std::net::SocketAddr>,
+        front_timeout: Option<u32>,
+        back_timeout: Option<u32>,
+        max_rx_datagram_size: Option<u32>,
+        max_flows: Option<u32>,
+    ) -> Result<(), CtlError> {
+        let patch = UpdateUdpListenerConfig {
+            address: address.into(),
+            public_address: public_address.map(|a| a.into()),
+            front_timeout,
+            back_timeout,
+            max_rx_datagram_size,
+            max_flows,
+        };
+        self.send_request(RequestType::UpdateUdpListener(patch).into())
     }
 
     pub fn remove_listener(

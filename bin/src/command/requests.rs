@@ -31,8 +31,8 @@ use sozu_command_lib::{
         MetricDetailStatus, MetricsConfiguration, QueryCertificatesFilters, QueryHealthChecks,
         QueryMetricsOptions, Request, ResponseContent, ResponseStatus, RunState, SetMetricDetail,
         SoftStop, Status, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
-        UpdateTcpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponses,
-        request::RequestType, response_content::ContentType,
+        UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest,
+        WorkerResponses, request::RequestType, response_content::ContentType,
     },
     sd_notify,
 };
@@ -246,6 +246,8 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::AddHttpsListener(_)
             | RequestType::AddTcpFrontend(_)
             | RequestType::AddTcpListener(_)
+            | RequestType::AddUdpFrontend(_)
+            | RequestType::AddUdpListener(_)
             | RequestType::ConfigureMetrics(_)
             | RequestType::DeactivateListener(_)
             | RequestType::RemoveBackend(_)
@@ -255,10 +257,12 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::RemoveHttpsFrontend(_)
             | RequestType::RemoveListener(_)
             | RequestType::RemoveTcpFrontend(_)
+            | RequestType::RemoveUdpFrontend(_)
             | RequestType::ReplaceCertificate(_)
             | RequestType::UpdateHttpListener(_)
             | RequestType::UpdateHttpsListener(_)
             | RequestType::UpdateTcpListener(_)
+            | RequestType::UpdateUdpListener(_)
             | RequestType::SetHealthCheck(_)
             | RequestType::RemoveHealthCheck(_)
             | RequestType::SoftStop(_)
@@ -351,6 +355,8 @@ impl Server {
             | RequestType::AddHttpsListener(_)
             | RequestType::AddTcpFrontend(_)
             | RequestType::AddTcpListener(_)
+            | RequestType::AddUdpFrontend(_)
+            | RequestType::AddUdpListener(_)
             | RequestType::ConfigureMetrics(_)
             | RequestType::DeactivateListener(_)
             | RequestType::RemoveBackend(_)
@@ -360,10 +366,12 @@ impl Server {
             | RequestType::RemoveHttpsFrontend(_)
             | RequestType::RemoveListener(_)
             | RequestType::RemoveTcpFrontend(_)
+            | RequestType::RemoveUdpFrontend(_)
             | RequestType::ReplaceCertificate(_)
             | RequestType::UpdateHttpListener(_)
             | RequestType::UpdateHttpsListener(_)
             | RequestType::UpdateTcpListener(_)
+            | RequestType::UpdateUdpListener(_)
             | RequestType::SetHealthCheck(_)
             | RequestType::RemoveHealthCheck(_) => {
                 worker_request(self, client, request_type);
@@ -1258,6 +1266,32 @@ fn audit_entry_for(
                 extras: AuditExtras::default(),
             })
         }
+        RequestType::AddUdpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("udp_frontend_added");
+            Some(AuditEntry {
+                kind: EventKind::FrontendAdded,
+                verb,
+                counter,
+                target: format!("frontend:udp:{}:{}", frontend.cluster_id, frontend.address),
+                cluster_id: Some(frontend.cluster_id.to_owned()),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::RemoveUdpFrontend(frontend) => {
+            let (verb, counter) = audit_verb!("udp_frontend_removed");
+            Some(AuditEntry {
+                kind: EventKind::FrontendRemoved,
+                verb,
+                counter,
+                target: format!("frontend:udp:{}:{}", frontend.cluster_id, frontend.address),
+                cluster_id: Some(frontend.cluster_id.to_owned()),
+                backend_id: None,
+                address: Some(frontend.address),
+                extras: AuditExtras::default(),
+            })
+        }
         RequestType::AddCertificate(add) => {
             let (verb, counter) = audit_verb!("certificate_added");
             Some(AuditEntry {
@@ -1389,6 +1423,24 @@ fn audit_entry_for(
                 extras: AuditExtras::default(),
             })
         }
+        RequestType::UpdateUdpListener(patch) => {
+            let (verb, counter) = audit_verb!("udp_listener_updated");
+            let current = state.udp_listeners.get(&SocketAddr::from(patch.address));
+            Some(AuditEntry {
+                kind: EventKind::ListenerUpdated,
+                verb,
+                counter,
+                target: format!(
+                    "listener:udp:{}:{}",
+                    patch.address,
+                    format_patch_diff_udp(patch, current),
+                ),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(patch.address),
+                extras: AuditExtras::default(),
+            })
+        }
         RequestType::AddHttpListener(listener) => {
             let (verb, counter) = audit_verb!("http_listener_added");
             Some(AuditEntry {
@@ -1422,6 +1474,19 @@ fn audit_entry_for(
                 verb,
                 counter,
                 target: format!("listener:tcp:{}", listener.address),
+                cluster_id: None,
+                backend_id: None,
+                address: Some(listener.address),
+                extras: AuditExtras::default(),
+            })
+        }
+        RequestType::AddUdpListener(listener) => {
+            let (verb, counter) = audit_verb!("udp_listener_added");
+            Some(AuditEntry {
+                kind: EventKind::ListenerAdded,
+                verb,
+                counter,
+                target: format!("listener:udp:{}", listener.address),
                 cluster_id: None,
                 backend_id: None,
                 address: Some(listener.address),
@@ -3306,6 +3371,43 @@ fn format_patch_diff_tcp(
     diff_req_copy!(front_timeout);
     diff_req_copy!(back_timeout);
     diff_req_copy!(connect_timeout);
+    if parts.is_empty() {
+        "(no-op)".to_owned()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// Render a UDP listener patch as a compact `field=old→new` diff for the audit
+/// trail, mirroring [`format_patch_diff_tcp`]. UDP has no `expect_proxy` /
+/// `connect_timeout`; its distinguishing knobs are `max_rx_datagram_size` and
+/// `max_flows`.
+fn format_patch_diff_udp(
+    p: &UpdateUdpListenerConfig,
+    current: Option<&sozu_command_lib::proto::command::UdpListenerConfig>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    macro_rules! diff_req_copy {
+        ($field:ident) => {
+            if let Some(v) = p.$field {
+                let old = current
+                    .map(|c| c.$field.to_string())
+                    .unwrap_or_else(|| "?".to_owned());
+                parts.push(format!("{}={old}→{v}", stringify!($field)));
+            }
+        };
+    }
+    if let Some(v) = p.public_address.as_ref() {
+        let old = current
+            .and_then(|c| c.public_address)
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        parts.push(format!("public_address={old}→{v}"));
+    }
+    diff_req_copy!(front_timeout);
+    diff_req_copy!(back_timeout);
+    diff_req_copy!(max_rx_datagram_size);
+    diff_req_copy!(max_flows);
     if parts.is_empty() {
         "(no-op)".to_owned()
     } else {

@@ -333,6 +333,7 @@ pub(crate) mod splice;
 
 pub mod server;
 pub mod tcp;
+pub mod udp;
 
 pub mod https;
 
@@ -369,9 +370,11 @@ pub enum Protocol {
     HTTP,
     HTTPS,
     TCP,
+    UDP,
     HTTPListen,
     HTTPSListen,
     TCPListen,
+    UDPListen,
     Channel,
     Metrics,
     Timer,

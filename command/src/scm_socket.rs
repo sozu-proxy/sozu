@@ -16,7 +16,7 @@ use std::{
     },
 };
 
-use mio::net::TcpListener;
+use mio::net::{TcpListener, UdpSocket};
 use nix::{cmsg_space, sys::socket};
 use prost::{DecodeError, Message};
 
@@ -120,6 +120,7 @@ impl ScmSocket {
             http: listeners.http.iter().map(|t| t.0.to_string()).collect(),
             tls: listeners.tls.iter().map(|t| t.0.to_string()).collect(),
             tcp: listeners.tcp.iter().map(|t| t.0.to_string()).collect(),
+            udp: listeners.udp.iter().map(|t| t.0.to_string()).collect(),
         };
 
         let message = listeners_count.encode_length_delimited_to_vec();
@@ -129,6 +130,7 @@ impl ScmSocket {
         file_descriptors.extend(listeners.http.iter().map(|t| t.1));
         file_descriptors.extend(listeners.tls.iter().map(|t| t.1));
         file_descriptors.extend(listeners.tcp.iter().map(|t| t.1));
+        file_descriptors.extend(listeners.udp.iter().map(|t| t.1));
 
         self.send_msg_and_fds(&message, &file_descriptors)
     }
@@ -148,21 +150,25 @@ impl ScmSocket {
             .map_err(ScmSocketError::DecodeError)?;
 
         // Validate the manifest before indexing into the fixed-size FD array.
-        // The peer-controlled `listeners_count.{http,tls,tcp}` lists are
+        // The peer-controlled `listeners_count.{http,tls,tcp,udp}` lists are
         // matched 1:1 with `received_fds` slots; without these bounds checks
         // a peer that declared more entries than MAX_FDS_OUT or more entries
         // than FDs actually arrived would panic the worker on
-        // `received_fds[index..index + len]`.
+        // `received_fds[index..index + len]`. `udp` is folded into the total
+        // and the inconsistency-error `tcp` slot for diagnostics rather than
+        // widening the error variant.
         let http_len = listeners_count.http.len();
         let tls_len = listeners_count.tls.len();
         let tcp_len = listeners_count.tcp.len();
+        let udp_len = listeners_count.udp.len();
         let total = http_len
             .checked_add(tls_len)
             .and_then(|s| s.checked_add(tcp_len))
+            .and_then(|s| s.checked_add(udp_len))
             .ok_or(ScmSocketError::ListenersCountInconsistent {
                 http: http_len,
                 tls: tls_len,
-                tcp: tcp_len,
+                tcp: tcp_len.saturating_add(udp_len),
                 total: usize::MAX,
                 fds_received: file_descriptor_length,
                 max_fds: MAX_FDS_OUT,
@@ -171,7 +177,7 @@ impl ScmSocket {
             return Err(ScmSocketError::ListenersCountInconsistent {
                 http: http_len,
                 tls: tls_len,
-                tcp: tcp_len,
+                tcp: tcp_len.saturating_add(udp_len),
                 total,
                 fds_received: file_descriptor_length,
                 max_fds: MAX_FDS_OUT,
@@ -181,6 +187,7 @@ impl ScmSocket {
         let mut http_addresses = parse_addresses(&listeners_count.http)?;
         let mut tls_addresses = parse_addresses(&listeners_count.tls)?;
         let mut tcp_addresses = parse_addresses(&listeners_count.tcp)?;
+        let mut udp_addresses = parse_addresses(&listeners_count.udp)?;
 
         let mut index = 0;
         let len = http_len;
@@ -209,7 +216,21 @@ impl ScmSocket {
                 .zip(received_fds[index..index + len].iter().cloned()),
         );
 
-        Ok(Listeners { http, tls, tcp })
+        index += len;
+        let len = udp_len;
+        let mut udp = Vec::new();
+        udp.extend(
+            udp_addresses
+                .drain(..)
+                .zip(received_fds[index..index + len].iter().cloned()),
+        );
+
+        Ok(Listeners {
+            http,
+            tls,
+            tcp,
+            udp,
+        })
     }
 
     /// Sends message and file descriptors separately. The file descriptors are summed up
@@ -274,12 +295,16 @@ impl ScmSocket {
     }
 }
 
-/// Socket addresses and file descriptors of TCP sockets, needed by a Proxy to start listening
+/// Socket addresses and file descriptors of listening sockets, needed by a
+/// Proxy to start listening. The transport is fd-type-agnostic: `udp` carries
+/// `UdpSocket` fds, the others carry `TcpListener` fds.
 #[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Listeners {
     pub http: Vec<(SocketAddr, RawFd)>,
     pub tls: Vec<(SocketAddr, RawFd)>,
     pub tcp: Vec<(SocketAddr, RawFd)>,
+    #[serde(default)]
+    pub udp: Vec<(SocketAddr, RawFd)>,
 }
 
 impl Listeners {
@@ -302,6 +327,13 @@ impl Listeners {
             .iter()
             .position(|(front, _)| front == addr)
             .map(|pos| self.tcp.remove(pos).1)
+    }
+
+    pub fn get_udp(&mut self, addr: &SocketAddr) -> Option<RawFd> {
+        self.udp
+            .iter()
+            .position(|(front, _)| front == addr)
+            .map(|pos| self.udp.remove(pos).1)
     }
 
     /// Deactivate all listeners by closing their file descriptors
@@ -330,6 +362,17 @@ impl Listeners {
             // close-by-drop). No other reference to the descriptor survives.
             unsafe {
                 let _ = TcpListener::from_raw_fd(*fd);
+            }
+        }
+
+        for (_, fd) in &self.udp {
+            // SAFETY: `*fd` is owned by this `ScmListeners` table and is
+            // about to be closed by the binding's `Drop` (intentional
+            // close-by-drop). No other reference to the descriptor survives.
+            // UDP listeners are `UdpSocket` fds, so take ownership through the
+            // matching wrapper.
+            unsafe {
+                let _ = UdpSocket::from_raw_fd(*fd);
             }
         }
     }
@@ -424,6 +467,8 @@ mod tests {
             MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
         let (tls_socket1, tls_socket2) =
             MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
+        let (udp_socket1, udp_socket2) =
+            MioUnixStream::pair().expect("Could not create a pair of mio unix streams");
 
         let listeners = Listeners {
             http: vec![
@@ -456,6 +501,16 @@ mod tests {
                     tls_socket2.as_raw_fd(),
                 ),
             ],
+            udp: vec![
+                (
+                    socket_addr_from_str("127.0.4.1:5353"),
+                    udp_socket1.as_raw_fd(),
+                ),
+                (
+                    socket_addr_from_str("127.0.4.2:5353"),
+                    udp_socket2.as_raw_fd(),
+                ),
+            ],
         };
 
         println!("self.fd: {}", sending_scm_socket.fd);
@@ -470,6 +525,9 @@ mod tests {
             .expect("Could not receive listeners");
 
         assert_eq!(listeners.http[0].0, received_listeners.http[0].0);
+        assert_eq!(listeners.udp.len(), received_listeners.udp.len());
+        assert_eq!(listeners.udp[0].0, received_listeners.udp[0].0);
+        assert_eq!(listeners.udp[1].0, received_listeners.udp[1].0);
     }
 
     /// Regression: a malformed `ListenersCount` whose entry counts do not
@@ -496,6 +554,7 @@ mod tests {
             ],
             tls: vec![],
             tcp: vec![],
+            udp: vec![],
         };
         let payload = bogus.encode_length_delimited_to_vec();
         sender

@@ -22,13 +22,14 @@ use crate::{
             HealthChecksList, HttpListenerConfig, HttpsListenerConfig, InitialState,
             ListedFrontends, ListenerType, ListenersList, PathRule, QueryCertificatesFilters,
             RemoveBackend, RemoveCertificate, RemoveListener, ReplaceCertificate, Request,
-            RequestCounts, RequestHttpFrontend, RequestTcpFrontend, SetHealthCheck, SocketAddress,
-            TcpListenerConfig, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
-            UpdateTcpListenerConfig, WorkerRequest, request::RequestType,
+            RequestCounts, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend,
+            SetHealthCheck, SocketAddress, TcpListenerConfig, UdpListenerConfig,
+            UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
+            UpdateUdpListenerConfig, WorkerRequest, request::RequestType,
         },
         display::format_request_type,
     },
-    response::{Backend, HttpFrontend, TcpFrontend},
+    response::{Backend, HttpFrontend, TcpFrontend, UdpFrontend},
 };
 
 /// To use throughout Sōzu
@@ -85,12 +86,15 @@ pub struct ConfigState {
     pub https_listeners: BTreeMap<SocketAddr, HttpsListenerConfig>,
     /// socket address -> TCP listener
     pub tcp_listeners: BTreeMap<SocketAddr, TcpListenerConfig>,
+    /// socket address -> UDP listener
+    pub udp_listeners: BTreeMap<SocketAddr, UdpListenerConfig>,
     /// HTTP frontends, indexed by a summary of each front's address;hostname;path, for uniqueness.
     /// For example: `"0.0.0.0:8080;lolcatho.st;P/api"`
     pub http_fronts: BTreeMap<String, HttpFrontend>,
     /// indexed by (address, hostname, path)
     pub https_fronts: BTreeMap<String, HttpFrontend>,
     pub tcp_fronts: HashMap<ClusterId, Vec<TcpFrontend>>,
+    pub udp_fronts: HashMap<ClusterId, Vec<UdpFrontend>>,
     pub certificates: HashMap<SocketAddr, HashMap<Fingerprint, CertificateAndKey>>,
     /// A census of requests that were received. Name of the request -> number of occurences
     pub request_counts: BTreeMap<String, i32>,
@@ -115,6 +119,7 @@ impl ConfigState {
             RequestType::AddHttpListener(listener) => self.add_http_listener(listener),
             RequestType::AddHttpsListener(listener) => self.add_https_listener(listener),
             RequestType::AddTcpListener(listener) => self.add_tcp_listener(listener),
+            RequestType::AddUdpListener(listener) => self.add_udp_listener(listener),
             RequestType::RemoveListener(remove) => self.remove_listener(remove),
             RequestType::ActivateListener(activate) => self.activate_listener(activate),
             RequestType::DeactivateListener(deactivate) => self.deactivate_listener(deactivate),
@@ -127,11 +132,14 @@ impl ConfigState {
             RequestType::RemoveHttpsFrontend(front) => self.remove_https_frontend(front),
             RequestType::AddTcpFrontend(front) => self.add_tcp_frontend(front),
             RequestType::RemoveTcpFrontend(front) => self.remove_tcp_frontend(front),
+            RequestType::AddUdpFrontend(front) => self.add_udp_frontend(front),
+            RequestType::RemoveUdpFrontend(front) => self.remove_udp_frontend(front),
             RequestType::AddBackend(add_backend) => self.add_backend(add_backend),
             RequestType::RemoveBackend(backend) => self.remove_backend(backend),
             RequestType::UpdateHttpListener(patch) => self.update_http_listener(patch),
             RequestType::UpdateHttpsListener(patch) => self.update_https_listener(patch),
             RequestType::UpdateTcpListener(patch) => self.update_tcp_listener(patch),
+            RequestType::UpdateUdpListener(patch) => self.update_udp_listener(patch),
             RequestType::SetHealthCheck(set) => self.set_health_check(set),
             RequestType::RemoveHealthCheck(cluster_id) => self.remove_health_check(cluster_id),
 
@@ -303,11 +311,26 @@ impl ConfigState {
         Ok(())
     }
 
+    fn add_udp_listener(&mut self, listener: &UdpListenerConfig) -> Result<(), StateError> {
+        let address: SocketAddr = listener.address.into();
+        match self.udp_listeners.entry(address) {
+            BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(*listener),
+            BTreeMapEntry::Occupied(_) => {
+                return Err(StateError::Exists {
+                    kind: ObjectKind::UdpListener,
+                    id: address.to_string(),
+                });
+            }
+        };
+        Ok(())
+    }
+
     fn remove_listener(&mut self, remove: &RemoveListener) -> Result<(), StateError> {
         match ListenerType::try_from(remove.proxy).map_err(StateError::WrongFieldValue)? {
             ListenerType::Http => self.remove_http_listener(&remove.address.into()),
             ListenerType::Https => self.remove_https_listener(&remove.address.into()),
             ListenerType::Tcp => self.remove_tcp_listener(&remove.address.into()),
+            ListenerType::Udp => self.remove_udp_listener(&remove.address.into()),
         }
     }
 
@@ -327,6 +350,13 @@ impl ConfigState {
 
     fn remove_tcp_listener(&mut self, address: &SocketAddr) -> Result<(), StateError> {
         if self.tcp_listeners.remove(address).is_none() {
+            return Err(StateError::NoChange);
+        }
+        Ok(())
+    }
+
+    fn remove_udp_listener(&mut self, address: &SocketAddr) -> Result<(), StateError> {
+        if self.udp_listeners.remove(address).is_none() {
             return Err(StateError::NoChange);
         }
         Ok(())
@@ -591,6 +621,38 @@ impl ConfigState {
         Ok(())
     }
 
+    /// Validate and apply a partial patch to an existing UDP listener.
+    ///
+    /// Only `Some` fields in the patch are written; `None` fields preserve the
+    /// current value. Returns `StateError::NotFound` if the address is unknown.
+    fn update_udp_listener(&mut self, patch: &UpdateUdpListenerConfig) -> Result<(), StateError> {
+        let address: SocketAddr = patch.address.into();
+        let listener =
+            self.udp_listeners
+                .get_mut(&address)
+                .ok_or_else(|| StateError::NotFound {
+                    kind: ObjectKind::UdpListener,
+                    id: address.to_string(),
+                })?;
+
+        if let Some(v) = patch.public_address {
+            listener.public_address = Some(v);
+        }
+        if let Some(v) = patch.front_timeout {
+            listener.front_timeout = v;
+        }
+        if let Some(v) = patch.back_timeout {
+            listener.back_timeout = v;
+        }
+        if let Some(v) = patch.max_rx_datagram_size {
+            listener.max_rx_datagram_size = v;
+        }
+        if let Some(v) = patch.max_flows {
+            listener.max_flows = v;
+        }
+        Ok(())
+    }
+
     fn activate_listener(&mut self, activate: &ActivateListener) -> Result<(), StateError> {
         match ListenerType::try_from(activate.proxy).map_err(StateError::WrongFieldValue)? {
             ListenerType::Http => self
@@ -615,6 +677,14 @@ impl ConfigState {
                 .map(|listener| listener.active = true)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::TcpListener,
+                    id: activate.address.to_string(),
+                }),
+            ListenerType::Udp => self
+                .udp_listeners
+                .get_mut(&activate.address.into())
+                .map(|listener| listener.active = true)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::UdpListener,
                     id: activate.address.to_string(),
                 }),
         }
@@ -644,6 +714,14 @@ impl ConfigState {
                 .map(|listener| listener.active = false)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::TcpListener,
+                    id: deactivate.address.to_string(),
+                }),
+            ListenerType::Udp => self
+                .udp_listeners
+                .get_mut(&deactivate.address.into())
+                .map(|listener| listener.active = false)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::UdpListener,
                     id: deactivate.address.to_string(),
                 }),
         }
@@ -838,6 +916,45 @@ impl ConfigState {
         Ok(())
     }
 
+    fn add_udp_frontend(&mut self, front: &RequestUdpFrontend) -> Result<(), StateError> {
+        let udp_frontends = self.udp_fronts.entry(front.cluster_id.clone()).or_default();
+
+        let udp_frontend = UdpFrontend {
+            cluster_id: front.cluster_id.clone(),
+            address: front.address.into(),
+            tags: front.tags.clone(),
+        };
+        if udp_frontends.contains(&udp_frontend) {
+            return Err(StateError::Exists {
+                kind: ObjectKind::UdpFrontend,
+                id: format!("{udp_frontend:?}"),
+            });
+        }
+
+        udp_frontends.push(udp_frontend);
+        Ok(())
+    }
+
+    fn remove_udp_frontend(
+        &mut self,
+        front_to_remove: &RequestUdpFrontend,
+    ) -> Result<(), StateError> {
+        let udp_frontends =
+            self.udp_fronts
+                .get_mut(&front_to_remove.cluster_id)
+                .ok_or(StateError::NotFound {
+                    kind: ObjectKind::UdpFrontend,
+                    id: format!("{front_to_remove:?}"),
+                })?;
+
+        let len = udp_frontends.len();
+        udp_frontends.retain(|front| front.address != front_to_remove.address.into());
+        if udp_frontends.len() == len {
+            return Err(StateError::NoChange);
+        }
+        Ok(())
+    }
+
     fn add_backend(&mut self, add_backend: &AddBackend) -> Result<(), StateError> {
         let backend = Backend {
             address: add_backend.address.into(),
@@ -922,6 +1039,20 @@ impl ConfigState {
             }
         }
 
+        for listener in self.udp_listeners.values() {
+            v.push(RequestType::AddUdpListener(*listener).into());
+            if listener.active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        address: listener.address,
+                        proxy: ListenerType::Udp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
         for cluster in self.clusters.values() {
             v.push(RequestType::AddCluster(cluster.clone()).into());
         }
@@ -950,6 +1081,12 @@ impl ConfigState {
         for front_list in self.tcp_fronts.values() {
             for front in front_list {
                 v.push(RequestType::AddTcpFrontend(front.clone().into()).into());
+            }
+        }
+
+        for front_list in self.udp_fronts.values() {
+            for front in front_list {
+                v.push(RequestType::AddUdpFrontend(front.clone().into()).into());
             }
         }
 
@@ -1010,6 +1147,21 @@ impl ConfigState {
                 .into(),
             );
         }
+        for front in self
+            .udp_listeners
+            .iter()
+            .filter(|(_, listener)| listener.active)
+            .map(|(k, _)| k)
+        {
+            v.push(
+                RequestType::ActivateListener(ActivateListener {
+                    address: SocketAddress::from(*front),
+                    proxy: ListenerType::Udp.into(),
+                    from_scm: false,
+                })
+                .into(),
+            );
+        }
 
         v
     }
@@ -1020,6 +1172,11 @@ impl ConfigState {
         let their_tcp_listeners: HashSet<&SocketAddr> = other.tcp_listeners.keys().collect();
         let removed_tcp_listeners = my_tcp_listeners.difference(&their_tcp_listeners);
         let added_tcp_listeners = their_tcp_listeners.difference(&my_tcp_listeners);
+
+        let my_udp_listeners: HashSet<&SocketAddr> = self.udp_listeners.keys().collect();
+        let their_udp_listeners: HashSet<&SocketAddr> = other.udp_listeners.keys().collect();
+        let removed_udp_listeners = my_udp_listeners.difference(&their_udp_listeners);
+        let added_udp_listeners = their_udp_listeners.difference(&my_udp_listeners);
 
         let my_http_listeners: HashSet<&SocketAddr> = self.http_listeners.keys().collect();
         let their_http_listeners: HashSet<&SocketAddr> = other.http_listeners.keys().collect();
@@ -1062,6 +1219,42 @@ impl ConfigState {
                     RequestType::ActivateListener(ActivateListener {
                         address: SocketAddress::from(**address),
                         proxy: ListenerType::Tcp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for address in removed_udp_listeners {
+            if self.udp_listeners[*address].active {
+                v.push(
+                    RequestType::DeactivateListener(DeactivateListener {
+                        address: SocketAddress::from(**address),
+                        proxy: ListenerType::Udp.into(),
+                        to_scm: false,
+                    })
+                    .into(),
+                );
+            }
+
+            v.push(
+                RequestType::RemoveListener(RemoveListener {
+                    address: SocketAddress::from(**address),
+                    proxy: ListenerType::Udp.into(),
+                })
+                .into(),
+            );
+        }
+
+        for address in added_udp_listeners.clone() {
+            v.push(RequestType::AddUdpListener(other.udp_listeners[*address]).into());
+
+            if other.udp_listeners[*address].active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        address: SocketAddress::from(**address),
+                        proxy: ListenerType::Udp.into(),
                         from_scm: false,
                     })
                     .into(),
@@ -1175,6 +1368,47 @@ impl ConfigState {
                     RequestType::ActivateListener(ActivateListener {
                         address: SocketAddress::from(**addr),
                         proxy: ListenerType::Tcp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for addr in my_udp_listeners.intersection(&their_udp_listeners) {
+            let my_listener = &self.udp_listeners[*addr];
+            let their_listener = &other.udp_listeners[*addr];
+
+            if my_listener != their_listener {
+                v.push(
+                    RequestType::RemoveListener(RemoveListener {
+                        address: SocketAddress::from(**addr),
+                        proxy: ListenerType::Udp.into(),
+                    })
+                    .into(),
+                );
+                // any added listener should be unactive
+                let mut listener_to_add = *their_listener;
+                listener_to_add.active = false;
+                v.push(RequestType::AddUdpListener(listener_to_add).into());
+            }
+
+            if my_listener.active && !their_listener.active {
+                v.push(
+                    RequestType::DeactivateListener(DeactivateListener {
+                        address: SocketAddress::from(**addr),
+                        proxy: ListenerType::Udp.into(),
+                        to_scm: false,
+                    })
+                    .into(),
+                );
+            }
+
+            if !my_listener.active && their_listener.active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        address: SocketAddress::from(**addr),
+                        proxy: ListenerType::Udp.into(),
                         from_scm: false,
                     })
                     .into(),
@@ -1399,6 +1633,30 @@ impl ConfigState {
             v.push(RequestType::AddTcpFrontend(front.clone().into()).into());
         }
 
+        let mut my_udp_fronts: HashSet<(&ClusterId, &UdpFrontend)> = HashSet::new();
+        for (cluster_id, front_list) in self.udp_fronts.iter() {
+            for front in front_list.iter() {
+                my_udp_fronts.insert((cluster_id, front));
+            }
+        }
+        let mut their_udp_fronts: HashSet<(&ClusterId, &UdpFrontend)> = HashSet::new();
+        for (cluster_id, front_list) in other.udp_fronts.iter() {
+            for front in front_list.iter() {
+                their_udp_fronts.insert((cluster_id, front));
+            }
+        }
+
+        let removed_udp_fronts = my_udp_fronts.difference(&their_udp_fronts);
+        let added_udp_fronts = their_udp_fronts.difference(&my_udp_fronts);
+
+        for &(_, front) in removed_udp_fronts {
+            v.push(RequestType::RemoveUdpFrontend(front.clone().into()).into());
+        }
+
+        for &(_, front) in added_udp_fronts {
+            v.push(RequestType::AddUdpFrontend(front.clone().into()).into());
+        }
+
         //pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
         let my_certificates: HashSet<(SocketAddr, &Fingerprint)> = HashSet::from_iter(
             self.certificates
@@ -1449,6 +1707,20 @@ impl ConfigState {
                     RequestType::ActivateListener(ActivateListener {
                         address: listener.address,
                         proxy: ListenerType::Tcp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        for address in added_udp_listeners {
+            let listener = &other.udp_listeners[*address];
+            if listener.active {
+                v.push(
+                    RequestType::ActivateListener(ActivateListener {
+                        address: listener.address,
+                        proxy: ListenerType::Udp.into(),
                         from_scm: false,
                     })
                     .into(),
@@ -1527,6 +1799,15 @@ impl ConfigState {
             .map(|front| front.clone().into())
             .collect();
 
+        let udp_frontends: Vec<RequestUdpFrontend> = self
+            .udp_fronts
+            .get(cluster_id)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|front| front.clone().into())
+            .collect();
+
         let backends: Vec<AddBackend> = self
             .backends
             .get(cluster_id)
@@ -1542,6 +1823,7 @@ impl ConfigState {
             https_frontends,
             tcp_frontends,
             backends,
+            udp_frontends,
         })
     }
 
@@ -1553,6 +1835,7 @@ impl ConfigState {
         self.http_fronts.values().count()
             + self.https_fronts.values().count()
             + self.tcp_fronts.values().fold(0, |acc, v| acc + v.len())
+            + self.udp_fronts.values().fold(0, |acc, v| acc + v.len())
     }
 
     pub fn get_cluster_ids_by_domain(
@@ -1643,6 +1926,19 @@ impl ConfigState {
             }
         }
 
+        // `FrontendFilters` has no dedicated `udp` flag, so UDP frontends ride
+        // the same default/all-pass path as TCP: surfaced when no protocol
+        // filter is set (`list_all`) or when the `tcp` filter is requested.
+        // Datagram frontends carry no hostname, so a `domain` filter excludes
+        // them (matching the TCP branch).
+        if (filters.tcp || list_all) && filters.domain.is_none() {
+            for udp_frontend in self.udp_fronts.values().flat_map(|v| v.iter()) {
+                listed_frontends
+                    .udp_frontends
+                    .push(udp_frontend.to_owned().into())
+            }
+        }
+
         listed_frontends
     }
 
@@ -1660,6 +1956,11 @@ impl ConfigState {
                 .collect(),
             tcp_listeners: self
                 .tcp_listeners
+                .iter()
+                .map(|(addr, listener)| (addr.to_string(), *listener))
+                .collect(),
+            udp_listeners: self
+                .udp_listeners
                 .iter()
                 .map(|(addr, listener)| (addr.to_string(), *listener))
                 .collect(),
@@ -2061,7 +2362,7 @@ mod tests {
     use super::*;
     use crate::proto::command::{
         CustomHttpAnswers, LoadBalancingParams, RequestHttpFrontend, RequestTcpFrontend,
-        RulePosition,
+        RequestUdpFrontend, RulePosition, UdpListenerConfig, UpdateUdpListenerConfig,
     };
 
     #[test]
@@ -2947,6 +3248,211 @@ mod tests {
             connect_timeout: 3,
             ..Default::default()
         }
+    }
+
+    fn make_udp_listener(address: SocketAddress, active: bool) -> UdpListenerConfig {
+        UdpListenerConfig {
+            address,
+            public_address: None,
+            front_timeout: 30,
+            back_timeout: 30,
+            max_rx_datagram_size: 1500,
+            max_flows: 0,
+            active,
+        }
+    }
+
+    /// Mandatory roundtrip guard for the UDP control-plane data model.
+    ///
+    /// 1. Build a state holding an active UDP listener + UDP frontend, run
+    ///    `generate_requests()`, replay every emitted request into a fresh
+    ///    `ConfigState`, and assert the two states are byte-for-byte equal.
+    /// 2. Prove a `diff()` between an empty state and the UDP-bearing state
+    ///    produces requests that, replayed, reconstruct the UDP listener and
+    ///    frontend (a hot-add path), and that the reverse diff tears them
+    ///    down again.
+    #[test]
+    fn test_udp_state_roundtrip() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 5353);
+
+        let mut state = ConfigState::default();
+        state
+            .dispatch(&RequestType::AddUdpListener(make_udp_listener(address, true)).into())
+            .expect("could not add udp listener");
+        state
+            .dispatch(
+                &RequestType::ActivateListener(ActivateListener {
+                    address,
+                    proxy: ListenerType::Udp.into(),
+                    from_scm: false,
+                })
+                .into(),
+            )
+            .expect("could not activate udp listener");
+        state
+            .dispatch(
+                &RequestType::AddUdpFrontend(RequestUdpFrontend {
+                    cluster_id: "udp_cluster".to_string(),
+                    address,
+                    tags: BTreeMap::from([("owner".to_string(), "team".to_string())]),
+                })
+                .into(),
+            )
+            .expect("could not add udp frontend");
+
+        assert_eq!(state.udp_listeners.len(), 1);
+        assert!(state.udp_listeners[&address.into()].active);
+        assert_eq!(
+            state.udp_fronts.get("udp_cluster").map(Vec::len),
+            Some(1usize)
+        );
+
+        // `request_counts` is a runtime census side-effect of `dispatch`; it
+        // diverges by construction whenever the number/shape of replayed
+        // requests differs from the originals, so compare the logical config
+        // with the census cleared on both sides.
+        let logical = |s: &ConfigState| {
+            let mut c = s.clone();
+            c.request_counts.clear();
+            c
+        };
+
+        // 1. generate_requests → replay → equal
+        let mut replayed = ConfigState::default();
+        for request in state.generate_requests() {
+            replayed
+                .dispatch(&request)
+                .expect("could not replay generated request");
+        }
+        assert_eq!(
+            logical(&state),
+            logical(&replayed),
+            "UDP listener + frontend must survive generate_requests → replay"
+        );
+
+        // 2. diff from empty reconstructs the UDP objects
+        let empty = ConfigState::default();
+        let mut from_diff = ConfigState::default();
+        for request in empty.diff(&state) {
+            from_diff
+                .dispatch(&request)
+                .expect("could not replay diff request");
+        }
+        assert_eq!(
+            logical(&state),
+            logical(&from_diff),
+            "diff(empty -> state) must reconstruct the UDP listener + frontend"
+        );
+
+        // reverse diff tears them back down to empty
+        let mut torn_down = state.clone();
+        for request in state.diff(&empty) {
+            torn_down
+                .dispatch(&request)
+                .expect("could not replay teardown diff request");
+        }
+        assert!(
+            torn_down.udp_listeners.is_empty(),
+            "diff(state -> empty) must remove the UDP listener"
+        );
+        assert!(
+            torn_down
+                .udp_fronts
+                .get("udp_cluster")
+                .map(Vec::is_empty)
+                .unwrap_or(true),
+            "diff(state -> empty) must remove the UDP frontend"
+        );
+
+        // update path: a partial patch mutates the stored listener in place
+        state
+            .dispatch(
+                &RequestType::UpdateUdpListener(UpdateUdpListenerConfig {
+                    address,
+                    max_flows: Some(4096),
+                    front_timeout: Some(15),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("could not update udp listener");
+        let updated = &state.udp_listeners[&address.into()];
+        assert_eq!(updated.max_flows, 4096);
+        assert_eq!(updated.front_timeout, 15);
+        assert_eq!(
+            updated.back_timeout, 30,
+            "unpatched field must be preserved"
+        );
+    }
+
+    /// `list_frontends` must surface UDP frontends alongside TCP ones. The
+    /// proto `FrontendFilters` has no `udp` flag, so UDP rides the default
+    /// (all-pass) and `tcp` filters; a `domain` filter excludes both.
+    #[test]
+    fn list_frontends_includes_udp() {
+        let tcp_addr = SocketAddress::new_v4(0, 0, 0, 0, 6379);
+        let udp_addr = SocketAddress::new_v4(0, 0, 0, 0, 5353);
+
+        let mut state = ConfigState::default();
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "tcp_cluster".to_string(),
+                    address: tcp_addr,
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("could not add tcp frontend");
+        state
+            .dispatch(
+                &RequestType::AddUdpFrontend(RequestUdpFrontend {
+                    cluster_id: "udp_cluster".to_string(),
+                    address: udp_addr,
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("could not add udp frontend");
+
+        // default filters (all false, no domain) → list everything, incl. UDP
+        let all = state.list_frontends(FrontendFilters::default());
+        assert_eq!(all.tcp_frontends.len(), 1, "tcp frontend must be listed");
+        assert_eq!(
+            all.udp_frontends.len(),
+            1,
+            "udp frontend must be listed under the default all-pass path"
+        );
+        assert_eq!(all.udp_frontends[0].cluster_id, "udp_cluster");
+        assert_eq!(all.udp_frontends[0].address, udp_addr);
+
+        // explicit `tcp` filter surfaces both TCP and UDP (no `udp` flag exists)
+        let tcp_only = state.list_frontends(FrontendFilters {
+            tcp: true,
+            ..Default::default()
+        });
+        assert_eq!(tcp_only.tcp_frontends.len(), 1);
+        assert_eq!(
+            tcp_only.udp_frontends.len(),
+            1,
+            "udp frontends ride the tcp filter"
+        );
+
+        // an `http` filter excludes both TCP and UDP
+        let http_only = state.list_frontends(FrontendFilters {
+            http: true,
+            ..Default::default()
+        });
+        assert!(http_only.tcp_frontends.is_empty());
+        assert!(http_only.udp_frontends.is_empty());
+
+        // a `domain` filter excludes UDP (no hostname), matching TCP behaviour
+        let domain_filtered = state.list_frontends(FrontendFilters {
+            domain: Some("example.com".to_string()),
+            ..Default::default()
+        });
+        assert!(domain_filtered.tcp_frontends.is_empty());
+        assert!(domain_filtered.udp_frontends.is_empty());
     }
 
     // ── update_https_listener ──────────────────────────────────────────────────

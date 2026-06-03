@@ -45,6 +45,8 @@ Each proxy implementation (HTTP, HTTPS and TCP) will use in each client session 
 
 Each protocol will work with the `Readiness` structure to indicate if it wants to read or write on each socket. As an example, the [rustls based handshake](https://github.com/sozu-proxy/sozu/blob/main/lib/src/protocol/rustls.rs) is only interested in the frontend socket.
 
+A fourth proxy implementation, **UDP**, load-balances datagram traffic (DNS, syslog, NTP, generic UDP). It is connectionless, so it deliberately sits outside the per-session `accept()`/state-machine model above: a single listener socket serves many virtual 4-tuple *flows*, each with its own connected upstream socket for symmetric NAT return. See [`lib/src/protocol/udp`](https://github.com/sozu-proxy/sozu/tree/main/lib/src/protocol/udp) and the UDP sections of [`doc/configure.md`](configure.md).
+
 They are all defined in [`lib/src/protocol`](https://github.com/sozu-proxy/sozu/tree/main/lib/src/protocol).
 
 ### HTTP/2 and the Mux layer

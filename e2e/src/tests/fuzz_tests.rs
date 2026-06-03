@@ -68,3 +68,8 @@ fn fuzz_frame_parser() {
 fn fuzz_hpack_decoder() {
     run_fuzz_target("fuzz_hpack_decoder");
 }
+
+#[test]
+fn fuzz_udp_flow() {
+    run_fuzz_target("fuzz_udp_flow");
+}

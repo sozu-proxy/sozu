@@ -67,8 +67,10 @@ use crate::{
         HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
         LoadBalancingParams, LoadMetric, MetricDetail, MetricsConfiguration, PathRule,
         ProtobufAccessLogFormat, ProxyProtocolConfig, RedirectPolicy, RedirectScheme, Request,
-        RequestHttpFrontend, RequestTcpFrontend, RulePosition, ServerConfig, ServerMetricsConfig,
-        SocketAddress, TcpListenerConfig, TlsVersion, WorkerRequest, request::RequestType,
+        RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend, RulePosition, ServerConfig,
+        ServerMetricsConfig, SocketAddress, TcpListenerConfig, TlsVersion, UdpAffinityKey,
+        UdpClusterConfig, UdpHealthConfig, UdpHealthMode, UdpListenerConfig, WorkerRequest,
+        request::RequestType,
     },
 };
 
@@ -122,6 +124,20 @@ pub const DEFAULT_CONNECT_TIMEOUT: u32 = 3;
 
 /// maximum time to receive a request since the connection started (10 seconds)
 pub const DEFAULT_REQUEST_TIMEOUT: u32 = 10;
+
+/// client/upstream flow idle timeout for a UDP listener (30 seconds)
+pub const DEFAULT_UDP_FRONT_TIMEOUT: u32 = 30;
+
+/// upstream flow idle timeout for a UDP listener (30 seconds)
+pub const DEFAULT_UDP_BACK_TIMEOUT: u32 = 30;
+
+/// maximum received datagram size for a UDP listener, in bytes (1500 = a
+/// typical Ethernet MTU). Capped at the effective `buffer_size` at runtime.
+pub const DEFAULT_UDP_MAX_RX_DATAGRAM_SIZE: u32 = 1500;
+
+/// maximum number of concurrent UDP flows per listener. `0` selects the
+/// runtime auto policy (~70% of the soft `RLIMIT_NOFILE`).
+pub const DEFAULT_UDP_MAX_FLOWS: u32 = 0;
 
 /// maximum time to wait for a worker to respond, until it is deemed NotAnswering (10 seconds)
 pub const DEFAULT_WORKER_TIMEOUT: u32 = 10;
@@ -504,6 +520,15 @@ pub struct ListenerBuilder {
     /// HTTP listeners at config-load time; this field is only meaningful
     /// for HTTPS listeners. Defaults to `None` (no HSTS).
     pub hsts: Option<FileHstsConfig>,
+    /// UDP listener only: maximum received datagram size, in bytes. Capped
+    /// at the effective `buffer_size` at config-load (clamp + warn when
+    /// larger). Defaults to [`DEFAULT_UDP_MAX_RX_DATAGRAM_SIZE`].
+    pub max_rx_datagram_size: Option<u32>,
+    /// UDP listener only: maximum number of concurrent flows. `0` (the
+    /// default) selects the runtime auto policy (~70% soft RLIMIT_NOFILE);
+    /// a warning is emitted at config-load when an explicit value exceeds
+    /// that bound.
+    pub max_flows: Option<u32>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -527,6 +552,12 @@ impl ListenerBuilder {
     /// or defaults if no config is provided
     pub fn new_https(address: SocketAddress) -> ListenerBuilder {
         Self::new(address, ListenerProtocol::Https)
+    }
+
+    /// starts building a UDP Listener with config values for timeouts,
+    /// or defaults if no config is provided
+    pub fn new_udp(address: SocketAddress) -> ListenerBuilder {
+        Self::new(address, ListenerProtocol::Udp)
     }
 
     /// starts building a Listener
@@ -588,6 +619,8 @@ impl ListenerBuilder {
             send_x_real_ip: None,
             answers: None,
             hsts: None,
+            max_rx_datagram_size: None,
+            max_flows: None,
         }
     }
 
@@ -1061,6 +1094,90 @@ impl ListenerBuilder {
             active: false,
         })
     }
+
+    /// build a UDP listener. UDP has no `expect_proxy` / `connect_timeout`;
+    /// flows are keyed by 4-tuple and torn down on idle.
+    ///
+    /// Timeouts: an unset `front_timeout` / `back_timeout` falls back to the
+    /// UDP-specific defaults ([`DEFAULT_UDP_FRONT_TIMEOUT`] /
+    /// [`DEFAULT_UDP_BACK_TIMEOUT`], both 30 s) — *not* the global HTTP/TCP
+    /// `front_timeout` (60 s) / `back_timeout`. This keeps the effective
+    /// default in lock-step with the CLI help and the proto
+    /// `UdpListenerConfig` defaults (both 30 s). The global config is consulted
+    /// only for `buffer_size` (the `max_rx_datagram_size` cap).
+    ///
+    /// Validation:
+    /// * `max_rx_datagram_size` is clamped to the effective `buffer_size`
+    ///   (with a warning) so a datagram can never exceed the pool buffer.
+    /// * an explicit non-zero `max_flows` that exceeds ~70% of the soft
+    ///   `RLIMIT_NOFILE` emits a warning (the per-flow connected sockets
+    ///   would otherwise risk EMFILE).
+    pub fn to_udp(&mut self, config: Option<&Config>) -> Result<UdpListenerConfig, ConfigError> {
+        if self.protocol != Some(ListenerProtocol::Udp) {
+            return Err(ConfigError::WrongListenerProtocol {
+                expected: ListenerProtocol::Udp,
+                found: self.protocol.to_owned(),
+            });
+        }
+
+        let mut max_rx_datagram_size = self
+            .max_rx_datagram_size
+            .unwrap_or(DEFAULT_UDP_MAX_RX_DATAGRAM_SIZE);
+        let buffer_size = config.map(|c| c.buffer_size).unwrap_or(DEFAULT_BUFFER_SIZE);
+        if u64::from(max_rx_datagram_size) > buffer_size {
+            warn!(
+                "UDP listener {}: max_rx_datagram_size = {} exceeds buffer_size = {}, clamping to buffer_size",
+                self.address, max_rx_datagram_size, buffer_size
+            );
+            max_rx_datagram_size = buffer_size as u32;
+        }
+
+        let max_flows = self.max_flows.unwrap_or(DEFAULT_UDP_MAX_FLOWS);
+        if max_flows > 0 {
+            if let Some(soft_limit) = soft_rlimit_nofile() {
+                let advisory = soft_limit.saturating_mul(7) / 10;
+                if u64::from(max_flows) > advisory {
+                    warn!(
+                        "UDP listener {}: max_flows = {} exceeds ~70% of the soft RLIMIT_NOFILE ({}); \
+                         per-flow connected sockets may hit EMFILE",
+                        self.address, max_flows, advisory
+                    );
+                }
+            }
+        }
+
+        Ok(UdpListenerConfig {
+            address: self.address.into(),
+            public_address: self.public_address.map(|a| a.into()),
+            front_timeout: self.front_timeout.unwrap_or(DEFAULT_UDP_FRONT_TIMEOUT),
+            back_timeout: self.back_timeout.unwrap_or(DEFAULT_UDP_BACK_TIMEOUT),
+            max_rx_datagram_size,
+            max_flows,
+            active: false,
+        })
+    }
+}
+
+/// Read the soft `RLIMIT_NOFILE` (max open file descriptors). Used as an
+/// advisory ceiling for `max_flows` on UDP listeners. Returns `None` when
+/// the limit cannot be read so callers skip the advisory check rather than
+/// failing config-load.
+fn soft_rlimit_nofile() -> Option<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` writes into the provided `rlimit` out-parameter and
+    // does not retain the pointer. A non-zero return means failure, in which
+    // case we ignore the (uninitialised-by-contract) value and return None.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    if rc == 0 {
+        // `rlim_cur` is `rlim_t`, which is `u64` on the Tier-1 targets sozu
+        // builds for, so it already matches the `Option<u64>` return type.
+        Some(limit.rlim_cur)
+    } else {
+        None
+    }
 }
 
 /// read a custom HTTP answer from a file
@@ -1433,6 +1550,9 @@ impl FileClusterFrontendConfig {
         Ok(TcpFrontendConfig {
             address: self.address,
             tags: self.tags.clone(),
+            // Resolved against `known_addresses` in `populate_clusters`; a
+            // bare `to_tcp_front` (no listener context) defaults to TCP.
+            udp: false,
         })
     }
 
@@ -1657,6 +1777,7 @@ pub enum ListenerProtocol {
     Http,
     Https,
     Tcp,
+    Udp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1802,6 +1923,80 @@ pub struct FileClusterConfig {
     /// (h2c) when true.
     #[serde(default)]
     pub health_check: Option<FileHealthCheckConfig>,
+    /// Optional UDP-specific cluster configuration, parsed from a
+    /// `[clusters.<id>.udp]` block. Additive: clusters without a `udp`
+    /// block produce `udp: None` on the resulting [`Cluster`].
+    #[serde(default)]
+    pub udp: Option<FileUdpClusterConfig>,
+}
+
+/// UDP backend health-check configuration, parsed from
+/// `[clusters.<id>.udp.health]`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileUdpHealthConfig {
+    /// probe mode, parsed in SCREAMING_SNAKE_CASE: `"HEALTH_OFF"`,
+    /// `"TCP_PROBE"`, or `"UDP_PROBE"`. Defaults to `TCP_PROBE` when a
+    /// `udp.health` block is present.
+    pub mode: Option<UdpHealthMode>,
+    pub tcp_port: Option<u32>,
+    pub rise: Option<u32>,
+    pub fall: Option<u32>,
+    pub fail_open: Option<bool>,
+    /// hex-free literal payload sent for a UDP probe.
+    pub udp_probe_payload: Option<String>,
+    pub probe_interval_seconds: Option<u32>,
+    pub probe_timeout_seconds: Option<u32>,
+}
+
+impl FileUdpHealthConfig {
+    pub fn to_proto(&self) -> UdpHealthConfig {
+        UdpHealthConfig {
+            mode: self.mode.map(|m| m as i32),
+            tcp_port: self.tcp_port,
+            rise: self.rise,
+            fall: self.fall,
+            fail_open: self.fail_open,
+            udp_probe_payload: self
+                .udp_probe_payload
+                .as_ref()
+                .map(|p| p.as_bytes().to_owned()),
+            probe_interval_seconds: self.probe_interval_seconds,
+            probe_timeout_seconds: self.probe_timeout_seconds,
+        }
+    }
+}
+
+/// UDP-specific cluster knobs, parsed from a `[clusters.<id>.udp]` block.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileUdpClusterConfig {
+    /// flow affinity key, parsed in SCREAMING_SNAKE_CASE: `"SOURCE_IP"`
+    /// (default) or `"SOURCE_IP_PORT"`.
+    pub affinity_key: Option<UdpAffinityKey>,
+    /// expected replies per flow; 0 = unlimited.
+    pub responses: Option<u32>,
+    /// max client datagrams per flow; 0 = unlimited.
+    pub requests: Option<u32>,
+    /// send a PROXY protocol v2 header to the backend.
+    pub send_proxy_protocol: Option<bool>,
+    /// prepend PPv2 to every datagram; false = first-datagram only.
+    pub proxy_protocol_every_datagram: Option<bool>,
+    /// optional backend health-check configuration.
+    pub health: Option<FileUdpHealthConfig>,
+}
+
+impl FileUdpClusterConfig {
+    pub fn to_proto(&self) -> UdpClusterConfig {
+        UdpClusterConfig {
+            affinity_key: self.affinity_key.map(|k| k as i32),
+            responses: self.responses,
+            requests: self.requests,
+            send_proxy_protocol: self.send_proxy_protocol,
+            proxy_protocol_every_datagram: self.proxy_protocol_every_datagram,
+            health: self.health.as_ref().map(|h| h.to_proto()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1868,6 +2063,8 @@ impl FileClusterConfig {
                     None => BTreeMap::new(),
                 };
 
+                let udp = self.udp.as_ref().map(|u| u.to_proto());
+
                 Ok(ClusterConfig::Tcp(TcpClusterConfig {
                     cluster_id: cluster_id.to_string(),
                     frontends,
@@ -1882,6 +2079,7 @@ impl FileClusterConfig {
                     max_connections_per_ip: self.max_connections_per_ip,
                     retry_after: self.retry_after,
                     health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
+                    udp,
                 }))
             }
             FileClusterProtocolConfig::Http => {
@@ -1905,6 +2103,8 @@ impl FileClusterConfig {
                     None => BTreeMap::new(),
                 };
 
+                let udp = self.udp.as_ref().map(|u| u.to_proto());
+
                 Ok(ClusterConfig::Http(HttpClusterConfig {
                     cluster_id: cluster_id.to_string(),
                     frontends,
@@ -1922,6 +2122,7 @@ impl FileClusterConfig {
                     max_connections_per_ip: self.max_connections_per_ip,
                     retry_after: self.retry_after,
                     health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
+                    udp,
                 }))
             }
         }
@@ -2080,6 +2281,10 @@ pub struct HttpClusterConfig {
     /// (h2c) when true.
     #[serde(default)]
     pub health_check: Option<HealthCheckConfig>,
+    /// Optional UDP-specific cluster configuration. Always `None` for HTTP
+    /// clusters; carried for shape uniformity with the proto [`Cluster`].
+    #[serde(default)]
+    pub udp: Option<UdpClusterConfig>,
 }
 
 impl HttpClusterConfig {
@@ -2101,6 +2306,7 @@ impl HttpClusterConfig {
                 max_connections_per_ip: self.max_connections_per_ip,
                 retry_after: self.retry_after,
                 health_check: self.health_check.clone(),
+                udp: self.udp.clone(),
             })
             .into(),
         ];
@@ -2138,6 +2344,14 @@ impl HttpClusterConfig {
 pub struct TcpFrontendConfig {
     pub address: SocketAddr,
     pub tags: Option<BTreeMap<String, String>>,
+    /// `true` when this frontend's address resolves to a `protocol = "udp"`
+    /// listener. Resolved at config-load in [`ConfigBuilder::populate_clusters`]
+    /// from `known_addresses`; selects `AddUdpFrontend` over `AddTcpFrontend`
+    /// in [`TcpClusterConfig::generate_requests`]. A UDP cluster is declared as
+    /// a `protocol = "tcp"` cluster whose frontends point at UDP listeners and
+    /// whose datagram knobs live under `[clusters.<id>.udp]`.
+    #[serde(default)]
+    pub udp: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2174,6 +2388,10 @@ pub struct TcpClusterConfig {
     /// HTTP/1.1 only and TCP-only backends should leave this absent.
     #[serde(default)]
     pub health_check: Option<HealthCheckConfig>,
+    /// Optional UDP-specific cluster configuration, parsed from a
+    /// `[clusters.<id>.udp]` block on this cluster.
+    #[serde(default)]
+    pub udp: Option<UdpClusterConfig>,
 }
 
 impl TcpClusterConfig {
@@ -2195,19 +2413,35 @@ impl TcpClusterConfig {
                 max_connections_per_ip: self.max_connections_per_ip,
                 retry_after: self.retry_after,
                 health_check: self.health_check.clone(),
+                udp: self.udp.clone(),
             })
             .into(),
         ];
 
         for frontend in &self.frontends {
-            v.push(
-                RequestType::AddTcpFrontend(RequestTcpFrontend {
-                    cluster_id: self.cluster_id.clone(),
-                    address: frontend.address.into(),
-                    tags: frontend.tags.clone().unwrap_or(BTreeMap::new()),
-                })
-                .into(),
-            );
+            // A frontend whose address resolves to a `protocol = "udp"`
+            // listener (flagged in `populate_clusters`) is added as a UDP
+            // frontend; all others stay TCP. Mixed TCP/UDP frontends on the
+            // same cluster are supported.
+            if frontend.udp {
+                v.push(
+                    RequestType::AddUdpFrontend(RequestUdpFrontend {
+                        cluster_id: self.cluster_id.clone(),
+                        address: frontend.address.into(),
+                        tags: frontend.tags.clone().unwrap_or(BTreeMap::new()),
+                    })
+                    .into(),
+                );
+            } else {
+                v.push(
+                    RequestType::AddTcpFrontend(RequestTcpFrontend {
+                        cluster_id: self.cluster_id.clone(),
+                        address: frontend.address.into(),
+                        tags: frontend.tags.clone().unwrap_or(BTreeMap::new()),
+                    })
+                    .into(),
+                );
+            }
         }
 
         for (backend_count, backend) in self.backends.iter().enumerate() {
@@ -2536,6 +2770,12 @@ impl ConfigBuilder {
         Ok(())
     }
 
+    fn push_udp_listener(&mut self, mut listener: ListenerBuilder) -> Result<(), ConfigError> {
+        let listener = listener.to_udp(Some(&self.built))?;
+        self.built.udp_listeners.push(listener);
+        Ok(())
+    }
+
     fn populate_listeners(&mut self, listeners: Vec<ListenerBuilder>) -> Result<(), ConfigError> {
         for listener in listeners.iter() {
             if self.known_addresses.contains_key(&listener.address) {
@@ -2563,6 +2803,7 @@ impl ConfigBuilder {
                 ListenerProtocol::Https => self.push_tls_listener(listener.clone())?,
                 ListenerProtocol::Http => self.push_http_listener(listener.clone())?,
                 ListenerProtocol::Tcp => self.push_tcp_listener(listener.clone())?,
+                ListenerProtocol::Udp => self.push_udp_listener(listener.clone())?,
             }
         }
         Ok(())
@@ -2583,6 +2824,11 @@ impl ConfigBuilder {
                             Some(ListenerProtocol::Tcp) => {
                                 return Err(ConfigError::WrongFrontendProtocol(
                                     ListenerProtocol::Tcp,
+                                ));
+                            }
+                            Some(ListenerProtocol::Udp) => {
+                                return Err(ConfigError::WrongFrontendProtocol(
+                                    ListenerProtocol::Udp,
                                 ));
                             }
                             Some(ListenerProtocol::Http) => {
@@ -2640,14 +2886,22 @@ impl ConfigBuilder {
                         }
                     }
                 }
-                ClusterConfig::Tcp(ref tcp) => {
+                ClusterConfig::Tcp(ref mut tcp) => {
                     //FIXME: verify that different TCP clusters do not request the same address
-                    for frontend in &tcp.frontends {
+                    for frontend in tcp.frontends.iter_mut() {
                         match self.known_addresses.get(&frontend.address) {
                             Some(ListenerProtocol::Http) | Some(ListenerProtocol::Https) => {
                                 return Err(ConfigError::WrongFrontendProtocol(
                                     ListenerProtocol::Http,
                                 ));
+                            }
+                            Some(ListenerProtocol::Udp) => {
+                                // A `protocol = "tcp"` cluster whose frontend
+                                // points at a `protocol = "udp"` listener is a
+                                // UDP cluster (datagram knobs under
+                                // `[clusters.<id>.udp]`). Mark the frontend so
+                                // `generate_requests` emits `AddUdpFrontend`.
+                                frontend.udp = true;
                             }
                             Some(ListenerProtocol::Tcp) => {}
                             None => {
@@ -2798,6 +3052,8 @@ pub struct Config {
     pub http_listeners: Vec<HttpListenerConfig>,
     pub https_listeners: Vec<HttpsListenerConfig>,
     pub tcp_listeners: Vec<TcpListenerConfig>,
+    #[serde(default)]
+    pub udp_listeners: Vec<UdpListenerConfig>,
     pub clusters: HashMap<String, ClusterConfig>,
     pub handle_process_affinity: bool,
     pub ctl_command_timeout: u64,
@@ -2945,6 +3201,14 @@ impl Config {
             count += 1;
         }
 
+        for listener in &self.udp_listeners {
+            v.push(WorkerRequest {
+                id: format!("CONFIG-{count}"),
+                content: RequestType::AddUdpListener(*listener).into(),
+            });
+            count += 1;
+        }
+
         for cluster in self.clusters.values() {
             let mut orders = cluster.generate_requests()?;
             for content in orders.drain(..) {
@@ -2989,6 +3253,19 @@ impl Config {
                     content: RequestType::ActivateListener(ActivateListener {
                         address: listener.address,
                         proxy: ListenerType::Tcp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                });
+                count += 1;
+            }
+
+            for listener in &self.udp_listeners {
+                v.push(WorkerRequest {
+                    id: format!("CONFIG-{count}"),
+                    content: RequestType::ActivateListener(ActivateListener {
+                        address: listener.address,
+                        proxy: ListenerType::Udp.into(),
                         from_scm: false,
                     })
                     .into(),
@@ -3588,6 +3865,124 @@ mod tests {
 
         assert_eq!(add_listener_count, 2);
         assert_eq!(activate_listener_count, 2);
+    }
+
+    #[test]
+    fn documented_udp_dns_example_loads_and_emits_udp_requests() {
+        // The DNS example from doc/configure.md ("#### UDP clusters"): a
+        // `protocol = "udp"` listener + a `protocol = "tcp"` cluster whose
+        // frontend points at that UDP listener address, with datagram knobs
+        // under `[clusters.dns.udp]`. This must load without a
+        // `WrongFrontendProtocol` error and emit an `AddUdpListener` and an
+        // `AddUdpFrontend` (not `AddTcpFrontend`).
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            activate_listeners = true
+
+            [[listeners]]
+            protocol = "udp"
+            address  = "0.0.0.0:53"
+
+            [clusters.dns]
+            protocol       = "tcp"
+            load_balancing = "HRW"
+            frontends = [
+              { address = "0.0.0.0:53" }
+            ]
+            backends = [
+              { address = "10.0.0.10:53" },
+              { address = "10.0.0.11:53" }
+            ]
+
+            [clusters.dns.udp]
+            affinity_key        = "SOURCE_IP"
+            responses           = 1
+            requests            = 0
+            send_proxy_protocol = true
+
+            [clusters.dns.udp.health]
+            mode      = "TCP_PROBE"
+            tcp_port  = 53
+            rise      = 2
+            fall      = 3
+            fail_open = true
+        "#;
+
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse documented DNS TOML");
+
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("documented UDP DNS example must load without WrongFrontendProtocol");
+
+        // The UDP listener was registered.
+        assert_eq!(
+            config.udp_listeners.len(),
+            1,
+            "the protocol=\"udp\" listener must be built"
+        );
+
+        let messages = config
+            .generate_config_messages()
+            .expect("Could not generate config messages");
+
+        let add_udp_listener_count = messages
+            .iter()
+            .filter(|m| matches!(m.content.request_type, Some(RequestType::AddUdpListener(_))))
+            .count();
+        assert_eq!(
+            add_udp_listener_count, 1,
+            "must emit exactly one AddUdpListener"
+        );
+
+        let add_udp_frontend_count = messages
+            .iter()
+            .filter(|m| matches!(m.content.request_type, Some(RequestType::AddUdpFrontend(_))))
+            .count();
+        assert_eq!(
+            add_udp_frontend_count, 1,
+            "the cluster frontend on the UDP listener must emit AddUdpFrontend"
+        );
+
+        // It must NOT have been emitted as a TCP frontend.
+        let add_tcp_frontend_count = messages
+            .iter()
+            .filter(|m| matches!(m.content.request_type, Some(RequestType::AddTcpFrontend(_))))
+            .count();
+        assert_eq!(
+            add_tcp_frontend_count, 0,
+            "a UDP-listener-addressed frontend must not be emitted as AddTcpFrontend"
+        );
+
+        // The AddUdpFrontend carries the cluster id and address.
+        let udp_frontend = messages
+            .iter()
+            .find_map(|m| match &m.content.request_type {
+                Some(RequestType::AddUdpFrontend(f)) => Some(f),
+                _ => None,
+            })
+            .expect("AddUdpFrontend must be present");
+        assert_eq!(udp_frontend.cluster_id, "dns");
+        assert_eq!(
+            SocketAddr::from(udp_frontend.address),
+            "0.0.0.0:53".parse().unwrap()
+        );
+
+        // The UDP cluster knobs from [clusters.dns.udp] survive onto the
+        // AddCluster request.
+        let cluster = messages
+            .iter()
+            .find_map(|m| match &m.content.request_type {
+                Some(RequestType::AddCluster(c)) if c.cluster_id == "dns" => Some(c),
+                _ => None,
+            })
+            .expect("AddCluster for 'dns' must be present");
+        let udp = cluster
+            .udp
+            .as_ref()
+            .expect("[clusters.dns.udp] block must carry onto the cluster");
+        assert_eq!(udp.responses, Some(1));
     }
 
     #[test]
