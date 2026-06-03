@@ -42,7 +42,10 @@ use sozu_command_lib::{
 };
 
 use crate::{
-    mock::{aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend},
+    mock::{
+        aggregator::SimpleAggregator, async_backend::BackendHandle as AsyncBackend,
+        raw_h2_stall_backend::RawH2StallBackend,
+    },
     sozu::worker::Worker,
     tests::{State, h2_utils::*, provide_port, repeat_until_error_or, tests::create_local_address},
 };
@@ -791,6 +794,19 @@ fn test_h2_window_stall_wu_drip_reaped() {
     );
 }
 
+// NOTE (M2 false-reject guard): the budget's false-reject-avoidance — a stream
+// making >= FC_STALL_CLEAR_FLOOR cumulative progress per idle period clears its
+// deadline and is NOT reaped — is proven DETERMINISTICALLY by the unit tests
+// `test_fc_stall_budget_floor_clears` and `test_fc_stall_budget_wu_drip_ages_until_floor`
+// (lib/src/protocol/mux/h2.rs). A pure-e2e version is intentionally omitted: at
+// the integration level the PER-STREAM IDLE guard (`stream_last_activity_at`,
+// refreshed only on outbound bytes) reaps any stream whose outbound flow pauses
+// for the idle timeout — so a window-stalled stream that drains in bursts (the
+// only way to hold it "blocked but progressing" from a test client) gets
+// idle-reaped on the gaps regardless of the budget, making an e2e false-reject
+// assertion race the idle guard rather than test the budget. The deterministic
+// unit test is the stronger, non-flaky guarantee.
+
 /// Fully-silent window-stall: peer sends one zero-window GET then NO further
 /// frames. The connection-timeout path must run the reaper AND flush the queued
 /// `RST_STREAM(CANCEL)` (M3: via `has_pending_control_write`, since
@@ -918,6 +934,158 @@ fn test_h2_window_stall_silent_reaped() {
             2,
             "H2 correctness: fully-silent window-stall reaped via connection-timeout reaper",
             try_h2_window_stall_silent_reaped
+        ),
+        State::Success
+    );
+}
+
+/// M4 (bidirectional reap): window-stall reaping is direction-agnostic, so a
+/// request UPLOAD stalled against a slow H2 backend (`Position::Client`) is
+/// reaped too. A real H2 backend (`cluster.http2 = true`) advertises
+/// `SETTINGS_INITIAL_WINDOW_SIZE = 0` and never grants WINDOW_UPDATE, so sozu's
+/// forwarded request body is window-blocked and never delivered. The stalled
+/// stream must be reaped and the client returned a `502` (via
+/// `end_stream_decision` -> `SendDefault(502)`), NOT left hanging.
+///
+/// This exercises the `Position::Client` reap path end-to-end — RST(CANCEL) to
+/// the backend leg, 502 to the client, slot freed — which every H1-backend
+/// upload test misses (the source-trace claim that the Client-side reap yields a
+/// clean 502 rather than a hang). NOTE: the reap is driven by the per-stream
+/// guards (the bidirectional window-stall arm AND the idle guard, which reaps a
+/// silent backend stream regardless), so this asserts the integration OUTCOME of
+/// the Client-position reap rather than isolating the window-stall guard
+/// specifically — the latter is covered deterministically by the
+/// `fc_stall_budget_decision` unit tests.
+fn try_h2_backend_upload_window_stall_reaped() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-COR-BACKEND-UPLOAD-STALL", config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_https(front_address.clone())
+        .to_tls(None)
+        .unwrap();
+    listener_config.h2_stream_idle_timeout_seconds = Some(2);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(listener_config));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    // cluster.http2 = true so sozu speaks H2 to the stall backend.
+    let mut h2_cluster = Worker::default_cluster("cluster_0");
+    h2_cluster.http2 = Some(true);
+    worker.send_proxy_request_type(RequestType::AddCluster(h2_cluster));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+
+    let back_address = create_local_address();
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0".to_owned(),
+        back_address,
+        None,
+    )));
+    // Hold this binding for the whole test so the stall backend keeps serving;
+    // its Drop joins the thread (releasing the port) at function end.
+    let _stall_backend = RawH2StallBackend::new(back_address);
+    // Let the backend bind before the client drives traffic.
+    thread::sleep(Duration::from_millis(150));
+    worker.read_to_last();
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // POST with a body so sozu has request DATA to forward to the backend; the
+    // backend's zero send window blocks it -> the upload stream window-stalls.
+    let header_block = vec![
+        0x83, // :method POST
+        0x84, // :path /
+        0x87, // :scheme https
+        0x41, 0x09, // :authority localhost
+        b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't',
+    ];
+    tls.write_all(&H2Frame::headers(1, header_block, true, false).encode())
+        .unwrap();
+    // ~8 KiB of request body, END_STREAM — buffered at sozu, blocked at backend.
+    let body = vec![0x41u8; 8192];
+    tls.write_all(&H2Frame::new(H2_FRAME_DATA, H2_FLAG_END_STREAM, 1, body).encode())
+        .unwrap();
+    tls.flush().unwrap();
+
+    // Within the idle deadline + margin the stalled upload must be reaped: the
+    // client sees a 502 response (HEADERS on stream 1) or a RST_STREAM(CANCEL),
+    // never a hang.
+    let mut reaped = false;
+    let mut acc: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 16384];
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        match tls.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                acc.extend_from_slice(&buf[..n]);
+                let frames = parse_h2_frames(&acc);
+                if !frames.is_empty() {
+                    log_frames("Backend-upload stall", &frames);
+                }
+                let got_response_headers = frames
+                    .iter()
+                    .any(|(t, _f, sid, _p)| *t == H2_FRAME_HEADERS && *sid == 1);
+                let got_rst = extract_rst_streams(&frames)
+                    .iter()
+                    .any(|(sid, ec)| *sid == 1 && *ec == 0x8);
+                if got_response_headers || got_rst {
+                    reaped = true;
+                    break;
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+    println!("Backend-upload window-stall reaped (502/RST to client): {reaped}");
+
+    let infra_ok = teardown(tls, front_port, worker, vec![]);
+    if infra_ok && reaped {
+        State::Success
+    } else {
+        println!("Backend-upload stall - FAIL: reaped={reaped} infra_ok={infra_ok}");
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_backend_upload_window_stall_reaped() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 correctness: window-stalled H2-backend upload is reaped (Position::Client, 502 to client)",
+            try_h2_backend_upload_window_stall_reaped
         ),
         State::Success
     );
