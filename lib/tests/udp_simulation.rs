@@ -1,4 +1,4 @@
-//! Deterministic simulation test (moonpool / VOPR-style) for the sans-io UDP
+//! Deterministic simulation test (FoundationDB/VOPR-style) for the sans-io UDP
 //! core (`sozu_lib::protocol::udp`).
 //!
 //! In the spirit of TigerBeetle's VOPR and FoundationDB's simulator: a single

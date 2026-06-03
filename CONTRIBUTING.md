@@ -39,6 +39,40 @@ they allow you to use the proxy without the overhead of the worker system.
 Otherwise, the proxy uses the `log` crate and follows the `RUST_LOG` environment
 variable convention, so you can precisely trace what happens.
 
+## Testing
+
+Read [`doc/testing.md`](./doc/testing.md) — it is the authoritative guide and describes Sōzu's testing
+doctrine (assertion-first, in the style of TigerBeetle's TigerStyle, plus deterministic simulation in the
+style of FoundationDB's simulator) and the five test categories (unit, integration/e2e, fuzz, deterministic
+simulation, regression guards).
+
+Before opening a pull request, the local validation chain must be green:
+
+```bash
+cargo build --all-features --locked
+cargo clippy --all-targets --all-features -- -D warnings
+cargo +nightly fmt --all -- --check
+cargo test --workspace --locked
+```
+
+Rules every change is expected to follow:
+
+- **Land tests in the same changeset.** A protocol, parser, or otherwise security-sensitive change ships its
+  unit + property/simulation + fuzz + e2e coverage in the same pull request — not as a follow-up.
+- **Assertion density for state machines.** New sans-io cores, parsers, and state machines carry dense
+  `debug_assert!` pre/post-conditions and pair assertions (assert what you expect *and* what you don't), and —
+  where applicable — a deterministic simulation harness on the pattern of `lib/tests/udp_simulation.rs`.
+- **Never panic on network-controlled input** on the release path: turn invalid traffic into a drop + metric +
+  contextual log (or the protocol's error response), never an `unwrap`/`panic!`. `debug_assert!` is for
+  invariant violations only and compiles out in release.
+- **No hardcoded ports in e2e** (allocate via `e2e/src/port_registry.rs`); drain responses with the
+  `loop_read_*` / `receive_until_eof` helpers; prefer deadlines / `repeat_until_error_or` over `sleep`; and
+  assert *provable* invariants rather than statistical fractions when an input varies between runs.
+- **`#[ignore]` must carry a reason string** and only gate an environment dependency or a tracked follow-up —
+  it must never hide a failing test. CI rejects a bare `#[ignore]`.
+- **Docs are code:** a change to a public metric, config key, or CLI flag updates its documentation in the same
+  changeset.
+
 ## Copyright assignment
 
 We ([Clever Cloud](https://www.clever-cloud.com)) will ask you to sign a

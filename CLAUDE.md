@@ -11,7 +11,7 @@ Cargo workspace with four members (`resolver = "2"`):
 - `bin/` — `sozu` binary + internal lib. Master/worker multiprocess supervisor, CLI (clap), config loader, hot-upgrade orchestrator, unix-socket command server.
 - `e2e/` — `sozu-e2e`. Integration tests that spawn real workers + mock clients/backends. Enables `sozu-lib`'s `e2e-hooks` feature.
 
-`fuzz/` is an out-of-workspace cargo-fuzz crate with two targets: `fuzz_frame_parser`, `fuzz_hpack_decoder`.
+`fuzz/` is an out-of-workspace cargo-fuzz crate with three targets: `fuzz_frame_parser`, `fuzz_hpack_decoder`, `fuzz_udp_flow`.
 
 Dependency graph: `lib → command`; `bin → lib + command`; `e2e → lib + command` (`e2e-hooks`).
 
@@ -66,26 +66,45 @@ Crypto-provider features live in `bin/Cargo.toml` + `lib/Cargo.toml`; CI exercis
 
 # Testing
 
-Unit tests live beside their modules (`#[cfg(test)] mod tests` in `lib/src/**`). Integration tests are in `e2e/src/tests/` and registered via `e2e/src/tests/mod.rs`:
+**Canonical guide: `doc/testing.md`** — Sōzu's testing doctrine (assertion-first à la TigerBeetle TigerStyle +
+deterministic simulation à la FoundationDB). Read it before adding tests or test infrastructure. The rules below are
+the load-bearing summary; `doc/testing.md` is authoritative and `CONTRIBUTING.md#testing` carries the contributor checklist.
 
-- `h2_tests.rs`, `h2_correctness_tests.rs`, `h2_security_tests.rs`, `h2_security_{parser,session,sni,header_injection}.rs`, `h2_priority_rearm_tests.rs` — H2 mux coverage (~181 tests on `main`).
-- `mux_tests.rs` — H1 + proxy-protocol + keepalive/hup edge cases.
-- `h1_security_tests.rs`, `tls_tests.rs`, `tcp_tests.rs`, `hsts_tests.rs`.
-- `command_channel_security_tests.rs` — command-channel and SCM FD-passing hardening (panic-OOB, length-prefix validation).
-- `cluster_ip_limit_tests.rs`, `eviction_tests.rs`, `listener_update_tests.rs`, `protocol_pair_matrix.rs`, `redirect_rewrite_auth_tests.rs` — feature coverage for per-IP rate-limit, accept-queue eviction, listener hot-update, the H1↔H2 protocol matrix, and the answer/redirect/rewrite/auth pipeline.
-- `fuzz_tests.rs` — `#[ignore]` wrappers around the cargo-fuzz targets. Run with `cargo test -p sozu-e2e -- --ignored fuzz`.
-- `h2_utils.rs` — shared helpers, including `loop_read_*` (absorbs TCP segmentation in assertions).
-- `tests.rs` — `setup_sync_test`, `setup_async_test`, worker harness, port-registry integration.
+Five categories: **unit** (`#[cfg(test)] mod tests` beside modules in `lib/src/**` / `command/src/**`), **integration/e2e**
+(`e2e/src/tests/`, registered in `e2e/src/tests/mod.rs`), **fuzz** (`fuzz/`), **deterministic simulation**
+(`lib/tests/udp_simulation.rs`), and **regression guards** (`lib/tests/log_layout.rs`).
 
-Mock backends live in `e2e/src/mock/`: `sync_backend.rs`, `async_backend.rs`, `h2_backend.rs`, `raw_h2_response_backend.rs`, `client.rs`, `https_client.rs`, `aggregator.rs`.
+E2E suites (non-exhaustive): `h2_tests.rs` + `h2_correctness_tests.rs` + `h2_security_{tests,parser,session,sni,header_injection}.rs`
++ `h2_priority_rearm_tests.rs` (~181 H2 tests); `mux_tests.rs` (H1 + proxy-protocol + keepalive/hup); `h1_security_tests.rs`,
+`tls_tests.rs`, `tcp_tests.rs`, `hsts_tests.rs`, `udp_tests.rs`; `command_channel_security_tests.rs` (SCM/length-prefix
+hardening); `cluster_ip_limit_tests.rs`, `eviction_tests.rs`, `listener_update_tests.rs`, `protocol_pair_matrix.rs`,
+`redirect_rewrite_auth_tests.rs`; `fuzz_tests.rs` (graceful-runtime-skip wrappers when nightly/cargo-fuzz are absent —
+CI skips them via `--skip tests::fuzz_tests::`); `h2_utils.rs`/`udp_utils` shared helpers; `tests.rs` harness
+(`setup_sync_test`, `setup_async_test`, port registry). Mock backends/clients live in `e2e/src/mock/`.
+
+**Assertion-first (TigerStyle) — required for sans-io cores / parsers / state machines:**
+
+- ≥2 meaningful `debug_assert!`s per non-trivial function: pre/post-conditions + **pair assertions** (assert what you
+  expect AND what you don't — positive + negative space). They compile out in release and run live in every
+  test/e2e/fuzz/dev build, turning silent correctness bugs into loud crashes.
+- A private `check_invariants()` full-sweep run as a post-condition at the end of every public state-machine entry
+  point (worked example: `lib/src/protocol/udp/manager.rs` + `flow.rs`).
+- **Never `assert!`/`panic!` on network-controlled input on the release path** — adversarial input → drop + metric +
+  log + `SessionResult`/`GOAWAY`/`RST_STREAM`. `debug_assert!` is for invariant violations only.
+
+**Deterministic simulation (FoundationDB/VOPR style):** the sans-io UDP core is driven under a seeded RNG + virtual
+clock + adversarial workload + buggify-style fault injection in `lib/tests/udp_simulation.rs` (default 256-seed sweep
+in normal `cargo test`; `SOZU_UDP_SIM_SEED`/`SOZU_UDP_SIM_SEEDS`/`SOZU_UDP_SIM_STEPS` for replay/sweep). New sans-io
+state machines (the H2 mux is the next candidate) should get a simulator on the same pattern — see `doc/udp_simulation.md`.
 
 **E2E conventions:**
 
 - **Never hardcode ports.** Allocate via `e2e/src/port_registry.rs`.
-- **Always `loop_read_*` when asserting on TCP responses.** A single `read()` sees one segment under load. Commits `7a7e87d9`, `6bd85a3f`, `73341f4f` exist only to paper over this being skipped.
-- **Prefer `repeat_until_error_or` / explicit deadlines over `sleep`** for timing-sensitive tests.
+- **Always `loop_read_*` / `receive_until_eof` when asserting on TCP responses.** A single `read()` sees one segment under load. Commits `7a7e87d9`, `6bd85a3f`, `73341f4f` exist only to paper over this being skipped.
+- **Prefer `repeat_until_error_or` / explicit deadlines over `sleep`** for timing-sensitive tests. Assert *provable* invariants, not statistical fractions, when an input (e.g. dynamically-allocated ports) varies between runs.
 - **Upgrade work**: read `doc/upgrade_e2e_tests.md` and run `cargo test -p sozu-e2e test_upgrade`.
-- **H2 parser / HPACK changes**: run the focused e2e tests plus both cargo-fuzz targets.
+- **H2 parser / HPACK changes**: run the focused e2e tests plus the cargo-fuzz targets.
+- **`#[ignore]` must carry a reason string** and only gate an environment dependency or a tracked follow-up — never hide a failing test.
 
 # H2 architecture (what reading code won't tell you)
 
