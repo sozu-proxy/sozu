@@ -321,15 +321,19 @@ fn try_udp_hrw_affinity_stable() -> State {
     let after = probe(&clients);
     println!("HRW after add: {after:?}");
     let served_after = after.iter().filter(|x| x.is_some()).count();
-    let preserved = before
+    // HRW minimal disruption is a *provable* invariant, independent of the
+    // dynamically-allocated backend ports: adding a backend can only move a key
+    // from its previous winner to the *new* backend (iff the newcomer now scores
+    // highest for that key) — it can never reshuffle a key between two pre-existing
+    // backends. So every key must either keep its backend or move to "BK3".
+    // Asserting a preserved *fraction* instead would be statistically flaky on a
+    // small key set: a favourably-hashing newcomer can legitimately capture a
+    // majority of just 6 keys (observed in CI under a different port allocation).
+    let only_moves_to_newcomer = before
         .iter()
         .zip(after.iter())
-        .filter(|(b, a)| b.is_some() && a.is_some() && b == a)
-        .count();
-    // Every key must still be served, and the majority must keep their backend
-    // (minimal disruption). With 6 keys + 1 added backend, at most ~1-2 should
-    // legitimately move; require >= half preserved as a robust lower bound.
-    let minimal_disruption = served_after == clients.len() && preserved * 2 >= clients.len();
+        .all(|(b, a)| a.is_some() && (a == b || a.as_deref() == Some("BK3")));
+    let minimal_disruption = served_after == clients.len() && only_moves_to_newcomer;
 
     for h in handles {
         h.stop();
@@ -342,7 +346,7 @@ fn try_udp_hrw_affinity_stable() -> State {
         State::Success
     } else {
         println!(
-            "HRW: deterministic={deterministic} preserved={preserved}/{} served_after={served_after}",
+            "HRW: deterministic={deterministic} only_moves_to_newcomer={only_moves_to_newcomer} served_after={served_after}/{}",
             clients.len()
         );
         State::Fail
