@@ -115,6 +115,14 @@ pub mod h2 {
     pub const CONNECTION_WINDOW_BYTES: &str = "h2.connection.window_bytes";
     pub const FLOW_CONTROL_STALL: &str = "h2.flow_control_stall";
 
+    // Per-stream reap counters — `cancel_timed_out_streams` breaks reaps down by
+    // which guard tripped (M1), plus a stall-budget subset for the
+    // `WINDOW_UPDATE`-drip vector the cumulative-stall budget closes (M2).
+    // `reaped.stall_budget` is a subset of `reaped.window_stall`.
+    pub const STREAMS_REAPED_IDLE_TIMEOUT: &str = "h2.streams.reaped.idle_timeout";
+    pub const STREAMS_REAPED_WINDOW_STALL: &str = "h2.streams.reaped.window_stall";
+    pub const STREAMS_REAPED_STALL_BUDGET: &str = "h2.streams.reaped.stall_budget";
+
     // Frame-TX counters (frame type fanout).
     pub const FRAMES_TX_CONTINUATION: &str = "h2.frames.tx.continuation";
     pub const FRAMES_TX_DATA: &str = "h2.frames.tx.data";

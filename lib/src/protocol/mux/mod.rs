@@ -1371,14 +1371,21 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             // response the peer refuses to drain by holding its receive window
             // shut — is reaped and its MAX_CONCURRENT_STREAMS slot freed, instead
             // of lingering until the 30-minute zombie checker. The reaper queues
-            // an `RST_STREAM(CANCEL)`; `should_write` below flushes it so the peer
-            // is actually told (the reaper's `arm_writable` only sets interest —
-            // the edge-triggered writable signal needs an explicit flush here).
+            // an `RST_STREAM(CANCEL)`; because `has_pending_write()` does NOT
+            // observe `pending_rst_streams` (it gates connection close, so a
+            // queued RST must not read as "keep open"), set `should_write` via
+            // the dedicated `has_pending_control_write()` probe so the reset is
+            // actually flushed to the peer before the connection closes — without
+            // it, a fully-silent peer's stalled stream is freed but the peer sees
+            // only EOF, never the RST(CANCEL).
             if let Connection::H2(h2) = &mut self.frontend {
                 h2.cancel_timed_out_streams(
                     &mut self.context,
                     &mut EndpointClient(&mut self.router),
                 );
+                if h2.has_pending_control_write() {
+                    should_write = true;
+                }
             }
             if self.frontend.has_pending_write() {
                 should_write = true;
