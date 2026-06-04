@@ -530,6 +530,13 @@ impl TcpSession {
     }
 
     fn set_back_token(&mut self, token: Token) {
+        // The frontend must own a token distinct from the backend's: the two
+        // index different slab slots, so wiring the same token to both would
+        // alias two sessions onto one slot.
+        debug_assert_ne!(
+            token, self.frontend_token,
+            "backend token must differ from the frontend token"
+        );
         self.backend_token = Some(token);
 
         match &mut self.state {
@@ -539,6 +546,15 @@ impl TcpSession {
             TcpStateMachine::ExpectProxyProtocol(_) => self.backend_token = Some(token),
             TcpStateMachine::FailedUpgrade(_) => unreachable!(),
         }
+
+        // Postcondition: the session now owns exactly the token it was asked
+        // to register — every arm above (including the Expect arm, which only
+        // stores the session-side token) leaves `backend_token == Some(token)`.
+        debug_assert_eq!(
+            self.backend_token,
+            Some(token),
+            "set_back_token must leave the session owning the registered token"
+        );
     }
 
     fn set_backend_id(&mut self, id: String) {
@@ -554,7 +570,24 @@ impl TcpSession {
 
     fn set_back_connected(&mut self, status: BackendConnectionStatus) {
         let last = self.backend_connected;
+        // Transitioning INTO `Connected` bumps the backend-connection gauge by
+        // exactly +1. Doing so from an already-`Connected` state would
+        // double-count (gauge drift that only `close_backend`'s single -1
+        // would later reconcile, leaving the gauge permanently +1). The
+        // promotion always comes from a `Connecting` (the normal handshake
+        // completion in `ready_inner`) — never from `Connected` itself.
+        debug_assert!(
+            status != BackendConnectionStatus::Connected
+                || last != BackendConnectionStatus::Connected,
+            "set_back_connected(Connected) must not run on an already-Connected backend (gauge would double-count)"
+        );
         self.backend_connected = status;
+
+        // Postcondition: the requested status is now in effect.
+        debug_assert_eq!(
+            self.backend_connected, status,
+            "set_back_connected must record the requested status"
+        );
 
         if status == BackendConnectionStatus::Connected {
             gauge_add!(names::backend::CONNECTIONS, 1);
@@ -622,6 +655,19 @@ impl TcpSession {
         }
 
         self.backend_token = None;
+
+        // Postcondition: the backend handle and its token are torn down
+        // together — neither may outlive the other (a dangling token would
+        // leave a stale slab reference; a dangling handle would over-count
+        // backend connections).
+        debug_assert!(
+            self.backend.is_none(),
+            "remove_backend must release the backend handle"
+        );
+        debug_assert!(
+            self.backend_token.is_none(),
+            "remove_backend must clear the backend token"
+        );
     }
 
     fn fail_backend_connection(&mut self) {
@@ -686,6 +732,67 @@ impl TcpSession {
     pub fn cancel_timeouts(&mut self) {
         self.container_frontend_timeout.cancel();
         self.container_backend_timeout.cancel();
+    }
+
+    /// Full cross-field invariant sweep for the TCP session state machine.
+    ///
+    /// Run as a run-to-completion postcondition at the END of `ready()` (the
+    /// only public entry point that drives the front/back token + readiness
+    /// state machine). These are OUR-logic invariants — never reachable from
+    /// hostile traffic — so a violation is a bug in Sōzu, not a malformed
+    /// peer. Compiled out in release.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        // Connection-attempt budget: every retry path increments
+        // `connection_attempt` and `connect_to_backend` refuses once the
+        // counter reaches `CONN_RETRIES`, so the value can touch but never
+        // exceed the configured ceiling (and resets to 0 on success).
+        debug_assert!(
+            self.connection_attempt <= CONN_RETRIES,
+            "connection_attempt ({}) must never exceed CONN_RETRIES ({})",
+            self.connection_attempt,
+            CONN_RETRIES
+        );
+
+        // Token ownership: a fully-connected backend always owns a backend
+        // token (set by `set_back_token` during `connect_to_backend`, before
+        // the status can ever flip to `Connected`). The `Connecting` phase is
+        // deliberately excluded: there is a transient window inside
+        // `connect_to_backend` where the status is `Connecting` but the token
+        // has not been wired yet — that window never spans a `ready()`
+        // boundary, so the postcondition still holds here.
+        if self.backend_connected == BackendConnectionStatus::Connected {
+            debug_assert!(
+                self.backend_token.is_some(),
+                "a Connected backend must own a backend token"
+            );
+        }
+
+        // A live backend handle implies the matching token is present: the
+        // two are wired together in `connect_to_backend` and torn down
+        // together in `remove_backend` (which clears the token) — they must
+        // never drift apart. (For the pure-TCP proxy `backend` is currently
+        // always `None`, so this is a guard against a future regression that
+        // starts populating it without the token.)
+        if self.backend.is_some() {
+            debug_assert!(
+                self.backend_token.is_some(),
+                "a live backend handle must have a backend token"
+            );
+        }
+
+        // Once the session has been closed it is terminal: the backend has
+        // been released and the per-(cluster, source-IP) slot untracked.
+        if self.has_been_closed {
+            debug_assert!(
+                self.backend.is_none(),
+                "a closed session must have released its backend handle"
+            );
+            debug_assert!(
+                !self.cluster_ip_tracked,
+                "a closed session must have untracked its (cluster, source-IP) slot"
+            );
+        }
     }
 
     fn ready_inner(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
@@ -925,6 +1032,12 @@ impl TcpSession {
             }
         }
 
+        // The -1 here pairs with the +1 in `set_back_connected(Connected)`:
+        // we decrement the gauge exactly once, iff this session had actually
+        // reached `Connected`. A `Connecting`/`NotConnected` backend never
+        // bumped the gauge, so it must not decrement it either — that
+        // asymmetry would underflow the gauge (a correctness bug, never a
+        // rounding issue).
         if back_connected == BackendConnectionStatus::Connected {
             gauge_add!(names::backend::CONNECTIONS, -1);
             gauge_add!(
@@ -936,12 +1049,35 @@ impl TcpSession {
         }
 
         self.set_back_connected(BackendConnectionStatus::NotConnected);
+
+        // Postcondition: the backend is fully torn down — `remove_backend`
+        // cleared the token/handle above and the status is now `NotConnected`,
+        // so a subsequent `connect_to_backend` starts from a clean slate.
+        debug_assert_eq!(
+            self.backend_connected,
+            BackendConnectionStatus::NotConnected,
+            "close_backend must leave the backend NotConnected"
+        );
+        debug_assert!(
+            self.backend_token.is_none(),
+            "close_backend must clear the backend token"
+        );
     }
 
     fn connect_to_backend(
         &mut self,
         session_rc: Rc<RefCell<dyn ProxySession>>,
     ) -> Result<BackendConnectAction, BackendConnectionError> {
+        // Precondition: the retry budget can sit AT the ceiling (the gate
+        // below converts that into `MaxConnectionRetries`) but the increment
+        // in `ready_inner` must never have pushed it past `CONN_RETRIES`.
+        debug_assert!(
+            self.connection_attempt <= CONN_RETRIES,
+            "connection_attempt ({}) overflowed CONN_RETRIES ({}) before the retry gate",
+            self.connection_attempt,
+            CONN_RETRIES
+        );
+
         let cluster_id = self
             .listener
             .borrow()
@@ -1057,6 +1193,19 @@ impl TcpSession {
         self.metrics.backend_start();
         self.set_backend_id(backend.borrow().backend_id.clone());
 
+        // Postcondition of a successful New connect: the session is wired to
+        // its freshly-registered backend token and the status reflects an
+        // in-flight handshake (`Connecting`). The promotion to `Connected`
+        // happens later in `ready_inner` once the socket signals writable.
+        debug_assert!(
+            self.backend_token.is_some(),
+            "a New backend connection must own its backend token"
+        );
+        debug_assert!(
+            self.backend_connected.is_connecting(),
+            "a New backend connection must be in the Connecting state"
+        );
+
         Ok(BackendConnectAction::New)
     }
 }
@@ -1066,6 +1215,14 @@ impl ProxySession for TcpSession {
         if self.has_been_closed {
             return;
         }
+
+        // Past the idempotency guard the session is closing for the first
+        // time: every gauge-restore / untrack below must run exactly once, so
+        // re-entry on an already-closed session would double-decrement.
+        debug_assert!(
+            !self.has_been_closed,
+            "close() body must only run on a not-yet-closed session"
+        );
 
         // TODO: the state should handle the timeouts
         trace!("{} Closing TCP session", log_context!(self));
@@ -1144,9 +1301,31 @@ impl ProxySession for TcpSession {
 
         self.close_backend();
         self.has_been_closed = true;
+
+        // Postcondition of the normal close path: the session is terminal and
+        // every accounting slot has been released — `close_backend` cleared
+        // the backend token, and the per-(cluster, source-IP) untrack above
+        // reset the flag. The idempotency guard now short-circuits any repeat.
+        debug_assert!(self.has_been_closed, "close() must mark the session closed");
+        debug_assert!(
+            self.backend_token.is_none(),
+            "close() must leave no dangling backend token"
+        );
+        debug_assert!(
+            !self.cluster_ip_tracked,
+            "close() must untrack the (cluster, source-IP) slot"
+        );
     }
 
     fn timeout(&mut self, token: Token) -> SessionIsToBeClosed {
+        // The frontend and backend slots are distinct tokens, so the two
+        // dispatch arms below are mutually exclusive — a single token can
+        // never match both. (Obsolete tokens matching neither are tolerated
+        // and fall through to the `false` arm.)
+        debug_assert!(
+            self.backend_token != Some(self.frontend_token),
+            "frontend and backend tokens must never collide"
+        );
         if self.frontend_token == token {
             self.container_frontend_timeout.triggered();
             return true;
@@ -1198,6 +1377,14 @@ impl ProxySession for TcpSession {
         };
 
         self.metrics.service_stop();
+
+        // Run-to-completion postcondition: the front/back token + readiness
+        // state machine must satisfy its cross-field invariants after every
+        // `ready()` pass. Cfg-guarded so the call (and `check_invariants`
+        // itself) is absent from release builds.
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+
         to_bo_closed
     }
 

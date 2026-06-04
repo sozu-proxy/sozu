@@ -147,6 +147,13 @@ impl ClientSession {
             return;
         }
         self.channel.interest.insert(Ready::WRITABLE);
+        // POST-CONDITION: a successfully queued response arms WRITABLE so the
+        // event loop flushes it to the client; without this interest the
+        // response would sit unsent in the back buffer.
+        debug_assert!(
+            self.channel.interest.is_writable(),
+            "send must arm WRITABLE interest so the queued response gets flushed"
+        );
     }
 
     pub fn update_readiness(&mut self, events: Ready) {
@@ -412,6 +419,14 @@ impl WorkerSession {
             return;
         }
         self.channel.interest.insert(Ready::WRITABLE);
+        // POST-CONDITION: a successfully queued request leaves the channel
+        // registered for WRITABLE, so the event loop will flush it. Dropping
+        // this interest would strand the request in the back buffer and hang
+        // every task waiting on this worker's response.
+        debug_assert!(
+            self.channel.interest.is_writable(),
+            "send must arm WRITABLE interest so the queued request gets flushed"
+        );
     }
 
     pub fn update_readiness(&mut self, events: Ready) {
@@ -469,7 +484,18 @@ where
         match message {
             Ok(message) => messages.push(message),
             Err(_) => {
-                if old_capacity == channel.front_buf.capacity() {
+                let new_capacity = channel.front_buf.capacity();
+                // INVARIANT: the read buffer only ever grows while we drain it
+                // (the channel doubles capacity on a partial read, never
+                // shrinks mid-loop). A shrink here would mean `read_message`
+                // reallocated downward and dropped buffered bytes — silent
+                // message corruption. This is also the loop-termination
+                // anchor: we stop precisely when capacity stopped growing.
+                debug_assert!(
+                    new_capacity >= old_capacity,
+                    "channel read buffer must not shrink while draining messages"
+                );
+                if old_capacity == new_capacity {
                     return messages;
                 }
             }

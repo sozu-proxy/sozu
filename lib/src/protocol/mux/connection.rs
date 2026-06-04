@@ -304,7 +304,20 @@ impl<Front: SocketHandler> Connection<Front> {
                         "{} H1 try_resume_reading: re-arming READABLE",
                         log_module_context!()
                     );
+                    // Pre: we only reach here because the connection parked on
+                    // buffer pressure AND the kawa now has room. Pair the
+                    // synthetic READABLE event with that drained-space fact:
+                    // edge-triggered epoll won't re-fire on its own, so this is
+                    // the sole re-arm path.
+                    debug_assert!(
+                        c.parked_on_buffer_pressure,
+                        "re-arm only fires for a connection parked on buffer pressure"
+                    );
                     c.readiness.signal_pending_read();
+                    debug_assert!(
+                        c.readiness.event.is_readable(),
+                        "signal_pending_read must leave a READABLE event queued"
+                    );
                     true
                 } else {
                     false
@@ -371,7 +384,17 @@ impl<Front: SocketHandler> Connection<Front> {
     fn pre_close_client_bookkeeping(&self) {
         if let Position::Client(cluster_id, backend, _) = self.position() {
             let mut backend_borrow = backend.borrow_mut();
+            // Pair the `dec_connections` with its prior value: the close path
+            // releases exactly one slot. `dec_connections` floors at 0 (a
+            // double-close from a desynced peer must not panic), so the
+            // post-relation is "decreased by one, unless already at zero".
+            let before = backend_borrow.active_connections;
             backend_borrow.dec_connections();
+            debug_assert_eq!(
+                backend_borrow.active_connections,
+                before.saturating_sub(1),
+                "close must release exactly one backend connection (saturating at 0)"
+            );
             gauge_add!(names::backend::CONNECTIONS, -1);
             // Pair with the `+1` at `router.rs::connect` (new-dial path).
             // This is the graceful-close decrement, used both by the dead
@@ -395,7 +418,21 @@ impl<Front: SocketHandler> Connection<Front> {
     fn pre_end_stream_client_bookkeeping(&self) {
         if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
             let mut backend_borrow = backend.borrow_mut();
+            // Pairs with the `+1` in `pre_start_stream_client_bookkeeping`.
+            // `saturating_sub` is the network-safe floor (a desync from the
+            // peer must not panic), so we can only assert the post-relation,
+            // not that `before > 0`.
+            let before = backend_borrow.active_requests;
             backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
+            debug_assert_eq!(
+                backend_borrow.active_requests,
+                before.saturating_sub(1),
+                "end_stream bookkeeping must decrement active_requests by one (saturating)"
+            );
+            debug_assert!(
+                backend_borrow.active_requests <= before,
+                "active_requests must not grow on stream end"
+            );
             trace!(
                 "{} connection end stream: {:#?}",
                 log_module_context!(),
@@ -407,7 +444,15 @@ impl<Front: SocketHandler> Connection<Front> {
     fn pre_start_stream_client_bookkeeping(&self) {
         if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
             let mut backend_borrow = backend.borrow_mut();
+            // Pairs with the `saturating_sub(1)` in the end path. Snapshot the
+            // counter so we can assert it advanced by exactly one.
+            let before = backend_borrow.active_requests;
             backend_borrow.active_requests += 1;
+            debug_assert_eq!(
+                backend_borrow.active_requests,
+                before + 1,
+                "start_stream bookkeeping must increment active_requests by exactly one"
+            );
             trace!(
                 "{} connection start stream: {:#?}",
                 log_module_context!(),
@@ -441,13 +486,42 @@ impl<Front: SocketHandler> Connection<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
+        // Snapshot the backend's in-flight counter so we can assert the
+        // increment/rollback is net-zero on the failure path: a refused
+        // `start_stream` must NOT leak an `active_requests` charge onto the
+        // backend (it would skew least-loaded balancing forever). The snapshot
+        // and its assert are both cfg'd so the `RefCell` borrow never exists in
+        // release (the helper is `#[cfg(debug_assertions)]` too).
+        #[cfg(debug_assertions)]
+        let before = self.backend_active_requests();
         self.pre_start_stream_client_bookkeeping();
         let started = forward!(self, start_stream(stream, context));
         if !started {
             // Undo active_requests increment on failure
             self.pre_end_stream_client_bookkeeping();
+            #[cfg(debug_assertions)]
+            debug_assert_eq!(
+                self.backend_active_requests(),
+                before,
+                "a refused start_stream must roll active_requests back to its prior value"
+            );
         }
         started
+    }
+
+    /// Snapshot the backend's in-flight request counter, or `None` when this
+    /// connection has no `Connected` backend (server position, or a client
+    /// that is still connecting / already keep-alive). Used by `start_stream`
+    /// to pair-assert the increment/rollback is net-zero on refusal. Cheap
+    /// `RefCell` borrow, compiled only with `debug_assertions`.
+    #[cfg(debug_assertions)]
+    fn backend_active_requests(&self) -> Option<usize> {
+        match self.position() {
+            Position::Client(_, backend, BackendStatus::Connected) => {
+                Some(backend.borrow().active_requests)
+            }
+            _ => None,
+        }
     }
 }
 

@@ -153,7 +153,18 @@ pub struct DefaultGatherer {
 #[allow(unused)]
 impl Gatherer for DefaultGatherer {
     fn inc_expected_responses(&mut self, count: usize) {
+        let before = self.expected_responses;
         self.expected_responses += count;
+        // INVARIANT: the expected-response budget advances by exactly `count`
+        // — this is the number tracked against `ok + errors` to decide when a
+        // scattered task has heard from every worker. An off-by-one here means
+        // the task either finishes early (drops a worker's answer) or hangs
+        // until timeout.
+        debug_assert_eq!(
+            self.expected_responses,
+            before + count,
+            "inc_expected_responses must grow the budget by exactly count"
+        );
     }
 
     fn has_finished(&self) -> bool {
@@ -167,6 +178,12 @@ impl Gatherer for DefaultGatherer {
         worker_id: WorkerId,
         message: WorkerResponse,
     ) {
+        // Snapshot the accounting before classifying so the post-conditions
+        // can assert that each message bumps at most one terminal counter and
+        // is always recorded exactly once.
+        let ok_before = self.ok;
+        let errors_before = self.errors;
+        let responses_before = self.responses.len();
         match ResponseStatus::try_from(message.status) {
             Ok(ResponseStatus::Ok) => self.ok += 1,
             Ok(ResponseStatus::Failure) => self.errors += 1,
@@ -177,6 +194,28 @@ impl Gatherer for DefaultGatherer {
             Err(e) => warn!("error decoding response status: {}", e),
         }
         self.responses.push((worker_id, message));
+        // INVARIANT: a single worker message counts toward completion at most
+        // once. An Ok bumps `ok`, a Failure bumps `errors`, a Processing /
+        // undecodable status bumps neither (it is not terminal). Double-
+        // counting would let `has_finished` fire before every worker replied.
+        debug_assert!(
+            self.ok - ok_before <= 1 && self.errors - errors_before <= 1,
+            "on_message must advance a terminal counter by at most one"
+        );
+        debug_assert_eq!(
+            (self.ok - ok_before) + (self.errors - errors_before),
+            usize::from(matches!(
+                ResponseStatus::try_from(self.responses[responses_before].1.status),
+                Ok(ResponseStatus::Ok | ResponseStatus::Failure)
+            )),
+            "exactly one terminal counter advances iff the message was Ok/Failure"
+        );
+        // INVARIANT: every message is archived exactly once for `on_finish`.
+        debug_assert_eq!(
+            self.responses.len(),
+            responses_before + 1,
+            "on_message must record the response exactly once"
+        );
     }
 }
 
@@ -286,7 +325,29 @@ impl CommandHub {
             session.actor_comm_display()
         );
         debug!("registering client {:?}", session);
+        // `token` came from the monotonic `next_session_token`, so it must not
+        // already key a live client; a collision would evict an existing
+        // client session and leak its channel/fd.
+        debug_assert!(
+            !self.clients.contains_key(&token),
+            "register_client must use a fresh session token"
+        );
+        let clients_before = self.clients.len();
         self.clients.insert(token, session);
+        // INVARIANT: exactly one client was registered, and it maps back from
+        // its token carrying the id/token we stamped. Every later lookup
+        // (`get_client_mut`, the event-loop dispatch) keys on this token.
+        debug_assert_eq!(
+            self.clients.len(),
+            clients_before + 1,
+            "register_client must add exactly one client session"
+        );
+        debug_assert!(
+            self.clients
+                .get(&token)
+                .is_some_and(|c| c.token == token && c.id == id),
+            "registered client must map back from its token with matching id"
+        );
     }
 
     /// Drain audit events queued by the [Server] during a client request and
@@ -610,6 +671,13 @@ impl CommandHub {
         task.job.on_finish(&mut self.server, client, false);
         self.in_flight
             .retain(|_, in_flight_task_id| *in_flight_task_id != task_id);
+        // POST-CONDITION: every in-flight entry pointing at this finished task
+        // has been purged. A leftover would make a late/duplicate worker
+        // response resolve to a task that is already gone, mis-routing it.
+        debug_assert!(
+            self.in_flight.values().all(|id| *id != task_id),
+            "handle_finishing_task must purge all in-flight entries for the finished task"
+        );
     }
 }
 
@@ -911,25 +979,54 @@ impl Server {
     }
 
     fn next_session_token(&mut self) -> Token {
+        // Token(0) is permanently reserved for the UnixListener; every handed
+        // out session token must therefore be strictly positive.
+        debug_assert!(
+            self.next_session_id >= 1,
+            "session ids start at 1; Token(0) is reserved for the listener"
+        );
+        let before = self.next_session_id;
         let token = Token(self.next_session_id);
         self.next_session_id += 1;
+        debug_assert_eq!(
+            self.next_session_id,
+            before + 1,
+            "session id counter must advance by exactly one"
+        );
         token
     }
     fn next_client_id(&mut self) -> ClientId {
         let id = self.next_client_id;
         self.next_client_id += 1;
+        // Monotonic, gap-free allocation: the next id is exactly one past the
+        // one we just handed out, so no two clients ever share an id.
+        debug_assert_eq!(
+            self.next_client_id,
+            id + 1,
+            "client id counter must advance by exactly one"
+        );
         id
     }
 
     fn next_task_id(&mut self) -> TaskId {
         let id = self.next_task_id;
         self.next_task_id += 1;
+        debug_assert_eq!(
+            self.next_task_id,
+            id + 1,
+            "task id counter must advance by exactly one"
+        );
         id
     }
 
     fn next_worker_id(&mut self) -> WorkerId {
         let id = self.next_worker_id;
         self.next_worker_id += 1;
+        debug_assert_eq!(
+            self.next_worker_id,
+            id + 1,
+            "worker id counter must advance by exactly one"
+        );
         id
     }
 
@@ -956,10 +1053,33 @@ impl Server {
         scm_socket: ScmSocket,
     ) -> Result<&mut WorkerSession, ServerError> {
         let token = self.next_session_token();
+        // `next_session_token` hands out a strictly increasing token, so the
+        // slot we are about to fill must be empty — a collision would evict a
+        // live worker session and orphan its channel.
+        debug_assert!(
+            !self.workers.contains_key(&token),
+            "register_worker must use a fresh, unoccupied session token"
+        );
+        let workers_before = self.workers.len();
         self.register(token, &mut channel.sock)?;
         self.workers.insert(
             token,
             WorkerSession::new(channel, worker_id, pid, token, scm_socket),
+        );
+        // INVARIANT: exactly one worker session was added, and it is the one
+        // keyed by `token` carrying the id/pid we just registered. This is the
+        // bookkeeping anchor every later lookup (`scatter_on`, `close_worker`,
+        // `handle_worker_response`) relies on.
+        debug_assert_eq!(
+            self.workers.len(),
+            workers_before + 1,
+            "register_worker must add exactly one worker session"
+        );
+        debug_assert!(
+            self.workers
+                .get(&token)
+                .is_some_and(|w| w.token == token && w.id == worker_id && w.pid == pid),
+            "registered worker must map back from its token with matching id/pid"
         );
         self.workers
             .get_mut(&token)
@@ -969,6 +1089,13 @@ impl Server {
     /// Add a task in a queue to make it accessible until the next tick
     pub fn new_task(&mut self, job: Box<dyn GatheringTask>, timeout: Timeout) -> TaskId {
         let task_id = self.next_task_id();
+        // `next_task_id` is monotonic, so this id must be unused in the queue;
+        // reusing one would silently drop the job already parked there.
+        debug_assert!(
+            !self.queued_tasks.contains_key(&task_id),
+            "new_task must allocate a fresh, unused task id"
+        );
+        let queued_before = self.queued_tasks.len();
         let timeout = match timeout {
             Timeout::None => None,
             Timeout::Default => Some(Duration::from_secs(self.config.worker_timeout as u64)),
@@ -977,6 +1104,18 @@ impl Server {
         .map(|duration| Instant::now() + duration);
         self.queued_tasks
             .insert(task_id, TaskContainer { job, timeout });
+        // INVARIANT: exactly one task was queued, retrievable by the id we
+        // return — the caller (`scatter`/`scatter_on`) immediately looks it
+        // up by this id.
+        debug_assert_eq!(
+            self.queued_tasks.len(),
+            queued_before + 1,
+            "new_task must queue exactly one task"
+        );
+        debug_assert!(
+            self.queued_tasks.contains_key(&task_id),
+            "the queued task must be retrievable by the returned id"
+        );
         task_id
     }
 
@@ -1013,6 +1152,14 @@ impl Server {
             content: request,
         };
 
+        // Snapshot the in-flight map size before the fan-out so the
+        // post-condition can assert the per-call delta. Note the in-flight
+        // map and `expected_responses` both accumulate across repeated
+        // `scatter_on` calls on the same task (see `requests.rs::load_state`,
+        // `upgrade.rs`), so only the increment of THIS call is assertable,
+        // never an absolute total.
+        let in_flight_before = self.in_flight.len();
+
         for worker in self.workers.values_mut().filter(|w| {
             target
                 .map(|id| id == w.id && w.run_state != RunState::Stopped)
@@ -1031,6 +1178,18 @@ impl Server {
             self.in_flight.insert(worker_request.id, task_id);
         }
         task.job.get_gatherer().inc_expected_responses(worker_count);
+
+        // INVARIANT: every worker we scattered to within this call has a
+        // distinct request id (the id embeds the unique worker id, plus the
+        // task and request indices), so the in-flight map must have grown by
+        // exactly `worker_count`. A smaller delta would mean an id collision
+        // overwrote an in-flight entry, which would silently lose a worker's
+        // response and hang the task until timeout.
+        debug_assert_eq!(
+            self.in_flight.len(),
+            in_flight_before + worker_count,
+            "scatter_on must register exactly one in-flight entry per scattered worker"
+        );
     }
 
     pub fn cancel_task(&mut self, task_id: TaskId) {
@@ -1102,6 +1261,21 @@ impl Server {
             Err(_) => info!("worker {} was already dead", worker.id),
         }
         worker.run_state = RunState::Stopped;
+        // POST-CONDITION: a closed worker is terminal — `Stopped` excludes it
+        // from `is_active`/`alive_workers`/`scatter_on` targeting, so no later
+        // request can be fanned out to a killed process.
+        debug_assert_eq!(
+            self.workers.get(token).map(|w| w.run_state),
+            Some(RunState::Stopped),
+            "close_worker must leave the worker in the Stopped run state"
+        );
+        debug_assert!(
+            !self
+                .workers
+                .get(token)
+                .is_some_and(WorkerSession::is_active),
+            "a closed worker must not report as active"
+        );
     }
 
     /// Make the file descriptors of the channel survive the upgrade

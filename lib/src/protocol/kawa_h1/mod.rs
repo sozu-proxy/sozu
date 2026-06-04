@@ -340,7 +340,24 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
         self.request_stream.clear();
         response_stream.clear();
+        // Pair-assert the keep-alive counter advances by exactly one per
+        // completed request: it gates the `WaitingForNewRequest` timeout-status
+        // branch and the keepalive-vs-error accounting in `readable`. A
+        // double-increment or stall would mis-attribute the next idle close.
+        let keepalive_before = self.keepalive_count;
         self.keepalive_count += 1;
+        debug_assert_eq!(
+            self.keepalive_count,
+            keepalive_before + 1,
+            "reset() must advance keepalive_count by exactly one"
+        );
+        // The response side has just been cleared, so it is back to its
+        // initial parsing phase — `writable` must not see a half-consumed
+        // response when the next request starts.
+        debug_assert!(
+            response_stream.is_initial(),
+            "response stream must be reset to initial on keep-alive"
+        );
         gauge_add!(names::http::ACTIVE_REQUESTS, -1);
 
         if let Some(backend) = &mut self.backend {
@@ -423,6 +440,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             return StateResult::Continue;
         }
 
+        let available_space = self.request_stream.storage.available_space();
         let (size, socket_state) = self
             .frontend_socket
             .socket_read(self.request_stream.storage.space());
@@ -433,8 +451,23 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             size
         );
 
+        // A read can never deliver more bytes than the buffer slice we handed
+        // it; `storage.fill(size)` below trusts this to advance the write
+        // cursor, and an over-long `size` would push the cursor past the
+        // buffer end (OOB on the next parse).
+        debug_assert!(
+            size <= available_space,
+            "socket_read returned {size} bytes for a {available_space}-byte buffer slice"
+        );
+
         if size > 0 {
+            let used_before = self.request_stream.storage.used().len();
             self.request_stream.storage.fill(size);
+            debug_assert_eq!(
+                self.request_stream.storage.used().len(),
+                used_before + size,
+                "storage.fill(size) must grow the used region by exactly the bytes read"
+            );
             count!(names::backend::BYTES_IN, size as i64);
             metrics.bin += size;
             // if self.kawa_request.storage.is_full() {
@@ -573,6 +606,16 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         );
 
         if size > 0 {
+            // A vectored write can only have flushed bytes that were actually
+            // queued in `bufs`; consuming more than we sent would advance the
+            // kawa output cursor past the data the peer received and truncate
+            // the next chunk. (`as_io_slice` is built from the same stream we
+            // now consume from.)
+            let queued = bufs.iter().map(|b| b.len()).sum::<usize>();
+            debug_assert!(
+                size <= queued,
+                "socket_write_vectored reported {size} bytes for {queued} queued"
+            );
             response_stream.consume(size);
             count!(names::backend::BYTES_OUT, size as i64);
             metrics.bout += size;
@@ -702,6 +745,14 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         let bufs = response_stream.as_io_slice();
         let (size, socket_state) = self.frontend_socket.socket_write_vectored(&bufs);
 
+        // Never consume more of the rendered default answer than the socket
+        // actually accepted, or the next flush would skip bytes and ship a
+        // truncated error page.
+        let queued = bufs.iter().map(|b| b.len()).sum::<usize>();
+        debug_assert!(
+            size <= queued,
+            "default-answer write reported {size} bytes for {queued} queued"
+        );
         count!(names::backend::BYTES_OUT, size as i64);
         metrics.bout += size;
         response_stream.consume(size);
@@ -761,6 +812,14 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         debug!("{} Wrote {} bytes", log_context!(self), size);
 
         if size > 0 {
+            // Consume only what the backend socket actually accepted from the
+            // queued request slices — over-consuming would drop request bytes
+            // the backend never saw (silent request truncation / smuggling).
+            let queued = bufs.iter().map(|b| b.len()).sum::<usize>();
+            debug_assert!(
+                size <= queued,
+                "backend socket_write_vectored reported {size} bytes for {queued} queued"
+            );
             self.request_stream.consume(size);
             count!(names::backend::BACK_BYTES_OUT, size as i64);
             metrics.backend_bout += size;
@@ -852,6 +911,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             return SessionResult::Continue;
         }
 
+        let available_space = response_stream.storage.available_space();
         let (size, socket_state) = backend_socket.socket_read(response_stream.storage.space());
         debug!(
             "{} Read {} bytes",
@@ -859,8 +919,22 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             size
         );
 
+        // Same buffer-slice bound as the frontend read path: a backend read
+        // can never exceed the space slice we handed it, or `fill(size)` would
+        // push the response write cursor past the buffer end.
+        debug_assert!(
+            size <= available_space,
+            "backend socket_read returned {size} bytes for a {available_space}-byte slice"
+        );
+
         if size > 0 {
+            let used_before = response_stream.storage.used().len();
             response_stream.storage.fill(size);
+            debug_assert_eq!(
+                response_stream.storage.used().len(),
+                used_before + size,
+                "response storage.fill(size) must grow the used region by exactly the bytes read"
+            );
             count!(names::backend::BACK_BYTES_IN, size as i64);
             metrics.backend_bin += size;
             // if self.kawa_response.storage.is_full() {
@@ -1180,6 +1254,14 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             self.context.backend_id.as_deref(),
             self.get_route(),
         );
+        // The answer engine only ever resolves to a template whose status line
+        // parsed as a 3-digit HTTP code (`Template::new` enforces it); a value
+        // outside `100..=999` here would mean a malformed template slipped
+        // through and the bytes on the wire would carry a bogus status.
+        debug_assert!(
+            (100..=999).contains(&resolved_status),
+            "default answer must resolve to a 3-digit HTTP status, got {resolved_status}"
+        );
         kawa.prepare(&mut kawa::h1::BlockConverter);
         // The template's resolved status may differ from the requested
         // code when a fallback template is selected (e.g. unknown status).
@@ -1195,6 +1277,19 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.response_stream = ResponseStream::DefaultAnswer(status, kawa);
         self.frontend_readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
         self.backend_readiness.interest = Ready::HUP | Ready::ERROR;
+        // Post: the session is now in the default-answer regime —
+        // `writable_default_answer` flushes the queued bytes and the frontend
+        // is steered to WRITABLE (never READABLE) while the backend is parked.
+        // This mirrors the `DefaultAnswer` arm of `check_invariants`.
+        debug_assert!(
+            matches!(self.response_stream, ResponseStream::DefaultAnswer(s, _) if s == status),
+            "set_answer must leave the response stream as the queued DefaultAnswer"
+        );
+        debug_assert!(
+            self.frontend_readiness.interest.is_writable()
+                && !self.frontend_readiness.interest.is_readable(),
+            "default answer must steer the frontend to WRITABLE only"
+        );
     }
 
     pub fn test_backend_socket(&self) -> bool {
@@ -1328,6 +1423,19 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 backend.borrow_mut().dec_connections();
             }
         }
+        // Post: the backend token is fully released — `close_backend` is the
+        // sole site that decrements the `CONNECTIONS` gauge, paired with the
+        // `+1` in `set_backend_connected`. Leaving a token behind would orphan
+        // the slab entry and skip the next session's gauge decrement.
+        debug_assert!(
+            self.backend_token.is_none(),
+            "close_backend must release the backend token"
+        );
+        debug_assert_ne!(
+            self.backend_connection_status,
+            BackendConnectionStatus::Connected,
+            "close_backend must leave the backend out of the Connected state"
+        );
     }
 
     /// Check the number of connection attempts against authorized connection retries
@@ -1352,6 +1460,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             });
             return Err(BackendConnectionError::MaxConnectionRetries(None));
         }
+        // Post (Ok branch): we only fall through when there is still budget for
+        // another connect attempt. `connect_to_backend` relies on this — it
+        // proceeds straight to the dial after a clean breaker check.
+        debug_assert!(
+            self.connection_attempts < CONN_RETRIES,
+            "check_circuit_breaker must only return Ok with retry budget remaining"
+        );
         Ok(())
     }
 
@@ -1685,6 +1800,17 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         self.backend_connection_status = connected;
 
         if connected == BackendConnectionStatus::Connected {
+            // Gauge ±1 pairing: the `CONNECTIONS` gauge is incremented here and
+            // decremented exactly once in `close_backend`. Transitioning into
+            // `Connected` from an already-`Connected` state would double-count
+            // and leave the gauge permanently inflated (it never underflows,
+            // but it would never return to zero either). The only legitimate
+            // predecessors are `NotConnected` and `Connecting(_)`.
+            debug_assert_ne!(
+                last,
+                BackendConnectionStatus::Connected,
+                "set_backend_connected(Connected) must not run twice without a close in between"
+            );
             gauge_add!(names::backend::CONNECTIONS, 1);
             gauge_add!(
                 names::backend::CONNECTIONS_PER_BACKEND,
@@ -1807,6 +1933,15 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         if response_stream.is_terminated() {
             return StateResult::CloseBackend;
         }
+        // Reaching the match means the response is neither fully readable nor
+        // already terminated — the early returns above peeled those cases off.
+        // The `(_, false)` arm relies on this when it force-terminates a
+        // length-less response: terminating an already-terminated stream would
+        // be a no-op masking a real double-close.
+        debug_assert!(
+            !response_stream.is_terminated(),
+            "backend_hup reached its decision match with an already-terminated response"
+        );
         match (
             self.request_stream.is_initial(),
             response_stream.is_initial(),
@@ -1826,9 +1961,22 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
                 response_stream.parsing_phase = kawa::ParsingPhase::Terminated;
 
+                // Post: the forced termination took — required for the
+                // length-less / truncated-response close path to make progress.
+                debug_assert!(
+                    response_stream.is_terminated(),
+                    "forced backend-hup termination must mark the response terminated"
+                );
+
                 // writable() will be called again and finish the session properly
                 // for this reason, writable must not short cut
                 self.frontend_readiness.interest.insert(Ready::WRITABLE);
+                // Post: the frontend is now armed to write so `writable` can
+                // flush whatever the backend already sent and then close.
+                debug_assert!(
+                    self.frontend_readiness.interest.is_writable(),
+                    "backend-hup termination must arm the frontend for the final flush"
+                );
                 StateResult::Continue
             }
             // probably backend hup between keep alive request, change backend
@@ -1886,7 +2034,24 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                     self.connection_attempts
                 );
 
+                // Each backend HUP-retry bumps the attempt counter by exactly
+                // one; the very next `connect_to_backend` runs the circuit
+                // breaker, which converts the `== CONN_RETRIES` case into a 503
+                // instead of dialling again — so the counter is never observed
+                // above `CONN_RETRIES` once the loop settles (see
+                // `check_invariants`).
+                let attempts_before = self.connection_attempts;
                 self.connection_attempts += 1;
+                debug_assert_eq!(
+                    self.connection_attempts,
+                    attempts_before + 1,
+                    "a backend retry must bump connection_attempts by exactly one"
+                );
+                debug_assert!(
+                    self.connection_attempts <= CONN_RETRIES,
+                    "connection_attempts ({}) must not exceed the breaker budget on retry",
+                    self.connection_attempts
+                );
                 self.fail_backend_connection(metrics);
 
                 self.backend_connection_status =
@@ -2073,6 +2238,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             return SessionResult::Close;
         }
 
+        // Post: a `Continue` exit means the loop drained all pending interest
+        // within the iteration budget (the `>= MAX_LOOP_ITERATIONS` arm above
+        // returns `Close` otherwise). This pins the no-infinite-loop contract.
+        debug_assert!(
+            counter < MAX_LOOP_ITERATIONS,
+            "ready_inner must only Continue when the loop settled within the iteration budget"
+        );
         SessionResult::Continue
     }
 
@@ -2088,6 +2260,64 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             TimeoutStatus::WaitingForNewRequest
         } else {
             TimeoutStatus::Request
+        }
+    }
+
+    /// Cross-field invariant sweep for the H1 session state machine.
+    ///
+    /// Run-to-completion postcondition: called via a `#[cfg(debug_assertions)]`
+    /// guard at the end of the [`SessionState::ready`] entry point, after the
+    /// inner loop has settled the session into a stable, between-events state.
+    /// It encodes relationships that must hold for ANY `Http` regardless of the
+    /// path (request, response, default answer, backend retry) that drove the
+    /// loop:
+    ///
+    /// - the circuit-breaker counter never exceeds the configured retry budget
+    ///   (`check_circuit_breaker` short-circuits at `CONN_RETRIES`, so a higher
+    ///   value would mean a retry slipped past the breaker);
+    /// - a `Connected` backend always names a live socket — `close_backend`
+    ///   takes the socket and drops back to `NotConnected` atomically, so any
+    ///   `Connected`-without-socket state is a teardown-ordering bug that would
+    ///   make `backend_writable`/`backend_readable` log "back socket not found";
+    /// - while a default answer is queued the frontend is steered toward
+    ///   WRITABLE and never asked to read more request bytes (the read path
+    ///   `error!`s and bails if it sees a `DefaultAnswer`), and the backend is
+    ///   never asked to read or write (we have nothing left to proxy);
+    /// - `context.status` agrees with the queued default-answer status, so the
+    ///   access-log / `save_http_status_metric` code never reports a different
+    ///   code than the bytes on the wire.
+    ///
+    /// Network input never reaches a hard `assert!` here — invalid traffic is
+    /// turned into a default answer or a close upstream; these `debug_assert!`s
+    /// fire only on our own logic bugs and compile out in release.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        debug_assert!(
+            self.connection_attempts <= CONN_RETRIES,
+            "connection_attempts ({}) must stay within the circuit-breaker budget ({CONN_RETRIES})",
+            self.connection_attempts
+        );
+        if self.backend_connection_status == BackendConnectionStatus::Connected {
+            debug_assert!(
+                self.backend_socket.is_some(),
+                "a Connected backend must own a live socket (teardown-ordering bug)"
+            );
+        }
+        if let ResponseStream::DefaultAnswer(status, _) = &self.response_stream {
+            debug_assert!(
+                !self.frontend_readiness.interest.is_readable(),
+                "frontend must not be asked to read more request bytes while a default answer is queued"
+            );
+            debug_assert!(
+                !self.backend_readiness.interest.is_readable()
+                    && !self.backend_readiness.interest.is_writable(),
+                "backend must be idle (no read/write interest) while a default answer is queued"
+            );
+            debug_assert_eq!(
+                self.context.status,
+                Some(*status),
+                "context.status must match the queued default-answer status"
+            );
         }
     }
 }
@@ -2116,6 +2346,10 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> SessionState 
                 .buffer
                 .sync(response_storage.end, response_storage.head);
         }
+        // Run-to-completion postcondition: the session has settled into a
+        // stable between-events state. Compiled out in release.
+        #[cfg(debug_assertions)]
+        self.check_invariants();
         session_result
     }
 
@@ -2289,6 +2523,15 @@ fn handle_connection_result(
 /// only carries `Some(status)` so the `else` branch is unnecessary here.
 fn save_http_status_metric(status: Option<u16>, context: LogContext) {
     if let Some(status) = status {
+        // Every status reaching this bucketer originates either from a parsed
+        // backend response status line or a validated answer template, both of
+        // which are 3-digit HTTP codes. A value outside `100..=999` would fall
+        // into the `STATUS_OTHER` catch-all below and signal a status that was
+        // never a real HTTP code — a logic bug upstream, not hostile traffic.
+        debug_assert!(
+            (100..=999).contains(&status),
+            "save_http_status_metric got a non-3-digit status: {status}"
+        );
         match status {
             100..=199 => {
                 incr!(

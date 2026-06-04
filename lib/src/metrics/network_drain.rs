@@ -95,6 +95,27 @@ impl NetworkDrain {
         self.queue
             .retain(|m| m.cluster_id.as_deref() != Some(cluster_id));
         self.removed_clusters.insert(cluster_id.to_owned());
+        // Post-condition: no stored counter, backend counter, or queued line
+        // for the cluster survives, and the tombstone is armed so live
+        // sessions cannot re-insert (see `receive_metric`).
+        debug_assert!(
+            self.cluster_metrics.keys().all(|(c, _)| c != cluster_id),
+            "no cluster-level counter for the removed cluster may survive"
+        );
+        debug_assert!(
+            self.backend_metrics.keys().all(|(c, _, _)| c != cluster_id),
+            "no backend counter under the removed cluster may survive"
+        );
+        debug_assert!(
+            self.queue
+                .iter()
+                .all(|m| m.cluster_id.as_deref() != Some(cluster_id)),
+            "no queued line for the removed cluster may survive"
+        );
+        debug_assert!(
+            self.removed_clusters.contains(cluster_id),
+            "remove_cluster must arm the tombstone for the id"
+        );
     }
 
     /// Re-arm a previously-removed cluster id so its metrics can flow on
@@ -103,6 +124,12 @@ impl NetworkDrain {
     /// removed.
     pub fn add_cluster(&mut self, cluster_id: &str) {
         self.removed_clusters.remove(cluster_id);
+        // Post-condition: the tombstone for the id is gone so metrics flow
+        // on the wire again. Idempotent on never-removed ids.
+        debug_assert!(
+            !self.removed_clusters.contains(cluster_id),
+            "add_cluster must clear the tombstone for the id"
+        );
     }
 
     /// Operator-issued reset triggered by `MetricsConfiguration::Clear`.
@@ -115,6 +142,22 @@ impl NetworkDrain {
         self.backend_metrics.clear();
         self.queue.clear();
         self.removed_clusters.clear();
+        // A full reset empties every wire-side map, the pending queue, and
+        // the tombstone set so any cluster id can resume emitting.
+        debug_assert!(
+            self.proxy_metrics.is_empty()
+                && self.cluster_metrics.is_empty()
+                && self.backend_metrics.is_empty(),
+            "clear must empty every wire-side metric map"
+        );
+        debug_assert!(
+            self.queue.is_empty(),
+            "clear must drop every queued timing line"
+        );
+        debug_assert!(
+            self.removed_clusters.is_empty(),
+            "clear must wipe the removed-cluster tombstones"
+        );
     }
 
     /// Drop all wire-side metric storage for one backend: stored counters
@@ -130,6 +173,22 @@ impl NetworkDrain {
             !(m.cluster_id.as_deref() == Some(cluster_id)
                 && m.backend_id.as_deref() == Some(backend_id))
         });
+        // Post-condition: no stored counter or queued line for exactly this
+        // (cluster, backend) pair survives. Other backends and the
+        // cluster-level entries are untouched (this does NOT tombstone).
+        debug_assert!(
+            self.backend_metrics
+                .keys()
+                .all(|(c, b, _)| !(c == cluster_id && b == backend_id)),
+            "no backend counter for the removed (cluster, backend) pair may survive"
+        );
+        debug_assert!(
+            self.queue
+                .iter()
+                .all(|m| !(m.cluster_id.as_deref() == Some(cluster_id)
+                    && m.backend_id.as_deref() == Some(backend_id))),
+            "no queued line for the removed (cluster, backend) pair may survive"
+        );
     }
 
     pub fn send_metrics(&mut self) {
@@ -138,12 +197,32 @@ impl NetworkDrain {
         let mut send_count = 0;
 
         // remove metrics that were not touched in the last 10mn
+        let cluster_before = self.cluster_metrics.len();
+        let backend_before = self.backend_metrics.len();
         self.cluster_metrics.retain(|_, ref value| {
             value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00)
         });
         self.backend_metrics.retain(|_, ref value| {
             value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00)
         });
+        // Staleness pruning is a pure shrink: `retain` only drops entries.
+        // Every surviving entry is either freshly updated or within the
+        // 10-minute window — never both stale AND not updated.
+        debug_assert!(
+            self.cluster_metrics.len() <= cluster_before
+                && self.backend_metrics.len() <= backend_before,
+            "staleness retain can only shrink the metric maps, never grow them"
+        );
+        debug_assert!(
+            self.cluster_metrics
+                .values()
+                .all(|v| v.updated || now.duration_since(v.last_sent) < Duration::new(600, 0))
+                && self
+                    .backend_metrics
+                    .values()
+                    .all(|v| v.updated || now.duration_since(v.last_sent) < Duration::new(600, 0)),
+            "every surviving entry must be updated or within the 10-minute window"
+        );
 
         if !self.is_writable {
             return;
@@ -198,8 +277,20 @@ impl NetworkDrain {
 
                 match res {
                     Ok(()) => {
+                        // A counter that was successfully emitted is consumed
+                        // to 0 (delta semantics on the statsd wire); a gauge
+                        // keeps its absolute value. Either way the stored
+                        // value must never be a negative count after emit.
+                        debug_assert!(
+                            !matches!(stored_metric.data, MetricValue::Count(c) if c < 0),
+                            "an emitted counter must reset to a non-negative value"
+                        );
                         stored_metric.last_sent = now;
                         stored_metric.updated = false;
+                        debug_assert!(
+                            !stored_metric.updated,
+                            "a successfully-sent metric must clear its updated flag"
+                        );
 
                         send_count += 1;
                         if send_count >= 10 {
@@ -208,6 +299,10 @@ impl NetworkDrain {
                             }*/
                             send_count = 0;
                         }
+                        debug_assert!(
+                            send_count < 10,
+                            "send_count must wrap back below the flush threshold"
+                        );
                     }
                     Err(e) => match e.kind() {
                         ErrorKind::WriteZero => {
@@ -282,8 +377,16 @@ impl NetworkDrain {
 
                 match res {
                     Ok(()) => {
+                        debug_assert!(
+                            !matches!(stored_metric.data, MetricValue::Count(c) if c < 0),
+                            "an emitted cluster counter must reset to a non-negative value"
+                        );
                         stored_metric.last_sent = now;
                         stored_metric.updated = false;
+                        debug_assert!(
+                            !stored_metric.updated,
+                            "a successfully-sent cluster metric must clear its updated flag"
+                        );
 
                         send_count += 1;
                         if send_count >= 10 {
@@ -292,6 +395,10 @@ impl NetworkDrain {
                             }*/
                             send_count = 0;
                         }
+                        debug_assert!(
+                            send_count < 10,
+                            "send_count must wrap back below the flush threshold"
+                        );
                     }
                     Err(e) => match e.kind() {
                         ErrorKind::WriteZero => {
@@ -366,8 +473,16 @@ impl NetworkDrain {
 
                 match res {
                     Ok(()) => {
+                        debug_assert!(
+                            !matches!(stored_metric.data, MetricValue::Count(c) if c < 0),
+                            "an emitted backend counter must reset to a non-negative value"
+                        );
                         stored_metric.last_sent = now;
                         stored_metric.updated = false;
+                        debug_assert!(
+                            !stored_metric.updated,
+                            "a successfully-sent backend metric must clear its updated flag"
+                        );
 
                         send_count += 1;
                         if send_count >= 10 {
@@ -376,6 +491,10 @@ impl NetworkDrain {
                             }*/
                             send_count = 0;
                         }
+                        debug_assert!(
+                            send_count < 10,
+                            "send_count must wrap back below the flush threshold"
+                        );
                     }
                     Err(e) => match e.kind() {
                         ErrorKind::WriteZero => {
@@ -507,16 +626,29 @@ impl Subscriber for NetworkDrain {
             if self.removed_clusters.contains(cid) {
                 return;
             }
+            // Past this point the cluster is NOT tombstoned, so any insert
+            // below is legitimate (a tombstoned cluster can never reach the
+            // map mutations).
+            debug_assert!(
+                !self.removed_clusters.contains(cid),
+                "a tombstoned cluster must not reach the wire-side map insert"
+            );
         }
 
         if metric.is_time() {
             if let MetricValue::Time(millis) = metric {
+                let before = self.queue.len();
                 self.queue.push_back(MetricLine {
                     label: key,
                     cluster_id: cluster_id.map(|s| s.to_string()),
                     backend_id: backend_id.map(|s| s.to_string()),
                     duration: millis,
                 });
+                debug_assert_eq!(
+                    self.queue.len(),
+                    before + 1,
+                    "a timing metric must enqueue exactly one line"
+                );
             }
             return;
         }
@@ -525,20 +657,44 @@ impl Subscriber for NetworkDrain {
             (None, _) => {}
             (Some(cid), None) => {
                 let k = (String::from(cid), String::from(key));
+                let existed = self.cluster_metrics.contains_key(&k);
+                let before_len = self.cluster_metrics.len();
                 if let Entry::Vacant(e) = self.cluster_metrics.entry(k.to_owned()) {
                     e.insert(StoredMetricValue::new(self.created, metric));
                 } else if let Some(stored_metric) = self.cluster_metrics.get_mut(&k) {
                     stored_metric.update(key, metric);
                 }
+                // Fresh key grows the map by one; an existing key is updated
+                // in place. The key is present either way.
+                debug_assert_eq!(
+                    self.cluster_metrics.len(),
+                    before_len + (!existed) as usize,
+                    "cluster metric insert grows the map by one iff the key was absent"
+                );
+                debug_assert!(
+                    self.cluster_metrics.contains_key(&k),
+                    "the cluster metric key must be present after receive_metric"
+                );
                 return;
             }
             (Some(cid), Some(bid)) => {
                 let k = (String::from(cid), String::from(bid), String::from(key));
+                let existed = self.backend_metrics.contains_key(&k);
+                let before_len = self.backend_metrics.len();
                 if let Entry::Vacant(e) = self.backend_metrics.entry(k.to_owned()) {
                     e.insert(StoredMetricValue::new(self.created, metric));
                 } else if let Some(stored_metric) = self.backend_metrics.get_mut(&k) {
                     stored_metric.update(key, metric);
                 }
+                debug_assert_eq!(
+                    self.backend_metrics.len(),
+                    before_len + (!existed) as usize,
+                    "backend metric insert grows the map by one iff the key was absent"
+                );
+                debug_assert!(
+                    self.backend_metrics.contains_key(&k),
+                    "the backend metric key must be present after receive_metric"
+                );
                 return;
             }
         }
@@ -567,9 +723,19 @@ impl Subscriber for NetworkDrain {
         */
 
         if !self.proxy_metrics.contains_key(key) {
+            let before_len = self.proxy_metrics.len();
             self.proxy_metrics.insert(
                 String::from(key),
                 StoredMetricValue::new(self.created, metric),
+            );
+            debug_assert_eq!(
+                self.proxy_metrics.len(),
+                before_len + 1,
+                "a fresh proxy metric must grow the map by exactly one"
+            );
+            debug_assert!(
+                self.proxy_metrics.contains_key(key),
+                "the proxy metric key must be present after a fresh insert"
             );
             return;
         }

@@ -285,6 +285,7 @@ macro_rules! ensure_frame_size {
 // `DEFAULT_MAX_FRAME_SIZE` freely because they construct isolated frame
 // buffers that never flow through a real peer handshake.
 pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHeader, ParserError> {
+    let in_len = input.len();
     let (i, payload_len) = be_u24(input)?;
     if payload_len > max_frame_size {
         return Err(Err::Failure(ParserError::new_h2(
@@ -296,8 +297,27 @@ pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHe
     let (i, t) = be_u8(i)?;
     let frame_type = convert_frame_type(t);
     let (i, flags) = be_u8(i)?;
-    let (i, stream_id) = be_u32(i)?;
-    let stream_id = stream_id & STREAM_ID_MASK;
+    let (i, raw_stream_id) = be_u32(i)?;
+    let stream_id = raw_stream_id & STREAM_ID_MASK;
+    // Post-conditions of the fixed 9-byte header decode: the parser never grows
+    // its input, it consumes exactly the header it just read, the size bound
+    // this function is contracted to enforce holds, and the reserved high bit is
+    // masked off the stream id.
+    debug_assert!(i.len() <= in_len, "parser must not grow its input");
+    debug_assert_eq!(
+        i.len(),
+        in_len - FRAME_HEADER_SIZE,
+        "frame_header must consume exactly the 9-byte header"
+    );
+    debug_assert!(
+        payload_len <= max_frame_size,
+        "frame_header must enforce the size bound it was given"
+    );
+    debug_assert_eq!(
+        stream_id & !STREAM_ID_MASK,
+        0,
+        "reserved high bit must be masked off the stream id"
+    );
 
     // RFC 9113 §5.5: unknown frame types MUST be silently discarded. Skip
     // stream-id parity validation for them — the spec places no constraints on
@@ -395,6 +415,7 @@ pub fn frame_body<'a>(
     i: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
+    let in_len = i.len();
     let f = match header.frame_type {
         FrameType::Data => data_frame(i, header)?,
         FrameType::Headers => headers_frame(i, header)?,
@@ -437,6 +458,16 @@ pub fn frame_body<'a>(
         FrameType::Unknown(_) => unknown_frame(i, header)?,
     };
 
+    // Whatever the frame type, decoding the body never grows the input and
+    // never leaves more bytes than there are payload bytes to consume.
+    debug_assert!(
+        f.0.len() <= in_len,
+        "frame body parser must not grow its input"
+    );
+    debug_assert!(
+        f.0.len() <= in_len.saturating_sub(header.payload_len as usize),
+        "frame body must consume at least the declared payload_len bytes"
+    );
     Ok(f)
 }
 
@@ -465,12 +496,20 @@ fn strip_padding<'a>(
     flags: u8,
     error_input: &'a [u8],
 ) -> IResult<&'a [u8], u8, ParserError<'a>> {
+    let in_len = i.len();
     let (i, pad_length) = if flags & FLAG_PADDED != 0 {
         let (i, pad_length) = be_u8(i)?;
         (i, pad_length)
     } else {
         (i, 0)
     };
+    // Reading the pad-length byte (PADDED set) shrinks the slice by exactly one;
+    // the unpadded path leaves it untouched.
+    debug_assert_eq!(
+        i.len(),
+        in_len - (flags & FLAG_PADDED != 0) as usize,
+        "strip_padding consumes the pad-length byte iff PADDED is set"
+    );
 
     if (pad_length as usize) > i.len() {
         return Err(Err::Failure(ParserError::new_h2(
@@ -479,6 +518,12 @@ fn strip_padding<'a>(
         )));
     }
 
+    // Post-condition this function is contracted to enforce (RFC 9113 §6.1):
+    // the returned pad length never exceeds the bytes that remain for it to trim.
+    debug_assert!(
+        pad_length as usize <= i.len(),
+        "strip_padding must reject pad_length larger than the remaining payload"
+    );
     Ok((i, pad_length))
 }
 
@@ -492,10 +537,22 @@ fn unpad<'a>(
     pad_length: u8,
     error_input: &'a [u8],
 ) -> Result<&'a [u8], Err<ParserError<'a>>> {
+    let in_len = i.len();
     let content_len = i
         .len()
         .checked_sub(pad_length as usize)
         .ok_or_else(|| Err::Failure(ParserError::new_h2(error_input, H2Error::ProtocolError)))?;
+    // Trimming padding only ever removes bytes, and removes exactly the declared
+    // padding (content + padding partition the input with no overlap or gap).
+    debug_assert!(
+        content_len <= in_len,
+        "unpad must not grow the content slice"
+    );
+    debug_assert_eq!(
+        content_len + pad_length as usize,
+        in_len,
+        "content and padding must exactly partition the input"
+    );
     Ok(&i[..content_len])
 }
 
@@ -503,10 +560,28 @@ pub fn data_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
+    let in_len = input.len();
     let (remaining, i) = take(header.payload_len)(input)?;
 
     let (i, pad_length) = strip_padding(i, header.flags, input)?;
     let payload = unpad(i, pad_length, input)?;
+
+    // `take` consumed exactly the declared payload; the visible content (after
+    // stripping the optional pad-length byte and the trailing padding) can never
+    // exceed it.
+    debug_assert_eq!(
+        remaining.len(),
+        in_len - header.payload_len as usize,
+        "data_frame must consume exactly payload_len bytes"
+    );
+    debug_assert!(
+        payload.len() <= header.payload_len as usize,
+        "data payload must fit within the declared frame payload"
+    );
+    debug_assert!(
+        pad_length as usize <= header.payload_len as usize,
+        "padding must not exceed the frame payload"
+    );
 
     Ok((
         remaining,
@@ -546,6 +621,7 @@ pub fn headers_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
+    let in_len = input.len();
     let (remaining, i) = take(header.payload_len)(input)?;
 
     let (i, pad_length) = strip_padding(i, header.flags, input)?;
@@ -565,6 +641,19 @@ pub fn headers_frame<'a>(
     };
 
     let header_block_fragment = unpad(i, pad_length, input)?;
+
+    // `take` consumed exactly the declared payload, and the header block fragment
+    // that survives after stripping pad-length, the optional 5-byte priority
+    // prefix, and trailing padding is necessarily a subslice of it.
+    debug_assert_eq!(
+        remaining.len(),
+        in_len - header.payload_len as usize,
+        "headers_frame must consume exactly payload_len bytes"
+    );
+    debug_assert!(
+        header_block_fragment.len() <= header.payload_len as usize,
+        "header block fragment must fit within the declared frame payload"
+    );
 
     Ok((
         remaining,
@@ -605,7 +694,20 @@ pub fn priority_frame<'a>(
     // symmetric with variable-size ones: if the upstream length invariant is
     // ever weakened we still consume exactly the declared payload and the
     // inner parse fails cleanly instead of reading random trailing bytes.
+    let in_len = input.len();
     let (i, data) = take(header.payload_len)(input)?;
+    // PRIORITY is a fixed 5-byte frame (RFC 9113 §6.3); the framing layer
+    // rejected mismatches, so the scoped payload is exactly that wide.
+    debug_assert_eq!(
+        i.len(),
+        in_len - header.payload_len as usize,
+        "priority_frame must consume exactly payload_len bytes"
+    );
+    debug_assert_eq!(
+        data.len(),
+        PRIORITY_PAYLOAD_SIZE as usize,
+        "PRIORITY payload must be exactly 5 bytes"
+    );
     let (_, (stream_dependency, weight)) = tuple((stream_dependency, be_u8))(data)?;
     Ok((
         i,
@@ -633,7 +735,20 @@ pub fn rst_stream_frame<'a>(
     // variable-size ones (see `priority_frame`). The framing layer already
     // enforced `payload_len == RST_STREAM_PAYLOAD_SIZE == 4`, so this
     // consumes exactly the 32-bit error-code field.
+    let in_len = input.len();
     let (i, data) = take(header.payload_len)(input)?;
+    // RST_STREAM is a fixed 4-byte frame (RFC 9113 §6.4); the framing layer
+    // enforced the size, so the scoped payload holds exactly the error code.
+    debug_assert_eq!(
+        i.len(),
+        in_len - header.payload_len as usize,
+        "rst_stream_frame must consume exactly payload_len bytes"
+    );
+    debug_assert_eq!(
+        data.len(),
+        RST_STREAM_PAYLOAD_SIZE as usize,
+        "RST_STREAM payload must be exactly 4 bytes"
+    );
     let (_, error_code) = be_u32(data)?;
     Ok((
         i,
@@ -681,12 +796,31 @@ pub fn settings_frame<'a>(
         )));
     }
 
+    let in_len = input.len();
     let (i, data) = take(header.payload_len)(input)?;
 
     let (_, settings) = many0(map(
         complete(tuple((be_u16, be_u32))),
         |(identifier, value)| Setting { identifier, value },
     ))(data)?;
+
+    // The framing layer guaranteed `payload_len % 6 == 0` and the cap above
+    // bounded the entry count; the decoded vector must reflect exactly that —
+    // one entry per 6-byte pair, never more than the allocation cap.
+    debug_assert_eq!(
+        i.len(),
+        in_len - header.payload_len as usize,
+        "settings_frame must consume exactly payload_len bytes"
+    );
+    debug_assert_eq!(
+        settings.len(),
+        header.payload_len as usize / SETTINGS_ENTRY_SIZE as usize,
+        "one SETTINGS entry decodes per 6 payload bytes"
+    );
+    debug_assert!(
+        settings.len() <= MAX_SETTINGS_ENTRIES,
+        "settings_frame must honour the MAX_SETTINGS_ENTRIES allocation cap"
+    );
 
     Ok((
         i,
@@ -734,7 +868,23 @@ pub fn ping_frame<'a>(
     // `take(header.payload_len)` (rather than `take(8usize)`) keeps the
     // fixed-size parsers symmetric with variable-size ones. The framing
     // layer already enforced `payload_len == PING_PAYLOAD_SIZE == 8`.
+    let in_len = input.len();
     let (i, data) = take(header.payload_len)(input)?;
+
+    // PING is a fixed 8-byte frame (RFC 9113 §6.7). The framing layer enforced
+    // the size, which is the invariant the unchecked `copy_from_slice(&data[..8])`
+    // below relies on — assert it before the copy so a weakened size check would
+    // fire here rather than panic on the slice index.
+    debug_assert_eq!(
+        i.len(),
+        in_len - header.payload_len as usize,
+        "ping_frame must consume exactly payload_len bytes"
+    );
+    debug_assert_eq!(
+        data.len(),
+        PING_PAYLOAD_SIZE as usize,
+        "PING payload must be exactly 8 bytes for the opaque-data copy"
+    );
 
     let mut p = Ping {
         payload: [0; 8],
@@ -756,11 +906,30 @@ pub fn goaway_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
+    let in_len = input.len();
     let (remaining, i) = take(header.payload_len)(input)?;
     let (i, raw_last_stream_id) = be_u32(i)?;
     // RFC 9113 §6.8: reserved bit must be masked (same as frame_header stream_id)
     let last_stream_id = raw_last_stream_id & STREAM_ID_MASK;
     let (additional_debug_data, error_code) = be_u32(i)?;
+    // The framing layer guaranteed `payload_len >= 8`; after the two fixed u32
+    // fields the remainder is the optional debug data, exactly `payload_len - 8`
+    // bytes, and the reserved high bit of Last-Stream-ID is cleared.
+    debug_assert_eq!(
+        remaining.len(),
+        in_len - header.payload_len as usize,
+        "goaway_frame must consume exactly payload_len bytes"
+    );
+    debug_assert_eq!(
+        additional_debug_data.len(),
+        header.payload_len as usize - GOAWAY_PAYLOAD_SIZE as usize,
+        "GOAWAY debug data is payload_len minus the 8-byte fixed prefix"
+    );
+    debug_assert_eq!(
+        last_stream_id & !STREAM_ID_MASK,
+        0,
+        "GOAWAY last_stream_id reserved high bit must be masked"
+    );
     Ok((
         remaining,
         Frame::GoAway(GoAway {
@@ -784,9 +953,27 @@ pub fn window_update_frame<'a>(
     // Scope input to payload_len like other fixed-size parsers (rst_stream_frame,
     // ping_frame). The caller enforces payload_len == 4; the take() ensures a
     // future relaxation doesn't desynchronize the frame stream.
+    let in_len = input.len();
     let (i, data) = take(header.payload_len)(input)?;
+    // WINDOW_UPDATE is a fixed 4-byte frame (RFC 9113 §6.9); the framing layer
+    // enforced the size so the scoped payload holds exactly the increment.
+    debug_assert_eq!(
+        i.len(),
+        in_len - header.payload_len as usize,
+        "window_update_frame must consume exactly payload_len bytes"
+    );
+    debug_assert_eq!(
+        data.len(),
+        WINDOW_UPDATE_PAYLOAD_SIZE as usize,
+        "WINDOW_UPDATE payload must be exactly 4 bytes"
+    );
     let (_, increment) = be_u32(data)?;
     let increment = increment & STREAM_ID_MASK;
+    // The reserved high bit is masked: the increment is a 31-bit value (§6.9).
+    debug_assert!(
+        increment <= STREAM_ID_MASK,
+        "window-size increment must be a 31-bit value"
+    );
 
     // NOTE: zero-increment validation is intentionally NOT performed here.
     // RFC 9113 §6.9 requires different error handling depending on whether the
@@ -819,7 +1006,13 @@ pub fn continuation_frame<'a>(
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
     // Consume the entire frame payload without storing fields
+    let in_len = input.len();
     let (remaining, _) = take(header.payload_len)(input)?;
+    debug_assert_eq!(
+        remaining.len(),
+        in_len - header.payload_len as usize,
+        "continuation_frame must consume exactly payload_len bytes"
+    );
     Ok((remaining, Frame::Continuation(Continuation)))
 }
 
@@ -831,7 +1024,13 @@ pub fn unknown_frame<'a>(
     input: &'a [u8],
     header: &FrameHeader,
 ) -> IResult<&'a [u8], Frame, ParserError<'a>> {
+    let in_len = input.len();
     let (remaining, _payload) = take(header.payload_len)(input)?;
+    debug_assert_eq!(
+        remaining.len(),
+        in_len - header.payload_len as usize,
+        "unknown_frame must consume exactly payload_len bytes"
+    );
     let raw = match header.frame_type {
         FrameType::Unknown(t) => t,
         _ => 0,
@@ -880,14 +1079,37 @@ pub fn priority_update_frame<'a>(
             H2Error::ProtocolError,
         )));
     }
+    let in_len = input.len();
     let (remaining, payload) = take(header.payload_len)(input)?;
     let (raw_id_bytes, value_bytes) = payload.split_at(PRIORITY_UPDATE_MIN_PAYLOAD as usize);
+    // The two checks above bound the value length; `split_at` partitions the
+    // payload into the 4-byte stream-id prefix and the SF-Item value with no
+    // overlap. Assert the bound this function is contracted to enforce.
+    debug_assert_eq!(
+        remaining.len(),
+        in_len - header.payload_len as usize,
+        "priority_update_frame must consume exactly payload_len bytes"
+    );
+    debug_assert_eq!(
+        raw_id_bytes.len(),
+        PRIORITY_UPDATE_MIN_PAYLOAD as usize,
+        "PRIORITY_UPDATE stream-id prefix must be exactly 4 bytes"
+    );
+    debug_assert!(
+        value_bytes.len() <= PRIORITY_UPDATE_MAX_VALUE,
+        "priority field value must respect the PRIORITY_UPDATE_MAX_VALUE cap"
+    );
     let prioritized_stream_id = u32::from_be_bytes([
         raw_id_bytes[0],
         raw_id_bytes[1],
         raw_id_bytes[2],
         raw_id_bytes[3],
     ]) & STREAM_ID_MASK;
+    debug_assert_eq!(
+        prioritized_stream_id & !STREAM_ID_MASK,
+        0,
+        "prioritized_stream_id reserved high bit must be masked"
+    );
     Ok((
         remaining,
         Frame::PriorityUpdate(PriorityUpdate {

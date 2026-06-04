@@ -124,7 +124,15 @@ pub fn any_supported_type(
 ///
 /// Returns `None` if the group name is unknown or not supported by the compiled provider.
 pub fn kx_group_by_name(name: &str) -> Option<&'static dyn rustls::crypto::SupportedKxGroup> {
+    debug_assert_provider_precedence();
     let provider = &*DEFAULT_PROVIDER;
+    // Invariant: the resolved provider always advertises at least one key
+    // exchange group, otherwise no TLS handshake could ever complete. This
+    // catches a mis-linked or empty provider build.
+    debug_assert!(
+        !provider.kx_groups.is_empty(),
+        "the active crypto provider must advertise at least one kx group"
+    );
     let named_group = match name {
         "x25519" | "X25519" => rustls::NamedGroup::X25519,
         "secp256r1" | "P-256" => rustls::NamedGroup::secp256r1,
@@ -132,11 +140,18 @@ pub fn kx_group_by_name(name: &str) -> Option<&'static dyn rustls::crypto::Suppo
         "X25519MLKEM768" => rustls::NamedGroup::X25519MLKEM768,
         _ => return None,
     };
-    provider
+    let resolved = provider
         .kx_groups
         .iter()
         .find(|g| g.name() == named_group)
-        .copied()
+        .copied();
+    // Post-condition: a resolved group reports exactly the name we searched
+    // for — the provider lookup must not return a mismatched group.
+    debug_assert!(
+        resolved.is_none_or(|g| g.name() == named_group),
+        "resolved kx group must match the requested named group"
+    );
+    resolved
 }
 
 /// Look up a cipher suite by its string name, filtered through the active
@@ -154,6 +169,13 @@ pub fn kx_group_by_name(name: &str) -> Option<&'static dyn rustls::crypto::Suppo
 /// `rustls/src/crypto/mod.rs` and `aws_lc_rs/mod.rs` ChaCha gating
 /// under `feature = "fips"`).
 pub fn cipher_suite_by_name(name: &str) -> Option<rustls::SupportedCipherSuite> {
+    debug_assert_provider_precedence();
+    // Invariant: the resolved provider always advertises at least one cipher
+    // suite — an empty set means a broken provider link.
+    debug_assert!(
+        !DEFAULT_PROVIDER.cipher_suites.is_empty(),
+        "the active crypto provider must advertise at least one cipher suite"
+    );
     let candidate = match name {
         "TLS13_AES_256_GCM_SHA384" => Some(TLS13_AES_256_GCM_SHA384),
         "TLS13_AES_128_GCM_SHA256" => Some(TLS13_AES_128_GCM_SHA256),
@@ -175,11 +197,59 @@ pub fn cipher_suite_by_name(name: &str) -> Option<rustls::SupportedCipherSuite> 
     // it. Compare by `CipherSuite` enum (newtype around the IANA value)
     // since `SupportedCipherSuite` does not implement `Eq`.
     let wanted = candidate.suite();
-    DEFAULT_PROVIDER
+    let resolved = DEFAULT_PROVIDER
         .cipher_suites
         .iter()
         .find(|s| s.suite() == wanted)
-        .copied()
+        .copied();
+    // Post-condition: a resolved suite is the exact IANA suite we matched on
+    // by name — the provider filter must not substitute a different suite.
+    debug_assert!(
+        resolved.is_none_or(|s| s.suite() == wanted),
+        "resolved cipher suite must match the suite the name mapped to"
+    );
+    resolved
+}
+
+/// Compile-time precedence-chain assertion: encodes the `fips > ring >
+/// aws-lc-rs > openssl` resolution that the `#[cfg(...)]` gates on the
+/// `pub use` blocks above implement, expressed via the `cfg!()` macro so it
+/// is evaluated against the *enabled feature set* rather than restating the
+/// type system. Called from the runtime provider lookups so a feature-gate
+/// regression (e.g. dropping a `not(feature = "fips")` guard) trips a
+/// `debug_assert!` in tests instead of silently linking the wrong provider.
+///
+/// The `cfg!(...)` calls are const-folded, so in release this whole function
+/// collapses to nothing.
+#[inline]
+fn debug_assert_provider_precedence() {
+    // At least one provider feature is enabled — mirrors the `compile_error!`
+    // guard at the top of the module, but as a runtime-checkable invariant.
+    debug_assert!(
+        cfg!(feature = "crypto-ring")
+            || cfg!(feature = "crypto-aws-lc-rs")
+            || cfg!(feature = "crypto-openssl"),
+        "at least one crypto provider feature must be enabled"
+    );
+    // `fips` implies `crypto-aws-lc-rs` (the Cargo manifest wires this), so a
+    // FIPS build always has aws-lc-rs available as its backing provider.
+    debug_assert!(
+        !cfg!(feature = "fips") || cfg!(feature = "crypto-aws-lc-rs"),
+        "the `fips` feature must imply `crypto-aws-lc-rs`"
+    );
+    // The aws-lc-rs `pub use` is selected only when neither `fips` nor
+    // `crypto-ring` wins ahead of it — i.e. ring outranks aws-lc-rs, which
+    // outranks openssl. Assert the openssl arm only activates when every
+    // higher-precedence provider feature is absent.
+    debug_assert!(
+        !cfg!(all(
+            feature = "crypto-openssl",
+            not(feature = "fips"),
+            not(feature = "crypto-ring"),
+            not(feature = "crypto-aws-lc-rs")
+        )) || cfg!(feature = "crypto-openssl"),
+        "the openssl provider arm is only reachable with openssl enabled"
+    );
 }
 
 #[cfg(test)]

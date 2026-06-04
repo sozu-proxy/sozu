@@ -46,11 +46,28 @@ fn filter_labels_for_detail<'a>(
     cluster_id: Option<&'a str>,
     backend_id: Option<&'a str>,
 ) -> (Option<&'a str>, Option<&'a str>) {
-    match detail {
+    let (out_cluster, out_backend) = match detail {
         MetricDetailLevel::Process | MetricDetailLevel::Frontend => (None, None),
         MetricDetailLevel::Cluster => (cluster_id, None),
         MetricDetailLevel::Backend => (cluster_id, backend_id),
-    }
+    };
+    // The filter only ever DROPS labels: an absent input can never become a
+    // present output, and a kept output must be the exact same borrow we
+    // were handed (no synthesised label). This is the cardinality-safety
+    // post-condition that keeps the local CLI view and the wire consistent.
+    debug_assert!(
+        cluster_id.is_some() || out_cluster.is_none(),
+        "filter must never invent a cluster_id"
+    );
+    debug_assert!(
+        backend_id.is_some() || out_backend.is_none(),
+        "filter must never invent a backend_id"
+    );
+    debug_assert!(
+        out_backend.is_none() || out_cluster.is_some(),
+        "a kept backend label implies a kept cluster label (no orphan backend)"
+    );
+    (out_cluster, out_backend)
 }
 
 /// Map a numeric HTTP status code to its dedicated counter name, if any.
@@ -129,8 +146,19 @@ impl MetricValue {
     fn update(&mut self, key: &'static str, m: MetricValue) -> bool {
         match (self, m) {
             (&mut MetricValue::Gauge(ref mut v1), MetricValue::Gauge(v2)) => {
+                // `changed` reflects the absolute set: true iff the stored
+                // value actually moves. Pair-assert the post-state matches
+                // the requested value and that `changed` is the equality
+                // relationship between before and after.
+                let before = *v1;
                 let changed = *v1 != v2;
                 *v1 = v2;
+                debug_assert_eq!(*v1, v2, "gauge set must store exactly the requested value");
+                debug_assert_eq!(
+                    changed,
+                    before != v2,
+                    "`changed` must report whether the gauge actually moved"
+                );
                 changed
             }
             (&mut MetricValue::Gauge(ref mut v1), MetricValue::GaugeAdd(v2)) => {
@@ -142,23 +170,45 @@ impl MetricValue {
                 // make underflow structurally impossible from live code,
                 // and a panic on a metric mismatch is too aggressive — the
                 // log line names the offending key for observability.
+                //
+                // INVARIANT (the canonical gauge-underflow guard): the post
+                // value is non-negative, equals `before + v2` on the
+                // non-underflow path, and is exactly the `0` floor whenever
+                // `before + v2` would have gone negative. We assert the
+                // *post-condition* (never panic the recovery path) rather
+                // than a `before >= -v2` pre-condition, because a real
+                // underflow is recovered (clamp + log) by design.
+                let before = *v1;
                 let changed = v2 != 0;
-                let res = *v1 as i64 + v2;
+                let res = before as i64 + v2;
                 *v1 = if res >= 0 {
                     res as usize
                 } else {
                     error!(
                         "metric {} underflow: previous value: {}, adding: {}",
-                        key, v1, v2
+                        key, before, v2
                     );
                     0
                 };
+                debug_assert!(
+                    res >= 0 || *v1 == 0,
+                    "gauge underflow must clamp to exactly 0 (never wrap)"
+                );
+                debug_assert!(
+                    res < 0 || *v1 as i64 == before as i64 + v2,
+                    "non-underflow gauge add must equal before + v2 exactly"
+                );
 
                 changed
             }
             (&mut MetricValue::Count(ref mut v1), MetricValue::Count(v2)) => {
+                // Counter delta: `v2` may be negative (e.g. `decr!`), so the
+                // monotonic-between-resets invariant is encoded as the exact
+                // delta — the post value equals the pre value plus `v2`.
+                let before = *v1;
                 let changed = v2 != 0;
                 *v1 += v2;
+                debug_assert_eq!(*v1, before + v2, "count update must advance by exactly v2");
                 changed
             }
             (s, m) => {
@@ -206,6 +256,13 @@ impl StoredMetricValue {
         } else {
             data
         };
+        // Post-conditions: a `GaugeAdd` seed never survives as `GaugeAdd`
+        // (it is normalised to a non-negative `Gauge`), and a fresh stored
+        // value is always flagged `updated` so the next drain emits it.
+        debug_assert!(
+            !matches!(data, MetricValue::GaugeAdd(_)),
+            "GaugeAdd must be normalised to a non-negative Gauge at construction"
+        );
         StoredMetricValue {
             last_sent,
             updated: true,
@@ -214,10 +271,23 @@ impl StoredMetricValue {
     }
 
     pub fn update(&mut self, key: &'static str, m: MetricValue) {
+        // The `updated` flag is a monotone latch within one drain cycle: it
+        // may only go from false→true here (the drain resets it to false on
+        // emit). So once set, it stays set; and if this update reports a
+        // change, the flag must be set afterwards.
+        let was_updated = self.updated;
         let updated = self.data.update(key, m);
         if !self.updated {
             self.updated = updated;
         }
+        debug_assert!(
+            self.updated || (!was_updated && !updated),
+            "`updated` must stay set once latched; a reported change must latch it"
+        );
+        debug_assert!(
+            !was_updated || self.updated,
+            "`updated` is a monotone latch within a drain cycle (never cleared here)"
+        );
     }
 }
 
@@ -457,6 +527,14 @@ impl Aggregator {
     pub fn set_up_detail(&mut self, detail: MetricDetailLevel) {
         self.configured = detail;
         self.recompute_effective();
+        // Raising the configured floor can only raise/hold the effective
+        // level; the full invariant set must hold afterwards.
+        debug_assert!(
+            self.effective >= self.configured,
+            "effective must dominate the freshly-set configured floor"
+        );
+        #[cfg(debug_assertions)]
+        self.check_lease_invariants();
     }
 
     /// Returns the static (configured) cardinality floor. Independent of
@@ -528,6 +606,7 @@ impl Aggregator {
             return LeaseApplyOutcome::Unauthorized;
         }
         let expires_at = Instant::now() + ttl;
+        let before_len = self.leases.len();
         self.leases.insert(
             client_id,
             LeaseEntry {
@@ -536,8 +615,34 @@ impl Aggregator {
                 binding,
             },
         );
+        // Map-accounting invariant: a renewal REPLACES in place (count
+        // stable) while a fresh insert grows the table by exactly one. The
+        // table must never exceed the cap on the insert path because the
+        // fresh-insert branch was gated by the `>= LEASE_TABLE_CAP` check
+        // above.
+        debug_assert_eq!(
+            self.leases.len(),
+            before_len + (!is_renewal) as usize,
+            "lease_apply grows the table by exactly one iff this is a fresh insert"
+        );
+        debug_assert!(
+            self.leases.len() <= LEASE_TABLE_CAP,
+            "lease table must never exceed LEASE_TABLE_CAP after an accepted apply"
+        );
         let previous_effective = self.effective;
         self.recompute_effective();
+        // An apply can only ELEVATE the effective level (a fresh/renewed
+        // lease adds to the max), never lower it below the prior effective.
+        debug_assert!(
+            self.effective >= previous_effective,
+            "lease_apply must not lower the effective detail level"
+        );
+        debug_assert!(
+            self.effective >= self.configured,
+            "effective must never drop below the configured floor"
+        );
+        #[cfg(debug_assertions)]
+        self.check_lease_invariants();
         LeaseApplyOutcome::Applied {
             previous_effective,
             new_effective: self.effective,
@@ -563,9 +668,33 @@ impl Aggregator {
         if entry.binding.is_known() && !entry.binding.matches(&presented) {
             return LeaseClearOutcome::Unauthorized;
         }
+        // We only reach here after the `get` above proved the key is
+        // present, so the removal evicts exactly one entry.
+        let before_len = self.leases.len();
         self.leases.remove(client_id);
+        debug_assert!(
+            !self.leases.contains_key(client_id),
+            "lease_clear must evict the cleared client_id"
+        );
+        debug_assert_eq!(
+            self.leases.len(),
+            before_len - 1,
+            "lease_clear removes exactly one entry on the authorised path"
+        );
         let previous = self.effective;
         self.recompute_effective();
+        // Clearing a lease can only LOWER or hold the effective level (one
+        // contributor to the max is gone), never raise it.
+        debug_assert!(
+            self.effective <= previous,
+            "lease_clear must not raise the effective detail level"
+        );
+        debug_assert!(
+            self.effective >= self.configured,
+            "effective must never drop below the configured floor"
+        );
+        #[cfg(debug_assertions)]
+        self.check_lease_invariants();
         LeaseClearOutcome::Cleared {
             previous_effective: previous,
         }
@@ -590,11 +719,33 @@ impl Aggregator {
         self.last_lease_tick = now;
         let before = self.leases.len();
         self.leases.retain(|_, entry| entry.expires_at > now);
+        // Expiry is a pure shrink: `retain` can only drop entries, never
+        // add them, and every surviving lease must be strictly in the
+        // future relative to `now`.
+        debug_assert!(
+            self.leases.len() <= before,
+            "lease_tick (expiry) can only shrink the table, never grow it"
+        );
+        debug_assert!(
+            self.leases.values().all(|entry| entry.expires_at > now),
+            "every surviving lease must expire strictly after `now`"
+        );
         if self.leases.len() == before {
             return None;
         }
         let previous = self.effective;
         self.recompute_effective();
+        // Losing leases can only lower or hold the effective level.
+        debug_assert!(
+            self.effective <= previous,
+            "lease expiry must not raise the effective detail level"
+        );
+        debug_assert!(
+            self.effective >= self.configured,
+            "effective must never drop below the configured floor"
+        );
+        #[cfg(debug_assertions)]
+        self.check_lease_invariants();
         if previous != self.effective {
             Some(previous)
         } else {
@@ -620,6 +771,53 @@ impl Aggregator {
             }
         }
         self.effective = max_lease;
+        // Post-condition: effective is the floor AND every active lease's
+        // ceiling — i.e. it is at least `configured` and at least each
+        // lease level, and it equals one of those contributors (max).
+        debug_assert!(
+            self.effective >= self.configured,
+            "effective is bounded below by the configured floor"
+        );
+        debug_assert!(
+            self.leases.values().all(|e| self.effective >= e.level),
+            "effective dominates every active lease level"
+        );
+        debug_assert!(
+            self.effective == self.configured
+                || self.leases.values().any(|e| e.level == self.effective),
+            "effective must equal the configured floor or one active lease level"
+        );
+    }
+
+    /// Debug-only full invariant sweep for the lease table, called as a
+    /// run-to-completion post-condition from every lease-mutating method.
+    /// Gathers the cross-field relationships that the individual delta
+    /// assertions cannot express on their own.
+    #[cfg(debug_assertions)]
+    fn check_lease_invariants(&self) {
+        debug_assert!(
+            self.leases.len() <= LEASE_TABLE_CAP,
+            "lease table size must stay within LEASE_TABLE_CAP"
+        );
+        debug_assert!(
+            self.leases
+                .keys()
+                .all(|id| id.len() <= LEASE_CLIENT_ID_MAX_BYTES),
+            "every stored client_id must respect LEASE_CLIENT_ID_MAX_BYTES"
+        );
+        debug_assert!(
+            self.effective >= self.configured,
+            "effective is at least the configured floor"
+        );
+        debug_assert!(
+            self.leases.values().all(|e| self.effective >= e.level),
+            "effective dominates every active lease level"
+        );
+        debug_assert!(
+            self.effective == self.configured
+                || self.leases.values().any(|e| e.level == self.effective),
+            "effective equals the configured floor or some active lease level"
+        );
     }
 
     pub fn socket(&self) -> Option<&UdpSocket> {

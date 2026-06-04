@@ -40,7 +40,17 @@ pub fn gen_frame_header<'a>(
         be_u32(frame.stream_id & parser::STREAM_ID_MASK),
     ));
 
-    r#gen(serializer, buf).map(|(buf, size)| (buf, size as usize))
+    r#gen(serializer, buf).map(|(buf, size)| {
+        // The header is the RFC 9113 §4.1 fixed-size envelope: on success it is
+        // always exactly 9 bytes, never more. (Failure short-circuits via the
+        // `Err` arm of `r#gen` and never reaches here.)
+        debug_assert_eq!(
+            size as usize,
+            parser::FRAME_HEADER_SIZE,
+            "a serialized H2 frame header is always exactly 9 bytes"
+        );
+        (buf, size as usize)
+    })
 }
 
 pub fn serialize_frame_type(f: &FrameType) -> u8 {
@@ -70,21 +80,33 @@ pub fn gen_ping_acknowledgement<'a>(
     buf: &'a mut [u8],
     payload: &[u8],
 ) -> Result<(&'a mut [u8], usize), GenError> {
+    let payload_len = payload.len();
     r#gen(
         tuple((slice(PING_ACKNOWLEDGEMENT_HEADER), slice(payload))),
         buf,
     )
-    .map(|(buf, size)| (buf, size as usize))
+    .map(|(buf, size)| {
+        // A PING ACK is the 9-byte canned header (whose length field encodes 8)
+        // followed by the opaque 8-byte payload echoed back verbatim. On success
+        // the emitted byte count is exactly header + payload.
+        debug_assert_eq!(
+            size as usize,
+            PING_ACKNOWLEDGEMENT_HEADER.len() + payload_len,
+            "PING ACK emits the 9-byte header plus the echoed payload"
+        );
+        (buf, size as usize)
+    })
 }
 
 pub fn gen_settings<'a>(
     buf: &'a mut [u8],
     settings: &H2Settings,
 ) -> Result<(&'a mut [u8], usize), GenError> {
+    let payload_len = parser::SETTINGS_ENTRY_SIZE * parser::SETTINGS_COUNT;
     gen_frame_header(
         buf,
         &FrameHeader {
-            payload_len: parser::SETTINGS_ENTRY_SIZE * parser::SETTINGS_COUNT,
+            payload_len,
             frame_type: FrameType::Settings,
             flags: 0,
             stream_id: 0,
@@ -112,7 +134,18 @@ pub fn gen_settings<'a>(
             )),
             buf,
         )
-        .map(|(buf, size)| (buf, (old_size + size as usize)))
+        .map(|(buf, size)| {
+            // The body we just emitted must be exactly the `payload_len` the
+            // header advertised — SETTINGS_COUNT (8) entries × 6 bytes each.
+            // A mismatch here would put a length on the wire that disagrees
+            // with the bytes that follow it, desynchronizing the peer parser.
+            debug_assert_eq!(old_size, parser::FRAME_HEADER_SIZE, "header is 9 bytes");
+            debug_assert_eq!(
+                size as usize, payload_len as usize,
+                "SETTINGS body length must match the advertised payload_len"
+            );
+            (buf, (old_size + size as usize))
+        })
     })
 }
 
@@ -131,8 +164,25 @@ fn gen_control_frame<F>(
 where
     F: FnOnce(&mut [u8]) -> Result<(&mut [u8], u64), GenError>,
 {
-    gen_frame_header(buf, &header)
-        .and_then(|(buf, old_size)| payload(buf).map(|(buf, size)| (buf, old_size + size as usize)))
+    let declared_payload_len = header.payload_len as usize;
+    gen_frame_header(buf, &header).and_then(|(buf, old_size)| {
+        // The header is the fixed 9-byte envelope; the body the closure writes
+        // must be exactly the `payload_len` that header advertised. This is the
+        // load-bearing serializer invariant: the length field on the wire and
+        // the bytes that follow it must agree, or the peer desyncs.
+        debug_assert_eq!(
+            old_size,
+            parser::FRAME_HEADER_SIZE,
+            "control frame header is always 9 bytes"
+        );
+        payload(buf).map(|(buf, size)| {
+            debug_assert_eq!(
+                size as usize, declared_payload_len,
+                "emitted control-frame body must match the header's payload_len"
+            );
+            (buf, old_size + size as usize)
+        })
+    })
 }
 
 pub fn gen_rst_stream(

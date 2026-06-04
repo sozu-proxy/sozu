@@ -132,14 +132,44 @@ impl HealthChecker {
             .iter()
             .map(|c| c.token.0 - HEALTH_CHECK_TOKEN_BASE)
             .collect();
+        // Invariant: every in-flight token sits inside the reserved namespace,
+        // so subtracting the base above never underflows and every offset is a
+        // valid slot index. Mirrors the bound enforced by `owns_token`.
+        debug_assert!(
+            in_flight.iter().all(|&o| o < HEALTH_CHECK_TOKEN_CAPACITY),
+            "every in-flight token offset must fall within the slot capacity"
+        );
+        debug_assert!(
+            in_flight.len() <= HEALTH_CHECK_TOKEN_CAPACITY,
+            "cannot have more in-flight checks than the token slot capacity"
+        );
 
         for _ in 0..HEALTH_CHECK_TOKEN_CAPACITY {
             let offset = self.next_token_id % HEALTH_CHECK_TOKEN_CAPACITY;
             self.next_token_id = self.next_token_id.wrapping_add(1);
             if !in_flight.contains(&offset) {
-                return Some(Token(HEALTH_CHECK_TOKEN_BASE + offset));
+                let token = Token(HEALTH_CHECK_TOKEN_BASE + offset);
+                // Post-condition: a freshly allocated token is owned by this
+                // namespace and does not collide with any in-flight stream.
+                debug_assert!(
+                    self.owns_token(token),
+                    "allocated token must fall inside the health-check namespace"
+                );
+                debug_assert!(
+                    !in_flight.contains(&offset),
+                    "allocated offset must not already be in flight"
+                );
+                return Some(token);
             }
         }
+        // Exhaustion: the slot table is full. This is graceful (returns None),
+        // never a panic — the caller records the probe as failed. The table is
+        // only full when every slot is occupied.
+        debug_assert_eq!(
+            in_flight.len(),
+            HEALTH_CHECK_TOKEN_CAPACITY,
+            "allocation only fails when every slot is occupied"
+        );
         error!(
             "{} token-table full ({} in-flight checks); refusing to allocate a new probe slot",
             log_context!(),
@@ -154,13 +184,33 @@ impl HealthChecker {
     /// `Token(usize::MAX)` (CVE-class regression caught during the
     /// post-1209 rebase cross-check).
     pub fn owns_token(&self, token: Token) -> bool {
-        token.0 >= HEALTH_CHECK_TOKEN_BASE
-            && token.0 < HEALTH_CHECK_TOKEN_BASE + HEALTH_CHECK_TOKEN_CAPACITY
+        let owned = token.0 >= HEALTH_CHECK_TOKEN_BASE
+            && token.0 < HEALTH_CHECK_TOKEN_BASE + HEALTH_CHECK_TOKEN_CAPACITY;
+        // The upper bound is load-bearing: it must reject the mux GOAWAY
+        // sentinel `Token(usize::MAX)`, which would otherwise be misclaimed as
+        // a health-check socket (CVE-class regression). Assert the relationship
+        // the comparison encodes rather than restating it.
+        debug_assert!(
+            !owned || token.0 - HEALTH_CHECK_TOKEN_BASE < HEALTH_CHECK_TOKEN_CAPACITY,
+            "an owned token must map to a valid bounded slot offset"
+        );
+        debug_assert!(
+            owned || token != Token(HEALTH_CHECK_TOKEN_BASE),
+            "the base token itself must always be classified as owned"
+        );
+        owned
     }
 
     /// Called by the server event loop when mio reports readiness for a health check socket.
     pub fn ready(&mut self, token: Token) {
         self.ready_tokens.insert(token);
+        // Post-condition: the readiness set now records this token. The set is
+        // drained wholesale in `progress_checks`, so a missed insert here would
+        // strand the socket until timeout.
+        debug_assert!(
+            self.ready_tokens.contains(&token),
+            "ready() must record the token in the readiness set"
+        );
     }
 
     /// Called on each event loop iteration. Initiates new health checks when intervals
@@ -355,8 +405,30 @@ impl HealthChecker {
         let now = Instant::now();
         let mut completed = Vec::new();
         let ready = std::mem::take(&mut self.ready_tokens);
+        // Post-condition of the wholesale take: the live readiness set is now
+        // empty, so a token re-armed during this pass is handled next loop.
+        debug_assert!(
+            self.ready_tokens.is_empty(),
+            "readiness set must be drained before processing in-flight checks"
+        );
+        let in_flight_before = self.in_flight.len();
 
         for (idx, check) in self.in_flight.iter_mut().enumerate() {
+            // Index must address a live in-flight slot — the basis for the
+            // descending-sort swap_remove below.
+            debug_assert!(
+                idx < in_flight_before,
+                "in-flight index ({idx}) must be within the live slot range ({in_flight_before})"
+            );
+            // The write cursor never runs past the request it is draining.
+            debug_assert!(
+                check
+                    .request_bytes
+                    .as_ref()
+                    .is_none_or(|r| check.write_offset <= r.len()),
+                "write_offset must never exceed the request length"
+            );
+
             // Always check timeouts regardless of readiness
             if now.duration_since(check.started_at) > check.timeout {
                 debug!(
@@ -404,11 +476,24 @@ impl HealthChecker {
                     completed.push((idx, success));
                 }
                 Ok(n) => {
+                    // A successful read never reports more bytes than the
+                    // fixed-size stack buffer can hold.
+                    debug_assert!(
+                        n <= buf.len(),
+                        "read reported {n} bytes into a {}-byte buffer",
+                        buf.len()
+                    );
                     if check.response_buf.len() + n > MAX_HEALTH_RESPONSE_SIZE {
                         completed.push((idx, false));
                         continue;
                     }
                     check.response_buf.extend_from_slice(&buf[..n]);
+                    // The accumulator stays within the documented ceiling once
+                    // the over-limit guard above has run.
+                    debug_assert!(
+                        check.response_buf.len() <= MAX_HEALTH_RESPONSE_SIZE,
+                        "response buffer must stay within the max health response size"
+                    );
                     if let Some(success) =
                         parse_probe_response(&check.response_buf, &check.config, check.h2c)
                     {
@@ -426,8 +511,26 @@ impl HealthChecker {
         // later indices — it moves the last element to the removed position,
         // which has already been processed or is beyond our range.
         completed.sort_by(|a, b| b.0.cmp(&a.0));
+        // We never schedule the same slot for removal twice, and never more
+        // removals than there are in-flight checks.
+        debug_assert!(
+            completed.len() <= in_flight_before,
+            "cannot complete more checks ({}) than were in flight ({in_flight_before})",
+            completed.len()
+        );
+        debug_assert!(
+            completed.windows(2).all(|w| w[0].0 > w[1].0),
+            "completed indices must be strictly descending and unique for swap_remove safety"
+        );
         for (idx, success) in completed {
+            let len_before = self.in_flight.len();
             let mut check = self.in_flight.swap_remove(idx);
+            // swap_remove drops exactly one in-flight slot.
+            debug_assert_eq!(
+                self.in_flight.len(),
+                len_before - 1,
+                "swap_remove must drop exactly one in-flight check"
+            );
             let _ = registry.deregister(&mut check.stream);
             Self::record_check_result(
                 backends,
@@ -460,7 +563,32 @@ impl HealthChecker {
         let mut backend = backend_ref.borrow_mut();
 
         if success {
+            // Snapshot the hysteresis status before the counter mutation so we
+            // can assert the flip happens exactly at the threshold. Read only
+            // inside debug_assert! → dead in release, but must compile.
+            let was_healthy = backend.health.is_healthy();
             let transitioned = backend.health.record_success(config.healthy_threshold);
+            // A success resets the failure counter and bumps the success
+            // counter; the rise counter must stay within [0, threshold] at the
+            // transition boundary. `transitioned` is true iff we crossed from
+            // unhealthy to healthy at exactly the configured threshold.
+            debug_assert!(
+                backend.health.consecutive_failures == 0,
+                "a recorded success must zero the consecutive-failure counter"
+            );
+            debug_assert_eq!(
+                transitioned,
+                !was_healthy && backend.health.is_healthy(),
+                "transition flag must be set iff the backend just flipped to healthy"
+            );
+            debug_assert!(
+                !transitioned || backend.health.consecutive_successes >= config.healthy_threshold,
+                "an UP transition only fires once the rise counter reaches the healthy threshold"
+            );
+            debug_assert!(
+                !transitioned || backend.health.is_healthy(),
+                "after an UP transition the backend must report healthy"
+            );
             if transitioned {
                 info!(
                     "{} backend {} at {} marked UP (health check passed {} consecutive times) for cluster {}",
@@ -487,7 +615,29 @@ impl HealthChecker {
             }
             count!(names::health_check::SUCCESS, 1);
         } else {
+            let was_healthy = backend.health.is_healthy();
             let transitioned = backend.health.record_failure(config.unhealthy_threshold);
+            // A failure resets the success counter and bumps the failure
+            // counter; the fall counter must stay within [0, threshold] at the
+            // transition boundary. `transitioned` is true iff we crossed from
+            // healthy to unhealthy at exactly the configured threshold.
+            debug_assert!(
+                backend.health.consecutive_successes == 0,
+                "a recorded failure must zero the consecutive-success counter"
+            );
+            debug_assert_eq!(
+                transitioned,
+                was_healthy && !backend.health.is_healthy(),
+                "transition flag must be set iff the backend just flipped to unhealthy"
+            );
+            debug_assert!(
+                !transitioned || backend.health.consecutive_failures >= config.unhealthy_threshold,
+                "a DOWN transition only fires once the fall counter reaches the unhealthy threshold"
+            );
+            debug_assert!(
+                !transitioned || !backend.health.is_healthy(),
+                "after a DOWN transition the backend must report unhealthy"
+            );
             if transitioned {
                 warn!(
                     "{} backend {} at {} marked DOWN (health check failed {} consecutive times) for cluster {}",
@@ -532,6 +682,13 @@ impl HealthChecker {
             .iter()
             .filter(|b| b.borrow().health.is_healthy())
             .count();
+        // Gauge pairing: the healthy count is a subset of the total, so the
+        // emitted gauge can never exceed the cluster size (it is a usize, but
+        // a gauge above `total` would be an accounting bug, not rounding).
+        debug_assert!(
+            healthy <= total,
+            "healthy backend count ({healthy}) must not exceed total ({total})"
+        );
         if total > 0 {
             gauge!(
                 "health_check.healthy_backends",
@@ -568,6 +725,15 @@ impl HealthChecker {
         self.last_check_time.remove(cluster_id);
         self.in_flight
             .retain(|check| check.cluster_id != cluster_id);
+        // Post-condition: no in-flight probe references the removed cluster.
+        debug_assert!(
+            self.in_flight.iter().all(|c| c.cluster_id != cluster_id),
+            "remove_cluster must drop every in-flight check for the cluster"
+        );
+        debug_assert!(
+            !self.last_check_time.contains_key(cluster_id),
+            "remove_cluster must forget the cluster's last-check timestamp"
+        );
     }
 }
 
@@ -587,6 +753,12 @@ fn try_parse_status_line(buf: &[u8], config: &HealthCheckConfig) -> Option<bool>
     let response = std::str::from_utf8(buf).ok()?;
     let first_line_end = response.find("\r\n")?;
     let status_line = &response[..first_line_end];
+    // The status line is the prefix before the first CRLF, so it can never be
+    // longer than the buffer it was sliced from.
+    debug_assert!(
+        status_line.len() < response.len(),
+        "status line must be a strict prefix ending before the CRLF"
+    );
 
     let (_, rest) = status_line.split_once(' ')?;
     let status_str = rest.split(' ').next()?;
@@ -595,11 +767,19 @@ fn try_parse_status_line(buf: &[u8], config: &HealthCheckConfig) -> Option<bool>
 }
 
 fn is_status_healthy(actual: u32, expected: u32) -> bool {
-    if expected == 0 {
+    let healthy = if expected == 0 {
         (200..300).contains(&actual)
     } else {
         actual == expected
-    }
+    };
+    // When a specific status is required, health is exact equality; the two
+    // branches must never both claim healthy for the same inputs unless the
+    // expected code is itself a 2xx.
+    debug_assert!(
+        expected == 0 || healthy == (actual == expected),
+        "with a specific expected status, health must be exact equality"
+    );
+    healthy
 }
 
 /// Compose a bare-minimum h2c (HTTP/2 over cleartext, prior-knowledge)
@@ -653,6 +833,17 @@ fn build_h2c_probe_bytes(uri: &str, address: SocketAddr) -> Vec<u8> {
     out.push(0x05); // END_STREAM | END_HEADERS
     out.extend_from_slice(&[0, 0, 0, 1]); // stream id = 1
     out.extend_from_slice(&hpack);
+    // Post-condition: a well-formed probe begins with the H2 connection
+    // preface and carries exactly preface + 2 frame headers + the HPACK block.
+    debug_assert!(
+        out.starts_with(H2_PRI.as_bytes()),
+        "an h2c probe must begin with the connection preface"
+    );
+    debug_assert_eq!(
+        out.len(),
+        H2_PRI.len() + FRAME_HEADER_SIZE * 2 + hpack.len(),
+        "probe length must be preface + SETTINGS + HEADERS header + HPACK block"
+    );
     out
 }
 
@@ -695,6 +886,7 @@ fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> 
         if remaining.len() < FRAME_HEADER_SIZE {
             return None;
         }
+        let consumable = remaining.len();
         let (rest, header) = match frame_header(remaining, MAX_FRAME_SIZE) {
             Ok(parsed) => parsed,
             // Header bytes are present but parser rejected them: malformed
@@ -702,6 +894,21 @@ fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> 
             // → probe is unhealthy.
             Err(_) => return Some(false),
         };
+        // Parser post-conditions: it consumes exactly the 9-byte header (never
+        // grows its input) and honours the size bound it was handed.
+        debug_assert!(
+            rest.len() < consumable,
+            "frame_header must consume at least the fixed frame header"
+        );
+        debug_assert_eq!(
+            consumable - rest.len(),
+            FRAME_HEADER_SIZE,
+            "frame_header must consume exactly the fixed-size frame header"
+        );
+        debug_assert!(
+            header.payload_len <= MAX_FRAME_SIZE,
+            "frame_header must enforce the max-frame-size bound it was given"
+        );
 
         let payload_len = header.payload_len as usize;
         if rest.len() < payload_len {
@@ -709,6 +916,23 @@ fn try_parse_h2c_status(buf: &[u8], config: &HealthCheckConfig) -> Option<bool> 
             return None;
         }
         let (payload, after) = rest.split_at(payload_len);
+        // Splitting at the declared payload length must not lose bytes: the
+        // payload plus the remainder reconstitute `rest`, and the walk makes
+        // forward progress so the loop terminates.
+        debug_assert_eq!(
+            payload.len(),
+            payload_len,
+            "payload split must yield exactly the declared payload length"
+        );
+        debug_assert_eq!(
+            payload.len() + after.len(),
+            rest.len(),
+            "payload + remainder must equal the pre-split buffer"
+        );
+        debug_assert!(
+            after.len() < remaining.len(),
+            "each iteration must shrink the remaining buffer to guarantee termination"
+        );
 
         match header.frame_type {
             FrameType::Headers if header.stream_id == 1 => {
@@ -773,7 +997,20 @@ fn strip_padded_priority(payload: &[u8], flags: u8) -> Option<&[u8]> {
         }
         start = new_start;
     }
-    payload.get(start..end)
+    // Post-condition: the surviving window `[start, end)` lies inside the
+    // input payload and never grows it. A returned slice is therefore a
+    // sub-slice of the original frame body.
+    debug_assert!(
+        start <= end && end <= payload.len(),
+        "stripped header window [{start}, {end}) must lie within the payload ({})",
+        payload.len()
+    );
+    let block = payload.get(start..end)?;
+    debug_assert!(
+        block.len() <= payload.len(),
+        "stripped block must never be larger than the original payload"
+    );
+    Some(block)
 }
 
 /// Run `loona_hpack::Decoder` over the assembled HEADERS block and

@@ -113,7 +113,7 @@ impl ConfigState {
 
         self.increment_request_count(request);
 
-        match request_type {
+        let result = match request_type {
             RequestType::AddCluster(cluster) => self.add_cluster(cluster),
             RequestType::RemoveCluster(cluster_id) => self.remove_cluster(cluster_id),
             RequestType::AddHttpListener(listener) => self.add_http_listener(listener),
@@ -166,7 +166,137 @@ impl ConfigState {
             | RequestType::HardStop(_) => Ok(()),
 
             _other_request => Err(StateError::UndispatchableRequest),
+        };
+
+        // Run-to-completion postcondition: whatever path `dispatch` took, the
+        // cross-map invariants of the model must hold once it returns. We run
+        // the full sweep on both success and error: a failed mutating handler
+        // (e.g. a duplicate `add_*` or an absent `remove_*`) is required to be
+        // a no-op, so the invariants must be intact regardless of the result.
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+
+        result
+    }
+
+    /// Full cross-map invariant sweep for the control-plane state model.
+    ///
+    /// This is the run-to-completion postcondition called via a
+    /// `#[cfg(debug_assertions)]` guard at the end of [`Self::dispatch`]. It
+    /// encodes the coherence invariants the diff/replay machinery relies on:
+    /// every map entry is self-consistent (a value's stored key/cluster_id
+    /// matches the key it is filed under), and the public accounting helpers
+    /// (`count_frontends`/`count_backends`) agree with the raw map contents.
+    ///
+    /// Compiled out entirely in release builds (no body, no callers).
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        // Listener maps: the value's `address` field must match the SocketAddr
+        // key it is filed under, or a hot-upgrade replay (which re-derives the
+        // key from the value) would land the entry under a different key.
+        for (addr, listener) in &self.http_listeners {
+            debug_assert_eq!(
+                SocketAddr::from(listener.address),
+                *addr,
+                "http_listener value address must match its map key"
+            );
         }
+        for (addr, listener) in &self.https_listeners {
+            debug_assert_eq!(
+                SocketAddr::from(listener.address),
+                *addr,
+                "https_listener value address must match its map key"
+            );
+        }
+        for (addr, listener) in &self.tcp_listeners {
+            debug_assert_eq!(
+                SocketAddr::from(listener.address),
+                *addr,
+                "tcp_listener value address must match its map key"
+            );
+        }
+
+        // Clusters: the value's `cluster_id` must match the key it is filed
+        // under (replay re-keys on `cluster.cluster_id`).
+        for (cluster_id, cluster) in &self.clusters {
+            debug_assert_eq!(
+                &cluster.cluster_id, cluster_id,
+                "cluster value cluster_id must match its map key"
+            );
+        }
+
+        // Backends: grouped by cluster_id. Every backend in a bucket must carry
+        // that bucket's cluster_id (replay groups on `backend.cluster_id`), and
+        // the per-cluster Vec must stay deduplicated on (backend_id, address) —
+        // `add_backend` upserts, so duplicates would mean lost state.
+        for (cluster_id, backends) in &self.backends {
+            for backend in backends {
+                debug_assert_eq!(
+                    &backend.cluster_id, cluster_id,
+                    "backend cluster_id must match its bucket key"
+                );
+            }
+            let unique: HashSet<(&String, &SocketAddr)> = backends
+                .iter()
+                .map(|b| (&b.backend_id, &b.address))
+                .collect();
+            debug_assert_eq!(
+                unique.len(),
+                backends.len(),
+                "backends within a cluster must be unique on (backend_id, address)"
+            );
+        }
+
+        // TCP frontends: grouped by cluster_id. Every frontend in a bucket must
+        // carry that bucket's cluster_id, and `add_tcp_frontend` rejects exact
+        // duplicates so each bucket stays a set.
+        for (cluster_id, fronts) in &self.tcp_fronts {
+            for front in fronts {
+                debug_assert_eq!(
+                    &front.cluster_id, cluster_id,
+                    "tcp_frontend cluster_id must match its bucket key"
+                );
+            }
+            let unique: HashSet<&TcpFrontend> = fronts.iter().collect();
+            debug_assert_eq!(
+                unique.len(),
+                fronts.len(),
+                "tcp frontends within a cluster must be unique"
+            );
+        }
+
+        // Certificates: nested map keyed by (address, fingerprint). The inner
+        // map's fingerprint key is the addressing identity used by diff; we do
+        // not recompute it here (expensive), but the outer/inner structure must
+        // not hold an empty inner map silently produced outside the API — an
+        // empty bucket is a benign no-op for diff/replay, so we only assert the
+        // address-key relationship is preserved by construction (trivially true
+        // for a BTree/HashMap), leaving the costly fingerprint recompute out.
+
+        // Public accounting helpers must agree with the raw maps. These are the
+        // numbers the CLI and metrics surface; a drift here is a real bug.
+        let raw_frontends = self.http_fronts.len()
+            + self.https_fronts.len()
+            + self.count_tcp_frontends_raw()
+            + self.udp_fronts.values().map(|v| v.len()).sum::<usize>();
+        debug_assert_eq!(
+            self.count_frontends(),
+            raw_frontends,
+            "count_frontends must equal the sum of all frontend map entries"
+        );
+        let raw_backends: usize = self.backends.values().map(|v| v.len()).sum();
+        debug_assert_eq!(
+            self.count_backends(),
+            raw_backends,
+            "count_backends must equal the sum of all backend Vec lengths"
+        );
+    }
+
+    /// Raw count of TCP frontends across all clusters — debug-only helper used
+    /// by [`Self::check_invariants`] to cross-check `count_frontends`.
+    #[cfg(debug_assertions)]
+    fn count_tcp_frontends_raw(&self) -> usize {
+        self.tcp_fronts.values().map(|v| v.len()).sum()
     }
 
     /// Increments the count for this request type
@@ -202,17 +332,49 @@ impl ConfigState {
             }
         }
         let cluster = cluster.clone();
-        self.clusters.insert(cluster.cluster_id.clone(), cluster);
+        // AddCluster is an upsert (replacing an existing cluster_id keeps the
+        // entry count flat), so we assert on presence/key-coherence rather than
+        // a strict +1 on len.
+        let cluster_id = cluster.cluster_id.clone();
+        self.clusters.insert(cluster_id.clone(), cluster);
+        debug_assert!(
+            self.clusters.contains_key(&cluster_id),
+            "add_cluster must leave the cluster present in the map"
+        );
+        debug_assert_eq!(
+            self.clusters.get(&cluster_id).map(|c| &c.cluster_id),
+            Some(&cluster_id),
+            "stored cluster must be keyed by its own cluster_id"
+        );
         Ok(())
     }
 
     fn remove_cluster(&mut self, cluster_id: &str) -> Result<(), StateError> {
+        let before = self.clusters.len();
         match self.clusters.remove(cluster_id) {
-            Some(_) => Ok(()),
-            None => Err(StateError::NotFound {
-                kind: ObjectKind::Cluster,
-                id: cluster_id.to_owned(),
-            }),
+            Some(_) => {
+                debug_assert!(
+                    !self.clusters.contains_key(cluster_id),
+                    "remove_cluster must evict the cluster"
+                );
+                debug_assert_eq!(
+                    self.clusters.len(),
+                    before - 1,
+                    "remove_cluster must drop exactly one entry"
+                );
+                Ok(())
+            }
+            None => {
+                debug_assert_eq!(
+                    self.clusters.len(),
+                    before,
+                    "a failed remove_cluster must not mutate the map"
+                );
+                Err(StateError::NotFound {
+                    kind: ObjectKind::Cluster,
+                    id: cluster_id.to_owned(),
+                })
+            }
         }
     }
 
@@ -271,43 +433,88 @@ impl ConfigState {
 
     fn add_http_listener(&mut self, listener: &HttpListenerConfig) -> Result<(), StateError> {
         let address: SocketAddr = listener.address.into();
+        let before = self.http_listeners.len();
         match self.http_listeners.entry(address) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             BTreeMapEntry::Occupied(_) => {
+                debug_assert_eq!(
+                    self.http_listeners.len(),
+                    before,
+                    "a rejected duplicate add_http_listener must not mutate the map"
+                );
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpListener,
                     id: address.to_string(),
                 });
             }
         };
+        debug_assert!(
+            self.http_listeners.contains_key(&address),
+            "add_http_listener must insert the listener under its address"
+        );
+        debug_assert_eq!(
+            self.http_listeners.len(),
+            before + 1,
+            "add_http_listener inserts exactly one entry on the vacant path"
+        );
         Ok(())
     }
 
     fn add_https_listener(&mut self, listener: &HttpsListenerConfig) -> Result<(), StateError> {
         let address: SocketAddr = listener.address.into();
+        let before = self.https_listeners.len();
         match self.https_listeners.entry(address) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(listener.clone()),
             BTreeMapEntry::Occupied(_) => {
+                debug_assert_eq!(
+                    self.https_listeners.len(),
+                    before,
+                    "a rejected duplicate add_https_listener must not mutate the map"
+                );
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpsListener,
                     id: address.to_string(),
                 });
             }
         };
+        debug_assert!(
+            self.https_listeners.contains_key(&address),
+            "add_https_listener must insert the listener under its address"
+        );
+        debug_assert_eq!(
+            self.https_listeners.len(),
+            before + 1,
+            "add_https_listener inserts exactly one entry on the vacant path"
+        );
         Ok(())
     }
 
     fn add_tcp_listener(&mut self, listener: &TcpListenerConfig) -> Result<(), StateError> {
         let address: SocketAddr = listener.address.into();
+        let before = self.tcp_listeners.len();
         match self.tcp_listeners.entry(address) {
             BTreeMapEntry::Vacant(vacant_entry) => vacant_entry.insert(*listener),
             BTreeMapEntry::Occupied(_) => {
+                debug_assert_eq!(
+                    self.tcp_listeners.len(),
+                    before,
+                    "a rejected duplicate add_tcp_listener must not mutate the map"
+                );
                 return Err(StateError::Exists {
                     kind: ObjectKind::TcpListener,
                     id: address.to_string(),
                 });
             }
         };
+        debug_assert!(
+            self.tcp_listeners.contains_key(&address),
+            "add_tcp_listener must insert the listener under its address"
+        );
+        debug_assert_eq!(
+            self.tcp_listeners.len(),
+            before + 1,
+            "add_tcp_listener inserts exactly one entry on the vacant path"
+        );
         Ok(())
     }
 
@@ -335,23 +542,68 @@ impl ConfigState {
     }
 
     fn remove_http_listener(&mut self, address: &SocketAddr) -> Result<(), StateError> {
+        let before = self.http_listeners.len();
         if self.http_listeners.remove(address).is_none() {
+            debug_assert_eq!(
+                self.http_listeners.len(),
+                before,
+                "a failed remove_http_listener must not mutate the map"
+            );
             return Err(StateError::NoChange);
         }
+        debug_assert!(
+            !self.http_listeners.contains_key(address),
+            "remove_http_listener must evict the address"
+        );
+        debug_assert_eq!(
+            self.http_listeners.len(),
+            before - 1,
+            "remove_http_listener drops exactly one entry"
+        );
         Ok(())
     }
 
     fn remove_https_listener(&mut self, address: &SocketAddr) -> Result<(), StateError> {
+        let before = self.https_listeners.len();
         if self.https_listeners.remove(address).is_none() {
+            debug_assert_eq!(
+                self.https_listeners.len(),
+                before,
+                "a failed remove_https_listener must not mutate the map"
+            );
             return Err(StateError::NoChange);
         }
+        debug_assert!(
+            !self.https_listeners.contains_key(address),
+            "remove_https_listener must evict the address"
+        );
+        debug_assert_eq!(
+            self.https_listeners.len(),
+            before - 1,
+            "remove_https_listener drops exactly one entry"
+        );
         Ok(())
     }
 
     fn remove_tcp_listener(&mut self, address: &SocketAddr) -> Result<(), StateError> {
+        let before = self.tcp_listeners.len();
         if self.tcp_listeners.remove(address).is_none() {
+            debug_assert_eq!(
+                self.tcp_listeners.len(),
+                before,
+                "a failed remove_tcp_listener must not mutate the map"
+            );
             return Err(StateError::NoChange);
         }
+        debug_assert!(
+            !self.tcp_listeners.contains_key(address),
+            "remove_tcp_listener must evict the address"
+        );
+        debug_assert_eq!(
+            self.tcp_listeners.len(),
+            before - 1,
+            "remove_tcp_listener drops exactly one entry"
+        );
         Ok(())
     }
 
@@ -729,6 +981,7 @@ impl ConfigState {
 
     fn add_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
         let front_as_key = front.to_string();
+        let before = self.http_fronts.len();
 
         match self.http_fronts.entry(front.to_string()) {
             BTreeMapEntry::Vacant(e) => {
@@ -740,17 +993,34 @@ impl ConfigState {
                 })?)
             }
             BTreeMapEntry::Occupied(_) => {
+                debug_assert_eq!(
+                    self.http_fronts.len(),
+                    before,
+                    "a rejected duplicate add_http_frontend must not mutate the map"
+                );
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpFrontend,
                     id: front.to_string(),
                 });
             }
         };
+        // On the conversion-error path the `?` already returned, so reaching
+        // here means exactly one entry was inserted under the route key.
+        debug_assert!(
+            self.http_fronts.contains_key(&front.to_string()),
+            "add_http_frontend must insert the route key on success"
+        );
+        debug_assert_eq!(
+            self.http_fronts.len(),
+            before + 1,
+            "add_http_frontend inserts exactly one entry on success"
+        );
         Ok(())
     }
 
     fn add_https_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
         let front_as_key = front.to_string();
+        let before = self.https_fronts.len();
 
         match self.https_fronts.entry(front.to_string()) {
             BTreeMapEntry::Vacant(e) => {
@@ -762,32 +1032,64 @@ impl ConfigState {
                 })?)
             }
             BTreeMapEntry::Occupied(_) => {
+                debug_assert_eq!(
+                    self.https_fronts.len(),
+                    before,
+                    "a rejected duplicate add_https_frontend must not mutate the map"
+                );
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpsFrontend,
                     id: front.to_string(),
                 });
             }
         };
+        debug_assert!(
+            self.https_fronts.contains_key(&front.to_string()),
+            "add_https_frontend must insert the route key on success"
+        );
+        debug_assert_eq!(
+            self.https_fronts.len(),
+            before + 1,
+            "add_https_frontend inserts exactly one entry on success"
+        );
         Ok(())
     }
 
     fn remove_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
-        self.http_fronts
-            .remove(&front.to_string())
-            .ok_or(StateError::NotFound {
-                kind: ObjectKind::HttpFrontend,
-                id: front.to_string(),
-            })?;
+        let key = front.to_string();
+        let before = self.http_fronts.len();
+        self.http_fronts.remove(&key).ok_or(StateError::NotFound {
+            kind: ObjectKind::HttpFrontend,
+            id: front.to_string(),
+        })?;
+        debug_assert!(
+            !self.http_fronts.contains_key(&key),
+            "remove_http_frontend must evict the route key"
+        );
+        debug_assert_eq!(
+            self.http_fronts.len(),
+            before - 1,
+            "remove_http_frontend drops exactly one entry"
+        );
         Ok(())
     }
 
     fn remove_https_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
-        self.https_fronts
-            .remove(&front.to_string())
-            .ok_or(StateError::NotFound {
-                kind: ObjectKind::HttpsFrontend,
-                id: front.to_string(),
-            })?;
+        let key = front.to_string();
+        let before = self.https_fronts.len();
+        self.https_fronts.remove(&key).ok_or(StateError::NotFound {
+            kind: ObjectKind::HttpsFrontend,
+            id: front.to_string(),
+        })?;
+        debug_assert!(
+            !self.https_fronts.contains_key(&key),
+            "remove_https_frontend must evict the route key"
+        );
+        debug_assert_eq!(
+            self.https_fronts.len(),
+            before - 1,
+            "remove_https_frontend drops exactly one entry"
+        );
         Ok(())
     }
 
@@ -814,7 +1116,17 @@ impl ConfigState {
             return Ok(());
         }
 
-        entry.insert(fingerprint, add.certificate);
+        let before = entry.len();
+        entry.insert(fingerprint.clone(), add.certificate);
+        debug_assert!(
+            entry.contains_key(&fingerprint),
+            "add_certificate must insert the fingerprint under its address"
+        );
+        debug_assert_eq!(
+            entry.len(),
+            before + 1,
+            "add_certificate inserts exactly one fingerprint on the new path"
+        );
         Ok(())
     }
 
@@ -826,6 +1138,10 @@ impl ConfigState {
 
         if let Some(index) = self.certificates.get_mut(&remove.address.into()) {
             index.remove(&fingerprint);
+            debug_assert!(
+                !index.contains_key(&fingerprint),
+                "remove_certificate must evict the fingerprint when the address is known"
+            );
         }
 
         Ok(())
@@ -874,6 +1190,22 @@ impl ConfigState {
                 replace.address
             )));
         }
+        // Postcondition: the new fingerprint is keyed under the address, and
+        // (unless old and new collide, e.g. a self-replace) the old one is gone.
+        debug_assert!(
+            self.certificates
+                .get(&replace_address)
+                .is_some_and(|certs| certs.contains_key(&new_fingerprint)),
+            "replace_certificate must leave the new fingerprint present"
+        );
+        debug_assert!(
+            new_fingerprint == old_fingerprint
+                || self
+                    .certificates
+                    .get(&replace_address)
+                    .is_none_or(|certs| !certs.contains_key(&old_fingerprint)),
+            "replace_certificate must evict the old fingerprint unless it equals the new one"
+        );
         Ok(())
     }
 
@@ -885,14 +1217,29 @@ impl ConfigState {
             address: front.address.into(),
             tags: front.tags.clone(),
         };
+        let before = tcp_frontends.len();
         if tcp_frontends.contains(&tcp_frontend) {
+            debug_assert_eq!(
+                tcp_frontends.len(),
+                before,
+                "a rejected duplicate add_tcp_frontend must not grow the bucket"
+            );
             return Err(StateError::Exists {
                 kind: ObjectKind::TcpFrontend,
                 id: format!("{tcp_frontend:?}"),
             });
         }
 
+        debug_assert_eq!(
+            tcp_frontend.cluster_id, front.cluster_id,
+            "the built frontend must carry its bucket's cluster_id"
+        );
         tcp_frontends.push(tcp_frontend);
+        debug_assert_eq!(
+            tcp_frontends.len(),
+            before + 1,
+            "add_tcp_frontend appends exactly one entry"
+        );
         Ok(())
     }
 
@@ -909,10 +1256,24 @@ impl ConfigState {
                 })?;
 
         let len = tcp_frontends.len();
-        tcp_frontends.retain(|front| front.address != front_to_remove.address.into());
-        if tcp_frontends.len() == len {
+        let remove_address: SocketAddr = front_to_remove.address.into();
+        tcp_frontends.retain(|front| front.address != remove_address);
+        let after = tcp_frontends.len();
+        if after == len {
             return Err(StateError::NoChange);
         }
+        // `retain` may drop more than one entry only if duplicates on the same
+        // address ever existed; `add_tcp_frontend` forbids that, so a
+        // successful removal must drop exactly one and leave none matching.
+        debug_assert_eq!(
+            after,
+            len - 1,
+            "remove_tcp_frontend drops exactly one entry"
+        );
+        debug_assert!(
+            !tcp_frontends.iter().any(|f| f.address == remove_address),
+            "remove_tcp_frontend must leave no frontend at the removed address"
+        );
         Ok(())
     }
 
@@ -965,12 +1326,39 @@ impl ConfigState {
             backup: add_backend.backup,
         };
         let backends = self.backends.entry(backend.cluster_id.clone()).or_default();
+        let backend_id = backend.backend_id.clone();
+        let backend_address = backend.address;
+        let before = backends.len();
 
-        // we might be modifying the sticky id or load balancing parameters
+        // we might be modifying the sticky id or load balancing parameters:
+        // the retain drops at most one prior copy (the map stays deduplicated
+        // on (backend_id, address)), then we re-push the new version. So the
+        // net length grows by exactly one iff this was a brand-new backend.
+        let was_present = backends
+            .iter()
+            .any(|b| b.backend_id == backend_id && b.address == backend_address);
         backends.retain(|b| b.backend_id != backend.backend_id || b.address != backend.address);
+        debug_assert_eq!(
+            backends.len(),
+            before - was_present as usize,
+            "the upsert retain must drop exactly the prior copy iff it existed"
+        );
         backends.push(backend);
         backends.sort();
 
+        debug_assert_eq!(
+            backends.len(),
+            before + (!was_present) as usize,
+            "add_backend grows the bucket by one iff the backend was new"
+        );
+        debug_assert_eq!(
+            backends
+                .iter()
+                .filter(|b| b.backend_id == backend_id && b.address == backend_address)
+                .count(),
+            1,
+            "exactly one copy of the upserted backend must remain"
+        );
         Ok(())
     }
 
@@ -984,12 +1372,22 @@ impl ConfigState {
                 })?;
 
         let len = backend_list.len();
-        let remove_address = backend.address.into();
+        let remove_address: SocketAddr = backend.address.into();
         backend_list.retain(|b| b.backend_id != backend.backend_id || b.address != remove_address);
         backend_list.sort();
-        if backend_list.len() == len {
+        let after = backend_list.len();
+        if after == len {
             return Err(StateError::NoChange);
         }
+        // The list is deduplicated on (backend_id, address), so a matching
+        // removal drops exactly one entry and leaves nothing matching.
+        debug_assert_eq!(after, len - 1, "remove_backend drops exactly one entry");
+        debug_assert!(
+            !backend_list
+                .iter()
+                .any(|b| b.backend_id == backend.backend_id && b.address == remove_address),
+            "remove_backend must leave no backend matching (backend_id, address)"
+        );
         Ok(())
     }
 
@@ -1096,6 +1494,34 @@ impl ConfigState {
             }
         }
 
+        // Bootstrap round-trip: replaying `generate_requests` into a fresh,
+        // empty `ConfigState` must reconstruct `self`'s maps exactly. This is
+        // the property SaveState/LoadState and worker bootstrap depend on. We
+        // compare the business maps only (not `request_counts`, which is
+        // bookkeeping mutated by `dispatch`).
+        #[cfg(debug_assertions)]
+        {
+            let mut replayed = ConfigState::new();
+            for request in &v {
+                debug_assert!(
+                    replayed.dispatch(request).is_ok(),
+                    "every request from generate_requests must replay cleanly"
+                );
+            }
+            debug_assert!(
+                replayed.clusters == self.clusters
+                    && replayed.backends == self.backends
+                    && replayed.http_listeners == self.http_listeners
+                    && replayed.https_listeners == self.https_listeners
+                    && replayed.tcp_listeners == self.tcp_listeners
+                    && replayed.http_fronts == self.http_fronts
+                    && replayed.https_fronts == self.https_fronts
+                    && replayed.tcp_fronts == self.tcp_fronts
+                    && replayed.certificates == self.certificates,
+                "replaying generate_requests into a fresh state must reproduce self"
+            );
+        }
+
         v
     }
 
@@ -1160,6 +1586,25 @@ impl ConfigState {
                     from_scm: false,
                 })
                 .into(),
+            );
+        }
+
+        // Symmetry with the active-listener census: exactly one ActivateListener
+        // is emitted per active listener across the three maps, no more, no less.
+        #[cfg(debug_assertions)]
+        {
+            let active_listeners = self.http_listeners.values().filter(|l| l.active).count()
+                + self.https_listeners.values().filter(|l| l.active).count()
+                + self.tcp_listeners.values().filter(|l| l.active).count();
+            debug_assert_eq!(
+                v.len(),
+                active_listeners,
+                "generate_activate_requests emits one request per active listener"
+            );
+            debug_assert!(
+                v.iter()
+                    .all(|r| matches!(r.request_type, Some(RequestType::ActivateListener(_)))),
+                "generate_activate_requests must emit only ActivateListener requests"
             );
         }
 
@@ -1350,6 +1795,23 @@ impl ConfigState {
                 let mut listener_to_add = *their_listener;
                 listener_to_add.active = false;
                 v.push(RequestType::AddTcpListener(listener_to_add).into());
+
+                // The Remove + Add(active=false) above wipes the listener's
+                // active state. Re-emit an ActivateListener whenever the target
+                // state keeps it active, otherwise a config change on a still
+                // active listener would silently deactivate it on replay. This
+                // subsumes the newly-active (`!my.active && their.active`) case:
+                // a differing `active` flag always makes the listeners unequal.
+                if their_listener.active {
+                    v.push(
+                        RequestType::ActivateListener(ActivateListener {
+                            address: SocketAddress::from(**addr),
+                            proxy: ListenerType::Tcp.into(),
+                            from_scm: false,
+                        })
+                        .into(),
+                    );
+                }
             }
 
             if my_listener.active && !their_listener.active {
@@ -1358,17 +1820,6 @@ impl ConfigState {
                         address: SocketAddress::from(**addr),
                         proxy: ListenerType::Tcp.into(),
                         to_scm: false,
-                    })
-                    .into(),
-                );
-            }
-
-            if !my_listener.active && their_listener.active {
-                v.push(
-                    RequestType::ActivateListener(ActivateListener {
-                        address: SocketAddress::from(**addr),
-                        proxy: ListenerType::Tcp.into(),
-                        from_scm: false,
                     })
                     .into(),
                 );
@@ -1391,6 +1842,23 @@ impl ConfigState {
                 let mut listener_to_add = *their_listener;
                 listener_to_add.active = false;
                 v.push(RequestType::AddUdpListener(listener_to_add).into());
+
+                // The Remove + Add(active=false) above wipes the listener's
+                // active state. Re-emit an ActivateListener whenever the target
+                // state keeps it active, otherwise a config change on a still
+                // active listener would silently deactivate it on replay. This
+                // subsumes the newly-active (`!my.active && their.active`) case:
+                // a differing `active` flag always makes the listeners unequal.
+                if their_listener.active {
+                    v.push(
+                        RequestType::ActivateListener(ActivateListener {
+                            address: SocketAddress::from(**addr),
+                            proxy: ListenerType::Udp.into(),
+                            from_scm: false,
+                        })
+                        .into(),
+                    );
+                }
             }
 
             if my_listener.active && !their_listener.active {
@@ -1399,17 +1867,6 @@ impl ConfigState {
                         address: SocketAddress::from(**addr),
                         proxy: ListenerType::Udp.into(),
                         to_scm: false,
-                    })
-                    .into(),
-                );
-            }
-
-            if !my_listener.active && their_listener.active {
-                v.push(
-                    RequestType::ActivateListener(ActivateListener {
-                        address: SocketAddress::from(**addr),
-                        proxy: ListenerType::Udp.into(),
-                        from_scm: false,
                     })
                     .into(),
                 );
@@ -1432,6 +1889,23 @@ impl ConfigState {
                 let mut listener_to_add = their_listener.clone();
                 listener_to_add.active = false;
                 v.push(RequestType::AddHttpListener(listener_to_add).into());
+
+                // The Remove + Add(active=false) above wipes the listener's
+                // active state. Re-emit an ActivateListener whenever the target
+                // state keeps it active, otherwise a config change on a still
+                // active listener would silently deactivate it on replay. This
+                // subsumes the newly-active (`!my.active && their.active`) case:
+                // a differing `active` flag always makes the listeners unequal.
+                if their_listener.active {
+                    v.push(
+                        RequestType::ActivateListener(ActivateListener {
+                            address: SocketAddress::from(**addr),
+                            proxy: ListenerType::Http.into(),
+                            from_scm: false,
+                        })
+                        .into(),
+                    );
+                }
             }
 
             if my_listener.active && !their_listener.active {
@@ -1440,17 +1914,6 @@ impl ConfigState {
                         address: SocketAddress::from(**addr),
                         proxy: ListenerType::Http.into(),
                         to_scm: false,
-                    })
-                    .into(),
-                );
-            }
-
-            if !my_listener.active && their_listener.active {
-                v.push(
-                    RequestType::ActivateListener(ActivateListener {
-                        address: SocketAddress::from(**addr),
-                        proxy: ListenerType::Http.into(),
-                        from_scm: false,
                     })
                     .into(),
                 );
@@ -1473,6 +1936,23 @@ impl ConfigState {
                 let mut listener_to_add = their_listener.clone();
                 listener_to_add.active = false;
                 v.push(RequestType::AddHttpsListener(listener_to_add).into());
+
+                // The Remove + Add(active=false) above wipes the listener's
+                // active state. Re-emit an ActivateListener whenever the target
+                // state keeps it active, otherwise a config change on a still
+                // active listener would silently deactivate it on replay. This
+                // subsumes the newly-active (`!my.active && their.active`) case:
+                // a differing `active` flag always makes the listeners unequal.
+                if their_listener.active {
+                    v.push(
+                        RequestType::ActivateListener(ActivateListener {
+                            address: SocketAddress::from(**addr),
+                            proxy: ListenerType::Https.into(),
+                            from_scm: false,
+                        })
+                        .into(),
+                    );
+                }
             }
 
             if my_listener.active && !their_listener.active {
@@ -1481,17 +1961,6 @@ impl ConfigState {
                         address: SocketAddress::from(**addr),
                         proxy: ListenerType::Https.into(),
                         to_scm: false,
-                    })
-                    .into(),
-                );
-            }
-
-            if !my_listener.active && their_listener.active {
-                v.push(
-                    RequestType::ActivateListener(ActivateListener {
-                        address: SocketAddress::from(**addr),
-                        proxy: ListenerType::Https.into(),
-                        from_scm: false,
                     })
                     .into(),
                 );
@@ -1726,6 +2195,55 @@ impl ConfigState {
                     .into(),
                 );
             }
+        }
+
+        // Replay symmetry: the request set `diff` emits, when replayed onto a
+        // clone of `self`, must reproduce `other`'s routing-relevant maps —
+        // listeners included, with their `active` flag. This is the property the
+        // hot-reconfig fan-out relies on — a worker applies these requests and
+        // must converge on `other`. We verify it in debug by actually replaying;
+        // `dispatch`'s own invariant sweep runs on every step.
+        //
+        // One deliberate normalization: `backends`/`tcp_fronts` are compared
+        // after dropping empty buckets. `remove_backend`/`remove_tcp_frontend`
+        // leave an empty `Vec` under a cluster key, whereas `other` may have no
+        // key at all. An empty bucket emits no requests and is semantically
+        // equivalent to an absent one, so we normalize it away before comparing.
+        #[cfg(debug_assertions)]
+        {
+            let mut replayed = self.clone();
+            for request in &v {
+                // A diff request must always be dispatchable onto `self`.
+                debug_assert!(
+                    replayed.dispatch(request).is_ok(),
+                    "every request emitted by diff must replay cleanly onto self"
+                );
+            }
+            let nonempty = |m: &BTreeMap<ClusterId, Vec<Backend>>| {
+                m.iter()
+                    .filter(|(_, v)| !v.is_empty())
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            let nonempty_tcp = |m: &HashMap<ClusterId, Vec<TcpFrontend>>| {
+                m.iter()
+                    .filter(|(_, v)| !v.is_empty())
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<HashMap<_, _>>()
+            };
+            debug_assert!(
+                replayed.clusters == other.clusters
+                    && nonempty(&replayed.backends) == nonempty(&other.backends)
+                    && replayed.http_fronts == other.http_fronts
+                    && replayed.https_fronts == other.https_fronts
+                    && nonempty_tcp(&replayed.tcp_fronts) == nonempty_tcp(&other.tcp_fronts)
+                    && replayed.certificates == other.certificates
+                    && replayed.http_listeners == other.http_listeners
+                    && replayed.https_listeners == other.https_listeners
+                    && replayed.tcp_listeners == other.tcp_listeners
+                    && replayed.udp_listeners == other.udp_listeners,
+                "replaying diff(self, other) onto self must reproduce other's clusters/backends/frontends/certificates/listeners"
+            );
         }
 
         v
@@ -3015,6 +3533,17 @@ mod tests {
                 ..Default::default()
             })
             .into(),
+            // The 8443 HTTPS listener is active in both states but its content
+            // changed (custom answers). The Remove + Add(active=false) above
+            // wipes the active flag, so diff must re-emit an ActivateListener to
+            // keep the listener live across the hot reconfig. Without it the
+            // worker would silently deactivate the listener on replay.
+            RequestType::ActivateListener(ActivateListener {
+                address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                proxy: ListenerType::Https.into(),
+                from_scm: false,
+            })
+            .into(),
         ];
 
         let diff = state.diff(&state2);
@@ -3026,6 +3555,41 @@ mod tests {
         let _hash2 = state2.hash_state();
 
         assert_eq!(diff, e);
+
+        // Round-trip: replaying diff(state -> state2) onto a clone of `state`
+        // must reproduce `state2`'s listener maps EXACTLY, active flag included.
+        // This is the hot-reconfig correctness property — a worker applies these
+        // requests and must converge on the target state. In particular the 8443
+        // HTTPS listener (active in both states, content changed) must come back
+        // ACTIVE, which is the bug the ActivateListener re-emission above fixes.
+        let mut replayed = state.clone();
+        for request in &diff {
+            replayed
+                .dispatch(request)
+                .expect("every diff request must replay cleanly onto the source state");
+        }
+        assert_eq!(
+            replayed.tcp_listeners, state2.tcp_listeners,
+            "replayed tcp_listeners must match the target state"
+        );
+        assert_eq!(
+            replayed.http_listeners, state2.http_listeners,
+            "replayed http_listeners must match the target state"
+        );
+        assert_eq!(
+            replayed.https_listeners, state2.https_listeners,
+            "replayed https_listeners must match the target state"
+        );
+        // Explicitly assert the still-active listener stays active across the
+        // config change (the core of the fixed bug).
+        let replayed_8443 = replayed
+            .https_listeners
+            .get(&SocketAddr::from(SocketAddress::new_v4(0, 0, 0, 0, 8443)))
+            .expect("8443 HTTPS listener must exist after replay");
+        assert!(
+            replayed_8443.active,
+            "the 8443 HTTPS listener must stay ACTIVE across a config change"
+        );
     }
 
     #[test]

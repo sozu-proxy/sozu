@@ -122,9 +122,30 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
             HeaderLen::Unix => 232,
         };
 
+        // Anti-oversized-header / partial-read invariant: the accumulation
+        // cursor never runs past the staging window, and the per-stage target
+        // never exceeds the fixed 232-byte buffer (the absolute upper bound on
+        // a PROXY-v2 header). A violation here would slice-panic on the read
+        // below; the asserts name it as a logic bug.
+        debug_assert!(
+            self.index <= total_len,
+            "read cursor must not exceed the current stage target"
+        );
+        debug_assert!(
+            total_len <= self.frontend_buffer.len(),
+            "stage target must fit the fixed proxy-protocol buffer"
+        );
+
+        let index_before = self.index;
         let (sz, socket_result) = self
             .frontend
             .socket_read(&mut self.frontend_buffer[self.index..total_len]);
+        // The socket may only fill the slice it was handed, so a successful
+        // read advances the cursor by at most the remaining stage capacity.
+        debug_assert!(
+            sz <= total_len - index_before,
+            "socket_read cannot return more bytes than the slice it was given"
+        );
         trace!(
             "{} read {} bytes and res={:?}, total_len = {}",
             log_context!(self),
@@ -135,6 +156,18 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
 
         if sz > 0 {
             self.index += sz;
+            // Partial-read accumulation is strictly monotonic and stays within
+            // the bounded buffer: bytes-consumed advances by exactly `sz` and
+            // never exceeds the buffer length (anti-oversized-header bound).
+            debug_assert_eq!(
+                self.index,
+                index_before + sz,
+                "read cursor advances by exactly the bytes just read"
+            );
+            debug_assert!(
+                self.index <= self.frontend_buffer.len(),
+                "accumulated bytes must never exceed the fixed buffer bound"
+            );
 
             count!(names::backend::BYTES_IN, sz as i64);
             metrics.bin += sz;
@@ -143,6 +176,10 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
                 self.frontend_readiness.interest.remove(Ready::READABLE);
             }
         } else {
+            debug_assert_eq!(
+                self.index, index_before,
+                "a non-positive read must leave the cursor unchanged"
+            );
             self.frontend_readiness.event.remove(Ready::READABLE);
         }
 
@@ -180,6 +217,14 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
 
         match parse_v2_header(&self.frontend_buffer[..self.index]) {
             Ok((rest, header)) => {
+                // Completion postcondition: the parser consumed a prefix of the
+                // accumulated bytes, so the unparsed remainder is no larger than
+                // what we fed it (a complete header was recognized within the
+                // bound).
+                debug_assert!(
+                    rest.len() <= self.index,
+                    "parser remainder cannot exceed the accumulated input"
+                );
                 trace!(
                     "{} got expect header: {:?}, rest.len() = {}",
                     log_context!(self),
@@ -331,7 +376,16 @@ impl<Front: SocketHandler> SessionState for ExpectProxyProtocol<Front> {
                 return SessionResult::Close;
             }
 
+            let counter_before = counter;
             counter += 1;
+            // The readiness loop is bounded by MAX_LOOP_ITERATIONS; the counter
+            // advances by exactly one per turn and stays within the cap, so the
+            // loop cannot spin unbounded on a stuck readiness state.
+            debug_assert_eq!(counter, counter_before + 1, "loop counter advances by one");
+            debug_assert!(
+                counter <= MAX_LOOP_ITERATIONS,
+                "loop counter must stay within the iteration cap"
+            );
         }
 
         if counter >= MAX_LOOP_ITERATIONS {

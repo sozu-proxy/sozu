@@ -77,7 +77,9 @@ pub struct HttpFrontend {
 
 impl From<HttpFrontend> for RequestHttpFrontend {
     fn from(val: HttpFrontend) -> Self {
-        RequestHttpFrontend {
+        let source_address = val.address;
+        let source_hostname = val.hostname.clone();
+        let request_frontend = RequestHttpFrontend {
             cluster_id: val.cluster_id,
             address: val.address.into(),
             hostname: val.hostname,
@@ -94,20 +96,57 @@ impl From<HttpFrontend> for RequestHttpFrontend {
             required_auth: val.required_auth,
             headers: val.headers,
             hsts: val.hsts,
-        }
+        };
+
+        // POST: the proto-encoded address decodes back to the source SocketAddr
+        // and the hostname is unchanged — the in-Sōzu → wire conversion must be
+        // routing-preserving (the SocketAddress ⇔ SocketAddr round-trip is
+        // exercised in request.rs; here we tie the frontend identity to it).
+        debug_assert_eq!(
+            SocketAddr::from(request_frontend.address),
+            source_address,
+            "frontend address must round-trip through the proto encoding"
+        );
+        debug_assert_eq!(
+            request_frontend.hostname, source_hostname,
+            "frontend hostname must survive the proto conversion"
+        );
+        request_frontend
     }
 }
 
 impl From<Backend> for AddBackend {
     fn from(val: Backend) -> Self {
-        AddBackend {
+        let source_address = val.address;
+        let source_cluster_id = val.cluster_id.clone();
+        let source_backend_id = val.backend_id.clone();
+        let add_backend = AddBackend {
             cluster_id: val.cluster_id,
             backend_id: val.backend_id,
             address: val.address.into(),
             sticky_id: val.sticky_id,
             load_balancing_parameters: val.load_balancing_parameters,
             backup: val.backup,
-        }
+        };
+
+        // POST: backend identity (cluster + backend id) and the wire address
+        // are preserved — a backend that changed cluster/id/address here would
+        // be registered under the wrong key and never receive (or steal)
+        // traffic.
+        debug_assert_eq!(
+            add_backend.cluster_id, source_cluster_id,
+            "backend cluster_id must survive the proto conversion"
+        );
+        debug_assert_eq!(
+            add_backend.backend_id, source_backend_id,
+            "backend_id must survive the proto conversion"
+        );
+        debug_assert_eq!(
+            SocketAddr::from(add_backend.address),
+            source_address,
+            "backend address must round-trip through the proto encoding"
+        );
+        add_backend
     }
 }
 
@@ -116,30 +155,50 @@ impl PathRule {
     where
         S: ToString,
     {
-        Self {
+        let rule = Self {
             kind: PathRuleKind::Prefix.into(),
             value: value.to_string(),
-        }
+        };
+        // POST: the encoded kind decodes back to the Prefix variant — the proto
+        // i32 must round-trip or the router would misclassify the match type.
+        debug_assert_eq!(
+            PathRuleKind::try_from(rule.kind),
+            Ok(PathRuleKind::Prefix),
+            "prefix() must encode a Prefix-kind rule"
+        );
+        rule
     }
 
     pub fn regex<S>(value: S) -> Self
     where
         S: ToString,
     {
-        Self {
+        let rule = Self {
             kind: PathRuleKind::Regex.into(),
             value: value.to_string(),
-        }
+        };
+        debug_assert_eq!(
+            PathRuleKind::try_from(rule.kind),
+            Ok(PathRuleKind::Regex),
+            "regex() must encode a Regex-kind rule"
+        );
+        rule
     }
 
     pub fn equals<S>(value: S) -> Self
     where
         S: ToString,
     {
-        Self {
+        let rule = Self {
             kind: PathRuleKind::Equals.into(),
             value: value.to_string(),
-        }
+        };
+        debug_assert_eq!(
+            PathRuleKind::try_from(rule.kind),
+            Ok(PathRuleKind::Equals),
+            "equals() must encode an Equals-kind rule"
+        );
+        rule
     }
 
     pub fn from_cli_options(
@@ -147,7 +206,12 @@ impl PathRule {
         path_regex: Option<String>,
         path_equals: Option<String>,
     ) -> Self {
-        match (path_prefix, path_regex, path_equals) {
+        // PRE: prefix takes precedence over regex, which takes precedence over
+        // equals. Capture which arms are populated so the post-condition can
+        // assert the precedence actually fired.
+        let had_prefix = path_prefix.is_some();
+        let had_regex = path_regex.is_some();
+        let rule = match (path_prefix, path_regex, path_equals) {
             (Some(prefix), _, _) => PathRule {
                 kind: PathRuleKind::Prefix as i32,
                 value: prefix,
@@ -161,7 +225,20 @@ impl PathRule {
                 value: equals,
             },
             _ => PathRule::default(),
-        }
+        };
+
+        // POST: a present prefix wins outright; absent a prefix, a present
+        // regex wins. The resolved kind must reflect that precedence so two
+        // simultaneously-set CLI flags can never silently pick the wrong rule.
+        debug_assert!(
+            !had_prefix || rule.kind == PathRuleKind::Prefix as i32,
+            "a path prefix must produce a Prefix rule regardless of other flags"
+        );
+        debug_assert!(
+            had_prefix || !had_regex || rule.kind == PathRuleKind::Regex as i32,
+            "absent a prefix, a regex must produce a Regex rule"
+        );
+        rule
     }
 }
 
@@ -191,11 +268,26 @@ pub struct TcpFrontend {
 
 impl From<TcpFrontend> for RequestTcpFrontend {
     fn from(val: TcpFrontend) -> Self {
-        RequestTcpFrontend {
+        let source_address = val.address;
+        let source_cluster_id = val.cluster_id.clone();
+        let request_frontend = RequestTcpFrontend {
             cluster_id: val.cluster_id,
             address: val.address.into(),
             tags: val.tags,
-        }
+        };
+
+        // POST: cluster identity and the wire address are preserved across the
+        // proto conversion (same routing guarantee as the HTTP frontend path).
+        debug_assert_eq!(
+            request_frontend.cluster_id, source_cluster_id,
+            "TCP frontend cluster_id must survive the proto conversion"
+        );
+        debug_assert_eq!(
+            SocketAddr::from(request_frontend.address),
+            source_address,
+            "TCP frontend address must round-trip through the proto encoding"
+        );
+        request_frontend
     }
 }
 
@@ -237,7 +329,20 @@ pub struct Backend {
 
 impl Ord for Backend {
     fn cmp(&self, o: &Backend) -> Ordering {
-        self.cluster_id
+        // INV: Equal can only be returned when every keyed field compares
+        // Equal — the tuple of field orderings is the source of truth, and the
+        // `.then(...)` fold must not collapse two distinct backends to Equal
+        // (which would let one silently evict the other from a BTree key set).
+        // Computed inline (no recursion into `cmp`) so it stays cheap.
+        let fields_all_equal = self.cluster_id == o.cluster_id
+            && self.backend_id == o.backend_id
+            && self.sticky_id == o.sticky_id
+            && self.load_balancing_parameters == o.load_balancing_parameters
+            && self.backup == o.backup
+            && self.address == o.address;
+
+        let ordering = self
+            .cluster_id
             .cmp(&o.cluster_id)
             .then(self.backend_id.cmp(&o.backend_id))
             .then(self.sticky_id.cmp(&o.sticky_id))
@@ -246,7 +351,14 @@ impl Ord for Backend {
                     .cmp(&o.load_balancing_parameters),
             )
             .then(self.backup.cmp(&o.backup))
-            .then(socketaddr_cmp(&self.address, &o.address))
+            .then(socketaddr_cmp(&self.address, &o.address));
+
+        debug_assert_eq!(
+            ordering == Ordering::Equal,
+            fields_all_equal,
+            "Backend::cmp returns Equal iff every keyed field is equal"
+        );
+        ordering
     }
 }
 
@@ -258,14 +370,29 @@ impl PartialOrd for Backend {
 
 impl Backend {
     pub fn to_add_backend(self) -> AddBackend {
-        AddBackend {
+        let source_address = self.address;
+        let source_backend_id = self.backend_id.clone();
+        let add_backend = AddBackend {
             cluster_id: self.cluster_id,
             address: self.address.into(),
             sticky_id: self.sticky_id,
             backend_id: self.backend_id,
             load_balancing_parameters: self.load_balancing_parameters,
             backup: self.backup,
-        }
+        };
+
+        // POST: identity (backend id) and wire address are preserved — same
+        // routing guarantee as the `From<Backend>` path, kept in lockstep.
+        debug_assert_eq!(
+            add_backend.backend_id, source_backend_id,
+            "backend_id must survive to_add_backend"
+        );
+        debug_assert_eq!(
+            SocketAddr::from(add_backend.address),
+            source_address,
+            "backend address must round-trip through to_add_backend"
+        );
+        add_backend
     }
 }
 
@@ -373,5 +500,14 @@ impl fmt::Display for FilteredTimeSerie {
 }
 
 fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
-    a.ip().cmp(&b.ip()).then(a.port().cmp(&b.port()))
+    let ordering = a.ip().cmp(&b.ip()).then(a.port().cmp(&b.port()));
+    // INV: two socket addresses compare Equal iff both IP and port match —
+    // the `.then` fold must not declare distinct (ip, port) pairs equal, which
+    // would make two different backends indistinguishable to the BTree key.
+    debug_assert_eq!(
+        ordering == Ordering::Equal,
+        a.ip() == b.ip() && a.port() == b.port(),
+        "socketaddr_cmp is Equal iff ip and port both match"
+    );
+    ordering
 }

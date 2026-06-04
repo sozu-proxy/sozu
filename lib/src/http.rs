@@ -174,8 +174,31 @@ impl HttpSession {
             })
         };
 
+        // Invariant: `create_session` allocates `token` from the session slab
+        // and registers the frontend socket under it before constructing us.
+        // A session whose frontend token aliased the listen-socket token (0)
+        // would route listener readiness into a session — a state-machine bug.
+        // (`Token(0)` is reserved in real workers; the test harness in this
+        // file builds listeners directly without going through `new`.)
+        debug_assert_eq!(
+            state.marker() as u8,
+            if expect_proxy {
+                StateMarker::Expect as u8
+            } else {
+                StateMarker::Mux as u8
+            },
+            "constructed state must match the expect_proxy branch"
+        );
+        // The freshly-built state can never be a FailedUpgrade: that marker
+        // only appears after a real upgrade attempt drains the state via
+        // `take()`. Catch a future refactor that constructs one by accident.
+        debug_assert!(
+            !state.failed(),
+            "a newly created session must not start in FailedUpgrade"
+        );
+
         let metrics = SessionMetrics::new(Some(wait_time));
-        Ok(HttpSession {
+        let session = HttpSession {
             configured_backend_timeout,
             configured_connect_timeout,
             configured_frontend_timeout,
@@ -187,11 +210,55 @@ impl HttpSession {
             pool,
             proxy,
             state,
-        })
+        };
+        debug_assert_eq!(
+            session.frontend_token, token,
+            "frontend token must be the slab token used for registration"
+        );
+        #[cfg(debug_assertions)]
+        session.check_invariants();
+        Ok(session)
+    }
+
+    /// Full cross-field invariant sweep for the session state machine, used as
+    /// a run-to-completion postcondition. Compiled out in release.
+    ///
+    /// Strong invariants asserted here:
+    /// - the frontend token is always present (slab key is never sentinel);
+    /// - once `close()` has run the state has been drained / cancelled, so the
+    ///   session is terminal and must not be re-driven (callers gate on the
+    ///   returned `SessionIsToBeClosed`);
+    /// - the live state marker is one of the three legal H1 stages — the
+    ///   `FailedUpgrade` marker is only transient (between `take()` and the
+    ///   `close()` that immediately follows a failed upgrade), so it is the
+    ///   single tolerated exception on a still-open session.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        let marker = self.state.marker();
+        debug_assert!(
+            matches!(
+                marker,
+                StateMarker::Expect | StateMarker::Mux | StateMarker::WebSocket
+            ),
+            "session marker must be a legal H1 stage (Expect/Mux/WebSocket), got {marker:?}"
+        );
+        // A failed state is only ever observed transiently between a failed
+        // upgrade and the close() that reaps it; if it survives to a postcondition
+        // sweep on a not-yet-closed session, a close path was skipped.
+        debug_assert!(
+            !self.state.failed() || self.has_been_closed,
+            "FailedUpgrade state must be reaped by close(), never left live"
+        );
     }
 
     pub fn upgrade(&mut self) -> SessionIsToBeClosed {
         debug!("{} upgrade", log_context!(self));
+        // Record the stage we are leaving so we can assert the transition is
+        // legal (no stage-skipping) after the handoff resolves. `take()`
+        // installs a `FailedUpgrade(marker)` placeholder carrying this same
+        // marker, so the session is never left in a half-moved state if an
+        // upgrade_* helper bails out.
+        let from_marker = self.state.marker();
         let new_state = match self.state.take() {
             HttpStateMachine::Mux(mux) => self.upgrade_mux(mux),
             HttpStateMachine::Expect(expect) => self.upgrade_expect(expect),
@@ -210,11 +277,39 @@ impl HttpSession {
 
         match new_state {
             Some(state) => {
+                // Legal transitions only: Expect→Mux, Mux→WebSocket, or the
+                // WebSocket self-loop (upgrade_websocket is a no-op guard). Any
+                // other pair means a stage was skipped or reversed.
+                debug_assert!(
+                    matches!(
+                        (from_marker, state.marker()),
+                        (StateMarker::Expect, StateMarker::Mux)
+                            | (StateMarker::Mux, StateMarker::WebSocket)
+                            | (StateMarker::WebSocket, StateMarker::WebSocket)
+                    ),
+                    "illegal protocol-upgrade transition {from_marker:?} -> {:?}",
+                    state.marker()
+                );
+                debug_assert!(
+                    !state.failed(),
+                    "a successful upgrade must not install a FailedUpgrade state"
+                );
                 self.state = state;
+                #[cfg(debug_assertions)]
+                self.check_invariants();
                 false
             }
             // The state stays FailedUpgrade, but the Session should be closed right after
-            None => true,
+            None => {
+                // On failure `take()` left a FailedUpgrade placeholder behind;
+                // the caller (`ready`) must close the session on the returned
+                // `true`, so we do not run the still-open invariant sweep here.
+                debug_assert!(
+                    self.state.failed(),
+                    "a failed upgrade must leave the session in FailedUpgrade"
+                );
+                true
+            }
         }
     }
 
@@ -267,6 +362,24 @@ impl HttpSession {
                 };
                 mux.frontend.readiness_mut().event = expect.frontend_readiness.event;
 
+                // The Expect→Mux handoff must carry the session's frontend
+                // token across unchanged: the slab slot and epoll registration
+                // are keyed by it, so a mismatch would misroute readiness.
+                debug_assert_eq!(
+                    mux.frontend_token, self.frontend_token,
+                    "expect upgrade must preserve the frontend token"
+                );
+                // Fresh Mux: exactly one stream was just created above, and no
+                // backend is connected yet (back token is set iff linked).
+                debug_assert_eq!(
+                    mux.context.streams.len(),
+                    1,
+                    "a freshly upgraded Mux owns exactly the request stream"
+                );
+
+                // Gauge pairing: this connection leaves PROXY_EXPECT and enters
+                // HTTP. The two adjustments must stay together so the live-state
+                // gauges sum to the session count (no double-count, no leak).
                 gauge_add!(names::protocol::PROXY_EXPECT, -1);
                 gauge_add!(names::protocol::HTTP, 1);
                 Some(HttpStateMachine::Mux(mux))
@@ -318,6 +431,16 @@ impl HttpSession {
             );
             return None;
         };
+        // Invariant (back token set iff backend connected): a Linked stream
+        // names a backend token that must exist in the router's backend map.
+        // We assert the map is non-empty here, then prove membership by the
+        // `remove` below — a Linked token absent from the map would be a
+        // book-keeping desync between stream state and the backend map.
+        debug_assert!(
+            mux.router.backends.contains_key(&back_token),
+            "a Linked stream's back token must index a connected backend"
+        );
+        let backends_before = mux.router.backends.len();
         let Some(backend) = mux.router.backends.remove(&back_token) else {
             error!(
                 "{} upgrade_mux: backend for token {:?} is missing (already disconnected?), closing",
@@ -352,6 +475,18 @@ impl HttpSession {
                 }
             };
 
+        // Post-removal book-keeping: the backend is gone from the map and the
+        // count dropped by exactly one (the `remove` matched a present key).
+        debug_assert!(
+            !mux.router.backends.contains_key(&back_token),
+            "the upgraded backend must be evicted from the router map"
+        );
+        debug_assert_eq!(
+            mux.router.backends.len(),
+            backends_before - 1,
+            "removing the backend must drop the backend count by exactly one"
+        );
+
         let ws_context = stream.context.websocket_context();
 
         container_frontend_timeout.reset();
@@ -384,10 +519,21 @@ impl HttpSession {
 
         pipe.frontend_readiness.event = frontend_readiness.event;
         pipe.backend_readiness.event = backend_readiness.event;
+        // The WebSocket pipe inherits the live backend connection, so its back
+        // token must be set (back token present iff a backend is connected).
         pipe.set_back_token(back_token);
+        debug_assert_eq!(
+            pipe.back_token(),
+            vec![back_token],
+            "websocket pipe must carry exactly the upgraded backend token"
+        );
 
         // http.active_requests was already decremented by generate_access_log()
         // in h1.rs when the 101 response was written (before MuxResult::Upgrade).
+        //
+        // Gauge pairing (Mux→WebSocket): leave HTTP, enter WS, and start
+        // accounting one active websocket request. These three must move
+        // together so the protocol gauges stay consistent with the session set.
         gauge_add!(names::protocol::HTTP, -1);
         gauge_add!(names::protocol::WS, 1);
         gauge_add!(names::websocket::ACTIVE_REQUESTS, 1);
@@ -412,6 +558,11 @@ impl ProxySession for HttpSession {
         if self.has_been_closed {
             return;
         }
+        // Reaching here means we are about to do the one-and-only teardown.
+        debug_assert!(
+            !self.has_been_closed,
+            "close past the guard must run on a not-yet-closed session"
+        );
 
         trace!("{} closing HTTP session", log_context!(self));
         self.metrics.service_stop();
@@ -438,6 +589,10 @@ impl ProxySession for HttpSession {
             self.state.close(self.proxy.clone(), &mut self.metrics);
             self.proxy.borrow().remove_session(self.frontend_token);
             self.has_been_closed = true;
+            debug_assert!(
+                self.has_been_closed,
+                "failed-upgrade close path must mark the session closed"
+            );
             return;
         }
 
@@ -476,6 +631,10 @@ impl ProxySession for HttpSession {
         proxy.remove_session(self.frontend_token);
 
         self.has_been_closed = true;
+        debug_assert!(
+            self.has_been_closed,
+            "close must leave the session marked closed (idempotency latch)"
+        );
     }
 
     fn timeout(&mut self, token: Token) -> SessionIsToBeClosed {
@@ -516,6 +675,14 @@ impl ProxySession for HttpSession {
         };
 
         self.metrics.service_stop();
+        // Run-to-completion postcondition: a session that is being kept alive
+        // must still satisfy its cross-field invariants. When `to_be_closed`
+        // is true the state may be a transient FailedUpgrade or already torn
+        // down, so the sweep only applies to the still-open path.
+        #[cfg(debug_assertions)]
+        if !to_be_closed {
+            self.check_invariants();
+        }
         to_be_closed
     }
 
@@ -1445,8 +1612,18 @@ impl ProxyConfiguration for HttpProxy {
             );
         }
         let mut session_manager = self.sessions.borrow_mut();
+        let slab_len_before = session_manager.slab.len();
         let session_entry = session_manager.slab.vacant_entry();
         let session_token = Token(session_entry.key());
+        // The token handed to the new session, used for epoll registration and
+        // every `remove_session(frontend_token)` call, MUST be the very slab
+        // key this entry will occupy. A drift here would deregister/free the
+        // wrong slot on close.
+        debug_assert_eq!(
+            session_token.0,
+            session_entry.key(),
+            "session token must equal the slab vacant-entry key"
+        );
         let owned = listener.borrow();
 
         if let Err(register_error) = self.registry.register(
@@ -1483,8 +1660,24 @@ impl ProxyConfiguration for HttpProxy {
             wait_time,
         )?;
 
+        // The session's frontend token must be exactly the slab key we are
+        // about to fill — the registration above and all later token lookups
+        // depend on it.
+        debug_assert_eq!(
+            session.frontend_token, session_token,
+            "session must own the frontend token it was created with"
+        );
+
         let session = Rc::new(RefCell::new(session));
         session_entry.insert(session);
+        // Inserting into the previously-vacant entry grows the live session
+        // count by exactly one (gauge-like ±1 pairing against close()'s
+        // try_remove). `len()` is the count of occupied slots.
+        debug_assert_eq!(
+            session_manager.slab.len(),
+            slab_len_before + 1,
+            "creating a session must occupy exactly one new slab slot"
+        );
 
         Ok(())
     }
@@ -1510,21 +1703,52 @@ impl L7Proxy for HttpProxy {
 
     fn add_session(&self, session: Rc<RefCell<dyn ProxySession>>) -> Token {
         let mut session_manager = self.sessions.borrow_mut();
+        let len_before = session_manager.slab.len();
         let entry = session_manager.slab.vacant_entry();
         let token = Token(entry.key());
         let _entry = entry.insert(session);
+        // The returned token is the slab key callers use to later remove this
+        // session, and the insert occupied exactly one new slot.
+        debug_assert_eq!(
+            session_manager.slab.len(),
+            len_before + 1,
+            "add_session must occupy exactly one new slab slot"
+        );
+        debug_assert!(
+            session_manager.slab.contains(token.0),
+            "the returned token must index the freshly inserted session"
+        );
         token
     }
 
     fn remove_session(&self, token: Token) -> bool {
         let mut sessions = self.sessions.borrow_mut();
+        let was_present = sessions.slab.contains(token.0);
+        let len_before = sessions.slab.len();
         // Drain the session's `(cluster, ip)` accounting before the slab
         // slot is freed — once the slot is reused for a new session the
         // token would otherwise alias an unrelated set of entries. No-op
         // when the session never tracked anything (feature disabled, or
         // no request reached `Router::connect`).
         sessions.untrack_all_cluster_ip(token);
-        sessions.slab.try_remove(token.0).is_some()
+        let removed = sessions.slab.try_remove(token.0).is_some();
+        // Removal must report exactly whether the slot was occupied, and the
+        // live count drops by one iff something was actually removed (±1
+        // pairing against add_session / create_session). The slot is gone.
+        debug_assert_eq!(
+            removed, was_present,
+            "try_remove reports presence iff the slot was occupied"
+        );
+        debug_assert_eq!(
+            sessions.slab.len(),
+            len_before - removed as usize,
+            "slab len drops by exactly one iff a session was removed"
+        );
+        debug_assert!(
+            !sessions.slab.contains(token.0),
+            "the slot must be free after remove_session"
+        );
+        removed
     }
 
     fn backends(&self) -> Rc<RefCell<BackendMap>> {

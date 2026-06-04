@@ -408,9 +408,68 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.splice_pipe.as_ref().map(|p| p.capacity).unwrap_or(0)
     }
 
+    /// Upper bound used by `debug_assert!`s on the splice pending counters.
+    /// On splice builds it is the realised kernel-pipe capacity; on builds
+    /// without splice the pending counters are hard-coded `0`, so any finite
+    /// bound holds — we return `usize::MAX` to keep the assertion a no-op
+    /// while still compiling in every profile. Invariant-only; not on a hot
+    /// path.
+    #[cfg(all(target_os = "linux", feature = "splice"))]
+    fn splice_capacity_or_max(&self) -> usize {
+        self.splice_capacity()
+    }
+    #[cfg(not(all(target_os = "linux", feature = "splice")))]
+    fn splice_capacity_or_max(&self) -> usize {
+        usize::MAX
+    }
+
+    /// Tear down both readiness trackers ahead of a `SessionResult::Close`.
+    ///
+    /// This is the *write-only-shutdown discipline* (CLAUDE.md gotcha: never
+    /// `shutdown(Shutdown::Both)` on a TLS frontend — it emits a TCP RST that
+    /// truncates the already-queued response). `Pipe` never issues an explicit
+    /// `shutdown`; it closes purely by clearing interest+event so the event
+    /// loop stops driving I/O and lets the kernel flush queued bytes, with the
+    /// peer close arriving via the normal read path. The post-condition
+    /// asserts both trackers are fully cleared.
+    fn reset_readiness_for_close(&mut self) {
+        self.frontend_readiness.reset();
+        self.backend_readiness.reset();
+        debug_assert!(
+            self.frontend_readiness.interest.is_empty() && self.frontend_readiness.event.is_empty(),
+            "frontend readiness must be fully cleared on close (write-only-shutdown discipline)"
+        );
+        debug_assert!(
+            self.backend_readiness.interest.is_empty() && self.backend_readiness.event.is_empty(),
+            "backend readiness must be fully cleared on close (write-only-shutdown discipline)"
+        );
+    }
+
     /// Wether the session should be kept open, depending on endpoints status
     /// and buffer usage (both in memory and in kernel)
     pub fn check_connections(&self) -> bool {
+        // In-flight accounting must never see more bytes queued than the
+        // backing storage can hold: buffered data ≤ buffer capacity and
+        // splice-pending ≤ realised kernel-pipe capacity. A violation here
+        // means a `fill`/`consume`/splice-delta elsewhere desynced the
+        // counters, which would corrupt the keep-alive decision below.
+        debug_assert!(
+            self.frontend_buffer.available_data() <= self.frontend_buffer.capacity(),
+            "frontend buffered data exceeds its capacity"
+        );
+        debug_assert!(
+            self.backend_buffer.available_data() <= self.backend_buffer.capacity(),
+            "backend buffered data exceeds its capacity"
+        );
+        debug_assert!(
+            self.splice_in_pending() <= self.splice_capacity_or_max(),
+            "frontend→backend splice pending exceeds kernel-pipe capacity"
+        );
+        debug_assert!(
+            self.splice_out_pending() <= self.splice_capacity_or_max(),
+            "backend→frontend splice pending exceeds kernel-pipe capacity"
+        );
+
         let request_is_inflight = self.frontend_buffer.available_data() > 0
             || self.frontend_readiness.event.is_readable()
             || self.splice_in_pending() > 0;
@@ -460,8 +519,21 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     pub fn backend_hup(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         self.backend_status = ConnectionStatus::Closed;
+        // The backend hung up: its status is now terminal regardless of which
+        // keep-alive branch we take below.
+        debug_assert!(
+            matches!(self.backend_status, ConnectionStatus::Closed),
+            "backend_hup must mark the backend Closed"
+        );
         let pipe_has_data = self.splice_out_pending() > 0;
         if self.backend_buffer.available_data() == 0 && !pipe_has_data {
+            // No buffered or in-kernel response data: there is nothing left to
+            // drain toward the frontend on this no-data branch.
+            debug_assert_eq!(
+                self.backend_buffer.available_data(),
+                0,
+                "no-data branch entered with response bytes still buffered"
+            );
             if self.backend_readiness.event.is_readable() {
                 self.backend_readiness.interest.insert(Ready::READABLE);
                 debug!(
@@ -502,15 +574,37 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             return SessionResult::Continue;
         }
 
+        let space_before = self.frontend_buffer.available_space();
+        let data_before = self.frontend_buffer.available_data();
+        let bin_before = metrics.bin;
         let (sz, res) = self.frontend.socket_read(self.frontend_buffer.space());
+        // `socket_read` fills `buf[..]` and returns `min(read, buf.len())`; it
+        // can never report more bytes than the space slice it was handed.
+        debug_assert!(
+            sz <= space_before,
+            "frontend socket_read reported more bytes ({sz}) than the buffer space offered ({space_before})"
+        );
         debug!("{} Read {} bytes", log_context!(self), sz);
 
         if sz > 0 {
             //FIXME: replace with copy()
             self.frontend_buffer.fill(sz);
+            // `fill(sz)` with `sz <= available_space` moves exactly `sz` bytes
+            // from free space into readable data — no truncation, no growth.
+            debug_assert_eq!(
+                self.frontend_buffer.available_data(),
+                data_before + sz,
+                "fill must grow readable data by exactly the bytes read"
+            );
 
             count!(names::backend::BYTES_IN, sz as i64);
             metrics.bin += sz;
+            // Front→proxy ingress metric advances by exactly the bytes read.
+            debug_assert_eq!(
+                metrics.bin,
+                bin_before + sz,
+                "metrics.bin must advance by exactly the bytes read"
+            );
 
             if self.frontend_buffer.available_space() == 0 {
                 self.frontend_readiness.interest.remove(Ready::READABLE);
@@ -529,22 +623,19 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
 
         if !self.check_connections() {
-            self.frontend_readiness.reset();
-            self.backend_readiness.reset();
+            self.reset_readiness_for_close();
             self.log_request_success(metrics);
             return SessionResult::Close;
         }
 
         match res {
             SocketResult::Error => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_error(metrics, "front socket read error");
                 return SessionResult::Close;
             }
             SocketResult::Closed => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_success(metrics);
                 return SessionResult::Close;
             }
@@ -572,6 +663,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             return SessionResult::Continue;
         }
 
+        let queued_total = self.backend_buffer.available_data();
         let mut sz = 0usize;
         let mut res = SocketResult::Continue;
         while res == SocketResult::Continue {
@@ -583,10 +675,28 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 self.frontend_readiness.interest.remove(Ready::WRITABLE);
                 return SessionResult::Continue;
             }
+            let queued = self.backend_buffer.available_data();
             let (current_sz, current_res) = self.frontend.socket_write(self.backend_buffer.data());
+            // A partial write can never report more than was queued: the
+            // socket writes from `data()` and returns `min(written, data.len())`.
+            debug_assert!(
+                current_sz <= queued,
+                "frontend socket_write reported {current_sz} bytes but only {queued} were queued"
+            );
             res = current_res;
-            self.backend_buffer.consume(current_sz);
+            let consumed = self.backend_buffer.consume(current_sz);
+            // `consume` drops exactly the written bytes (we already proved
+            // `current_sz <= available_data`, so no clamping occurs).
+            debug_assert_eq!(
+                consumed, current_sz,
+                "consume must drop exactly the bytes written to the frontend"
+            );
             sz += current_sz;
+            // Cumulative transfer never overruns what was queued at entry.
+            debug_assert!(
+                sz <= queued_total,
+                "cumulative frontend write ({sz}) exceeded the queued backend data ({queued_total})"
+            );
 
             if current_sz == 0 && res == SocketResult::Continue {
                 self.frontend_status = match self.frontend_status {
@@ -599,8 +709,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             if !self.check_connections() {
                 metrics.bout += sz;
                 count!(names::backend::BYTES_OUT, sz as i64);
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_success(metrics);
                 return SessionResult::Close;
             }
@@ -621,14 +730,12 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
         match res {
             SocketResult::Error => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_error(metrics, "front socket write error");
                 return SessionResult::Close;
             }
             SocketResult::Closed => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_success(metrics);
                 return SessionResult::Close;
             }
@@ -672,10 +779,25 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                     return SessionResult::Continue;
                 }
 
+                let queued = self.frontend_buffer.available_data();
                 let (current_sz, current_res) = backend.socket_write(self.frontend_buffer.data());
+                // A partial write can never report more than was queued.
+                debug_assert!(
+                    current_sz <= queued,
+                    "backend socket_write reported {current_sz} bytes but only {queued} were queued"
+                );
                 socket_res = current_res;
-                self.frontend_buffer.consume(current_sz);
+                let consumed = self.frontend_buffer.consume(current_sz);
+                debug_assert_eq!(
+                    consumed, current_sz,
+                    "consume must drop exactly the bytes written to the backend"
+                );
                 sz += current_sz;
+                // Cumulative transfer never overruns the data queued at entry.
+                debug_assert!(
+                    sz <= output_size,
+                    "cumulative backend write ({sz}) exceeded the queued frontend data ({output_size})"
+                );
 
                 if current_sz == 0 && current_res == SocketResult::Continue {
                     self.backend_status = match self.backend_status {
@@ -687,12 +809,18 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             }
         }
 
+        let backend_bout_before = metrics.backend_bout;
         count!(names::backend::BACK_BYTES_OUT, sz as i64);
         metrics.backend_bout += sz;
+        // Proxy→backend egress metric advances by exactly the bytes written.
+        debug_assert_eq!(
+            metrics.backend_bout,
+            backend_bout_before + sz,
+            "metrics.backend_bout must advance by exactly the bytes written"
+        );
 
         if !self.check_connections() {
-            self.frontend_readiness.reset();
-            self.backend_readiness.reset();
+            self.reset_readiness_for_close();
             self.log_request_success(metrics);
             return SessionResult::Close;
         }
@@ -706,14 +834,12 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
         match socket_res {
             SocketResult::Error => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_error(metrics, "back socket write error");
                 return SessionResult::Close;
             }
             SocketResult::Closed => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_success(metrics);
                 return SessionResult::Close;
             }
@@ -740,9 +866,24 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             return SessionResult::Continue;
         }
 
+        let space_before = self.backend_buffer.available_space();
+        let data_before = self.backend_buffer.available_data();
+        let backend_bin_before = metrics.backend_bin;
         if let Some(ref mut backend) = self.backend_socket {
             let (size, remaining) = backend.socket_read(self.backend_buffer.space());
+            // `socket_read` reports at most the space slice it was handed.
+            debug_assert!(
+                size <= space_before,
+                "backend socket_read reported more bytes ({size}) than the buffer space offered ({space_before})"
+            );
             self.backend_buffer.fill(size);
+            // `fill(size)` with `size <= available_space` moves exactly `size`
+            // bytes from free space into readable data.
+            debug_assert_eq!(
+                self.backend_buffer.available_data(),
+                data_before + size,
+                "fill must grow readable data by exactly the bytes read"
+            );
 
             debug!("{} Read {} bytes", log_context!(self), size);
 
@@ -753,6 +894,12 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 self.frontend_readiness.interest.insert(Ready::WRITABLE);
                 count!(names::backend::BACK_BYTES_IN, size as i64);
                 metrics.backend_bin += size;
+                // Backend→proxy ingress metric advances by exactly bytes read.
+                debug_assert_eq!(
+                    metrics.backend_bin,
+                    backend_bin_before + size,
+                    "metrics.backend_bin must advance by exactly the bytes read"
+                );
             }
 
             if size == 0 && remaining == SocketResult::Closed {
@@ -763,8 +910,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 };
 
                 if !self.check_connections() {
-                    self.frontend_readiness.reset();
-                    self.backend_readiness.reset();
+                    self.reset_readiness_for_close();
                     self.log_request_success(metrics);
                     return SessionResult::Close;
                 }
@@ -772,15 +918,13 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
             match remaining {
                 SocketResult::Error => {
-                    self.frontend_readiness.reset();
-                    self.backend_readiness.reset();
+                    self.reset_readiness_for_close();
                     self.log_request_error(metrics, "back socket read error");
                     return SessionResult::Close;
                 }
                 SocketResult::Closed => {
                     if !self.check_connections() {
-                        self.frontend_readiness.reset();
-                        self.backend_readiness.reset();
+                        self.reset_readiness_for_close();
                         self.log_request_success(metrics);
                         return SessionResult::Close;
                     }
@@ -815,14 +959,35 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             return SessionResult::Continue;
         }
 
+        let pending_before = self.splice_in_pending();
+        let bin_before = metrics.bin;
         let pipe_write_end = self.splice_pipe.as_ref().unwrap().in_pipe[1];
         let (sz, res) = splice::splice_in(self.frontend.socket_ref(), pipe_write_end, capacity);
+        // The kernel pipe physically holds at most `capacity` bytes, so a
+        // splice into a pipe already holding `pending_before` can add no more
+        // than the remaining headroom.
+        debug_assert!(
+            pending_before + sz <= capacity,
+            "splice_in moved {sz} bytes into a pipe with only {} headroom (capacity {capacity})",
+            capacity - pending_before
+        );
         debug!("{} Spliced {} bytes from frontend", log_context!(self), sz);
 
         if sz > 0 {
             self.splice_pipe.as_mut().unwrap().in_pipe_pending += sz;
+            // Pending advanced by exactly the spliced bytes and stays bounded.
+            debug_assert_eq!(
+                self.splice_in_pending(),
+                pending_before + sz,
+                "in_pipe_pending must grow by exactly the spliced bytes"
+            );
             count!(names::backend::BYTES_IN, sz as i64);
             metrics.bin += sz;
+            debug_assert_eq!(
+                metrics.bin,
+                bin_before + sz,
+                "metrics.bin must advance by exactly the spliced bytes"
+            );
             self.backend_readiness.interest.insert(Ready::WRITABLE);
         } else {
             self.frontend_readiness.event.remove(Ready::READABLE);
@@ -837,22 +1002,19 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
 
         if !self.check_connections() {
-            self.frontend_readiness.reset();
-            self.backend_readiness.reset();
+            self.reset_readiness_for_close();
             self.log_request_success(metrics);
             return SessionResult::Close;
         }
 
         match res {
             SocketResult::Error => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_error(metrics, "splice front socket read error");
                 return SessionResult::Close;
             }
             SocketResult::Closed => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_success(metrics);
                 return SessionResult::Close;
             }
@@ -895,9 +1057,21 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             let pipe_read_end = self.splice_pipe.as_ref().unwrap().out_pipe[0];
             let (current_sz, current_res) =
                 splice::splice_out(pipe_read_end, self.frontend.socket_ref(), pending);
+            // `splice_out` was asked for `pending` bytes and can drain no more
+            // than the pipe holds; draining more than `pending` would underflow
+            // `out_pipe_pending` below.
+            debug_assert!(
+                current_sz <= pending,
+                "splice_out drained {current_sz} bytes but only {pending} were pending (would underflow)"
+            );
             res = current_res;
             if current_sz > 0 {
                 self.splice_pipe.as_mut().unwrap().out_pipe_pending -= current_sz;
+                debug_assert_eq!(
+                    self.splice_out_pending(),
+                    pending - current_sz,
+                    "out_pipe_pending must shrink by exactly the drained bytes"
+                );
             }
             sz += current_sz;
 
@@ -912,8 +1086,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             if !self.check_connections() {
                 metrics.bout += sz;
                 count!(names::backend::BYTES_OUT, sz as i64);
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_success(metrics);
                 return SessionResult::Close;
             }
@@ -934,14 +1107,12 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
         match res {
             SocketResult::Error => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_error(metrics, "splice front socket write error");
                 return SessionResult::Close;
             }
             SocketResult::Closed => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_success(metrics);
                 return SessionResult::Close;
             }
@@ -988,11 +1159,26 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 Some(b) => splice::splice_out(pipe_read_end, b, pending),
                 None => break,
             };
+            // Draining more than `pending` would underflow `in_pipe_pending`.
+            debug_assert!(
+                current_sz <= pending,
+                "splice_out drained {current_sz} bytes but only {pending} were pending (would underflow)"
+            );
             socket_res = current_res;
             if current_sz > 0 {
                 self.splice_pipe.as_mut().unwrap().in_pipe_pending -= current_sz;
+                debug_assert_eq!(
+                    self.splice_in_pending(),
+                    pending - current_sz,
+                    "in_pipe_pending must shrink by exactly the drained bytes"
+                );
             }
             sz += current_sz;
+            // Cumulative drain never exceeds what was pending at entry.
+            debug_assert!(
+                sz <= output_size,
+                "cumulative splice drain ({sz}) exceeded the bytes pending at entry ({output_size})"
+            );
 
             if current_sz == 0 && current_res == SocketResult::Continue {
                 self.backend_status = match self.backend_status {
@@ -1007,8 +1193,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         metrics.backend_bout += sz;
 
         if !self.check_connections() {
-            self.frontend_readiness.reset();
-            self.backend_readiness.reset();
+            self.reset_readiness_for_close();
             self.log_request_success(metrics);
             return SessionResult::Close;
         }
@@ -1022,14 +1207,12 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
         match socket_res {
             SocketResult::Error => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_error(metrics, "splice back socket write error");
                 return SessionResult::Close;
             }
             SocketResult::Closed => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_success(metrics);
                 return SessionResult::Close;
             }
@@ -1059,11 +1242,21 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             return SessionResult::Continue;
         }
 
+        let pending_before = self.splice_out_pending();
+        let backend_bin_before = metrics.backend_bin;
         let pipe_write_end = self.splice_pipe.as_ref().unwrap().out_pipe[1];
         let (size, remaining) = match self.backend_socket.as_ref() {
             Some(b) => splice::splice_in(b, pipe_write_end, capacity),
             None => return SessionResult::Continue,
         };
+        // The out_pipe physically holds at most `capacity` bytes; a splice into
+        // a pipe already holding `pending_before` can add no more than the
+        // remaining headroom.
+        debug_assert!(
+            pending_before + size <= capacity,
+            "splice_in moved {size} bytes into a pipe with only {} headroom (capacity {capacity})",
+            capacity - pending_before
+        );
 
         debug!("{} Spliced {} bytes from backend", log_context!(self), size);
 
@@ -1072,9 +1265,19 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
         if size > 0 {
             self.splice_pipe.as_mut().unwrap().out_pipe_pending += size;
+            debug_assert_eq!(
+                self.splice_out_pending(),
+                pending_before + size,
+                "out_pipe_pending must grow by exactly the spliced bytes"
+            );
             self.frontend_readiness.interest.insert(Ready::WRITABLE);
             count!(names::backend::BACK_BYTES_IN, size as i64);
             metrics.backend_bin += size;
+            debug_assert_eq!(
+                metrics.backend_bin,
+                backend_bin_before + size,
+                "metrics.backend_bin must advance by exactly the spliced bytes"
+            );
         }
 
         if size == 0 && remaining == SocketResult::Closed {
@@ -1085,8 +1288,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             };
 
             if !self.check_connections() {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_success(metrics);
                 return SessionResult::Close;
             }
@@ -1094,15 +1296,13 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
         match remaining {
             SocketResult::Error => {
-                self.frontend_readiness.reset();
-                self.backend_readiness.reset();
+                self.reset_readiness_for_close();
                 self.log_request_error(metrics, "splice back socket read error");
                 return SessionResult::Close;
             }
             SocketResult::Closed => {
                 if !self.check_connections() {
-                    self.frontend_readiness.reset();
-                    self.backend_readiness.reset();
+                    self.reset_readiness_for_close();
                     self.log_request_success(metrics);
                     return SessionResult::Close;
                 }

@@ -326,12 +326,28 @@ impl SessionManager {
         if limit == 0 {
             return false;
         }
-        if self
+        // Pure query: the limit==0 branch already returned, so any work below
+        // runs only with a positive cap.
+        debug_assert!(
+            limit > 0,
+            "limit==0 (unlimited) must have returned before reaching the bounded check"
+        );
+        let already_tracked = self
             .cluster_ip_tracks
             .get(&token)
             .and_then(|by_cluster| by_cluster.get(cluster_id))
-            .is_some_and(|ips| ips.contains(ip))
-        {
+            .is_some_and(|ips| ips.contains(ip));
+        if already_tracked {
+            // Reverse-index/forward-count coherence: if this token already
+            // holds a slot for (cluster, ip), the forward count must be > 0
+            // (decrement-to-zero reaps the inner entry in untrack_all).
+            debug_assert!(
+                self.connections_per_cluster_ip
+                    .get(cluster_id)
+                    .and_then(|by_ip| by_ip.get(ip))
+                    .is_some_and(|c| *c > 0),
+                "a tracked (token, cluster, ip) slot must have a positive forward count"
+            );
             return false;
         }
         self.connections_per_cluster_ip
@@ -350,6 +366,15 @@ impl SessionManager {
     /// new outer-map slot. Subsequent IPs under the same `(token,
     /// cluster)` reuse the existing slot.
     pub fn track_cluster_ip(&mut self, token: Token, cluster_id: String, ip: IpAddr) {
+        // Snapshot the forward count for this (cluster, ip) before the insert
+        // so we can pair-assert the delta. Ungated `let`: read only inside the
+        // debug_assert! below → optimised out in release (no E0425).
+        let count_before = self
+            .connections_per_cluster_ip
+            .get(&cluster_id)
+            .and_then(|by_ip| by_ip.get(&ip))
+            .copied()
+            .unwrap_or(0);
         let inserted = self
             .cluster_ip_tracks
             .entry(token)
@@ -360,11 +385,32 @@ impl SessionManager {
         if inserted {
             *self
                 .connections_per_cluster_ip
-                .entry(cluster_id)
+                .entry(cluster_id.clone())
                 .or_default()
                 .entry(ip)
                 .or_insert(0) += 1;
         }
+        // Postconditions: the reverse index now records this (token, cluster,
+        // ip), and the forward count advanced by exactly `inserted as usize`
+        // (idempotent: a repeat call for the same triple is a no-op on both).
+        debug_assert!(
+            self.cluster_ip_tracks
+                .get(&token)
+                .and_then(|by_cluster| by_cluster.get(&cluster_id))
+                .is_some_and(|ips| ips.contains(&ip)),
+            "track must leave the (token, cluster, ip) recorded in the reverse index"
+        );
+        debug_assert_eq!(
+            self.connections_per_cluster_ip
+                .get(&cluster_id)
+                .and_then(|by_ip| by_ip.get(&ip))
+                .copied()
+                .unwrap_or(0),
+            count_before + inserted as usize,
+            "forward count must advance by exactly 1 on first track, 0 on a repeat"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
     }
 
     /// Drain every `(cluster, ip)` slot held by `token` and apply the
@@ -377,6 +423,12 @@ impl SessionManager {
         let Some(by_cluster) = self.cluster_ip_tracks.remove(&token) else {
             return;
         };
+        // The reverse index for this token was just drained by `remove`; no
+        // other code path re-inserts it within this call.
+        debug_assert!(
+            !self.cluster_ip_tracks.contains_key(&token),
+            "untrack_all must evict the token from the reverse index"
+        );
         for (cluster_id, ips) in by_cluster {
             let Entry::Occupied(mut outer) = self.connections_per_cluster_ip.entry(cluster_id)
             else {
@@ -395,6 +447,16 @@ impl SessionManager {
                 outer.remove();
             }
         }
+        // No orphan bookkeeping survives: the forward map must not retain a
+        // cluster with an empty inner ip-map, nor an ip whose count is zero.
+        debug_assert!(
+            self.connections_per_cluster_ip
+                .values()
+                .all(|by_ip| !by_ip.is_empty() && by_ip.values().all(|&c| c > 0)),
+            "untrack_all must not leave empty inner maps or zero-count ips behind"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
     }
 
     /// Wipe every per-(cluster, source-IP) accounting bucket. Called by
@@ -404,6 +466,14 @@ impl SessionManager {
     pub fn clear_cluster_ip_tracking(&mut self) {
         self.cluster_ip_tracks.clear();
         self.connections_per_cluster_ip.clear();
+        // Both halves of the per-(cluster, ip) accounting are now empty; a
+        // future re-enable starts from a clean slate.
+        debug_assert!(
+            self.cluster_ip_tracks.is_empty() && self.connections_per_cluster_ip.is_empty(),
+            "clear must wipe both the reverse index and the forward count map"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
     }
 
     /// The slab is considered at capacity if it contains more sessions than twice max_connections
@@ -423,16 +493,35 @@ impl SessionManager {
     /// (against `slab.capacity()`) and `slab.accept_threshold_percent`
     /// (against this gate) are emitted as independent gauges.
     pub fn accept_slab_threshold(&self) -> usize {
-        10 + 2 * self.max_connections
+        let threshold = 10 + 2 * self.max_connections;
+        // The gate must leave headroom above the connection cap so listener /
+        // system slots (Channel, Metrics, Timer, listeners) are never starved
+        // by frontend connections alone.
+        debug_assert!(
+            threshold > self.max_connections,
+            "accept gate must sit strictly above max_connections to reserve system slots"
+        );
+        threshold
     }
 
     /// Check the number of connections against max_connections, and the slab capacity.
     /// Returns false if limits are reached.
     pub fn check_limits(&mut self) -> bool {
+        // Live-count invariant: the accounted connection count never exceeds
+        // the configured cap (incr() enforces this, decr() never underflows).
+        debug_assert!(
+            self.nb_connections <= self.max_connections,
+            "nb_connections must never exceed max_connections"
+        );
         if self.nb_connections >= self.max_connections {
             error!("max number of session connection reached, flushing the accept queue");
             gauge!(names::accept_queue::BACKPRESSURE, 1);
             self.can_accept = false;
+            // A negative result must have closed the accept gate.
+            debug_assert!(
+                !self.can_accept,
+                "refusing at the cap must clear can_accept"
+            );
             return false;
         }
 
@@ -445,9 +534,18 @@ impl SessionManager {
             gauge!(names::accept_queue::BACKPRESSURE, 1);
             self.can_accept = false;
 
+            debug_assert!(
+                !self.can_accept,
+                "refusing at slab capacity must clear can_accept"
+            );
             return false;
         }
 
+        // A positive result means there is room under both gates.
+        debug_assert!(
+            self.nb_connections < self.max_connections && !self.at_capacity(),
+            "check_limits returned room while a gate was actually saturated"
+        );
         true
     }
 
@@ -456,8 +554,15 @@ impl SessionManager {
     }
 
     pub fn incr(&mut self) {
+        let before = self.nb_connections;
         self.nb_connections += 1;
         assert!(self.nb_connections <= self.max_connections);
+        // The counter advances by exactly one per accepted session.
+        debug_assert_eq!(
+            self.nb_connections,
+            before + 1,
+            "incr must raise nb_connections by exactly one"
+        );
         // `client.connections_max` and `client.connections_percent` are
         // emitted from the run loop alongside `process.uptime_seconds` /
         // `server.live` so all proxy gauges advance in lock-step. Keeping
@@ -470,7 +575,14 @@ impl SessionManager {
     /// if the capacity limit of 90% has not been reached.
     pub fn decr(&mut self) {
         assert!(self.nb_connections != 0);
+        let before = self.nb_connections;
         self.nb_connections -= 1;
+        // Mirror of incr: exactly one connection is released, no underflow.
+        debug_assert_eq!(
+            self.nb_connections,
+            before - 1,
+            "decr must lower nb_connections by exactly one"
+        );
         gauge!(names::client::CONNECTIONS, self.nb_connections);
 
         // do not be ready to accept right away, wait until we get back to 10% capacity
@@ -482,6 +594,53 @@ impl SessionManager {
             gauge!(names::accept_queue::BACKPRESSURE, 0);
             self.can_accept = true;
         }
+    }
+
+    /// Full cross-field invariant sweep for the session manager. Called as a
+    /// `debug_assert!`-guarded postcondition from the mutating cluster-IP
+    /// tracking methods. Asserts logic-bug conditions only — every clause
+    /// holds on any well-formed manager regardless of traffic.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        // 1. Live connection count never exceeds the configured cap.
+        debug_assert!(
+            self.nb_connections <= self.max_connections,
+            "nb_connections {} exceeds max_connections {}",
+            self.nb_connections,
+            self.max_connections
+        );
+        // 2. The forward count map never retains an empty inner ip-map or a
+        //    zero count (both are reaped on the last untrack).
+        debug_assert!(
+            self.connections_per_cluster_ip
+                .values()
+                .all(|by_ip| !by_ip.is_empty() && by_ip.values().all(|&c| c > 0)),
+            "connections_per_cluster_ip holds an empty inner map or a zero count"
+        );
+        // 3. Reverse-index → forward-count coherence: every (token, cluster,
+        //    ip) recorded in the reverse index must have a positive forward
+        //    count. The forward count is the sum of contributing tokens, so a
+        //    tracked slot can never point at a missing/zero count.
+        debug_assert!(
+            self.cluster_ip_tracks.values().all(|by_cluster| {
+                by_cluster.iter().all(|(cluster_id, ips)| {
+                    ips.iter().all(|ip| {
+                        self.connections_per_cluster_ip
+                            .get(cluster_id)
+                            .and_then(|by_ip| by_ip.get(ip))
+                            .is_some_and(|&c| c > 0)
+                    })
+                })
+            }),
+            "a tracked (token, cluster, ip) slot has no positive forward count"
+        );
+        // 4. The reverse index never retains an empty inner structure.
+        debug_assert!(
+            self.cluster_ip_tracks.values().all(|by_cluster| {
+                !by_cluster.is_empty() && by_cluster.values().all(|ips| !ips.is_empty())
+            }),
+            "cluster_ip_tracks retains an empty per-token or per-cluster entry"
+        );
     }
 }
 
@@ -1194,6 +1353,12 @@ impl Server {
             return;
         }
         info!("zombie check");
+        // `now` is sampled this iteration and we only get here past the
+        // interval gate, so the check timestamp advances monotonically.
+        debug_assert!(
+            now >= self.last_zombie_check,
+            "zombie-check timestamp must never move backwards"
+        );
         self.last_zombie_check = now;
 
         let mut zombie_tokens = HashSet::new();
@@ -1212,6 +1377,22 @@ impl Server {
                 zombie_tokens.insert(session_token);
             }
         }
+
+        // Listen/system sessions report `Instant::now()` as their last event,
+        // so `now - last_event` is ~0 and never exceeds the interval: a
+        // listener can never be collected as a zombie. Assert the set is free
+        // of listen protocols before we reap it.
+        debug_assert!(
+            !self.sessions.borrow().slab.iter().any(|(_, session)| {
+                let s = session.borrow();
+                zombie_tokens.contains(&s.frontend_token())
+                    && matches!(
+                        s.protocol(),
+                        Protocol::HTTPListen | Protocol::HTTPSListen | Protocol::TCPListen
+                    )
+            }),
+            "zombie reaping must never target a listener session"
+        );
 
         let zombie_count = zombie_tokens.len() as i64;
         count!(names::misc::ZOMBIES, zombie_count);
@@ -1233,9 +1414,22 @@ impl Server {
         // close the sessions associated with the tokens
         for token in &tokens {
             if self.sessions.borrow().slab.contains(token.0) {
+                let slab_before = self.sessions.borrow().slab.len();
                 let session = { self.sessions.borrow_mut().slab.remove(token.0) };
                 session.borrow_mut().close();
                 self.sessions.borrow_mut().decr();
+                // The removed token is truly gone afterwards. The slab may shrink
+                // by MORE than one: `close()` also frees the session's backend
+                // slab slot(s) (the multi-token pattern), so assert it shrank by
+                // at least the frontend slot we just removed, not exactly one.
+                debug_assert!(
+                    !self.sessions.borrow().slab.contains(token.0),
+                    "removed token must be absent from the slab"
+                );
+                debug_assert!(
+                    self.sessions.borrow().slab.len() < slab_before,
+                    "removing a present session must free at least its own slab slot"
+                );
             }
         }
 
@@ -1256,6 +1450,18 @@ impl Server {
                 dangling_entries_count += 1;
             }
         }
+        // Postcondition: no surviving slab entry still references any of the
+        // closed frontend tokens — both the direct remove and the dangling
+        // sweep together leave the slab clean of these sessions.
+        debug_assert!(
+            !self
+                .sessions
+                .borrow()
+                .slab
+                .iter()
+                .any(|(_, session)| tokens.contains(&session.borrow().frontend_token())),
+            "no slab entry may reference a closed frontend token after teardown"
+        );
         dangling_entries_count
     }
 
@@ -1910,6 +2116,12 @@ impl Server {
             }
             Some(RequestType::RemoveListener(ref remove)) => {
                 debug!("{} remove {:?} listener {:?}", req_id, remove.proxy, remove);
+                // We only remove a listener that was previously added, so the
+                // base count is at least 1 — the subtraction cannot underflow.
+                debug_assert!(
+                    self.base_sessions_count > 0,
+                    "removing a listener with base_sessions_count == 0 would underflow"
+                );
                 self.base_sessions_count -= 1;
                 let response = match ListenerType::try_from(remove.proxy) {
                     Ok(ListenerType::Http) => self.http.borrow_mut().notify(request),
@@ -2011,6 +2223,14 @@ impl Server {
         }
 
         let mut session_manager = self.sessions.borrow_mut();
+        // The vacant entry's key is free now and becomes the listener's token.
+        let slab_before = session_manager.slab.len();
+        debug_assert!(
+            !session_manager
+                .slab
+                .contains(session_manager.slab.vacant_key()),
+            "the next vacant slab key must be free before insertion"
+        );
         let entry = session_manager.slab.vacant_entry();
         let token = Token(entry.key());
 
@@ -2019,6 +2239,17 @@ impl Server {
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::HTTPListen,
                 })));
+                // The listener session occupies exactly the token's slab key,
+                // and the slab grew by exactly one slot.
+                debug_assert!(
+                    session_manager.slab.contains(token.0),
+                    "listener insert must occupy the token's slab key"
+                );
+                debug_assert_eq!(
+                    session_manager.slab.len(),
+                    slab_before + 1,
+                    "adding a listener must occupy exactly one slab slot"
+                );
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
@@ -2038,6 +2269,13 @@ impl Server {
         }
 
         let mut session_manager = self.sessions.borrow_mut();
+        let slab_before = session_manager.slab.len();
+        debug_assert!(
+            !session_manager
+                .slab
+                .contains(session_manager.slab.vacant_key()),
+            "the next vacant slab key must be free before insertion"
+        );
         let entry = session_manager.slab.vacant_entry();
         let token = Token(entry.key());
 
@@ -2050,6 +2288,15 @@ impl Server {
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::HTTPSListen,
                 })));
+                debug_assert!(
+                    session_manager.slab.contains(token.0),
+                    "listener insert must occupy the token's slab key"
+                );
+                debug_assert_eq!(
+                    session_manager.slab.len(),
+                    slab_before + 1,
+                    "adding a listener must occupy exactly one slab slot"
+                );
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
@@ -2069,6 +2316,13 @@ impl Server {
         }
 
         let mut session_manager = self.sessions.borrow_mut();
+        let slab_before = session_manager.slab.len();
+        debug_assert!(
+            !session_manager
+                .slab
+                .contains(session_manager.slab.vacant_key()),
+            "the next vacant slab key must be free before insertion"
+        );
         let entry = session_manager.slab.vacant_entry();
         let token = Token(entry.key());
 
@@ -2077,6 +2331,15 @@ impl Server {
                 entry.insert(Rc::new(RefCell::new(ListenSession {
                     protocol: Protocol::TCPListen,
                 })));
+                debug_assert!(
+                    session_manager.slab.contains(token.0),
+                    "listener insert must occupy the token's slab key"
+                );
+                debug_assert_eq!(
+                    session_manager.slab.len(),
+                    slab_before + 1,
+                    "adding a listener must occupy exactly one slab slot"
+                );
                 self.base_sessions_count += 1;
                 WorkerResponse::ok(req_id)
             }
@@ -2534,6 +2797,24 @@ impl Server {
                 .map(|(addr, listener)| (*addr, listener.as_raw_fd()))
                 .collect(),
         };
+        // Each handed-back listener is collected exactly once: the assembled
+        // fd lists mirror the give_back lists one-to-one (the maps above are
+        // straight `.iter().map().collect()` with no filtering or dedup).
+        debug_assert_eq!(
+            listeners.http.len(),
+            http_listeners.len(),
+            "every HTTP listener must be collected exactly once"
+        );
+        debug_assert_eq!(
+            listeners.tls.len(),
+            https_listeners.len(),
+            "every HTTPS listener must be collected exactly once"
+        );
+        debug_assert_eq!(
+            listeners.tcp.len(),
+            tcp_listeners.len(),
+            "every TCP listener must be collected exactly once"
+        );
         info!("sending default listeners: {:?}", listeners);
         let res = self.scm.send_listeners(&listeners);
 
@@ -2589,6 +2870,16 @@ impl Server {
             }
         };
 
+        // Past the guard, `accepted_protocol` is one of the three listen
+        // variants — the inner dispatch's `unreachable!` arm relies on this.
+        debug_assert!(
+            matches!(
+                accepted_protocol,
+                Protocol::TCPListen | Protocol::HTTPListen | Protocol::HTTPSListen
+            ),
+            "accept dispatch must run with a listen protocol only"
+        );
+
         loop {
             let result = match accepted_protocol {
                 Protocol::TCPListen => self.tcp.borrow_mut().accept(token),
@@ -2614,6 +2905,7 @@ impl Server {
                     if let Some(peer_addr) = peer.as_ref() {
                         incr!(per_source_bucket(peer_addr));
                     }
+                    let queue_before = self.accept_queue.len();
                     self.accept_queue.push_back((
                         sock,
                         token,
@@ -2621,6 +2913,12 @@ impl Server {
                         Instant::now(),
                         peer,
                     ));
+                    // One accepted socket enqueues exactly one entry.
+                    debug_assert_eq!(
+                        self.accept_queue.len(),
+                        queue_before + 1,
+                        "each accepted socket must enqueue exactly one entry"
+                    );
                 }
                 Err(AcceptError::WouldBlock) => {
                     self.accept_ready.remove(&token);
@@ -2702,6 +3000,16 @@ impl Server {
             //FIXME: check the timestamp
             //TODO: create_session should return the session and
             // the server should insert it in the the SessionManager
+            // The accept path only ever enqueues listen protocols, so the
+            // `_ => panic!` arm below is genuinely unreachable. Assert the set
+            // here so a future enqueue regression trips in debug, not prod.
+            debug_assert!(
+                matches!(
+                    protocol,
+                    Protocol::TCPListen | Protocol::HTTPListen | Protocol::HTTPSListen
+                ),
+                "accept queue must only hold listen protocols, got {protocol:?}"
+            );
             match protocol {
                 Protocol::TCPListen => {
                     let proxy = self.tcp.clone();
@@ -2737,7 +3045,14 @@ impl Server {
                 }
                 _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
             };
+            let nb_before = self.sessions.borrow().nb_connections;
             self.sessions.borrow_mut().incr();
+            // A successfully created session bumps the live count by one.
+            debug_assert_eq!(
+                self.sessions.borrow().nb_connections,
+                nb_before + 1,
+                "create_sessions must account exactly one new connection per created session"
+            );
         }
 
         gauge!(names::accept_queue::CONNECTIONS, self.accept_queue.len());
@@ -2752,6 +3067,13 @@ impl Server {
             let protocol = self.sessions.borrow().slab[session_token]
                 .borrow()
                 .protocol();
+            // NOTE: `token` is NOT necessarily the session's frontend token. A
+            // session is registered under BOTH its frontend and its backend slab
+            // slots (the multi-token pattern: `connect_to_backend` inserts the
+            // same session Rc under a second vacant key), so `ready()` is also
+            // dispatched with the backend token, where `frontend_token() !=
+            // session_token`. There is therefore no `token == frontend_token`
+            // identity to assert here.
             //info!("protocol: {:?}", protocol);
             match protocol {
                 Protocol::HTTPListen | Protocol::HTTPSListen | Protocol::TCPListen => {

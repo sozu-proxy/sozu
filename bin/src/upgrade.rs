@@ -105,15 +105,81 @@ pub fn fork_main_into_new_main(
         }
     })?;
 
+    // Snapshot the count of worker sessions being handed off BEFORE we move
+    // `upgrade_data` into serialization, so we can reconcile it against what
+    // the re-execed master will recover (round-trip below). Gated to debug:
+    // the snapshots are read only inside the `#[cfg(debug_assertions)]` block.
+    #[cfg(debug_assertions)]
+    let workers_to_handoff = upgrade_data.workers.len();
+    #[cfg(debug_assertions)]
+    let boot_generation_handoff = upgrade_data.boot_generation;
+
     info!("Writing upgrade data to file");
     let upgrade_data_string =
         serde_json::to_string(&upgrade_data).map_err(UpgradeError::SerdeWriteError)?;
+
+    // The serialized payload must round-trip: deserializing what we are about
+    // to write back into `UpgradeData` and re-serializing must reproduce the
+    // exact same bytes. `UpgradeData` field order is fixed by declaration, so
+    // a stable serializer yields a canonical string — a mismatch would mean a
+    // (de)serialization bug that would silently corrupt the recovered master
+    // state on the other side of the re-exec. This is the cheap, in-process
+    // half of the write->read round-trip that `begin_new_main_process`
+    // completes after exec. (Guarded both let + assert: the re-parse only
+    // exists for the check, so it is dead code stripped in release.)
+    #[cfg(debug_assertions)]
+    {
+        match serde_json::from_str::<UpgradeData>(&upgrade_data_string) {
+            Ok(reparsed) => {
+                debug_assert_eq!(
+                    reparsed.workers.len(),
+                    workers_to_handoff,
+                    "round-tripped upgrade data must preserve the worker-session count"
+                );
+                debug_assert_eq!(
+                    reparsed.boot_generation, boot_generation_handoff,
+                    "round-tripped upgrade data must preserve the boot generation"
+                );
+                let reserialized = serde_json::to_string(&reparsed)
+                    .expect("re-serializing already-parsed upgrade data cannot fail");
+                debug_assert_eq!(
+                    reserialized, upgrade_data_string,
+                    "upgrade data must serialize->deserialize->serialize identically (canonical round-trip)"
+                );
+            }
+            Err(e) => debug_assert!(
+                false,
+                "upgrade data we just serialized must deserialize back: {e}"
+            ),
+        }
+    }
+
     upgrade_file
         .write_all(upgrade_data_string.as_bytes())
         .map_err(UpgradeError::WriteFile)?;
     upgrade_file.rewind().map_err(UpgradeError::Rewind)?;
 
     let (old_to_new, new_to_old) = UnixStream::pair().map_err(UpgradeError::CreateUnixStream)?;
+
+    // The descriptors the new binary inherits across the re-exec must be
+    // distinct kernel objects — none handed off twice. Three are in play at
+    // this site: the confirmation channel (`new_to_old`, passed as `--fd`),
+    // the upgrade-state file (passed as `--upgrade-fd`), and the unix command
+    // listener carried inside `UpgradeData` (`command_socket_fd`). A collision
+    // would mean a single fd is being used for two roles after exec — an
+    // fd-bookkeeping bug in the handoff.
+    debug_assert!(
+        new_to_old.as_raw_fd() != upgrade_file.as_raw_fd(),
+        "confirmation-channel fd must not alias the upgrade-state file fd"
+    );
+    debug_assert!(
+        new_to_old.as_raw_fd() != upgrade_data.command_socket_fd,
+        "confirmation-channel fd must not alias the inherited command-socket fd"
+    );
+    debug_assert!(
+        upgrade_file.as_raw_fd() != upgrade_data.command_socket_fd,
+        "upgrade-state file fd must not alias the inherited command-socket fd"
+    );
 
     util::disable_close_on_exec(new_to_old.as_raw_fd()).map_err(|util_err| {
         UpgradeError::DisableCloexec {
@@ -140,6 +206,15 @@ pub fn fork_main_into_new_main(
     // after that point.
     match unsafe { fork().map_err(UpgradeError::Fork)? } {
         ForkResult::Parent { child } => {
+            // The parent branch of a successful `fork()` always observes the
+            // child's pid, which is strictly positive (0 is the child branch;
+            // a failure returns `Err` above). A non-positive value here would
+            // mean we mis-classified the fork outcome and would report a bogus
+            // new-main pid to the operator.
+            debug_assert!(
+                child.as_raw() > 0,
+                "fork parent branch must observe a strictly positive new-main pid"
+            );
             info!("new main launched, with pid {}", child);
 
             Ok((child.into(), fork_confirmation_channel))
@@ -193,6 +268,25 @@ pub fn begin_new_main_process(
     command_buffer_size: u64,
     max_command_buffer_size: u64,
 ) -> Result<(), UpgradeError> {
+    // Both descriptors were handed to us across the re-exec by the old master
+    // (`fork_main_into_new_main`), each derived from a live `as_raw_fd()`: they
+    // are valid (>= 0) and reference two distinct kernel objects (the
+    // confirmation channel vs. the upgrade-state file). Aliasing them would be
+    // an fd-bookkeeping bug on the handoff side. (Stays a `debug_assert!`: a
+    // genuinely bad descriptor surfaces as a returned channel / read error.)
+    debug_assert!(
+        new_to_old_channel_fd >= 0,
+        "inherited new-main-to-old-main channel fd must be a valid descriptor"
+    );
+    debug_assert!(
+        upgrade_file_fd >= 0,
+        "inherited upgrade-state file fd must be a valid descriptor"
+    );
+    debug_assert!(
+        new_to_old_channel_fd != upgrade_file_fd,
+        "the confirmation channel and upgrade-state file must be two distinct fds"
+    );
+
     let mut fork_confirmation_channel: Channel<bool, ()> = Channel::new(
         // SAFETY: `new_to_old_channel_fd` was just inherited from the
         // pre-exec parent process via the `--fd` CLI argument. It is a valid
@@ -220,6 +314,22 @@ pub fn begin_new_main_process(
     let _ = upgrade_file
         .read_to_string(&mut content)
         .map_err(UpgradeError::ReadFile)?;
+
+    // This is the read side of the write->read round-trip started in
+    // `fork_main_into_new_main`: the old master wrote a non-empty serialized
+    // `UpgradeData` object. The recovered payload must therefore be non-empty
+    // and start with the JSON object delimiter. An empty/truncated read means
+    // the fd handoff or the file rewind was botched — a malformed payload
+    // still surfaces as a returned `SerdeReadError` below, this only flags the
+    // logic bug earlier and loudly.
+    debug_assert!(
+        !content.is_empty(),
+        "recovered upgrade state must not be empty (write->read round-trip)"
+    );
+    debug_assert!(
+        content.trim_start().starts_with('{'),
+        "recovered upgrade state must be a serialized JSON object"
+    );
 
     let upgrade_data: UpgradeData =
         serde_json::from_str(&content).map_err(UpgradeError::SerdeReadError)?;

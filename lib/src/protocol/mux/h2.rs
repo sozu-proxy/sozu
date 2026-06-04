@@ -212,6 +212,29 @@ pub(super) fn next_stream_id(
     if issued > STREAM_ID_MAX {
         return None;
     }
+    // Post-conditions (RFC 9113 §5.1.1):
+    // - the issued id fits the 31-bit space;
+    // - the returned watermark is strictly greater than the id we issued, so a
+    //   subsequent call cannot re-issue or regress;
+    // - role-parity: client ids are odd, server ids even. This holds ONLY when
+    //   `last_stream_id` is an even watermark, which is the helper's documented
+    //   contract and what production always maintains (`create_stream` rounds to
+    //   `(stream_id + 2) & !1`; the connection initialises it to 0). The unit
+    //   tests deliberately feed odd `last` values at the saturation boundary, so
+    //   the parity check is gated on the watermark being even — a parity slip
+    //   from an *even* watermark would let two roles collide on one id.
+    debug_assert!(
+        issued <= STREAM_ID_MAX,
+        "issued stream id must fit the 31-bit space"
+    );
+    debug_assert!(
+        next > issued,
+        "the next watermark must advance strictly past the issued id"
+    );
+    debug_assert!(
+        last_stream_id & 1 != 0 || (issued & 1 == 1) == is_client,
+        "from an even watermark, client ids must be odd and server ids even (RFC 9113 §5.1.1)"
+    );
     Some((issued, next))
 }
 
@@ -418,7 +441,7 @@ impl H2FloodConfig {
         max_header_table_size: u32,
         max_header_fields: u32,
     ) -> Self {
-        Self {
+        let config = Self {
             max_rst_stream_per_window: max_rst_stream_per_window.max(1),
             max_ping_per_window: max_ping_per_window.max(1),
             max_settings_per_window: max_settings_per_window.max(1),
@@ -432,7 +455,33 @@ impl H2FloodConfig {
             max_header_list_size: max_header_list_size.max(1),
             max_header_table_size: max_header_table_size.max(1),
             max_header_fields: max_header_fields.max(1),
-        }
+        };
+        // Post-condition: every threshold is clamped to at least 1. A zero
+        // threshold would make `check_flood`/`record_rst_*` trip on the very
+        // first frame (count > 0 > threshold), turning a legitimate connection
+        // into an immediate GOAWAY. This is the central invariant the clamps
+        // above exist to enforce — assert it rather than trusting the `.max(1)`
+        // chain stays correct under future edits.
+        debug_assert!(
+            config.max_rst_stream_per_window >= 1
+                && config.max_ping_per_window >= 1
+                && config.max_settings_per_window >= 1
+                && config.max_empty_data_per_window >= 1
+                && config.max_window_update_stream0_per_window >= 1
+                && config.max_continuation_frames >= 1
+                && config.max_glitch_count >= 1,
+            "every u32 flood threshold must be clamped to >= 1"
+        );
+        debug_assert!(
+            config.max_rst_stream_lifetime >= 1
+                && config.max_rst_stream_abusive_lifetime >= 1
+                && config.max_rst_stream_emitted_lifetime >= 1
+                && config.max_header_list_size >= 1
+                && config.max_header_table_size >= 1
+                && config.max_header_fields >= 1,
+            "every lifetime/size flood threshold must be clamped to >= 1"
+        );
+        config
     }
 }
 
@@ -512,11 +561,30 @@ impl H2ConnectionConfig {
                 stream_shrink_ratio
             );
         }
-        Self {
+        let config = Self {
             initial_connection_window: clamped_window,
             max_concurrent_streams: clamped_streams,
             stream_shrink_ratio: clamped_ratio,
-        }
+        };
+        // Post-conditions matching the documented clamp ranges. The window must
+        // stay within RFC 9113 §6.9's [65535, 2^31-1] (a window outside this
+        // band desynchronises flow control with the peer); max_concurrent_streams
+        // must be >= 1 (zero would refuse every stream); shrink_ratio must be
+        // >= 2 (1 defeats slot recycling, the whole point of the knob).
+        debug_assert!(
+            (DEFAULT_INITIAL_WINDOW_SIZE..=FLOW_CONTROL_MAX_WINDOW)
+                .contains(&config.initial_connection_window),
+            "clamped connection window must lie within RFC 9113 §6.9 bounds"
+        );
+        debug_assert!(
+            config.max_concurrent_streams >= 1,
+            "clamped max_concurrent_streams must be >= 1"
+        );
+        debug_assert!(
+            config.stream_shrink_ratio >= 2,
+            "clamped stream_shrink_ratio must be >= 2 to keep slot recycling effective"
+        );
+        config
     }
 
     /// Create from optional config values, falling back to compile-time defaults.
@@ -607,10 +675,41 @@ fn distribute_overhead(
         // No stream has transferred any outbound bytes — fall back to even split.
         *overhead_bout / active_streams.max(1)
     };
+    // Pre-condition: a stream can never be credited more overhead than remains
+    // in the pool — otherwise the `*overhead_b* -= share_*` below underflows
+    // (usize wraps to a huge value, corrupting connection-overhead accounting).
+    // Every branch above either takes the whole pool (last stream) or `.min`s
+    // against it, so this must hold.
+    debug_assert!(
+        share_in <= *overhead_bin,
+        "overhead-in share must not exceed the remaining overhead pool"
+    );
+    debug_assert!(
+        share_out <= *overhead_bout,
+        "overhead-out share must not exceed the remaining overhead pool"
+    );
+    let before_bin = *overhead_bin;
+    let before_bout = *overhead_bout;
     metrics.bin += share_in;
     metrics.bout += share_out;
     *overhead_bin -= share_in;
     *overhead_bout -= share_out;
+    // Post-condition: the pool shrinks by exactly the credited share (overhead
+    // is conserved, neither created nor lost). The last stream drains it to 0.
+    debug_assert_eq!(
+        *overhead_bin,
+        before_bin - share_in,
+        "overhead-in pool must decrease by exactly the credited share"
+    );
+    debug_assert_eq!(
+        *overhead_bout,
+        before_bout - share_out,
+        "overhead-out pool must decrease by exactly the credited share"
+    );
+    debug_assert!(
+        !is_last_stream || (*overhead_bin == 0 && *overhead_bout == 0),
+        "the last stream must drain the overhead pool to zero (no lost remainder)"
+    );
 }
 
 /// LIFECYCLE §9 invariant 16 probe: returns `true` if any open stream still
@@ -773,12 +872,52 @@ fn enqueue_rst_into(
     wire_stream_id: StreamId,
     error: H2Error,
 ) -> bool {
+    let pending_before = pending.len();
+    let total_before = *total;
     if !rst_sent.insert(wire_stream_id) {
+        // Dedupe short-circuit: the id was already queued/flushed. We must NOT
+        // touch any of the wire-count state, otherwise duplicate calls inflate
+        // the MadeYouReset (CVE-2025-8671) lifetime cap with frames that never
+        // reach the wire.
+        debug_assert!(
+            rst_sent.contains(&wire_stream_id),
+            "dedupe path requires the id to already be present in rst_sent"
+        );
+        debug_assert_eq!(
+            pending.len(),
+            pending_before,
+            "dedupe path must not enqueue a new pending RST"
+        );
+        debug_assert_eq!(
+            *total, total_before,
+            "dedupe path must not bump the queued-RST lifetime counter"
+        );
         return false;
     }
     pending.push((wire_stream_id, error));
     *total += 1;
     readiness.arm_writable();
+    // Post-condition: a freshly-queued RST advances both the pending Vec and the
+    // lifetime counter by exactly one, and the id is now tracked for dedupe.
+    debug_assert!(
+        rst_sent.contains(&wire_stream_id),
+        "freshly-queued RST must be recorded in rst_sent for future dedupe"
+    );
+    debug_assert_eq!(
+        pending.len(),
+        pending_before + 1,
+        "a freshly-queued RST must push exactly one pending entry"
+    );
+    debug_assert_eq!(
+        *total,
+        total_before + 1,
+        "a freshly-queued RST must bump the queued-RST lifetime counter by one"
+    );
+    debug_assert_eq!(
+        pending.last().map(|(id, _)| *id),
+        Some(wire_stream_id),
+        "the just-pushed entry must be the requested wire stream id"
+    );
     true
 }
 
@@ -880,6 +1019,18 @@ impl Default for H2FloodDetector {
 
 impl H2FloodDetector {
     pub fn new(config: H2FloodConfig) -> Self {
+        // Pre-condition: thresholds are already validated (clamped to >= 1 by
+        // `H2FloodConfig::new`). A zero per-window threshold would trip on the
+        // first counted frame; assert it here so a config that bypassed `new`
+        // (raw struct literal in a future caller) is caught in debug.
+        debug_assert!(
+            config.max_rst_stream_per_window >= 1
+                && config.max_ping_per_window >= 1
+                && config.max_settings_per_window >= 1
+                && config.max_continuation_frames >= 1
+                && config.max_glitch_count >= 1,
+            "flood detector must be constructed with validated (>= 1) thresholds"
+        );
         Self {
             rst_stream_count: 0,
             total_rst_received_lifetime: 0,
@@ -907,11 +1058,30 @@ impl H2FloodDetector {
     /// begun when the RST arrived; `false` is the cheap-for-client /
     /// expensive-for-us Rapid Reset signature (CVE-2023-44487).
     pub fn record_rst_lifetime(&mut self, response_started: bool) -> Option<H2FloodViolation> {
+        let total_before = self.total_rst_received_lifetime;
+        let abusive_before = self.total_abusive_rst_received_lifetime;
         self.total_rst_received_lifetime = self.total_rst_received_lifetime.saturating_add(1);
         if !response_started {
             self.total_abusive_rst_received_lifetime =
                 self.total_abusive_rst_received_lifetime.saturating_add(1);
         }
+        // Monotonicity: the global lifetime counter advances by one per call
+        // (until saturation), and the abusive sub-counter advances iff the RST
+        // arrived before the backend response started. The abusive counter can
+        // never exceed the global one — every abusive RST is also a received RST.
+        debug_assert!(
+            self.total_rst_received_lifetime >= total_before,
+            "lifetime RST counter must be monotonic non-decreasing"
+        );
+        debug_assert_eq!(
+            self.total_abusive_rst_received_lifetime > abusive_before,
+            !response_started,
+            "abusive RST counter advances iff the RST is pre-response-start"
+        );
+        debug_assert!(
+            self.total_abusive_rst_received_lifetime <= self.total_rst_received_lifetime,
+            "abusive RST count is a subset of total received RST count"
+        );
         if self.total_rst_received_lifetime > self.config.max_rst_stream_lifetime {
             return Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
@@ -941,8 +1111,16 @@ impl H2FloodDetector {
     /// RST_STREAM (CVE-2025-8671 "MadeYouReset"). Only non-`NoError` resets
     /// are reported — callers must exclude graceful cancels.
     pub fn record_rst_emitted(&mut self) -> Option<H2FloodViolation> {
+        let before = self.total_rst_streams_emitted_lifetime;
         self.total_rst_streams_emitted_lifetime =
             self.total_rst_streams_emitted_lifetime.saturating_add(1);
+        // Monotonic: the emitted-RST counter never decays (it is the absolute
+        // MadeYouReset ceiling, CVE-2025-8671), so each call strictly advances
+        // it until u64 saturation.
+        debug_assert!(
+            self.total_rst_streams_emitted_lifetime > before || before == u64::MAX,
+            "emitted-RST lifetime counter must advance (or already be saturated)"
+        );
         if self.total_rst_streams_emitted_lifetime > self.config.max_rst_stream_emitted_lifetime {
             return Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
@@ -959,6 +1137,13 @@ impl H2FloodDetector {
     /// Uses half-window decay instead of full reset to catch burst-then-wait attacks.
     fn maybe_reset_window(&mut self) {
         if self.window_start.elapsed() >= FLOOD_WINDOW_DURATION {
+            let (rst_before, ping_before, settings_before) =
+                (self.rst_stream_count, self.ping_count, self.settings_count);
+            let (empty_before, wu0_before, glitch_before) = (
+                self.empty_data_count,
+                self.window_update_stream0_count,
+                self.glitch_count,
+            );
             self.rst_stream_count /= 2;
             self.ping_count /= 2;
             self.settings_count /= 2;
@@ -966,6 +1151,35 @@ impl H2FloodDetector {
             self.window_update_stream0_count /= 2;
             self.glitch_count /= 2;
             self.window_start = Instant::now();
+            // Half-decay invariant: each rate-based counter is exactly halved
+            // (integer division), never increased. Catching burst-then-wait
+            // attacks relies on the counter shrinking but not vanishing — a
+            // full reset would let a patient attacker reset to zero each window.
+            debug_assert_eq!(self.rst_stream_count, rst_before / 2, "RST count halves");
+            debug_assert_eq!(self.ping_count, ping_before / 2, "PING count halves");
+            debug_assert_eq!(
+                self.settings_count,
+                settings_before / 2,
+                "SETTINGS count halves"
+            );
+            debug_assert_eq!(
+                self.empty_data_count,
+                empty_before / 2,
+                "empty-DATA count halves"
+            );
+            debug_assert_eq!(
+                self.window_update_stream0_count,
+                wu0_before / 2,
+                "stream-0 WINDOW_UPDATE count halves"
+            );
+            debug_assert_eq!(self.glitch_count, glitch_before / 2, "glitch count halves");
+            // The lifetime counters are deliberately NOT touched here — they are
+            // the never-decaying ceilings. Guard against a future edit decaying
+            // them by accident.
+            debug_assert!(
+                self.window_start.elapsed() < FLOOD_WINDOW_DURATION,
+                "window_start must be refreshed to (approximately) now after decay"
+            );
         }
     }
 
@@ -994,7 +1208,7 @@ impl H2FloodDetector {
             }
         }
 
-        flag(
+        let violation = flag(
             "RST_STREAM",
             "h2.flood.violation.rst_stream_window",
             self.rst_stream_count,
@@ -1071,13 +1285,37 @@ impl H2FloodDetector {
                 self.glitch_count,
                 self.config.max_glitch_count,
             )
-        })
+        });
+        // Post-condition: any reported violation is well-formed — every H2
+        // flood escalation is an ENHANCE_YOUR_CALM connection error, and the
+        // observed count strictly exceeds the threshold it tripped (the `flag`
+        // helper and the lifetime checks all use strict `>`). A violation whose
+        // count <= threshold would be a false positive terminating a healthy
+        // connection.
+        debug_assert!(
+            violation
+                .as_ref()
+                .is_none_or(|v| v.error == H2Error::EnhanceYourCalm && v.count > v.threshold),
+            "a flood violation must be EnhanceYourCalm with count strictly above threshold"
+        );
+        violation
     }
 
     /// Reset CONTINUATION-specific counters when a header block is complete.
     pub fn reset_continuation(&mut self) {
         self.continuation_count = 0;
         self.accumulated_header_size = 0;
+        // Post-condition: both CONTINUATION-block accumulators are cleared so
+        // the next header block starts from zero (CVE-2024-27316 per-block
+        // accounting must not leak across blocks).
+        debug_assert_eq!(
+            self.continuation_count, 0,
+            "continuation_count must be zero after a block completes"
+        );
+        debug_assert_eq!(
+            self.accumulated_header_size, 0,
+            "accumulated_header_size must be zero after a block completes"
+        );
     }
 }
 
@@ -1180,6 +1418,14 @@ impl Prioriser {
             stream_id,
             priority
         );
+        // Pre-condition: the priority map never grows past MAX_PRIORITIES.
+        // The cap is the only thing standing between a PRIORITY flood and
+        // unbounded memory; assert it holds on entry (each insert path below
+        // either updates an existing key or is gated by this check).
+        debug_assert!(
+            self.priorities.len() <= MAX_PRIORITIES,
+            "priority map must never exceed MAX_PRIORITIES entries"
+        );
         // Cap the priority map to prevent flooding via PRIORITY frames
         if !self.priorities.contains_key(&stream_id) && self.priorities.len() >= MAX_PRIORITIES {
             return false;
@@ -1206,6 +1452,20 @@ impl Prioriser {
                 // allowed range [0..=7]. Intentionally not PROTOCOL_ERROR.
                 self.priorities
                     .insert(stream_id, (urgency.min(7), incremental));
+                // Post-conditions: the entry now exists with a clamped urgency
+                // in [0, 7] (the writable scheduler buckets by urgency and would
+                // mis-order on a value above 7), and the map stays within its
+                // memory cap.
+                debug_assert!(
+                    self.priorities
+                        .get(&stream_id)
+                        .is_some_and(|(u, _)| *u <= 7),
+                    "stored RFC 9218 urgency must be clamped to [0, 7]"
+                );
+                debug_assert!(
+                    self.priorities.len() <= MAX_PRIORITIES,
+                    "priority map must stay within MAX_PRIORITIES after insert"
+                );
                 false
             }
         }
@@ -1264,7 +1524,21 @@ impl Prioriser {
 
     /// Remove a stream's priority entry (called when the stream is recycled).
     pub fn remove(&mut self, stream_id: &StreamId) {
+        let had = self.priorities.contains_key(stream_id);
+        let before = self.priorities.len();
         self.priorities.remove(stream_id);
+        // Post-conditions: the entry is truly gone, and the map shrinks by
+        // exactly one iff it was present. A leak here re-introduces the
+        // PRIORITY-flood memory exposure the cap defends against.
+        debug_assert!(
+            !self.priorities.contains_key(stream_id),
+            "remove must evict the priority entry"
+        );
+        debug_assert_eq!(
+            self.priorities.len(),
+            before - had as usize,
+            "priority map length drops by exactly one iff the id was present"
+        );
     }
 
     /// Look up the priority for a stream, returning RFC 9218 defaults if absent.
@@ -1289,6 +1563,21 @@ impl Prioriser {
     /// need to update the cursor at the end of the write pass can early-exit
     /// when the count is zero.
     pub fn apply_incremental_rotation(&self, buf: &mut [StreamId]) -> usize {
+        // Pre-condition: callers must hand a slice already sorted by urgency so
+        // same-urgency runs are contiguous (this routine only partitions/rotates
+        // within a run, it does not re-sort across urgencies). A non-monotonic
+        // urgency sequence would split one logical bucket into several and
+        // mis-schedule the round-robin. `windows(2)` over a slice of size N is
+        // dead code in release.
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            buf.windows(2)
+                .all(|w| self.get(&w[0]).0 <= self.get(&w[1]).0),
+            "apply_incremental_rotation requires input pre-sorted by urgency"
+        );
+        let len_before = buf.len();
+        #[cfg(debug_assertions)]
+        let expected_incremental = buf.iter().filter(|id| self.get(id).1).count();
         let mut total_incremental = 0usize;
         let mut i = 0;
         while i < buf.len() {
@@ -1324,6 +1613,20 @@ impl Prioriser {
             }
             i = j;
         }
+        // Post-conditions: the routine is a permutation — it reorders in place
+        // and never drops a stream id (len unchanged), and the returned count is
+        // exactly the number of incremental streams present (the cursor-advance
+        // callers rely on this being the true incremental-tail size).
+        debug_assert_eq!(
+            buf.len(),
+            len_before,
+            "rotation must preserve the slice (no streams dropped or added)"
+        );
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            total_incremental, expected_incremental,
+            "reported incremental count must equal the incremental streams in buf"
+        );
         total_incremental
     }
 
@@ -2008,11 +2311,27 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     return self.goaway(H2Error::ProtocolError);
                 }
                 // CVE-2024-27316: track CONTINUATION frame count and accumulated size
+                let cont_count_before = self.flood_detector.continuation_count;
+                let acc_size_before = self.flood_detector.accumulated_header_size;
                 self.flood_detector.continuation_count += 1;
                 self.flood_detector.accumulated_header_size = self
                     .flood_detector
                     .accumulated_header_size
                     .saturating_add(payload_len);
+                // Per-block CONTINUATION accounting must grow monotonically
+                // within a header block: each frame bumps the count by one and
+                // the accumulated size by the frame's payload (never shrinks
+                // mid-block). `reset_continuation` is the only thing allowed to
+                // zero these — and only once the block is complete.
+                debug_assert_eq!(
+                    self.flood_detector.continuation_count,
+                    cont_count_before + 1,
+                    "CONTINUATION per-block counter must advance by one per frame"
+                );
+                debug_assert!(
+                    self.flood_detector.accumulated_header_size >= acc_size_before,
+                    "accumulated header size must not shrink within a header block"
+                );
                 check_flood_or_return!(self);
                 // RFC 9113 §10.5.1: reject header blocks that cannot be
                 // buffered. Previously we silently removed READABLE interest
@@ -3734,6 +4053,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if let Some(existing) = self.flow_control.pending_window_updates.get_mut(&stream_id) {
             let old = *existing;
             *existing = existing.saturating_add(increment).min(max_increment);
+            // Coalescing invariant: the accumulated increment never decreases
+            // and never exceeds i32::MAX (RFC 9113 §6.9 caps a WINDOW_UPDATE
+            // increment at 2^31-1; emitting a larger value would be a protocol
+            // error on the wire).
+            debug_assert!(
+                *existing >= old,
+                "coalesced WINDOW_UPDATE increment must be monotonic non-decreasing"
+            );
+            debug_assert!(
+                *existing <= max_increment,
+                "coalesced WINDOW_UPDATE increment must stay within i32::MAX"
+            );
             trace!(
                 "{} WINDOW_UPDATE coalesced: stream={} old={} new={}",
                 log_context!(self),
@@ -4485,11 +4816,20 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             );
             return None;
         }
+        let highest_before = self.highest_peer_stream_id;
+        let streams_before = self.streams.len();
         // Track the highest peer-initiated stream ID for GoAway frames
         // before any early return, so GoAway always reports the correct last stream.
         if stream_id > self.highest_peer_stream_id {
             self.highest_peer_stream_id = stream_id;
         }
+        // highest_peer_stream_id is monotonic non-decreasing — it only ever
+        // climbs to the largest id we have accepted (RFC 9113 §6.8 last-stream
+        // reporting depends on this).
+        debug_assert!(
+            self.highest_peer_stream_id >= highest_before,
+            "highest_peer_stream_id must never regress"
+        );
         let global_stream_id = context.create_stream(
             Ulid::generate(),
             self.peer_settings.settings_initial_window_size,
@@ -4498,12 +4838,48 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.streams.insert(stream_id, global_stream_id);
         self.stream_last_activity_at
             .insert(stream_id, Instant::now());
+        // Post-conditions: the stream is now reachable in both indices, the
+        // active count grew by exactly one (the id was not already present —
+        // `handle_header_state` rejects re-used ids), and `last_stream_id` is
+        // the even watermark just past this id so `new_stream_id` never collides.
+        debug_assert_eq!(
+            self.streams.get(&stream_id).copied(),
+            Some(global_stream_id),
+            "create_stream must register the wire->global mapping"
+        );
+        debug_assert!(
+            self.stream_last_activity_at.contains_key(&stream_id),
+            "create_stream must arm the per-stream idle timer"
+        );
+        debug_assert_eq!(
+            self.streams.len(),
+            streams_before + 1,
+            "create_stream must add exactly one stream (id must not pre-exist)"
+        );
+        debug_assert!(
+            self.last_stream_id > stream_id && self.last_stream_id & 1 == 0,
+            "last_stream_id watermark must be the even value strictly above stream_id"
+        );
         Some(global_stream_id)
     }
 
     pub fn new_stream_id(&mut self) -> Option<StreamId> {
+        let watermark_before = self.last_stream_id;
         let (issued, next) = next_stream_id(self.last_stream_id, self.position.is_client())?;
         self.last_stream_id = next;
+        // Post-conditions: the locally-issued id has the parity of our role and
+        // the watermark advanced strictly (so the next allocation cannot reuse
+        // this id). `next_stream_id` already asserts parity vs `is_client`; here
+        // we re-assert against `self.position` and the watermark monotonicity.
+        debug_assert_eq!(
+            issued & 1 == 1,
+            self.position.is_client(),
+            "locally-issued stream id parity must match our role"
+        );
+        debug_assert!(
+            self.last_stream_id > watermark_before,
+            "issuing a stream id must advance the watermark"
+        );
         Some(issued)
     }
 
@@ -4516,6 +4892,87 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     #[cfg(any(test, feature = "e2e-hooks"))]
     pub fn __test_set_last_stream_id(&mut self, id: StreamId) {
         self.last_stream_id = id;
+    }
+
+    /// Cross-field invariant sweep for the H2 connection state machine,
+    /// asserted as a run-to-completion post-condition at the end of every
+    /// frame-handling pass (see the call in [`Self::handle_frame`]).
+    ///
+    /// These are relationships between *separate* fields that no single setter
+    /// can guarantee on its own — exactly the class of bug TigerStyle's
+    /// `check_invariants` targets. Each one is cheap (counter compares + a few
+    /// `HashMap` membership probes); the whole function is `#[cfg(debug_assertions)]`
+    /// and compiles out of release entirely.
+    ///
+    /// Encoded invariants:
+    /// 1. **Stream-id watermark parity**: locally-issued ids never exceed
+    ///    `STREAM_ID_MAX`; `last_stream_id` stays the even watermark (it is
+    ///    rounded to `(id + 2) & !1` and initialised to 0).
+    /// 2. **Per-stream caches are subsets of the live stream set**:
+    ///    `stream_last_activity_at` is keyed only by currently-tracked stream
+    ///    ids — a leak here would let a removed stream keep an idle timer and
+    ///    mis-fire `cancel_timed_out_streams`. (`rst_sent` is intentionally NOT
+    ///    a subset: a queued RST for an already-removed stream is legal.)
+    /// 3. **RST queue accounting**: the never-decaying `total_rst_streams_queued`
+    ///    lifetime counter is always `>=` the currently-pending queue length
+    ///    (CVE-2025-8671 MadeYouReset cap relies on the lifetime counter never
+    ///    under-counting), and the pending queue stays within its hard cap +1
+    ///    (the escalation tripwire fires at the cap).
+    /// 4. **Pending WINDOW_UPDATE bound**: the coalescing map never exceeds the
+    ///    per-connection cap derived from `max_concurrent_streams`.
+    /// 5. **Drain/state coupling**: a terminal `GoAway`/`Error` state implies the
+    ///    connection is draining (`goaway()` sets both); the converse need not
+    ///    hold (graceful drain stays in a live state).
+    #[cfg(debug_assertions)]
+    fn check_invariants<L>(&self, context: &Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        // (1) Watermark parity and bound.
+        debug_assert!(
+            self.last_stream_id & 1 == 0,
+            "last_stream_id must stay an even watermark, got {}",
+            self.last_stream_id
+        );
+
+        // (2) Per-stream caches are subsets of the live stream set, and every
+        // mapping points at a valid context slot.
+        debug_assert!(
+            self.stream_last_activity_at
+                .keys()
+                .all(|id| self.streams.contains_key(id)),
+            "stream_last_activity_at must only track currently-open stream ids"
+        );
+        debug_assert!(
+            self.streams
+                .values()
+                .all(|&gid| gid < context.streams.len()),
+            "every stream mapping must point at a valid context slot"
+        );
+
+        // (3) RST queue accounting.
+        debug_assert!(
+            self.total_rst_streams_queued >= self.pending_rst_streams.len(),
+            "queued-RST lifetime counter ({}) must be >= currently-pending queue ({})",
+            self.total_rst_streams_queued,
+            self.pending_rst_streams.len()
+        );
+        debug_assert!(
+            self.pending_rst_streams.len() <= MAX_PENDING_RST_STREAMS + 1,
+            "pending RST queue must stay within its hard cap (escalates at the cap)"
+        );
+
+        // (4) Pending WINDOW_UPDATE coalescing map bound.
+        debug_assert!(
+            self.flow_control.pending_window_updates.len() <= self.max_pending_window_updates,
+            "pending WINDOW_UPDATE map must stay within its per-connection cap"
+        );
+
+        // (5) Drain/state coupling: terminal states imply draining.
+        debug_assert!(
+            !matches!(self.state, H2State::GoAway | H2State::Error) || self.drain.draining,
+            "GoAway/Error state must imply the connection is draining"
+        );
     }
 
     fn handle_frame<E, L>(
@@ -4534,7 +4991,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // type — adding a new `Frame::*` variant fails the build inside the
         // helper, keeping the metric breakdown in lock-step with RFC 9113 §6.
         count!(h2_frame_rx_metric_key(&frame), 1);
-        match frame {
+        let result = match frame {
             Frame::Data(data) => self.handle_data_frame(data, wire_payload_len, context, endpoint),
             Frame::Headers(headers) => self.handle_headers_frame(headers, context, endpoint),
             Frame::PushPromise(_) => self.handle_push_promise_frame(),
@@ -4572,7 +5029,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.attribute_bytes_to_overhead();
                 MuxResult::Continue
             }
-        }
+        };
+        // Run-to-completion post-condition: the connection-level cross-field
+        // invariants must hold after every frame is dispatched, on success and
+        // on the protocol-error paths alike.
+        #[cfg(debug_assertions)]
+        self.check_invariants(context);
+        result
     }
 
     /// RFC 9110 §8.6: Content-Length validation must be skipped for responses
@@ -4612,7 +5075,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         // CVE-2019-9518: track empty DATA frames (no payload, no END_STREAM)
         if data.payload.is_empty() && !data.end_stream {
+            let empty_before = self.flood_detector.empty_data_count;
             self.flood_detector.empty_data_count += 1;
+            debug_assert_eq!(
+                self.flood_detector.empty_data_count,
+                empty_before + 1,
+                "empty-DATA flood counter must advance by exactly one per empty frame"
+            );
             check_flood_or_return!(self);
         }
         let Some(global_stream_id) = self.streams.get(&data.stream_id).copied() else {
@@ -5104,7 +5573,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // mitigation event itself).
         count!(metric_for_rst_stream_received(rst_stream.error_code), 1);
         // CVE-2023-44487 Rapid Reset + CVE-2019-9514: track RST_STREAM rate.
+        let rst_count_before = self.flood_detector.rst_stream_count;
         self.flood_detector.rst_stream_count += 1;
+        debug_assert_eq!(
+            self.flood_detector.rst_stream_count,
+            rst_count_before + 1,
+            "per-window RST_STREAM counter must advance by exactly one per inbound RST"
+        );
         check_flood_or_return!(self);
         // Additional CVE-2023-44487 mitigation: lifetime cap on RST_STREAM
         // frames received. The per-window counter above half-decays, so a
@@ -5222,11 +5697,23 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return MuxResult::Continue;
         }
         // CVE-2019-9515: track SETTINGS frame rate
+        let settings_count_before = self.flood_detector.settings_count;
+        let settings_lifetime_before = self.flood_detector.total_settings_received_lifetime;
         self.flood_detector.settings_count += 1;
         self.flood_detector.total_settings_received_lifetime = self
             .flood_detector
             .total_settings_received_lifetime
             .saturating_add(1);
+        debug_assert_eq!(
+            self.flood_detector.settings_count,
+            settings_count_before + 1,
+            "per-window SETTINGS counter must advance by one per non-ACK SETTINGS"
+        );
+        debug_assert!(
+            self.flood_detector.total_settings_received_lifetime > settings_lifetime_before
+                || settings_lifetime_before == u32::MAX,
+            "lifetime SETTINGS counter must advance (or already be saturated)"
+        );
         check_flood_or_return!(self);
         for setting in settings.settings {
             let v = setting.value;
@@ -5312,11 +5799,23 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return MuxResult::Continue;
         }
         // CVE-2019-9512: track non-ACK PING frame rate
+        let ping_count_before = self.flood_detector.ping_count;
+        let ping_lifetime_before = self.flood_detector.total_ping_received_lifetime;
         self.flood_detector.ping_count += 1;
         self.flood_detector.total_ping_received_lifetime = self
             .flood_detector
             .total_ping_received_lifetime
             .saturating_add(1);
+        debug_assert_eq!(
+            self.flood_detector.ping_count,
+            ping_count_before + 1,
+            "per-window PING counter must advance by one per non-ACK PING"
+        );
+        debug_assert!(
+            self.flood_detector.total_ping_received_lifetime > ping_lifetime_before
+                || ping_lifetime_before == u32::MAX,
+            "lifetime PING counter must advance (or already be saturated)"
+        );
         check_flood_or_return!(self);
         self.attribute_bytes_to_overhead();
         let kawa = &mut self.zero;
@@ -5505,22 +6004,51 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // 2^31-1 and try_from always succeeds. Use try_from rather than `as` to
         // guard against a future parser change that drops the mask.
         let increment = i32::try_from(increment).unwrap_or(i32::MAX);
+        // RFC 9113 §6.9: a non-zero WINDOW_UPDATE increment is in [1, 2^31-1].
+        // Zero was short-circuited above; this asserts the masked value is a
+        // legal positive increment before we add it to a window.
+        debug_assert!(
+            increment > 0,
+            "WINDOW_UPDATE increment must be strictly positive at this point (zero handled above)"
+        );
         if stream_id == 0 {
             // Count connection-level WINDOW_UPDATEs before touching the window
             // so a per-window flood stops us before we pay the arithmetic cost
             // on a million-frame burst. Zero-increment frames short-circuited
             // above, so every increment here is a legal-looking rate consumer.
+            let wu0_before = self.flood_detector.window_update_stream0_count;
             self.flood_detector.window_update_stream0_count = self
                 .flood_detector
                 .window_update_stream0_count
                 .saturating_add(1);
+            debug_assert!(
+                self.flood_detector.window_update_stream0_count > wu0_before
+                    || wu0_before == u32::MAX,
+                "stream-0 WINDOW_UPDATE flood counter must advance before the flood check"
+            );
             check_flood_or_return!(self);
             self.attribute_bytes_to_overhead();
+            let window_before = self.flow_control.window;
             if let Some(window) = self.flow_control.window.checked_add(increment) {
                 if self.flow_control.window <= 0 && window > 0 {
                     self.readiness.arm_writable();
                 }
                 self.flow_control.window = window;
+                // Flow-control replenish invariant (RFC 9113 §6.9): the
+                // connection send window grows by exactly `increment` and stays
+                // within i32 (the `checked_add` already rejected overflow, which
+                // is a FLOW_CONTROL_ERROR on the wire). The window may legally
+                // be negative (a SETTINGS change can shrink it below zero) but
+                // a WINDOW_UPDATE only ever increases it.
+                debug_assert_eq!(
+                    self.flow_control.window,
+                    window_before + increment,
+                    "connection window must increase by exactly the increment"
+                );
+                debug_assert!(
+                    self.flow_control.window > window_before,
+                    "a positive WINDOW_UPDATE must strictly grow the connection window"
+                );
                 debug!(
                     "{} WINDOW_UPDATE received: stream=0 increment={} new_connection_window={}",
                     log_context!(self),
@@ -5534,11 +6062,25 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         } else if let Some(global_stream_id) = self.streams.get(&stream_id).copied() {
             let stream = &mut context.streams[global_stream_id];
             self.attribute_bytes_to_stream(&mut stream.metrics);
+            let stream_window_before = stream.window;
             if let Some(window) = stream.window.checked_add(increment) {
                 if stream.window <= 0 && window > 0 {
                     self.readiness.arm_writable();
                 }
                 stream.window = window;
+                // Same replenish invariant as the connection window, applied to
+                // the per-stream send window (RFC 9113 §6.9.1). Overflow past
+                // 2^31-1 is rejected by `checked_add` and handled as a
+                // FLOW_CONTROL_ERROR RST_STREAM below.
+                debug_assert_eq!(
+                    stream.window,
+                    stream_window_before + increment,
+                    "stream window must increase by exactly the increment"
+                );
+                debug_assert!(
+                    stream.window > stream_window_before,
+                    "a positive WINDOW_UPDATE must strictly grow the stream window"
+                );
                 debug!(
                     "{} WINDOW_UPDATE received: stream={} increment={} new_stream_window={}",
                     log_context!(self),

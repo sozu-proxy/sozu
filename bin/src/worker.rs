@@ -89,6 +89,33 @@ pub fn begin_worker_process(
     command_buffer_size: u64,
     max_command_buffer_size: u64,
 ) -> Result<(), WorkerError> {
+    // The three descriptors were handed to us by the master via
+    // `fork_main_into_worker`, each derived from a live `as_raw_fd()`, so
+    // they are always valid (>= 0) and pairwise distinct — three separate
+    // kernel objects (command channel, SCM socket, state file). A negative
+    // value or a collision would mean the master's fd bookkeeping aliased
+    // two handoffs, an internal logic bug. (Stays a `debug_assert!`: a
+    // genuinely bad descriptor surfaces downstream as a returned channel /
+    // file error, never a panic.)
+    debug_assert!(
+        worker_to_main_channel_fd >= 0,
+        "inherited worker-to-main channel fd must be a valid descriptor"
+    );
+    debug_assert!(
+        worker_to_main_scm_fd >= 0,
+        "inherited worker-to-main SCM fd must be a valid descriptor"
+    );
+    debug_assert!(
+        configuration_state_fd >= 0,
+        "inherited configuration-state fd must be a valid descriptor"
+    );
+    debug_assert!(
+        worker_to_main_channel_fd != worker_to_main_scm_fd
+            && worker_to_main_channel_fd != configuration_state_fd
+            && worker_to_main_scm_fd != configuration_state_fd,
+        "the channel, SCM and state descriptors must be three distinct fds, never aliased"
+    );
+
     let mut worker_to_main_channel: Channel<WorkerResponse, ServerConfig> = Channel::new(
         // SAFETY: `worker_to_main_channel_fd` was just inherited from the
         // pre-exec parent process via the `--fd` CLI argument. It is a valid
@@ -119,6 +146,19 @@ pub fn begin_worker_process(
         .map_err(WorkerError::ReadChannel)?;
 
     let worker_id = format!("{}-{:02}", "WRK", id);
+
+    // The display id is derived purely from the numeric `id` the master
+    // assigned (`WorkerId`, a monotonic counter handed in via `--id`): it
+    // must carry the canonical `WRK-` prefix and embed that very id so log
+    // correlation between master and worker is unambiguous.
+    debug_assert!(
+        worker_id.starts_with("WRK-"),
+        "worker display id must carry the canonical WRK- prefix"
+    );
+    debug_assert!(
+        id < 0 || worker_id.ends_with(&id.to_string()),
+        "worker display id must embed the numeric worker id handed in by the master"
+    );
 
     let access_log_format = AccessLogFormat::from(&worker_config.access_log_format());
 
@@ -257,6 +297,19 @@ pub fn fork_main_into_worker(
         }
     })?;
 
+    // The three descriptors the worker child will inherit via its CLI args are
+    // distinct kernel objects — none handed off twice: the command channel
+    // (`worker_to_main`, `--fd`), the SCM socket (`worker_to_main_scm`,
+    // `--scm`) and the state file (`--configuration-state-fd`). A collision
+    // would alias two roles onto one fd after exec. (The SCM listener fds
+    // themselves travel separately over `send_listeners`, not as CLI args.)
+    debug_assert!(
+        worker_to_main.as_raw_fd() != worker_to_main_scm.as_raw_fd()
+            && worker_to_main.as_raw_fd() != state_file.as_raw_fd()
+            && worker_to_main_scm.as_raw_fd() != state_file.as_raw_fd(),
+        "worker channel, SCM and state descriptors must be three distinct fds, never aliased"
+    );
+
     let worker_config = ServerConfig::from(config);
 
     let mut main_to_worker_channel: Channel<ServerConfig, WorkerResponse> = Channel::new(
@@ -279,6 +332,15 @@ pub fn fork_main_into_worker(
     // image entirely — no inherited state matters after that point.
     match unsafe { fork().map_err(WorkerError::Fork)? } {
         ForkResult::Parent { child: worker_pid } => {
+            // A successful `fork()` returns the child's pid in the parent
+            // branch, which is always strictly positive (0 is the child
+            // branch, < 0 never reaches here — `fork` would have returned
+            // `Err`). A non-positive pid here would mean we mis-classified
+            // the fork outcome and are about to register a bogus worker.
+            debug_assert!(
+                worker_pid.as_raw() > 0,
+                "fork parent branch must observe a strictly positive child pid"
+            );
             info!("launching worker {} with pid {}", worker_id, worker_pid);
             main_to_worker_channel
                 .write_message(&worker_config)

@@ -183,6 +183,16 @@ impl Template {
         } else {
             return Err(TemplateError::InvalidType);
         };
+        // Post (status validity): a template that reached `is_main_phase()`
+        // above carries a syntactically valid response status line. HTTP
+        // status codes are exactly 3 digits (RFC 9110 §15), so the parsed
+        // code is bounded to `100..=999`. Downstream `save_http_status_metric`
+        // buckets on this range; an out-of-band code would silently fall into
+        // the `STATUS_OTHER` bucket.
+        debug_assert!(
+            (100..=999).contains(&resolved_status),
+            "parsed template status must be a 3-digit HTTP code, got {resolved_status}"
+        );
         let buf = kawa.storage.buffer();
         let mut blocks = VecDeque::new();
         let mut header_replacements = Vec::new();
@@ -292,6 +302,19 @@ impl Template {
                                             data: Store::new_slice(buf, &data[start..i]),
                                         }));
                                     }
+                                    // Pre (no underflow): the `%NAME` literal we
+                                    // are about to remove from the running
+                                    // body-size total (`%` + the variable name)
+                                    // was counted into `body_size` when this
+                                    // chunk's bytes were added above, so the
+                                    // subtraction cannot underflow.
+                                    debug_assert!(
+                                        body_size > variable.name.len(),
+                                        "body_size accounting underflow: {} < %{} ({} bytes)",
+                                        body_size,
+                                        variable.name,
+                                        variable.name.len() + 1
+                                    );
                                     body_size -= variable.name.len() + 1;
                                     start = i + variable.name.len() + 1;
                                     i += variable.name.len();
@@ -330,6 +353,31 @@ impl Template {
             }
         }
         kawa.blocks = blocks;
+        // Post (replacement bookkeeping): every replacement we recorded points
+        // at a block index that exists in the pre-baked sequence — `fill`
+        // indexes `blocks[replacement.block_index]` directly, so a stale index
+        // would be an out-of-bounds panic on the hot path. Both replacement
+        // lists are bounded by the block count.
+        debug_assert!(
+            header_replacements
+                .iter()
+                .chain(body_replacements.iter())
+                .all(|r| r.block_index < kawa.blocks.len()),
+            "every replacement index must address a block within the pre-baked sequence"
+        );
+        // Post (one ContentLength): at most one block is wired to the
+        // auto-computed `Content-Length` placeholder — duplicate
+        // `Content-Length` is a CWE-444 request-smuggling primitive and is
+        // rejected via `AlreadyConsumed` above, so the rendered response must
+        // never carry two.
+        debug_assert!(
+            header_replacements
+                .iter()
+                .filter(|r| matches!(r.typ, ReplacementType::ContentLength))
+                .count()
+                <= 1,
+            "at most one Content-Length placeholder may survive template compilation"
+        );
         Ok(Self {
             status: resolved_status,
             keep_alive,
@@ -347,6 +395,33 @@ impl Template {
         variables: &[Vec<u8>],
         variables_once: &mut [Vec<u8>],
     ) -> DefaultAnswerStream {
+        // Pre (slot coverage): every `Variable(i)` / `VariableOnce(i)` recorded
+        // at compile time must have a runtime slot supplied by the caller.
+        // `Template::new` re-indexes the variables into contiguous slots, so
+        // the caller's vectors must be at least as long as the highest index
+        // referenced. A short vector would be an out-of-bounds index panic on
+        // the hot path; this surfaces the caller/template mismatch loudly in
+        // debug while staying a plain index in release.
+        #[cfg(debug_assertions)]
+        for replacement in self
+            .body_replacements
+            .iter()
+            .chain(&self.header_replacements)
+        {
+            match replacement.typ {
+                ReplacementType::Variable(i) => debug_assert!(
+                    i < variables.len(),
+                    "Variable({i}) has no runtime slot (only {} supplied)",
+                    variables.len()
+                ),
+                ReplacementType::VariableOnce(i) => debug_assert!(
+                    i < variables_once.len(),
+                    "VariableOnce({i}) has no runtime slot (only {} supplied)",
+                    variables_once.len()
+                ),
+                ReplacementType::ContentLength => {}
+            }
+        }
         let mut blocks = self.kawa.blocks.clone();
         let mut body_size = self.body_size;
         for replacement in &self.body_replacements {
@@ -391,6 +466,17 @@ impl Template {
                 }
             }
         }
+        // Post (body-size monotonicity): substituting runtime values only ever
+        // adds bytes on top of the template's literal body, so the rendered
+        // total cannot be smaller than the compile-time `body_size` of the
+        // literal-only body. A regression that subtracted here would render a
+        // short `Content-Length` and truncate the answer on the wire.
+        debug_assert!(
+            body_size >= self.body_size,
+            "rendered body_size {} must not be below the template's literal body_size {}",
+            body_size,
+            self.body_size
+        );
         Kawa {
             storage: Buffer::new(self.kawa.storage.buffer.clone()),
             blocks,
@@ -1188,6 +1274,15 @@ impl HttpAnswers {
             _ => return None,
         };
         let template = Self::template(name, answer_str).ok()?;
+        // The redirect template name (`"301"`/`"302"`/`"308"`) pins the
+        // expected status at compile time (`Template::new(Some(code), …)`), so
+        // a successfully compiled template's status must equal the requested
+        // redirect code. The doc comment promises callers `template.status ==
+        // code`; this guards that contract against a future name/code skew.
+        debug_assert_eq!(
+            template.status, code,
+            "inline redirect template status must match the requested redirect code"
+        );
         // Variable order must match the matching `DefaultAnswer::Answer{301,302,308}`
         // arm of `HttpAnswers::get`: `(ROUTE, REQUEST_ID)` are persistent
         // `Variable` slots, `REDIRECT_LOCATION` is the once slot.
@@ -1358,6 +1453,16 @@ impl HttpAnswers {
             .and_then(|answers| answers.get(name))
             .or_else(|| self.listener_answers.get(name))
             .unwrap_or(&self.fallback);
+        // Post (resolved status validity): the template we selected was
+        // validated to carry a 3-digit status at `Template::new` time; the
+        // lookup chain (per-cluster → listener → fallback) can never produce a
+        // template with an out-of-range status. The returned code feeds
+        // `self.context.status` and `save_http_status_metric`.
+        debug_assert!(
+            (100..=999).contains(&template.status),
+            "resolved answer status must be a 3-digit HTTP code, got {}",
+            template.status
+        );
         (
             template.status,
             template.keep_alive,

@@ -117,14 +117,23 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
         if self.header.is_none() {
             if let Ok(local_addr) = self.front_socket().local_addr() {
                 if let Ok(frontend_addr) = self.front_socket().peer_addr() {
-                    self.header = Some(
-                        ProxyProtocolHeader::V2(HeaderV2::new(
-                            Command::Proxy,
-                            frontend_addr,
-                            local_addr,
-                        ))
-                        .into_bytes(),
+                    let v2 = HeaderV2::new(Command::Proxy, frontend_addr, local_addr);
+                    let declared_len = v2.len();
+                    let serialized = ProxyProtocolHeader::V2(v2).into_bytes();
+                    // Send postcondition: the byte vector we will stream out is
+                    // exactly the length the header model declared. The cursor
+                    // logic below relies on `header.len()` being this serialized
+                    // size to detect completion.
+                    debug_assert_eq!(
+                        serialized.len(),
+                        declared_len,
+                        "serialized send header length must match HeaderV2::len()"
                     );
+                    debug_assert!(
+                        serialized.len() >= 16,
+                        "a v2 send header is at least its 16-byte fixed prefix"
+                    );
+                    self.header = Some(serialized);
                 } else {
                     return SessionResult::Close;
                 }
@@ -134,9 +143,32 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
         if let Some(ref mut socket) = self.backend {
             if let Some(ref mut header) = self.header {
                 loop {
+                    // The cursor never overruns the serialized header: it only
+                    // advances by reported write sizes and stops at `len()`.
+                    debug_assert!(
+                        self.cursor_header <= header.len(),
+                        "send cursor must stay within the serialized header"
+                    );
+                    let remaining = header.len() - self.cursor_header;
                     match socket.write(&header[self.cursor_header..]) {
                         Ok(sz) => {
+                            debug_assert!(
+                                sz <= remaining,
+                                "socket.write cannot send more than the unsent header tail"
+                            );
+                            let cursor_before = self.cursor_header;
                             self.cursor_header += sz;
+                            // Strictly monotonic: the cursor tracks exactly the
+                            // bytes emitted and never passes the header length.
+                            debug_assert_eq!(
+                                self.cursor_header,
+                                cursor_before + sz,
+                                "send cursor advances by exactly the bytes written"
+                            );
+                            debug_assert!(
+                                self.cursor_header <= header.len(),
+                                "send cursor must not pass the header length"
+                            );
                             count!(names::backend::BACK_BYTES_OUT, sz as i64);
                             metrics.backend_bout += sz;
 

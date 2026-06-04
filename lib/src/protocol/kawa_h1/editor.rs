@@ -70,13 +70,44 @@ fn random_id<const N: usize>() -> [u8; N] {
 
 #[cfg(feature = "opentelemetry")]
 fn build_traceparent(trace_id: &[u8; 32], parent_id: &[u8; 16]) -> [u8; 55] {
+    // Pre: the ids are hex (they come from a parsed traceparent or our own
+    // hex `random_id`). Hex digits are inherently CR/LF-free, so this also
+    // upholds the anti-injection guarantee for the value we splice into the
+    // `traceparent` header. Inline (not via `is_crlf_free`) so the release
+    // build under `--features opentelemetry` still compiles (HARD RULE 2).
+    debug_assert!(
+        trace_id.iter().all(u8::is_ascii_hexdigit) && parent_id.iter().all(u8::is_ascii_hexdigit),
+        "traceparent ids must be hex (CR/LF-free header value)"
+    );
     let mut buf = [0; 55];
     buf[..3].copy_from_slice(b"00-");
     buf[3..35].copy_from_slice(trace_id);
     buf[35] = b'-';
     buf[36..52].copy_from_slice(parent_id);
     buf[52..55].copy_from_slice(b"-01");
+    // Post: the value is exactly the `00-<trace>-<parent>-01` shape with the
+    // dash separators at the fixed offsets the parser expects.
+    debug_assert!(
+        buf[2] == b'-' && buf[35] == b'-' && buf[52] == b'-',
+        "traceparent must carry dash separators at fixed offsets"
+    );
     buf
+}
+
+/// `true` when `bytes` contains no CR or LF — the anti-injection
+/// invariant for any header value Sōzu serialises onto the wire. A value
+/// carrying a raw CR/LF could split one header into two (request/response
+/// smuggling, CWE-93/CWE-113).
+///
+/// Compiled in EVERY profile (HARD RULE 2): it is referenced inside plain
+/// `debug_assert!` calls whose arguments still compile with
+/// `debug_assertions` OFF, so a `#[cfg(debug_assertions)]` gate would break
+/// the release build with E0425. In release it is only reached from
+/// optimised-out `debug_assert!` bodies, so the optimiser drops it — hence
+/// `#[allow(dead_code)]` to keep `-D warnings` clean.
+#[allow(dead_code)]
+fn is_crlf_free(bytes: &[u8]) -> bool {
+    !bytes.iter().any(|b| *b == b'\r' || *b == b'\n')
 }
 
 /// Write the ";for=..;by=.." portion of a Forwarded header into `buf`
@@ -90,6 +121,7 @@ fn build_traceparent(trace_id: &[u8; 32], parent_id: &[u8; 16]) -> [u8; 55] {
 /// (`_7239_print_ip6` in `src/http_ext.c`), which is the de-facto reference
 /// implementation of RFC 7239 in the proxy world. See sozu issue #1254.
 fn write_forwarded_for_by(buf: &mut Vec<u8>, peer_ip: IpAddr, peer_port: u16, public_ip: IpAddr) {
+    let before = buf.len();
     buf.extend_from_slice(b";for=\"");
     write_ip_literal(buf, peer_ip);
     buf.push(b':');
@@ -106,12 +138,27 @@ fn write_forwarded_for_by(buf: &mut Vec<u8>, peer_ip: IpAddr, peer_port: u16, pu
             buf.push(b'"');
         }
     }
+    // Post: the fragment grew the buffer and the whole appended span is
+    // CR/LF-free — it is spliced verbatim into a `Forwarded` header value,
+    // so a stray CR/LF would let an attacker-influenced peer address split
+    // the header (CWE-93). `peer_ip`/`public_ip` are `IpAddr` and the port
+    // is a `u16`, so no untrusted bytes reach here, but the guard pins the
+    // anti-injection contract against future edits to this fragment.
+    debug_assert!(
+        buf.len() > before,
+        "the Forwarded ;for=;by= fragment must emit bytes"
+    );
+    debug_assert!(
+        is_crlf_free(&buf[before..]),
+        "the Forwarded fragment must be CR/LF-free (anti-injection)"
+    );
 }
 
 /// Write an `IP-literal` per RFC 3986 §3.2.2 / RFC 7239 §6: IPv4 verbatim,
 /// IPv6 wrapped in `[...]`. Caller is responsible for any surrounding quotes
 /// required by the embedding syntax (RFC 7239 mandates them for IPv6).
 fn write_ip_literal(buf: &mut Vec<u8>, ip: IpAddr) {
+    let before = buf.len();
     match ip {
         IpAddr::V4(_) => {
             let _ = write!(buf, "{ip}");
@@ -122,6 +169,21 @@ fn write_ip_literal(buf: &mut Vec<u8>, ip: IpAddr) {
             buf.push(b']');
         }
     }
+    // Post: a non-empty literal was appended (every IpAddr renders to at
+    // least one byte) and the emitted bytes carry no CR/LF — an IpAddr can
+    // only render `[0-9a-fA-F:.]` plus the brackets we add, so this is a
+    // belt-and-suspenders guard on the value we splice into a header.
+    debug_assert!(buf.len() > before, "write_ip_literal must emit bytes");
+    debug_assert!(
+        is_crlf_free(&buf[before..]),
+        "an IP literal spliced into a header must be CR/LF-free"
+    );
+    // IPv6 is bracketed on both ends; IPv4 is bare (RFC 3986 §3.2.2).
+    debug_assert_eq!(
+        matches!(ip, IpAddr::V6(_)),
+        buf[before] == b'[' && buf[buf.len() - 1] == b']',
+        "IPv6 literals are bracketed, IPv4 literals are not"
+    );
 }
 
 /// Write ", proto=<proto>;for=..;by=.." (the suffix appended to an existing Forwarded value).
@@ -132,9 +194,32 @@ fn write_forwarded_suffix(
     peer_port: u16,
     public_ip: IpAddr,
 ) {
+    // Pre: `proto` is the proxy-chosen scheme label ("http"/"https"), never
+    // attacker-controlled — assert it carries no CR/LF before it is spliced
+    // into the `Forwarded` value (anti-injection, CWE-93).
+    debug_assert!(
+        is_crlf_free(proto.as_bytes()),
+        "the proto label spliced into Forwarded must be CR/LF-free"
+    );
+    let before = buf.len();
     buf.extend_from_slice(b", proto=");
     buf.extend_from_slice(proto.as_bytes());
     write_forwarded_for_by(buf, peer_ip, peer_port, public_ip);
+    // Post: the suffix grew the buffer, begins with the `, proto=`
+    // separator (so it appends cleanly to an existing value), and the whole
+    // appended span is CR/LF-free.
+    debug_assert!(
+        buf.len() > before + b", proto=".len(),
+        "the Forwarded suffix must emit the separator plus a value"
+    );
+    debug_assert!(
+        buf[before..].starts_with(b", proto="),
+        "the Forwarded suffix must start with the `, proto=` separator"
+    );
+    debug_assert!(
+        is_crlf_free(&buf[before..]),
+        "the Forwarded suffix must be CR/LF-free (anti-injection)"
+    );
 }
 
 /// This is the container used to store and use information about the session from within a Kawa parser callback
@@ -471,6 +556,11 @@ impl HttpContext {
     ///   - user-agent
     ///   - x-request-id (preserved if present, else derived from `self.id`)
     fn on_request_headers(&mut self, request: &mut GenericHttpStream) {
+        // Editing never drops a block — it only elides in place (key set to
+        // Empty, length preserved) or pushes new headers. Snapshot the count
+        // so the postcondition can pin "blocks only grow" for the whole edit.
+        let blocks_at_entry = request.blocks.len();
+
         let buf = request.storage.mut_buffer();
 
         // Captures the request line
@@ -504,6 +594,15 @@ impl HttpContext {
             _ => unreachable!(),
         };
 
+        // `proto` is the proxy-resolved scheme label, sourced from the
+        // listener protocol (never from request bytes). The match above
+        // already rejects anything but HTTP/HTTPS; pin that it is one of the
+        // two CR/LF-free literals we splice into forwarding headers.
+        debug_assert!(
+            proto == "http" || proto == "https",
+            "proto must be the http/https scheme label"
+        );
+
         // Find and remove the sticky_name cookie
         // if found its value is stored in sticky_session_found
         for cookie in &mut request.detached.jar {
@@ -512,6 +611,12 @@ impl HttpContext {
                 let val = cookie.val.data(buf);
                 self.sticky_session_found = from_utf8(val).ok().map(ToOwned::to_owned);
                 cookie.elide();
+                // Post: the matched sticky cookie is gone from the forwarded
+                // jar so the backend never sees Sōzu's own session cookie.
+                debug_assert!(
+                    cookie.is_elided(),
+                    "the matched sticky cookie must be elided after capture"
+                );
             }
         }
 
@@ -596,7 +701,17 @@ impl HttpContext {
                         // HEADERS frames bypass this callback; they are
                         // covered by the matching elision in
                         // `pkawa::handle_trailer`.
+                        debug_assert!(
+                            self.elide_x_real_ip,
+                            "X-Real-IP is only elided when anti-spoofing is enabled"
+                        );
                         header.elide();
+                        // Post: the spoofable client value is stripped before
+                        // forwarding (anti-spoofing invariant, CWE-348).
+                        debug_assert!(
+                            header.is_elided(),
+                            "client X-Real-IP must be elided when elide_x_real_ip is set"
+                        );
                     } else if compare_no_case(key, b"Forwarded") {
                         forwarded = Some(header);
                     } else if compare_no_case(key, b"User-Agent") {
@@ -672,31 +787,77 @@ impl HttpContext {
             let mut hdr_buf = Vec::with_capacity(128);
 
             if let Some(header) = x_for {
+                let prior_len = header.val.data(buf).len();
                 hdr_buf.extend_from_slice(header.val.data(buf));
                 let _ = write!(hdr_buf, ", {peer_ip}");
+                // Pre: we only ever extend the client-attested chain — the
+                // existing value stays a prefix and we appended the `, ip`
+                // separator, so the rewritten value is strictly longer and
+                // CR/LF-free (else the appended peer would split the header).
+                debug_assert!(
+                    hdr_buf.len() > prior_len,
+                    "X-Forwarded-For append must grow the value"
+                );
+                debug_assert!(
+                    is_crlf_free(&hdr_buf[prior_len..]),
+                    "the X-Forwarded-For hop we append must be CR/LF-free (anti-injection)"
+                );
                 header.val = kawa::Store::from_vec(std::mem::take(&mut hdr_buf));
             }
             if let Some(header) = &mut forwarded {
+                let prior_len = header.val.data(buf).len();
                 hdr_buf.extend_from_slice(header.val.data(buf));
                 write_forwarded_suffix(&mut hdr_buf, proto, peer_ip, peer_port, public_ip);
+                // Pre: same contract for the structured `Forwarded` chain —
+                // the existing value is preserved as a prefix and our suffix
+                // is CR/LF-free (`write_forwarded_suffix` asserts the suffix
+                // span too; this pins it relative to the prior value).
+                debug_assert!(
+                    hdr_buf.len() > prior_len,
+                    "Forwarded append must grow the value"
+                );
+                debug_assert!(
+                    is_crlf_free(&hdr_buf[prior_len..]),
+                    "the Forwarded element we append must be CR/LF-free (anti-injection)"
+                );
                 header.val = kawa::Store::from_vec(std::mem::take(&mut hdr_buf));
             }
 
             if !has_x_for {
+                let blocks_before = request.blocks.len();
                 let _ = write!(hdr_buf, "{peer_ip}");
+                debug_assert!(
+                    is_crlf_free(&hdr_buf),
+                    "a synthesised X-Forwarded-For value must be CR/LF-free"
+                );
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"X-Forwarded-For"),
                     val: kawa::Store::from_vec(std::mem::take(&mut hdr_buf)),
                 }));
+                debug_assert_eq!(
+                    request.blocks.len(),
+                    blocks_before + 1,
+                    "creating X-Forwarded-For must push exactly one block"
+                );
             }
             if !has_forwarded {
+                let blocks_before = request.blocks.len();
                 hdr_buf.extend_from_slice(b"proto=");
                 hdr_buf.extend_from_slice(proto.as_bytes());
                 write_forwarded_for_by(&mut hdr_buf, peer_ip, peer_port, public_ip);
+                debug_assert!(
+                    is_crlf_free(&hdr_buf),
+                    "a synthesised Forwarded value must be CR/LF-free"
+                );
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"Forwarded"),
                     val: kawa::Store::from_vec(std::mem::take(&mut hdr_buf)),
                 }));
+                debug_assert_eq!(
+                    request.blocks.len(),
+                    blocks_before + 1,
+                    "creating Forwarded must push exactly one block"
+                );
             }
 
             // Inject a proxy-generated `X-Real-IP` header carrying the
@@ -710,11 +871,27 @@ impl HttpContext {
             // header is appended last so order in the resulting block
             // list is deterministic for tests.
             if self.send_x_real_ip {
+                let blocks_before = request.blocks.len();
+                debug_assert!(
+                    hdr_buf.is_empty(),
+                    "the header scratch buffer was taken before reuse"
+                );
                 let _ = write!(hdr_buf, "{peer_ip}");
+                // The proxy-generated value is a rendered IpAddr — non-empty
+                // and CR/LF-free, so it cannot inject a second header.
+                debug_assert!(
+                    !hdr_buf.is_empty() && is_crlf_free(&hdr_buf),
+                    "the injected X-Real-IP value must be a CR/LF-free IP"
+                );
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"X-Real-IP"),
                     val: kawa::Store::from_vec(std::mem::take(&mut hdr_buf)),
                 }));
+                debug_assert_eq!(
+                    request.blocks.len(),
+                    blocks_before + 1,
+                    "injecting X-Real-IP must push exactly one block"
+                );
             }
         }
 
@@ -761,6 +938,12 @@ impl HttpContext {
             incr!(names::http::X_REQUEST_ID_PROPAGATED);
         } else {
             let value = self.id.to_string();
+            // The generated id is a ULID rendering — Crockford base-32, so
+            // CR/LF-free by construction.
+            debug_assert!(
+                is_crlf_free(value.as_bytes()),
+                "the generated X-Request-Id must be CR/LF-free"
+            );
             request.push_block(kawa::Block::Header(kawa::Pair {
                 key: kawa::Store::Static(b"X-Request-Id"),
                 val: kawa::Store::from_string(value.clone()),
@@ -768,13 +951,34 @@ impl HttpContext {
             self.x_request_id = Some(value);
             incr!(names::http::X_REQUEST_ID_GENERATED);
         }
+        // Either branch leaves the forwarded value recorded for the access
+        // log so it matches exactly what the backend receives.
+        debug_assert!(
+            self.x_request_id.is_some(),
+            "on_request_headers must record the forwarded X-Request-Id"
+        );
 
         // Create a custom correlation header (defaults to "Sozu-Id", can be
         // renamed via the `sozu_id_header` listener config knob).
+        let blocks_before_sozu_id = request.blocks.len();
         request.push_block(kawa::Block::Header(kawa::Pair {
             key: kawa::Store::from_string(self.sozu_id_header.clone()),
             val: kawa::Store::from_string(self.id.to_string()),
         }));
+        debug_assert_eq!(
+            request.blocks.len(),
+            blocks_before_sozu_id + 1,
+            "the Sozu-Id correlation header must be pushed exactly once"
+        );
+
+        // Postcondition: the whole edit only ever added or elided headers —
+        // the block count is monotonically non-decreasing (a removed header
+        // is elided in place, never popped), so the backend never loses a
+        // header it should have seen.
+        debug_assert!(
+            request.blocks.len() >= blocks_at_entry,
+            "header editing must never drop a block from the request"
+        );
     }
 
     /// Callback for response:
@@ -785,6 +989,10 @@ impl HttpContext {
     ///   - reason
     ///   - back keep-alive
     fn on_response_headers(&mut self, response: &mut GenericHttpStream) {
+        // Like the request path, response editing only adds or elides — pin
+        // the entry count so the postcondition can assert "blocks only grow".
+        let blocks_at_entry = response.blocks.len();
+
         let buf = &mut response.storage.mut_buffer();
 
         // Captures the response line
@@ -824,28 +1032,77 @@ impl HttpContext {
         // create a "Set-Cookie" header to update the sticky_name value
         if let Some(sticky_session) = &self.sticky_session {
             if self.sticky_session != self.sticky_session_found {
+                let blocks_before = response.blocks.len();
                 let mut cookie_buf =
                     Vec::with_capacity(self.sticky_name.len() + 1 + sticky_session.len() + 8);
                 cookie_buf.extend_from_slice(self.sticky_name.as_bytes());
                 cookie_buf.push(b'=');
                 cookie_buf.extend_from_slice(sticky_session.as_bytes());
                 cookie_buf.extend_from_slice(b"; Path=/");
+                // The cookie value is `name=session; Path=/`, built from the
+                // proxy-controlled sticky name + session id — assert it is
+                // well-formed (contains the `=` separator, ends with the
+                // attribute suffix) and CR/LF-free so it cannot inject an
+                // extra Set-Cookie / split the response (CWE-113).
+                debug_assert!(
+                    cookie_buf.contains(&b'='),
+                    "the Set-Cookie value must carry the name=value separator"
+                );
+                debug_assert!(
+                    cookie_buf.ends_with(b"; Path=/"),
+                    "the Set-Cookie value must end with the Path attribute"
+                );
+                debug_assert!(
+                    is_crlf_free(&cookie_buf),
+                    "the synthesised Set-Cookie value must be CR/LF-free (anti-injection)"
+                );
                 response.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"Set-Cookie"),
                     val: kawa::Store::from_vec(cookie_buf),
                 }));
+                debug_assert_eq!(
+                    response.blocks.len(),
+                    blocks_before + 1,
+                    "synthesising Set-Cookie must push exactly one block"
+                );
             }
         }
 
         // Create a custom correlation header (defaults to "Sozu-Id", can be
         // renamed via the `sozu_id_header` listener config knob).
+        let blocks_before_sozu_id = response.blocks.len();
         response.push_block(kawa::Block::Header(kawa::Pair {
             key: kawa::Store::from_string(self.sozu_id_header.clone()),
             val: kawa::Store::from_string(self.id.to_string()),
         }));
+        debug_assert_eq!(
+            response.blocks.len(),
+            blocks_before_sozu_id + 1,
+            "the Sozu-Id correlation header must be pushed exactly once"
+        );
+
+        // Postcondition: response editing only added or elided headers, so
+        // the block count never decreased.
+        debug_assert!(
+            response.blocks.len() >= blocks_at_entry,
+            "header editing must never drop a block from the response"
+        );
     }
 
     pub fn reset(&mut self) {
+        // Snapshot the connection-scoped identity + TLS/listener fields that
+        // reset() must NOT touch (set once at handshake, reused across every
+        // keep-alive request). Cheap to copy — all `Copy`. Read only inside
+        // the postcondition `debug_assert!`s below, so dead code in release.
+        let session_id_before = self.session_id;
+        let id_before = self.id;
+        let strict_sni_before = self.strict_sni_binding;
+        let elide_before = self.elide_x_real_ip;
+        let send_before = self.send_x_real_ip;
+        let tls_version_before = self.tls_version;
+        let tls_cipher_before = self.tls_cipher;
+        let tls_alpn_before = self.tls_alpn;
+
         self.keep_alive_backend = true;
         self.keep_alive_frontend = true;
         self.sticky_session_found = None;
@@ -866,6 +1123,37 @@ impl HttpContext {
         // connection-scoped — set once at handshake completion and reused
         // across every keep-alive request, so reset() intentionally leaves
         // them in place.
+
+        // Post: request-scoped state is fully cleared (a stale value here
+        // would leak across pipelined requests on the same connection).
+        debug_assert!(
+            self.method.is_none()
+                && self.authority.is_none()
+                && self.path.is_none()
+                && self.status.is_none()
+                && self.x_request_id.is_none()
+                && self.headers_response.is_empty(),
+            "reset() must clear all request-scoped state"
+        );
+        debug_assert!(
+            self.keep_alive_backend && self.keep_alive_frontend,
+            "reset() must restore keep-alive to its optimistic default"
+        );
+        // Post: connection-scoped identity + TLS/listener knobs are untouched.
+        debug_assert_eq!(
+            self.session_id, session_id_before,
+            "reset() must preserve the connection session id"
+        );
+        debug_assert_eq!(self.id, id_before, "reset() must preserve the request id");
+        debug_assert!(
+            self.strict_sni_binding == strict_sni_before
+                && self.elide_x_real_ip == elide_before
+                && self.send_x_real_ip == send_before
+                && self.tls_version == tls_version_before
+                && self.tls_cipher == tls_cipher_before
+                && self.tls_alpn == tls_alpn_before,
+            "reset() must preserve connection-scoped TLS/listener knobs"
+        );
     }
 
     pub fn extract_route(&self) -> Result<(&str, &str, &Method), RetrieveClusterError> {
@@ -876,6 +1164,15 @@ impl HttpContext {
             .ok_or(RetrieveClusterError::NoHost)?;
         let given_path = self.path.as_deref().ok_or(RetrieveClusterError::NoPath)?;
 
+        // Post: the triple is returned in (authority, path, method) order —
+        // pin it against a future field-swap regression that would route to
+        // the wrong cluster. (Both fields can be empty strings on the wire,
+        // so we assert the mapping, not non-emptiness.)
+        debug_assert!(
+            std::ptr::eq(given_authority, self.authority.as_deref().unwrap())
+                && std::ptr::eq(given_path, self.path.as_deref().unwrap()),
+            "extract_route must return (authority, path, method) in order"
+        );
         Ok((given_authority, given_path, given_method))
     }
 
@@ -903,12 +1200,21 @@ impl HttpContext {
     }
 
     pub fn log_context(&self) -> LogContext<'_> {
-        LogContext {
+        let ctx = LogContext {
             session_id: self.session_id,
             request_id: Some(self.id),
             cluster_id: self.cluster_id.as_deref(),
             backend_id: self.backend_id.as_deref(),
-        }
+        };
+        // The access-log bracket `[session req cluster backend]` is keyed on
+        // session + request id; both must always be present so the log line
+        // is correlatable. cluster/backend are legitimately absent before
+        // routing, so they are not asserted here.
+        debug_assert!(
+            ctx.request_id.is_some(),
+            "log_context must always carry the request id for correlation"
+        );
+        ctx
     }
 }
 

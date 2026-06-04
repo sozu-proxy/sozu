@@ -166,6 +166,27 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
         let private_key = PrivateKeyDer::from_pem_slice(cert.key.as_bytes())
             .map_err(|_| CertificateResolverError::EmptyKeys)?;
 
+        // Postconditions of chain assembly: the leaf was pushed first, so the
+        // chain is never empty and its head is exactly the parsed leaf DER.
+        // Dedup only ever *drops* entries it recognises as the leaf, so the
+        // assembled length can never exceed leaf + supplied links.
+        debug_assert!(
+            !chain.is_empty(),
+            "assembled certificate chain must contain at least the leaf"
+        );
+        debug_assert_eq!(
+            chain[0].as_ref(),
+            leaf_der.as_slice(),
+            "the leaf must remain at index 0 of the chain"
+        );
+        // SHA-256 fingerprint is exactly 32 bytes — anything else means the
+        // digest pipeline changed underneath us.
+        debug_assert_eq!(
+            fingerprint.0.len(),
+            32,
+            "a SHA-256 fingerprint must be 32 bytes"
+        );
+
         match any_supported_type(&private_key) {
             Ok(signing_key) => {
                 let stored_certificate = CertifiedKeyWrapper {
@@ -253,6 +274,17 @@ impl CertificateResolver {
             return Ok(cert_to_add.fingerprint);
         }
 
+        // Past the duplicate guard the fingerprint is genuinely new, so the
+        // store will grow by exactly one. Snapshot the count to assert that
+        // delta below (ungated `let` — read only inside the debug_assert, so
+        // the optimizer drops it in release while it still compiles).
+        let certificates_before = self.certificates.len();
+        let new_fingerprint = cert_to_add.fingerprint.clone();
+        debug_assert!(
+            !self.certificates.contains_key(&new_fingerprint),
+            "add_certificate past the dedup guard must be inserting a new fingerprint"
+        );
+
         for new_name in &cert_to_add.names {
             let fingerprints_for_this_name = self
                 .name_fingerprint_idx
@@ -288,6 +320,27 @@ impl CertificateResolver {
             .insert(cert_to_add.fingerprint.to_owned(), cert_to_add.clone());
         self.publish_min_expiration_gauge();
 
+        // Postconditions: the new fingerprint is now stored, the store grew by
+        // exactly one (the dedup guard above ruled out an overwrite), and
+        // every name the cert advertises now resolves to it through the index.
+        debug_assert!(
+            self.certificates.contains_key(&new_fingerprint),
+            "add_certificate must store the new certificate"
+        );
+        debug_assert_eq!(
+            self.certificates.len(),
+            certificates_before + 1,
+            "add_certificate must grow the store by exactly one"
+        );
+        debug_assert!(
+            cert_to_add.names.iter().all(|name| {
+                self.name_fingerprint_idx
+                    .get(name)
+                    .is_some_and(|fps| fps.iter().any(|(fp, _)| *fp == new_fingerprint))
+            }),
+            "every name of the added cert must be indexed to its fingerprint"
+        );
+
         trace!("{} {:#?}", log_module_context!(), self);
 
         Ok(cert_to_add.fingerprint)
@@ -299,7 +352,19 @@ impl CertificateResolver {
         &mut self,
         fingerprint: &Fingerprint,
     ) -> Result<(), CertificateResolverError> {
+        // Snapshot the store size so the postcondition can assert that a
+        // present cert drops the count by exactly one and an absent one is a
+        // no-op. Ungated `let`: read only inside the debug_asserts below, so
+        // it compiles in release and the optimizer drops it.
+        let certificates_before = self.certificates.len();
+        let was_present = self.certificates.contains_key(fingerprint);
+
         if let Some(certificate_to_remove) = self.get_certificate(fingerprint) {
+            // Names snapshot used only by the index-cleanup postcondition.
+            // Gate BOTH the `let` and its assert with `#[cfg(debug_assertions)]`
+            // so the clone never runs (and never warns) in release.
+            #[cfg(debug_assertions)]
+            let removed_names = certificate_to_remove.names.clone();
             for name in certificate_to_remove.names {
                 self.domains.domain_remove(&name.as_bytes().to_vec());
 
@@ -324,6 +389,40 @@ impl CertificateResolver {
 
             self.certificates.remove(fingerprint);
             self.publish_min_expiration_gauge();
+
+            // Postconditions on the present-cert path: the fingerprint is
+            // truly gone, the store shrank by exactly one, and no name still
+            // points at the removed fingerprint in the index (a leftover would
+            // let `resolve` hand back a fingerprint with no backing cert).
+            debug_assert!(
+                !self.certificates.contains_key(fingerprint),
+                "remove_certificate must evict the fingerprint"
+            );
+            debug_assert_eq!(
+                self.certificates.len(),
+                certificates_before - 1,
+                "removing a present cert must shrink the store by exactly one"
+            );
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                removed_names.iter().all(|name| {
+                    self.name_fingerprint_idx
+                        .get(name)
+                        .is_none_or(|fps| fps.iter().all(|(fp, _)| fp != fingerprint))
+                }),
+                "no name may still index the removed fingerprint"
+            );
+        } else {
+            // Absent-cert path is a pure no-op: the store size is unchanged.
+            debug_assert!(
+                !was_present,
+                "the absent-cert branch must only run when the fingerprint was not stored"
+            );
+            debug_assert_eq!(
+                self.certificates.len(),
+                certificates_before,
+                "removing an absent cert must not change the store"
+            );
         }
         trace!("{} {:#?}", log_module_context!(), self);
 
@@ -362,14 +461,33 @@ impl CertificateResolver {
 
         if let Ok(old_fingerprint) = Fingerprint::from_str(&replace.old_fingerprint) {
             if old_fingerprint == new_fingerprint {
+                // Idempotent replace: the new cert is byte-identical to the
+                // one already serving this name. Removing `old == new` would
+                // delete the entry the caller meant to keep, so we must NOT
+                // touch the store — assert it is untouched on this path.
+                let stored_before = self.certificates.contains_key(&new_fingerprint);
                 // Re-publish the expiration gauge so dashboards observe the
                 // replace request even when the certificate set is unchanged.
                 self.publish_min_expiration_gauge();
+                debug_assert_eq!(
+                    self.certificates.contains_key(&new_fingerprint),
+                    stored_before,
+                    "idempotent replace must not change whether the cert is stored"
+                );
                 return Ok(new_fingerprint);
             }
         }
 
         let new_fingerprint = self.add_certificate(&add)?;
+
+        // After a non-idempotent add the new certificate is in the store,
+        // ready to serve handshakes before the old one is torn down (the
+        // add-before-remove ordering that keeps the name continuously
+        // resolvable).
+        debug_assert!(
+            self.certificates.contains_key(&new_fingerprint),
+            "the replacement certificate must be stored before the old one is removed"
+        );
 
         match Fingerprint::from_str(&replace.old_fingerprint) {
             Ok(old_fingerprint) => self.remove_certificate(&old_fingerprint)?,
@@ -501,10 +619,26 @@ impl ResolvesServerCert for MutexCertificateResolver {
                 fingerprint
             );
 
+            // Strict-binding invariant: when the SNI trie resolves a name to a
+            // fingerprint, the served cert is exactly the one stored under
+            // that fingerprint — never a substitute. This guards cert
+            // SELECTION (our own store consistency), not the peer-supplied SNI
+            // itself, so a `debug_assert` is correct here (a violation is a
+            // resolver bug, not hostile traffic). The cert may legitimately be
+            // `None` if the trie still indexes a fingerprint whose cert was
+            // concurrently removed; we only assert the positive case.
             let cert = resolver
                 .certificates
                 .get(fingerprint)
                 .map(|cert| cert.inner.clone());
+            debug_assert!(
+                cert.is_none()
+                    || resolver
+                        .certificates
+                        .get(fingerprint)
+                        .is_some_and(|stored| Arc::ptr_eq(&stored.inner, cert.as_ref().unwrap())),
+                "resolved certificate must be the one stored under the looked-up fingerprint"
+            );
 
             trace!(
                 "{} found for fingerprint {}: {}",

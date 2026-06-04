@@ -23,6 +23,13 @@ const PROTOCOL_SIGNATURE_V2: [u8; 12] = [
 fn parse_command(i: &[u8]) -> IResult<&[u8], Command> {
     let i2 = i;
     let (i, cmd) = be_u8(i)?;
+    // `be_u8` consumes exactly one byte on success; the remainder must be one
+    // shorter than the input we were given.
+    debug_assert_eq!(
+        i.len() + 1,
+        i2.len(),
+        "command byte parse consumes exactly one byte"
+    );
     match cmd {
         0x20 => Ok((i, Command::Local)),
         0x21 => Ok((i, Command::Proxy)),
@@ -31,12 +38,44 @@ fn parse_command(i: &[u8]) -> IResult<&[u8], Command> {
 }
 
 pub fn parse_v2_header(i: &[u8]) -> IResult<&[u8], HeaderV2> {
+    let input_len = i.len();
     let (i, _) = tag(&PROTOCOL_SIGNATURE_V2)(i)?;
     let (i, command) = parse_command(i)?;
     let (i, family) = be_u8(i)?;
     let (i, len) = be_u16(i)?;
     let (i, data) = take(len)(i)?;
-    let (_, addr) = parse_addr_v2(family)(data)?;
+    // The length field gates exactly `len` address bytes; `take` already
+    // enforces availability, so `data` is precisely that many bytes.
+    debug_assert_eq!(
+        data.len(),
+        len as usize,
+        "address block must be exactly the declared length"
+    );
+    let (data_rest, addr) = parse_addr_v2(family)(data)?;
+    // The address parser may not consume every advertised byte (TLVs / over-
+    // long length fields are tolerated by leaving a tail), but it must never
+    // read past the block it was handed.
+    debug_assert!(
+        data_rest.len() <= data.len(),
+        "address parser cannot grow its input"
+    );
+
+    // Postcondition: a parser never grows its input — the unconsumed remainder
+    // is no longer than the original, and the consumed prefix (the full v2
+    // header) is the 16-byte fixed part plus the declared address length.
+    debug_assert!(i.len() <= input_len, "parser cannot grow its input");
+    debug_assert_eq!(
+        input_len - i.len(),
+        PROTOCOL_SIGNATURE_V2.len() + 1 + 1 + 2 + len as usize,
+        "consumed header length must reconcile with the signature, fixed fields, and declared address length"
+    );
+    // The family byte is in the enumerated set the address parser accepts: a
+    // rejected family would have short-circuited via `?` above, so on this
+    // success path the high nibble is AF_UNSPEC/INET/INET6.
+    debug_assert!(
+        matches!((family >> 4) & 0x0f, 0x00..=0x02),
+        "accepted family nibble must be AF_UNSPEC, AF_INET, or AF_INET6"
+    );
 
     Ok((
         i,
@@ -58,10 +97,21 @@ fn parse_addr_v2(family: u8) -> impl Fn(&[u8]) -> IResult<&[u8], ProxyAddr> {
 }
 
 fn parse_ipv4_on_v2(i: &[u8]) -> IResult<&[u8], ProxyAddr> {
+    let in_len = i.len();
     let (i, src_ip) = take(4u8)(i)?;
     let (i, dest_ip) = take(4u8)(i)?;
     let (i, src_port) = be_u16(i)?;
     let (i, dest_port) = be_u16(i)?;
+    // An IPv4 v2 address block is fixed at 4 + 4 + 2 + 2 = 12 bytes; the parser
+    // must have consumed exactly that on success and never grown its input.
+    debug_assert_eq!(src_ip.len(), 4, "IPv4 source address is 4 bytes");
+    debug_assert_eq!(dest_ip.len(), 4, "IPv4 destination address is 4 bytes");
+    debug_assert!(i.len() <= in_len, "parser cannot grow its input");
+    debug_assert_eq!(
+        in_len - i.len(),
+        12,
+        "IPv4 v2 address block is exactly 12 bytes"
+    );
 
     Ok((
         i,
@@ -79,10 +129,22 @@ fn parse_ipv4_on_v2(i: &[u8]) -> IResult<&[u8], ProxyAddr> {
 }
 
 fn parse_ipv6_on_v2(i: &[u8]) -> IResult<&[u8], ProxyAddr> {
+    let in_len = i.len();
     let (i, src_ip) = take(16u8)(i)?;
     let (i, dest_ip) = take(16u8)(i)?;
     let (i, src_port) = be_u16(i)?;
     let (i, dest_port) = be_u16(i)?;
+    // An IPv6 v2 address block is fixed at 16 + 16 + 2 + 2 = 36 bytes; `take`
+    // guarantees the slice widths fed to `slice_to_ipv6`, so its 16-byte
+    // precondition holds on this path.
+    debug_assert_eq!(src_ip.len(), 16, "IPv6 source address is 16 bytes");
+    debug_assert_eq!(dest_ip.len(), 16, "IPv6 destination address is 16 bytes");
+    debug_assert!(i.len() <= in_len, "parser cannot grow its input");
+    debug_assert_eq!(
+        in_len - i.len(),
+        36,
+        "IPv6 v2 address block is exactly 36 bytes"
+    );
 
     Ok((
         i,
@@ -95,6 +157,11 @@ fn parse_ipv6_on_v2(i: &[u8]) -> IResult<&[u8], ProxyAddr> {
 
 // assumes the slice has 16 bytes
 pub fn slice_to_ipv6(sl: &[u8]) -> Ipv6Addr {
+    // Precondition (internal invariant): every caller hands a slice sized by a
+    // `take(16)`, so a wrong length here is a logic bug, not attacker input.
+    // `clone_from_slice` below would itself panic on a mismatch; the
+    // debug_assert names the contract loudly in debug/test/fuzz builds.
+    debug_assert_eq!(sl.len(), 16, "slice_to_ipv6 requires exactly 16 bytes");
     let mut arr: [u8; 16] = [0; 16];
     arr.clone_from_slice(sl);
     Ipv6Addr::from(arr)
