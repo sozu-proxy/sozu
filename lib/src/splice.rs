@@ -70,12 +70,20 @@ fn requested_pipe_capacity() -> usize {
 /// that `Pipe::check_connections` consumes to keep half-closed sessions
 /// alive while the kernel still owns the data.
 ///
-/// `capacity` is the realised kernel-pipe size in bytes after applying
+/// `capacity` is the nominal kernel-pipe size in bytes after applying
 /// the operator-requested capacity via `fcntl(F_SETPIPE_SZ)`. It may
 /// differ from the request: the kernel rounds up to a page boundary
 /// and clamps at `/proc/sys/fs/pipe-max-size` for unprivileged
 /// processes. `splice_in` uses this value as the per-call `len`, so a
 /// larger pipe means fewer syscalls under bulk-transfer load.
+///
+/// IMPORTANT: this is the *nominal* buffer size (what `F_GETPIPE_SZ`
+/// reports), NOT a hard cap on bytes in flight. `splice(2)` moves
+/// skb-backed segments by reference, so a single pipe ring slot can hold
+/// a GRO super-packet far larger than a page; the pipe's actual
+/// byte-occupancy (and thus `*_pipe_pending`) routinely *exceeds*
+/// `capacity` on loopback bulk transfers. Treat it as a soft backpressure
+/// threshold — never assert `pending <= capacity`.
 pub struct SplicePipe {
     pub in_pipe: [libc::c_int; 2],
     pub out_pipe: [libc::c_int; 2],

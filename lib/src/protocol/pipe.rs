@@ -408,21 +408,6 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.splice_pipe.as_ref().map(|p| p.capacity).unwrap_or(0)
     }
 
-    /// Upper bound used by `debug_assert!`s on the splice pending counters.
-    /// On splice builds it is the realised kernel-pipe capacity; on builds
-    /// without splice the pending counters are hard-coded `0`, so any finite
-    /// bound holds — we return `usize::MAX` to keep the assertion a no-op
-    /// while still compiling in every profile. Invariant-only; not on a hot
-    /// path.
-    #[cfg(all(target_os = "linux", feature = "splice"))]
-    fn splice_capacity_or_max(&self) -> usize {
-        self.splice_capacity()
-    }
-    #[cfg(not(all(target_os = "linux", feature = "splice")))]
-    fn splice_capacity_or_max(&self) -> usize {
-        usize::MAX
-    }
-
     /// Tear down both readiness trackers ahead of a `SessionResult::Close`.
     ///
     /// This is the *write-only-shutdown discipline* (CLAUDE.md gotcha: never
@@ -448,11 +433,13 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     /// Wether the session should be kept open, depending on endpoints status
     /// and buffer usage (both in memory and in kernel)
     pub fn check_connections(&self) -> bool {
-        // In-flight accounting must never see more bytes queued than the
-        // backing storage can hold: buffered data ≤ buffer capacity and
-        // splice-pending ≤ realised kernel-pipe capacity. A violation here
-        // means a `fill`/`consume`/splice-delta elsewhere desynced the
-        // counters, which would corrupt the keep-alive decision below.
+        // In-flight accounting must never see more *buffered* bytes than the
+        // backing Checkout buffer can hold. We intentionally do NOT bound the
+        // splice-pending counters by the pipe `capacity`: a kernel pipe buffers
+        // well beyond its nominal `F_GETPIPE_SZ` when `splice(2)` moves
+        // skb-backed GRO segments, so `splice_*_pending` legitimately exceeds it
+        // (see `splice_readable`). A violation here means a `fill`/`consume`
+        // elsewhere desynced the counters, corrupting the keep-alive decision.
         debug_assert!(
             self.frontend_buffer.available_data() <= self.frontend_buffer.capacity(),
             "frontend buffered data exceeds its capacity"
@@ -460,14 +447,6 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         debug_assert!(
             self.backend_buffer.available_data() <= self.backend_buffer.capacity(),
             "backend buffered data exceeds its capacity"
-        );
-        debug_assert!(
-            self.splice_in_pending() <= self.splice_capacity_or_max(),
-            "frontend→backend splice pending exceeds kernel-pipe capacity"
-        );
-        debug_assert!(
-            self.splice_out_pending() <= self.splice_capacity_or_max(),
-            "backend→frontend splice pending exceeds kernel-pipe capacity"
         );
 
         let request_is_inflight = self.frontend_buffer.available_data() > 0
@@ -963,19 +942,24 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         let bin_before = metrics.bin;
         let pipe_write_end = self.splice_pipe.as_ref().unwrap().in_pipe[1];
         let (sz, res) = splice::splice_in(self.frontend.socket_ref(), pipe_write_end, capacity);
-        // The kernel pipe physically holds at most `capacity` bytes, so a
-        // splice into a pipe already holding `pending_before` can add no more
-        // than the remaining headroom.
+        // `splice_in` is asked for at most `capacity` bytes, so the kernel can
+        // never report moving more than that in one call. We deliberately do
+        // NOT assert `in_pipe_pending <= capacity`: a kernel pipe buffers well
+        // beyond its nominal `F_GETPIPE_SZ` when `splice(2)` moves skb-backed
+        // segments — a GRO super-packet on loopback hands a single ring slot far
+        // more than a page — so byte-occupancy legitimately exceeds `capacity`.
+        // `capacity` is the per-call `len` and a soft backpressure threshold,
+        // not a hard occupancy bound.
         debug_assert!(
-            pending_before + sz <= capacity,
-            "splice_in moved {sz} bytes into a pipe with only {} headroom (capacity {capacity})",
-            capacity - pending_before
+            sz <= capacity,
+            "splice_in reported {sz} bytes but was capped at len {capacity}"
         );
         debug!("{} Spliced {} bytes from frontend", log_context!(self), sz);
 
         if sz > 0 {
             self.splice_pipe.as_mut().unwrap().in_pipe_pending += sz;
-            // Pending advanced by exactly the spliced bytes and stays bounded.
+            // Pending advanced by exactly the spliced bytes (tracks real
+            // kernel-pipe occupancy; see the capacity note above).
             debug_assert_eq!(
                 self.splice_in_pending(),
                 pending_before + sz,
@@ -1249,13 +1233,15 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             Some(b) => splice::splice_in(b, pipe_write_end, capacity),
             None => return SessionResult::Continue,
         };
-        // The out_pipe physically holds at most `capacity` bytes; a splice into
-        // a pipe already holding `pending_before` can add no more than the
-        // remaining headroom.
+        // `splice_in` is capped at `len = capacity`, so the kernel never reports
+        // moving more than that per call. As in `splice_readable`, we do NOT
+        // assert `out_pipe_pending <= capacity`: a kernel pipe holds well beyond
+        // its nominal `F_GETPIPE_SZ` when `splice(2)` moves skb-backed (GRO)
+        // segments, so byte-occupancy legitimately exceeds `capacity` — it is
+        // only the per-call `len` and a soft backpressure threshold.
         debug_assert!(
-            pending_before + size <= capacity,
-            "splice_in moved {size} bytes into a pipe with only {} headroom (capacity {capacity})",
-            capacity - pending_before
+            size <= capacity,
+            "splice_in reported {size} bytes but was capped at len {capacity}"
         );
 
         debug!("{} Spliced {} bytes from backend", log_context!(self), size);
