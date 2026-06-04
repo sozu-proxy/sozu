@@ -12,6 +12,7 @@ For deep per-protocol detail, follow the `LIFECYCLE.md` siblings:
 - HTTP/2 mux: [`lib/src/protocol/mux/LIFECYCLE.md`](../lib/src/protocol/mux/LIFECYCLE.md)
 - HTTP/1.1 (Kawa-backed): [`lib/src/protocol/kawa_h1/LIFECYCLE.md`](../lib/src/protocol/kawa_h1/LIFECYCLE.md)
 - PROXY-protocol pre-flight: [`lib/src/protocol/proxy_protocol/LIFECYCLE.md`](../lib/src/protocol/proxy_protocol/LIFECYCLE.md)
+- UDP datagram flows (connectionless; sits outside the per-session model): [`lib/src/protocol/udp/LIFECYCLE.md`](../lib/src/protocol/udp/LIFECYCLE.md)
 - Master/worker supervisor: [`bin/src/command/LIFECYCLE.md`](../bin/src/command/LIFECYCLE.md)
 
 This file stays narrative. Cited paths are repo-relative; SHA-pinned
