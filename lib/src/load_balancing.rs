@@ -24,12 +24,17 @@ pub const DEFAULT_HASH_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 /// is clamped to at least `1` so a `0`/negative configured weight never zeroes
 /// out a backend's share (which would make weighted hashing degenerate).
 fn backend_weight(backend: &Backend) -> u32 {
-    backend
+    let weight = backend
         .load_balancing_parameters
         .as_ref()
         .map(|p| p.weight)
         .unwrap_or(DEFAULT_WEIGHT)
-        .max(1) as u32
+        .max(1) as u32;
+    // The clamp guarantees every backend carries a strictly positive weight,
+    // otherwise weighted hashing (HRW score, Maglev slot share) would zero out
+    // the backend's share and skew or divide-by-zero the distribution.
+    debug_assert!(weight >= 1, "backend weight must be clamped to at least 1");
+    weight
 }
 
 /// Deterministic, seedable 64-bit hash over the backend's STABLE identifier.
@@ -85,6 +90,14 @@ fn next_prime(n: usize) -> usize {
     while !is_prime(candidate) {
         candidate += 1;
     }
+    // The result is the smallest prime not below `max(n, 2)`: it is prime, it
+    // is at least 2, and it never went below the requested floor.
+    debug_assert!(is_prime(candidate), "next_prime must return a prime");
+    debug_assert!(candidate >= 2, "next_prime must return at least 2");
+    debug_assert!(
+        candidate >= n,
+        "next_prime ({candidate}) must be >= the requested floor ({n})"
+    );
     candidate
 }
 
@@ -176,12 +189,28 @@ impl LoadBalancingAlgorithm for RoundRobin {
         if backends.is_empty() {
             return None;
         }
+        debug_assert!(
+            !backends.is_empty(),
+            "round-robin index math runs only on a non-empty set"
+        );
 
-        let res = backends
-            .get(self.next_backend as usize % backends.len())
-            .map(|backend| (*backend).clone());
+        let index = self.next_backend as usize % backends.len();
+        // The reduced index always addresses a real slot, so the lookup yields
+        // a backend (never the `None` arm of `get`).
+        debug_assert!(index < backends.len(), "round-robin index out of bounds");
+        let res = backends.get(index).map(|backend| (*backend).clone());
+        debug_assert!(
+            res.is_some(),
+            "round-robin must select a backend from a non-empty set"
+        );
 
         self.next_backend = (self.next_backend + 1) % backends.len() as u32;
+        // The cursor stays a valid index into the current set after advancing,
+        // so the next call never starts out of range.
+        debug_assert!(
+            (self.next_backend as usize) < backends.len(),
+            "round-robin cursor must stay within bounds"
+        );
         res
     }
 }
@@ -208,6 +237,7 @@ impl LoadBalancingAlgorithm for Random {
         backends: &mut Vec<Rc<RefCell<Backend>>>,
     ) -> Option<Rc<RefCell<Backend>>> {
         let mut rng = rng();
+        let len = backends.len();
         let weights: Vec<i32> = backends
             .iter()
             .map(|b| {
@@ -218,14 +248,30 @@ impl LoadBalancingAlgorithm for Random {
                     .unwrap_or(100)
             })
             .collect();
+        // One weight per backend feeds the weighted distribution; a mismatch
+        // would make `dist.sample` index a backend that does not exist.
+        debug_assert_eq!(
+            weights.len(),
+            len,
+            "Random must derive exactly one weight per backend"
+        );
 
         if let Ok(dist) = WeightedIndex::new(weights) {
             let index = dist.sample(&mut rng);
+            // `WeightedIndex` only samples valid indices into the weight vector,
+            // which is the same length as `backends`, so the lookup hits.
+            debug_assert!(index < len, "Random sampled an out-of-range index");
             backends.get(index).cloned()
         } else {
-            (*backends)
-                .choose(&mut rng)
-                .map(|backend| (*backend).clone())
+            // `WeightedIndex::new` fails only when the set is empty or every
+            // weight is zero; the uniform `choose` then selects iff non-empty.
+            let chosen = (*backends).choose(&mut rng).map(|backend| (*backend).clone());
+            debug_assert_eq!(
+                chosen.is_some(),
+                len > 0,
+                "Random fallback selects iff the set is non-empty"
+            );
+            chosen
         }
     }
 }
@@ -241,6 +287,7 @@ impl LoadBalancingAlgorithm for LeastLoaded {
         _key: Option<u64>,
         backends: &mut Vec<Rc<RefCell<Backend>>>,
     ) -> Option<Rc<RefCell<Backend>>> {
+        let was_empty = backends.is_empty();
         let opt_b = match self.metric {
             LoadMetric::Connections => backends
                 .iter_mut()
@@ -268,6 +315,14 @@ impl LoadBalancingAlgorithm for LeastLoaded {
                 b.map(|(_cost, backend)| backend)
             }
         };
+        // Least-loaded over a non-empty set always finds a minimum; an empty
+        // set yields nothing. (`min_by_key` / the manual fold both have this
+        // shape.)
+        debug_assert_eq!(
+            opt_b.is_some(),
+            !was_empty,
+            "LeastLoaded selects iff the candidate set is non-empty"
+        );
         opt_b.map(|backend| (*backend).clone())
     }
 }
@@ -283,6 +338,7 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
         _key: Option<u64>,
         backends: &mut Vec<Rc<RefCell<Backend>>>,
     ) -> Option<Rc<RefCell<Backend>>> {
+        let len = backends.len();
         let mut first = None;
         let mut second = None;
 
@@ -310,6 +366,28 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
                 first = Some((measure, backend));
             }
         }
+
+        // `first` holds the lighter of the two tracked candidates and `second`
+        // the heavier — the running fold keeps `first.measure <= second.measure`
+        // — and the candidates populate in step with the set size (none for an
+        // empty set, only `first` for a singleton, both for >= 2 backends).
+        debug_assert!(
+            match (&first, &second) {
+                (Some((f, _)), Some((s, _))) => f <= s,
+                _ => true,
+            },
+            "power-of-two: first candidate must be no heavier than second"
+        );
+        debug_assert_eq!(
+            first.is_some(),
+            len > 0,
+            "power-of-two must hold a primary candidate iff the set is non-empty"
+        );
+        debug_assert_eq!(
+            second.is_some(),
+            len > 1,
+            "power-of-two holds a second candidate iff the set has >= 2 backends"
+        );
 
         match (first, second) {
             (None, None) => None,
@@ -382,7 +460,19 @@ impl Rendezvous {
         let h = hash_backend(self.seed, key, &backend.address);
         // (h + 0.5) / 2^64 keeps the value strictly inside (0, 1).
         let unit = (h as f64 + 0.5) / (u64::MAX as f64 + 1.0);
-        -weight / unit.ln()
+        // `unit` must land strictly inside (0, 1) so `ln(unit) < 0` and the
+        // score stays a positive, finite number — the whole HRW ordering relies
+        // on a well-defined comparable score for every backend.
+        debug_assert!(
+            unit > 0.0 && unit < 1.0,
+            "HRW unit must lie strictly inside (0, 1), got {unit}"
+        );
+        let score = -weight / unit.ln();
+        debug_assert!(
+            score.is_finite() && score > 0.0,
+            "HRW score must be finite and positive, got {score}"
+        );
+        score
     }
 }
 
@@ -407,6 +497,21 @@ impl LoadBalancingAlgorithm for Rendezvous {
             match best {
                 Some((best_score, _)) if best_score >= score => {}
                 _ => best = Some((score, backend)),
+            }
+        }
+        // A non-empty set always yields a winner, and that winner's score is the
+        // maximum over the whole set (HRW = highest random weight).
+        debug_assert!(
+            best.is_some(),
+            "HRW must select a winner from a non-empty set"
+        );
+        #[cfg(debug_assertions)]
+        if let Some((best_score, _)) = best {
+            for backend in backends.iter() {
+                debug_assert!(
+                    best_score >= self.score(key, &backend.borrow()),
+                    "HRW winner does not maximize the score over the set"
+                );
             }
         }
         best.map(|(_, backend)| backend.clone())
@@ -518,12 +623,28 @@ impl Maglev {
             // so `offset` and `skip` are uncorrelated.
             let h1 = hash_backend(self.seed, 0x6F66_6673_6574, &addr); // "offset"
             let h2 = hash_backend(self.seed, 0x736B_6970_5F5F, &addr); // "skip__"
-            offsets.push((h1 % m as u64) as usize);
-            skips.push((h2 % (m as u64 - 1)) as usize + 1);
+            let offset = (h1 % m as u64) as usize;
+            let skip = (h2 % (m as u64 - 1)) as usize + 1;
+            // The permutation parameters must address valid slots and keep a
+            // non-zero stride; `skip ∈ [1, m-1]` is coprime with the prime `m`,
+            // which is what guarantees the population loop visits every slot.
+            debug_assert!(offset < m, "Maglev offset must be a valid slot");
+            debug_assert!(
+                (1..m).contains(&skip),
+                "Maglev skip must lie in [1, m-1] to stay coprime with the prime table"
+            );
+            offsets.push(offset);
+            skips.push(skip);
             let w = backend_weight(&b) as u64;
             weights.push(w);
             total_weight += w;
         }
+        // Every backend contributes weight >= 1, so a non-empty set has a
+        // strictly positive total — the proportional target math divides by it.
+        debug_assert!(
+            total_weight > 0,
+            "Maglev total weight must be positive for a non-empty backend set"
+        );
 
         // Target slot count per backend, proportional to weight. The sum of
         // targets equals `m` (remainder handed to the heaviest/first backends).
@@ -541,6 +662,16 @@ impl Maglev {
             assigned += 1;
             i += 1;
         }
+        // The targets must sum to exactly `m`: this is the termination
+        // guarantee for the population loop below — it writes one slot per unit
+        // of target budget and stops at `count == m`, so an under/over sum would
+        // either leave holes (`usize::MAX` entries) or loop forever.
+        debug_assert_eq!(assigned, m, "Maglev target budget must sum to the table size");
+        debug_assert_eq!(
+            targets.iter().sum::<usize>(),
+            m,
+            "Maglev per-backend targets must sum to the table size"
+        );
 
         // Standard Maglev population loop, capped per backend by `targets`.
         let mut table = vec![usize::MAX; m];
@@ -567,6 +698,18 @@ impl Maglev {
                 }
             }
         }
+        // The loop terminates with every slot claimed exactly once: `count`
+        // reached `m`, no slot still holds the `usize::MAX` sentinel, and each
+        // backend filled precisely its target budget.
+        debug_assert_eq!(count, m, "Maglev population loop must fill exactly m slots");
+        debug_assert!(
+            table.iter().all(|&slot| slot != usize::MAX),
+            "Maglev population loop left an unfilled slot"
+        );
+        debug_assert!(
+            filled == targets,
+            "Maglev filled counts must match the per-backend targets"
+        );
 
         self.table = table;
 
@@ -657,11 +800,27 @@ impl LoadBalancingAlgorithm for Maglev {
         );
         for i in 0..self.size {
             let slot = (start + i) % self.size;
+            // Both the running slot and the index it stores are in range: the
+            // table is `size` long and every entry is a valid `backend_addrs`
+            // index (rebuild post-condition), so the resolution below is total.
+            debug_assert!(slot < self.size, "Maglev probe slot out of range");
             let idx = self.table[slot];
+            debug_assert!(
+                idx < self.backend_addrs.len(),
+                "Maglev table entry indexes outside the captured address set"
+            );
             // Resolve the table's backend index back to an address captured at
             // the last rebuild, then look it up in the live healthy subset.
             if let Some(addr) = self.backend_addrs.get(idx) {
                 if let Some(backend) = backends.iter().find(|b| b.borrow().address == *addr) {
+                    // The chosen backend is, by construction, a member of the
+                    // healthy subset we were handed.
+                    debug_assert!(
+                        backends
+                            .iter()
+                            .any(|b| b.borrow().address == backend.borrow().address),
+                        "Maglev must return a backend from the healthy subset"
+                    );
                     return Some(backend.clone());
                 }
             }

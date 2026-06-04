@@ -186,12 +186,27 @@ fn tcp_socket_read(
             incr!(names::socket::READ_INFINITE_LOOP_ERROR);
             return (size, SocketResult::Error);
         }
+        // Loop invariant: the running cursor never overshoots the buffer, so the
+        // `&mut buf[size..]` slice below can never panic on a bad offset.
+        debug_assert!(
+            size <= buf.len(),
+            "read cursor {size} overran buffer len {} (would slice out of bounds)",
+            buf.len()
+        );
         if size == buf.len() {
             return (size, SocketResult::Continue);
         }
         match stream.read(&mut buf[size..]) {
             Ok(0) => return (size, SocketResult::Closed),
-            Ok(sz) => size += sz,
+            Ok(sz) => {
+                // `read` cannot report more bytes than the slice it was given.
+                debug_assert!(
+                    sz <= buf.len() - size,
+                    "read reported {sz} bytes into a {}-byte remaining slice",
+                    buf.len() - size
+                );
+                size += sz;
+            }
             Err(e) => match e.kind() {
                 ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
                 // Treat `ConnectionRefused` as a closed socket, mirroring the
@@ -253,12 +268,27 @@ fn tcp_socket_write(
             incr!(names::socket::WRITE_INFINITE_LOOP_ERROR);
             return (size, SocketResult::Error);
         }
+        // Loop invariant: the cursor never overshoots the buffer, so the
+        // `&buf[size..]` slice below can never panic on a bad offset.
+        debug_assert!(
+            size <= buf.len(),
+            "write cursor {size} overran buffer len {} (would slice out of bounds)",
+            buf.len()
+        );
         if size == buf.len() {
             return (size, SocketResult::Continue);
         }
         match stream.write(&buf[size..]) {
             Ok(0) => return (size, SocketResult::Continue),
-            Ok(sz) => size += sz,
+            Ok(sz) => {
+                // `write` cannot report more bytes than the slice it was given.
+                debug_assert!(
+                    sz <= buf.len() - size,
+                    "write reported {sz} bytes from a {}-byte remaining slice",
+                    buf.len() - size
+                );
+                size += sz;
+            }
             Err(e) => match e.kind() {
                 ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
                 ErrorKind::ConnectionReset
@@ -306,7 +336,15 @@ fn tcp_socket_write_vectored(
     configured_peer: Option<SocketAddr>,
 ) -> (usize, SocketResult) {
     match stream.write_vectored(bufs) {
-        Ok(sz) => (sz, SocketResult::Continue),
+        Ok(sz) => {
+            // `write_vectored` cannot report more bytes than the slices held.
+            debug_assert!(
+                sz <= bufs.iter().map(|b| b.len()).sum::<usize>(),
+                "write_vectored reported {sz} bytes from {}-byte slices",
+                bufs.iter().map(|b| b.len()).sum::<usize>()
+            );
+            (sz, SocketResult::Continue)
+        }
         Err(e) => match e.kind() {
             ErrorKind::WouldBlock => (0, SocketResult::WouldBlock),
             ErrorKind::ConnectionReset
@@ -509,6 +547,13 @@ impl SocketHandler for FrontRustls {
                 break;
             }
 
+            // Loop invariant: the plaintext cursor never overshoots the caller's
+            // buffer, so every `&mut buf[size..]` below is a valid slice.
+            debug_assert!(
+                size <= buf.len(),
+                "rustls read cursor {size} overran buffer len {} (would slice out of bounds)",
+                buf.len()
+            );
             if size == buf.len() {
                 break;
             }
@@ -574,6 +619,13 @@ impl SocketHandler for FrontRustls {
                 match self.session.reader().read(&mut buf[size..]) {
                     Ok(0) => break,
                     Ok(sz) => {
+                        // The rustls reader cannot return more plaintext than
+                        // the remaining slice it was handed.
+                        debug_assert!(
+                            sz <= buf.len() - size,
+                            "rustls reader returned {sz} bytes into a {}-byte remaining slice",
+                            buf.len() - size
+                        );
                         size += sz;
                     }
                     Err(e) => match e.kind() {
@@ -600,6 +652,18 @@ impl SocketHandler for FrontRustls {
             }
         }
 
+        // Post-condition: we never report more plaintext than the caller asked
+        // for, and Error/Closed are mutually exclusive (the loop `break`s on the
+        // first one set, so both can never be true on the same pass).
+        debug_assert!(
+            size <= buf.len(),
+            "rustls socket_read returned {size} bytes for a {}-byte buffer",
+            buf.len()
+        );
+        debug_assert!(
+            !(is_error && is_closed),
+            "rustls socket_read cannot be both Error and Closed"
+        );
         if is_error {
             (size, SocketResult::Error)
         } else if is_closed {
@@ -645,6 +709,13 @@ impl SocketHandler for FrontRustls {
                 is_error = true;
                 break;
             }
+            // Loop invariant: the absorbed-plaintext cursor never overshoots the
+            // caller's buffer, so `&buf[buffered_size..]` is always a valid slice.
+            debug_assert!(
+                buffered_size <= buf.len(),
+                "rustls write cursor {buffered_size} overran buffer len {} (would slice out of bounds)",
+                buf.len()
+            );
             if buffered_size == buf.len() {
                 break;
             }
@@ -656,6 +727,12 @@ impl SocketHandler for FrontRustls {
             match self.session.writer().write(&buf[buffered_size..]) {
                 Ok(0) => {} // zero byte written means that the Rustls buffers are full, we will try to write on the socket and try again
                 Ok(sz) => {
+                    // rustls cannot absorb more plaintext than the remaining slice.
+                    debug_assert!(
+                        sz <= buf.len() - buffered_size,
+                        "rustls writer absorbed {sz} bytes from a {}-byte remaining slice",
+                        buf.len() - buffered_size
+                    );
                     buffered_size += sz;
                 }
                 Err(e) => match e.kind() {
@@ -758,6 +835,18 @@ impl SocketHandler for FrontRustls {
             }
         }
 
+        // Post-condition: we never report absorbing more plaintext than the
+        // caller handed us — over-reporting is exactly the truncation-class bug
+        // these two symmetric paths exist to avoid.
+        debug_assert!(
+            buffered_size <= buf.len(),
+            "rustls socket_write reported {buffered_size} bytes for a {}-byte buffer",
+            buf.len()
+        );
+        debug_assert!(
+            !(is_error && is_closed),
+            "rustls socket_write cannot be both Error and Closed"
+        );
         if is_error {
             (buffered_size, SocketResult::Error)
         } else if is_closed {
@@ -808,6 +897,12 @@ impl SocketHandler for FrontRustls {
                 is_error = true;
                 break;
             }
+            // Loop invariant: the absorbed-plaintext cursor never overshoots the
+            // summed slice length we computed up front (mirrors the scalar path).
+            debug_assert!(
+                buffered_size <= total_len,
+                "rustls vectored write cursor {buffered_size} overran total slice len {total_len}"
+            );
             if buffered_size == total_len {
                 break;
             }
@@ -824,6 +919,11 @@ impl SocketHandler for FrontRustls {
                 match self.session.writer().write_vectored(bufs) {
                     Ok(0) => {}
                     Ok(sz) => {
+                        // rustls cannot absorb more plaintext than the slices held.
+                        debug_assert!(
+                            sz <= total_len,
+                            "rustls writer absorbed {sz} bytes from {total_len}-byte slices"
+                        );
                         buffered_size += sz;
                     }
                     Err(e) => match e.kind() {
@@ -955,6 +1055,17 @@ impl SocketHandler for FrontRustls {
             }
         }
 
+        // Post-condition: report no more than the summed slice length, and keep
+        // Error/Closed mutually exclusive — must stay structurally symmetric with
+        // `socket_write` (divergence here is the 4.5 MB truncation-class bug).
+        debug_assert!(
+            buffered_size <= total_len,
+            "rustls socket_write_vectored reported {buffered_size} bytes for {total_len}-byte slices"
+        );
+        debug_assert!(
+            !(is_error && is_closed),
+            "rustls socket_write_vectored cannot be both Error and Closed"
+        );
         if is_error {
             (buffered_size, SocketResult::Error)
         } else if is_closed {
@@ -1035,6 +1146,49 @@ pub fn server_bind(addr: SocketAddr) -> Result<TcpListener, ServerBindError> {
     // FIXME: make the backlog configurable?
     sock.listen(1024).map_err(ServerBindError::Listen)?;
 
+    // Post-conditions (invariant violations only — every fallible syscall above
+    // already returns an error; these `debug_assert!`s catch a flag we *set*
+    // silently not sticking, which would be our own logic bug, not a syscall
+    // failure on network input). The getters return `io::Result`; we only
+    // assert when the kernel answers, degrading to a no-op on the rare query
+    // failure so we never panic on a dying fd.
+    if let Ok(nonblocking) = sock.nonblocking() {
+        debug_assert!(
+            nonblocking,
+            "server_bind must return a non-blocking socket (the worker event loop is edge-triggered)"
+        );
+    }
+    // `SO_REUSEPORT` is set on every platform; assert it stuck so a SCM hand-off
+    // across a hot-upgrade can re-bind the same address.
+    #[cfg(unix)]
+    if let Ok(reuse_port) = sock.reuse_port() {
+        debug_assert!(
+            reuse_port,
+            "server_bind must set SO_REUSEPORT so the listener survives a hot-upgrade re-bind"
+        );
+    }
+    // `SO_REUSEADDR` is unix-only here (mirrors libstd).
+    #[cfg(unix)]
+    if let Ok(reuse_address) = sock.reuse_address() {
+        debug_assert!(
+            reuse_address,
+            "server_bind must set SO_REUSEADDR on unix (mirrors libstd)"
+        );
+    }
+    // A bound STREAM socket carries a local address in the requested family.
+    if let Ok(local) = sock.local_addr() {
+        debug_assert_eq!(
+            local.is_ipv4(),
+            addr.is_ipv4(),
+            "bound socket family must match the requested address family"
+        );
+        debug_assert_eq!(
+            local.is_ipv6(),
+            addr.is_ipv6(),
+            "bound socket family must match the requested address family"
+        );
+    }
+
     Ok(TcpListener::from_std(sock.into()))
 }
 
@@ -1066,6 +1220,44 @@ pub fn udp_bind(addr: SocketAddr) -> Result<UdpSocket, ServerBindError> {
         .map_err(ServerBindError::SetNonBlocking)?;
 
     // No `listen()` for DGRAM sockets.
+
+    // Post-conditions — same rationale as `server_bind`: assert the flags we set
+    // stuck (logic bug if not), degrading to a no-op when the kernel refuses the
+    // query so a dying fd never panics. There is deliberately no `listen()`
+    // check here: DGRAM sockets are never listened on.
+    if let Ok(nonblocking) = sock.nonblocking() {
+        debug_assert!(
+            nonblocking,
+            "udp_bind must return a non-blocking socket (the worker event loop is edge-triggered)"
+        );
+    }
+    #[cfg(unix)]
+    if let Ok(reuse_port) = sock.reuse_port() {
+        debug_assert!(
+            reuse_port,
+            "udp_bind must set SO_REUSEPORT so the listener survives a hot-upgrade re-bind"
+        );
+    }
+    #[cfg(unix)]
+    if let Ok(reuse_address) = sock.reuse_address() {
+        debug_assert!(
+            reuse_address,
+            "udp_bind must set SO_REUSEADDR on unix (mirrors libstd / server_bind)"
+        );
+    }
+    if let Ok(local) = sock.local_addr() {
+        debug_assert_eq!(
+            local.is_ipv4(),
+            addr.is_ipv4(),
+            "bound UDP socket family must match the requested address family"
+        );
+        debug_assert_eq!(
+            local.is_ipv6(),
+            addr.is_ipv6(),
+            "bound UDP socket family must match the requested address family"
+        );
+    }
+
     Ok(UdpSocket::from_std(sock.into()))
 }
 
@@ -1085,6 +1277,18 @@ pub fn udp_connect(backend: SocketAddr) -> Result<UdpSocket, ServerBindError> {
         SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
         SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
     };
+    // The ephemeral bind address must be in the backend's family with port 0,
+    // or the subsequent `connect` would mix families / pin a wrong local port.
+    debug_assert_eq!(
+        unspecified.is_ipv4(),
+        backend.is_ipv4(),
+        "ephemeral bind family must match the backend family"
+    );
+    debug_assert_eq!(
+        unspecified.port(),
+        0,
+        "ephemeral bind must use port 0 so the kernel picks the source port"
+    );
     let sock = Socket::new(
         Domain::for_address(backend),
         Type::DGRAM,
@@ -1100,6 +1304,41 @@ pub fn udp_connect(backend: SocketAddr) -> Result<UdpSocket, ServerBindError> {
     // connect on UDP completes immediately (no handshake).
     sock.connect(&backend.into())
         .map_err(ServerBindError::BindError)?;
+
+    // Post-conditions — assert the flag/connect state stuck (logic bug if not),
+    // degrading to a no-op when the kernel refuses the query so a dying fd never
+    // panics on this network-facing path.
+    if let Ok(nonblocking) = sock.nonblocking() {
+        debug_assert!(
+            nonblocking,
+            "udp_connect must return a non-blocking socket (the worker event loop is edge-triggered)"
+        );
+    }
+    // The connected return socket's local addr family must match the backend,
+    // and the kernel must have assigned a concrete source port (no longer 0).
+    if let Ok(local) = sock.local_addr() {
+        debug_assert_eq!(
+            local.is_ipv4(),
+            backend.is_ipv4(),
+            "connected UDP socket family must match the backend family"
+        );
+        if let Some(local) = local.as_socket() {
+            debug_assert_ne!(
+                local.port(),
+                0,
+                "connect must bind a concrete ephemeral source port (the return-demux key)"
+            );
+        }
+    }
+    // `connect` pinned the peer 4-tuple — `getpeername(2)` must echo the backend.
+    if let Ok(peer) = sock.peer_addr() {
+        if let Some(peer) = peer.as_socket() {
+            debug_assert_eq!(
+                peer, backend,
+                "connect must pin the peer to the requested backend (symmetric-NAT return-demux key)"
+            );
+        }
+    }
 
     Ok(UdpSocket::from_std(sock.into()))
 }
@@ -1147,7 +1386,8 @@ pub mod stats {
         // representation; zero-init satisfies `assume_init`'s invariant
         // (and `std::mem::zeroed` is the canonical idiom for that).
         let mut tcp_info: TcpInfo = unsafe { std::mem::zeroed() };
-        let mut len = std::mem::size_of::<TcpInfo>() as libc::socklen_t;
+        let struct_len = std::mem::size_of::<TcpInfo>() as libc::socklen_t;
+        let mut len = struct_len;
         // SAFETY: `tcp_info` and `len` are fully initialised above; libc
         // reads only `len` bytes through the pointer and writes back the
         // resulting length. We check the return value (`status != 0`) to
@@ -1161,7 +1401,19 @@ pub mod stats {
                 &mut len,
             )
         };
-        if status != 0 { None } else { Some(tcp_info) }
+        if status != 0 {
+            None
+        } else {
+            // The kernel writes back the number of bytes it populated. It must
+            // never claim to have written more than the buffer we handed it —
+            // that would mean it overran `tcp_info`, an out-of-bounds write we
+            // could not have detected by the return code alone.
+            debug_assert!(
+                len <= struct_len,
+                "getsockopt(TCP_INFO) wrote back len {len} > struct size {struct_len} (buffer overrun)"
+            );
+            Some(tcp_info)
+        }
     }
     #[cfg(not(unix))]
     pub fn socketinfo(fd: libc::c_int) -> Option<TcpInfo> {
