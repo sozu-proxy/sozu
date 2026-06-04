@@ -265,7 +265,9 @@ impl LoadBalancingAlgorithm for Random {
         } else {
             // `WeightedIndex::new` fails only when the set is empty or every
             // weight is zero; the uniform `choose` then selects iff non-empty.
-            let chosen = (*backends).choose(&mut rng).map(|backend| (*backend).clone());
+            let chosen = (*backends)
+                .choose(&mut rng)
+                .map(|backend| (*backend).clone());
             debug_assert_eq!(
                 chosen.is_some(),
                 len > 0,
@@ -666,7 +668,10 @@ impl Maglev {
         // guarantee for the population loop below — it writes one slot per unit
         // of target budget and stops at `count == m`, so an under/over sum would
         // either leave holes (`usize::MAX` entries) or loop forever.
-        debug_assert_eq!(assigned, m, "Maglev target budget must sum to the table size");
+        debug_assert_eq!(
+            assigned, m,
+            "Maglev target budget must sum to the table size"
+        );
         debug_assert_eq!(
             targets.iter().sum::<usize>(),
             m,
