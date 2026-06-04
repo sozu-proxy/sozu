@@ -35,7 +35,7 @@ For minor and patch releases, the upgrade process must always pass correctly.
 
 ### Update the changelog
 
-Move the contents of `## [Unreleased]` into a new release section and reset the unreleased block. Do this **before** pushing the tag — the release workflow's `awk` extractor at `.github/workflows/release.yml` needs a `## [VERSION]` section to exist at tag time. If the section is missing, the draft release body falls back to a placeholder and the workflow emits a `::warning::`.
+Move the contents of `## [Unreleased]` into a new `## X.Y.Z - DATE` release section and reset the unreleased block. Do this **before** pushing the tag — the release workflow's `awk` extractor at `.github/workflows/release.yml` keys off the `## <version>` heading (the `## X.Y.Z - DATE` form used by every released section; a bracketed `## [X.Y.Z]` is also accepted) and reads until the next `## ` heading. If the section is missing, the draft release body falls back to a placeholder and the workflow emits a `::warning::`.
 
 ## Publish the new version
 

@@ -345,28 +345,31 @@ jobs:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
-          # Extract the `## [VERSION]` section into RELEASE_BODY.md and
-          # pass it to action-gh-release via `body_path` (heredoc-safe).
-          # If the section is missing, emit a `::warning::` so the run
-          # page surfaces the silent skip — operators can still edit the
-          # draft before publishing — but DO NOT fail the workflow:
-          # missing changelog stanzas should not block a real release.
+          # Extract this version's changelog section into RELEASE_BODY.md
+          # and pass it to action-gh-release via `body_path` (heredoc-safe).
+          # Released sections use `## X.Y.Z - DATE` (a bracketed
+          # `## [X.Y.Z]` heading is also accepted); the section runs until
+          # the next `## ` heading. If the section is missing, emit a
+          # `::warning::` so the run page surfaces the silent skip —
+          # operators can still edit the draft before publishing — but DO
+          # NOT fail the workflow: missing changelog stanzas should not
+          # block a real release.
           awk -v ver="${VERSION}" '
             BEGIN { in_section = 0 }
-            /^## \[/ {
+            /^## / {
               if (in_section) exit
-              if ($0 ~ ("^## \\[" ver "\\]")) { in_section = 1; next }
+              if ($0 ~ ("^## \\[?" ver "\\]?( |$)")) { in_section = 1; next }
             }
             in_section { print }
           ' CHANGELOG.md > RELEASE_BODY.md
           if [ ! -s RELEASE_BODY.md ]; then
-            echo "::warning::CHANGELOG.md has no '## [${VERSION}]' section; the draft release body falls back to a placeholder. Edit the draft before publishing."
+            echo "::warning::CHANGELOG.md has no '## ${VERSION}' section; the draft release body falls back to a placeholder. Edit the draft before publishing."
             {
               echo "Pre-built binaries for ${VERSION}."
               echo ""
               echo "Verify with: \`sha256sum -c SHA256SUMS\`."
               echo ""
-              echo "_NOTE_: this body was auto-generated because the maintainer did not move the \`## [Unreleased]\` block into a \`## [${VERSION}]\` section before tagging. Edit before publishing."
+              echo "_NOTE_: this body was auto-generated because the maintainer did not move the \`## [Unreleased]\` block into a \`## ${VERSION}\` section before tagging. Edit before publishing."
             } > RELEASE_BODY.md
           fi
           cat RELEASE_BODY.md
