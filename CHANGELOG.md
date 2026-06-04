@@ -2,10 +2,18 @@
 
 ## [Unreleased]
 
+## 2.0.2 - 2026-06-04
+
+Patch release: one OpenTelemetry-friendly access-log field plus an HTTP/2 memory-amplification DoS mitigation. Additive only — the new `ProtobufAccessLog.start_time` field and the `h2_max_header_fields` listener knob both carry safe defaults, so existing configurations and `sozu-command-lib` consumers can bump from `^2.0.1` to `^2.0.2` without code changes.
+
 ### ✨ Added
 
 - **`fix(otel)`: wall-clock `start_time` field in `ProtobufAccessLog`** (field 30, optional `Uint128`).
   Access-log consumers reconstructing OpenTelemetry spans no longer need to compute `time - request_time` — a subtraction that mixed `CLOCK_REALTIME` and `CLOCK_MONOTONIC` and produced unreliable start timestamps on short-lived requests. The new field is captured at request start via `SessionMetrics::mark_request_start()` and should be preferred whenever present. Old consumers ignore the unknown field; new consumers with old producers see `None` and can fall back to the subtraction.
+
+### 🐛 Fixed
+
+- **`fix(ci/release)`: release-notes extractor matches the `## X.Y.Z - DATE` changelog heading.** `release.yml`'s `awk` extractor only recognized bracketed `## [VERSION]` headings, but every released section uses `## X.Y.Z - DATE`, so since 2.0.0 the draft release body silently fell back to a placeholder (a non-fatal `::warning::`). The extractor now matches the actual heading format (a bracketed `## [X.Y.Z]` is still accepted) and reads until the next `## ` heading, so the GitHub release body is populated from `CHANGELOG.md` at tag time. `RELEASE.md` is updated to match.
 
 ### 🔒 Security
 
