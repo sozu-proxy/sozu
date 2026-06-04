@@ -171,10 +171,8 @@ impl ScmSocket {
         // The FD vector must reconcile with the address totals: one descriptor
         // per listener, folded http+tls+tcp+udp. If these disagree the receiver
         // would zip mismatched (address, fd) pairs.
-        let address_total = listeners.http.len()
-            + listeners.tls.len()
-            + listeners.tcp.len()
-            + listeners.udp.len();
+        let address_total =
+            listeners.http.len() + listeners.tls.len() + listeners.tcp.len() + listeners.udp.len();
         debug_assert_eq!(
             file_descriptors.len(),
             address_total,
