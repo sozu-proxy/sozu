@@ -54,6 +54,8 @@ Sōzu is a reverse proxy for load balancing, written in Rust. Its main job is to
 
 * [H2 Mux LIFECYCLE.md][h2lc] — In-tree state-machine reference, maintained alongside the code
 
+* [UDP LIFECYCLE.md][udplc] — In-tree flow/state-machine reference for the UDP datapath (userland conntrack, NAT return, teardown, hardening), maintained alongside the code
+
 * [Health Checks][hc]
 
 * [Lifetime of a session][li]
@@ -91,6 +93,7 @@ Sōzu is a reverse proxy for load balancing, written in Rust. Its main job is to
 [r]: ./recipes.md
 [h2]: ./h2_mux_internals.md
 [h2lc]: ../lib/src/protocol/mux/LIFECYCLE.md
+[udplc]: ../lib/src/protocol/udp/LIFECYCLE.md
 [hc]: ./health_checks.md
 [li]: ./lifetime_of_a_session.md
 [tst]: ./testing.md

@@ -25,6 +25,9 @@
 //! UDP never goes through `accept()` / `create_session()`: a `Protocol::UDP`
 //! listener readable event falls through `Server::ready`'s generic arm into
 //! `ProxySession::ready`.
+//!
+//! Long-form lifecycle (datapath, NAT return, teardown, control plane,
+//! hardening): `lib/src/protocol/udp/LIFECYCLE.md`.
 
 use std::{
     cell::RefCell,

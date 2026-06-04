@@ -20,6 +20,9 @@
 //! - [`UdpFlow`](flow::UdpFlow): per-admitted-flow teardown counters, idle /
 //!   lifetime deadlines, PPv2 bookkeeping, chosen backend, forward/return
 //!   decisions, and a `timer_gen`.
+//!
+//! Long-form lifecycle (flow state machine, NAT return, teardown, hardening):
+//! `lib/src/protocol/udp/LIFECYCLE.md`.
 
 pub mod flow;
 pub mod manager;
