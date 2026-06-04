@@ -123,6 +123,41 @@ impl Request {
             | RequestType::SubscribeEvents(_)
             | RequestType::ReloadConfiguration(_) => {}
         }
+
+        // POST: HTTP-frontend orders route to the HTTP proxy ONLY, HTTPS /
+        // certificate orders to the HTTPS proxy ONLY, and TCP-frontend orders
+        // to the TCP proxy ONLY — a frontend order must never fan out across
+        // protocol planes (that would double-apply the order). Cluster-wide
+        // and broadcast orders (AddCluster, SoftStop, …) legitimately target
+        // all three, so we only assert the single-plane exclusivity here.
+        debug_assert!(
+            !(proxy_destination.to_http_proxy
+                && proxy_destination.to_https_proxy
+                && proxy_destination.to_tcp_proxy)
+                || matches!(
+                    self.request_type,
+                    Some(
+                        RequestType::AddCluster(_)
+                            | RequestType::AddBackend(_)
+                            | RequestType::RemoveCluster(_)
+                            | RequestType::RemoveBackend(_)
+                            | RequestType::SetHealthCheck(_)
+                            | RequestType::RemoveHealthCheck(_)
+                            | RequestType::SoftStop(_)
+                            | RequestType::HardStop(_)
+                            | RequestType::Status(_)
+                    )
+                ),
+            "only cluster-wide / broadcast orders may target all three proxy planes"
+        );
+        // POST: a None request_type carries no destination at all.
+        debug_assert!(
+            self.request_type.is_some()
+                || (!proxy_destination.to_http_proxy
+                    && !proxy_destination.to_https_proxy
+                    && !proxy_destination.to_tcp_proxy),
+            "a request without a request_type must have no proxy destination"
+        );
         proxy_destination
     }
 
@@ -179,7 +214,9 @@ pub struct ProxyDestinations {
 impl RequestHttpFrontend {
     /// convert a requested frontend to a usable one by parsing its address
     pub fn to_frontend(self) -> Result<HttpFrontend, RequestError> {
-        Ok(HttpFrontend {
+        let requested_hostname = self.hostname.clone();
+        let requested_cluster_id = self.cluster_id.clone();
+        let frontend = HttpFrontend {
             address: self.address.into(),
             cluster_id: self.cluster_id,
             hostname: self.hostname,
@@ -201,7 +238,21 @@ impl RequestHttpFrontend {
             required_auth: self.required_auth,
             headers: self.headers,
             hsts: self.hsts,
-        })
+        };
+
+        // POST: routing identity (hostname + cluster_id) is carried through
+        // unchanged — only the address is reparsed and the position is mapped
+        // through the proto enum. A frontend whose hostname or cluster shifted
+        // here would route traffic to the wrong place.
+        debug_assert_eq!(
+            frontend.hostname, requested_hostname,
+            "hostname must survive the frontend conversion"
+        );
+        debug_assert_eq!(
+            frontend.cluster_id, requested_cluster_id,
+            "cluster_id must survive the frontend conversion"
+        );
+        Ok(frontend)
     }
 }
 
@@ -278,17 +329,42 @@ impl From<SocketAddr> for SocketAddress {
             }
         };
 
-        SocketAddress {
+        let encoded = SocketAddress {
             port: socket_addr.port() as u32,
             ip: IpAddress {
                 inner: Some(ip_inner),
             },
-        }
+        };
+
+        // POST: the port widens losslessly (u16 → u32) and the proto address
+        // family matches the source family — a V4 SocketAddr must never encode
+        // as a V6 inner and vice versa, or the reverse `From` would synthesize
+        // the wrong address.
+        debug_assert_eq!(
+            encoded.port,
+            socket_addr.port() as u32,
+            "port must round-trip losslessly into the proto"
+        );
+        debug_assert_eq!(
+            matches!(encoded.ip.inner, Some(ip_address::Inner::V4(_))),
+            socket_addr.is_ipv4(),
+            "proto IP family must match the source SocketAddr family"
+        );
+        encoded
     }
 }
 
 impl From<SocketAddress> for SocketAddr {
     fn from(socket_address: SocketAddress) -> Self {
+        // PRE: a wire-sourced proto port may exceed u16::MAX (16-bit on the
+        // wire is carried as a 32-bit field). This is peer/config input, so we
+        // narrow rather than panic; the debug_assert only guards our *own*
+        // encoders, which never emit an out-of-range port.
+        debug_assert!(
+            socket_address.port <= u16::MAX as u32,
+            "self-encoded proto port must fit in a u16"
+        );
+        let had_inner = socket_address.ip.inner.is_some();
         let port = socket_address.port as u16;
 
         let ip = match socket_address.ip.inner {
@@ -299,13 +375,33 @@ impl From<SocketAddress> for SocketAddr {
             None => IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), // should never happen
         };
 
-        SocketAddr::new(ip, port)
+        let decoded = SocketAddr::new(ip, port);
+        // POST: a self-encoded proto address always carries an inner IP, so the
+        // unspecified-V4 fallback is only ever reached on malformed peer input.
+        debug_assert!(
+            had_inner || decoded.ip() == IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            "missing inner IP must decode to the unspecified-V4 sentinel"
+        );
+        decoded
     }
 }
 
 impl From<Uint128> for u128 {
     fn from(value: Uint128) -> Self {
-        value.low as u128 | ((value.high as u128) << 64)
+        let combined = value.low as u128 | ((value.high as u128) << 64);
+        // POST: the two 64-bit halves occupy disjoint bit ranges, so the low
+        // half is recoverable as the bottom 64 bits and the high half as the
+        // top 64 bits — the pack is bijective.
+        debug_assert_eq!(
+            combined as u64, value.low,
+            "low half must be the bottom 64 bits"
+        );
+        debug_assert_eq!(
+            (combined >> 64) as u64,
+            value.high,
+            "high half must be the top 64 bits"
+        );
+        combined
     }
 }
 
@@ -313,7 +409,19 @@ impl From<u128> for Uint128 {
     fn from(value: u128) -> Self {
         let low = value as u64;
         let high = (value >> 64) as u64;
-        Uint128 { low, high }
+        let packed = Uint128 { low, high };
+        // POST: splitting then recombining reproduces the original u128 — the
+        // split-into-halves and join-from-halves operations are mutual
+        // inverses (no bit is lost or duplicated).
+        debug_assert_eq!(
+            u128::from(Uint128 {
+                low: packed.low,
+                high: packed.high
+            }),
+            value,
+            "u128 → Uint128 → u128 must round-trip"
+        );
+        packed
     }
 }
 
@@ -326,13 +434,29 @@ impl From<i128> for Uint128 {
 impl From<Ulid> for Uint128 {
     fn from(value: Ulid) -> Self {
         let (low, high) = value.into();
-        Uint128 { low, high }
+        let packed = Uint128 { low, high };
+        // POST: the (low, high) tuple is carried verbatim into the proto, so
+        // re-reading it reconstructs the same Ulid — the encoding loses no bits.
+        debug_assert_eq!(
+            Ulid::from((packed.low, packed.high)),
+            value,
+            "Ulid → Uint128 must preserve all 128 bits"
+        );
+        packed
     }
 }
 
 impl From<Uint128> for Ulid {
     fn from(value: Uint128) -> Self {
         let Uint128 { low, high } = value;
-        Ulid::from((low, high))
+        let ulid = Ulid::from((low, high));
+        // POST: the decode is the exact inverse of the encode above — the same
+        // halves go back out, so Uint128 → Ulid → Uint128 round-trips.
+        debug_assert_eq!(
+            Uint128::from(ulid),
+            value,
+            "Uint128 → Ulid must preserve all 128 bits"
+        );
+        ulid
     }
 }

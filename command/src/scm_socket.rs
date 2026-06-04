@@ -99,6 +99,12 @@ impl ScmSocket {
         if self.blocking == blocking {
             return Ok(());
         }
+        // Past the idempotent early-return the flag must actually be flipping.
+        debug_assert_ne!(
+            self.blocking, blocking,
+            "set_blocking only reaches the syscall when the state actually changes"
+        );
+        let blocking_before = self.blocking;
         // SAFETY: `self.fd` is borrowed for the duration of this block. We wrap
         // it in a `StdUnixStream` to call `set_nonblocking`, then immediately
         // release ownership with `into_raw_fd` so the descriptor is not closed
@@ -111,6 +117,15 @@ impl ScmSocket {
             let _dropped_fd = stream.into_raw_fd();
         }
         self.blocking = blocking;
+        // The flag landed on the requested value and genuinely toggled.
+        debug_assert_eq!(
+            self.blocking, blocking,
+            "blocking flag must reflect the requested state after a successful set"
+        );
+        debug_assert_ne!(
+            self.blocking, blocking_before,
+            "blocking flag must have toggled across a real state change"
+        );
         Ok(())
     }
 
@@ -123,6 +138,27 @@ impl ScmSocket {
             udp: listeners.udp.iter().map(|t| t.0.to_string()).collect(),
         };
 
+        // The manifest is built 1:1 from the listener tables; each address slot
+        // ships exactly one FD, so the per-protocol counts must agree on both
+        // sides of the wire. The receiver reconstructs (address, fd) pairs by
+        // zipping these counts against the FD array — drift here is the exact
+        // bug class `command_channel_security_tests` guards.
+        debug_assert_eq!(
+            listeners_count.http.len(),
+            listeners.http.len(),
+            "http manifest count must match the http listener table"
+        );
+        debug_assert_eq!(
+            listeners_count.tls.len(),
+            listeners.tls.len(),
+            "tls manifest count must match the tls listener table"
+        );
+        debug_assert_eq!(
+            listeners_count.tcp.len(),
+            listeners.tcp.len(),
+            "tcp manifest count must match the tcp listener table"
+        );
+
         let message = listeners_count.encode_length_delimited_to_vec();
 
         let mut file_descriptors: Vec<RawFd> = Vec::new();
@@ -131,6 +167,19 @@ impl ScmSocket {
         file_descriptors.extend(listeners.tls.iter().map(|t| t.1));
         file_descriptors.extend(listeners.tcp.iter().map(|t| t.1));
         file_descriptors.extend(listeners.udp.iter().map(|t| t.1));
+
+        // The FD vector must reconcile with the address totals: one descriptor
+        // per listener, folded http+tls+tcp+udp. If these disagree the receiver
+        // would zip mismatched (address, fd) pairs.
+        let address_total = listeners.http.len()
+            + listeners.tls.len()
+            + listeners.tcp.len()
+            + listeners.udp.len();
+        debug_assert_eq!(
+            file_descriptors.len(),
+            address_total,
+            "the FD count sent must equal the total listener-address count (one FD per address)"
+        );
 
         self.send_msg_and_fds(&message, &file_descriptors)
     }
@@ -184,36 +233,107 @@ impl ScmSocket {
             });
         }
 
+        // Past the consistency guard, the folded total reconciles with both the
+        // fixed FD-array bound and the number of FDs that actually arrived.
+        // These are the invariants that keep every `received_fds[index..index+len]`
+        // slice below in bounds — a malformed manifest already returned an error
+        // and never reaches here.
+        debug_assert_eq!(
+            total,
+            http_len + tls_len + tcp_len + udp_len,
+            "folded total must equal the sum of per-protocol counts"
+        );
+        debug_assert!(
+            total <= MAX_FDS_OUT,
+            "total FD slots must fit the fixed-size received_fds array before indexing"
+        );
+        debug_assert!(
+            total <= file_descriptor_length,
+            "manifest total must not exceed the FDs actually received"
+        );
+        debug_assert!(
+            total <= received_fds.len(),
+            "every (address, fd) zip below must stay within the received_fds array"
+        );
+
         let mut http_addresses = parse_addresses(&listeners_count.http)?;
         let mut tls_addresses = parse_addresses(&listeners_count.tls)?;
         let mut tcp_addresses = parse_addresses(&listeners_count.tcp)?;
         let mut udp_addresses = parse_addresses(&listeners_count.udp)?;
 
+        // Each parsed address list maps 1:1 onto a contiguous FD slice; the
+        // counts must survive `parse_addresses` unchanged.
+        debug_assert_eq!(
+            http_addresses.len(),
+            http_len,
+            "parsed http address count must match the manifest count"
+        );
+        debug_assert_eq!(
+            tls_addresses.len(),
+            tls_len,
+            "parsed tls address count must match the manifest count"
+        );
+        debug_assert_eq!(
+            tcp_addresses.len(),
+            tcp_len,
+            "parsed tcp address count must match the manifest count"
+        );
+
         let mut index = 0;
         let len = http_len;
+        // Each FD slice end must stay within the validated total (and thus the
+        // array); pair-assert the slice window before every zip.
+        debug_assert!(
+            index + len <= total,
+            "http FD slice must lie within the reconciled total"
+        );
         let mut http = Vec::new();
         http.extend(
             http_addresses
                 .drain(..)
                 .zip(received_fds[index..index + len].iter().cloned()),
         );
+        // Each address was wrapped with exactly one FD.
+        debug_assert_eq!(
+            http.len(),
+            http_len,
+            "every http address must be paired with exactly one FD"
+        );
 
         index += len;
         let len = tls_len;
+        debug_assert!(
+            index + len <= total,
+            "tls FD slice must lie within the reconciled total"
+        );
         let mut tls = Vec::new();
         tls.extend(
             tls_addresses
                 .drain(..)
                 .zip(received_fds[index..index + len].iter().cloned()),
         );
+        debug_assert_eq!(
+            tls.len(),
+            tls_len,
+            "every tls address must be paired with exactly one FD"
+        );
 
         index += len;
         let len = tcp_len;
+        debug_assert!(
+            index + len <= total,
+            "tcp FD slice must lie within the reconciled total"
+        );
         let mut tcp = Vec::new();
         tcp.extend(
             tcp_addresses
                 .drain(..)
                 .zip(received_fds[index..index + len].iter().cloned()),
+        );
+        debug_assert_eq!(
+            tcp.len(),
+            tcp_len,
+            "every tcp address must be paired with exactly one FD"
         );
 
         index += len;
@@ -223,6 +343,24 @@ impl ScmSocket {
             udp_addresses
                 .drain(..)
                 .zip(received_fds[index..index + len].iter().cloned()),
+        );
+        debug_assert_eq!(
+            udp.len(),
+            udp_len,
+            "every udp address must be paired with exactly one FD"
+        );
+
+        // The reconstructed tables consume every FD slot the manifest declared:
+        // the final cursor lands exactly on the folded total (http+tls+tcp+udp).
+        debug_assert_eq!(
+            index + len,
+            total,
+            "the (address, fd) zips must consume exactly the reconciled total of FD slots"
+        );
+        debug_assert_eq!(
+            http.len() + tls.len() + tcp.len() + udp.len(),
+            total,
+            "reconstructed listener count must equal the reconciled FD total"
         );
 
         Ok(Listeners {
@@ -263,6 +401,9 @@ impl ScmSocket {
         message: &mut [u8],
         fds: &mut [RawFd],
     ) -> Result<(usize, usize), ScmSocketError> {
+        // Snapshot the buffer length before `message` is borrowed mutably by
+        // `iov`; the received byte count is asserted against it below.
+        let message_capacity = message.len();
         let mut cmsg = cmsg_space!([RawFd; MAX_FDS_OUT]);
         let mut iov = [IoSliceMut::new(message)];
 
@@ -275,6 +416,13 @@ impl ScmSocket {
         let msg = socket::recvmsg::<()>(self.fd, &mut iov[..], Some(&mut cmsg), flags)
             .map_err(|error| ScmSocketError::Receive(error.to_string()))?;
 
+        // The destination slice is the receiver's fixed `[RawFd; MAX_FDS_OUT]`
+        // array; the zip below cannot write past it.
+        let fds_capacity = fds.len();
+        debug_assert!(
+            fds_capacity <= MAX_FDS_OUT,
+            "destination FD slice must not exceed the MAX_FDS_OUT cmsg space"
+        );
         let mut fd_count = 0;
         let received_fds = msg
             .cmsgs()
@@ -290,7 +438,23 @@ impl ScmSocket {
         for (fd, place) in received_fds.zip(fds.iter_mut()) {
             fd_count += 1;
             *place = fd;
+            // The zip is bounded by `fds.iter_mut()`, so each wrap stays within
+            // the destination array — never write past `fds_capacity`.
+            debug_assert!(
+                fd_count <= fds_capacity,
+                "received FD count must never exceed the destination array capacity"
+            );
         }
+        // Post-condition: the reported count reconciles with the destination
+        // bound and the byte count is within the message buffer we handed in.
+        debug_assert!(
+            fd_count <= fds_capacity,
+            "final received FD count must fit the destination array"
+        );
+        debug_assert!(
+            msg.bytes <= message_capacity,
+            "received byte count must not exceed the message buffer it was read into"
+        );
         Ok((msg.bytes, fd_count))
     }
 }
@@ -309,24 +473,53 @@ pub struct Listeners {
 
 impl Listeners {
     pub fn get_http(&mut self, addr: &SocketAddr) -> Option<RawFd> {
-        self.http
-            .iter()
-            .position(|(front, _)| front == addr)
-            .map(|pos| self.http.remove(pos).1)
+        let before = self.http.len();
+        let pos = self.http.iter().position(|(front, _)| front == addr);
+        let result = pos.map(|pos| self.http.remove(pos).1);
+        // Exactly the matched entry is removed: the length drops by one iff a
+        // match was found, and the removed address is truly gone.
+        debug_assert_eq!(
+            self.http.len(),
+            before - result.is_some() as usize,
+            "http listener table shrinks by exactly one iff an address matched"
+        );
+        debug_assert!(
+            result.is_none() || !self.http.iter().any(|(front, _)| front == addr),
+            "the matched http address must no longer be present after removal"
+        );
+        result
     }
 
     pub fn get_https(&mut self, addr: &SocketAddr) -> Option<RawFd> {
-        self.tls
-            .iter()
-            .position(|(front, _)| front == addr)
-            .map(|pos| self.tls.remove(pos).1)
+        let before = self.tls.len();
+        let pos = self.tls.iter().position(|(front, _)| front == addr);
+        let result = pos.map(|pos| self.tls.remove(pos).1);
+        debug_assert_eq!(
+            self.tls.len(),
+            before - result.is_some() as usize,
+            "tls listener table shrinks by exactly one iff an address matched"
+        );
+        debug_assert!(
+            result.is_none() || !self.tls.iter().any(|(front, _)| front == addr),
+            "the matched tls address must no longer be present after removal"
+        );
+        result
     }
 
     pub fn get_tcp(&mut self, addr: &SocketAddr) -> Option<RawFd> {
-        self.tcp
-            .iter()
-            .position(|(front, _)| front == addr)
-            .map(|pos| self.tcp.remove(pos).1)
+        let before = self.tcp.len();
+        let pos = self.tcp.iter().position(|(front, _)| front == addr);
+        let result = pos.map(|pos| self.tcp.remove(pos).1);
+        debug_assert_eq!(
+            self.tcp.len(),
+            before - result.is_some() as usize,
+            "tcp listener table shrinks by exactly one iff an address matched"
+        );
+        debug_assert!(
+            result.is_none() || !self.tcp.iter().any(|(front, _)| front == addr),
+            "the matched tcp address must no longer be present after removal"
+        );
+        result
     }
 
     pub fn get_udp(&mut self, addr: &SocketAddr) -> Option<RawFd> {

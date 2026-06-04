@@ -79,7 +79,7 @@ impl HeaderV1 {
     }
 
     pub fn into_bytes(&self) -> Vec<u8> {
-        if self.protocol.eq(&ProtocolSupportedV1::UNKNOWN) {
+        let bytes = if self.protocol.eq(&ProtocolSupportedV1::UNKNOWN) {
             format!("{} {}\r\n", PROXY_PROTO_IDENTIFIER, self.protocol,).into_bytes()
         } else {
             format!(
@@ -92,7 +92,18 @@ impl HeaderV1 {
                 self.addr_dst.port(),
             )
             .into_bytes()
-        }
+        };
+        // The v1 text header is framed `PROXY ...\r\n`; both the identifier
+        // prefix and the CRLF terminator are load-bearing for the peer parser.
+        debug_assert!(
+            bytes.starts_with(PROXY_PROTO_IDENTIFIER.as_bytes()),
+            "v1 header must start with the PROXY identifier"
+        );
+        debug_assert!(
+            bytes.ends_with(b"\r\n"),
+            "v1 header must be CRLF-terminated"
+        );
+        bytes
     }
 }
 
@@ -145,21 +156,42 @@ pub struct HeaderV2 {
 impl HeaderV2 {
     pub fn new(command: Command, addr_src: SocketAddr, addr_dst: SocketAddr) -> Self {
         let addr = ProxyAddr::from(addr_src, addr_dst);
+        let family = get_family(&addr);
+
+        // Invariant: the cached `family` byte is exactly the one derived from
+        // `addr`. Serialization writes both independently, so they must agree
+        // or the wire header would self-contradict (family vs. address block).
+        debug_assert_eq!(
+            family,
+            get_family(&addr),
+            "cached family must match the address it describes"
+        );
+        debug_assert!(
+            matches!(addr, ProxyAddr::AfUnspec) == (family == 0x00),
+            "AfUnspec iff zero family byte"
+        );
 
         HeaderV2 {
             command,
-            family: get_family(&addr),
+            family,
             addr,
         }
     }
 
     pub fn into_bytes(&self) -> Vec<u8> {
-        let mut header = Vec::with_capacity(self.len());
+        let expected_len = self.len();
+        let addr_len = self.addr.len() as usize;
+        let mut header = Vec::with_capacity(expected_len);
 
         let signature = [
             0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
         ];
         header.extend_from_slice(&signature);
+        debug_assert_eq!(
+            header.len(),
+            signature.len(),
+            "v2 header must open with exactly the 12-byte signature"
+        );
 
         let command = match self.command {
             Command::Local => 0,
@@ -170,13 +202,43 @@ impl HeaderV2 {
 
         header.push(self.family);
         header.extend_from_slice(&u16_to_array_of_u8(self.addr.len()));
+        // Fixed 12-byte signature + 1 (ver/cmd) + 1 (family) + 2 (length) = 16
+        // bytes precede the variable address block.
+        debug_assert_eq!(
+            header.len(),
+            16,
+            "v2 fixed prefix (signature + ver/cmd + family + length) must be 16 bytes"
+        );
         self.addr.write_bytes_to(&mut header);
+        // Postcondition: the serialized header length reconciles with the
+        // declared `len()` and with the 16-byte prefix plus the address block.
+        debug_assert_eq!(
+            header.len(),
+            expected_len,
+            "serialized v2 header length must match HeaderV2::len()"
+        );
+        debug_assert_eq!(
+            header.len(),
+            16 + addr_len,
+            "serialized v2 header must be the 16-byte prefix plus the address block"
+        );
         header
     }
 
     pub fn len(&self) -> usize {
         // signature + ver_and_cmd + family + len + addr
-        12 + 1 + 1 + 2 + self.addr.len() as usize
+        let total = 12 + 1 + 1 + 2 + self.addr.len() as usize;
+        // The fixed prefix is always 16 bytes; the only variable part is the
+        // address block, whose size is one of the enumerated ProxyAddr lengths.
+        debug_assert!(
+            total >= 16,
+            "v2 header is at least its 16-byte fixed prefix"
+        );
+        debug_assert!(
+            total <= 16 + 216,
+            "v2 header never exceeds the 16-byte prefix plus the largest (unix) address block"
+        );
+        total
     }
 
     pub fn is_empty(&self) -> bool {
@@ -202,7 +264,7 @@ pub enum ProxyAddr {
 
 impl ProxyAddr {
     pub fn from(addr_src: SocketAddr, addr_dst: SocketAddr) -> Self {
-        match (addr_src, addr_dst) {
+        let addr = match (addr_src, addr_dst) {
             (SocketAddr::V4(addr_ipv4_src), SocketAddr::V4(addr_ipv4_dst)) => ProxyAddr::Ipv4Addr {
                 src_addr: addr_ipv4_src,
                 dst_addr: addr_ipv4_dst,
@@ -212,7 +274,21 @@ impl ProxyAddr {
                 dst_addr: addr_ipv6_dst,
             },
             _ => ProxyAddr::AfUnspec,
-        }
+        };
+        // Postcondition: a same-family pair maps to a concrete variant, a
+        // mixed v4/v6 pair collapses to AfUnspec (PROXY-v2 has no cross-family
+        // encoding). The chosen variant must agree with both inputs' family.
+        debug_assert_eq!(
+            matches!(addr, ProxyAddr::Ipv4Addr { .. }),
+            addr_src.is_ipv4() && addr_dst.is_ipv4(),
+            "Ipv4Addr variant iff both endpoints are IPv4"
+        );
+        debug_assert_eq!(
+            matches!(addr, ProxyAddr::Ipv6Addr { .. }),
+            addr_src.is_ipv6() && addr_dst.is_ipv6(),
+            "Ipv6Addr variant iff both endpoints are IPv6"
+        );
+        addr
     }
 
     fn len(&self) -> u16 {
@@ -242,6 +318,8 @@ impl ProxyAddr {
 
     // TODO: rename to a less ambiguous name, like "write bytes to buffer"
     fn write_bytes_to(&self, buf: &mut Vec<u8>) {
+        let before = buf.len();
+        let declared = self.len() as usize;
         match *self {
             ProxyAddr::Ipv4Addr { src_addr, dst_addr } => {
                 buf.extend_from_slice(&src_addr.ip().octets());
@@ -261,6 +339,19 @@ impl ProxyAddr {
             }
             ProxyAddr::AfUnspec => {}
         };
+        // Postcondition: the bytes appended must be exactly the address
+        // block size advertised by `len()` — the wire length field is
+        // derived from `len()`, so any divergence would desynchronize the
+        // serialized header from its declared length.
+        debug_assert!(
+            buf.len() >= before,
+            "write_bytes_to must never shrink the buffer"
+        );
+        debug_assert_eq!(
+            buf.len() - before,
+            declared,
+            "appended address bytes must equal the declared ProxyAddr::len()"
+        );
     }
 }
 
@@ -318,18 +409,43 @@ impl PartialEq for ProxyAddr {
 }
 
 fn get_family(addr: &ProxyAddr) -> u8 {
-    match *addr {
+    let family = match *addr {
         ProxyAddr::Ipv4Addr { .. } => 0x10 | 0x01, // AF_INET  = 1 + STREAM = 1
         ProxyAddr::Ipv6Addr { .. } => 0x20 | 0x01, // AF_INET6 = 2 + STREAM = 1
         ProxyAddr::UnixAddr { .. } => 0x30 | 0x01, // AF_UNIX  = 3 + STREAM = 1
         ProxyAddr::AfUnspec => 0x00,               // AF_UNSPEC + UNSPEC
-    }
+    };
+    // Postcondition: the high nibble (address family) is within the
+    // enumerated set the parser accepts (0..=3), and the low nibble
+    // (transport) is STREAM for the concrete families, UNSPEC for AfUnspec.
+    debug_assert!(
+        (family >> 4) <= 0x03,
+        "address family nibble must be one of AF_UNSPEC/INET/INET6/UNIX"
+    );
+    debug_assert!(
+        matches!(addr, ProxyAddr::AfUnspec) == (family == 0x00),
+        "only AfUnspec maps to the all-zero family byte"
+    );
+    debug_assert!(
+        matches!(addr, ProxyAddr::AfUnspec) || (family & 0x0f) == 0x01,
+        "concrete address families must advertise the STREAM transport"
+    );
+    family
 }
 
 fn u16_to_array_of_u8(x: u16) -> [u8; 2] {
     let b1: u8 = ((x >> 8) & 0xff) as u8;
     let b2: u8 = (x & 0xff) as u8;
-    [b1, b2]
+    let out = [b1, b2];
+    // Postcondition: this is a pure big-endian split — reassembling the two
+    // bytes must round-trip to the input exactly. Port/length fields on the
+    // wire depend on this being byte-exact.
+    debug_assert_eq!(
+        u16::from_be_bytes(out),
+        x,
+        "big-endian split must round-trip the input u16"
+    );
+    out
 }
 
 #[cfg(test)]

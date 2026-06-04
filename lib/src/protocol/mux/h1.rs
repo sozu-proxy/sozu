@@ -166,6 +166,13 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
     /// RST_STREAM(InternalError) rather than a silent END_STREAM with a
     /// truncated body — RFC 9112 §7.1 requires the zero-chunk terminator.
     fn terminate_close_delimited(kawa: &mut super::GenericHttpStream, stream_id: GlobalStreamId) {
+        // Pre: we only synthesize an end-of-body for a response still in its
+        // body phase. A kawa already Terminated/Error must not be re-terminated
+        // (it would double-push an END_STREAM flag onto the converter).
+        debug_assert!(
+            !kawa.is_terminated(),
+            "terminate_close_delimited must not run on an already-terminated kawa"
+        );
         if kawa.body_size == kawa::BodySize::Chunked {
             warn!(
                 "{} H1 backend EOF mid-chunked response on stream {}: emitting RST_STREAM",
@@ -177,6 +184,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 .error(kawa::ParsingErrorKind::Processing {
                     message: "INTERNAL_ERROR",
                 });
+            // Post: a truncated chunked body is demoted to Error so the
+            // converter emits RST_STREAM, never a silent END_STREAM.
+            debug_assert!(
+                kawa.is_error(),
+                "truncated chunked response must end in the Error phase"
+            );
             return;
         }
         debug!(
@@ -191,6 +204,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             end_stream: true,
         }));
         kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+        // Post: a close-delimited body is now Terminated so the converter
+        // emits DATA with END_STREAM on the last frame.
+        debug_assert!(
+            kawa.is_terminated(),
+            "close-delimited body must end in the Terminated phase"
+        );
     }
 
     pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
@@ -228,13 +247,38 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         if kawa.storage.available_space() == 0 {
             self.readiness.event.remove(Ready::READABLE);
             self.parked_on_buffer_pressure = true;
+            // Pair the park flag with the cleared READABLE event: only
+            // `try_resume_reading` may re-arm it once the peer drains space.
+            debug_assert!(
+                self.parked_on_buffer_pressure && !self.readiness.event.is_readable(),
+                "parking on buffer pressure must clear the READABLE event"
+            );
             return MuxResult::Continue;
         }
 
         self.parked_on_buffer_pressure = false;
+        // Pre: we never ask the socket to read into a full buffer (that path
+        // returned above) — `socket_read` requires a non-empty target slice.
+        let space_before = kawa.storage.available_space();
+        debug_assert!(
+            space_before > 0,
+            "socket_read must target a buffer with free space"
+        );
         let (size, status) = self.socket.socket_read(kawa.storage.space());
+        // A read cannot deliver more bytes than the buffer had room for.
+        // `debug_assert!` only — `size` is socket-derived, never trusted to
+        // panic, but a violation here is a SocketHandler contract bug.
+        debug_assert!(
+            size <= space_before,
+            "socket_read returned more bytes than the buffer could hold"
+        );
         context.debug.push(DebugEvent::StreamEvent(0, size));
         kawa.storage.fill(size);
+        debug_assert_eq!(
+            kawa.storage.available_space(),
+            space_before - size,
+            "fill must consume exactly `size` bytes of free space"
+        );
         self.position.count_bytes_in_counter(size);
         self.position.count_bytes_in(parts.metrics, size);
         if update_readiness_after_read(size, status, &mut self.readiness) {
@@ -355,7 +399,19 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     set_default_answer(stream, &mut self.readiness, 400, &answers);
                     return MuxResult::Continue;
                 }
+                // First-seen request on this (server) connection: the keep-alive
+                // request counter advances by exactly one and the matching
+                // `http.active_requests` gauge `+1` is paired with flipping
+                // `request_counted` true (the `generate_access_log` `-1` is
+                // gated on that flag, so they must stay balanced).
+                let requests_before = self.requests;
+                let links_before = context.pending_links.len();
                 self.requests += 1;
+                debug_assert_eq!(
+                    self.requests,
+                    requests_before + 1,
+                    "server keep-alive request counter must advance by exactly one"
+                );
                 trace!("{} REQUESTS: {}", log_context!(self), self.requests);
                 incr!(names::http::REQUESTS);
                 gauge_add!(names::http::ACTIVE_REQUESTS, 1);
@@ -364,6 +420,22 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 stream.request_counted = true;
                 stream.state = StreamState::Link;
                 context.pending_links.push_back(stream_id);
+                // Post: the stream is queued for backend linking exactly once
+                // and is now in the Link state the ready loop expects.
+                debug_assert!(
+                    stream.request_counted,
+                    "request_counted must be set when the active-requests gauge is incremented"
+                );
+                debug_assert_eq!(
+                    stream.state,
+                    StreamState::Link,
+                    "a first-seen request must transition the stream to Link"
+                );
+                debug_assert_eq!(
+                    context.pending_links.len(),
+                    links_before + 1,
+                    "a first-seen request must enqueue exactly one pending link"
+                );
             }
             if let StreamState::Linked(token) = stream.state {
                 // Signal pending write alongside the WRITABLE interest flip: the
@@ -462,7 +534,14 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             return MuxResult::Continue;
         }
         let tls_only_flush = io_slices.is_empty();
+        // Total bytes we offered the socket across the gathered slices; a
+        // vectored write can never report more consumed than we handed it.
+        let queued: usize = io_slices.iter().map(|s| s.len()).sum();
         let (size, status) = self.socket.socket_write_vectored(&io_slices);
+        debug_assert!(
+            size <= queued,
+            "socket_write_vectored reported more bytes written than were queued"
+        );
         context.debug.push(DebugEvent::StreamEvent(1, size));
         kawa.consume(size);
         self.position.count_bytes_out_counter(size);
@@ -470,6 +549,13 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         let should_yield = update_readiness_after_write(size, status, &mut self.readiness);
         if self.socket.socket_wants_write() {
             self.readiness.signal_pending_write();
+            // Pair the queued-write signal with the socket's own report: we
+            // only synthesize a WRITABLE event when the socket still has bytes
+            // buffered (edge-triggered epoll won't re-fire on its own).
+            debug_assert!(
+                self.readiness.event.is_writable(),
+                "signal_pending_write must leave a WRITABLE event queued"
+            );
             return MuxResult::Continue;
         }
         if !tls_only_flush && should_yield {
@@ -588,6 +674,24 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         // Transition back to Idle so buffered pipelined requests
                         // trigger a phase transition on the next readable() call.
                         stream.state = StreamState::Idle;
+                        // Post: the keep-alive reset leaves a clean, closed slot
+                        // ready for the next pipelined request. `request_counted`
+                        // was already cleared by `generate_access_log` above, so
+                        // the slot carries no pending active-requests charge.
+                        debug_assert_eq!(
+                            stream.state,
+                            StreamState::Idle,
+                            "keep-alive reset must return the stream to Idle"
+                        );
+                        debug_assert_eq!(stream.attempts, 0, "keep-alive reset must zero attempts");
+                        debug_assert!(
+                            !stream.request_counted,
+                            "keep-alive reset must leave no counted request (active-requests leak)"
+                        );
+                        debug_assert!(
+                            stream.back.storage.is_empty(),
+                            "keep-alive reset must drain the response storage"
+                        );
                         // HTTP/1.1 pipelining: if there's still data in the frontend
                         // storage (pipelined requests already read from the socket),
                         // parse it now. We can't rely on a new READABLE event because
@@ -671,13 +775,31 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         if !self.position.is_server() {
             return false;
         }
+        // Past the guard we are always server-side; close_notify is a
+        // frontend-only TLS concern.
+        debug_assert!(
+            self.position.is_server(),
+            "initiate_close_notify past the guard must be server-side"
+        );
         if !self.close_notify_sent {
             trace!("{} H1 initiating CLOSE_NOTIFY", log_context!(self));
             self.socket.socket_close();
             self.close_notify_sent = true;
         }
+        // `close_notify` is monotone: once requested it stays sent for the
+        // connection's lifetime (a second send would corrupt the TLS stream).
+        debug_assert!(
+            self.close_notify_sent,
+            "close_notify_sent must be set once initiate_close_notify has run"
+        );
         if self.socket.socket_wants_write() {
             self.readiness.arm_writable();
+            // arm_writable pairs interest + event so the deferred TLS flush is
+            // actually scheduled under edge-triggered epoll.
+            debug_assert!(
+                self.readiness.interest.is_writable() && self.readiness.event.is_writable(),
+                "arm_writable must set both WRITABLE interest and event"
+            );
             true
         } else {
             false
@@ -756,7 +878,28 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             );
             return;
         }
+        // Reached only on the matched-stream path: the connection's active
+        // stream is exactly the one being ended.
+        debug_assert_eq!(
+            self.stream,
+            Some(stream),
+            "end_stream past the guard must target the active stream"
+        );
         context.unlink_stream(stream);
+        // Post: whatever backend token this stream was Linked to no longer
+        // lists it in the reverse index — `unlink_stream` is the single
+        // eviction point, so a subsequent end/close cannot double-remove it.
+        // (The `state` field is still `Linked` here; the arms below retire it.)
+        #[cfg(debug_assertions)]
+        if let StreamState::Linked(token) = context.streams[stream].state {
+            debug_assert!(
+                context
+                    .backend_streams
+                    .get(&token)
+                    .is_none_or(|ids| !ids.contains(&stream)),
+                "unlink_stream must evict the stream from the backend reverse index"
+            );
+        }
         let answers_rc = context.listener.borrow().get_answers().clone();
         let stream_id = stream;
         let stream = &mut context.streams[stream_id];
@@ -773,6 +916,17 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 if stream.state != StreamState::Recycle {
                     stream.state = StreamState::Unlinked;
                 }
+                // Post: the client connection detaches from its stream and the
+                // slot is retired (Unlinked) unless already marked for reuse —
+                // never left dangling in an open/Linked state.
+                debug_assert!(
+                    self.stream.is_none(),
+                    "client end_stream must detach the stream"
+                );
+                debug_assert!(
+                    !matches!(stream.state, StreamState::Linked(_)),
+                    "detached stream must not remain Linked"
+                );
                 self.readiness.interest.remove(Ready::ALL);
                 self.force_disconnect();
             }
@@ -781,6 +935,14 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 if stream.state != StreamState::Recycle {
                     stream.state = StreamState::Unlinked;
                 }
+                debug_assert!(
+                    self.stream.is_none(),
+                    "client end_stream must detach the stream"
+                );
+                debug_assert!(
+                    !matches!(stream.state, StreamState::Linked(_)),
+                    "detached stream must not remain Linked"
+                );
                 self.readiness.interest.remove(Ready::ALL);
                 // keep alive should probably be used only if the http context is fully reset
                 // in case end_stream occurs due to an error the connection state is probably
@@ -845,9 +1007,23 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         );
         self.readiness.interest.insert(Ready::ALL);
         self.stream = Some(stream);
+        debug_assert_eq!(
+            self.stream,
+            Some(stream),
+            "start_stream must pin the connection's active stream"
+        );
         match &mut self.position {
             Position::Client(_, _, status @ BackendStatus::KeepAlive) => {
                 *status = BackendStatus::Connected;
+                // A keep-alive client transitions to Connected when it picks up
+                // a new stream; it must not stay parked in KeepAlive.
+                debug_assert!(
+                    matches!(
+                        self.position,
+                        Position::Client(_, _, BackendStatus::Connected)
+                    ),
+                    "a reused keep-alive client must become Connected on start_stream"
+                );
             }
             Position::Client(_, _, BackendStatus::Disconnecting) => {
                 error!(

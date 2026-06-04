@@ -242,11 +242,28 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
         if current_capacity >= self.max_buffer_size {
             return None;
         }
+        // Precondition: we only reach here below the ceiling, so a strictly
+        // larger size always exists within [current+1, max_buffer_size].
+        debug_assert!(
+            current_capacity < self.max_buffer_size,
+            "grow_size must only grow buffers that are strictly below the max ceiling"
+        );
         // double the capacity, but don't exceed max
         let new_size = min(current_capacity.saturating_mul(2), self.max_buffer_size);
         // ensure we grow by at least something (in case current_capacity is 0)
         let new_size = new_size.max(current_capacity + 1);
-        Some(min(new_size, self.max_buffer_size))
+        let new_size = min(new_size, self.max_buffer_size);
+        // Postconditions: the new capacity strictly grows (forward progress,
+        // no spin) and never overshoots the configured ceiling.
+        debug_assert!(
+            new_size > current_capacity,
+            "grow_size must make forward progress (new capacity strictly larger)"
+        );
+        debug_assert!(
+            new_size <= self.max_buffer_size,
+            "grow_size must never exceed the configured max_buffer_size ceiling"
+        );
+        Some(new_size)
     }
 
     /// Check if a buffer has exceeded the high watermark and log a warning once
@@ -307,12 +324,26 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                         &mut self.front_high_watermark_logged,
                     );
                     self.front_buf.grow(new_size);
+                    // The read buffer must never grow past the configured ceiling.
+                    debug_assert!(
+                        self.front_buf.capacity() <= self.max_buffer_size,
+                        "front buffer capacity must stay within the max_buffer_size ceiling"
+                    );
                 } else {
                     self.interest.remove(Ready::READABLE);
                     break;
                 }
             }
 
+            // The slice handed to `read` is exactly the free tail; the kernel
+            // can never write more than that, so a successful read of N bytes
+            // is bounded by the space we just measured (post-grow).
+            let space_before = self.front_buf.available_space();
+            debug_assert!(
+                space_before > 0,
+                "readable must only call read() with non-empty space (zero-space path grows or breaks)"
+            );
+            let data_before = self.front_buf.available_data();
             match self.sock.read(self.front_buf.space()) {
                 Ok(0) => {
                     self.interest = Ready::EMPTY;
@@ -332,8 +363,22 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                     }
                 },
                 Ok(bytes_read) => {
+                    // A read can never deliver more bytes than the free space
+                    // it was handed; otherwise `fill` would corrupt offsets.
+                    debug_assert!(
+                        bytes_read <= space_before,
+                        "read delivered more bytes than the buffer space it was given"
+                    );
                     count += bytes_read;
                     self.front_buf.fill(bytes_read);
+                    // `fill` advances `end` by exactly the bytes read, so the
+                    // available data grows by that delta — pair-assert the
+                    // offset mutation.
+                    debug_assert_eq!(
+                        self.front_buf.available_data(),
+                        data_before + bytes_read,
+                        "front buffer available_data must increase by exactly bytes_read"
+                    );
                 }
             };
         }
@@ -357,6 +402,7 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                 break;
             }
 
+            let data_before = self.back_buf.available_data();
             match self.sock.write(self.back_buf.data()) {
                 Ok(0) => {
                     self.interest = Ready::EMPTY;
@@ -364,8 +410,25 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                     return Err(ChannelError::NoByteWritten);
                 }
                 Ok(bytes_written) => {
+                    // The kernel cannot accept more than the slice (`data()`)
+                    // it was handed; otherwise `consume` would underflow.
+                    debug_assert!(
+                        bytes_written <= data_before,
+                        "write reported more bytes than the buffer data it was given"
+                    );
                     count += bytes_written;
-                    self.back_buf.consume(bytes_written);
+                    let consumed = self.back_buf.consume(bytes_written);
+                    // `consume` is saturating but the bound above guarantees an
+                    // exact consume here; pair-assert the offset mutation.
+                    debug_assert_eq!(
+                        consumed, bytes_written,
+                        "back buffer must consume exactly the bytes written to the socket"
+                    );
+                    debug_assert_eq!(
+                        self.back_buf.available_data(),
+                        data_before - bytes_written,
+                        "back buffer available_data must shrink by exactly bytes_written"
+                    );
                 }
                 Err(write_error) => match write_error.kind() {
                     ErrorKind::WouldBlock => {
@@ -456,7 +519,21 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
 
     /// parse a prost message from the front buffer, grow it if necessary
     fn try_read_delimited_message(&mut self) -> Result<Option<Rx>, ChannelError> {
+        // Invariant guarding all the slice indexing below: the front buffer can
+        // never have grown past the configured ceiling. Every grow site routes
+        // through `grow_size`/`max_buffer_size`; if this ever fired the length
+        // checks would be reasoning against a stale bound.
+        debug_assert!(
+            self.front_buf.capacity() <= self.max_buffer_size,
+            "front buffer capacity must never exceed max_buffer_size"
+        );
         let buffer = self.front_buf.data();
+        // `data()` returns `memory[position..end]`, so its length is exactly the
+        // available data and can never exceed the buffer capacity.
+        debug_assert!(
+            buffer.len() <= self.front_buf.capacity(),
+            "available data slice cannot exceed buffer capacity"
+        );
         if buffer.len() >= delimiter_size() {
             let delimiter = buffer[..delimiter_size()]
                 .try_into()
@@ -499,9 +576,47 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
             }
 
             if buffer.len() >= message_len {
+                // By the time we slice, the two guards above have proven the
+                // length prefix is well-formed: it is at least the delimiter
+                // (so `delimiter_size()..message_len` runs forward) and at most
+                // the configured ceiling (so it cannot drive growth). The
+                // `buffer.len() >= message_len` branch then guarantees the whole
+                // frame is in the buffer. These are the exact invariants that
+                // keep the slice and the `consume` in bounds — never reachable
+                // from a malformed length, which already returned an error.
+                debug_assert!(
+                    message_len >= delimiter_size(),
+                    "decode path requires a frame at least as large as its delimiter"
+                );
+                debug_assert!(
+                    message_len <= self.max_buffer_size,
+                    "decode path requires the declared length within the max ceiling"
+                );
+                debug_assert!(
+                    message_len <= buffer.len(),
+                    "decode path requires the full frame to be buffered before slicing"
+                );
+                let available_before = self.front_buf.available_data();
+                debug_assert_eq!(
+                    available_before,
+                    buffer.len(),
+                    "available_data must equal the data slice length we validated against"
+                );
                 let message = Rx::decode(&buffer[delimiter_size()..message_len])
                     .map_err(ChannelError::InvalidProtobufMessage)?;
-                self.front_buf.consume(message_len);
+                let consumed = self.front_buf.consume(message_len);
+                // The whole frame (delimiter + payload) is consumed exactly:
+                // pair-assert that consume advanced by message_len and the data
+                // pointer moved forward by the same amount.
+                debug_assert_eq!(
+                    consumed, message_len,
+                    "must consume exactly the validated frame length"
+                );
+                debug_assert_eq!(
+                    self.front_buf.available_data(),
+                    available_before - message_len,
+                    "available_data must drop by exactly the consumed frame length"
+                );
                 return Ok(Some(message));
             }
         }
@@ -576,12 +691,21 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
 
         let payload_len = payload.len() + delimiter_size();
 
+        // The framed length is the payload plus a fixed delimiter, so it is by
+        // construction at least one delimiter wide — the mirror of the
+        // `MessageLengthUnderDelimiter` invariant the reader enforces.
+        debug_assert!(
+            payload_len >= delimiter_size(),
+            "framed length must include the fixed-size delimiter prefix"
+        );
+
         let delimiter = payload_len.to_le_bytes();
 
         if payload_len > self.back_buf.available_space() {
             self.back_buf.shift();
         }
 
+        let data_before = self.back_buf.available_data();
         if payload_len > self.back_buf.available_space() {
             let needed = payload_len - self.back_buf.available_space() + self.back_buf.capacity();
             if needed > self.max_buffer_size {
@@ -591,13 +715,34 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                     max: self.max_buffer_size,
                 });
             }
+            // Past the ceiling check, the required size is within the ceiling
+            // and at least the current capacity (we only enter on shortfall).
+            debug_assert!(
+                needed <= self.max_buffer_size,
+                "grow target must be within the max ceiling once the cap check passed"
+            );
 
+            let capacity_before = self.back_buf.capacity();
             // use doubling strategy to reach at least `needed`, amortizing future writes
             let mut new_length = self.back_buf.capacity();
             while new_length < needed {
                 new_length = new_length.saturating_mul(2).max(new_length + 1);
             }
             new_length = min(new_length, self.max_buffer_size);
+            // Post-grow target: large enough to fit the frame yet capped at the
+            // configured ceiling and never below where we started.
+            debug_assert!(
+                new_length >= needed,
+                "doubling growth must reach at least the needed capacity"
+            );
+            debug_assert!(
+                new_length <= self.max_buffer_size,
+                "grown back buffer must stay within the max_buffer_size ceiling"
+            );
+            debug_assert!(
+                new_length >= capacity_before,
+                "growth must never shrink the back buffer"
+            );
             Self::check_high_watermark(
                 "back",
                 new_length,
@@ -605,6 +750,11 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                 &mut self.back_high_watermark_logged,
             );
             self.back_buf.grow(new_length);
+            // After the grow the frame must fit in the now-available space.
+            debug_assert!(
+                payload_len <= self.back_buf.available_space(),
+                "back buffer must have room for the full frame after growth"
+            );
         }
 
         self.back_buf
@@ -613,6 +763,18 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
         self.back_buf
             .write_all(&payload)
             .map_err(ChannelError::Write)?;
+
+        // The two writes appended exactly `payload_len` bytes (delimiter +
+        // payload) to the back buffer's pending data.
+        debug_assert_eq!(
+            self.back_buf.available_data(),
+            data_before + payload_len,
+            "back buffer pending data must grow by exactly the framed length"
+        );
+        debug_assert!(
+            self.back_buf.capacity() <= self.max_buffer_size,
+            "back buffer capacity must never exceed the max_buffer_size ceiling"
+        );
 
         Ok(())
     }
@@ -624,10 +786,27 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
         if capacity <= self.initial_buffer_size {
             return;
         }
+        // Past the early return, we are strictly above the floor, so a shrink
+        // back to `initial_buffer_size` is a genuine reduction.
+        debug_assert!(
+            capacity > self.initial_buffer_size,
+            "shrink path only runs when capacity is above the initial floor"
+        );
         // only shrink when the buffer has little pending data
         if self.front_buf.available_data() * 4 < self.initial_buffer_size {
+            let data_before = self.front_buf.available_data();
             self.front_buf.shrink(self.initial_buffer_size);
             self.front_high_watermark_logged = false;
+            // Shrink preserves pending data and never drops below the floor.
+            debug_assert!(
+                self.front_buf.capacity() >= self.initial_buffer_size,
+                "front buffer must never shrink below the initial buffer size floor"
+            );
+            debug_assert_eq!(
+                self.front_buf.available_data(),
+                data_before,
+                "shrink must preserve all pending front-buffer data"
+            );
             trace!(
                 "front buffer shrunk from {} to {} bytes",
                 capacity, self.initial_buffer_size
@@ -641,9 +820,24 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
         if capacity <= self.initial_buffer_size {
             return;
         }
+        debug_assert!(
+            capacity > self.initial_buffer_size,
+            "shrink path only runs when capacity is above the initial floor"
+        );
         if self.back_buf.available_data() == 0 {
             self.back_buf.shrink(self.initial_buffer_size);
             self.back_high_watermark_logged = false;
+            // The back buffer is only shrunk once fully drained; it must end at
+            // the floor with no pending data resurrected.
+            debug_assert!(
+                self.back_buf.capacity() >= self.initial_buffer_size,
+                "back buffer must never shrink below the initial buffer size floor"
+            );
+            debug_assert_eq!(
+                self.back_buf.available_data(),
+                0,
+                "back buffer must stay empty across a drained shrink"
+            );
             trace!(
                 "back buffer shrunk from {} to {} bytes",
                 capacity, self.initial_buffer_size

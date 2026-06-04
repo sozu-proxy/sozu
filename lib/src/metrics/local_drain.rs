@@ -55,15 +55,23 @@ impl AggregatedMetric {
         match metric {
             MetricValue::Gauge(value) => Ok(AggregatedMetric::Gauge(value)),
             MetricValue::GaugeAdd(value) => {
-                if value >= 0 {
-                    Ok(AggregatedMetric::Gauge(value as usize))
+                // First emission via a relative add: a negative seed clamps
+                // to 0 (never wraps through `value as usize`). Post-state is
+                // always a `Gauge` with the clamped magnitude.
+                let aggregated = if value >= 0 {
+                    AggregatedMetric::Gauge(value as usize)
                 } else {
                     error!(
                         "local drain metric created with negative GaugeAdd({}), clamping to 0",
                         value
                     );
-                    Ok(AggregatedMetric::Gauge(0))
-                }
+                    AggregatedMetric::Gauge(0)
+                };
+                debug_assert!(
+                    matches!(&aggregated, AggregatedMetric::Gauge(v) if *v as i64 == value.max(0)),
+                    "GaugeAdd seed must clamp negatives to 0 and keep non-negatives verbatim"
+                );
+                Ok(aggregated)
             }
             MetricValue::Count(value) => Ok(AggregatedMetric::Count(value)),
             MetricValue::Time(value) => {
@@ -81,6 +89,18 @@ impl AggregatedMetric {
                     }
                 })?;
 
+                // A freshly-seeded histogram holds exactly the one sample we
+                // just recorded; min/max collapse to that single value.
+                debug_assert_eq!(
+                    histogram.len(),
+                    1,
+                    "fresh time histogram must hold exactly one sample"
+                );
+                debug_assert!(
+                    histogram.min() <= histogram.max(),
+                    "histogram min must never exceed max"
+                );
+
                 Ok(AggregatedMetric::Time(histogram))
             }
         }
@@ -90,25 +110,69 @@ impl AggregatedMetric {
         match (self, m) {
             (&mut AggregatedMetric::Gauge(ref mut v1), MetricValue::Gauge(v2)) => {
                 *v1 = v2;
+                debug_assert_eq!(*v1, v2, "gauge set must store exactly the requested value");
             }
             (&mut AggregatedMetric::Gauge(ref mut v1), MetricValue::GaugeAdd(v2)) => {
-                let res = *v1 as i64 + v2;
+                // Canonical gauge-underflow guard (CLAUDE.md: "Gauge
+                // underflow is a correctness bug, not a rounding issue"). We
+                // saturate + log rather than panic because a clear()/remove
+                // during live traffic can legitimately drive a paired
+                // decrement below a fresh-zero baseline — a recovery path,
+                // not a logic bug. The post-condition asserts the clamp is
+                // exact (to 0, never wrapped) and that the non-underflow
+                // path equals `before + v2`.
+                let before = *v1;
+                let res = before as i64 + v2;
                 *v1 = if res >= 0 {
                     res as usize
                 } else {
                     error!(
                         "local drain metric {} underflow: previous value: {}, adding: {}",
-                        key, *v1, v2
+                        key, before, v2
                     );
                     0
                 };
+                debug_assert!(
+                    res >= 0 || *v1 == 0,
+                    "gauge underflow must clamp to exactly 0 (never wrap to usize::MAX)"
+                );
+                debug_assert!(
+                    res < 0 || *v1 as i64 == before as i64 + v2,
+                    "non-underflow gauge add must equal before + v2 exactly"
+                );
             }
             (&mut AggregatedMetric::Count(ref mut v1), MetricValue::Count(v2)) => {
+                // Counters advance by exactly the delta between resets.
+                let before = *v1;
                 *v1 += v2;
+                debug_assert_eq!(*v1, before + v2, "count update must advance by exactly v2");
             }
             (&mut AggregatedMetric::Time(ref mut v1), MetricValue::Time(v2)) => {
-                if let Err(e) = (*v1).record(v2 as u64) {
-                    error!("could not record time metric: {:?}", e.to_string());
+                // A successful record grows the cumulative sample count by
+                // exactly one and keeps min ≤ max consistent. On the
+                // hdrhistogram error path (value out of range) nothing is
+                // recorded — assert only on success.
+                let before_len = v1.len();
+                match v1.record(v2 as u64) {
+                    Ok(()) => {
+                        debug_assert_eq!(
+                            v1.len(),
+                            before_len + 1,
+                            "a recorded time sample must grow the histogram by exactly one"
+                        );
+                        debug_assert!(
+                            v1.min() <= v1.max(),
+                            "histogram min must never exceed max after record"
+                        );
+                    }
+                    Err(e) => {
+                        error!("could not record time metric: {:?}", e.to_string());
+                        debug_assert_eq!(
+                            v1.len(),
+                            before_len,
+                            "a rejected time sample must not change the histogram count"
+                        );
+                    }
                 }
             }
             (s, m) => {
@@ -139,7 +203,7 @@ impl AggregatedMetric {
 
 pub fn histogram_to_percentiles(hist: &Histogram<u64>) -> Percentiles {
     let sum = hist.len() as f64 * hist.mean();
-    Percentiles {
+    let percentiles = Percentiles {
         samples: hist.len(),
         p_50: hist.value_at_percentile(50.0),
         p_90: hist.value_at_percentile(90.0),
@@ -149,7 +213,25 @@ pub fn histogram_to_percentiles(hist: &Histogram<u64>) -> Percentiles {
         p_99_999: hist.value_at_percentile(99.999),
         p_100: hist.value_at_percentile(100.0),
         sum: sum as u64,
-    }
+    };
+    // Percentiles over a single distribution are monotonic non-decreasing,
+    // and the reported sample count must match the histogram length. p_100
+    // is the maximum recorded value, so it bounds every lower percentile.
+    debug_assert_eq!(
+        percentiles.samples,
+        hist.len(),
+        "reported sample count must equal the histogram length"
+    );
+    debug_assert!(
+        percentiles.p_50 <= percentiles.p_90
+            && percentiles.p_90 <= percentiles.p_99
+            && percentiles.p_99 <= percentiles.p_99_9
+            && percentiles.p_99_9 <= percentiles.p_99_99
+            && percentiles.p_99_99 <= percentiles.p_99_999
+            && percentiles.p_99_999 <= percentiles.p_100,
+        "percentiles must be monotonic non-decreasing (p50 ≤ … ≤ p100)"
+    );
+    percentiles
 }
 
 /// convert a collected histogram to a prometheus-compatible format
@@ -160,16 +242,42 @@ pub fn filter_histogram(hist: &Histogram<u64>) -> FilteredMetrics {
         .sum();
 
     let mut count = 0;
-    let buckets = hist
+    let mut prev_le = 0u64;
+    let mut prev_count = 0u64;
+    let buckets: Vec<Bucket> = hist
         .iter_log(1, 2.0)
         .map(|value| {
             count += value.count_since_last_iteration();
+            // Cumulative prometheus buckets: upper bounds (`le`) strictly
+            // increase and the running count is monotonic non-decreasing.
+            debug_assert!(
+                value.value_iterated_to() >= prev_le,
+                "prometheus bucket upper bounds must be non-decreasing"
+            );
+            debug_assert!(
+                count >= prev_count,
+                "cumulative bucket count must be monotonic non-decreasing"
+            );
+            prev_le = value.value_iterated_to();
+            prev_count = count;
             Bucket {
                 le: value.value_iterated_to(),
                 count,
             }
         })
         .collect();
+
+    // The final cumulative bucket count is the total recorded sample count,
+    // and an empty histogram yields no buckets / zero count.
+    debug_assert_eq!(
+        count,
+        hist.len(),
+        "final cumulative bucket count must equal the total sample count"
+    );
+    debug_assert!(
+        !hist.is_empty() || buckets.is_empty(),
+        "an empty histogram must yield no buckets"
+    );
 
     FilteredMetrics {
         inner: Some(filtered_metrics::Inner::Histogram(FilteredHistogram {
@@ -223,6 +331,8 @@ impl MetricsMap {
         metric_name: &str,
         new_value: MetricValue,
     ) -> Result<(), MetricError> {
+        let before_len = self.map.len();
+        let existed = self.map.contains_key(metric_name);
         match self.map.get_mut(metric_name) {
             Some(old_value) => old_value.update(metric_name, new_value),
             None => {
@@ -230,6 +340,18 @@ impl MetricsMap {
                 self.map.insert(metric_name.to_owned(), aggregated_metric);
             }
         }
+        // Map-accounting invariant: an update of an existing key keeps the
+        // size; a fresh insert grows it by exactly one. The key is always
+        // present afterwards (we either updated it or inserted it).
+        debug_assert_eq!(
+            self.map.len(),
+            before_len + (!existed) as usize,
+            "receive_metric grows the map by exactly one iff the key was absent"
+        );
+        debug_assert!(
+            self.map.contains_key(metric_name),
+            "the metric key must be present after receive_metric"
+        );
         Ok(())
     }
 
@@ -260,6 +382,8 @@ impl LocalClusterMetrics {
         backend_id: &str,
         new_value: MetricValue,
     ) -> Result<(), MetricError> {
+        let existed = self.contains_backend(backend_id);
+        let before_len = self.backends.len();
         let backend = self
             .backends
             .iter_mut()
@@ -267,6 +391,11 @@ impl LocalClusterMetrics {
 
         if let Some(backend) = backend {
             backend.metrics.receive_metric(metric_name, new_value)?;
+            debug_assert_eq!(
+                self.backends.len(),
+                before_len,
+                "updating an existing backend must not change the backend count"
+            );
             return Ok(());
         }
 
@@ -277,6 +406,22 @@ impl LocalClusterMetrics {
             backend_id: backend_id.to_owned(),
             metrics,
         });
+        // A fresh backend grows the vec by exactly one, and the
+        // backend_id must now be present. We also uphold the single-entry-
+        // per-backend invariant: a brand-new id was absent before.
+        debug_assert!(
+            !existed,
+            "fresh backend insert path must only run for an absent backend_id"
+        );
+        debug_assert_eq!(
+            self.backends.len(),
+            before_len + 1,
+            "a fresh backend must grow the vec by exactly one"
+        );
+        debug_assert!(
+            self.contains_backend(backend_id),
+            "the backend_id must be present after a fresh insert"
+        );
         Ok(())
     }
 
@@ -399,6 +544,20 @@ impl LocalDrain {
         self.proxy_metrics = MetricsMap::new();
         self.cluster_metrics.clear();
         self.removed_clusters.clear();
+        // A full reset must leave every map empty — proxy-wide, per-cluster
+        // (and therefore per-backend), and the tombstone set.
+        debug_assert!(
+            self.proxy_metrics.map.is_empty(),
+            "clear must empty the proxy-wide metric map"
+        );
+        debug_assert!(
+            self.cluster_metrics.is_empty(),
+            "clear must empty every cluster (and backend) row"
+        );
+        debug_assert!(
+            self.removed_clusters.is_empty(),
+            "clear must wipe the removed-cluster tombstones"
+        );
     }
 
     /// Drop all metrics for a cluster from the local drain and mark the
@@ -425,6 +584,16 @@ impl LocalDrain {
     pub fn remove_cluster(&mut self, cluster_id: &str) {
         self.cluster_metrics.remove(cluster_id);
         self.removed_clusters.insert(cluster_id.to_owned());
+        // Post-condition: the cluster row is gone AND the tombstone is armed
+        // so late session emissions for the id are dropped on the floor.
+        debug_assert!(
+            !self.cluster_metrics.contains_key(cluster_id),
+            "remove_cluster must drop the cluster row"
+        );
+        debug_assert!(
+            self.removed_clusters.contains(cluster_id),
+            "remove_cluster must arm the tombstone for the id"
+        );
     }
 
     /// Re-arm a previously-removed cluster id so its metrics flow again.
@@ -433,6 +602,12 @@ impl LocalDrain {
     /// removed.
     pub fn add_cluster(&mut self, cluster_id: &str) {
         self.removed_clusters.remove(cluster_id);
+        // Post-condition: the tombstone for the id is gone so fresh
+        // emissions are recorded again. Idempotent on never-removed ids.
+        debug_assert!(
+            !self.removed_clusters.contains(cluster_id),
+            "add_cluster must clear the tombstone for the id"
+        );
     }
 
     /// Drop all metrics for one backend within a cluster. Called from the
@@ -446,7 +621,18 @@ impl LocalDrain {
     /// the tombstone.
     pub fn remove_backend(&mut self, cluster_id: &str, backend_id: &str) {
         let drop_cluster = if let Some(cluster) = self.cluster_metrics.get_mut(cluster_id) {
+            let before = cluster.backends.len();
             cluster.backends.retain(|b| b.backend_id != backend_id);
+            // The targeted backend is gone, and `retain` removes at most one
+            // entry (backend_ids are unique within a cluster).
+            debug_assert!(
+                !cluster.contains_backend(backend_id),
+                "remove_backend must evict the targeted backend"
+            );
+            debug_assert!(
+                cluster.backends.len() == before || cluster.backends.len() == before - 1,
+                "remove_backend drops at most one backend (ids are unique per cluster)"
+            );
             cluster.cluster.map.is_empty() && cluster.backends.is_empty()
         } else {
             false
@@ -454,6 +640,19 @@ impl LocalDrain {
         if drop_cluster {
             self.cluster_metrics.remove(cluster_id);
         }
+        // Post-condition: the cluster row survives iff it still holds
+        // cluster-level metrics or at least one other backend.
+        debug_assert!(
+            !drop_cluster || !self.cluster_metrics.contains_key(cluster_id),
+            "an emptied cluster row must be dropped to avoid phantom keyspace"
+        );
+        debug_assert!(
+            self.cluster_metrics
+                .get(cluster_id)
+                .map(|c| !c.contains_backend(backend_id))
+                .unwrap_or(true),
+            "no surviving cluster row may still contain the removed backend"
+        );
     }
 
     pub fn query(&mut self, options: &QueryMetricsOptions) -> Result<ResponseContent, MetricError> {
@@ -662,6 +861,12 @@ impl LocalDrain {
         if self.removed_clusters.contains(cluster_id) {
             return Ok(());
         }
+        // We only reach the insert with a non-tombstoned id: a row for a
+        // removed cluster must never be (re)created here.
+        debug_assert!(
+            !self.removed_clusters.contains(cluster_id),
+            "a tombstoned cluster must not reach the entry().or_default() insert"
+        );
 
         let local_cluster_metric = self
             .cluster_metrics
@@ -685,6 +890,10 @@ impl LocalDrain {
         if self.removed_clusters.contains(cluster_id) {
             return Ok(());
         }
+        debug_assert!(
+            !self.removed_clusters.contains(cluster_id),
+            "a tombstoned cluster must not reach the backend insert"
+        );
 
         let local_cluster_metric = self
             .cluster_metrics
@@ -699,6 +908,8 @@ impl LocalDrain {
         metric_name: &str,
         metric: MetricValue,
     ) -> Result<(), MetricError> {
+        let before_len = self.proxy_metrics.map.len();
+        let existed = self.proxy_metrics.map.contains_key(metric_name);
         match self.proxy_metrics.map.get_mut(metric_name) {
             Some(stored_metric) => stored_metric.update(metric_name, metric),
             None => {
@@ -709,6 +920,17 @@ impl LocalDrain {
                     .insert(String::from(metric_name), aggregated_metric);
             }
         }
+        // Proxy-wide map accounting: an update keeps the size, a fresh
+        // insert grows it by exactly one, and the key is present afterwards.
+        debug_assert_eq!(
+            self.proxy_metrics.map.len(),
+            before_len + (!existed) as usize,
+            "receive_proxy_metric grows the map by exactly one iff the key was absent"
+        );
+        debug_assert!(
+            self.proxy_metrics.map.contains_key(metric_name),
+            "the proxy metric key must be present after receive_proxy_metric"
+        );
         Ok(())
     }
 }

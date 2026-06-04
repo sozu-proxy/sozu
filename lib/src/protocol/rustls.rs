@@ -119,9 +119,24 @@ impl TlsHandshake {
     /// before any bytes were exchanged); callers should not emit
     /// `tls.handshake_ms` in that case.
     fn record_handshake_duration_ms(&mut self) -> Option<u128> {
-        self.handshake_started_at
+        let was_anchored = self.handshake_started_at.is_some();
+        let elapsed = self
+            .handshake_started_at
             .take()
-            .map(|t| t.elapsed().as_millis())
+            .map(|t| t.elapsed().as_millis());
+        // `take()` is idempotent-disarming: the anchor is always cleared so the
+        // histogram is recorded at most once, and a duration is returned iff an
+        // anchor existed.
+        debug_assert!(
+            self.handshake_started_at.is_none(),
+            "handshake anchor must be cleared after recording the duration"
+        );
+        debug_assert_eq!(
+            elapsed.is_some(),
+            was_anchored,
+            "a duration is returned iff the handshake had been anchored"
+        );
+        elapsed
     }
 
     pub fn readable(&mut self) -> SessionResult {
@@ -130,6 +145,16 @@ impl TlsHandshake {
         // anchor sticky across `WouldBlock` retries and across the
         // readable/writable boundary.
         self.handshake_started_at.get_or_insert_with(Instant::now);
+        // The anchor is sticky once set: this method must never run unanchored.
+        debug_assert!(
+            self.handshake_started_at.is_some(),
+            "handshake anchor must be set before driving TLS I/O"
+        );
+
+        // rustls handshake completion is monotonic (`true → false`, never
+        // back). Snapshot it so the exit assertions can prove we never resurrect
+        // a finished handshake.
+        let was_handshaking = self.session.is_handshaking();
 
         let mut can_read = true;
 
@@ -172,9 +197,22 @@ impl TlsHandshake {
             }
         }
 
+        // Handshake completion is monotonic: a handshake that had already
+        // finished at entry cannot become unfinished by pumping `read_tls`.
+        debug_assert!(
+            was_handshaking || !self.session.is_handshaking(),
+            "rustls handshake must not regress from finished back to handshaking"
+        );
+
+        // Readiness must mirror rustls's own wants: we only drop READABLE
+        // interest when the session no longer wants to read.
         if !self.session.wants_read() {
             self.frontend_readiness.interest.remove(Ready::READABLE);
         }
+        debug_assert!(
+            self.session.wants_read() || !self.frontend_readiness.interest.is_readable(),
+            "READABLE interest must be cleared once rustls stops wanting reads"
+        );
 
         if self.session.wants_write() {
             self.frontend_readiness.interest.insert(Ready::WRITABLE);
@@ -187,6 +225,12 @@ impl TlsHandshake {
             if self.session.wants_write() {
                 SessionResult::Continue
             } else {
+                // Upgrade is only signalled once the handshake is complete and
+                // there is nothing left to flush to the peer.
+                debug_assert!(
+                    !self.session.is_handshaking() && !self.session.wants_write(),
+                    "Upgrade requires a completed handshake with no pending output"
+                );
                 self.frontend_readiness.interest.insert(Ready::READABLE);
                 self.frontend_readiness.event.insert(Ready::READABLE);
                 self.frontend_readiness.interest.insert(Ready::WRITABLE);
@@ -201,6 +245,13 @@ impl TlsHandshake {
     pub fn writable(&mut self) -> SessionResult {
         // Same anchor logic as `readable()` — see the comment there.
         self.handshake_started_at.get_or_insert_with(Instant::now);
+        debug_assert!(
+            self.handshake_started_at.is_some(),
+            "handshake anchor must be set before driving TLS I/O"
+        );
+
+        // Snapshot handshake completion for the monotonicity post-condition.
+        let was_handshaking = self.session.is_handshaking();
 
         let mut can_write = true;
 
@@ -239,9 +290,22 @@ impl TlsHandshake {
             }
         }
 
+        // Handshake completion is monotonic: pumping `write_tls` can finish a
+        // handshake but never un-finish one.
+        debug_assert!(
+            was_handshaking || !self.session.is_handshaking(),
+            "rustls handshake must not regress from finished back to handshaking"
+        );
+
+        // Readiness mirrors rustls's wants: WRITABLE interest is only dropped
+        // once the session no longer wants to write.
         if !self.session.wants_write() {
             self.frontend_readiness.interest.remove(Ready::WRITABLE);
         }
+        debug_assert!(
+            self.session.wants_write() || !self.frontend_readiness.interest.is_writable(),
+            "WRITABLE interest must be cleared once rustls stops wanting writes"
+        );
 
         if self.session.wants_read() {
             self.frontend_readiness.interest.insert(Ready::READABLE);
@@ -250,12 +314,22 @@ impl TlsHandshake {
         if self.session.is_handshaking() {
             SessionResult::Continue
         } else if self.session.wants_read() {
+            // Upgrade after a completed handshake; the session still wants to
+            // read application data, which the upgraded state will drive.
+            debug_assert!(
+                !self.session.is_handshaking(),
+                "Upgrade requires a completed handshake"
+            );
             self.frontend_readiness.interest.insert(Ready::READABLE);
             if let Some(elapsed_ms) = self.record_handshake_duration_ms() {
                 time!(names::tls::HANDSHAKE_MS, elapsed_ms);
             }
             SessionResult::Upgrade
         } else {
+            debug_assert!(
+                !self.session.is_handshaking(),
+                "Upgrade requires a completed handshake"
+            );
             self.frontend_readiness.interest.insert(Ready::WRITABLE);
             self.frontend_readiness.interest.insert(Ready::READABLE);
             if let Some(elapsed_ms) = self.record_handshake_duration_ms() {
@@ -296,6 +370,13 @@ impl TlsHandshake {
     /// can split spikes by category without having to grep logs.
     fn log_handshake_error(&self, err: &RustlsError) {
         let reason = handshake_failure_reason(err);
+        // Every reason must stay inside the bounded `tls.handshake.failed.*`
+        // namespace so statsd cardinality is predictable — unknown variants
+        // collapse to `.other`, never an unnamespaced key.
+        debug_assert!(
+            reason.starts_with("tls.handshake.failed."),
+            "handshake failure metric {reason} escaped the tls.handshake.failed. namespace"
+        );
         match err {
             RustlsError::AlertReceived(_) => debug!(
                 "{} Could not perform handshake: {:?}",

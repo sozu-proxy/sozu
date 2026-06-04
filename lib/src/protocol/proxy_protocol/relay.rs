@@ -112,11 +112,26 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
     }
 
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        let space_before = self.frontend_buffer.available_space();
         let (sz, res) = self.frontend.socket_read(self.frontend_buffer.space());
         debug!("{} read {} bytes and res={:?}", log_context!(self), sz, res);
+        // The socket can only write into the free space it was handed.
+        debug_assert!(
+            sz <= space_before,
+            "socket_read cannot return more bytes than the available space"
+        );
 
         if sz > 0 {
+            let data_before = self.frontend_buffer.available_data();
             self.frontend_buffer.fill(sz);
+            // `fill` admits the freshly read bytes into the readable window:
+            // available data grows by exactly `sz` (the read fit, asserted
+            // above, so `fill` does not clamp).
+            debug_assert_eq!(
+                self.frontend_buffer.available_data(),
+                data_before + sz,
+                "fill must expose exactly the bytes just read"
+            );
 
             count!(names::backend::BYTES_IN, sz as i64);
             metrics.bin += sz;
@@ -136,6 +151,7 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                 self.frontend_readiness.event.remove(Ready::READABLE);
             }
 
+            let data_len = self.frontend_buffer.available_data();
             let read_sz = match parse_v2_header(self.frontend_buffer.data()) {
                 Ok((rest, header)) => {
                     self.frontend_readiness.interest.remove(Ready::READABLE);
@@ -146,7 +162,16 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
                     // forwarded verbatim onto the backend by
                     // `back_writable`.
                     self.addresses = Some(header.addr);
-                    self.frontend_buffer.data().offset(rest)
+                    let consumed = self.frontend_buffer.data().offset(rest);
+                    // The header length is the prefix the parser consumed; it
+                    // is a real (non-empty) prefix of the buffered data and can
+                    // never exceed what was buffered.
+                    debug_assert!(
+                        consumed <= data_len,
+                        "parsed header length cannot exceed the buffered bytes"
+                    );
+                    debug_assert!(consumed > 0, "a recognized v2 header is non-empty");
+                    consumed
                 }
                 Err(Err::Incomplete(_)) => return SessionResult::Continue,
                 Err(e) => {
@@ -175,9 +200,25 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
         if let Some(ref mut socket) = self.backend {
             if let Some(ref header_size) = self.header_size {
                 loop {
+                    let available_before = self.frontend_buffer.available_data();
                     match socket.write(self.frontend_buffer.data()) {
                         Ok(sz) => {
+                            // A socket write reports at most the bytes it was
+                            // offered, so the forwarded count never exceeds the
+                            // buffered header tail.
+                            debug_assert!(
+                                sz <= available_before,
+                                "socket.write cannot send more than the buffered bytes"
+                            );
+                            let cursor_before = self.cursor_header;
                             self.cursor_header += sz;
+                            // The forwarding cursor is strictly monotonic and
+                            // tracks exactly the bytes emitted this write.
+                            debug_assert_eq!(
+                                self.cursor_header,
+                                cursor_before + sz,
+                                "header cursor advances by exactly the bytes written"
+                            );
 
                             count!(names::backend::BACK_BYTES_OUT, sz as i64);
                             metrics.backend_bout += sz;

@@ -894,6 +894,15 @@ impl ListenerBuilder {
             ..Default::default()
         };
 
+        // POST: the built listener binds exactly the address that was
+        // requested — a listener whose address drifted here would bind the
+        // wrong socket. (We reached this point only because the protocol guard
+        // at entry confirmed this is an HTTP listener.)
+        debug_assert_eq!(
+            configuration.address,
+            self.address.into(),
+            "HTTP listener must bind the requested address"
+        );
         Ok(configuration)
     }
 
@@ -1068,6 +1077,53 @@ impl ListenerBuilder {
             },
         };
 
+        // POST: the built listener binds the requested address and starts
+        // inactive (the protocol guard at entry confirmed this is an HTTPS
+        // listener).
+        debug_assert_eq!(
+            https_listener_config.address,
+            self.address.into(),
+            "HTTPS listener must bind the requested address"
+        );
+        debug_assert!(
+            !https_listener_config.active,
+            "a freshly built HTTPS listener must start inactive"
+        );
+        // POST: the resolved ALPN list is non-empty, contains only the two
+        // protocols Sōzu speaks, and is duplicate-free — the validation/dedup
+        // branches above are the sole producers, so a malformed list here would
+        // mean an unvalidated path slipped through.
+        debug_assert!(
+            !https_listener_config.alpn_protocols.is_empty(),
+            "resolved ALPN list must not be empty"
+        );
+        debug_assert!(
+            https_listener_config
+                .alpn_protocols
+                .iter()
+                .all(|p| p == "h2" || p == "http/1.1"),
+            "resolved ALPN list must contain only h2 and http/1.1"
+        );
+        debug_assert!(
+            {
+                let mut seen = std::collections::HashSet::new();
+                https_listener_config
+                    .alpn_protocols
+                    .iter()
+                    .all(|p| seen.insert(p))
+            },
+            "resolved ALPN list must be duplicate-free"
+        );
+        // POST: disable_http11 + http/1.1 in ALPN is a self-DoS that the
+        // validation above rejects — an Ok return must never carry that combo.
+        debug_assert!(
+            !(self.disable_http11.unwrap_or(false)
+                && https_listener_config
+                    .alpn_protocols
+                    .iter()
+                    .any(|p| p == "http/1.1")),
+            "disable_http11 with http/1.1 in ALPN must have been rejected"
+        );
         Ok(https_listener_config)
     }
 
@@ -1084,7 +1140,7 @@ impl ListenerBuilder {
             self.assign_config_timeouts(config);
         }
 
-        Ok(TcpListenerConfig {
+        let tcp_listener_config = TcpListenerConfig {
             address: self.address.into(),
             public_address: self.public_address.map(|a| a.into()),
             expect_proxy: self.expect_proxy.unwrap_or(false),
@@ -1092,7 +1148,20 @@ impl ListenerBuilder {
             back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             active: false,
-        })
+        };
+
+        // POST: the built listener binds exactly the requested address and is
+        // created inactive (activation is a later, explicit step).
+        debug_assert_eq!(
+            tcp_listener_config.address,
+            self.address.into(),
+            "TCP listener must bind the requested address"
+        );
+        debug_assert!(
+            !tcp_listener_config.active,
+            "a freshly built TCP listener must start inactive"
+        );
+        Ok(tcp_listener_config)
     }
 
     /// build a UDP listener. UDP has no `expect_proxy` / `connect_timeout`;
@@ -1267,6 +1336,17 @@ pub fn load_answers(
         }
         out.insert(code.to_owned(), resolve_answer_source(value)?);
     }
+    // POST: the loaded map never invents a status code (every output key is an
+    // input key) and never grows past the input — empty-valued entries are
+    // skipped, so |out| <= |answers|.
+    debug_assert!(
+        out.len() <= answers.len(),
+        "load_answers must not synthesize entries"
+    );
+    debug_assert!(
+        out.keys().all(|k| answers.contains_key(k)),
+        "every loaded status code must come from the input map"
+    );
     Ok(out)
 }
 
@@ -1513,13 +1593,28 @@ impl FileHstsConfig {
             }
         }
 
-        Ok(HstsConfig {
+        let config = HstsConfig {
             enabled: Some(enabled),
             max_age,
             include_subdomains,
             preload,
             force_replace_backend: self.force_replace_backend,
-        })
+        };
+
+        // POST: a built HstsConfig always records an explicit `enabled` flag
+        // (the `None` case errored above), and an enabled policy always carries
+        // a max_age — defaulted to DEFAULT_HSTS_MAX_AGE when the operator left
+        // it unset, so the worker never emits an `max-age`-less STS header.
+        debug_assert_eq!(
+            config.enabled,
+            Some(enabled),
+            "built HSTS config must record the resolved enabled flag"
+        );
+        debug_assert!(
+            !enabled || config.max_age.is_some(),
+            "an enabled HSTS policy must carry a max_age"
+        );
+        Ok(config)
     }
 }
 
@@ -1547,13 +1642,29 @@ impl FileClusterFrontendConfig {
             ));
         }
 
-        Ok(TcpFrontendConfig {
+        let tcp_front = TcpFrontendConfig {
             address: self.address,
             tags: self.tags.clone(),
             // Resolved against `known_addresses` in `populate_clusters`; a
             // bare `to_tcp_front` (no listener context) defaults to TCP.
             udp: false,
-        })
+        };
+        // POST: a TCP frontend binds exactly the requested address and carries
+        // no HTTP-only attributes — the guards above reject hostname / path /
+        // certificate, so an Ok return is a witness that none leaked through
+        // (an L7 attribute on an L4 frontend is a config-shape violation).
+        debug_assert_eq!(
+            tcp_front.address, self.address,
+            "TCP frontend must bind the requested address"
+        );
+        debug_assert!(
+            self.hostname.is_none()
+                && self.path.is_none()
+                && self.certificate.is_none()
+                && self.certificate_chain.is_none(),
+            "a built TCP frontend must carry no HTTP-only attributes"
+        );
+        Ok(tcp_front)
     }
 
     pub fn to_http_front(&self, _cluster_id: &str) -> Result<HttpFrontendConfig, ConfigError> {
@@ -1714,11 +1825,25 @@ pub(crate) fn parse_header_edit(
             field: "value",
         });
     }
-    Ok(Header {
+    let header = Header {
         position: position as i32,
         key: entry.key.clone(),
         val: entry.value.clone(),
-    })
+    };
+    // POST: a Header that escapes this function carries a key that is a valid
+    // RFC 9110 token and a value free of the forbidden control bytes — the two
+    // guards above are the sole gate, so an emitted Header can never inject a
+    // CRLF or a bad token onto the H1 wire (mirrors the runtime filter in
+    // mux/converter.rs).
+    debug_assert!(
+        header_name_is_valid_token(header.key.as_bytes()),
+        "an emitted header key must be a valid token"
+    );
+    debug_assert!(
+        !header_value_contains_forbidden_controls(header.val.as_bytes()),
+        "an emitted header value must be free of forbidden control bytes"
+    );
+    Ok(header)
 }
 
 /// Field names follow the RFC 9110 §5.1 `token` grammar: non-empty,
@@ -1815,14 +1940,26 @@ pub struct FileHealthCheckConfig {
 
 impl FileHealthCheckConfig {
     pub fn to_proto(&self) -> HealthCheckConfig {
-        HealthCheckConfig {
+        let proto = HealthCheckConfig {
             uri: self.uri.to_owned(),
             interval: self.interval,
             timeout: self.timeout,
             healthy_threshold: self.healthy_threshold,
             unhealthy_threshold: self.unhealthy_threshold,
             expected_status: self.expected_status,
-        }
+        };
+        // POST: the proto mirrors the file config exactly — the URI and all
+        // timing knobs are carried through verbatim (no clamping or defaulting
+        // happens at this layer; defaults are applied by serde at parse time).
+        debug_assert_eq!(proto.uri, self.uri, "proto URI must mirror the file config");
+        debug_assert!(
+            proto.interval == self.interval
+                && proto.timeout == self.timeout
+                && proto.healthy_threshold == self.healthy_threshold
+                && proto.unhealthy_threshold == self.unhealthy_threshold,
+            "proto timing knobs must mirror the file config"
+        );
+        proto
     }
 }
 
@@ -1859,6 +1996,22 @@ pub fn validate_health_check_config(cfg: &HealthCheckConfig) -> Result<(), &'sta
     {
         return Err("health check URI must not contain CR, LF, NUL, or other C0 control bytes");
     }
+    // POST: a validated config has strictly-positive timing knobs (a zero
+    // interval/timeout/threshold would make the health-check loop spin or
+    // never converge) and a request-target the worker can splice into an HTTP
+    // probe without smuggling a second message. Every Ok return is a witness
+    // for all of these.
+    debug_assert!(
+        cfg.interval > 0
+            && cfg.timeout > 0
+            && cfg.healthy_threshold > 0
+            && cfg.unhealthy_threshold > 0,
+        "validated health-check thresholds must all be strictly positive"
+    );
+    debug_assert!(
+        cfg.uri.starts_with('/'),
+        "validated health-check URI must be an absolute path"
+    );
     Ok(())
 }
 
@@ -2015,6 +2168,9 @@ impl FileClusterConfig {
         cluster_id: &str,
         expect_proxy: &HashSet<SocketAddr>,
     ) -> Result<ClusterConfig, ConfigError> {
+        // PRE: every frontend that converts cleanly must survive into the built
+        // cluster — no frontend is silently dropped during conversion.
+        let requested_frontend_count = self.frontends.len();
         match self.protocol {
             FileClusterProtocolConfig::Tcp => {
                 let mut has_expect_proxy = None;
@@ -2064,6 +2220,26 @@ impl FileClusterConfig {
                 };
 
                 let udp = self.udp.as_ref().map(|u| u.to_proto());
+                // POST: every requested frontend converted (none dropped), and
+                // the resolved proxy-protocol mode is the documented function of
+                // the (send, expect) pair — expect-only must never resolve to a
+                // send-header mode and vice versa, which would corrupt the wire
+                // framing.
+                debug_assert_eq!(
+                    frontends.len(),
+                    requested_frontend_count,
+                    "every TCP frontend must survive conversion"
+                );
+                debug_assert_eq!(
+                    proxy_protocol,
+                    match (send_proxy, expect_proxy) {
+                        (true, true) => Some(ProxyProtocolConfig::RelayHeader),
+                        (true, false) => Some(ProxyProtocolConfig::SendHeader),
+                        (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
+                        (false, false) => None,
+                    },
+                    "proxy_protocol must be the (send, expect) function"
+                );
 
                 Ok(ClusterConfig::Tcp(TcpClusterConfig {
                     cluster_id: cluster_id.to_string(),
@@ -2104,6 +2280,13 @@ impl FileClusterConfig {
                 };
 
                 let udp = self.udp.as_ref().map(|u| u.to_proto());
+                // POST: every requested HTTP frontend converted — none dropped
+                // (a dropped frontend would silently stop routing a hostname).
+                debug_assert_eq!(
+                    frontends.len(),
+                    requested_frontend_count,
+                    "every HTTP frontend must survive conversion"
+                );
 
                 Ok(ClusterConfig::Http(HttpClusterConfig {
                     cluster_id: cluster_id.to_string(),
@@ -2289,7 +2472,7 @@ pub struct HttpClusterConfig {
 
 impl HttpClusterConfig {
     pub fn generate_requests(&self) -> Result<Vec<Request>, ConfigError> {
-        let mut v = vec![
+        let mut v: Vec<Request> = vec![
             RequestType::AddCluster(Cluster {
                 cluster_id: self.cluster_id.clone(),
                 sticky_session: self.sticky_session,
@@ -2336,6 +2519,24 @@ impl HttpClusterConfig {
             );
         }
 
+        // POST: the order stream begins with exactly one AddCluster and emits
+        // exactly one AddBackend per configured backend — a missing AddCluster
+        // would orphan every backend, and a miscounted backend set would
+        // silently drop or duplicate a backend registration.
+        debug_assert!(
+            matches!(
+                v.first().and_then(|r| r.request_type.as_ref()),
+                Some(RequestType::AddCluster(_))
+            ),
+            "HTTP cluster orders must lead with an AddCluster"
+        );
+        debug_assert_eq!(
+            v.iter()
+                .filter(|r| matches!(r.request_type, Some(RequestType::AddBackend(_))))
+                .count(),
+            self.backends.len(),
+            "one AddBackend order per configured backend"
+        );
         Ok(v)
     }
 }
@@ -2396,7 +2597,7 @@ pub struct TcpClusterConfig {
 
 impl TcpClusterConfig {
     pub fn generate_requests(&self) -> Result<Vec<Request>, ConfigError> {
-        let mut v = vec![
+        let mut v: Vec<Request> = vec![
             RequestType::AddCluster(Cluster {
                 cluster_id: self.cluster_id.clone(),
                 sticky_session: false,
@@ -2464,6 +2665,33 @@ impl TcpClusterConfig {
             );
         }
 
+        // POST: the order stream leads with one AddCluster and emits exactly
+        // one AddTcpFrontend per frontend and one AddBackend per backend — the
+        // worker reconstructs the cluster topology solely from these counts.
+        debug_assert!(
+            matches!(
+                v.first().and_then(|r| r.request_type.as_ref()),
+                Some(RequestType::AddCluster(_))
+            ),
+            "TCP cluster orders must lead with an AddCluster"
+        );
+        debug_assert_eq!(
+            v.iter()
+                .filter(|r| matches!(
+                    r.request_type,
+                    Some(RequestType::AddTcpFrontend(_)) | Some(RequestType::AddUdpFrontend(_))
+                ))
+                .count(),
+            self.frontends.len(),
+            "one AddTcpFrontend or AddUdpFrontend order per configured frontend"
+        );
+        debug_assert_eq!(
+            v.iter()
+                .filter(|r| matches!(r.request_type, Some(RequestType::AddBackend(_))))
+                .count(),
+            self.backends.len(),
+            "one AddBackend order per configured backend"
+        );
         Ok(v)
     }
 }
@@ -2744,6 +2972,24 @@ impl ConfigBuilder {
             ..Default::default()
         };
 
+        // POST: the buffer free-list floor is clamped to never exceed the
+        // ceiling — the `std::cmp::min(min_buffers, max_buffers)` above is the
+        // sole guarantor of this, so assert it held.
+        debug_assert!(
+            built.min_buffers <= built.max_buffers,
+            "min_buffers must be clamped to <= max_buffers in the builder"
+        );
+        // POST: an explicit slab override, if present, was clamped into the
+        // documented [MIN, MAX] window; an absent override stays None.
+        debug_assert!(
+            built.slab_entries_per_connection.is_none_or(|n| {
+                (ServerConfig::MIN_SLAB_ENTRIES_PER_CONNECTION
+                    ..=ServerConfig::MAX_SLAB_ENTRIES_PER_CONNECTION)
+                    .contains(&n)
+            }),
+            "a set slab_entries_per_connection must be clamped into [MIN, MAX]"
+        );
+
         Self {
             file: file_config,
             known_addresses: HashMap::new(),
@@ -3006,10 +3252,34 @@ impl ConfigBuilder {
             return Err(ConfigError::Missing(MissingKind::SavedState));
         }
 
-        Ok(Config {
+        let config = Config {
             command_socket: command_socket_path,
             ..self.built.clone()
-        })
+        };
+
+        // POST: a successfully built config satisfies the buffer-pool
+        // invariants every worker relies on.
+        // 1. min_buffers <= max_buffers — guaranteed by the `std::cmp::min`
+        //    clamp in `new`; a violation would let a worker size its free-list
+        //    floor above its ceiling.
+        debug_assert!(
+            config.min_buffers <= config.max_buffers,
+            "min_buffers must not exceed max_buffers"
+        );
+        // 2. If any HTTPS listener advertises h2 in its ALPN, the global
+        //    buffer_size is at least the H2 minimum — otherwise the early
+        //    return above would have produced a BufferSizeTooSmallForH2 error
+        //    rather than this Ok. (Recomputed here so the assert is independent
+        //    of the local `h2_listeners` binding above.)
+        debug_assert!(
+            !config
+                .https_listeners
+                .iter()
+                .any(|l| l.alpn_protocols.iter().any(|p| p == "h2"))
+                || config.buffer_size >= H2_MIN_BUFFER_SIZE,
+            "an h2-advertising config must satisfy the H2 minimum buffer size"
+        );
+        Ok(config)
     }
 }
 
@@ -3475,13 +3745,22 @@ impl ServerConfig {
     /// Effective slab-entries-per-connection. Applies the [MIN, MAX] clamp
     /// and falls back to the default when the proto field is absent or 0.
     pub fn effective_slab_entries_per_connection(&self) -> u64 {
-        match self.slab_entries_per_connection {
+        let effective = match self.slab_entries_per_connection {
             Some(0) | None => Self::DEFAULT_SLAB_ENTRIES_PER_CONNECTION,
             Some(n) => n.clamp(
                 Self::MIN_SLAB_ENTRIES_PER_CONNECTION,
                 Self::MAX_SLAB_ENTRIES_PER_CONNECTION,
             ),
-        }
+        };
+        // POST: the effective value is always inside the documented clamp
+        // window [MIN, MAX], regardless of the raw config input. The default
+        // itself sits inside that window, so every branch satisfies the bound.
+        debug_assert!(
+            (Self::MIN_SLAB_ENTRIES_PER_CONNECTION..=Self::MAX_SLAB_ENTRIES_PER_CONNECTION)
+                .contains(&effective),
+            "effective slab entries per connection must stay within [MIN, MAX]"
+        );
+        effective
     }
 
     /// Size of the slab for the Session manager.
@@ -3491,7 +3770,21 @@ impl ServerConfig {
     /// [`Self::effective_slab_entries_per_connection`] entries per connection
     /// instead of the old H1-only multiplier of 2.
     pub fn slab_capacity(&self) -> u64 {
-        10 + self.effective_slab_entries_per_connection() * self.max_connections
+        let per_conn = self.effective_slab_entries_per_connection();
+        let capacity = 10 + per_conn * self.max_connections;
+        // POST: the slab always reserves the 10-entry base (listeners, command
+        // channel, etc.) plus at least MIN entries per connection, so it can
+        // never be smaller than the base. Strict `>` for any non-zero
+        // max_connections since per_conn >= MIN >= 2.
+        debug_assert!(
+            capacity >= 10,
+            "slab capacity must reserve the base entries"
+        );
+        debug_assert!(
+            self.max_connections == 0 || capacity > 10,
+            "a non-zero connection cap must reserve per-connection slab entries"
+        );
+        capacity
     }
 }
 
@@ -3504,7 +3797,7 @@ impl From<&Config> for ServerConfig {
             prefix: m.prefix,
             detail: Some(MetricDetail::from(m.detail) as i32),
         });
-        Self {
+        let server_config = Self {
             max_connections: config.max_connections as u64,
             front_timeout: config.front_timeout,
             back_timeout: config.back_timeout,
@@ -3530,7 +3823,25 @@ impl From<&Config> for ServerConfig {
             max_connections_per_ip: Some(config.max_connections_per_ip),
             retry_after: Some(config.retry_after),
             splice_pipe_capacity_bytes: config.splice_pipe_capacity_bytes,
-        }
+        };
+
+        // POST: the worker-facing config preserves the buffer-pool invariant
+        // (min <= max) and carries the sizing knobs through unchanged — a
+        // worker derives its slab and buffer pool straight from these, so any
+        // drift here would desynchronize the master's view from the worker's.
+        debug_assert!(
+            server_config.min_buffers <= server_config.max_buffers,
+            "ServerConfig must preserve min_buffers <= max_buffers"
+        );
+        debug_assert_eq!(
+            server_config.buffer_size, config.buffer_size,
+            "ServerConfig buffer_size must mirror the source config"
+        );
+        debug_assert_eq!(
+            server_config.max_connections, config.max_connections as u64,
+            "ServerConfig max_connections must mirror the source config"
+        );
+        server_config
     }
 }
 

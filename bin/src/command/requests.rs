@@ -326,6 +326,45 @@ impl Server {
         // cost is one env-var lookup per command in non-systemd
         // deployments.
         let mutating = is_mutating_verb(&request_type);
+        // INVARIANT: the systemd bracket is symmetric. `mutating` is the
+        // sole gate for BOTH the RELOADING=1 (entry) and READY=1 (exit)
+        // notifications below, so it must be captured exactly once into this
+        // local and reused — never recomputed against a moved/mutated verb —
+        // otherwise a verb that opened the reload window could skip closing
+        // it (leaving the unit stuck in `reloading`) or vice versa.
+        debug_assert_eq!(
+            mutating,
+            is_mutating_verb(&request_type),
+            "is_mutating_verb must be a pure function of the verb (RELOADING/READY bracket gate)"
+        );
+        // INVARIANT: read-only verbs are never bracketed. The pure dashboard
+        // polls (Status / Query* / List* / Count) are dispatched WITHOUT
+        // touching `ConfigState` or the fleet, so flapping the systemd unit
+        // through `reloading` for them would be a correctness bug for any
+        // unit-state-watching tooling. SetMetricDetail is also excluded by
+        // design (runtime lease, not a transition — see the doc on the fn).
+        debug_assert!(
+            !mutating
+                || !matches!(
+                    request_type,
+                    RequestType::Status(_)
+                        | RequestType::ListWorkers(_)
+                        | RequestType::ListFrontends(_)
+                        | RequestType::ListListeners(_)
+                        | RequestType::QueryClustersHashes(_)
+                        | RequestType::QueryClustersByDomain(_)
+                        | RequestType::QueryClusterById(_)
+                        | RequestType::QueryCertificatesFromWorkers(_)
+                        | RequestType::QueryCertificatesFromTheState(_)
+                        | RequestType::QueryMetrics(_)
+                        | RequestType::QueryHealthChecks(_)
+                        | RequestType::CountRequests(_)
+                        | RequestType::SubscribeEvents(_)
+                        | RequestType::QueryMaxConnectionsPerIp(_)
+                        | RequestType::SetMetricDetail(_)
+                ),
+            "read-only / non-transition verbs must not open the systemd reload window"
+        );
         if mutating {
             if let Err(e) = sd_notify::notify(sd_notify::STATE_RELOADING) {
                 warn!("could not notify systemd RELOADING=1: {}", e);
@@ -434,10 +473,18 @@ impl Server {
                 let cluster_ids = self
                     .state
                     .get_cluster_ids_by_domain(domain.hostname, domain.path);
-                let vec = cluster_ids
+                let vec: Vec<_> = cluster_ids
                     .iter()
                     .filter_map(|cluster_id| self.state.cluster_state(cluster_id))
                     .collect();
+                // INVARIANT: `filter_map` can only drop entries, so the
+                // resolved cluster-info vec never exceeds the matched id set.
+                // A larger vec would mean we synthesised a cluster the domain
+                // index never resolved.
+                debug_assert!(
+                    vec.len() <= cluster_ids.len(),
+                    "QueryClustersByDomain result must not exceed the matched cluster-id set"
+                );
                 Some(ContentType::Clusters(ClusterInformations { vec }).into())
             }
             RequestType::QueryClustersHashes(_) => Some(
@@ -875,6 +922,16 @@ impl GatheringTask for LoadStaticConfigTask {
         client: &mut OptionalClient,
         _timed_out: bool,
     ) {
+        // PRECONDITION: `load_static_config` scatters with `Timeout::None`,
+        // so the task is released only once every expected worker answered.
+        debug_assert!(
+            self.gatherer.ok + self.gatherer.errors >= self.gatherer.expected_responses,
+            "LoadStaticConfigTask::on_finish: every expected worker must have answered (no timeout)"
+        );
+        // Snapshot the failure tally before the loop consumes `responses`; the
+        // failure-message list built below must contain exactly one entry per
+        // counted error. Read only inside the post-loop assert (ungated, E0425).
+        let errors_before = self.gatherer.errors;
         let mut messages = vec![];
         for (worker_id, response) in self.gatherer.responses {
             match ResponseStatus::try_from(response.status) {
@@ -885,6 +942,16 @@ impl GatheringTask for LoadStaticConfigTask {
                 Err(e) => warn!("error decoding response status: {}", e),
             }
         }
+        // INVARIANT: the gatherer's `errors` counter (incremented in
+        // `on_message` for every Failure status) must match the number of
+        // failure lines we just collected from the same `Failure` responses.
+        // A mismatch means the counter and the response log disagree on how
+        // many workers rejected the config.
+        debug_assert_eq!(
+            messages.len(),
+            errors_before,
+            "LoadStaticConfig failure-message count must equal the gatherer error tally"
+        );
 
         if self.gatherer.errors > 0 {
             client.finish_failure(format!(
@@ -1517,6 +1584,15 @@ fn audit_entry_for(
 /// clients, and write the structured audit log line at `info!` level. Used
 /// by every control-plane mutation handler.
 fn audit_emit(server: &mut Server, client: &ClientSession, entry: AuditEntry, result: AuditResult) {
+    // PRECONDITION: the verb tag and its counter key are non-empty. Both come
+    // from `audit_verb!` string literals; an empty `counter` would silently
+    // collapse every audited verb onto one metric series, and an empty `verb`
+    // would render an unattributable audit line. Bumping the counter exactly
+    // once per emission is the metric contract dashboards rely on.
+    debug_assert!(
+        !entry.counter.is_empty() && !entry.verb.is_empty(),
+        "audit entry must carry a non-empty verb tag and counter key"
+    );
     let request_id = Ulid::generate();
     // `entry.counter` is the pre-built `config.<verb>` static-str key
     // chosen at the construction site (paired with `verb` via
@@ -1599,6 +1675,21 @@ pub fn audit_worker_metric_detail_transition(
         let truncated: String = sanitized.chars().take(AUDIT_LEASE_ID_MAX_CHARS).collect();
         truncated
     });
+    // POSTCONDITION: the audit lease_id never exceeds the SIEM-visible cap.
+    // The operator-initiated path applies the same `take(AUDIT_LEASE_ID_MAX_CHARS)`
+    // bound; a worker-local line that slipped past it would give SOC tooling
+    // an inconsistent upper bound across the two emission sites.
+    debug_assert!(
+        lease_id
+            .as_deref()
+            .is_none_or(|id| id.chars().count() <= AUDIT_LEASE_ID_MAX_CHARS),
+        "worker-local audit lease_id must respect AUDIT_LEASE_ID_MAX_CHARS"
+    );
+    // The counter for this verb is bumped exactly once at entry (above).
+    debug_assert!(
+        !verb.is_empty() && !counter.is_empty(),
+        "worker-local metric-detail audit must carry a non-empty verb/counter"
+    );
 
     // Render the text-sink line. Match the operator-initiated envelope's
     // KV shape so a SOC analyst can correlate worker-local and operator
@@ -2047,10 +2138,46 @@ pub fn worker_request(
         None
     };
 
+    // INVARIANT: a single verb resolves to at most ONE audit channel. The
+    // three are derived from disjoint `RequestType` matches: a full
+    // `AuditEntry` (audit_entry_for), the inline ConfigureMetrics line
+    // (metrics_target), or the inline SetMetricDetail line
+    // (metric_detail_audit). If two were ever populated together, the
+    // dispatch/error/on_finish arms below — which are `if/else if` chains —
+    // would silently drop the second, producing an un-audited mutation. The
+    // `as u8` sum counts how many channels fired; it must never exceed one.
+    debug_assert!(
+        (audit.is_some() as u8)
+            + (metrics_target.is_some() as u8)
+            + (metric_detail_audit.is_some() as u8)
+            <= 1,
+        "a verb must map to at most one audit channel (entry / metrics / metric_detail)"
+    );
+
     let request: sozu_command_lib::proto::command::Request = request_content.into();
     let request_sha256 = compute_request_sha256(&request);
 
+    // Snapshot the state hash so the error path can assert the rejected
+    // dispatch was a true no-op on `ConfigState` — a partially-applied
+    // mutation that then errors would leave the master's persisted state
+    // diverged from every worker (which never saw the fan-out). The state
+    // handlers guarantee this (see `ConfigState::dispatch` postcondition),
+    // and we re-check it here at the request boundary. NOTE: we deliberately
+    // do NOT assert the success path *changed* the hash — many "mutating"
+    // verbs (ConfigureMetrics, SetMetricDetail, SetMaxConnectionsPerIp,
+    // Logging) are runtime/worker-only and `dispatch` is `Ok(())` no-op on
+    // ConfigState for them (see state.rs:138). `hash_state()` is a cheap
+    // per-cluster map; the snapshot is read ONLY inside the debug_assert
+    // below, so it is dead code in release but must stay ungated (E0425).
+    let state_hash_before = server.state.hash_state();
+
     if let Err(error) = server.state.dispatch(&request) {
+        // INVARIANT: a rejected dispatch must not mutate persisted state.
+        debug_assert_eq!(
+            server.state.hash_state(),
+            state_hash_before,
+            "a dispatch that returns Err must leave ConfigState byte-identical (no partial apply)"
+        );
         let reason = error.to_string();
         if let Some(mut entry) = audit {
             entry.extras.error_code = Some(AuditErrorCode::DispatchError);
@@ -2130,6 +2257,26 @@ pub fn worker_request(
             }
         })
     };
+    // INVARIANT: the completion-time channel threaded into `WorkerTask`
+    // mirrors the attempt-time channel exactly. `audit_for_task` carries the
+    // full-entry verbs; `inline_audit` carries the ConfigureMetrics /
+    // SetMetricDetail inline verbs. They are disjoint by construction (an
+    // entry-bearing verb has no metrics_target / metric_detail_audit) — if
+    // both were ever set, `WorkerTask::on_finish` would emit the entry arm
+    // and silently drop the inline completion line.
+    debug_assert!(
+        !(audit_for_task.is_some() && inline_audit.is_some()),
+        "WorkerTask carries at most one completion-time audit channel (entry XOR inline)"
+    );
+    // INVARIANT: the completion channel is present iff its attempt-time
+    // source was. `audit_for_task` is `audit.as_ref().map(...)` so it is Some
+    // exactly when `audit` is; losing it here would drop the completion line.
+    debug_assert_eq!(
+        audit_for_task.is_some(),
+        audit.is_some(),
+        "audit_for_task must be Some iff the attempt-time AuditEntry was Some"
+    );
+
     // Operator-controlled SetMetricDetail fields (lease_id + reason) we
     // need to thread into both the attempt-time Ok line below and the
     // completion-time line in `on_finish`. Cloning once keeps the
@@ -2210,6 +2357,26 @@ impl GatheringTask for WorkerTask {
         client: &mut OptionalClient,
         timed_out: bool,
     ) {
+        // PRECONDITION: the gatherer ran to completion. Either every expected
+        // worker answered (`ok + errors >= expected`, the `has_finished`
+        // predicate that drives the task off the in-flight queue) or the task
+        // tripped its timeout. A handler that fires with neither would be a
+        // dispatcher accounting bug (a response counted twice, or the task
+        // released before its workers replied). Read-only snapshots feed the
+        // debug_asserts only → dead code in release, but must stay ungated.
+        debug_assert!(
+            timed_out
+                || self.gatherer.ok + self.gatherer.errors >= self.gatherer.expected_responses,
+            "WorkerTask::on_finish: must be finished (ok+errors >= expected) unless timed out"
+        );
+        // INVARIANT: every accounted ok/err corresponds to a stored response.
+        // `on_message` pushes to `responses` for every ok/err/processing, so
+        // the response log can never be shorter than the ok+err tally.
+        debug_assert!(
+            self.gatherer.responses.len() >= self.gatherer.ok + self.gatherer.errors,
+            "responses log must hold at least one entry per accounted ok/err"
+        );
+
         let mut messages = vec![];
 
         for (worker_id, response) in self.gatherer.responses {
@@ -2257,6 +2424,24 @@ impl GatheringTask for WorkerTask {
             workers_err: u32::try_from(errors).unwrap_or(u32::MAX),
             workers_expected: u32::try_from(expected).unwrap_or(u32::MAX),
         };
+
+        // INVARIANT: the audit result mirrors the fanout status. A row tagged
+        // `result=ok` must never carry a Timeout/Partial fanout, and an
+        // `result=err` row must never claim a clean Ok/LocalOnly fanout —
+        // a SIEM correlating the two columns would otherwise see a row that
+        // contradicts itself.
+        debug_assert_eq!(
+            matches!(result, AuditResult::Err),
+            matches!(fanout_status, FanoutStatus::Timeout | FanoutStatus::Partial),
+            "AuditResult and FanoutStatus must agree on success vs failure"
+        );
+        // INVARIANT: `LocalOnly` means no worker was scattered to, so there
+        // can be no per-worker tallies. If a worker answered while the status
+        // says local-only, the expected-count accounting drifted.
+        debug_assert!(
+            !matches!(fanout_status, FanoutStatus::LocalOnly) || (ok == 0 && errors == 0),
+            "LocalOnly fanout must have zero worker ok/err tallies"
+        );
 
         // Completion-time audit: attributes the same verb as the attempt-time
         // line but with fanout / worker counts / elapsed_ms filled in. Skip
@@ -2341,11 +2526,20 @@ fn elapsed_ms(started_at: Instant) -> u64 {
 fn compute_request_sha256(request: &sozu_command_lib::proto::command::Request) -> String {
     let bytes = request.encode_to_vec();
     let digest = Sha256::digest(&bytes);
+    // INVARIANT: SHA-256 always yields 32 bytes; we render the first 8 as
+    // 2-hex-digit pairs, so the audit prefix is always exactly 16 chars.
+    debug_assert_eq!(digest.len(), 32, "SHA-256 digest must be 32 bytes");
     let mut hex = String::with_capacity(16);
     for byte in digest.iter().take(8) {
         use std::fmt::Write as _;
         let _ = write!(&mut hex, "{byte:02x}");
     }
+    // POSTCONDITION: greppable fixed-width 16-char (64-bit) audit prefix.
+    debug_assert_eq!(
+        hex.len(),
+        16,
+        "request sha256 audit prefix must be 16 hex chars"
+    );
     hex
 }
 
@@ -2356,11 +2550,22 @@ fn compute_request_sha256(request: &sozu_command_lib::proto::command::Request) -
 /// for log terseness — operators correlate via the 64-bit prefix.
 fn compute_certificate_fingerprint(certificate_pem: &[u8]) -> Option<String> {
     let fp = sozu_command_lib::certificate::calculate_fingerprint(certificate_pem).ok()?;
+    // INVARIANT: a SHA-256 fingerprint is 32 bytes; we render the first 8.
+    debug_assert!(
+        fp.len() >= 8,
+        "certificate fingerprint must hold at least the 8 bytes we truncate to"
+    );
     let mut hex = String::with_capacity(16);
     for byte in fp.iter().take(8) {
         use std::fmt::Write as _;
         let _ = write!(&mut hex, "{byte:02x}");
     }
+    // POSTCONDITION: fixed-width 16-char (64-bit) fingerprint prefix.
+    debug_assert_eq!(
+        hex.len(),
+        16,
+        "certificate fingerprint prefix must be 16 hex chars"
+    );
     Some(hex)
 }
 
@@ -2482,11 +2687,38 @@ pub fn set_metric_detail_request(
         reason: req.reason.clone().filter(|s| !s.is_empty()),
     };
 
+    // POSTCONDITION of the master-side pre-validation above: by the time we
+    // reach fan-out, the request honours both lease bounds (the two guards
+    // returned early otherwise). The worker enforces these again as
+    // defence-in-depth, but a request that slipped past here would amplify a
+    // bad input across every worker (N rejections + N audit lines).
+    debug_assert!(
+        req.client_id.len() <= sozu_lib::metrics::LEASE_CLIENT_ID_MAX_BYTES,
+        "SetMetricDetail must be length-validated before fan-out"
+    );
+    debug_assert!(
+        req.ttl_seconds
+            .is_none_or(|t| u64::from(t) <= sozu_lib::metrics::LEASE_TTL_MAX.as_secs()),
+        "SetMetricDetail must be TTL-validated before fan-out"
+    );
+
     let started_at = Instant::now();
+    // Snapshot the cluster-hash so we can confirm SetMetricDetail is a
+    // ConfigState no-op (it is runtime-only — `dispatch` returns `Ok(())`
+    // without touching persisted state; see state.rs:138). Read only inside
+    // the post-dispatch assert → ungated for the release build (E0425).
+    let state_hash_before = server.state.hash_state();
     let request: Request = RequestType::SetMetricDetail(req).into();
 
     // Attempt-time dispatch gate (mirrors `state.dispatch` in worker_request).
     if let Err(error) = server.state.dispatch(&request) {
+        // INVARIANT: a rejected runtime-only dispatch leaves ConfigState
+        // untouched (it never mutates it in the first place).
+        debug_assert_eq!(
+            server.state.hash_state(),
+            state_hash_before,
+            "SetMetricDetail dispatch must not mutate ConfigState"
+        );
         let reason = error.to_string();
         let (verb, counter) = audit_verb!("metric_detail_changed");
         let target = metric_detail_audit.target.clone();
@@ -2509,6 +2741,16 @@ pub fn set_metric_detail_request(
         ));
         return;
     }
+
+    // INVARIANT: even on the success path, SetMetricDetail is a ConfigState
+    // no-op — the runtime lease lives in each worker's `Aggregator`, never in
+    // the master's persisted `ConfigState`. If the hash changed, a future
+    // edit accidentally wired a runtime knob into persisted state.
+    debug_assert_eq!(
+        server.state.hash_state(),
+        state_hash_before,
+        "SetMetricDetail must not mutate ConfigState even on success"
+    );
 
     // Attempt-time audit Ok.
     let (verb, counter) = audit_verb!("metric_detail_changed");
@@ -2568,6 +2810,15 @@ impl GatheringTask for SetMetricDetailTask {
         client: &mut OptionalClient,
         timed_out: bool,
     ) {
+        // PRECONDITION: the scatter ran to completion (or timed out). Mirrors
+        // the generic `WorkerTask::on_finish` finished-or-timeout guard so a
+        // SetMetricDetail task released before its workers replied trips here.
+        debug_assert!(
+            timed_out
+                || self.gatherer.ok + self.gatherer.errors >= self.gatherer.expected_responses,
+            "SetMetricDetailTask::on_finish: must be finished (ok+errors >= expected) unless timed out"
+        );
+
         // Per-worker status: each worker now returns its own
         // `WorkerMetricDetailStatus` payload via
         // `ContentType::WorkerMetricDetailStatus` in the SetMetricDetail
@@ -2632,6 +2883,21 @@ impl GatheringTask for SetMetricDetailTask {
             workers_err: u32::try_from(errors).unwrap_or(u32::MAX),
             workers_expected: u32::try_from(expected).unwrap_or(u32::MAX),
         };
+        // INVARIANT: the per-worker status map holds only successfully-ACK'd
+        // workers (the loop above skips non-Ok responses), so it can never be
+        // larger than the OK tally. A larger map would mean a non-Ok worker
+        // leaked into the operator-visible `MetricDetailStatus.workers`.
+        debug_assert!(
+            status.workers.len() <= ok,
+            "MetricDetailStatus.workers must not exceed the OK worker tally"
+        );
+        // INVARIANT: audit result agrees with fanout status (same as the
+        // generic WorkerTask path).
+        debug_assert_eq!(
+            matches!(result, AuditResult::Err),
+            matches!(fanout_status, FanoutStatus::Timeout | FanoutStatus::Partial),
+            "AuditResult and FanoutStatus must agree on success vs failure"
+        );
         if let Some(client_ref) = client.as_deref() {
             let mut extras = self.metric_detail_audit.into_extras();
             extras.elapsed_ms = Some(elapsed_ms(self.started_at));
@@ -2893,7 +3159,20 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
 
                 for request in requests {
                     if server.state.dispatch(&request.content).is_ok() {
+                        // INVARIANT: the scatter request_id advances by
+                        // exactly one per dispatched request. `scatter_on`
+                        // embeds it in the per-worker request id, so a stale
+                        // or repeated counter would collide two in-flight ids
+                        // and silently drop a worker's response, hanging the
+                        // task. Snapshot is read only inside the assert →
+                        // ungated for the release (E0425) build.
+                        let counter_before = scatter_request_counter;
                         scatter_request_counter += 1;
+                        debug_assert_eq!(
+                            scatter_request_counter,
+                            counter_before + 1,
+                            "load_state must advance the scatter request_id by exactly one per dispatch"
+                        );
                         server.scatter_on(request.content, task_id, scatter_request_counter, None);
                     }
                 }
@@ -2958,13 +3237,33 @@ impl GatheringTask for LoadStateTask {
         client: &mut OptionalClient,
         _timed_out: bool,
     ) {
-        let DefaultGatherer { ok, errors, .. } = self.gatherer;
+        let DefaultGatherer {
+            ok,
+            errors,
+            expected_responses,
+            ..
+        } = self.gatherer;
+        // PRECONDITION: `load_state` scatters with `Timeout::None`, so the
+        // task is only released once every worker has answered — never on a
+        // timeout. The ok/err tally must therefore cover the full expected
+        // fan-out.
+        debug_assert!(
+            ok + errors >= expected_responses,
+            "LoadStateTask::on_finish: every expected worker must have answered (no timeout path)"
+        );
         server.update_counts();
         let result = if errors == 0 {
             AuditResult::Ok
         } else {
             AuditResult::Err
         };
+        // INVARIANT: the audit result matches the error tally — an `ok:N
+        // errors:0` line must be tagged Ok, any error tagged Err.
+        debug_assert_eq!(
+            matches!(result, AuditResult::Ok),
+            errors == 0,
+            "LoadStateTask audit result must agree with the worker error tally"
+        );
         if let Some(client_ref) = client.as_deref() {
             let (verb, counter) = audit_verb!("state_loaded");
             audit_emit_inline(
@@ -3093,6 +3392,15 @@ fn stop(server: &mut Server, client: &mut ClientSession, hardness: bool) {
     });
 
     server.run_state = ServerState::WorkersStopping;
+    // POSTCONDITION: the stop request has opened the shutdown sequence. The
+    // matching `StopTask::on_finish` will later advance to `Stopping`. We do
+    // NOT assert the prior state was `Running` — an operator may legitimately
+    // re-issue stop while a soft-stop is already draining.
+    debug_assert_eq!(
+        server.run_state,
+        ServerState::WorkersStopping,
+        "stop() must move the master into WorkersStopping before fan-out"
+    );
     if hardness {
         client.return_processing("Performing hard stop...");
         server.scatter(
@@ -3127,6 +3435,17 @@ impl GatheringTask for StopTask {
         client: &mut OptionalClient,
         timed_out: bool,
     ) {
+        // PRECONDITION: a StopTask is only created by `stop()`, which moves
+        // the master to `WorkersStopping` BEFORE scattering. The server must
+        // therefore never still be `Running` when a stop task finishes —
+        // that would mean the run-state transition that brackets shutdown
+        // was skipped. (`Stopping` is also acceptable: a prior stop task may
+        // already have advanced it.)
+        debug_assert_ne!(
+            server.run_state,
+            ServerState::Running,
+            "StopTask::on_finish must observe a shutdown run-state, never Running"
+        );
         if timed_out && self.hardness {
             client.finish_failure(format!(
                 "Workers take too long to stop ({} ok, {} errors), stopping the main process to sever the link",
@@ -3134,6 +3453,12 @@ impl GatheringTask for StopTask {
             ));
         }
         server.run_state = ServerState::Stopping;
+        // POSTCONDITION: shutdown is now committed.
+        debug_assert_eq!(
+            server.run_state,
+            ServerState::Stopping,
+            "StopTask::on_finish must leave the master in the Stopping state"
+        );
         client.finish_ok(format!(
             "Successfully closed {} workers, {} errors, stopping the main process...",
             self.gatherer.ok, self.gatherer.errors

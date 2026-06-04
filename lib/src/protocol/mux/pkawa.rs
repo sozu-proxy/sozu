@@ -138,10 +138,11 @@ fn is_invalid_te_value(value: &[u8]) -> bool {
 /// used for the RFC 9113 §8.3.1 equivalence check between a literal ``host``
 /// header and the ``:authority`` pseudo-header when both are present.
 fn strip_port(value: &[u8]) -> &[u8] {
+    let in_len = value.len();
     // Do not strip port from IPv6 literals (e.g., [::1]:8080)
     if value.contains(&b'[') {
         // Bracketed IPv6: look for "]:port"
-        return match value.iter().rposition(|&b| b == b']') {
+        let stripped = match value.iter().rposition(|&b| b == b']') {
             Some(bracket) => {
                 if value.get(bracket + 1) == Some(&b':')
                     && bracket + 2 < value.len()
@@ -154,13 +155,35 @@ fn strip_port(value: &[u8]) -> &[u8] {
             }
             None => value,
         };
+        // Stripping only ever removes a trailing `:port` suffix — the result
+        // is a prefix of the input and never longer than what we started with.
+        debug_assert!(
+            stripped.len() <= in_len,
+            "strip_port must not grow its input (IPv6 path)"
+        );
+        debug_assert!(
+            stripped.as_ptr() == value.as_ptr(),
+            "strip_port returns a prefix of value (shares its start)"
+        );
+        return stripped;
     }
-    match value.iter().rposition(|&b| b == b':') {
+    let stripped = match value.iter().rposition(|&b| b == b':') {
         Some(i) if i + 1 < value.len() && value[i + 1..].iter().all(|b| b.is_ascii_digit()) => {
             &value[..i]
         }
         _ => value,
-    }
+    };
+    // A stripped value is strictly shorter (we dropped at least `:` + 1 digit);
+    // an unstripped value is byte-identical. Either way it is a prefix.
+    debug_assert!(
+        stripped.len() <= in_len,
+        "strip_port must not grow its input"
+    );
+    debug_assert!(
+        stripped.len() == in_len || stripped.len() + 2 <= in_len,
+        "a real port strip removes at least a colon and one digit"
+    );
+    stripped
 }
 
 /// Case-insensitively compare a literal ``host`` header value to an
@@ -177,6 +200,16 @@ fn host_matches_authority(host: &[u8], authority: &[u8]) -> bool {
     // If both have explicit ports but differ, the origins differ.
     let host_stripped = strip_port(host);
     let auth_stripped = strip_port(authority);
+    // strip_port only ever drops a trailing `:port` suffix, so the stripped
+    // forms are no longer than their inputs; len inequality is the port flag.
+    debug_assert!(
+        host_stripped.len() <= host.len(),
+        "stripped host cannot grow"
+    );
+    debug_assert!(
+        auth_stripped.len() <= authority.len(),
+        "stripped authority cannot grow"
+    );
     let host_has_port = host_stripped.len() != host.len();
     let auth_has_port = auth_stripped.len() != authority.len();
     if host_has_port && auth_has_port {
@@ -365,13 +398,25 @@ fn classify_invalid_value_byte(value: &[u8]) -> Option<RejectReason> {
             _ => {}
         }
     }
-    if saw_crlf {
+    // CR/LF takes precedence over NUL when both are present (more dangerous
+    // smuggling vector), but the result is non-None iff at least one forbidden
+    // byte was seen — never the other way around.
+    let result = if saw_crlf {
         Some(RejectReason::CrlfInValue)
     } else if saw_nul {
         Some(RejectReason::NulInValue)
     } else {
         None
-    }
+    };
+    debug_assert!(
+        result.is_some() == (saw_crlf || saw_nul),
+        "classify must reject iff a CR/LF or NUL byte was observed"
+    );
+    debug_assert!(
+        !(saw_crlf && result != Some(RejectReason::CrlfInValue)),
+        "CR/LF must classify as CrlfInValue even when NUL is also present"
+    );
+    result
 }
 
 /// Thin wrapper kept for tests and any code path that just needs the boolean.
@@ -385,13 +430,26 @@ fn is_invalid_h2_header(name: &[u8], value: &[u8]) -> bool {
 /// Validate and set Content-Length, returning false if it conflicts with a prior value
 /// (RFC 9110 §8.6: multiple disagreeing Content-Length values are malformed).
 fn set_content_length(body_size: &mut BodySize, length: usize) -> bool {
-    match *body_size {
+    let before = *body_size;
+    let accepted = match *body_size {
         BodySize::Length(existing) if existing != length => false,
         _ => {
             *body_size = BodySize::Length(length);
             true
         }
-    }
+    };
+    // On rejection the prior framing must be untouched; on acceptance the body
+    // size must now equal the value we were asked to record (RFC 9110 §8.6
+    // forbids a second, disagreeing Content-Length).
+    debug_assert!(
+        accepted || *body_size == before,
+        "rejected content-length must leave body_size unchanged"
+    );
+    debug_assert!(
+        !accepted || *body_size == BodySize::Length(length),
+        "accepted content-length must set body_size to exactly Length(length)"
+    );
+    accepted
 }
 
 /// Store a pseudo-header value into kawa storage.
@@ -427,6 +485,7 @@ fn store_pseudo_header(
         return Err(RejectReason::OversizedPseudoValue);
     }
     let start = kawa.storage.end as u32;
+    let end_before = kawa.storage.end;
     if kawa.storage.write_all(value).is_err() {
         // Storage exhaustion: report as `oversized_pseudo_value` since a
         // pseudo whose bytes don't fit is functionally an oversized payload
@@ -434,6 +493,23 @@ fn store_pseudo_header(
         // bounded without inventing a transport-failure reason.
         return Err(RejectReason::OversizedPseudoValue);
     }
+    // A successful write_all is all-or-nothing: storage advanced by exactly the
+    // value length, so the slice we are about to mint lies fully inside the
+    // written region (start..end). Reaching here also means the value is
+    // non-empty (the guard above rejected `value.is_empty()`).
+    debug_assert_eq!(
+        kawa.storage.end,
+        end_before + value.len(),
+        "pseudo store must advance storage.end by exactly value.len()"
+    );
+    debug_assert!(
+        start as usize + value.len() <= kawa.storage.end,
+        "pseudo slice must stay within the written storage region"
+    );
+    debug_assert!(
+        !value.is_empty(),
+        "empty pseudo value must already be rejected"
+    );
     Ok(Store::Slice(Slice {
         start,
         len: value.len() as u32,
@@ -460,9 +536,16 @@ fn write_regular_header(
     let len_key = key.len() as u32;
     let len_val = value.len() as u32;
     let start = kawa.storage.end as u32;
+    let end_before_val = kawa.storage.end;
     if kawa.storage.write_all(value).is_err() {
         return Err(RejectReason::OversizedPseudoValue);
     }
+    // All-or-nothing write_all: storage.end advanced by exactly the value length.
+    debug_assert_eq!(
+        kawa.storage.end,
+        end_before_val + value.len(),
+        "regular header value write must advance storage.end by value.len()"
+    );
     let val = Store::Slice(Slice {
         start,
         len: len_val,
@@ -483,13 +566,31 @@ fn write_regular_header(
             return Err(RejectReason::DuplicateCl);
         }
     }
+    let end_before_key = kawa.storage.end;
     if kawa.storage.write_all(key).is_err() {
         return Err(RejectReason::OversizedPseudoValue);
     }
+    // The key was appended immediately after the value, so it starts at
+    // `start + len_val` and the two slices tile [start, end) contiguously
+    // with no gap and no overlap.
+    debug_assert_eq!(
+        kawa.storage.end,
+        end_before_key + key.len(),
+        "regular header key write must advance storage.end by key.len()"
+    );
+    debug_assert_eq!(
+        end_before_key as u32,
+        start + len_val,
+        "key must begin exactly where the value ended (contiguous, no gap)"
+    );
     let key = Store::Slice(Slice {
         start: start + len_val,
         len: len_key,
     });
+    debug_assert!(
+        (start + len_val + len_key) as usize <= kawa.storage.end,
+        "key+val slices must stay within the written storage region"
+    );
     kawa.push_block(Block::Header(Pair { key, val }));
     Ok(())
 }
@@ -533,6 +634,9 @@ pub(super) fn parse_rfc9218_priority(value: &[u8]) -> (u8, bool) {
             if let Ok(s) = std::str::from_utf8(&token[2..]) {
                 if let Ok(n) = s.parse::<u8>() {
                     urgency = n.min(7);
+                    // The `.min(7)` clamp is the only writer of `urgency` after
+                    // the default; it can never leave the RFC 9218 §4 range.
+                    debug_assert!(urgency <= 7, "clamped urgency must stay within 0..=7");
                 }
             }
         } else if token == b"i" || token == b"i=?1" {
@@ -542,6 +646,13 @@ pub(super) fn parse_rfc9218_priority(value: &[u8]) -> (u8, bool) {
         }
     }
 
+    // RFC 9218 §4: urgency is a 3-bit field (0..=7). The default (3) and the
+    // clamped parse path are the only writers, so this always holds — the
+    // Prioriser downstream relies on it for its urgency-bucket array indexing.
+    debug_assert!(
+        urgency <= 7,
+        "parse_rfc9218_priority must yield an urgency within the RFC 9218 range"
+    );
     (urgency, incremental)
 }
 
@@ -575,6 +686,7 @@ where
         if invalid_headers || budget_exceeded || field_limit_exceeded {
             return;
         }
+        let bytes_before = decoded_bytes;
         // RFC 9113 §6.5.2: the size accounted against SETTINGS_MAX_HEADER_LIST_SIZE
         // is the name + value octets PLUS a 32-octet per-field overhead. The
         // overhead is what bounds the field count under a fixed byte budget;
@@ -584,10 +696,22 @@ where
             .saturating_add(k.len())
             .saturating_add(v.len())
             .saturating_add(crate::protocol::mux::h2::HEADER_FIELD_SIZE_OVERHEAD);
+        // The running header-list size only ever grows as pairs are admitted;
+        // it must never shrink between callbacks (RFC 9113 §6.5.2 accounting).
+        debug_assert!(
+            decoded_bytes >= bytes_before,
+            "decoded header-list size must be monotonic non-decreasing"
+        );
         if decoded_bytes > max_decoded_bytes {
             budget_exceeded = true;
             return;
         }
+        // We only reach per_header for pairs that fit the budget; the running
+        // total stays at or below the negotiated MAX_HEADER_LIST_SIZE here.
+        debug_assert!(
+            decoded_bytes <= max_decoded_bytes,
+            "admitted pairs must keep the running size within the budget"
+        );
         // Cap the COUNT of materialized header fields (cf. nginx `max_headers`,
         // Apache `LimitRequestFields`): the bomb's real cost is one `Pair` of
         // per-entry bookkeeping per field, not the decoded byte size.
@@ -615,6 +739,12 @@ where
         error!("{} INVALID FRAGMENT: {:?}", log_module_context!(), error);
         return Err((H2Error::CompressionError, true));
     }
+    // budget_exceeded is set exactly when the running total crossed the cap; if
+    // it stayed clear the whole decode fit inside MAX_HEADER_LIST_SIZE.
+    debug_assert!(
+        budget_exceeded || decoded_bytes <= max_decoded_bytes,
+        "a non-overflowing decode must end at or below the budget"
+    );
     if budget_exceeded {
         metric_reject(RejectReason::HeaderListOverBudget);
         error!(
@@ -635,6 +765,12 @@ where
         );
         return Err((H2Error::EnhanceYourCalm, false));
     }
+    // Reaching the Ok branch means we neither errored nor overflowed the budget,
+    // so the final accounted size is within the negotiated cap.
+    debug_assert!(
+        decoded_bytes <= max_decoded_bytes,
+        "successful decode must report a header-list size within the budget"
+    );
     Ok(invalid_headers)
 }
 
@@ -919,6 +1055,18 @@ where
                 // Match — drop it. kawa's H1 serializer emits Host: from
                 // :authority on its own.
             }
+            // All four mandatory request pseudo-headers passed the presence gate
+            // above (RFC 9113 §8.3.1); none may be Store::Empty at this point.
+            // `store_pseudo_header` already enforced uniqueness and the
+            // pseudo-before-regular ordering, so a populated quartet here is the
+            // proof the request line is well-formed before we mint it.
+            debug_assert!(
+                !method.is_empty()
+                    && !authority.is_empty()
+                    && !path.is_empty()
+                    && !scheme.is_empty(),
+                "all four request pseudo-headers must be present after validation"
+            );
             StatusLine::Request {
                 version: Version::V20,
                 method,
@@ -950,9 +1098,21 @@ where
                         match store_pseudo_header(&status, regular_headers, kawa, &v) {
                             Ok(s) => {
                                 status = s;
+                                // The three-digit ASCII guard above proves each
+                                // byte is in b'0'..=b'9', so this hand-rolled
+                                // base-10 decode lands in 100..=999 with no
+                                // overflow of the u16 accumulator.
+                                debug_assert!(
+                                    v.len() == 3 && v.iter().all(|b| b.is_ascii_digit()),
+                                    ":status reaching the decode must be three ASCII digits"
+                                );
                                 code = (v[0] - b'0') as u16 * 100
                                     + (v[1] - b'0') as u16 * 10
                                     + (v[2] - b'0') as u16;
+                                debug_assert!(
+                                    (100..=999).contains(&code),
+                                    "decoded :status code must be in 100..=999"
+                                );
                             }
                             Err(reason) => {
                                 metric_reject(reason);
@@ -975,6 +1135,17 @@ where
                 error!("{} INVALID HEADERS", log_module_context!());
                 return Err((H2Error::ProtocolError, false));
             }
+            // Past the validity gate, :status was exactly three ASCII digits
+            // (the in-loop guard rejected anything else), so the decimal `code`
+            // is in 100..=999 and `status` is a stored, non-empty slice.
+            debug_assert!(
+                (100..=999).contains(&code),
+                "response :status code must be a three-digit value in 100..=999"
+            );
+            debug_assert!(
+                !status.is_empty(),
+                "validated response must carry a non-empty :status pseudo"
+            );
             StatusLine::Response {
                 version: Version::V20,
                 code,
@@ -1068,12 +1239,27 @@ where
         return Ok(());
     }
 
+    // A stream that still expects a body (`!end_stream`) must have had its
+    // framing resolved to a concrete length or chunked encoding above — the
+    // `BodySize::Empty` upgrade-to-chunked branch guarantees we never enter the
+    // phase mapping with an unframed body when more bytes are coming.
+    debug_assert!(
+        end_stream || kawa.body_size != BodySize::Empty,
+        "a continuing stream must have a resolved body framing before phasing"
+    );
     kawa.parsing_phase = match kawa.body_size {
         BodySize::Chunked => ParsingPhase::Chunks { first: true },
         BodySize::Length(0) => ParsingPhase::Terminated,
         BodySize::Length(_) => ParsingPhase::Body,
         BodySize::Empty => ParsingPhase::Chunks { first: true },
     };
+    // The phase we just selected must be consistent with the framing: a
+    // length-framed body lands in Body/Terminated, never mid-chunk.
+    debug_assert!(
+        !matches!(kawa.body_size, BodySize::Length(n) if n > 0)
+            || kawa.parsing_phase == ParsingPhase::Body,
+        "a non-empty Content-Length body must transition to ParsingPhase::Body"
+    );
     Ok(())
 }
 
@@ -1145,20 +1331,36 @@ pub fn handle_trailer(
     // wild, RFC 9110 §6.5 imposes no minimum) and an order of magnitude
     // tighter than the HEADERS cap.
     let max_decoded = (max_header_list_size as usize).min(MAX_TRAILER_BYTES);
+    // The trailer carve-out can only tighten the budget, never relax it below
+    // the negotiated MAX_HEADER_LIST_SIZE.
+    debug_assert!(
+        max_decoded <= max_header_list_size as usize && max_decoded <= MAX_TRAILER_BYTES,
+        "trailer budget is the min of MAX_HEADER_LIST_SIZE and the carve-out cap"
+    );
     let decode_status = decoder.decode_with_cb(input, |k, v| {
         if invalid_trailers || budget_exceeded || field_limit_exceeded {
             return;
         }
+        let bytes_before = decoded_bytes;
         // RFC 9113 §6.5.2: count name + value octets plus the 32-octet
         // per-field overhead, matching the HEADERS path.
         decoded_bytes = decoded_bytes
             .saturating_add(k.len())
             .saturating_add(v.len())
             .saturating_add(crate::protocol::mux::h2::HEADER_FIELD_SIZE_OVERHEAD);
+        debug_assert!(
+            decoded_bytes >= bytes_before,
+            "decoded trailer size must be monotonic non-decreasing"
+        );
         if decoded_bytes > max_decoded {
             budget_exceeded = true;
             return;
         }
+        // Admitted trailers keep the running total within the carve-out cap.
+        debug_assert!(
+            decoded_bytes <= max_decoded,
+            "admitted trailers must stay within the trailer budget"
+        );
         field_count += 1;
         if field_count > max_header_fields {
             field_limit_exceeded = true;
@@ -1200,13 +1402,26 @@ pub fn handle_trailer(
             return;
         }
         let start = kawa.storage.end as u32;
+        let end_before = kawa.storage.end;
         if kawa.storage.write_all(&k).is_err() || kawa.storage.write_all(&v).is_err() {
             metric_reject(RejectReason::OversizedPseudoValue);
             invalid_trailers = true;
             return;
         }
+        // Both writes succeeded, so storage.end advanced by exactly key+value
+        // and the two slices tile [start, end) contiguously (key first, then
+        // value at `start + len_key`).
+        debug_assert_eq!(
+            kawa.storage.end,
+            end_before + k.len() + v.len(),
+            "trailer write must advance storage.end by key.len() + value.len()"
+        );
         let len_key = k.len() as u32;
         let len_val = v.len() as u32;
+        debug_assert!(
+            (start + len_key + len_val) as usize <= kawa.storage.end,
+            "trailer key+val slices must stay within the written storage region"
+        );
         let key = Store::Slice(Slice {
             start,
             len: len_key,
@@ -1246,6 +1461,13 @@ pub fn handle_trailer(
         error!("{} INVALID TRAILERS", log_module_context!());
         return Err((H2Error::ProtocolError, false));
     }
+    // Reaching here means the trailer block decoded cleanly, never overflowed
+    // the carve-out budget, and carried no invalid field — the three rejection
+    // gates above already returned on the negative space.
+    debug_assert!(
+        !budget_exceeded && !invalid_trailers && decoded_bytes <= max_decoded,
+        "an accepted trailer block must fit the budget and pass validation"
+    );
 
     // RFC 9110 §6.5: if the request/response was framed with a
     // fixed Content-Length (not chunked), the H1-side serializer cannot emit

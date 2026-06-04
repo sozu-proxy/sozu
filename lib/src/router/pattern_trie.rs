@@ -120,14 +120,48 @@ impl<V: Debug + Clone> TrieNode<V> {
             return InsertResult::Failed;
         }
 
+        #[cfg(debug_assertions)]
+        let before = self.count_values();
+
         let insert_result = self.insert_recursive(&key, &key, value);
         assert_ne!(insert_result, InsertResult::Failed);
+
+        // Post: the value count grows by exactly one on a fresh insert
+        // and is unchanged when the key already existed. `Failed` is
+        // ruled out above, so these two are the only reachable cases.
+        #[cfg(debug_assertions)]
+        {
+            let after = self.count_values();
+            match insert_result {
+                InsertResult::Ok => debug_assert_eq!(
+                    after,
+                    before + 1,
+                    "a fresh insert must add exactly one value to the trie",
+                ),
+                InsertResult::Existing => debug_assert_eq!(
+                    after, before,
+                    "an Existing insert must not change the trie value count",
+                ),
+                InsertResult::Failed => {
+                    unreachable!("insert_recursive returned Failed after key validation")
+                }
+            }
+            self.check_invariants();
+        }
+
         insert_result
     }
 
     pub fn insert_recursive(&mut self, partial_key: &[u8], key: &Key, value: V) -> InsertResult {
         //println!("insert_rec: key == {}", std::str::from_utf8(partial_key).unwrap());
         assert_ne!(partial_key, &b""[..]);
+        // `partial_key` is always a suffix of the full `key` being
+        // inserted — the recursion only ever shrinks the head, never
+        // rewrites the tail.
+        debug_assert!(
+            partial_key.len() <= key.len(),
+            "insert recursion must consume the key, never grow past it",
+        );
 
         if partial_key[partial_key.len() - 1] == b'/' {
             let pos = find_last_slash(&partial_key[..partial_key.len() - 1]);
@@ -139,9 +173,28 @@ impl<V: Debug + Clone> TrieNode<V> {
 
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
                     let anchored_s = format!("\\A{s}\\z");
+                    debug_assert!(
+                        anchored_s.starts_with("\\A") && anchored_s.ends_with("\\z"),
+                        "segment regex must be fully anchored so it matches the whole segment only",
+                    );
                     for t in self.regexps.iter_mut() {
                         if t.0.as_str() == anchored_s {
-                            return t.1.insert_recursive(&partial_key[..pos - 1], key, value);
+                            // `pos > 0`: there is a `.`-separated prefix
+                            // before this regex segment; recurse on it
+                            // (dropping the leading `.` via `pos - 1`).
+                            // `pos == 0`: the regex is the leftmost/only
+                            // segment, so its subtree is already a
+                            // value-bearing leaf (the create-path below
+                            // built it via `TrieNode::new`); re-inserting
+                            // the same host is `Existing`. The pre-fix code
+                            // did `partial_key[..pos - 1]` unconditionally,
+                            // underflowing to `usize::MAX` and panicking on
+                            // `pos == 0` (same latent bug as `lookup_mut`).
+                            if pos > 0 {
+                                return t.1.insert_recursive(&partial_key[..pos - 1], key, value);
+                            } else {
+                                return InsertResult::Existing;
+                            }
                         }
                     }
 
@@ -193,6 +246,18 @@ impl<V: Debug + Clone> TrieNode<V> {
                 }
             }
             Some(pos) => {
+                // The dot at `pos` is kept on the child key (suffix) and
+                // stripped from the recursive prefix; the two slices
+                // partition `partial_key` exactly.
+                debug_assert_eq!(
+                    partial_key[..pos].len() + partial_key[pos..].len(),
+                    partial_key.len(),
+                    "dot-split must partition partial_key without losing bytes",
+                );
+                debug_assert_eq!(
+                    partial_key[pos], b'.',
+                    "find_last_dot must point at a '.' byte",
+                );
                 if let Some(child) = self.children.get_mut(&partial_key[pos..]) {
                     return child.insert_recursive(&partial_key[..pos], key, value);
                 }
@@ -210,7 +275,32 @@ impl<V: Debug + Clone> TrieNode<V> {
     }
 
     pub fn remove(&mut self, key: &Key) -> RemoveResult {
-        self.remove_recursive(key)
+        #[cfg(debug_assertions)]
+        let before = self.count_values();
+
+        let remove_result = self.remove_recursive(key);
+
+        // Post: a successful remove drops exactly one value; a NotFound
+        // is a no-op on the value count. The structural invariants then
+        // guarantee no emptied subtree was stranded by the prune.
+        #[cfg(debug_assertions)]
+        {
+            let after = self.count_values();
+            match remove_result {
+                RemoveResult::Ok => debug_assert_eq!(
+                    after + 1,
+                    before,
+                    "a successful remove must drop exactly one value from the trie",
+                ),
+                RemoveResult::NotFound => debug_assert_eq!(
+                    after, before,
+                    "a NotFound remove must not change the trie value count",
+                ),
+            }
+            self.check_invariants();
+        }
+
+        remove_result
     }
 
     pub fn remove_recursive(&mut self, partial_key: &[u8]) -> RemoveResult {
@@ -273,13 +363,34 @@ impl<V: Debug + Clone> TrieNode<V> {
             Some(pos) => (&partial_key[..pos], &partial_key[pos..]),
         };
         //println!("remove: prefix|suffix: {} | {}", std::str::from_utf8(prefix).unwrap(), std::str::from_utf8(suffix).unwrap());
+        debug_assert_eq!(
+            prefix.len() + suffix.len(),
+            partial_key.len(),
+            "dot-split must partition the key without losing or duplicating bytes",
+        );
 
         match self.children.get_mut(suffix) {
             Some(child) => match child.remove_recursive(prefix) {
                 RemoveResult::NotFound => RemoveResult::NotFound,
                 RemoveResult::Ok => {
+                    // An emptied child subtree MUST be pruned here so the
+                    // parent never strands a node with no value. After the
+                    // prune the suffix key is gone from `children`.
                     if child.is_empty() {
                         self.children.remove(suffix);
+                        debug_assert!(
+                            !self.children.contains_key(suffix),
+                            "an emptied child subtree must be removed from the parent",
+                        );
+                    } else {
+                        // `count_values` is debug-only; gate the whole
+                        // assert so the call does not have to compile in
+                        // release (HARD RULE 2 — E0425 guard).
+                        #[cfg(debug_assertions)]
+                        debug_assert!(
+                            child.count_values() > 0,
+                            "a retained child subtree must still hold at least one value",
+                        );
                     }
                     RemoveResult::Ok
                 }
@@ -311,6 +422,18 @@ impl<V: Debug + Clone> TrieNode<V> {
             None => (&b""[..], partial_key),
             Some(pos) => (&partial_key[..pos], &partial_key[pos..]),
         };
+        // The dot-split partitions the key exactly: prefix ++ suffix is
+        // the whole input, and a dotted split puts the `.` at the head
+        // of the suffix (this is the byte the wildcard/regex arms strip).
+        debug_assert_eq!(
+            prefix.len() + suffix.len(),
+            partial_key.len(),
+            "dot-split must partition the key without losing or duplicating bytes",
+        );
+        debug_assert!(
+            pos.is_none() || suffix.first() == Some(&b'.'),
+            "a dotted split must place the separator at the head of the suffix",
+        );
 
         match self.children.get(suffix) {
             Some(child) => child.lookup_with_path(prefix, accept_wildcard, trace),
@@ -355,6 +478,15 @@ impl<V: Debug + Clone> TrieNode<V> {
             Some(pos) => (&partial_key[..pos], &partial_key[pos..]),
         };
         //println!("lookup: prefix|suffix: {} | {}", std::str::from_utf8(prefix).unwrap(), std::str::from_utf8(suffix).unwrap());
+        debug_assert_eq!(
+            prefix.len() + suffix.len(),
+            partial_key.len(),
+            "dot-split must partition the key without losing or duplicating bytes",
+        );
+        debug_assert!(
+            !suffix.is_empty(),
+            "the suffix the trie matches children against must be non-empty",
+        );
 
         match self.children.get(suffix) {
             Some(child) => child.lookup(prefix, accept_wildcard),
@@ -414,7 +546,20 @@ impl<V: Debug + Clone> TrieNode<V> {
                     let anchored_s = format!("\\A{s}\\z");
                     for t in self.regexps.iter_mut() {
                         if t.0.as_str() == anchored_s {
-                            return t.1.lookup_mut(&partial_key[..pos - 1], accept_wildcard);
+                            // `pos == 0` means the regex is the leftmost
+                            // segment and its subtree is a value-bearing
+                            // leaf, reachable via the empty-prefix recursion
+                            // (`lookup_mut(b"")` returns `key_value`). The
+                            // pre-fix `partial_key[..pos - 1]` underflowed to
+                            // `usize::MAX` and panicked on `pos == 0` — the
+                            // same latent bug as the insert dedup loop. Drop
+                            // the leading `.` only when there is one.
+                            let rest = if pos > 0 {
+                                &partial_key[..pos - 1]
+                            } else {
+                                &partial_key[..0]
+                            };
+                            return t.1.lookup_mut(rest, accept_wildcard);
                         }
                     }
                 }
@@ -429,6 +574,15 @@ impl<V: Debug + Clone> TrieNode<V> {
             Some(pos) => (&partial_key[..pos], &partial_key[pos..]),
         };
         //println!("lookup: prefix|suffix: {} | {}", std::str::from_utf8(prefix).unwrap(), std::str::from_utf8(suffix).unwrap());
+        debug_assert_eq!(
+            prefix.len() + suffix.len(),
+            partial_key.len(),
+            "dot-split must partition the key without losing or duplicating bytes",
+        );
+        debug_assert!(
+            !suffix.is_empty(),
+            "the suffix the trie matches children against must be non-empty",
+        );
 
         match self.children.get_mut(suffix) {
             Some(child) => child.lookup_mut(prefix, accept_wildcard),
@@ -509,6 +663,80 @@ impl<V: Debug + Clone> TrieNode<V> {
         }
         for (_, child) in self.regexps.iter_mut() {
             child.for_each_value_mut(f);
+        }
+    }
+
+    /// Count every value slot reachable from this node: the literal
+    /// `key_value`, the leftmost `wildcard`, plus all values stored in
+    /// child subtrees and regex subtrees. Used only by the
+    /// `#[cfg(debug_assertions)]` invariant checks as the leaf-count
+    /// accounting (`inserts − removes`); never called in release.
+    #[cfg(debug_assertions)]
+    fn count_values(&self) -> usize {
+        let local = self.key_value.is_some() as usize + self.wildcard.is_some() as usize;
+        let in_children: usize = self.children.values().map(TrieNode::count_values).sum();
+        let in_regexps: usize = self.regexps.iter().map(|(_, c)| c.count_values()).sum();
+        local + in_children + in_regexps
+    }
+
+    /// Full structural invariant sweep for the trie, asserted as a
+    /// run-to-completion postcondition at the end of every mutating
+    /// public operation. Encodes the cross-field invariants that the
+    /// recursive insert/remove logic must preserve:
+    ///
+    /// - **No stranded interior node**: every non-root node reachable
+    ///   through `children` / `regexps` must hold a value somewhere in
+    ///   its subtree (`!is_empty()` and `count_values() > 0`). A node
+    ///   that holds neither a value nor any descendant value is a leak —
+    ///   `remove_recursive` is supposed to prune it via `is_empty()`.
+    /// - **Unique regex segments**: the anchored pattern strings stored
+    ///   in `regexps` are unique within a node (insert dedups by
+    ///   `as_str()` before pushing a new subtree).
+    /// - **Child-key invariant**: no child is keyed by the empty slice.
+    ///
+    /// `debug_assertions`-only; compiled out of release builds.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        // Regex segment patterns are unique per node.
+        for i in 0..self.regexps.len() {
+            for j in (i + 1)..self.regexps.len() {
+                debug_assert_ne!(
+                    self.regexps[i].0.as_str(),
+                    self.regexps[j].0.as_str(),
+                    "trie node must not hold two subtrees for the same regex segment",
+                );
+            }
+        }
+
+        for (child_key, child) in self.children.iter() {
+            debug_assert!(
+                !child_key.is_empty(),
+                "trie child must not be keyed by the empty segment",
+            );
+            // A child subtree that has been fully emptied must have been
+            // pruned by remove_recursive; reaching it here means a
+            // subtree was stranded.
+            debug_assert!(
+                !child.is_empty(),
+                "trie must not strand an empty child subtree (remove must prune)",
+            );
+            debug_assert!(
+                child.count_values() > 0,
+                "trie child subtree must lead to at least one value",
+            );
+            child.check_invariants();
+        }
+
+        for (_, child) in self.regexps.iter() {
+            debug_assert!(
+                !child.is_empty(),
+                "trie must not strand an empty regex subtree (remove must prune)",
+            );
+            debug_assert!(
+                child.count_values() > 0,
+                "trie regex subtree must lead to at least one value",
+            );
+            child.check_invariants();
         }
     }
 
@@ -1000,5 +1228,51 @@ mod tests {
     #[test]
     fn size() {
         assert_size!(TrieNode<u32>, 136);
+    }
+
+    /// Regression: a hostname whose LEFTMOST segment is a regex
+    /// (`/test[0-9]/.example.com`) used to underflow `pos - 1` (to
+    /// `usize::MAX`) and panic on the second insert (the dedup loop) and
+    /// on any `lookup_mut`. Both paths now special-case `pos == 0`
+    /// (regex is the leftmost/only segment → value-bearing leaf). This
+    /// asserts the panic is gone and the entry resolves correctly.
+    #[test]
+    fn leftmost_regex_segment_reinsert_and_lookup_mut_do_not_panic() {
+        let mut root: TrieNode<u8> = TrieNode::root();
+
+        assert_eq!(
+            root.insert(Vec::from(&b"/test[0-9]/.example.com"[..]), 7),
+            InsertResult::Ok
+        );
+        // Second insert of the SAME leftmost-regex host: dedup loop with
+        // pos == 0. Previously panicked; must now report Existing.
+        assert_eq!(
+            root.insert(Vec::from(&b"/test[0-9]/.example.com"[..]), 8),
+            InsertResult::Existing
+        );
+
+        // lookup_mut on the existing leftmost-regex host: previously
+        // panicked at `partial_key[..pos - 1]`; must now resolve the leaf
+        // (value unchanged from the first insert — Existing did not
+        // overwrite).
+        let resolved = root.domain_lookup_mut(b"test4.example.com", false);
+        assert_eq!(
+            resolved.map(|(_, v)| *v),
+            Some(7),
+            "leftmost-regex host must resolve via lookup_mut without panicking",
+        );
+
+        // The immutable lookup path (never buggy) agrees.
+        assert_eq!(
+            root.domain_lookup(b"test4.example.com", false),
+            Some(&(b"/test[0-9]/.example.com"[..].to_vec(), 7))
+        );
+
+        // Removing the last rule clears the host.
+        assert_eq!(
+            root.domain_remove(&Vec::from(&b"/test[0-9]/.example.com"[..])),
+            RemoveResult::Ok
+        );
+        assert_eq!(root.domain_lookup(b"test4.example.com", false), None);
     }
 }

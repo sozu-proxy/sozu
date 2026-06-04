@@ -143,7 +143,7 @@ impl Stream {
             }
             None => return None,
         };
-        Some(Self {
+        let stream = Self {
             state: StreamState::Idle,
             attempts: 0,
             window: i32::try_from(window).unwrap_or(i32::MAX),
@@ -156,7 +156,68 @@ impl Stream {
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
             context,
             metrics: SessionMetrics::new(None),
-        })
+        };
+        // Post: a freshly checked-out stream is a clean, closed slot — no
+        // request has been counted yet (so `generate_access_log` won't
+        // gauge-underflow `http.active_requests`) and no DATA has been seen on
+        // either half (the content-length reconciliation counters start at 0).
+        debug_assert_eq!(stream.state, StreamState::Idle, "new stream must be Idle");
+        debug_assert!(
+            !stream.state.is_open(),
+            "an Idle stream slot must not report as open"
+        );
+        debug_assert!(
+            !stream.request_counted,
+            "new stream must not have a counted request (gauge-underflow guard)"
+        );
+        debug_assert_eq!(
+            (stream.front_data_received, stream.back_data_received),
+            (0, 0),
+            "new stream DATA counters must start at 0"
+        );
+        #[cfg(debug_assertions)]
+        stream.check_invariants();
+        Some(stream)
+    }
+
+    /// Cross-field invariant sweep for the per-request stream state machine.
+    ///
+    /// Encodes the relationships that must hold for ANY `Stream` regardless of
+    /// the mux path (H1 or H2) that drives it:
+    /// - `state.is_open()` agrees with the `Idle`/`Recycle` discriminants
+    ///   (the open/closed split is the load-bearing predicate for shutdown and
+    ///   slot reuse).
+    /// - a `Recycle` slot is fully reset — no counted request can be left
+    ///   pending on a slot advertised as reusable, or `create_stream` would
+    ///   resurrect a stale `http.active_requests` charge.
+    /// - a `Linked` stream names a backend token; the `Linked(token)`
+    ///   discriminant and `linked_token()` must agree (the access-log and
+    ///   reverse-index lookups both depend on this equivalence).
+    ///
+    /// Compiled only with `debug_assertions`; the optimizer drops every call
+    /// in release. Network input never reaches a hard `assert!` here — these
+    /// fire only on our own logic bugs.
+    #[cfg(debug_assertions)]
+    pub(super) fn check_invariants(&self) {
+        debug_assert_eq!(
+            self.state.is_open(),
+            !matches!(self.state, StreamState::Idle | StreamState::Recycle),
+            "is_open() must agree with the Idle/Recycle discriminants"
+        );
+        if self.state == StreamState::Recycle {
+            debug_assert!(
+                !self.request_counted,
+                "a Recycle slot must not carry a counted request (active-requests leak)"
+            );
+        }
+        // `linked_token()` is the canonical accessor for the backend token; it
+        // must return Some iff the slot is `Linked`, since the reverse index
+        // and the access-log RTT lookup both branch on it.
+        debug_assert_eq!(
+            self.linked_token().is_some(),
+            matches!(self.state, StreamState::Linked(_)),
+            "linked_token() must be Some iff the stream is Linked"
+        );
     }
     /// Convenience accessor for the backend token when the stream is `Linked`.
     /// Used by access-log emission sites to look up the backend socket on the
@@ -182,6 +243,19 @@ impl Stream {
     }
 
     pub fn split(&mut self, position: &Position) -> StreamParts<'_> {
+        // Pre: the front buffer always parses requests and the back buffer
+        // always parses responses. `split` only re-labels them as read/write
+        // for the caller's position — it must never swap their kawa kinds.
+        debug_assert_eq!(
+            self.front.kind,
+            kawa::Kind::Request,
+            "front buffer must hold a Request kawa"
+        );
+        debug_assert_eq!(
+            self.back.kind,
+            kawa::Kind::Response,
+            "back buffer must hold a Response kawa"
+        );
         match position {
             Position::Client(..) => StreamParts {
                 window: &mut self.window,
@@ -231,10 +305,26 @@ impl Stream {
         // backend-error 504. Caller-supplied `message` (e.g. parsing
         // errors) takes precedence when both are present.
         let message = message.or(context.access_log_message);
+        // Pair the `http.active_requests` gauge `-1` with `request_counted`:
+        // it must transition true -> false exactly once so a re-entry (H1
+        // keep-alive, double access-log on the same stream) cannot
+        // double-decrement the gauge into underflow. `request_counted` is set
+        // true at the matching `gauge_add!(.., 1)` in the H1/H2 readable paths.
+        let was_counted = self.request_counted;
         if self.request_counted {
             gauge_add!(names::http::ACTIVE_REQUESTS, -1);
             self.request_counted = false;
         }
+        debug_assert!(
+            !self.request_counted,
+            "generate_access_log must leave request_counted false (gauge-underflow guard)"
+        );
+        // The flag may only move true->false here (one `-1`); it must never be
+        // observed flipping back on within this call.
+        debug_assert!(
+            was_counted >= self.request_counted,
+            "request_counted must only clear here, never spontaneously set"
+        );
         if error {
             // Labelled with `(cluster_id, backend_id)`; see the matching
             // emission in `kawa_h1::log_request_error` for the cardinality

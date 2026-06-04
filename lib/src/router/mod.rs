@@ -144,10 +144,21 @@ impl Router {
                             match method_rule.matches(method) {
                                 // FIXME: the rule order will be important here
                                 MethodRuleResult::Equals => {
+                                    // Longest-prefix wins: the selected
+                                    // length is monotonically non-decreasing
+                                    // across the candidate scan.
+                                    debug_assert!(
+                                        size >= prefix_length,
+                                        "longest-prefix selection must never shrink the match length",
+                                    );
                                     prefix_length = size;
                                     matched = Some((rule, route));
                                 }
                                 MethodRuleResult::All => {
+                                    debug_assert!(
+                                        size >= prefix_length,
+                                        "longest-prefix selection must never shrink the match length",
+                                    );
                                     prefix_length = size;
                                     matched = Some((rule, route));
                                 }
@@ -337,16 +348,49 @@ impl Router {
                 let mut empty = true;
                 if let Some((_, paths)) = self.tree.domain_lookup_mut(hostname.as_bytes(), false) {
                     empty = false;
+                    let before = paths.len();
                     if !paths.iter().any(|(p, m, _)| p == path && m == method) {
                         paths.push((path.to_owned(), method.to_owned(), cluster.to_owned()));
+                        // Append must add exactly one (path, method) leaf
+                        // and the new rule must now be present.
+                        debug_assert_eq!(
+                            paths.len(),
+                            before + 1,
+                            "appending a tree rule must grow the leaf's rule list by exactly one",
+                        );
+                        debug_assert!(
+                            paths.iter().any(|(p, m, _)| p == path && m == method),
+                            "the freshly appended (path, method) rule must be present after insert",
+                        );
                         return true;
                     }
                 }
 
                 if empty {
+                    // Snapshot the ASCII host bytes before the move so the
+                    // post-insert reachability check can re-look-up the
+                    // domain. Ungated `let` (read only inside the gated
+                    // assert) → dropped by the optimizer in release.
+                    let inserted_host = hostname.clone().into_bytes();
                     self.tree.domain_insert(
                         hostname.into_bytes(),
                         vec![(path.to_owned(), method.to_owned(), cluster.to_owned())],
+                    );
+                    // A fresh domain must now be reachable, carrying the
+                    // single rule just inserted. Use `domain_lookup_mut`
+                    // (not the immutable `domain_lookup`): only the `_mut`
+                    // resolver handles a literal wildcard key (`*.sozu.io`)
+                    // via its `partial_key == b"*"` segment case, which is
+                    // exactly the resolution the append branch above relies
+                    // on. The immutable `lookup` lacks that case and would
+                    // miss wildcard entries.
+                    debug_assert!(
+                        self.tree
+                            .domain_lookup_mut(&inserted_host, false)
+                            .is_some_and(|(_, paths)| paths
+                                .iter()
+                                .any(|(p, m, _)| p == path && m == method)),
+                        "a freshly inserted tree domain must resolve to its inserted rule",
                     );
                     return true;
                 }
@@ -376,6 +420,12 @@ impl Router {
 
                     if let Some((_, paths)) = paths_opt {
                         paths.retain(|(p, m, _)| p != path || m != method);
+                        // `retain` evicts every matching (path, method)
+                        // rule; none may survive the filter.
+                        debug_assert!(
+                            !paths.iter().any(|(p, m, _)| p == path && m == method),
+                            "remove must evict every matching (path, method) rule from the leaf",
+                        );
                     }
 
                     paths_opt
@@ -385,7 +435,19 @@ impl Router {
                 };
 
                 if should_delete {
+                    let removed_host = hostname.clone().into_bytes();
                     self.tree.domain_remove(&hostname.into_bytes());
+                    // Dropping the last rule must make the whole domain
+                    // unreachable — no stranded empty leaf left behind.
+                    // `domain_lookup_mut` resolves literal wildcard keys
+                    // (`*.sozu.io`), so this genuinely verifies wildcard
+                    // entries are gone too (the immutable `lookup` lacks
+                    // the `partial_key == b"*"` case and would always read
+                    // None for a wildcard host, weakening the check).
+                    debug_assert!(
+                        self.tree.domain_lookup_mut(&removed_host, false).is_none(),
+                        "a domain whose last rule was removed must be unreachable",
+                    );
                 }
 
                 true
@@ -498,6 +560,7 @@ impl Router {
         method: &MethodRule,
         cluster_id: &Route,
     ) -> bool {
+        let before = self.pre.len();
         if !self
             .pre
             .iter()
@@ -509,8 +572,27 @@ impl Router {
                 method.to_owned(),
                 cluster_id.to_owned(),
             ));
+            // A new pre-rule grows the list by exactly one and is now
+            // present (dedup of the same triple is the caller's `false`
+            // path, not this one).
+            debug_assert_eq!(
+                self.pre.len(),
+                before + 1,
+                "adding a unique pre-rule must push exactly one entry",
+            );
+            debug_assert!(
+                self.pre
+                    .iter()
+                    .any(|(d, p, m, _)| d == domain && p == path && m == method),
+                "the freshly added pre-rule must be present",
+            );
             true
         } else {
+            debug_assert_eq!(
+                self.pre.len(),
+                before,
+                "a duplicate pre-rule must not change the list length",
+            );
             false
         }
     }
@@ -522,6 +604,7 @@ impl Router {
         method: &MethodRule,
         cluster_id: &Route,
     ) -> bool {
+        let before = self.post.len();
         if !self
             .post
             .iter()
@@ -533,8 +616,24 @@ impl Router {
                 method.to_owned(),
                 cluster_id.to_owned(),
             ));
+            debug_assert_eq!(
+                self.post.len(),
+                before + 1,
+                "adding a unique post-rule must push exactly one entry",
+            );
+            debug_assert!(
+                self.post
+                    .iter()
+                    .any(|(d, p, m, _)| d == domain && p == path && m == method),
+                "the freshly added post-rule must be present",
+            );
             true
         } else {
+            debug_assert_eq!(
+                self.post.len(),
+                before,
+                "a duplicate post-rule must not change the list length",
+            );
             false
         }
     }
@@ -545,14 +644,36 @@ impl Router {
         path: &PathRule,
         method: &MethodRule,
     ) -> bool {
+        let before = self.pre.len();
         match self
             .pre
             .iter()
             .position(|(d, p, m, _)| d == domain && p == path && m == method)
         {
-            None => false,
+            None => {
+                debug_assert_eq!(
+                    self.pre.len(),
+                    before,
+                    "a no-op pre-rule removal must not change the list length",
+                );
+                false
+            }
             Some(index) => {
+                debug_assert!(index < self.pre.len(), "found index must be in bounds");
                 self.pre.remove(index);
+                // Exactly one entry left, and the triple is now gone.
+                debug_assert_eq!(
+                    self.pre.len() + 1,
+                    before,
+                    "removing a pre-rule must drop exactly one entry",
+                );
+                debug_assert!(
+                    !self
+                        .pre
+                        .iter()
+                        .any(|(d, p, m, _)| d == domain && p == path && m == method),
+                    "the removed pre-rule must no longer be present",
+                );
                 true
             }
         }
@@ -564,14 +685,35 @@ impl Router {
         path: &PathRule,
         method: &MethodRule,
     ) -> bool {
+        let before = self.post.len();
         match self
             .post
             .iter()
             .position(|(d, p, m, _)| d == domain && p == path && m == method)
         {
-            None => false,
+            None => {
+                debug_assert_eq!(
+                    self.post.len(),
+                    before,
+                    "a no-op post-rule removal must not change the list length",
+                );
+                false
+            }
             Some(index) => {
+                debug_assert!(index < self.post.len(), "found index must be in bounds");
                 self.post.remove(index);
+                debug_assert_eq!(
+                    self.post.len() + 1,
+                    before,
+                    "removing a post-rule must drop exactly one entry",
+                );
+                debug_assert!(
+                    !self
+                        .post
+                        .iter()
+                        .any(|(d, p, m, _)| d == domain && p == path && m == method),
+                    "the removed post-rule must no longer be present",
+                );
                 true
             }
         }
@@ -691,10 +833,26 @@ impl DomainRule {
         match self {
             DomainRule::Any => true,
             DomainRule::Wildcard(s) => {
+                // A stored wildcard always keeps its leading `*`, so the
+                // suffix (pattern minus `*`) is a strict sub-slice and the
+                // bare `*` (Any) never reaches this arm.
+                debug_assert_eq!(
+                    s.as_bytes().first(),
+                    Some(&b'*'),
+                    "a Wildcard rule must retain its leading '*'",
+                );
                 let suffix = &s.as_bytes()[1..];
-                hostname
+                let matched = hostname
                     .strip_suffix(suffix)
-                    .is_some_and(|prefix| !prefix.is_empty() && !prefix.contains(&b'.'))
+                    .is_some_and(|prefix| !prefix.is_empty() && !prefix.contains(&b'.'));
+                // A wildcard never matches a hostname no longer than its
+                // own suffix — there is no room left for the mandatory
+                // single non-empty leftmost label.
+                debug_assert!(
+                    !matched || hostname.len() > suffix.len(),
+                    "a wildcard match requires a non-empty leftmost label before the suffix",
+                );
+                matched
             }
             DomainRule::Exact(s) => s.as_bytes() == hostname,
             DomainRule::Regex(r) => {
@@ -775,6 +933,13 @@ impl PathRule {
         match self {
             PathRule::Prefix(prefix) => {
                 if path.starts_with(prefix.as_bytes()) {
+                    // The reported prefix length is the matched-byte count
+                    // the router uses for longest-prefix tie-breaking; it
+                    // must equal the prefix and never exceed the path.
+                    debug_assert!(
+                        prefix.len() <= path.len(),
+                        "a matching prefix cannot be longer than the path it matched",
+                    );
                     PathRuleResult::Prefix(prefix.len())
                 } else {
                     PathRuleResult::None
@@ -1135,6 +1300,20 @@ impl RewriteParts {
                 result.push(RewritePart::String(template[start..i].to_owned()));
             }
         }
+        // Every capture reference the parser emitted is within the caps it
+        // was given; out-of-range indices return None above, never a part.
+        debug_assert!(
+            result.iter().all(|part| match part {
+                RewritePart::Host(idx) => *idx < host_cap_cap,
+                RewritePart::Path(idx) => *idx < path_cap_cap,
+                RewritePart::String(_) => true,
+            }),
+            "a parsed rewrite template must only reference captures within the rule's caps",
+        );
+        debug_assert!(
+            *used_index_host <= host_cap_cap && *used_index_path <= path_cap_cap,
+            "the highest referenced capture index cannot exceed the cap",
+        );
         Some(Self(result))
     }
 
@@ -1160,6 +1339,14 @@ impl RewriteParts {
                 RewritePart::Path(i) => result.write_str(path_captures.get(*i).unwrap_or(&"")),
             };
         }
+        // The capacity pass and the write pass consult the same parts and
+        // captures, so the single up-front allocation must be exact — the
+        // result never reallocates.
+        debug_assert_eq!(
+            result.len(),
+            cap,
+            "rewrite output length must equal the pre-computed one-pass capacity",
+        );
         result
     }
 }

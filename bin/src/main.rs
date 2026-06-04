@@ -99,7 +99,7 @@ fn main(args: Args) -> Result<(), MainError> {
             max_command_buffer_size,
         } => {
             let max_command_buffer_size =
-                max_command_buffer_size.unwrap_or(command_buffer_size * 2);
+                resolve_max_command_buffer_size(command_buffer_size, max_command_buffer_size);
             worker::begin_worker_process(
                 worker_to_main_channel_fd,
                 worker_to_main_scm_fd,
@@ -118,7 +118,7 @@ fn main(args: Args) -> Result<(), MainError> {
             max_command_buffer_size,
         } => {
             let max_command_buffer_size =
-                max_command_buffer_size.unwrap_or(command_buffer_size * 2);
+                resolve_max_command_buffer_size(command_buffer_size, max_command_buffer_size);
             upgrade::begin_new_main_process(
                 fd,
                 upgrade_fd,
@@ -134,6 +134,37 @@ fn main(args: Args) -> Result<(), MainError> {
         eprintln!("\n{main_error}\n");
     }
     result
+}
+
+/// Resolve the effective `max_command_buffer_size` for an internal `worker` /
+/// `main` re-exec subcommand. When the caller (always the `sozu` CLI during
+/// an upgrade — these subcommands are never operator-facing) omits an explicit
+/// max, it defaults to twice the base command buffer.
+///
+/// The default branch carries a hard logic invariant we assert here:
+/// `max >= base`, because doubling never shrinks a `u64`. We deliberately do
+/// NOT assert the relation across the explicit-`Some` branch: that value is
+/// caller/config-supplied input (`Config::max_command_buffer_size`, which
+/// defaults independently of `command_buffer_size`), so a `max < base` there
+/// is a misconfiguration to surface as a runtime error downstream, not a logic
+/// bug to panic on. The default uses the same `command_buffer_size * 2`
+/// expression as before (behaviour-identical); the assertion only observes it.
+fn resolve_max_command_buffer_size(command_buffer_size: u64, explicit_max: Option<u64>) -> u64 {
+    match explicit_max {
+        Some(max) => max,
+        None => {
+            let default_max = command_buffer_size * 2;
+            // INVARIANT: the defaulted max is at least the base buffer, so an
+            // IPC frame that fits the base can always grow into the max. This
+            // is the load-bearing relation the framing layer relies on; it is
+            // guaranteed for the default but NOT for an explicit caller value.
+            debug_assert!(
+                default_max >= command_buffer_size,
+                "defaulted max_command_buffer_size must be >= command_buffer_size"
+            );
+            default_max
+        }
+    }
 }
 
 fn register_panic_hook() {

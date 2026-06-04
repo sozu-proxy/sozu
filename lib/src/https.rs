@@ -92,6 +92,20 @@ enum AlpnProtocol {
     Http11,
 }
 
+/// Monotonic rank of an HTTPS lifecycle stage, used only by `debug_assert!`s to
+/// check that upgrades move strictly forward (Expect → Handshake → Mux →
+/// WebSocket) and never re-enter an earlier stage. Gated to debug builds so it
+/// does not register as dead code in release.
+#[cfg(debug_assertions)]
+fn https_stage_rank(marker: StateMarker) -> u8 {
+    match marker {
+        StateMarker::Expect => 0,
+        StateMarker::Handshake => 1,
+        StateMarker::Mux => 2,
+        StateMarker::WebSocket => 3,
+    }
+}
+
 /// Module-level prefix for log lines emitted from this file when no session
 /// is in scope. Produces a bold bright-white `HTTPS` label in colored mode.
 /// Used by [`HttpsProxy`] / [`HttpsListener`] callbacks (`notify`,
@@ -159,6 +173,19 @@ impl HttpsSession {
         token: Token,
         wait_time: Duration,
     ) -> HttpsSession {
+        // Timeouts are wired from the listener config and feed `TimeoutContainer`s
+        // that arm the event loop. A zero request timeout would arm a deadline that
+        // fires on the very next tick, so reaching this constructor with one signals
+        // a config-loading bug upstream rather than hostile input.
+        debug_assert!(
+            !configured_request_timeout.is_zero(),
+            "HTTPS session request timeout must be non-zero (would arm an immediate deadline)"
+        );
+        debug_assert!(
+            !configured_frontend_timeout.is_zero() && !configured_backend_timeout.is_zero(),
+            "HTTPS session front/back timeouts must be non-zero"
+        );
+
         let peer_address = if expect_proxy {
             // Will be defined later once the expect proxy header has been received and parsed
             None
@@ -188,6 +215,24 @@ impl HttpsSession {
             ))
         };
 
+        // The freshly built state must reflect the entry-protocol choice exactly:
+        // `expect_proxy` enters via PROXY-protocol parsing, otherwise straight into
+        // the TLS handshake. No other entry state is legal, and `peer_address` is
+        // unknown until the PROXY header is parsed (mirror of the `if` above).
+        debug_assert_eq!(
+            matches!(state, HttpsStateMachine::Expect(..)),
+            expect_proxy,
+            "fresh HTTPS session must start in Expect iff expect_proxy is set"
+        );
+        debug_assert!(
+            expect_proxy || matches!(state, HttpsStateMachine::Handshake(_)),
+            "non-expect-proxy HTTPS session must start in the TLS Handshake state"
+        );
+        debug_assert!(
+            !expect_proxy || peer_address.is_none(),
+            "expect-proxy peer address is only known after the PROXY header is parsed"
+        );
+
         let metrics = SessionMetrics::new(Some(wait_time));
         HttpsSession {
             configured_backend_timeout,
@@ -208,6 +253,13 @@ impl HttpsSession {
 
     pub fn upgrade(&mut self) -> SessionIsToBeClosed {
         debug!("{} upgrade", log_context!(self));
+        // `take()` swaps in a FailedUpgrade carrying the marker of the state we
+        // are leaving, so the marker observed here is the *origin* of this
+        // upgrade. Capture it to check the transition is forward-only below.
+        // Read only by debug-only asserts → cfg-gated so release has no unused
+        // binding.
+        #[cfg(debug_assertions)]
+        let from_marker = self.state.marker();
         let new_state = match self.state.take() {
             HttpsStateMachine::Expect(expect, ssl) => self.upgrade_expect(expect, ssl),
             HttpsStateMachine::Handshake(handshake) => self.upgrade_handshake(handshake),
@@ -227,11 +279,47 @@ impl HttpsSession {
 
         match new_state {
             Some(state) => {
+                // The HTTPS lifecycle is strictly forward: Expect → Handshake →
+                // Mux → WebSocket. A successful upgrade must move to a strictly
+                // later stage and never re-enter the one it came from (no
+                // re-handshake mid-stream, no fall-back to Expect). `WebSocket`
+                // is terminal: `upgrade_websocket` returns the same state, so we
+                // exempt the self-loop there. The whole assert is cfg-gated (not
+                // just `debug_assert!`'s runtime guard) because its argument calls
+                // the debug-only `https_stage_rank`; leaving the call to compile
+                // in release would be an E0425 (HARD RULE #2).
+                #[cfg(debug_assertions)]
+                debug_assert!(
+                    https_stage_rank(state.marker()) > https_stage_rank(from_marker)
+                        || matches!(from_marker, StateMarker::WebSocket),
+                    "HTTPS upgrade must advance the lifecycle (from {:?} to {:?})",
+                    from_marker,
+                    state.marker()
+                );
+                debug_assert!(
+                    !state.failed(),
+                    "a successful HTTPS upgrade must not yield a FailedUpgrade state"
+                );
                 self.state = state;
                 false
             }
             // The state stays FailedUpgrade, but the Session should be closed right after
-            None => true,
+            None => {
+                // On a refused upgrade `take()` left a FailedUpgrade behind that
+                // still remembers the origin stage, so `close()` can restore the
+                // right gauge. Guard that the marker survived the failed attempt.
+                debug_assert!(
+                    self.state.failed(),
+                    "a refused HTTPS upgrade must leave the state in FailedUpgrade"
+                );
+                // cfg-gated for the same E0425 reason as the success arm above.
+                #[cfg(debug_assertions)]
+                debug_assert!(
+                    https_stage_rank(self.state.marker()) == https_stage_rank(from_marker),
+                    "FailedUpgrade must retain the origin stage marker for gauge restoration"
+                );
+                true
+            }
         }
     }
 
@@ -267,6 +355,19 @@ impl HttpsSession {
                 // so the event loop properly monitors the socket after the transition.
                 handshake.frontend_readiness = readiness;
                 handshake.frontend_readiness.event.insert(Ready::READABLE);
+
+                // The PROXY header just resolved both endpoints; the session now
+                // knows its true peer, and the handshake must watch for readable
+                // bytes or the TLS ClientHello will never be serviced.
+                debug_assert_eq!(
+                    self.peer_address,
+                    Some(session_address),
+                    "expect upgrade must adopt the PROXY-advertised source as the peer address"
+                );
+                debug_assert!(
+                    handshake.frontend_readiness.event.is_readable(),
+                    "handshake handed off from expect must be armed for READABLE"
+                );
 
                 gauge_add!(names::protocol::PROXY_EXPECT, -1);
                 gauge_add!(names::protocol::TLS_HANDSHAKE, 1);
@@ -368,6 +469,26 @@ impl HttpsSession {
                 (AlpnProtocol::Http11, None)
             }
         };
+
+        // Post-decision invariant: every refusal path above already returned, so
+        // reaching here means the negotiated protocol is one Sōzu serves. An
+        // H2-only listener must therefore have landed on H2 — never on the H1
+        // dispatch — or the `disable_http11` guard leaked a downgrade. The label,
+        // when present, must name exactly the protocol we are about to build.
+        debug_assert!(
+            !disable_http11 || matches!(alpn, AlpnProtocol::H2),
+            "H2-only listener must not dispatch an HTTP/1.1 session past ALPN"
+        );
+        debug_assert!(
+            match (&alpn, alpn_label) {
+                (AlpnProtocol::H2, Some(l)) => l == "h2",
+                (AlpnProtocol::Http11, Some(l)) => l == "http/1.1",
+                // Absent label only for ALPN-less HTTP/1.1 downgrade.
+                (AlpnProtocol::Http11, None) => true,
+                (AlpnProtocol::H2, None) => false,
+            },
+            "negotiated ALPN protocol and its wire label must agree"
+        );
 
         // Capture the negotiated TLS metadata as `&'static str` labels for the
         // access log alongside the existing metric counters. Both calls are
@@ -490,6 +611,24 @@ impl HttpsSession {
                 }),
             None => None,
         };
+        // Structural postcondition of the SAN-snapshot builder above: a cert-name
+        // snapshot only exists when the client sent an SNI (the `None => None`
+        // arm), and when present it is non-empty (empty collapses to `None`) and
+        // sorted+deduped (so the H2 router's coalescing check sees a canonical
+        // set). These hold regardless of `strict_sni_binding`; the binding policy
+        // is *enforced* later at routing, but the snapshot feeding it must be
+        // well-formed here.
+        debug_assert!(
+            tls_cert_names.is_none() || sni_owned.is_some(),
+            "cert-name snapshot must not exist without an SNI to key it"
+        );
+        debug_assert!(
+            tls_cert_names
+                .as_ref()
+                .is_none_or(|names| { !names.is_empty() && names.windows(2).all(|w| w[0] < w[1]) }),
+            "cert-name snapshot must be non-empty and strictly sorted (sorted + deduped)"
+        );
+
         // Bind the TLS SNI to this session so the routing layer can reject any
         // H2 stream whose `:authority` crosses the TLS trust boundary (see
         // `route_from_request`).
@@ -542,6 +681,22 @@ impl HttpsSession {
             .readiness_mut()
             .event
             .insert(Ready::READABLE | Ready::WRITABLE);
+
+        // Post-handoff: the mux frontend MUST be armed for both directions or the
+        // H2 preface→SETTINGS exchange deadlocks (see the comment above). This is
+        // the structural guarantee the insert just made — assert it survived.
+        debug_assert!(
+            frontend.readiness_mut().event.is_readable()
+                && frontend.readiness_mut().event.is_writable(),
+            "post-handshake mux frontend must be armed for READABLE and WRITABLE"
+        );
+        // The two crate halves of the H2/H1 session reference streams by a shared
+        // ulid; the handshake-derived ulid must thread through both the connection
+        // and its context unchanged, otherwise per-stream lookups cross sessions.
+        debug_assert_eq!(
+            context.session_ulid, session_ulid,
+            "mux context and connection must share the handshake-derived session ulid"
+        );
 
         gauge_add!(names::protocol::HTTPS, 1);
         Some(HttpsStateMachine::Mux(Mux {
@@ -655,6 +810,14 @@ impl HttpsSession {
         pipe.frontend_readiness.event = frontend_readiness.event;
         pipe.backend_readiness.event = backend_readiness.event;
         pipe.set_back_token(back_token);
+        // The WSS pipe is a frontend↔backend bridge: it only exists because the
+        // upgrading stream was `Linked(back_token)` to a *connected* backend (the
+        // guard arms above already rejected `!Connected` and missing backends).
+        // So the back token must be set, and set to exactly the token we routed.
+        debug_assert!(
+            pipe.back_token().contains(&back_token),
+            "WSS pipe back token must be the connected backend token carried from the mux"
+        );
         // Carry the connection-scoped TLS metadata captured at handshake time
         // into the post-upgrade WSS pipe so its access log records the same
         // version/cipher/sni/alpn the H1 request log already emitted. `clone`
@@ -665,6 +828,20 @@ impl HttpsSession {
             stream.context.tls_cipher,
             stream.context.tls_server_name.clone(),
             stream.context.tls_alpn,
+        );
+
+        // Gauge accounting for the Mux→WebSocket transition is a balanced
+        // hand-off: exactly one HTTPS gauge leaves and one WSS gauge arrives, so
+        // the live-session total is conserved. The readiness events captured from
+        // the mux frontend/backend must survive the transfer into the pipe — a
+        // lost event would silently park the bridge with no epoll wake-up.
+        debug_assert_eq!(
+            pipe.frontend_readiness.event, frontend_readiness.event,
+            "WSS pipe must inherit the mux frontend readiness event verbatim"
+        );
+        debug_assert_eq!(
+            pipe.backend_readiness.event, backend_readiness.event,
+            "WSS pipe must inherit the mux backend readiness event verbatim"
         );
 
         // http.active_requests was already decremented by generate_access_log()
@@ -686,6 +863,56 @@ impl HttpsSession {
         );
         Some(HttpsStateMachine::WebSocket(wss))
     }
+
+    /// Full cross-field invariant sweep for the session state machine, run as a
+    /// run-to-completion postcondition at the end of `ready()` (the public
+    /// mutating entry point). Encodes only relationships that must hold for any
+    /// live HTTPS session regardless of network input; a violation here is a
+    /// Sōzu logic bug, never a property of hostile traffic.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        // Timeouts are immutable for the session's lifetime and were validated as
+        // non-zero at construction; they must never drift to zero (which would
+        // arm an immediate-firing deadline on the next state hand-off).
+        debug_assert!(
+            !self.configured_frontend_timeout.is_zero()
+                && !self.configured_backend_timeout.is_zero()
+                && !self.configured_connect_timeout.is_zero(),
+            "HTTPS session timeouts must stay non-zero for the session lifetime"
+        );
+        // The marker is total over the four live stages plus FailedUpgrade; a
+        // FailedUpgrade session is awaiting close and must report `failed()`,
+        // while any of the four live stages must not. This is the structural
+        // bridge the gauge-restore logic in `close()` relies on.
+        if self.state.failed() {
+            debug_assert!(
+                matches!(
+                    self.state.marker(),
+                    StateMarker::Expect
+                        | StateMarker::Handshake
+                        | StateMarker::Mux
+                        | StateMarker::WebSocket
+                ),
+                "FailedUpgrade must retain a valid origin-stage marker"
+            );
+        } else {
+            debug_assert!(
+                !self.state.failed(),
+                "a non-failed session must not also report FailedUpgrade"
+            );
+        }
+        // Before the PROXY header resolves, the Expect stage has no peer address;
+        // once any later stage is reached the address is either the real peer
+        // (direct TLS) or the PROXY-advertised source. We only assert the Expect
+        // direction, since direct-TLS `peer_addr()` may legitimately fail and
+        // leave `None` at handshake time.
+        debug_assert!(
+            !matches!(self.state.marker(), StateMarker::Expect)
+                || self.peer_address.is_none()
+                || self.state.failed(),
+            "a live Expect-stage session has no resolved peer address yet"
+        );
+    }
 }
 
 impl ProxySession for HttpsSession {
@@ -693,6 +920,14 @@ impl ProxySession for HttpsSession {
         if self.has_been_closed {
             return;
         }
+        // Reaching past the idempotency guard means this is the *first* close.
+        // Every exit below sets `has_been_closed = true`, so a clear flag here is
+        // a real precondition (the gauge restore that follows must run exactly
+        // once or the per-protocol gauge underflows / over-counts).
+        debug_assert!(
+            !self.has_been_closed,
+            "close() body must run only on a not-yet-closed session"
+        );
 
         trace!("{} closing HTTPS session", log_context!(self));
         self.metrics.service_stop();
@@ -762,6 +997,13 @@ impl ProxySession for HttpsSession {
         proxy.remove_session(self.frontend_token);
 
         self.has_been_closed = true;
+        // Postcondition: a session that completed `close()` is sealed — any later
+        // `close()` short-circuits on the guard above, keeping the gauge restore
+        // single-shot.
+        debug_assert!(
+            self.has_been_closed,
+            "close() must leave the session marked closed"
+        );
     }
 
     fn timeout(&mut self, token: Token) -> SessionIsToBeClosed {
@@ -815,6 +1057,12 @@ impl ProxySession for HttpsSession {
                 self.state.marker()
             );
         }
+
+        // Run-to-completion postcondition: whatever state `ready()` (and any
+        // nested upgrade) left the session in must satisfy the full cross-field
+        // invariant set before we yield back to the event loop.
+        #[cfg(debug_assertions)]
+        self.check_invariants();
 
         self.metrics.service_stop();
         to_be_closed
@@ -1151,6 +1399,15 @@ impl HttpsListener {
 
         self.listener = Some(listener);
         self.active = true;
+        // Post: an activated listener owns a bound socket and is flagged active,
+        // so a later `activate()` short-circuits on the `self.active` guard and
+        // `give_back_listener*` find a socket to hand back. The two must move in
+        // lockstep — an active listener with no socket would silently accept
+        // nothing.
+        debug_assert!(
+            self.active && self.listener.is_some(),
+            "an activated HTTPS listener must hold a bound socket and be flagged active"
+        );
         Ok(self.token)
     }
 
@@ -1384,6 +1641,14 @@ impl HttpsListener {
             // Build succeeded — commit.
             self.config.alpn_protocols = alpn_wrapper.values.clone();
             self.rustls_details = new_rustls;
+            // Post: the commit is atomic — the live config must now name exactly
+            // the patched ALPN set. New handshakes negotiate against this set, so
+            // the `upgrade_handshake` "protocol ∈ configured ALPN" property is
+            // anchored to what we just stored.
+            debug_assert_eq!(
+                self.config.alpn_protocols, alpn_wrapper.values,
+                "committed ALPN config must match the patch values exactly"
+            );
         }
 
         // HTTP answers: merge legacy `http_answers` and the new `answers`
@@ -2010,6 +2275,15 @@ impl ProxyConfiguration for HttpsProxy {
         let mut session_manager = self.sessions.borrow_mut();
         let entry = session_manager.slab.vacant_entry();
         let session_token = Token(entry.key());
+        // The session token IS the slab key: the event loop later indexes the
+        // slab directly by the mio `Token` it receives, so any divergence here
+        // would route readiness to the wrong session slot. Snapshot the key to
+        // re-check after `entry.insert` consumes the entry.
+        debug_assert_eq!(
+            session_token.0,
+            entry.key(),
+            "HTTPS session token must equal its slab key"
+        );
 
         self.registry
             .register(
@@ -2047,6 +2321,14 @@ impl ProxyConfiguration for HttpsProxy {
             session_token,
             wait_time,
         )));
+        // The freshly built session must own exactly the token it is filed under,
+        // so event-loop dispatch (slab key → session) and self-removal
+        // (`frontend_token()` → slab key) agree.
+        debug_assert_eq!(
+            session.borrow().frontend_token(),
+            session_token,
+            "stored HTTPS session must report the slab token as its frontend token"
+        );
         entry.insert(session);
 
         Ok(())

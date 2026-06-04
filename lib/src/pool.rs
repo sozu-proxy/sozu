@@ -24,12 +24,35 @@ pub struct Pool {
 
 impl Pool {
     pub fn with_capacity(minimum: usize, maximum: usize, buffer_size: usize) -> Pool {
+        debug_assert!(
+            minimum <= maximum,
+            "pool minimum ({minimum}) must not exceed maximum ({maximum})"
+        );
         let mut inner = poule::Pool::with_extra(maximum, buffer_size);
         inner.grow_to(minimum);
-        Pool { inner, buffer_size }
+        let pool = Pool { inner, buffer_size };
+        // Post-condition: a fresh pool hands out nothing and respects its
+        // capacity ceiling. `grow_to(minimum)` may pre-allocate, but never
+        // beyond `maximum`, and nothing is checked out yet.
+        debug_assert_eq!(pool.inner.used(), 0, "a fresh pool has nothing checked out");
+        debug_assert!(
+            pool.inner.capacity() <= maximum,
+            "grown capacity must never exceed the configured maximum"
+        );
+        #[cfg(debug_assertions)]
+        pool.check_invariants();
+        pool
     }
 
     pub fn checkout(&mut self) -> Option<Checkout> {
+        // Pre-condition: the accounting invariant holds on entry.
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+        // Snapshot used-count before any growth or checkout so the
+        // post-conditions can assert the exact delta. Read only inside
+        // `debug_assert!` → dead code in release, but it must still compile.
+        let used_before = self.inner.used();
+
         if self.inner.used() == self.inner.capacity()
             && self.inner.capacity() < self.inner.maximum_capacity()
         {
@@ -44,7 +67,9 @@ impl Pool {
             );
         }
         let capacity = self.buffer_size;
-        self.inner
+        let buffer_size = self.buffer_size;
+        let result = self
+            .inner
             .checkout(|| {
                 trace!("initializing a buffer with capacity {}", capacity);
                 BufferMetadata::new()
@@ -53,7 +78,90 @@ impl Pool {
                 let old_buffer_count = BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
                 gauge!(names::buffer::IN_USE, old_buffer_count + 1);
                 Checkout { inner: c }
-            })
+            });
+
+        match &result {
+            Some(checkout) => {
+                // A successful checkout consumes exactly one slot: the pool's
+                // used-count rose by one and never exceeded the live capacity.
+                debug_assert_eq!(
+                    self.inner.used(),
+                    used_before + 1,
+                    "a successful checkout must increment used-count by exactly 1"
+                );
+                debug_assert!(
+                    self.inner.used() <= self.inner.capacity(),
+                    "used-count must never exceed the pool capacity"
+                );
+                // The handed-out buffer must carry at least the configured size
+                // (poule rounds the per-entry extra up to `align_of::<Entry>`, so
+                // capacity equals buffer_size only when it is already aligned —
+                // the default 16393 rounds to 16400) and start empty
+                // (position == end == 0 from `BufferMetadata::new`).
+                debug_assert!(
+                    checkout.capacity() >= buffer_size,
+                    "a checked-out buffer must hold at least the configured buffer size"
+                );
+                debug_assert_eq!(
+                    checkout.available_data(),
+                    0,
+                    "a freshly checked-out buffer must hold no data"
+                );
+            }
+            None => {
+                // Exhaustion is graceful (never a panic): the used-count must
+                // be unchanged on the failure path. The pool was at its hard
+                // ceiling, so capacity equals maximum_capacity.
+                debug_assert_eq!(
+                    self.inner.used(),
+                    used_before,
+                    "a failed checkout must not change the used-count"
+                );
+                debug_assert_eq!(
+                    self.inner.capacity(),
+                    self.inner.maximum_capacity(),
+                    "checkout only fails once the pool is grown to its maximum"
+                );
+            }
+        }
+
+        // Post-condition: the accounting invariant still holds on exit.
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+        result
+    }
+
+    /// Full accounting-invariant sweep for the buffer pool, used as a
+    /// `debug_assert!`-guarded pre/post-condition on every public mutating
+    /// method. Encodes the `available + checked_out == capacity` contract in
+    /// terms of `poule`'s accounting: the number of checked-out buffers
+    /// (`used`) plus the number still available equals the live capacity, and
+    /// capacity stays bounded by the configured hard maximum. Compiled out
+    /// entirely in release.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        let used = self.inner.used();
+        let capacity = self.inner.capacity();
+        let maximum = self.inner.maximum_capacity();
+
+        // `available + checked_out == capacity`: every slot in the live
+        // capacity is either checked out or available, never both, never lost.
+        debug_assert!(
+            used <= capacity,
+            "checked-out buffers ({used}) must never exceed live capacity ({capacity})"
+        );
+        let available = capacity - used;
+        debug_assert_eq!(
+            available + used,
+            capacity,
+            "available ({available}) + checked_out ({used}) must equal capacity ({capacity})"
+        );
+
+        // Capacity grows lazily but is hard-bounded by the configured maximum.
+        debug_assert!(
+            capacity <= maximum,
+            "live capacity ({capacity}) must never exceed maximum_capacity ({maximum})"
+        );
     }
 }
 
@@ -115,6 +223,16 @@ impl ops::DerefMut for Checkout {
 impl Drop for Checkout {
     fn drop(&mut self) {
         let old_buffer_count = BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
+        // Gauge-underflow guard: every live `Checkout` was paired with a
+        // `fetch_add(1)` at checkout time, so the global in-use counter must
+        // be strictly positive when one is dropped. A zero here means a
+        // double-checkin or an unbalanced add/sub — a real accounting bug, not
+        // a rounding issue. `fetch_sub` wraps in release; the assert makes the
+        // violation loud in debug/test/fuzz.
+        debug_assert!(
+            old_buffer_count >= 1,
+            "buffer in-use gauge underflow on checkin: count was {old_buffer_count} before decrement"
+        );
         gauge!(names::buffer::IN_USE, old_buffer_count - 1);
     }
 }
@@ -136,35 +254,128 @@ impl Checkout {
         self.inner.position == self.inner.end
     }
 
+    /// Internal buffer-window invariant: `position <= end <= capacity`. The
+    /// occupied window `[position, end)` is the live data; everything outside
+    /// it is free space. Used as a `debug_assert!`-guarded pre/post-condition
+    /// on the slice-mutating methods. Compiled out in release.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        let position = self.inner.position;
+        let end = self.inner.end;
+        let capacity = self.capacity();
+        debug_assert!(
+            position <= end,
+            "buffer position ({position}) must not pass end ({end})"
+        );
+        debug_assert!(
+            end <= capacity,
+            "buffer end ({end}) must not exceed capacity ({capacity})"
+        );
+        // consumed-prefix + available_data + available_space == capacity:
+        // the three regions partition the buffer with no overlap or loss.
+        debug_assert_eq!(
+            position + self.available_data() + self.available_space(),
+            capacity,
+            "consumed prefix + available data + free space must tile the whole buffer"
+        );
+    }
+
     pub fn consume(&mut self, count: usize) -> usize {
-        let cnt = cmp::min(count, self.available_data());
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+        let available_before = self.available_data();
+        let cnt = cmp::min(count, available_before);
+        // `consume` can never advance past the available data — `cnt` is
+        // clamped above, so this read can never underflow `available_data`.
+        debug_assert!(
+            cnt <= available_before,
+            "consume count ({cnt}) must not exceed available data ({available_before})"
+        );
         self.inner.position += cnt;
         if self.inner.position > self.capacity() / 2 {
             //trace!("consume shift: pos {}, end {}", self.position, self.end);
             self.shift();
         }
+        // Post-condition: exactly `cnt` bytes left the readable window (a
+        // shift relocates but does not change `available_data`).
+        debug_assert_eq!(
+            self.available_data(),
+            available_before - cnt,
+            "consume must shrink available data by exactly the consumed count"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
         cnt
     }
 
     pub fn fill(&mut self, count: usize) -> usize {
-        let cnt = cmp::min(count, self.available_space());
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+        let data_before = self.available_data();
+        let space_before = self.available_space();
+        let cnt = cmp::min(count, space_before);
+        // `fill` can never claim more than the free space — `cnt` is clamped,
+        // so advancing `end` by `cnt` can never overrun the buffer.
+        debug_assert!(
+            cnt <= space_before,
+            "fill count ({cnt}) must not exceed available space ({space_before})"
+        );
         self.inner.end += cnt;
         if self.available_space() < self.available_data() + cnt {
             //trace!("fill shift: pos {}, end {}", self.position, self.end);
             self.shift();
         }
-
+        // Post-condition: exactly `cnt` bytes entered the readable window (a
+        // shift relocates but does not change `available_data`).
+        debug_assert_eq!(
+            self.available_data(),
+            data_before + cnt,
+            "fill must grow available data by exactly the filled count"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
         cnt
     }
 
     pub fn reset(&mut self) {
         self.inner.position = 0;
         self.inner.end = 0;
+        // Post-condition: a reset buffer is empty and offers its full
+        // capacity as free space.
+        debug_assert_eq!(self.available_data(), 0, "reset must empty the buffer");
+        debug_assert_eq!(
+            self.available_space(),
+            self.capacity(),
+            "reset must restore the full capacity as free space"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
     }
 
     pub fn sync(&mut self, end: usize, position: usize) {
+        // Pre-condition: the caller must supply a coherent window —
+        // `position <= end <= capacity`. `sync` restores a previously valid
+        // window (e.g. after a `Vec`-backed parse), so a violation here is a
+        // caller logic bug, not network input.
+        debug_assert!(
+            position <= end,
+            "sync position ({position}) must not pass end ({end})"
+        );
+        debug_assert!(
+            end <= self.capacity(),
+            "sync end ({end}) must not exceed capacity ({})",
+            self.capacity()
+        );
         self.inner.position = position;
         self.inner.end = end;
+        // Post-condition: the readable window matches the requested span.
+        debug_assert_eq!(
+            self.available_data(),
+            end - position,
+            "sync must expose exactly end - position readable bytes"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
     }
 
     pub fn data(&self) -> &[u8] {
@@ -177,8 +388,11 @@ impl Checkout {
     }
 
     pub fn shift(&mut self) {
+        #[cfg(debug_assertions)]
+        self.check_invariants();
         let pos = self.inner.position;
         let end = self.inner.end;
+        let data_before = self.available_data();
         if pos > 0 {
             // SAFETY: src and dst point into the same checkout buffer
             // (`self.inner.extra`); the slice indexing above bounds-checks
@@ -195,10 +409,28 @@ impl Checkout {
                 self.inner.end = length;
             }
         }
+        // Post-condition: shift relocates the readable window to the front but
+        // never changes how many bytes are readable.
+        debug_assert_eq!(
+            self.available_data(),
+            data_before,
+            "shift must preserve the amount of readable data"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
     }
 
     pub fn delete_slice(&mut self, start: usize, length: usize) -> Option<usize> {
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+        let data_before = self.available_data();
         if start + length >= self.available_data() {
+            // Out-of-range deletes are a graceful no-op: nothing changed.
+            debug_assert_eq!(
+                self.available_data(),
+                data_before,
+                "rejected delete_slice must not mutate the buffer"
+            );
             return None;
         }
 
@@ -217,16 +449,42 @@ impl Checkout {
             );
             self.inner.end = next_end;
         }
+        // Post-condition: removing `length` bytes from the middle shrinks the
+        // readable window by exactly `length`.
+        debug_assert_eq!(
+            self.available_data(),
+            data_before - length,
+            "delete_slice must shrink available data by exactly the deleted length"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
         Some(self.available_data())
     }
 
     pub fn replace_slice(&mut self, data: &[u8], start: usize, length: usize) -> Option<usize> {
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+        let data_before = self.available_data();
         let data_len = data.len();
         if start + length > self.available_data()
             || self.inner.position + start + data_len > self.capacity()
         {
+            // Rejected replace is a graceful no-op.
+            debug_assert_eq!(
+                self.available_data(),
+                data_before,
+                "rejected replace_slice must not mutate the buffer"
+            );
             return None;
         }
+        // Pre-condition: the replacement window lies within the readable data
+        // (guaranteed by the early-return above). The net length change is
+        // `data_len - length`.
+        debug_assert!(
+            start + length <= data_before,
+            "replace_slice window [{start}, {}) must lie within available data ({data_before})",
+            start + length
+        );
 
         // SAFETY: every `ptr::copy` below moves bytes inside the same
         // checkout buffer (`self.inner.extra`) or copies from the caller's
@@ -267,16 +525,42 @@ impl Checkout {
                 self.inner.end += data_len - length;
             }
         }
+        // Post-condition: the readable window grew/shrank by exactly the net
+        // difference between the inserted data and the replaced span. Compare
+        // as i64 to keep the arithmetic signed and avoid usize underflow in
+        // the assertion itself.
+        debug_assert_eq!(
+            self.available_data() as i64,
+            data_before as i64 + data_len as i64 - length as i64,
+            "replace_slice must change available data by exactly data_len - length"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
         Some(self.available_data())
     }
 
     pub fn insert_slice(&mut self, data: &[u8], start: usize) -> Option<usize> {
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+        let data_before = self.available_data();
         let data_len = data.len();
         if start > self.available_data()
             || self.inner.position + self.inner.end + data_len > self.capacity()
         {
+            // Rejected insert is a graceful no-op.
+            debug_assert_eq!(
+                self.available_data(),
+                data_before,
+                "rejected insert_slice must not mutate the buffer"
+            );
             return None;
         }
+        // Pre-condition: the insertion point lies within the readable data and
+        // the resulting buffer stays within capacity (guaranteed above).
+        debug_assert!(
+            start <= data_before,
+            "insert_slice start ({start}) must lie within available data ({data_before})"
+        );
 
         // SAFETY: both `ptr::copy` calls touch `self.inner.extra` (same
         // allocation) or copy from `data` into it. The early-return checks
@@ -298,6 +582,15 @@ impl Checkout {
             );
             self.inner.end += data_len;
         }
+        // Post-condition: inserting `data_len` bytes grows the readable window
+        // by exactly `data_len`.
+        debug_assert_eq!(
+            self.available_data(),
+            data_before + data_len,
+            "insert_slice must grow available data by exactly the inserted length"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
         Some(self.available_data())
     }
 }
