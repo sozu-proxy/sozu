@@ -1067,6 +1067,14 @@ impl Default for Readiness {
 }
 
 impl Readiness {
+    /// Mask of every bit `Ready` defines (READABLE | WRITABLE | ERROR | HUP).
+    /// Any bit outside this set in `event` or `interest` is a corrupted
+    /// readiness word — checked by [`Self::check_invariants`]. Not
+    /// `#[cfg(debug_assertions)]`-gated: it is read from inside `debug_assert!`s
+    /// whose arguments must still compile in release (HARD RULE 2 / E0425).
+    const KNOWN_BITS: Ready =
+        Ready(Ready::READABLE.0 | Ready::WRITABLE.0 | Ready::ERROR.0 | Ready::HUP.0);
+
     pub const fn new() -> Readiness {
         Readiness {
             event: Ready::EMPTY,
@@ -1074,26 +1082,96 @@ impl Readiness {
         }
     }
 
+    /// Cross-field invariant sweep: neither `event` nor `interest` may carry a
+    /// bit `Ready` does not define. A stray bit would silently widen
+    /// `filter_interest`'s mask and wake (or starve) a session on a phantom
+    /// readiness. Cheap enough to call as a postcondition from every mutator.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        debug_assert_eq!(
+            self.event & Self::KNOWN_BITS,
+            self.event,
+            "Readiness.event carries a bit outside READABLE|WRITABLE|ERROR|HUP"
+        );
+        debug_assert_eq!(
+            self.interest & Self::KNOWN_BITS,
+            self.interest,
+            "Readiness.interest carries a bit outside READABLE|WRITABLE|ERROR|HUP"
+        );
+    }
+
     pub fn reset(&mut self) {
         self.event = Ready::EMPTY;
         self.interest = Ready::EMPTY;
+        // Post-condition: a reset clears *both* words — a half-reset leaves a
+        // session armed on stale interest after teardown.
+        debug_assert!(
+            self.event.is_empty() && self.interest.is_empty(),
+            "reset must clear both event and interest"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
     }
 
     /// filters the readiness we actually want
     pub fn filter_interest(&self) -> Ready {
-        self.event & self.interest
+        // Pre-condition: both source words must be well-formed before we mask —
+        // a stray bit upstream would leak through the intersection and wake (or
+        // starve) a session on a phantom readiness.
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+        let filtered = self.event & self.interest;
+        // Post-condition: the result is a subset of the recognized bits and can
+        // only contain bits the session both saw AND asked for.
+        debug_assert_eq!(
+            filtered & Self::KNOWN_BITS,
+            filtered,
+            "filter_interest must not yield an unknown bit"
+        );
+        debug_assert!(
+            self.interest.contains(filtered) && self.event.contains(filtered),
+            "filtered readiness must be present in both interest and event"
+        );
+        filtered
     }
 
     /// Signal that the socket has buffered data to write (e.g., TLS internal
     /// buffers) that won't generate a new epoll WRITABLE event.
     pub fn signal_pending_write(&mut self) {
+        // Snapshot the unrelated bits (everything but WRITABLE) so we can prove
+        // we flipped exactly the WRITABLE bit. `Ready` exposes no `!`, so mask on
+        // the public `.0` word.
+        let other_event_before = Ready(self.event.0 & !Ready::WRITABLE.0);
         self.event.insert(Ready::WRITABLE);
+        debug_assert!(
+            self.event.is_writable(),
+            "signal_pending_write must set the WRITABLE event bit"
+        );
+        debug_assert_eq!(
+            Ready(self.event.0 & !Ready::WRITABLE.0),
+            other_event_before,
+            "signal_pending_write must touch only the WRITABLE bit"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
     }
 
     /// Signal that the socket has buffered data to read (e.g., TLS plaintext
     /// buffer after a 1xx clear) that won't generate a new epoll READABLE event.
     pub fn signal_pending_read(&mut self) {
+        let other_event_before = Ready(self.event.0 & !Ready::READABLE.0);
         self.event.insert(Ready::READABLE);
+        debug_assert!(
+            self.event.is_readable(),
+            "signal_pending_read must set the READABLE event bit"
+        );
+        debug_assert_eq!(
+            Ready(self.event.0 & !Ready::READABLE.0),
+            other_event_before,
+            "signal_pending_read must touch only the READABLE bit"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
     }
 
     /// Pair `Ready::WRITABLE` insert with `signal_pending_write` — the canonical
@@ -1101,8 +1179,28 @@ impl Readiness {
     /// under edge-triggered epoll. See `lib/src/protocol/mux/LIFECYCLE.md`.
     #[inline]
     pub fn arm_writable(&mut self) {
+        // Snapshot the non-WRITABLE bits of both words: arm_writable must set the
+        // WRITABLE bit in *both* interest and event and leave everything else as-is.
+        let other_interest_before = Ready(self.interest.0 & !Ready::WRITABLE.0);
+        let other_event_before = Ready(self.event.0 & !Ready::WRITABLE.0);
         self.interest.insert(Ready::WRITABLE);
         self.signal_pending_write();
+        debug_assert!(
+            self.interest.is_writable() && self.event.is_writable(),
+            "arm_writable must set WRITABLE in both interest and event"
+        );
+        debug_assert_eq!(
+            Ready(self.interest.0 & !Ready::WRITABLE.0),
+            other_interest_before,
+            "arm_writable must touch only the WRITABLE interest bit"
+        );
+        debug_assert_eq!(
+            Ready(self.event.0 & !Ready::WRITABLE.0),
+            other_event_before,
+            "arm_writable must touch only the WRITABLE event bit"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
     }
 }
 

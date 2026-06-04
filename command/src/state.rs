@@ -1590,12 +1590,13 @@ impl ConfigState {
         }
 
         // Symmetry with the active-listener census: exactly one ActivateListener
-        // is emitted per active listener across the three maps, no more, no less.
+        // is emitted per active listener across the four maps, no more, no less.
         #[cfg(debug_assertions)]
         {
             let active_listeners = self.http_listeners.values().filter(|l| l.active).count()
                 + self.https_listeners.values().filter(|l| l.active).count()
-                + self.tcp_listeners.values().filter(|l| l.active).count();
+                + self.tcp_listeners.values().filter(|l| l.active).count()
+                + self.udp_listeners.values().filter(|l| l.active).count();
             debug_assert_eq!(
                 v.len(),
                 active_listeners,

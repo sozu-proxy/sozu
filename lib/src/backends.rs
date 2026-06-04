@@ -88,12 +88,31 @@ impl Default for HealthState {
 impl HealthState {
     /// Record a successful health check. Returns true if the backend transitioned to healthy.
     pub fn record_success(&mut self, healthy_threshold: u32) -> bool {
+        let was_unhealthy = self.status == HealthStatus::Unhealthy;
+        let successes_before = self.consecutive_successes;
         self.consecutive_failures = 0;
         self.consecutive_successes += 1;
 
-        if self.status == HealthStatus::Unhealthy && self.consecutive_successes >= healthy_threshold
-        {
+        // A success resets the failure streak and advances the success streak by
+        // exactly one — the two counters are never both non-zero afterwards.
+        debug_assert_eq!(
+            self.consecutive_failures, 0,
+            "a success must clear the consecutive-failure streak"
+        );
+        debug_assert_eq!(
+            self.consecutive_successes,
+            successes_before + 1,
+            "a success must advance the success streak by exactly one"
+        );
+
+        if was_unhealthy && self.consecutive_successes >= healthy_threshold {
             self.status = HealthStatus::Healthy;
+            // The transition is only reported when crossing the threshold from
+            // Unhealthy; a backend that was already Healthy never "transitions".
+            debug_assert!(
+                self.status == HealthStatus::Healthy,
+                "a reported recovery must leave the status Healthy"
+            );
             return true;
         }
         false
@@ -101,12 +120,29 @@ impl HealthState {
 
     /// Record a failed health check. Returns true if the backend transitioned to unhealthy.
     pub fn record_failure(&mut self, unhealthy_threshold: u32) -> bool {
+        let was_healthy = self.status == HealthStatus::Healthy;
+        let failures_before = self.consecutive_failures;
         self.consecutive_successes = 0;
         self.consecutive_failures += 1;
 
-        if self.status == HealthStatus::Healthy && self.consecutive_failures >= unhealthy_threshold
-        {
+        // A failure resets the success streak and advances the failure streak by
+        // exactly one — symmetric with `record_success`.
+        debug_assert_eq!(
+            self.consecutive_successes, 0,
+            "a failure must clear the consecutive-success streak"
+        );
+        debug_assert_eq!(
+            self.consecutive_failures,
+            failures_before + 1,
+            "a failure must advance the failure streak by exactly one"
+        );
+
+        if was_healthy && self.consecutive_failures >= unhealthy_threshold {
             self.status = HealthStatus::Unhealthy;
+            debug_assert!(
+                self.status == HealthStatus::Unhealthy,
+                "a reported drop must leave the status Unhealthy"
+            );
             return true;
         }
         false
@@ -194,30 +230,75 @@ impl Backend {
     }
 
     pub fn inc_connections(&mut self) -> Option<usize> {
+        let before = self.active_connections;
         if self.status == BackendStatus::Normal {
             self.active_connections += 1;
+            // A `Normal` backend always increments by exactly one and reports the
+            // post-increment count back to the caller.
+            debug_assert_eq!(
+                self.active_connections,
+                before + 1,
+                "inc_connections must add exactly one active connection"
+            );
             Some(self.active_connections)
         } else {
+            // Non-`Normal` backends refuse new connections and leave the gauge
+            // untouched (no silent increment on a Closing/Closed backend).
+            debug_assert_eq!(
+                self.active_connections, before,
+                "inc_connections must not touch the count for a non-Normal backend"
+            );
             None
         }
     }
 
     /// TODO: normalize with saturating_sub()
     pub fn dec_connections(&mut self) -> Option<usize> {
+        let before = self.active_connections;
         match self.status {
             BackendStatus::Normal => {
                 if self.active_connections > 0 {
                     self.active_connections -= 1;
                 }
+                // The count drops by one when positive, otherwise saturates at
+                // zero — it must never wrap below zero (usize underflow).
+                debug_assert!(
+                    self.active_connections <= before,
+                    "dec_connections must never increase the active-connection count"
+                );
+                debug_assert_eq!(
+                    self.active_connections,
+                    before.saturating_sub(1),
+                    "dec_connections must drop by exactly one (saturating at zero)"
+                );
                 Some(self.active_connections)
             }
-            BackendStatus::Closed => None,
+            BackendStatus::Closed => {
+                // A Closed backend has already been retired: nothing to decrement.
+                debug_assert_eq!(
+                    self.active_connections, before,
+                    "dec_connections on a Closed backend must not mutate the count"
+                );
+                None
+            }
             BackendStatus::Closing => {
                 if self.active_connections > 0 {
                     self.active_connections -= 1;
                 }
+                debug_assert_eq!(
+                    self.active_connections,
+                    before.saturating_sub(1),
+                    "dec_connections must drop by exactly one (saturating at zero)"
+                );
                 if self.active_connections == 0 {
                     self.status = BackendStatus::Closed;
+                    // Draining a Closing backend to zero retires it: the
+                    // lifecycle advances to Closed and we stop reporting a count.
+                    debug_assert_eq!(
+                        self.status,
+                        BackendStatus::Closed,
+                        "a fully drained Closing backend must become Closed"
+                    );
                     None
                 } else {
                     Some(self.active_connections)
@@ -238,16 +319,48 @@ impl Backend {
         if self.status != BackendStatus::Normal {
             return Err(BackendError::Status(self.status.to_owned()));
         }
+        // Reaching the connect attempt implies we passed the status gate; the
+        // failure counter is whatever prior attempts accumulated.
+        debug_assert_eq!(
+            self.status,
+            BackendStatus::Normal,
+            "try_connect only attempts a connection on a Normal backend"
+        );
+        let failures_before = self.failures;
+        let connections_before = self.active_connections;
 
         match mio::net::TcpStream::connect(self.address) {
             Ok(tcp_stream) => {
                 //self.retry_policy.succeed();
                 self.inc_connections();
+                // Success registers exactly one new active connection and never
+                // touches the failure counter.
+                debug_assert_eq!(
+                    self.active_connections,
+                    connections_before + 1,
+                    "a successful connect must register exactly one active connection"
+                );
+                debug_assert_eq!(
+                    self.failures, failures_before,
+                    "a successful connect must not bump the failure counter"
+                );
                 Ok(tcp_stream)
             }
             Err(io_error) => {
                 self.retry_policy.fail();
                 self.failures += 1;
+                // A failed connect arms the retry policy and advances the
+                // failure counter by exactly one, leaving the connection gauge
+                // untouched (no connection was established).
+                debug_assert_eq!(
+                    self.failures,
+                    failures_before + 1,
+                    "a failed connect must advance the failure counter by exactly one"
+                );
+                debug_assert_eq!(
+                    self.active_connections, connections_before,
+                    "a failed connect must not register an active connection"
+                );
                 // TODO: handle EINPROGRESS. It is difficult. It is discussed here:
                 // https://docs.rs/mio/latest/mio/net/struct.TcpStream.html#method.connect
                 // with an example code here:
@@ -323,6 +436,17 @@ impl BackendMap {
         };
 
         let (available, total) = list.evaluate_availability();
+        // A subset count can never exceed the whole, and it must match the
+        // live backend vector length the helper just walked.
+        debug_assert!(
+            available <= total,
+            "available backends ({available}) cannot exceed total ({total})"
+        );
+        debug_assert_eq!(
+            total,
+            list.backends.len(),
+            "total must equal the number of registered backends"
+        );
         gauge!(
             names::cluster::AVAILABLE_BACKENDS,
             available,
@@ -341,8 +465,24 @@ impl BackendMap {
         } else {
             ClusterAvailability::Available
         };
+        // Empty clusters never report AllDown (avoids bootstrap log spam); a
+        // cluster with at least one available backend is always Available.
+        debug_assert!(
+            !(total == 0 && new_state == ClusterAvailability::AllDown),
+            "an empty cluster must never be reported AllDown"
+        );
+        debug_assert!(
+            !(available > 0 && new_state == ClusterAvailability::AllDown),
+            "a cluster with an available backend must not be AllDown"
+        );
 
         let prev = list.availability.replace(new_state);
+        // The cell now holds exactly the freshly computed state.
+        debug_assert_eq!(
+            list.availability.get(),
+            new_state,
+            "the availability cell must latch the newly computed state"
+        );
         if prev == new_state {
             return;
         }
@@ -442,10 +582,19 @@ impl BackendMap {
     }
 
     pub fn add_backend(&mut self, cluster_id: &str, backend: Backend) {
+        let address = backend.address;
         self.backends
             .entry(cluster_id.to_string())
             .or_default()
             .add_backend(backend);
+        // Adding a backend must leave the cluster present and containing the
+        // just-added address (whether it created the entry or updated in place).
+        debug_assert!(
+            self.backends
+                .get(cluster_id)
+                .is_some_and(|list| list.has_backend(&address)),
+            "add_backend must leave the backend present in its cluster"
+        );
         // Publish initial gauges and surface the corner case where a fresh
         // cluster's first backend is already down (e.g. registered with a
         // pre-existing failed retry policy). For an `Available` initial
@@ -474,6 +623,14 @@ impl BackendMap {
             );
             return Vec::new();
         };
+        // Whatever ids came back, the address is now gone from the cluster's
+        // live set (remove_backend evicts every backend at that address).
+        debug_assert!(
+            self.backends
+                .get(cluster_id)
+                .is_none_or(|list| !list.has_backend(backend_address)),
+            "remove_backend must evict every backend at the address"
+        );
         // Re-evaluate so removing the last backend logs an explicit
         // `AllDown` transition (or, with `total == 0`, drops back to
         // silent gauges).
@@ -515,6 +672,11 @@ impl BackendMap {
             self.record_cluster_availability(cluster_id);
             return Err(BackendError::NoBackendForCluster(cluster_id.to_owned()));
         }
+        // Past the empty guard there is at least one backend to pick from.
+        debug_assert!(
+            !cluster_backends.backends.is_empty(),
+            "selection runs only on a non-empty backend list"
+        );
 
         let next_backend = match cluster_backends.next_available_backend() {
             Some(nb) => nb,
@@ -562,6 +724,16 @@ impl BackendMap {
         let _ = cluster_backends;
         self.record_cluster_availability(cluster_id);
 
+        // The selected backend is a live member of the cluster it was drawn
+        // from — selection never fabricates or returns a stale backend.
+        debug_assert!(
+            self.backends.get(cluster_id).is_some_and(|list| {
+                let picked = next_backend.borrow().address;
+                list.has_backend(&picked)
+            }),
+            "the selected backend must belong to the cluster's live set"
+        );
+
         Ok((next_backend.clone(), tcp_stream))
     }
 
@@ -593,6 +765,10 @@ impl BackendMap {
             self.record_cluster_availability(cluster_id);
             return Err(BackendError::NoBackendForCluster(cluster_id.to_owned()));
         }
+        debug_assert!(
+            !cluster_backends.backends.is_empty(),
+            "keyed selection runs only on a non-empty backend list"
+        );
 
         let next_backend = match cluster_backends.next_available_backend_with_key(key) {
             Some(nb) => nb,
@@ -607,6 +783,12 @@ impl BackendMap {
             let borrowed = next_backend.borrow();
             (borrowed.backend_id.to_owned(), borrowed.address)
         };
+        // The keyed selection returns a live member of the cluster — the
+        // surfaced identity (id, address) belongs to a registered backend.
+        debug_assert!(
+            cluster_backends.has_backend(&address),
+            "keyed selection must return a backend in the cluster's live set"
+        );
         Ok((backend_id, address))
     }
 
@@ -708,7 +890,47 @@ impl BackendList {
             .iter()
             .filter(|b| b.borrow().is_available())
             .count();
+        // The available count is a filtered subset of the total, so it can
+        // never exceed it, and `total` mirrors the backend vector length.
+        debug_assert!(
+            available <= total,
+            "available ({available}) cannot exceed total ({total})"
+        );
+        debug_assert_eq!(total, self.backends.len(), "total must equal backend count");
         (available, total)
+    }
+
+    /// Full invariant sweep over the backend list. Called as a `debug_assert!`
+    /// postcondition by every mutating method so any cross-field corruption
+    /// (duplicate addresses, a `next_id` that underflowed below the registered
+    /// count) surfaces immediately under test/fuzz.
+    #[cfg(debug_assertions)]
+    fn check_invariants(&self) {
+        // `next_id` is a monotonically incremented registration counter: it is
+        // bumped once per *newly inserted* backend (never decremented, even on
+        // removal), so it is always at least the current live count.
+        debug_assert!(
+            self.next_id as usize >= self.backends.len(),
+            "next_id ({}) must be >= live backend count ({})",
+            self.next_id,
+            self.backends.len()
+        );
+        // Addresses are the routing-stable identity used by `has_backend` /
+        // `remove_backend`; two live backends may legitimately share an address
+        // (A/B variant) but must then differ by `backend_id`. The (address,
+        // backend_id) pair is therefore unique across the live set.
+        for (i, a) in self.backends.iter().enumerate() {
+            let a = a.borrow();
+            for b in self.backends.iter().skip(i + 1) {
+                let b = b.borrow();
+                debug_assert!(
+                    a.address != b.address || a.backend_id != b.backend_id,
+                    "duplicate (address, backend_id) in the live set: {:?} / {}",
+                    a.address,
+                    a.backend_id
+                );
+            }
+        }
     }
 
     pub fn import_configuration_state(
@@ -730,6 +952,12 @@ impl BackendList {
     }
 
     pub fn add_backend(&mut self, backend: Backend) {
+        let address = backend.address;
+        let len_before = self.backends.len();
+        let next_id_before = self.next_id;
+        let existed = self.backends.iter().any(|b| {
+            b.borrow().address == backend.address && b.borrow().backend_id == backend.backend_id
+        });
         match self.backends.iter_mut().find(|b| {
             b.borrow().address == backend.address && b.borrow().backend_id == backend.backend_id
         }) {
@@ -748,11 +976,29 @@ impl BackendList {
                 b.backup = backend.backup;
             }
         }
+        // Insert grows the list by exactly one and bumps `next_id`; an update
+        // in place leaves both untouched. The address is present either way.
+        debug_assert_eq!(
+            self.backends.len(),
+            len_before + (!existed) as usize,
+            "add_backend grows the list by one only on a genuine insert"
+        );
+        debug_assert_eq!(
+            self.next_id,
+            next_id_before + (!existed) as u32,
+            "next_id advances by one only on a genuine insert"
+        );
+        debug_assert!(
+            self.has_backend(&address),
+            "add_backend must leave the backend present in the list"
+        );
         // Refresh table-based policies (Maglev) off the datapath whenever the
         // full backend set or a weight changes. This is the ONLY place the
         // table is rebuilt on mutation; selection never rebuilds. The default
         // `rebuild` is a no-op for the stateless policies.
         self.load_balancing.rebuild(&self.backends);
+        #[cfg(debug_assertions)]
+        self.check_invariants();
     }
 
     /// Remove every backend at `backend_address` and return the list of
@@ -763,6 +1009,7 @@ impl BackendList {
     /// ids closes the identity drift between runtime-removal-by-address
     /// and metrics-removal-by-id.
     pub fn remove_backend(&mut self, backend_address: &SocketAddr) -> Vec<String> {
+        let len_before = self.backends.len();
         let mut removed = Vec::new();
         self.backends.retain(|backend| {
             let b = backend.borrow();
@@ -773,12 +1020,25 @@ impl BackendList {
                 true
             }
         });
+        // The list shrinks by exactly the number of ids reported removed, and
+        // the address is fully evicted (no straggler left behind).
+        debug_assert_eq!(
+            self.backends.len(),
+            len_before - removed.len(),
+            "remove_backend must drop exactly the backends it reports"
+        );
+        debug_assert!(
+            !self.has_backend(backend_address),
+            "remove_backend must evict every backend at the address"
+        );
         // Rebuild table-based policies (Maglev) off the datapath after the set
         // shrinks, only when something was actually removed. No-op for the
         // stateless policies.
         if !removed.is_empty() {
             self.load_balancing.rebuild(&self.backends);
         }
+        #[cfg(debug_assertions)]
+        self.check_invariants();
         removed
     }
 
@@ -844,9 +1104,23 @@ impl BackendList {
                 );
                 self.fail_open_warned = false;
             }
-            return self
+            // The candidate set is a subset of the live backend list, so a
+            // chosen backend is always a live cluster member.
+            debug_assert!(
+                backends.len() <= self.backends.len(),
+                "candidate set cannot be larger than the full backend list"
+            );
+            let picked = self
                 .load_balancing
                 .next_available_backend(key, &mut backends);
+            debug_assert!(
+                picked.as_ref().is_none_or(|b| {
+                    let addr = b.borrow().address;
+                    self.backends.iter().any(|x| x.borrow().address == addr)
+                }),
+                "selection must return a backend present in the live list"
+            );
+            return picked;
         }
 
         // Fail-open: when no backend passes the full `can_open()` gate,
