@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### 🐛 Fixed
+
+- **`fix(ci/release)`: pin the cosign binary to the 2.x line.** `sigstore/cosign-installer` floated the cosign binary to v3, whose `cosign sign-blob` defaults to `--new-bundle-format` and ignores `--output-signature` / `--output-certificate`, so the `2.0.2` release run failed at the signing step (`create bundle file: open : no such file or directory`) and the draft GitHub release + Docker push were skipped. Pin `cosign-release: v2.6.3` (latest 2.x, ≥ the documented 2.4.1 verify baseline) so keyless signing keeps emitting the `SHA256SUMS.sig` + `SHA256SUMS.pem` side files. Migrating verification to the v3 `--bundle` format is tracked separately.
+
 ## 2.0.2 - 2026-06-04
 
 Patch release: one OpenTelemetry-friendly access-log field plus an HTTP/2 memory-amplification DoS mitigation. Additive only — the new `ProtobufAccessLog.start_time` field and the `h2_max_header_fields` listener knob both carry safe defaults, so existing configurations and `sozu-command-lib` consumers can bump from `^2.0.1` to `^2.0.2` without code changes.

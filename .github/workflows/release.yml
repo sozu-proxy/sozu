@@ -307,6 +307,13 @@ jobs:
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+        with:
+          # Pin the cosign *binary* to the latest 2.x. cosign-installer
+          # otherwise floats to v3, whose `sign-blob` defaults to
+          # `--new-bundle-format` and ignores `--output-signature` /
+          # `--output-certificate`, breaking the published `.sig` + `.pem`
+          # side files. Revisit when migrating verification to v3 bundles.
+          cosign-release: 'v2.6.3'
 
       - name: Sign SHA256SUMS (keyless via sigstore)
         working-directory: dist
