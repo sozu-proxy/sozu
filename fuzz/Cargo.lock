@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-command-lib"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "hex",
  "libc",
@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-fuzz"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "libfuzzer-sys",
  "loona-hpack",
@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-lib"
-version = "2.0.1"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

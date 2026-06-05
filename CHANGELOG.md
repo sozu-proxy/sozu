@@ -2,17 +2,13 @@
 
 ## [Unreleased]
 
-### 🐛 Fixed
+## 2.1.0 - 2026-06-05
 
-- **`fix(ci/release)`: pin the cosign binary to the 2.x line.** `sigstore/cosign-installer` floated the cosign binary to v3, whose `cosign sign-blob` defaults to `--new-bundle-format` and ignores `--output-signature` / `--output-certificate`, so the `2.0.2` release run failed at the signing step (`create bundle file: open : no such file or directory`) and the draft GitHub release + Docker push were skipped. Pin `cosign-release: v2.6.3` (latest 2.x, ≥ the documented 2.4.1 verify baseline) so keyless signing keeps emitting the `SHA256SUMS.sig` + `SHA256SUMS.pem` side files. Migrating verification to the v3 `--bundle` format is tracked separately.
-
-## 2.0.2 - 2026-06-04
-
-Patch release: one OpenTelemetry-friendly access-log field plus an HTTP/2 memory-amplification DoS mitigation. Additive only — the new `ProtobufAccessLog.start_time` field and the `h2_max_header_fields` listener knob both carry safe defaults, so existing configurations and `sozu-command-lib` consumers can bump from `^2.0.1` to `^2.0.2` without code changes.
+Minor release: first-class UDP load balancing. Additive — the new `protocol = "udp"` listener type is opt-in, and the new proto messages (`UdpListenerConfig`, `RequestUdpFrontend`), configuration keys, and metrics all carry safe defaults, so existing configurations and `sozu-command-lib` consumers can bump from `^2.0.2` to `^2.1.0` without code changes.
 
 ### ✨ Added
 
-- **`feat(udp)`: first-class UDP listeners with load balancing** ([#1273](https://github.com/sozu-proxy/sozu/pull/1273)).
+- **`feat(udp)`: first-class UDP listeners with load balancing** ([#1274](https://github.com/sozu-proxy/sozu/pull/1274); RFC [#1273](https://github.com/sozu-proxy/sozu/issues/1273), closes [#654](https://github.com/sozu-proxy/sozu/issues/654)).
   A new `protocol = "udp"` listener type sits alongside `tcp`/`http`/`https`, with full hot-reconfig and CLI parity, fronting datagram services (DNS, syslog, NTP, generic UDP). The userland datapath runs in the existing single-threaded mio loop with **static per-listener worker ownership** (scale by running multiple listeners) and virtual 4-tuple flow sessions torn down by a three-knob policy (`responses` / idle timeout / `requests`). Highlights:
   - **Load balancing:** two source-hash algorithms selectable per cluster via the shared `load_balancing` key — **`HRW`** (Highest-Random-Weight / rendezvous hashing, recommended UDP default, no rebuild stall on reconfig) and **`MAGLEV`** (opt-in `O(1)` lookup table for large backend sets), plus the existing `ROUND_ROBIN`. Flow affinity keys on the client source IP (`SOURCE_IP`) or full 2-tuple (`SOURCE_IP_PORT`).
   - **PROXY protocol v2 to backend** (`send_proxy_protocol`, first datagram by default; `proxy_protocol_every_datagram` opt-in), carrying the real client address.
@@ -20,6 +16,32 @@ Patch release: one OpenTelemetry-friendly access-log field plus an HTTP/2 memory
   - **Metrics:** `udp.datagrams.{in,out}`, `udp.bytes.{in,out}`, `udp.active_flows` (gauge), `udp.flows.{created,evicted,shed}`, `udp.datagrams.dropped` (by reason), `udp.backend.health`, `udp.flow.duration`.
   - **Config:** `[[listeners]]` gains `max_rx_datagram_size` (capped at the global `buffer_size`; oversized datagrams truncate and drop) and `max_flows` (`0` = auto, ~70% of the soft `RLIMIT_NOFILE`). Inbound UDP PROXY-protocol decode (`expect_proxy`) is not supported. Plaintext only; in-flight flows reset on hot-upgrade (listener fd handed off, flow state not migrated). See [`doc/configure.md`](doc/configure.md) for the full schema.
   - **Testing:** a FoundationDB/VOPR-style **deterministic simulation harness** (`lib/tests/udp_simulation.rs`) drives the pure sans-io UDP core through a seeded, adversarial workload (weighted action grammar + FoundationDB-`buggify` fault injection + a 256-seed sweep), layered on dense `debug_assert` invariants (TigerBeetle TigerStyle) in `manager.rs`/`flow.rs`; failures reproduce from a printed seed via `SOZU_UDP_SIM_SEED`. See [`doc/testing.md`](doc/testing.md) and [`doc/udp_simulation.md`](doc/udp_simulation.md).
+
+### 🐛 Fixed
+
+- **`fix(state)`: hot-reconfig no longer silently deactivates a listener whose configuration changed while staying active.** `ConfigState::diff()` replayed an in-place listener configuration change as Remove+Add without re-emitting `ActivateListener` when the target state kept the listener active, so a state replay (hot upgrade, `LoadState`) silently deactivated it. Fixed for all four listener types (HTTP/HTTPS/TCP/UDP); the `diff()` post-condition now asserts listener-map convergence, including `udp_listeners`.
+- **`fix(router)`: pattern-trie arithmetic-underflow panic on regex-leading hostnames.** A frontend hostname whose leftmost segment is a regex (e.g. `/test[0-9]/.example.com`) underflowed `pos - 1` to `usize::MAX` and panicked on re-insert (the dedup loop) and on any `lookup_mut`. Both paths now special-case `pos == 0` (the regex subtree is already a value-bearing leaf); regression test added.
+- **`fix(ci/release)`: pin the cosign binary to the 2.x line.** `sigstore/cosign-installer` floated the cosign binary to v3, whose `cosign sign-blob` defaults to `--new-bundle-format` and ignores `--output-signature` / `--output-certificate`, so the `2.0.2` release run failed at the signing step (`create bundle file: open : no such file or directory`) and the draft GitHub release + Docker push were skipped. Pin `cosign-release: v2.6.3` (latest 2.x, ≥ the documented 2.4.1 verify baseline) so keyless signing keeps emitting the `SHA256SUMS.sig` + `SHA256SUMS.pem` side files. The 2.1.0 tag is the first to exercise the fix. Migrating verification to the v3 `--bundle` format is tracked separately.
+
+### 🔄 Changed
+
+- **TigerStyle assertion-density sweep across `lib` + `command` + `bin`**: ~1100 `debug_assert!`s + 16 private `check_invariants()` full-sweeps across the H2/H1 mux, all protocols, the data plane, the server event loop, the command plane (channel/SCM/state/config/request/response/cert), and the bin supervisor + master command server. All compiled out in release builds — no production behavior change; they run live in every test/e2e/fuzz/dev build, turning silent correctness bugs into loud crashes. Doctrine in [`doc/testing.md`](doc/testing.md).
+
+### 🤖 CI
+
+- The nightly fuzz job now also runs `fuzz_udp_flow` alongside `fuzz_frame_parser` and `fuzz_hpack_decoder`; a new test-hygiene job rejects bare `#[ignore]` attributes (a reason string is required); and a scheduled `simulation-sweep.yml` runs a daily FoundationDB-style seed swarm over the deterministic UDP simulator (debug build, TigerStyle invariants live) plus extended fuzzing of all three targets.
+
+### 📚 Documentation
+
+- [`doc/testing.md`](doc/testing.md) — the authoritative testing doctrine (assertion-first TigerBeetle TigerStyle + FoundationDB-style deterministic simulation, the five test categories, how to run each), with the contributor checklist in `CONTRIBUTING.md#testing`.
+- [`lib/src/protocol/udp/LIFECYCLE.md`](lib/src/protocol/udp/LIFECYCLE.md) — canonical internals reference for the UDP load-balancing datapath, matching the existing mux/kawa_h1/proxy_protocol LIFECYCLE siblings.
+- [`doc/configure.md`](doc/configure.md) / `bin/config.toml` — the cluster load-balancing key is `load_balancing` (not `load_balancing_policy`), now documenting all six algorithms: `ROUND_ROBIN`, `RANDOM`, `LEAST_LOADED`, `POWER_OF_TWO`, `HRW`, `MAGLEV`.
+
+## 2.0.2 - 2026-06-04
+
+Patch release: one OpenTelemetry-friendly access-log field plus an HTTP/2 memory-amplification DoS mitigation. Additive only — the new `ProtobufAccessLog.start_time` field and the `h2_max_header_fields` listener knob both carry safe defaults, so existing configurations and `sozu-command-lib` consumers can bump from `^2.0.1` to `^2.0.2` without code changes.
+
+### ✨ Added
 
 - **`fix(otel)`: wall-clock `start_time` field in `ProtobufAccessLog`** (field 30, optional `Uint128`).
   Access-log consumers reconstructing OpenTelemetry spans no longer need to compute `time - request_time` — a subtraction that mixed `CLOCK_REALTIME` and `CLOCK_MONOTONIC` and produced unreliable start timestamps on short-lived requests. The new field is captured at request start via `SessionMetrics::mark_request_start()` and should be preferred whenever present. Old consumers ignore the unknown field; new consumers with old producers see `None` and can fall back to the subtraction.
