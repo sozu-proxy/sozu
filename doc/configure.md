@@ -619,8 +619,10 @@ _Mandatory parameters:_
 protocol = "http"
 
 # per cluster load balancing algorithm. The possible values are
-# "roundrobin" and "random". Defaults to "roundrobin"
-# load_balancing_policy="roundrobin"
+# "ROUND_ROBIN", "RANDOM", "LEAST_LOADED", "POWER_OF_TWO", "HRW" and
+# "MAGLEV". HRW and MAGLEV are flow-affine policies designed for UDP
+# clusters (see "UDP clusters" below). Defaults to "ROUND_ROBIN"
+# load_balancing = "ROUND_ROBIN"
 
 # force cluster to redirect http traffic to https
 # https_redirect = true

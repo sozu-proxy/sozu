@@ -490,7 +490,9 @@ cipher_list = [
 protocol = "http"
 
 # per cluster load balancing algorithm. The possible values are
-# "ROUND_ROBIN", "RANDOM", "LEAST_LOADED" and "POWER_OF_TWO". Defaults to "ROUND_ROBIN"
+# "ROUND_ROBIN", "RANDOM", "LEAST_LOADED", "POWER_OF_TWO", "HRW" and "MAGLEV".
+# HRW and MAGLEV are flow-affine policies designed for UDP clusters.
+# Defaults to "ROUND_ROBIN"
 load_balancing = "ROUND_ROBIN"
 # metric evaluating the load on the backend. available options: connections, requests, connection_time
 # load_metric = "connections"
