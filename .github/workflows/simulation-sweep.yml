@@ -58,7 +58,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Checkout sources
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
 
       - name: Install rust 1.88.0
         uses: dtolnay/rust-toolchain@1.88.0
@@ -94,7 +94,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
 
       - name: Checkout sources
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
 
       - name: Install rust nightly
         uses: dtolnay/rust-toolchain@nightly
