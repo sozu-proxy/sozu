@@ -42,6 +42,14 @@
   per seed-step than the former pure-sync handmade swarm. All CI toolchain pins
   move 1.88.0 → 1.91.0.
 
+### 🔐 Security
+
+- **`chore(deps)`: bump `anyhow` 1.0.102 → 1.0.103** for
+  [RUSTSEC-2026-0190](https://rustsec.org/advisories/RUSTSEC-2026-0190)
+  (unsoundness in `Error::downcast_mut()` after `Error::context()`). Lockfile-only
+  — the workspace `^1.0.102` requirement already permitted it; restores a green
+  `cargo audit --deny warnings`.
+
 ## 2.1.0 - 2026-06-05
 
 Minor release: first-class UDP load balancing. Additive — the new `protocol = "udp"` listener type is opt-in, and the new proto messages (`UdpListenerConfig`, `RequestUdpFrontend`), configuration keys, and metrics all carry safe defaults, so existing configurations and `sozu-command-lib` consumers can bump from `^2.0.2` to `^2.1.0` without code changes.
