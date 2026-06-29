@@ -1,9 +1,10 @@
 [workspace]
-members = ["lib", "command", "bin", "e2e"]
+members = ["lib", "command", "bin", "e2e", "sim"]
 resolver = "2" # consistent with rust edition 2024, see https://doc.rust-lang.org/cargo/reference/resolver.html#features
 
 [workspace.dependencies]
 anyhow = "^1.0.102"
+async-trait = "^0.1.89"
 base64 = "^0.22.1"
 clap = "^4.6.1"
 cookie-factory = "^0.3.3"
@@ -24,6 +25,14 @@ libc = "^0.2.186"
 log = "^0.4.30"
 memchr = "^2.8.1"
 mio = "^1.2.0"
+# Deterministic-simulation engine (Pierre Zemb's framework) driving the sans-io
+# UDP core sweep in `sim/`. Pinned to a git rev because the published 0.7.0 does
+# not build on stable (needs tracing_unstable, removed post-0.7.0 on `main`);
+# `main` builds cleanly. Swapping this to a crates.io `=x.y.z` once a
+# stable-buildable release ships is a tracked follow-up, not a blocker.
+# `--cfg tokio_unstable` is scoped to the `sozu-sim` build only (cfg-gated
+# dev-deps); test-infra only — pulled in by `sozu-sim`, never by the `sozu` binary.
+moonpool-sim = { git = "https://github.com/PierreZ/moonpool", rev = "60eb07694e3203c8b489d304c84f6e6a9bf506c3" }
 nix = "^0.31.3"
 nom = "^7.1.3"
 num_cpus = "^1.17.0"

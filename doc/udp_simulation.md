@@ -9,6 +9,23 @@ a single seeded RNG drives a randomized, adversarial workload against the pure
 core across many seeds, so that **same seed → bit-for-bit identical run**, and
 every failure reproduces exactly from its seed.
 
+> **Two harnesses, one core.** This document describes the **handmade**
+> synchronous harness (`lib/tests/udp_simulation.rs`), the pure-core driver and
+> the deep CI swarm. A second harness in the **`sozu-sim`** crate
+> (`sim/tests/udp_simulation.rs`) drives the *same* `UdpManager` through the real
+> [`moonpool-sim`][moonpool] engine (async workload over moonpool's seeded
+> runtime / virtual clock / RNG / `buggify`), keeping `lib/` async-free. It
+> ports the same action grammar, shadow model, invariants and the
+> `SOZU_UDP_SIM_SEED`/`_SEEDS`/`_STEPS` knobs; it requires `--cfg tokio_unstable`
+> (moonpool's `RngSeed`), but **scoped to the sim build only** — the moonpool
+> dev-deps and the test are `#[cfg(tokio_unstable)]`-gated, so a plain
+> `cargo test --workspace` builds it as an empty 0-test binary and the flag never
+> touches the rest of the workspace. Seed *values* are not portable between the
+> two (different RNG engines). Run it with
+> `RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test udp_simulation`.
+> The two run in parallel until per-action / per-drop-reason coverage equivalence
+> is proven. See `doc/testing.md` for the rationale.
+
 ## Why deterministic simulation fits here
 
 The UDP core is **pure sans-io**: time is an injected `now: Instant`, the hash

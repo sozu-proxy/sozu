@@ -2,6 +2,45 @@
 
 ## [Unreleased]
 
+### ✨ Added
+
+- **`test(sim)`: moonpool-sim-driven deterministic UDP simulation.** A new
+  test-only workspace crate `sim/` (`sozu-sim`, `publish = false`) hosts a
+  deterministic simulation of the sans-io UDP core
+  (`sim/tests/udp_simulation.rs`) driven by the [`moonpool-sim`](https://crates.io/crates/moonpool-sim)
+  engine (seeded runtime, virtual clock, RNG, `buggify` fault injection). It
+  ports the handmade harness's weighted action grammar, shadow model,
+  cross-step invariants and determinism guard onto moonpool, keeping the
+  `SOZU_UDP_SIM_SEED`/`_SEEDS`/`_STEPS` replay/sweep knobs. The handmade
+  synchronous harness (`lib/tests/udp_simulation.rs`) is **retained in
+  parallel** as the pure-core driver and the deep CI swarm. `lib/`/`bin/` stay
+  async-free: moonpool/tokio are `sim/` **dev-dependencies** only. `moonpool-sim`
+  is pinned to a git rev (the published 0.7.0 doesn't build on stable; `main`
+  does) — swapping to a crates.io release later is a follow-up, not a blocker.
+
+### 🔄 Changed
+
+- **MSRV bumped 1.88.0 → 1.91.0** (`rust-toolchain` + every crate's
+  `rust-version`). Required by `moonpool-sim`, which uses `Duration::from_hours`
+  /`from_mins` — const-stable only since Rust 1.91. moonpool also needs
+  `--cfg tokio_unstable` (it seeds tokio's runtime RNG via the unstable `RngSeed`
+  API for scheduler determinism), but it is **scoped to the `sozu-sim` build
+  only** — the moonpool dev-deps live under `[target.'cfg(tokio_unstable)'.dev-dependencies]`
+  and the harness is `#![cfg(tokio_unstable)]`-gated, so `cargo test --workspace`
+  and every production build stay free of the flag (the sweep sets it via
+  `RUSTFLAGS`). No workspace-wide `.cargo/config.toml`.
+- **`chore(lint)`: resolved the Rust 1.91 clippy lints** (`collapsible_if`,
+  `manual_is_multiple_of`, `derivable_impls`, `mismatched_lifetime_syntaxes`)
+  surfaced across `lib`/`command`/`bin` by the MSRV bump. No behavior change.
+
+### 🤖 CI
+
+- **`ci(simulation-sweep)`: the daily swarm now runs both UDP simulators** — the
+  handmade harness keeps the deep `4096 × 20000` sweep (fast: pure sync), and a
+  new job runs the moonpool `sozu-sim` sweep at modest parameters (moonpool's
+  per-seed tokio-runtime construction is ~100× slower per seed-step). All CI
+  toolchain pins move 1.88.0 → 1.91.0.
+
 ## 2.1.0 - 2026-06-05
 
 Minor release: first-class UDP load balancing. Additive — the new `protocol = "udp"` listener type is opt-in, and the new proto messages (`UdpListenerConfig`, `RequestUdpFrontend`), configuration keys, and metrics all carry safe defaults, so existing configurations and `sozu-command-lib` consumers can bump from `^2.0.2` to `^2.1.0` without code changes.

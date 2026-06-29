@@ -19,11 +19,23 @@ Three public bodies of work shape the doctrine and are cited throughout:
   simulation, `buggify` fault injection, nightly seed swarms, and exact replay
   of a failing seed. <https://apple.github.io/foundationdb/testing.html>
 - **`moonpool-sim`** — a deterministic-simulation engine that brings the
-  FoundationDB approach (seeded RNG, virtual clock, in-process network) to Rust;
-  it is the inspiration for Sōzu's harness. Sōzu does not depend on it: the
-  `sozu-lib` no-`async fn` rule and the synchronous sans-io `UdpManager` make a
-  direct seeded loop (clock + seed injected as plain arguments) the right fit
-  rather than `moonpool-sim`'s async provider bundle.
+  FoundationDB approach (seeded RNG, virtual clock, in-process network) to Rust.
+  Sōzu uses it for the UDP core simulation, hosted in the **`sim/` (`sozu-sim`)**
+  crate (`sim/tests/udp_simulation.rs`): the workload runs as an `async` moonpool
+  task that draws from moonpool's RNG, advances its virtual clock, and steps the
+  **synchronous** sans-io `UdpManager` between awaits, so `lib/` stays async-free
+  (moonpool/tokio are `sim/` dev-dependencies only). The engine requires
+  `--cfg tokio_unstable` (it seeds tokio's runtime RNG via `RngSeed` for scheduler
+  determinism), but **scoped to the sim build only**: the moonpool dev-deps sit
+  under `[target.'cfg(tokio_unstable)'.dev-dependencies]` and the test is
+  `#![cfg(tokio_unstable)]`-gated, so a plain `cargo test --workspace` builds
+  `sozu-sim` as an empty 0-test binary and the flag never touches the rest of the
+  workspace; run it with `RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim`.
+  The original handmade
+  direct-seeded loop (`lib/tests/udp_simulation.rs`) is **retained in parallel**
+  as the pure-core synchronous driver and the deep CI swarm until per-action /
+  per-drop-reason coverage equivalence is proven; both exercise the same in-source
+  `check_invariants()` and `fuzz_udp_flow` surface.
   <https://crates.io/crates/moonpool-sim>
 
 ---
@@ -74,7 +86,7 @@ catching.
 | **Unit** | `#[cfg(test)] mod tests` beside each module in `lib/src/**`, `command/src/**` | nothing beyond `protoc` + toolchain | run by `cargo test -p sozu-lib` | yes |
 | **Integration / e2e** | `e2e/src/tests/*` (registered in `e2e/src/tests/mod.rs`), mocks in `e2e/src/mock/*` | spawns real workers + mock clients/backends; `h2spec` for one conformance test | `cargo test -p sozu-e2e` | yes |
 | **Fuzz** | `fuzz/fuzz_targets/*` (out-of-workspace `sozu-fuzz` crate) | nightly toolchain + `cargo-fuzz` | nightly `fuzz` CI job; `#[ignore]`-style runtime skip when prereqs absent | smoke per-PR, real fuzzing nightly |
-| **Deterministic simulation** | `lib/tests/udp_simulation.rs` | nothing (pure core, no I/O) | runs in `cargo test --workspace`; widened via env knobs | yes (256-seed sweep) |
+| **Deterministic simulation** | `lib/tests/udp_simulation.rs` (handmade, sync) + `sim/tests/udp_simulation.rs` (`sozu-sim`, moonpool-sim) | handmade: nothing; moonpool: `RUSTFLAGS="--cfg tokio_unstable"` (scoped to the sim — cfg-gated, off by default) | handmade in `cargo test --workspace`; moonpool in its own flagged sweep | handmade yes; moonpool nightly sweep |
 | **Regression guards** | `lib/tests/log_layout.rs` | nothing | runs in `cargo test -p sozu-lib`; build-time `cargo:warning=` echo from `lib/build.rs` | yes |
 
 Notes:
@@ -93,7 +105,7 @@ Notes:
 
 ## 3. Running the suites
 
-All commands assume `protoc` is installed and the `1.88.0` toolchain pinned by
+All commands assume `protoc` is installed and the `1.91.0` toolchain pinned by
 `rust-toolchain` (CI exercises stable/beta/nightly on top of that).
 
 ### Full local validation chain
@@ -120,7 +132,9 @@ cargo test -p sozu-e2e -- test_udp_        # all UDP e2e tests
 cargo test -p sozu-e2e test_upgrade        # worker-upgrade e2e (see doc/upgrade_e2e_tests.md)
 
 # Deterministic UDP simulation:
-cargo test -p sozu-lib --test udp_simulation        # the default 256-seed sweep
+cargo test -p sozu-lib --test udp_simulation        # handmade, sync; default 256-seed sweep
+# moonpool-sim engine (sozu-sim): cfg-gated, so the flag is required or it runs 0 tests:
+RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test udp_simulation
 ```
 
 ### Simulation sweep + single-seed replay

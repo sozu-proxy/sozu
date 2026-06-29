@@ -60,8 +60,8 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - name: Install rust 1.88.0
-        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Install rust 1.91.0
+        uses: dtolnay/rust-toolchain@1.91.0
 
       - name: Cache cargo target
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
@@ -75,6 +75,49 @@ jobs:
       # release build would strip. A failing seed is printed by the test.
       - name: UDP simulation sweep (debug, asserts live)
         run: cargo test -p sozu-lib --locked --test udp_simulation -- --nocapture
+
+  # ┌──────────────────────────────────────────────────────────────┐
+  # │ Same sans-io UDP core, driven by the moonpool-sim engine      │
+  # │   (sozu-sim crate). MODEST params on purpose: moonpool builds │
+  # │   a fresh tokio runtime per seed, ~100x slower per seed-step  │
+  # │   than the handmade harness above, so the deep 4096x20000     │
+  # │   swarm stays on the handmade job. Debug build (asserts live).│
+  # │   `--cfg tokio_unstable` is scoped here via RUSTFLAGS — NOT    │
+  # │   workspace-wide; moonpool deps + test are cfg-gated, so the   │
+  # │   per-PR `cargo test --workspace` never sets it.               │
+  # └──────────────────────────────────────────────────────────────┘
+  udp-simulation-sweep-moonpool:
+    name: UDP simulation seed sweep (moonpool-sim)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Fixed modest sweep (NOT the handmade 4096x20000 inputs — that would take
+    # hours under moonpool). ~512x3000 completes in well under the cap.
+    env:
+      # Scopes the unstable flag to THIS job only (moonpool needs it for tokio
+      # RngSeed scheduler determinism); cfg-gated deps mean it is not needed
+      # anywhere else in the workspace.
+      RUSTFLAGS: '--cfg tokio_unstable'
+      SOZU_UDP_SIM_SEEDS: '512'
+      SOZU_UDP_SIM_STEPS: '3000'
+    steps:
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Checkout sources
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Install rust 1.91.0
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          cache-all-crates: true
+          prefix-key: sim-sweep-moonpool
+          workspaces: . -> target/
+
+      - name: UDP simulation sweep — moonpool engine (debug, asserts live)
+        run: cargo test -p sozu-sim --locked --test udp_simulation -- --nocapture
 
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Extended fuzzing — longer than the per-PR 300s budget.        │
@@ -107,8 +150,8 @@ jobs:
           workspaces: . -> target/
 
       # `+nightly` is REQUIRED here: the repo's `rust-toolchain` file pins
-      # 1.88.0, and that directory override beats the nightly default installed
-      # above. Without the explicit toolchain, `cargo install` runs under 1.88.0
+      # 1.91.0, and that directory override beats the nightly default installed
+      # above. Without the explicit toolchain, `cargo install` runs under 1.91.0
       # and cargo-fuzz's locked dep tree (cargo-platform 0.3.3, rust-version
       # 1.91) fails the MSRV gate. The fuzz step below uses `cargo +nightly`.
       - name: Install cargo-fuzz
