@@ -117,27 +117,26 @@ impl<Front: SocketHandler> SendProxyProtocol<Front> {
         if self.header.is_none()
             && let Ok(local_addr) = self.front_socket().local_addr()
         {
-            if let Ok(frontend_addr) = self.front_socket().peer_addr() {
-                let v2 = HeaderV2::new(Command::Proxy, frontend_addr, local_addr);
-                let declared_len = v2.len();
-                let serialized = ProxyProtocolHeader::V2(v2).into_bytes();
-                // Send postcondition: the byte vector we will stream out is
-                // exactly the length the header model declared. The cursor
-                // logic below relies on `header.len()` being this serialized
-                // size to detect completion.
-                debug_assert_eq!(
-                    serialized.len(),
-                    declared_len,
-                    "serialized send header length must match HeaderV2::len()"
-                );
-                debug_assert!(
-                    serialized.len() >= 16,
-                    "a v2 send header is at least its 16-byte fixed prefix"
-                );
-                self.header = Some(serialized);
-            } else {
+            let Ok(frontend_addr) = self.front_socket().peer_addr() else {
                 return SessionResult::Close;
-            }
+            };
+            let v2 = HeaderV2::new(Command::Proxy, frontend_addr, local_addr);
+            let declared_len = v2.len();
+            let serialized = ProxyProtocolHeader::V2(v2).into_bytes();
+            // Send postcondition: the byte vector we will stream out is
+            // exactly the length the header model declared. The cursor
+            // logic below relies on `header.len()` being this serialized
+            // size to detect completion.
+            debug_assert_eq!(
+                serialized.len(),
+                declared_len,
+                "serialized send header length must match HeaderV2::len()"
+            );
+            debug_assert!(
+                serialized.len() >= 16,
+                "a v2 send header is at least its 16-byte fixed prefix"
+            );
+            self.header = Some(serialized);
         };
 
         if let Some(ref mut socket) = self.backend

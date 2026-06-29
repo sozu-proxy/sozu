@@ -639,14 +639,15 @@ fn udp_simulation_seed_sweep() {
 /// Fast smoke test pinning one representative seed.
 #[test]
 fn udp_simulation_replays_known_seed() {
+    let steps = 4_000;
     let report = SimulationBuilder::new()
         .workload(UdpSimWorkload {
-            steps: 4_000,
+            steps,
             verbose: false,
             sink: None,
         })
         .set_debug_seeds(vec![0x5E_ED_C0_DE])
-        .run_time_budget(run_budget(4_000))
+        .run_time_budget(run_budget(steps))
         .run();
     assert_no_failures(&report);
 }
@@ -657,15 +658,16 @@ fn udp_simulation_replays_known_seed() {
 #[test]
 fn udp_simulation_is_deterministic() {
     fn fingerprint(seed: u64) -> (u64, u64, u64) {
+        let steps = 1_500;
         let sink: FingerprintSink = Arc::new(Mutex::new(Vec::new()));
         let report = SimulationBuilder::new()
             .workload(UdpSimWorkload {
-                steps: 1_500,
+                steps,
                 verbose: false,
                 sink: Some(sink.clone()),
             })
             .set_debug_seeds(vec![seed])
-            .run_time_budget(run_budget(1_500))
+            .run_time_budget(run_budget(steps))
             .run();
         assert_no_failures(&report);
         let v = sink.lock().unwrap();
