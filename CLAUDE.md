@@ -73,7 +73,7 @@ the load-bearing summary; `doc/testing.md` is authoritative and `CONTRIBUTING.md
 
 Five categories: **unit** (`#[cfg(test)] mod tests` beside modules in `lib/src/**` / `command/src/**`), **integration/e2e**
 (`e2e/src/tests/`, registered in `e2e/src/tests/mod.rs`), **fuzz** (`fuzz/`), **deterministic simulation**
-(`lib/tests/udp_simulation.rs`), and **regression guards** (`lib/tests/log_layout.rs`).
+(`sim/tests/udp_simulation.rs` — the `sozu-sim` crate, moonpool-driven), and **regression guards** (`lib/tests/log_layout.rs`).
 
 E2E suites (non-exhaustive): `h2_tests.rs` + `h2_correctness_tests.rs` + `h2_security_{tests,parser,session,sni,header_injection}.rs`
 + `h2_priority_rearm_tests.rs` (~181 H2 tests); `mux_tests.rs` (H1 + proxy-protocol + keepalive/hup); `h1_security_tests.rs`,
@@ -94,9 +94,12 @@ CI skips them via `--skip tests::fuzz_tests::`); `h2_utils.rs`/`udp_utils` share
   log + `SessionResult`/`GOAWAY`/`RST_STREAM`. `debug_assert!` is for invariant violations only.
 
 **Deterministic simulation (FoundationDB/VOPR style):** the sans-io UDP core is driven under a seeded RNG + virtual
-clock + adversarial workload + buggify-style fault injection in `lib/tests/udp_simulation.rs` (default 256-seed sweep
-in normal `cargo test`; `SOZU_UDP_SIM_SEED`/`SOZU_UDP_SIM_SEEDS`/`SOZU_UDP_SIM_STEPS` for replay/sweep). New sans-io
-state machines (the H2 mux is the next candidate) should get a simulator on the same pattern — see `doc/udp_simulation.md`.
+clock + adversarial workload + buggify fault injection in `sim/tests/udp_simulation.rs` (the `sozu-sim` crate) via the
+moonpool-sim engine. It needs `--cfg tokio_unstable` (moonpool's tokio `RngSeed`), scoped to the `sozu-sim` build only
+(cfg-gated dev-deps + `#![cfg(tokio_unstable)]` test), so a plain `cargo test --workspace` builds it as an empty 0-test
+binary; run it with `RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim` (`SOZU_UDP_SIM_SEED`/`SOZU_UDP_SIM_SEEDS`/`SOZU_UDP_SIM_STEPS`
+for replay/sweep). New sans-io state machines (the H2 mux is the next candidate) should get a simulator on the same
+pattern — see `doc/udp_simulation.md`.
 
 **E2E conventions:**
 

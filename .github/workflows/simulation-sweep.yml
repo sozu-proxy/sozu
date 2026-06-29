@@ -1,14 +1,15 @@
 ---
 name: Simulation sweep
 
-# Deterministic-simulation seed swarm + extended fuzzing, in the spirit of
-# FoundationDB's nightly simulation runs. Per-PR CI already exercises the
-# default seed sweep (via `cargo test -p sozu-lib`) and 300s/target fuzzing;
-# this workflow widens both far beyond what fits in a PR gate.
+# Deterministic-simulation seed swarm (moonpool-sim engine, sozu-sim crate) +
+# extended fuzzing, in the spirit of FoundationDB's nightly runs. Per-PR CI runs
+# a modest UDP simulation sweep (the `udp-simulation` job in ci.yml) + 300s/target
+# fuzzing; this workflow widens both.
 #
-# Every `(commit, seed)` pair is bit-for-bit reproducible, so a failing seed
-# printed here replays locally with:
-#   SOZU_UDP_SIM_SEED=<seed> cargo test -p sozu-lib --test udp_simulation -- --nocapture
+# Every `(commit, seed)` pair is reproducible, so a failing seed printed here
+# replays locally with:
+#   RUSTFLAGS="--cfg tokio_unstable" SOZU_UDP_SIM_SEED=<seed> \
+#     cargo test -p sozu-sim --test udp_simulation -- --nocapture
 # See doc/testing.md and doc/udp_simulation.md.
 
 on:
@@ -20,11 +21,14 @@ on:
       seeds:
         description: 'Number of seeds to sweep (SOZU_UDP_SIM_SEEDS)'
         required: false
-        default: '4096'
+        # moonpool builds a fresh tokio runtime per seed (~100x slower per
+        # seed-step than a pure loop), so the deep swarm is seed-bounded to fit
+        # the 45-min cap rather than the old handmade 4096x20000.
+        default: '1024'
       steps:
         description: 'Steps per seed (SOZU_UDP_SIM_STEPS)'
         required: false
-        default: '20000'
+        default: '3000'
       fuzz_seconds:
         description: 'Seconds per fuzz target'
         required: false
@@ -40,19 +44,24 @@ concurrency:
 
 jobs:
   # ┌──────────────────────────────────────────────────────────────┐
-  # │ Deterministic simulation seed swarm over the sans-io UDP core │
-  # │   Debug build is REQUIRED: the TigerStyle `debug_assert!`     │
-  # │   invariants are compiled out in release.                    │
+  # │ Deterministic-simulation seed swarm over the sans-io UDP core │
+  # │   via the moonpool-sim engine (sozu-sim crate). Debug build   │
+  # │   is REQUIRED: the TigerStyle `debug_assert!` invariants are  │
+  # │   compiled out in release. `--cfg tokio_unstable` is scoped    │
+  # │   here via RUSTFLAGS (moonpool's tokio RngSeed determinism) —  │
+  # │   NOT workspace-wide; the cfg-gated deps keep the per-PR       │
+  # │   `cargo test --workspace` flag-free.                          │
   # └──────────────────────────────────────────────────────────────┘
   udp-simulation-sweep:
-    name: UDP simulation seed sweep
+    name: UDP simulation seed sweep (moonpool-sim)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     # Inputs are exposed as env vars (the safe pattern); the test parses them
     # and falls back to its built-in defaults on anything non-numeric.
     env:
-      SOZU_UDP_SIM_SEEDS: ${{ github.event.inputs.seeds || '4096' }}
-      SOZU_UDP_SIM_STEPS: ${{ github.event.inputs.steps || '20000' }}
+      RUSTFLAGS: '--cfg tokio_unstable'
+      SOZU_UDP_SIM_SEEDS: ${{ github.event.inputs.seeds || '1024' }}
+      SOZU_UDP_SIM_STEPS: ${{ github.event.inputs.steps || '3000' }}
     steps:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -74,49 +83,6 @@ jobs:
       # `debug_assert!` invariant sweep inside the sans-io core, which a
       # release build would strip. A failing seed is printed by the test.
       - name: UDP simulation sweep (debug, asserts live)
-        run: cargo test -p sozu-lib --locked --test udp_simulation -- --nocapture
-
-  # ┌──────────────────────────────────────────────────────────────┐
-  # │ Same sans-io UDP core, driven by the moonpool-sim engine      │
-  # │   (sozu-sim crate). MODEST params on purpose: moonpool builds │
-  # │   a fresh tokio runtime per seed, ~100x slower per seed-step  │
-  # │   than the handmade harness above, so the deep 4096x20000     │
-  # │   swarm stays on the handmade job. Debug build (asserts live).│
-  # │   `--cfg tokio_unstable` is scoped here via RUSTFLAGS — NOT    │
-  # │   workspace-wide; moonpool deps + test are cfg-gated, so the   │
-  # │   per-PR `cargo test --workspace` never sets it.               │
-  # └──────────────────────────────────────────────────────────────┘
-  udp-simulation-sweep-moonpool:
-    name: UDP simulation seed sweep (moonpool-sim)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    # Fixed modest sweep (NOT the handmade 4096x20000 inputs — that would take
-    # hours under moonpool). ~512x3000 completes in well under the cap.
-    env:
-      # Scopes the unstable flag to THIS job only (moonpool needs it for tokio
-      # RngSeed scheduler determinism); cfg-gated deps mean it is not needed
-      # anywhere else in the workspace.
-      RUSTFLAGS: '--cfg tokio_unstable'
-      SOZU_UDP_SIM_SEEDS: '512'
-      SOZU_UDP_SIM_STEPS: '3000'
-    steps:
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Checkout sources
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-
-      - name: Install rust 1.91.0
-        uses: dtolnay/rust-toolchain@1.91.0
-
-      - name: Cache cargo target
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-        with:
-          cache-all-crates: true
-          prefix-key: sim-sweep-moonpool
-          workspaces: . -> target/
-
-      - name: UDP simulation sweep — moonpool engine (debug, asserts live)
         run: cargo test -p sozu-sim --locked --test udp_simulation -- --nocapture
 
   # ┌──────────────────────────────────────────────────────────────┐

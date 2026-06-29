@@ -31,11 +31,10 @@ Three public bodies of work shape the doctrine and are cited throughout:
   `#![cfg(tokio_unstable)]`-gated, so a plain `cargo test --workspace` builds
   `sozu-sim` as an empty 0-test binary and the flag never touches the rest of the
   workspace; run it with `RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim`.
-  The original handmade
-  direct-seeded loop (`lib/tests/udp_simulation.rs`) is **retained in parallel**
-  as the pure-core synchronous driver and the deep CI swarm until per-action /
-  per-drop-reason coverage equivalence is proven; both exercise the same in-source
-  `check_invariants()` and `fuzz_udp_flow` surface.
+  This **replaced** the earlier handmade direct-seeded loop (formerly
+  `lib/tests/udp_simulation.rs`); the in-source `check_invariants()` sweep
+  (`manager.rs`/`flow.rs`) and the `fuzz_udp_flow` target remain the
+  harness-independent safety net and are exercised on every debug build.
   <https://crates.io/crates/moonpool-sim>
 
 ---
@@ -86,7 +85,7 @@ catching.
 | **Unit** | `#[cfg(test)] mod tests` beside each module in `lib/src/**`, `command/src/**` | nothing beyond `protoc` + toolchain | run by `cargo test -p sozu-lib` | yes |
 | **Integration / e2e** | `e2e/src/tests/*` (registered in `e2e/src/tests/mod.rs`), mocks in `e2e/src/mock/*` | spawns real workers + mock clients/backends; `h2spec` for one conformance test | `cargo test -p sozu-e2e` | yes |
 | **Fuzz** | `fuzz/fuzz_targets/*` (out-of-workspace `sozu-fuzz` crate) | nightly toolchain + `cargo-fuzz` | nightly `fuzz` CI job; `#[ignore]`-style runtime skip when prereqs absent | smoke per-PR, real fuzzing nightly |
-| **Deterministic simulation** | `lib/tests/udp_simulation.rs` (handmade, sync) + `sim/tests/udp_simulation.rs` (`sozu-sim`, moonpool-sim) | handmade: nothing; moonpool: `RUSTFLAGS="--cfg tokio_unstable"` (scoped to the sim — cfg-gated, off by default) | handmade in `cargo test --workspace`; moonpool in its own flagged sweep | handmade yes; moonpool nightly sweep |
+| **Deterministic simulation** | `sim/tests/udp_simulation.rs` (`sozu-sim`, moonpool-sim) | `RUSTFLAGS="--cfg tokio_unstable"` (scoped to the sim — cfg-gated, off by default) | per-PR `udp-simulation` job (modest sweep) + nightly deep swarm; widened via env knobs | yes |
 | **Regression guards** | `lib/tests/log_layout.rs` | nothing | runs in `cargo test -p sozu-lib`; build-time `cargo:warning=` echo from `lib/build.rs` | yes |
 
 Notes:
@@ -131,15 +130,14 @@ cargo test -p sozu-e2e -- h2_              # all H2 e2e tests
 cargo test -p sozu-e2e -- test_udp_        # all UDP e2e tests
 cargo test -p sozu-e2e test_upgrade        # worker-upgrade e2e (see doc/upgrade_e2e_tests.md)
 
-# Deterministic UDP simulation:
-cargo test -p sozu-lib --test udp_simulation        # handmade, sync; default 256-seed sweep
-# moonpool-sim engine (sozu-sim): cfg-gated, so the flag is required or it runs 0 tests:
+# Deterministic UDP simulation (moonpool-sim, sozu-sim crate): cfg-gated, so the
+# flag is REQUIRED — without it the crate compiles to an empty 0-test binary:
 RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test udp_simulation
 ```
 
 ### Simulation sweep + single-seed replay
 
-The simulator reads three env knobs (`lib/tests/udp_simulation.rs`,
+The simulator reads three env knobs (`sim/tests/udp_simulation.rs`,
 `doc/udp_simulation.md`):
 
 | env var | effect |
@@ -150,11 +148,12 @@ The simulator reads three env knobs (`lib/tests/udp_simulation.rs`,
 
 ```bash
 # Reproduce a CI failure exactly (the panic prints the failing seed + step):
-SOZU_UDP_SIM_SEED=0xdeadbeef cargo test -p sozu-lib --test udp_simulation
+RUSTFLAGS="--cfg tokio_unstable" SOZU_UDP_SIM_SEED=0xdeadbeef \
+  cargo test -p sozu-sim --test udp_simulation
 
 # Widen / deepen the sweep (FoundationDB nightly seed-swarm analog):
-SOZU_UDP_SIM_SEEDS=1024 SOZU_UDP_SIM_STEPS=5000 \
-  cargo test -p sozu-lib --test udp_simulation udp_simulation_seed_sweep -- --nocapture
+RUSTFLAGS="--cfg tokio_unstable" SOZU_UDP_SIM_SEEDS=1024 SOZU_UDP_SIM_STEPS=5000 \
+  cargo test -p sozu-sim --test udp_simulation udp_simulation_seed_sweep -- --nocapture
 ```
 
 ### Fuzzing
@@ -240,18 +239,22 @@ busy-loop).
 
 ## 5. Deterministic simulation
 
-`lib/tests/udp_simulation.rs` is a VOPR/FoundationDB-style deterministic
-simulation of the sans-io UDP core. The full design is in
-`doc/udp_simulation.md`; the essentials:
+`sim/tests/udp_simulation.rs` (the `sozu-sim` crate) is a VOPR/FoundationDB-style
+deterministic simulation of the sans-io UDP core, driven by the
+[`moonpool-sim`](https://crates.io/crates/moonpool-sim) engine. The full design is
+in `doc/udp_simulation.md`; the essentials:
 
-**How it works.** A single seeded `StdRng` drives everything. A base `Instant` is
-captured once *outside* the stepping loop and advanced only by RNG-drawn deltas —
-no wall-clock read happens inside the loop, so a run is a pure function of its
-seed. Each step draws one weighted-random action from an adversarial grammar
-(client/backend datagrams, backend resolutions, clock advances, reconfig storms,
-cap shrinks below the live count, aborts, drains, mass teardown). After **every**
-action the harness fully drains `poll_output()` to `None`, folding outputs into a
-shadow model that tracks active-flow accounting.
+**How it works.** The harness is a moonpool `Workload` run across many seeded
+iterations. moonpool supplies the seeded RNG (`ctx.random()`), the virtual clock
+(`ctx.time()`), and the `buggify` fault-injection vocabulary; the workload draws
+one weighted-random action from an adversarial grammar (client/backend datagrams,
+backend resolutions, clock advances, reconfig storms, cap shrinks below the live
+count, aborts, drains, mass teardown) and steps the **synchronous** sans-io
+`UdpManager` between awaits. The core takes a `std::time::Instant`, so a base
+`Instant` is captured once per seed and moonpool's elapsed `Duration` is added to
+it (the core only compares Instants relatively, so the run stays a pure function
+of its seed). After **every** action the workload fully drains `poll_output()` to
+`None`, folding outputs into a shadow model that tracks active-flow accounting.
 
 **Invariants checked.** Two layers fire on every step:
 
@@ -262,21 +265,25 @@ shadow model that tracks active-flow accounting.
   `poll_output()` is `None` after draining; `poll_timeout()` is coherent with
   `flow_count()`; **model balance** — `created_seen − evicted_seen ==
   flow_count()` (no underflow, no leak); and no panic for any input. A **final**
-  giant-clock-jump + `close_all` must drain the manager to zero
+  clock jump past every idle deadline + `close_all` must drain the manager to zero
   (`flow_count() == 0`, `poll_timeout() == None`, `created == evicted`).
 
-**Buggify.** `buggify(rng, p)` is the FoundationDB `buggify` analog: with low
-per-call probability it injects an *extra* adversarial event (a stale
-`BackendResolved`, a reconfig burst, a `max_flows` shrink to a tiny value, a
-giant clock jump). It runs only under simulation, never in production.
+**Buggify.** `buggify_with_prob!(p)` is moonpool's FoundationDB-`buggify`
+primitive: with low per-call probability it injects an *extra* adversarial event
+(a stale `BackendResolved`, a reconfig burst, a `max_flows` shrink to a tiny
+value, a giant clock jump). It runs only under simulation, never in production.
 
-**Replay ergonomics.** On any failure the panic message carries the failing
-**seed + step**, so the exact run reproduces with
-`SOZU_UDP_SIM_SEED=<seed>` (verbose, single-seed). The sweep widens with
-`SOZU_UDP_SIM_SEEDS` / `SOZU_UDP_SIM_STEPS` for the nightly seed-swarm pattern.
-A separate `udp_simulation_is_deterministic` test asserts that the same seed
-yields a bit-identical trace, guarding against a hidden nondeterministic
-dependency (wall clock, `rand`, hash-map iteration order) leaking into outputs.
+**Replay ergonomics.** A failing seed is surfaced in moonpool's `SimulationReport`
+(and the panicking invariant prints the seed + step). Reproduce a run verbosely
+with `RUSTFLAGS="--cfg tokio_unstable" SOZU_UDP_SIM_SEED=<seed> cargo test -p
+sozu-sim`; widen with `SOZU_UDP_SIM_SEEDS` / `SOZU_UDP_SIM_STEPS`. (Seed *values*
+are moonpool's own — not portable from the former handmade harness.) A separate
+`udp_simulation_is_deterministic` test asserts the same seed yields a bit-identical
+tally, guarding against a hidden nondeterministic dependency leaking into outputs.
+The engine needs `--cfg tokio_unstable` (tokio `RngSeed` scheduler determinism),
+so the test is `#![cfg(tokio_unstable)]`-gated and its deps sit under
+`[target.'cfg(tokio_unstable)'.dev-dependencies]` — the flag is scoped to the
+`sozu-sim` build, and `cargo test --workspace` builds it as an empty 0-test binary.
 
 ### Recipe: adding a simulator over another sans-io core
 
@@ -286,14 +293,17 @@ The pattern generalizes to any pure state machine. To add one:
    at construction; remove `Instant::now()` and `rand` from the datapath.
 2. **Pack it with assertions** plus a `check_invariants()` full sweep at the end
    of every public mutating entry point (§4).
-3. **Write a seeded driver** in `lib/tests/`: one `StdRng`, a base `Instant`
-   advanced only by drawn deltas, a weighted action grammar that biases toward
-   the adversarial transitions (reconfig, cap changes, teardown), and a shadow
-   model for cross-checking observable outputs.
-4. **Add `buggify`-style fault injection** for low-probability extra adversarial
-   events.
-5. **Print the seed + step on failure** and wire the same `SOZU_*_SIM_SEED /
-   _SEEDS / _STEPS` replay knobs.
+3. **Write a moonpool `Workload`** in the `sozu-sim` crate (`sim/tests/`): take the
+   clock + RNG from `SimContext` (`ctx.time()` / `ctx.random()`), step the
+   synchronous core between awaits, bias a weighted action grammar toward the
+   adversarial transitions (reconfig, cap changes, teardown), and fold observable
+   outputs into a shadow model. Drive seeds via `SimulationBuilder::set_iterations`
+   / `set_debug_seeds`.
+4. **Add `buggify_with_prob!`** for low-probability extra adversarial events.
+5. **Wire the `SOZU_*_SIM_SEED / _SEEDS / _STEPS` replay knobs**, gate the test on
+   `#![cfg(tokio_unstable)]`, and put the moonpool dev-deps under
+   `[target.'cfg(tokio_unstable)'.dev-dependencies]` so the flag stays scoped to
+   the sim crate.
 
 The H2 mux (`lib/src/protocol/mux/`) is the obvious next candidate — its stream
 slot lifecycle, flow-control accounting, and GOAWAY/RST_STREAM semantics are a

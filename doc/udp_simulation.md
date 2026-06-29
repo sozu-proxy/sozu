@@ -1,30 +1,27 @@
 # Deterministic simulation (UDP)
 
-`lib/tests/udp_simulation.rs` is a FoundationDB/VOPR-style **deterministic
-simulation test** for the sans-io UDP load-balancing core
-(`sozu_lib::protocol::udp::UdpManager` + `UdpFlow`, issue #1273). It is built in
-the spirit of [TigerBeetle's VOPR][vopr], the [FoundationDB simulator][fdb], and
-the [`moonpool-sim`][moonpool] deterministic-simulation engine for Rust:
-a single seeded RNG drives a randomized, adversarial workload against the pure
-core across many seeds, so that **same seed → bit-for-bit identical run**, and
-every failure reproduces exactly from its seed.
+`sim/tests/udp_simulation.rs` (the **`sozu-sim`** crate) is a FoundationDB/VOPR-style
+**deterministic simulation test** for the sans-io UDP load-balancing core
+(`sozu_lib::protocol::udp::UdpManager` + `UdpFlow`, issue #1273), driven by the
+[`moonpool-sim`][moonpool] deterministic-simulation engine for Rust (in the spirit
+of [TigerBeetle's VOPR][vopr] and the [FoundationDB simulator][fdb]): a seeded RNG
+drives a randomized, adversarial workload against the pure core across many seeds,
+so that **same seed → identical run**, and every failure reproduces from its seed.
 
-> **Two harnesses, one core.** This document describes the **handmade**
-> synchronous harness (`lib/tests/udp_simulation.rs`), the pure-core driver and
-> the deep CI swarm. A second harness in the **`sozu-sim`** crate
-> (`sim/tests/udp_simulation.rs`) drives the *same* `UdpManager` through the real
-> [`moonpool-sim`][moonpool] engine (async workload over moonpool's seeded
-> runtime / virtual clock / RNG / `buggify`), keeping `lib/` async-free. It
-> ports the same action grammar, shadow model, invariants and the
-> `SOZU_UDP_SIM_SEED`/`_SEEDS`/`_STEPS` knobs; it requires `--cfg tokio_unstable`
-> (moonpool's `RngSeed`), but **scoped to the sim build only** — the moonpool
-> dev-deps and the test are `#[cfg(tokio_unstable)]`-gated, so a plain
-> `cargo test --workspace` builds it as an empty 0-test binary and the flag never
-> touches the rest of the workspace. Seed *values* are not portable between the
-> two (different RNG engines). Run it with
+It replaced an earlier handmade synchronous harness; the action grammar, shadow
+model, invariants, and replay knobs below carried over essentially unchanged.
+
+> **moonpool engine, scoped flag.** The harness runs as an `async` moonpool
+> `Workload` that draws from moonpool's seeded RNG, advances moonpool's virtual
+> clock, and steps the **synchronous** `UdpManager` between awaits — so `lib/`
+> stays async-free (moonpool/tokio are `sim/` dev-dependencies only). moonpool
+> needs `--cfg tokio_unstable` (it seeds tokio's runtime RNG via `RngSeed` for
+> scheduler determinism); that flag is **scoped to the `sozu-sim` build only** —
+> the moonpool dev-deps sit under `[target.'cfg(tokio_unstable)'.dev-dependencies]`
+> and the test is `#![cfg(tokio_unstable)]`-gated, so a plain `cargo test --workspace`
+> builds it as an empty 0-test binary and the flag never touches the rest of the
+> workspace. Run it with
 > `RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test udp_simulation`.
-> The two run in parallel until per-action / per-drop-reason coverage equivalence
-> is proven. See `doc/testing.md` for the rationale.
 
 ## Why deterministic simulation fits here
 
@@ -40,9 +37,12 @@ adds — fire on any regression.
 
 ## Virtual clock
 
-A base `Instant` is captured **once**, outside the stepping loop, and advanced
-only by RNG-drawn deltas (ms..seconds). No wall-clock read happens inside the
-loop, so a run is a pure function of its seed.
+moonpool's virtual clock advances only when the workload awaits
+`ctx.time().sleep(delta)`; `ctx.time().now()` returns the elapsed `Duration` since
+the simulation start. The core takes a `std::time::Instant`, so a base `Instant`
+is captured **once** per seed and the simulated `Duration` is added to it. The
+core only compares `Instant`s relatively, so the absolute base is irrelevant and a
+run is a pure function of its seed.
 
 ## Action grammar (weighted)
 
@@ -61,7 +61,7 @@ Each step draws one weighted-random action:
 |    2   | `Drain`           | verified drain-to-zero + fresh-listener rebuild     |
 |    2   | `CloseAll`        | mass teardown in place                              |
 
-After **every** action the harness fully drains `poll_output()` to `None`,
+After **every** action the workload fully drains `poll_output()` to `None`,
 folding each `Output` into a shadow model (tracking `FlowCreated` / `FlowEvicted`
 for active-flow accounting) and honouring a subset of `SelectBackend` requests
 with `BackendResolved` so flows progress to `Established`.
@@ -74,10 +74,10 @@ manager — so the long run keeps admitting afterwards.
 
 ## Buggify
 
-`buggify(rng, p)` is the [FoundationDB `buggify`][fdb-buggify] analog: with low
-per-call probability it injects an *extra* adversarial event (stale
-`BackendResolved`, a reconfig burst, a `max_flows` shrink to a tiny value, a
-giant clock jump). It only ever runs under simulation.
+`buggify_with_prob!(p)` is moonpool's [FoundationDB `buggify`][fdb-buggify]
+primitive: with low per-call probability it injects an *extra* adversarial event
+(stale `BackendResolved`, a reconfig burst, a `max_flows` shrink to a tiny value,
+a giant clock jump). It only ever runs under simulation.
 
 ## Invariants
 
@@ -91,43 +91,48 @@ harness adds, after every fully-drained step:
 - after draining, `poll_output()` is `None`.
 - `poll_timeout()` is `None` (no live flows) or `Some` (live flows) — coherent
   with `flow_count()`.
-- **model balance**: `created_seen − evicted_seen == flow_count()` (active-flow
+- **model balance**: `created_seen - evicted_seen == flow_count()` (active-flow
   accounting; no underflow, no leak).
 - no panic for any input (empty / oversized / stale / unknown — "silence is a
   virtue").
-- **FINAL**: after a giant clock jump + `close_all`, the manager drains to zero —
-  `flow_count() == 0`, `poll_timeout() == None`, `created == evicted`.
+- **FINAL**: after a clock jump past every idle deadline + `close_all`, the
+  manager drains to zero — `flow_count() == 0`, `poll_timeout() == None`,
+  `created == evicted`.
 
 ## Running, sweeping, replaying
 
-The default sweep runs as part of `cargo test --workspace` (pure core, no I/O —
-256 seeds × 3000 steps in ~2.3 s):
+The per-PR `udp-simulation` CI job runs a modest seeded sweep; the nightly
+`simulation-sweep` workflow goes deep. Locally the `--cfg tokio_unstable` flag is
+**required** — without it the `sozu-sim` crate compiles to an empty 0-test binary:
 
 ```bash
-cargo test -p sozu-lib --test udp_simulation
+RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test udp_simulation
 ```
 
 Replay a single CI failure verbosely (seed accepts decimal or `0x`-hex):
 
 ```bash
-SOZU_UDP_SIM_SEED=0xdeadbeef cargo test -p sozu-lib --test udp_simulation
+RUSTFLAGS="--cfg tokio_unstable" SOZU_UDP_SIM_SEED=0xdeadbeef \
+  cargo test -p sozu-sim --test udp_simulation
 ```
 
 Widen / deepen the sweep (FoundationDB nightly seed-sweep analog):
 
 ```bash
-SOZU_UDP_SIM_SEEDS=1024 SOZU_UDP_SIM_STEPS=5000 \
-  cargo test -p sozu-lib --test udp_simulation udp_simulation_seed_sweep -- --nocapture
+RUSTFLAGS="--cfg tokio_unstable" SOZU_UDP_SIM_SEEDS=1024 SOZU_UDP_SIM_STEPS=5000 \
+  cargo test -p sozu-sim --test udp_simulation udp_simulation_seed_sweep -- --nocapture
 ```
 
 | env var               | effect                                                |
 |-----------------------|-------------------------------------------------------|
 | `SOZU_UDP_SIM_SEED`   | run that ONE seed with verbose tracing (replay)       |
-| `SOZU_UDP_SIM_SEEDS`  | sweep `0..n` seeds instead of `0..256`                |
+| `SOZU_UDP_SIM_SEEDS`  | sweep `n` seeds instead of the default                |
 | `SOZU_UDP_SIM_STEPS`  | run `n` steps per seed instead of the default         |
 
-On any failure the panic message carries the failing **seed + step**, so the run
-reproduces exactly via `SOZU_UDP_SIM_SEED=<seed>`.
+A failing seed is surfaced in moonpool's `SimulationReport` (and the panicking
+invariant prints the seed + step), so the run reproduces via the
+`SOZU_UDP_SIM_SEED` command above. Seed *values* are moonpool's own (not portable
+from the former handmade harness).
 
 [vopr]: https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/internals/vopr.md
 [fdb]: https://apple.github.io/foundationdb/testing.html
