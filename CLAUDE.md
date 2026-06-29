@@ -1,19 +1,20 @@
-Sōzu — a hot-reconfigurable HTTP/1.x + HTTP/2 reverse proxy (AGPL-3.0). Rust 2024 (MSRV 1.88.0, matching the `1.88.0` toolchain pinned in `rust-toolchain`). Upstream: `github.com/sozu-proxy/sozu`. The H2 multiplexer rewrite landed on `main` via PR #1209 (merged commit `98c56a4c`); subsequent hardening (parser, command IPC, metrics, audit fixes) builds on it.
+Sōzu — a hot-reconfigurable HTTP/1.x + HTTP/2 reverse proxy (AGPL-3.0). Rust 2024 (MSRV 1.91.0, matching the `1.91.0` toolchain pinned in `rust-toolchain`; bumped from 1.88.0 for the `sim/` crate's moonpool-sim dependency). Upstream: `github.com/sozu-proxy/sozu`. The H2 multiplexer rewrite landed on `main` via PR #1209 (merged commit `98c56a4c`); subsequent hardening (parser, command IPC, metrics, audit fixes) builds on it.
 
 This file is the primary agent instruction for the repo. It is symlinked to `AGENTS.md` so OpenAI Codex picks up the same content. Anthropic's global `~/.claude/CLAUDE.md` conventions (worktree-first, GPG sign-off, commitizen style) still apply and are not duplicated here.
 
 # Workspace
 
-Cargo workspace with four members (`resolver = "2"`):
+Cargo workspace with five members (`resolver = "2"`):
 
 - `command/` — `sozu-command-lib` (LGPL-3.0). Protobuf IPC schema, config parser, state, logging macros, channel + SCM FD passing. Control-plane library.
 - `lib/` — `sozu-lib` (AGPL-3.0). Event loop, protocols (H1, H2, TCP, TLS, proxy-protocol), routing, sockets, metrics, buffer pool. Single-threaded mio runtime.
 - `bin/` — `sozu` binary + internal lib. Master/worker multiprocess supervisor, CLI (clap), config loader, hot-upgrade orchestrator, unix-socket command server.
 - `e2e/` — `sozu-e2e`. Integration tests that spawn real workers + mock clients/backends. Enables `sozu-lib`'s `e2e-hooks` feature.
+- `sim/` — `sozu-sim` (AGPL-3.0, `publish = false`). Test-only home for moonpool-sim-driven deterministic simulations of the sans-io cores. The harness lives in `sim/tests/udp_simulation.rs`; moonpool-sim + tokio are **dev-dependencies** so the async closure never enters `sozu-lib`/`sozu` (the no-`async fn`-in-`lib/` rule holds). Requires `--cfg tokio_unstable` (moonpool's `RngSeed` runtime seeding), but **scoped to the sim build only** — the moonpool dev-deps live under `[target.'cfg(tokio_unstable)'.dev-dependencies]` and the test is `#![cfg(tokio_unstable)]`-gated, so a plain `cargo test --workspace` compiles `sozu-sim` to an empty 0-test binary and never sets the flag anywhere else. Run the sweep with `RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim`.
 
 `fuzz/` is an out-of-workspace cargo-fuzz crate with three targets: `fuzz_frame_parser`, `fuzz_hpack_decoder`, `fuzz_udp_flow`.
 
-Dependency graph: `lib → command`; `bin → lib + command`; `e2e → lib + command` (`e2e-hooks`).
+Dependency graph: `lib → command`; `bin → lib + command`; `e2e → lib + command` (`e2e-hooks`); `sim → lib` (dev-only, + moonpool-sim).
 
 # Build
 
@@ -52,14 +53,14 @@ Crypto-provider features live in `bin/Cargo.toml` + `lib/Cargo.toml`; CI exercis
 
 # Code style
 
-- **Edition 2024**, MSRV 1.88. Use 2024-only idioms freely.
+- **Edition 2024**, MSRV 1.91. Use 2024-only idioms freely.
 - **Errors**: `thiserror` for library error enums, `anyhow` at binary boundaries. Follow the nearest existing `thiserror::Error` enum; don't introduce new error crates.
 - **No panic on network-facing input.** In parser, socket, mux, TLS, command-channel, and config paths, convert invalid traffic into `SessionResult` / H2 `GOAWAY` / `RST_STREAM` / default HTTP answer + metric + contextual log. `unwrap`/`expect`/`panic!`/`unreachable!` are acceptable in tests and in hard internal invariants with useful messages.
 - **Ownership**: prefer `ToOwned::to_owned()` over `Clone::clone()` when going `&str → String` or `&[u8] → Vec<u8>` (clearer intent). Stick with `.clone()` when the type is already `Clone + !ToOwned`.
 - **Logging**: every protocol module defines its own `macro_rules! log_context!` / `log_context_lite!` / `log_module_context!` (see `protocol/mux/mod.rs:49/87/118`, `protocol/mux/router.rs:30`, `protocol/mux/connection.rs:40`, `protocol/mux/parser.rs:19`, `protocol/mux/pkawa.rs:25`, `protocol/mux/stream.rs:27`, `protocol/mux/converter.rs:24`, `protocol/rustls.rs:23`, `protocol/pipe.rs:26`, `protocol/kawa_h1/mod.rs:64`, `protocol/proxy_protocol/{expect,relay,send}.rs`, `tcp.rs:68`, `socket.rs:86/133`, `tls.rs`, `http.rs`, `https.rs`). Prefix tags `MUX`, `MUX-H1`, `MUX-H2`, `MUX-CONN`, `MUX-ROUTER`, `MUX-PARSER`, `MUX-PKAWA`, `MUX-STREAM`, `MUX-CONV`, `RUSTLS`, `SOCKET`, `PIPE`, `KAWA-H1`, `TCP`, `HTTP`, `HTTPS`, `TLS-RESOLVER`, `PROXY-EXPECT`, `PROXY-RELAY`, `PROXY-SEND` are load-bearing for log-search. Use the macros — do NOT call `log::info!`/`log::error!` directly from protocol code. When a macro has an `HttpContext` in scope, prefer `$http_ctx.log_context()` (`kawa_h1/editor.rs:587`) over hand-rolling a `LogContext { ... }` struct literal — the helper is canonical (see `rustls.rs:44`, `router.rs:67`) and renders the same `[session req cluster backend]` bracket as RUSTLS/PIPE/TCP. A regression guard at `lib/tests/log_layout.rs` (with a non-fatal `cargo:warning=` echo from `lib/build.rs`) catches drift; new sites must use the canonical envelope or join the `KNOWN_PREEXISTING_VIOLATIONS` allowlist if the legacy site is out of scope.
 - **Log levels**: `debug!`/`trace!` for expected idle closes, timeouts, noisy state. `warn!`/`error!` for real protocol errors or invariant breaks.
 - **Worker runtime is single-threaded per worker** — no `Arc<Mutex>` inside the event loop. Session state is slab-allocated.
-- **No `async fn` in `lib/`.** `lib/` is pure mio + edge-triggered epoll; introducing tokio/futures there is a design violation. `e2e/` may use tokio because it hosts hyper-based mock clients.
+- **No `async fn` in `lib/`.** `lib/` is pure mio + edge-triggered epoll; introducing tokio/futures there is a design violation. `e2e/` may use tokio because it hosts hyper-based mock clients, and `sim/` may use tokio (via moonpool-sim, dev-only) because it hosts the deterministic-simulation harness. `lib/` and `bin/` stay async-free.
 - **Metrics macros** live in `lib/src/metrics/mod.rs`: `incr!`, `count!`, `gauge!`, `gauge_add!`, `time!`. Update `doc/configure.md` when adding or renaming a public metric. Gauge underflow is a correctness bug, not a rounding issue.
 - **Don't hand-edit `command/src/proto/command.rs`.** It is regenerated by `prost-build` at build time and ignored by `rustfmt.toml`. Edit `command/src/command.proto` and let `build.rs` regenerate.
 - **New `unsafe` in hot paths needs an invariant comment + a test.** Existing `unsafe` in socket and H2 code is gated by explicit local invariants; new usage follows suit.
@@ -142,7 +143,7 @@ Crypto-provider features (`crypto-ring`, `crypto-aws-lc-rs`, `crypto-openssl`, `
 # Gotchas
 
 - **`protoc` missing** = `command/build.rs` fails before any Rust compiles. CI installs `protobuf-compiler` explicitly.
-- **`rust-toolchain` pins `1.88.0`** — local builds must match. CI still exercises stable/beta/nightly.
+- **`rust-toolchain` pins `1.91.0`** — local builds must match (bumped from 1.88.0; `Duration::from_hours`/`from_mins` used transitively via moonpool-sim are const-stable only since 1.91). CI still exercises stable/beta/nightly.
 - **Release strips `DEBUG`/`TRACE` logs** unless built with `--features logs-debug,logs-trace`.
 - **Repro for event-loop / zombie bugs**: `worker_count = 1`, `worker_automatic_restart = false`, `RUST_BACKTRACE=1`.
 - **`CHANGELOG.md` follows Keep-a-Changelog.** Update it when a change ships user-visible behavior (config keys, metrics, CLI flags).

@@ -61,13 +61,13 @@ To get started check out our [documentation](./doc/README.md) !
 
 - **Docker** images are published to [Docker Hub](https://hub.docker.com/r/clevercloud/sozu/) for every tagged release as `clevercloud/sozu:<VERSION>` and `clevercloud/sozu:latest` (stable tags only).
 
-  **Note on Docker images vs. signed tarballs.** `clevercloud/sozu:<VERSION>` is built from source by the same release workflow (`.github/workflows/release.yml`) but inside an Alpine builder stage that uses the distro's `cargo` and `rust` packages, not the `dtolnay/rust-toolchain@1.88.0` pin used for the Linux tarballs. The image therefore links musl libc and is **not** byte-equivalent to either the `gnu` or `musl` tarballs verified by the cosign-signed `SHA256SUMS`. SLSA build provenance currently covers the tarballs only. If you need the cosign-attested binary, extract `sozu-<VERSION>-x86_64-unknown-linux-musl.tar.gz` and run `sozu` directly. A from-tarball Docker image is tracked as a follow-up.
+  **Note on Docker images vs. signed tarballs.** `clevercloud/sozu:<VERSION>` is built from source by the same release workflow (`.github/workflows/release.yml`) but inside an Alpine builder stage that uses the distro's `cargo` and `rust` packages, not the `dtolnay/rust-toolchain@1.91.0` pin used for the Linux tarballs. The image therefore links musl libc and is **not** byte-equivalent to either the `gnu` or `musl` tarballs verified by the cosign-signed `SHA256SUMS`. SLSA build provenance currently covers the tarballs only. If you need the cosign-attested binary, extract `sozu-<VERSION>-x86_64-unknown-linux-musl.tar.gz` and run `sozu` directly. A from-tarball Docker image is tracked as a follow-up.
 
 - **From source.** See [`doc/getting_started.md`](./doc/getting_started.md) for compilation prerequisites (`protoc`, Rust toolchain pinned via `rust-toolchain`).
 
 ## Quickstart
 
-Once the prerequisites (`protoc`, Rust 1.88 via the pinned `rust-toolchain`) are installed, building and starting Sōzu takes two commands:
+Once the prerequisites (`protoc`, Rust 1.91 via the pinned `rust-toolchain`) are installed, building and starting Sōzu takes two commands:
 
 ```sh
 cargo build -p sozu --release --locked
@@ -78,12 +78,13 @@ target/release/sozu start -c bin/config.toml
 
 ## Exploring the source
 
-The Cargo workspace ships four crates (Rust 2024 edition, MSRV 1.88):
+The Cargo workspace ships five crates (Rust 2024 edition, MSRV 1.91):
 
 - `lib/`: the `sozu-lib` reverse proxy library hosts the single-threaded mio event loop, the HTTP/1.1 (Kawa) and HTTP/2 multiplexer, TCP, UDP, and TLS protocols, routing, per-IP rate limiting, sockets, metrics, and the buffer pool.
 - `bin/`: the `sozu` binary wraps the library in a master/worker supervisor, exposes the unix command socket, orchestrates hot reconfiguration and zero-downtime upgrades, and ships the optional `sozu top` TUI behind the `tui` feature.
 - `command/`: the `sozu-command-lib` ships the protobuf IPC schema, configuration parser, replicated state, length-prefixed channels, and SCM FD-passing helpers used by both `lib` and `bin`.
 - `e2e/`: the `sozu-e2e` integration harness spawns real workers plus mock clients and backends to exercise the H1, H2, TLS, PROXY-protocol, command-channel hardening, and listener/upgrade hot-reconfig paths.
+- `sim/`: the `sozu-sim` test-only crate (`publish = false`) hosts the moonpool-sim-driven deterministic simulation of the sans-io UDP core; moonpool and tokio are dev-dependencies, so `lib` and `bin` stay async-free.
 
 The `fuzz/` crate (`fuzz_frame_parser`, `fuzz_hpack_decoder`) lives outside the Cargo workspace and is built with `cargo +nightly fuzz` from inside `fuzz/`.
 

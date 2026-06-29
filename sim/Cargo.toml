@@ -1,0 +1,37 @@
+[package]
+name = "sozu-sim"
+description = "Deterministic-simulation harness (moonpool-sim) for sozu's sans-io cores"
+repository = "https://github.com/sozu-proxy/sozu"
+homepage = "https://sozu.io"
+version = "2.1.0"
+license = "AGPL-3.0"
+authors = [
+  "Eloi Demolis <eloi.demolis@clever-cloud.com>",
+  "Emmanuel Bosquet <emmanuel.bosquet@clever-cloud.com>",
+  "Florentin Dubois <florentin.dubois@clever-cloud.com>",
+]
+categories = ["network-programming", "development-tools::testing"]
+edition = "2024"
+rust-version = "1.91.0"
+# Test-only harness crate: never published, never linked by the `sozu` binary.
+publish = false
+
+# `#[cfg(tokio_unstable)]` gates the harness (see tests/udp_simulation.rs); declare
+# the cfg so it doesn't trip `unexpected_cfgs`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
+# The harness is an integration test (tests/udp_simulation.rs) gated on
+# `--cfg tokio_unstable` (which moonpool-sim needs for tokio `RngSeed` scheduler
+# determinism). Gating the dev-deps on the SAME cfg means cargo only resolves and
+# COMPILES the async moonpool/tokio closure when the flag is set — so a plain
+# `cargo test --workspace` (no flag) builds an empty 0-test binary here and never
+# pulls tokio_unstable into the rest of the workspace. Run the real sweep with:
+#   RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test udp_simulation
+[target.'cfg(tokio_unstable)'.dev-dependencies]
+async-trait = { workspace = true }
+# moonpool-sim drives the seeded runtime / virtual clock / RNG / fault injection.
+moonpool-sim = { workspace = true }
+# crypto-ring so sozu-lib resolves a rustls provider and compiles; the UDP core
+# under simulation never touches TLS.
+sozu-lib = { workspace = true, features = ["crypto-ring"] }
