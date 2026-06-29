@@ -207,8 +207,13 @@ jobs:
           prefix-key: ci-fuzz
           workspaces: . -> target/
 
+      # `+nightly` is REQUIRED here: the repo's `rust-toolchain` file pins
+      # 1.88.0, and that directory override beats the nightly default installed
+      # above. Without the explicit toolchain, `cargo install` runs under 1.88.0
+      # and cargo-fuzz's locked dep tree (cargo-platform 0.3.3, rust-version
+      # 1.91) fails the MSRV gate. The fuzz steps below use `cargo +nightly`.
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo +nightly install cargo-fuzz --locked
 
       # 300s per target × 3 targets = ~15 min wall, fits inside the
       # 30-min timeout with ~15 min slack for libFuzzer warm-up and
