@@ -249,19 +249,19 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     }
 
     fn reset_timeouts(&mut self) {
-        if let Some(t) = self.container_frontend_timeout.as_mut() {
-            if !t.reset() {
-                error!(
-                    "{} Could not reset front timeout (pipe)",
-                    log_context!(self)
-                );
-            }
+        if let Some(t) = self.container_frontend_timeout.as_mut()
+            && !t.reset()
+        {
+            error!(
+                "{} Could not reset front timeout (pipe)",
+                log_context!(self)
+            );
         }
 
-        if let Some(t) = self.container_backend_timeout.as_mut() {
-            if !t.reset() {
-                error!("{} Could not reset back timeout (pipe)", log_context!(self));
-            }
+        if let Some(t) = self.container_backend_timeout.as_mut()
+            && !t.reset()
+        {
+            error!("{} Could not reset back timeout (pipe)", log_context!(self));
         }
     }
 

@@ -108,12 +108,12 @@ fn is_prime(x: usize) -> bool {
     if x < 2 {
         return false;
     }
-    if x % 2 == 0 {
+    if x.is_multiple_of(2) {
         return x == 2;
     }
     let mut d = 3;
     while d * d <= x {
-        if x % d == 0 {
+        if x.is_multiple_of(d) {
             return false;
         }
         d += 2;
@@ -816,18 +816,18 @@ impl LoadBalancingAlgorithm for Maglev {
             );
             // Resolve the table's backend index back to an address captured at
             // the last rebuild, then look it up in the live healthy subset.
-            if let Some(addr) = self.backend_addrs.get(idx) {
-                if let Some(backend) = backends.iter().find(|b| b.borrow().address == *addr) {
-                    // The chosen backend is, by construction, a member of the
-                    // healthy subset we were handed.
-                    debug_assert!(
-                        backends
-                            .iter()
-                            .any(|b| b.borrow().address == backend.borrow().address),
-                        "Maglev must return a backend from the healthy subset"
-                    );
-                    return Some(backend.clone());
-                }
+            if let Some(addr) = self.backend_addrs.get(idx)
+                && let Some(backend) = backends.iter().find(|b| b.borrow().address == *addr)
+            {
+                // The chosen backend is, by construction, a member of the
+                // healthy subset we were handed.
+                debug_assert!(
+                    backends
+                        .iter()
+                        .any(|b| b.borrow().address == backend.borrow().address),
+                    "Maglev must return a backend from the healthy subset"
+                );
+                return Some(backend.clone());
             }
         }
 

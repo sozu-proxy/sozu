@@ -344,16 +344,16 @@ impl Router {
                 return Err(BackendConnectionError::MaxSessionsMemory);
             }
             // For reused backends: set context fields and metrics lifecycle
-            if let Some(backend_conn) = self.backends.get(&token) {
-                if let Position::Client(_, backend_ref, _) = backend_conn.position() {
-                    let backend = backend_ref.borrow();
-                    let stream = &mut context.streams[stream_id];
-                    stream.context.backend_id = Some(backend.backend_id.to_owned());
-                    stream.context.backend_address = Some(backend.address);
-                    stream.metrics.backend_id = Some(backend.backend_id.to_owned());
-                    stream.metrics.backend_start();
-                    stream.metrics.backend_connected();
-                }
+            if let Some(backend_conn) = self.backends.get(&token)
+                && let Position::Client(_, backend_ref, _) = backend_conn.position()
+            {
+                let backend = backend_ref.borrow();
+                let stream = &mut context.streams[stream_id];
+                stream.context.backend_id = Some(backend.backend_id.to_owned());
+                stream.context.backend_address = Some(backend.address);
+                stream.metrics.backend_id = Some(backend.backend_id.to_owned());
+                stream.metrics.backend_start();
+                stream.metrics.backend_connected();
             }
             context.link_stream(stream_id, token);
             return Ok(());
@@ -988,21 +988,20 @@ fn apply_request_rewrites_and_headers(
     // be mutated so an H1 frontend forwarding to an H1 backend AND an
     // H2 frontend forwarding to an H1 backend (or vice versa) see the
     // rewritten target on the wire.
-    if rewritten_host.is_some() || rewritten_path.is_some() {
-        if let kawa::StatusLine::Request {
+    if (rewritten_host.is_some() || rewritten_path.is_some())
+        && let kawa::StatusLine::Request {
             authority,
             path,
             uri,
             ..
         } = &mut kawa.detached.status_line
-        {
-            if let Some(new_host) = rewritten_host {
-                *authority = Store::from_string(new_host.to_owned());
-            }
-            if let Some(new_path) = rewritten_path {
-                *path = Store::from_string(new_path.to_owned());
-                *uri = Store::from_string(new_path.to_owned());
-            }
+    {
+        if let Some(new_host) = rewritten_host {
+            *authority = Store::from_string(new_host.to_owned());
+        }
+        if let Some(new_path) = rewritten_path {
+            *path = Store::from_string(new_path.to_owned());
+            *uri = Store::from_string(new_path.to_owned());
         }
     }
 

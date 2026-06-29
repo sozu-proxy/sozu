@@ -459,23 +459,23 @@ impl CertificateResolver {
         let new_cert = CertifiedKeyWrapper::try_from(&add)?;
         let new_fingerprint = new_cert.fingerprint.to_owned();
 
-        if let Ok(old_fingerprint) = Fingerprint::from_str(&replace.old_fingerprint) {
-            if old_fingerprint == new_fingerprint {
-                // Idempotent replace: the new cert is byte-identical to the
-                // one already serving this name. Removing `old == new` would
-                // delete the entry the caller meant to keep, so we must NOT
-                // touch the store — assert it is untouched on this path.
-                let stored_before = self.certificates.contains_key(&new_fingerprint);
-                // Re-publish the expiration gauge so dashboards observe the
-                // replace request even when the certificate set is unchanged.
-                self.publish_min_expiration_gauge();
-                debug_assert_eq!(
-                    self.certificates.contains_key(&new_fingerprint),
-                    stored_before,
-                    "idempotent replace must not change whether the cert is stored"
-                );
-                return Ok(new_fingerprint);
-            }
+        if let Ok(old_fingerprint) = Fingerprint::from_str(&replace.old_fingerprint)
+            && old_fingerprint == new_fingerprint
+        {
+            // Idempotent replace: the new cert is byte-identical to the
+            // one already serving this name. Removing `old == new` would
+            // delete the entry the caller meant to keep, so we must NOT
+            // touch the store — assert it is untouched on this path.
+            let stored_before = self.certificates.contains_key(&new_fingerprint);
+            // Re-publish the expiration gauge so dashboards observe the
+            // replace request even when the certificate set is unchanged.
+            self.publish_min_expiration_gauge();
+            debug_assert_eq!(
+                self.certificates.contains_key(&new_fingerprint),
+                stored_before,
+                "idempotent replace must not change whether the cert is stored"
+            );
+            return Ok(new_fingerprint);
         }
 
         let new_fingerprint = self.add_certificate(&add)?;

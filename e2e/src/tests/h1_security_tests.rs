@@ -392,12 +392,12 @@ fn try_h1_smuggling_te_te_obfuscated() -> State {
     // Try to receive on any existing backend connection first, then accept new.
     let mut served = false;
     for cid in 0..health_client_id {
-        if let Some(data) = backend.receive(cid) {
-            if data.contains("GET /healthz") {
-                backend.send(cid);
-                served = true;
-                break;
-            }
+        if let Some(data) = backend.receive(cid)
+            && data.contains("GET /healthz")
+        {
+            backend.send(cid);
+            served = true;
+            break;
         }
     }
     if !served {
@@ -1098,12 +1098,12 @@ fn try_h1_chunked_encoding_edge_cases() -> State {
     // Try existing connections first, then accept a new one.
     let mut served = false;
     for cid in 0..health_id {
-        if let Some(data) = backend.receive(cid) {
-            if data.contains("GET /healthz") {
-                backend.send(cid);
-                served = true;
-                break;
-            }
+        if let Some(data) = backend.receive(cid)
+            && data.contains("GET /healthz")
+        {
+            backend.send(cid);
+            served = true;
+            break;
         }
     }
     if !served {

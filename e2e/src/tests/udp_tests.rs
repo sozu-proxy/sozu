@@ -215,10 +215,10 @@ fn try_udp_round_robin_distribution() -> State {
     let mut hit: HashMap<String, usize> = HashMap::new();
     for i in 0..6 {
         let client = UdpClient::new(format!("C{i}"), front);
-        if let Some(reply) = client.round_trip(format!("q{i}").as_bytes(), RT) {
-            if let Some((name, _)) = strip_reply_tag(&reply) {
-                *hit.entry(name).or_default() += 1;
-            }
+        if let Some(reply) = client.round_trip(format!("q{i}").as_bytes(), RT)
+            && let Some((name, _)) = strip_reply_tag(&reply)
+        {
+            *hit.entry(name).or_default() += 1;
         }
     }
 
@@ -839,10 +839,9 @@ fn try_udp_failopen_some_backends_down() -> State {
         let client = UdpClient::new(format!("F{i}"), front);
         if let Some(reply) =
             client.round_trip(format!("p{i}").as_bytes(), Duration::from_millis(600))
+            && strip_reply_tag(&reply).is_some()
         {
-            if strip_reply_tag(&reply).is_some() {
-                served += 1;
-            }
+            served += 1;
         }
     }
 
@@ -952,10 +951,10 @@ fn try_udp_affinity_source_ip_port() -> State {
     let client = UdpClient::new("C", front);
     let mut chosen: Vec<String> = Vec::new();
     for i in 0..3 {
-        if let Some(reply) = client.round_trip(format!("k{i}").as_bytes(), RT) {
-            if let Some((name, _)) = strip_reply_tag(&reply) {
-                chosen.push(name);
-            }
+        if let Some(reply) = client.round_trip(format!("k{i}").as_bytes(), RT)
+            && let Some((name, _)) = strip_reply_tag(&reply)
+        {
+            chosen.push(name);
         }
     }
 

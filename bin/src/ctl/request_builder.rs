@@ -189,13 +189,13 @@ impl CommandManager {
                 // ports are 16-bit. Reject out-of-range values up front so
                 // a typo doesn't render `Location: https://host:70000/...`
                 // on the wire.
-                if let Some(port) = https_redirect_port {
-                    if port == 0 || port > u16::MAX as u32 {
-                        return Err(CtlError::ArgsNeeded(
-                            "TCP port in 1..=65535".to_string(),
-                            format!("got https_redirect_port={port}"),
-                        ));
-                    }
+                if let Some(port) = https_redirect_port
+                    && (port == 0 || port > u16::MAX as u32)
+                {
+                    return Err(CtlError::ArgsNeeded(
+                        "TCP port in 1..=65535".to_string(),
+                        format!("got https_redirect_port={port}"),
+                    ));
                 }
 
                 // Resolve each `--answer code=value` entry. The
@@ -1418,13 +1418,13 @@ fn build_http_frontend_add(cmd: HttpFrontendCmd) -> Result<RequestHttpFrontend, 
         }),
     };
 
-    if let Some(port) = rewrite_port {
-        if port == 0 || port > u16::MAX as u32 {
-            return Err(CtlError::ArgsNeeded(
-                "TCP port in 1..=65535".to_owned(),
-                format!("got rewrite_port={port}"),
-            ));
-        }
+    if let Some(port) = rewrite_port
+        && (port == 0 || port > u16::MAX as u32)
+    {
+        return Err(CtlError::ArgsNeeded(
+            "TCP port in 1..=65535".to_owned(),
+            format!("got rewrite_port={port}"),
+        ));
     }
 
     // Each `--header` entry is `<position>=<key>=<value>`. Split on the

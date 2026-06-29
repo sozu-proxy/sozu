@@ -1202,16 +1202,16 @@ impl ListenerBuilder {
         }
 
         let max_flows = self.max_flows.unwrap_or(DEFAULT_UDP_MAX_FLOWS);
-        if max_flows > 0 {
-            if let Some(soft_limit) = soft_rlimit_nofile() {
-                let advisory = soft_limit.saturating_mul(7) / 10;
-                if u64::from(max_flows) > advisory {
-                    warn!(
-                        "UDP listener {}: max_flows = {} exceeds ~70% of the soft RLIMIT_NOFILE ({}); \
+        if max_flows > 0
+            && let Some(soft_limit) = soft_rlimit_nofile()
+        {
+            let advisory = soft_limit.saturating_mul(7) / 10;
+            if u64::from(max_flows) > advisory {
+                warn!(
+                    "UDP listener {}: max_flows = {} exceeds ~70% of the soft RLIMIT_NOFILE ({}); \
                          per-flow connected sockets may hit EMFILE",
-                        self.address, max_flows, advisory
-                    );
-                }
+                    self.address, max_flows, advisory
+                );
             }
         }
 
@@ -1364,19 +1364,13 @@ pub fn load_answers(
 ///   cardinality).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum MetricDetailLevel {
     Process,
     Frontend,
+    #[default]
     Cluster,
     Backend,
-}
-
-impl Default for MetricDetailLevel {
-    fn default() -> Self {
-        // Preserve the historical (pre-knob) behaviour: cluster-scoped
-        // metrics are emitted by default.
-        Self::Cluster
-    }
 }
 
 impl From<MetricDetailLevel> for MetricDetail {

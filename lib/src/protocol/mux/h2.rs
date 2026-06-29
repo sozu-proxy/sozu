@@ -2412,15 +2412,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.cancel_timed_out_streams(context, &mut endpoint);
 
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
-        if let Some(sent_at) = self.settings_sent_at {
-            if sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT {
-                warn!(
-                    "{} SETTINGS ACK timeout: no SETTINGS ACK observed within {:?}",
-                    log_context!(self),
-                    SETTINGS_ACK_TIMEOUT
-                );
-                return self.goaway(H2Error::SettingsTimeout);
-            }
+        if let Some(sent_at) = self.settings_sent_at
+            && sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT
+        {
+            warn!(
+                "{} SETTINGS ACK timeout: no SETTINGS ACK observed within {:?}",
+                log_context!(self),
+                SETTINGS_ACK_TIMEOUT
+            );
+            return self.goaway(H2Error::SettingsTimeout);
         }
 
         // Don't reset the timeout unconditionally here. Only application data
@@ -3001,10 +3001,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     // later streams in the same 'outer iteration see the live
                     // count, not the snapshot. Missing this costs one voluntary
                     // yield per same-urgency peer that trails the RST.
-                    if freshly_rst && is_incremental {
-                        if let Some(c) = ready_incremental_by_urgency.get_mut(&urgency) {
-                            *c = c.saturating_sub(1);
-                        }
+                    if freshly_rst
+                        && is_incremental
+                        && let Some(c) = ready_incremental_by_urgency.get_mut(&urgency)
+                    {
+                        *c = c.saturating_sub(1);
                     }
                     // Account for the RST that `initialize` is about to emit
                     // for this stream. Without this the MadeYouReset lifetime
@@ -3080,10 +3081,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     // Defer accounting until after `drop(converter)`; same
                     // reason as the pre-prepare collector above.
                     freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
-                    if is_incremental {
-                        if let Some(c) = ready_incremental_by_urgency.get_mut(&urgency) {
-                            *c = c.saturating_sub(1);
-                        }
+                    if is_incremental
+                        && let Some(c) = ready_incremental_by_urgency.get_mut(&urgency)
+                    {
+                        *c = c.saturating_sub(1);
                     }
                 }
                 consumed = window - converter.window;
@@ -3120,10 +3121,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // be killed by `cancel_timed_out_streams` mid-delivery — the
             // inbound-only refresh at h2.rs:3887-3895 / 4026-4031 never
             // fires while the peer is idle.
-            if stream_bytes > 0 {
-                if let Some(t) = self.stream_last_activity_at.get_mut(&stream_id) {
-                    *t = Instant::now();
-                }
+            if stream_bytes > 0
+                && let Some(t) = self.stream_last_activity_at.get_mut(&stream_id)
+            {
+                *t = Instant::now();
             }
             // Arm/age the dedicated flow-control-stall deadline that catches a
             // window-stalled stream — a buffered RESPONSE to a slow frontend
@@ -3201,10 +3202,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     // LIFECYCLE §9 invariant 17: decrement INSIDE 'outer so
                     // later iterations see the reduced count. The post-loop
                     // retirement at remove_dead_stream is too late.
-                    if is_incremental {
-                        if let Some(c) = ready_incremental_by_urgency.get_mut(&urgency) {
-                            *c = c.saturating_sub(1);
-                        }
+                    if is_incremental
+                        && let Some(c) = ready_incremental_by_urgency.get_mut(&urgency)
+                    {
+                        *c = c.saturating_sub(1);
                     }
                 }
             }
@@ -3576,15 +3577,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
 
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
-        if let Some(sent_at) = self.settings_sent_at {
-            if sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT {
-                warn!(
-                    "{} SETTINGS ACK timeout: no SETTINGS ACK observed within {:?}",
-                    log_context!(self),
-                    SETTINGS_ACK_TIMEOUT
-                );
-                return Some(self.goaway(H2Error::SettingsTimeout));
-            }
+        if let Some(sent_at) = self.settings_sent_at
+            && sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT
+        {
+            warn!(
+                "{} SETTINGS ACK timeout: no SETTINGS ACK observed within {:?}",
+                log_context!(self),
+                SETTINGS_ACK_TIMEOUT
+            );
+            return Some(self.goaway(H2Error::SettingsTimeout));
         }
 
         // Stage — resume zero-buffer flush.
@@ -4381,10 +4382,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     fn account_emitted_rst(&mut self, error: H2Error) -> Option<MuxResult> {
         incr!(names::h2::FRAMES_TX_RST_STREAM);
         count!(metric_for_rst_stream_sent(error), 1);
-        if !matches!(error, H2Error::NoError) {
-            if let Some(violation) = self.flood_detector.record_rst_emitted() {
-                return Some(self.handle_flood_violation(violation));
-            }
+        if !matches!(error, H2Error::NoError)
+            && let Some(violation) = self.flood_detector.record_rst_emitted()
+        {
+            return Some(self.handle_flood_violation(violation));
         }
         None
     }
@@ -5054,10 +5055,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return true;
         }
         // 1xx, 204, 304 status codes
-        if let Some(status) = context.status {
-            if (100..200).contains(&status) || status == 204 || status == 304 {
-                return true;
-            }
+        if let Some(status) = context.status
+            && ((100..200).contains(&status) || status == 204 || status == 304)
+        {
+            return true;
         }
         false
     }
@@ -5142,32 +5143,31 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // RFC 9113 §8.1.1: if Content-Length is present, total DATA payload
         // must not exceed the declared length (check on every frame).
         // RFC 9110 §8.6: skip for HEAD/1xx/204/304 responses (body absent by definition).
-        if !cl_exempt {
-            if let Some(expected) = declared_length {
-                if data_received > expected {
-                    error!(
-                        "{} Content-Length mismatch: received {} > declared {}",
-                        log_context!(self),
-                        data_received,
-                        expected
-                    );
-                    // Pair WRITABLE arming with the queued connection-level
-                    // WINDOW_UPDATE before returning; otherwise the credit sits
-                    // until the next inbound frame on this connection.
-                    if !self.flow_control.pending_window_updates.is_empty() {
-                        self.readiness.arm_writable();
-                    }
-                    let result = self.reset_stream(
-                        data.stream_id,
-                        global_stream_id,
-                        context,
-                        endpoint,
-                        H2Error::ProtocolError,
-                    );
-                    self.remove_dead_stream(data.stream_id, global_stream_id);
-                    return result;
-                }
+        if !cl_exempt
+            && let Some(expected) = declared_length
+            && data_received > expected
+        {
+            error!(
+                "{} Content-Length mismatch: received {} > declared {}",
+                log_context!(self),
+                data_received,
+                expected
+            );
+            // Pair WRITABLE arming with the queued connection-level
+            // WINDOW_UPDATE before returning; otherwise the credit sits
+            // until the next inbound frame on this connection.
+            if !self.flow_control.pending_window_updates.is_empty() {
+                self.readiness.arm_writable();
             }
+            let result = self.reset_stream(
+                data.stream_id,
+                global_stream_id,
+                context,
+                endpoint,
+                H2Error::ProtocolError,
+            );
+            self.remove_dead_stream(data.stream_id, global_stream_id);
+            return result;
         }
 
         let stream = &mut context.streams[global_stream_id];
@@ -5198,10 +5198,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Empty DATA frames (CVE-2019-9518 vector) must NOT reset the timer,
         // otherwise an attacker can keep a stream alive indefinitely with
         // zero-length frames while pinning a MAX_CONCURRENT_STREAMS slot.
-        if content_len > 0 {
-            if let Some(t) = self.stream_last_activity_at.get_mut(&data.stream_id) {
-                *t = Instant::now();
-            }
+        if content_len > 0
+            && let Some(t) = self.stream_last_activity_at.get_mut(&data.stream_id)
+        {
+            *t = Instant::now();
         }
 
         if is_unlinked {
@@ -5248,26 +5248,25 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             if data.end_stream {
                 // RFC 9113 §8.1.1: on end_stream, total DATA must equal Content-Length.
                 // RFC 9110 §8.6: skip for HEAD/1xx/204/304 responses.
-                if !cl_exempt {
-                    if let Some(expected) = declared_length {
-                        if data_received != expected {
-                            error!(
-                                "{} Content-Length mismatch: received {} != declared {}",
-                                log_context!(self),
-                                data_received,
-                                expected
-                            );
-                            let result = self.reset_stream(
-                                data.stream_id,
-                                global_stream_id,
-                                context,
-                                endpoint,
-                                H2Error::ProtocolError,
-                            );
-                            self.remove_dead_stream(data.stream_id, global_stream_id);
-                            return result;
-                        }
-                    }
+                if !cl_exempt
+                    && let Some(expected) = declared_length
+                    && data_received != expected
+                {
+                    error!(
+                        "{} Content-Length mismatch: received {} != declared {}",
+                        log_context!(self),
+                        data_received,
+                        expected
+                    );
+                    let result = self.reset_stream(
+                        data.stream_id,
+                        global_stream_id,
+                        context,
+                        endpoint,
+                        H2Error::ProtocolError,
+                    );
+                    self.remove_dead_stream(data.stream_id, global_stream_id);
+                    return result;
                 }
                 let is_chunked = kawa.body_size == kawa::BodySize::Chunked;
                 kawa.push_block(kawa::Block::Flags(kawa::Flags {
@@ -5343,18 +5342,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             *t = Instant::now();
         }
 
-        if let Some(priority) = &headers.priority {
-            if self.prioriser.push_priority(stream_id, priority.clone()) {
-                self.reset_stream(
-                    stream_id,
-                    global_stream_id,
-                    context,
-                    endpoint,
-                    H2Error::ProtocolError,
-                );
-                self.remove_dead_stream(stream_id, global_stream_id);
-                return MuxResult::Continue;
-            }
+        if let Some(priority) = &headers.priority
+            && self.prioriser.push_priority(stream_id, priority.clone())
+        {
+            self.reset_stream(
+                stream_id,
+                global_stream_id,
+                context,
+                endpoint,
+                H2Error::ProtocolError,
+            );
+            self.remove_dead_stream(stream_id, global_stream_id);
+            return MuxResult::Continue;
         }
 
         let stream = &mut context.streams[global_stream_id];
@@ -5402,24 +5401,24 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // RFC 9110 §8.6: skip for HEAD/1xx/204/304 responses.
             if !was_initial && !self.content_length_exempt(&stream.context) {
                 let parts = stream.split(&self.position);
-                if let kawa::BodySize::Length(expected) = parts.rbuffer.body_size {
-                    if *parts.data_received != expected {
-                        error!(
-                            "{} Content-Length mismatch on trailers: received {} != declared {}",
-                            log_context!(self),
-                            *parts.data_received,
-                            expected
-                        );
-                        let result = self.reset_stream(
-                            stream_id,
-                            global_stream_id,
-                            context,
-                            endpoint,
-                            H2Error::ProtocolError,
-                        );
-                        self.remove_dead_stream(stream_id, global_stream_id);
-                        return result;
-                    }
+                if let kawa::BodySize::Length(expected) = parts.rbuffer.body_size
+                    && *parts.data_received != expected
+                {
+                    error!(
+                        "{} Content-Length mismatch on trailers: received {} != declared {}",
+                        log_context!(self),
+                        *parts.data_received,
+                        expected
+                    );
+                    let result = self.reset_stream(
+                        stream_id,
+                        global_stream_id,
+                        context,
+                        endpoint,
+                        H2Error::ProtocolError,
+                    );
+                    self.remove_dead_stream(stream_id, global_stream_id);
+                    return result;
                 }
             }
             self.mark_end_of_stream(stream);
@@ -8611,10 +8610,8 @@ mod tests {
         let urgency: u8 = 1;
         let is_incremental = true;
         // Simulate a stream in urgency=1 going ineligible mid-pass.
-        if is_incremental {
-            if let Some(c) = map.get_mut(&urgency) {
-                *c = c.saturating_sub(1);
-            }
+        if is_incremental && let Some(c) = map.get_mut(&urgency) {
+            *c = c.saturating_sub(1);
         }
         assert_eq!(map.get(&1), Some(&2), "urgency-1 bucket must drop to 2");
         assert_eq!(map.get(&3), Some(&2), "urgency-3 bucket untouched");
@@ -8634,10 +8631,8 @@ mod tests {
     fn ready_incremental_bucket_decrement_skipped_for_non_incremental() {
         let mut map = make_bucket(&[(1, 3)]);
         let is_incremental = false;
-        if is_incremental {
-            if let Some(c) = map.get_mut(&1) {
-                *c = c.saturating_sub(1);
-            }
+        if is_incremental && let Some(c) = map.get_mut(&1) {
+            *c = c.saturating_sub(1);
         }
         assert_eq!(
             map.get(&1),

@@ -138,10 +138,8 @@ pub fn begin_main_process(args: &Args) -> Result<(), StartError> {
     // the forked new master will own its own `READY=1` / `STOPPING=1`
     // lifecycle. An old-master `STOPPING=1` here would race the new
     // master's `MAINPID=` and flip the unit to inactive prematurely.
-    if !upgrading {
-        if let Err(e) = sd_notify::notify(sd_notify::STATE_STOPPING) {
-            warn!("could not notify systemd STOPPING=1: {}", e);
-        }
+    if !upgrading && let Err(e) = sd_notify::notify(sd_notify::STATE_STOPPING) {
+        warn!("could not notify systemd STOPPING=1: {}", e);
     }
 
     info!("main process stopped");

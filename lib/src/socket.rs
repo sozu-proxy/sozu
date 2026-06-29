@@ -1331,13 +1331,13 @@ pub fn udp_connect(backend: SocketAddr) -> Result<UdpSocket, ServerBindError> {
         }
     }
     // `connect` pinned the peer 4-tuple — `getpeername(2)` must echo the backend.
-    if let Ok(peer) = sock.peer_addr() {
-        if let Some(peer) = peer.as_socket() {
-            debug_assert_eq!(
-                peer, backend,
-                "connect must pin the peer to the requested backend (symmetric-NAT return-demux key)"
-            );
-        }
+    if let Ok(peer) = sock.peer_addr()
+        && let Some(peer) = peer.as_socket()
+    {
+        debug_assert_eq!(
+            peer, backend,
+            "connect must pin the peer to the requested backend (symmetric-NAT return-demux key)"
+        );
     }
 
     Ok(UdpSocket::from_std(sock.into()))

@@ -631,13 +631,13 @@ pub(super) fn parse_rfc9218_priority(value: &[u8]) -> (u8, bool) {
         }
         if token.len() >= 3 && token[0] == b'u' && token[1] == b'=' {
             // Parse `u=N` where N may be a multi-digit value (clamped to 0-7)
-            if let Ok(s) = std::str::from_utf8(&token[2..]) {
-                if let Ok(n) = s.parse::<u8>() {
-                    urgency = n.min(7);
-                    // The `.min(7)` clamp is the only writer of `urgency` after
-                    // the default; it can never leave the RFC 9218 §4 range.
-                    debug_assert!(urgency <= 7, "clamped urgency must stay within 0..=7");
-                }
+            if let Ok(s) = std::str::from_utf8(&token[2..])
+                && let Ok(n) = s.parse::<u8>()
+            {
+                urgency = n.min(7);
+                // The `.min(7)` clamp is the only writer of `urgency` after
+                // the default; it can never leave the RFC 9218 §4 range.
+                debug_assert!(urgency <= 7, "clamped urgency must stay within 0..=7");
             }
         } else if token == b"i" || token == b"i=?1" {
             incremental = true;

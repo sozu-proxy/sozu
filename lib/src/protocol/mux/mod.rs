@@ -1051,15 +1051,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             // discards the receive buffer and elicits TCP RST, truncating the
                             // already-queued response. Canonical write-up: `lib/src/https.rs:650-655`.
                             // Backend sockets follow the same discipline for symmetry.
-                            if let Err(e) = socket.shutdown(Shutdown::Write) {
-                                if e.kind() != ErrorKind::NotConnected {
-                                    error!(
-                                        "{} error shutting down back socket({:?}): {:?}",
-                                        log_context!(self),
-                                        socket,
-                                        e
-                                    );
-                                }
+                            if let Err(e) = socket.shutdown(Shutdown::Write)
+                                && e.kind() != ErrorKind::NotConnected
+                            {
+                                error!(
+                                    "{} error shutting down back socket({:?}): {:?}",
+                                    log_context!(self),
+                                    socket,
+                                    e
+                                );
                             }
                         } else {
                             error!("{} session {:?} has no backend!", log_context!(self), token);
@@ -1770,15 +1770,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             // discards the receive buffer and elicits TCP RST, truncating the
             // already-queued response. Canonical write-up: `lib/src/https.rs:650-655`.
             // Backend sockets follow the same discipline for symmetry.
-            if let Err(e) = socket.shutdown(Shutdown::Write) {
-                if e.kind() != ErrorKind::NotConnected {
-                    error!(
-                        "{} error shutting down back socket({:?}): {:?}",
-                        log_context_lite!(self),
-                        socket,
-                        e
-                    );
-                }
+            if let Err(e) = socket.shutdown(Shutdown::Write)
+                && e.kind() != ErrorKind::NotConnected
+            {
+                error!(
+                    "{} error shutting down back socket({:?}): {:?}",
+                    log_context_lite!(self),
+                    socket,
+                    e
+                );
             }
             if !proxy_borrow.remove_session(*token) {
                 error!(

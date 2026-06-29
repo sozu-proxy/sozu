@@ -365,10 +365,8 @@ impl Server {
                 ),
             "read-only / non-transition verbs must not open the systemd reload window"
         );
-        if mutating {
-            if let Err(e) = sd_notify::notify(sd_notify::STATE_RELOADING) {
-                warn!("could not notify systemd RELOADING=1: {}", e);
-            }
+        if mutating && let Err(e) = sd_notify::notify(sd_notify::STATE_RELOADING) {
+            warn!("could not notify systemd RELOADING=1: {}", e);
         }
 
         match request_type {
@@ -453,10 +451,8 @@ impl Server {
             }
         }
 
-        if mutating {
-            if let Err(e) = sd_notify::notify(sd_notify::STATE_READY) {
-                warn!("could not notify systemd READY=1: {}", e);
-            }
+        if mutating && let Err(e) = sd_notify::notify(sd_notify::STATE_READY) {
+            warn!("could not notify systemd READY=1: {}", e);
         }
     }
 

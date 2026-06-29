@@ -1030,42 +1030,42 @@ impl HttpContext {
 
         // If the sticky_session is set and differs from the one found in the request
         // create a "Set-Cookie" header to update the sticky_name value
-        if let Some(sticky_session) = &self.sticky_session {
-            if self.sticky_session != self.sticky_session_found {
-                let blocks_before = response.blocks.len();
-                let mut cookie_buf =
-                    Vec::with_capacity(self.sticky_name.len() + 1 + sticky_session.len() + 8);
-                cookie_buf.extend_from_slice(self.sticky_name.as_bytes());
-                cookie_buf.push(b'=');
-                cookie_buf.extend_from_slice(sticky_session.as_bytes());
-                cookie_buf.extend_from_slice(b"; Path=/");
-                // The cookie value is `name=session; Path=/`, built from the
-                // proxy-controlled sticky name + session id — assert it is
-                // well-formed (contains the `=` separator, ends with the
-                // attribute suffix) and CR/LF-free so it cannot inject an
-                // extra Set-Cookie / split the response (CWE-113).
-                debug_assert!(
-                    cookie_buf.contains(&b'='),
-                    "the Set-Cookie value must carry the name=value separator"
-                );
-                debug_assert!(
-                    cookie_buf.ends_with(b"; Path=/"),
-                    "the Set-Cookie value must end with the Path attribute"
-                );
-                debug_assert!(
-                    is_crlf_free(&cookie_buf),
-                    "the synthesised Set-Cookie value must be CR/LF-free (anti-injection)"
-                );
-                response.push_block(kawa::Block::Header(kawa::Pair {
-                    key: kawa::Store::Static(b"Set-Cookie"),
-                    val: kawa::Store::from_vec(cookie_buf),
-                }));
-                debug_assert_eq!(
-                    response.blocks.len(),
-                    blocks_before + 1,
-                    "synthesising Set-Cookie must push exactly one block"
-                );
-            }
+        if let Some(sticky_session) = &self.sticky_session
+            && self.sticky_session != self.sticky_session_found
+        {
+            let blocks_before = response.blocks.len();
+            let mut cookie_buf =
+                Vec::with_capacity(self.sticky_name.len() + 1 + sticky_session.len() + 8);
+            cookie_buf.extend_from_slice(self.sticky_name.as_bytes());
+            cookie_buf.push(b'=');
+            cookie_buf.extend_from_slice(sticky_session.as_bytes());
+            cookie_buf.extend_from_slice(b"; Path=/");
+            // The cookie value is `name=session; Path=/`, built from the
+            // proxy-controlled sticky name + session id — assert it is
+            // well-formed (contains the `=` separator, ends with the
+            // attribute suffix) and CR/LF-free so it cannot inject an
+            // extra Set-Cookie / split the response (CWE-113).
+            debug_assert!(
+                cookie_buf.contains(&b'='),
+                "the Set-Cookie value must carry the name=value separator"
+            );
+            debug_assert!(
+                cookie_buf.ends_with(b"; Path=/"),
+                "the Set-Cookie value must end with the Path attribute"
+            );
+            debug_assert!(
+                is_crlf_free(&cookie_buf),
+                "the synthesised Set-Cookie value must be CR/LF-free (anti-injection)"
+            );
+            response.push_block(kawa::Block::Header(kawa::Pair {
+                key: kawa::Store::Static(b"Set-Cookie"),
+                val: kawa::Store::from_vec(cookie_buf),
+            }));
+            debug_assert_eq!(
+                response.blocks.len(),
+                blocks_before + 1,
+                "synthesising Set-Cookie must push exactly one block"
+            );
         }
 
         // Create a custom correlation header (defaults to "Sozu-Id", can be

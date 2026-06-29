@@ -1021,13 +1021,13 @@ impl TcpSession {
                 // buffer to truncate, so `Shutdown::Both` is the right call.
                 // If the TCP listener ever gains an inline TLS upgrade,
                 // switch to `Shutdown::Write` here.
-                if let Err(e) = sock.shutdown(Shutdown::Both) {
-                    if e.kind() != ErrorKind::NotConnected {
-                        error!(
-                            "{} Error closing back socket({:?}): {:?}",
-                            log_context, sock, e
-                        );
-                    }
+                if let Err(e) = sock.shutdown(Shutdown::Both)
+                    && e.kind() != ErrorKind::NotConnected
+                {
+                    error!(
+                        "{} Error closing back socket({:?}): {:?}",
+                        log_context, sock, e
+                    );
                 }
             }
         }
@@ -1355,10 +1355,10 @@ impl ProxySession for TcpSession {
 
         if self.frontend_token == token {
             self.front_readiness().event = self.front_readiness().event | events;
-        } else if self.backend_token == Some(token) {
-            if let Some(r) = self.back_readiness() {
-                r.event |= events;
-            }
+        } else if self.backend_token == Some(token)
+            && let Some(r) = self.back_readiness()
+        {
+            r.event |= events;
         }
     }
 

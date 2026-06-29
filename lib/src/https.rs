@@ -328,51 +328,50 @@ impl HttpsSession {
         mut expect: ExpectProxyProtocol<MioTcpStream>,
         ssl: ServerConnection,
     ) -> Option<HttpsStateMachine> {
-        if let Some(ref addresses) = expect.addresses {
-            if let (Some(public_address), Some(session_address)) =
+        if let Some(ref addresses) = expect.addresses
+            && let (Some(public_address), Some(session_address)) =
                 (addresses.destination(), addresses.source())
-            {
-                self.public_address = public_address;
-                self.peer_address = Some(session_address);
+        {
+            self.public_address = public_address;
+            self.peer_address = Some(session_address);
 
-                let ExpectProxyProtocol {
-                    container_frontend_timeout,
-                    frontend,
-                    frontend_readiness: readiness,
-                    request_id,
-                    ..
-                } = expect;
+            let ExpectProxyProtocol {
+                container_frontend_timeout,
+                frontend,
+                frontend_readiness: readiness,
+                request_id,
+                ..
+            } = expect;
 
-                let mut handshake = TlsHandshake::new(
-                    container_frontend_timeout,
-                    ssl,
-                    frontend,
-                    self.frontend_token,
-                    request_id,
-                    self.peer_address,
-                );
-                // Transfer both interest and event from the proxy protocol state,
-                // so the event loop properly monitors the socket after the transition.
-                handshake.frontend_readiness = readiness;
-                handshake.frontend_readiness.event.insert(Ready::READABLE);
+            let mut handshake = TlsHandshake::new(
+                container_frontend_timeout,
+                ssl,
+                frontend,
+                self.frontend_token,
+                request_id,
+                self.peer_address,
+            );
+            // Transfer both interest and event from the proxy protocol state,
+            // so the event loop properly monitors the socket after the transition.
+            handshake.frontend_readiness = readiness;
+            handshake.frontend_readiness.event.insert(Ready::READABLE);
 
-                // The PROXY header just resolved both endpoints; the session now
-                // knows its true peer, and the handshake must watch for readable
-                // bytes or the TLS ClientHello will never be serviced.
-                debug_assert_eq!(
-                    self.peer_address,
-                    Some(session_address),
-                    "expect upgrade must adopt the PROXY-advertised source as the peer address"
-                );
-                debug_assert!(
-                    handshake.frontend_readiness.event.is_readable(),
-                    "handshake handed off from expect must be armed for READABLE"
-                );
+            // The PROXY header just resolved both endpoints; the session now
+            // knows its true peer, and the handshake must watch for readable
+            // bytes or the TLS ClientHello will never be serviced.
+            debug_assert_eq!(
+                self.peer_address,
+                Some(session_address),
+                "expect upgrade must adopt the PROXY-advertised source as the peer address"
+            );
+            debug_assert!(
+                handshake.frontend_readiness.event.is_readable(),
+                "handshake handed off from expect must be armed for READABLE"
+            );
 
-                gauge_add!(names::protocol::PROXY_EXPECT, -1);
-                gauge_add!(names::protocol::TLS_HANDSHAKE, 1);
-                return Some(HttpsStateMachine::Handshake(handshake));
-            }
+            gauge_add!(names::protocol::PROXY_EXPECT, -1);
+            gauge_add!(names::protocol::TLS_HANDSHAKE, 1);
+            return Some(HttpsStateMachine::Handshake(handshake));
         }
 
         // currently, only happens in expect proxy protocol with AF_UNSPEC address
