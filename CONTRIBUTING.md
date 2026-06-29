@@ -61,9 +61,8 @@ Rules every change is expected to follow:
   unit + property/simulation + fuzz + e2e coverage in the same pull request — not as a follow-up.
 - **Assertion density for state machines.** New sans-io cores, parsers, and state machines carry dense
   `debug_assert!` pre/post-conditions and pair assertions (assert what you expect *and* what you don't), and —
-  where applicable — a deterministic simulation harness on the pattern of `lib/tests/udp_simulation.rs`
-  (the handmade synchronous driver) or `sim/tests/udp_simulation.rs` (the `sozu-sim` crate, driven by the
-  `moonpool-sim` engine).
+  where applicable — a deterministic simulation harness on the pattern of `sim/tests/udp_simulation.rs`
+  (the `sozu-sim` crate, driven by the `moonpool-sim` engine).
 - **Never panic on network-controlled input** on the release path: turn invalid traffic into a drop + metric +
   contextual log (or the protocol's error response), never an `unwrap`/`panic!`. `debug_assert!` is for
   invariant violations only and compiles out in release.

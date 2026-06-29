@@ -311,20 +311,25 @@ jobs:
           echo "OK: every #[ignore] carries a reason string."
 
   # ┌──────────────────────────────────────────────────────────────┐
-  # │ Group C‴ — moonpool-sim harness build guard. The sozu-sim     │
-  # │   harness is cfg-gated off in the main matrix (no             │
-  # │   tokio_unstable), so COMPILE it here with the flag to catch   │
-  # │   API/compile regressions per-PR. No sweep (`--no-run`); the   │
-  # │   full moonpool sweep runs nightly (simulation-sweep.yml).     │
+  # │ Group C‴ — moonpool-sim UDP simulation (the sole UDP sim).    │
+  # │   The sozu-sim harness is cfg-gated off in the main matrix    │
+  # │   (no tokio_unstable), so run a MODEST seeded sweep here with  │
+  # │   the flag as the per-PR gate; the deep swarm runs nightly     │
+  # │   (simulation-sweep.yml). Debug build keeps the in-core        │
+  # │   `debug_assert!` invariants live.                             │
   # └──────────────────────────────────────────────────────────────┘
-  sim-build-check:
-    name: moonpool sim build check
+  udp-simulation:
+    name: UDP simulation (moonpool)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       # Scopes the unstable flag to THIS job; cfg-gated deps mean the rest of the
       # workspace (and the main test matrix) never sets it.
       RUSTFLAGS: '--cfg tokio_unstable'
+      # Modest per-PR sweep — moonpool builds a fresh tokio runtime per seed
+      # (~100x slower per seed-step than a pure loop); the nightly job goes deep.
+      SOZU_UDP_SIM_SEEDS: '64'
+      SOZU_UDP_SIM_STEPS: '2000'
     steps:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -339,11 +344,11 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           cache-all-crates: true
-          prefix-key: sim-build-check
+          prefix-key: sim-pr
           workspaces: . -> target/
 
-      - name: Compile the moonpool sim harness (no sweep)
-        run: cargo test -p sozu-sim --locked --test udp_simulation --no-run
+      - name: UDP simulation sweep (debug, asserts live)
+        run: cargo test -p sozu-sim --locked --test udp_simulation -- --nocapture
 
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Group D — Bombardier load benches (folded from benchmark.yml) │

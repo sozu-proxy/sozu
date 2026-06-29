@@ -7,17 +7,15 @@
 //! Deterministic simulation of the sans-io UDP core (`sozu_lib::protocol::udp`)
 //! driven by the [moonpool-sim] engine.
 //!
-//! This is the moonpool port of the handmade FoundationDB/VOPR-style simulator
-//! at `lib/tests/udp_simulation.rs`. moonpool supplies the seeded runtime, the
-//! virtual clock ([`SimContext::time`]), the seeded RNG ([`SimContext::random`])
+//! This is the sole UDP deterministic-sim, driven by moonpool-sim; it replaced
+//! an earlier handmade synchronous harness. moonpool supplies the seeded runtime,
+//! the virtual clock ([`SimContext::time`]), the seeded RNG ([`SimContext::random`])
 //! and the `buggify` fault-injection vocabulary; this file supplies the
 //! adversarial workload, the shadow model, and the cross-step invariants that
 //! drive [`UdpManager`] hard across many seeds.
 //!
-//! The handmade harness is retained in parallel as the pure-core synchronous
-//! driver (and the deep CI swarm) until per-action / per-drop-reason coverage
-//! equivalence is proven; `lib/` stays async-free — this crate is the only
-//! async home for the UDP simulation.
+//! `lib/` stays async-free — this crate is the only async home for the UDP
+//! simulation (moonpool/tokio are dev-dependencies, gated on `tokio_unstable`).
 //!
 //! # Why a `std::time::Instant` base
 //!
@@ -35,8 +33,8 @@
 //!
 //! On a hard invariant violation the panic carries the failing seed (via
 //! `current_sim_seed`) + step; moonpool also records it in the report's
-//! `seeds_failing`. (Seed values are moonpool's, not portable from the handmade
-//! harness — the RNG engine differs.)
+//! `seeds_failing`. (Seed values are moonpool's, not portable from the former
+//! handmade harness — the RNG engine differs.)
 //!
 //! [moonpool-sim]: https://crates.io/crates/moonpool-sim
 

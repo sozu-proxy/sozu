@@ -9,12 +9,12 @@
   deterministic simulation of the sans-io UDP core
   (`sim/tests/udp_simulation.rs`) driven by the [`moonpool-sim`](https://crates.io/crates/moonpool-sim)
   engine (seeded runtime, virtual clock, RNG, `buggify` fault injection). It
-  ports the handmade harness's weighted action grammar, shadow model,
+  ports the former handmade harness's weighted action grammar, shadow model,
   cross-step invariants and determinism guard onto moonpool, keeping the
-  `SOZU_UDP_SIM_SEED`/`_SEEDS`/`_STEPS` replay/sweep knobs. The handmade
-  synchronous harness (`lib/tests/udp_simulation.rs`) is **retained in
-  parallel** as the pure-core driver and the deep CI swarm. `lib/`/`bin/` stay
-  async-free: moonpool/tokio are `sim/` **dev-dependencies** only. `moonpool-sim`
+  `SOZU_UDP_SIM_SEED`/`_SEEDS`/`_STEPS` replay/sweep knobs, and **replaces** it:
+  the handmade `lib/tests/udp_simulation.rs` is removed — moonpool is now the
+  sole UDP deterministic-sim. `lib/`/`bin/` stay async-free: moonpool/tokio are
+  `sim/` **dev-dependencies** only. `moonpool-sim`
   is pinned to a git rev (the published 0.7.0 doesn't build on stable; `main`
   does) — swapping to a crates.io release later is a follow-up, not a blocker.
 
@@ -35,11 +35,12 @@
 
 ### 🤖 CI
 
-- **`ci(simulation-sweep)`: the daily swarm now runs both UDP simulators** — the
-  handmade harness keeps the deep `4096 × 20000` sweep (fast: pure sync), and a
-  new job runs the moonpool `sozu-sim` sweep at modest parameters (moonpool's
-  per-seed tokio-runtime construction is ~100× slower per seed-step). All CI
-  toolchain pins move 1.88.0 → 1.91.0.
+- **`ci(sim)`: the moonpool `sozu-sim` sweep is the sole UDP swarm.** A per-PR
+  `udp-simulation` job runs a modest seeded sweep (with `--cfg tokio_unstable`),
+  and the nightly `simulation-sweep` workflow goes deep — seed-bounded to fit the
+  45-min cap, since moonpool's per-seed tokio-runtime construction is ~100× slower
+  per seed-step than the former pure-sync handmade swarm. All CI toolchain pins
+  move 1.88.0 → 1.91.0.
 
 ## 2.1.0 - 2026-06-05
 

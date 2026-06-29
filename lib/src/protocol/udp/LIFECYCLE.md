@@ -50,7 +50,8 @@ The core performs **no I/O**: no socket, no `Instant::now()`/`SystemTime`, no
 `rand`, no `Arc<Mutex>` (`mod.rs:5-10`). Time is injected as `now: Instant` on
 every time-dependent entry point; the hash seed is injected once at construction
 (`manager.rs:98`/`116`). This purity is exactly what the deterministic-simulation
-test in `lib/tests/udp_simulation.rs` exploits (see `doc/udp_simulation.md`).
+test in `sim/tests/udp_simulation.rs` (the `sozu-sim` crate, moonpool-driven)
+exploits (see `doc/udp_simulation.md`).
 
 The two halves talk over a narrow message contract in `mod.rs`:
 
@@ -409,8 +410,9 @@ model.
 8. **Debug invariants everywhere.** `check_invariants` (`manager.rs:685`) runs
    as a post-condition after every public mutating method
    (`handle_input`, `manager.rs:189`); the deterministic simulator
-   (`lib/tests/udp_simulation.rs`) and the property tests (`prop_flow_invariants`
-   `manager.rs:1632`) drive the core hard enough to trip any regression.
+   (`sim/tests/udp_simulation.rs`, the moonpool-driven `sozu-sim` crate) and the
+   property tests (`prop_flow_invariants` `manager.rs:1632`) drive the core hard
+   enough to trip any regression.
 
 ---
 
