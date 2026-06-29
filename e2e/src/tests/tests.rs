@@ -4854,11 +4854,11 @@ pub fn try_health_check_excludes_unhealthy() -> State {
             );
             client.connect();
             client.send();
-            if let Some(response) = client.receive() {
-                if !response.contains("pong1") {
-                    all_pong1 = false;
-                    break;
-                }
+            if let Some(response) = client.receive()
+                && !response.contains("pong1")
+            {
+                all_pong1 = false;
+                break;
             }
         }
         if all_pong1 {
@@ -5179,10 +5179,10 @@ pub fn try_health_check_fail_open() -> State {
         );
         client.connect();
         client.send();
-        if let Some(response) = client.receive() {
-            if response.contains("fail-open-ok") {
-                success_count += 1;
-            }
+        if let Some(response) = client.receive()
+            && response.contains("fail-open-ok")
+        {
+            success_count += 1;
         }
         thread::sleep(Duration::from_millis(200));
     }

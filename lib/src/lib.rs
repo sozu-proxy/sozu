@@ -1439,17 +1439,17 @@ impl SessionMetrics {
         time!(names::event_loop::REQUEST_TIME, request_time.as_millis());
         time!(names::event_loop::SERVICE_TIME, service_time.as_millis());
 
-        if let Some(backend_id) = self.backend_id.as_ref() {
-            if let Some(backend_response_time) = self.backend_response_time() {
-                record_backend_metrics!(
-                    context.cluster_id.as_str_or("-"),
-                    backend_id,
-                    backend_response_time.as_millis(),
-                    self.backend_connection_time(),
-                    self.backend_bin,
-                    self.backend_bout
-                );
-            }
+        if let Some(backend_id) = self.backend_id.as_ref()
+            && let Some(backend_response_time) = self.backend_response_time()
+        {
+            record_backend_metrics!(
+                context.cluster_id.as_str_or("-"),
+                backend_id,
+                backend_response_time.as_millis(),
+                self.backend_connection_time(),
+                self.backend_bin,
+                self.backend_bout
+            );
         }
 
         incr!(

@@ -1590,10 +1590,10 @@ impl UdpListenerSession {
 
     fn on_close_flow(&mut self, flow: FlowId) {
         if let Some(token) = self.flow_to_upstream.remove(&flow) {
-            if let Some(mut socket) = self.upstream_sockets.remove(&token) {
-                if let Err(e) = self.registry.deregister(&mut socket) {
-                    debug!("{} deregister upstream on close: {}", log_context!(self), e);
-                }
+            if let Some(mut socket) = self.upstream_sockets.remove(&token)
+                && let Err(e) = self.registry.deregister(&mut socket)
+            {
+                debug!("{} deregister upstream on close: {}", log_context!(self), e);
             }
             // Drop any queued (un-drained) forward datagrams with the socket so
             // the per-flow queue cannot leak; gauge correctness is preserved

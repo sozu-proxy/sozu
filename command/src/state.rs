@@ -323,13 +323,13 @@ impl ConfigState {
         // reload, SaveState/LoadState, and direct API AddCluster requests
         // bypass the SetHealthCheck-side check and let an attacker-controlled
         // health-check URI smuggle CRLF into outbound HTTP/1.1 probes.
-        if let Some(hc) = cluster.health_check.as_ref() {
-            if let Err(reason) = crate::config::validate_health_check_config(hc) {
-                return Err(StateError::InvalidValue {
-                    field: "health_check",
-                    reason,
-                });
-            }
+        if let Some(hc) = cluster.health_check.as_ref()
+            && let Err(reason) = crate::config::validate_health_check_config(hc)
+        {
+            return Err(StateError::InvalidValue {
+                field: "health_check",
+                reason,
+            });
         }
         let cluster = cluster.clone();
         // AddCluster is an upsert (replacing an existing cluster_id keeps the
@@ -2269,18 +2269,18 @@ impl ConfigState {
             .collect();
 
         for front in self.http_fronts.values() {
-            if let Some(cluster_id) = &front.cluster_id {
-                if let Some(hasher) = hm.get_mut(cluster_id) {
-                    front.hash(hasher);
-                }
+            if let Some(cluster_id) = &front.cluster_id
+                && let Some(hasher) = hm.get_mut(cluster_id)
+            {
+                front.hash(hasher);
             }
         }
 
         for front in self.https_fronts.values() {
-            if let Some(cluster_id) = &front.cluster_id {
-                if let Some(hasher) = hm.get_mut(cluster_id) {
-                    front.hash(hasher);
-                }
+            if let Some(cluster_id) = &front.cluster_id
+                && let Some(hasher) = hm.get_mut(cluster_id)
+            {
+                front.hash(hasher);
             }
         }
 
@@ -2365,18 +2365,18 @@ impl ConfigState {
         let mut cluster_ids: HashSet<ClusterId> = HashSet::new();
 
         self.http_fronts.values().for_each(|front| {
-            if domain_check(&front.hostname, &front.path, &hostname, &path) {
-                if let Some(id) = &front.cluster_id {
-                    cluster_ids.insert(id.to_string());
-                }
+            if domain_check(&front.hostname, &front.path, &hostname, &path)
+                && let Some(id) = &front.cluster_id
+            {
+                cluster_ids.insert(id.to_string());
             }
         });
 
         self.https_fronts.values().for_each(|front| {
-            if domain_check(&front.hostname, &front.path, &hostname, &path) {
-                if let Some(id) = &front.cluster_id {
-                    cluster_ids.insert(id.to_string());
-                }
+            if domain_check(&front.hostname, &front.path, &hostname, &path)
+                && let Some(id) = &front.cluster_id
+            {
+                cluster_ids.insert(id.to_string());
             }
         });
 
@@ -2533,7 +2533,7 @@ impl ConfigState {
             file.write_all(&b"\n\0"[..])
                 .map_err(StateError::FileError)?;
 
-            if counter % 1000 == 0 {
+            if counter.is_multiple_of(1000) {
                 info!("writing {} commands to file", counter);
                 file.sync_all().map_err(StateError::FileError)?;
             }
@@ -2594,13 +2594,13 @@ pub fn validate_h2_flood_knobs_http(patch: &UpdateHttpListenerConfig) -> Result<
     require_ge1!(patch.h2_max_concurrent_streams, "h2_max_concurrent_streams");
     // Shrink ratio runtime floor is 2 (lib/src/protocol/mux/h2.rs ~448 .max(2));
     // anything lower is silently promoted so reject at control plane.
-    if let Some(v) = patch.h2_stream_shrink_ratio {
-        if v < 2 {
-            return Err(StateError::InvalidValue {
-                field: "h2_stream_shrink_ratio",
-                reason: "must be >= 2",
-            });
-        }
+    if let Some(v) = patch.h2_stream_shrink_ratio
+        && v < 2
+    {
+        return Err(StateError::InvalidValue {
+            field: "h2_stream_shrink_ratio",
+            reason: "must be >= 2",
+        });
     }
     // Lifetime caps and HPACK limits — must be >= 1 or the runtime trips on the
     // first qualifying frame. doc/configure.md advertises "u64 (>= 1)" etc.
@@ -2657,13 +2657,13 @@ pub fn validate_h2_flood_knobs_https(patch: &UpdateHttpsListenerConfig) -> Resul
         "h2_max_window_update_stream0_per_window"
     );
     require_ge1!(patch.h2_max_concurrent_streams, "h2_max_concurrent_streams");
-    if let Some(v) = patch.h2_stream_shrink_ratio {
-        if v < 2 {
-            return Err(StateError::InvalidValue {
-                field: "h2_stream_shrink_ratio",
-                reason: "must be >= 2",
-            });
-        }
+    if let Some(v) = patch.h2_stream_shrink_ratio
+        && v < 2
+    {
+        return Err(StateError::InvalidValue {
+            field: "h2_stream_shrink_ratio",
+            reason: "must be >= 2",
+        });
     }
     require_ge1!(
         patch.h2_max_rst_stream_lifetime,

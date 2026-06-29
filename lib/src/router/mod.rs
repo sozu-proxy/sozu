@@ -734,14 +734,13 @@ impl Router {
         }
 
         // Check tree rules (exact match only, no wildcard resolution)
-        if let Ok(ascii_hostname) = ::idna::domain_to_ascii(hostname) {
-            if self
+        if let Ok(ascii_hostname) = ::idna::domain_to_ascii(hostname)
+            && self
                 .tree
                 .domain_lookup(ascii_hostname.as_bytes(), false)
                 .is_some()
-            {
-                return true;
-            }
+        {
+            return true;
         }
 
         // Check post rules

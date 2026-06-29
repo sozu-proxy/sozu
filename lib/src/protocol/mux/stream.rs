@@ -370,14 +370,14 @@ impl Stream {
             context.backend_id.as_deref()
         );
 
-        if let Some(status) = context.status {
-            if let Some(per_code) = crate::metrics::http_status_code_metric_name(status) {
-                incr!(
-                    per_code,
-                    context.cluster_id.as_deref(),
-                    context.backend_id.as_deref()
-                );
-            }
+        if let Some(status) = context.status
+            && let Some(per_code) = crate::metrics::http_status_code_metric_name(status)
+        {
+            incr!(
+                per_code,
+                context.cluster_id.as_deref(),
+                context.backend_id.as_deref()
+            );
         }
 
         let endpoint = sozu_command::logging::EndpointRecord::Http {

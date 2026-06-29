@@ -1118,12 +1118,12 @@ impl Server {
                 }
             }
 
-            if let Some(t) = self.should_poll_at.as_ref() {
-                if *t <= Instant::now() {
-                    while let Some(t) = TIMER.with(|timer| timer.borrow_mut().poll()) {
-                        //info!("polled for timeout: {:?}", t);
-                        self.timeout(t);
-                    }
+            if let Some(t) = self.should_poll_at.as_ref()
+                && *t <= Instant::now()
+            {
+                while let Some(t) = TIMER.with(|timer| timer.borrow_mut().poll()) {
+                    //info!("polled for timeout: {:?}", t);
+                    self.timeout(t);
                 }
             }
             self.handle_remaining_readiness();
@@ -1487,15 +1487,15 @@ impl Server {
 
         if new_sessions_count < sessions_count {
             let now = Instant::now();
-            if let Some(last) = self.last_shutting_down_message {
-                if (now - last) > Duration::from_secs(5) {
-                    info!(
-                        "closed {} sessions, {} sessions left, base_sessions_count = {}",
-                        sessions_count - new_sessions_count,
-                        new_sessions_count,
-                        self.base_sessions_count
-                    );
-                }
+            if let Some(last) = self.last_shutting_down_message
+                && (now - last) > Duration::from_secs(5)
+            {
+                info!(
+                    "closed {} sessions, {} sessions left, base_sessions_count = {}",
+                    sessions_count - new_sessions_count,
+                    new_sessions_count,
+                    self.base_sessions_count
+                );
             }
             self.last_shutting_down_message = Some(now);
         }
@@ -1553,10 +1553,10 @@ impl Server {
                         }
                     }
 
-                    if self.channel.back_buf.available_data() > 0 {
-                        if let Err(e) = self.channel.writable() {
-                            error!("error writing to channel: {:?}", e);
-                        }
+                    if self.channel.back_buf.available_data() > 0
+                        && let Err(e) = self.channel.writable()
+                    {
+                        error!("error writing to channel: {:?}", e);
                     }
 
                     if !self.channel.readiness.is_writable() {
@@ -2010,11 +2010,11 @@ impl Server {
                 // a CRLF/NUL/C0 URI or zero thresholds. The SetHealthCheck
                 // handler below already runs the same validation; this is the
                 // AddCluster mirror.
-                if let Some(hc) = cluster.health_check.as_ref() {
-                    if let Err(reason) = sozu_command::config::validate_health_check_config(hc) {
-                        push_queue(worker_response_error(req_id, reason));
-                        return;
-                    }
+                if let Some(hc) = cluster.health_check.as_ref()
+                    && let Err(reason) = sozu_command::config::validate_health_check_config(hc)
+                {
+                    push_queue(worker_response_error(req_id, reason));
+                    return;
                 }
                 self.add_cluster(cluster);
                 // Re-arm the metric drain tombstone in case this cluster id

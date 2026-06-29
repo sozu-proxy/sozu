@@ -1388,15 +1388,15 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             // RST. If backend-TLS lands later (#1218), this MUST move to
             // `Shutdown::Write` (or `socket.send_close_notify()`) to avoid the
             // canonical truncation anti-pattern documented in CLAUDE.md.
-            if let Err(e) = socket.shutdown(Shutdown::Both) {
-                if e.kind() != ErrorKind::NotConnected {
-                    error!(
-                        "{} Error shutting down back socket({:?}): {:?}",
-                        log_context!(self),
-                        socket,
-                        e
-                    );
-                }
+            if let Err(e) = socket.shutdown(Shutdown::Both)
+                && e.kind() != ErrorKind::NotConnected
+            {
+                error!(
+                    "{} Error shutting down back socket({:?}): {:?}",
+                    log_context!(self),
+                    socket,
+                    e
+                );
             }
         }
 

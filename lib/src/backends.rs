@@ -640,10 +640,10 @@ impl BackendMap {
 
     // TODO: return <Result, BackendError>, log the error downstream
     pub fn close_backend_connection(&mut self, cluster_id: &str, addr: &SocketAddr) {
-        if let Some(cluster_backends) = self.backends.get_mut(cluster_id) {
-            if let Some(ref mut backend) = cluster_backends.find_backend(addr) {
-                backend.borrow_mut().dec_connections();
-            }
+        if let Some(cluster_backends) = self.backends.get_mut(cluster_id)
+            && let Some(ref mut backend) = cluster_backends.find_backend(addr)
+        {
+            backend.borrow_mut().dec_connections();
         }
     }
 

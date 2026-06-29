@@ -491,10 +491,10 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
         self.set_timeout(Some(Duration::from_millis(100)))?;
 
         let status = loop {
-            if let Some(timeout) = timeout {
-                if now.elapsed() >= timeout {
-                    break Err(ChannelError::TimeoutReached(timeout));
-                }
+            if let Some(timeout) = timeout
+                && now.elapsed() >= timeout
+            {
+                break Err(ChannelError::TimeoutReached(timeout));
             }
 
             if let Some(message) = self.try_read_delimited_message()? {

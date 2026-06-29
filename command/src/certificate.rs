@@ -87,13 +87,13 @@ pub fn get_cn_and_san_attributes(x509: &X509Certificate) -> Vec<String> {
     let mut san_dns_seen = false;
 
     for extension in x509.extensions() {
-        if extension.oid == OID_X509_EXT_SUBJECT_ALT_NAME {
-            if let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension() {
-                for name in &san.general_names {
-                    if let GeneralName::DNSName(name) = name {
-                        san_dns_seen = true;
-                        names.push(name.to_string());
-                    }
+        if extension.oid == OID_X509_EXT_SUBJECT_ALT_NAME
+            && let ParsedExtension::SubjectAlternativeName(san) = extension.parsed_extension()
+        {
+            for name in &san.general_names {
+                if let GeneralName::DNSName(name) = name {
+                    san_dns_seen = true;
+                    names.push(name.to_string());
                 }
             }
         }

@@ -522,10 +522,11 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         for flow_id in due {
             // Re-check under current state (a flow may have been closed by an
             // earlier iteration's teardown, though here ids are disjoint).
-            if let Some(flow) = self.flows.get(flow_id) {
-                if flow.idle_deadline <= now && flow.phase != FlowPhase::Closing {
-                    self.close_flow(flow_id, CloseReason::Idle);
-                }
+            if let Some(flow) = self.flows.get(flow_id)
+                && flow.idle_deadline <= now
+                && flow.phase != FlowPhase::Closing
+            {
+                self.close_flow(flow_id, CloseReason::Idle);
             }
         }
         self.reschedule();

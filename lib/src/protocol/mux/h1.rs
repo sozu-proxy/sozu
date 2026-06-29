@@ -448,11 +448,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         // 1xx informational: the 100 response skips main_phase (goes straight to
         // Terminated), so the normal "set endpoint writable" above never fires.
         // Trigger the frontend to write the 1xx response after all borrows end.
-        if is_1xx_backend {
-            if let StreamState::Linked(token) = stream.state {
-                let peer = endpoint.readiness_mut(token);
-                peer.arm_writable();
-            }
+        if is_1xx_backend && let StreamState::Linked(token) = stream.state {
+            let peer = endpoint.readiness_mut(token);
+            peer.arm_writable();
         }
 
         // Close-delimited response: socket_read returned (size > 0, Closed) —

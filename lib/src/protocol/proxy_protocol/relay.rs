@@ -197,45 +197,45 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
     pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
         debug!("{} writing proxy protocol header", log_context!(self));
 
-        if let Some(ref mut socket) = self.backend {
-            if let Some(ref header_size) = self.header_size {
-                loop {
-                    let available_before = self.frontend_buffer.available_data();
-                    match socket.write(self.frontend_buffer.data()) {
-                        Ok(sz) => {
-                            // A socket write reports at most the bytes it was
-                            // offered, so the forwarded count never exceeds the
-                            // buffered header tail.
-                            debug_assert!(
-                                sz <= available_before,
-                                "socket.write cannot send more than the buffered bytes"
-                            );
-                            let cursor_before = self.cursor_header;
-                            self.cursor_header += sz;
-                            // The forwarding cursor is strictly monotonic and
-                            // tracks exactly the bytes emitted this write.
-                            debug_assert_eq!(
-                                self.cursor_header,
-                                cursor_before + sz,
-                                "header cursor advances by exactly the bytes written"
-                            );
+        if let Some(ref mut socket) = self.backend
+            && let Some(ref header_size) = self.header_size
+        {
+            loop {
+                let available_before = self.frontend_buffer.available_data();
+                match socket.write(self.frontend_buffer.data()) {
+                    Ok(sz) => {
+                        // A socket write reports at most the bytes it was
+                        // offered, so the forwarded count never exceeds the
+                        // buffered header tail.
+                        debug_assert!(
+                            sz <= available_before,
+                            "socket.write cannot send more than the buffered bytes"
+                        );
+                        let cursor_before = self.cursor_header;
+                        self.cursor_header += sz;
+                        // The forwarding cursor is strictly monotonic and
+                        // tracks exactly the bytes emitted this write.
+                        debug_assert_eq!(
+                            self.cursor_header,
+                            cursor_before + sz,
+                            "header cursor advances by exactly the bytes written"
+                        );
 
-                            count!(names::backend::BACK_BYTES_OUT, sz as i64);
-                            metrics.backend_bout += sz;
-                            self.frontend_buffer.consume(sz);
+                        count!(names::backend::BACK_BYTES_OUT, sz as i64);
+                        metrics.backend_bout += sz;
+                        self.frontend_buffer.consume(sz);
 
-                            if self.cursor_header >= *header_size {
-                                info!("{} proxy protocol sent, upgrading", log_context!(self));
-                                return SessionResult::Upgrade;
-                            }
+                        if self.cursor_header >= *header_size {
+                            info!("{} proxy protocol sent, upgrading", log_context!(self));
+                            return SessionResult::Upgrade;
                         }
-                        Err(e) => {
-                            incr!(names::proxy_protocol::ERRORS);
-                            self.frontend_readiness.reset();
-                            self.backend_readiness.reset();
-                            debug!("{} write error: {}", log_context!(self), e);
-                            break;
-                        }
+                    }
+                    Err(e) => {
+                        incr!(names::proxy_protocol::ERRORS);
+                        self.frontend_readiness.reset();
+                        self.backend_readiness.reset();
+                        debug!("{} write error: {}", log_context!(self), e);
+                        break;
                     }
                 }
             }

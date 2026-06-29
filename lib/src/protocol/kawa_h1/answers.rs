@@ -174,10 +174,10 @@ impl Template {
         }
         let resolved_status = if let StatusLine::Response { code, .. } = &kawa.detached.status_line
         {
-            if let Some(expected_code) = status {
-                if expected_code != *code {
-                    return Err(TemplateError::InvalidStatusCode(*code));
-                }
+            if let Some(expected_code) = status
+                && expected_code != *code
+            {
+                return Err(TemplateError::InvalidStatusCode(*code));
             }
             *code
         } else {

@@ -482,11 +482,11 @@ impl CommandHub {
                         self.handle_finishing_task(task_id, task, false);
                         return None;
                     }
-                    if let Some(timeout) = task.timeout {
-                        if timeout < now {
-                            self.handle_finishing_task(task_id, task, true);
-                            return None;
-                        }
+                    if let Some(timeout) = task.timeout
+                        && timeout < now
+                    {
+                        self.handle_finishing_task(task_id, task, true);
+                        return None;
                     }
                     Some((task_id, task))
                 })
@@ -615,14 +615,14 @@ impl CommandHub {
             // `requests.rs::worker_request`. Without this, the worker's
             // polled janitor expiring a lease would leave no audit
             // trail, masking implicit cardinality changes from SOC tools.
-            if event.kind == EventKind::MetricDetailChanged as i32 {
-                if let Some(transition) = event.metric_detail.as_ref() {
-                    crate::command::requests::audit_worker_metric_detail_transition(
-                        &mut self.server,
-                        worker_id,
-                        transition,
-                    );
-                }
+            if event.kind == EventKind::MetricDetailChanged as i32
+                && let Some(transition) = event.metric_detail.as_ref()
+            {
+                crate::command::requests::audit_worker_metric_detail_transition(
+                    &mut self.server,
+                    worker_id,
+                    transition,
+                );
             }
             for client_token in &self.server.event_subscribers {
                 if let Some(client) = self.clients.get_mut(client_token) {

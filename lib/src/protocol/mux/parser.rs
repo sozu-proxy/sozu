@@ -284,7 +284,10 @@ macro_rules! ensure_frame_size {
 // `self.local_settings.settings_max_frame_size` correctly. Tests may use
 // `DEFAULT_MAX_FRAME_SIZE` freely because they construct isolated frame
 // buffers that never flow through a real peer handshake.
-pub fn frame_header(input: &[u8], max_frame_size: u32) -> IResult<&[u8], FrameHeader, ParserError> {
+pub fn frame_header(
+    input: &[u8],
+    max_frame_size: u32,
+) -> IResult<&[u8], FrameHeader, ParserError<'_>> {
     let in_len = input.len();
     let (i, payload_len) = be_u24(input)?;
     if payload_len > max_frame_size {
@@ -435,7 +438,7 @@ pub fn frame_body<'a>(
                 i,
                 !(header.flags & FLAG_ACK != 0 && header.payload_len != 0)
             );
-            ensure_frame_size!(i, header.payload_len % SETTINGS_ENTRY_SIZE == 0);
+            ensure_frame_size!(i, header.payload_len.is_multiple_of(SETTINGS_ENTRY_SIZE));
             settings_frame(i, header)?
         }
         FrameType::Ping => {

@@ -232,10 +232,10 @@ impl ResponseContent {
 impl WorkerResponses {
     fn contain_cluster_infos(&self) -> bool {
         for (_worker_id, response) in self.map.iter() {
-            if let Some(content_type) = &response.content_type {
-                if matches!(content_type, ContentType::Clusters(_)) {
-                    return true;
-                }
+            if let Some(content_type) = &response.content_type
+                && matches!(content_type, ContentType::Clusters(_))
+            {
+                return true;
             }
         }
         false
@@ -243,10 +243,10 @@ impl WorkerResponses {
 
     fn contain_cluster_hashes(&self) -> bool {
         for (_worker_id, response) in self.map.iter() {
-            if let Some(content_type) = &response.content_type {
-                if matches!(content_type, ContentType::ClusterHashes(_)) {
-                    return true;
-                }
+            if let Some(content_type) = &response.content_type
+                && matches!(content_type, ContentType::ClusterHashes(_))
+            {
+                return true;
             }
         }
         false
