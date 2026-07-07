@@ -8,7 +8,7 @@
 //! - Connection: close header with proper TLS teardown
 
 use std::{
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{SocketAddr, TcpStream},
     sync::{
         Arc,
@@ -38,6 +38,11 @@ use crate::{
     sozu::worker::Worker,
     tests::{State, provide_port, repeat_until_error_or, tests::create_local_address},
 };
+
+const PUSHER_CONNECTION_ESTABLISHED: &str =
+    r#"{"event":"pusher:connection_established","data":"{}"}"#;
+const PUSHER_PING: &str = r#"{"event":"pusher:ping","data":"{}"}"#;
+const PUSHER_PONG: &str = r#"{"event":"pusher:pong","data":"{}"}"#;
 
 struct BlockingHttpBackend {
     stop: Arc<AtomicBool>,
@@ -113,6 +118,92 @@ impl BlockingHttpBackend {
             let _ = thread.join();
         }
     }
+}
+
+fn websocket_text_frame(payload: &str) -> Vec<u8> {
+    let payload = payload.as_bytes();
+    let mut frame = Vec::with_capacity(payload.len() + 4);
+    frame.push(0x81);
+    if payload.len() <= 125 {
+        frame.push(payload.len() as u8);
+    } else {
+        debug_assert!(u16::try_from(payload.len()).is_ok());
+        frame.push(126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn masked_websocket_text_frame(payload: &str) -> Vec<u8> {
+    let payload = payload.as_bytes();
+    let mask = [0x12, 0x34, 0x56, 0x78];
+    let mut frame = Vec::with_capacity(payload.len() + 8);
+    frame.push(0x81);
+    if payload.len() <= 125 {
+        frame.push(0x80 | payload.len() as u8);
+    } else {
+        debug_assert!(u16::try_from(payload.len()).is_ok());
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    frame.extend_from_slice(&mask);
+    for (idx, byte) in payload.iter().enumerate() {
+        frame.push(byte ^ mask[idx % mask.len()]);
+    }
+    frame
+}
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn backend_send_bytes(backend: &mut SyncBackend, client_id: usize, bytes: &[u8]) -> bool {
+    match backend.clients.get_mut(&client_id) {
+        Some(stream) => stream.write_all(bytes).is_ok() && stream.flush().is_ok(),
+        None => false,
+    }
+}
+
+fn backend_read_bytes(backend: &mut SyncBackend, client_id: usize) -> Option<Vec<u8>> {
+    let mut buf = [0u8; 4096];
+    match backend.clients.get_mut(&client_id)?.read(&mut buf) {
+        Ok(n) if n > 0 => Some(buf[..n].to_vec()),
+        _ => None,
+    }
+}
+
+fn read_tls_until_contains_all(
+    tls_stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+    needles: &[&[u8]],
+) -> Option<Vec<u8>> {
+    let mut received = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut buf = [0u8; 4096];
+
+    while Instant::now() < deadline {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => return None,
+            Ok(n) => {
+                received.extend_from_slice(&buf[..n]);
+                if needles
+                    .iter()
+                    .all(|needle| bytes_contain(&received, needle))
+                {
+                    return Some(received);
+                }
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) => {
+                println!("TLS read failed while waiting for WebSocket frame: {error}");
+                return None;
+            }
+        }
+    }
+
+    None
 }
 
 impl Drop for BlockingHttpBackend {
@@ -1178,9 +1269,9 @@ fn try_wss_server_speaks_first_after_upgrade() -> State {
     backend.receive(0);
     backend.send(0);
 
-    let mut buf = [0u8; 4096];
-    let upgrade = match tls_stream.read(&mut buf) {
-        Ok(n) if n > 0 => String::from_utf8_lossy(&buf[..n]).to_string(),
+    let upgrade = match read_tls_until_contains_all(&mut tls_stream, &[b"101 Switching Protocols"])
+    {
+        Some(upgrade) => upgrade,
         other => {
             println!("unexpected WSS upgrade read: {other:?}");
             worker.soft_stop();
@@ -1188,31 +1279,24 @@ fn try_wss_server_speaks_first_after_upgrade() -> State {
             return State::Fail;
         }
     };
-    if !upgrade.contains("101") {
-        println!("unexpected WSS upgrade response: {upgrade:?}");
-        worker.soft_stop();
-        worker.wait_for_server_stop();
-        return State::Fail;
-    }
-    if upgrade.contains("server-speaks-first") {
+    if bytes_contain(&upgrade, PUSHER_CONNECTION_ESTABLISHED.as_bytes()) {
         worker.soft_stop();
         worker.wait_for_server_stop();
         return State::Success;
     }
 
-    backend.set_response("server-speaks-first");
-    backend.send(0);
+    thread::sleep(Duration::from_millis(50));
 
-    let result = match tls_stream.read(&mut buf) {
-        Ok(n) if n > 0 => {
-            let data = String::from_utf8_lossy(&buf[..n]);
-            data.contains("server-speaks-first")
-        }
-        other => {
-            println!("server-first WSS payload was not flushed before client data: {other:?}");
-            false
-        }
-    };
+    let connection_established = websocket_text_frame(PUSHER_CONNECTION_ESTABLISHED);
+    let result = backend_send_bytes(&mut backend, 0, &connection_established)
+        && read_tls_until_contains_all(
+            &mut tls_stream,
+            &[PUSHER_CONNECTION_ESTABLISHED.as_bytes()],
+        )
+        .is_some();
+    if !result {
+        println!("server-first WSS frame was not flushed before client data");
+    }
 
     worker.soft_stop();
     let stopped = worker.wait_for_server_stop();
@@ -1231,6 +1315,160 @@ fn test_wss_server_speaks_first_after_upgrade() {
             10,
             "WSS server-speaks-first payload after 101",
             try_wss_server_speaks_first_after_upgrade,
+        ),
+        State::Success,
+    );
+}
+
+fn try_wss_client_frame_after_upgrade_receives_pusher_pong() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let back_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("WSS-PUSHER-PING-PONG", config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: "localhost".to_owned(),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = SyncBackend::new(
+        "BACKEND_0",
+        back_address,
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    );
+    backend.connect();
+
+    let tls_config = {
+        let mut config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Verifier))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config
+    };
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_millis(500))).ok();
+    tcp.set_write_timeout(Some(Duration::from_millis(500))).ok();
+    let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+
+    let request = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    if tls_stream.write_all(request.as_bytes()).is_err() {
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    tls_stream.flush().ok();
+
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    if read_tls_until_contains_all(&mut tls_stream, &[b"101 Switching Protocols"]).is_none() {
+        println!("client did not receive WSS 101 before sending pusher ping");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    let connection_established = websocket_text_frame(PUSHER_CONNECTION_ESTABLISHED);
+    if !backend_send_bytes(&mut backend, 0, &connection_established) {
+        println!("backend could not send pusher connection_established frame");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    let ping = masked_websocket_text_frame(PUSHER_PING);
+    if tls_stream.write_all(&ping).is_err() || tls_stream.flush().is_err() {
+        println!("client could not send masked pusher ping frame");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    let backend_received_ping =
+        backend_read_bytes(&mut backend, 0)
+            .as_ref()
+            .is_some_and(|received| {
+                received.first() == Some(&0x81) && received.get(1).is_some_and(|b| b & 0x80 != 0)
+            });
+    if !backend_received_ping {
+        println!("backend did not receive a masked websocket text frame from client");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    let pong = websocket_text_frame(PUSHER_PONG);
+    let result = backend_send_bytes(&mut backend, 0, &pong)
+        && read_tls_until_contains_all(
+            &mut tls_stream,
+            &[
+                PUSHER_CONNECTION_ESTABLISHED.as_bytes(),
+                PUSHER_PONG.as_bytes(),
+            ],
+        )
+        .is_some();
+    if !result {
+        println!("client did not receive both pusher connection_established and pong frames");
+    }
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    if result && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_wss_client_frame_after_upgrade_receives_pusher_pong() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "WSS client pusher ping after 101 receives pusher pong",
+            try_wss_client_frame_after_upgrade_receives_pusher_pong,
         ),
         State::Success,
     );
