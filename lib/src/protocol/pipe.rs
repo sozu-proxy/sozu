@@ -1,10 +1,11 @@
 //! Transparent byte-stream forwarder (TCP + WebSocket post-upgrade).
 //!
 //! Forwards bytes between front and back through fixed-size buffers without
-//! payload inspection. Readiness is managed via direct mio interest toggles
-//! (no `signal_pending_write` / `arm_writable` here — those belong to the
-//! mux H2 path). Used as the post-handshake state for raw TCP listeners and
-//! after a successful WebSocket upgrade on the H1 path.
+//! payload inspection. When bytes enter a sozu-owned buffer, the opposite
+//! endpoint is armed via `Readiness::arm_writable()` so edge-triggered epoll
+//! cannot park buffered data behind a missing writable edge. Used as the
+//! post-handshake state for raw TCP listeners and after a successful WebSocket
+//! upgrade on the H1 path.
 
 use std::{cell::RefCell, net::SocketAddr, rc::Rc};
 
@@ -529,7 +530,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 "{} Pipe::backend_hup: backend connection closed, keeping alive due to inflight data in buffers.",
                 log_context!(self)
             );
-            self.frontend_readiness.interest.insert(Ready::WRITABLE);
+            self.frontend_readiness.arm_writable();
             if self.backend_readiness.event.is_readable() {
                 self.backend_readiness.interest.insert(Ready::READABLE);
             }
@@ -870,7 +871,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 self.backend_readiness.event.remove(Ready::READABLE);
             }
             if size > 0 {
-                self.frontend_readiness.interest.insert(Ready::WRITABLE);
+                self.frontend_readiness.arm_writable();
                 count!(names::backend::BACK_BYTES_IN, size as i64);
                 metrics.backend_bin += size;
                 // Backend→proxy ingress metric advances by exactly bytes read.
@@ -1222,7 +1223,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         if self.splice_out_pending() >= capacity {
             // Pipe is full — stop reading and let the frontend drain it.
             self.backend_readiness.interest.remove(Ready::READABLE);
-            self.frontend_readiness.interest.insert(Ready::WRITABLE);
+            self.frontend_readiness.arm_writable();
             return SessionResult::Continue;
         }
 
@@ -1256,7 +1257,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 pending_before + size,
                 "out_pipe_pending must grow by exactly the spliced bytes"
             );
-            self.frontend_readiness.interest.insert(Ready::WRITABLE);
+            self.frontend_readiness.arm_writable();
             count!(names::backend::BACK_BYTES_IN, size as i64);
             metrics.backend_bin += size;
             debug_assert_eq!(
@@ -1488,5 +1489,110 @@ impl<Front: SocketHandler, L: ListenerHandler> SessionState for Pipe<Front, L> {
             self.backend_token,
             self.backend_readiness
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        io::Write,
+        net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream},
+        time::Duration,
+    };
+
+    use super::*;
+    use crate::pool::Pool;
+
+    struct TestListener {
+        address: SocketAddr,
+    }
+
+    impl ListenerHandler for TestListener {
+        fn get_addr(&self) -> &SocketAddr {
+            &self.address
+        }
+
+        fn get_tags(&self, _key: &str) -> Option<&sozu_command::logging::CachedTags> {
+            None
+        }
+
+        fn set_tags(&mut self, _key: String, _tags: Option<BTreeMap<String, String>>) {}
+
+        fn protocol(&self) -> Protocol {
+            Protocol::HTTP
+        }
+
+        fn public_address(&self) -> SocketAddr {
+            self.address
+        }
+    }
+
+    fn connected_pair() -> (StdTcpStream, StdTcpStream) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener local addr");
+        let client = StdTcpStream::connect(address).expect("connect test client");
+        let (server, _) = listener.accept().expect("accept test server");
+        client.set_nonblocking(true).expect("client nonblocking");
+        server.set_nonblocking(true).expect("server nonblocking");
+        (client, server)
+    }
+
+    #[test]
+    fn backend_readable_arms_frontend_writable_event_when_buffering_response() {
+        let (frontend_peer, frontend_socket) = connected_pair();
+        let (mut backend_peer, backend_socket) = connected_pair();
+
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let backend_buffer = pool.checkout().expect("backend buffer");
+        let frontend_buffer = pool.checkout().expect("frontend buffer");
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let listener = Rc::new(RefCell::new(TestListener { address }));
+
+        let mut pipe = Pipe::new(
+            backend_buffer,
+            None,
+            Some(TcpStream::from_std(backend_socket)),
+            None,
+            None,
+            None,
+            None,
+            frontend_buffer,
+            Token(0),
+            TcpStream::from_std(frontend_socket),
+            listener,
+            Protocol::HTTP,
+            Ulid::generate(),
+            Ulid::generate(),
+            None,
+            WebSocketContext::Tcp,
+        );
+        pipe.set_back_token(Token(1));
+        pipe.frontend_readiness.event = Ready::EMPTY;
+        pipe.frontend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        pipe.backend_readiness.event = Ready::READABLE;
+        pipe.backend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+
+        backend_peer
+            .write_all(b"server-speaks-first")
+            .expect("write backend payload");
+
+        let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
+        assert_eq!(pipe.backend_readable(&mut metrics), SessionResult::Continue);
+
+        assert!(
+            pipe.backend_buffer.available_data() > 0,
+            "backend_readable must buffer backend bytes"
+        );
+        assert!(
+            pipe.frontend_readiness.interest.is_writable(),
+            "buffered backend bytes must arm frontend WRITABLE interest"
+        );
+        assert!(
+            pipe.frontend_readiness.event.is_writable(),
+            "buffered backend bytes must queue a frontend WRITABLE event"
+        );
+
+        drop(frontend_peer);
     }
 }

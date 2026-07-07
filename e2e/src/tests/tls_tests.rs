@@ -32,6 +32,7 @@ use crate::{
         aggregator::SimpleAggregator,
         async_backend::BackendHandle as AsyncBackend,
         https_client::{Verifier, build_h2_client, build_https_client, resolve_request},
+        sync_backend::Backend as SyncBackend,
     },
     port_registry::bind_std_listener,
     sozu::worker::Worker,
@@ -1093,6 +1094,145 @@ fn test_tls_connection_close_large_response() {
             try_tls_connection_close_large_response
         ),
         State::Success
+    );
+}
+
+fn try_wss_server_speaks_first_after_upgrade() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let back_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("WSS-SERVER-FIRST", config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: "localhost".to_owned(),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = SyncBackend::new(
+        "BACKEND_0",
+        back_address,
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    );
+    backend.connect();
+
+    let tls_config = {
+        let mut config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(Verifier))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config
+    };
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(tls_config), server_name.to_owned()).unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_millis(500))).ok();
+    tcp.set_write_timeout(Some(Duration::from_millis(500))).ok();
+    let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+
+    let request = "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    if tls_stream.write_all(request.as_bytes()).is_err() {
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    tls_stream.flush().ok();
+
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    let mut buf = [0u8; 4096];
+    let upgrade = match tls_stream.read(&mut buf) {
+        Ok(n) if n > 0 => String::from_utf8_lossy(&buf[..n]).to_string(),
+        other => {
+            println!("unexpected WSS upgrade read: {other:?}");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    };
+    if !upgrade.contains("101") {
+        println!("unexpected WSS upgrade response: {upgrade:?}");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    if upgrade.contains("server-speaks-first") {
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Success;
+    }
+
+    backend.set_response("server-speaks-first");
+    backend.send(0);
+
+    let result = match tls_stream.read(&mut buf) {
+        Ok(n) if n > 0 => {
+            let data = String::from_utf8_lossy(&buf[..n]);
+            data.contains("server-speaks-first")
+        }
+        other => {
+            println!("server-first WSS payload was not flushed before client data: {other:?}");
+            false
+        }
+    };
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    if result && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_wss_server_speaks_first_after_upgrade() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "WSS server-speaks-first payload after 101",
+            try_wss_server_speaks_first_after_upgrade,
+        ),
+        State::Success,
     );
 }
 
