@@ -313,6 +313,81 @@ fn test_websocket_upgrade() {
     );
 }
 
+fn try_websocket_server_speaks_first_after_upgrade() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "WS-SERVER-FIRST",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.set_response(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    );
+    backend.connect();
+
+    let mut client = Client::new(
+        "ws-server-first-client",
+        front_address,
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+    );
+    client.connect();
+    client.send();
+    backend.accept(0);
+    backend.receive(0);
+    backend.send(0);
+
+    let response = match client.receive() {
+        Some(response) if response.contains("101") => response,
+        other => {
+            println!("unexpected upgrade response: {other:?}");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    };
+    if response.contains("server-speaks-first") {
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Success;
+    }
+
+    backend.set_response("server-speaks-first");
+    backend.send(0);
+
+    match client.receive() {
+        Some(data) if data.contains("server-speaks-first") => {
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            State::Success
+        }
+        other => {
+            println!("server-first payload was not flushed before client data: {other:?}");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            State::Fail
+        }
+    }
+}
+
+#[test]
+fn test_websocket_server_speaks_first_after_upgrade() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "WebSocket server-speaks-first payload after 101",
+            try_websocket_server_speaks_first_after_upgrade,
+        ),
+        State::Success,
+    );
+}
+
 // =========================================================================
 // Test 3: Rapid connect-disconnect without proxy protocol
 // =========================================================================
