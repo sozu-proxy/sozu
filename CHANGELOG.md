@@ -33,6 +33,14 @@
   `manual_is_multiple_of`, `derivable_impls`, `mismatched_lifetime_syntaxes`)
   surfaced across `lib`/`command`/`bin` by the MSRV bump. No behavior change.
 
+### 🐛 Fixed
+
+- **`fix(pipe)`: WebSocket/WSS server-first frames are flushed after `101 Switching Protocols`.**
+  The post-upgrade pipe now arms writable readiness when bytes enter either
+  sozu-owned direction buffer, so edge-triggered epoll cannot park a backend
+  frame such as Pusher/Reverb `connection_established` until the client sends
+  its first WebSocket frame.
+
 ### 🤖 CI
 
 - **`ci(sim)`: the moonpool `sozu-sim` sweep is the sole UDP swarm.** A per-PR
