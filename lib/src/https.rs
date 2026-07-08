@@ -806,8 +806,7 @@ impl HttpsSession {
             ws_context,
         );
 
-        pipe.frontend_readiness.event = frontend_readiness.event;
-        pipe.backend_readiness.event = backend_readiness.event;
+        pipe.restore_readiness_events(frontend_readiness.event, backend_readiness.event);
         pipe.set_back_token(back_token);
         // The WSS pipe is a frontend↔backend bridge: it only exists because the
         // upgrading stream was `Linked(back_token)` to a *connected* backend (the

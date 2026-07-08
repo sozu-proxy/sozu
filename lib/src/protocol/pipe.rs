@@ -201,15 +201,25 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             },
         };
 
-        if session.backend_buffer.available_data() > 0 {
-            session.frontend_readiness.arm_writable();
-        }
-        if session.frontend_buffer.available_data() > 0 && session.backend_socket.is_some() {
-            session.backend_readiness.arm_writable();
-        }
+        session.arm_inherited_buffer_writes();
 
         trace!("{} created pipe", log_context!(session));
         session
+    }
+
+    fn arm_inherited_buffer_writes(&mut self) {
+        if self.backend_buffer.available_data() > 0 {
+            self.frontend_readiness.arm_writable();
+        }
+        if self.frontend_buffer.available_data() > 0 && self.backend_socket.is_some() {
+            self.backend_readiness.arm_writable();
+        }
+    }
+
+    pub fn restore_readiness_events(&mut self, frontend_event: Ready, backend_event: Ready) {
+        self.frontend_readiness.event = frontend_event;
+        self.backend_readiness.event = backend_event;
+        self.arm_inherited_buffer_writes();
     }
 
     /// Stamp connection-scoped TLS metadata captured at handshake time onto
@@ -1658,6 +1668,57 @@ mod tests {
             "buffered frontend bytes must queue a backend WRITABLE event"
         );
 
+        drop(backend_peer);
+    }
+
+    #[test]
+    fn restore_readiness_events_rearms_inherited_buffered_writes() {
+        let (frontend_peer, frontend_socket) = connected_pair();
+        let (backend_peer, backend_socket) = connected_pair();
+
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let mut backend_buffer = pool.checkout().expect("backend buffer");
+        let mut frontend_buffer = pool.checkout().expect("frontend buffer");
+        backend_buffer
+            .write_all(b"backend bytes inherited from 101 read")
+            .expect("write backend buffer");
+        frontend_buffer
+            .write_all(b"frontend bytes inherited from upgrade read")
+            .expect("write frontend buffer");
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let listener = Rc::new(RefCell::new(TestListener { address }));
+
+        let mut pipe = Pipe::new(
+            backend_buffer,
+            None,
+            Some(TcpStream::from_std(backend_socket)),
+            None,
+            None,
+            None,
+            None,
+            frontend_buffer,
+            Token(0),
+            TcpStream::from_std(frontend_socket),
+            listener,
+            Protocol::HTTP,
+            Ulid::generate(),
+            Ulid::generate(),
+            None,
+            WebSocketContext::Tcp,
+        );
+
+        pipe.restore_readiness_events(Ready::EMPTY, Ready::EMPTY);
+
+        assert!(
+            pipe.frontend_readiness.event.is_writable(),
+            "restoring inherited frontend events must not park backend-buffered bytes"
+        );
+        assert!(
+            pipe.backend_readiness.event.is_writable(),
+            "restoring inherited backend events must not park frontend-buffered bytes"
+        );
+
+        drop(frontend_peer);
         drop(backend_peer);
     }
 }
