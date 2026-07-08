@@ -994,10 +994,10 @@ impl App {
         // incremented at request-receive time without cluster_id, so it
         // surfaces traffic the user is generating even before the first
         // response cycle finishes.
-        if total_requests_observed == 0 {
-            if let Some(v) = count_value(m.proxying.get(names::http::REQUESTS)) {
-                total_requests = total_requests.saturating_add(v);
-            }
+        if total_requests_observed == 0
+            && let Some(v) = count_value(m.proxying.get(names::http::REQUESTS))
+        {
+            total_requests = total_requests.saturating_add(v);
         }
 
         // Per-second rate from the cumulative counter. The first observation
