@@ -12,9 +12,9 @@ use std::{
 };
 
 use nom::{
-    Err, IResult,
+    AsChar, Err, IResult, Parser,
     bytes::{self, complete::take_while},
-    character::{complete::digit1, is_alphanumeric},
+    character::complete::digit1,
     combinator::opt,
     error::{Error, ErrorKind},
     sequence::preceded,
@@ -103,7 +103,7 @@ impl fmt::Display for Method {
 
 #[cfg(feature = "tolerant-http1-parser")]
 fn is_hostname_char(i: u8) -> bool {
-    is_alphanumeric(i) ||
+    i.is_alphanum() ||
   // the domain name should not start with a hyphen or dot
   // but is it important here, since we will match this to
   // the list of accepted clusters?
@@ -118,7 +118,7 @@ fn is_hostname_char(i: u8) -> bool {
 
 #[cfg(not(feature = "tolerant-http1-parser"))]
 fn is_hostname_char(i: u8) -> bool {
-    is_alphanumeric(i) ||
+    i.is_alphanum() ||
   // the domain name should not start with a hyphen or dot
   // but is it important here, since we will match this to
   // the list of accepted clusters?
@@ -132,7 +132,7 @@ pub fn hostname_and_port(i: &[u8]) -> IResult<&[u8], (&[u8], Option<u16>)> {
     if host.is_empty() {
         return Err(Err::Error(Error::new(i, ErrorKind::Alpha)));
     }
-    let (i, port_bytes) = opt(preceded(bytes::complete::tag(":"), digit1))(i)?;
+    let (i, port_bytes) = opt(preceded(bytes::complete::tag(":"), digit1)).parse(i)?;
     let port = match port_bytes {
         // `digit1` guarantees ASCII digits, so the slice is always valid UTF-8;
         // `parse::<u16>()` rejects values that overflow the 16-bit port space

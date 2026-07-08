@@ -39,7 +39,7 @@ fn parse_command(i: &[u8]) -> IResult<&[u8], Command> {
 
 pub fn parse_v2_header(i: &[u8]) -> IResult<&[u8], HeaderV2> {
     let input_len = i.len();
-    let (i, _) = tag(&PROTOCOL_SIGNATURE_V2)(i)?;
+    let (i, _) = tag(&PROTOCOL_SIGNATURE_V2[..])(i)?;
     let (i, command) = parse_command(i)?;
     let (i, family) = be_u8(i)?;
     let (i, len) = be_u16(i)?;
