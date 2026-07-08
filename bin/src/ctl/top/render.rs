@@ -235,10 +235,10 @@ pub fn run(
             if cfg.tick_once && frames_drawn >= 1 {
                 break;
             }
-            if let Some(target) = snapshot_frames_target {
-                if frames_drawn >= target {
-                    break;
-                }
+            if let Some(target) = snapshot_frames_target
+                && frames_drawn >= target
+            {
+                break;
             }
         }
     }
