@@ -1,5 +1,5 @@
 use nom::{
-    IResult,
+    IResult, Parser,
     bytes::streaming::is_not,
     character::complete::char,
     combinator::map_res,
@@ -62,7 +62,8 @@ where
     many0(nom::combinator::complete(terminated(
         map_res(is_not("\0"), parse_one_request),
         char('\0'),
-    )))(input)
+    )))
+    .parse(input)
 }
 
 #[cfg(test)]

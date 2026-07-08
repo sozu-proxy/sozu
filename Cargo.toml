@@ -3,7 +3,7 @@ members = ["lib", "command", "bin", "e2e", "sim"]
 resolver = "2" # consistent with rust edition 2024, see https://doc.rust-lang.org/cargo/reference/resolver.html#features
 
 [workspace.dependencies]
-anyhow = "^1.0.102"
+anyhow = "^1.0.103"
 async-trait = "^0.1.89"
 base64 = "^0.22.1"
 clap = "^4.6.1"
@@ -14,7 +14,7 @@ hdrhistogram = "^7.5.4"
 hex = "^0.4.3"
 loona-hpack = "^0.4.3"
 http-body-util = "^0.1.3"
-hyper = "^1.9.0"
+hyper = "^1.10.1"
 hyper-rustls = { version = "^0.27.9", default-features = false }
 hyper-util = "^0.1.20"
 idna = "^1.1.0"
@@ -22,9 +22,9 @@ itoa = "^1.0.18"
 jemallocator = "^0.5.4"
 kawa = { version = "^0.6.8", default-features = false }
 libc = "^0.2.186"
-log = "^0.4.30"
-memchr = "^2.8.1"
-mio = "^1.2.0"
+log = "^0.4.33"
+memchr = "^2.8.3"
+mio = "^1.2.1"
 # Deterministic-simulation engine (Pierre Zemb's framework) driving the sans-io
 # UDP core sweep in `sim/`. Pinned to a git rev because the published 0.7.0 does
 # not build on stable (needs tracing_unstable, removed post-0.7.0 on `main`);
@@ -34,20 +34,20 @@ mio = "^1.2.0"
 # dev-deps); test-infra only — pulled in by `sozu-sim`, never by the `sozu` binary.
 moonpool-sim = { git = "https://github.com/PierreZ/moonpool", rev = "60eb07694e3203c8b489d304c84f6e6a9bf506c3" }
 nix = "^0.31.3"
-nom = "^7.1.3"
+nom = "^8.0.0"
 num_cpus = "^1.17.0"
 paw = "^1.0.0"
 pool = "^0.1.4"
 poule = "^0.3.2"
 prettytable-rs = { version = "^0.10.0", default-features = false }
-prost = "^0.14.3"
-prost-build = "^0.14.3"
+prost = "^0.14.4"
+prost-build = "^0.14.4"
 criterion = { version = "^0.8.2", features = ["html_reports"] }
 quickcheck = "^1.1.0"
-rand = "^0.10.1"
-regex = "^1.12.3"
+rand = "^0.10.2"
+regex = "^1.12.4"
 rustls-openssl = { version = "^0.3.1", default-features = false, features = ["tls12"] }
-rustls = { version = "^0.23.40", default-features = false, features = [
+rustls = { version = "^0.23.41", default-features = false, features = [
   "logging",
   "std",
   "tls12",
@@ -55,17 +55,17 @@ rustls = { version = "^0.23.40", default-features = false, features = [
 rusty_ulid = "^2.0.0"
 serde = "^1.0.228"
 serde_json = "^1.0.150"
-serial_test = "^3.4.0"
+serial_test = "^3.5.0"
 sha2 = "^0.11.0"
 slab = "^0.4.12"
-socket2 = "^0.6.3"
+socket2 = "^0.6.4"
 sozu-command-lib = { version = "^2.1.0", path = "command" }
 sozu-lib = { version = "^2.1.0", path = "lib", default-features = false }
 subtle = "^2.6.1"
 tempfile = "^3.27.0"
 termion = "^4.0.6"
 thiserror = "^2.0.18"
-time = "^0.3.47"
+time = "^0.3.53"
 tiny_http = "^0.12.0"
 tokio = "^1.52.3"
 toml = { version = "^1.1.2", features = ["preserve_order"] }
@@ -76,15 +76,15 @@ x509-parser = "^0.18.1"
 # any of them in. Versions pinned 2026-05-10 against crates.io HEAD; bump
 # the patch component locally if cargo update lands a fix.
 color-eyre           = "^0.6.5"
-crossbeam-channel    = "^0.5.15"
+crossbeam-channel    = "^0.5.16"
 crossterm            = { version = "^0.29.0", default-features = false }
 ctrlc                = "^3.5.2"
-ratatui              = { version = "^0.30.0", default-features = false }
-throbber-widgets-tui = "^0.11.0"
-tui-big-text         = "^0.8.4"
+ratatui              = { version = "^0.30.2", default-features = false }
+throbber-widgets-tui = "^0.11.1"
+tui-big-text         = "^0.8.8"
 tui-input            = "^0.15.3"
-tui-popup            = "^0.7.4"
-tui-scrollview       = "^0.6.4"
+tui-popup            = "^0.7.6"
+tui-scrollview       = "^0.6.7"
 tui-tree-widget      = "^0.24.0"
 
 [profile.release]

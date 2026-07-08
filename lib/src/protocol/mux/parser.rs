@@ -12,13 +12,12 @@ use std::convert::From;
 
 use kawa::repr::Slice;
 use nom::{
-    Err, IResult,
+    Err, IResult, Parser,
     bytes::complete::{tag, take},
     combinator::{complete, map},
     error::{ErrorKind, ParseError},
     multi::many0,
     number::complete::{be_u8, be_u16, be_u24, be_u32},
-    sequence::tuple,
 };
 use sozu_command::logging::ansi_palette;
 
@@ -251,7 +250,7 @@ impl<'a> From<(&'a [u8], ErrorKind)> for ParserError<'a> {
 }
 
 pub fn preface(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    tag(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")(i)
+    tag(&b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"[..])(i)
 }
 
 /// `if !$cond { return FrameSizeError; }` wrapping macro for the seven
@@ -616,7 +615,8 @@ fn stream_dependency(i: &[u8]) -> IResult<&[u8], StreamDependency, ParserError<'
     let (i, stream) = map(be_u32, |i| StreamDependency {
         exclusive: i & 0x80000000 != 0,
         stream_id: i & STREAM_ID_MASK,
-    })(i)?;
+    })
+    .parse(i)?;
     Ok((i, stream))
 }
 
@@ -711,7 +711,7 @@ pub fn priority_frame<'a>(
         PRIORITY_PAYLOAD_SIZE as usize,
         "PRIORITY payload must be exactly 5 bytes"
     );
-    let (_, (stream_dependency, weight)) = tuple((stream_dependency, be_u8))(data)?;
+    let (_, (stream_dependency, weight)) = (stream_dependency, be_u8).parse(data)?;
     Ok((
         i,
         Frame::Priority(Priority {
@@ -802,10 +802,10 @@ pub fn settings_frame<'a>(
     let in_len = input.len();
     let (i, data) = take(header.payload_len)(input)?;
 
-    let (_, settings) = many0(map(
-        complete(tuple((be_u16, be_u32))),
-        |(identifier, value)| Setting { identifier, value },
-    ))(data)?;
+    let (_, settings) = many0(map(complete((be_u16, be_u32)), |(identifier, value)| {
+        Setting { identifier, value }
+    }))
+    .parse(data)?;
 
     // The framing layer guaranteed `payload_len % 6 == 0` and the cap above
     // bounded the entry count; the decoded vector must reflect exactly that —
