@@ -517,8 +517,7 @@ impl HttpSession {
             ws_context,
         );
 
-        pipe.frontend_readiness.event = frontend_readiness.event;
-        pipe.backend_readiness.event = backend_readiness.event;
+        pipe.restore_readiness_events(frontend_readiness.event, backend_readiness.event);
         // The WebSocket pipe inherits the live backend connection, so its back
         // token must be set (back token present iff a backend is connected).
         pipe.set_back_token(back_token);
