@@ -39,7 +39,9 @@
   The post-upgrade pipe now arms writable readiness when bytes enter either
   sozu-owned direction buffer, so edge-triggered epoll cannot park a backend
   frame such as Pusher/Reverb `connection_established` until the client sends
-  its first WebSocket frame.
+  its first WebSocket frame. It also arms writable readiness for bytes already
+  inherited from the H1 mux during upgrade, including a backend frame carried in
+  the same read buffer as the `101 Switching Protocols` response.
 
 ### 🤖 CI
 

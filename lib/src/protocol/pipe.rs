@@ -161,7 +161,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             ConnectionStatus::Normal
         };
 
-        let session = Pipe {
+        let mut session = Pipe {
             backend_buffer,
             backend_id,
             backend_readiness: Readiness {
@@ -200,6 +200,13 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 None
             },
         };
+
+        if session.backend_buffer.available_data() > 0 {
+            session.frontend_readiness.arm_writable();
+        }
+        if session.frontend_buffer.available_data() > 0 && session.backend_socket.is_some() {
+            session.backend_readiness.arm_writable();
+        }
 
         trace!("{} created pipe", log_context!(session));
         session
