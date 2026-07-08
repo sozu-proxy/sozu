@@ -164,6 +164,23 @@ fn raw_read(stream: &mut TcpStream) -> Option<String> {
     }
 }
 
+fn websocket_text_frame(payload: &str) -> Vec<u8> {
+    let payload = payload.as_bytes();
+    let mut frame = Vec::with_capacity(payload.len() + 2);
+    debug_assert!(payload.len() <= 125);
+    frame.push(0x81);
+    frame.push(payload.len() as u8);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn backend_send_bytes(backend: &mut SyncBackend, client_id: usize, bytes: &[u8]) -> bool {
+    match backend.clients.get_mut(&client_id) {
+        Some(stream) => stream.write_all(bytes).is_ok() && stream.flush().is_ok(),
+        None => false,
+    }
+}
+
 // =========================================================================
 // Test 1: Client HUP during in-flight request
 // =========================================================================
@@ -383,6 +400,72 @@ fn test_websocket_server_speaks_first_after_upgrade() {
             10,
             "WebSocket server-speaks-first payload after 101",
             try_websocket_server_speaks_first_after_upgrade,
+        ),
+        State::Success,
+    );
+}
+
+fn try_websocket_backend_frame_in_same_read_as_101() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "WS-ONEFLUSH",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.connect();
+
+    let mut client = raw_connect(front_address);
+    let request = b"GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    if client.write_all(request).is_err() || client.flush().is_err() {
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    backend.accept(0);
+    backend.receive(0);
+
+    let mut response =
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            .to_vec();
+    response.extend_from_slice(&websocket_text_frame("HELLO-ONEFLUSH"));
+    if !backend_send_bytes(&mut backend, 0, &response) {
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    let result = match raw_read(&mut client) {
+        Some(data)
+            if data.contains("101 Switching Protocols") && data.contains("HELLO-ONEFLUSH") =>
+        {
+            State::Success
+        }
+        other => {
+            println!("upgrade plus same-buffer websocket frame read: {other:?}");
+            State::Fail
+        }
+    };
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    result
+}
+
+#[test]
+fn test_websocket_backend_frame_in_same_read_as_101() {
+    assert_eq!(
+        repeat_until_error_or(
+            10,
+            "WebSocket backend frame in same read buffer as 101",
+            try_websocket_backend_frame_in_same_read_as_101,
         ),
         State::Success,
     );

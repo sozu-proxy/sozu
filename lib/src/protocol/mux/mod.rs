@@ -637,6 +637,21 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L>
 }
 
 impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> Mux<Front, L> {
+    fn sync_upgrade_buffers(&mut self) {
+        for stream in &mut self.context.streams {
+            stream
+                .front
+                .storage
+                .buffer
+                .sync(stream.front.storage.end, stream.front.storage.head);
+            stream
+                .back
+                .storage
+                .buffer
+                .sync(stream.back.storage.end, stream.back.storage.head);
+        }
+    }
+
     fn delay_close_for_frontend_flush(&mut self, reason: &'static str) -> bool {
         let _ = self.frontend.initiate_close_notify();
         // LIFECYCLE §9 invariant 16: consult per-stream back-buffers in
@@ -798,7 +813,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 return SessionResult::Close;
                             }
                         }
-                        MuxResult::Upgrade => return SessionResult::Upgrade,
+                        MuxResult::Upgrade => {
+                            self.sync_upgrade_buffers();
+                            return SessionResult::Upgrade;
+                        }
                     }
                 }
 
@@ -1118,7 +1136,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 return SessionResult::Close;
                             }
                         }
-                        MuxResult::Upgrade => return SessionResult::Upgrade,
+                        MuxResult::Upgrade => {
+                            self.sync_upgrade_buffers();
+                            return SessionResult::Upgrade;
+                        }
                     }
                     // Cross-readiness: frontend wrote → wake parked backends.
                     // If any backend resumes, invalidate the stale readiness
