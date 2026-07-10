@@ -396,10 +396,13 @@ pub enum ConfigError {
     /// A TCP frontend's `hostname` (mapped to the wire `sni` field) is
     /// neither an exact hostname nor a single leading `*.` wildcard label
     /// (sozu-proxy/sozu#1279). Rejects `*.*.example.com`, an embedded `*`
-    /// anywhere but the leading label, and an empty label.
+    /// anywhere but the leading label, an empty label, and any `/` — never
+    /// valid in a hostname, and a leftmost `/.../` label would otherwise be
+    /// inserted into the `pattern_trie` route table as a REGEX segment.
     #[error(
         "invalid SNI pattern '{sni}' for a TCP frontend: expected an exact hostname or a \
-         single leading \"*.\" wildcard label (e.g. \"example.com\" or \"*.example.com\")"
+         single leading \"*.\" wildcard label (e.g. \"example.com\" or \"*.example.com\"); \
+         '/' and non-leading '*' are rejected"
     )]
     InvalidSniPattern { sni: String },
     /// A TCP frontend's SNI pattern contains non-ASCII characters. On-wire
@@ -2001,7 +2004,13 @@ pub(crate) fn validate_sni_pattern(sni: &str) -> Result<String, ConfigError> {
     // non-empty.
     let remainder = sni.strip_prefix("*.").unwrap_or(sni);
 
-    if remainder.is_empty() || remainder.contains('*') {
+    // `/` is never valid in a hostname — and the SNI route table is a
+    // `pattern_trie::TrieNode`, whose insert treats a leftmost label wrapped
+    // in `/.../` as a REGEX segment; letting one through would silently
+    // widen routing beyond the documented "exact host or one leading `*.`"
+    // contract. Checking `remainder` covers the whole pattern: the only
+    // stripped prefix is the literal `*.`, which cannot contain `/`.
+    if remainder.is_empty() || remainder.contains('*') || remainder.contains('/') {
         return Err(invalid());
     }
     if remainder.split('.').any(|label| label.is_empty()) {
@@ -5108,10 +5117,20 @@ mod tests {
     }
 
     /// (a) An SNI pattern with more than one wildcard label, an embedded
-    /// `*`, or an empty label is rejected at config-load.
+    /// `*`, an empty label, or any `/` (a leftmost `/.../` label would be
+    /// inserted into the `pattern_trie` route table as a REGEX segment,
+    /// silently widening routing) is rejected at config-load.
     #[test]
     fn tcp_frontend_invalid_sni_pattern_rejected() {
-        for invalid in ["*.*.example.com", "foo.*.com", "*", "example..com", ""] {
+        for invalid in [
+            "*.*.example.com",
+            "foo.*.com",
+            "*",
+            "example..com",
+            "",
+            "/[a-z]+/.example.com",
+            "foo/bar.example.com",
+        ] {
             let frontend = FileClusterFrontendConfig {
                 address: "127.0.0.1:8080".parse().unwrap(),
                 hostname: Some(invalid.to_string()),

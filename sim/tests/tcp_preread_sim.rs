@@ -241,12 +241,19 @@ fn one_of(protocols: &[&[u8]]) -> AlpnMatcher {
     )
 }
 
+/// Expected terminal for an accepted scenario. `matched_sni_pattern` /
+/// `matched_alpn` are the shadow model's independent prediction of WHICH
+/// route entry wins (the trie key — `*.wild.example.com` for wildcard
+/// scenarios, not the concrete SNI — and the winning matcher), mirroring
+/// `Output::Routed`'s matched-route identity fields.
 fn routed(
     cluster: &str,
     sni: &str,
     alpn: &[&[u8]],
     content_offset: usize,
     proxy_source: Option<SocketAddr>,
+    matched_sni_pattern: &str,
+    matched_alpn: AlpnMatcher,
 ) -> Output {
     Output::Routed {
         cluster: cluster.to_owned(),
@@ -254,6 +261,8 @@ fn routed(
         proxy_source,
         sni: sni.to_owned(),
         alpn: alpn.iter().map(|p| p.to_vec()).collect(),
+        matched_sni_pattern: matched_sni_pattern.to_owned(),
+        matched_alpn,
     }
 }
 
@@ -401,6 +410,8 @@ fn gen_accept_exact_any(ctx: &SimContext) -> Scenario {
         &alpn_choice,
         0,
         None,
+        "exact.example.com",
+        AlpnMatcher::Any,
     );
     let mut s = Scenario::new(wire, Some(expected), "accept_exact_any");
     s.delivery = pick_delivery(ctx, s.wire.len());
@@ -422,6 +433,10 @@ fn gen_accept_wildcard(ctx: &SimContext) -> Scenario {
         if with_alpn { &[b"h2"] } else { &[] },
         0,
         None,
+        // The matched pattern is the trie KEY -- the wildcard itself, not
+        // the concrete `hostN.wild.example.com` the client sent.
+        "*.wild.example.com",
+        AlpnMatcher::Any,
     );
     let mut s = Scenario::new(wire, Some(expected), "accept_wildcard");
     s.delivery = pick_delivery(ctx, s.wire.len());
@@ -436,7 +451,22 @@ fn gen_accept_alpn_first_pref(ctx: &SimContext) -> Scenario {
         (&[b"http/1.1", b"h2"], "cluster-http11")
     };
     let wire = hello("prefs.example.com", offer);
-    let expected = routed(expected_cluster, "prefs.example.com", offer, 0, None);
+    // Client preference order picks the entry whose OneOf contains the
+    // first offered protocol.
+    let expected_matcher = if h2_first {
+        one_of(&[b"h2"])
+    } else {
+        one_of(&[b"http/1.1"])
+    };
+    let expected = routed(
+        expected_cluster,
+        "prefs.example.com",
+        offer,
+        0,
+        None,
+        "prefs.example.com",
+        expected_matcher,
+    );
     let mut s = Scenario::new(wire, Some(expected), "accept_alpn_first_pref");
     s.delivery = pick_delivery(ctx, s.wire.len());
     s
@@ -450,6 +480,8 @@ fn gen_accept_alpn_catch_all(ctx: &SimContext) -> Scenario {
         &[b"spdy/1"],
         0,
         None,
+        "mixed.example.com",
+        AlpnMatcher::Any,
     );
     let mut s = Scenario::new(wire, Some(expected), "accept_alpn_catch_all");
     s.delivery = pick_delivery(ctx, s.wire.len());
@@ -458,7 +490,15 @@ fn gen_accept_alpn_catch_all(ctx: &SimContext) -> Scenario {
 
 fn gen_accept_no_alpn_catch_all(ctx: &SimContext) -> Scenario {
     let wire = hello_no_alpn("mixed.example.com");
-    let expected = routed("cluster-default-mixed", "mixed.example.com", &[], 0, None);
+    let expected = routed(
+        "cluster-default-mixed",
+        "mixed.example.com",
+        &[],
+        0,
+        None,
+        "mixed.example.com",
+        AlpnMatcher::Any,
+    );
     let mut s = Scenario::new(wire, Some(expected), "accept_no_alpn_catch_all");
     s.delivery = pick_delivery(ctx, s.wire.len());
     s
@@ -472,7 +512,15 @@ fn gen_accept_mixed_case(ctx: &SimContext) -> Scenario {
     ];
     let raw = VARIANTS[ctx.random().random_range(0..VARIANTS.len())];
     let wire = hello_no_alpn(raw);
-    let expected = routed("cluster-exact-any", "exact.example.com", &[], 0, None);
+    let expected = routed(
+        "cluster-exact-any",
+        "exact.example.com",
+        &[],
+        0,
+        None,
+        "exact.example.com",
+        AlpnMatcher::Any,
+    );
     let mut s = Scenario::new(wire, Some(expected), "accept_mixed_case_sni");
     s.delivery = pick_delivery(ctx, s.wire.len());
     s
@@ -480,7 +528,15 @@ fn gen_accept_mixed_case(ctx: &SimContext) -> Scenario {
 
 fn gen_accept_trailing_dot(ctx: &SimContext) -> Scenario {
     let wire = hello_no_alpn("exact.example.com.");
-    let expected = routed("cluster-exact-any", "exact.example.com", &[], 0, None);
+    let expected = routed(
+        "cluster-exact-any",
+        "exact.example.com",
+        &[],
+        0,
+        None,
+        "exact.example.com",
+        AlpnMatcher::Any,
+    );
     let mut s = Scenario::new(wire, Some(expected), "accept_trailing_dot_sni");
     s.delivery = pick_delivery(ctx, s.wire.len());
     s
@@ -493,7 +549,15 @@ fn gen_accept_with_grease(ctx: &SimContext) -> Scenario {
         encode_alpn_extension(&[b"h2"]),
         encode_grease_extension(ctx),
     ]);
-    let expected = routed("cluster-exact-any", "exact.example.com", &[b"h2"], 0, None);
+    let expected = routed(
+        "cluster-exact-any",
+        "exact.example.com",
+        &[b"h2"],
+        0,
+        None,
+        "exact.example.com",
+        AlpnMatcher::Any,
+    );
     let mut s = Scenario::new(wire, Some(expected), "accept_with_grease");
     s.delivery = pick_delivery(ctx, s.wire.len());
     s
@@ -503,7 +567,15 @@ fn gen_accept_multi_record(ctx: &SimContext) -> Scenario {
     let wire_full = hello("split.example.com", &[b"h2"]);
     let chunks: usize = ctx.random().random_range(2..7usize);
     let split = split_into_records(&wire_full, chunks);
-    let expected = routed("cluster-split", "split.example.com", &[b"h2"], 0, None);
+    let expected = routed(
+        "cluster-split",
+        "split.example.com",
+        &[b"h2"],
+        0,
+        None,
+        "split.example.com",
+        AlpnMatcher::Any,
+    );
     let mut s = Scenario::new(split, Some(expected), "accept_multi_record");
     s.is_multi_record = true;
     s.delivery = pick_delivery(ctx, s.wire.len());
@@ -516,7 +588,15 @@ fn gen_accept_multi_record(ctx: &SimContext) -> Scenario {
 /// selects elsewhere.
 fn gen_accept_one_byte_drip(_ctx: &SimContext) -> Scenario {
     let wire = hello_no_alpn("exact.example.com");
-    let expected = routed("cluster-exact-any", "exact.example.com", &[], 0, None);
+    let expected = routed(
+        "cluster-exact-any",
+        "exact.example.com",
+        &[],
+        0,
+        None,
+        "exact.example.com",
+        AlpnMatcher::Any,
+    );
     let mut s = Scenario::new(wire, Some(expected), "accept_one_byte_drip");
     s.delivery = Delivery::OneByteDrip;
     s
@@ -667,7 +747,15 @@ fn gen_complete_over_cap_routes(ctx: &SimContext) -> Scenario {
     let trailing_len = ctx.random().random_range(1..64usize);
     let mut wire = hello_wire.clone();
     wire.extend((0..trailing_len).map(|_| ctx.random().random::<u8>()));
-    let expected = routed("cluster-exact-any", "exact.example.com", &[], 0, None);
+    let expected = routed(
+        "cluster-exact-any",
+        "exact.example.com",
+        &[],
+        0,
+        None,
+        "exact.example.com",
+        AlpnMatcher::Any,
+    );
     let mut s = Scenario::new(wire, Some(expected), "complete_over_cap_routes");
     // At or above the hello's own length (inclusive) and below the total
     // wire length (exclusive), so the window is never treated as
@@ -716,6 +804,8 @@ fn gen_proxy_prefixed_valid(ctx: &SimContext) -> Scenario {
         &[],
         header.len(),
         Some(src),
+        "exact.example.com",
+        AlpnMatcher::Any,
     );
     let mut s = Scenario::new(wire, Some(expected), "proxy_prefixed_valid");
     s.inbound_proxy = true;
@@ -1173,6 +1263,8 @@ fn fold_fingerprint(acc: u64, out: &Output) -> u64 {
             proxy_source,
             sni,
             alpn,
+            matched_sni_pattern,
+            matched_alpn,
         } => {
             let mut h = fnv1a(cluster.as_bytes()) ^ fnv1a(sni.as_bytes());
             h ^= *content_offset as u64;
@@ -1181,6 +1273,18 @@ fn fold_fingerprint(acc: u64, out: &Output) -> u64 {
             }
             for p in alpn {
                 h ^= fnv1a(p);
+            }
+            // The matched route identity is part of the terminal outcome:
+            // fold it in so the determinism guard also detects a
+            // nondeterministic matched-entry selection.
+            h ^= fnv1a(matched_sni_pattern.as_bytes()).rotate_left(13);
+            match matched_alpn {
+                AlpnMatcher::Any => h ^= 0x3C,
+                AlpnMatcher::OneOf(set) => {
+                    for p in set {
+                        h ^= fnv1a(p).rotate_left(29);
+                    }
+                }
             }
             h ^ 0xA5
         }

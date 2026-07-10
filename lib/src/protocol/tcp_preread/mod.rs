@@ -104,6 +104,16 @@ pub enum Output {
         proxy_source: Option<SocketAddr>,
         sni: String,
         alpn: Vec<Vec<u8>>,
+        /// The trie KEY that matched -- the route's configured pattern, not
+        /// the client's concrete SNI: for a wildcard route this is
+        /// `*.example.com` even when `sni` is `a.example.com`. Carries the
+        /// matched route's identity so the shell/session can key
+        /// per-frontend state (e.g. access-log tags) without re-running the
+        /// lookup.
+        matched_sni_pattern: String,
+        /// Clone of the winning route entry's [`AlpnMatcher`] -- the other
+        /// half of the matched route's identity.
+        matched_alpn: AlpnMatcher,
     },
     /// Terminal, non-routable verdict. See [`RejectReason`].
     Reject(RejectReason),
@@ -330,19 +340,19 @@ impl SniPrereadCore {
             }
         };
 
-        let Some((_, entries)) = cfg
+        let Some((matched_key, entries)) = cfg
             .routes
             .domain_lookup(sni.as_bytes(), cfg.accept_wildcard)
         else {
             return self.decide(Output::Reject(RejectReason::SniUnmatched));
         };
 
-        let Some(cluster) = resolve_alpn(entries, &alpn) else {
+        let Some((matched_alpn, cluster)) = resolve_alpn(entries, &alpn) else {
             return self.decide(Output::Reject(RejectReason::AlpnUnmatched));
         };
 
         // Route determinism (pair): re-running the SAME lookup + ALPN
-        // resolution must yield the SAME cluster -- routing is a pure
+        // resolution must yield the SAME entry -- routing is a pure
         // function of (sni, accept_wildcard, alpn) at a given instant, so a
         // divergence here means the trie or `resolve_alpn` has a hidden
         // side effect or non-determinism (e.g. iterating a HashMap without
@@ -353,10 +363,10 @@ impl SniPrereadCore {
                 .routes
                 .domain_lookup(sni.as_bytes(), cfg.accept_wildcard)
                 .expect("a route that just matched must match again");
-            let replay_cluster = resolve_alpn(replay_entries, &alpn);
+            let replay_entry = resolve_alpn(replay_entries, &alpn);
             debug_assert_eq!(
-                replay_cluster,
-                Some(cluster),
+                replay_entry,
+                Some((matched_alpn, cluster)),
                 "route lookup + ALPN resolution must be deterministic for the same (sni, alpn)"
             );
         }
@@ -371,6 +381,11 @@ impl SniPrereadCore {
             proxy_source,
             sni,
             alpn,
+            // The trie key is the route's configured pattern verbatim
+            // (lowercased at insert); `from_utf8_lossy` is defensive -- keys
+            // originate from config/IPC `String`s, never raw network bytes.
+            matched_sni_pattern: String::from_utf8_lossy(matched_key).into_owned(),
+            matched_alpn: matched_alpn.clone(),
         })
     }
 
@@ -410,8 +425,15 @@ impl SniPrereadCore {
         );
         // Pair (positive + negative space): a latched SNI is always already
         // normalized -- lowercase, no trailing dot -- because `route` never
-        // stores the raw wire-form SNI.
-        if let Some(Output::Routed { sni, .. }) = &self.decided {
+        // stores the raw wire-form SNI. The matched pattern is the trie KEY
+        // (lowercased at insert): either the concrete SNI itself (exact
+        // route) or a `*.`-prefixed wildcard whose suffix the SNI ends with.
+        if let Some(Output::Routed {
+            sni,
+            matched_sni_pattern,
+            ..
+        }) = &self.decided
+        {
             debug_assert_eq!(
                 sni,
                 &sni.to_ascii_lowercase(),
@@ -420,6 +442,18 @@ impl SniPrereadCore {
             debug_assert!(
                 !sni.ends_with('.'),
                 "latched SNI must not carry a trailing dot after normalization"
+            );
+            debug_assert_eq!(
+                matched_sni_pattern,
+                &matched_sni_pattern.to_ascii_lowercase(),
+                "latched matched_sni_pattern must already be lowercase (trie keys are lowercased at insert)"
+            );
+            debug_assert!(
+                matched_sni_pattern == sni
+                    || matched_sni_pattern
+                        .strip_prefix("*.")
+                        .is_some_and(|suffix| sni.ends_with(suffix)),
+                "matched_sni_pattern must be the SNI itself (exact route) or a wildcard the SNI falls under"
             );
         }
     }
@@ -444,20 +478,20 @@ impl SniPrereadCore {
 fn resolve_alpn<'r>(
     entries: &'r [(AlpnMatcher, ClusterId)],
     offered: &[Vec<u8>],
-) -> Option<&'r ClusterId> {
+) -> Option<(&'r AlpnMatcher, &'r ClusterId)> {
     for protocol in offered {
         for (matcher, cluster) in entries {
             if let AlpnMatcher::OneOf(set) = matcher
                 && set.contains(protocol)
             {
-                return Some(cluster);
+                return Some((matcher, cluster));
             }
         }
     }
     entries
         .iter()
         .find(|(matcher, _)| matches!(matcher, AlpnMatcher::Any))
-        .map(|(_, cluster)| cluster)
+        .map(|(matcher, cluster)| (matcher, cluster))
 }
 
 /// Normalize a wire-form SNI: ASCII-lowercase, then strip AT MOST one
@@ -1001,7 +1035,21 @@ mod tests {
 
         let mut core = SniPrereadCore::new();
         match feed(&mut core, &cfg, &hello_no_alpn("a.example.com")) {
-            Output::Routed { cluster, .. } => assert_eq!(cluster, "wildcard-cluster"),
+            Output::Routed {
+                cluster,
+                sni,
+                matched_sni_pattern,
+                matched_alpn,
+                ..
+            } => {
+                assert_eq!(cluster, "wildcard-cluster");
+                // The matched-route identity is the trie KEY (the
+                // configured wildcard pattern), NOT the client's concrete
+                // SNI -- downstream tags keying depends on this.
+                assert_eq!(sni, "a.example.com");
+                assert_eq!(matched_sni_pattern, "*.example.com");
+                assert_eq!(matched_alpn, AlpnMatcher::Any);
+            }
             other => panic!("*.example.com must match a.example.com, got {other:?}"),
         }
 
