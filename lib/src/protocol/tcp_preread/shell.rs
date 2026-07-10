@@ -30,7 +30,7 @@ use std::{net::SocketAddr, time::Instant};
 use mio::{Token, net::TcpStream};
 use rusty_ulid::Ulid;
 
-use super::{Input, Output, PrereadConfig, SniPrereadCore};
+use super::{AlpnMatcher, Input, Output, PrereadConfig, SniPrereadCore};
 use crate::{
     Readiness, SessionMetrics, SessionResult,
     metrics::names,
@@ -70,6 +70,14 @@ pub struct RoutedOutcome {
     pub proxy_source: Option<SocketAddr>,
     pub sni: String,
     pub alpn: Vec<Vec<u8>>,
+    /// The matched route's configured pattern (trie key) -- `*.example.com`
+    /// for a wildcard route, not the client's concrete SNI. Together with
+    /// `matched_alpn` this is the matched FRONTEND's identity, which
+    /// `TcpSession::upgrade_sni_preread` uses to rebuild the per-frontend
+    /// access-log tags key (`sni_tags_key` in `lib/src/tcp.rs`).
+    pub matched_sni_pattern: String,
+    /// Clone of the winning route entry's [`AlpnMatcher`].
+    pub matched_alpn: AlpnMatcher,
 }
 
 /// TCP session state that owns the frontend socket and the accumulating
@@ -311,6 +319,8 @@ impl<Front: SocketHandler> SniPreread<Front> {
                 proxy_source,
                 sni,
                 alpn,
+                matched_sni_pattern,
+                matched_alpn,
             } => {
                 debug_assert!(
                     self.outcome.is_none(),
@@ -339,6 +349,8 @@ impl<Front: SocketHandler> SniPreread<Front> {
                     proxy_source,
                     sni,
                     alpn,
+                    matched_sni_pattern,
+                    matched_alpn,
                 });
                 SessionResult::Continue
             }

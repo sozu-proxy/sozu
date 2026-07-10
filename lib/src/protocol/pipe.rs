@@ -118,6 +118,12 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     /// paths or when the client omitted the SNI extension.
     tls_sni: Option<String>,
     tls_alpn: Option<&'static str>,
+    /// Override for the access-log tags lookup key. `None` (every path but
+    /// TCP SNI-preread) falls back to the historical bare listener-address
+    /// key; SNI-routed TCP sessions carry the matched frontend's composed
+    /// key (`sni_tags_key` in `lib/src/tcp.rs`) so one listener's many
+    /// SNI/ALPN fronts each log their own tags.
+    tags_key: Option<String>,
     /// Kernel-pipe pair used for zero-copy `splice(2)` forwarding on
     /// `Protocol::TCP` listeners. Allocated lazily in `new()` and
     /// `None` for WebSocket-after-upgrade paths or when allocation
@@ -193,6 +199,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             tls_cipher: None,
             tls_sni: None,
             tls_alpn: None,
+            tags_key: None,
             #[cfg(all(target_os = "linux", feature = "splice"))]
             splice_pipe: if protocol == Protocol::TCP {
                 SplicePipe::new()
@@ -297,6 +304,14 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.cluster_id = cluster_id;
     }
 
+    /// Override the access-log tags lookup key (see the `tags_key` field
+    /// doc). Called from `lib/src/tcp.rs`'s pipe-building upgrade paths for
+    /// SNI-routed sessions; `None` (the default) keeps the historical
+    /// bare-address lookup.
+    pub fn set_tags_key(&mut self, tags_key: Option<String>) {
+        self.tags_key = tags_key;
+    }
+
     pub fn set_backend_id(&mut self, backend_id: Option<String>) {
         self.backend_id = backend_id;
     }
@@ -338,6 +353,11 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         let context = self.log_context();
         let endpoint = self.log_endpoint();
         metrics.register_end_of_session(&context);
+        // TCP SNI-preread sessions carry the matched frontend's own tags
+        // key (`set_tags_key`); every other path keeps the historical
+        // bare-address lookup.
+        let address_key = listener.get_addr().to_string();
+        let tags_key = self.tags_key.as_deref().unwrap_or(&address_key);
         log_access!(
             error,
             on_failure: { incr!(names::access_logs::UNSENT) },
@@ -347,7 +367,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             backend_address: self.get_backend_address(),
             protocol: self.protocol_string(),
             endpoint,
-            tags: listener.get_tags(&listener.get_addr().to_string()),
+            tags: listener.get_tags(tags_key),
             client_rtt: socket_rtt(self.front_socket()),
             server_rtt: self.backend_socket.as_ref().and_then(socket_rtt),
             service_time: metrics.service_time(),

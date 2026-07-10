@@ -152,6 +152,15 @@ pub struct TcpSession {
     /// terminates TLS -- so this is informational (the client's
     /// preference), not a negotiated value.
     routed_alpn_label: Option<&'static str>,
+    /// Canonical access-log tags key for the MATCHED SNI/ALPN frontend
+    /// (`sni_tags_key`), rebuilt in `upgrade_sni_preread` from the route
+    /// decision's `matched_sni_pattern` + `matched_alpn`. `None` for every
+    /// non-SNI-routed session, whose tags stay keyed by the bare listener
+    /// address exactly as before SNI routing existed. Unlike `routed_sni`
+    /// it is never consumed: `log_request` reads it for the session-level
+    /// access log, and the `Pipe` receives a clone at upgrade time for the
+    /// post-upgrade log.
+    tags_key: Option<String>,
 }
 
 impl TcpSession {
@@ -267,6 +276,7 @@ impl TcpSession {
             cluster_ip_tracked: false,
             routed_sni: None,
             routed_alpn_label: None,
+            tags_key: None,
         }
     }
 
@@ -349,6 +359,7 @@ impl TcpSession {
             cluster_ip_tracked: false,
             routed_sni: None,
             routed_alpn_label: None,
+            tags_key: None,
         }
     }
 
@@ -378,6 +389,11 @@ impl TcpSession {
         let listener = self.listener.borrow();
         let context = self.log_context();
         self.metrics.register_end_of_session(&context);
+        // SNI-routed sessions carry the matched front's own tags key
+        // (`sni_tags_key`, stashed by `upgrade_sni_preread`); everything
+        // else keeps the historical bare-address key.
+        let address_key = listener.get_addr().to_string();
+        let tags_key = self.tags_key.as_deref().unwrap_or(&address_key);
         info_access!(
             on_failure: { incr!(names::access_logs::UNSENT) },
             message: None,
@@ -386,7 +402,7 @@ impl TcpSession {
             backend_address: None,
             protocol: "TCP",
             endpoint: EndpointRecord::Tcp,
-            tags: listener.get_tags(&listener.get_addr().to_string()),
+            tags: listener.get_tags(tags_key),
             client_rtt: socket_rtt(self.state.front_socket()),
             server_rtt: None,
             user_agent: None,
@@ -607,6 +623,9 @@ impl TcpSession {
             if let Some(sni) = self.routed_sni.take() {
                 pipe.set_tls_metadata(None, None, Some(sni), self.routed_alpn_label.take());
             }
+            // `None` for legacy sessions (keeps the bare-address tags
+            // lookup); the matched front's composed key for SNI-routed ones.
+            pipe.set_tags_key(self.tags_key.clone());
             gauge_add!(names::protocol::PROXY_SEND, -1);
             gauge_add!(names::protocol::TCP, 1);
             return Some(TcpStateMachine::Pipe(pipe));
@@ -772,6 +791,18 @@ impl TcpSession {
         // `routed_sni` field doc).
         self.routed_sni = Some(outcome.sni.clone());
         self.routed_alpn_label = known_alpn_label(&outcome.alpn);
+        // Rebuild the MATCHED front's tags key from the route decision's
+        // identity (`matched_sni_pattern` is the trie key — the configured
+        // pattern, not the client's concrete SNI — and `matched_alpn` the
+        // winning matcher), so the access log emits the tags of the front
+        // that actually routed this session, not whichever front was added
+        // last. Must compose the same key `add_tcp_front` stored — see
+        // `sni_tags_key`'s canonical-form doc.
+        self.tags_key = Some(sni_tags_key(
+            self.listener.borrow().get_addr(),
+            &outcome.matched_sni_pattern,
+            &alpn_matcher_protocols(&outcome.matched_alpn),
+        ));
 
         let proxy_protocol = self
             .proxy
@@ -890,6 +921,9 @@ impl TcpSession {
         if let Some(sni) = self.routed_sni.take() {
             pipe.set_tls_metadata(None, None, Some(sni), self.routed_alpn_label.take());
         }
+        // The matched front's composed tags key (always `Some` here — this
+        // is only reachable from `upgrade_sni_preread`, which just set it).
+        pipe.set_tags_key(self.tags_key.clone());
         gauge_add!(names::protocol::TCP, 1);
         TcpStateMachine::Pipe(pipe)
     }
@@ -2067,6 +2101,27 @@ impl TcpListener {
                     );
                 }
 
+                // SNI SHAPE check, mirroring config.rs's
+                // `validate_sni_pattern` (which a direct `AddTcpFrontend`
+                // over the command socket or a `LoadState` replay bypasses
+                // entirely): `/` is never valid in a hostname — and
+                // `pattern_trie`'s insert treats a leftmost `/.../` label as
+                // a REGEX segment — and `*` is only legal as a single
+                // leading `*.` wildcard label. Without this, a malformed
+                // SNI reaching the worker would be silently inserted as a
+                // regex/wildcard route.
+                let star_outside_leading_label = match sni.strip_prefix("*.") {
+                    Some(rest) => rest.contains('*'),
+                    None => sni.contains('*'),
+                };
+                if sni.contains('/') || star_outside_leading_label {
+                    return reject(format!(
+                        "sni {sni:?} has an invalid shape: '/' is never valid in an SNI \
+                         hostname (a leftmost '/.../' label would become a regex route), and \
+                         '*' is only allowed as a single leading \"*.\" wildcard label"
+                    ));
+                }
+
                 // Same key as `insert_sni_route`'s own lookup, so this checks
                 // against exactly the entries the new route would be appended
                 // alongside. This is bookkeeping over the key's OWN node, not
@@ -2270,7 +2325,7 @@ fn handle_connection_result(
 /// small the preread read is zero-length and spins until the loop guard (the
 /// `max`). Config-load rejects a sub-floor `sni_preread_max_bytes` loudly
 /// (`ConfigError::SniPrereadMaxBytesTooSmall`), but a `0` knob from a direct
-/// `sozu listener tcp add`/`update` CLI/IPC request, or a stale `LoadState`
+/// `sozu listener tcp add` CLI/IPC request, or a stale `LoadState`
 /// replay, bypasses that check and reaches the worker -- this floor degrades
 /// it to the 5-byte TLS-record-header minimum instead, killing the spin for
 /// EVERY config source at the single point of use. `buffer_capacity` is
@@ -2296,6 +2351,43 @@ fn known_alpn_label(offered: &[Vec<u8>]) -> Option<&'static str> {
         Some(b"h2") => Some("h2"),
         Some(b"http/1.1") => Some("http/1.1"),
         _ => None,
+    }
+}
+
+/// Canonical access-log tags key for an SNI-scoped TCP frontend: one
+/// listener can carry many SNI/ALPN fronts, each with its own `tags`, so
+/// keying tags by the bare listener address (the pre-SNI behavior, kept
+/// verbatim for no-SNI fronts) would let the LAST added front clobber every
+/// sibling and let removing ANY front clear tags for the whole address.
+///
+/// The key is `(address, lowercased sni pattern, sorted alpn)`: the same
+/// identity triple `command/src/state.rs`'s `add_tcp_frontend` deduplicates
+/// on. `sni` is lowercased to match `insert_sni_route`'s trie key; `alpn`
+/// is SORTED so the key is order-independent — `add_tcp_front` receives the
+/// operator's order while the route-time rebuild in `upgrade_sni_preread`
+/// iterates an [`AlpnMatcher::OneOf`] `BTreeSet` (already sorted; `String`
+/// and byte-wise ordering agree because `str` compares byte-wise). The `|`
+/// separator cannot appear in an address, a validated SNI, or an ALPN
+/// protocol name, and a composed key never collides with a bare-address
+/// key.
+fn sni_tags_key(address: &SocketAddr, sni: &str, alpn: &[String]) -> String {
+    let mut alpn: Vec<&str> = alpn.iter().map(String::as_str).collect();
+    alpn.sort_unstable();
+    format!("{address}|{}|{}", sni.to_ascii_lowercase(), alpn.join(","))
+}
+
+/// The matched [`AlpnMatcher`]'s protocols as strings, for rebuilding the
+/// [`sni_tags_key`] a route decision maps to: `Any` is the empty-`alpn`
+/// catch-all front, `OneOf` yields its (BTreeSet-sorted) protocol list.
+/// `from_utf8_lossy` is defensive — matcher protocols originate from
+/// config/IPC `String`s, never raw network bytes.
+fn alpn_matcher_protocols(matcher: &AlpnMatcher) -> Vec<String> {
+    match matcher {
+        AlpnMatcher::Any => Vec::new(),
+        AlpnMatcher::OneOf(set) => set
+            .iter()
+            .map(|protocol| String::from_utf8_lossy(protocol).into_owned())
+            .collect(),
     }
 }
 
@@ -2456,11 +2548,17 @@ impl TcpProxy {
 
         self.fronts
             .insert(front.cluster_id.to_string(), listener.token);
-        listener.set_tags(address.to_string(), Some(front.tags));
 
         match front.sni {
-            Some(sni) => listener.insert_sni_route(sni, front.alpn, front.cluster_id),
+            Some(sni) => {
+                // Per-frontend tags key: many SNI/ALPN fronts share one
+                // listener, so the bare-address key (kept for no-SNI fronts
+                // below) would clobber siblings — see `sni_tags_key`.
+                listener.set_tags(sni_tags_key(&address, &sni, &front.alpn), Some(front.tags));
+                listener.insert_sni_route(sni, front.alpn, front.cluster_id);
+            }
             None => {
+                listener.set_tags(address.to_string(), Some(front.tags));
                 listener.cluster_id = Some(front.cluster_id);
             }
         }
@@ -2488,14 +2586,17 @@ impl TcpProxy {
             None => return Err(ProxyError::NoListenerFound(address)),
         };
 
-        listener.set_tags(address.to_string(), None);
-
         match front.sni {
             Some(sni) => {
+                // Clear ONLY this front's own tags entry (`sni_tags_key`) —
+                // the pre-SNI bare-address removal here used to strip tags
+                // for every sibling front on the listener.
+                listener.set_tags(sni_tags_key(&address, &sni, &front.alpn), None);
                 listener.remove_sni_route(sni, front.alpn, &front.cluster_id);
                 self.fronts.remove(&front.cluster_id);
             }
             None => {
+                listener.set_tags(address.to_string(), None);
                 if let Some(cluster_id) = listener.cluster_id.take() {
                     self.fronts.remove(&cluster_id);
                 }
@@ -3440,6 +3541,195 @@ mod sni_routing_tests {
             listener.validate_new_tcp_front(&front).is_ok(),
             "a disjoint ALPN addition on the same wildcard SNI must be accepted"
         );
+    }
+
+    /// The worker boundary must reject malformed SNI SHAPES that a direct
+    /// `AddTcpFrontend` (command socket) or `LoadState` replay could carry
+    /// past config.rs's `validate_sni_pattern`: a `/.../` label would be
+    /// inserted into the `pattern_trie` as a REGEX route and a misplaced
+    /// `*` as an unintended wildcard — silently widening routing.
+    #[test]
+    fn validate_new_tcp_front_rejects_malformed_sni_shapes() {
+        let listener = test_listener();
+
+        for bad in [
+            "/[a-z]+/.example.com",
+            "foo/bar.example.com",
+            "a.*.example.com",
+            "*.*.example.com",
+            "*",
+        ] {
+            let front = frontend("cluster-a", Some(bad), &[]);
+            assert!(
+                listener.validate_new_tcp_front(&front).is_err(),
+                "malformed SNI shape {bad:?} must be rejected at the worker boundary"
+            );
+        }
+
+        // The two documented-legal shapes must still pass.
+        for good in ["a.example.com", "*.example.com"] {
+            let front = frontend("cluster-a", Some(good), &[]);
+            assert!(
+                listener.validate_new_tcp_front(&front).is_ok(),
+                "legal SNI shape {good:?} must still be accepted"
+            );
+        }
+    }
+
+    // ---- per-frontend access-log tags keying (sozu-proxy/sozu#1290) ----
+
+    #[test]
+    fn sni_fronts_keep_distinct_tags_under_distinct_keys() {
+        let mut proxy = test_proxy();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build listener config");
+        let token = Token(0);
+        proxy
+            .add_listener(config, token)
+            .expect("could not add listener");
+
+        let front_a = RequestTcpFrontend {
+            cluster_id: "cluster-a".to_owned(),
+            address,
+            sni: Some("a.example.com".to_owned()),
+            alpn: vec![],
+            tags: std::collections::BTreeMap::from([("team".to_owned(), "alpha".to_owned())]),
+        };
+        let front_b = RequestTcpFrontend {
+            cluster_id: "cluster-b".to_owned(),
+            address,
+            sni: Some("b.example.com".to_owned()),
+            alpn: vec!["h2".to_owned()],
+            tags: std::collections::BTreeMap::from([("team".to_owned(), "beta".to_owned())]),
+        };
+        proxy
+            .add_tcp_front(front_a)
+            .expect("add_tcp_front A must succeed");
+        proxy
+            .add_tcp_front(front_b)
+            .expect("add_tcp_front B must succeed");
+
+        let std_address: SocketAddr = address.into();
+        let key_a = sni_tags_key(&std_address, "a.example.com", &[]);
+        let key_b = sni_tags_key(&std_address, "b.example.com", &["h2".to_owned()]);
+
+        let listener = proxy
+            .listeners
+            .get(&token)
+            .expect("listener must be present")
+            .borrow();
+        let tags_a = listener
+            .get_tags(&key_a)
+            .expect("front A's tags must live under its own composed key");
+        assert_eq!(
+            tags_a.tags.get("team").map(String::as_str),
+            Some("alpha"),
+            "front A's tags must survive front B's add, not be clobbered by it"
+        );
+        let tags_b = listener
+            .get_tags(&key_b)
+            .expect("front B's tags must live under its own composed key");
+        assert_eq!(tags_b.tags.get("team").map(String::as_str), Some("beta"));
+    }
+
+    #[test]
+    fn removing_one_sni_front_clears_only_its_own_tags() {
+        let mut proxy = test_proxy();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build listener config");
+        let token = Token(0);
+        proxy
+            .add_listener(config, token)
+            .expect("could not add listener");
+
+        let front_a = RequestTcpFrontend {
+            cluster_id: "cluster-a".to_owned(),
+            address,
+            sni: Some("a.example.com".to_owned()),
+            alpn: vec![],
+            tags: std::collections::BTreeMap::from([("team".to_owned(), "alpha".to_owned())]),
+        };
+        let front_b = RequestTcpFrontend {
+            cluster_id: "cluster-b".to_owned(),
+            address,
+            sni: Some("b.example.com".to_owned()),
+            alpn: vec!["h2".to_owned()],
+            tags: std::collections::BTreeMap::from([("team".to_owned(), "beta".to_owned())]),
+        };
+        proxy
+            .add_tcp_front(front_a.clone())
+            .expect("add_tcp_front A must succeed");
+        proxy
+            .add_tcp_front(front_b)
+            .expect("add_tcp_front B must succeed");
+
+        proxy
+            .remove_tcp_front(front_a)
+            .expect("remove_tcp_front A must succeed");
+
+        let std_address: SocketAddr = address.into();
+        let key_a = sni_tags_key(&std_address, "a.example.com", &[]);
+        let key_b = sni_tags_key(&std_address, "b.example.com", &["h2".to_owned()]);
+
+        let listener = proxy
+            .listeners
+            .get(&token)
+            .expect("listener must be present")
+            .borrow();
+        assert!(
+            listener.get_tags(&key_a).is_none(),
+            "removing front A must clear its own tags entry"
+        );
+        assert!(
+            listener.get_tags(&key_b).is_some(),
+            "removing front A must NOT clear sibling front B's tags"
+        );
+    }
+
+    /// A session routed to front A must look tags up under front A's key:
+    /// the key `add_tcp_front` stores and the key `upgrade_sni_preread`
+    /// rebuilds from the route decision (`matched_sni_pattern` +
+    /// `matched_alpn`) must be identical, regardless of the operator's
+    /// original ALPN order or SNI casing, and must never collide with the
+    /// bare-address key used by no-SNI fronts.
+    #[test]
+    fn route_time_tags_key_rebuild_matches_the_add_time_key() {
+        let address: SocketAddr = "127.0.0.1:9000".parse().expect("test address");
+
+        // Wildcard front, operator wrote mixed case + reverse ALPN order.
+        let add_time = sni_tags_key(
+            &address,
+            "*.Example.COM",
+            &["http/1.1".to_owned(), "h2".to_owned()],
+        );
+        let matcher =
+            AlpnMatcher::OneOf([b"h2".to_vec(), b"http/1.1".to_vec()].into_iter().collect());
+        let route_time = sni_tags_key(
+            &address,
+            "*.example.com", // matched_sni_pattern: the lowercased trie key
+            &alpn_matcher_protocols(&matcher),
+        );
+        assert_eq!(
+            add_time, route_time,
+            "add-time and route-time keys must agree for the same front"
+        );
+
+        // Catch-all front: empty alpn at add time <-> AlpnMatcher::Any.
+        assert_eq!(
+            sni_tags_key(&address, "a.example.com", &[]),
+            sni_tags_key(
+                &address,
+                "a.example.com",
+                &alpn_matcher_protocols(&AlpnMatcher::Any)
+            )
+        );
+
+        // A composed key never collides with the bare-address key.
+        assert_ne!(add_time, address.to_string());
     }
 
     #[test]
