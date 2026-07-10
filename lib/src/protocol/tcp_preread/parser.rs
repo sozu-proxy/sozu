@@ -5,10 +5,11 @@
 //! (possibly multi-record) ClientHello handshake message, and extracts the
 //! `server_name` (RFC 6066 §3) and `application_layer_protocol_negotiation`
 //! (RFC 7301 §3.1) extensions plus the presence of `encrypted_client_hello`
-//! (RFC 8446bis / draft-ietf-tls-esni, assigned type `0xfe0d`). It never
-//! mutates or copies `buf` except for the transient multi-record reassembly
-//! buffer ([`append_fragment`]), and it performs no semantic validation
-//! beyond framing -- cipher/version negotiation is the backend's job.
+//! (draft-ietf-tls-esni, assigned type `0xfe0d`). It never mutates `buf`,
+//! and copies from it only for the transient multi-record reassembly buffer
+//! ([`append_fragment`]) and the extracted SNI/ALPN values it returns; it
+//! performs no semantic validation beyond framing -- cipher/version
+//! negotiation is the backend's job.
 //!
 //! Two parsing regimes coexist deliberately:
 //! - The **outer record/handshake framing** uses `nom::*::streaming`
@@ -67,8 +68,9 @@ pub(super) enum ParseOutcome {
 }
 
 /// TLS record layer header (RFC 8446 §5.1): 1-byte `ContentType`, 2-byte
-/// legacy `ProtocolVersion` (tolerated, unvalidated -- TLS 1.3 fixes this
-/// field at `{3, 3}` for ClientHello records but middleboxes vary), 2-byte
+/// legacy `ProtocolVersion` (tolerated, unvalidated -- RFC 8446 §5.1
+/// deprecates the field and requires ignoring it; an initial ClientHello
+/// record may even carry `{3, 1}` for middlebox compatibility), 2-byte
 /// big-endian length.
 struct RecordHeader {
     content_type: u8,
@@ -268,7 +270,7 @@ fn parse_client_hello_fields(body: &[u8]) -> Result<ClientHelloFields, RejectRea
     );
     debug_assert!(
         in_len - i.len() >= 2 + 32 + 1 + 1 + 2,
-        "legacy_version + random + the two length-prefix bytes must be consumed"
+        "legacy_version (2) + random (32) + the session_id (1), cipher_suites (2) and compression_methods (1) length prefixes must be consumed"
     );
 
     // Extensions are the last block. RFC 8446 §4.1.2 makes the block itself
@@ -311,8 +313,9 @@ fn parse_extensions(mut ext_block: &[u8]) -> Result<ClientHelloFields, RejectRea
 
         match ext_type {
             EXT_SERVER_NAME => {
-                // RFC 6066 §3: take the FIRST `server_name` extension seen;
-                // a well-formed ClientHello sends at most one.
+                // Take the FIRST `server_name` (RFC 6066 §3) extension seen;
+                // a well-formed ClientHello carries at most one extension of
+                // a given type (RFC 8446 §4.2).
                 if sni.is_none() {
                     sni = parse_server_name_extension(data)?;
                 }
@@ -718,10 +721,9 @@ mod tests {
     /// A `server_name` extension whose inner `server_name_list` length
     /// declares more bytes than the extension body carries. That length is
     /// ATTACKER-CONTROLLED: it must map to `Reject(MalformedHandshake)`,
-    /// never a panic. Regression for the `fuzz_tcp_clienthello` finding
-    /// (`fuzz/artifacts/fuzz_tcp_clienthello/crash-*`): a `debug_assert!` on
-    /// this exact field, placed BEFORE the enforcing `take`, panicked every
-    /// debug-assertions build (dev/test/e2e/sim/fuzz).
+    /// never a panic. Regression for a `fuzz_tcp_clienthello` crash finding:
+    /// a `debug_assert!` on this exact field, placed BEFORE the enforcing
+    /// `take`, panicked every debug-assertions build (dev/test/e2e/sim/fuzz).
     #[test]
     fn sni_list_len_overflowing_extension_body_is_malformed_not_panic() {
         let mut data = Vec::new();

@@ -8,32 +8,35 @@
 //! completes its own handshake -- proving Sōzu never terminates TLS on
 //! this path, only reads far enough to route.
 //!
-//! Naming matches the ledger item's V-numbers (`e2e-sni-mtls`):
-//! - V7: SNI routing to the correct backend by cert, mTLS passthrough,
+//! Coverage, by section (in file order):
+//! - SNI routing to the correct backend by cert, mTLS passthrough,
 //!   byte-for-byte ClientHello replay.
-//! - V8: the full preread reject matrix, plus positive ALPN routing.
-//! - V9: PROXY-protocol composition with the SNI preread (expect / send /
+//! - the full preread reject matrix, plus positive ALPN routing.
+//! - PROXY-protocol composition with the SNI preread (expect / send /
 //!   relay / none).
-//! - V10: a large payload through an SNI-routed session (splice-agnostic).
-//! - V15: per-(cluster, source-IP) counter conservation across a
+//! - a large payload through an SNI-routed session (splice-agnostic).
+//! - per-(cluster, source-IP) counter conservation across a
 //!   reject-then-route sequence.
 //!
-//! Metric-observability note (read before touching V15): `tcp.sni_preread.*`
+//! Metric-observability note (read before touching the counter-conservation
+//! test): `tcp.sni_preread.*`
 //! are process-wide gauges/counters (`lib/src/metrics/names.rs`), queryable
 //! from an e2e test via `QueryMetrics { no_clusters: true, .. }`. The
 //! per-(cluster, source-IP) admission count (`lib/src/server.rs`'s
 //! `connections_per_cluster_ip`) is a plain in-memory `HashMap`, never
 //! published as a named metric (deliberately -- a per-IP-keyed gauge would
-//! be a cardinality bomb), so THAT half of V15 is a behavioral proxy: a
+//! be a cardinality bomb), so THAT half of the counter-conservation test is
+//! a behavioral proxy: a
 //! `max_connections_per_ip = 1` cluster must still accept its first real
 //! connection after N unrelated preread rejects (no leaked slot), and must
 //! still reject a second concurrent one (the limiter itself still works).
-//! The OTHER half of V15 -- active-count conservation -- is now a LIVE
+//! The OTHER half -- active-count conservation -- is now a LIVE
 //! metric assertion against the real `tcp.sni_preread.active` gauge (see
 //! the fixed-defects note just below).
 //!
 //! Defects this suite surfaced (all FOUND by these tests, all now FIXED in
-//! `lib` by the feature owner as part of sozu-proxy/sozu#1279 -- these
+//! `lib` on this branch -- PR sozu-proxy/sozu#1290, implementing the #1279
+//! SNI-preread feature -- these
 //! notes are the durable record of what the tests below now guard against
 //! regressing, not open bugs):
 //!
@@ -42,24 +45,32 @@
 //!   every SNI-preread session and its "active count" was permanently 0.
 //!   Fixed: `TcpSession::new_sni_preread` now `+1`s the gauge on entry
 //!   (`lib/src/tcp.rs`, the `gauge_add!(...ACTIVE, 1)` next to the
-//!   `SniPreread` state construction), matched by the two existing `-1`
-//!   exits. `test_tcp_sni_reject_then_valid_connection_not_limited` (V15)
+//!   `SniPreread` state construction), matched by the two `-1` exits (the
+//!   routed upgrade in `upgrade_sni_preread`, and `close()`'s
+//!   `StateMarker::SniPreread` arm).
+//!   `test_tcp_sni_reject_then_valid_connection_not_limited`
 //!   now asserts the gauge increments while a session is mid-preread AND
 //!   returns to a clean 0 after a reject-storm + a routed connection + a
-//!   limit-rejected connection -- a genuine leak would now be caught
-//!   (proven red: see that test's own note).
+//!   limit-rejected connection -- against the pre-fix gauge (clamped to a
+//!   permanent 0) the mid-preread `>= 1` assertion cannot pass, so a
+//!   re-regression fails loudly.
 //!
 //! - A legitimate, small ClientHello immediately followed by a large
 //!   payload in the SAME TCP send (no gap -- what any real fast client
 //!   does) was mishandled on the coalesced-read path: the preread read was
 //!   not capped at `effective_max_bytes` (spurious `RejectReason::TooLarge`
-//!   before the backend was ever dialed), and the queued tail was at risk
-//!   of being dropped on the handoff to `Pipe`. Fixed in `lib`: the preread
+//!   before the backend was ever dialed), and bytes already read from the
+//!   frontend and queued for the backend were dropped when the frontend
+//!   closed before they flushed. Fixed in `lib`: the preread
 //!   read is now hard-capped at `effective_max_bytes`
-//!   (`lib/src/protocol/tcp_preread/shell.rs`), and the `Pipe`
-//!   close-before-flush drains queued bytes.
+//!   (`lib/src/protocol/tcp_preread/shell.rs`), and `Pipe` now drains
+//!   queued front->back bytes instead of closing on every frontend-close
+//!   signal -- the EOF (`SocketResult::Closed`) arm of `readable`, the
+//!   `frontend_hup` (EPOLLRDHUP) in-flight branch, and `splice_readable`'s
+//!   EOF arm for bytes already spliced into the kernel pipe
+//!   (`lib/src/protocol/pipe.rs`).
 //!   `test_tcp_sni_large_payload_coalesced_with_hello_delivered_intact`
-//!   (V10) now asserts the connection routes (not rejected) AND the full
+//!   now asserts the connection routes (not rejected) AND the full
 //!   1 MiB payload reaches the backend byte-identical; it is the permanent
 //!   regression guard for that path.
 
@@ -124,8 +135,9 @@ struct SniRoute {
 /// Boot a worker with ONE SNI-preread TCP listener at `front_address` plus
 /// every route in `routes`, each wired to its own cluster + single
 /// backend. `expect_proxy` toggles the listener's inbound PROXY-v2
-/// preread (V9); `sni_preread_timeout`/`sni_preread_max_bytes` override
-/// the preread budget (V8's timeout/oversized cases).
+/// preread (the PROXY-protocol composition tests);
+/// `sni_preread_timeout`/`sni_preread_max_bytes` override
+/// the preread budget (the timeout/oversized reject cases).
 fn setup_sni_worker(
     name: &str,
     front_address: SocketAddr,
@@ -176,7 +188,7 @@ fn setup_sni_worker(
     worker
 }
 
-/// Convenience wrapper for the many V8 reject-matrix cases: a listener
+/// Convenience wrapper for the many reject-matrix cases: a listener
 /// with exactly ONE real SNI route (`known.example.com`, never actually
 /// reached by these tests). A listener needs at least one route at all --
 /// `TcpProxy::create_session` refuses the connection outright when BOTH
@@ -227,7 +239,7 @@ fn insecure_client_config(alpn: &[&[u8]]) -> ClientConfig {
 }
 
 /// Same as [`insecure_client_config`] but presents `cert_pem`/`key_pem` as
-/// the client's OWN identity (mTLS positive-space case, V7).
+/// the client's OWN identity (the mTLS positive-space case).
 fn insecure_client_config_with_identity(
     alpn: &[&[u8]],
     cert_pem: &[u8],
@@ -269,8 +281,8 @@ fn build_client_hello(sni: &str, alpn: &[&[u8]]) -> Vec<u8> {
 }
 
 /// Same as [`build_client_hello`] but with the SNI extension itself
-/// suppressed at the protocol level (V8's "valid ClientHello, no SNI
-/// extension" case) -- `ServerName` is still syntactically required to
+/// suppressed at the protocol level (the "valid ClientHello, no SNI
+/// extension" reject case) -- `ServerName` is still syntactically required to
 /// construct a `ClientConnection`, even though `enable_sni = false`
 /// drops the wire extension.
 fn build_client_hello_no_sni(alpn: &[&[u8]]) -> Vec<u8> {
@@ -316,7 +328,7 @@ fn raw_read_all(stream: &mut TcpStream) -> Vec<u8> {
     result
 }
 
-/// The shared shape of every V8 reject assertion: block for up to
+/// The shared shape of every reject assertion in this module: block for up to
 /// `budget` waiting for Sōzu to close the connection (EOF or a hard
 /// error). Returns `true` iff the close was observed within `budget` --
 /// `false` covers BOTH "still open when the budget ran out" (`WouldBlock`
@@ -470,7 +482,7 @@ fn query_global_count(worker: &mut Worker, metric_name: &str) -> Option<i64> {
 }
 
 // =========================================================================
-// V7 — SNI passthrough + mTLS (the canonical case)
+// SNI passthrough + mTLS (the canonical case)
 // =========================================================================
 
 /// Two TLS-terminating backends, two SNI routes on ONE TCP listener.
@@ -836,7 +848,7 @@ fn test_tcp_sni_byte_for_byte_replay() {
 }
 
 // =========================================================================
-// V8 — reject matrix + positive ALPN routing
+// Preread reject matrix + positive ALPN routing
 // =========================================================================
 
 fn try_tcp_sni_reject_non_tls_bytes() -> State {
@@ -1054,8 +1066,9 @@ fn test_tcp_sni_reject_preread_timeout() {
 /// `sni_preread_max_bytes` (16) must be rejected as oversized -- any real
 /// ClientHello vastly exceeds 16 bytes, so this deterministically
 /// exercises `RejectReason::TooLarge` regardless of exact extension
-/// sizes. Post sozu#1279 Defect D fix, the preread `socket_read` is
-/// hard-capped at `effective_max_bytes`, so the hello reaches the core
+/// sizes. Because the preread `socket_read` is
+/// hard-capped at `effective_max_bytes`
+/// (`lib/src/protocol/tcp_preread/shell.rs`), the hello reaches the core
 /// INCOMPLETE with `buf.len() == max_bytes` -- the exact `TooLarge`
 /// condition (`need_more_or_too_large`) -- and the reject fires FAST (no
 /// dependence on the preread timeout). Asserted specifically via the
@@ -1202,7 +1215,7 @@ fn test_tcp_sni_alpn_routes_by_client_preference() {
 }
 
 // =========================================================================
-// V9 — PROXY-protocol composition with the SNI preread
+// PROXY-protocol composition with the SNI preread
 // =========================================================================
 
 /// `expect_proxy` listener + `ExpectHeader` cluster: the client sends a
@@ -1392,13 +1405,13 @@ fn test_tcp_sni_relay_proxy_forwards_header_verbatim() {
     );
 }
 
-/// The deviation flagged by the shell implementor (documented at
-/// `lib/src/tcp.rs`'s `upgrade_sni_preread`): a `None`-proxy_protocol
+/// Intended behavior, documented at `lib/src/tcp.rs`'s
+/// `upgrade_sni_preread`: a `None`-proxy_protocol
 /// cluster behind an `expect_proxy = true` SNI listener must ALSO deliver
 /// a clean stream to the backend -- the inbound PPv2 header is absorbed,
 /// not leaked, even though the routed cluster itself asked for no PROXY
-/// protocol at all. Confirmed here as INTENDED behavior (see the report),
-/// not treated as a defect.
+/// protocol at all (a backend that expects no PROXY header must never
+/// receive a stray one).
 fn try_tcp_sni_none_proxy_protocol_absorbs_inbound_header() -> State {
     let front_address = create_local_address();
     let backend_address = create_local_address();
@@ -1458,7 +1471,7 @@ fn test_tcp_sni_none_proxy_protocol_absorbs_inbound_header() {
 }
 
 // =========================================================================
-// V10 — splice cell: large payload through an SNI-routed session
+// Large payload through an SNI-routed session (splice-agnostic)
 // =========================================================================
 
 /// A 1 MiB payload sent AFTER the routing decision has demonstrably been
@@ -1467,20 +1480,19 @@ fn test_tcp_sni_none_proxy_protocol_absorbs_inbound_header() {
 /// backend byte-identical. Splice-agnostic by construction (no
 /// `#[cfg]`): the assertion is on the final byte content, not on which
 /// code path moved it, so this test passes whether or not the build
-/// enables `sozu-lib/splice` (see the acceptance command in the final
-/// report for the explicit `--features` run). The non-SNI splice path
+/// enables `sozu-lib/splice` (CI's full-feature cells run it with
+/// `--features opentelemetry,splice,simd`). The non-SNI splice path
 /// itself is already covered by the pre-existing `test_tcp_proxy_large_payload`
-/// in `tcp_tests.rs` (part of the "8 named regression tests" this suite
-/// must not regress) -- not duplicated here.
+/// in `tcp_tests.rs` -- not duplicated here.
 ///
 /// NOTE: this test deliberately gives the ClientHello a clear run at the
 /// preread core before any payload bytes hit the wire. The harder
 /// variant that sends both back-to-back with NO gap --
 /// `try_tcp_sni_large_payload_coalesced_with_hello_delivered_intact`
-/// below -- exercises the coalesced-read path (sozu#1279 Defect C) and is
+/// below -- exercises the coalesced-read path (the reproducer for the
+/// sozu#1279 close-before-flush truncation) and is
 /// kept as a separate test so the plain "after a clear route" contract
-/// and the coalesced-delivery guard are each individually legible in the
-/// test report.
+/// and the coalesced-delivery guard each fail individually and legibly.
 fn try_tcp_sni_large_payload_after_route() -> State {
     let front_address = create_local_address();
     let backend_address = create_local_address();
@@ -1571,8 +1583,9 @@ fn test_tcp_sni_large_payload_after_route() {
     );
 }
 
-/// V10 permanent regression guard for sozu-proxy/sozu#1279 Defect C (the
-/// coalesced-payload path). Sends the SAME ClientHello immediately
+/// Permanent regression guard for the sozu-proxy/sozu#1279
+/// close-before-flush truncation, on the coalesced-payload path. Sends
+/// the SAME ClientHello immediately
 /// followed by the SAME 1 MiB payload as
 /// `try_tcp_sni_large_payload_after_route` above, but with NO gap and NO
 /// synchronization between the two writes -- exactly what any real fast
@@ -1580,9 +1593,8 @@ fn test_tcp_sni_large_payload_after_route() {
 /// early application data in the same TCP send, delivered to Sōzu inside
 /// ONE read).
 ///
-/// This input pattern was, when this suite was authored, an EXPECTED-FAIL
-/// defect proof: it surfaced two now-fixed `lib` defects on the
-/// coalesced-read path, both part of sozu#1279:
+/// When first written, this test FAILED: it surfaced two `lib` defects on
+/// the coalesced-read path, both since fixed on this branch (PR #1290):
 ///
 ///  - A spurious `RejectReason::TooLarge`: the preread `socket_read` was
 ///    not hard-capped at `effective_max_bytes`, so a small valid
@@ -1591,15 +1603,19 @@ fn test_tcp_sni_large_payload_after_route() {
 ///    the connection before the backend was ever dialed. (The default
 ///    9-byte gap between `sni_preread_max_bytes` = 16384 and `buffer_size`
 ///    = 16393 made this trivial to hit -- not a contrived edge case.)
-///  - Silent tail truncation (Defect C proper): the queued payload risked
-///    being dropped on the `Pipe` handoff when the session closed before
-///    the queued bytes were flushed.
+///  - Silent tail truncation (the close-before-flush drop): bytes already
+///    read from the frontend and queued for the backend were dropped when
+///    the frontend closed before they flushed.
 ///
 /// Both are FIXED in `lib`: the preread read is now hard-capped at
 /// `effective_max_bytes` (`lib/src/protocol/tcp_preread/shell.rs`, so an
 /// over-cap hello reaches the core INCOMPLETE and only a genuinely
 /// oversized hello -- not one padded by trailing payload -- rejects), and
-/// the `Pipe` close-before-flush now drains queued bytes before teardown.
+/// `Pipe` now drains queued front->back bytes before teardown on every
+/// frontend-close signal: the EOF (`SocketResult::Closed`) arm of
+/// `readable`, the `frontend_hup` (EPOLLRDHUP) in-flight branch, and
+/// `splice_readable`'s EOF arm for bytes already spliced into the kernel
+/// pipe (`lib/src/protocol/pipe.rs`).
 ///
 /// The assertion is now the permanent guard: the connection must ROUTE
 /// (`tcp.sni_preread.routed` incremented, `tcp.sni_preread.rejected.too_large`
@@ -1733,7 +1749,7 @@ fn test_tcp_sni_large_payload_coalesced_with_hello_delivered_intact() {
     assert_eq!(
         repeat_until_error_or(
             3,
-            "TCP SNI regression guard (sozu#1279 Defect C): a payload coalesced with the ClientHello (no gap) routes and reaches the backend byte-identical",
+            "TCP SNI regression guard (sozu#1279 close-before-flush truncation): a payload coalesced with the ClientHello (no gap) routes and reaches the backend byte-identical",
             try_tcp_sni_large_payload_coalesced_with_hello_delivered_intact,
         ),
         State::Success,
@@ -1741,7 +1757,7 @@ fn test_tcp_sni_large_payload_coalesced_with_hello_delivered_intact() {
 }
 
 // =========================================================================
-// V15 — counter conservation across a reject-then-route sequence
+// Counter conservation across a reject-then-route sequence
 // =========================================================================
 
 /// Drive N preread rejects from one source IP (127.0.0.1, as every
@@ -1758,8 +1774,9 @@ fn test_tcp_sni_large_payload_coalesced_with_hello_delivered_intact() {
 ///    itself is not a no-op -- the first assertion alone couldn't
 ///    distinguish "not leaking" from "not enforcing at all");
 /// 3. the REAL `tcp.sni_preread.active` process-wide gauge (queried via
-///    `QueryMetrics`, not a proxy) is now a LIVE assertion (sozu#1279
-///    Defect A -- the missing on-entry increment -- is fixed): while a
+///    `QueryMetrics`, not a proxy) is now a LIVE assertion (the gauge's
+///    once-missing on-entry increment now fires in
+///    `TcpSession::new_sni_preread`): while a
 ///    connection is parked mid-preread the gauge reads >= 1, and once
 ///    every preread session (the mid-preread probe, the reject storm, the
 ///    routed connection, and the limit-rejected connection) has closed the
@@ -1770,7 +1787,7 @@ fn try_tcp_sni_reject_then_valid_connection_not_limited() -> State {
     let front_address = create_local_address();
     let backend_address = create_local_address();
     let mut worker = setup_sni_worker(
-        "TCP-SNI-V15-LIMIT",
+        "TCP-SNI-LIMIT",
         front_address,
         false,
         DEFAULT_SNI_PREREAD_TIMEOUT,
@@ -1793,7 +1810,7 @@ fn try_tcp_sni_reject_then_valid_connection_not_limited() -> State {
     // treating absence as a signal), normalized through `unwrap_or(0)`.
     let baseline_active = query_global_gauge(&mut worker, active).unwrap_or(0);
 
-    // (Defect A live-check) Mid-preread observation: an accepted
+    // (gauge-increment live-check) Mid-preread observation: an accepted
     // SNI-listener connection increments `tcp.sni_preread.active` on entry
     // (`TcpSession::new_sni_preread`). Park one mid-preread with a PARTIAL
     // ClientHello (deterministically `NeedMore`, so it never routes and

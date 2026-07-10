@@ -391,9 +391,12 @@ impl TcpSession {
             server_rtt: None,
             user_agent: None,
             x_request_id: None,
-            // TCP listener accepts a raw `MioTcpStream` (lib/src/tcp.rs:128)
-            // — Sōzu does not terminate TLS on the TCP path, so all five TLS
-            // fields and the parsed XFF chain are always absent here.
+            // Sōzu never terminates TLS on the TCP path (the frontend is a
+            // raw `MioTcpStream`), so no negotiated version/cipher exists.
+            // A preread SNI/ALPN (SNI-routed listeners) is stamped on the
+            // `Pipe`'s own access log via `set_tls_metadata` at upgrade
+            // time; this pre-Pipe log site emits `None` for all four TLS
+            // fields and the parsed XFF chain.
             tls_version: None,
             tls_cipher: None,
             tls_sni: None,
@@ -584,9 +587,11 @@ impl TcpSession {
             // (clobbering the backend-writable interest `Pipe::new` armed for a
             // non-empty inherited frontend buffer) and re-inserts only
             // READABLE. That is harmless for a legacy `SendHeader` session
-            // (empty accumulator) but strands the coalesced payload tail carried
-            // in from `SniPreread`'s `SendHeader` branch (sozu-proxy/sozu#1279
-            // Defect C). Re-run the inherited-write arm by feeding the pipe's
+            // (empty accumulator) but strands the coalesced payload tail
+            // carried in from `SniPreread`'s `SendHeader` branch -- the
+            // sozu-proxy/sozu#1279 close-before-flush truncation, where bytes
+            // already queued for the backend were dropped instead of flushed.
+            // Re-run the inherited-write arm by feeding the pipe's
             // own current events back through `restore_readiness_events`; it is
             // additive (never clears interest) and a no-op when the buffers are
             // empty, so the legacy path is unaffected.
@@ -671,12 +676,12 @@ impl TcpSession {
     /// - `Some(RelayHeader)` -> NO consume: the already-parsed inbound
     ///   header bytes ARE the header this backend expects, replayed
     ///   verbatim ahead of the ClientHello.
-    /// - `None` -> also consumed (a listener with `expect_proxy` but a
-    ///   `None`-proxy_protocol cluster still must not leak a stray inbound
-    ///   PPv2 prefix onto a backend that expects none; this is the one
-    ///   deviation this implementation adds beyond what the ledger item's
-    ///   text spelled out verbatim for `Expect`/`Relay`, inferred from the
-    ///   `SendHeader` wire-order note. See the final report's deviations.)
+    /// - `None` -> also consumed: a listener with `expect_proxy` but a
+    ///   `None`-proxy_protocol cluster still must not leak the stray
+    ///   inbound PPv2 prefix onto a backend that expects none -- the
+    ///   preread parsed those bytes for routing only, and a backend with
+    ///   no PROXY-protocol contract would read them as part of the TLS
+    ///   stream.
     ///
     /// `tcp.sni_preread.duration` is recorded on EVERY exit from this
     /// function, including the four defensive early returns below: once
@@ -759,7 +764,7 @@ impl TcpSession {
             .set_duration(Duration::from_secs(
                 self.listener.borrow().config.front_timeout as u64,
             ));
-        // Access-log tagging (design item 8): stash the routed SNI/ALPN for
+        // Access-log tagging: stash the routed SNI/ALPN for
         // whichever of the four `proxy_protocol` branches below eventually
         // reaches `Pipe` -- immediately via `build_pipe_from_preread` for
         // `Expect`/`Relay`/`None`, or one `ready()` cycle later via
@@ -879,7 +884,7 @@ impl TcpSession {
         // guaranteed by `Pipe::readable`'s half-close drain (sozu-proxy/sozu#1279).
         pipe.restore_readiness_events(frontend_event, backend_event);
         pipe.set_back_token(backend_token);
-        // Access-log tagging (design item 8): reaching `Pipe` straight from
+        // Access-log tagging: reaching `Pipe` straight from
         // `SniPreread` (Expect/Relay/None) -- unlike `SendHeader`, which
         // detours through `SendProxyProtocol` first (see `upgrade_send`).
         if let Some(sni) = self.routed_sni.take() {
@@ -2091,11 +2096,18 @@ impl TcpListener {
                 //   literal ancestry, and `insert` never creates a literal
                 //   `*` child that could shadow the node's `wildcard` slot.
                 //
-                // `starts_with(b"*.")` is the complete wildcard predicate:
-                // `command/src/config.rs`'s `validate_sni_pattern` only
-                // admits a single leading `*.` label (any other `*` is
-                // rejected), and a non-`*.`-prefixed key traverses literal
-                // children in both `lookup` and `insert_recursive`.
+                // `starts_with(b"*.")` matches every wildcard shape
+                // config-load can emit: `command/src/config.rs`'s
+                // `validate_sni_pattern` only admits a single leading `*.`
+                // label (any other `*` placement is rejected), and a plain
+                // hostname key traverses literal children in both `lookup`
+                // and `insert_recursive`. A bare `*` key (config-load
+                // rejects it; only a bypassing IPC request can carry one)
+                // is the known gap: `lookup_mut`'s short-circuit maps it to
+                // the wildcard slot while this immutable self-lookup (flag
+                // `false`) cannot see an existing entry there, so duplicate
+                // bare-`*` fronts are not detected -- sibling keys stay
+                // untouched either way.
                 let key = sni.to_ascii_lowercase().into_bytes();
                 let accept_wildcard_for_self_lookup = key.starts_with(b"*.");
                 if let Some((_, existing)) = self
@@ -3151,7 +3163,7 @@ mod sni_routing_tests {
         );
     }
 
-    // ---- known_alpn_label (access-log tagging, design item 8) ----------
+    // ---- known_alpn_label (access-log tagging) -------------------------
 
     #[test]
     fn known_alpn_label_picks_the_clients_first_offer() {
@@ -3300,7 +3312,7 @@ mod sni_routing_tests {
     }
 
     // ---- exact-key bookkeeping must not fall back to a sibling wildcard
-    // (sozu-proxy/sozu#1290 review finding 1) --------------------------
+    // (route-table corruption caught in sozu-proxy/sozu#1290 review) ----
 
     #[test]
     fn insert_sni_route_creates_a_distinct_node_for_an_exact_key_over_a_sibling_wildcard() {
@@ -3818,7 +3830,9 @@ mod sni_routing_tests {
         // (robust to any starting value), not an absolute reading. The
         // net-zero-per-session contract spans the full lifecycle (accept ->
         // live backend connect -> upgrade/teardown) and is the behavioural job
-        // of the e2e `tcp_` gauge assertion, not reproducible at this unit
+        // of the e2e gauge assertion
+        // (`test_tcp_sni_reject_then_valid_connection_not_limited` in
+        // `e2e/src/tests/tcp_sni_tests.rs`), not reproducible at this unit
         // level.
         let ServerParts {
             registry,

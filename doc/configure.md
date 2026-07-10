@@ -640,10 +640,11 @@ host. A connection is rejected (TCP FIN, no bytes forwarded) when:
   check payload, ...);
 - the ClientHello is malformed, or fragments past `sni_preread_timeout`
   without becoming complete;
-- the accumulated bytes reach `sni_preread_max_bytes` before a complete
-  ClientHello is seen (a COMPLETE hello routes regardless of total length —
-  the client keeps sending after its hello in passthrough, so the cap only
-  ever rejects a genuinely incomplete window);
+- the ClientHello fails to complete within the first `sni_preread_max_bytes`
+  bytes (the preread never reads past the cap, so a hello genuinely larger
+  than it is rejected; a hello that completes within the cap routes no
+  matter how much data the client has already coalesced after it — the
+  excess stays in the kernel socket buffer and reaches the backend intact);
 - the ClientHello carries no usable SNI (absent, empty, or hidden behind
   Encrypted Client Hello with no outer name);
 - the SNI matches no configured `hostname` on this listener, or matches one
@@ -664,9 +665,9 @@ rejection — see that section's note.
 | Two frontends on the same `(address, hostname)` share an `alpn` protocol | **Error** `TcpFrontendAlpnOverlap` — routing must be deterministic, not iteration-order-dependent |
 | More than one frontend on the same `(address, hostname)` omits `alpn` | **Error** `TcpFrontendMultipleAlpnCatchAll` — at most one catch-all per `(address, hostname)` |
 | A listener has both a no-`hostname` frontend and at least one `hostname`-scoped frontend | **Error** `TcpListenerMixesSniAndNoSni` |
-| `sni_preread_timeout` exceeds this listener's `front_timeout` | **Error** `SniPrereadTimeoutExceedsFrontTimeout` — the preread phase cannot outlive the timeout that would already have closed the connection |
+| `sni_preread_timeout` exceeds `front_timeout` on an SNI-enabled listener | **Error** `SniPrereadTimeoutExceedsFrontTimeout` — the preread phase cannot outlive the timeout that would already have closed the connection |
 | `sni_preread_max_bytes` is below 5 bytes (a full TLS record header) on an SNI-enabled listener | **Error** `SniPrereadMaxBytesTooSmall` — `0` in particular makes the shell issue reads that can never make progress, spinning until the event-loop iteration guard trips |
-| `sni_preread_max_bytes` exceeds the global `buffer_size` | **Error** `SniPrereadMaxBytesExceedsBufferSize` — the preread buffer is carved out of the same per-session buffer used for relaying |
+| `sni_preread_max_bytes` exceeds the global `buffer_size` on an SNI-enabled listener | **Error** `SniPrereadMaxBytesExceedsBufferSize` — the preread buffer is carved out of the same per-session buffer used for relaying |
 
 > **The routing-SHAPE validations — the mixing ban (`TcpListenerMixesSniAndNoSni`),
 > ALPN-overlap / catch-all uniqueness (`TcpFrontendAlpnOverlap` /
@@ -680,12 +681,17 @@ rejection — see that section's note.
 > `NonAsciiSniPattern` (is `hostname` an exact host or one leading `*.`
 > label, and pure ASCII) — and the listener-level timeout/buffer checks
 > (`SniPrereadTimeoutExceedsFrontTimeout` / `SniPrereadMaxBytesTooSmall` /
-> `SniPrereadMaxBytesExceedsBufferSize`) still run at TOML config-load only;
-> a malformed `--sni` pattern or a `0` `--sni-preread-max-bytes` sent via
-> `sozu listener tcp add`/`update` is not yet re-validated on that path.
-> Prefer declaring TCP SNI routing in the TOML file and reloading, or
-> double-check hot-added routes and listener knobs carefully, until that
-> remaining gap is closed.
+> `SniPrereadMaxBytesExceedsBufferSize`) still run at TOML config-load only:
+> a malformed pattern sent via `sozu frontend tcp add --sni` is installed
+> as-is (it silently never matches on-wire SNI), and `sozu listener tcp add`
+> accepts out-of-range preread knobs without error. An out-of-range
+> `sni_preread_max_bytes` is at least degraded safely at the point of use —
+> the worker clamps the effective cap to the session buffer's capacity and
+> floors it at the 5-byte TLS record header, so a hot-added `0` cannot spin
+> the preread loop — but a `sni_preread_timeout` above `front_timeout` is
+> applied as-is during the preread phase. Prefer declaring TCP SNI routing
+> in the TOML file and reloading, or double-check hot-added routes and
+> listener knobs carefully, until that remaining gap is closed.
 
 ##### Runtime CLI surface
 
@@ -2534,7 +2540,7 @@ Incremented when a session fails to transition between protocol phases:
 | `tcp.upgrade.send.failed`        | counter | proxy | TCP: PROXY protocol send transition failed                 |
 | `tcp.upgrade.relay.failed`       | counter | proxy | TCP: PROXY protocol relay transition failed                |
 | `tcp.upgrade.expect.failed`      | counter | proxy | TCP: PROXY protocol expect transition failed               |
-| `tcp.upgrade.sni_preread.failed` | counter | proxy | TCP: SNI-preread → pipe transition failed (see below)       |
+| `tcp.upgrade.sni_preread.failed` | counter | proxy | TCP: SNI-preread → pipe / PROXY-protocol-send transition failed (see below) |
 
 #### TCP SNI preread (passthrough routing)
 
@@ -2557,7 +2563,7 @@ teardown). A bare TCP health check (connect then close, zero bytes sent) is
 | `tcp.sni_preread.rejected.malformed_record`       | counter | proxy | Bad TLS record framing (declared length lies, or a non-handshake record interrupts an in-progress hello) |
 | `tcp.sni_preread.rejected.malformed_handshake`    | counter | proxy | Not a ClientHello, or a length-prefixed field inside it lies about the bytes available |
 | `tcp.sni_preread.rejected.fragmented`              | counter | proxy | The preread deadline (`sni_preread_timeout`) fired before a terminal verdict            |
-| `tcp.sni_preread.rejected.too_large`               | counter | proxy | The window reached `sni_preread_max_bytes` while still incomplete (a complete hello always routes, regardless of total length) |
+| `tcp.sni_preread.rejected.too_large`               | counter | proxy | The ClientHello failed to complete within `sni_preread_max_bytes` (the preread never reads past the cap; a hello that completes within it routes even when coalesced bytes follow) |
 | `tcp.sni_preread.rejected.no_sni`                  | counter | proxy | The `server_name` extension was absent, empty, or its `host_name` entry missing         |
 | `tcp.sni_preread.rejected.ech_outer_absent`        | counter | proxy | Encrypted Client Hello (`0xfe0d`) was present with no usable outer SNI — distinct from `no_sni` |
 | `tcp.sni_preread.rejected.sni_unmatched`           | counter | proxy | The normalized SNI matched no configured `hostname` on this listener                    |
