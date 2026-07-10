@@ -2552,7 +2552,7 @@ teardown). A bare TCP health check (connect then close, zero bytes sent) is
 | ------------------------------------------------ | ------- | ----- | --------------------------------------------------------------------------------------- |
 | `tcp.sni_preread.routed`                          | counter | proxy | A cluster was chosen from the ClientHello's SNI (+ optional ALPN)                       |
 | `tcp.sni_preread.active`                          | gauge   | proxy | Sessions currently prereading. Never underflows                                        |
-| `tcp.sni_preread.duration`                        | time    | proxy | Wall-clock time spent prereading, recorded on every exit alongside the `active` decrement |
+| `tcp.sni_preread.duration`                        | time    | proxy | Wall-clock time spent prereading, recorded on every exit (including the defensive upgrade-time early-return paths, which record it immediately rather than waiting on the `active` decrement, since the latter may only land later, in `close()`) |
 | `tcp.sni_preread.rejected.not_tls`                | counter | proxy | First TLS record's `ContentType` wasn't `handshake`                                    |
 | `tcp.sni_preread.rejected.malformed_record`       | counter | proxy | Bad TLS record framing (declared length lies, or a non-handshake record interrupts an in-progress hello) |
 | `tcp.sni_preread.rejected.malformed_handshake`    | counter | proxy | Not a ClientHello, or a length-prefixed field inside it lies about the bytes available |

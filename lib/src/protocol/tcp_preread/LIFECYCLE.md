@@ -349,7 +349,38 @@ dropping the inherited preread bytes. The regression guard is
    application data before the frontend closes), but the defect could hit any
    plain-TCP upload racing a frontend close, independent of SNI preread.
    Regression guard: `frontend_eof_flushes_queued_backend_bytes_before_closing`
-   (`pipe.rs:1857`).
+   (`pipe.rs:1905`).
+
+   The HUP path (`Pipe::frontend_hup`, `pipe.rs:511`) had the exact same
+   defect, reached through a different door: `command/src/ready.rs`'s
+   `From<&mio::event::Event>` maps `EPOLLRDHUP` to `Ready::HUP`
+   independently of `Ready::READABLE`, so a client FIN that coalesces with
+   the payload tail into one epoll batch on a loaded event loop delivers
+   BOTH bits in the same event — `TcpSession::ready_inner`
+   (`lib/src/tcp.rs`) checked `front_readiness().event.is_hup()` before its
+   processing loop and called `frontend_hup`, which unconditionally
+   returned `Close`, dropping whatever hadn't been forwarded yet (queued in
+   `frontend_buffer`, or still sitting unread in the kernel receive
+   buffer). The fix mirrors `backend_hup`'s drain branch: if
+   `request_is_inflight` (same three-way check as `check_connections`) and
+   a backend socket exists, `frontend_hup` re-arms frontend `READABLE`
+   interest (when the READABLE event bit is also set, so the kernel tail
+   still gets drained to EOF via the `SocketResult::Closed` arm above),
+   arms backend-writable, and returns `Continue` instead of `Close`.
+   `ready_inner`'s front-HUP check had to change too: a `Continue` here
+   must NOT `return` immediately (the client is silent post-FIN, so under
+   edge-triggered epoll no further frontend event will ever wake the
+   session) — it now clears the consumed `HUP` bit and falls through into
+   the same-pass `while` loop so `readable`/`back_writable` can finish the
+   drain synchronously, exactly like the existing in-loop `back_hup`
+   handling. Regression guards:
+   `frontend_hup_drains_inflight_request_bytes_before_closing` /
+   `frontend_hup_closes_immediately_when_nothing_is_inflight`
+   (`pipe.rs:2016`, `pipe.rs:2084`). The `splice` fast path has the same
+   drain: `splice_readable`'s `Closed` arm defers teardown until
+   `splice_backend_writable` empties the kernel `in_pipe`
+   (`request_is_inflight` counts `splice_in_pending()`), guarded by
+   `splice_readable_eof_drains_kernel_pipe_bytes_before_closing`.
 
 5. **Route lookup + ALPN resolution is asserted deterministic.**
    `SniPrereadCore::route` (`mod.rs:306-371`) re-runs the SAME trie lookup +
