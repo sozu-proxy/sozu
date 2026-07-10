@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-command-lib"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "hex",
  "libc",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-lib"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
