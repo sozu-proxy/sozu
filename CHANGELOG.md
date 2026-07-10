@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## 2.1.1 - 2026-07-10
+
+Patch release: dependency updates, Rust 1.91.0 MSRV alignment, deterministic
+simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
+
 ### ✨ Added
 
 - **`test(sim)`: moonpool-sim-driven deterministic UDP simulation.** A new
