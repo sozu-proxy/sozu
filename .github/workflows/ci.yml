@@ -215,8 +215,8 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo +nightly install cargo-fuzz --locked
 
-      # 300s per target × 3 targets = ~15 min wall, fits inside the
-      # 30-min timeout with ~15 min slack for libFuzzer warm-up and
+      # 300s per target × 4 targets = ~20 min wall, fits inside the
+      # 30-min timeout with ~10 min slack for libFuzzer warm-up and
       # corpus replay. cargo-fuzz writes crash artefacts to
       # `fuzz/artifacts/<target>/`, picked up by the upload step.
       - name: Fuzz fuzz_frame_parser (300s)
@@ -230,6 +230,10 @@ jobs:
       - name: Fuzz fuzz_udp_flow (300s)
         working-directory: fuzz
         run: cargo +nightly fuzz run fuzz_udp_flow -- -max_total_time=300
+
+      - name: Fuzz fuzz_tcp_clienthello (300s)
+        working-directory: fuzz
+        run: cargo +nightly fuzz run fuzz_tcp_clienthello -- -max_total_time=300
 
       - name: Upload fuzz crashes
         if: failure()
@@ -311,10 +315,11 @@ jobs:
           echo "OK: every #[ignore] carries a reason string."
 
   # ┌──────────────────────────────────────────────────────────────┐
-  # │ Group C‴ — moonpool-sim UDP simulation (the sole UDP sim).    │
+  # │ Group C‴ — moonpool-sim deterministic simulations (UDP core + │
+  # │   TCP passthrough SNI-preread core, sozu-proxy/sozu#1279).    │
   # │   The sozu-sim harness is cfg-gated off in the main matrix    │
-  # │   (no tokio_unstable), so run a MODEST seeded sweep here with  │
-  # │   the flag as the per-PR gate; the deep swarm runs nightly     │
+  # │   (no tokio_unstable), so run MODEST seeded sweeps here with   │
+  # │   the flag as the per-PR gate; the deep swarms run nightly     │
   # │   (simulation-sweep.yml). Debug build keeps the in-core        │
   # │   `debug_assert!` invariants live.                             │
   # └──────────────────────────────────────────────────────────────┘
@@ -330,6 +335,13 @@ jobs:
       # (~100x slower per seed-step than a pure loop); the nightly job goes deep.
       SOZU_UDP_SIM_SEEDS: '64'
       SOZU_UDP_SIM_STEPS: '2000'
+      # tcp_preread_sim has no per-seed tokio runtime (SniPrereadCore is a
+      # small, near-stateless per-connection state machine, not a long-lived
+      # flow table), so it is far cheaper per seed than the UDP sim — a
+      # locally measured 2048 seeds × 200 connections/seed runs in ~14s.
+      # Still kept modest here on principle; the nightly job goes deeper.
+      SOZU_TCP_PREREAD_SIM_SEEDS: '512'
+      SOZU_TCP_PREREAD_SIM_STEPS: '64'
     steps:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -349,6 +361,9 @@ jobs:
 
       - name: UDP simulation sweep (debug, asserts live)
         run: cargo test -p sozu-sim --locked --test udp_simulation -- --nocapture
+
+      - name: TCP preread simulation sweep (debug, asserts live)
+        run: cargo test -p sozu-sim --locked --test tcp_preread_sim -- --nocapture
 
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Group D — Bombardier load benches (folded from benchmark.yml) │

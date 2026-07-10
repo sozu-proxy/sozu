@@ -113,6 +113,45 @@ fn load_state_buffer_loop_consumes_v1_1_1_payload() {
     assert_eq!(requests.len(), 3);
 }
 
+/// sozu-proxy/sozu#1279 added `sni` (optional) and `alpn` (repeated) to
+/// `RequestTcpFrontend`. A pre-#1279 client emits an `ADD_TCP_FRONTEND`
+/// record with neither key present at all; `alpn` needs
+/// `#[serde(default)]` (see `command/build.rs`) for the same reason
+/// `Cluster.answers` does above, or this record would be rejected with
+/// "missing field `alpn`".
+#[test]
+fn legacy_tcp_frontend_without_sni_alpn_deserializes_with_defaults() {
+    let record = format!(
+        r#"{{"id":"PROXY-MANAGER-LEGACY-TCP","content":{{"request_type":{{"ADD_TCP_FRONTEND":{{"cluster_id":"app-1","address":{{"ip":{{"inner":{{"V4":{LOCALHOST_V4}}}}},"port":9000}},"tags":{{}}}}}}}}}}"#,
+    );
+    let mut payload = Vec::new();
+    payload.extend_from_slice(record.as_bytes());
+    payload.extend_from_slice(b"\n\0");
+
+    let (rest, requests) = parse_several_requests::<WorkerRequest>(&payload)
+        .expect("legacy (pre-#1279) TCP frontend record must parse against current schema");
+    assert!(
+        rest.is_empty(),
+        "leftover bytes after parsing: {} bytes — would fire 'Error consuming load state message'",
+        rest.len(),
+    );
+    assert_eq!(requests.len(), 1);
+
+    let frontend = match requests[0].content.request_type.as_ref() {
+        Some(RequestType::AddTcpFrontend(f)) => f,
+        other => panic!("expected ADD_TCP_FRONTEND, got {other:?}"),
+    };
+    assert_eq!(frontend.cluster_id, "app-1");
+    assert_eq!(
+        frontend.sni, None,
+        "sni must default to None for a legacy record that never carried it"
+    );
+    assert!(
+        frontend.alpn.is_empty(),
+        "RequestTcpFrontend.alpn must default to empty",
+    );
+}
+
 #[test]
 fn missing_required_scalar_still_fails() {
     // Strictness contract: a record without the required `cluster_id` scalar

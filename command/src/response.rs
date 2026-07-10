@@ -264,16 +264,28 @@ pub struct TcpFrontend {
     pub address: SocketAddr,
     /// custom tags to identify the frontend in the access logs
     pub tags: BTreeMap<String, String>,
+    /// SNI hostname to match against the TLS ClientHello (exact hostname or a
+    /// single leading `*.` wildcard label). `None` matches regardless of SNI.
+    #[serde(default)]
+    pub sni: Option<String>,
+    /// ALPN protocol names this frontend matches; empty is the catch-all for
+    /// its `sni` on this listener.
+    #[serde(default)]
+    pub alpn: Vec<String>,
 }
 
 impl From<TcpFrontend> for RequestTcpFrontend {
     fn from(val: TcpFrontend) -> Self {
         let source_address = val.address;
         let source_cluster_id = val.cluster_id.clone();
+        let source_sni = val.sni.clone();
+        let source_alpn = val.alpn.clone();
         let request_frontend = RequestTcpFrontend {
             cluster_id: val.cluster_id,
             address: val.address.into(),
             tags: val.tags,
+            sni: val.sni,
+            alpn: val.alpn,
         };
 
         // POST: cluster identity and the wire address are preserved across the
@@ -286,6 +298,17 @@ impl From<TcpFrontend> for RequestTcpFrontend {
             SocketAddr::from(request_frontend.address),
             source_address,
             "TCP frontend address must round-trip through the proto encoding"
+        );
+        // POST: SNI/ALPN routing identity is preserved across the proto
+        // conversion — losing either here would silently misroute or
+        // over-match traffic on this frontend's listener.
+        debug_assert_eq!(
+            request_frontend.sni, source_sni,
+            "TCP frontend sni must survive the proto conversion"
+        );
+        debug_assert_eq!(
+            request_frontend.alpn, source_alpn,
+            "TCP frontend alpn must survive the proto conversion"
         );
         request_frontend
     }

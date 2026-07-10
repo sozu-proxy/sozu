@@ -72,6 +72,7 @@ pub fn main() {
         .field_attribute("HttpsListenerConfig.answers", "#[serde(default)]")
         .field_attribute("TcpListenerConfig.answers", "#[serde(default)]")
         .field_attribute("RequestUdpFrontend.tags", "#[serde(default)]")
+        .field_attribute("RequestTcpFrontend.alpn", "#[serde(default)]")
         .enum_attribute(".", "#[serde(rename_all = \"SCREAMING_SNAKE_CASE\")]")
         .enum_attribute(
             "ResponseContent.content_type",

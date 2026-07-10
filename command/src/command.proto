@@ -663,6 +663,17 @@ message TcpListenerConfig {
     required uint32 connect_timeout = 6 [default = 3];
     // wether the listener is actively listening on its socket
     required bool active = 7 [default = false];
+    // Time allowed to receive enough bytes of the TLS ClientHello to read the
+    // SNI extension, in seconds. Only meaningful when at least one SNI-scoped
+    // `RequestTcpFrontend` targets this listener; a listener with only
+    // no-SNI frontends never prereads and ignores this value.
+    optional uint32 sni_preread_timeout = 8 [default = 5];
+    // Maximum number of bytes buffered while prereading the TLS ClientHello
+    // looking for the SNI extension. Only meaningful when at least one
+    // SNI-scoped `RequestTcpFrontend` targets this listener. Clamped by the
+    // global `buffer_size`: a value greater than `buffer_size` is a
+    // configuration error at load time (raise `buffer_size` instead).
+    optional uint32 sni_preread_max_bytes = 9 [default = 16384];
 }
 
 // details of a UDP listener
@@ -905,6 +916,19 @@ message RequestTcpFrontend {
     required SocketAddress address = 2;
     // custom tags to identify the frontend in the access logs
     map<string, string> tags = 3;
+    // SNI hostname to match against the TLS ClientHello, read via preread on
+    // the listener before any bytes are relayed to a backend. Either an
+    // exact hostname (e.g. "example.com") or a single leading `*.` wildcard
+    // label (e.g. "*.example.com"); no other wildcard shape is accepted.
+    // Absent means this frontend matches regardless of SNI (a raw-TCP
+    // fallback), and a listener cannot mix SNI and no-SNI frontends.
+    optional string sni = 4;
+    // ALPN protocol names this frontend matches, read from the TLS
+    // ClientHello during the same preread as `sni`. Empty means this
+    // frontend is the catch-all for its `sni` on this listener; at most one
+    // frontend per `(address, sni)` may leave this empty, and no two
+    // frontends on the same `(address, sni)` may share a protocol name.
+    repeated string alpn = 5;
 }
 
 message RequestUdpFrontend {

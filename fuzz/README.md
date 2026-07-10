@@ -20,7 +20,9 @@ fuzz/
 ├── Cargo.lock                        # pinned for reproducibility
 ├── fuzz_targets/
 │   ├── fuzz_frame_parser.rs          # H2 frame-codec fuzzer (RFC 9113)
-│   └── fuzz_hpack_decoder.rs         # HPACK-decoder fuzzer (RFC 7541)
+│   ├── fuzz_hpack_decoder.rs         # HPACK-decoder fuzzer (RFC 7541)
+│   ├── fuzz_udp_flow.rs              # sans-io UDP load-balancing core fuzzer
+│   └── fuzz_tcp_clienthello.rs       # sans-io TCP SNI-preread core fuzzer
 ├── corpus/                           # tracked seed corpora
 │   ├── fuzz_frame_parser/
 │   │   ├── connection_preface
@@ -29,8 +31,15 @@ fuzz/
 │   │   ├── headers_frame
 │   │   ├── crash-d7a34a0d-padded-headers-underflow-regression
 │   │   └── ...
-│   └── fuzz_hpack_decoder/
-│       └── ...
+│   ├── fuzz_hpack_decoder/
+│   │   └── ...
+│   └── fuzz_tcp_clienthello/
+│       ├── routed_exact_sni
+│       ├── proxy_v2_prefixed_hello
+│       ├── truncated_hello_then_timeout
+│       ├── grease_heavy_hello_oneof_alpn
+│       ├── non_tls_junk
+│       └── malformed_record_oversize
 └── artifacts/                        # crash artifacts, not committed
     ├── fuzz_frame_parser/
     └── fuzz_hpack_decoder/
@@ -90,6 +99,52 @@ imported through `loona-hpack = "0.4"` (`fuzz/Cargo.toml:12`); the fuzzer
 covers the worst-case shapes that the in-tree HPACK consumer
 (`lib/src/protocol/mux/pkawa.rs`) routes into the decoder.
 
+### 2.3 `fuzz_tcp_clienthello`
+
+Source: `fuzz/fuzz_targets/fuzz_tcp_clienthello.rs`.
+
+Drives [`SniPrereadCore::handle_input`](../lib/src/protocol/tcp_preread/mod.rs)
+— the sans-io TCP-passthrough SNI-preread core (issue #1279) — entirely
+through its public API (plus the already-public
+`sozu_lib::router::pattern_trie::TrieNode` it reuses for routing). A
+big-endian `Reader` over the fuzz input (mirroring `fuzz_udp_flow.rs`)
+derives, in order:
+
+1. a route table of 1-4 entries, each an SNI key from a fixed pool
+   (`a.example.com`, `*.example.com`, `b.example.net`, `*.wild.example.org`)
+   mapped to an `AlpnMatcher` (`Any`, or a 1-2-protocol `OneOf` drawn from
+   `{h2, http/1.1, h3, foo}`) and a synthesized cluster id;
+2. a `PrereadConfig`: `inbound_proxy` flag, `max_bytes` in `64..=16384`, a
+   fixed 3-second timeout, `accept_wildcard` flag;
+3. a bounded (≤ 4096 iterations) step loop that either grows the
+   accumulated preread window by a length-prefixed chunk taken DIRECTLY
+   from the remaining fuzz bytes and feeds `Input::Bytes` under a monotonic
+   injected clock, advances that clock without feeding bytes, or injects
+   `Input::Timeout` / `Input::FrontClosed`.
+
+Invariants asserted beyond "never panic": the fed window is byte-identical
+before and after every call; once a terminal `Output` (`Routed` / `Reject`)
+is latched, every later call replays it identically and `NeedMore` can never
+reappear; `Routed::content_offset` never exceeds the window it was derived
+from; a `NeedMore::deadline`, once observed, never decreases across calls.
+
+Bug class defended: parser panics / smuggling-shaped desyncs in the TLS
+record-layer + ClientHello reassembly (multi-record split, PROXY-v2
+prefix stripping, GREASE-laden extension walks) that decide TCP passthrough
+routing without ever terminating TLS.
+
+Seed corpus (`fuzz/corpus/fuzz_tcp_clienthello/`), each mapped to the state
+it drives the core into:
+
+| Seed | Drives the core to |
+|---|---|
+| `routed_exact_sni` | A single-record ClientHello for `a.example.com` fed whole → `Routed` via an `Any` route, `content_offset = 0`. |
+| `proxy_v2_prefixed_hello` | A 28-byte PROXY-v2 IPv4 header fed alone (`NeedMore`), then the ClientHello appended → `Routed` with `content_offset = 28` and `proxy_source` set from the PPv2 header. |
+| `truncated_hello_then_timeout` | Half of a valid ClientHello, then a `Timeout` before completion → `Reject(Fragmented)`. |
+| `grease_heavy_hello_oneof_alpn` | A ClientHello with RFC 8701 GREASE extensions bracketing the `server_name` + `alpn` extensions, routed against a `OneOf({"h2"})` entry → `Routed` (the extension walk skips GREASE by length, ALPN client-preference-order picks `h2`). |
+| `non_tls_junk` | A 5-byte record whose `ContentType` is `application_data` (23), not `handshake` → `Reject(NotTls)`. |
+| `malformed_record_oversize` | A `handshake`-typed record declaring a length past the 2^14 RFC 8446 cap → `Reject(MalformedRecord)`. |
+
 ---
 
 ## 3. Running Locally
@@ -105,6 +160,8 @@ Then from the repository root:
 cd fuzz
 cargo +nightly fuzz run fuzz_frame_parser
 cargo +nightly fuzz run fuzz_hpack_decoder
+cargo +nightly fuzz run fuzz_udp_flow
+cargo +nightly fuzz run fuzz_tcp_clienthello
 ```
 
 Each invocation runs forever until you stop it. To time-bound a run:
@@ -223,3 +280,6 @@ Until that happens, the two existing safety nets are:
   decoder it relies on.
 - `lib/src/protocol/mux/LIFECYCLE.md` — context for the framing rules
   the parser enforces.
+- `lib/src/protocol/tcp_preread/mod.rs` — the sans-io TCP SNI-preread core
+  the `fuzz_tcp_clienthello` target drives; `lib/src/protocol/tcp_preread/parser.rs`
+  owns the ClientHello wire parsing it exercises.

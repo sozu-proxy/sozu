@@ -29,3 +29,8 @@ doc = false
 name = "fuzz_udp_flow"
 path = "fuzz_targets/fuzz_udp_flow.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_tcp_clienthello"
+path = "fuzz_targets/fuzz_tcp_clienthello.rs"
+doc = false

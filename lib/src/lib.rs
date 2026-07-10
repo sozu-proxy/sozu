@@ -875,6 +875,19 @@ pub enum ProxyError {
          true on address {0:?} (RFC 6797 §7.2)"
     )]
     HstsOnPlainHttp(SocketAddr),
+    /// A TCP `AddTcpFrontend` would corrupt this listener's SNI/ALPN
+    /// routing invariants (sozu-proxy/sozu#1279): mixing a no-SNI
+    /// catch-all with SNI-scoped routes, an `alpn`-scoped frontend with no
+    /// `sni` to preread against, or an ALPN protocol / catch-all that
+    /// overlaps an existing route on the same `(address, sni)`. TOML
+    /// config-load already rejects the same shapes
+    /// (`command/src/config.rs::ConfigError`), but `AddTcpFrontend` can
+    /// also arrive directly over the command socket or via `LoadState`
+    /// replay of a hand-edited/stale state file, bypassing config.rs
+    /// entirely — see `TcpListener::validate_new_tcp_front`
+    /// (`lib/src/tcp.rs`).
+    #[error("rejected AddTcpFrontend on listener {address:?}: {reason}")]
+    InvalidTcpFrontend { address: SocketAddr, reason: String },
 }
 
 use self::server::ListenToken;

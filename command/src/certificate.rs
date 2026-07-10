@@ -41,8 +41,17 @@ pub enum CertificateError {
     InvalidTlsVersion(String),
     #[error("failed to parse fingerprint, {0}")]
     InvalidFingerprint(FromHexError),
+    // `ConfigError` is boxed to keep `CertificateError` small: this enum is
+    // embedded by value in `sozu-lib`'s `ListenerError`/`ProxyError`, and an
+    // unboxed `ConfigError` (which grows with every new config-validation
+    // variant) pushed those past clippy's `result_large_err` 128-byte
+    // threshold at 42 call sites. Same pattern as
+    // `ProxyError::WrongInputFrontend { front: Box<RequestHttpFrontend> }`.
     #[error("could not load file on path {path}: {error}")]
-    LoadFile { path: String, error: ConfigError },
+    LoadFile {
+        path: String,
+        error: Box<ConfigError>,
+    },
     #[error("Failed at decoding the hex encoded certificate: {0}")]
     DecodeError(FromHexError),
 }
@@ -338,7 +347,7 @@ pub fn get_fingerprint_from_certificate_path(
     let bytes =
         Config::load_file_bytes(certificate_path).map_err(|e| CertificateError::LoadFile {
             path: certificate_path.to_string(),
-            error: e,
+            error: Box::new(e),
         })?;
 
     let parsed_bytes = calculate_fingerprint(&bytes)?;
@@ -369,19 +378,19 @@ pub fn load_full_certificate(
     let certificate =
         Config::load_file(certificate_path).map_err(|e| CertificateError::LoadFile {
             path: certificate_path.to_string(),
-            error: e,
+            error: Box::new(e),
         })?;
 
     let certificate_chain = Config::load_file(certificate_chain_path)
         .map(split_certificate_chain)
         .map_err(|e| CertificateError::LoadFile {
             path: certificate_chain_path.to_string(),
-            error: e,
+            error: Box::new(e),
         })?;
 
     let key = Config::load_file(key_path).map_err(|e| CertificateError::LoadFile {
         path: key_path.to_string(),
-        error: e,
+        error: Box::new(e),
     })?;
 
     let versions_len = versions.len();

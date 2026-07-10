@@ -122,6 +122,31 @@ pub const DEFAULT_BACK_TIMEOUT: u32 = 30;
 /// maximum time to connect to a backend server (3 seconds)
 pub const DEFAULT_CONNECT_TIMEOUT: u32 = 3;
 
+/// maximum time allowed to receive enough bytes of the TLS ClientHello to
+/// read the SNI extension on a TCP listener (5 seconds). Only relevant when
+/// at least one SNI-scoped `TcpFrontendConfig` targets the listener. Must
+/// match the proto default on `TcpListenerConfig.sni_preread_timeout`.
+pub const DEFAULT_SNI_PREREAD_TIMEOUT: u32 = 5;
+
+/// maximum number of bytes buffered while prereading the TLS ClientHello
+/// looking for the SNI extension on a TCP listener (16 KB — matches the
+/// H2 frame ceiling used elsewhere in this file). Only relevant when at
+/// least one SNI-scoped `TcpFrontendConfig` targets the listener; clamped by
+/// the global `buffer_size` (see `ConfigError::SniPrereadMaxBytesTooLarge`).
+/// Must match the proto default on
+/// `TcpListenerConfig.sni_preread_max_bytes`.
+pub const DEFAULT_SNI_PREREAD_MAX_BYTES: u32 = 16384;
+
+/// minimum allowed `sni_preread_max_bytes` on a TCP listener targeted by an
+/// SNI frontend (5 bytes — a full TLS record header: 1-byte `ContentType` +
+/// 2-byte `ProtocolVersion` + 2-byte length, RFC 8446 §5.1). `0` (and every
+/// value below this floor) makes the preread shell issue reads that can
+/// never accumulate enough bytes to parse even the outer record framing,
+/// spinning until the event-loop iteration guard (`MAX_LOOP_ITERATIONS`)
+/// trips instead of ever reaching a routing decision. See
+/// `ConfigError::SniPrereadMaxBytesTooSmall`.
+pub const MIN_SNI_PREREAD_MAX_BYTES: u32 = 5;
+
 /// maximum time to receive a request since the connection started (10 seconds)
 pub const DEFAULT_REQUEST_TIMEOUT: u32 = 10;
 
@@ -368,6 +393,129 @@ pub enum ConfigError {
          (RFC 6797 §7.2 forbids the header over plaintext HTTP)"
     )]
     HstsOnPlainHttp(String),
+    /// A TCP frontend's `hostname` (mapped to the wire `sni` field) is
+    /// neither an exact hostname nor a single leading `*.` wildcard label
+    /// (sozu-proxy/sozu#1279). Rejects `*.*.example.com`, an embedded `*`
+    /// anywhere but the leading label, and an empty label.
+    #[error(
+        "invalid SNI pattern '{sni}' for a TCP frontend: expected an exact hostname or a \
+         single leading \"*.\" wildcard label (e.g. \"example.com\" or \"*.example.com\")"
+    )]
+    InvalidSniPattern { sni: String },
+    /// A TCP frontend's SNI pattern contains non-ASCII characters. On-wire
+    /// SNI is always an ASCII A-label (RFC 6066 §3 / IDNA), so a Unicode
+    /// U-label in the config would load fine but never match any
+    /// ClientHello — a silent routing failure. Rejected loudly until IDNA
+    /// normalization is supported at config-load; the operator must write
+    /// the punycode A-label form instead.
+    #[error(
+        "non-ASCII SNI pattern '{sni}' for a TCP frontend: on-wire SNI is always an ASCII \
+         A-label (RFC 6066), so this pattern would never match a ClientHello. Write the \
+         punycode A-label form instead (e.g. \"xn--mnchen-3ya.example\" for \
+         \"münchen.example\")"
+    )]
+    NonAsciiSniPattern { sni: String },
+    /// A TCP frontend set `alpn` but left `hostname` (mapped to the wire
+    /// `sni` field) unset. An ALPN matcher only ever gets consulted from
+    /// within the SNI-scoped preread route table; a frontend with no `sni`
+    /// installs the worker's raw no-SNI catch-all path instead
+    /// (`TcpListener::cluster_id`), which never looks at `alpn` at all --
+    /// the configured protocol list would silently never be enforced.
+    /// Reject at config-load rather than mis-routing every connection
+    /// through unconditionally.
+    #[error(
+        "TCP frontend {address} sets alpn but no hostname (sni): alpn only matches within an \
+         SNI-scoped preread, so a frontend without hostname would silently ignore its alpn list. \
+         Set hostname or drop alpn."
+    )]
+    AlpnWithoutSni { address: SocketAddr },
+    /// Two TCP frontends on the same `(address, sni)` advertise an
+    /// overlapping ALPN protocol. Routing on a listener must be
+    /// deterministic: if both frontends could match the same ClientHello,
+    /// which cluster receives the connection would depend on iteration
+    /// order rather than configuration.
+    #[error(
+        "TCP frontends on {address} with sni {sni:?} both match ALPN protocol '{protocol}': \
+         ALPN matchers for the same (address, sni) must not overlap"
+    )]
+    TcpFrontendAlpnOverlap {
+        address: SocketAddr,
+        sni: Option<String>,
+        protocol: String,
+    },
+    /// More than one TCP frontend on the same `(address, sni)` left `alpn`
+    /// empty. An empty `alpn` is the catch-all match for that `sni`; two
+    /// catch-alls on the same `(address, sni)` are as ambiguous as two
+    /// frontends sharing an explicit protocol.
+    #[error(
+        "more than one TCP frontend on {address} with sni {sni:?} leaves alpn empty (the \
+         catch-all match): at most one frontend per (address, sni) may omit alpn"
+    )]
+    TcpFrontendMultipleAlpnCatchAll {
+        address: SocketAddr,
+        sni: Option<String>,
+    },
+    /// A TCP listener address is targeted by both a no-SNI frontend and at
+    /// least one SNI-scoped frontend. An SNI-enabled listener prereads the
+    /// ClientHello before choosing a backend; a raw-TCP fallback frontend
+    /// with no SNI to match against would be unreachable for any client
+    /// that doesn't send SNI, and ambiguous for any that does, so the two
+    /// shapes cannot share a listener.
+    #[error(
+        "TCP listener {address} is targeted by both a no-SNI frontend and at least one \
+         SNI-scoped frontend: an SNI-enabled listener must not also have a raw-TCP fallback \
+         frontend on the same address"
+    )]
+    TcpListenerMixesSniAndNoSni { address: SocketAddr },
+    /// `sni_preread_timeout` on a TCP listener exceeds that listener's
+    /// `front_timeout`. The preread phase is bounded by the frontend's own
+    /// inactivity timeout, so a preread budget longer than the timeout that
+    /// would kill the connection anyway can never fully elapse — it is
+    /// either a config mistake or silently dead configuration.
+    #[error(
+        "sni_preread_timeout = {sni_preread_timeout}s on TCP listener {address} exceeds its \
+         front_timeout = {front_timeout}s: the preread phase cannot outlive the frontend \
+         inactivity timeout that would already have closed the connection"
+    )]
+    SniPrereadTimeoutExceedsFrontTimeout {
+        address: SocketAddr,
+        sni_preread_timeout: u32,
+        front_timeout: u32,
+    },
+    /// `sni_preread_max_bytes` on a TCP listener targeted by at least one
+    /// SNI frontend exceeds the global `buffer_size`. The preread buffer is
+    /// carved out of the same per-session buffer the proxy uses for
+    /// relaying, so a preread ceiling above `buffer_size` can never be
+    /// reached in practice and signals a misconfiguration.
+    #[error(
+        "sni_preread_max_bytes = {sni_preread_max_bytes} on TCP listener {address} exceeds \
+         buffer_size = {buffer_size}: raise buffer_size to >= {sni_preread_max_bytes} or lower \
+         sni_preread_max_bytes"
+    )]
+    SniPrereadMaxBytesExceedsBufferSize {
+        address: SocketAddr,
+        sni_preread_max_bytes: u32,
+        buffer_size: u64,
+    },
+    /// `sni_preread_max_bytes` on a TCP listener targeted by at least one
+    /// SNI frontend is below [`MIN_SNI_PREREAD_MAX_BYTES`]. `0` in
+    /// particular makes the preread shell issue zero-length reads that can
+    /// never make progress -- the session spins until the event-loop
+    /// iteration guard (`MAX_LOOP_ITERATIONS`) trips instead of ever
+    /// completing a preread decision. The floor is a full TLS record
+    /// header (1-byte `ContentType` + 2-byte `ProtocolVersion` + 2-byte
+    /// length, RFC 8446 §5.1): below that, the shell cannot even learn how
+    /// many more bytes to wait for.
+    #[error(
+        "sni_preread_max_bytes = {sni_preread_max_bytes} on TCP listener {address} is below the \
+         minimum of {minimum} bytes (a full TLS record header): the preread shell could never \
+         read enough bytes to make progress. Raise sni_preread_max_bytes to >= {minimum}"
+    )]
+    SniPrereadMaxBytesTooSmall {
+        address: SocketAddr,
+        sni_preread_max_bytes: u32,
+        minimum: u32,
+    },
 }
 
 /// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
@@ -529,6 +677,17 @@ pub struct ListenerBuilder {
     /// a warning is emitted at config-load when an explicit value exceeds
     /// that bound.
     pub max_flows: Option<u32>,
+    /// TCP listener only: time allowed to receive enough bytes of the TLS
+    /// ClientHello to read the SNI extension, in seconds. Only meaningful
+    /// when at least one SNI-scoped frontend targets this listener.
+    /// Defaults to [`DEFAULT_SNI_PREREAD_TIMEOUT`].
+    pub sni_preread_timeout: Option<u32>,
+    /// TCP listener only: maximum number of bytes buffered while prereading
+    /// the TLS ClientHello looking for the SNI extension. Only meaningful
+    /// when at least one SNI-scoped frontend targets this listener; must
+    /// not exceed the global `buffer_size` (validated at config-load).
+    /// Defaults to [`DEFAULT_SNI_PREREAD_MAX_BYTES`].
+    pub sni_preread_max_bytes: Option<u32>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -621,6 +780,8 @@ impl ListenerBuilder {
             hsts: None,
             max_rx_datagram_size: None,
             max_flows: None,
+            sni_preread_timeout: None,
+            sni_preread_max_bytes: None,
         }
     }
 
@@ -1148,6 +1309,14 @@ impl ListenerBuilder {
             back_timeout: self.back_timeout.unwrap_or(DEFAULT_BACK_TIMEOUT),
             connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             active: false,
+            sni_preread_timeout: Some(
+                self.sni_preread_timeout
+                    .unwrap_or(DEFAULT_SNI_PREREAD_TIMEOUT),
+            ),
+            sni_preread_max_bytes: Some(
+                self.sni_preread_max_bytes
+                    .unwrap_or(DEFAULT_SNI_PREREAD_MAX_BYTES),
+            ),
         };
 
         // POST: the built listener binds exactly the requested address and is
@@ -1426,6 +1595,15 @@ pub enum PathRuleType {
 pub struct FileClusterFrontendConfig {
     pub address: SocketAddr,
     pub hostname: Option<String>,
+    /// TCP frontend only (sozu-proxy/sozu#1279): ALPN protocol names to
+    /// match, read from the TLS ClientHello during the same preread that
+    /// resolves `hostname` (mapped to the wire `sni` field for TCP
+    /// frontends). Empty (the default) is the catch-all for this
+    /// frontend's `hostname`/SNI on its listener. Rejected on HTTP/HTTPS
+    /// frontends — ALPN there is negotiated by the listener's
+    /// `alpn_protocols`, not per-frontend.
+    #[serde(default)]
+    pub alpn: Vec<String>,
     /// creates a path routing rule where the request URL path has to match this
     pub path: Option<String>,
     /// declares whether the path rule is Prefix (default), Regex, or Equals
@@ -1614,9 +1792,6 @@ impl FileHstsConfig {
 
 impl FileClusterFrontendConfig {
     pub fn to_tcp_front(&self) -> Result<TcpFrontendConfig, ConfigError> {
-        if self.hostname.is_some() {
-            return Err(ConfigError::InvalidFrontendConfig("hostname".to_string()));
-        }
         if self.path.is_some() {
             return Err(ConfigError::InvalidFrontendConfig(
                 "path_prefix".to_string(),
@@ -1627,41 +1802,68 @@ impl FileClusterFrontendConfig {
                 "certificate".to_string(),
             ));
         }
-        if self.hostname.is_some() {
-            return Err(ConfigError::InvalidFrontendConfig("hostname".to_string()));
-        }
         if self.certificate_chain.is_some() {
             return Err(ConfigError::InvalidFrontendConfig(
                 "certificate_chain".to_string(),
             ));
         }
 
+        // `hostname` maps to the TCP frontend's `sni` (sozu-proxy/sozu#1279):
+        // an SNI-scoped frontend reads the same TOML key HTTP frontends use
+        // for their routing hostname, validated for the TCP-specific
+        // exact-or-single-wildcard shape.
+        let sni = match &self.hostname {
+            Some(hostname) => Some(validate_sni_pattern(hostname)?),
+            None => None,
+        };
+
+        // `alpn` only ever gets consulted from within the SNI-scoped
+        // preread route table (sozu-proxy/sozu#1279 hardening): a frontend
+        // with no `hostname`/`sni` installs the worker's raw no-SNI
+        // catch-all path instead, which never looks at `alpn` at all. Left
+        // unchecked, this would load fine and then silently never enforce
+        // the configured protocol list.
+        if sni.is_none() && !self.alpn.is_empty() {
+            return Err(ConfigError::AlpnWithoutSni {
+                address: self.address,
+            });
+        }
+
         let tcp_front = TcpFrontendConfig {
             address: self.address,
             tags: self.tags.clone(),
+            sni,
+            alpn: self.alpn.clone(),
             // Resolved against `known_addresses` in `populate_clusters`; a
             // bare `to_tcp_front` (no listener context) defaults to TCP.
             udp: false,
         };
         // POST: a TCP frontend binds exactly the requested address and carries
-        // no HTTP-only attributes — the guards above reject hostname / path /
-        // certificate, so an Ok return is a witness that none leaked through
-        // (an L7 attribute on an L4 frontend is a config-shape violation).
+        // no HTTP-only attributes — the guards above reject path / certificate,
+        // so an Ok return is a witness that none leaked through (an L7
+        // attribute on an L4 frontend is a config-shape violation). `hostname`
+        // is intentionally excluded from this witness: it is consumed above
+        // into `sni`, not rejected.
         debug_assert_eq!(
             tcp_front.address, self.address,
             "TCP frontend must bind the requested address"
         );
         debug_assert!(
-            self.hostname.is_none()
-                && self.path.is_none()
-                && self.certificate.is_none()
-                && self.certificate_chain.is_none(),
+            self.path.is_none() && self.certificate.is_none() && self.certificate_chain.is_none(),
             "a built TCP frontend must carry no HTTP-only attributes"
+        );
+        debug_assert!(
+            tcp_front.sni.is_some() || tcp_front.alpn.is_empty(),
+            "a built TCP frontend without sni must never carry a non-empty alpn"
         );
         Ok(tcp_front)
     }
 
     pub fn to_http_front(&self, _cluster_id: &str) -> Result<HttpFrontendConfig, ConfigError> {
+        if !self.alpn.is_empty() {
+            return Err(ConfigError::InvalidFrontendConfig("alpn".to_string()));
+        }
+
         let hostname = match &self.hostname {
             Some(hostname) => hostname.to_owned(),
             None => {
@@ -1764,6 +1966,63 @@ impl FileClusterFrontendConfig {
             hsts,
         })
     }
+}
+
+/// Validates and normalizes a TCP frontend's SNI pattern
+/// (sozu-proxy/sozu#1279): either an exact hostname or a single leading
+/// `*.` wildcard label. Rejects an embedded `*` anywhere else (so
+/// `*.*.example.com` and `foo.*.com` are both invalid), a bare `*`, any
+/// empty label (leading/trailing/consecutive dots), and any non-ASCII
+/// character ([`ConfigError::NonAsciiSniPattern`]) — on-wire SNI is always
+/// an ASCII A-label (RFC 6066 §3 / IDNA), so a Unicode U-label would load
+/// fine but never match at runtime, a silent routing failure. Full IDNA/
+/// punycode transformation at config-load is intentionally out of scope
+/// (no `idna` dependency in this crate); operators write the A-label form
+/// directly, consistent with what the HTTP router produces via
+/// `idna::domain_to_ascii` in `lib/src/router/mod.rs`. ASCII-lowercases
+/// the accepted pattern for case-insensitive comparison.
+pub(crate) fn validate_sni_pattern(sni: &str) -> Result<String, ConfigError> {
+    let invalid = || ConfigError::InvalidSniPattern {
+        sni: sni.to_string(),
+    };
+
+    if sni.is_empty() {
+        return Err(invalid());
+    }
+
+    if !sni.is_ascii() {
+        return Err(ConfigError::NonAsciiSniPattern {
+            sni: sni.to_string(),
+        });
+    }
+
+    // Only a single leading "*." wildcard label is accepted; strip it (if
+    // present) before checking the remainder is otherwise plain and
+    // non-empty.
+    let remainder = sni.strip_prefix("*.").unwrap_or(sni);
+
+    if remainder.is_empty() || remainder.contains('*') {
+        return Err(invalid());
+    }
+    if remainder.split('.').any(|label| label.is_empty()) {
+        return Err(invalid());
+    }
+
+    let normalized = sni.to_ascii_lowercase();
+    // POST: the normalized pattern carries exactly one '*' (the leading
+    // wildcard marker) or none at all — never more, since the checks above
+    // reject any '*' in the remainder — and is pure ASCII, since non-ASCII
+    // input was rejected before normalization (a non-ASCII pattern can
+    // never match the ASCII A-label SNI on the wire).
+    debug_assert!(
+        normalized.matches('*').count() <= 1,
+        "a validated SNI pattern must carry at most one wildcard marker"
+    );
+    debug_assert!(
+        normalized.is_ascii(),
+        "a validated SNI pattern must be pure ASCII"
+    );
+    Ok(normalized)
 }
 
 /// Parse a `redirect` TOML value (case-insensitive) into the proto enum.
@@ -2547,6 +2806,15 @@ pub struct TcpFrontendConfig {
     /// whose datagram knobs live under `[clusters.<id>.udp]`.
     #[serde(default)]
     pub udp: bool,
+    /// SNI hostname this frontend matches, validated and normalized by
+    /// [`FileClusterFrontendConfig::to_tcp_front`] (sozu-proxy/sozu#1279).
+    /// `None` matches regardless of SNI (a raw-TCP fallback).
+    #[serde(default)]
+    pub sni: Option<String>,
+    /// ALPN protocol names this frontend matches; empty is the catch-all
+    /// for its `sni` on this listener.
+    #[serde(default)]
+    pub alpn: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2633,6 +2901,8 @@ impl TcpClusterConfig {
                         cluster_id: self.cluster_id.clone(),
                         address: frontend.address.into(),
                         tags: frontend.tags.clone().unwrap_or(BTreeMap::new()),
+                        sni: frontend.sni.clone(),
+                        alpn: frontend.alpn.clone(),
                     })
                     .into(),
                 );
@@ -3171,6 +3441,127 @@ impl ConfigBuilder {
 
         if let Some(file_cluster_configs) = &self.file.clusters {
             self.populate_clusters(file_cluster_configs.clone())?;
+        }
+
+        // TCP SNI/ALPN routing invariants (sozu-proxy/sozu#1279). Collect
+        // every TCP frontend's (address, sni, alpn) across all clusters,
+        // then validate:
+        //   (c) a listener must not mix a no-SNI frontend with any
+        //       SNI-scoped frontend — an SNI-enabled listener prereads the
+        //       ClientHello, so a raw-TCP fallback on the same address is
+        //       unreachable for clients that don't send SNI and ambiguous
+        //       for those that do;
+        //   (b) two frontends on the same (address, sni) must not share an
+        //       ALPN protocol, and at most one may leave alpn empty (the
+        //       catch-all) — otherwise routing on that listener would
+        //       depend on iteration order rather than configuration;
+        //   (d)/(e) sni_preread_timeout must not exceed front_timeout, and
+        //       sni_preread_max_bytes must not exceed buffer_size, on any
+        //       listener an SNI frontend targets. Both are gated on
+        //       SNI-presence (not just any TCP listener) so a legacy
+        //       TCP-only config with a low front_timeout or small
+        //       buffer_size — set long before this feature existed and
+        //       never opting into SNI — keeps loading byte-identically.
+        type SniAlpnByAddress = HashMap<SocketAddr, Vec<(Option<String>, Vec<String>)>>;
+        let mut frontends_by_address: SniAlpnByAddress = HashMap::new();
+        let mut addresses_with_no_sni_frontend: HashSet<SocketAddr> = HashSet::new();
+        for cluster in self.built.clusters.values() {
+            if let ClusterConfig::Tcp(tcp) = cluster {
+                for frontend in &tcp.frontends {
+                    // A `protocol = "tcp"` cluster frontend resolved against a
+                    // `protocol = "udp"` listener (`frontend.udp`, set in
+                    // `populate_clusters`) emits `AddUdpFrontend`, which
+                    // carries no `sni`/`alpn` on the wire — it is not a real
+                    // SNI-preread TCP frontend and must not participate in
+                    // these TCP-only invariants.
+                    if frontend.udp {
+                        continue;
+                    }
+                    if frontend.sni.is_none() {
+                        addresses_with_no_sni_frontend.insert(frontend.address);
+                    }
+                    frontends_by_address
+                        .entry(frontend.address)
+                        .or_default()
+                        .push((frontend.sni.clone(), frontend.alpn.clone()));
+                }
+            }
+        }
+
+        let mut addresses_with_sni_frontend: HashSet<SocketAddr> = HashSet::new();
+        for (address, frontends) in &frontends_by_address {
+            if !frontends.iter().any(|(sni, _)| sni.is_some()) {
+                continue;
+            }
+            addresses_with_sni_frontend.insert(*address);
+
+            if addresses_with_no_sni_frontend.contains(address) {
+                return Err(ConfigError::TcpListenerMixesSniAndNoSni { address: *address });
+            }
+
+            let mut alpn_lists_by_sni: HashMap<Option<String>, Vec<&Vec<String>>> = HashMap::new();
+            for (sni, alpn) in frontends {
+                alpn_lists_by_sni.entry(sni.clone()).or_default().push(alpn);
+            }
+            for (sni, alpn_lists) in alpn_lists_by_sni {
+                let mut seen_protocols: HashSet<&str> = HashSet::new();
+                let mut catch_all_count = 0usize;
+                for alpn in alpn_lists {
+                    if alpn.is_empty() {
+                        catch_all_count += 1;
+                        if catch_all_count > 1 {
+                            return Err(ConfigError::TcpFrontendMultipleAlpnCatchAll {
+                                address: *address,
+                                sni: sni.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                    for protocol in alpn {
+                        if !seen_protocols.insert(protocol.as_str()) {
+                            return Err(ConfigError::TcpFrontendAlpnOverlap {
+                                address: *address,
+                                sni: sni.clone(),
+                                protocol: protocol.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        for listener in &self.built.tcp_listeners {
+            let address: SocketAddr = listener.address.into();
+            if !addresses_with_sni_frontend.contains(&address) {
+                continue;
+            }
+            let sni_preread_timeout = listener
+                .sni_preread_timeout
+                .unwrap_or(DEFAULT_SNI_PREREAD_TIMEOUT);
+            if sni_preread_timeout > listener.front_timeout {
+                return Err(ConfigError::SniPrereadTimeoutExceedsFrontTimeout {
+                    address,
+                    sni_preread_timeout,
+                    front_timeout: listener.front_timeout,
+                });
+            }
+            let sni_preread_max_bytes = listener
+                .sni_preread_max_bytes
+                .unwrap_or(DEFAULT_SNI_PREREAD_MAX_BYTES);
+            if sni_preread_max_bytes < MIN_SNI_PREREAD_MAX_BYTES {
+                return Err(ConfigError::SniPrereadMaxBytesTooSmall {
+                    address,
+                    sni_preread_max_bytes,
+                    minimum: MIN_SNI_PREREAD_MAX_BYTES,
+                });
+            }
+            if u64::from(sni_preread_max_bytes) > self.built.buffer_size {
+                return Err(ConfigError::SniPrereadMaxBytesExceedsBufferSize {
+                    address,
+                    sni_preread_max_bytes,
+                    buffer_size: self.built.buffer_size,
+                });
+            }
         }
 
         // RFC 9113 §6.5.2 + §4.1: the H2 mux must accept up to
@@ -3957,6 +4348,7 @@ mod tests {
         let frontend = FileClusterFrontendConfig {
             address: "127.0.0.1:8080".parse().unwrap(),
             hostname: Some("example.com".to_owned()),
+            alpn: vec![],
             path: None,
             path_type: None,
             method: None,
@@ -4597,5 +4989,687 @@ mod tests {
     fn resolve_answer_source_file_scheme_empty_path_errors() {
         let err = resolve_answer_source("file://").expect_err("empty path must error");
         assert!(matches!(err, ConfigError::FileOpen { .. }));
+    }
+
+    // ── TCP SNI/ALPN frontends (sozu-proxy/sozu#1279) ───────────────────────
+
+    /// A legacy-style TCP frontend TOML (no `hostname`/`alpn` keys at all)
+    /// must still parse, and the built frontend/listener must carry the
+    /// same values as before this feature existed: `sni = None`,
+    /// `alpn = []`, and the proto default SNI-preread knobs (unused since
+    /// no SNI frontend targets the listener).
+    #[test]
+    fn legacy_tcp_frontend_toml_without_sni_alpn_parses_unchanged() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9000"
+
+            [clusters.legacy]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9000" }
+            ]
+            backends = [
+              { address = "10.0.0.1:9000" }
+            ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse legacy TCP TOML");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("legacy TCP config without sni/alpn must load unchanged");
+
+        assert_eq!(config.tcp_listeners.len(), 1);
+        let listener = &config.tcp_listeners[0];
+        assert_eq!(
+            listener.sni_preread_timeout,
+            Some(DEFAULT_SNI_PREREAD_TIMEOUT),
+            "proto default sni_preread_timeout must be populated even though unused"
+        );
+        assert_eq!(
+            listener.sni_preread_max_bytes,
+            Some(DEFAULT_SNI_PREREAD_MAX_BYTES),
+            "proto default sni_preread_max_bytes must be populated even though unused"
+        );
+
+        let messages = config
+            .generate_config_messages()
+            .expect("Could not generate config messages");
+        let tcp_frontend = messages
+            .iter()
+            .find_map(|m| match &m.content.request_type {
+                Some(RequestType::AddTcpFrontend(f)) => Some(f),
+                _ => None,
+            })
+            .expect("AddTcpFrontend must be present");
+        assert_eq!(tcp_frontend.sni, None, "legacy frontend must carry no sni");
+        assert!(
+            tcp_frontend.alpn.is_empty(),
+            "legacy frontend must carry no alpn"
+        );
+    }
+
+    /// `hostname` on a TCP frontend maps to the wire `sni` field, exact
+    /// hostnames and a single leading `*.` wildcard are both accepted.
+    #[test]
+    fn tcp_frontend_hostname_maps_to_sni_exact_and_wildcard() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9010"
+
+            [clusters.exact]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9010", hostname = "example.com", alpn = ["h2"] }
+            ]
+            backends = [ { address = "10.0.0.1:9010" } ]
+
+            [clusters.wildcard]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9010", hostname = "*.example.com" }
+            ]
+            backends = [ { address = "10.0.0.2:9010" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("exact + wildcard SNI frontends on distinct sni must load");
+
+        let messages = config
+            .generate_config_messages()
+            .expect("Could not generate config messages");
+        let mut frontends: Vec<_> = messages
+            .iter()
+            .filter_map(|m| match &m.content.request_type {
+                Some(RequestType::AddTcpFrontend(f)) => Some(f.clone()),
+                _ => None,
+            })
+            .collect();
+        frontends.sort_by(|a, b| a.cluster_id.cmp(&b.cluster_id));
+
+        assert_eq!(frontends.len(), 2);
+        assert_eq!(frontends[0].sni, Some("example.com".to_string()));
+        assert_eq!(frontends[0].alpn, vec!["h2".to_string()]);
+        assert_eq!(frontends[1].sni, Some("*.example.com".to_string()));
+        assert!(frontends[1].alpn.is_empty());
+    }
+
+    /// (a) An SNI pattern with more than one wildcard label, an embedded
+    /// `*`, or an empty label is rejected at config-load.
+    #[test]
+    fn tcp_frontend_invalid_sni_pattern_rejected() {
+        for invalid in ["*.*.example.com", "foo.*.com", "*", "example..com", ""] {
+            let frontend = FileClusterFrontendConfig {
+                address: "127.0.0.1:8080".parse().unwrap(),
+                hostname: Some(invalid.to_string()),
+                alpn: vec![],
+                path: None,
+                path_type: None,
+                method: None,
+                certificate: None,
+                key: None,
+                certificate_chain: None,
+                tls_versions: vec![],
+                position: RulePosition::Tree,
+                tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: None,
+                hsts: None,
+            };
+            match frontend.to_tcp_front() {
+                Err(ConfigError::InvalidSniPattern { sni }) => assert_eq!(sni, invalid),
+                other => panic!("expected InvalidSniPattern for {invalid:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// (a) A non-ASCII SNI pattern is rejected loudly: on-wire SNI is
+    /// always an ASCII A-label (RFC 6066 / IDNA), so a Unicode U-label in
+    /// the config would load fine but never match a ClientHello — a
+    /// silent routing failure. The error names the punycode form the
+    /// operator must write instead.
+    #[test]
+    fn tcp_frontend_non_ascii_sni_pattern_rejected() {
+        for non_ascii in ["münchen.example", "*.bücher.example", "日本.example"] {
+            let frontend = FileClusterFrontendConfig {
+                address: "127.0.0.1:8080".parse().unwrap(),
+                hostname: Some(non_ascii.to_string()),
+                alpn: vec![],
+                path: None,
+                path_type: None,
+                method: None,
+                certificate: None,
+                key: None,
+                certificate_chain: None,
+                tls_versions: vec![],
+                position: RulePosition::Tree,
+                tags: None,
+                redirect: None,
+                redirect_scheme: None,
+                redirect_template: None,
+                rewrite_host: None,
+                rewrite_path: None,
+                rewrite_port: None,
+                required_auth: None,
+                headers: None,
+                hsts: None,
+            };
+            match frontend.to_tcp_front() {
+                Err(ConfigError::NonAsciiSniPattern { sni }) => assert_eq!(sni, non_ascii),
+                other => panic!("expected NonAsciiSniPattern for {non_ascii:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The punycode A-label form of an internationalized hostname — what
+    /// the NonAsciiSniPattern error tells the operator to write — is
+    /// accepted, both exact and wildcarded, and case-normalized like any
+    /// other ASCII pattern.
+    #[test]
+    fn tcp_frontend_punycode_sni_pattern_accepted() {
+        assert_eq!(
+            validate_sni_pattern("xn--mnchen-3ya.example").expect("A-label must be accepted"),
+            "xn--mnchen-3ya.example"
+        );
+        assert_eq!(
+            validate_sni_pattern("*.xn--bcher-kva.example")
+                .expect("wildcarded A-label must be accepted"),
+            "*.xn--bcher-kva.example"
+        );
+        assert_eq!(
+            validate_sni_pattern("XN--MNCHEN-3YA.Example")
+                .expect("mixed-case A-label must be accepted"),
+            "xn--mnchen-3ya.example",
+            "A-label patterns are ASCII-lowercased like any other pattern"
+        );
+    }
+
+    /// `alpn` is a TCP-only concept; setting it on an HTTP frontend is
+    /// rejected rather than silently ignored.
+    #[test]
+    fn alpn_rejected_on_http_frontend() {
+        let frontend = FileClusterFrontendConfig {
+            address: "127.0.0.1:8080".parse().unwrap(),
+            hostname: Some("example.com".to_owned()),
+            alpn: vec!["h2".to_string()],
+            path: None,
+            path_type: None,
+            method: None,
+            certificate: None,
+            key: None,
+            certificate_chain: None,
+            tls_versions: vec![],
+            position: RulePosition::Tree,
+            tags: None,
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: None,
+            hsts: None,
+        };
+        match frontend.to_http_front("api") {
+            Err(ConfigError::InvalidFrontendConfig(field)) => assert_eq!(field, "alpn"),
+            other => panic!("expected InvalidFrontendConfig(\"alpn\"), got {other:?}"),
+        }
+    }
+
+    /// A TCP frontend that sets `alpn` but leaves `hostname` (the wire
+    /// `sni` field) unset is a config error: an ALPN matcher only ever gets
+    /// consulted from within the SNI-scoped preread route table, so a
+    /// no-SNI frontend would install the raw catch-all path and silently
+    /// never enforce the configured protocol list.
+    #[test]
+    fn tcp_frontend_alpn_without_sni_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9019"
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9019", alpn = ["h2"] }
+            ]
+            backends = [ { address = "10.0.0.1:9019" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::AlpnWithoutSni { address }) => {
+                assert_eq!(address.to_string(), "127.0.0.1:9019");
+            }
+            other => panic!("expected AlpnWithoutSni, got {other:?}"),
+        }
+    }
+
+    /// (b) Two TCP frontends on the same (address, sni) advertising an
+    /// overlapping ALPN protocol is a config error — routing on that
+    /// listener would otherwise depend on iteration order.
+    #[test]
+    fn tcp_frontend_alpn_overlap_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9020"
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9020", hostname = "example.com", alpn = ["h2"] }
+            ]
+            backends = [ { address = "10.0.0.1:9020" } ]
+
+            [clusters.b]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9020", hostname = "example.com", alpn = ["h2", "http/1.1"] }
+            ]
+            backends = [ { address = "10.0.0.2:9020" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::TcpFrontendAlpnOverlap { protocol, .. }) => {
+                assert_eq!(protocol, "h2");
+            }
+            other => panic!("expected TcpFrontendAlpnOverlap, got {other:?}"),
+        }
+    }
+
+    /// (b) At most one TCP frontend per (address, sni) may leave `alpn`
+    /// empty (the catch-all match); a second is as ambiguous as an
+    /// overlapping explicit protocol.
+    #[test]
+    fn tcp_frontend_multiple_alpn_catch_all_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9021"
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9021", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9021" } ]
+
+            [clusters.b]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9021", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.2:9021" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::TcpFrontendMultipleAlpnCatchAll { .. })
+            ),
+            "expected TcpFrontendMultipleAlpnCatchAll, got {result:?}"
+        );
+    }
+
+    /// (c) A listener targeted by both a no-SNI frontend and an SNI-scoped
+    /// frontend is a config error: an SNI-enabled listener must not also
+    /// carry a raw-TCP fallback.
+    #[test]
+    fn tcp_listener_mixes_sni_and_no_sni_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9022"
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9022", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9022" } ]
+
+            [clusters.b]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9022" }
+            ]
+            backends = [ { address = "10.0.0.2:9022" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            matches!(result, Err(ConfigError::TcpListenerMixesSniAndNoSni { .. })),
+            "expected TcpListenerMixesSniAndNoSni, got {result:?}"
+        );
+    }
+
+    /// (d) `sni_preread_timeout` (proto default: 5s) exceeding the
+    /// listener's `front_timeout` is rejected — but only when an SNI
+    /// frontend actually targets that listener, so legacy TCP-only
+    /// configs with a low front_timeout keep loading unchanged.
+    #[test]
+    fn sni_preread_timeout_exceeding_front_timeout_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol      = "tcp"
+            address       = "127.0.0.1:9030"
+            front_timeout = 2
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9030", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9030" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::SniPrereadTimeoutExceedsFrontTimeout {
+                sni_preread_timeout: 5,
+                front_timeout: 2,
+                ..
+            }) => {}
+            other => panic!("expected SniPrereadTimeoutExceedsFrontTimeout, got {other:?}"),
+        }
+    }
+
+    /// (e) `sni_preread_max_bytes` (proto default: 16384) exceeding the
+    /// global `buffer_size` is rejected — again only when an SNI frontend
+    /// targets the listener.
+    #[test]
+    fn sni_preread_max_bytes_exceeding_buffer_size_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 8192
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9031"
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9031", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9031" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::SniPrereadMaxBytesExceedsBufferSize {
+                sni_preread_max_bytes: 16384,
+                buffer_size: 8192,
+                ..
+            }) => {}
+            other => panic!("expected SniPrereadMaxBytesExceedsBufferSize, got {other:?}"),
+        }
+    }
+
+    /// `sni_preread_max_bytes = 0` on an SNI-enabled listener is rejected:
+    /// the preread shell would issue zero-length reads that never make
+    /// progress, spinning until the event-loop iteration guard trips
+    /// instead of ever reaching a routing decision.
+    #[test]
+    fn sni_preread_max_bytes_zero_rejected() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol             = "tcp"
+            address              = "127.0.0.1:9033"
+            sni_preread_max_bytes = 0
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9033", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9033" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::SniPrereadMaxBytesTooSmall {
+                sni_preread_max_bytes: 0,
+                minimum: 5,
+                ..
+            }) => {}
+            other => panic!("expected SniPrereadMaxBytesTooSmall, got {other:?}"),
+        }
+    }
+
+    /// The floor itself (`MIN_SNI_PREREAD_MAX_BYTES` = 5 bytes) must load
+    /// successfully — only values strictly below it are rejected.
+    #[test]
+    fn sni_preread_max_bytes_at_the_floor_loads() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol             = "tcp"
+            address              = "127.0.0.1:9034"
+            sni_preread_max_bytes = 5
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9034", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9034" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "sni_preread_max_bytes at the exact floor must load: {result:?}"
+        );
+    }
+
+    /// Gating proof for (d)/(e): a TCP listener with a low front_timeout
+    /// and small buffer_size, but *no* SNI frontend, must load unchanged —
+    /// the new knobs are dead weight on a listener that never prereads.
+    #[test]
+    fn sni_preread_validation_ignored_without_sni_frontend() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            buffer_size = 8192
+
+            [[listeners]]
+            protocol      = "tcp"
+            address       = "127.0.0.1:9032"
+            front_timeout = 2
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9032" }
+            ]
+            backends = [ { address = "10.0.0.1:9032" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "a no-SNI TCP listener must ignore sni_preread validation entirely: {result:?}"
+        );
+    }
+
+    /// The actual use case sozu-proxy/sozu#1279 exists for: two TCP
+    /// frontends sharing the same `(address, sni)` with disjoint,
+    /// non-empty `alpn` lists must load successfully and both must be
+    /// individually reachable — ALPN multiplexing within one SNI. The
+    /// negative tests above only prove overlap is rejected; this proves
+    /// non-overlap actually works.
+    #[test]
+    fn tcp_frontend_disjoint_alpn_same_sni_both_load() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "tcp"
+            address  = "127.0.0.1:9040"
+
+            [clusters.h2_cluster]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9040", hostname = "example.com", alpn = ["h2"] }
+            ]
+            backends = [ { address = "10.0.0.1:9040" } ]
+
+            [clusters.http11_cluster]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9040", hostname = "example.com", alpn = ["http/1.1"] }
+            ]
+            backends = [ { address = "10.0.0.2:9040" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("disjoint non-empty ALPN lists on the same (address, sni) must load");
+
+        let messages = config
+            .generate_config_messages()
+            .expect("Could not generate config messages");
+        let mut frontends: Vec<_> = messages
+            .iter()
+            .filter_map(|m| match &m.content.request_type {
+                Some(RequestType::AddTcpFrontend(f)) => Some(f.clone()),
+                _ => None,
+            })
+            .collect();
+        frontends.sort_by(|a, b| a.cluster_id.cmp(&b.cluster_id));
+
+        assert_eq!(frontends.len(), 2, "both frontends must be emitted");
+        assert_eq!(frontends[0].cluster_id, "h2_cluster");
+        assert_eq!(frontends[0].sni, Some("example.com".to_string()));
+        assert_eq!(frontends[0].alpn, vec!["h2".to_string()]);
+        assert_eq!(frontends[1].cluster_id, "http11_cluster");
+        assert_eq!(frontends[1].sni, Some("example.com".to_string()));
+        assert_eq!(frontends[1].alpn, vec!["http/1.1".to_string()]);
+    }
+
+    /// A `protocol = "tcp"` cluster frontend resolved against a
+    /// `protocol = "udp"` listener (`TcpFrontendConfig.udp = true`, set in
+    /// `populate_clusters`) emits `AddUdpFrontend`, not `AddTcpFrontend` —
+    /// it carries no `sni`/`alpn` on the wire and must not participate in
+    /// the TCP-only mixing-ban / ALPN-overlap invariants. Two "tcp"
+    /// clusters at the same UDP-listener address, one with `hostname` set
+    /// and one without, must load successfully rather than spuriously
+    /// tripping `TcpListenerMixesSniAndNoSni`.
+    #[test]
+    fn udp_routed_tcp_frontends_are_excluded_from_sni_invariants() {
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+
+            [[listeners]]
+            protocol = "udp"
+            address  = "127.0.0.1:9050"
+
+            [clusters.a]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9050", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:9050" } ]
+
+            [clusters.b]
+            protocol       = "tcp"
+            load_balancing = "ROUND_ROBIN"
+            frontends = [
+              { address = "127.0.0.1:9050" }
+            ]
+            backends = [ { address = "10.0.0.2:9050" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "UDP-routed tcp-cluster frontends must not trip the SNI mixing-ban: {result:?}"
+        );
+
+        let config = result.expect("checked is_ok above");
+        let messages = config
+            .generate_config_messages()
+            .expect("Could not generate config messages");
+        let add_udp_frontend_count = messages
+            .iter()
+            .filter(|m| matches!(m.content.request_type, Some(RequestType::AddUdpFrontend(_))))
+            .count();
+        assert_eq!(
+            add_udp_frontend_count, 2,
+            "both cluster frontends on the udp listener must emit AddUdpFrontend"
+        );
     }
 }

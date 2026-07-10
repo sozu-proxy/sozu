@@ -557,8 +557,14 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Read content from the session
     pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        // Inherited preread bytes (e.g. SNI ClientHello replay) sit in
+        // `frontend_buffer`; splice never drains that userspace buffer, so it
+        // must be empty before the fast path takes over.
         #[cfg(all(target_os = "linux", feature = "splice"))]
-        if self.protocol == Protocol::TCP && self.splice_pipe.is_some() {
+        if self.protocol == Protocol::TCP
+            && self.splice_pipe.is_some()
+            && self.frontend_buffer.available_data() == 0
+        {
             return self.splice_readable(metrics);
         }
 
@@ -632,9 +638,34 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 return SessionResult::Close;
             }
             SocketResult::Closed => {
-                self.reset_readiness_for_close();
-                self.log_request_success(metrics);
-                return SessionResult::Close;
+                // The frontend read side closed (EOF). Bytes it already
+                // delivered may still be queued in `frontend_buffer` for the
+                // backend; returning `Close` here unconditionally dropped
+                // them, silently truncating the stream whenever a front->back
+                // tail was still in flight (sozu-proxy/sozu#1279 Defect C: a
+                // payload coalesced with the SNI ClientHello is the
+                // reproducer, but the drop hit any plain-TCP upload racing a
+                // frontend close). Transition to the half-closed `WriteOpen`
+                // status exactly as the WouldBlock/Continue path does below,
+                // arm the backend writable to flush the queue, and defer the
+                // teardown to `check_connections`, which closes only once
+                // nothing is in flight (mirrors `backend_hup`'s drain branch).
+                self.frontend_status = match self.frontend_status {
+                    ConnectionStatus::Normal => ConnectionStatus::WriteOpen,
+                    ConnectionStatus::ReadOpen => ConnectionStatus::Closed,
+                    s => s,
+                };
+                self.frontend_readiness.event.remove(Ready::READABLE);
+                self.frontend_readiness.interest.remove(Ready::READABLE);
+                if self.frontend_buffer.available_data() > 0 && self.backend_socket.is_some() {
+                    self.backend_readiness.arm_writable();
+                }
+                if !self.check_connections() {
+                    self.reset_readiness_for_close();
+                    self.log_request_success(metrics);
+                    return SessionResult::Close;
+                }
+                return SessionResult::Continue;
             }
             SocketResult::WouldBlock => {
                 self.frontend_readiness.event.remove(Ready::READABLE);
@@ -648,8 +679,14 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Forward content to session
     pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        // Inherited preread bytes sit in `backend_buffer`; splice never
+        // drains that userspace buffer, so it must be empty before the fast
+        // path takes over.
         #[cfg(all(target_os = "linux", feature = "splice"))]
-        if self.protocol == Protocol::TCP && self.splice_pipe.is_some() {
+        if self.protocol == Protocol::TCP
+            && self.splice_pipe.is_some()
+            && self.backend_buffer.available_data() == 0
+        {
             return self.splice_writable(metrics);
         }
 
@@ -747,8 +784,14 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Forward content to cluster
     pub fn backend_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        // Inherited preread bytes (e.g. SNI ClientHello replay) sit in
+        // `frontend_buffer`; splice never drains that userspace buffer, so it
+        // must be empty before the fast path takes over.
         #[cfg(all(target_os = "linux", feature = "splice"))]
-        if self.protocol == Protocol::TCP && self.splice_pipe.is_some() {
+        if self.protocol == Protocol::TCP
+            && self.splice_pipe.is_some()
+            && self.frontend_buffer.available_data() == 0
+        {
             return self.splice_backend_writable(metrics);
         }
 
@@ -850,8 +893,14 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Read content from cluster
     pub fn backend_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+        // Inherited preread bytes sit in `backend_buffer`; splice never
+        // drains that userspace buffer, so it must be empty before the fast
+        // path takes over.
         #[cfg(all(target_os = "linux", feature = "splice"))]
-        if self.protocol == Protocol::TCP && self.splice_pipe.is_some() {
+        if self.protocol == Protocol::TCP
+            && self.splice_pipe.is_some()
+            && self.backend_buffer.available_data() == 0
+        {
             return self.splice_backend_readable(metrics);
         }
 
@@ -1720,5 +1769,188 @@ mod tests {
 
         drop(frontend_peer);
         drop(backend_peer);
+    }
+
+    /// Regression guard for the splice/preread interaction: when `Pipe` is
+    /// constructed with the splice fast path available (`Protocol::TCP`)
+    /// AND a non-empty inherited `frontend_buffer` (the SNI-preread
+    /// ClientHello replay scenario), `backend_writable` must drain those
+    /// buffered bytes to the backend socket through the normal buffered
+    /// path first. Without the gate in `backend_writable`, this call would
+    /// dispatch straight to `splice_backend_writable`, which only drains the
+    /// kernel pipe (`splice_in_pending`) — 0 here — and returns immediately
+    /// without ever touching `frontend_buffer`, silently dropping the
+    /// preread bytes.
+    #[cfg(all(target_os = "linux", feature = "splice"))]
+    #[test]
+    fn backend_writable_drains_inherited_frontend_buffer_before_splice_engages() {
+        use std::io::Read;
+
+        let (frontend_peer, frontend_socket) = connected_pair();
+        let (mut backend_peer, backend_socket) = connected_pair();
+
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let backend_buffer = pool.checkout().expect("backend buffer");
+        let mut frontend_buffer = pool.checkout().expect("frontend buffer");
+        frontend_buffer
+            .write_all(b"inherited-preread-client-hello")
+            .expect("write inherited frontend buffer");
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let listener = Rc::new(RefCell::new(TestListener { address }));
+
+        let mut pipe = Pipe::new(
+            backend_buffer,
+            None,
+            Some(TcpStream::from_std(backend_socket)),
+            None,
+            None,
+            None,
+            None,
+            frontend_buffer,
+            Token(0),
+            TcpStream::from_std(frontend_socket),
+            listener,
+            Protocol::TCP,
+            Ulid::generate(),
+            Ulid::generate(),
+            None,
+            WebSocketContext::Tcp,
+        );
+        pipe.set_back_token(Token(1));
+
+        assert!(
+            pipe.splice_pipe.is_some(),
+            "Protocol::TCP must allocate the splice kernel pipe for this test to be meaningful"
+        );
+        assert!(
+            pipe.frontend_buffer.available_data() > 0,
+            "test setup must inherit a non-empty frontend buffer"
+        );
+
+        let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
+        assert_eq!(pipe.backend_writable(&mut metrics), SessionResult::Continue);
+
+        assert_eq!(
+            pipe.frontend_buffer.available_data(),
+            0,
+            "inherited preread bytes must drain through the buffered path before splice engages"
+        );
+
+        let mut received = [0u8; 64];
+        let n = backend_peer
+            .read(&mut received)
+            .expect("backend socket must have received the drained preread bytes");
+        assert_eq!(&received[..n], b"inherited-preread-client-hello");
+
+        drop(frontend_peer);
+    }
+
+    /// Regression guard for the close-before-flush data loss
+    /// (sozu-proxy/sozu#1279 Defect C): when the frontend read side reaches
+    /// EOF while `frontend_buffer` still holds bytes queued for the backend,
+    /// `readable` must NOT return `Close` (which discarded them, silently
+    /// truncating the stream -- the reproducer was a payload coalesced with an
+    /// SNI ClientHello). It must keep the session alive to drain, then the
+    /// queued bytes must reach the backend and only then may the session
+    /// close.
+    #[test]
+    fn frontend_eof_flushes_queued_backend_bytes_before_closing() {
+        use std::io::{Read, Write};
+
+        let (frontend_peer, frontend_socket) = connected_pair();
+        let (mut backend_peer, backend_socket) = connected_pair();
+
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let backend_buffer = pool.checkout().expect("backend buffer");
+        let mut frontend_buffer = pool.checkout().expect("frontend buffer");
+        // Bytes the frontend already delivered, still queued for the backend.
+        frontend_buffer
+            .write_all(b"front-to-back-tail-still-queued")
+            .expect("seed queued frontend bytes");
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let listener = Rc::new(RefCell::new(TestListener { address }));
+
+        let mut pipe = Pipe::new(
+            backend_buffer,
+            None,
+            Some(TcpStream::from_std(backend_socket)),
+            None,
+            None,
+            None,
+            None,
+            frontend_buffer,
+            Token(0),
+            TcpStream::from_std(frontend_socket),
+            listener,
+            Protocol::TCP,
+            Ulid::generate(),
+            Ulid::generate(),
+            None,
+            WebSocketContext::Tcp,
+        );
+        pipe.set_back_token(Token(1));
+        pipe.frontend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        pipe.frontend_readiness.event = Ready::READABLE;
+
+        // The frontend closes right after delivering its bytes (no gap): the
+        // pipe reads EOF while `frontend_buffer` is still non-empty.
+        drop(frontend_peer);
+
+        // Nonblocking EOF is not observable on the very first read on every
+        // platform, so retry `readable` (bounded, no sleep) until it observes
+        // the close. `readable` must never report `Close` while bytes remain
+        // queued.
+        let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
+        let mut saw_eof = false;
+        for _ in 0..100_000 {
+            let result = pipe.readable(&mut metrics);
+            assert_ne!(
+                result,
+                SessionResult::Close,
+                "readable must not close while {} queued backend bytes remain",
+                pipe.frontend_buffer.available_data()
+            );
+            if matches!(pipe.frontend_status, ConnectionStatus::WriteOpen) {
+                saw_eof = true;
+                break;
+            }
+        }
+        assert!(
+            saw_eof,
+            "frontend EOF was never observed within the retry budget"
+        );
+        assert!(
+            pipe.frontend_buffer.available_data() > 0,
+            "the queued backend bytes must survive the frontend EOF, not be dropped"
+        );
+
+        // Draining now delivers every queued byte to the backend.
+        assert_eq!(pipe.backend_writable(&mut metrics), SessionResult::Continue);
+        assert_eq!(
+            pipe.frontend_buffer.available_data(),
+            0,
+            "the queued bytes must all drain to the backend after EOF"
+        );
+
+        let mut received = Vec::new();
+        // Read until we have the full payload (a single read may segment).
+        for _ in 0..100_000 {
+            let mut buf = [0u8; 64];
+            match backend_peer.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    received.extend_from_slice(&buf[..n]);
+                    if received.len() >= b"front-to-back-tail-still-queued".len() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            received, b"front-to-back-tail-still-queued",
+            "the backend must receive the queued tail byte-for-byte, not a truncation"
+        );
     }
 }

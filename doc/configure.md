@@ -542,6 +542,182 @@ openssl req -new -key ecdsa.key -x509 -days 365 \
 > extension matching the frontend hostname. Certificates without SANs may cause
 > TLS handshake failures.
 
+#### Options specific to TCP listeners
+
+A `protocol = "tcp"` listener forwards raw bytes to a cluster's backends
+without terminating TLS. By default one TCP listener routes to exactly one
+cluster (the legacy shape). Since [#1279](https://github.com/sozu-proxy/sozu/issues/1279)
+a TCP listener can instead fan out to **multiple** clusters on the same
+`address:port` by reading the TLS ClientHello's SNI (RFC 6066 §3) and, per
+route entry, ALPN (RFC 7301 §3.1) — all **without decrypting or terminating**
+the connection. The backend still performs its own TLS handshake with the
+unmodified client bytes.
+
+```toml
+[[listeners]]
+protocol = "tcp"
+address  = "0.0.0.0:8443"
+
+# Time allowed to receive enough bytes of the TLS ClientHello to read the SNI
+# extension, in seconds. Only meaningful once at least one SNI-scoped
+# frontend (see below) targets this listener — a listener with only
+# no-SNI (legacy) frontends never prereads and ignores this value.
+# Defaults to 5. Must not exceed this listener's front_timeout
+# (rejected at TOML config-load; see the validation matrix below).
+sni_preread_timeout = 5
+
+# Maximum bytes buffered while prereading the ClientHello looking for the SNI
+# extension. Only meaningful under the same condition as above. Clamped to
+# the global buffer_size at runtime (>= sni_preread_max_bytes is required at
+# TOML config-load; see the validation matrix below). Defaults to 16384.
+sni_preread_max_bytes = 16384
+```
+
+A TCP frontend opts into SNI-scoped routing with `hostname` (mapped to the
+wire `sni` field) and, optionally, `alpn`:
+
+```toml
+[clusters.web-a]
+protocol  = "tcp"
+frontends = [
+  { address = "0.0.0.0:8443", hostname = "a.example.com" },
+]
+
+[clusters.web-b]
+protocol  = "tcp"
+frontends = [
+  # Only matches when the client also offers "h2" in its ALPN extension.
+  { address = "0.0.0.0:8443", hostname = "b.example.com", alpn = ["h2"] },
+]
+
+[clusters.web-b-fallback]
+protocol  = "tcp"
+frontends = [
+  # Catch-all for b.example.com when the client's ALPN offer doesn't match
+  # any explicit entry above (or offers no ALPN at all). At most one
+  # catch-all (empty `alpn`) per (address, hostname) is allowed.
+  { address = "0.0.0.0:8443", hostname = "b.example.com" },
+]
+
+[clusters.legacy-passthrough]
+protocol  = "tcp"
+frontends = [
+  # No `hostname` at all: the legacy single-cluster catch-all. A listener
+  # cannot mix this shape with any SNI-scoped frontend above.
+  { address = "0.0.0.0:9443" },
+]
+```
+
+##### SNI matching
+
+`hostname` accepts either an exact host (`"example.com"`) or a single
+leading `*.` wildcard label (`"*.example.com"`, matching `a.example.com` but
+neither the apex `example.com` nor `a.b.example.com`) — the same trie the
+HTTP/HTTPS router uses (`crate::router::pattern_trie`). No other wildcard
+shape is accepted (`*.*.example.com`, an embedded `*` outside the leading
+label, and a bare `*` are all rejected at config-load). The pattern must be
+plain ASCII: on-wire SNI is always an ASCII A-label (RFC 6066 §3 / IDNA), so
+write the punycode A-label form for non-ASCII hostnames (e.g.
+`"xn--mnchen-3ya.example"` for `"münchen.example"`) rather than a Unicode
+U-label, which would load but never match.
+
+##### ALPN matching
+
+Within one `(address, hostname)` pair, route entries are tried in **client
+preference order**: the client's first offered protocol that is claimed by
+ANY entry's `alpn` list wins, regardless of route-table order. Only once no
+offered protocol matched any explicit entry does the catch-all (the one
+entry, if any, with an empty/absent `alpn`) win — including for a client that
+offers no ALPN extension at all.
+
+##### Reject policy on an SNI-enabled listener
+
+Once at least one SNI-scoped frontend targets a listener, EVERY connection on
+that listener is preread — including ones destined for a no-SNI-configured
+host. A connection is rejected (TCP FIN, no bytes forwarded) when:
+
+- the first bytes aren't a TLS ClientHello at all (plain-TCP client, health
+  check payload, ...);
+- the ClientHello is malformed, or fragments past `sni_preread_timeout`
+  without becoming complete;
+- the accumulated bytes reach `sni_preread_max_bytes` before a complete
+  ClientHello is seen (a COMPLETE hello routes regardless of total length —
+  the client keeps sending after its hello in passthrough, so the cap only
+  ever rejects a genuinely incomplete window);
+- the ClientHello carries no usable SNI (absent, empty, or hidden behind
+  Encrypted Client Hello with no outer name);
+- the SNI matches no configured `hostname` on this listener, or matches one
+  but no route entry's `alpn` accepts the client's offer.
+
+Each of these eleven rejection reasons has its own metric — see
+[TCP SNI preread](#tcp-sni-preread-passthrough-routing) below. A bare TCP
+health check (connect + close, zero bytes) is **not** counted as a
+rejection — see that section's note.
+
+##### Validation matrix (TOML config-load)
+
+| Configuration | Outcome |
+|---|---|
+| `hostname` is neither an exact host nor a single leading `*.` label | **Error** `InvalidSniPattern` |
+| `hostname` contains a non-ASCII character | **Error** `NonAsciiSniPattern` — write the punycode A-label form |
+| `alpn` is non-empty but `hostname` is absent | **Error** `AlpnWithoutSni` — a no-SNI frontend installs the raw catch-all path, which never consults `alpn`; the protocol list would silently never be enforced |
+| Two frontends on the same `(address, hostname)` share an `alpn` protocol | **Error** `TcpFrontendAlpnOverlap` — routing must be deterministic, not iteration-order-dependent |
+| More than one frontend on the same `(address, hostname)` omits `alpn` | **Error** `TcpFrontendMultipleAlpnCatchAll` — at most one catch-all per `(address, hostname)` |
+| A listener has both a no-`hostname` frontend and at least one `hostname`-scoped frontend | **Error** `TcpListenerMixesSniAndNoSni` |
+| `sni_preread_timeout` exceeds this listener's `front_timeout` | **Error** `SniPrereadTimeoutExceedsFrontTimeout` — the preread phase cannot outlive the timeout that would already have closed the connection |
+| `sni_preread_max_bytes` is below 5 bytes (a full TLS record header) on an SNI-enabled listener | **Error** `SniPrereadMaxBytesTooSmall` — `0` in particular makes the shell issue reads that can never make progress, spinning until the event-loop iteration guard trips |
+| `sni_preread_max_bytes` exceeds the global `buffer_size` | **Error** `SniPrereadMaxBytesExceedsBufferSize` — the preread buffer is carved out of the same per-session buffer used for relaying |
+
+> **The routing-SHAPE validations — the mixing ban (`TcpListenerMixesSniAndNoSni`),
+> ALPN-overlap / catch-all uniqueness (`TcpFrontendAlpnOverlap` /
+> `TcpFrontendMultipleAlpnCatchAll`), and ALPN-without-SNI
+> (`AlpnWithoutSni`) — are enforced BOTH at TOML config-load
+> (`command/src/config.rs`) AND defensively on the worker's hot path
+> (`TcpListener::validate_new_tcp_front` in `lib/src/tcp.rs`), so an
+> `AddTcpFrontend` sent directly over the command socket, or replayed from a
+> hand-edited/stale `LoadState` snapshot, is rejected exactly like a bad
+> TOML file would be. The pattern-SHAPE checks — `InvalidSniPattern` /
+> `NonAsciiSniPattern` (is `hostname` an exact host or one leading `*.`
+> label, and pure ASCII) — and the listener-level timeout/buffer checks
+> (`SniPrereadTimeoutExceedsFrontTimeout` / `SniPrereadMaxBytesTooSmall` /
+> `SniPrereadMaxBytesExceedsBufferSize`) still run at TOML config-load only;
+> a malformed `--sni` pattern or a `0` `--sni-preread-max-bytes` sent via
+> `sozu listener tcp add`/`update` is not yet re-validated on that path.
+> Prefer declaring TCP SNI routing in the TOML file and reloading, or
+> double-check hot-added routes and listener knobs carefully, until that
+> remaining gap is closed.
+
+##### Runtime CLI surface
+
+```
+sozu frontend tcp add \
+  --id web-b \
+  --address 0.0.0.0:8443 \
+  --sni b.example.com \
+  --alpn h2
+
+sozu frontend tcp remove \
+  --id web-b \
+  --address 0.0.0.0:8443 \
+  --sni b.example.com \
+  --alpn h2
+
+sozu listener tcp add \
+  --address 0.0.0.0:8443 \
+  --sni-preread-timeout 5 \
+  --sni-preread-max-bytes 16384
+```
+
+`--sni`/`--alpn` are optional on both `add` and `remove` — omit both for a
+legacy no-SNI catch-all frontend. On `remove`, they must match the exact
+values the frontend was added with (same string, same wildcard shape, same
+`alpn` set): a mismatch removes nothing, silently, rather than erroring.
+
+`--sni-preread-timeout`/`--sni-preread-max-bytes` are **add-only**: the
+`UpdateTcpListenerConfig` hot-reconfig message has no fields for them, so
+`sozu listener tcp update` cannot patch either knob on a live listener —
+remove and re-add the listener (or edit the TOML and reload) to change them.
+
 #### Options specific to UDP listeners
 
 A `protocol = "udp"` listener load-balances datagram traffic (DNS, syslog, NTP,
@@ -2358,6 +2534,40 @@ Incremented when a session fails to transition between protocol phases:
 | `tcp.upgrade.send.failed`        | counter | proxy | TCP: PROXY protocol send transition failed                 |
 | `tcp.upgrade.relay.failed`       | counter | proxy | TCP: PROXY protocol relay transition failed                |
 | `tcp.upgrade.expect.failed`      | counter | proxy | TCP: PROXY protocol expect transition failed               |
+| `tcp.upgrade.sni_preread.failed` | counter | proxy | TCP: SNI-preread → pipe transition failed (see below)       |
+
+#### TCP SNI preread (passthrough routing)
+
+Emitted by the SNI+ALPN preread routing feature
+([#1279](https://github.com/sozu-proxy/sozu/issues/1279)) on a TCP listener
+with at least one `hostname`-scoped frontend. `tcp.sni_preread.active` is a
+gauge and is guaranteed not to underflow: it is incremented exactly once per
+session entering the preread state and decremented exactly once on whichever
+of its three mutually-exclusive exits fires (reject / upgrade-to-backend /
+teardown). A bare TCP health check (connect then close, zero bytes sent) is
+**not** counted in any `rejected.*` reason — see the reject-policy note in
+[Options specific to TCP listeners](#options-specific-to-tcp-listeners).
+
+| Metric                                          | Type    | Scope | Description                                                                            |
+| ------------------------------------------------ | ------- | ----- | --------------------------------------------------------------------------------------- |
+| `tcp.sni_preread.routed`                          | counter | proxy | A cluster was chosen from the ClientHello's SNI (+ optional ALPN)                       |
+| `tcp.sni_preread.active`                          | gauge   | proxy | Sessions currently prereading. Never underflows                                        |
+| `tcp.sni_preread.duration`                        | time    | proxy | Wall-clock time spent prereading, recorded on every exit alongside the `active` decrement |
+| `tcp.sni_preread.rejected.not_tls`                | counter | proxy | First TLS record's `ContentType` wasn't `handshake`                                    |
+| `tcp.sni_preread.rejected.malformed_record`       | counter | proxy | Bad TLS record framing (declared length lies, or a non-handshake record interrupts an in-progress hello) |
+| `tcp.sni_preread.rejected.malformed_handshake`    | counter | proxy | Not a ClientHello, or a length-prefixed field inside it lies about the bytes available |
+| `tcp.sni_preread.rejected.fragmented`              | counter | proxy | The preread deadline (`sni_preread_timeout`) fired before a terminal verdict            |
+| `tcp.sni_preread.rejected.too_large`               | counter | proxy | The window reached `sni_preread_max_bytes` while still incomplete (a complete hello always routes, regardless of total length) |
+| `tcp.sni_preread.rejected.no_sni`                  | counter | proxy | The `server_name` extension was absent, empty, or its `host_name` entry missing         |
+| `tcp.sni_preread.rejected.ech_outer_absent`        | counter | proxy | Encrypted Client Hello (`0xfe0d`) was present with no usable outer SNI — distinct from `no_sni` |
+| `tcp.sni_preread.rejected.sni_unmatched`           | counter | proxy | The normalized SNI matched no configured `hostname` on this listener                    |
+| `tcp.sni_preread.rejected.alpn_unmatched`          | counter | proxy | The SNI matched a route but no entry's `alpn` accepted the client's offer (and no catch-all was present) |
+| `tcp.sni_preread.rejected.proxy_header_invalid`    | counter | proxy | The inbound PROXY-v2 header (on an `expect_proxy` listener) failed to parse            |
+| `tcp.sni_preread.rejected.front_closed`            | counter | proxy | The frontend closed before a decision was reached (bytes were seen; a bare zero-byte health check is silent, not counted here) |
+
+See `lib/src/protocol/tcp_preread/LIFECYCLE.md` for the full state lifecycle,
+the four `proxy_protocol` handoff paths out of preread, and the reasoning
+behind each reject reason.
 
 #### Socket and I/O errors
 
