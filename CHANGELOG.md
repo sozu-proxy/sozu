@@ -31,7 +31,9 @@ simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
   frontend `hostname` (mapped to the wire `sni` field; exact host or a single
   leading `*.` wildcard) and `alpn` (repeatable; empty is the per-`(address,
   hostname)` catch-all), and listener `sni_preread_timeout` (default 5s) /
-  `sni_preread_max_bytes` (default 16384, clamped to `buffer_size`). New CLI
+  `sni_preread_max_bytes` (default 16384; config-load rejects a value above
+  the global `buffer_size`, and the worker defensively clamps the effective
+  cap to the session buffer at runtime). New CLI
   flags: `sozu frontend tcp add|remove --sni <host> --alpn <proto>` and `sozu
   listener tcp add --sni-preread-timeout <secs> --sni-preread-max-bytes
   <bytes>` (add-only — no wire support yet for patching either knob via
@@ -58,7 +60,8 @@ simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
   state lifecycle. New test coverage: unit tests in
   `lib/src/protocol/tcp_preread/{mod,shell}.rs`, e2e suite
   `e2e/src/tests/tcp_sni_tests.rs`, the `fuzz_tcp_clienthello` cargo-fuzz
-  target (wired into the nightly `fuzz` CI job and `simulation-sweep.yml`'s
+  target (wired into the `fuzz` CI job — nightly toolchain, 300s per target
+  on every push/PR — and `simulation-sweep.yml`'s daily
   extended-fuzz matrix), and a moonpool-driven deterministic simulation
   (`sim/tests/tcp_preread_sim.rs`, `sozu-sim` crate — wired into both the
   per-PR `udp-simulation` CI job and a new nightly
@@ -89,7 +92,7 @@ simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
   inherited from the H1 mux during upgrade, including a backend frame carried in
   the same read buffer as the `101 Switching Protocols` response.
 - **`fix(pipe)`: stopped truncating in-flight bytes on a frontend half-close**
-  ([#1279](https://github.com/sozu-proxy/sozu/issues/1279) Defect C). When the
+  (surfaced by [#1279](https://github.com/sozu-proxy/sozu/issues/1279)). When the
   frontend read side reached EOF while `frontend_buffer` still held bytes
   queued for the backend, `Pipe::readable` returned `Close` unconditionally,
   silently dropping them instead of flushing first — any front-to-back tail

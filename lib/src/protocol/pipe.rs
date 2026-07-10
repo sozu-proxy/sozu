@@ -222,12 +222,22 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.arm_inherited_buffer_writes();
     }
 
-    /// Stamp connection-scoped TLS metadata captured at handshake time onto
-    /// the pipe for access-log emission. Called from the HTTPS→WSS upgrade
-    /// path in `https.rs::upgrade_mux` after the `Pipe` has been built from
-    /// the prior mux `HttpContext`. Leaves plaintext paths (plain TCP, plain
-    /// WS, proxy-protocol) untouched so their access logs continue to emit
-    /// `None` for all TLS fields.
+    /// Stamp connection-scoped TLS metadata onto the pipe for access-log
+    /// emission. Two caller classes exist:
+    ///
+    /// - the HTTPS→WSS upgrade path (`https.rs::upgrade_mux`), which stamps
+    ///   all four fields captured at handshake time from the prior mux
+    ///   `HttpContext` (version/cipher/SNI/ALPN);
+    /// - the TCP SNI-preread upgrade paths (`tcp.rs::upgrade_send` and
+    ///   `tcp.rs::build_pipe_from_preread`), which stamp the routed SNI and
+    ///   the offered-ALPN label with `version`/`cipher` deliberately `None`:
+    ///   Sōzu never terminates that TLS session — it only parses the
+    ///   ClientHello in passthrough — so it never learns the negotiated
+    ///   parameters.
+    ///
+    /// Plain (non-SNI-routed) TCP, plain WS, and proxy-protocol paths never
+    /// call this, so their access logs continue to emit `None` for all TLS
+    /// fields.
     pub fn set_tls_metadata(
         &mut self,
         version: Option<&'static str>,
@@ -518,11 +528,13 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         );
         // EPOLLRDHUP only means the client sent FIN; on a loaded event loop it
         // can coalesce with the payload tail into the same epoll batch, so
-        // bytes may still sit in `frontend_buffer` (already read) or in the
+        // bytes may still sit in `frontend_buffer` (already read), in the
         // kernel receive buffer (not read yet, signalled by a pending
-        // READABLE event) — see the sibling `SocketResult::Closed` drain in
-        // `readable` above and `check_connections`'s `request_is_inflight`
-        // (sozu-proxy/sozu#1290, the HUP-path sibling of Defect C).
+        // READABLE event), or in the splice `in_pipe` (`splice_in_pending`)
+        // — see the sibling `SocketResult::Closed` drains in `readable` and
+        // `splice_readable` below and `check_connections`'s
+        // `request_is_inflight` (sozu-proxy/sozu#1290, the HUP-path variant
+        // of the same close-before-flush truncation).
         let request_is_inflight = self.frontend_buffer.available_data() > 0
             || self.frontend_readiness.event.is_readable()
             || self.splice_in_pending() > 0;
@@ -687,15 +699,15 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 // delivered may still be queued in `frontend_buffer` for the
                 // backend; returning `Close` here unconditionally dropped
                 // them, silently truncating the stream whenever a front->back
-                // tail was still in flight (sozu-proxy/sozu#1279 Defect C: a
+                // tail was still in flight (sozu-proxy/sozu#1279: a
                 // payload coalesced with the SNI ClientHello is the
                 // reproducer, but the drop hit any plain-TCP upload racing a
                 // frontend close). Transition to the half-closed `WriteOpen`
-                // status exactly as the WouldBlock/Continue path does below,
+                // status (same mapping as the zero-byte `Continue` read above),
                 // arm the backend writable to flush the queue, and defer the
                 // teardown to `check_connections`, which closes only once
                 // nothing is in flight (mirrors `backend_hup`'s drain branch).
-                // `frontend_hup` (EPOLLRDHUP, below) has the same drain
+                // `frontend_hup` (EPOLLRDHUP, above) has the same drain
                 // requirement for the same reason: FIN can coalesce with the
                 // payload tail into one epoll batch on a loaded event loop.
                 // So does `splice_readable`'s own `Closed` arm, for bytes
@@ -729,8 +741,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Forward content to session
     pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        // Inherited preread bytes sit in `backend_buffer`; splice never
-        // drains that userspace buffer, so it must be empty before the fast
+        // Mirror of the front-side preread gate: splice never drains the
+        // userspace `backend_buffer`, so it must be empty before the fast
         // path takes over.
         #[cfg(all(target_os = "linux", feature = "splice"))]
         if self.protocol == Protocol::TCP
@@ -943,8 +955,8 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
 
     // Read content from cluster
     pub fn backend_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        // Inherited preread bytes sit in `backend_buffer`; splice never
-        // drains that userspace buffer, so it must be empty before the fast
+        // Mirror of the front-side preread gate: splice never drains the
+        // userspace `backend_buffer`, so it must be empty before the fast
         // path takes over.
         #[cfg(all(target_os = "linux", feature = "splice"))]
         if self.protocol == Protocol::TCP
@@ -1117,7 +1129,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             SocketResult::Closed => {
                 // The frontend read side closed (EOF). This is the SPLICE
                 // sibling of `readable`'s `SocketResult::Closed` drain above
-                // (sozu-proxy/sozu#1279 Defect C) and of `frontend_hup`'s
+                // (sozu-proxy/sozu#1279) and of `frontend_hup`'s
                 // drain branch: bytes already spliced into the kernel
                 // `in_pipe` (`splice_in_pending()`) still belong to the
                 // backend, and returning `Close` here unconditionally
@@ -1923,7 +1935,7 @@ mod tests {
     }
 
     /// Regression guard for the close-before-flush data loss
-    /// (sozu-proxy/sozu#1279 Defect C): when the frontend read side reaches
+    /// (sozu-proxy/sozu#1279): when the frontend read side reaches
     /// EOF while `frontend_buffer` still holds bytes queued for the backend,
     /// `readable` must NOT return `Close` (which discarded them, silently
     /// truncating the stream -- the reproducer was a payload coalesced with an
@@ -2107,7 +2119,7 @@ mod tests {
     }
 
     /// Sibling of the above: when nothing is in flight (no buffered bytes,
-    /// no pending READABLE event), `frontend_hup` keeps today's legacy
+    /// no pending READABLE event), `frontend_hup` keeps its pre-existing
     /// behavior of closing immediately -- there is nothing left to drain.
     #[test]
     fn frontend_hup_closes_immediately_when_nothing_is_inflight() {
@@ -2166,7 +2178,7 @@ mod tests {
     }
 
     /// Regression guard for the SPLICE sibling of the close-before-flush
-    /// data loss (sozu-proxy/sozu#1279 Defect C / #1290): `splice_readable`'s
+    /// data loss (sozu-proxy/sozu#1279 / #1290): `splice_readable`'s
     /// `SocketResult::Closed` arm used to return `Close` unconditionally,
     /// dropping whatever `splice_in_pending()` bytes sat in the kernel
     /// `in_pipe` when the frontend's FIN was observed. It must instead keep
@@ -2223,9 +2235,9 @@ mod tests {
             .write_all(&payload)
             .expect("write frontend payload");
 
-        // Splice the payload into the kernel in_pipe (bounded retries: the
-        // loopback delivery and the per-call capacity cap may need several
-        // calls, and an early call can observe WouldBlock).
+        // Splice the payload into the kernel in_pipe (bounded retries:
+        // loopback delivers the payload in several chunks, and an early
+        // call can observe WouldBlock).
         let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
         for _ in 0..100_000 {
             if pipe.splice_in_pending() >= payload.len() {

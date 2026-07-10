@@ -132,7 +132,7 @@ pub const DEFAULT_SNI_PREREAD_TIMEOUT: u32 = 5;
 /// looking for the SNI extension on a TCP listener (16 KB — matches the
 /// H2 frame ceiling used elsewhere in this file). Only relevant when at
 /// least one SNI-scoped `TcpFrontendConfig` targets the listener; clamped by
-/// the global `buffer_size` (see `ConfigError::SniPrereadMaxBytesTooLarge`).
+/// the global `buffer_size` (see `ConfigError::SniPrereadMaxBytesExceedsBufferSize`).
 /// Must match the proto default on
 /// `TcpListenerConfig.sni_preread_max_bytes`.
 pub const DEFAULT_SNI_PREREAD_MAX_BYTES: u32 = 16384;

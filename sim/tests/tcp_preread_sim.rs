@@ -28,14 +28,14 @@
 //! every class is reachable BY CONSTRUCTION, not by hoping randomness finds
 //! it) and a chaos generator (`gen_random_mutation_chaos`) that fuzzes
 //! arbitrary bytes with an unconstrained expected outcome. A low-probability
-//! `buggify_with_prob!` bit-flip additionally perturbs otherwise-directed
-//! wires (clearing their expectation, never their invariants).
+//! `buggify_with_prob!` mutation (one byte XOR `0xFF`) additionally perturbs
+//! generated wires (clearing the directed expectation, never the invariants).
 //!
 //! ClientHello wires are built by a small hand-rolled encoder in this file
-//! (record layer + handshake + `server_name`/`alpn`/GREASE/ECH extensions):
-//! the core's own wire builders in `tcp_preread/{mod,parser}.rs` are
-//! `#[cfg(test)]`-private to that module and are not linked into this
-//! integration-test binary.
+//! (record layer + handshake + `server_name`/`alpn`/GREASE-shaped/ECH
+//! extensions): the core's own wire builders in `tcp_preread/parser.rs` are
+//! `#[cfg(test)] pub(super)` -- compiled only into `sozu-lib`'s own test
+//! build, never visible to this external integration-test crate.
 //!
 //! # Invariants checked per connection
 //!
@@ -55,19 +55,20 @@
 //!   same wire (one shot) against the same route table must reach the same
 //!   terminal -- UNLESS the original connection needed an out-of-band
 //!   `Timeout`/`FrontClosed` signal to decide (a RUNTIME fact, not a static
-//!   per-scenario-class one -- both the directed `fragmented_timeout` /
-//!   `front_closed_now` generators and an unlucky `random_mutation_chaos`
-//!   wire can land here), in which case the check instead confirms the wire
-//!   genuinely stays `NeedMore` on its own.
+//!   per-scenario-class one -- the directed `fragmented_timeout` /
+//!   `front_closed_now` generators as well as an unlucky
+//!   `random_mutation_chaos` or buggify-mutated wire can land here), in
+//!   which case the check instead confirms the wire genuinely stays
+//!   `NeedMore` on its own.
 //!
 //! # Hard coverage gate
 //!
 //! The default sweep asserts, after merging every seed's tally, that
 //! `accepted` and EVERY [`RejectReason`] counter, plus `fragmented_delivery`,
 //! `multi_record`, and `complete_over_cap` (a COMPLETE hello with trailing
-//! bytes past `max_bytes` that still routes -- the regression class for the
-//! `on_bytes` reorder that made `TooLarge` conditional on genuine
-//! incompleteness), are non-zero -- see [`CoverageTally::assert_full_coverage`].
+//! bytes past `max_bytes` that still routes -- the regression class guarding
+//! that `TooLarge` fires only on genuine incompleteness, never on a
+//! completed parse), are non-zero -- see [`CoverageTally::assert_full_coverage`].
 //! A sweep that never exercises one of these classes fails loudly rather than
 //! silently under-covering the core.
 //!
@@ -106,10 +107,10 @@ use sozu_lib::{
 // --------------------------------------------------------------------------
 // Hand-rolled ClientHello / TLS-record wire encoder.
 //
-// This deliberately duplicates the shape of the (private, #[cfg(test)]-only)
-// builders in `lib/src/protocol/tcp_preread/parser.rs` -- they are not
-// visible from this external integration-test crate, and the module doc
-// asks for "your own small builder" rather than reaching for them.
+// This deliberately duplicates the shape of the `#[cfg(test)] pub(super)`
+// builders in `lib/src/protocol/tcp_preread/parser.rs` -- they compile only
+// into `sozu-lib`'s own test build and are not visible from this external
+// integration-test crate, so the harness carries its own copy.
 // --------------------------------------------------------------------------
 
 const TLS_CONTENT_TYPE_HANDSHAKE: u8 = 22;
@@ -149,8 +150,10 @@ fn encode_alpn_extension(protocols: &[&[u8]]) -> Vec<u8> {
     encode_extension(EXT_ALPN, &data)
 }
 
-/// RFC 8701 GREASE extension value (`0x?A?A` pattern), randomized per call so
-/// the parser proves it skips ANY GREASE codepoint by length, not just one.
+/// GREASE-shaped unknown extension: `0x0A0A` (the RFC 8701 GREASE value)
+/// when the drawn nibble is 0, an arbitrary unassigned `0x?A0A` codepoint
+/// otherwise -- randomized per call so the parser proves it skips ANY
+/// unrecognized extension purely by declared length, not one codepoint.
 fn encode_grease_extension(ctx: &SimContext) -> Vec<u8> {
     let nibble: u16 = ctx.random().random_range(0..16u16);
     let ext_type = (nibble << 12) | 0x0A0A;
@@ -194,7 +197,8 @@ fn wrap_record(content_type: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Build a single-record wire ClientHello:
-/// `wrap_record(22, wrap_handshake(TYPE_CLIENT_HELLO, build_client_hello_body(...)))`.
+/// `wrap_record(22, wrap_handshake_with_type(TLS_HANDSHAKE_TYPE_CLIENT_HELLO,
+/// build_client_hello_body(...)))`.
 fn build_client_hello_wire(extra_extensions: &[Vec<u8>]) -> Vec<u8> {
     wrap_record(
         TLS_CONTENT_TYPE_HANDSHAKE,
@@ -647,16 +651,17 @@ fn gen_too_large(ctx: &SimContext) -> Scenario {
     s
 }
 
-/// Regression coverage for the `on_bytes` reorder (Defect B fix): a
-/// COMPLETE ClientHello followed by trailing bytes (e.g. the rest of the
+/// Regression coverage for the cap-vs-completeness ordering in `on_bytes`:
+/// a COMPLETE ClientHello followed by trailing bytes (e.g. the rest of the
 /// handshake / early data) that push the accumulated window past
 /// `max_bytes` must still ROUTE -- the cap only ever gates a would-be
-/// `NeedMore` path, never a completed parse. `max_bytes` is pinned strictly
-/// between the hello's own length and the full (hello + trailing) length,
-/// mirroring the core-level `complete_hello_with_trailing_bytes_over_cap_routes`
-/// unit test in `tcp_preread/mod.rs`. Without this directed class, a
-/// regression that re-introduced checking the cap before completeness
-/// would hide inside ordinary `accepted` coverage.
+/// `NeedMore` path (`need_more_or_too_large`), never a completed parse.
+/// `max_bytes` is pinned at or above the hello's own length and strictly
+/// below the full (hello + trailing) length, mirroring the core-level
+/// `complete_hello_with_trailing_bytes_over_cap_routes` unit test in
+/// `tcp_preread/mod.rs`. Without this directed class, a regression that
+/// re-introduced checking the cap before completeness would hide inside
+/// ordinary `accepted` coverage.
 fn gen_complete_over_cap_routes(ctx: &SimContext) -> Scenario {
     let hello_wire = hello_no_alpn("exact.example.com");
     let trailing_len = ctx.random().random_range(1..64usize);
@@ -664,7 +669,7 @@ fn gen_complete_over_cap_routes(ctx: &SimContext) -> Scenario {
     wire.extend((0..trailing_len).map(|_| ctx.random().random::<u8>()));
     let expected = routed("cluster-exact-any", "exact.example.com", &[], 0, None);
     let mut s = Scenario::new(wire, Some(expected), "complete_over_cap_routes");
-    // Strictly between the hello's own length (inclusive) and the total
+    // At or above the hello's own length (inclusive) and below the total
     // wire length (exclusive), so the window is never treated as
     // incomplete-at-cap yet the total wire still exceeds the cap.
     s.max_bytes = ctx
@@ -719,9 +724,13 @@ fn gen_proxy_prefixed_valid(ctx: &SimContext) -> Scenario {
 }
 
 /// Builds a strict, random-length prefix of an otherwise-valid ClientHello --
-/// guaranteed to `NeedMore` on its own for any cut in `[0, len)` (see the
-/// module doc for why a plain truncation of a well-formed wire can never
-/// prematurely reject).
+/// guaranteed to `NeedMore` on its own for any cut in `[0, len)`: the record
+/// and handshake layers are parsed with streaming combinators against
+/// explicit length prefixes, so a truncation always surfaces as `Incomplete`
+/// (`NeedMore`), and the body validation that could reject only runs once
+/// the framing has proven the full message present. The parser-level
+/// `one_byte_drip_needs_more_until_complete` unit test proves this
+/// per-prefix.
 fn truncated_incomplete_wire(ctx: &SimContext, force_empty: bool) -> Vec<u8> {
     let full = hello("exact.example.com", &[b"h2"]);
     let cut = if force_empty {
@@ -1221,7 +1230,7 @@ impl Workload for TcpPrereadSimWorkload {
             let mut scenario = generate_scenario(ctx);
             // Buggify: low-probability extra adversarial mutation, using
             // moonpool's fault-injection primitive. The directed expectation
-            // is cleared unconditionally -- a bit-flip can change which
+            // is cleared unconditionally -- a flipped byte can change which
             // (if any) terminal a wire reaches, but `run_connection`'s
             // route-determinism check is a RUNTIME fact (whether finalize
             // was actually needed), so it stays correct for a mutated wire

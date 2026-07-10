@@ -1,8 +1,9 @@
 //! Integration test that runs fuzz targets for a bounded time.
 //! Requires: cargo-fuzz installed, nightly Rust toolchain.
 //!
-//! Both targets run 10 s of fuzzing each and are part of the default
-//! `cargo test` run. When the nightly toolchain or `cargo-fuzz` is not
+//! Each registered target (one `#[test]` wrapper per cargo-fuzz target
+//! below) runs 10 s of fuzzing and is part of the default `cargo test`
+//! run. When the nightly toolchain or `cargo-fuzz` is not
 //! available — common on developer machines without `rustup` nightly
 //! and on CI legs that lack the install step — the tests log a notice
 //! and return cleanly rather than panicking, so the rest of the e2e

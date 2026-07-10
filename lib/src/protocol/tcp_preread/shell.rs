@@ -15,12 +15,15 @@
 //! This module intentionally emits its OWN `tcp.sni_preread.*` decision
 //! metrics (routed / rejected.<reason>) and log lines, but does **not** own
 //! the `tcp.sni_preread.active` gauge lifecycle or the eventual state
-//! transition out of `SniPreread` -- both live in `lib/src/tcp.rs`
-//! (`TcpSession::close` and `TcpSession::upgrade_sni_preread`
-//! respectively), which alone has the `TcpProxy`/`TcpListener` context
-//! (per-cluster `proxy_protocol`, buffers, listener) needed to pick the
-//! right next state and guarantee the gauge is adjusted exactly once per
-//! session, on exactly one of its three exits (reject / upgrade / teardown).
+//! transition out of `SniPreread` -- both live in `lib/src/tcp.rs` (gauge:
+//! +1 on entry in `TcpSession::new_sni_preread`, -1 in
+//! `TcpSession::upgrade_sni_preread` on the upgrade exit or in
+//! `TcpSession::close`'s `StateMarker::SniPreread` arm on the
+//! reject/teardown exits; transition: `TcpSession::upgrade_sni_preread`),
+//! which alone has the `TcpProxy`/`TcpListener` context (per-cluster
+//! `proxy_protocol`, buffers, listener) needed to pick the right next state
+//! and guarantee the gauge is adjusted exactly once per session, on exactly
+//! one of its three exits (reject / upgrade / teardown).
 
 use std::{net::SocketAddr, time::Instant};
 
@@ -37,7 +40,7 @@ use crate::{
 };
 
 /// Per-session prefix for log lines emitted with a [`SniPreread`] in scope.
-/// Renders the canonical `\tTCP-SNI\tSession(...)\t >>>` envelope, reusing
+/// Renders the canonical `TCP-SNI\tSession(...)\t >>>` envelope, reusing
 /// the `TCP-SNI` tag already established by the core's own `log_context!`
 /// (`tcp_preread/mod.rs`) so operators can grep core decisions and shell
 /// orchestration together.
@@ -84,9 +87,11 @@ pub struct SniPreread<Front: SocketHandler> {
     /// The session's own frontend accumulator, growing from wire offset 0.
     /// NEVER `consume()`d while undecided.
     pub frontend_buffer: Checkout,
-    /// `min(listener.config.sni_preread_max_bytes, frontend_buffer.capacity())`,
-    /// captured once at construction -- the buffer's capacity is fixed for
-    /// its lifetime, so this never needs re-deriving.
+    /// The listener's `sni_preread_max_bytes` knob (default 16 384) clamped
+    /// to `frontend_buffer.capacity()` and floored at the 5-byte TLS
+    /// record-header minimum -- see `effective_sni_preread_max_bytes` in
+    /// `lib/src/tcp.rs`. Captured once at construction: the buffer's
+    /// capacity is fixed for its lifetime, so this never needs re-deriving.
     effective_max_bytes: usize,
     core: SniPrereadCore,
     outcome: Option<RoutedOutcome>,
@@ -177,24 +182,28 @@ impl<Front: SocketHandler> SniPreread<Front> {
         cfg: &PrereadConfig<'_>,
     ) -> SessionResult {
         if self.outcome.is_some() {
-            // Already decided; nothing left to read for. The frontend
-            // interest should already be quiesced by the caller once
-            // routed, but stay defensive against a stray extra event.
+            // Already decided -- and deliberately not reading: bytes the
+            // client sends past the routed window must stay in the kernel
+            // socket buffer for the post-upgrade state to consume. Frontend
+            // READABLE interest stays armed until the upgrade swaps states
+            // (nothing quiesces it mid-connect), so a re-dispatch here is
+            // normal, not an error.
             return SessionResult::Continue;
         }
 
         // Enforce `effective_max_bytes` as a HARD read bound, not merely an
         // advisory the core applies on its NeedMore path. The frontend
-        // `Checkout` is sized to the pool buffer (>= 16 KiB), far larger than
-        // a tight `sni_preread_max_bytes`; draining all of it would read an
+        // `Checkout` is sized to the pool buffer (`buffer_size`, 16 393
+        // bytes by default), far larger than a tight
+        // `sni_preread_max_bytes`; draining all of it would read an
         // oversized-but-COMPLETE ClientHello in full, which the core then
         // routes (it caps only would-be-NeedMore windows -- see
         // `mod.rs::need_more_or_too_large`). Capping the read makes an
         // over-cap hello reach the core INCOMPLETE with `buf.len() ==
-        // max_bytes`, the exact `TooLarge` reject condition
-        // (sozu-proxy/sozu#1279 Defect D). A hello that fits within the cap
-        // still routes, and any coalesced bytes past the cap stay in the
-        // kernel socket buffer for the `Pipe` to replay byte-for-byte.
+        // max_bytes`, the exact `TooLarge` reject condition. A hello that
+        // fits within the cap still routes, and any coalesced bytes past
+        // the cap stay in the kernel socket buffer for the `Pipe` to
+        // replay byte-for-byte.
         let cap_remaining = self
             .effective_max_bytes
             .saturating_sub(self.frontend_buffer.available_data());
@@ -344,7 +353,9 @@ impl<Front: SocketHandler> SniPreread<Front> {
     }
 
     /// The `back_writable` dispatch point: only ever reachable once routed
-    /// -- the `ready_inner` connect-gate in `lib/src/tcp.rs` guarantees
+    /// -- the not-yet-routed guard in
+    /// `TcpSession::attempt_backend_connect_if_needed` (`lib/src/tcp.rs`,
+    /// both call sites inside `ready_inner`) guarantees
     /// `connect_to_backend` (and therefore any backend-writable event)
     /// never runs before a route decision. The actual per-`ProxyProtocolConfig`
     /// dispatch lives in `TcpSession::upgrade_sni_preread` (it needs the
@@ -424,8 +435,8 @@ mod tests {
         assert!(cfg.accept_wildcard);
     }
 
-    /// Regression guard for the un-enforced preread cap
-    /// (sozu-proxy/sozu#1279 Defect D): `readable` must never pull more than
+    /// Regression guard for the SNI-preread read cap (sozu-proxy/sozu#1279):
+    /// `readable` must never pull more than
     /// `effective_max_bytes` into the accumulator in a single read, even
     /// though the backing buffer is far larger and the socket has far more
     /// queued. Without the cap the shell drains the whole buffer, so an

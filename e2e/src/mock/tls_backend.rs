@@ -16,7 +16,9 @@
 //!   (mTLS), which a terminating proxy would break by presenting its own
 //!   identity to the backend instead of relaying the client's.
 //!
-//! Every other V8/V9/V10/V15 case in `tcp_sni_tests.rs` only needs to
+//! Every other case in `tcp_sni_tests.rs` (the reject matrix,
+//! PROXY-protocol composition, large-payload delivery, counter
+//! conservation) only needs to
 //! observe RAW bytes (Sōzu forwards them unchanged regardless of what
 //! they contain), so those use a plain raw-byte-capture backend instead
 //! of this module -- see `tcp_sni_tests.rs`'s `spawn_raw_capture_backend`.
@@ -58,7 +60,8 @@ pub struct TlsBackendCapture {
 }
 
 /// Build a single-cert `ServerConfig` (no client auth) from a PEM cert +
-/// key pair -- the plain SNI-routing backends (V7 backend A / backend B).
+/// key pair -- the plain SNI-routing backends (backend A / backend B in
+/// `tcp_sni_tests.rs`).
 pub fn server_config_single_cert(cert_pem: &[u8], key_pem: &[u8]) -> Arc<ServerConfig> {
     let cert = CertificateDer::from_pem_slice(cert_pem).expect("parse TLS backend certificate PEM");
     let key = PrivateKeyDer::from_pem_slice(key_pem).expect("parse TLS backend key PEM");
@@ -70,7 +73,7 @@ pub fn server_config_single_cert(cert_pem: &[u8], key_pem: &[u8]) -> Arc<ServerC
 }
 
 /// Build a `ServerConfig` that REQUIRES a client certificate, verified
-/// against `ca_cert_pem` as the sole trust anchor (V7 mTLS backend, the
+/// against `ca_cert_pem` as the sole trust anchor (the mTLS backend, the
 /// Kubernetes-API-server-style case). A client that presents no
 /// certificate, or one not signed by this CA, fails the handshake --
 /// [`spawn_accept_one`] surfaces that as a `None` capture.
@@ -105,7 +108,8 @@ pub fn server_config_requiring_client_cert(
 /// TLS session, and returns the resulting [`TlsBackendCapture`].
 ///
 /// Returns `None` (the join handle yields `None`) when the accept, the
-/// handshake, or the read/write fails -- in particular, the mTLS
+/// handshake, or the read fails (a failed response WRITE is only logged;
+/// the capture is already complete by then) -- in particular, the mTLS
 /// negative-space case (a client with no certificate against a verifier
 /// that requires one) fails INSIDE the first `read` (rustls drives
 /// `complete_io` there), so a `None` capture is this function's positive

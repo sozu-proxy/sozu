@@ -14,9 +14,10 @@
 //! near-stateless core (`decided` latch + `deadline`, see
 //! [`SniPrereadCore`]) driven by [`Input`] / [`Output`] through
 //! [`SniPrereadCore::handle_input`], with the accumulating byte buffer owned
-//! by the shell (`lib/src/tcp.rs`, out of scope for this module) rather than
-//! by the core itself -- every [`Input::Bytes`] carries the FULL
-//! accumulated window from wire offset 0, not a delta.
+//! by the I/O shell ([`shell::SniPreread`], wired into the session lifecycle
+//! by `lib/src/tcp.rs`) rather than by the core itself -- every
+//! [`Input::Bytes`] carries the FULL accumulated window from wire offset 0,
+//! not a delta.
 //!
 //! [`parser`] owns the nom-based wire format (TLS record layer, ClientHello,
 //! and extensions); this module owns the PROXY-v2 stripping, the SNI/ALPN
@@ -116,8 +117,9 @@ pub enum RejectReason {
     /// A TLS record's framing is invalid (bad length, or a non-`handshake`
     /// record interrupting an in-progress ClientHello reassembly).
     MalformedRecord,
-    /// The handshake message is not a ClientHello, or a length-prefixed
-    /// field inside it lies about the bytes available.
+    /// The handshake message is not a ClientHello, a length-prefixed field
+    /// inside it lies about the bytes available, or the `server_name`
+    /// extension's `host_name` is not valid UTF-8.
     MalformedHandshake,
     /// The preread deadline fired before a terminal verdict was reached.
     Fragmented,
@@ -224,7 +226,9 @@ impl SniPrereadCore {
         // passthrough the client keeps sending after its hello, so one read
         // routinely delivers a complete ClientHello PLUS trailing bytes that
         // push the window over the cap -- a complete hello must still route
-        // (e2e regression: `complete_hello_with_trailing_bytes_over_cap_routes`).
+        // (regression guards: `complete_hello_with_trailing_bytes_over_cap_routes`
+        // below, plus the e2e coalesced-read test
+        // `test_tcp_sni_large_payload_coalesced_with_hello_delivered_intact`).
         // The cap gates only the would-be-NeedMore paths below, via
         // [`Self::need_more_or_too_large`].
         let (content_offset, proxy_source) = if cfg.inbound_proxy {
@@ -618,8 +622,10 @@ mod tests {
         );
     }
 
-    /// Regression (e2e finding): in TLS passthrough the client keeps
-    /// sending after its hello (rest of handshake / early data), so one
+    /// Regression, surfaced by the e2e coalesced-read test
+    /// (`test_tcp_sni_large_payload_coalesced_with_hello_delivered_intact`
+    /// in `e2e/src/tests/tcp_sni_tests.rs`): in TLS passthrough the client
+    /// keeps sending after its hello (rest of handshake / early data), so one
     /// socket read routinely delivers a COMPLETE ClientHello PLUS trailing
     /// bytes that push the window over `max_bytes`. The cap is a rejection
     /// criterion ONLY while the hello is still incomplete -- a complete
@@ -958,7 +964,7 @@ mod tests {
         }
     }
 
-    // ---- route semantics (V3) ----------------------------------------------
+    // ---- route semantics: SNI precedence + ALPN resolution ------------------
 
     #[test]
     fn exact_sni_beats_wildcard_before_alpn() {
