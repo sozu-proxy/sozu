@@ -161,13 +161,10 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
-      - name: Install rust 1.88.0
-        # SHA pin keeps the action at a known revision; `with.toolchain`
-        # makes the rustc version explicit (the action otherwise keys off
-        # `github.action_ref`, which a SHA ref does not carry).
-        uses: dtolnay/rust-toolchain@98e1b82157cd469e843cb7f524c1313b4ad9492c  # branch 1.88.0
+      - name: Install rust 1.91.0
+        # Release builds must match the MSRV pinned in `rust-toolchain`.
+        uses: dtolnay/rust-toolchain@1.91.0
         with:
-          toolchain: 1.88.0
           targets: ${{ matrix.target }}
 
       - name: Cache cargo target
