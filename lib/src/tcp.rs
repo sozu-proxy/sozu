@@ -678,11 +678,17 @@ impl TcpSession {
     ///   text spelled out verbatim for `Expect`/`Relay`, inferred from the
     ///   `SendHeader` wire-order note. See the final report's deviations.)
     ///
-    /// `tcp.sni_preread.active` is decremented and `tcp.sni_preread.duration`
-    /// recorded exactly once here, on the "upgrade" exit named by the
-    /// gauge's `-1 on every exit` contract; the "reject"/"teardown" exits are
-    /// each other's counterpart in `SniPreread::handle_output` (metric only)
-    /// and `TcpSession::close`'s `StateMarker::SniPreread` arm (gauge).
+    /// `tcp.sni_preread.duration` is recorded on EVERY exit from this
+    /// function, including the four defensive early returns below: once
+    /// `preread.outcome()`/`preread`'s `SniPreread` value is consumed by the
+    /// `TcpStateMachine::FailedUpgrade`/`Pipe` transition its caller drives,
+    /// `close()`'s `StateMarker::SniPreread` arm can no longer reach a
+    /// `SniPreread` to read `started_at()` from, so recording later is not an
+    /// option. `tcp.sni_preread.active`, by contrast, is decremented exactly
+    /// once, on the "upgrade" exit named by the gauge's `-1 on every exit`
+    /// contract; the "reject"/"teardown" exits are each other's counterpart
+    /// in `SniPreread::handle_output` (metric only) and `TcpSession::close`'s
+    /// `StateMarker::SniPreread` arm (gauge).
     fn upgrade_sni_preread(
         &mut self,
         mut preread: SniPreread<MioTcpStream>,
@@ -694,11 +700,17 @@ impl TcpSession {
         // `self.state` is still (or, via `FailedUpgrade`, was last)
         // `SniPreread` -- decrementing here AND there for the same session
         // would underflow the gauge on this (defensive, should-never-happen)
-        // failure path.
+        // failure path. The gauge is deferred to `close()` on these paths,
+        // but the duration is NOT: it is recorded right before each `return
+        // None` below, symmetric with the success path's `time!` call.
         let Some(outcome) = preread.outcome().cloned() else {
             error!(
                 "{} upgrade_sni_preread called before a route decision",
                 log_context!(self)
+            );
+            time!(
+                names::tcp::sni_preread::DURATION,
+                preread.started_at().elapsed().as_millis() as i64
             );
             return None;
         };
@@ -707,6 +719,10 @@ impl TcpSession {
                 "{} SNI preread upgrade with no backend socket set",
                 log_context!(self)
             );
+            time!(
+                names::tcp::sni_preread::DURATION,
+                preread.started_at().elapsed().as_millis() as i64
+            );
             return None;
         };
         let Some(backend_token) = preread.backend_token else {
@@ -714,12 +730,20 @@ impl TcpSession {
                 "{} SNI preread upgrade with no backend token set",
                 log_context!(self)
             );
+            time!(
+                names::tcp::sni_preread::DURATION,
+                preread.started_at().elapsed().as_millis() as i64
+            );
             return None;
         };
         let Some(back_buffer) = self.backend_buffer.take() else {
             error!(
                 "{} SNI preread upgrade with no backend buffer queued",
                 log_context!(self)
+            );
+            time!(
+                names::tcp::sni_preread::DURATION,
+                preread.started_at().elapsed().as_millis() as i64
             );
             return None;
         };
@@ -1266,10 +1290,20 @@ impl TcpSession {
 
         if self.front_readiness().event.is_hup() {
             let session_result = self.front_hup();
-            if session_result == SessionResult::Continue {
-                self.front_readiness().event.remove(Ready::HUP);
+            if session_result != SessionResult::Continue {
+                return session_result;
             }
-            return session_result;
+            // `front_hup` drained in-flight request bytes and wants the
+            // session kept alive (`Pipe::frontend_hup`'s in-flight branch):
+            // the client already sent FIN, so under edge-triggered epoll no
+            // further frontend event will ever arrive -- returning here
+            // would stall the session forever waiting for a wake-up that
+            // never comes. Clear the now-consumed HUP bit and fall through
+            // into the loop below so `readable` (drains the kernel tail to
+            // EOF) and `back_writable` (flushes `frontend_buffer`) can run
+            // synchronously in this same pass, exactly how a backend HUP is
+            // already handled inside the loop.
+            self.front_readiness().event.remove(Ready::HUP);
         }
 
         while counter < MAX_LOOP_ITERATIONS {
@@ -2028,11 +2062,46 @@ impl TcpListener {
                     );
                 }
 
-                // Same key + same accept_wildcard as `insert_sni_route`'s own
-                // lookup, so this checks against exactly the entries the new
-                // route would be appended alongside.
+                // Same key as `insert_sni_route`'s own lookup, so this checks
+                // against exactly the entries the new route would be appended
+                // alongside. This is bookkeeping over the key's OWN node, not
+                // the routing lookup (`preread_config` keeps `true` for
+                // that), so `accept_wildcard` must make the lookup EXACT for
+                // both key shapes:
+                //
+                // - literal key -> `false`. With `true`, a literal key with
+                //   no child yet (e.g. `a.example.com` when only
+                //   `*.example.com` exists) falls back to the sibling
+                //   wildcard's entries (`pattern_trie.rs`'s `lookup`
+                //   wildcard-fallback branch), misattributing the wildcard's
+                //   catch-all to the exact key (falsely rejecting a
+                //   legitimate exact catch-all) — and symmetrically,
+                //   `insert_sni_route`/`remove_sni_route` would corrupt the
+                //   WILDCARD's `Vec` instead of touching a distinct
+                //   exact-key node.
+                // - wildcard key -> `true`. Unlike `lookup_mut` (which
+                //   short-circuits `partial_key == b"*"` before consulting
+                //   `accept_wildcard`, so insert/remove stay on `false`),
+                //   the immutable `lookup` reaches a wildcard entry ONLY
+                //   through the fallback branch; with `false` an existing
+                //   `*.example.com` entry is invisible here and a duplicate
+                //   catch-all / overlapping-ALPN wildcard front bypasses
+                //   validation. For a wildcard key, `true` IS the exact
+                //   self-lookup: the traversal descends the key's own
+                //   literal ancestry, and `insert` never creates a literal
+                //   `*` child that could shadow the node's `wildcard` slot.
+                //
+                // `starts_with(b"*.")` is the complete wildcard predicate:
+                // `command/src/config.rs`'s `validate_sni_pattern` only
+                // admits a single leading `*.` label (any other `*` is
+                // rejected), and a non-`*.`-prefixed key traverses literal
+                // children in both `lookup` and `insert_recursive`.
                 let key = sni.to_ascii_lowercase().into_bytes();
-                if let Some((_, existing)) = self.sni_routes.domain_lookup(&key, true) {
+                let accept_wildcard_for_self_lookup = key.starts_with(b"*.");
+                if let Some((_, existing)) = self
+                    .sni_routes
+                    .domain_lookup(&key, accept_wildcard_for_self_lookup)
+                {
                     let new_is_catch_all = front.alpn.is_empty();
                     for (matcher, _cluster_id) in existing {
                         match matcher {
@@ -2079,7 +2148,11 @@ impl TcpListener {
         } else {
             AlpnMatcher::OneOf(alpn.into_iter().map(String::into_bytes).collect())
         };
-        match self.sni_routes.domain_lookup_mut(&key, true) {
+        // `accept_wildcard: false` — see `validate_new_tcp_front`'s comment:
+        // an exact key must never fall back to a sibling wildcard's entry,
+        // or this push would corrupt the WILDCARD's route `Vec` instead of
+        // creating this key's own node.
+        match self.sni_routes.domain_lookup_mut(&key, false) {
             Some((_, entries)) => entries.push((matcher, cluster_id)),
             None => {
                 self.sni_routes
@@ -2099,7 +2172,10 @@ impl TcpListener {
         } else {
             AlpnMatcher::OneOf(alpn.into_iter().map(String::into_bytes).collect())
         };
-        if let Some((_, entries)) = self.sni_routes.domain_lookup_mut(&key, true) {
+        // `accept_wildcard: false` — same reasoning as `insert_sni_route`:
+        // removing the exact key must never reach into and strip a sibling
+        // wildcard's entries.
+        if let Some((_, entries)) = self.sni_routes.domain_lookup_mut(&key, false) {
             entries.retain(|(m, c)| !(*m == matcher && c == cluster_id));
             if entries.is_empty() {
                 self.sni_routes.domain_remove(&key);
@@ -3220,6 +3296,169 @@ mod sni_routing_tests {
                 .sni_routes
                 .domain_lookup(b"example.com", true)
                 .is_some()
+        );
+    }
+
+    // ---- exact-key bookkeeping must not fall back to a sibling wildcard
+    // (sozu-proxy/sozu#1290 review finding 1) --------------------------
+
+    #[test]
+    fn insert_sni_route_creates_a_distinct_node_for_an_exact_key_over_a_sibling_wildcard() {
+        let mut listener = test_listener();
+        // Wildcard catch-all first.
+        listener.insert_sni_route(
+            "*.example.com".to_owned(),
+            vec![],
+            "cluster-wildcard".to_owned(),
+        );
+        // Exact ALPN-scoped route for one specific subdomain.
+        listener.insert_sni_route(
+            "a.example.com".to_owned(),
+            vec!["h2".to_owned()],
+            "cluster-a-h2".to_owned(),
+        );
+
+        // The exact key must have gotten its OWN trie node -- with
+        // `accept_wildcard: true` this lookup would instead fall back to
+        // (and the insert above would have corrupted) the wildcard's node,
+        // since no literal `a` child existed yet at insert time.
+        let (_, a_entries) = listener
+            .sni_routes
+            .domain_lookup(b"a.example.com", false)
+            .expect("a.example.com must have a distinct exact-key node");
+        assert_eq!(
+            a_entries,
+            &vec![(
+                AlpnMatcher::OneOf([b"h2".to_vec()].into_iter().collect()),
+                "cluster-a-h2".to_owned()
+            )],
+            "the exact key's own Vec must hold only its own entry, not the wildcard's"
+        );
+
+        // Any OTHER subdomain must still resolve to ONLY the wildcard, via
+        // the same `accept_wildcard: true` lookup the routing path uses
+        // (`preread_config`) -- it must never see `a.example.com`'s h2 route.
+        let (_, b_entries) = listener
+            .sni_routes
+            .domain_lookup(b"b.example.com", true)
+            .expect("b.example.com must fall back to the wildcard catch-all");
+        assert_eq!(
+            b_entries,
+            &vec![(AlpnMatcher::Any, "cluster-wildcard".to_owned())],
+            "an unrelated subdomain must see ONLY the wildcard's entry"
+        );
+    }
+
+    #[test]
+    fn validate_new_tcp_front_accepts_an_exact_catch_all_sibling_of_a_wildcard_catch_all() {
+        let mut listener = test_listener();
+        listener.insert_sni_route(
+            "*.example.com".to_owned(),
+            vec![],
+            "cluster-wildcard".to_owned(),
+        );
+
+        // An exact catch-all for one subdomain must be accepted: it is a
+        // SIBLING of the wildcard's catch-all, not a duplicate of it. With
+        // `accept_wildcard: true` this lookup would wrongly find the
+        // wildcard's own `AlpnMatcher::Any` entry and reject it as "already
+        // has a catch-all".
+        let front = frontend("cluster-a", Some("a.example.com"), &[]);
+        assert!(
+            listener.validate_new_tcp_front(&front).is_ok(),
+            "an exact catch-all must be accepted when only a SIBLING wildcard has a catch-all"
+        );
+    }
+
+    #[test]
+    fn validate_new_tcp_front_rejects_a_duplicate_wildcard_catch_all() {
+        let mut listener = test_listener();
+        listener.insert_sni_route(
+            "*.example.com".to_owned(),
+            vec![],
+            "cluster-wildcard".to_owned(),
+        );
+
+        // A SECOND catch-all for the SAME wildcard key is an ambiguous
+        // duplicate and must be rejected. The immutable trie `lookup` has no
+        // literal-`*` short-circuit (only `lookup_mut` does), so a plain
+        // `accept_wildcard: false` self-lookup never sees the existing
+        // wildcard entry and waves the duplicate through -- which
+        // `insert_sni_route` (lookup_mut, short-circuit present) would then
+        // happily append.
+        let front = frontend("cluster-dup", Some("*.example.com"), &[]);
+        assert!(
+            listener.validate_new_tcp_front(&front).is_err(),
+            "a second catch-all on the same wildcard SNI must be rejected as a duplicate"
+        );
+    }
+
+    #[test]
+    fn validate_new_tcp_front_rejects_overlapping_alpn_on_the_same_wildcard() {
+        let mut listener = test_listener();
+        listener.insert_sni_route(
+            "*.example.com".to_owned(),
+            vec!["h2".to_owned()],
+            "cluster-wildcard-h2".to_owned(),
+        );
+
+        // Same wildcard key, overlapping ALPN protocol: ambiguous, must be
+        // rejected (same bypass as the duplicate catch-all above).
+        let front = frontend("cluster-dup", Some("*.example.com"), &["h2"]);
+        assert!(
+            listener.validate_new_tcp_front(&front).is_err(),
+            "an overlapping ALPN matcher on the same wildcard SNI must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_new_tcp_front_accepts_a_disjoint_alpn_addition_on_the_same_wildcard() {
+        let mut listener = test_listener();
+        listener.insert_sni_route(
+            "*.example.com".to_owned(),
+            vec![],
+            "cluster-wildcard".to_owned(),
+        );
+
+        // A non-overlapping ALPN-scoped addition alongside the wildcard's
+        // catch-all stays legal -- the wildcard-aware self-lookup must not
+        // over-reject.
+        let front = frontend("cluster-h2", Some("*.example.com"), &["h2"]);
+        assert!(
+            listener.validate_new_tcp_front(&front).is_ok(),
+            "a disjoint ALPN addition on the same wildcard SNI must be accepted"
+        );
+    }
+
+    #[test]
+    fn remove_sni_route_for_an_absent_exact_key_does_not_strip_a_sibling_wildcards_entry() {
+        let mut listener = test_listener();
+        listener.insert_sni_route(
+            "*.example.com".to_owned(),
+            vec![],
+            "cluster-wildcard".to_owned(),
+        );
+
+        // "a.example.com" was never inserted as its own route -- only the
+        // wildcard catch-all exists. A remove targeting the exact host
+        // (e.g. a stale `RemoveTcpFrontend` replayed from a hand-edited
+        // `LoadState`) must be a no-op here, not reach into and strip the
+        // WILDCARD's own catch-all entry.
+        listener.remove_sni_route(
+            "a.example.com".to_owned(),
+            vec![],
+            &"cluster-wildcard".to_owned(),
+        );
+
+        let (_, wildcard_entries) = listener
+            .sni_routes
+            .domain_lookup(b"b.example.com", true)
+            .expect(
+                "the wildcard catch-all must survive a remove targeting an unrelated exact key",
+            );
+        assert_eq!(
+            wildcard_entries,
+            &vec![(AlpnMatcher::Any, "cluster-wildcard".to_owned())]
         );
     }
 

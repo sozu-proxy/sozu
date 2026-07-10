@@ -509,9 +509,54 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
     }
 
     pub fn frontend_hup(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-        self.log_request_success(metrics);
         self.frontend_status = ConnectionStatus::Closed;
-        SessionResult::Close
+        // The frontend hung up: its status is now terminal regardless of
+        // which branch we take below (mirrors `backend_hup`).
+        debug_assert!(
+            matches!(self.frontend_status, ConnectionStatus::Closed),
+            "frontend_hup must mark the frontend Closed"
+        );
+        // EPOLLRDHUP only means the client sent FIN; on a loaded event loop it
+        // can coalesce with the payload tail into the same epoll batch, so
+        // bytes may still sit in `frontend_buffer` (already read) or in the
+        // kernel receive buffer (not read yet, signalled by a pending
+        // READABLE event) — see the sibling `SocketResult::Closed` drain in
+        // `readable` above and `check_connections`'s `request_is_inflight`
+        // (sozu-proxy/sozu#1290, the HUP-path sibling of Defect C).
+        let request_is_inflight = self.frontend_buffer.available_data() > 0
+            || self.frontend_readiness.event.is_readable()
+            || self.splice_in_pending() > 0;
+        if request_is_inflight && self.backend_socket.is_some() {
+            // Positive space: the branch that keeps the session alive must
+            // never be entered without something left to drain.
+            debug_assert!(
+                self.frontend_buffer.available_data() > 0
+                    || self.frontend_readiness.event.is_readable()
+                    || self.splice_in_pending() > 0,
+                "drain branch entered without any observable in-flight request bytes"
+            );
+            if self.frontend_readiness.event.is_readable() {
+                // Keep reading: the kernel still has the tail of the payload
+                // queued behind the FIN. The `SocketResult::Closed` arm in
+                // `readable` finishes the lifecycle once that tail hits EOF.
+                self.frontend_readiness.interest.insert(Ready::READABLE);
+            }
+            self.backend_readiness.arm_writable();
+            debug!(
+                "{} Pipe::frontend_hup: frontend connection closed, keeping alive due to inflight request data.",
+                log_context!(self)
+            );
+            SessionResult::Continue
+        } else {
+            // Negative space: closing outright must never drop bytes still
+            // queued for a live backend.
+            debug_assert!(
+                self.backend_socket.is_none() || self.frontend_buffer.available_data() == 0,
+                "close branch entered with backend present but request bytes still queued"
+            );
+            self.log_request_success(metrics);
+            SessionResult::Close
+        }
     }
 
     pub fn backend_hup(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
@@ -650,6 +695,11 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 // arm the backend writable to flush the queue, and defer the
                 // teardown to `check_connections`, which closes only once
                 // nothing is in flight (mirrors `backend_hup`'s drain branch).
+                // `frontend_hup` (EPOLLRDHUP, below) has the same drain
+                // requirement for the same reason: FIN can coalesce with the
+                // payload tail into one epoll batch on a loaded event loop.
+                // So does `splice_readable`'s own `Closed` arm, for bytes
+                // sitting in the kernel `in_pipe` instead of `frontend_buffer`.
                 self.frontend_status = match self.frontend_status {
                     ConnectionStatus::Normal => ConnectionStatus::WriteOpen,
                     ConnectionStatus::ReadOpen => ConnectionStatus::Closed,
@@ -1065,9 +1115,36 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
                 return SessionResult::Close;
             }
             SocketResult::Closed => {
-                self.reset_readiness_for_close();
-                self.log_request_success(metrics);
-                return SessionResult::Close;
+                // The frontend read side closed (EOF). This is the SPLICE
+                // sibling of `readable`'s `SocketResult::Closed` drain above
+                // (sozu-proxy/sozu#1279 Defect C) and of `frontend_hup`'s
+                // drain branch: bytes already spliced into the kernel
+                // `in_pipe` (`splice_in_pending()`) still belong to the
+                // backend, and returning `Close` here unconditionally
+                // dropped them. Transition to the half-closed `WriteOpen`
+                // status, arm the backend writable to drain the kernel pipe
+                // via `splice_backend_writable`, and defer teardown to
+                // `check_connections`, whose `request_is_inflight` already
+                // counts `splice_in_pending() > 0`; once the pipe drains,
+                // the next `splice_readable` re-observes EOF with nothing
+                // inflight and closes through the `check_connections` gate
+                // above this match.
+                self.frontend_status = match self.frontend_status {
+                    ConnectionStatus::Normal => ConnectionStatus::WriteOpen,
+                    ConnectionStatus::ReadOpen => ConnectionStatus::Closed,
+                    s => s,
+                };
+                self.frontend_readiness.event.remove(Ready::READABLE);
+                self.frontend_readiness.interest.remove(Ready::READABLE);
+                if self.splice_in_pending() > 0 && self.backend_socket.is_some() {
+                    self.backend_readiness.arm_writable();
+                }
+                if !self.check_connections() {
+                    self.reset_readiness_for_close();
+                    self.log_request_success(metrics);
+                    return SessionResult::Close;
+                }
+                return SessionResult::Continue;
             }
             SocketResult::WouldBlock => {
                 self.frontend_readiness.event.remove(Ready::READABLE);
@@ -1951,6 +2028,300 @@ mod tests {
         assert_eq!(
             received, b"front-to-back-tail-still-queued",
             "the backend must receive the queued tail byte-for-byte, not a truncation"
+        );
+    }
+
+    /// Regression guard for the HUP-path sibling of the close-before-flush
+    /// data loss (sozu-proxy/sozu#1290): `command/src/ready.rs`'s
+    /// `From<&mio::event::Event>` sets `Ready::HUP` whenever
+    /// `is_read_closed()`/`is_write_closed()` fires, independently of
+    /// `Ready::READABLE` -- so a client FIN that coalesces with the payload
+    /// tail on a loaded event loop delivers a SINGLE epoll batch carrying
+    /// BOTH bits. `frontend_hup` must not drop bytes still queued in
+    /// `frontend_buffer` (already read) or still pending in the kernel
+    /// receive buffer (signalled by the retained READABLE event) just
+    /// because HUP also fired.
+    #[test]
+    fn frontend_hup_drains_inflight_request_bytes_before_closing() {
+        let (frontend_peer, frontend_socket) = connected_pair();
+        let (_backend_peer, backend_socket) = connected_pair();
+
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let backend_buffer = pool.checkout().expect("backend buffer");
+        let mut frontend_buffer = pool.checkout().expect("frontend buffer");
+        frontend_buffer
+            .write_all(b"front-to-back-tail-still-queued")
+            .expect("seed queued frontend bytes");
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let listener = Rc::new(RefCell::new(TestListener { address }));
+
+        let mut pipe = Pipe::new(
+            backend_buffer,
+            None,
+            Some(TcpStream::from_std(backend_socket)),
+            None,
+            None,
+            None,
+            None,
+            frontend_buffer,
+            Token(0),
+            TcpStream::from_std(frontend_socket),
+            listener,
+            Protocol::TCP,
+            Ulid::generate(),
+            Ulid::generate(),
+            None,
+            WebSocketContext::Tcp,
+        );
+        pipe.set_back_token(Token(1));
+        // The kernel receive buffer still has a tail behind the FIN: both
+        // bits set in the same batch, exactly as `ready.rs` would produce.
+        pipe.frontend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        pipe.frontend_readiness.event = Ready::READABLE | Ready::HUP;
+        pipe.backend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        pipe.backend_readiness.event = Ready::EMPTY;
+
+        let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
+        let result = pipe.frontend_hup(&mut metrics);
+
+        assert_eq!(
+            result,
+            SessionResult::Continue,
+            "frontend_hup must keep the session alive while request bytes are still in flight"
+        );
+        assert!(
+            matches!(pipe.frontend_status, ConnectionStatus::Closed),
+            "frontend_hup must still mark the frontend Closed even on the drain branch"
+        );
+        assert!(
+            pipe.backend_readiness.interest.is_writable()
+                && pipe.backend_readiness.event.is_writable(),
+            "the drain branch must arm backend WRITABLE to flush the queued frontend bytes"
+        );
+        assert!(
+            pipe.frontend_readiness.interest.is_readable(),
+            "the drain branch must retain frontend READABLE interest to read the kernel tail to EOF"
+        );
+
+        drop(frontend_peer);
+    }
+
+    /// Sibling of the above: when nothing is in flight (no buffered bytes,
+    /// no pending READABLE event), `frontend_hup` keeps today's legacy
+    /// behavior of closing immediately -- there is nothing left to drain.
+    #[test]
+    fn frontend_hup_closes_immediately_when_nothing_is_inflight() {
+        let (frontend_peer, frontend_socket) = connected_pair();
+        let (_backend_peer, backend_socket) = connected_pair();
+
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let backend_buffer = pool.checkout().expect("backend buffer");
+        let frontend_buffer = pool.checkout().expect("frontend buffer");
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let listener = Rc::new(RefCell::new(TestListener { address }));
+
+        let mut pipe = Pipe::new(
+            backend_buffer,
+            None,
+            Some(TcpStream::from_std(backend_socket)),
+            None,
+            None,
+            None,
+            None,
+            frontend_buffer,
+            Token(0),
+            TcpStream::from_std(frontend_socket),
+            listener,
+            Protocol::TCP,
+            Ulid::generate(),
+            Ulid::generate(),
+            None,
+            WebSocketContext::Tcp,
+        );
+        pipe.set_back_token(Token(1));
+        // HUP only, no readable event, no queued bytes: nothing to drain.
+        pipe.frontend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        pipe.frontend_readiness.event = Ready::HUP;
+        pipe.backend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        pipe.backend_readiness.event = Ready::EMPTY;
+
+        let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
+        let result = pipe.frontend_hup(&mut metrics);
+
+        assert_eq!(
+            result,
+            SessionResult::Close,
+            "frontend_hup must close immediately when nothing is in flight (unchanged legacy behavior)"
+        );
+        assert!(
+            matches!(pipe.frontend_status, ConnectionStatus::Closed),
+            "frontend_hup must mark the frontend Closed"
+        );
+        assert!(
+            !pipe.backend_readiness.event.is_writable(),
+            "the close branch must not arm backend WRITABLE when there is nothing queued"
+        );
+
+        drop(frontend_peer);
+    }
+
+    /// Regression guard for the SPLICE sibling of the close-before-flush
+    /// data loss (sozu-proxy/sozu#1279 Defect C / #1290): `splice_readable`'s
+    /// `SocketResult::Closed` arm used to return `Close` unconditionally,
+    /// dropping whatever `splice_in_pending()` bytes sat in the kernel
+    /// `in_pipe` when the frontend's FIN was observed. It must instead keep
+    /// the session alive until `splice_backend_writable` drains the kernel
+    /// pipe, then close on the next EOF re-observation once nothing is
+    /// inflight.
+    #[cfg(all(target_os = "linux", feature = "splice"))]
+    #[test]
+    fn splice_readable_eof_drains_kernel_pipe_bytes_before_closing() {
+        use std::io::Read;
+
+        let (mut frontend_peer, frontend_socket) = connected_pair();
+        let (mut backend_peer, backend_socket) = connected_pair();
+
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let backend_buffer = pool.checkout().expect("backend buffer");
+        // The frontend buffer stays EMPTY: the splice fast path only engages
+        // when no inherited userspace bytes remain (see `readable`'s gate).
+        let frontend_buffer = pool.checkout().expect("frontend buffer");
+        let address = "127.0.0.1:0".parse().expect("test address");
+        let listener = Rc::new(RefCell::new(TestListener { address }));
+
+        let mut pipe = Pipe::new(
+            backend_buffer,
+            None,
+            Some(TcpStream::from_std(backend_socket)),
+            None,
+            None,
+            None,
+            None,
+            frontend_buffer,
+            Token(0),
+            TcpStream::from_std(frontend_socket),
+            listener,
+            Protocol::TCP,
+            Ulid::generate(),
+            Ulid::generate(),
+            None,
+            WebSocketContext::Tcp,
+        );
+        pipe.set_back_token(Token(1));
+        pipe.frontend_readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        pipe.frontend_readiness.event = Ready::READABLE;
+
+        assert!(
+            pipe.splice_pipe.is_some(),
+            "Protocol::TCP must allocate the splice kernel pipe for this test to be meaningful"
+        );
+
+        // 32 KiB: below the 64 KiB default pipe capacity so the whole
+        // payload fits the kernel in_pipe without backpressure pauses.
+        let payload = vec![0x5a_u8; 32 * 1024];
+        frontend_peer
+            .write_all(&payload)
+            .expect("write frontend payload");
+
+        // Splice the payload into the kernel in_pipe (bounded retries: the
+        // loopback delivery and the per-call capacity cap may need several
+        // calls, and an early call can observe WouldBlock).
+        let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
+        for _ in 0..100_000 {
+            if pipe.splice_in_pending() >= payload.len() {
+                break;
+            }
+            let result = pipe.splice_readable(&mut metrics);
+            assert_ne!(
+                result,
+                SessionResult::Close,
+                "splice_readable must not close while splicing the payload in"
+            );
+        }
+        assert_eq!(
+            pipe.splice_in_pending(),
+            payload.len(),
+            "the whole payload must sit in the kernel in_pipe before EOF"
+        );
+
+        // The frontend closes right after its payload: FIN behind the
+        // spliced bytes.
+        drop(frontend_peer);
+
+        // Keep calling until EOF is observed (WriteOpen transition). The
+        // buggy arm returned `Close` here, dropping the kernel-pipe bytes.
+        let mut saw_eof = false;
+        for _ in 0..100_000 {
+            let result = pipe.splice_readable(&mut metrics);
+            assert_ne!(
+                result,
+                SessionResult::Close,
+                "splice_readable must not close while {} kernel-pipe bytes remain",
+                pipe.splice_in_pending()
+            );
+            if matches!(pipe.frontend_status, ConnectionStatus::WriteOpen) {
+                saw_eof = true;
+                break;
+            }
+        }
+        assert!(
+            saw_eof,
+            "frontend EOF was never observed within the retry budget"
+        );
+        assert_eq!(
+            pipe.splice_in_pending(),
+            payload.len(),
+            "the kernel-pipe bytes must survive the frontend EOF, not be dropped"
+        );
+        assert!(
+            pipe.backend_readiness.interest.is_writable()
+                && pipe.backend_readiness.event.is_writable(),
+            "EOF with kernel-pipe bytes pending must arm backend WRITABLE to drain them"
+        );
+
+        // Drain the kernel pipe to the backend and read the peer: the bytes
+        // must arrive byte-identical (interleave drain + read so a full
+        // backend socket buffer cannot deadlock the loop).
+        let mut received = Vec::with_capacity(payload.len());
+        for _ in 0..100_000 {
+            let drain = pipe.splice_backend_writable(&mut metrics);
+            assert_ne!(
+                drain,
+                SessionResult::Close,
+                "draining the kernel pipe must not tear the session down mid-flight"
+            );
+            let mut buf = [0u8; 16384];
+            match backend_peer.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => break,
+            }
+            if received.len() >= payload.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            received, payload,
+            "the backend must receive the spliced tail byte-for-byte, not a truncation"
+        );
+        assert_eq!(
+            pipe.splice_in_pending(),
+            0,
+            "the kernel in_pipe must be fully drained"
+        );
+
+        // Nothing inflight and the frontend is half-closed: the session is
+        // now closeable, and the next EOF re-observation closes it through
+        // `splice_readable`'s check_connections gate.
+        assert!(
+            !pipe.check_connections(),
+            "with nothing inflight and the frontend closed, the session must be closeable"
+        );
+        assert_eq!(
+            pipe.splice_readable(&mut metrics),
+            SessionResult::Close,
+            "re-observing EOF with nothing inflight must close the session"
         );
     }
 }

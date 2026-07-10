@@ -95,7 +95,19 @@
   `readable` now transitions to the half-closed `WriteOpen` status (matching
   the existing `WouldBlock`/`Continue` handling), arms backend-writable to
   drain the queue, and defers the actual teardown to `check_connections`,
-  which only closes once nothing is in flight.
+  which only closes once nothing is in flight. The HUP path had the same
+  defect under a heavier load: EPOLLRDHUP can coalesce with the payload tail
+  into a single epoll batch, so `TcpSession::ready_inner` observed `HUP`
+  before its processing loop even ran and called `Pipe::frontend_hup`, which
+  also returned `Close` unconditionally; it now drains in-flight request
+  bytes the same way (`Continue` + backend-writable + retained frontend
+  `READABLE` interest), and `ready_inner` falls through into its
+  same-pass loop on that `Continue` instead of returning immediately, so the
+  drain completes without waiting on a frontend event that — the client
+  already sent FIN — will never arrive. The `splice` fast path's EOF arm
+  (`Pipe::splice_readable`) had the same unconditional close, dropping bytes
+  already spliced into the kernel pipe; it now defers teardown the same way
+  until `splice_backend_writable` drains them.
 
 ### 🤖 CI
 
