@@ -16,12 +16,16 @@ use mio::{
 use rusty_ulid::Ulid;
 use sozu_command::{
     ObjectKind,
-    config::MAX_LOOP_ITERATIONS,
+    config::{
+        DEFAULT_SNI_PREREAD_MAX_BYTES, DEFAULT_SNI_PREREAD_TIMEOUT, MAX_LOOP_ITERATIONS,
+        MIN_SNI_PREREAD_MAX_BYTES,
+    },
     logging::{EndpointRecord, LogContext, ansi_palette},
     proto::command::request::RequestType,
 };
 
 use crate::metrics::names;
+use crate::router::pattern_trie::TrieNode;
 use crate::{
     AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus, CachedTags,
     ListenerError, ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession,
@@ -34,6 +38,7 @@ use crate::{
         proxy_protocol::{
             expect::ExpectProxyProtocol, relay::RelayProxyProtocol, send::SendProxyProtocol,
         },
+        tcp_preread::{AlpnMatcher, PrereadConfig, shell::SniPreread},
     },
     retry::RetryPolicy,
     server::{CONN_RETRIES, ListenToken, SessionManager, push_event},
@@ -52,13 +57,15 @@ use crate::{
 StateMachineBuilder! {
     /// The various Stages of a TCP connection:
     ///
-    /// 1. optional (ExpectProxyProtocol | SendProxyProtocol | RelayProxyProtocol)
-    /// 2. Pipe
+    /// 1. optional SniPreread (SNI-routed listeners only, sozu-proxy/sozu#1279)
+    /// 2. optional (ExpectProxyProtocol | SendProxyProtocol | RelayProxyProtocol)
+    /// 3. Pipe
     enum TcpStateMachine {
         Pipe(Pipe<MioTcpStream, TcpListener>),
         SendProxyProtocol(SendProxyProtocol<MioTcpStream>),
         RelayProxyProtocol(RelayProxyProtocol<MioTcpStream>),
         ExpectProxyProtocol(ExpectProxyProtocol<MioTcpStream>),
+        SniPreread(SniPreread<MioTcpStream>),
     }
 }
 
@@ -130,6 +137,21 @@ pub struct TcpSession {
     /// the close path's untrack when the feature is disabled or no
     /// admit ever ran.
     cluster_ip_tracked: bool,
+    /// SNI-preread routing result (sozu-proxy/sozu#1279), captured once by
+    /// `upgrade_sni_preread` for every `proxy_protocol` case and consumed
+    /// (`Option::take`) at the point the session actually reaches `Pipe`:
+    /// immediately in `build_pipe_from_preread` for
+    /// `Expect`/`Relay`/`None`, or one `ready()` cycle later in
+    /// `upgrade_send` for `SendHeader` (which transitions through
+    /// `SendProxyProtocol` first). `None` for every non-SNI-routed session.
+    routed_sni: Option<String>,
+    /// Paired with `routed_sni`: the client's first ALPN offer, mapped to a
+    /// known `&'static str` label (`"h2"` / `"http/1.1"`) for the access
+    /// log, or `None` if the client offered nothing recognized. Sōzu never
+    /// negotiates ALPN itself on the TCP passthrough path -- the backend
+    /// terminates TLS -- so this is informational (the client's
+    /// preference), not a negotiated value.
+    routed_alpn_label: Option<&'static str>,
 }
 
 impl TcpSession {
@@ -243,6 +265,90 @@ impl TcpSession {
             request_id,
             state,
             cluster_ip_tracked: false,
+            routed_sni: None,
+            routed_alpn_label: None,
+        }
+    }
+
+    /// Construct a session that starts in [`TcpStateMachine::SniPreread`]
+    /// instead of resolving a `proxy_protocol` up front -- the cluster (and
+    /// therefore the per-cluster `proxy_protocol`) is only known once
+    /// [`crate::protocol::tcp_preread::SniPrereadCore`] decides a route.
+    /// Mirrors [`Self::new`]'s tail; kept as a separate constructor rather
+    /// than folding a synthetic sentinel into `proxy_protocol:
+    /// Option<ProxyProtocolConfig>` (a proto-generated enum this crate does
+    /// not own).
+    #[allow(clippy::too_many_arguments)]
+    fn new_sni_preread(
+        backend_buffer: Checkout,
+        configured_backend_timeout: Duration,
+        configured_connect_timeout: Duration,
+        frontend_buffer: Checkout,
+        frontend_token: Token,
+        listener: Rc<RefCell<TcpListener>>,
+        proxy: Rc<RefCell<TcpProxy>>,
+        socket: MioTcpStream,
+        wait_time: Duration,
+        preread_timeout: Duration,
+        effective_max_bytes: usize,
+    ) -> TcpSession {
+        let frontend_address = socket.peer_addr().ok();
+        let request_id = Ulid::generate();
+
+        // Armed with the SHORT preread timeout directly (not the listener's
+        // configured front_timeout) -- `upgrade_sni_preread` restores the
+        // configured duration on the SAME container once routed, so there is
+        // exactly one `TimeoutContainer` for the frontend token throughout,
+        // never a diverging clone (a clone independently rearmed to a
+        // shorter duration would strand `TcpSession::readable`'s own
+        // unconditional `reset()` on a since-cancelled timer-wheel entry).
+        let container_frontend_timeout = TimeoutContainer::new(preread_timeout, frontend_token);
+        let container_backend_timeout = TimeoutContainer::new_empty(configured_connect_timeout);
+
+        let state = TcpStateMachine::SniPreread(SniPreread::new(
+            socket,
+            frontend_token,
+            request_id,
+            frontend_buffer,
+            effective_max_bytes,
+        ));
+
+        // Enter the `SniPreread` state: +1 the active gauge exactly once, and
+        // unconditionally, so every one of the two `-1` decrements has a
+        // matching increment. The gauge is decremented on precisely one of the
+        // two mutually-exclusive exits: the "upgrade" exit in
+        // `upgrade_sni_preread` (which first transitions `self.state` away from
+        // `SniPreread`, so `close()` cannot re-decrement), and the
+        // "reject"/"teardown" exit in `close()`'s `StateMarker::SniPreread`
+        // arm. A session therefore nets to 0 and never underflows.
+        gauge_add!(names::tcp::sni_preread::ACTIVE, 1);
+
+        let metrics = SessionMetrics::new(Some(wait_time));
+
+        TcpSession {
+            backend_buffer: Some(backend_buffer),
+            backend_connected: BackendConnectionStatus::NotConnected,
+            backend_id: None,
+            backend_token: None,
+            backend: None,
+            cluster_id: None,
+            configured_backend_timeout,
+            connection_attempt: 0,
+            container_backend_timeout,
+            container_frontend_timeout,
+            frontend_address,
+            frontend_buffer: None,
+            frontend_token,
+            has_been_closed: false,
+            last_event: Instant::now(),
+            listener,
+            metrics,
+            proxy,
+            request_id,
+            state,
+            cluster_ip_tracked: false,
+            routed_sni: None,
+            routed_alpn_label: None,
         }
     }
 
@@ -262,6 +368,7 @@ impl TcpSession {
             TcpStateMachine::RelayProxyProtocol(rpp) => {
                 rpp.addresses.as_ref().and_then(|pa| pa.source())
             }
+            TcpStateMachine::SniPreread(preread) => preread.outcome().and_then(|o| o.proxy_source),
             TcpStateMachine::SendProxyProtocol(_) | TcpStateMachine::FailedUpgrade(_) => None,
         }
         .or(self.frontend_address)
@@ -303,8 +410,18 @@ impl TcpSession {
     }
 
     fn front_hup(&mut self) -> SessionResult {
+        let listener = self.listener.borrow();
         match &mut self.state {
             TcpStateMachine::Pipe(pipe) => pipe.frontend_hup(&mut self.metrics),
+            // No access log here, mirroring `readable()`'s own error paths
+            // for the other pre-Pipe states (none of them call
+            // `log_request()` either): the shell itself decides silent vs.
+            // metered based on whether any bytes were ever received.
+            TcpStateMachine::SniPreread(preread) => {
+                let cfg = listener.preread_config(preread.effective_max_bytes());
+                preread.on_front_closed(&cfg);
+                SessionResult::Close
+            }
             _ => {
                 self.log_request();
                 SessionResult::Close
@@ -313,6 +430,11 @@ impl TcpSession {
     }
 
     fn back_hup(&mut self) -> SessionResult {
+        // `SniPreread` falls into the wildcard catch-all below (unconditional
+        // close + access log), same as Send/Relay/Expect: a backend HUP
+        // while still prereading is an ordinary connect-time failure with no
+        // preread-specific accounting to do (the core only ever reasons
+        // about frontend bytes).
         match &mut self.state {
             TcpStateMachine::Pipe(pipe) => pipe.backend_hup(&mut self.metrics),
             _ => {
@@ -346,13 +468,31 @@ impl TcpSession {
                 log_context!(self)
             );
         }
-        match &mut self.state {
+        let listener = self.listener.borrow();
+        let result = match &mut self.state {
             TcpStateMachine::Pipe(pipe) => pipe.readable(&mut self.metrics),
             TcpStateMachine::RelayProxyProtocol(pp) => pp.readable(&mut self.metrics),
             TcpStateMachine::ExpectProxyProtocol(pp) => pp.readable(&mut self.metrics),
             TcpStateMachine::SendProxyProtocol(_) => SessionResult::Continue,
+            TcpStateMachine::SniPreread(preread) => {
+                let cfg = listener.preread_config(preread.effective_max_bytes());
+                preread.readable(&mut self.metrics, &cfg)
+            }
             TcpStateMachine::FailedUpgrade(_) => unreachable!(),
+        };
+        drop(listener);
+
+        // Sync `cluster_id` the moment SNI preread lands a route, so
+        // `connect_to_backend`'s cluster source (`self.cluster_id.clone().or_else(...)`)
+        // sees it without waiting for a second dispatch.
+        if let TcpStateMachine::SniPreread(preread) = &self.state
+            && self.cluster_id.is_none()
+            && let Some(outcome) = preread.outcome()
+        {
+            self.cluster_id = Some(outcome.cluster.clone());
         }
+
+        result
     }
 
     fn writable(&mut self) -> SessionResult {
@@ -387,6 +527,10 @@ impl TcpSession {
             TcpStateMachine::Pipe(pipe) => pipe.backend_writable(&mut self.metrics),
             TcpStateMachine::RelayProxyProtocol(pp) => pp.back_writable(&mut self.metrics),
             TcpStateMachine::SendProxyProtocol(pp) => pp.back_writable(&mut self.metrics),
+            // The FIRST backend-writable event while routed drives the
+            // upgrade out of `SniPreread` -- see
+            // `SniPreread::back_writable`'s doc and `upgrade_sni_preread`.
+            TcpStateMachine::SniPreread(preread) => preread.back_writable(),
             TcpStateMachine::ExpectProxyProtocol(_) => SessionResult::Continue,
             TcpStateMachine::FailedUpgrade(_) => {
                 unreachable!()
@@ -399,6 +543,7 @@ impl TcpSession {
             TcpStateMachine::Pipe(pipe) => pipe.back_socket_mut(),
             TcpStateMachine::SendProxyProtocol(pp) => pp.back_socket_mut(),
             TcpStateMachine::RelayProxyProtocol(pp) => pp.back_socket_mut(),
+            TcpStateMachine::SniPreread(preread) => preread.back_socket_mut(),
             TcpStateMachine::ExpectProxyProtocol(_) => None,
             TcpStateMachine::FailedUpgrade(_) => unreachable!(),
         }
@@ -409,6 +554,7 @@ impl TcpSession {
             TcpStateMachine::SendProxyProtocol(spp) => self.upgrade_send(spp),
             TcpStateMachine::RelayProxyProtocol(rpp) => self.upgrade_relay(rpp),
             TcpStateMachine::ExpectProxyProtocol(epp) => self.upgrade_expect(epp),
+            TcpStateMachine::SniPreread(preread) => self.upgrade_sni_preread(preread),
             TcpStateMachine::Pipe(_) => None,
             TcpStateMachine::FailedUpgrade(_) => todo!(),
         };
@@ -434,7 +580,28 @@ impl TcpSession {
                 self.listener.clone(),
             );
 
+            // `SendProxyProtocol::into_pipe` overwrites the whole readiness
+            // (clobbering the backend-writable interest `Pipe::new` armed for a
+            // non-empty inherited frontend buffer) and re-inserts only
+            // READABLE. That is harmless for a legacy `SendHeader` session
+            // (empty accumulator) but strands the coalesced payload tail carried
+            // in from `SniPreread`'s `SendHeader` branch (sozu-proxy/sozu#1279
+            // Defect C). Re-run the inherited-write arm by feeding the pipe's
+            // own current events back through `restore_readiness_events`; it is
+            // additive (never clears interest) and a no-op when the buffers are
+            // empty, so the legacy path is unaffected.
+            let frontend_event = pipe.frontend_readiness.event;
+            let backend_event = pipe.backend_readiness.event;
+            pipe.restore_readiness_events(frontend_event, backend_event);
+
             pipe.set_cluster_id(self.cluster_id.clone());
+            // Only `Some` when this `SendProxyProtocol` was itself reached
+            // via `upgrade_sni_preread`'s `SendHeader` branch (sozu-proxy/sozu#1279)
+            // -- a legacy, non-SNI-routed `SendHeader` cluster never
+            // populates these fields, so this is a no-op for it.
+            if let Some(sni) = self.routed_sni.take() {
+                pipe.set_tls_metadata(None, None, Some(sni), self.routed_alpn_label.take());
+            }
             gauge_add!(names::protocol::PROXY_SEND, -1);
             gauge_add!(names::protocol::TCP, 1);
             return Some(TcpStateMachine::Pipe(pipe));
@@ -490,12 +657,221 @@ impl TcpSession {
         None
     }
 
+    /// Dispatch out of [`TcpStateMachine::SniPreread`] once its backend has
+    /// connected, by the ROUTED cluster's `proxy_protocol` config:
+    ///
+    /// - `Some(SendHeader)` -> `SendProxyProtocol` synthesizes its OWN PPv2
+    ///   header for the backend, so any inbound PPv2 prefix this listener's
+    ///   `expect_proxy` preread already parsed (`content_offset` bytes) is
+    ///   dropped from the accumulator first: the wire order is `[synth
+    ///   PPv2][ClientHello...]`, never both headers back to back.
+    /// - `Some(ExpectHeader)` -> the inbound PPv2 prefix is consumed the
+    ///   same way (Sōzu terminates it locally; the backend never sees a
+    ///   PROXY header at all), then straight into `Pipe`.
+    /// - `Some(RelayHeader)` -> NO consume: the already-parsed inbound
+    ///   header bytes ARE the header this backend expects, replayed
+    ///   verbatim ahead of the ClientHello.
+    /// - `None` -> also consumed (a listener with `expect_proxy` but a
+    ///   `None`-proxy_protocol cluster still must not leak a stray inbound
+    ///   PPv2 prefix onto a backend that expects none; this is the one
+    ///   deviation this implementation adds beyond what the ledger item's
+    ///   text spelled out verbatim for `Expect`/`Relay`, inferred from the
+    ///   `SendHeader` wire-order note. See the final report's deviations.)
+    ///
+    /// `tcp.sni_preread.active` is decremented and `tcp.sni_preread.duration`
+    /// recorded exactly once here, on the "upgrade" exit named by the
+    /// gauge's `-1 on every exit` contract; the "reject"/"teardown" exits are
+    /// each other's counterpart in `SniPreread::handle_output` (metric only)
+    /// and `TcpSession::close`'s `StateMarker::SniPreread` arm (gauge).
+    fn upgrade_sni_preread(
+        &mut self,
+        mut preread: SniPreread<MioTcpStream>,
+    ) -> Option<TcpStateMachine> {
+        // Every early return below (a route decision missing, or the
+        // backend socket/token/buffer not yet wired) must happen BEFORE the
+        // `tcp.sni_preread.active` gauge is touched: `close()`'s
+        // `StateMarker::SniPreread` arm runs unconditionally whenever
+        // `self.state` is still (or, via `FailedUpgrade`, was last)
+        // `SniPreread` -- decrementing here AND there for the same session
+        // would underflow the gauge on this (defensive, should-never-happen)
+        // failure path.
+        let Some(outcome) = preread.outcome().cloned() else {
+            error!(
+                "{} upgrade_sni_preread called before a route decision",
+                log_context!(self)
+            );
+            return None;
+        };
+        let Some(backend_socket) = preread.backend.take() else {
+            error!(
+                "{} SNI preread upgrade with no backend socket set",
+                log_context!(self)
+            );
+            return None;
+        };
+        let Some(backend_token) = preread.backend_token else {
+            error!(
+                "{} SNI preread upgrade with no backend token set",
+                log_context!(self)
+            );
+            return None;
+        };
+        let Some(back_buffer) = self.backend_buffer.take() else {
+            error!(
+                "{} SNI preread upgrade with no backend buffer queued",
+                log_context!(self)
+            );
+            return None;
+        };
+
+        gauge_add!(names::tcp::sni_preread::ACTIVE, -1);
+        time!(
+            names::tcp::sni_preread::DURATION,
+            preread.started_at().elapsed().as_millis() as i64
+        );
+
+        self.cluster_id = Some(outcome.cluster.clone());
+        self.container_frontend_timeout
+            .set_duration(Duration::from_secs(
+                self.listener.borrow().config.front_timeout as u64,
+            ));
+        // Access-log tagging (design item 8): stash the routed SNI/ALPN for
+        // whichever of the four `proxy_protocol` branches below eventually
+        // reaches `Pipe` -- immediately via `build_pipe_from_preread` for
+        // `Expect`/`Relay`/`None`, or one `ready()` cycle later via
+        // `upgrade_send` for `SendHeader` (see that method and the
+        // `routed_sni` field doc).
+        self.routed_sni = Some(outcome.sni.clone());
+        self.routed_alpn_label = known_alpn_label(&outcome.alpn);
+
+        let proxy_protocol = self
+            .proxy
+            .borrow()
+            .configs
+            .get(&outcome.cluster)
+            .and_then(|c| c.proxy_protocol);
+
+        let frontend_event = preread.frontend_readiness.event;
+        let backend_event = preread.backend_readiness.event;
+        let mut frontend_buffer = preread.frontend_buffer;
+        let frontend = preread.frontend;
+        let frontend_token = preread.frontend_token;
+        let request_id = preread.request_id;
+
+        match proxy_protocol {
+            Some(ProxyProtocolConfig::SendHeader) => {
+                frontend_buffer.consume(outcome.content_offset);
+                self.frontend_buffer = Some(frontend_buffer);
+                self.backend_buffer = Some(back_buffer);
+                gauge_add!(names::protocol::PROXY_SEND, 1);
+                let mut spp = SendProxyProtocol::new(
+                    frontend,
+                    frontend_token,
+                    request_id,
+                    Some(backend_socket),
+                );
+                spp.frontend_readiness.event = frontend_event;
+                spp.backend_readiness.event = backend_event;
+                spp.set_back_token(backend_token);
+                spp.set_back_connected(BackendConnectionStatus::Connected);
+                Some(TcpStateMachine::SendProxyProtocol(spp))
+            }
+            Some(ProxyProtocolConfig::ExpectHeader) | None => {
+                frontend_buffer.consume(outcome.content_offset);
+                Some(self.build_pipe_from_preread(
+                    back_buffer,
+                    frontend_buffer,
+                    frontend,
+                    frontend_token,
+                    frontend_event,
+                    backend_event,
+                    backend_socket,
+                    backend_token,
+                    request_id,
+                    outcome.proxy_source,
+                    outcome.cluster,
+                ))
+            }
+            Some(ProxyProtocolConfig::RelayHeader) => Some(self.build_pipe_from_preread(
+                back_buffer,
+                frontend_buffer,
+                frontend,
+                frontend_token,
+                frontend_event,
+                backend_event,
+                backend_socket,
+                backend_token,
+                request_id,
+                outcome.proxy_source,
+                outcome.cluster,
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_pipe_from_preread(
+        &mut self,
+        back_buffer: Checkout,
+        frontend_buffer: Checkout,
+        frontend: MioTcpStream,
+        frontend_token: Token,
+        frontend_event: Ready,
+        backend_event: Ready,
+        backend_socket: MioTcpStream,
+        backend_token: Token,
+        request_id: Ulid,
+        proxy_source: Option<SocketAddr>,
+        cluster_id: ClusterId,
+    ) -> TcpStateMachine {
+        let addr = proxy_source.or(self.frontend_address);
+        let mut pipe = Pipe::new(
+            back_buffer,
+            self.backend_id.clone(),
+            Some(backend_socket),
+            None,
+            None,
+            None,
+            Some(cluster_id),
+            frontend_buffer,
+            frontend_token,
+            frontend,
+            self.listener.clone(),
+            Protocol::TCP,
+            request_id,
+            request_id,
+            addr,
+            WebSocketContext::Tcp,
+        );
+        // `Pipe::new` armed backend-writable for the inherited frontend
+        // accumulator (the ClientHello + any coalesced payload) via
+        // `arm_inherited_buffer_writes`. Restore the preread's readiness
+        // events through `restore_readiness_events` rather than a bare
+        // `pipe.frontend_readiness.event = …` / `pipe.backend_readiness.event
+        // = …` pair: it sets both `.event`s and THEN re-runs the inherited
+        // arm, so the synthetic backend-writable event survives even in the
+        // case where the restored `backend_event` does not itself carry
+        // WRITABLE (the byte-for-byte drain of the accumulator must not depend
+        // on that). The eventual flush-on-close of that accumulator is
+        // guaranteed by `Pipe::readable`'s half-close drain (sozu-proxy/sozu#1279).
+        pipe.restore_readiness_events(frontend_event, backend_event);
+        pipe.set_back_token(backend_token);
+        // Access-log tagging (design item 8): reaching `Pipe` straight from
+        // `SniPreread` (Expect/Relay/None) -- unlike `SendHeader`, which
+        // detours through `SendProxyProtocol` first (see `upgrade_send`).
+        if let Some(sni) = self.routed_sni.take() {
+            pipe.set_tls_metadata(None, None, Some(sni), self.routed_alpn_label.take());
+        }
+        gauge_add!(names::protocol::TCP, 1);
+        TcpStateMachine::Pipe(pipe)
+    }
+
     fn front_readiness(&mut self) -> &mut Readiness {
         match &mut self.state {
             TcpStateMachine::Pipe(pipe) => &mut pipe.frontend_readiness,
             TcpStateMachine::SendProxyProtocol(pp) => &mut pp.frontend_readiness,
             TcpStateMachine::RelayProxyProtocol(pp) => &mut pp.frontend_readiness,
             TcpStateMachine::ExpectProxyProtocol(pp) => &mut pp.frontend_readiness,
+            TcpStateMachine::SniPreread(preread) => &mut preread.frontend_readiness,
             TcpStateMachine::FailedUpgrade(_) => unreachable!(),
         }
     }
@@ -505,6 +881,7 @@ impl TcpSession {
             TcpStateMachine::Pipe(pipe) => Some(&mut pipe.backend_readiness),
             TcpStateMachine::SendProxyProtocol(pp) => Some(&mut pp.backend_readiness),
             TcpStateMachine::RelayProxyProtocol(pp) => Some(&mut pp.backend_readiness),
+            TcpStateMachine::SniPreread(preread) => Some(&mut preread.backend_readiness),
             TcpStateMachine::ExpectProxyProtocol(_) => None,
             TcpStateMachine::FailedUpgrade(_) => unreachable!(),
         }
@@ -515,6 +892,7 @@ impl TcpSession {
             TcpStateMachine::Pipe(pipe) => pipe.set_back_socket(socket),
             TcpStateMachine::SendProxyProtocol(pp) => pp.set_back_socket(socket),
             TcpStateMachine::RelayProxyProtocol(pp) => pp.set_back_socket(socket),
+            TcpStateMachine::SniPreread(preread) => preread.set_back_socket(socket),
             TcpStateMachine::ExpectProxyProtocol(_) => {
                 error!(
                     "{} We should not set the back socket for the expect proxy protocol",
@@ -542,6 +920,7 @@ impl TcpSession {
         match &mut self.state {
             TcpStateMachine::Pipe(pipe) => pipe.set_back_token(token),
             TcpStateMachine::SendProxyProtocol(pp) => pp.set_back_token(token),
+            TcpStateMachine::SniPreread(preread) => preread.set_back_token(token),
             TcpStateMachine::RelayProxyProtocol(pp) => pp.set_back_token(token),
             TcpStateMachine::ExpectProxyProtocol(_) => self.backend_token = Some(token),
             TcpStateMachine::FailedUpgrade(_) => unreachable!(),
@@ -795,6 +1174,49 @@ impl TcpSession {
         }
     }
 
+    /// Attempt a fresh backend connect, exactly like `ready_inner`'s
+    /// top-of-function gate -- but callable a second time from inside the
+    /// dispatch loop. A `SniPreread` session's route decision can complete
+    /// INSIDE `readable()`'s own dispatch (the SAME `ready_inner` call), and
+    /// without a second attempt right after that dispatch the session would
+    /// stall until an unrelated readiness event re-entered `ready_inner`.
+    ///
+    /// A no-op whenever `back_connected() != NotConnected` (already
+    /// attempted, or backend already up) or the state is a NOT-YET-ROUTED
+    /// `SniPreread` (the cluster -- and therefore the backend to dial -- is
+    /// unknown until `SniPrereadCore` decides), so this changes nothing for
+    /// any pre-existing state/path.
+    fn attempt_backend_connect_if_needed(
+        &mut self,
+        session: &Rc<RefCell<dyn ProxySession>>,
+    ) -> Option<SessionResult> {
+        if self.back_connected() != BackendConnectionStatus::NotConnected {
+            return None;
+        }
+        if matches!(&self.state, TcpStateMachine::SniPreread(preread) if !preread.is_routed()) {
+            return None;
+        }
+
+        let connection_result = self.connect_to_backend(session.clone());
+        if let Err(err) = &connection_result {
+            match err {
+                // Already logged at warn! + metered at the retry-budget
+                // gate in connect_to_backend; avoid double-emission.
+                BackendConnectionError::MaxConnectionRetries(_) => trace!(
+                    "{} Error connecting to backend: {}",
+                    log_context!(self),
+                    err
+                ),
+                _ => warn!(
+                    "{} Error connecting to backend: {}",
+                    log_context!(self),
+                    err
+                ),
+            }
+        }
+        handle_connection_result(connection_result)
+    }
+
     fn ready_inner(&mut self, session: Rc<RefCell<dyn ProxySession>>) -> SessionResult {
         let mut counter = 0;
 
@@ -836,26 +1258,10 @@ impl TcpSession {
                 self.connection_attempt = 0;
                 self.set_back_connected(BackendConnectionStatus::Connected);
             }
-        } else if back_connected == BackendConnectionStatus::NotConnected {
-            let connection_result = self.connect_to_backend(session.clone());
-            if let Err(err) = &connection_result {
-                match err {
-                    BackendConnectionError::MaxConnectionRetries(_) => trace!(
-                        "{} Error connecting to backend: {}",
-                        log_context!(self),
-                        err
-                    ),
-                    _ => warn!(
-                        "{} Error connecting to backend: {}",
-                        log_context!(self),
-                        err
-                    ),
-                }
-            }
-
-            if let Some(state_result) = handle_connection_result(connection_result) {
-                return state_result;
-            }
+        } else if back_connected == BackendConnectionStatus::NotConnected
+            && let Some(state_result) = self.attempt_backend_connect_if_needed(&session)
+        {
+            return state_result;
         }
 
         if self.front_readiness().event.is_hup() {
@@ -898,6 +1304,15 @@ impl TcpSession {
                 let session_result = self.readable();
                 if session_result != SessionResult::Continue {
                     return session_result;
+                }
+                // A `SniPreread` route decision can complete INSIDE this
+                // very `readable()` call; without a second attempt here the
+                // session would stall until an unrelated readiness event
+                // re-entered `ready_inner` to reach the top-of-function
+                // connect gate. A no-op for every other state/backend
+                // status (see `attempt_backend_connect_if_needed`'s guard).
+                if let Some(state_result) = self.attempt_backend_connect_if_needed(&session) {
+                    return state_result;
                 }
             }
 
@@ -1078,11 +1493,15 @@ impl TcpSession {
             CONN_RETRIES
         );
 
+        // Prefer the SNI-routed cluster (set by `TcpSession::readable` once
+        // `SniPrereadCore` decides) over the listener's legacy no-SNI
+        // catch-all -- a listener never configures both (sozu-proxy/sozu#1279),
+        // but this order is also simply correct for the routed case, where
+        // `listener.cluster_id` is `None`.
         let cluster_id = self
-            .listener
-            .borrow()
             .cluster_id
             .clone()
+            .or_else(|| self.listener.borrow().cluster_id.clone())
             .ok_or(BackendConnectionError::NotFound(ObjectKind::TcpCluster))?;
 
         self.cluster_id = Some(cluster_id.clone());
@@ -1242,12 +1661,28 @@ impl ProxySession for TcpSession {
             self.cluster_ip_tracked = false;
         }
 
-        // Restore gauges
+        // Restore gauges. `SniPreread` is the "reject"/"teardown" half of
+        // `tcp.sni_preread.active`'s "-1 on every exit" contract -- the
+        // "upgrade" exit already decremented it in `upgrade_sni_preread`,
+        // which also transitions `self.state` away from `SniPreread` before
+        // `close()` can ever observe that marker again. A session that
+        // reaches `close()` still marked `SniPreread` (directly, or via
+        // `FailedUpgrade(SniPreread)` if `upgrade_sni_preread` itself failed)
+        // therefore never had its gauge/duration accounted for yet.
         match self.state.marker() {
             StateMarker::Pipe => gauge_add!(names::protocol::TCP, -1),
             StateMarker::SendProxyProtocol => gauge_add!(names::protocol::PROXY_SEND, -1),
             StateMarker::RelayProxyProtocol => gauge_add!(names::protocol::PROXY_RELAY, -1),
             StateMarker::ExpectProxyProtocol => gauge_add!(names::protocol::PROXY_EXPECT, -1),
+            StateMarker::SniPreread => {
+                gauge_add!(names::tcp::sni_preread::ACTIVE, -1);
+                if let TcpStateMachine::SniPreread(preread) = &self.state {
+                    time!(
+                        names::tcp::sni_preread::DURATION,
+                        preread.started_at().elapsed().as_millis() as i64
+                    );
+                }
+            }
         }
 
         if self.state.failed() {
@@ -1256,6 +1691,7 @@ impl ProxySession for TcpSession {
                 StateMarker::SendProxyProtocol => incr!(names::tcp::UPGRADE_SEND_FAILED),
                 StateMarker::RelayProxyProtocol => incr!(names::tcp::UPGRADE_RELAY_FAILED),
                 StateMarker::ExpectProxyProtocol => incr!(names::tcp::UPGRADE_EXPECT_FAILED),
+                StateMarker::SniPreread => incr!(names::tcp::UPGRADE_SNI_PREREAD_FAILED),
             }
             return;
         }
@@ -1328,6 +1764,15 @@ impl ProxySession for TcpSession {
         );
         if self.frontend_token == token {
             self.container_frontend_timeout.triggered();
+            // The preread deadline firing always closes the session either
+            // way (matches every other state's front-timeout behavior);
+            // this only exists for its `tcp.sni_preread.rejected.fragmented`
+            // metric + log side effect.
+            if let TcpStateMachine::SniPreread(preread) = &mut self.state {
+                let listener = self.listener.borrow();
+                let cfg = listener.preread_config(preread.effective_max_bytes());
+                preread.on_timeout(&cfg);
+            }
             return true;
         }
         if self.backend_token == Some(token) {
@@ -1402,6 +1847,7 @@ impl ProxySession for TcpSession {
             TcpStateMachine::SendProxyProtocol(_) => String::from("Send"),
             TcpStateMachine::RelayProxyProtocol(_) => String::from("Relay"),
             TcpStateMachine::Pipe(_) => String::from("TCP"),
+            TcpStateMachine::SniPreread(_) => String::from("SniPreread"),
             TcpStateMachine::FailedUpgrade(marker) => format!("FailedUpgrade({marker:?})"),
         };
 
@@ -1410,6 +1856,7 @@ impl ProxySession for TcpSession {
             TcpStateMachine::SendProxyProtocol(send) => Some(&send.frontend_readiness),
             TcpStateMachine::RelayProxyProtocol(relay) => Some(&relay.frontend_readiness),
             TcpStateMachine::Pipe(pipe) => Some(&pipe.frontend_readiness),
+            TcpStateMachine::SniPreread(preread) => Some(&preread.frontend_readiness),
             TcpStateMachine::FailedUpgrade(_) => None,
         };
 
@@ -1417,6 +1864,7 @@ impl ProxySession for TcpSession {
             TcpStateMachine::SendProxyProtocol(send) => Some(&send.backend_readiness),
             TcpStateMachine::RelayProxyProtocol(relay) => Some(&relay.backend_readiness),
             TcpStateMachine::Pipe(pipe) => Some(&pipe.backend_readiness),
+            TcpStateMachine::SniPreread(preread) => Some(&preread.backend_readiness),
             TcpStateMachine::ExpectProxyProtocol(_) => None,
             TcpStateMachine::FailedUpgrade(_) => None,
         };
@@ -1451,6 +1899,13 @@ pub struct TcpListener {
     cluster_id: Option<String>,
     config: TcpListenerConfig,
     listener: Option<MioTcpListener>,
+    /// SNI -> `(AlpnMatcher, ClusterId)` route table (sozu-proxy/sozu#1279).
+    /// Populated by `add_tcp_front`/`remove_tcp_front` from
+    /// `RequestTcpFrontend.sni`/`.alpn`; empty for a listener whose fronts
+    /// are all no-SNI (the legacy `cluster_id` catch-all). A listener never
+    /// mixes both (enforced at config load, `command/src/config.rs`), but
+    /// `create_session`'s routing gate stays defensive and checks both.
+    sni_routes: TrieNode<Vec<(AlpnMatcher, ClusterId)>>,
     tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
@@ -1492,8 +1947,164 @@ impl TcpListener {
             address: config.address.into(),
             config,
             active: false,
+            sni_routes: TrieNode::root(),
             tags: BTreeMap::new(),
         })
+    }
+
+    /// Build the [`PrereadConfig`] this listener's `SniPreread` sessions
+    /// feed to [`crate::protocol::tcp_preread::SniPrereadCore::handle_input`].
+    /// `routes`/`inbound_proxy`/`timeout` come straight from the listener
+    /// config; `effective_max_bytes` is session-specific (already clamped to
+    /// that session's buffer capacity at construction, see `create_session`),
+    /// so it is passed in rather than re-derived here.
+    fn preread_config(&self, effective_max_bytes: usize) -> PrereadConfig<'_> {
+        PrereadConfig {
+            routes: &self.sni_routes,
+            inbound_proxy: self.config.expect_proxy,
+            max_bytes: effective_max_bytes,
+            timeout: Duration::from_secs(u64::from(
+                self.config
+                    .sni_preread_timeout
+                    .unwrap_or(DEFAULT_SNI_PREREAD_TIMEOUT),
+            )),
+            accept_wildcard: true,
+        }
+    }
+
+    /// Validate an incoming `AddTcpFrontend` against this listener's
+    /// CURRENT routing state before any mutation, mirroring
+    /// `command/src/config.rs`'s TOML config-load TCP SNI/ALPN invariants
+    /// (sozu-proxy/sozu#1279):
+    ///
+    /// - `alpn` set with no `sni`: the worker's no-SNI catch-all path never
+    ///   consults `alpn`, so the protocol list would silently never be
+    ///   enforced (mirrors `ConfigError::AlpnWithoutSni`).
+    /// - a no-SNI frontend added to a listener that already has SNI-scoped
+    ///   routes, or an SNI-scoped frontend added to a listener that already
+    ///   has a no-SNI catch-all cluster (mirrors
+    ///   `ConfigError::TcpListenerMixesSniAndNoSni`).
+    /// - an ALPN protocol, or a catch-all (empty `alpn`), that overlaps an
+    ///   existing route already registered for the same `(address, sni)`
+    ///   (mirrors `ConfigError::TcpFrontendAlpnOverlap` /
+    ///   `TcpFrontendMultipleAlpnCatchAll`).
+    ///
+    /// Config-load already rejects all of these shapes for requests built
+    /// from a TOML file, but `AddTcpFrontend` can also arrive directly over
+    /// the command socket, or via `LoadState` replay of a hand-edited or
+    /// stale state file, bypassing config.rs entirely -- the worker must
+    /// not silently corrupt its own routing table when that happens.
+    fn validate_new_tcp_front(&self, front: &RequestTcpFrontend) -> Result<(), ProxyError> {
+        let reject = |reason: String| {
+            Err(ProxyError::InvalidTcpFrontend {
+                address: self.address,
+                reason,
+            })
+        };
+
+        match &front.sni {
+            None => {
+                if !front.alpn.is_empty() {
+                    return reject(format!(
+                        "alpn = {:?} set without sni: alpn only matches within an SNI-scoped \
+                         preread, so a frontend without sni would silently ignore its alpn list",
+                        front.alpn
+                    ));
+                }
+                if !self.sni_routes.is_empty() {
+                    return reject(
+                        "a no-SNI frontend cannot be added to a listener that already has \
+                         SNI-scoped routes"
+                            .to_string(),
+                    );
+                }
+            }
+            Some(sni) => {
+                if self.cluster_id.is_some() {
+                    return reject(
+                        "an SNI-scoped frontend cannot be added to a listener that already has \
+                         a no-SNI catch-all cluster"
+                            .to_string(),
+                    );
+                }
+
+                // Same key + same accept_wildcard as `insert_sni_route`'s own
+                // lookup, so this checks against exactly the entries the new
+                // route would be appended alongside.
+                let key = sni.to_ascii_lowercase().into_bytes();
+                if let Some((_, existing)) = self.sni_routes.domain_lookup(&key, true) {
+                    let new_is_catch_all = front.alpn.is_empty();
+                    for (matcher, _cluster_id) in existing {
+                        match matcher {
+                            AlpnMatcher::Any if new_is_catch_all => {
+                                return reject(format!(
+                                    "sni {sni:?} already has a catch-all (empty alpn) \
+                                     frontend: at most one frontend per (address, sni) may \
+                                     omit alpn"
+                                ));
+                            }
+                            AlpnMatcher::OneOf(protocols) => {
+                                if let Some(overlap) = front
+                                    .alpn
+                                    .iter()
+                                    .find(|protocol| protocols.contains(protocol.as_bytes()))
+                                {
+                                    return reject(format!(
+                                        "sni {sni:?} already has a frontend matching ALPN \
+                                         protocol {overlap:?}: ALPN matchers for the same \
+                                         (address, sni) must not overlap"
+                                    ));
+                                }
+                            }
+                            AlpnMatcher::Any => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Add one `(AlpnMatcher, ClusterId)` entry to this listener's SNI route
+    /// table, appending to the SNI key's existing `Vec` if one is already
+    /// present rather than clobbering it (multiple ALPN-scoped fronts can
+    /// share the same SNI). `sni` is defensively lowercased: the
+    /// SNI-preread core normalizes (lowercase, no trailing dot) before ever
+    /// looking a route up, so the table key must already be in that form.
+    fn insert_sni_route(&mut self, sni: String, alpn: Vec<String>, cluster_id: ClusterId) {
+        let key = sni.to_ascii_lowercase().into_bytes();
+        let matcher = if alpn.is_empty() {
+            AlpnMatcher::Any
+        } else {
+            AlpnMatcher::OneOf(alpn.into_iter().map(String::into_bytes).collect())
+        };
+        match self.sni_routes.domain_lookup_mut(&key, true) {
+            Some((_, entries)) => entries.push((matcher, cluster_id)),
+            None => {
+                self.sni_routes
+                    .domain_insert(key, vec![(matcher, cluster_id)]);
+            }
+        }
+    }
+
+    /// Symmetric counterpart to [`Self::insert_sni_route`]: removes the
+    /// matching `(AlpnMatcher, ClusterId)` entry, then `domain_remove`s the
+    /// SNI key itself once its `Vec` is empty (no stranded empty entries in
+    /// the trie).
+    fn remove_sni_route(&mut self, sni: String, alpn: Vec<String>, cluster_id: &ClusterId) {
+        let key = sni.to_ascii_lowercase().into_bytes();
+        let matcher = if alpn.is_empty() {
+            AlpnMatcher::Any
+        } else {
+            AlpnMatcher::OneOf(alpn.into_iter().map(String::into_bytes).collect())
+        };
+        if let Some((_, entries)) = self.sni_routes.domain_lookup_mut(&key, true) {
+            entries.retain(|(m, c)| !(*m == matcher && c == cluster_id));
+            if entries.is_empty() {
+                self.sni_routes.domain_remove(&key);
+            }
+        }
     }
 
     pub fn activate(
@@ -1560,6 +2171,43 @@ fn handle_connection_result(
             // we may want to retry instead of closing
             Some(SessionResult::Close)
         }
+    }
+}
+
+/// `min(listener.config.sni_preread_max_bytes, frontend_buffer.capacity())`,
+/// floored at [`MIN_SNI_PREREAD_MAX_BYTES`] -- the SNI-preread core has no
+/// independent backstop of its own (`SniPrereadCore::handle_input` trusts
+/// `PrereadConfig::max_bytes` entirely), so the shell must never hand it a
+/// cap the checked-out buffer cannot actually hold (the `min`), NOR a cap so
+/// small the preread read is zero-length and spins until the loop guard (the
+/// `max`). Config-load rejects a sub-floor `sni_preread_max_bytes` loudly
+/// (`ConfigError::SniPrereadMaxBytesTooSmall`), but a `0` knob from a direct
+/// `sozu listener tcp add`/`update` CLI/IPC request, or a stale `LoadState`
+/// replay, bypasses that check and reaches the worker -- this floor degrades
+/// it to the 5-byte TLS-record-header minimum instead, killing the spin for
+/// EVERY config source at the single point of use. `buffer_capacity` is
+/// always `>= MIN_SNI_PREREAD_MAX_BYTES` in practice (buffers are KB-sized),
+/// so the `min` never fights the `max`.
+fn effective_sni_preread_max_bytes(configured: Option<u32>, buffer_capacity: usize) -> usize {
+    (configured.unwrap_or(DEFAULT_SNI_PREREAD_MAX_BYTES) as usize)
+        .min(buffer_capacity)
+        .max(MIN_SNI_PREREAD_MAX_BYTES as usize)
+}
+
+/// Access-log ALPN tag for an SNI-routed TCP session: the client's FIRST
+/// offered protocol (client preference order, matching
+/// `SniPrereadCore::route`'s own routing precedence), mapped to a known
+/// `&'static str` label -- the same two labels `https.rs`'s own ALPN
+/// negotiation records (`"h2"` / `"http/1.1"`) -- so `tcp.sni_preread`
+/// sessions and terminated-TLS sessions chart under the same values.
+/// `None` for an empty offer or an unrecognized protocol: Sōzu never
+/// terminates TLS on this path, so this is the client's stated preference,
+/// not a negotiated outcome.
+fn known_alpn_label(offered: &[Vec<u8>]) -> Option<&'static str> {
+    match offered.first().map(Vec::as_slice) {
+        Some(b"h2") => Some("h2"),
+        Some(b"http/1.1") => Some("http/1.1"),
+        _ => None,
     }
 }
 
@@ -1709,10 +2357,34 @@ impl TcpProxy {
             .ok_or(ProxyError::NoListenerFound(address))?
             .borrow_mut();
 
+        // Hard-reject a request that would corrupt this listener's SNI/ALPN
+        // routing invariants BEFORE any mutation below. Config-load
+        // (`command/src/config.rs`, sozu-proxy/sozu#1279) already rejects
+        // the same shapes for TOML-sourced requests, but `AddTcpFrontend`
+        // can also arrive directly over the command socket, or via
+        // `LoadState` replay of a hand-edited/stale state file, bypassing
+        // config.rs entirely.
+        listener.validate_new_tcp_front(&front)?;
+
         self.fronts
             .insert(front.cluster_id.to_string(), listener.token);
         listener.set_tags(address.to_string(), Some(front.tags));
-        listener.cluster_id = Some(front.cluster_id);
+
+        match front.sni {
+            Some(sni) => listener.insert_sni_route(sni, front.alpn, front.cluster_id),
+            None => {
+                listener.cluster_id = Some(front.cluster_id);
+            }
+        }
+
+        // POST: the mixing invariant must hold after every successful add —
+        // `validate_new_tcp_front` is the enforcement point above, this is
+        // the cheap live re-check that it actually held.
+        debug_assert!(
+            listener.cluster_id.is_none() || listener.sni_routes.is_empty(),
+            "a TCP listener must never mix a no-SNI catch-all cluster with SNI-scoped routes"
+        );
+
         Ok(())
     }
 
@@ -1729,9 +2401,19 @@ impl TcpProxy {
         };
 
         listener.set_tags(address.to_string(), None);
-        if let Some(cluster_id) = listener.cluster_id.take() {
-            self.fronts.remove(&cluster_id);
+
+        match front.sni {
+            Some(sni) => {
+                listener.remove_sni_route(sni, front.alpn, &front.cluster_id);
+                self.fronts.remove(&front.cluster_id);
+            }
+            None => {
+                if let Some(cluster_id) = listener.cluster_id.take() {
+                    self.fronts.remove(&cluster_id);
+                }
+            }
         }
+
         Ok(())
     }
 }
@@ -1878,7 +2560,10 @@ impl ProxyConfiguration for TcpProxy {
             }
         };
 
-        if owned.cluster_id.is_none() {
+        // A listener may route either by a legacy no-SNI catch-all cluster
+        // OR by SNI-scoped routes (never both -- enforced at config load,
+        // sozu-proxy/sozu#1279); reject only when NEITHER is configured.
+        if owned.cluster_id.is_none() && owned.sni_routes.is_empty() {
             error!(
                 "{} listener at address {:?} has no linked cluster",
                 log_module_context!(),
@@ -1886,11 +2571,6 @@ impl ProxyConfiguration for TcpProxy {
             );
             return Err(AcceptError::IoError);
         }
-
-        let proxy_protocol = self
-            .configs
-            .get(owned.cluster_id.as_ref().unwrap())
-            .and_then(|c| c.proxy_protocol);
 
         if let Err(e) = frontend_sock.set_nodelay(true) {
             error!(
@@ -1919,21 +2599,54 @@ impl ProxyConfiguration for TcpProxy {
             return Err(AcceptError::RegisterError);
         }
 
-        let session = TcpSession::new(
-            back_buffer,
-            None,
-            owned.cluster_id.clone(),
-            Duration::from_secs(owned.config.back_timeout as u64),
-            Duration::from_secs(owned.config.connect_timeout as u64),
-            Duration::from_secs(owned.config.front_timeout as u64),
-            front_buffer,
-            frontend_token,
-            listener.clone(),
-            proxy_protocol,
-            proxy,
-            frontend_sock,
-            wait_time,
-        );
+        let session = if !owned.sni_routes.is_empty() {
+            // Routing decides the cluster post-accept; the effective
+            // preread cap can never exceed what the checked-out buffer can
+            // actually hold, regardless of the configured knob.
+            let effective_max_bytes = effective_sni_preread_max_bytes(
+                owned.config.sni_preread_max_bytes,
+                front_buffer.capacity(),
+            );
+            let preread_timeout = Duration::from_secs(u64::from(
+                owned
+                    .config
+                    .sni_preread_timeout
+                    .unwrap_or(DEFAULT_SNI_PREREAD_TIMEOUT),
+            ));
+            TcpSession::new_sni_preread(
+                back_buffer,
+                Duration::from_secs(owned.config.back_timeout as u64),
+                Duration::from_secs(owned.config.connect_timeout as u64),
+                front_buffer,
+                frontend_token,
+                listener.clone(),
+                proxy,
+                frontend_sock,
+                wait_time,
+                preread_timeout,
+                effective_max_bytes,
+            )
+        } else {
+            let proxy_protocol = self
+                .configs
+                .get(owned.cluster_id.as_ref().unwrap())
+                .and_then(|c| c.proxy_protocol);
+            TcpSession::new(
+                back_buffer,
+                None,
+                owned.cluster_id.clone(),
+                Duration::from_secs(owned.config.back_timeout as u64),
+                Duration::from_secs(owned.config.connect_timeout as u64),
+                Duration::from_secs(owned.config.front_timeout as u64),
+                front_buffer,
+                frontend_token,
+                listener.clone(),
+                proxy_protocol,
+                proxy,
+                frontend_sock,
+                wait_time,
+            )
+        };
         incr!(names::tcp::REQUESTS);
 
         let session = Rc::new(RefCell::new(session));
@@ -2280,5 +2993,652 @@ mod tests {
         }
 
         Ok(command)
+    }
+}
+
+/// Unit coverage for the SNI-preread routing shell added for
+/// sozu-proxy/sozu#1279: the route-table mutations (`add_tcp_front` /
+/// `remove_tcp_front`), the `AlpnMatcher` mapping, the effective preread
+/// cap, and the routing gate's data invariants. None of this needs a live
+/// socket or event loop -- it is a separate module (rather than nested in
+/// the `tests` module above) purely to avoid that module's `use
+/// std::net::TcpListener` import shadowing `super::TcpListener` (this
+/// crate's listener struct).
+#[cfg(test)]
+mod sni_routing_tests {
+    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
+
+    use super::*;
+    use crate::testing::{ServerParts, prebuild_server, provide_port};
+
+    fn test_listener() -> TcpListener {
+        let config = ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, provide_port()))
+            .to_tcp(None)
+            .expect("could not build a TcpListenerConfig for the test");
+        TcpListener::new(config, Token(0)).expect("could not build a bare TcpListener for the test")
+    }
+
+    fn frontend(cluster_id: &str, sni: Option<&str>, alpn: &[&str]) -> RequestTcpFrontend {
+        RequestTcpFrontend {
+            cluster_id: cluster_id.to_owned(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, provide_port()),
+            sni: sni.map(str::to_owned),
+            alpn: alpn.iter().map(|p| p.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    // ---- effective_sni_preread_max_bytes ------------------------------
+
+    #[test]
+    fn effective_max_bytes_falls_back_to_default_when_unconfigured() {
+        assert_eq!(
+            effective_sni_preread_max_bytes(None, 65536),
+            DEFAULT_SNI_PREREAD_MAX_BYTES as usize
+        );
+    }
+
+    #[test]
+    fn effective_max_bytes_is_the_min_of_knob_and_capacity() {
+        assert_eq!(effective_sni_preread_max_bytes(Some(8192), 16384), 8192);
+        assert_eq!(effective_sni_preread_max_bytes(Some(32768), 16384), 16384);
+        assert_eq!(effective_sni_preread_max_bytes(Some(16384), 16384), 16384);
+    }
+
+    #[test]
+    fn effective_max_bytes_never_below_the_floor() {
+        // A `sni_preread_max_bytes = 0` knob reaching the worker from a
+        // direct `sozu listener tcp add`/`update` CLI/IPC request (or a stale
+        // LoadState replay) bypasses config.rs's loud MIN_SNI_PREREAD_MAX_BYTES
+        // load-time reject. Without the floor the shell would issue
+        // zero-length preread reads and spin until the loop guard closes each
+        // session; the floor degrades a sub-minimum knob to the 5-byte
+        // TLS-record-header minimum instead.
+        assert_eq!(
+            effective_sni_preread_max_bytes(Some(0), 16384),
+            MIN_SNI_PREREAD_MAX_BYTES as usize,
+            "a 0 knob must degrade to the floor, never 0 (would spin the preread)"
+        );
+        assert_eq!(
+            effective_sni_preread_max_bytes(Some(3), 16384),
+            MIN_SNI_PREREAD_MAX_BYTES as usize,
+            "any sub-floor knob must be raised to the floor"
+        );
+        // The floor itself, and anything above it, are respected unchanged.
+        assert_eq!(
+            effective_sni_preread_max_bytes(Some(MIN_SNI_PREREAD_MAX_BYTES), 16384),
+            MIN_SNI_PREREAD_MAX_BYTES as usize
+        );
+        assert_eq!(
+            effective_sni_preread_max_bytes(Some(MIN_SNI_PREREAD_MAX_BYTES + 1), 16384),
+            (MIN_SNI_PREREAD_MAX_BYTES + 1) as usize
+        );
+    }
+
+    // ---- known_alpn_label (access-log tagging, design item 8) ----------
+
+    #[test]
+    fn known_alpn_label_picks_the_clients_first_offer() {
+        assert_eq!(
+            known_alpn_label(&[b"h2".to_vec(), b"http/1.1".to_vec()]),
+            Some("h2")
+        );
+        assert_eq!(
+            known_alpn_label(&[b"http/1.1".to_vec(), b"h2".to_vec()]),
+            Some("http/1.1"),
+            "client preference order must win, not a fixed h2-first priority"
+        );
+    }
+
+    #[test]
+    fn known_alpn_label_is_none_for_empty_or_unrecognized_offers() {
+        assert_eq!(known_alpn_label(&[]), None);
+        assert_eq!(known_alpn_label(&[b"spdy/1".to_vec()]), None);
+    }
+
+    // ---- AlpnMatcher mapping + route-table add/remove symmetry --------
+
+    #[test]
+    fn empty_alpn_maps_to_any_non_empty_maps_to_one_of() {
+        let mut listener = test_listener();
+        listener.insert_sni_route("example.com".to_owned(), vec![], "cluster-any".to_owned());
+        listener.insert_sni_route(
+            "h2.example.com".to_owned(),
+            vec!["h2".to_owned(), "http/1.1".to_owned()],
+            "cluster-h2".to_owned(),
+        );
+
+        let (_, any_entries) = listener
+            .sni_routes
+            .domain_lookup(b"example.com", true)
+            .expect("example.com must be routable");
+        assert_eq!(
+            any_entries,
+            &vec![(AlpnMatcher::Any, "cluster-any".to_owned())]
+        );
+
+        let (_, h2_entries) = listener
+            .sni_routes
+            .domain_lookup(b"h2.example.com", true)
+            .expect("h2.example.com must be routable");
+        assert_eq!(
+            h2_entries,
+            &vec![(
+                AlpnMatcher::OneOf([b"h2".to_vec(), b"http/1.1".to_vec()].into_iter().collect()),
+                "cluster-h2".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn insert_sni_route_appends_under_the_same_sni() {
+        let mut listener = test_listener();
+        listener.insert_sni_route(
+            "example.com".to_owned(),
+            vec!["h2".to_owned()],
+            "cluster-h2".to_owned(),
+        );
+        listener.insert_sni_route(
+            "example.com".to_owned(),
+            vec![],
+            "cluster-default".to_owned(),
+        );
+
+        let (_, entries) = listener
+            .sni_routes
+            .domain_lookup(b"example.com", true)
+            .expect("example.com must be routable");
+        assert_eq!(entries.len(), 2, "both fronts must share the SNI's Vec");
+    }
+
+    #[test]
+    fn remove_sni_route_drops_only_the_matching_entry() {
+        let mut listener = test_listener();
+        listener.insert_sni_route(
+            "example.com".to_owned(),
+            vec!["h2".to_owned()],
+            "cluster-h2".to_owned(),
+        );
+        listener.insert_sni_route(
+            "example.com".to_owned(),
+            vec![],
+            "cluster-default".to_owned(),
+        );
+
+        listener.remove_sni_route(
+            "example.com".to_owned(),
+            vec!["h2".to_owned()],
+            &"cluster-h2".to_owned(),
+        );
+
+        let (_, entries) = listener
+            .sni_routes
+            .domain_lookup(b"example.com", true)
+            .expect("example.com must still be routable via the remaining entry");
+        assert_eq!(
+            entries,
+            &vec![(AlpnMatcher::Any, "cluster-default".to_owned())],
+            "removing one entry must not disturb the other"
+        );
+    }
+
+    #[test]
+    fn remove_sni_route_empties_the_trie_key_when_the_last_entry_goes() {
+        let mut listener = test_listener();
+        listener.insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned());
+        assert!(!listener.sni_routes.is_empty());
+
+        listener.remove_sni_route("example.com".to_owned(), vec![], &"cluster-a".to_owned());
+
+        assert!(
+            listener.sni_routes.is_empty(),
+            "domain_remove must run once the SNI's Vec empties, leaving no stranded key"
+        );
+        assert!(
+            listener
+                .sni_routes
+                .domain_lookup(b"example.com", true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn remove_sni_route_on_an_absent_sni_is_a_harmless_no_op() {
+        let mut listener = test_listener();
+        listener.insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned());
+
+        // Removing a route for a SNI that was never inserted must not panic
+        // and must not disturb the existing route.
+        listener.remove_sni_route(
+            "other.example.net".to_owned(),
+            vec![],
+            &"cluster-a".to_owned(),
+        );
+
+        assert!(
+            listener
+                .sni_routes
+                .domain_lookup(b"example.com", true)
+                .is_some()
+        );
+    }
+
+    // ---- routing gate data invariant: never both cluster_id AND routes ----
+
+    #[test]
+    fn a_no_sni_front_leaves_the_route_table_empty() {
+        let mut listener = test_listener();
+        listener.cluster_id = Some("legacy-catch-all".to_owned());
+        assert!(
+            listener.sni_routes.is_empty(),
+            "a listener with only a no-SNI front must never populate sni_routes"
+        );
+    }
+
+    #[test]
+    fn an_sni_scoped_front_leaves_cluster_id_unset() {
+        let mut listener = test_listener();
+        listener.insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned());
+        assert!(
+            listener.cluster_id.is_none(),
+            "a listener with only SNI-scoped fronts must never populate the legacy cluster_id"
+        );
+    }
+
+    // ---- end-to-end through TcpProxy::add_tcp_front / remove_tcp_front ----
+
+    fn test_proxy() -> TcpProxy {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+        TcpProxy::new(registry, sessions, pool, backends)
+    }
+
+    #[test]
+    fn add_then_remove_sni_front_round_trips_through_tcp_proxy() {
+        let mut proxy = test_proxy();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build listener config");
+        let token = Token(0);
+        proxy
+            .add_listener(config, token)
+            .expect("could not add listener");
+
+        let front = RequestTcpFrontend {
+            cluster_id: "cluster-a".to_owned(),
+            address,
+            sni: Some("Example.COM".to_owned()),
+            alpn: vec![],
+            ..Default::default()
+        };
+        proxy
+            .add_tcp_front(front.clone())
+            .expect("add_tcp_front must succeed");
+
+        {
+            let listener = proxy
+                .listeners
+                .get(&token)
+                .expect("listener must be present")
+                .borrow();
+            assert!(listener.cluster_id.is_none());
+            let (_, entries) = listener
+                .sni_routes
+                // Lowercased at insert time regardless of wire-form casing.
+                .domain_lookup(b"example.com", true)
+                .expect("example.com must be routable after add_tcp_front");
+            assert_eq!(entries, &vec![(AlpnMatcher::Any, "cluster-a".to_owned())]);
+        }
+        assert_eq!(proxy.fronts.get("cluster-a"), Some(&token));
+
+        proxy
+            .remove_tcp_front(front)
+            .expect("remove_tcp_front must succeed");
+
+        {
+            let listener = proxy
+                .listeners
+                .get(&token)
+                .expect("listener must be present")
+                .borrow();
+            assert!(
+                listener.sni_routes.is_empty(),
+                "remove_tcp_front must leave no stranded route"
+            );
+        }
+        assert_eq!(
+            proxy.fronts.get("cluster-a"),
+            None,
+            "remove_tcp_front must undo add_tcp_front's self.fronts bookkeeping"
+        );
+    }
+
+    #[test]
+    fn add_then_remove_legacy_no_sni_front_round_trips() {
+        let mut proxy = test_proxy();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build listener config");
+        let token = Token(0);
+        proxy
+            .add_listener(config, token)
+            .expect("could not add listener");
+
+        let front = frontend("cluster-legacy", None, &[]);
+        let front = RequestTcpFrontend { address, ..front };
+        proxy
+            .add_tcp_front(front.clone())
+            .expect("add_tcp_front must succeed");
+
+        assert_eq!(
+            proxy
+                .listeners
+                .get(&token)
+                .expect("listener must be present")
+                .borrow()
+                .cluster_id,
+            Some("cluster-legacy".to_owned())
+        );
+
+        proxy
+            .remove_tcp_front(front)
+            .expect("remove_tcp_front must succeed");
+
+        assert_eq!(
+            proxy
+                .listeners
+                .get(&token)
+                .expect("listener must be present")
+                .borrow()
+                .cluster_id,
+            None
+        );
+        assert_eq!(proxy.fronts.get("cluster-legacy"), None);
+    }
+
+    // ---- add_tcp_front hard-rejects routing-corrupting requests --------
+    //
+    // Worker-side mirror of `command/src/config.rs`'s TOML config-load
+    // invariants (sozu-proxy/sozu#1279 hardening): `AddTcpFrontend` can
+    // reach the worker directly over the command socket, or via `LoadState`
+    // replay, bypassing config.rs entirely, so `add_tcp_front` must defend
+    // itself rather than rely on a debug-only assertion.
+
+    #[test]
+    fn add_tcp_front_rejects_alpn_without_sni() {
+        let mut proxy = test_proxy();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build listener config");
+        proxy
+            .add_listener(config, Token(0))
+            .expect("could not add listener");
+
+        let front = frontend("cluster-a", None, &["h2"]);
+        let front = RequestTcpFrontend { address, ..front };
+        match proxy.add_tcp_front(front) {
+            Err(ProxyError::InvalidTcpFrontend { .. }) => {}
+            other => panic!("expected InvalidTcpFrontend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_tcp_front_rejects_no_sni_front_on_listener_with_sni_routes() {
+        let mut proxy = test_proxy();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build listener config");
+        proxy
+            .add_listener(config, Token(0))
+            .expect("could not add listener");
+
+        let sni_front = frontend("cluster-a", Some("example.com"), &[]);
+        let sni_front = RequestTcpFrontend {
+            address,
+            ..sni_front
+        };
+        proxy
+            .add_tcp_front(sni_front)
+            .expect("the first, SNI-scoped frontend must be accepted");
+
+        let no_sni_front = frontend("cluster-b", None, &[]);
+        let no_sni_front = RequestTcpFrontend {
+            address,
+            ..no_sni_front
+        };
+        match proxy.add_tcp_front(no_sni_front) {
+            Err(ProxyError::InvalidTcpFrontend { .. }) => {}
+            other => panic!("expected InvalidTcpFrontend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_tcp_front_rejects_sni_front_on_listener_with_no_sni_cluster() {
+        let mut proxy = test_proxy();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build listener config");
+        proxy
+            .add_listener(config, Token(0))
+            .expect("could not add listener");
+
+        let no_sni_front = frontend("cluster-a", None, &[]);
+        let no_sni_front = RequestTcpFrontend {
+            address,
+            ..no_sni_front
+        };
+        proxy
+            .add_tcp_front(no_sni_front)
+            .expect("the first, no-SNI frontend must be accepted");
+
+        let sni_front = frontend("cluster-b", Some("example.com"), &[]);
+        let sni_front = RequestTcpFrontend {
+            address,
+            ..sni_front
+        };
+        match proxy.add_tcp_front(sni_front) {
+            Err(ProxyError::InvalidTcpFrontend { .. }) => {}
+            other => panic!("expected InvalidTcpFrontend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_tcp_front_rejects_alpn_overlap_on_same_sni() {
+        let mut proxy = test_proxy();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build listener config");
+        proxy
+            .add_listener(config, Token(0))
+            .expect("could not add listener");
+
+        let first = frontend("cluster-a", Some("example.com"), &["h2"]);
+        let first = RequestTcpFrontend { address, ..first };
+        proxy
+            .add_tcp_front(first)
+            .expect("the first frontend must be accepted");
+
+        // Second frontend shares "h2" with the first on the same sni.
+        let second = frontend("cluster-b", Some("example.com"), &["h2", "http/1.1"]);
+        let second = RequestTcpFrontend { address, ..second };
+        match proxy.add_tcp_front(second) {
+            Err(ProxyError::InvalidTcpFrontend { .. }) => {}
+            other => panic!("expected InvalidTcpFrontend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_tcp_front_rejects_duplicate_catch_all_on_same_sni() {
+        let mut proxy = test_proxy();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build listener config");
+        proxy
+            .add_listener(config, Token(0))
+            .expect("could not add listener");
+
+        let first = frontend("cluster-a", Some("example.com"), &[]);
+        let first = RequestTcpFrontend { address, ..first };
+        proxy
+            .add_tcp_front(first)
+            .expect("the first catch-all frontend must be accepted");
+
+        let second = frontend("cluster-b", Some("example.com"), &[]);
+        let second = RequestTcpFrontend { address, ..second };
+        match proxy.add_tcp_front(second) {
+            Err(ProxyError::InvalidTcpFrontend { .. }) => {}
+            other => panic!("expected InvalidTcpFrontend, got {other:?}"),
+        }
+    }
+
+    /// The valid, intended shape (sozu-proxy/sozu#1279's whole reason for
+    /// existing) must still be accepted: disjoint, non-empty `alpn` lists
+    /// on the same `(address, sni)`, and a catch-all alongside a
+    /// specific-protocol entry.
+    #[test]
+    fn add_tcp_front_accepts_disjoint_alpn_and_catch_all_on_same_sni() {
+        let mut proxy = test_proxy();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build listener config");
+        proxy
+            .add_listener(config, Token(0))
+            .expect("could not add listener");
+
+        let h2 = frontend("cluster-h2", Some("example.com"), &["h2"]);
+        let h2 = RequestTcpFrontend { address, ..h2 };
+        proxy
+            .add_tcp_front(h2)
+            .expect("disjoint alpn frontend must be accepted");
+
+        let http11 = frontend("cluster-http11", Some("example.com"), &["http/1.1"]);
+        let http11 = RequestTcpFrontend { address, ..http11 };
+        proxy
+            .add_tcp_front(http11)
+            .expect("second disjoint alpn frontend must be accepted");
+
+        let catch_all = frontend("cluster-default", Some("example.com"), &[]);
+        let catch_all = RequestTcpFrontend {
+            address,
+            ..catch_all
+        };
+        proxy
+            .add_tcp_front(catch_all)
+            .expect("a catch-all alongside specific-protocol entries must be accepted");
+    }
+
+    // ---- tcp.sni_preread.active gauge accounting ----------------------
+
+    /// Read the current process-local `tcp.sni_preread.active` gauge,
+    /// treating an absent key as 0. `dump_local_proxy_metrics` is a
+    /// non-draining filter over the proxy `MetricsMap`, so repeated reads are
+    /// side-effect free and the key is the raw metric name.
+    fn sni_preread_active_gauge() -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(names::tcp::sni_preread::ACTIVE)
+                .and_then(|fm| fm.inner.as_ref())
+                .and_then(|inner| match inner {
+                    Inner::Gauge(v) => Some(*v as i64),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    #[test]
+    fn entering_sni_preread_increments_the_active_gauge() {
+        // Regression guard for the missing-`+1` gauge bug
+        // (sozu-proxy/sozu#1279): `new_sni_preread` must bump
+        // `tcp.sni_preread.active` by exactly one when a session ENTERS the
+        // state, so each of the two `-1` decrements -- the "upgrade" exit in
+        // `upgrade_sni_preread` and the "reject"/"teardown" exit in `close()`'s
+        // `StateMarker::SniPreread` arm -- has a matching increment. Without
+        // this `+1` the first `-1` underflows a fresh-zero gauge (clamped to 0,
+        // ERROR-logged), pinning the gauge at 0 and rendering the e2e gauge
+        // assertion vacuous.
+        //
+        // `METRICS` is a thread-local shared across unit tests on the same
+        // worker thread, so this asserts the DELTA around one constructor call
+        // (robust to any starting value), not an absolute reading. The
+        // net-zero-per-session contract spans the full lifecycle (accept ->
+        // live backend connect -> upgrade/teardown) and is the behavioural job
+        // of the e2e `tcp_` gauge assertion, not reproducible at this unit
+        // level.
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+
+        let proxy = Rc::new(RefCell::new(TcpProxy::new(
+            registry,
+            sessions,
+            pool.clone(),
+            backends,
+        )));
+        let listener = Rc::new(RefCell::new(test_listener()));
+
+        let (front_buffer, back_buffer) = {
+            let mut pool = pool.borrow_mut();
+            (
+                pool.checkout().expect("front buffer checkout must succeed"),
+                pool.checkout().expect("back buffer checkout must succeed"),
+            )
+        };
+
+        // A non-blocking connect to a (likely unused) loopback port returns a
+        // real `MioTcpStream` handle immediately, regardless of whether the
+        // connection completes; `new_sni_preread` only reads `peer_addr()`.
+        let socket = MioTcpStream::connect(
+            format!("127.0.0.1:{}", provide_port())
+                .parse()
+                .expect("loopback address must parse"),
+        )
+        .expect("mio connect must return a socket handle");
+
+        let before = sni_preread_active_gauge();
+        let session = TcpSession::new_sni_preread(
+            back_buffer,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            front_buffer,
+            Token(0),
+            listener,
+            proxy,
+            socket,
+            Duration::from_millis(0),
+            Duration::from_secs(3),
+            16384,
+        );
+        let after = sni_preread_active_gauge();
+
+        // The session is measured while still in `SniPreread`; hold it across
+        // the read so no future `Drop` side effect could race the measurement.
+        assert!(matches!(session.state, TcpStateMachine::SniPreread(_)));
+
+        assert_eq!(
+            after - before,
+            1,
+            "entering the SniPreread state must increment tcp.sni_preread.active by exactly one"
+        );
     }
 }

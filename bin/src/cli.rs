@@ -807,6 +807,16 @@ pub enum TcpFrontendCmd {
             value_parser = parse_tags
         )]
         tags: Option<BTreeMap<String, String>>,
+        #[clap(
+            long = "sni",
+            help = "SNI hostname to match against the TLS ClientHello, read via preread on the listener before any bytes are relayed to a backend. Either an exact hostname (e.g. 'example.com') or a single leading '*.' wildcard label (e.g. '*.example.com'). Omit for a legacy no-SNI catch-all frontend; a listener cannot mix SNI-scoped and no-SNI frontends."
+        )]
+        sni: Option<String>,
+        #[clap(
+            long = "alpn",
+            help = "ALPN protocol name to match, read from the same ClientHello preread as --sni (repeatable, e.g. --alpn h2 --alpn http/1.1). Omit to make this frontend the catch-all for its --sni on this listener: at most one frontend per (address, sni) may omit --alpn, and no two frontends on the same (address, sni) may share a protocol name."
+        )]
+        alpn: Vec<String>,
     },
     #[clap(name = "remove")]
     Remove {
@@ -822,6 +832,16 @@ pub enum TcpFrontendCmd {
             help = "frontend address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "sni",
+            help = "SNI pattern this frontend was added with. Must match exactly (same string, same wildcard shape) to identify the route entry to remove; omit only if the frontend was added without --sni. A mismatch removes nothing, silently."
+        )]
+        sni: Option<String>,
+        #[clap(
+            long = "alpn",
+            help = "ALPN protocol(s) this frontend was added with (repeatable). Must match the exact set used on add; omit only if the frontend was added without --alpn. A mismatch removes nothing, silently."
+        )]
+        alpn: Vec<String>,
     },
 }
 
@@ -1463,6 +1483,16 @@ pub enum TcpListenerCmd {
             help = "Configures the client socket to receive a PROXY protocol header"
         )]
         expect_proxy: bool,
+        #[clap(
+            long = "sni-preread-timeout",
+            help = "Time allowed to receive enough bytes of the TLS ClientHello to read the SNI extension, in seconds. Only meaningful once at least one SNI-scoped TCP frontend (see 'frontend tcp add --sni') targets this listener; must not exceed the listener's front_timeout. Defaults to 5. Not patchable via 'listener tcp update' — remove and re-add the listener to change it."
+        )]
+        sni_preread_timeout: Option<u32>,
+        #[clap(
+            long = "sni-preread-max-bytes",
+            help = "Maximum bytes buffered while prereading the TLS ClientHello looking for the SNI extension. Only meaningful once at least one SNI-scoped TCP frontend targets this listener; clamped to buffer_size at runtime. Defaults to 16384. Not patchable via 'listener tcp update' — remove and re-add the listener to change it."
+        )]
+        sni_preread_max_bytes: Option<u32>,
     },
     #[clap(name = "remove")]
     Remove {

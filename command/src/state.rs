@@ -1216,9 +1216,20 @@ impl ConfigState {
             cluster_id: front.cluster_id.clone(),
             address: front.address.into(),
             tags: front.tags.clone(),
+            sni: front.sni.clone(),
+            alpn: front.alpn.clone(),
         };
         let before = tcp_frontends.len();
-        if tcp_frontends.contains(&tcp_frontend) {
+        // INV: TCP frontend identity for add/remove is (address, sni, alpn),
+        // not the whole struct — two frontends differing only in `tags`
+        // would still match the exact same wire traffic, so they must still
+        // collide here even though they compare unequal as full structs.
+        let identity_conflict = tcp_frontends.iter().any(|existing| {
+            existing.address == tcp_frontend.address
+                && existing.sni == tcp_frontend.sni
+                && existing.alpn == tcp_frontend.alpn
+        });
+        if identity_conflict {
             debug_assert_eq!(
                 tcp_frontends.len(),
                 before,
@@ -1257,22 +1268,35 @@ impl ConfigState {
 
         let len = tcp_frontends.len();
         let remove_address: SocketAddr = front_to_remove.address.into();
-        tcp_frontends.retain(|front| front.address != remove_address);
+        let remove_sni = front_to_remove.sni.clone();
+        let remove_alpn = front_to_remove.alpn.clone();
+        // INV: removal identity mirrors add_tcp_frontend's (address, sni,
+        // alpn) key — removing one SNI-scoped frontend on a listener must
+        // not also evict a sibling frontend at the same address with a
+        // different sni/alpn.
+        tcp_frontends.retain(|front| {
+            !(front.address == remove_address
+                && front.sni == remove_sni
+                && front.alpn == remove_alpn)
+        });
         let after = tcp_frontends.len();
         if after == len {
             return Err(StateError::NoChange);
         }
         // `retain` may drop more than one entry only if duplicates on the same
-        // address ever existed; `add_tcp_frontend` forbids that, so a
-        // successful removal must drop exactly one and leave none matching.
+        // (address, sni, alpn) ever existed; `add_tcp_frontend` forbids that,
+        // so a successful removal must drop exactly one and leave none
+        // matching.
         debug_assert_eq!(
             after,
             len - 1,
             "remove_tcp_frontend drops exactly one entry"
         );
         debug_assert!(
-            !tcp_frontends.iter().any(|f| f.address == remove_address),
-            "remove_tcp_frontend must leave no frontend at the removed address"
+            !tcp_frontends.iter().any(|f| f.address == remove_address
+                && f.sni == remove_sni
+                && f.alpn == remove_alpn),
+            "remove_tcp_frontend must leave no frontend matching the removed (address, sni, alpn)"
         );
         Ok(())
     }
@@ -3948,6 +3972,175 @@ mod tests {
             updated.back_timeout, 30,
             "unpatched field must be preserved"
         );
+    }
+
+    /// Mandatory roundtrip + identity guard for SNI/ALPN-scoped TCP
+    /// frontends (sozu-proxy/sozu#1279).
+    ///
+    /// 1. Build a state holding a TCP listener with non-default SNI-preread
+    ///    knobs plus two SNI-scoped frontends on the same address, run
+    ///    `generate_requests()`, replay every emitted request into a fresh
+    ///    `ConfigState`, and assert the two states are byte-for-byte equal.
+    /// 2. Prove `diff()` between an empty state and this state reconstructs
+    ///    the listener + both frontends (hot-add), and the reverse diff
+    ///    tears them back down.
+    /// 3. Prove add/remove identity is `(address, sni, alpn)`: removing one
+    ///    SNI-scoped sibling leaves the other untouched, and a
+    ///    address-only removal (mismatched sni/alpn) is rejected rather
+    ///    than silently nuking every frontend at that address.
+    #[test]
+    fn test_tcp_sni_alpn_state_roundtrip() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 6443);
+
+        let mut state = ConfigState::default();
+        state
+            .dispatch(
+                &RequestType::AddTcpListener(TcpListenerConfig {
+                    address,
+                    front_timeout: 60,
+                    back_timeout: 30,
+                    connect_timeout: 3,
+                    active: true,
+                    sni_preread_timeout: Some(2),
+                    sni_preread_max_bytes: Some(8192),
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("could not add tcp listener");
+        state
+            .dispatch(
+                &RequestType::ActivateListener(ActivateListener {
+                    address,
+                    proxy: ListenerType::Tcp.into(),
+                    from_scm: false,
+                })
+                .into(),
+            )
+            .expect("could not activate tcp listener");
+
+        let frontend_a = RequestTcpFrontend {
+            cluster_id: "cluster_sni_a".to_string(),
+            address,
+            tags: BTreeMap::new(),
+            sni: Some("example.com".to_string()),
+            alpn: vec!["h2".to_string()],
+        };
+        let frontend_b = RequestTcpFrontend {
+            cluster_id: "cluster_sni_b".to_string(),
+            address,
+            tags: BTreeMap::new(),
+            sni: Some("other.example.com".to_string()),
+            alpn: vec![],
+        };
+        state
+            .dispatch(&RequestType::AddTcpFrontend(frontend_a.clone()).into())
+            .expect("could not add sni-a tcp frontend");
+        state
+            .dispatch(&RequestType::AddTcpFrontend(frontend_b.clone()).into())
+            .expect("could not add sni-b tcp frontend");
+
+        assert_eq!(state.tcp_listeners.len(), 1);
+        assert!(state.tcp_listeners[&address.into()].active);
+        assert_eq!(
+            state.tcp_listeners[&address.into()].sni_preread_timeout,
+            Some(2)
+        );
+        assert_eq!(
+            state.tcp_listeners[&address.into()].sni_preread_max_bytes,
+            Some(8192)
+        );
+        assert_eq!(state.count_tcp_frontends_raw(), 2);
+
+        // `request_counts` is a runtime census side-effect of `dispatch`; it
+        // diverges by construction whenever the number/shape of replayed
+        // requests differs from the originals, so compare the logical config
+        // with the census cleared on both sides.
+        let logical = |s: &ConfigState| {
+            let mut c = s.clone();
+            c.request_counts.clear();
+            c
+        };
+
+        // 1. generate_requests → replay → equal
+        let mut replayed = ConfigState::default();
+        for request in state.generate_requests() {
+            replayed
+                .dispatch(&request)
+                .expect("could not replay generated request");
+        }
+        assert_eq!(
+            logical(&state),
+            logical(&replayed),
+            "SNI/ALPN TCP listener + frontends must survive generate_requests → replay"
+        );
+
+        // 2. diff from empty reconstructs the TCP objects
+        let empty = ConfigState::default();
+        let mut from_diff = ConfigState::default();
+        for request in empty.diff(&state) {
+            from_diff
+                .dispatch(&request)
+                .expect("could not replay diff request");
+        }
+        assert_eq!(
+            logical(&state),
+            logical(&from_diff),
+            "diff(empty -> state) must reconstruct the tcp listener + both sni frontends"
+        );
+
+        // reverse diff tears them back down to empty
+        let mut torn_down = state.clone();
+        for request in state.diff(&empty) {
+            torn_down
+                .dispatch(&request)
+                .expect("could not replay teardown diff request");
+        }
+        assert!(
+            torn_down.tcp_listeners.is_empty(),
+            "diff(state -> empty) must remove the tcp listener"
+        );
+        assert_eq!(
+            torn_down.count_tcp_frontends_raw(),
+            0,
+            "diff(state -> empty) must remove both sni frontends"
+        );
+
+        // 3a. an address-only removal (mismatched sni/alpn) must not match
+        // either sibling — identity is (address, sni, alpn), not address
+        // alone.
+        let mismatched_removal = state.dispatch(
+            &RequestType::RemoveTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_sni_a".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: None,
+                alpn: vec![],
+            })
+            .into(),
+        );
+        assert!(
+            mismatched_removal.is_err(),
+            "removing by address alone (no matching sni/alpn) must be rejected"
+        );
+        assert_eq!(
+            state.count_tcp_frontends_raw(),
+            2,
+            "a rejected mismatched removal must not change either sibling"
+        );
+
+        // 3b. removing the exact (address, sni, alpn) identity of frontend_a
+        // must drop only that entry and leave frontend_b untouched.
+        state
+            .dispatch(&RequestType::RemoveTcpFrontend(frontend_a).into())
+            .expect("could not remove sni-a tcp frontend");
+        assert_eq!(state.count_tcp_frontends_raw(), 1);
+        let remaining = state
+            .tcp_fronts
+            .get("cluster_sni_b")
+            .expect("cluster_sni_b bucket must survive");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].sni, Some("other.example.com".to_string()));
     }
 
     /// `list_frontends` must surface UDP frontends alongside TCP ones. The

@@ -333,6 +333,31 @@ impl Worker {
         }
     }
 
+    /// TCP frontend scoped to an SNI hostname (and optionally a set of
+    /// ALPN protocol names), for the passthrough SNI+ALPN preread routing
+    /// added by sozu-proxy/sozu#1279 (`RequestTcpFrontend.sni` / `.alpn`).
+    /// Added alongside `default_tcp_frontend` rather than folding the two
+    /// new fields into it: every e2e test exercising the SNI-preread
+    /// listener needs `sni`/`alpn` set (an SNI-scoped route is meaningless
+    /// with them absent), while every pre-existing no-SNI TCP e2e test
+    /// needs them absent — keeping both builders separate avoids an
+    /// `Option`/`Vec` argument creeping into every existing
+    /// `default_tcp_frontend` call site in `tcp_tests.rs`.
+    pub fn sni_tcp_frontend<S: Into<String>>(
+        cluster_id: S,
+        address: SocketAddr,
+        sni: Option<&str>,
+        alpn: &[&str],
+    ) -> RequestTcpFrontend {
+        RequestTcpFrontend {
+            cluster_id: cluster_id.into(),
+            address: address.into(),
+            sni: sni.map(str::to_owned),
+            alpn: alpn.iter().map(|protocol| protocol.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
     pub fn default_http_frontend<S: Into<String>>(
         cluster_id: S,
         address: SocketAddr,

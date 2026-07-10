@@ -86,6 +86,7 @@ catching.
 | **Integration / e2e** | `e2e/src/tests/*` (registered in `e2e/src/tests/mod.rs`), mocks in `e2e/src/mock/*` | spawns real workers + mock clients/backends; `h2spec` for one conformance test | `cargo test -p sozu-e2e` | yes |
 | **Fuzz** | `fuzz/fuzz_targets/*` (out-of-workspace `sozu-fuzz` crate) | nightly toolchain + `cargo-fuzz` | nightly `fuzz` CI job; `#[ignore]`-style runtime skip when prereqs absent | smoke per-PR, real fuzzing nightly |
 | **Deterministic simulation** | `sim/tests/udp_simulation.rs` (`sozu-sim`, moonpool-sim) | `RUSTFLAGS="--cfg tokio_unstable"` (scoped to the sim — cfg-gated, off by default) | per-PR `udp-simulation` job (modest sweep) + nightly deep swarm; widened via env knobs | yes |
+| **Deterministic simulation** | `sim/tests/tcp_preread_sim.rs` (`sozu-sim`, moonpool-sim) — TCP SNI-preread core, [#1279](https://github.com/sozu-proxy/sozu/issues/1279) | same `--cfg tokio_unstable` gating as above | per-PR `udp-simulation` job (same job, added step, modest sweep) + nightly `tcp-preread-simulation-sweep` job in `simulation-sweep.yml` (deep swarm); widened via `SOZU_TCP_PREREAD_SIM_*` env knobs | yes |
 | **Regression guards** | `lib/tests/log_layout.rs` | nothing | runs in `cargo test -p sozu-lib`; build-time `cargo:warning=` echo from `lib/build.rs` | yes |
 
 Notes:
@@ -93,12 +94,20 @@ Notes:
 - The e2e suite includes H1/H2/TLS/TCP/UDP coverage plus targeted security and
   feature suites; see `e2e/src/tests/mod.rs` for the full module list
   (`h2_tests`, `h2_security_*`, `mux_tests`, `tls_tests`, `tcp_tests`,
-  `udp_tests`, `command_channel_security_tests`, `listener_update_tests`, …).
+  `tcp_sni_tests` (SNI+ALPN passthrough routing, #1279), `udp_tests`,
+  `command_channel_security_tests`, `listener_update_tests`, …).
+- The TCP SNI-preread sans-io core (`lib/src/protocol/tcp_preread/{mod,shell}.rs`)
+  follows the same unit-test + assertion-density pattern as the UDP core (§4):
+  a `decided`/`deadline` latch, a `check_invariants()` sweep run at both ends of
+  `handle_input`, and one unit test per reachable `RejectReason` variant. See
+  `lib/src/protocol/tcp_preread/LIFECYCLE.md` for the full lifecycle.
 - `e2e/src/tests/fuzz_tests.rs` is a thin integration wrapper that shells out to
-  the three fuzz targets for 10 s each. It *skips gracefully* (prints a notice,
+  the four fuzz targets for 10 s each. It *skips gracefully* (prints a notice,
   returns clean) when the nightly toolchain or `cargo-fuzz` is missing, so the
   rest of the e2e suite still runs. CI skips it in the per-cell pipeline (`--skip
-  tests::fuzz_tests::`) and runs real fuzzing in the dedicated nightly job.
+  tests::fuzz_tests::`) and runs real fuzzing in the dedicated nightly job, which
+  now has a step for each of the four targets, including `fuzz_tcp_clienthello`
+  (see §6).
 
 ---
 
@@ -122,7 +131,9 @@ cargo test --workspace --locked            # unit + simulation + regression guar
 ### Targeted runs
 
 ```bash
-# Unit + lib-level tests (includes the UDP simulation + log-layout guard):
+# Unit + lib-level tests (includes the log-layout guard; the UDP and
+# TCP-preread deterministic simulations moved to the sozu-sim crate — see
+# the targeted `-p sozu-sim` invocations below):
 cargo test -p sozu-lib --locked
 
 # A single test module / filter:
@@ -133,11 +144,14 @@ cargo test -p sozu-e2e test_upgrade        # worker-upgrade e2e (see doc/upgrade
 # Deterministic UDP simulation (moonpool-sim, sozu-sim crate): cfg-gated, so the
 # flag is REQUIRED — without it the crate compiles to an empty 0-test binary:
 RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test udp_simulation
+
+# Deterministic TCP SNI-preread simulation (same crate, same cfg gating):
+RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test tcp_preread_sim
 ```
 
 ### Simulation sweep + single-seed replay
 
-The simulator reads three env knobs (`sim/tests/udp_simulation.rs`,
+The UDP simulator reads three env knobs (`sim/tests/udp_simulation.rs`,
 `doc/udp_simulation.md`):
 
 | env var | effect |
@@ -156,6 +170,16 @@ RUSTFLAGS="--cfg tokio_unstable" SOZU_UDP_SIM_SEEDS=1024 SOZU_UDP_SIM_STEPS=5000
   cargo test -p sozu-sim --test udp_simulation udp_simulation_seed_sweep -- --nocapture
 ```
 
+The TCP SNI-preread simulator (`sim/tests/tcp_preread_sim.rs`) mirrors the
+same replay/sweep contract under its own env-var namespace
+(`SOZU_TCP_PREREAD_SIM_SEED` / `_SEEDS` / `_STEPS`, default 256 seeds × 48
+connections per seed):
+
+```bash
+RUSTFLAGS="--cfg tokio_unstable" SOZU_TCP_PREREAD_SIM_SEED=0xdeadbeef \
+  cargo test -p sozu-sim --test tcp_preread_sim
+```
+
 ### Fuzzing
 
 ```bash
@@ -163,6 +187,7 @@ RUSTFLAGS="--cfg tokio_unstable" SOZU_UDP_SIM_SEEDS=1024 SOZU_UDP_SIM_STEPS=5000
 cargo +nightly fuzz run fuzz_frame_parser
 cargo +nightly fuzz run fuzz_hpack_decoder
 cargo +nightly fuzz run fuzz_udp_flow
+cargo +nightly fuzz run fuzz_tcp_clienthello
 
 # Bounded run (what the e2e wrapper and CI do):
 cargo +nightly fuzz run fuzz_frame_parser -- -max_total_time=300
@@ -313,7 +338,7 @@ state machine of the same shape. This is a stated direction, not a commitment.
 
 ## 6. Fuzzing
 
-The out-of-workspace `sozu-fuzz` crate (`fuzz/`) has three cargo-fuzz targets
+The out-of-workspace `sozu-fuzz` crate (`fuzz/`) has four cargo-fuzz targets
 (`fuzz/fuzz_targets/`), each defending a network-facing parser or state machine:
 
 | Target | Surface | Defends against |
@@ -321,22 +346,29 @@ The out-of-workspace `sozu-fuzz` crate (`fuzz/`) has three cargo-fuzz targets
 | `fuzz_frame_parser` | H2 frame parser (`protocol::mux::parser`, RFC 9113 §6) | length-confusion / framing CVEs (`ensure_frame_size!`); parser must reject via `H2Error`/`nom::Err`, never panic |
 | `fuzz_hpack_decoder` | HPACK decoder (RFC 7541, `loona-hpack`) under three dynamic-table profiles | header-block oversize and incomplete-update flaws; resize/eviction paths |
 | `fuzz_udp_flow` | the sans-io UDP core + flow-key extraction + PPv2 DGRAM framing | flow-count overrun, gauge underflow, fd/slab leak; reuses the same invariants the simulator asserts |
+| `fuzz_tcp_clienthello` | the sans-io TCP SNI-preread core (`protocol::tcp_preread`, [#1279](https://github.com/sozu-proxy/sozu/issues/1279)) — TLS record/ClientHello parsing, PROXY-v2 stripping, SNI/ALPN routing | byte-replay corruption, a `RejectReason` other than the latched terminal reappearing, `content_offset` exceeding the fed window, a `NeedMore` deadline regressing across calls |
 
 Run a target locally (from inside `fuzz/`, nightly + `cargo-fuzz` required):
 
 ```bash
 cargo +nightly fuzz run fuzz_udp_flow
+cargo +nightly fuzz run fuzz_tcp_clienthello
 ```
 
 **CI.** The dedicated nightly `fuzz` job (`.github/workflows/ci.yml`) installs
-`cargo-fuzz` on the nightly toolchain and runs `fuzz_frame_parser` and
-`fuzz_hpack_decoder` for 300 s each, uploading any crash artefacts from
+`cargo-fuzz` on the nightly toolchain and runs all four targets —
+`fuzz_frame_parser`, `fuzz_hpack_decoder`, `fuzz_udp_flow`, and
+`fuzz_tcp_clienthello` — for 300 s each, uploading any crash artefacts from
 `fuzz/artifacts/`. The per-cell pipeline skips the e2e `fuzz_tests` wrapper to
-avoid rebuilding the fuzz crate under every crypto-provider cache.
+avoid rebuilding the fuzz crate under every crypto-provider cache;
+`fuzz_tcp_clienthello` also runs in that per-cell-skipped 10 s e2e smoke
+wrapper (§2) as a fast sanity check between the two 300 s nightly runs. The
+nightly `simulation-sweep.yml` widens all four targets to `fuzz_seconds`
+(default 900 s) via its `extended-fuzz` job matrix.
 
-**When to run fuzzers.** Any H2 parser, HPACK, or UDP-core change must run the
-focused e2e tests *and* the relevant cargo-fuzz target before pushing
-(`CLAUDE.md > Testing`).
+**When to run fuzzers.** Any H2 parser, HPACK, UDP-core, or TCP SNI-preread
+change must run the focused e2e tests *and* the relevant cargo-fuzz target
+before pushing (`CLAUDE.md > Testing`).
 
 ---
 

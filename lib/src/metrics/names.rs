@@ -309,7 +309,61 @@ pub mod tcp {
     pub const UPGRADE_PIPE_FAILED: &str = "tcp.upgrade.pipe.failed";
     pub const UPGRADE_RELAY_FAILED: &str = "tcp.upgrade.relay.failed";
     pub const UPGRADE_SEND_FAILED: &str = "tcp.upgrade.send.failed";
+    pub const UPGRADE_SNI_PREREAD_FAILED: &str = "tcp.upgrade.sni_preread.failed";
     pub const WRITE_ERROR: &str = "tcp.write.error";
+
+    /// SNI-preread counters (TCP passthrough routing, sozu-proxy/sozu#1279),
+    /// fed by the shell in `lib/src/protocol/tcp_preread/shell.rs` (decision
+    /// metrics) and `lib/src/tcp.rs` (the `ACTIVE` gauge + `DURATION`
+    /// timing, both owned centrally by the session lifecycle so each is
+    /// touched exactly once per session regardless of which of the three
+    /// exits -- reject / upgrade / teardown -- it takes).
+    pub mod sni_preread {
+        use crate::protocol::tcp_preread::RejectReason;
+
+        /// A cluster was chosen from the ClientHello's SNI (+ optional ALPN).
+        pub const ROUTED: &str = "tcp.sni_preread.routed";
+        /// Gauge: sessions currently prereading. Incremented once at
+        /// `SniPreread` construction, decremented exactly once on every
+        /// exit (reject / upgrade / teardown); underflow is a bug.
+        pub const ACTIVE: &str = "tcp.sni_preread.active";
+        /// `time!` of the wall-clock spent prereading, recorded on every
+        /// exit alongside the `ACTIVE` decrement.
+        pub const DURATION: &str = "tcp.sni_preread.duration";
+
+        pub const REJECTED_NOT_TLS: &str = "tcp.sni_preread.rejected.not_tls";
+        pub const REJECTED_MALFORMED_RECORD: &str = "tcp.sni_preread.rejected.malformed_record";
+        pub const REJECTED_MALFORMED_HANDSHAKE: &str =
+            "tcp.sni_preread.rejected.malformed_handshake";
+        pub const REJECTED_FRAGMENTED: &str = "tcp.sni_preread.rejected.fragmented";
+        pub const REJECTED_TOO_LARGE: &str = "tcp.sni_preread.rejected.too_large";
+        pub const REJECTED_NO_SNI: &str = "tcp.sni_preread.rejected.no_sni";
+        pub const REJECTED_ECH_OUTER_ABSENT: &str = "tcp.sni_preread.rejected.ech_outer_absent";
+        pub const REJECTED_SNI_UNMATCHED: &str = "tcp.sni_preread.rejected.sni_unmatched";
+        pub const REJECTED_ALPN_UNMATCHED: &str = "tcp.sni_preread.rejected.alpn_unmatched";
+        pub const REJECTED_PROXY_HEADER_INVALID: &str =
+            "tcp.sni_preread.rejected.proxy_header_invalid";
+        pub const REJECTED_FRONT_CLOSED: &str = "tcp.sni_preread.rejected.front_closed";
+
+        /// Total function over every `RejectReason` variant: a new variant
+        /// added to the core without a matching arm here fails to compile,
+        /// so the metric surface can never silently drop a rejection reason.
+        pub fn rejected_name(reason: RejectReason) -> &'static str {
+            match reason {
+                RejectReason::NotTls => REJECTED_NOT_TLS,
+                RejectReason::MalformedRecord => REJECTED_MALFORMED_RECORD,
+                RejectReason::MalformedHandshake => REJECTED_MALFORMED_HANDSHAKE,
+                RejectReason::Fragmented => REJECTED_FRAGMENTED,
+                RejectReason::TooLarge => REJECTED_TOO_LARGE,
+                RejectReason::NoSni => REJECTED_NO_SNI,
+                RejectReason::EchOuterAbsent => REJECTED_ECH_OUTER_ABSENT,
+                RejectReason::SniUnmatched => REJECTED_SNI_UNMATCHED,
+                RejectReason::AlpnUnmatched => REJECTED_ALPN_UNMATCHED,
+                RejectReason::ProxyHeaderInvalid => REJECTED_PROXY_HEADER_INVALID,
+                RejectReason::FrontClosed => REJECTED_FRONT_CLOSED,
+            }
+        }
+    }
 }
 
 /// UDP datapath counters/gauges, fed by the UDP I/O shell in `lib/src/udp.rs`.

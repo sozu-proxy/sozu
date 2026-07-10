@@ -1,15 +1,20 @@
 ---
 name: Simulation sweep
 
-# Deterministic-simulation seed swarm (moonpool-sim engine, sozu-sim crate) +
-# extended fuzzing, in the spirit of FoundationDB's nightly runs. Per-PR CI runs
-# a modest UDP simulation sweep (the `udp-simulation` job in ci.yml) + 300s/target
-# fuzzing; this workflow widens both.
+# Deterministic-simulation seed swarms (moonpool-sim engine, sozu-sim crate) —
+# the sans-io UDP core AND the TCP passthrough SNI-preread core
+# (sozu-proxy/sozu#1279) — plus extended fuzzing, in the spirit of FoundationDB's
+# nightly runs. Per-PR CI runs a modest sweep of both simulations (the
+# `udp-simulation` job in ci.yml) + 300s/target fuzzing; this workflow widens all
+# of it.
 #
 # Every `(commit, seed)` pair is reproducible, so a failing seed printed here
 # replays locally with:
 #   RUSTFLAGS="--cfg tokio_unstable" SOZU_UDP_SIM_SEED=<seed> \
 #     cargo test -p sozu-sim --test udp_simulation -- --nocapture
+# or, for the TCP preread sim:
+#   RUSTFLAGS="--cfg tokio_unstable" SOZU_TCP_PREREAD_SIM_SEED=<seed> \
+#     cargo test -p sozu-sim --test tcp_preread_sim -- --nocapture
 # See doc/testing.md and doc/udp_simulation.md.
 
 on:
@@ -29,6 +34,18 @@ on:
         description: 'Steps per seed (SOZU_UDP_SIM_STEPS)'
         required: false
         default: '3000'
+      tcp_preread_seeds:
+        description: 'Number of seeds to sweep (SOZU_TCP_PREREAD_SIM_SEEDS)'
+        required: false
+        # tcp_preread_sim has no per-seed tokio runtime (SniPrereadCore is a
+        # small, near-stateless per-connection state machine), so it is far
+        # cheaper per seed than the UDP sim — a locally measured 2048 seeds ×
+        # 200 connections/seed ran in ~14s, so the nightly swarm can go wider.
+        default: '4096'
+      tcp_preread_steps:
+        description: 'Connections per seed (SOZU_TCP_PREREAD_SIM_STEPS)'
+        required: false
+        default: '256'
       fuzz_seconds:
         description: 'Seconds per fuzz target'
         required: false
@@ -86,6 +103,46 @@ jobs:
         run: cargo test -p sozu-sim --locked --test udp_simulation -- --nocapture
 
   # ┌──────────────────────────────────────────────────────────────┐
+  # │ Deterministic-simulation seed swarm over the TCP passthrough  │
+  # │   SNI-preread core (sozu-proxy/sozu#1279) via moonpool-sim     │
+  # │   (sozu-sim crate). Debug build is REQUIRED for the same       │
+  # │   reason as the UDP sweep above. Unlike the UDP core,          │
+  # │   `SniPrereadCore` has no per-seed tokio runtime overhead      │
+  # │   (it's a small, near-stateless per-connection state machine), │
+  # │   so this swarm can go wider for the same wall-clock budget.  │
+  # └──────────────────────────────────────────────────────────────┘
+  tcp-preread-simulation-sweep:
+    name: TCP preread simulation seed sweep (moonpool-sim)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Inputs are exposed as env vars (the safe pattern); the test parses them
+    # and falls back to its built-in defaults on anything non-numeric.
+    env:
+      RUSTFLAGS: '--cfg tokio_unstable'
+      SOZU_TCP_PREREAD_SIM_SEEDS: ${{ github.event.inputs.tcp_preread_seeds || '4096' }}
+      SOZU_TCP_PREREAD_SIM_STEPS: ${{ github.event.inputs.tcp_preread_steps || '256' }}
+    steps:
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Checkout sources
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Install rust 1.91.0
+        uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          cache-all-crates: true
+          prefix-key: sim-sweep-tcp-preread
+          workspaces: . -> target/
+
+      # Debug profile on purpose: same rationale as the UDP sweep above.
+      - name: TCP preread simulation sweep (debug, asserts live)
+        run: cargo test -p sozu-sim --locked --test tcp_preread_sim -- --nocapture
+
+  # ┌──────────────────────────────────────────────────────────────┐
   # │ Extended fuzzing — longer than the per-PR 300s budget.        │
   # └──────────────────────────────────────────────────────────────┘
   extended-fuzz:
@@ -95,7 +152,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [fuzz_frame_parser, fuzz_hpack_decoder, fuzz_udp_flow]
+        target: [fuzz_frame_parser, fuzz_hpack_decoder, fuzz_udp_flow, fuzz_tcp_clienthello]
     env:
       FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '900' }}
     steps:

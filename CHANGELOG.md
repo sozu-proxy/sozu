@@ -22,6 +22,47 @@ simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
   `sim/` **dev-dependencies** only. `moonpool-sim`
   is pinned to a git rev (the published 0.7.0 doesn't build on stable; `main`
   does) — swapping to a crates.io release later is a follow-up, not a blocker.
+- **`feat(tcp)`: TCP passthrough routing by TLS SNI + ALPN** ([#1279](https://github.com/sozu-proxy/sozu/issues/1279)).
+  A `protocol = "tcp"` listener can now fan out to multiple clusters on the
+  same `address:port` by reading the TLS ClientHello's SNI (RFC 6066 §3) and,
+  per route entry, ALPN (RFC 7301 §3.1) during a bounded preread phase —
+  without decrypting or terminating the connection; the backend still
+  completes its own handshake with the untouched bytes. New TOML keys: TCP
+  frontend `hostname` (mapped to the wire `sni` field; exact host or a single
+  leading `*.` wildcard) and `alpn` (repeatable; empty is the per-`(address,
+  hostname)` catch-all), and listener `sni_preread_timeout` (default 5s) /
+  `sni_preread_max_bytes` (default 16384, clamped to `buffer_size`). New CLI
+  flags: `sozu frontend tcp add|remove --sni <host> --alpn <proto>` and `sozu
+  listener tcp add --sni-preread-timeout <secs> --sni-preread-max-bytes
+  <bytes>` (add-only — no wire support yet for patching either knob via
+  `listener tcp update`). New metrics:
+  `tcp.sni_preread.{routed,active,duration}` and eleven
+  `tcp.sni_preread.rejected.<reason>` counters (`not_tls`, `malformed_record`,
+  `malformed_handshake`, `fragmented`, `too_large`, `no_sni`,
+  `ech_outer_absent`, `sni_unmatched`, `alpn_unmatched`,
+  `proxy_header_invalid`, `front_closed`) plus
+  `tcp.upgrade.sni_preread.failed`. A listener cannot mix SNI-scoped and
+  no-SNI (legacy single-cluster) frontends; `alpn` requires `hostname`
+  (`ConfigError::AlpnWithoutSni` — a no-SNI frontend would silently never
+  enforce it); `sni_preread_max_bytes` must be >= 5 bytes, a full TLS record
+  header (`ConfigError::SniPrereadMaxBytesTooSmall` — `0` would spin the
+  preread shell on zero-progress reads). These routing-shape invariants (the
+  mixing ban, ALPN-overlap/catch-all uniqueness, and ALPN-without-SNI) are
+  now enforced BOTH at TOML config-load (`command/src/config.rs`) AND
+  defensively on the worker's hot `AddTcpFrontend` path
+  (`TcpListener::validate_new_tcp_front`, `lib/src/tcp.rs`), so a request
+  sent directly over the command socket or replayed from a stale
+  `LoadState` snapshot can no longer bypass config.rs and corrupt a
+  listener's routing table. See `doc/configure.md` and
+  `lib/src/protocol/tcp_preread/LIFECYCLE.md` for the full config surface and
+  state lifecycle. New test coverage: unit tests in
+  `lib/src/protocol/tcp_preread/{mod,shell}.rs`, e2e suite
+  `e2e/src/tests/tcp_sni_tests.rs`, the `fuzz_tcp_clienthello` cargo-fuzz
+  target (wired into the nightly `fuzz` CI job and `simulation-sweep.yml`'s
+  extended-fuzz matrix), and a moonpool-driven deterministic simulation
+  (`sim/tests/tcp_preread_sim.rs`, `sozu-sim` crate — wired into both the
+  per-PR `udp-simulation` CI job and a new nightly
+  `tcp-preread-simulation-sweep` job in `simulation-sweep.yml`).
 
 ### 🔄 Changed
 
@@ -47,6 +88,19 @@ simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
   its first WebSocket frame. It also arms writable readiness for bytes already
   inherited from the H1 mux during upgrade, including a backend frame carried in
   the same read buffer as the `101 Switching Protocols` response.
+- **`fix(pipe)`: stopped truncating in-flight bytes on a frontend half-close**
+  ([#1279](https://github.com/sozu-proxy/sozu/issues/1279) Defect C). When the
+  frontend read side reached EOF while `frontend_buffer` still held bytes
+  queued for the backend, `Pipe::readable` returned `Close` unconditionally,
+  silently dropping them instead of flushing first — any front-to-back tail
+  still in flight at the exact moment of frontend close was lost. The
+  reproducer that surfaced it was a request payload coalesced with the SNI
+  ClientHello in the same read (TCP passthrough routing above), but the bug
+  was general: any plain-TCP upload racing a frontend close could hit it.
+  `readable` now transitions to the half-closed `WriteOpen` status (matching
+  the existing `WouldBlock`/`Continue` handling), arms backend-writable to
+  drain the queue, and defers the actual teardown to `check_connections`,
+  which only closes once nothing is in flight.
 
 ### 🤖 CI
 

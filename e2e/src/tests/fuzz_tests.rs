@@ -73,3 +73,8 @@ fn fuzz_hpack_decoder() {
 fn fuzz_udp_flow() {
     run_fuzz_target("fuzz_udp_flow");
 }
+
+#[test]
+fn fuzz_tcp_clienthello() {
+    run_fuzz_target("fuzz_tcp_clienthello");
+}

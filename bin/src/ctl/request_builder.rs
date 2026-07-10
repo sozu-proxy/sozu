@@ -358,18 +358,33 @@ impl CommandManager {
 
     pub fn tcp_frontend_command(&mut self, cmd: TcpFrontendCmd) -> Result<(), CtlError> {
         match cmd {
-            TcpFrontendCmd::Add { id, address, tags } => self.send_request(
+            TcpFrontendCmd::Add {
+                id,
+                address,
+                tags,
+                sni,
+                alpn,
+            } => self.send_request(
                 RequestType::AddTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
                     address: address.into(),
                     tags: tags.unwrap_or(BTreeMap::new()),
+                    sni,
+                    alpn,
                 })
                 .into(),
             ),
-            TcpFrontendCmd::Remove { id, address } => self.send_request(
+            TcpFrontendCmd::Remove {
+                id,
+                address,
+                sni,
+                alpn,
+            } => self.send_request(
                 RequestType::RemoveTcpFrontend(RequestTcpFrontend {
                     cluster_id: id,
                     address: address.into(),
+                    sni,
+                    alpn,
                     ..Default::default()
                 })
                 .into(),
@@ -730,10 +745,20 @@ impl CommandManager {
                 address,
                 public_address,
                 expect_proxy,
+                sni_preread_timeout,
+                sni_preread_max_bytes,
             } => {
-                let listener = ListenerBuilder::new_tcp(address.into())
+                let mut listener_builder = ListenerBuilder::new_tcp(address.into());
+                listener_builder
                     .with_public_address(public_address)
-                    .with_expect_proxy(expect_proxy)
+                    .with_expect_proxy(expect_proxy);
+                // No `with_sni_preread_timeout`/`with_sni_preread_max_bytes`
+                // builder methods exist yet — `ListenerBuilder`'s fields are
+                // all `pub`, so set them directly rather than adding two
+                // trivial builder methods out of this CLI's ownership scope.
+                listener_builder.sni_preread_timeout = sni_preread_timeout;
+                listener_builder.sni_preread_max_bytes = sni_preread_max_bytes;
+                let listener = listener_builder
                     .to_tcp(Some(&self.config))
                     .map_err(CtlError::CreateListener)?;
 
