@@ -163,7 +163,7 @@ jobs:
 
       - name: Install rust 1.91.0
         # Release builds must match the MSRV pinned in `rust-toolchain`.
-        uses: dtolnay/rust-toolchain@1.91.0
+        uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: ${{ matrix.target }}
 
