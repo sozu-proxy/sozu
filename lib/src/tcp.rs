@@ -18,14 +18,14 @@ use sozu_command::{
     ObjectKind,
     config::{
         DEFAULT_SNI_PREREAD_MAX_BYTES, DEFAULT_SNI_PREREAD_TIMEOUT, MAX_LOOP_ITERATIONS,
-        MIN_SNI_PREREAD_MAX_BYTES,
+        MIN_SNI_PREREAD_MAX_BYTES, validate_sni_pattern,
     },
     logging::{EndpointRecord, LogContext, ansi_palette},
     proto::command::request::RequestType,
 };
 
 use crate::metrics::names;
-use crate::router::pattern_trie::TrieNode;
+use crate::router::pattern_trie::{InsertResult, TrieNode};
 use crate::{
     AcceptError, BackendConnectAction, BackendConnectionError, BackendConnectionStatus, CachedTags,
     ListenerError, ListenerHandler, Protocol, ProxyConfiguration, ProxyError, ProxySession,
@@ -392,7 +392,7 @@ impl TcpSession {
         // SNI-routed sessions carry the matched front's own tags key
         // (`sni_tags_key`, stashed by `upgrade_sni_preread`); everything
         // else keeps the historical bare-address key.
-        let address_key = listener.get_addr().to_string();
+        let address_key = TcpFrontendTagsKey::Address(*listener.get_addr()).to_string();
         let tags_key = self.tags_key.as_deref().unwrap_or(&address_key);
         info_access!(
             on_failure: { incr!(names::access_logs::UNSENT) },
@@ -473,7 +473,12 @@ impl TcpSession {
     }
 
     fn readable(&mut self) -> SessionResult {
-        if !self.container_frontend_timeout.reset() {
+        // The absolute SNI-preread deadline (armed once, at session
+        // creation) must stand while undecided -- see
+        // `frontend_timeout_resets_on_readable`'s doc.
+        if frontend_timeout_resets_on_readable(&self.state)
+            && !self.container_frontend_timeout.reset()
+        {
             error!(
                 "{} Could not reset frontend timeout on readable",
                 log_context!(self)
@@ -509,6 +514,21 @@ impl TcpSession {
             && let Some(outcome) = preread.outcome()
         {
             self.cluster_id = Some(outcome.cluster.clone());
+            // Restore the listener's configured `front_timeout` THE MOMENT
+            // routing succeeds, not only once the backend connect completes
+            // (previously done only in `upgrade_sni_preread`, which can run
+            // one or more `ready()` cycles later): a slow-but-legitimate
+            // backend connect must be bounded by
+            // `front_timeout`/`connect_timeout`, never by the short
+            // `sni_preread_timeout` that only makes sense while a route
+            // decision is still pending (sozu-proxy/sozu#1290). This is
+            // also the point from which
+            // `frontend_timeout_resets_on_readable` starts resetting this
+            // container again on every future `readable()`.
+            self.container_frontend_timeout
+                .set_duration(Duration::from_secs(
+                    self.listener.borrow().config.front_timeout as u64,
+                ));
         }
 
         result
@@ -713,6 +733,24 @@ impl TcpSession {
     /// contract; the "reject"/"teardown" exits are each other's counterpart
     /// in `SniPreread::handle_output` (metric only) and `TcpSession::close`'s
     /// `StateMarker::SniPreread` arm (gauge).
+    /// Shared abort path for `upgrade_sni_preread`'s early-return guards:
+    /// logs `reason` through the same envelope as the rest of this module,
+    /// then records `tcp.sni_preread.duration` -- see the long comment on
+    /// `upgrade_sni_preread` for why that metric must fire on every exit --
+    /// before returning `None`.
+    fn abort_sni_preread_upgrade(
+        &self,
+        preread: &SniPreread<MioTcpStream>,
+        reason: &str,
+    ) -> Option<TcpStateMachine> {
+        error!("{} {}", log_context!(self), reason);
+        time!(
+            names::tcp::sni_preread::DURATION,
+            preread.started_at().elapsed().as_millis() as i64
+        );
+        None
+    }
+
     fn upgrade_sni_preread(
         &mut self,
         mut preread: SniPreread<MioTcpStream>,
@@ -728,48 +766,28 @@ impl TcpSession {
         // but the duration is NOT: it is recorded right before each `return
         // None` below, symmetric with the success path's `time!` call.
         let Some(outcome) = preread.outcome().cloned() else {
-            error!(
-                "{} upgrade_sni_preread called before a route decision",
-                log_context!(self)
+            return self.abort_sni_preread_upgrade(
+                &preread,
+                "upgrade_sni_preread called before a route decision",
             );
-            time!(
-                names::tcp::sni_preread::DURATION,
-                preread.started_at().elapsed().as_millis() as i64
-            );
-            return None;
         };
         let Some(backend_socket) = preread.backend.take() else {
-            error!(
-                "{} SNI preread upgrade with no backend socket set",
-                log_context!(self)
+            return self.abort_sni_preread_upgrade(
+                &preread,
+                "SNI preread upgrade with no backend socket set",
             );
-            time!(
-                names::tcp::sni_preread::DURATION,
-                preread.started_at().elapsed().as_millis() as i64
-            );
-            return None;
         };
         let Some(backend_token) = preread.backend_token else {
-            error!(
-                "{} SNI preread upgrade with no backend token set",
-                log_context!(self)
+            return self.abort_sni_preread_upgrade(
+                &preread,
+                "SNI preread upgrade with no backend token set",
             );
-            time!(
-                names::tcp::sni_preread::DURATION,
-                preread.started_at().elapsed().as_millis() as i64
-            );
-            return None;
         };
         let Some(back_buffer) = self.backend_buffer.take() else {
-            error!(
-                "{} SNI preread upgrade with no backend buffer queued",
-                log_context!(self)
+            return self.abort_sni_preread_upgrade(
+                &preread,
+                "SNI preread upgrade with no backend buffer queued",
             );
-            time!(
-                names::tcp::sni_preread::DURATION,
-                preread.started_at().elapsed().as_millis() as i64
-            );
-            return None;
         };
 
         gauge_add!(names::tcp::sni_preread::ACTIVE, -1);
@@ -779,10 +797,14 @@ impl TcpSession {
         );
 
         self.cluster_id = Some(outcome.cluster.clone());
-        self.container_frontend_timeout
-            .set_duration(Duration::from_secs(
-                self.listener.borrow().config.front_timeout as u64,
-            ));
+        // `container_frontend_timeout` is NOT restored here anymore: by the
+        // time this runs, `TcpSession::readable`'s route-capture block has
+        // already restored it to the listener's configured `front_timeout`
+        // the moment the route decision first became visible (potentially
+        // one or more `ready()` cycles before this upgrade, while the
+        // backend was still connecting) -- see that block's doc
+        // (sozu-proxy/sozu#1290). Restoring it again here
+        // would just re-arm the same duration a second time.
         // Access-log tagging: stash the routed SNI/ALPN for
         // whichever of the four `proxy_protocol` branches below eventually
         // reaches `Pipe` -- immediately via `build_pipe_from_preread` for
@@ -1838,13 +1860,31 @@ impl ProxySession for TcpSession {
         if self.frontend_token == token {
             self.container_frontend_timeout.triggered();
             // The preread deadline firing always closes the session either
-            // way (matches every other state's front-timeout behavior);
-            // this only exists for its `tcp.sni_preread.rejected.fragmented`
-            // metric + log side effect.
+            // way (matches every other state's front-timeout behavior).
+            // Route-aware: only feed `Input::Timeout` into the core while
+            // still UNDECIDED, for its `tcp.sni_preread.rejected.fragmented`
+            // metric + log side effect. Once a route has already latched
+            // (backend connect still pending), this same front-timeout
+            // firing is a plain "connect/upgrade took too long" close, NOT a
+            // fresh preread verdict -- re-feeding `Input::Timeout` into an
+            // already-decided core would just replay the SAME latched
+            // `Output::Routed` through `SniPreread::handle_output`'s
+            // `Routed` arm a SECOND time: double-incrementing
+            // `tcp.sni_preread.routed` in release, and tripping its
+            // `debug_assert!(self.outcome.is_none(), ...)` in debug
+            // (sozu-proxy/sozu#1290).
             if let TcpStateMachine::SniPreread(preread) = &mut self.state {
-                let listener = self.listener.borrow();
-                let cfg = listener.preread_config(preread.effective_max_bytes());
-                preread.on_timeout(&cfg);
+                if preread.is_routed() {
+                    debug!(
+                        "{} frontend timeout while a routed SNI-preread session was still \
+                         waiting on its backend connect",
+                        log_context!(self)
+                    );
+                } else {
+                    let listener = self.listener.borrow();
+                    let cfg = listener.preread_config(preread.effective_max_bytes());
+                    preread.on_timeout(&cfg);
+                }
             }
             return true;
         }
@@ -2101,26 +2141,26 @@ impl TcpListener {
                     );
                 }
 
-                // SNI SHAPE check, mirroring config.rs's
-                // `validate_sni_pattern` (which a direct `AddTcpFrontend`
-                // over the command socket or a `LoadState` replay bypasses
-                // entirely): `/` is never valid in a hostname — and
-                // `pattern_trie`'s insert treats a leftmost `/.../` label as
-                // a REGEX segment — and `*` is only legal as a single
-                // leading `*.` wildcard label. Without this, a malformed
-                // SNI reaching the worker would be silently inserted as a
-                // regex/wildcard route.
-                let star_outside_leading_label = match sni.strip_prefix("*.") {
-                    Some(rest) => rest.contains('*'),
-                    None => sni.contains('*'),
+                // SNI SHAPE check: delegate to the SAME validator config-load
+                // uses (`sozu_command::config::validate_sni_pattern`) rather
+                // than a hand-rolled partial check. A direct `AddTcpFrontend`
+                // over the command socket, or a `LoadState` replay, bypasses
+                // config.rs entirely, so the worker boundary must enforce
+                // the identical rule -- including the checks a bare '/'/'*'
+                // scan used to miss: empty string, non-ASCII, and any empty
+                // label (leading/trailing/consecutive dots). An unvalidated
+                // leading-empty-label pattern like `.example.com` would
+                // otherwise reach `insert_sni_route` ->
+                // `pattern_trie::insert_recursive`'s RELEASE-mode
+                // `assert_ne!(partial_key, &b""[..])` and crash the worker.
+                let normalized_sni = match validate_sni_pattern(sni) {
+                    Ok(normalized) => normalized,
+                    Err(config_error) => {
+                        return reject(format!(
+                            "sni {sni:?} failed SNI shape validation: {config_error}"
+                        ));
+                    }
                 };
-                if sni.contains('/') || star_outside_leading_label {
-                    return reject(format!(
-                        "sni {sni:?} has an invalid shape: '/' is never valid in an SNI \
-                         hostname (a leftmost '/.../' label would become a regex route), and \
-                         '*' is only allowed as a single leading \"*.\" wildcard label"
-                    ));
-                }
 
                 // Same key as `insert_sni_route`'s own lookup, so this checks
                 // against exactly the entries the new route would be appended
@@ -2163,7 +2203,14 @@ impl TcpListener {
                 // `false`) cannot see an existing entry there, so duplicate
                 // bare-`*` fronts are not detected -- sibling keys stay
                 // untouched either way.
-                let key = sni.to_ascii_lowercase().into_bytes();
+                //
+                // `normalized_sni` (not a fresh `sni.to_ascii_lowercase()`)
+                // is used here: `validate_sni_pattern` already returned the
+                // canonical lowercased form above, and reusing it keeps this
+                // function's notion of "the key" identical to what
+                // `insert_sni_route`/`remove_sni_route` compute from the
+                // same input.
+                let key = normalized_sni.into_bytes();
                 let accept_wildcard_for_self_lookup = key.starts_with(b"*.");
                 if let Some((_, existing)) = self
                     .sni_routes
@@ -2208,22 +2255,59 @@ impl TcpListener {
     /// share the same SNI). `sni` is defensively lowercased: the
     /// SNI-preread core normalizes (lowercase, no trailing dot) before ever
     /// looking a route up, so the table key must already be in that form.
-    fn insert_sni_route(&mut self, sni: String, alpn: Vec<String>, cluster_id: ClusterId) {
-        let key = sni.to_ascii_lowercase().into_bytes();
-        let matcher = if alpn.is_empty() {
-            AlpnMatcher::Any
-        } else {
-            AlpnMatcher::OneOf(alpn.into_iter().map(String::into_bytes).collect())
-        };
+    ///
+    /// Returns `Err` when the underlying trie insert reports
+    /// [`InsertResult::Failed`] (a malformed key, e.g. an empty label) —
+    /// the caller (`TcpProxy::add_tcp_front`) must propagate this rather
+    /// than silently keep going with an add that reports success while the
+    /// route table never gained a usable entry. With `validate_new_tcp_front`
+    /// enforcing the shared SNI shape validator before this ever runs, a
+    /// `Failed` result should be unreachable here — the `debug_assert_ne!`
+    /// below asserts OUR OWN validated invariant, not raw wire/IPC input,
+    /// and is a loud Sōzu-internal-bug canary in debug builds; the `Err`
+    /// path is the release-mode graceful fallback if that invariant is ever
+    /// violated by a future bug.
+    fn insert_sni_route(
+        &mut self,
+        sni: String,
+        alpn: Vec<String>,
+        cluster_id: ClusterId,
+    ) -> Result<(), ProxyError> {
+        let (key, matcher) = route_key_and_matcher(&sni, alpn);
         // `accept_wildcard: false` — see `validate_new_tcp_front`'s comment:
         // an exact key must never fall back to a sibling wildcard's entry,
         // or this push would corrupt the WILDCARD's route `Vec` instead of
         // creating this key's own node.
         match self.sni_routes.domain_lookup_mut(&key, false) {
-            Some((_, entries)) => entries.push((matcher, cluster_id)),
+            Some((_, entries)) => {
+                entries.push((matcher, cluster_id));
+                Ok(())
+            }
             None => {
-                self.sni_routes
+                let insert_result = self
+                    .sni_routes
                     .domain_insert(key, vec![(matcher, cluster_id)]);
+                debug_assert_ne!(
+                    insert_result,
+                    InsertResult::Failed,
+                    "insert_sni_route's key must already be validated by validate_new_tcp_front"
+                );
+                if insert_result == InsertResult::Failed {
+                    error!(
+                        "{} SNI route insert failed for {:?} despite passing shape \
+                         validation -- rejecting to avoid a silently dead route",
+                        log_module_context!(),
+                        sni
+                    );
+                    return Err(ProxyError::InvalidTcpFrontend {
+                        address: self.address,
+                        reason: format!(
+                            "internal error: the route table rejected sni {sni:?} despite \
+                             passing shape validation"
+                        ),
+                    });
+                }
+                Ok(())
             }
         }
     }
@@ -2233,12 +2317,7 @@ impl TcpListener {
     /// SNI key itself once its `Vec` is empty (no stranded empty entries in
     /// the trie).
     fn remove_sni_route(&mut self, sni: String, alpn: Vec<String>, cluster_id: &ClusterId) {
-        let key = sni.to_ascii_lowercase().into_bytes();
-        let matcher = if alpn.is_empty() {
-            AlpnMatcher::Any
-        } else {
-            AlpnMatcher::OneOf(alpn.into_iter().map(String::into_bytes).collect())
-        };
+        let (key, matcher) = route_key_and_matcher(&sni, alpn);
         // `accept_wildcard: false` — same reasoning as `insert_sni_route`:
         // removing the exact key must never reach into and strip a sibling
         // wildcard's entries.
@@ -2337,6 +2416,25 @@ fn effective_sni_preread_max_bytes(configured: Option<u32>, buffer_capacity: usi
         .max(MIN_SNI_PREREAD_MAX_BYTES as usize)
 }
 
+/// Whether `TcpSession::readable`'s frontend-timeout reset should fire for
+/// the CURRENT state. `false` only while the session is an UNDECIDED
+/// `SniPreread`: the preread deadline armed at session creation
+/// (`new_sni_preread`) is an ABSOLUTE budget, not a per-fragment idle timer
+/// -- resetting it on every `readable()` event would let a client
+/// trickling one byte just before each expiry hold the session (and both
+/// its checked-out buffers) open far past the configured
+/// `sni_preread_timeout` (sozu-proxy/sozu#1290). Every
+/// other state -- a `SniPreread` that has already routed, or any state
+/// reached after it -- resets normally: once routed, the frontend timeout
+/// reverts to being a genuine per-read idle timer (see the `front_timeout`
+/// restore in `readable()`'s route-capture block).
+fn frontend_timeout_resets_on_readable(state: &TcpStateMachine) -> bool {
+    !matches!(
+        state,
+        TcpStateMachine::SniPreread(preread) if preread.outcome().is_none()
+    )
+}
+
 /// Access-log ALPN tag for an SNI-routed TCP session: the client's FIRST
 /// offered protocol (client preference order, matching
 /// `SniPrereadCore::route`'s own routing precedence), mapped to a known
@@ -2354,26 +2452,84 @@ fn known_alpn_label(offered: &[Vec<u8>]) -> Option<&'static str> {
     }
 }
 
+/// Worker-internal, collision-free identity for a TCP frontend's access-log
+/// tags entry (sozu-proxy/sozu#1290). ALPN protocol
+/// identifiers are opaque RFC 7301 byte strings -- nothing forbids a `,` or
+/// `|` inside one -- so a naive `sorted_alpn.join(",")` string key let two
+/// legal, DISJOINT fronts collide: a single protocol `"a,b"` and the pair
+/// `["a", "b"]` both joined to the identical string `"a,b"`, so the second
+/// `add_tcp_front` silently clobbered the first front's tags entry.
+///
+/// `TcpListener::tags: BTreeMap<String, CachedTags>` and
+/// `Pipe::set_tags_key(Option<String>)` (`lib/src/protocol/pipe.rs`) both
+/// key on a plain `String` -- crossing either boundary still needs one --
+/// so this type does not replace that storage; it is the SINGLE place that
+/// composes the string, via [`Self::fmt`]'s length-prefixed per-protocol
+/// encoding, so no choice of in-band separator can be confused with a
+/// protocol-name boundary the way a bare `join(",")` could.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum TcpFrontendTagsKey {
+    /// Legacy no-SNI catch-all front: keyed by the bare listener address,
+    /// exactly as before SNI routing existed.
+    Address(SocketAddr),
+    /// An SNI-scoped front. `alpn` is sorted (and deduped, since a plain
+    /// `Vec<String>` cannot enforce uniqueness the way
+    /// [`AlpnMatcher::OneOf`]'s `BTreeSet` does) so two constructions from
+    /// the same logical protocol set always compare equal regardless of
+    /// the caller's original order.
+    Sni {
+        address: SocketAddr,
+        sni: String,
+        alpn: Vec<String>,
+    },
+}
+
+impl TcpFrontendTagsKey {
+    /// The identity triple `command/src/state.rs`'s `add_tcp_frontend`
+    /// deduplicates on: `sni` is lowercased to match `insert_sni_route`'s
+    /// trie key, `alpn` sorted + deduped so `add_tcp_front`'s operator
+    /// order and the route-time rebuild's [`AlpnMatcher::OneOf`] `BTreeSet`
+    /// order (`alpn_matcher_protocols`) always agree.
+    fn sni(address: SocketAddr, sni: &str, alpn: &[String]) -> Self {
+        let mut alpn: Vec<String> = alpn.to_vec();
+        alpn.sort_unstable();
+        alpn.dedup();
+        TcpFrontendTagsKey::Sni {
+            address,
+            sni: sni.to_ascii_lowercase(),
+            alpn,
+        }
+    }
+}
+
+impl std::fmt::Display for TcpFrontendTagsKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TcpFrontendTagsKey::Address(address) => write!(f, "{address}"),
+            TcpFrontendTagsKey::Sni { address, sni, alpn } => {
+                write!(f, "{address}|{sni}|")?;
+                for protocol in alpn {
+                    // `<len>:<bytes>` per protocol: the length prefix is
+                    // CHECKED against the following bytes, never scanned
+                    // for, so a `,`/`:` embedded in one protocol name can
+                    // never be misread as a boundary between two --
+                    // unlike the old bare `join(",")`.
+                    write!(f, "{}:{protocol}", protocol.len())?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Canonical access-log tags key for an SNI-scoped TCP frontend: one
 /// listener can carry many SNI/ALPN fronts, each with its own `tags`, so
 /// keying tags by the bare listener address (the pre-SNI behavior, kept
 /// verbatim for no-SNI fronts) would let the LAST added front clobber every
-/// sibling and let removing ANY front clear tags for the whole address.
-///
-/// The key is `(address, lowercased sni pattern, sorted alpn)`: the same
-/// identity triple `command/src/state.rs`'s `add_tcp_frontend` deduplicates
-/// on. `sni` is lowercased to match `insert_sni_route`'s trie key; `alpn`
-/// is SORTED so the key is order-independent — `add_tcp_front` receives the
-/// operator's order while the route-time rebuild in `upgrade_sni_preread`
-/// iterates an [`AlpnMatcher::OneOf`] `BTreeSet` (already sorted; `String`
-/// and byte-wise ordering agree because `str` compares byte-wise). The `|`
-/// separator cannot appear in an address, a validated SNI, or an ALPN
-/// protocol name, and a composed key never collides with a bare-address
-/// key.
+/// sibling and let removing ANY front clear tags for the whole address. See
+/// [`TcpFrontendTagsKey`] for the collision-free composition.
 fn sni_tags_key(address: &SocketAddr, sni: &str, alpn: &[String]) -> String {
-    let mut alpn: Vec<&str> = alpn.iter().map(String::as_str).collect();
-    alpn.sort_unstable();
-    format!("{address}|{}|{}", sni.to_ascii_lowercase(), alpn.join(","))
+    TcpFrontendTagsKey::sni(*address, sni, alpn).to_string()
 }
 
 /// The matched [`AlpnMatcher`]'s protocols as strings, for rebuilding the
@@ -2389,6 +2545,22 @@ fn alpn_matcher_protocols(matcher: &AlpnMatcher) -> Vec<String> {
             .map(|protocol| String::from_utf8_lossy(protocol).into_owned())
             .collect(),
     }
+}
+
+/// Shared `(trie key, ALPN matcher)` construction for
+/// [`TcpListener::insert_sni_route`] and [`TcpListener::remove_sni_route`]:
+/// `sni` lowercased into the trie key, `alpn` collapsed to
+/// [`AlpnMatcher::Any`] when empty (catch-all) or [`AlpnMatcher::OneOf`]
+/// otherwise. `alpn` is taken by value since neither caller needs it again
+/// afterward.
+fn route_key_and_matcher(sni: &str, alpn: Vec<String>) -> (Vec<u8>, AlpnMatcher) {
+    let key = sni.to_ascii_lowercase().into_bytes();
+    let matcher = if alpn.is_empty() {
+        AlpnMatcher::Any
+    } else {
+        AlpnMatcher::OneOf(alpn.into_iter().map(String::into_bytes).collect())
+    };
+    (key, matcher)
 }
 
 #[derive(Debug)]
@@ -2555,10 +2727,13 @@ impl TcpProxy {
                 // listener, so the bare-address key (kept for no-SNI fronts
                 // below) would clobber siblings — see `sni_tags_key`.
                 listener.set_tags(sni_tags_key(&address, &sni, &front.alpn), Some(front.tags));
-                listener.insert_sni_route(sni, front.alpn, front.cluster_id);
+                listener.insert_sni_route(sni, front.alpn, front.cluster_id)?;
             }
             None => {
-                listener.set_tags(address.to_string(), Some(front.tags));
+                listener.set_tags(
+                    TcpFrontendTagsKey::Address(address).to_string(),
+                    Some(front.tags),
+                );
                 listener.cluster_id = Some(front.cluster_id);
             }
         }
@@ -2596,7 +2771,7 @@ impl TcpProxy {
                 self.fronts.remove(&front.cluster_id);
             }
             None => {
-                listener.set_tags(address.to_string(), None);
+                listener.set_tags(TcpFrontendTagsKey::Address(address).to_string(), None);
                 if let Some(cluster_id) = listener.cluster_id.take() {
                     self.fronts.remove(&cluster_id);
                 }
@@ -3290,12 +3465,16 @@ mod sni_routing_tests {
     #[test]
     fn empty_alpn_maps_to_any_non_empty_maps_to_one_of() {
         let mut listener = test_listener();
-        listener.insert_sni_route("example.com".to_owned(), vec![], "cluster-any".to_owned());
-        listener.insert_sni_route(
-            "h2.example.com".to_owned(),
-            vec!["h2".to_owned(), "http/1.1".to_owned()],
-            "cluster-h2".to_owned(),
-        );
+        listener
+            .insert_sni_route("example.com".to_owned(), vec![], "cluster-any".to_owned())
+            .expect("insert_sni_route must succeed for a valid test SNI");
+        listener
+            .insert_sni_route(
+                "h2.example.com".to_owned(),
+                vec!["h2".to_owned(), "http/1.1".to_owned()],
+                "cluster-h2".to_owned(),
+            )
+            .expect("insert_sni_route must succeed for a valid test SNI");
 
         let (_, any_entries) = listener
             .sni_routes
@@ -3322,16 +3501,20 @@ mod sni_routing_tests {
     #[test]
     fn insert_sni_route_appends_under_the_same_sni() {
         let mut listener = test_listener();
-        listener.insert_sni_route(
-            "example.com".to_owned(),
-            vec!["h2".to_owned()],
-            "cluster-h2".to_owned(),
-        );
-        listener.insert_sni_route(
-            "example.com".to_owned(),
-            vec![],
-            "cluster-default".to_owned(),
-        );
+        listener
+            .insert_sni_route(
+                "example.com".to_owned(),
+                vec!["h2".to_owned()],
+                "cluster-h2".to_owned(),
+            )
+            .expect("insert_sni_route must succeed for a valid test SNI");
+        listener
+            .insert_sni_route(
+                "example.com".to_owned(),
+                vec![],
+                "cluster-default".to_owned(),
+            )
+            .expect("insert_sni_route must succeed for a valid test SNI");
 
         let (_, entries) = listener
             .sni_routes
@@ -3343,16 +3526,20 @@ mod sni_routing_tests {
     #[test]
     fn remove_sni_route_drops_only_the_matching_entry() {
         let mut listener = test_listener();
-        listener.insert_sni_route(
-            "example.com".to_owned(),
-            vec!["h2".to_owned()],
-            "cluster-h2".to_owned(),
-        );
-        listener.insert_sni_route(
-            "example.com".to_owned(),
-            vec![],
-            "cluster-default".to_owned(),
-        );
+        listener
+            .insert_sni_route(
+                "example.com".to_owned(),
+                vec!["h2".to_owned()],
+                "cluster-h2".to_owned(),
+            )
+            .expect("insert_sni_route must succeed for a valid test SNI");
+        listener
+            .insert_sni_route(
+                "example.com".to_owned(),
+                vec![],
+                "cluster-default".to_owned(),
+            )
+            .expect("insert_sni_route must succeed for a valid test SNI");
 
         listener.remove_sni_route(
             "example.com".to_owned(),
@@ -3374,7 +3561,9 @@ mod sni_routing_tests {
     #[test]
     fn remove_sni_route_empties_the_trie_key_when_the_last_entry_goes() {
         let mut listener = test_listener();
-        listener.insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned());
+        listener
+            .insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned())
+            .expect("insert_sni_route must succeed for a valid test SNI");
         assert!(!listener.sni_routes.is_empty());
 
         listener.remove_sni_route("example.com".to_owned(), vec![], &"cluster-a".to_owned());
@@ -3394,7 +3583,9 @@ mod sni_routing_tests {
     #[test]
     fn remove_sni_route_on_an_absent_sni_is_a_harmless_no_op() {
         let mut listener = test_listener();
-        listener.insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned());
+        listener
+            .insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned())
+            .expect("insert_sni_route must succeed for a valid test SNI");
 
         // Removing a route for a SNI that was never inserted must not panic
         // and must not disturb the existing route.
@@ -3419,17 +3610,21 @@ mod sni_routing_tests {
     fn insert_sni_route_creates_a_distinct_node_for_an_exact_key_over_a_sibling_wildcard() {
         let mut listener = test_listener();
         // Wildcard catch-all first.
-        listener.insert_sni_route(
-            "*.example.com".to_owned(),
-            vec![],
-            "cluster-wildcard".to_owned(),
-        );
+        listener
+            .insert_sni_route(
+                "*.example.com".to_owned(),
+                vec![],
+                "cluster-wildcard".to_owned(),
+            )
+            .expect("insert_sni_route must succeed for a valid test SNI");
         // Exact ALPN-scoped route for one specific subdomain.
-        listener.insert_sni_route(
-            "a.example.com".to_owned(),
-            vec!["h2".to_owned()],
-            "cluster-a-h2".to_owned(),
-        );
+        listener
+            .insert_sni_route(
+                "a.example.com".to_owned(),
+                vec!["h2".to_owned()],
+                "cluster-a-h2".to_owned(),
+            )
+            .expect("insert_sni_route must succeed for a valid test SNI");
 
         // The exact key must have gotten its OWN trie node -- with
         // `accept_wildcard: true` this lookup would instead fall back to
@@ -3465,11 +3660,13 @@ mod sni_routing_tests {
     #[test]
     fn validate_new_tcp_front_accepts_an_exact_catch_all_sibling_of_a_wildcard_catch_all() {
         let mut listener = test_listener();
-        listener.insert_sni_route(
-            "*.example.com".to_owned(),
-            vec![],
-            "cluster-wildcard".to_owned(),
-        );
+        listener
+            .insert_sni_route(
+                "*.example.com".to_owned(),
+                vec![],
+                "cluster-wildcard".to_owned(),
+            )
+            .expect("insert_sni_route must succeed for a valid test SNI");
 
         // An exact catch-all for one subdomain must be accepted: it is a
         // SIBLING of the wildcard's catch-all, not a duplicate of it. With
@@ -3486,11 +3683,13 @@ mod sni_routing_tests {
     #[test]
     fn validate_new_tcp_front_rejects_a_duplicate_wildcard_catch_all() {
         let mut listener = test_listener();
-        listener.insert_sni_route(
-            "*.example.com".to_owned(),
-            vec![],
-            "cluster-wildcard".to_owned(),
-        );
+        listener
+            .insert_sni_route(
+                "*.example.com".to_owned(),
+                vec![],
+                "cluster-wildcard".to_owned(),
+            )
+            .expect("insert_sni_route must succeed for a valid test SNI");
 
         // A SECOND catch-all for the SAME wildcard key is an ambiguous
         // duplicate and must be rejected. The immutable trie `lookup` has no
@@ -3509,11 +3708,13 @@ mod sni_routing_tests {
     #[test]
     fn validate_new_tcp_front_rejects_overlapping_alpn_on_the_same_wildcard() {
         let mut listener = test_listener();
-        listener.insert_sni_route(
-            "*.example.com".to_owned(),
-            vec!["h2".to_owned()],
-            "cluster-wildcard-h2".to_owned(),
-        );
+        listener
+            .insert_sni_route(
+                "*.example.com".to_owned(),
+                vec!["h2".to_owned()],
+                "cluster-wildcard-h2".to_owned(),
+            )
+            .expect("insert_sni_route must succeed for a valid test SNI");
 
         // Same wildcard key, overlapping ALPN protocol: ambiguous, must be
         // rejected (same bypass as the duplicate catch-all above).
@@ -3527,11 +3728,13 @@ mod sni_routing_tests {
     #[test]
     fn validate_new_tcp_front_accepts_a_disjoint_alpn_addition_on_the_same_wildcard() {
         let mut listener = test_listener();
-        listener.insert_sni_route(
-            "*.example.com".to_owned(),
-            vec![],
-            "cluster-wildcard".to_owned(),
-        );
+        listener
+            .insert_sni_route(
+                "*.example.com".to_owned(),
+                vec![],
+                "cluster-wildcard".to_owned(),
+            )
+            .expect("insert_sni_route must succeed for a valid test SNI");
 
         // A non-overlapping ALPN-scoped addition alongside the wildcard's
         // catch-all stays legal -- the wildcard-aware self-lookup must not
@@ -3574,6 +3777,76 @@ mod sni_routing_tests {
                 "legal SNI shape {good:?} must still be accepted"
             );
         }
+    }
+
+    /// `validate_new_tcp_front`'s OLD hand-rolled shape check only rejected
+    /// `/` and a misplaced `*`, letting an empty label (leading dot,
+    /// trailing dot, consecutive dots), an empty string, or a non-ASCII
+    /// pattern reach `insert_sni_route` -> `pattern_trie::insert_recursive`,
+    /// whose RELEASE-mode `assert_ne!(partial_key, &b""[..])` panics the
+    /// worker on a leading-empty-label key like `.example.com`. This is the
+    /// worker-boundary counterpart to `config.rs`'s `validate_sni_pattern`
+    /// tests: every shape the shared validator rejects at config-load must
+    /// also be rejected here, for `AddTcpFrontend`/`LoadState` requests that
+    /// bypass config.rs entirely.
+    #[test]
+    fn add_tcp_front_enforces_the_shared_sni_validator_at_the_worker_boundary() {
+        let mut proxy = test_proxy();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build listener config");
+        let token = Token(0);
+        proxy
+            .add_listener(config, token)
+            .expect("could not add listener");
+
+        for bad in [
+            ".example.com",     // leading empty label -- the pattern_trie-crashing shape
+            "example.com.",     // trailing empty label
+            "a..b.example.com", // consecutive dots -- empty middle label
+            "",                 // empty pattern
+            "exämple.com",      // non-ASCII
+        ] {
+            let front = frontend("cluster-a", Some(bad), &[]);
+            let front = RequestTcpFrontend { address, ..front };
+            match proxy.add_tcp_front(front) {
+                Err(ProxyError::InvalidTcpFrontend { .. }) => {}
+                other => panic!("malformed sni {bad:?} must be rejected, got {other:?}"),
+            }
+
+            let listener = proxy
+                .listeners
+                .get(&token)
+                .expect("listener must be present")
+                .borrow();
+            assert!(
+                listener.sni_routes.is_empty(),
+                "a rejected sni {bad:?} must leave sni_routes empty"
+            );
+            assert!(
+                listener.cluster_id.is_none(),
+                "a rejected sni {bad:?} must leave cluster_id unset"
+            );
+        }
+
+        // A space IS valid ASCII, is not '*'/'/', and splits into non-empty
+        // labels ("exa", "mple.com") -- none of the shared validator's rules
+        // (empty pattern, non-ASCII, misplaced '*', empty label) cover "not a
+        // valid hostname character" in general, so this shape is ACCEPTED,
+        // not rejected. Documenting the validator's actual behavior rather
+        // than assuming a hostname-shaped string with a space would be
+        // caught too.
+        let space_front = frontend("cluster-space", Some("exa mple.com"), &[]);
+        let space_front = RequestTcpFrontend {
+            address,
+            ..space_front
+        };
+        assert!(
+            proxy.add_tcp_front(space_front).is_ok(),
+            "the shared SNI validator does not reject an embedded space -- \
+             it is valid ASCII with no empty label"
+        );
     }
 
     // ---- per-frontend access-log tags keying (sozu-proxy/sozu#1290) ----
@@ -3732,14 +4005,129 @@ mod sni_routing_tests {
         assert_ne!(add_time, address.to_string());
     }
 
+    /// Regression from the sozu-proxy/sozu#1290 review: ALPN protocol
+    /// identifiers are opaque byte strings -- nothing forbids a `,` inside
+    /// one -- so a SINGLE protocol `"a,b"` and the DISJOINT pair `["a",
+    /// "b"]` are two legal, distinct `AlpnMatcher`s on the same
+    /// `(address, sni)`, yet the naive `sorted_alpn.join(",")` key collapses
+    /// both to the literal string `"a,b"`.
+    #[test]
+    fn alpn_sets_differing_only_by_an_embedded_separator_get_distinct_tags_keys() {
+        let address: SocketAddr = "127.0.0.1:9001".parse().expect("test address");
+        let key_joined = sni_tags_key(&address, "example.com", &["a,b".to_owned()]);
+        let key_split = sni_tags_key(&address, "example.com", &["a".to_owned(), "b".to_owned()]);
+        assert_ne!(
+            key_joined, key_split,
+            "a single \"a,b\" protocol must not collide with the disjoint [\"a\", \"b\"] pair"
+        );
+    }
+
+    /// End-to-end through `TcpProxy`: both fronts are accepted (they are
+    /// genuinely disjoint `AlpnMatcher`s, so `validate_new_tcp_front`'s
+    /// overlap check does not reject either), each keeps its OWN tags under
+    /// its own composed key, and removing one leaves the other's tags
+    /// intact.
+    #[test]
+    fn alpn_sets_differing_only_by_an_embedded_separator_keep_distinct_tags() {
+        let mut proxy = test_proxy();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build listener config");
+        let token = Token(0);
+        proxy
+            .add_listener(config, token)
+            .expect("could not add listener");
+
+        let front_joined = RequestTcpFrontend {
+            cluster_id: "cluster-joined".to_owned(),
+            address,
+            sni: Some("example.com".to_owned()),
+            alpn: vec!["a,b".to_owned()],
+            tags: std::collections::BTreeMap::from([("variant".to_owned(), "joined".to_owned())]),
+        };
+        let front_split = RequestTcpFrontend {
+            cluster_id: "cluster-split".to_owned(),
+            address,
+            sni: Some("example.com".to_owned()),
+            alpn: vec!["a".to_owned(), "b".to_owned()],
+            tags: std::collections::BTreeMap::from([("variant".to_owned(), "split".to_owned())]),
+        };
+
+        proxy
+            .add_tcp_front(front_joined.clone())
+            .expect("the single \"a,b\" protocol front must be accepted");
+        proxy.add_tcp_front(front_split.clone()).expect(
+            "the disjoint [\"a\", \"b\"] front must be accepted -- it is NOT the same ALPN \
+                 set as [\"a,b\"]",
+        );
+
+        let std_address: SocketAddr = address.into();
+        let key_joined = sni_tags_key(&std_address, "example.com", &["a,b".to_owned()]);
+        let key_split = sni_tags_key(
+            &std_address,
+            "example.com",
+            &["a".to_owned(), "b".to_owned()],
+        );
+        assert_ne!(key_joined, key_split);
+
+        {
+            let listener = proxy
+                .listeners
+                .get(&token)
+                .expect("listener must be present")
+                .borrow();
+            assert_eq!(
+                listener
+                    .get_tags(&key_joined)
+                    .and_then(|t| t.tags.get("variant"))
+                    .map(String::as_str),
+                Some("joined"),
+                "the joined front's tags must live under its own composed key"
+            );
+            assert_eq!(
+                listener
+                    .get_tags(&key_split)
+                    .and_then(|t| t.tags.get("variant"))
+                    .map(String::as_str),
+                Some("split"),
+                "the split front's tags must live under its own DISTINCT composed key"
+            );
+        }
+
+        proxy
+            .remove_tcp_front(front_joined)
+            .expect("remove the joined front");
+
+        let listener = proxy
+            .listeners
+            .get(&token)
+            .expect("listener must be present")
+            .borrow();
+        assert!(
+            listener.get_tags(&key_joined).is_none(),
+            "removing the joined front must clear its own tags entry"
+        );
+        assert_eq!(
+            listener
+                .get_tags(&key_split)
+                .and_then(|t| t.tags.get("variant"))
+                .map(String::as_str),
+            Some("split"),
+            "removing the joined front must not disturb its sibling's tags"
+        );
+    }
+
     #[test]
     fn remove_sni_route_for_an_absent_exact_key_does_not_strip_a_sibling_wildcards_entry() {
         let mut listener = test_listener();
-        listener.insert_sni_route(
-            "*.example.com".to_owned(),
-            vec![],
-            "cluster-wildcard".to_owned(),
-        );
+        listener
+            .insert_sni_route(
+                "*.example.com".to_owned(),
+                vec![],
+                "cluster-wildcard".to_owned(),
+            )
+            .expect("insert_sni_route must succeed for a valid test SNI");
 
         // "a.example.com" was never inserted as its own route -- only the
         // wildcard catch-all exists. A remove targeting the exact host
@@ -3779,7 +4167,9 @@ mod sni_routing_tests {
     #[test]
     fn an_sni_scoped_front_leaves_cluster_id_unset() {
         let mut listener = test_listener();
-        listener.insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned());
+        listener
+            .insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned())
+            .expect("insert_sni_route must succeed for a valid test SNI");
         assert!(
             listener.cluster_id.is_none(),
             "a listener with only SNI-scoped fronts must never populate the legacy cluster_id"
@@ -4183,5 +4573,235 @@ mod sni_routing_tests {
             1,
             "entering the SniPreread state must increment tcp.sni_preread.active by exactly one"
         );
+    }
+
+    // ---- absolute preread deadline + route-aware timeout (sozu-proxy/sozu#1290) ----
+
+    /// `frontend_timeout_resets_on_readable` must gate the reset on exactly
+    /// one thing: whether the CURRENT state is an undecided `SniPreread`.
+    /// Constructed directly (no socket I/O needed) since the predicate is a
+    /// pure function of `&TcpStateMachine`.
+    #[test]
+    fn frontend_timeout_reset_is_gated_on_sni_preread_decision() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 16 * 1024);
+        let frontend_buffer = pool.checkout().expect("frontend buffer");
+        let socket = MioTcpStream::connect(
+            format!("127.0.0.1:{}", provide_port())
+                .parse()
+                .expect("loopback address must parse"),
+        )
+        .expect("mio connect must return a socket handle");
+
+        let undecided = TcpStateMachine::SniPreread(SniPreread::new(
+            socket,
+            Token(0),
+            Ulid::generate(),
+            frontend_buffer,
+            16384,
+        ));
+        assert!(
+            !frontend_timeout_resets_on_readable(&undecided),
+            "an undecided SniPreread must not have its absolute deadline reset"
+        );
+
+        // Every OTHER state resets normally -- represented here by
+        // `ExpectProxyProtocol`, cheaply constructible without driving a
+        // real route decision (unlike a ROUTED `SniPreread`, whose
+        // `outcome` field has no test-only setter and can only become
+        // `Some` by parsing a real ClientHello -- see
+        // `frontend_timeout_restored_and_timeout_after_route_is_not_double_counted`
+        // below for that scenario end-to-end).
+        let socket2 = MioTcpStream::connect(
+            format!("127.0.0.1:{}", provide_port())
+                .parse()
+                .expect("loopback address must parse"),
+        )
+        .expect("mio connect must return a socket handle");
+        let container = crate::timer::TimeoutContainer::new_empty(Duration::from_secs(5));
+        let other = TcpStateMachine::ExpectProxyProtocol(ExpectProxyProtocol::new(
+            container,
+            socket2,
+            Token(1),
+            Ulid::generate(),
+        ));
+        assert!(
+            frontend_timeout_resets_on_readable(&other),
+            "every non-preread-undecided state must keep resetting its frontend timeout"
+        );
+    }
+
+    /// Minimal single-record TLS ClientHello wire carrying only a
+    /// `server_name` extension for `host` -- hand-built rather than reusing
+    /// `tcp_preread::parser`'s test-only wire-building helpers (`mod
+    /// parser` is private to `tcp_preread`, unreachable from this sibling
+    /// module) to drive a REAL route decision through
+    /// `TcpSession::readable()` for the regression test below.
+    fn minimal_client_hello_wire(host: &str) -> Vec<u8> {
+        let mut name_list = vec![0u8]; // name_type = host_name
+        name_list.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        name_list.extend_from_slice(host.as_bytes());
+        let mut sni_ext_data = Vec::new();
+        sni_ext_data.extend_from_slice(&(name_list.len() as u16).to_be_bytes());
+        sni_ext_data.extend_from_slice(&name_list);
+        let mut sni_ext = Vec::new();
+        sni_ext.extend_from_slice(&0x0000u16.to_be_bytes()); // server_name extension type
+        sni_ext.extend_from_slice(&(sni_ext_data.len() as u16).to_be_bytes());
+        sni_ext.extend_from_slice(&sni_ext_data);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        body.extend_from_slice(&[0u8; 32]); // random
+        body.push(0); // session_id: empty
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher_suites
+        body.push(1); // compression_methods length
+        body.push(0); // compression_method: null
+        body.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes()); // extensions block length
+        body.extend_from_slice(&sni_ext);
+
+        let mut handshake = Vec::new();
+        handshake.push(1u8); // msg_type = client_hello
+        let hs_len = body.len() as u32;
+        handshake.extend_from_slice(&hs_len.to_be_bytes()[1..4]);
+        handshake.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.push(22u8); // ContentType::handshake
+        record.extend_from_slice(&[0x03, 0x03]); // legacy record version
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    /// Read the current process-local `tcp.sni_preread.routed` counter.
+    /// Same non-draining-read pattern as `sni_preread_active_gauge`, but
+    /// for a `Count` metric instead of a `Gauge`.
+    fn sni_preread_routed_count() -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(names::tcp::sni_preread::ROUTED)
+                .and_then(|fm| fm.inner.as_ref())
+                .and_then(|inner| match inner {
+                    Inner::Count(v) => Some(*v),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// End-to-end regression from the sozu-proxy/sozu#1290 review:
+    ///
+    /// (a) the moment a real ClientHello routes, `container_frontend_timeout`
+    ///     must already carry the listener's configured `front_timeout` --
+    ///     not just once `upgrade_sni_preread` eventually runs (which can be
+    ///     one or more `ready()` cycles later, after the backend connects);
+    /// (b) a front-timeout firing AFTER that route decision (backend connect
+    ///     still pending) must not re-feed `Input::Timeout` into the
+    ///     already-decided core: pre-fix, doing so replayed the SAME latched
+    ///     `Output::Routed` through `SniPreread::handle_output`'s `Routed`
+    ///     arm a second time, double-incrementing `tcp.sni_preread.routed`
+    ///     (release) and tripping `debug_assert!(self.outcome.is_none(),
+    ///     ...)` (debug -- this test runs in a debug build, so pre-fix it
+    ///     panics here).
+    #[test]
+    fn frontend_timeout_restored_and_timeout_after_route_is_not_double_counted() {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+        let proxy = Rc::new(RefCell::new(TcpProxy::new(
+            registry,
+            sessions,
+            pool.clone(),
+            backends,
+        )));
+
+        let mut bare_listener = test_listener();
+        bare_listener
+            .insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned())
+            .expect("insert_sni_route must succeed for a valid test SNI");
+        let configured_front_timeout = bare_listener.config.front_timeout;
+        let listener = Rc::new(RefCell::new(bare_listener));
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = std_listener.local_addr().expect("listener local addr");
+        let mut client = std::net::TcpStream::connect(addr).expect("connect test client");
+        let (server, _) = std_listener.accept().expect("accept test server");
+        server.set_nonblocking(true).expect("server nonblocking");
+
+        let (front_buffer, back_buffer) = {
+            let mut pool = pool.borrow_mut();
+            (
+                pool.checkout().expect("front buffer checkout must succeed"),
+                pool.checkout().expect("back buffer checkout must succeed"),
+            )
+        };
+
+        let mut session = TcpSession::new_sni_preread(
+            back_buffer,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            front_buffer,
+            Token(0),
+            listener,
+            proxy,
+            MioTcpStream::from_std(server),
+            Duration::from_millis(0),
+            Duration::from_secs(3),
+            16384,
+        );
+
+        {
+            use std::io::Write as _;
+            client
+                .write_all(&minimal_client_hello_wire("example.com"))
+                .expect("write ClientHello");
+            client.flush().ok();
+        }
+
+        let routed_before = sni_preread_routed_count();
+        for _ in 0..10 {
+            if session.cluster_id.is_some() {
+                break;
+            }
+            let _ = session.readable();
+        }
+        assert_eq!(
+            session.cluster_id.as_deref(),
+            Some("cluster-a"),
+            "the session must have routed on a valid ClientHello for a configured SNI"
+        );
+        assert_eq!(
+            sni_preread_routed_count() - routed_before,
+            1,
+            "routing must count tcp.sni_preread.routed exactly once"
+        );
+
+        // (a) front_timeout is restored the moment routing succeeds.
+        assert_eq!(
+            session.container_frontend_timeout.duration(),
+            Duration::from_secs(configured_front_timeout as u64),
+            "the frontend timeout must already carry the configured front_timeout right after \
+             routing, not only once the backend connects"
+        );
+
+        // (b) a timeout firing after the route already latched must not
+        // double-count tcp.sni_preread.routed, and (running in a debug
+        // build) must not panic on SniPreread::handle_output's
+        // `debug_assert!(self.outcome.is_none(), ...)`.
+        let _ = session.timeout(Token(0));
+        assert_eq!(
+            sni_preread_routed_count() - routed_before,
+            1,
+            "a timeout firing after the route already latched must not double-count \
+             tcp.sni_preread.routed"
+        );
+
+        drop(client);
     }
 }

@@ -1,14 +1,16 @@
 # Sōzu — Fuzzing
 
 `fuzz/` is an out-of-workspace `cargo-fuzz` crate hosting libFuzzer harnesses
-for the H2 wire surface. The crate is intentionally outside the main Cargo
-workspace (see `[workspace]` block at `fuzz/Cargo.toml:16`) so that nightly
-sanitizer builds do not pull the rest of the workspace through libFuzzer's
-build flags.
+for the H2 wire surface, the sans-io UDP load-balancing core, and the
+sans-io TCP SNI-preread core. The crate is intentionally outside the main
+Cargo workspace (see `[workspace]` block at `fuzz/Cargo.toml:16`) so that
+nightly sanitizer builds do not pull the rest of the workspace through
+libFuzzer's build flags.
 
-This document covers the layout, the two harnesses, how to run them locally,
-how to triage findings, and what would be required to wire the project into
-ClusterFuzzLite / OSS-Fuzz.
+This document covers the layout, the four harnesses, how to run them
+locally, how to triage findings, how CI's dedicated nightly fuzz job
+exercises them, and what would additionally be required to wire the
+project into ClusterFuzzLite / OSS-Fuzz.
 
 ---
 
@@ -39,10 +41,13 @@ fuzz/
 │       ├── truncated_hello_then_timeout
 │       ├── grease_heavy_hello_oneof_alpn
 │       ├── non_tls_junk
-│       └── malformed_record_oversize
+│       ├── malformed_record_oversize
+│       └── ...
 └── artifacts/                        # crash artifacts, not committed
     ├── fuzz_frame_parser/
-    └── fuzz_hpack_decoder/
+    ├── fuzz_hpack_decoder/
+    ├── fuzz_udp_flow/
+    └── fuzz_tcp_clienthello/
 ```
 
 The seed corpora under `fuzz/corpus/` are committed to the repository on
@@ -57,7 +62,7 @@ either reviewed for promotion or pruned with `git clean -f fuzz/corpus/`.
 
 ---
 
-## 2. The Two Harnesses
+## 2. The Four Harnesses
 
 ### 2.1 `fuzz_frame_parser`
 
@@ -99,7 +104,36 @@ imported through `loona-hpack = "0.4"` (`fuzz/Cargo.toml:12`); the fuzzer
 covers the worst-case shapes that the in-tree HPACK consumer
 (`lib/src/protocol/mux/pkawa.rs`) routes into the decoder.
 
-### 2.3 `fuzz_tcp_clienthello`
+### 2.3 `fuzz_udp_flow`
+
+Source: `fuzz/fuzz_targets/fuzz_udp_flow.rs`.
+
+Drives [`UdpManager`](../lib/src/protocol/udp/manager.rs) — the sans-io UDP
+load-balancing core (issue #1273) — through an arbitrary sequence of
+client/backend datagrams, control-plane reconfig events, backend
+resolutions, and clock advances, fully draining `poll_output` after every
+step. It also exercises `SourceTupleExtractor::flow_key` and the PPv2
+`dgram_header` / `prepend_dgram_header` builders directly on arbitrary
+bytes and addresses. The core is pure sans-io (no socket, no
+`Instant::now()` on the datapath); the target injects a monotonic clock
+advanced only by deltas parsed out of the input, so a given input always
+produces the same run.
+
+Invariants asserted beyond "never panic": live flow count never exceeds
+the high-water mark of every `max_flows` cap ever set; the `CloseFlow` /
+`FlowCreated` gauge never underflows; a final long clock advance reaps
+every flow back to zero with no armed timer left (no fd / slab leak); the
+2-tuple `FlowKey` form always normalises the port to zero; the PPv2 header
+is never shorter than its 16-byte fixed prefix and prefixing accounts for
+every byte exactly.
+
+Bug class defended: flow-table admission/eviction races, gauge leaks, and
+PPv2 datagram-framing bugs in the UDP load-balancing core. No named seed
+corpus is committed for this target — `fuzz/corpus/fuzz_udp_flow/` holds
+only locally-grown, untracked libFuzzer corpus entries (see the
+`.gitignore` pattern noted in §1).
+
+### 2.4 `fuzz_tcp_clienthello`
 
 Source: `fuzz/fuzz_targets/fuzz_tcp_clienthello.rs`.
 
@@ -144,6 +178,24 @@ it drives the core into:
 | `grease_heavy_hello_oneof_alpn` | A ClientHello with RFC 8701 GREASE extensions bracketing the `server_name` + `alpn` extensions, routed against a `OneOf({"h2"})` entry → `Routed` (the extension walk skips GREASE by length, ALPN client-preference-order picks `h2`). |
 | `non_tls_junk` | A 5-byte record whose `ContentType` is `application_data` (23), not `handshake` → `Reject(NotTls)`. |
 | `malformed_record_oversize` | A `handshake`-typed record declaring a length past the 2^14 RFC 8446 cap → `Reject(MalformedRecord)`. |
+| `regression-sni-list-len-overflow-1` | A wire-declared `server_name_list` / extension length that overruns the container it sits in → `Reject(MalformedHandshake)`, never a panic. |
+| `regression-sni-list-len-overflow-2` | Same crash class, a second lying-length variant. |
+| `regression-sni-list-len-overflow-3` | Same crash class, a third lying-length variant. |
+
+These three are regressions for a `debug_assert!` that was placed before
+the enforcing `take` on a declared list length and used to panic on
+exactly this shape. The underlying bug class is unit-tested directly in
+`lib/src/protocol/tcp_preread/parser.rs` as
+`sni_list_len_overflowing_extension_body_is_malformed_not_panic` (whose doc
+comment names it as the `fuzz_tcp_clienthello` regression) plus the
+sibling-field cases `sni_name_len_overflowing_list_is_malformed_not_panic`,
+`alpn_list_len_overflowing_extension_body_is_malformed_not_panic`, and
+`extension_len_overflowing_block_is_malformed_not_panic`; each fix
+reordered its check so an attacker-controlled length rejects cleanly
+instead of panicking. The three corpus files are distinct fuzzer-found
+byte sequences that triggered this bug class before the fix; this
+document does not assert a 1:1 mapping between a given file and a specific
+named test above.
 
 ---
 
@@ -177,10 +229,12 @@ The in-tree smoke check `e2e/src/tests/fuzz_tests.rs` runs each target for
 ten seconds inside the standard `cargo test` flow when the nightly
 toolchain and `cargo-fuzz` are available; when they are not, the test
 logs a skip notice and returns cleanly so the rest of the e2e suite still
-runs. Invoke it explicitly with:
+runs. The four wrappers are ordinary `#[test]` functions — not
+`#[ignore]`d — so they already run as part of a plain
+`cargo test -p sozu-e2e`. To run only them:
 
 ```bash
-cargo test -p sozu-e2e -- --ignored fuzz
+cargo test -p sozu-e2e fuzz
 ```
 
 ---
@@ -230,11 +284,18 @@ is reserved for the maintainers.
 
 ### 6.1 Current state
 
-ClusterFuzzLite is **not** wired up on this branch as of 2026-04-26.
-There is no `.clusterfuzzlite/` directory at the repository root and no
-fuzzing job in `.github/workflows/`. The two harnesses are only exercised
-locally and via the `e2e/src/tests/fuzz_tests.rs` ten-second smoke check
-documented above.
+ClusterFuzzLite itself is **not** wired up: there is no `.clusterfuzzlite/`
+directory at the repository root and no
+`google/clusterfuzzlite/actions/run_fuzzers` job. CI does, however, run a
+dedicated `fuzz` job (`.github/workflows/ci.yml`, nightly Rust toolchain,
+`timeout-minutes: 45`) on every push and pull request: it installs
+`cargo-fuzz` and runs each of the four targets for `-max_total_time=300`
+seconds, uploading `fuzz/artifacts/` on failure. The four harnesses are
+therefore exercised in three places: that CI job, local
+`cargo +nightly fuzz run` (§3), and the `e2e/src/tests/fuzz_tests.rs`
+ten-second smoke check documented above (skipped by test-name in the main
+pipeline's `Test sozu-e2e` step, to avoid rebuilding `fuzz/` under every
+crypto-provider cache key — see the comment above that step in `ci.yml`).
 
 ### 6.2 Steps to integrate ClusterFuzzLite (per-PR continuous fuzzing)
 
@@ -248,7 +309,7 @@ the work is roughly:
      `CLAUDE.md`);
    - sets `WORKDIR /src/sozu`.
 2. **Add `.clusterfuzzlite/build.sh`** that runs
-   `cargo +nightly fuzz build` for both targets and copies the produced
+   `cargo +nightly fuzz build` for all four targets and copies the produced
    binaries into `$OUT/`.
 3. **Add `.github/workflows/clusterfuzzlite.yml`** that runs the
    `google/clusterfuzzlite/actions/run_fuzzers@v1` action on `pull_request`
@@ -260,19 +321,23 @@ the work is roughly:
    `Cargo.toml`); the OSS-Fuzz project policy on copyleft licences should
    be re-checked before submitting an integration PR.
 
-Until that happens, the two existing safety nets are:
+Until ClusterFuzzLite is added, the existing safety nets are:
 
+- CI's dedicated `fuzz` job (§6.1), running all four targets for 300 s
+  each on every push and pull request;
 - the local `cargo +nightly fuzz run` workflow documented in §3, run by
   reviewers when touching `lib/src/protocol/mux/parser.rs`,
-  `lib/src/protocol/mux/pkawa.rs`, or `lib/src/protocol/mux/serializer.rs`;
+  `lib/src/protocol/mux/pkawa.rs`, `lib/src/protocol/mux/serializer.rs`,
+  `lib/src/protocol/udp/`, or `lib/src/protocol/tcp_preread/`;
 - the in-tree `e2e/src/tests/fuzz_tests.rs` ten-second smoke check.
 
 ---
 
 ## 7. Cross-References
 
-- `e2e/src/tests/fuzz_tests.rs` — `#[ignore]`-wrapped smoke harness that
-  exercises both targets for a bounded time during `cargo test`.
+- `e2e/src/tests/fuzz_tests.rs` — ordinary `#[test]` smoke wrappers (no
+  `#[ignore]`) that exercise all four targets for a bounded time during
+  `cargo test`, skipping gracefully when nightly / `cargo-fuzz` are absent.
 - `lib/src/protocol/mux/parser.rs` — the H2 frame parser the
   `fuzz_frame_parser` target drives.
 - `lib/src/protocol/mux/pkawa.rs` — in-tree HPACK consumer; the
@@ -280,6 +345,10 @@ Until that happens, the two existing safety nets are:
   decoder it relies on.
 - `lib/src/protocol/mux/LIFECYCLE.md` — context for the framing rules
   the parser enforces.
+- `lib/src/protocol/udp/manager.rs` — the sans-io UDP load-balancing core
+  the `fuzz_udp_flow` target drives.
 - `lib/src/protocol/tcp_preread/mod.rs` — the sans-io TCP SNI-preread core
   the `fuzz_tcp_clienthello` target drives; `lib/src/protocol/tcp_preread/parser.rs`
   owns the ClientHello wire parsing it exercises.
+- `.github/workflows/ci.yml` — the dedicated `fuzz` job (nightly
+  toolchain) that runs all four targets in CI; see §6.1.

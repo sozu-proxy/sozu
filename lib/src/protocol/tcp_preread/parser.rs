@@ -290,12 +290,28 @@ fn parse_client_hello_fields(body: &[u8]) -> Result<ClientHelloFields, RejectRea
 /// extension -- including every RFC 8701 GREASE value (`0x?A?A`, reserved
 /// precisely so clients can probe unknown-extension tolerance) -- is
 /// skipped by its declared length with no special-casing.
+///
+/// RFC 8446 §4.2 forbids more than one extension of a given type. A
+/// well-formed client never sends a second `server_name` or `alpn`
+/// extension, so accepting one silently is not "tolerance" -- it is a
+/// parser-differential hazard: the original bytes are
+/// forwarded untouched to the backend, so a tolerant backend resolving the
+/// duplicate differently than Sōzu did would see a different SNI/ALPN than
+/// the one that was routed on. `seen_sni` / `seen_alpn` therefore track
+/// EXTENSION PRESENCE, independent of whether a value was extracted from
+/// it (an extension can legitimately decode to `None` / empty), so a
+/// second occurrence of either rejects outright instead of silently
+/// keeping the first (`sni`) or overwriting with the last (`alpn`, the
+/// pre-fix behavior). GREASE/unknown extension types are unaffected --
+/// only these two routing-relevant types get duplicate detection.
 fn parse_extensions(mut ext_block: &[u8]) -> Result<ClientHelloFields, RejectReason> {
     use nom::{bytes::complete::take, number::complete::be_u16};
 
     let mut sni: Option<String> = None;
     let mut alpn: Vec<Vec<u8>> = Vec::new();
     let mut ech_present = false;
+    let mut seen_sni = false;
+    let mut seen_alpn = false;
 
     while !ext_block.is_empty() {
         let in_len = ext_block.len();
@@ -313,14 +329,19 @@ fn parse_extensions(mut ext_block: &[u8]) -> Result<ClientHelloFields, RejectRea
 
         match ext_type {
             EXT_SERVER_NAME => {
-                // Take the FIRST `server_name` (RFC 6066 §3) extension seen;
-                // a well-formed ClientHello carries at most one extension of
-                // a given type (RFC 8446 §4.2).
-                if sni.is_none() {
-                    sni = parse_server_name_extension(data)?;
+                if seen_sni {
+                    return Err(RejectReason::MalformedHandshake);
                 }
+                seen_sni = true;
+                sni = parse_server_name_extension(data)?;
             }
-            EXT_ALPN => alpn = parse_alpn_extension(data)?,
+            EXT_ALPN => {
+                if seen_alpn {
+                    return Err(RejectReason::MalformedHandshake);
+                }
+                seen_alpn = true;
+                alpn = parse_alpn_extension(data)?;
+            }
             EXT_ENCRYPTED_CLIENT_HELLO => ech_present = true,
             _ => {}
         }
@@ -328,13 +349,31 @@ fn parse_extensions(mut ext_block: &[u8]) -> Result<ClientHelloFields, RejectRea
         ext_block = i;
     }
 
+    // Post (pair): `sni`/`alpn` can only carry an extracted value when the
+    // corresponding extension was actually walked -- these are the
+    // function's OWN bookkeeping flags (set exactly once per branch above,
+    // gated by an early return before either flag is set), not raw wire
+    // fields, so asserting their relationship to the extracted output is a
+    // computed post-condition, not a trust-the-attacker precondition.
+    debug_assert!(
+        seen_sni || sni.is_none(),
+        "sni can only be extracted when a server_name extension was seen"
+    );
+    debug_assert!(
+        seen_alpn || alpn.is_empty(),
+        "alpn can only be non-empty when an alpn extension was seen"
+    );
+
     Ok((sni, alpn, ech_present))
 }
 
 /// Decode a `server_name` extension body (RFC 6066 §3):
 /// `u16 server_name_list_len` then a list of `(u8 name_type, u16 name_len,
-/// name)`. Returns the first `host_name` (type `0`) entry; later entries
-/// (of any type) never overwrite it.
+/// name)`. Returns the `host_name` (type `0`) entry. RFC 6066 §3: "The
+/// ServerNameList MUST NOT contain more than one name of the same
+/// name_type" -- a SECOND `host_name` entry is therefore rejected outright
+/// rather than silently kept-first; entries of any
+/// OTHER type are still skipped by length with no special-casing.
 fn parse_server_name_extension(data: &[u8]) -> Result<Option<String>, RejectReason> {
     use nom::{
         bytes::complete::take,
@@ -358,20 +397,35 @@ fn parse_server_name_extension(data: &[u8]) -> Result<Option<String>, RejectReas
     let (_, mut entries) = take(list_len)(i).map_err(malformed)?;
 
     let mut host_name: Option<&[u8]> = None;
+    let mut host_name_entries: u32 = 0;
     while !entries.is_empty() {
         let (i, name_type) = be_u8(entries).map_err(malformed)?;
         let (i, name_len) = be_u16(i).map_err(malformed)?;
         let (i, name) = take(name_len)(i).map_err(malformed)?;
-        if name_type == 0 && host_name.is_none() {
+        if name_type == 0 {
+            host_name_entries += 1;
+            if host_name_entries > 1 {
+                return Err(RejectReason::MalformedHandshake);
+            }
             host_name = Some(name);
         }
         entries = i;
     }
-    // Post: the server_name_list is drained exactly -- a well-formed walk
-    // never exits with bytes left unaccounted for.
+    // Post (pair): the server_name_list is drained exactly -- a well-formed
+    // walk never exits with bytes left unaccounted for -- and at most one
+    // `host_name` entry ever survives the walk: RFC 6066 forbids more than
+    // one name of the same type, and a second sighting returns early
+    // above, so completing the loop implies `host_name_entries <= 1`. Both
+    // are the walk's OWN bookkeeping (a local counter and a cursor),
+    // checked only after `take` has already bounded every field against
+    // the declared lengths -- not a trust-the-attacker precondition.
     debug_assert!(
         entries.is_empty(),
         "server_name_list walk must fully drain the declared list"
+    );
+    debug_assert!(
+        host_name_entries <= 1,
+        "at most one host_name entry may survive the walk -- a second must reject early"
     );
 
     match host_name {
@@ -386,6 +440,18 @@ fn parse_server_name_extension(data: &[u8]) -> Result<Option<String>, RejectReas
 /// Decode an `application_layer_protocol_negotiation` extension body (RFC
 /// 7301 §3.1): `u16 list_len` then a list of `(u8 len, name)` entries,
 /// preserved in client offer order.
+///
+/// RFC 7301 §3.1 declares `opaque ProtocolName<1..2^8-1>` -- a protocol
+/// name is NEVER zero-length -- and `ProtocolName
+/// protocol_name_list<2..2^16-1>` -- the list always carries at least one
+/// entry. Both are enforced here: a zero-length name
+/// used to cost only 1 wire byte yet still allocate a `Vec<u8>` + `Vec`
+/// slot, so a single ClientHello could inflate `protocols` into tens of
+/// thousands of empty entries that `Output::Routed` then clones and the
+/// routed info-log renders one by one. Rejecting `name_len == 0` restores
+/// the natural bound: every surviving entry costs >= 2 wire bytes (the
+/// 1-byte length prefix plus >= 1 name byte), so the entry count can no
+/// longer approach the raw byte length of the list.
 fn parse_alpn_extension(data: &[u8]) -> Result<Vec<Vec<u8>>, RejectReason> {
     use nom::{
         bytes::complete::take,
@@ -398,16 +464,30 @@ fn parse_alpn_extension(data: &[u8]) -> Result<Vec<Vec<u8>>, RejectReason> {
     let mut protocols = Vec::new();
     while !entries.is_empty() {
         let (i, name_len) = be_u8(entries).map_err(malformed)?;
+        if name_len == 0 {
+            return Err(RejectReason::MalformedHandshake);
+        }
         let (i, name) = take(name_len)(i).map_err(malformed)?;
         protocols.push(name.to_vec());
         entries = i;
     }
-    // Post (pair): every entry came out of the declared list bytes, so the
-    // entry count (each >= 1 byte: the length prefix alone) can never
-    // exceed the byte length of the list itself.
+    // An extension that IS present but whose list carries zero entries is
+    // a malformed offer, not "no ALPN" -- the latter is only ever
+    // represented by `alpn: Vec::new()` for a hello that omitted the
+    // extension entirely (see `parse_extensions`'s default), so folding an
+    // explicit empty list into that same shape would let a malformed
+    // offer through as a legitimate "no preference" signal.
+    if protocols.is_empty() {
+        return Err(RejectReason::MalformedHandshake);
+    }
+    // Post (pair): every entry came out of the declared list bytes and now
+    // costs >= 2 bytes (1-byte length prefix + >= 1 name byte, `name_len
+    // == 0` having just been rejected above), so the entry count can never
+    // exceed half the byte length of the list -- tighter than the pre-fix
+    // bound of one entry per byte.
     debug_assert!(
-        protocols.len() <= list_len as usize,
-        "ALPN entry count cannot exceed the declared list length in bytes"
+        protocols.len() <= list_len as usize / 2,
+        "post-fix, each ALPN entry costs >= 2 wire bytes, halving the pre-fix entry-count bound"
     );
     debug_assert!(
         entries.is_empty(),
@@ -784,5 +864,118 @@ mod tests {
             parse_client_hello(&wire),
             ParseOutcome::Reject(RejectReason::MalformedHandshake)
         ));
+    }
+
+    // ---- duplicate routing extensions ---------------------------------------
+    //
+    // A well-formed ClientHello carries at most one extension of a given
+    // type (RFC 8446 §4.2). The extension walk used to keep the FIRST
+    // usable `server_name` but OVERWRITE `alpn` with the LAST occurrence --
+    // and since the original bytes are forwarded untouched to the backend,
+    // a tolerant backend with a different duplicate-resolution policy could
+    // see a different SNI/ALPN than the one Sōzu routed on. Both routing-
+    // relevant extension types must now reject outright on a second sighting.
+
+    #[test]
+    fn duplicate_server_name_extension_is_rejected() {
+        let wire = build_client_hello_wire(&[
+            encode_sni_extension("first.example.com"),
+            encode_sni_extension("second.example.com"),
+        ]);
+        assert!(matches!(
+            parse_client_hello(&wire),
+            ParseOutcome::Reject(RejectReason::MalformedHandshake)
+        ));
+    }
+
+    #[test]
+    fn duplicate_alpn_extension_is_rejected() {
+        let wire = build_client_hello_wire(&[
+            encode_alpn_extension(&[b"h2"]),
+            encode_alpn_extension(&[b"http/1.1"]),
+        ]);
+        assert!(matches!(
+            parse_client_hello(&wire),
+            ParseOutcome::Reject(RejectReason::MalformedHandshake)
+        ));
+    }
+
+    /// RFC 6066 §3: "the ServerNameList MUST NOT contain more than one name
+    /// of the same name_type." A single `server_name` extension whose list
+    /// carries two `host_name` (type 0) entries must reject, not silently
+    /// keep the first as before.
+    #[test]
+    fn server_name_list_with_two_host_name_entries_is_rejected() {
+        let mut name_list = Vec::new();
+        name_list.push(0u8); // name_type = host_name
+        name_list.extend_from_slice(&(b"first.example.com".len() as u16).to_be_bytes());
+        name_list.extend_from_slice(b"first.example.com");
+        name_list.push(0u8); // name_type = host_name, again
+        name_list.extend_from_slice(&(b"second.example.com".len() as u16).to_be_bytes());
+        name_list.extend_from_slice(b"second.example.com");
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&(name_list.len() as u16).to_be_bytes());
+        data.extend_from_slice(&name_list);
+
+        let wire = build_client_hello_wire(&[encode_extension(EXT_SERVER_NAME, &data)]);
+        assert!(matches!(
+            parse_client_hello(&wire),
+            ParseOutcome::Reject(RejectReason::MalformedHandshake)
+        ));
+    }
+
+    // ---- zero-length ALPN protocol names ------------------------------------
+    //
+    // RFC 7301 §3.1: `opaque ProtocolName<1..2^8-1>` -- a protocol name is
+    // never zero-length, and `ProtocolName protocol_name_list<2..2^16-1>`
+    // -- the list itself always carries at least one entry. Before this
+    // fix, a zero-length name cost only 1 wire byte yet still allocated a
+    // `Vec<u8>` + `Vec` slot, letting a single ClientHello inflate into an
+    // outsized `Vec<Vec<u8>>` that `Output::Routed` then clones and the
+    // routed info-log renders entry by entry.
+
+    #[test]
+    fn alpn_extension_with_zero_length_name_is_rejected() {
+        let wire = build_client_hello_wire(&[encode_alpn_extension(&[b"h2", b"", b"http/1.1"])]);
+        assert!(matches!(
+            parse_client_hello(&wire),
+            ParseOutcome::Reject(RejectReason::MalformedHandshake)
+        ));
+    }
+
+    #[test]
+    fn alpn_extension_with_empty_protocol_list_is_rejected() {
+        let wire = build_client_hello_wire(&[encode_alpn_extension(&[])]);
+        assert!(matches!(
+            parse_client_hello(&wire),
+            ParseOutcome::Reject(RejectReason::MalformedHandshake)
+        ));
+    }
+
+    // ---- positive control ---------------------------------------------------
+
+    /// Same shape as `byte_replay_buffer_is_untouched_by_parsing` -- proves
+    /// the duplicate-detection and zero-length-name rejections added above
+    /// don't disturb a well-formed hello carrying exactly one SNI and one
+    /// ALPN extension: same extracted values as before this change.
+    #[test]
+    fn single_sni_and_alpn_extension_still_parses_unchanged() {
+        let wire = build_client_hello_wire(&[
+            encode_sni_extension("example.com"),
+            encode_alpn_extension(&[b"h2", b"http/1.1"]),
+        ]);
+        match parse_client_hello(&wire) {
+            ParseOutcome::ClientHello {
+                sni,
+                alpn,
+                ech_present,
+            } => {
+                assert_eq!(sni.as_deref(), Some("example.com"));
+                assert_eq!(alpn, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+                assert!(!ech_present);
+            }
+            _ => panic!("expected a complete ClientHello"),
+        }
     }
 }

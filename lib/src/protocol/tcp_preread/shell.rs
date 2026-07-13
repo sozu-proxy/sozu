@@ -59,6 +59,32 @@ macro_rules! log_context {
     }};
 }
 
+/// Maximum number of client-offered ALPN protocols the routed info-log
+/// (`handle_output`'s `Output::Routed` arm) renders individually. The wire
+/// parser (`tcp_preread::parser`) already bounds a ClientHello's ALPN offer
+/// to roughly 32K entries within a 64 KiB extension -- far fewer under the
+/// default 16 KiB preread cap -- but this `info!` is always compiled in
+/// (unlike `debug!`/`trace!`), so a hostile hello offering thousands of
+/// tiny protocol names could still make one log line allocate/render
+/// thousands of entries.
+const LOGGED_ALPN_LIMIT: usize = 8;
+
+/// Render at most [`LOGGED_ALPN_LIMIT`] client-offered ALPN protocols as a
+/// debug-list, appending a `"(+N more)"` suffix when the offer was
+/// truncated.
+fn render_alpn_for_log(alpn: &[Vec<u8>]) -> String {
+    let shown: Vec<String> = alpn
+        .iter()
+        .take(LOGGED_ALPN_LIMIT)
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    if alpn.len() > LOGGED_ALPN_LIMIT {
+        format!("{shown:?} (+{} more)", alpn.len() - LOGGED_ALPN_LIMIT)
+    } else {
+        format!("{shown:?}")
+    }
+}
+
 /// Captured exactly once, when [`Output::Routed`] first fires. The core's
 /// own `decided` latch guarantees the SAME terminal verdict replays on every
 /// subsequent `handle_input` call, so [`SniPreread::outcome`] never changes
@@ -327,13 +353,11 @@ impl<Front: SocketHandler> SniPreread<Front> {
                     "a route must be captured at most once per SniPreread lifetime"
                 );
                 info!(
-                    "{} SNI preread routed to cluster {} (sni={:?}, alpn={:?})",
+                    "{} SNI preread routed to cluster {} (sni={:?}, alpn={})",
                     log_context!(self),
                     cluster,
                     sni,
-                    alpn.iter()
-                        .map(|p| String::from_utf8_lossy(p).into_owned())
-                        .collect::<Vec<_>>()
+                    render_alpn_for_log(&alpn)
                 );
                 incr!(names::tcp::sni_preread::ROUTED);
                 // Arm backend-writable interest now so the FIRST backend
@@ -432,6 +456,37 @@ mod tests {
             timeout: Duration::from_secs(3),
             accept_wildcard: true,
         }
+    }
+
+    // ---- routed info-log ALPN rendering bound (sozu-proxy/sozu#1290) ----
+
+    #[test]
+    fn render_alpn_for_log_shows_everything_within_the_limit() {
+        let alpn: Vec<Vec<u8>> = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        assert_eq!(render_alpn_for_log(&alpn), r#"["h2", "http/1.1"]"#);
+    }
+
+    #[test]
+    fn render_alpn_for_log_truncates_past_the_limit_with_a_count_suffix() {
+        let alpn: Vec<Vec<u8>> = (0..(LOGGED_ALPN_LIMIT + 5))
+            .map(|i| i.to_string().into_bytes())
+            .collect();
+        let rendered = render_alpn_for_log(&alpn);
+        assert!(
+            rendered.ends_with("(+5 more)"),
+            "expected a truncation suffix for 5 entries past the limit, got {rendered:?}"
+        );
+        // Exactly `LOGGED_ALPN_LIMIT` entries rendered individually before
+        // the suffix -- not the full (limit + 5).
+        let shown_count = alpn
+            .iter()
+            .take(LOGGED_ALPN_LIMIT)
+            .filter(|p| {
+                let s = String::from_utf8_lossy(p).into_owned();
+                rendered.contains(&format!("{s:?}"))
+            })
+            .count();
+        assert_eq!(shown_count, LOGGED_ALPN_LIMIT);
     }
 
     #[test]

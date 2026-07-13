@@ -671,27 +671,28 @@ rejection — see that section's note.
 
 > **The routing-SHAPE validations — the mixing ban (`TcpListenerMixesSniAndNoSni`),
 > ALPN-overlap / catch-all uniqueness (`TcpFrontendAlpnOverlap` /
-> `TcpFrontendMultipleAlpnCatchAll`), and ALPN-without-SNI
-> (`AlpnWithoutSni`) — are enforced BOTH at TOML config-load
-> (`command/src/config.rs`) AND defensively on the worker's hot path
-> (`TcpListener::validate_new_tcp_front` in `lib/src/tcp.rs`), so an
-> `AddTcpFrontend` sent directly over the command socket, or replayed from a
-> hand-edited/stale `LoadState` snapshot, is rejected exactly like a bad
-> TOML file would be. The pattern-SHAPE checks — `InvalidSniPattern` /
-> `NonAsciiSniPattern` (is `hostname` an exact host or one leading `*.`
-> label, and pure ASCII) — and the listener-level timeout/buffer checks
-> (`SniPrereadTimeoutExceedsFrontTimeout` / `SniPrereadMaxBytesTooSmall` /
-> `SniPrereadMaxBytesExceedsBufferSize`) still run at TOML config-load only:
-> a malformed pattern sent via `sozu frontend tcp add --sni` is installed
-> as-is (it silently never matches on-wire SNI), and `sozu listener tcp add`
-> accepts out-of-range preread knobs without error. An out-of-range
+> `TcpFrontendMultipleAlpnCatchAll`), ALPN-without-SNI (`AlpnWithoutSni`),
+> and the pattern-SHAPE checks (`InvalidSniPattern` / `NonAsciiSniPattern` —
+> is `hostname` an exact host or one leading `*.` label, every label
+> non-empty, and pure ASCII) — are all enforced BOTH at TOML config-load
+> (`command/src/config.rs`) AND on the worker's hot path
+> (`TcpListener::validate_new_tcp_front` in `lib/src/tcp.rs`, which calls
+> the identical shared pattern validator config-load uses), so an
+> `AddTcpFrontend` sent directly over the command socket, a hot-added
+> `sozu frontend tcp add --sni`, or a replay from a hand-edited/stale
+> `LoadState` snapshot, is rejected exactly like a bad TOML file would be —
+> a malformed pattern is never silently installed. Only the listener-level
+> timeout/buffer checks (`SniPrereadTimeoutExceedsFrontTimeout` /
+> `SniPrereadMaxBytesTooSmall` / `SniPrereadMaxBytesExceedsBufferSize`) still
+> run at TOML config-load only: `sozu listener tcp add`/`update` accepts
+> out-of-range preread knobs without error. An out-of-range
 > `sni_preread_max_bytes` is at least degraded safely at the point of use —
 > the worker clamps the effective cap to the session buffer's capacity and
 > floors it at the 5-byte TLS record header, so a hot-added `0` cannot spin
 > the preread loop — but a `sni_preread_timeout` above `front_timeout` is
 > applied as-is during the preread phase. Prefer declaring TCP SNI routing
-> in the TOML file and reloading, or double-check hot-added routes and
-> listener knobs carefully, until that remaining gap is closed.
+> in the TOML file and reloading, or double-check hot-added listener knobs
+> carefully, until that remaining gap is closed.
 
 ##### Runtime CLI surface
 
