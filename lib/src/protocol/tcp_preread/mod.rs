@@ -127,9 +127,26 @@ pub enum RejectReason {
     /// A TLS record's framing is invalid (bad length, or a non-`handshake`
     /// record interrupting an in-progress ClientHello reassembly).
     MalformedRecord,
-    /// The handshake message is not a ClientHello, a length-prefixed field
-    /// inside it lies about the bytes available, or the `server_name`
-    /// extension's `host_name` is not valid UTF-8.
+    /// The known-complete ClientHello body fails ANY of the following
+    /// (`parser.rs`'s single catch-all for the inner body, since none of
+    /// them can be `NeedMore` once the outer handshake framing has already
+    /// proven the body fully present):
+    /// - the handshake message is not a ClientHello (wrong `msg_type`);
+    /// - a length-prefixed field inside the body lies about the bytes
+    ///   available (`session_id`/`cipher_suites`/`compression_methods`/
+    ///   extensions-block lengths, or a nested extension's own declared
+    ///   length);
+    /// - the `server_name` extension's `host_name` is not valid UTF-8;
+    /// - a second `server_name` extension, or a second `alpn` extension, is
+    ///   present (RFC 8446 §4.2 forbids more than one of the same type —
+    ///   Sōzu forwards the original bytes verbatim, so silently resolving a
+    ///   duplicate differently than a tolerant backend would be a routing/
+    ///   forwarding mismatch);
+    /// - a single `server_name` extension's `server_name_list` itself
+    ///   carries more than one `host_name` (type `0`) entry (RFC 6066 §3);
+    /// - the `alpn` extension's `protocol_name_list` contains a
+    ///   zero-length protocol name, or is present but empty (RFC 7301
+    ///   §3.1 declares both `1..2^8-1`-length names and a non-empty list).
     MalformedHandshake,
     /// The preread deadline fired before a terminal verdict was reached.
     Fragmented,
@@ -230,6 +247,21 @@ impl SniPrereadCore {
 
         if let Some(decided) = &self.decided {
             return decided.clone();
+        }
+
+        // Defensively enforce the ABSOLUTE deadline here too, not just on
+        // `Input::Timeout`: the shell (`TcpSession::readable` in
+        // `lib/src/tcp.rs`) is expected to stop re-arming the frontend
+        // timeout once undecided and instead let `Input::Timeout` fire, but
+        // `now` is injected deterministically, so the core can and must
+        // reject on its own the moment a `Bytes` input arrives at or after
+        // the deadline it latched -- same terminal verdict `on_timeout`
+        // produces, even for a fragment that happens to complete a
+        // routable ClientHello. Without this, a client trickling one byte
+        // per read forever holds the preread open on a sliding budget
+        // instead of the configured absolute one (sozu-proxy/sozu#1290).
+        if now >= deadline {
+            return self.decide(Output::Reject(RejectReason::Fragmented));
         }
 
         // NOTE: the `max_bytes` cap is deliberately NOT checked here. In
@@ -402,6 +434,13 @@ impl SniPrereadCore {
             "only a terminal Output (Routed/Reject) may be latched via decide()"
         );
         self.decided = Some(output.clone());
+        // Renders the full `Output` (including, for a `Routed` verdict, the
+        // entire client-offered `alpn: Vec<Vec<u8>>`) via `Debug`,
+        // unbounded -- left as-is because `debug!` is compiled out of
+        // release builds entirely unless built with `--features
+        // logs-debug` (see `doc/configure.md`'s feature table), unlike the
+        // `info!` in `shell.rs::handle_output` (always compiled in) that
+        // this same hostile-input concern required bounding.
         debug!(
             "{} latched terminal preread decision: {:?}",
             log_context!(self),
@@ -916,6 +955,91 @@ mod tests {
             }
             other => panic!("expected Routed at full length, got {other:?}"),
         }
+    }
+
+    /// Regression from the sozu-proxy/sozu#1290 review: the preread
+    /// deadline is an ABSOLUTE budget armed once on the first `Input::Bytes`
+    /// (see [`SniPrereadCore::on_bytes`]), not a per-fragment idle timer.
+    /// Feed valid, incomplete fragments with `now` stepping right up to
+    /// (but never past) the latched deadline -- each must `NeedMore` with
+    /// the SAME deadline, never a moved one. Then feed a fragment at/after
+    /// the deadline: even though it happens to be a COMPLETE, otherwise-
+    /// routable ClientHello, the core must reject `Fragmented` -- the exact
+    /// same terminal verdict `Input::Timeout` produces -- rather than
+    /// route. The latch must then keep replaying `Fragmented` forever,
+    /// never `Routed`, for any further input.
+    #[test]
+    fn bytes_at_or_after_the_latched_deadline_reject_fragmented_without_moving_it() {
+        let mut routes = TrieNode::root();
+        routes.domain_insert(
+            b"example.com".to_vec(),
+            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+        );
+        let mut cfg = cfg(&routes);
+        cfg.timeout = Duration::from_secs(5);
+        let wire = hello_no_alpn("example.com");
+        let incomplete = &wire[..wire.len() - 1];
+
+        let mut core = SniPrereadCore::new();
+        let start = Instant::now();
+
+        // First fragment arms the deadline.
+        let deadline = match core.handle_input(
+            &cfg,
+            Input::Bytes {
+                buf: incomplete,
+                now: start,
+            },
+        ) {
+            Output::NeedMore { deadline } => deadline,
+            other => panic!("expected NeedMore on the first incomplete fragment, got {other:?}"),
+        };
+        assert_eq!(deadline, start + cfg.timeout);
+
+        // A later fragment, still incomplete, still well before the
+        // deadline: NeedMore again, deadline UNCHANGED.
+        let almost_deadline = deadline - Duration::from_millis(1);
+        match core.handle_input(
+            &cfg,
+            Input::Bytes {
+                buf: incomplete,
+                now: almost_deadline,
+            },
+        ) {
+            Output::NeedMore { deadline: d } => {
+                assert_eq!(d, deadline, "the latched deadline must never move")
+            }
+            other => panic!("expected NeedMore just before the deadline, got {other:?}"),
+        }
+
+        // A COMPLETE, otherwise-routable hello arriving exactly AT the
+        // deadline must still reject Fragmented -- the absolute deadline is
+        // a hard cutoff, not merely advisory once bytes happen to complete.
+        assert_eq!(
+            core.handle_input(
+                &cfg,
+                Input::Bytes {
+                    buf: &wire,
+                    now: deadline,
+                },
+            ),
+            Output::Reject(RejectReason::Fragmented),
+            "a complete hello arriving at/after the latched deadline must reject Fragmented, not route"
+        );
+
+        // The latch replays Fragmented forever, even further past the
+        // deadline, even though `wire` remains a complete, valid,
+        // routable hello.
+        assert_eq!(
+            core.handle_input(
+                &cfg,
+                Input::Bytes {
+                    buf: &wire,
+                    now: deadline + Duration::from_secs(1),
+                },
+            ),
+            Output::Reject(RejectReason::Fragmented)
+        );
     }
 
     #[test]

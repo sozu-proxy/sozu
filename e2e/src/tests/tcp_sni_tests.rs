@@ -16,7 +16,10 @@
 //!   relay / none).
 //! - a large payload through an SNI-routed session (splice-agnostic).
 //! - per-(cluster, source-IP) counter conservation across a
-//!   reject-then-route sequence.
+//!   reject-then-route sequence, and the paired differential that proves
+//!   the limiter's rejection is attributable to the cap itself (a second
+//!   concurrent connection is admitted once the cap is raised, using the
+//!   SAME genuinely-held-open first connection).
 //!
 //! Metric-observability note (read before touching the counter-conservation
 //! test): `tcp.sni_preread.*`
@@ -77,7 +80,10 @@
 use std::{
     io::{ErrorKind, Read, Write},
     net::{SocketAddr, TcpStream},
-    sync::Arc,
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -347,11 +353,48 @@ fn expect_closed_within(stream: &mut TcpStream, budget: Duration) -> bool {
     }
 }
 
+/// Shared byte-capture loop for [`spawn_raw_capture_backend`] and
+/// [`spawn_held_multi_capture_backend`]: read from `stream` until a quiet
+/// 300ms gap once at least one byte has arrived, tolerating up to 2s for
+/// the FIRST byte to arrive (scheduling jitter under parallel test load).
+/// Every caller either reads a response back right away (which would
+/// otherwise race a fixed multi-second capture deadline) or ignores the
+/// captured bytes entirely, so there is no reason to hold a full deadline
+/// hostage once a burst is over.
+fn capture_until_quiet(stream: &mut TcpStream) -> Vec<u8> {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .ok();
+    let mut received = Vec::new();
+    let mut buf = [0u8; 8192];
+    let first_byte_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                if !received.is_empty() || Instant::now() >= first_byte_deadline {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    received
+}
+
 /// Spawn a thread that accepts ONE raw TCP connection and captures every
-/// byte it receives over up to two seconds (Sōzu forwards raw bytes
+/// byte it receives (via [`capture_until_quiet`]; Sōzu forwards raw bytes
 /// verbatim on this path -- a "backend" here only needs to prove WHICH
 /// bytes reached it, never a TLS handshake). Writes `response` once the
-/// client goes quiet, then returns the accumulated bytes.
+/// client goes quiet, then returns the accumulated bytes -- dropping both
+/// the stream and the one-shot listener. This is a TRUE one-shot: it is
+/// only suited to scenarios where nothing after the response matters,
+/// since the moment this thread returns, the backend is both
+/// disconnected AND unreachable (no listener left to accept a follow-up
+/// connection). A caller that needs the connection to stay open, or that
+/// needs a SECOND connection to reach a live backend, must use
+/// [`spawn_held_multi_capture_backend`] instead.
 fn spawn_raw_capture_backend(
     address: SocketAddr,
     response: &'static [u8],
@@ -365,35 +408,86 @@ fn spawn_raw_capture_backend(
                 return Vec::new();
             }
         };
-        stream
-            .set_read_timeout(Some(Duration::from_millis(300)))
-            .ok();
-        let mut received = Vec::new();
-        let mut buf = [0u8; 8192];
-        // Tolerate up to 2s for the FIRST byte to arrive (scheduling
-        // jitter under parallel test load), but once at least one byte
-        // has been seen, a single quiet 300ms gap means the client is
-        // done sending its current burst -- stop waiting immediately.
-        // Every caller either reads `response` back right away (which
-        // would otherwise race a fixed multi-second capture deadline) or
-        // ignores it entirely, so there is no reason to hold the full
-        // deadline hostage once the burst is over.
-        let first_byte_deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => received.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                    if !received.is_empty() || Instant::now() >= first_byte_deadline {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+        let received = capture_until_quiet(&mut stream);
         let _ = stream.write_all(response);
         received
     })
+}
+
+/// Spawn a backend that accepts up to `max_conns` raw TCP connections (in
+/// acceptance order, each numbered by a 0-based `index`) and holds EACH
+/// one open behind its own release gate, rather than letting it drop as
+/// soon as it has responded.
+///
+/// Contrast [`spawn_raw_capture_backend`]: that one is a true one-shot,
+/// so a caller which then attempts a SECOND connection to the same
+/// backend address observes a close that proves nothing about whatever
+/// admission logic it meant to exercise -- the fixed listener is simply
+/// gone by then (sozu-proxy/sozu#1290).
+///
+/// Each accepted connection runs on its OWN worker thread: it captures
+/// bytes until a quiet gap ([`capture_until_quiet`]), writes
+/// `responses[index.min(responses.len() - 1)]`, reports `(index,
+/// captured_bytes)` on the shared, returned `Receiver` the instant the
+/// response has been flushed -- the caller's synchronization point,
+/// proving the end-to-end path is live rather than guessing with a sleep
+/// -- then BLOCKS holding the stream open (no FIN) until the caller sends
+/// on the matching `Sender` in the returned `Vec` (indexed the same way).
+/// Running each accepted connection on its own thread (rather than
+/// serially in the acceptor loop) lets a later connection be accepted and
+/// served concurrently with an earlier one that is still held open --
+/// exactly what proves a raised/unlimited per-IP cap admits a second
+/// CONCURRENT connection while the first is still live.
+///
+/// The acceptor thread's own `JoinHandle` is intentionally NOT returned:
+/// if the very regression this backend is built to catch reoccurs (the
+/// per-(cluster, IP) limiter never releases a slot), the acceptor's
+/// `accept()` for a later index blocks forever. Joining that thread from
+/// the test would turn a should-fail assertion into a hung test; the
+/// caller's own bookkeeping (via the `Receiver` and the booleans it
+/// computes) is what decides pass/fail, not the backend thread reaching
+/// completion.
+fn spawn_held_multi_capture_backend(
+    address: SocketAddr,
+    responses: &'static [&'static [u8]],
+    max_conns: usize,
+) -> (Receiver<(usize, Vec<u8>)>, Vec<Sender<()>>) {
+    let (ready_tx, ready_rx) = mpsc::channel::<(usize, Vec<u8>)>();
+    let mut release_txs = Vec::with_capacity(max_conns);
+    let mut release_rxs = Vec::with_capacity(max_conns);
+    for _ in 0..max_conns {
+        let (tx, rx) = mpsc::channel::<()>();
+        release_txs.push(tx);
+        release_rxs.push(rx);
+    }
+    let mut release_rxs = release_rxs.into_iter();
+    thread::spawn(move || {
+        let listener = bind_std_listener(address, "sni held multi-capture backend");
+        for index in 0..max_conns {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    println!("sni held multi-capture backend: accept {index} failed: {error}");
+                    break;
+                }
+            };
+            let ready_tx = ready_tx.clone();
+            let response = responses[index.min(responses.len() - 1)];
+            let release_rx = release_rxs
+                .next()
+                .expect("one release channel reserved per connection slot");
+            thread::spawn(move || {
+                let received = capture_until_quiet(&mut stream);
+                let _ = stream.write_all(response);
+                let _ = ready_tx.send((index, received));
+                // Hold the stream open (no FIN) until released -- proves
+                // the (cluster, IP) slot backing this connection stays
+                // occupied for as long as the test needs it to.
+                let _ = release_rx.recv();
+            });
+        }
+    });
+    (ready_rx, release_txs)
 }
 
 /// Build a PROXY-protocol V2 PROXY header (IPv4, 28 bytes). Mirrors
@@ -1757,37 +1851,69 @@ fn test_tcp_sni_large_payload_coalesced_with_hello_delivered_intact() {
 }
 
 // =========================================================================
-// Counter conservation across a reject-then-route sequence
+// Per-(cluster, source-IP) limiter: rejection, decrement, and the
+// differential that proves both are attributable to the limiter itself
 // =========================================================================
 
-/// Drive N preread rejects from one source IP (127.0.0.1, as every
-/// localhost e2e client is), then a valid SNI connection from the SAME IP
-/// to a `max_connections_per_ip = 1` cluster. Asserts:
+/// Distinct ack payloads for the two backend connection slots the
+/// per-IP limiter differential below ever lets reach the backend (see
+/// [`spawn_held_multi_capture_backend`]): slot 0 is always the FIRST
+/// client connection; slot 1 is whichever client connection is the
+/// SECOND one that actually reaches the backend -- the raised-limit
+/// cell's second connection, or the limit=1 cell's post-release third
+/// connection.
+const PER_IP_LIMITER_RESPONSES: [&[u8]; 2] = [b"backend-slot-a-ack", b"backend-slot-b-ack"];
+
+/// Shared harness for the per-(cluster, source-IP) limiter differential
+/// (see the two `#[test]`s below): identical worker/listener/backend setup
+/// and connection choreography, varying only `max_connections_per_ip`.
+/// Both cells route the first connection through
+/// [`spawn_held_multi_capture_backend`], which holds the accepted backend
+/// stream open behind an explicit release gate instead of dropping it as
+/// soon as it has responded -- so "the first connection is still open"
+/// when the second connection is attempted is an enforced invariant, not
+/// an assumption. (sozu-proxy/sozu#1290: an earlier version of this test
+/// used a true one-shot capture backend that had already accepted,
+/// responded, and returned -- dropping both the stream and its listener
+/// -- by the time the second connection was attempted, so its observed
+/// close proved nothing about the limiter: a completely no-op limiter
+/// would have produced the identical observation, because the second
+/// connection's own backend dial would fail against the now-unreachable
+/// address.)
 ///
-/// 1. the first legitimate connection still succeeds (a rejected preread
-///    must never leak into the per-(cluster, source-IP) admission count --
-///    see the module doc for why this is a behavioral proxy rather than a
-///    direct gauge read: `connections_per_cluster_ip` is a plain
-///    `HashMap`, never published as a named metric);
-/// 2. a SECOND concurrent connection from the same IP to the same
-///    cluster is STILL correctly limit-rejected (proving the limiter
-///    itself is not a no-op -- the first assertion alone couldn't
-///    distinguish "not leaking" from "not enforcing at all");
-/// 3. the REAL `tcp.sni_preread.active` process-wide gauge (queried via
-///    `QueryMetrics`, not a proxy) is now a LIVE assertion (the gauge's
-///    once-missing on-entry increment now fires in
-///    `TcpSession::new_sni_preread`): while a
-///    connection is parked mid-preread the gauge reads >= 1, and once
-///    every preread session (the mid-preread probe, the reject storm, the
-///    routed connection, and the limit-rejected connection) has closed the
-///    gauge returns to exactly its pre-test baseline (0). Before the fix
-///    the gauge underflow-clamped to a permanent 0, so this was a vacuous
-///    `0 == 0`; it now genuinely catches an active-count leak.
-fn try_tcp_sni_reject_then_valid_connection_not_limited() -> State {
+/// - `limit == 1`: drives N preread rejects from the source IP first
+///   (must never leak into the admission count), then the first
+///   legitimate connection (must succeed), then a SECOND concurrent
+///   connection from the SAME IP (must be limit-rejected BEFORE ever
+///   reaching the backend -- proven by the backend's ready-channel never
+///   reporting a second accepted connection while the first is held).
+///   Releasing the first connection and retrying then MUST admit a THIRD
+///   connection from the same IP, proving the limiter decremented its
+///   count on close rather than only ever refusing. The real
+///   `tcp.sni_preread.active` gauge is also asserted: it increments while
+///   a connection is parked mid-preread, and returns to its pre-test
+///   baseline only once every session opened above (the mid-preread
+///   probe, the reject storm, the held-then-released first connection,
+///   the rejected second connection, and the released third connection)
+///   has actually closed.
+/// - any other `limit` (the differential control; the paired test below
+///   passes `2`): the SAME second concurrent connection that the
+///   `limit == 1` cell rejects, sent while the first is genuinely still
+///   held open, MUST instead reach the backend and complete end-to-end.
+///   Without this cell, a broken (always-reject, or permanently-stuck)
+///   limiter could make the `limit == 1` cell's rejection assertion pass
+///   for the wrong reason; this cell proves the identical harness, with
+///   only the cap raised, lets the second connection through -- so the
+///   rejection above is attributable to the limiter's cap, not to some
+///   artifact of holding a backend connection open. The reject-storm and
+///   gauge-conservation checks are specific to proving the limited
+///   cluster doesn't leak/underflow and are skipped here; they do not
+///   depend on which cap value is configured.
+fn try_tcp_sni_per_ip_limiter(limit: u64) -> State {
     let front_address = create_local_address();
     let backend_address = create_local_address();
     let mut worker = setup_sni_worker(
-        "TCP-SNI-LIMIT",
+        "TCP-SNI-LIMIT-DIFF",
         front_address,
         false,
         DEFAULT_SNI_PREREAD_TIMEOUT,
@@ -1798,103 +1924,189 @@ fn try_tcp_sni_reject_then_valid_connection_not_limited() -> State {
             cluster_id: "cluster_limited",
             proxy_protocol: None,
             backend_address,
-            max_connections_per_ip: Some(1),
+            max_connections_per_ip: Some(limit),
         }],
     );
 
     let active = sozu_lib::metrics::names::tcp::sni_preread::ACTIVE;
 
-    // Baseline: no preread session has run yet, so the gauge is absent from
-    // the `QueryMetrics` response (empty `proxy` map) -- a legitimate "0"
-    // state (mirrors `metrics_lifecycle_tests.rs`'s `cluster_row_present`
-    // treating absence as a signal), normalized through `unwrap_or(0)`.
-    let baseline_active = query_global_gauge(&mut worker, active).unwrap_or(0);
-
-    // (gauge-increment live-check) Mid-preread observation: an accepted
-    // SNI-listener connection increments `tcp.sni_preread.active` on entry
-    // (`TcpSession::new_sni_preread`). Park one mid-preread with a PARTIAL
-    // ClientHello (deterministically `NeedMore`, so it never routes and
-    // never touches the per-IP admission count) and poll until the gauge
-    // reflects it -- proving the increment fires and is observable, which
-    // the pre-fix underflow-clamped gauge never could.
-    let full_hello = build_client_hello("limited.example.com", &[]);
-    let partial_len = full_hello.len().min(8);
-    let mut probe = raw_connect(front_address);
-    probe
-        .write_all(&full_hello[..partial_len])
-        .expect("write partial ClientHello probe");
+    // Gauge/reject-storm setup is only meaningful against the limited
+    // (=1) cluster -- see the doc comment above.
+    let mut baseline_active = 0u64;
     let mut observed_active = 0u64;
-    let probe_deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < probe_deadline {
-        if let Some(value) = query_global_gauge(&mut worker, active)
-            && value >= 1
-        {
-            observed_active = value;
-            break;
+    if limit == 1 {
+        // Baseline: no preread session has run yet, so the gauge is absent
+        // from the `QueryMetrics` response (empty `proxy` map) -- a
+        // legitimate "0" state (mirrors `metrics_lifecycle_tests.rs`'s
+        // `cluster_row_present` treating absence as a signal), normalized
+        // through `unwrap_or(0)`.
+        baseline_active = query_global_gauge(&mut worker, active).unwrap_or(0);
+
+        // (gauge-increment live-check) Mid-preread observation: an accepted
+        // SNI-listener connection increments `tcp.sni_preread.active` on
+        // entry (`TcpSession::new_sni_preread`). Park one mid-preread with a
+        // PARTIAL ClientHello (deterministically `NeedMore`, so it never
+        // routes and never touches the per-IP admission count) and poll
+        // until the gauge reflects it -- proving the increment fires and is
+        // observable, which the pre-fix underflow-clamped gauge never
+        // could.
+        let full_hello = build_client_hello("limited.example.com", &[]);
+        let partial_len = full_hello.len().min(8);
+        let mut probe = raw_connect(front_address);
+        probe
+            .write_all(&full_hello[..partial_len])
+            .expect("write partial ClientHello probe");
+        let probe_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < probe_deadline {
+            if let Some(value) = query_global_gauge(&mut worker, active)
+                && value >= 1
+            {
+                observed_active = value;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
         }
-        thread::sleep(Duration::from_millis(20));
-    }
-    drop(probe);
+        drop(probe);
 
-    const REJECT_ATTEMPTS: usize = 5;
-    for _ in 0..REJECT_ATTEMPTS {
-        let mut stream = raw_connect(front_address);
-        let _ = stream.write_all(b"not a tls client hello, just junk bytes");
-        let _ = expect_closed_within(&mut stream, Duration::from_secs(2));
+        const REJECT_ATTEMPTS: usize = 5;
+        for _ in 0..REJECT_ATTEMPTS {
+            let mut stream = raw_connect(front_address);
+            let _ = stream.write_all(b"not a tls client hello, just junk bytes");
+            let _ = expect_closed_within(&mut stream, Duration::from_secs(2));
+        }
     }
 
-    // First legitimate connection from the SAME source IP: must succeed.
-    let handle_first = spawn_raw_capture_backend(backend_address, b"limited-ack");
+    let (ready_rx, release_txs) =
+        spawn_held_multi_capture_backend(backend_address, &PER_IP_LIMITER_RESPONSES, 2);
     thread::sleep(Duration::from_millis(50));
-    let hello = build_client_hello("limited.example.com", &[]);
+
+    // First connection: must succeed and reach the backend -- the
+    // synchronization point for everything that follows. Waiting on
+    // `ready_rx` (rather than a sleep) proves the response was actually
+    // flushed end-to-end before the test moves on, and the backend holds
+    // this stream open (no FIN) until `release_txs[0]` fires below.
+    let hello_first = build_client_hello("limited.example.com", &[]);
     let mut first = raw_connect(front_address);
     first
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    first.write_all(&hello).expect("write first ClientHello");
+    first
+        .write_all(&hello_first)
+        .expect("write first ClientHello");
+    let first_ready = ready_rx.recv_timeout(Duration::from_secs(3));
     let first_response = raw_read_all(&mut first);
-    let first_capture = handle_first.join().expect("first backend thread panicked");
+    let first_ok = matches!(
+        &first_ready,
+        Ok((index, captured)) if *index == 0
+            && captured.as_slice() == hello_first.as_slice()
+            && first_response.as_slice() == PER_IP_LIMITER_RESPONSES[0]
+    );
 
-    // Second CONCURRENT connection from the same IP (first is still
-    // open): must be limit-rejected, proving the limiter still works.
+    // Second CONCURRENT connection from the SAME source IP, sent while the
+    // first is still held open at a LIVE backend connection -- not
+    // dropped, not closed: `spawn_held_multi_capture_backend` blocks it on
+    // `release_txs[0]`, which nothing has signaled yet.
     let hello_second = build_client_hello("limited.example.com", &[]);
     let mut second = raw_connect(front_address);
     second
         .write_all(&hello_second)
         .expect("write second ClientHello");
-    let second_limited = expect_closed_within(&mut second, Duration::from_secs(2));
 
-    // Conservation: once every preread session above has reached terminal
-    // close, the gauge must return to exactly the baseline. Poll-until so
-    // the async close of the last sessions does not race the read; a
-    // genuine leak never reaches baseline and fails here.
-    let mut final_active = query_global_gauge(&mut worker, active).unwrap_or(0);
-    let settle_deadline = Instant::now() + Duration::from_secs(3);
-    while final_active != baseline_active && Instant::now() < settle_deadline {
-        thread::sleep(Duration::from_millis(50));
-        final_active = query_global_gauge(&mut worker, active).unwrap_or(0);
-    }
+    let differential_ok = if limit == 1 {
+        // Rejection cell: the second connection must be limit-closed
+        // BEFORE ever reaching the backend -- `cluster_ip_at_limit`
+        // returns `Err(TooManyConnectionsPerIp)` ahead of any backend dial
+        // (`lib/src/tcp.rs`'s `connect()`), so the backend's `ready_rx`
+        // must stay silent for it.
+        let second_limited = expect_closed_within(&mut second, Duration::from_secs(2));
+        let second_never_reached_backend = ready_rx.try_recv().is_err();
+        drop(second);
 
-    drop(first);
-    drop(second);
+        // Release the first connection and retry a THIRD connection (same
+        // source IP) until it succeeds -- proving the limiter DECREMENTED
+        // on close rather than only ever rejecting. The close is
+        // asynchronous (backend EOF -> `Pipe::backend_hup` ->
+        // `SessionResult::Close` -> `TcpSession::close`'s
+        // `untrack_all_cluster_ip`, all on the worker's own event loop), so
+        // retry on a deadline instead of guessing a fixed sleep.
+        release_txs[0]
+            .send(())
+            .expect("release the first backend connection");
+        drop(first);
+
+        let third_deadline = Instant::now() + Duration::from_secs(3);
+        let mut third_ok = false;
+        let mut third_response = Vec::new();
+        while Instant::now() < third_deadline && !third_ok {
+            let hello_third = build_client_hello("limited.example.com", &[]);
+            let mut third = raw_connect(front_address);
+            third
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let _ = third.write_all(&hello_third);
+            if let Ok((index, captured)) = ready_rx.recv_timeout(Duration::from_millis(700))
+                && index == 1
+                && captured == hello_third
+            {
+                third_response = raw_read_all(&mut third);
+                third_ok = true;
+            } else {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        let third_ok = third_ok && third_response.as_slice() == PER_IP_LIMITER_RESPONSES[1];
+        let _ = release_txs[1].send(());
+
+        // Conservation: once every preread session above has reached
+        // terminal close (mid-preread probe, reject storm, first, second,
+        // third), the gauge must return to exactly the baseline. Poll-until
+        // so the async close of the last sessions does not race the read; a
+        // genuine leak never reaches baseline and fails here.
+        let mut final_active = query_global_gauge(&mut worker, active).unwrap_or(0);
+        let settle_deadline = Instant::now() + Duration::from_secs(3);
+        while final_active != baseline_active && Instant::now() < settle_deadline {
+            thread::sleep(Duration::from_millis(50));
+            final_active = query_global_gauge(&mut worker, active).unwrap_or(0);
+        }
+        let gauge_incremented_mid_preread = observed_active >= 1;
+        let gauge_back_to_baseline = final_active == baseline_active;
+
+        println!(
+            "limit=1: first_ok={first_ok} second_limited={second_limited} second_never_reached_backend={second_never_reached_backend} third_ok={third_ok} observed_active={observed_active} baseline_active={baseline_active} final_active={final_active} gauge_incremented_mid_preread={gauge_incremented_mid_preread} gauge_back_to_baseline={gauge_back_to_baseline}"
+        );
+
+        second_limited
+            && second_never_reached_backend
+            && third_ok
+            && gauge_incremented_mid_preread
+            && gauge_back_to_baseline
+    } else {
+        // Differential control: the SAME harness, but the raised cap must
+        // let the second connection through concurrently, while the first
+        // is still held open and unreleased.
+        let second_ready = ready_rx.recv_timeout(Duration::from_secs(3));
+        let second_response = raw_read_all(&mut second);
+        let second_ok = matches!(
+            &second_ready,
+            Ok((index, captured)) if *index == 1
+                && captured.as_slice() == hello_second.as_slice()
+                && second_response.as_slice() == PER_IP_LIMITER_RESPONSES[1]
+        );
+
+        let _ = release_txs[0].send(());
+        let _ = release_txs[1].send(());
+        drop(first);
+        drop(second);
+
+        println!("limit={limit}: first_ok={first_ok} second_ok={second_ok}");
+
+        second_ok
+    };
 
     worker.soft_stop();
     let stopped = worker.wait_for_server_stop();
 
-    let first_ok = first_capture == hello && first_response == b"limited-ack";
-    let gauge_incremented_mid_preread = observed_active >= 1;
-    let gauge_back_to_baseline = final_active == baseline_active;
-
-    println!(
-        "first_ok={first_ok} second_limited={second_limited} observed_active={observed_active} baseline_active={baseline_active} final_active={final_active} gauge_incremented_mid_preread={gauge_incremented_mid_preread} gauge_back_to_baseline={gauge_back_to_baseline}"
-    );
-
-    if stopped
-        && first_ok
-        && second_limited
-        && gauge_incremented_mid_preread
-        && gauge_back_to_baseline
-    {
+    if stopped && first_ok && differential_ok {
         State::Success
     } else {
         State::Fail
@@ -1902,12 +2114,24 @@ fn try_tcp_sni_reject_then_valid_connection_not_limited() -> State {
 }
 
 #[test]
-fn test_tcp_sni_reject_then_valid_connection_not_limited() {
+fn test_tcp_sni_per_ip_limiter_rejects_second_then_admits_after_release() {
     assert_eq!(
         repeat_until_error_or(
             5,
-            "TCP SNI: preread rejects never leak the per-(cluster, IP) admission count, and tcp.sni_preread.active increments mid-preread then returns to baseline",
-            try_tcp_sni_reject_then_valid_connection_not_limited,
+            "TCP SNI per-(cluster, IP) limiter: a concurrent second connection is rejected while the first is genuinely held open end-to-end (not a torn-down one-shot backend), and releasing the first admits a third connection -- proving the limiter both enforces and decrements",
+            || try_tcp_sni_per_ip_limiter(1),
+        ),
+        State::Success,
+    );
+}
+
+#[test]
+fn test_tcp_sni_per_ip_limiter_admits_concurrent_connection_when_raised() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "TCP SNI per-(cluster, IP) limiter differential control: with the cap raised to 2, the SAME second concurrent connection that the limit=1 test rejects must instead reach the backend and complete end-to-end -- proving the rejection above is attributable to the limiter, not an artifact of holding a backend connection open",
+            || try_tcp_sni_per_ip_limiter(2),
         ),
         State::Success,
     );

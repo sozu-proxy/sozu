@@ -15,6 +15,7 @@ use prost::{Message, UnknownEnumValue};
 use crate::{
     ObjectKind,
     certificate::{CertificateError, Fingerprint, calculate_fingerprint},
+    config::validate_sni_pattern,
     proto::{
         command::{
             ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
@@ -66,6 +67,13 @@ pub enum StateError {
         field: &'static str,
         reason: &'static str,
     },
+    /// Mirrors the worker's `ProxyError::InvalidTcpFrontend`
+    /// (`lib/src/tcp.rs`): the master rejects an `AddTcpFrontend` for the
+    /// same reasons `validate_new_tcp_front` would, so a route never lands
+    /// in `ConfigState` only to be NACKed by every worker on the next
+    /// fan-out (sozu-proxy/sozu#1290).
+    #[error("invalid TCP frontend for address {address}: {reason}")]
+    InvalidTcpFrontend { address: SocketAddr, reason: String },
 }
 
 /// The `ConfigState` represents the state of Sōzu's business, which is to forward traffic
@@ -1209,38 +1217,158 @@ impl ConfigState {
         Ok(())
     }
 
+    /// Admission control mirrors the worker's `validate_new_tcp_front`
+    /// (`lib/src/tcp.rs`) so the master never persists a route its own
+    /// workers reject on the next fan-out (sozu-proxy/sozu#1290): the
+    /// command server mutates master state before dispatching to workers,
+    /// and a worker NACK never rolls the master back. Every check below
+    /// runs, and every canonicalization is computed, BEFORE `self.tcp_fronts`
+    /// is touched -- an early `Err` return is a true no-op on `self`.
     fn add_tcp_frontend(&mut self, front: &RequestTcpFrontend) -> Result<(), StateError> {
-        let tcp_frontends = self.tcp_fronts.entry(front.cluster_id.clone()).or_default();
+        let address: SocketAddr = front.address.into();
 
-        let tcp_frontend = TcpFrontend {
-            cluster_id: front.cluster_id.clone(),
-            address: front.address.into(),
-            tags: front.tags.clone(),
-            sni: front.sni.clone(),
-            alpn: front.alpn.clone(),
+        // Canonicalize first: shape-validate and lowercase `sni` through the
+        // SAME `validate_sni_pattern` config-load and the worker use, and
+        // reduce `alpn` to its canonical sorted+deduped set. Both canonical
+        // forms are what gets stored (so the state's own hashing/diffing/
+        // `generate_requests` replay sees one identity per route,
+        // independent of how the caller cased/ordered its request) AND what
+        // every admission check below compares against.
+        let normalized_sni = match &front.sni {
+            Some(sni) => Some(validate_sni_pattern(sni).map_err(|config_error| {
+                StateError::InvalidTcpFrontend {
+                    address,
+                    reason: format!("sni {sni:?} failed SNI shape validation: {config_error}"),
+                }
+            })?),
+            None => None,
         };
-        let before = tcp_frontends.len();
-        // INV: TCP frontend identity for add/remove is (address, sni, alpn),
-        // not the whole struct — two frontends differing only in `tags`
-        // would still match the exact same wire traffic, so they must still
-        // collide here even though they compare unequal as full structs.
-        let identity_conflict = tcp_frontends.iter().any(|existing| {
-            existing.address == tcp_frontend.address
-                && existing.sni == tcp_frontend.sni
-                && existing.alpn == tcp_frontend.alpn
-        });
-        if identity_conflict {
-            debug_assert_eq!(
-                tcp_frontends.len(),
-                before,
-                "a rejected duplicate add_tcp_frontend must not grow the bucket"
-            );
-            return Err(StateError::Exists {
-                kind: ObjectKind::TcpFrontend,
-                id: format!("{tcp_frontend:?}"),
+        let alpn = canonical_tcp_alpn(&front.alpn);
+
+        // Worker parity (`validate_new_tcp_front`'s first no-SNI check):
+        // alpn only matches within an SNI-scoped preread, so a frontend
+        // without sni would silently ignore its alpn list. Config-load's
+        // `to_tcp_front` already rejects this shape; a raw `AddTcpFrontend`
+        // over the command socket must not slip past the master either.
+        if normalized_sni.is_none() && !alpn.is_empty() {
+            return Err(StateError::InvalidTcpFrontend {
+                address,
+                reason: format!(
+                    "alpn = {alpn:?} set without sni: alpn only matches within an SNI-scoped \
+                     preread, so a frontend without sni would silently ignore its alpn list"
+                ),
             });
         }
 
+        let total_before = self.count_tcp_frontends_raw();
+
+        // Listener-wide scan across ALL clusters' buckets at this address --
+        // the previous check only walked `front.cluster_id`'s own bucket, so
+        // a duplicate identity, a no-SNI/SNI mix, a second catch-all, or an
+        // overlapping ALPN set under a DIFFERENT cluster_id all used to pass
+        // here and then fail on every worker.
+        let mut listener_has_no_sni_front = false;
+        let mut listener_has_sni_front = false;
+        for existing in self
+            .tcp_fronts
+            .values()
+            .flatten()
+            .filter(|existing| existing.address == address)
+        {
+            if tcp_frontend_matches(existing, address, &normalized_sni, &alpn) {
+                return Err(StateError::Exists {
+                    kind: ObjectKind::TcpFrontend,
+                    id: format!(
+                        "TcpFrontend {{ address: {address}, sni: {normalized_sni:?}, \
+                         alpn: {alpn:?} }}"
+                    ),
+                });
+            }
+            match &existing.sni {
+                None => listener_has_no_sni_front = true,
+                Some(existing_sni) => {
+                    listener_has_sni_front = true;
+                    // Catch-all / ALPN-overlap only matter between two
+                    // SNI-scoped fronts sharing the exact same normalized
+                    // sni -- exact and wildcard patterns are DISTINCT keys
+                    // here, never matched against each other (no trie
+                    // matching in `ConfigState`), mirroring the worker's own
+                    // `accept_wildcard: false` self-lookup.
+                    if normalized_sni.as_deref() != Some(existing_sni.as_str()) {
+                        continue;
+                    }
+                    let existing_is_catch_all = existing.alpn.is_empty();
+                    let new_is_catch_all = alpn.is_empty();
+                    if existing_is_catch_all && new_is_catch_all {
+                        return Err(StateError::InvalidTcpFrontend {
+                            address,
+                            reason: format!(
+                                "sni {existing_sni:?} already has a catch-all (empty alpn) \
+                                 frontend: at most one frontend per (address, sni) may omit \
+                                 alpn"
+                            ),
+                        });
+                    }
+                    // A catch-all coexisting with an ALPN-scoped sibling on
+                    // the same sni is legal (worker parity: `AlpnMatcher::Any`
+                    // only conflicts with another `Any`, never with a
+                    // `OneOf`) -- only two ALPN-scoped fronts can overlap.
+                    if !existing_is_catch_all
+                        && !new_is_catch_all
+                        && let Some(overlap) = alpn
+                            .iter()
+                            .find(|protocol| existing.alpn.contains(protocol))
+                    {
+                        return Err(StateError::InvalidTcpFrontend {
+                            address,
+                            reason: format!(
+                                "sni {existing_sni:?} already has a frontend matching ALPN \
+                                 protocol {overlap:?}: ALPN matchers for the same (address, \
+                                 sni) must not overlap"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        match &normalized_sni {
+            None if listener_has_sni_front => {
+                return Err(StateError::InvalidTcpFrontend {
+                    address,
+                    reason: "a no-SNI frontend cannot be added to a listener that already has \
+                             SNI-scoped routes"
+                        .to_string(),
+                });
+            }
+            Some(_) if listener_has_no_sni_front => {
+                return Err(StateError::InvalidTcpFrontend {
+                    address,
+                    reason: "an SNI-scoped frontend cannot be added to a listener that already \
+                             has a no-SNI catch-all cluster"
+                        .to_string(),
+                });
+            }
+            _ => {}
+        }
+        // POST: every admission check above either returned `Err` or fell
+        // through -- none of them may mutate `self`, so the total frontend
+        // count observed before the scan must still hold at this point.
+        debug_assert_eq!(
+            self.count_tcp_frontends_raw(),
+            total_before,
+            "add_tcp_frontend must not mutate tcp_fronts before every admission check has \
+             passed"
+        );
+
+        let tcp_frontend = TcpFrontend {
+            cluster_id: front.cluster_id.clone(),
+            address,
+            tags: front.tags.clone(),
+            sni: normalized_sni,
+            alpn,
+        };
+        let tcp_frontends = self.tcp_fronts.entry(front.cluster_id.clone()).or_default();
+        let before = tcp_frontends.len();
         debug_assert_eq!(
             tcp_frontend.cluster_id, front.cluster_id,
             "the built frontend must carry its bucket's cluster_id"
@@ -1268,16 +1396,23 @@ impl ConfigState {
 
         let len = tcp_frontends.len();
         let remove_address: SocketAddr = front_to_remove.address.into();
-        let remove_sni = front_to_remove.sni.clone();
-        let remove_alpn = front_to_remove.alpn.clone();
+        // Canonicalize for matching, mirroring add_tcp_frontend and the
+        // worker: lowercase `sni` (the SNI-preread core normalizes to
+        // lowercase before ever looking a route up, and `TcpFrontend.sni` is
+        // stored in that same normalized form) and reduce `alpn` to its
+        // canonical sorted+deduped set, so a request differing only in sni
+        // case or alpn order still matches the stored frontend instead of
+        // falling through to `NoChange`. Shape is intentionally NOT
+        // re-validated here: a malformed pattern could never have been
+        // stored post-fix, so it simply matches nothing below.
+        let remove_sni = front_to_remove.sni.as_deref().map(str::to_ascii_lowercase);
+        let remove_alpn = canonical_tcp_alpn(&front_to_remove.alpn);
         // INV: removal identity mirrors add_tcp_frontend's (address, sni,
         // alpn) key — removing one SNI-scoped frontend on a listener must
         // not also evict a sibling frontend at the same address with a
         // different sni/alpn.
         tcp_frontends.retain(|front| {
-            !(front.address == remove_address
-                && front.sni == remove_sni
-                && front.alpn == remove_alpn)
+            !tcp_frontend_matches(front, remove_address, &remove_sni, &remove_alpn)
         });
         let after = tcp_frontends.len();
         if after == len {
@@ -1293,9 +1428,12 @@ impl ConfigState {
             "remove_tcp_frontend drops exactly one entry"
         );
         debug_assert!(
-            !tcp_frontends.iter().any(|f| f.address == remove_address
-                && f.sni == remove_sni
-                && f.alpn == remove_alpn),
+            !tcp_frontends.iter().any(|f| tcp_frontend_matches(
+                f,
+                remove_address,
+                &remove_sni,
+                &remove_alpn
+            )),
             "remove_tcp_frontend must leave no frontend matching the removed (address, sni, alpn)"
         );
         Ok(())
@@ -2821,6 +2959,48 @@ fn domain_check(
     true
 }
 
+/// Canonicalize a TCP frontend's ALPN list into its sorted, deduplicated set
+/// representation. ALPN matching (the worker's `AlpnMatcher::OneOf` in
+/// `lib/src/tcp.rs`) is semantically a *set* of protocol names, not an
+/// ordered list: comparing `Vec`s directly treats `["h2", "http/1.1"]` and
+/// `["http/1.1", "h2"]` as distinct identities, silently admitting a
+/// duplicate/overlapping frontend the worker rejects on the next fan-out
+/// (sozu-proxy/sozu#1290). Used both to canonicalize a frontend for storage
+/// and to canonicalize a candidate for comparison, so `TcpFrontend.alpn` is
+/// always already in this form.
+fn canonical_tcp_alpn(alpn: &[String]) -> Vec<String> {
+    let mut alpn = alpn.to_vec();
+    alpn.sort();
+    alpn.dedup();
+    // POST: strictly increasing (sorted, no adjacent duplicates) — the
+    // single property every caller relies on to treat two canonical lists
+    // as set-equal via plain `==`.
+    debug_assert!(
+        alpn.windows(2).all(|pair| pair[0] < pair[1]),
+        "canonical_tcp_alpn must return a strictly sorted, duplicate-free list"
+    );
+    alpn
+}
+
+/// Identity predicate for a TCP frontend: `(address, sni, alpn)`, not the
+/// whole struct -- two frontends differing only in `tags` still collide
+/// here even though they compare unequal as full structs, since they'd
+/// still match the exact same wire traffic. `sni` and `alpn` are expected
+/// to already be in canonical form (normalized-lowercase sni, sorted+deduped
+/// alpn via [`canonical_tcp_alpn`]) on both sides -- this is a plain
+/// equality check, not itself a canonicalizer. Shared by
+/// `add_tcp_frontend`'s duplicate check and `remove_tcp_frontend`'s
+/// retain/postcondition so the three call sites can never drift apart
+/// (sozu-proxy/sozu#1290).
+fn tcp_frontend_matches(
+    front: &TcpFrontend,
+    address: SocketAddr,
+    sni: &Option<String>,
+    alpn: &[String],
+) -> bool {
+    front.address == address && front.sni == *sni && front.alpn.as_slice() == alpn
+}
+
 struct DiffMap<'a, K: Ord, V, I1, I2> {
     my_it: I1,
     other_it: I2,
@@ -4141,6 +4321,441 @@ mod tests {
             .expect("cluster_sni_b bucket must survive");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].sni, Some("other.example.com".to_string()));
+    }
+
+    // ── master-side TCP frontend admission parity (sozu-proxy/sozu#1290) ──────
+    //
+    // The command server mutates master `ConfigState` before fanning a
+    // request out to workers, and a worker NACK never rolls the master back.
+    // These tests prove the master rejects everything the worker's
+    // `validate_new_tcp_front` (`lib/src/tcp.rs`) would reject, BEFORE any
+    // mutation -- every rejection case asserts `hash_state()` and
+    // `count_tcp_frontends_raw()` (plus the relevant bucket lengths) are
+    // byte-for-byte unchanged, not just that the call returned `Err`.
+
+    fn add_tcp_test_cluster(state: &mut ConfigState, cluster_id: &str) {
+        state
+            .dispatch(
+                &RequestType::AddCluster(Cluster {
+                    cluster_id: cluster_id.to_string(),
+                    sticky_session: false,
+                    https_redirect: false,
+                    ..Default::default()
+                })
+                .into(),
+            )
+            .expect("could not add cluster");
+    }
+
+    /// The (address, sni, alpn) identity check must span ALL clusters at a
+    /// listener address, not just the candidate's own `cluster_id` bucket --
+    /// otherwise the same identity under a different cluster_id is silently
+    /// accepted by the master and then rejected by every worker.
+    #[test]
+    fn add_tcp_frontend_rejects_cross_cluster_duplicate_identity() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9001);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_x");
+        add_tcp_test_cluster(&mut state, "cluster_y");
+
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_x".to_string(),
+                    address,
+                    tags: BTreeMap::new(),
+                    sni: Some("example.com".to_string()),
+                    alpn: vec!["h2".to_string()],
+                })
+                .into(),
+            )
+            .expect("could not add cluster_x tcp frontend");
+
+        let hash_before = state.hash_state();
+        let count_before = state.count_tcp_frontends_raw();
+
+        let result = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_y".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: Some("example.com".to_string()),
+                alpn: vec!["h2".to_string()],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_err(),
+            "the same (address, sni, alpn) under a different cluster_id must be rejected, \
+             got: {result:?}"
+        );
+        assert_eq!(
+            state.hash_state(),
+            hash_before,
+            "a rejected cross-cluster duplicate must not change the state hash"
+        );
+        assert_eq!(
+            state.count_tcp_frontends_raw(),
+            count_before,
+            "a rejected cross-cluster duplicate must not change the frontend count"
+        );
+        assert_eq!(state.tcp_fronts.get("cluster_x").map(Vec::len), Some(1));
+        assert_eq!(
+            state.tcp_fronts.get("cluster_y").map(Vec::len).unwrap_or(0),
+            0
+        );
+    }
+
+    /// ALPN identity is a *set*: the same protocols in a different order
+    /// must still collide as a duplicate, even within one cluster's bucket.
+    #[test]
+    fn add_tcp_frontend_rejects_reordered_alpn_duplicate() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9002);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_reorder");
+
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_reorder".to_string(),
+                    address,
+                    tags: BTreeMap::new(),
+                    sni: Some("example.com".to_string()),
+                    alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+                })
+                .into(),
+            )
+            .expect("could not add first tcp frontend");
+
+        let hash_before = state.hash_state();
+        let count_before = state.count_tcp_frontends_raw();
+
+        let result = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_reorder".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: Some("example.com".to_string()),
+                alpn: vec!["http/1.1".to_string(), "h2".to_string()],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_err(),
+            "the same ALPN set in a different order must be rejected as a duplicate \
+             identity, got: {result:?}"
+        );
+        assert_eq!(state.hash_state(), hash_before);
+        assert_eq!(state.count_tcp_frontends_raw(), count_before);
+        assert_eq!(
+            state.tcp_fronts.get("cluster_reorder").map(Vec::len),
+            Some(1)
+        );
+    }
+
+    /// Symmetric counterpart: removal must also treat ALPN as a set, so a
+    /// request differing only in protocol order still matches the stored
+    /// (canonical) frontend instead of falling through to `NoChange`.
+    #[test]
+    fn remove_tcp_frontend_matches_reordered_alpn() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9003);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_remove_reorder");
+
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_remove_reorder".to_string(),
+                    address,
+                    tags: BTreeMap::new(),
+                    sni: Some("example.com".to_string()),
+                    alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+                })
+                .into(),
+            )
+            .expect("could not add tcp frontend");
+
+        let result = state.dispatch(
+            &RequestType::RemoveTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_remove_reorder".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: Some("example.com".to_string()),
+                alpn: vec!["http/1.1".to_string(), "h2".to_string()],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_ok(),
+            "removing with the same ALPN set in a different order must succeed, got: {result:?}"
+        );
+        assert_eq!(state.count_tcp_frontends_raw(), 0);
+    }
+
+    /// ALPN-set overlap on the same (address, normalized sni) must be
+    /// rejected even across different clusters -- the previous check never
+    /// looked outside the candidate's own cluster bucket at all.
+    #[test]
+    fn add_tcp_frontend_rejects_alpn_overlap_across_clusters_same_sni() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9004);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_overlap_a");
+        add_tcp_test_cluster(&mut state, "cluster_overlap_b");
+
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_overlap_a".to_string(),
+                    address,
+                    tags: BTreeMap::new(),
+                    sni: Some("example.com".to_string()),
+                    alpn: vec!["h2".to_string()],
+                })
+                .into(),
+            )
+            .expect("could not add cluster_overlap_a tcp frontend");
+
+        let hash_before = state.hash_state();
+        let count_before = state.count_tcp_frontends_raw();
+
+        let result = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_overlap_b".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: Some("example.com".to_string()),
+                alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_err(),
+            "an overlapping ALPN set on the same (address, sni) under a different cluster_id \
+             must be rejected, got: {result:?}"
+        );
+        assert_eq!(state.hash_state(), hash_before);
+        assert_eq!(state.count_tcp_frontends_raw(), count_before);
+        assert_eq!(
+            state
+                .tcp_fronts
+                .get("cluster_overlap_b")
+                .map(Vec::len)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    /// Listener-wide no-SNI/SNI mixing must be enforced in both directions,
+    /// across cluster buckets.
+    #[test]
+    fn add_tcp_frontend_rejects_no_sni_sni_mixing_both_directions() {
+        let address_a = SocketAddress::new_v4(127, 0, 0, 1, 9005);
+        let address_b = SocketAddress::new_v4(127, 0, 0, 1, 9006);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_mix_1");
+        add_tcp_test_cluster(&mut state, "cluster_mix_2");
+        add_tcp_test_cluster(&mut state, "cluster_mix_3");
+        add_tcp_test_cluster(&mut state, "cluster_mix_4");
+
+        // Direction 1: a no-SNI frontend exists; adding an SNI-scoped
+        // frontend at the SAME address must be rejected.
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_mix_1".to_string(),
+                    address: address_a,
+                    tags: BTreeMap::new(),
+                    sni: None,
+                    alpn: vec![],
+                })
+                .into(),
+            )
+            .expect("could not add no-sni tcp frontend");
+        let hash_before_a = state.hash_state();
+        let count_before_a = state.count_tcp_frontends_raw();
+        let result_a = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_mix_2".to_string(),
+                address: address_a,
+                tags: BTreeMap::new(),
+                sni: Some("example.com".to_string()),
+                alpn: vec![],
+            })
+            .into(),
+        );
+        assert!(
+            result_a.is_err(),
+            "an SNI-scoped frontend must not be added to a listener with an existing no-SNI \
+             front, got: {result_a:?}"
+        );
+        assert_eq!(state.hash_state(), hash_before_a);
+        assert_eq!(state.count_tcp_frontends_raw(), count_before_a);
+
+        // Direction 2: an SNI-scoped frontend exists; adding a no-SNI
+        // frontend at the SAME address must be rejected.
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_mix_3".to_string(),
+                    address: address_b,
+                    tags: BTreeMap::new(),
+                    sni: Some("example.com".to_string()),
+                    alpn: vec![],
+                })
+                .into(),
+            )
+            .expect("could not add sni-scoped tcp frontend");
+        let hash_before_b = state.hash_state();
+        let count_before_b = state.count_tcp_frontends_raw();
+        let result_b = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_mix_4".to_string(),
+                address: address_b,
+                tags: BTreeMap::new(),
+                sni: None,
+                alpn: vec![],
+            })
+            .into(),
+        );
+        assert!(
+            result_b.is_err(),
+            "a no-SNI frontend must not be added to a listener with existing SNI-scoped \
+             fronts, got: {result_b:?}"
+        );
+        assert_eq!(state.hash_state(), hash_before_b);
+        assert_eq!(state.count_tcp_frontends_raw(), count_before_b);
+    }
+
+    /// A malformed SNI pattern must be rejected by the master itself, not
+    /// merely by config-load's `to_tcp_front` -- a raw `AddTcpFrontend` over
+    /// the command socket, or a `LoadState` replay, bypasses `config.rs`
+    /// entirely.
+    #[test]
+    fn add_tcp_frontend_rejects_malformed_sni_shape() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9007);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_malformed");
+
+        let hash_before = state.hash_state();
+        let count_before = state.count_tcp_frontends_raw();
+
+        let result = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_malformed".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                // Leading empty label -- rejected by `validate_sni_pattern`.
+                sni: Some(".example.com".to_string()),
+                alpn: vec![],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_err(),
+            "a malformed SNI pattern must be rejected by the master, not merely by \
+             config-load, got: {result:?}"
+        );
+        assert_eq!(state.hash_state(), hash_before);
+        assert_eq!(state.count_tcp_frontends_raw(), count_before);
+        assert_eq!(
+            state
+                .tcp_fronts
+                .get("cluster_malformed")
+                .map(Vec::len)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    /// A non-empty `alpn` without `sni` must be rejected by the master:
+    /// alpn only matches within an SNI-scoped preread, so a no-SNI frontend
+    /// would silently ignore its alpn list. Config-load (`to_tcp_front`) and
+    /// the worker both reject this shape; a raw `AddTcpFrontend` over the
+    /// command socket must not slip past the master.
+    #[test]
+    fn add_tcp_frontend_rejects_alpn_without_sni() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9009);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_alpn_no_sni");
+
+        let hash_before = state.hash_state();
+        let count_before = state.count_tcp_frontends_raw();
+
+        let result = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_alpn_no_sni".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: None,
+                alpn: vec!["h2".to_string()],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_err(),
+            "a non-empty alpn without sni must be rejected by the master, got: {result:?}"
+        );
+        assert_eq!(
+            state.hash_state(),
+            hash_before,
+            "a rejected alpn-without-sni add must not change the state hash"
+        );
+        assert_eq!(
+            state.count_tcp_frontends_raw(),
+            count_before,
+            "a rejected alpn-without-sni add must not change the frontend count"
+        );
+        assert_eq!(
+            state
+                .tcp_fronts
+                .get("cluster_alpn_no_sni")
+                .map(Vec::len)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    /// Worker-parity guard: an exact catch-all and a wildcard catch-all on
+    /// the SAME address are DISTINCT (address, sni) keys and must both be
+    /// accepted -- the listener-wide admission checks above must not
+    /// over-forbid this legal combination by conflating exact and wildcard
+    /// SNI as the same key.
+    #[test]
+    fn add_tcp_frontend_accepts_exact_and_wildcard_catch_all_siblings() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9008);
+        let mut state = ConfigState::new();
+        add_tcp_test_cluster(&mut state, "cluster_exact_catchall");
+        add_tcp_test_cluster(&mut state, "cluster_wildcard_catchall");
+
+        state
+            .dispatch(
+                &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: "cluster_exact_catchall".to_string(),
+                    address,
+                    tags: BTreeMap::new(),
+                    sni: Some("example.com".to_string()),
+                    alpn: vec![],
+                })
+                .into(),
+            )
+            .expect("could not add exact catch-all tcp frontend");
+
+        let result = state.dispatch(
+            &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                cluster_id: "cluster_wildcard_catchall".to_string(),
+                address,
+                tags: BTreeMap::new(),
+                sni: Some("*.example.com".to_string()),
+                alpn: vec![],
+            })
+            .into(),
+        );
+        assert!(
+            result.is_ok(),
+            "an exact catch-all and a wildcard catch-all on the same address must both be \
+             accepted, got: {result:?}"
+        );
+        assert_eq!(state.count_tcp_frontends_raw(), 2);
     }
 
     /// `list_frontends` must surface UDP frontends alongside TCP ones. The

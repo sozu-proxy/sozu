@@ -1984,7 +1984,14 @@ impl FileClusterFrontendConfig {
 /// directly, consistent with what the HTTP router produces via
 /// `idna::domain_to_ascii` in `lib/src/router/mod.rs`. ASCII-lowercases
 /// the accepted pattern for case-insensitive comparison.
-pub(crate) fn validate_sni_pattern(sni: &str) -> Result<String, ConfigError> {
+///
+/// Public: this is the SINGLE SNI shape validator shared by TOML config
+/// load (this module) and the worker's request boundary
+/// (`TcpListener::validate_new_tcp_front` in `lib/src/tcp.rs`), which an
+/// `AddTcpFrontend` sent directly over the command socket, or a
+/// `LoadState` replay, can reach without ever going through config-load —
+/// both call sites must reject the identical set of malformed shapes.
+pub fn validate_sni_pattern(sni: &str) -> Result<String, ConfigError> {
     let invalid = || ConfigError::InvalidSniPattern {
         sni: sni.to_string(),
     };
