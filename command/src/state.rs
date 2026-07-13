@@ -300,9 +300,13 @@ impl ConfigState {
         );
     }
 
-    /// Raw count of TCP frontends across all clusters — debug-only helper used
-    /// by [`Self::check_invariants`] to cross-check `count_frontends`.
-    #[cfg(debug_assertions)]
+    /// Raw count of TCP frontends across all clusters. Used by the debug-only
+    /// [`Self::check_invariants`] to cross-check `count_frontends`, and by
+    /// `add_tcp_frontend`'s no-mutation-before-admission accounting.
+    /// Compiled unconditionally (unlike `check_invariants`): it is a trivial
+    /// sum of bucket lengths, and `debug_assert!` arguments still typecheck
+    /// in release builds even though they compile out — a debug-gated helper
+    /// referenced there breaks the release/bench build.
     fn count_tcp_frontends_raw(&self) -> usize {
         self.tcp_fronts.values().map(|v| v.len()).sum()
     }
