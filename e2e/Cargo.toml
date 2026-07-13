@@ -3,6 +3,7 @@ name = "sozu-e2e"
 version = "2.1.1"
 rust-version = "1.91.0"
 edition = "2024"
+publish = false
 
 [lints.rust.unexpected_cfgs]
 level = "warn"
