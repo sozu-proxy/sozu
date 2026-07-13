@@ -25,14 +25,7 @@ libc = "^0.2.186"
 log = "^0.4.33"
 memchr = "^2.8.3"
 mio = "^1.2.1"
-# Deterministic-simulation engine (Pierre Zemb's framework) driving the sans-io
-# UDP core sweep in `sim/`. Pinned to a git rev because the published 0.7.0 does
-# not build on stable (needs tracing_unstable, removed post-0.7.0 on `main`);
-# `main` builds cleanly. Swapping this to a crates.io `=x.y.z` once a
-# stable-buildable release ships is a tracked follow-up, not a blocker.
-# `--cfg tokio_unstable` is scoped to the `sozu-sim` build only (cfg-gated
-# dev-deps); test-infra only — pulled in by `sozu-sim`, never by the `sozu` binary.
-moonpool-sim = { git = "https://github.com/PierreZ/moonpool", rev = "60eb07694e3203c8b489d304c84f6e6a9bf506c3" }
+moonpool-sim = "^0.8.0"
 nix = "^0.31.3"
 nom = "^8.0.0"
 num_cpus = "^1.17.0"
@@ -45,7 +38,7 @@ prost-build = "^0.14.4"
 criterion = { version = "^0.8.2", features = ["html_reports"] }
 quickcheck = "^1.1.0"
 rand = "^0.10.2"
-regex = "^1.12.4"
+regex = "^1.13.0"
 rustls-openssl = { version = "^0.3.1", default-features = false, features = ["tls12"] }
 rustls = { version = "^0.23.41", default-features = false, features = [
   "logging",
