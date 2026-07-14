@@ -178,19 +178,32 @@ Notable security-relevant fields on `HttpContext`:
 
 ### 3.1 CL.TE framing guard (`on_request_headers`)
 
-The very first thing `on_request_headers` does (`editor.rs:558-591`, before
-capturing `:method`/authority/path) is reject requests where a
-`Transfer-Encoding` header survived kawa's header pass without kawa actually
-adopting chunked framing (RFC 9110 §7.6 / RFC 9112 §6.1; reopen of
+The very first thing `on_request_headers` does (`editor.rs:558-597`, before
+capturing `:method`/authority/path) is reject requests whose Transfer-Encoding
+framing is ambiguous (RFC 9110 §7.6 / RFC 9112 §6.1; reopen of
 [#726](https://github.com/sozu-proxy/sozu/issues/726)). An intermediary must not
-forward a message whose framing is ambiguous — a `Transfer-Encoding` the parser
-did not resolve to chunked, left in place next to a `Content-Length`, is exactly
-that.
+forward a message whose framing is ambiguous.
 
 The guard runs once per request, after kawa's own header pass (`process_headers`)
 has finalised `body_size` but before `HttpContext` captures anything from the
-request. If `body_size != BodySize::Chunked`, it scans `request.blocks` for
-any non-elided `Transfer-Encoding` header; if one is found, it increments
+request. kawa never elides the `Transfer-Encoding` header and evaluates each TE
+field line independently — a leading `Transfer-Encoding: chunked` line latches
+`body_size = Chunked`, but a second, later TE line (e.g. `identity`) that does
+not itself end in `chunked` is left in place (kawa only `warn!`s), so gating the
+scan on `body_size != Chunked` alone would let that second line ride through.
+The guard therefore counts every non-elided `Transfer-Encoding` header in
+`request.blocks` (`te_count`) and rejects when either:
+
+- `te_count > 1` — more than one non-elided TE header. RFC 9112 §6.1 requires
+  `chunked` be applied once and be the final coding; multiple TE field lines
+  cannot be safely reconciled here, and it is exactly the shape that lets a
+  `Chunked` latch from an earlier line mask a later, differently-framed line
+  (the multi-line CL.TE bypass this guard was hardened against); or
+- `te_count >= 1 && body_size != BodySize::Chunked` — a TE header is present
+  but kawa did not adopt chunked framing (e.g. `chunked\t`, trailing OWS, or
+  `chunked` not the final coding on a single line).
+
+If either condition holds, the guard increments
 `names::http::FRONTEND_TE_SMUGGLING`, logs a `warn!`, and calls
 `request.parsing_phase.error(...)` before returning early. It does **not**
 short-circuit anything else in kawa — the very next line back in

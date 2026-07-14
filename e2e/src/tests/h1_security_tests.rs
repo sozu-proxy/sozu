@@ -1405,11 +1405,22 @@ fn test_h1_connection_close_terminates() {
 // `chunked ` (trailing space), and `chunked, gzip` (chunked not the final
 // coding) all fail the match while the header itself survives forwarding
 // unelided. Sozu must fail closed rather than forward the ambiguity.
+//
+// The `multi-line-chunked-then-identity` case covers a second bypass: kawa
+// evaluates each Transfer-Encoding *field line* independently rather than
+// eliding/merging them, so a first `Transfer-Encoding: chunked` line
+// latches `body_size = Chunked` while a second, separate
+// `Transfer-Encoding: identity` line is left in place (kawa only `warn!`s
+// on it). A guard gated on `body_size != Chunked` alone would treat this
+// message as already-resolved chunked framing and skip the scan entirely,
+// forwarding both TE lines (`chunked, identity` — chunked NOT the final
+// coding). The guard must instead count every non-elided TE header and
+// reject whenever more than one survives, regardless of `body_size`.
 // =========================================================================
 
 /// Malformed Transfer-Encoding shapes that must each be rejected with 400
 /// before ever reaching the backend, with or without a Content-Length.
-const TE_SMUGGLING_CASES: [(&str, &[u8]); 4] = [
+const TE_SMUGGLING_CASES: [(&str, &[u8]); 5] = [
     (
         "trailing-tab",
         b"POST /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\t\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHello",
@@ -1425,6 +1436,10 @@ const TE_SMUGGLING_CASES: [(&str, &[u8]); 4] = [
     (
         "no-content-length",
         b"GET /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\t\r\nConnection: close\r\n\r\n",
+    ),
+    (
+        "multi-line-chunked-then-identity",
+        b"POST /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\nConnection: close\r\n\r\n5\r\nHello\r\n0\r\n\r\n",
     ),
 ];
 
@@ -1490,7 +1505,7 @@ fn test_h1_smuggling_te_cl_trailing_tab() {
     assert_eq!(
         repeat_until_error_or(
             5,
-            "H1 security: CL.TE smuggling via an unhonored Transfer-Encoding (trailing tab/space/non-final coding, with and without Content-Length)",
+            "H1 security: CL.TE smuggling via an unhonored Transfer-Encoding (trailing tab/space/non-final coding, with and without Content-Length, and duplicate TE field lines)",
             try_h1_smuggling_te_cl_trailing_tab,
         ),
         State::Success,
