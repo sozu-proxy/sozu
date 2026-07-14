@@ -8,11 +8,15 @@
   `HttpContext::on_request_headers` (`lib/src/protocol/kawa_h1/editor.rs`) now
   answers `400` when a request carries a `Transfer-Encoding` header that the
   parser did not accept as chunked framing, rather than forwarding it alongside
-  a `Content-Length`. Per RFC 9110 §7.6 / RFC 9112 §6.1 an intermediary must not
-  forward ambiguous message framing. The rejection runs before routing and
-  increments the new `http.frontend.transfer_encoding_smuggling` metric; it
-  mirrors the existing HTTP/2 → H1 framing-conflict rejection. A complementary
-  upstream `kawa` parser fix is the follow-up.
+  a `Content-Length`, and also when more than one non-elided `Transfer-Encoding`
+  header survives kawa's header pass (kawa evaluates each TE field line
+  independently, so a first `chunked` line can latch chunked framing while a
+  second, differently-framed line rides along uncaught). Per RFC 9110 §7.6 /
+  RFC 9112 §6.1 an intermediary must not forward ambiguous message framing. The
+  rejection runs before routing and increments the
+  `http.frontend.transfer_encoding_smuggling` metric; it mirrors the existing
+  HTTP/2 → H1 framing-conflict rejection. A complementary upstream `kawa`
+  parser fix is the follow-up.
 
 ## 2.1.1 - 2026-07-10
 

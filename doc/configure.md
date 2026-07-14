@@ -2173,7 +2173,7 @@ Incremented when Sōzu generates a default error response instead of proxying:
 | Metric                                      | Type    | Scope | Description                                                                                                                                                                                     |
 | -------------------------------------------- | ------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `http.frontend_parse_errors`                 | counter | proxy | Frontend request parsing failures (malformed HTTP/1.1 or HPACK decode errors in HTTP/2)                                                                                                        |
-| `http.frontend.transfer_encoding_smuggling`  | counter | proxy | H1 request rejected (400) because a `Transfer-Encoding` header was not accepted as chunked framing (ambiguous framing, RFC 9110 §7.6 / RFC 9112 §6.1; #726)                                      |
+| `http.frontend.transfer_encoding_smuggling`  | counter | proxy | H1 request rejected (400) for ambiguous `Transfer-Encoding` framing: more than one non-elided `Transfer-Encoding` header, or one present without kawa adopting chunked framing (RFC 9110 §7.6 / RFC 9112 §6.1; #726)                                      |
 | `http.backend_parse_errors`                  | counter | proxy | Backend response parsing failures                                                                                                                                                              |
 
 #### Backend health
