@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### 🔐 Security
+
+- **`fix(h1)`: harden HTTP/1 `Transfer-Encoding` framing (reopen of [#726](https://github.com/sozu-proxy/sozu/issues/726)).**
+  `HttpContext::on_request_headers` (`lib/src/protocol/kawa_h1/editor.rs`) now
+  answers `400` when a request carries a `Transfer-Encoding` header that the
+  parser did not accept as chunked framing, rather than forwarding it alongside
+  a `Content-Length`. Per RFC 9110 §7.6 / RFC 9112 §6.1 an intermediary must not
+  forward ambiguous message framing. The rejection runs before routing and
+  increments the new `http.frontend.transfer_encoding_smuggling` metric; it
+  mirrors the existing HTTP/2 → H1 framing-conflict rejection. A complementary
+  upstream `kawa` parser fix is the follow-up.
+
 ## 2.1.1 - 2026-07-10
 
 Patch release: dependency updates, Rust 1.91.0 MSRV alignment, deterministic

@@ -128,6 +128,7 @@ Conservative changes + tests required in:
 
 - `lib/src/tls.rs`, `lib/src/https.rs`, `lib/src/protocol/rustls.rs` — rustls config, ALPN, SNI binding, cert loading, close-notify.
 - `lib/src/protocol/mux/` — parser, HPACK, pseudo-header ordering, request smuggling, content-length reconciliation, flow control, GOAWAY/RST_STREAM semantics, edge-triggered readiness.
+- `lib/src/protocol/kawa_h1/editor.rs` — the H1 request path rejects (400) any request carrying an unhonored `Transfer-Encoding` header (CL.TE smuggling guard in `on_request_headers`, CWE-444).
 - `lib/src/protocol/proxy_protocol/` — partial headers, oversized headers, TCP health checks.
 - `command/src/channel.rs`, `command/src/scm_socket.rs`, `command/src/command.proto`, `bin/src/command/` — message framing, buffer sizing, FD passing, state replay.
 - Metrics / logs — never leak sensitive values; counters/gauges must stay correct on error paths and shutdown.

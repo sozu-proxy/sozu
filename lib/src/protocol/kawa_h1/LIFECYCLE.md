@@ -176,6 +176,43 @@ Notable security-relevant fields on `HttpContext`:
   unconditionally in `on_request_headers` so the access log always has a
   cross-component join key.
 
+### 3.1 CL.TE framing guard (`on_request_headers`)
+
+The very first thing `on_request_headers` does (`editor.rs:558-591`, before
+capturing `:method`/authority/path) is reject requests where a
+`Transfer-Encoding` header survived kawa's header pass without kawa actually
+adopting chunked framing (RFC 9110 §7.6 / RFC 9112 §6.1; reopen of
+[#726](https://github.com/sozu-proxy/sozu/issues/726)). An intermediary must not
+forward a message whose framing is ambiguous — a `Transfer-Encoding` the parser
+did not resolve to chunked, left in place next to a `Content-Length`, is exactly
+that.
+
+The guard runs once per request, after kawa's own header pass (`process_headers`)
+has finalised `body_size` but before `HttpContext` captures anything from the
+request. If `body_size != BodySize::Chunked`, it scans `request.blocks` for
+any non-elided `Transfer-Encoding` header; if one is found, it increments
+`names::http::FRONTEND_TE_SMUGGLING`, logs a `warn!`, and calls
+`request.parsing_phase.error(...)` before returning early. It does **not**
+short-circuit anything else in kawa — the very next line back in
+`kawa::h1::parse`'s loop re-checks `parsing_phase`, sees `Error`, and returns.
+
+Both `HttpContext` consumers observe the resulting `ParsingPhase::Error`
+identically, since they share the same `HttpContext`/`ParserCallbacks` impl
+(`crate::protocol::http` is a `pub use ... kawa_h1 as http` re-export, not a
+separate type):
+
+- the standalone `Http` session (`mod.rs:529-567`) turns it into
+  `DefaultAnswer::Answer400` via `set_answer`;
+- the mux H1 connection (`lib/src/protocol/mux/h1.rs:313-336`) checks
+  `kawa.is_error()` immediately after `kawa::h1::parse` and, on the server
+  side, calls `set_default_answer(..., 400, ...)` and returns — before routing
+  or the per-frontend Basic-auth check (`mux/router.rs:834`,
+  `mux/auth.rs::check_basic`) run, so an ambiguously-framed request is rejected
+  before it reaches routing.
+
+Mirrors the equivalent HTTP/2 → H1 defense, `RejectReason::ClTeConflict`
+(`lib/src/protocol/mux/pkawa.rs:287`).
+
 ---
 
 ## 4. Default Answers
