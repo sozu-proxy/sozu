@@ -183,6 +183,9 @@ pub mod http {
     pub const E2E_HTTP11: &str = "http.e2e.http11";
     pub const EARLY_RESPONSE_CLOSE: &str = "http.early_response_close";
     pub const FAILED_BACKEND_MATCHING: &str = "http.failed_backend_matching";
+    /// Requests rejected because a Transfer-Encoding header survived parsing without
+    /// kawa adopting chunked framing (CL.TE request-smuggling defense, CWE-444).
+    pub const FRONTEND_TE_SMUGGLING: &str = "http.frontend.transfer_encoding_smuggling";
     pub const FRONTEND_PARSE_ERRORS: &str = "http.frontend_parse_errors";
     pub const HSTS_FRONTEND_ADDED: &str = "http.hsts.frontend_added";
     pub const HSTS_FRONTEND_REFRESHED: &str = "http.hsts.frontend_refreshed";

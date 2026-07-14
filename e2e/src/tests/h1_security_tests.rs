@@ -17,9 +17,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::Engine;
+use sozu_command_lib::{
+    config::ListenerBuilder,
+    proto::command::{
+        ActivateListener, Cluster, ListenerType, Request, RequestHttpFrontend, request::RequestType,
+    },
+};
+
 use crate::{
     http_utils::http_ok_response,
     mock::{client::Client, sync_backend::Backend as SyncBackend},
+    port_registry::attach_reserved_http_listener,
     sozu::worker::Worker,
     tests::{State, repeat_until_error_or, setup_sync_test},
 };
@@ -1374,6 +1383,421 @@ fn test_h1_connection_close_terminates() {
             5,
             "H1 security: Connection: close properly terminates the connection",
             try_h1_connection_close_terminates,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 13: CL.TE request smuggling via an unhonored Transfer-Encoding
+// (regression of #726 / kawa 0.6.8's suffix-only "chunked" check)
+//
+// RFC 9110 §7.6 / RFC 7230 §3.3.3: a message carrying a Transfer-Encoding
+// header that is not actually honored as the framing mechanism, alongside
+// a Content-Length, is a desync primitive (CWE-444) — a lenient backend
+// may trim trailing whitespace/control bytes and treat the message as
+// chunked while sozu framed it by Content-Length (or treat it as
+// length-framed while sozu forwarded a value it never validated).
+//
+// kawa 0.6.8's chunked recognition is a bare suffix compare with no OWS
+// trim (`lib/src/protocol/kawa_h1/editor.rs`'s guard comment cites the
+// exact kawa source), so `Transfer-Encoding: chunked\t` (trailing tab),
+// `chunked ` (trailing space), and `chunked, gzip` (chunked not the final
+// coding) all fail the match while the header itself survives forwarding
+// unelided. Sozu must fail closed rather than forward the ambiguity.
+// =========================================================================
+
+/// Malformed Transfer-Encoding shapes that must each be rejected with 400
+/// before ever reaching the backend, with or without a Content-Length.
+const TE_SMUGGLING_CASES: [(&str, &[u8]); 4] = [
+    (
+        "trailing-tab",
+        b"POST /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\t\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHello",
+    ),
+    (
+        "trailing-space",
+        b"POST /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked \r\nContent-Length: 5\r\nConnection: close\r\n\r\nHello",
+    ),
+    (
+        "not-final-coding",
+        b"POST /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked, gzip\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHello",
+    ),
+    (
+        "no-content-length",
+        b"GET /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\t\r\nConnection: close\r\n\r\n",
+    ),
+];
+
+fn try_h1_smuggling_te_cl_trailing_tab() -> State {
+    for (label, request) in TE_SMUGGLING_CASES {
+        let front_address = create_local_address();
+
+        let (config, listeners, state) = Worker::empty_config();
+        let (mut worker, mut backends) = setup_sync_test(
+            format!("TE-SMUGGLE-{label}"),
+            config,
+            listeners,
+            state,
+            front_address,
+            1,
+            false,
+        );
+        let mut backend = backends.pop().unwrap();
+        backend.connect();
+
+        let mut stream = raw_connect(front_address);
+        stream
+            .write_all(request)
+            .unwrap_or_else(|e| panic!("{label}: write attack bytes: {e}"));
+
+        // Assertion 2: the malformed request must never reach the backend.
+        if !assert_attack_not_forwarded(label, &mut backend, Duration::from_millis(300)) {
+            println!("{label}: FAIL — malformed framing reached the backend");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+
+        // Assertion 1: sozu answers 400.
+        match raw_read(&mut stream) {
+            Some(r) if r.contains("400") => {
+                println!("{label}: correctly rejected with 400");
+            }
+            other => {
+                println!("{label}: FAIL — expected 400, got {other:?}");
+                worker.soft_stop();
+                worker.wait_for_server_stop();
+                return State::Fail;
+            }
+        }
+        drop(stream);
+
+        if !verify_sozu_healthy(front_address, &mut backend, false) {
+            println!("{label}: FAIL — sozu unhealthy after the attack");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+    }
+    State::Success
+}
+
+#[test]
+fn test_h1_smuggling_te_cl_trailing_tab() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: CL.TE smuggling via an unhonored Transfer-Encoding (trailing tab/space/non-final coding, with and without Content-Length)",
+            try_h1_smuggling_te_cl_trailing_tab,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 14: Non-regression — legitimately framed requests are still forwarded
+//
+// The CL.TE guard added to `editor.rs::on_request_headers` must reject
+// only requests where a Transfer-Encoding header survives without kawa
+// adopting chunked framing. It must never fire when the framing is
+// unambiguous, including the shapes below.
+// =========================================================================
+
+fn try_h1_valid_framing_still_forwarded() -> State {
+    let cases: [(&str, &[u8]); 5] = [
+        (
+            "chunked",
+            b"POST /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nHello\r\n0\r\n\r\n",
+        ),
+        (
+            "multi-coding-chunked-final",
+            b"POST /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\nConnection: close\r\n\r\n5\r\nHello\r\n0\r\n\r\n",
+        ),
+        (
+            "content-length-only",
+            b"POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHello",
+        ),
+        (
+            "cl-and-te-together",
+            b"POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nHello\r\n0\r\n\r\n",
+        ),
+        (
+            "get-no-body",
+            b"GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ),
+    ];
+
+    for (label, request) in cases {
+        let front_address = create_local_address();
+
+        let (config, listeners, state) = Worker::empty_config();
+        let (mut worker, mut backends) = setup_sync_test(
+            format!("VALID-FRAME-{label}"),
+            config,
+            listeners,
+            state,
+            front_address,
+            1,
+            false,
+        );
+        let mut backend = backends.pop().unwrap();
+        backend.connect();
+
+        let mut stream = raw_connect(front_address);
+        stream
+            .write_all(request)
+            .unwrap_or_else(|e| panic!("{label}: write request: {e}"));
+
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let mut forwarded = false;
+        while Instant::now() < deadline {
+            if backend.accept(0) {
+                forwarded = true;
+                break;
+            }
+        }
+        if !forwarded {
+            println!("{label}: FAIL — request never reached the backend");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+
+        let received = backend.receive(0);
+        backend.send(0);
+        let response = raw_read(&mut stream);
+        drop(stream);
+
+        let ok = received.is_some()
+            && matches!(&response, Some(r) if r.contains("200") && r.contains("pong0"));
+
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+
+        if !ok {
+            println!(
+                "{label}: FAIL — expected 200/pong0, got response={response:?} received={received:?}"
+            );
+            return State::Fail;
+        }
+        println!("{label}: correctly forwarded, got 200");
+    }
+    State::Success
+}
+
+#[test]
+fn test_h1_valid_framing_still_forwarded() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: legitimately framed requests (chunked, CL, both, neither) are still forwarded",
+            try_h1_valid_framing_still_forwarded,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// Test 15: CL.TE smuggling cannot bypass per-frontend Basic auth
+//
+// Sozu supports per-frontend HTTP Basic auth (`required_auth = true` +
+// `authorized_hashes` + `www_authenticate`). A classic use of CL/TE
+// desync is to hide a second, unauthenticated request inside what the
+// auth-enforcing proxy believes is opaque body content of the first
+// request, so the smuggled request never passes through the proxy's
+// per-request auth gate at all. With the CL.TE guard, the outer request
+// is rejected (400) before routing or the auth check ever run — see
+// `lib/src/protocol/mux/h1.rs`'s `kawa.is_error()` short-circuit, which
+// fires immediately after `kawa::h1::parse` and before the router/auth
+// check further down the same read event.
+// =========================================================================
+
+/// SHA-256 hex of the literal byte string `s3cr3t` (`printf 's3cr3t' |
+/// sha256sum`). The attack request in this test never supplies a matching
+/// `Authorization` header — the guard must reject the malformed framing
+/// before the auth check ever runs — so this hash only backs the
+/// post-attack health check, which authenticates for real to prove the
+/// CL.TE guard didn't collaterally break the (unrelated) Basic-auth gate.
+const AUTH_BYPASS_SECRET_SHA256_HEX: &str =
+    "4e738ca5563c06cfd0018299933d58db1dd8bf97f6973dc99bf6cdc64b5550bd";
+
+/// Spins up a worker with a single HTTP listener, one cluster gated by
+/// per-frontend Basic auth, and one backend. Duplicated locally rather
+/// than reusing `redirect_rewrite_auth_tests::spawn_worker_with_http_listener`
+/// / `make_basic_auth_cluster` — those helpers are private to that module.
+fn spawn_auth_gated_worker(
+    label: &str,
+    front_address: SocketAddr,
+    back_address: SocketAddr,
+) -> Worker {
+    let (config, mut listeners, state) = Worker::empty_config();
+    attach_reserved_http_listener(&mut listeners, front_address);
+    let mut worker = Worker::start_new_worker_owned(label, config, listeners, state);
+
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::AddHttpListener(
+            ListenerBuilder::new_http(front_address.into())
+                .to_http(None)
+                .expect("default HTTP listener must build"),
+        )),
+    });
+    worker.send_proxy_request(Request {
+        request_type: Some(RequestType::ActivateListener(ActivateListener {
+            address: front_address.into(),
+            proxy: ListenerType::Http.into(),
+            from_scm: true,
+        })),
+    });
+    worker.send_proxy_request(
+        RequestType::AddCluster(Cluster {
+            authorized_hashes: vec![format!("admin:{AUTH_BYPASS_SECRET_SHA256_HEX}")],
+            www_authenticate: Some("Basic realm=\"sozu\"".to_owned()),
+            ..Worker::default_cluster("auth_bypass_cluster")
+        })
+        .into(),
+    );
+    worker.send_proxy_request(
+        RequestType::AddHttpFrontend(RequestHttpFrontend {
+            required_auth: Some(true),
+            ..Worker::default_http_frontend("auth_bypass_cluster", front_address)
+        })
+        .into(),
+    );
+    worker.send_proxy_request(
+        RequestType::AddBackend(Worker::default_backend(
+            "auth_bypass_cluster",
+            "auth_bypass_back_0",
+            back_address,
+            None,
+        ))
+        .into(),
+    );
+    worker.read_to_last();
+    worker
+}
+
+fn try_h1_smuggling_auth_bypass() -> State {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let mut worker = spawn_auth_gated_worker("AUTH-BYPASS", front_address, back_address);
+    let mut backend = SyncBackend::new(
+        "auth_bypass_back_0",
+        back_address,
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong",
+    );
+    backend.connect();
+
+    let token = base64::engine::general_purpose::STANDARD.encode(b"admin:s3cr3t");
+
+    // The outer request carries VALID `Authorization` credentials — this is
+    // the actual bypass primitive: a per-request Basic-auth gate that only
+    // ever validates the *outer* request's headers is worthless if a
+    // malformed Transfer-Encoding/Content-Length pair lets a second, fully
+    // -formed request ride along hidden inside what sozu treats as opaque,
+    // already-authenticated body bytes. Pre-fix, sozu's auth check passes
+    // on the outer headers and forwards the whole Content-Length-framed
+    // blob — smuggled request included — to the backend, having checked
+    // credentials exactly once for what a lenient backend treats as two
+    // requests. Post-fix, the CL.TE guard rejects the whole thing (400)
+    // before routing or the auth check ever run, regardless of whether the
+    // outer credentials were valid.
+    let smuggled_request = concat!("GET /admin HTTP/1.1\r\n", "Host: localhost\r\n", "\r\n",);
+    let body = format!("0\r\n\r\n{smuggled_request}");
+    let attack = format!(
+        "POST /secured HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {token}\r\nTransfer-Encoding: chunked\t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body,
+    );
+
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(attack.as_bytes())
+        .expect("write CL.TE auth-bypass attack");
+
+    // Even with valid outer credentials, neither the outer request nor the
+    // smuggled inner request may reach the backend — the malformed framing
+    // must be rejected before the (would-be successful) auth check runs.
+    if !assert_attack_not_forwarded("AUTH-BYPASS", &mut backend, Duration::from_millis(300)) {
+        println!(
+            "AUTH-BYPASS: FAIL — authenticated-but-malformed request (with smuggled payload) reached the backend"
+        );
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    match raw_read(&mut stream) {
+        Some(r) if r.contains("400") => {
+            println!("AUTH-BYPASS: correctly rejected with 400 before routing/auth");
+        }
+        other => {
+            println!("AUTH-BYPASS: FAIL — expected 400, got {other:?}");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+    drop(stream);
+
+    // Post-attack health check: this deliberately does NOT reuse the
+    // shared `verify_sozu_healthy` helper, which sends an unauthenticated
+    // GET to `/healthz` — against this test's `required_auth = true`
+    // frontend on path prefix "/", that would itself get a 401 and the
+    // helper would misreport failure. Instead, authenticate for real
+    // against the same auth-gated route to prove the CL.TE guard didn't
+    // collaterally break the Basic-auth gate.
+    let healthy_request = format!(
+        "GET /secured HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {token}\r\nConnection: close\r\n\r\n"
+    );
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(healthy_request.as_bytes())
+        .expect("write authenticated health-check request");
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut connected = false;
+    while Instant::now() < deadline {
+        if backend.accept(0) {
+            connected = true;
+            break;
+        }
+    }
+    if !connected {
+        println!("AUTH-BYPASS: FAIL — authenticated health check never reached the backend");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    backend.receive(0);
+    backend.send(0);
+
+    match raw_read(&mut stream) {
+        Some(r) if r.contains("200") => {
+            println!("AUTH-BYPASS: post-attack authenticated health check succeeded");
+        }
+        other => {
+            println!("AUTH-BYPASS: FAIL — authenticated health check got {other:?}");
+            worker.soft_stop();
+            worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_h1_smuggling_auth_bypass() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: CL.TE smuggling cannot bypass per-frontend Basic auth",
+            try_h1_smuggling_auth_bypass,
         ),
         State::Success,
     );

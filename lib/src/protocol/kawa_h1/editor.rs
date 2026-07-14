@@ -561,6 +561,37 @@ impl HttpContext {
         // so the postcondition can pin "blocks only grow" for the whole edit.
         let blocks_at_entry = request.blocks.len();
 
+        // Defense-in-depth against CL.TE request smuggling (CWE-444, RFC 9110 §7.6 /
+        // RFC 7230 §3.3.3; reopen of #726). kawa never elides the Transfer-Encoding
+        // header itself; when its chunked check does not fire (e.g. a trailing tab in
+        // `chunked\t`, trailing OWS, or `chunked` not the final coding), the TE header
+        // survives to forwarding while the body stays length/empty-framed. Forwarding an
+        // unhonored Transfer-Encoding next to a Content-Length is a desync primitive, so
+        // reject rather than forward ambiguous framing. Mirrors the HTTP/2 -> H1
+        // `RejectReason::ClTeConflict` rejection in `mux/pkawa.rs`.
+        if request.body_size != kawa::BodySize::Chunked {
+            let unhonored_te = {
+                let buf0 = request.storage.buffer();
+                request.blocks.iter().any(|block| {
+                    matches!(block,
+                        kawa::Block::Header(header)
+                            if !header.is_elided()
+                                && compare_no_case(header.key.data(buf0), b"transfer-encoding"))
+                })
+            };
+            if unhonored_te {
+                incr!(names::http::FRONTEND_TE_SMUGGLING);
+                warn!(
+                    "{} rejecting request: Transfer-Encoding not honored as chunked framing (possible CL.TE request smuggling)",
+                    self.log_context()
+                );
+                request
+                    .parsing_phase
+                    .error("Transfer-Encoding conflicts with message framing".into());
+                return;
+            }
+        }
+
         let buf = request.storage.mut_buffer();
 
         // Captures the request line
