@@ -569,22 +569,42 @@ impl HttpContext {
         //   * more than one non-elided TE header  (RFC 9112 §6.1: chunked must be applied
         //     once and be the final coding; multiple field lines can't be safely
         //     reconciled here and a Chunked latch would leave a second line forwarded), or
-        //   * a TE header present while kawa did not adopt chunked framing (e.g. `chunked\t`,
-        //     trailing OWS, or `chunked` not the final coding).
-        let te_count = {
+        //   * a TE header whose raw value does not literally end in `chunked`, or
+        //   * a TE header present while kawa did not adopt chunked framing.
+        //
+        // The literal-suffix check is what keeps OWS-obfuscated codings (`chunked\t`,
+        // `chunked `) and non-final codings (`chunked, gzip`) fail-closed. kawa >=0.7.0
+        // OWS-trims the final coding, so it frames `chunked\t` AS chunked and elides the
+        // Content-Length — but it still forwards the TE field line *verbatim*. A backend
+        // that does not itself trim OWS would then see neither a coding it recognizes nor
+        // a Content-Length, and would read our chunked body bytes as a pipelined request:
+        // a TE.TE desync. Framing the message correctly is kawa's job; refusing to forward
+        // an obfuscated coding we had to normalize to understand is ours.
+        let (te_count, te_all_suffix_chunked) = {
+            const CHUNKED: &[u8] = b"chunked";
             let buf0 = request.storage.buffer();
             request
                 .blocks
                 .iter()
-                .filter(|block| {
-                    matches!(block,
-                        kawa::Block::Header(header)
-                            if !header.is_elided()
-                                && compare_no_case(header.key.data(buf0), b"transfer-encoding"))
+                .filter_map(|block| match block {
+                    kawa::Block::Header(header)
+                        if !header.is_elided()
+                            && compare_no_case(header.key.data(buf0), b"transfer-encoding") =>
+                    {
+                        Some(header.val.data(buf0))
+                    }
+                    _ => None,
                 })
-                .count()
+                .fold((0usize, true), |(count, all_chunked), val| {
+                    let suffix_chunked = val.len() >= CHUNKED.len()
+                        && compare_no_case(&val[val.len() - CHUNKED.len()..], CHUNKED);
+                    (count + 1, all_chunked && suffix_chunked)
+                })
         };
-        if te_count > 1 || (te_count >= 1 && request.body_size != kawa::BodySize::Chunked) {
+        if te_count > 1
+            || (te_count == 1
+                && (!te_all_suffix_chunked || request.body_size != kawa::BodySize::Chunked))
+        {
             incr!(names::http::FRONTEND_TE_SMUGGLING);
             warn!(
                 "{} rejecting request: ambiguous Transfer-Encoding framing (possible CL.TE request smuggling)",
