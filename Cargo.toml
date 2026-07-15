@@ -13,7 +13,7 @@ futures = "^0.3.32"
 hdrhistogram = "^7.5.4"
 hex = "^0.4.3"
 loona-hpack = "^0.4.3"
-http-body-util = "^0.1.3"
+http-body-util = "^0.1.4"
 hyper = "^1.10.1"
 hyper-rustls = { version = "^0.27.9", default-features = false }
 hyper-util = "^0.1.20"
@@ -24,7 +24,7 @@ kawa = { version = "^0.6.8", default-features = false }
 libc = "^0.2.186"
 log = "^0.4.33"
 memchr = "^2.8.3"
-mio = "^1.2.1"
+mio = "^1.2.2"
 moonpool-sim = "^0.8.0"
 nix = "^0.31.3"
 nom = "^8.0.0"
@@ -40,7 +40,7 @@ quickcheck = "^1.1.0"
 rand = "^0.10.2"
 regex = "^1.13.0"
 rustls-openssl = { version = "^0.3.1", default-features = false, features = ["tls12"] }
-rustls = { version = "^0.23.41", default-features = false, features = [
+rustls = { version = "^0.23.42", default-features = false, features = [
   "logging",
   "std",
   "tls12",
@@ -51,7 +51,7 @@ serde_json = "^1.0.150"
 serial_test = "^3.5.0"
 sha2 = "^0.11.0"
 slab = "^0.4.12"
-socket2 = "^0.6.4"
+socket2 = "^0.6.5"
 sozu-command-lib = { version = "^2.1.1", path = "command" }
 sozu-lib = { version = "^2.1.1", path = "lib", default-features = false }
 subtle = "^2.6.1"
@@ -61,7 +61,7 @@ thiserror = "^2.0.18"
 time = "^0.3.53"
 tiny_http = "^0.12.0"
 tokio = "^1.52.3"
-toml = { version = "^1.1.2", features = ["preserve_order"] }
+toml = { version = "^1.1.3", features = ["preserve_order"] }
 x509-parser = "^0.18.1"
 
 # Dependencies for the `sozu top` TUI subcommand. All gated behind the
