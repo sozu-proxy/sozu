@@ -1856,12 +1856,12 @@ dependencies = [
 
 [[package]]
 name = "kawa"
-version = "0.6.8"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "113ce3f8c163e6a7ef4efa50659b98cab3f325218e28a88dd5a2bebeeb55725d"
+checksum = "0f4f2d444456cff5c3dcc08e51135c64ac33ca4b3c5177e59e858ff5fb0d10cb"
 dependencies = [
  "log",
- "nom 7.1.3",
+ "nom 8.0.0",
 ]
 
 [[package]]
