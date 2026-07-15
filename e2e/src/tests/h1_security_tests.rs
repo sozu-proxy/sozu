@@ -111,6 +111,24 @@ fn assert_attack_not_forwarded(label: &str, backend: &mut SyncBackend, deadline:
     true
 }
 
+/// Concatenate everything the backend reads on `client_id` for the whole
+/// `window`, instead of trusting one `receive` — a single `read()` sees one
+/// segment (CLAUDE.md: "Always `loop_read_*` ... when asserting on TCP").
+/// The full window is always drained rather than stopping at the first
+/// complete head, because these assertions are about bytes that must NOT
+/// appear: stopping early would let a late segment carry them past the test.
+/// Each `receive` costs at most the accepted stream's 100 ms read timeout.
+fn backend_drain(backend: &mut SyncBackend, client_id: usize, window: Duration) -> String {
+    let start = Instant::now();
+    let mut received = String::new();
+    while start.elapsed() < window {
+        if let Some(chunk) = backend.receive(client_id) {
+            received.push_str(&chunk);
+        }
+    }
+    received
+}
+
 // =========================================================================
 // Verification helper
 // =========================================================================
@@ -1389,31 +1407,36 @@ fn test_h1_connection_close_terminates() {
 }
 
 // =========================================================================
-// Test 13: CL.TE request smuggling via an unhonored Transfer-Encoding
-// (regression of #726 / kawa 0.6.8's suffix-only "chunked" check)
+// Test 13: CL.TE request smuggling via an ambiguous Transfer-Encoding
+// (regression of #726)
 //
-// RFC 9110 §7.6 / RFC 7230 §3.3.3: a message carrying a Transfer-Encoding
-// header that is not actually honored as the framing mechanism, alongside
-// a Content-Length, is a desync primitive (CWE-444) — a lenient backend
-// may trim trailing whitespace/control bytes and treat the message as
-// chunked while sozu framed it by Content-Length (or treat it as
-// length-framed while sozu forwarded a value it never validated).
+// RFC 9110 §7.6 / RFC 7230 §3.3.3: a message whose Transfer-Encoding is not
+// the framing actually applied, alongside a Content-Length, is a desync
+// primitive (CWE-444) — a lenient backend may frame on the Transfer-Encoding
+// while sozu framed by Content-Length, so the two disagree on where the
+// message ends and the tail of one becomes a request of its own.
 //
-// `Transfer-Encoding: chunked\t` (trailing tab), `chunked ` (trailing
-// space), and `chunked, gzip` (chunked not the final coding) are all
-// obfuscated codings that sozu must fail closed on rather than forward.
+// The invariant sozu upholds is NOT "reject anything unusual" but:
 //
-// kawa >=0.7.0 OWS-trims the final coding, so it frames `chunked\t` and
-// `chunked ` AS chunked and elides the Content-Length (RFC 9110 §6.3) —
-// which fixes the CL.TE desync at the framing level but is NOT sufficient
-// on its own: kawa still forwards the Transfer-Encoding field line
-// verbatim. A backend that does not itself trim OWS would see neither a
-// coding it recognizes nor a Content-Length, and would read sozu's chunked
-// body bytes as a pipelined request (a TE.TE desync). So the guard in
-// `lib/src/protocol/kawa_h1/editor.rs` additionally requires the raw TE
-// value to literally end in `chunked`, refusing to forward an obfuscated
-// coding it had to normalize to understand. Legitimate `chunked` and
-// `gzip, chunked` codings still pass.
+//     sozu never forwards a Transfer-Encoding that differs from the framing
+//     it applied — it either normalizes, or it rejects.
+//
+// Two layers cooperate. kawa >=0.7.1 excludes leading/trailing OWS from every
+// field value (RFC 9112 §5), so `chunked\t` and `chunked ` ARE `chunked`:
+// they select chunked framing, elide every Content-Length (RFC 9110 §6.3),
+// and — the part that matters here — are FORWARDED as the canonical
+// `chunked`, never as the obfuscated spelling. (kawa 0.7.0 framed on the
+// trimmed reading but forwarded the raw bytes; a backend that did not itself
+// trim then saw no coding it recognised and no length, and read the chunked
+// body as a pipelined request. That gap is what `chunked\t` used to be
+// rejected for.) The guard in `lib/src/protocol/kawa_h1/editor.rs` then
+// rejects what remains genuinely ambiguous: more than one surviving TE header,
+// or a value whose final coding is not chunked.
+//
+// So an OWS-obfuscated coding is now handled rather than refused — it is a
+// legal chunked request and rejecting it would reject legal traffic. What it
+// must never do is reach a backend still obfuscated: see
+// `test_h1_te_ows_forwarded_canonically`, which pins the forwarded bytes.
 //
 // The `multi-line-chunked-then-identity` case covers a second bypass:
 // a first `Transfer-Encoding: chunked` line must not be able to latch
@@ -1424,9 +1447,17 @@ fn test_h1_connection_close_terminates() {
 // `body_size`.
 // =========================================================================
 
-/// Malformed Transfer-Encoding shapes that must each be rejected with 400
+/// Ambiguous Transfer-Encoding shapes that must each be rejected with 400
 /// before ever reaching the backend, with or without a Content-Length.
-const TE_SMUGGLING_CASES: [(&str, &[u8]); 5] = [
+///
+/// The `trailing-tab` / `trailing-space` cases are rejected for their BODY,
+/// not their coding: `chunked\t` frames as chunked (OWS is not part of the
+/// field value), and `Hello` is not a valid chunk. They are kept because a
+/// Content-Length that a lenient peer might frame on must never survive
+/// alongside chunked framing — the request must die rather than reach the
+/// backend with two framings. An OWS-obfuscated coding with a *valid* body
+/// is a legal request and is covered by `test_h1_te_ows_forwarded_canonically`.
+const TE_SMUGGLING_CASES: [(&str, &[u8]); 4] = [
     (
         "trailing-tab",
         b"POST /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\t\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHello",
@@ -1438,10 +1469,6 @@ const TE_SMUGGLING_CASES: [(&str, &[u8]); 5] = [
     (
         "not-final-coding",
         b"POST /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked, gzip\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHello",
-    ),
-    (
-        "no-content-length",
-        b"GET /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\t\r\nConnection: close\r\n\r\n",
     ),
     (
         "multi-line-chunked-then-identity",
@@ -1511,8 +1538,106 @@ fn test_h1_smuggling_te_cl_trailing_tab() {
     assert_eq!(
         repeat_until_error_or(
             5,
-            "H1 security: CL.TE smuggling via an unhonored Transfer-Encoding (trailing tab/space/non-final coding, with and without Content-Length, and duplicate TE field lines)",
+            "H1 security: CL.TE smuggling via an ambiguous Transfer-Encoding (trailing tab/space and non-final coding alongside a Content-Length, and duplicate TE field lines)",
             try_h1_smuggling_te_cl_trailing_tab,
+        ),
+        State::Success,
+    );
+}
+
+/// An OWS-obfuscated `Transfer-Encoding` with a valid chunked body is a
+/// legal request (RFC 9112 §5: trailing OWS is not part of the field value),
+/// so it is handled rather than refused — refusing it would reject legal
+/// traffic. The property that keeps it safe is what reaches the backend:
+/// the coding sozu framed on, and no second framing header.
+///
+/// This is the assertion the old suite never made. It asserted `400` and so
+/// could not tell "sozu normalized correctly" from "sozu forwarded
+/// `chunked\t` verbatim" — which is exactly what kawa 0.7.0 did, and exactly
+/// how a TE.TE desync starts: a backend that does not itself trim OWS sees
+/// no coding it recognises and, the Content-Length having been elided, no
+/// length either, so it reads the chunked body as a pipelined request.
+fn try_h1_te_ows_forwarded_canonically() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "TE-OWS-CANONICAL",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().unwrap();
+    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong");
+    backend.connect();
+
+    // `chunked\t` frames as chunked and elides the Content-Length; the body
+    // is valid chunked ("Hello"), so nothing else can reject this request.
+    const REQUEST: &[u8] = b"POST /api HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\t\r\nContent-Length: 5\r\nConnection: close\r\n\r\n5\r\nHello\r\n0\r\n\r\n";
+
+    let mut stream = raw_connect(front_address);
+    stream.write_all(REQUEST).expect("write OWS-coding request");
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut accepted = false;
+    while Instant::now() < deadline {
+        if backend.accept(0) {
+            accepted = true;
+            break;
+        }
+    }
+    if !accepted {
+        println!("TE-OWS-CANONICAL: FAIL — a legal chunked request never reached the backend");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    let forwarded = backend_drain(&mut backend, 0, Duration::from_millis(300));
+    backend.send(0);
+    println!("TE-OWS-CANONICAL: backend received {forwarded:?}");
+
+    // The coding we framed on is the coding we forward.
+    if !forwarded.contains("Transfer-Encoding: chunked\r\n") {
+        println!(
+            "TE-OWS-CANONICAL: FAIL — backend did not receive a canonical `Transfer-Encoding: chunked`"
+        );
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    // The obfuscated spelling must not survive to the backend.
+    if forwarded.contains("chunked\t") || forwarded.contains("chunked \r\n") {
+        println!("TE-OWS-CANONICAL: FAIL — the obfuscated coding was forwarded verbatim");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    // RFC 9110 §6.3: Transfer-Encoding overrides Content-Length, so no
+    // second framing header may reach the backend.
+    if forwarded.to_lowercase().contains("content-length") {
+        println!("TE-OWS-CANONICAL: FAIL — a Content-Length survived alongside chunked framing");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    drop(stream);
+
+    worker.soft_stop();
+    worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_h1_te_ows_forwarded_canonically() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H1 security: an OWS-obfuscated Transfer-Encoding is forwarded as the canonical coding, with no Content-Length beside it",
+            try_h1_te_ows_forwarded_canonically,
         ),
         State::Success,
     );
@@ -1715,16 +1840,23 @@ fn try_h1_smuggling_auth_bypass() -> State {
 
     // The outer request carries VALID `Authorization` credentials — this is
     // the actual bypass primitive: a per-request Basic-auth gate that only
-    // ever validates the *outer* request's headers is worthless if a
-    // malformed Transfer-Encoding/Content-Length pair lets a second, fully
+    // ever validates the *outer* request's headers is worthless if an
+    // ambiguous Transfer-Encoding/Content-Length pair lets a second, fully
     // -formed request ride along hidden inside what sozu treats as opaque,
-    // already-authenticated body bytes. Pre-fix, sozu's auth check passes
-    // on the outer headers and forwards the whole Content-Length-framed
-    // blob — smuggled request included — to the backend, having checked
-    // credentials exactly once for what a lenient backend treats as two
-    // requests. Post-fix, the CL.TE guard rejects the whole thing (400)
-    // before routing or the auth check ever run, regardless of whether the
-    // outer credentials were valid.
+    // already-authenticated body bytes. Pre-fix, sozu's auth check passed on
+    // the outer headers and forwarded the whole Content-Length-framed blob —
+    // smuggled request included — to the backend, having checked credentials
+    // exactly once for what a lenient backend treats as two requests.
+    //
+    // Post-fix the bypass is gone by construction rather than by rejection.
+    // `chunked\t` IS `chunked` (RFC 9112 §5), so the Content-Length that
+    // framed the blob is elided (RFC 9110 §6.3) and the body ends at its
+    // terminating `0\r\n\r\n` chunk. The trailing bytes are therefore no
+    // longer *inside* a body at all: they are a pipelined request, which
+    // sozu parses and auth-checks on its own merits. The outer, genuinely
+    // authenticated POST is forwarded — that is correct — but the smuggled
+    // `GET /admin` must never ride along inside it, and must never reach the
+    // backend on the strength of the outer request's credentials.
     let smuggled_request = concat!("GET /admin HTTP/1.1\r\n", "Host: localhost\r\n", "\r\n",);
     let body = format!("0\r\n\r\n{smuggled_request}");
     let attack = format!(
@@ -1738,24 +1870,67 @@ fn try_h1_smuggling_auth_bypass() -> State {
         .write_all(attack.as_bytes())
         .expect("write CL.TE auth-bypass attack");
 
-    // Even with valid outer credentials, neither the outer request nor the
-    // smuggled inner request may reach the backend — the malformed framing
-    // must be rejected before the (would-be successful) auth check runs.
-    if !assert_attack_not_forwarded("AUTH-BYPASS", &mut backend, Duration::from_millis(300)) {
-        println!(
-            "AUTH-BYPASS: FAIL — authenticated-but-malformed request (with smuggled payload) reached the backend"
-        );
+    // The outer POST is authenticated and correctly framed, so it is expected
+    // to reach the backend.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut accepted = false;
+    while Instant::now() < deadline {
+        if backend.accept(0) {
+            accepted = true;
+            break;
+        }
+    }
+    if !accepted {
+        println!("AUTH-BYPASS: FAIL — the authenticated outer request never reached the backend");
         worker.soft_stop();
         worker.wait_for_server_stop();
         return State::Fail;
     }
 
+    let forwarded = backend_drain(&mut backend, 0, Duration::from_millis(300));
+    backend.send(0);
+    println!("AUTH-BYPASS: backend received {forwarded:?}");
+
+    // THE bypass assertion: the smuggled request must never reach the backend
+    // hidden inside the authenticated request's body.
+    if forwarded.contains("/admin") {
+        println!(
+            "AUTH-BYPASS: FAIL — the smuggled `GET /admin` rode along inside the authenticated body"
+        );
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    // ...and it must not have been smuggled by leaving both framings in place.
+    if forwarded.to_lowercase().contains("content-length") {
+        println!("AUTH-BYPASS: FAIL — a Content-Length survived alongside chunked framing");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    if !forwarded.contains("Transfer-Encoding: chunked\r\n") {
+        println!("AUTH-BYPASS: FAIL — backend did not receive a canonical chunked framing");
+        worker.soft_stop();
+        worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    drop(stream);
+
+    // The auth gate must still be per-request: the smuggled request's own
+    // credentials (it has none) are what decide its fate, not the outer
+    // request's. Replay it on its own and prove it is challenged, not served.
+    let mut stream = raw_connect(front_address);
+    stream
+        .write_all(smuggled_request.as_bytes())
+        .expect("write the smuggled request on its own");
     match raw_read(&mut stream) {
-        Some(r) if r.contains("400") => {
-            println!("AUTH-BYPASS: correctly rejected with 400 before routing/auth");
+        Some(r) if r.contains("401") => {
+            println!("AUTH-BYPASS: the smuggled request is challenged (401) on its own merits");
         }
         other => {
-            println!("AUTH-BYPASS: FAIL — expected 400, got {other:?}");
+            println!(
+                "AUTH-BYPASS: FAIL — expected 401 for the unauthenticated request, got {other:?}"
+            );
             worker.soft_stop();
             worker.wait_for_server_stop();
             return State::Fail;
@@ -1778,22 +1953,33 @@ fn try_h1_smuggling_auth_bypass() -> State {
         .write_all(healthy_request.as_bytes())
         .expect("write authenticated health-check request");
 
-    let deadline = Instant::now() + Duration::from_millis(500);
-    let mut connected = false;
+    // The outer POST was legitimately forwarded, so unlike the pre-kawa-0.7.1
+    // version of this test the backend already has a connection here. Try to
+    // serve on it before accepting a new one (same reasoning as
+    // `verify_sozu_healthy`'s `smuggling_forwarded` path) — whether sozu
+    // reuses the pooled backend connection or opens a fresh one is not what
+    // this check is about.
+    let deadline = Instant::now() + Duration::from_millis(1000);
+    let mut served = false;
     while Instant::now() < deadline {
-        if backend.accept(0) {
-            connected = true;
+        if backend.receive(0).is_some() {
+            backend.send(0);
+            served = true;
+            break;
+        }
+        if backend.accept(1) {
+            backend.receive(1);
+            backend.send(1);
+            served = true;
             break;
         }
     }
-    if !connected {
+    if !served {
         println!("AUTH-BYPASS: FAIL — authenticated health check never reached the backend");
         worker.soft_stop();
         worker.wait_for_server_stop();
         return State::Fail;
     }
-    backend.receive(0);
-    backend.send(0);
 
     match raw_read(&mut stream) {
         Some(r) if r.contains("200") => {
