@@ -15,8 +15,25 @@
   RFC 9112 §6.1 an intermediary must not forward ambiguous message framing. The
   rejection runs before routing and increments the
   `http.frontend.transfer_encoding_smuggling` metric; it mirrors the existing
-  HTTP/2 → H1 framing-conflict rejection. A complementary upstream `kawa`
-  parser fix is the follow-up.
+  HTTP/2 → H1 framing-conflict rejection.
+
+- **`chore`: update `kawa` to 0.7.0 — the complementary upstream parser fix.**
+  `kawa` 0.7.0 resolves `Transfer-Encoding` before `Content-Length` and applies
+  RFC 9110 §6.3 / RFC 9112 §6.1 at the parser level: a present
+  `Transfer-Encoding` now elides *every* `Content-Length` regardless of header
+  order (previously only once chunked framing had been adopted), repeated
+  `Transfer-Encoding` field lines combine with the last line deciding the final
+  coding (so a leading `chunked` line no longer latches chunked framing on its
+  own), and a request whose combined final coding is not `chunked` is rejected
+  by the parser instead of forwarded. The `on_request_headers` guard above is
+  kept as defense-in-depth and additionally fail-closes on a
+  `Transfer-Encoding` whose raw value does not literally end in `chunked`:
+  0.7.0 trims optional whitespace around the final coding, so it frames
+  `chunked\t` and `chunked ` *as* chunked, yet still forwards the field line
+  verbatim — a backend that does not itself trim would then see neither a
+  coding it recognizes nor a `Content-Length` (elided) and would read the
+  chunked body bytes as a pipelined request. Requests using a legitimate
+  `chunked` or `gzip, chunked` coding are unaffected.
 
 ## 2.1.1 - 2026-07-10
 

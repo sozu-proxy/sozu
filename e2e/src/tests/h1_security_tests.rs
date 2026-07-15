@@ -1399,23 +1399,29 @@ fn test_h1_connection_close_terminates() {
 // chunked while sozu framed it by Content-Length (or treat it as
 // length-framed while sozu forwarded a value it never validated).
 //
-// kawa 0.6.8's chunked recognition is a bare suffix compare with no OWS
-// trim (`lib/src/protocol/kawa_h1/editor.rs`'s guard comment cites the
-// exact kawa source), so `Transfer-Encoding: chunked\t` (trailing tab),
-// `chunked ` (trailing space), and `chunked, gzip` (chunked not the final
-// coding) all fail the match while the header itself survives forwarding
-// unelided. Sozu must fail closed rather than forward the ambiguity.
+// `Transfer-Encoding: chunked\t` (trailing tab), `chunked ` (trailing
+// space), and `chunked, gzip` (chunked not the final coding) are all
+// obfuscated codings that sozu must fail closed on rather than forward.
 //
-// The `multi-line-chunked-then-identity` case covers a second bypass: kawa
-// evaluates each Transfer-Encoding *field line* independently rather than
-// eliding/merging them, so a first `Transfer-Encoding: chunked` line
-// latches `body_size = Chunked` while a second, separate
-// `Transfer-Encoding: identity` line is left in place (kawa only `warn!`s
-// on it). A guard gated on `body_size != Chunked` alone would treat this
-// message as already-resolved chunked framing and skip the scan entirely,
-// forwarding both TE lines (`chunked, identity` — chunked NOT the final
-// coding). The guard must instead count every non-elided TE header and
-// reject whenever more than one survives, regardless of `body_size`.
+// kawa >=0.7.0 OWS-trims the final coding, so it frames `chunked\t` and
+// `chunked ` AS chunked and elides the Content-Length (RFC 9110 §6.3) —
+// which fixes the CL.TE desync at the framing level but is NOT sufficient
+// on its own: kawa still forwards the Transfer-Encoding field line
+// verbatim. A backend that does not itself trim OWS would see neither a
+// coding it recognizes nor a Content-Length, and would read sozu's chunked
+// body bytes as a pipelined request (a TE.TE desync). So the guard in
+// `lib/src/protocol/kawa_h1/editor.rs` additionally requires the raw TE
+// value to literally end in `chunked`, refusing to forward an obfuscated
+// coding it had to normalize to understand. Legitimate `chunked` and
+// `gzip, chunked` codings still pass.
+//
+// The `multi-line-chunked-then-identity` case covers a second bypass:
+// a first `Transfer-Encoding: chunked` line must not be able to latch
+// chunked framing while a second, separate `Transfer-Encoding: identity`
+// line rides along — forwarding both lines yields `chunked, identity`,
+// with chunked NOT the final coding. The guard counts every non-elided TE
+// header and rejects whenever more than one survives, regardless of
+// `body_size`.
 // =========================================================================
 
 /// Malformed Transfer-Encoding shapes that must each be rejected with 400
