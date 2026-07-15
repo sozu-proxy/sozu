@@ -20,7 +20,7 @@ hyper-util = "^0.1.20"
 idna = "^1.1.0"
 itoa = "^1.0.18"
 jemallocator = "^0.5.4"
-kawa = { version = "^0.7.0", default-features = false }
+kawa = { version = "^0.7.1", default-features = false }
 libc = "^0.2.186"
 log = "^0.4.33"
 memchr = "^2.8.3"

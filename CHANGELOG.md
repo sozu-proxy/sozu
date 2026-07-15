@@ -17,7 +17,7 @@
   `http.frontend.transfer_encoding_smuggling` metric; it mirrors the existing
   HTTP/2 → H1 framing-conflict rejection.
 
-- **`chore`: update `kawa` to 0.7.0 — the complementary upstream parser fix.**
+- **`chore`: update `kawa` to 0.7.1 — the complementary upstream parser fix.**
   `kawa` 0.7.0 resolves `Transfer-Encoding` before `Content-Length` and applies
   RFC 9110 §6.3 / RFC 9112 §6.1 at the parser level: a present
   `Transfer-Encoding` now elides *every* `Content-Length` regardless of header
@@ -25,14 +25,29 @@
   `Transfer-Encoding` field lines combine with the last line deciding the final
   coding (so a leading `chunked` line no longer latches chunked framing on its
   own), and a request whose combined final coding is not `chunked` is rejected
-  by the parser instead of forwarded. The `on_request_headers` guard above is
-  kept as defense-in-depth and additionally fail-closes on a
-  `Transfer-Encoding` whose raw value does not literally end in `chunked`:
-  0.7.0 trims optional whitespace around the final coding, so it frames
-  `chunked\t` and `chunked ` *as* chunked, yet still forwards the field line
-  verbatim — a backend that does not itself trim would then see neither a
-  coding it recognizes nor a `Content-Length` (elided) and would read the
-  chunked body bytes as a pipelined request. Requests using a legitimate
+  by the parser instead of forwarded.
+
+  `kawa` 0.7.1 ([CleverCloud/kawa#21](https://github.com/CleverCloud/kawa/pull/21))
+  completes it by excluding leading and trailing optional whitespace from every
+  header field value, per RFC 9112 §5 (*"A field value does not include leading
+  or trailing whitespace"*). Two behaviours change for sozu. A legal
+  `Content-Length: 5 ` (trailing space) is no longer rejected as an invalid
+  field value. And a `Transfer-Encoding: chunked\t` — which 0.7.0 already framed
+  *as* chunked, since the value is whitespace-trimmed to determine the final
+  coding, but then forwarded verbatim — is now forwarded as the canonical
+  `chunked`. Framing on one reading of a value while forwarding another is a
+  desync primitive in its own right: with the `Content-Length` elided, a backend
+  that does not itself trim would see neither a coding it recognizes nor a
+  length, and would read the chunked body bytes as a pipelined request.
+
+  An whitespace-obfuscated coding is therefore now *handled* rather than
+  refused — it is a legal chunked request, and rejecting it would reject legal
+  traffic the same way `Content-Length: 5 ` was being rejected. What sozu
+  guarantees is that it never forwards a `Transfer-Encoding` that differs from
+  the framing it applied: it normalizes, or it rejects. The
+  `on_request_headers` guard above is kept as defense-in-depth for what remains
+  genuinely ambiguous — more than one surviving `Transfer-Encoding` header, or a
+  value whose final coding is not `chunked`. Requests using a legitimate
   `chunked` or `gzip, chunked` coding are unaffected.
 
 ## 2.1.1 - 2026-07-10

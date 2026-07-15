@@ -128,7 +128,7 @@ Conservative changes + tests required in:
 
 - `lib/src/tls.rs`, `lib/src/https.rs`, `lib/src/protocol/rustls.rs` — rustls config, ALPN, SNI binding, cert loading, close-notify.
 - `lib/src/protocol/mux/` — parser, HPACK, pseudo-header ordering, request smuggling, content-length reconciliation, flow control, GOAWAY/RST_STREAM semantics, edge-triggered readiness.
-- `lib/src/protocol/kawa_h1/editor.rs` — the H1 request path rejects (400) any request carrying an unhonored `Transfer-Encoding` header (CL.TE smuggling guard in `on_request_headers`, CWE-444).
+- `lib/src/protocol/kawa_h1/editor.rs` — the H1 request path never forwards a `Transfer-Encoding` that differs from the framing it applied: it normalizes, or it rejects (400) — more than one surviving TE header, or a final coding that is not `chunked` (CL.TE smuggling guard in `on_request_headers`, CWE-444). Whitespace around a coding is not ambiguity: kawa >= 0.7.1 excludes OWS from field values (RFC 9112 §5), so `chunked\t` frames as chunked and is forwarded as canonical `chunked`.
 - `lib/src/protocol/proxy_protocol/` — partial headers, oversized headers, TCP health checks.
 - `command/src/channel.rs`, `command/src/scm_socket.rs`, `command/src/command.proto`, `bin/src/command/` — message framing, buffer sizing, FD passing, state replay.
 - Metrics / logs — never leak sensitive values; counters/gauges must stay correct on error paths and shutdown.
