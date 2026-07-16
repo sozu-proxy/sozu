@@ -39,14 +39,24 @@ Move the contents of `## [Unreleased]` into a new `## X.Y.Z - DATE` release sect
 
 ## Publish the new version
 
-Update `version` in each per-crate `[package]` table — `bin/Cargo.toml`, `lib/Cargo.toml`, `command/Cargo.toml`, `e2e/Cargo.toml` — keeping all four in lockstep. The release workflow's preflight job (`.github/workflows/release.yml`) validates that all four match the pushed tag and aborts the release if any drift remains.
+Update `version` in each per-crate `[package]` table, keeping all six in lockstep — the five workspace members plus the out-of-workspace `fuzz/` crate:
 
-The four workspace crates currently published from this repository are:
+- `bin/Cargo.toml`, `lib/Cargo.toml`, `command/Cargo.toml`, `e2e/Cargo.toml`
+- `sim/Cargo.toml` (workspace member) and `fuzz/Cargo.toml` (excluded from the workspace by its own `[workspace]` table, but version-locked to the release)
 
-- `command/` (`sozu-command-lib`)
-- `lib/` (`sozu-lib`)
-- `bin/` (`sozu`)
-- `e2e/` (`sozu-e2e`, internal harness — generally not published to crates.io)
+The release workflow's preflight job (`.github/workflows/release.yml`) validates that all six match the pushed tag and aborts the release if any drift remains. It covered only the first four until 2.2.0, which is why 2.1.1 shipped and then needed a follow-up commit to align `fuzz/`.
+
+Also bump `Version:` in `os-build/linux-rpm/sozu.spec` — its `Source0` resolves `…/archive/%{version}.tar.gz`, so a stale value fetches the wrong source tarball. (`os-build/archlinux/PKGBUILD` needs no bump: `pkgname` is `sozu-git` and its `pkgver()` derives the real version from `git describe --tags`.)
+
+Bump the two `[workspace.dependencies]` requirements in the root `Cargo.toml` as well — `sozu-command-lib` and `sozu-lib` — since those reqs are what get baked into the published manifests.
+
+The crates published from this repository, in mandatory dependency order, are:
+
+1. `command/` (`sozu-command-lib`)
+2. `lib/` (`sozu-lib`)
+3. `bin/` (`sozu`)
+
+`e2e/` (`sozu-e2e`), `sim/` (`sozu-sim`) and `fuzz/` (`sozu-fuzz`) all carry `publish = false` and are never published.
 
 Run `cargo build --locked` at the root of the project to refresh `Cargo.lock`.
 

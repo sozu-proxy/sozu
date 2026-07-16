@@ -64,11 +64,14 @@ jobs:
           EXPECTED: ${{ steps.resolve.outputs.version }}
         run: |
           # The repo has no `[workspace.package]` table; each crate pins
-          # its own `[package].version`. Validate every workspace member
-          # so a partial bump cannot ship.
+          # its own `[package].version`. Validate every crate that tracks the
+          # release version — the five workspace members plus the
+          # out-of-workspace `fuzz/` crate — so a partial bump cannot ship.
+          # `sim/` and `fuzz/` went unchecked until 2.2.0, which is how 2.1.1
+          # shipped and then needed a follow-up commit to align `fuzz/`.
           set -euo pipefail
           fail=0
-          for manifest in bin/Cargo.toml lib/Cargo.toml command/Cargo.toml e2e/Cargo.toml; do
+          for manifest in bin/Cargo.toml lib/Cargo.toml command/Cargo.toml e2e/Cargo.toml sim/Cargo.toml fuzz/Cargo.toml; do
             v=$(grep -m1 -oP '^[[:space:]]*version[[:space:]]*=[[:space:]]*"\K[^"]+' "${manifest}" || true)
             echo "${manifest}: ${v}"
             if [ "${v}" != "${EXPECTED}" ]; then
