@@ -2,6 +2,122 @@
 
 ## [Unreleased]
 
+## 2.2.0 - 2026-07-16
+
+Minor release: TCP passthrough routing by TLS SNI + ALPN, HTTP/1
+`Transfer-Encoding` smuggling hardening, and frontend half-close data-loss
+fixes across the pipe and `splice` paths.
+
+### ✨ Added
+
+- **`feat(tcp)`: TCP passthrough routing by TLS SNI + ALPN** ([#1279](https://github.com/sozu-proxy/sozu/issues/1279)).
+  A `protocol = "tcp"` listener can now fan out to multiple clusters on the
+  same `address:port` by reading the TLS ClientHello's SNI (RFC 6066 §3) and,
+  per route entry, ALPN (RFC 7301 §3.1) during a bounded preread phase —
+  without decrypting or terminating the connection; the backend still
+  completes its own handshake with the untouched bytes. New TOML keys: TCP
+  frontend `hostname` (mapped to the wire `sni` field; exact host or a single
+  leading `*.` wildcard) and `alpn` (repeatable; empty is the per-`(address,
+  hostname)` catch-all), and listener `sni_preread_timeout` (default 5s) /
+  `sni_preread_max_bytes` (default 16384; config-load rejects a value above
+  the global `buffer_size`, and the worker defensively clamps the effective
+  cap to the session buffer at runtime). New CLI
+  flags: `sozu frontend tcp add|remove --sni <host> --alpn <proto>` and `sozu
+  listener tcp add --sni-preread-timeout <secs> --sni-preread-max-bytes
+  <bytes>` (add-only — no wire support yet for patching either knob via
+  `listener tcp update`). New metrics:
+  `tcp.sni_preread.{routed,active,duration}` and eleven
+  `tcp.sni_preread.rejected.<reason>` counters (`not_tls`, `malformed_record`,
+  `malformed_handshake`, `fragmented`, `too_large`, `no_sni`,
+  `ech_outer_absent`, `sni_unmatched`, `alpn_unmatched`,
+  `proxy_header_invalid`, `front_closed`) plus
+  `tcp.upgrade.sni_preread.failed`. A listener cannot mix SNI-scoped and
+  no-SNI (legacy single-cluster) frontends; `alpn` requires `hostname`
+  (`ConfigError::AlpnWithoutSni` — a no-SNI frontend would silently never
+  enforce it); `sni_preread_max_bytes` must be >= 5 bytes, a full TLS record
+  header (`ConfigError::SniPrereadMaxBytesTooSmall` — `0` would spin the
+  preread shell on zero-progress reads). These routing-shape invariants (the
+  mixing ban, ALPN-overlap/catch-all uniqueness, and ALPN-without-SNI) are
+  now enforced BOTH at TOML config-load (`command/src/config.rs`) AND
+  defensively on the worker's hot `AddTcpFrontend` path
+  (`TcpListener::validate_new_tcp_front`, `lib/src/tcp.rs`), so a request
+  sent directly over the command socket or replayed from a stale
+  `LoadState` snapshot can no longer bypass config.rs and corrupt a
+  listener's routing table. See `doc/configure.md` and
+  `lib/src/protocol/tcp_preread/LIFECYCLE.md` for the full config surface and
+  state lifecycle. New test coverage: unit tests in
+  `lib/src/protocol/tcp_preread/{mod,shell}.rs`, e2e suite
+  `e2e/src/tests/tcp_sni_tests.rs`, the `fuzz_tcp_clienthello` cargo-fuzz
+  target (wired into the `fuzz` CI job — nightly toolchain, 300s per target
+  on every push/PR — and `simulation-sweep.yml`'s daily
+  extended-fuzz matrix), and a moonpool-driven deterministic simulation
+  (`sim/tests/tcp_preread_sim.rs`, `sozu-sim` crate — wired into both the
+  per-PR `udp-simulation` CI job and a new nightly
+  `tcp-preread-simulation-sweep` job in `simulation-sweep.yml`).
+
+### 🔄 Changed
+
+- **`chore(deps)`: `moonpool-sim` tracks its published crates.io release.**
+  The `sozu-sim` dev-dependency moves from a pinned `main` git rev to `^0.8.0`
+  on crates.io, closing the follow-up 2.1.1 flagged when the then-published
+  0.7.0 could not build on stable.
+- **`chore(deps)`: dependency refresh** — `http-body-util` 0.1.3 → 0.1.4,
+  `mio` 1.2.1 → 1.2.2, `regex` 1.12.4 → 1.13.0, `rustls` 0.23.41 → 0.23.42,
+  `socket2` 0.6.4 → 0.6.5, `toml` 1.1.2 → 1.1.3.
+
+### 🐛 Fixed
+
+- **`fix(pipe)`: stopped truncating in-flight bytes on a frontend half-close**
+  (surfaced by [#1279](https://github.com/sozu-proxy/sozu/issues/1279)). When the
+  frontend read side reached EOF while `frontend_buffer` still held bytes
+  queued for the backend, `Pipe::readable` returned `Close` unconditionally,
+  silently dropping them instead of flushing first — any front-to-back tail
+  still in flight at the exact moment of frontend close was lost. The
+  reproducer that surfaced it was a request payload coalesced with the SNI
+  ClientHello in the same read (TCP passthrough routing above), but the bug
+  was general: any plain-TCP upload racing a frontend close could hit it.
+  `readable` now transitions to the half-closed `WriteOpen` status (matching
+  the existing `WouldBlock`/`Continue` handling), arms backend-writable to
+  drain the queue, and defers the actual teardown to `check_connections`,
+  which only closes once nothing is in flight. The HUP path had the same
+  defect under a heavier load: EPOLLRDHUP can coalesce with the payload tail
+  into a single epoll batch, so `TcpSession::ready_inner` observed `HUP`
+  before its processing loop even ran and called `Pipe::frontend_hup`, which
+  also returned `Close` unconditionally; it now drains in-flight request
+  bytes the same way (`Continue` + backend-writable + retained frontend
+  `READABLE` interest), and `ready_inner` falls through into its
+  same-pass loop on that `Continue` instead of returning immediately, so the
+  drain completes without waiting on a frontend event that — the client
+  already sent FIN — will never arrive. The `splice` fast path's EOF arm
+  (`Pipe::splice_readable`) had the same unconditional close, dropping bytes
+  already spliced into the kernel pipe; it now defers teardown the same way
+  until `splice_backend_writable` drains them.
+- **`fix(command)`: `count_tcp_frontends_raw` compiles unconditionally.** The
+  helper was gated `#[cfg(debug_assertions)]` while `add_tcp_frontend`
+  references it inside `debug_assert!` expressions — which still typecheck in
+  release builds even though they compile out — so the bench and release
+  profiles (CI's Criterion step, the Docker image build) failed with `E0599`
+  while every debug-profile gate stayed green (`command/src/state.rs`).
+- **`fix(packaging)`: the RPM spec `Version` tracks the release.**
+  `os-build/linux-rpm/sozu.spec` still declared `2.1.0` after the 2.1.1
+  release. Its `Source0` resolves `…/archive/%{version}.tar.gz`, so the stale
+  value made the spec fetch the wrong source tarball; it is now bumped in
+  lockstep with the crates.
+
+### 🤖 CI
+
+- **`fix(ci)`: the release build uses the pinned MSRV toolchain.** The
+  per-target release job installs Rust 1.91.0 with its matrix target, matching
+  the `rust-toolchain` pin (it still requested 1.88.0 after the MSRV bump).
+- **`fix(ci)`: the release preflight validates every crate version.** The
+  drift check covered `bin`/`lib`/`command`/`e2e` only, while `sim/` (a
+  workspace member) and the out-of-workspace `fuzz/` track the same version, so
+  a partially-bumped tree could ship a green preflight — which is why 2.1.1
+  needed two follow-up commits to align `fuzz/`. The loop now covers all six
+  manifests and `RELEASE.md` names them.
+- **`chore(e2e)`: `sozu-e2e` carries `publish = false`.** The integration-test
+  harness is not published to crates.io.
+
 ### 🔐 Security
 
 - **`fix(h1)`: harden HTTP/1 `Transfer-Encoding` framing (reopen of [#726](https://github.com/sozu-proxy/sozu/issues/726)).**
@@ -70,50 +186,6 @@ simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
   `sim/` **dev-dependencies** only. `moonpool-sim`
   is pinned to a git rev (the published 0.7.0 doesn't build on stable; `main`
   does) — swapping to a crates.io release later is a follow-up, not a blocker.
-- **`feat(tcp)`: TCP passthrough routing by TLS SNI + ALPN** ([#1279](https://github.com/sozu-proxy/sozu/issues/1279)).
-  A `protocol = "tcp"` listener can now fan out to multiple clusters on the
-  same `address:port` by reading the TLS ClientHello's SNI (RFC 6066 §3) and,
-  per route entry, ALPN (RFC 7301 §3.1) during a bounded preread phase —
-  without decrypting or terminating the connection; the backend still
-  completes its own handshake with the untouched bytes. New TOML keys: TCP
-  frontend `hostname` (mapped to the wire `sni` field; exact host or a single
-  leading `*.` wildcard) and `alpn` (repeatable; empty is the per-`(address,
-  hostname)` catch-all), and listener `sni_preread_timeout` (default 5s) /
-  `sni_preread_max_bytes` (default 16384; config-load rejects a value above
-  the global `buffer_size`, and the worker defensively clamps the effective
-  cap to the session buffer at runtime). New CLI
-  flags: `sozu frontend tcp add|remove --sni <host> --alpn <proto>` and `sozu
-  listener tcp add --sni-preread-timeout <secs> --sni-preread-max-bytes
-  <bytes>` (add-only — no wire support yet for patching either knob via
-  `listener tcp update`). New metrics:
-  `tcp.sni_preread.{routed,active,duration}` and eleven
-  `tcp.sni_preread.rejected.<reason>` counters (`not_tls`, `malformed_record`,
-  `malformed_handshake`, `fragmented`, `too_large`, `no_sni`,
-  `ech_outer_absent`, `sni_unmatched`, `alpn_unmatched`,
-  `proxy_header_invalid`, `front_closed`) plus
-  `tcp.upgrade.sni_preread.failed`. A listener cannot mix SNI-scoped and
-  no-SNI (legacy single-cluster) frontends; `alpn` requires `hostname`
-  (`ConfigError::AlpnWithoutSni` — a no-SNI frontend would silently never
-  enforce it); `sni_preread_max_bytes` must be >= 5 bytes, a full TLS record
-  header (`ConfigError::SniPrereadMaxBytesTooSmall` — `0` would spin the
-  preread shell on zero-progress reads). These routing-shape invariants (the
-  mixing ban, ALPN-overlap/catch-all uniqueness, and ALPN-without-SNI) are
-  now enforced BOTH at TOML config-load (`command/src/config.rs`) AND
-  defensively on the worker's hot `AddTcpFrontend` path
-  (`TcpListener::validate_new_tcp_front`, `lib/src/tcp.rs`), so a request
-  sent directly over the command socket or replayed from a stale
-  `LoadState` snapshot can no longer bypass config.rs and corrupt a
-  listener's routing table. See `doc/configure.md` and
-  `lib/src/protocol/tcp_preread/LIFECYCLE.md` for the full config surface and
-  state lifecycle. New test coverage: unit tests in
-  `lib/src/protocol/tcp_preread/{mod,shell}.rs`, e2e suite
-  `e2e/src/tests/tcp_sni_tests.rs`, the `fuzz_tcp_clienthello` cargo-fuzz
-  target (wired into the `fuzz` CI job — nightly toolchain, 300s per target
-  on every push/PR — and `simulation-sweep.yml`'s daily
-  extended-fuzz matrix), and a moonpool-driven deterministic simulation
-  (`sim/tests/tcp_preread_sim.rs`, `sozu-sim` crate — wired into both the
-  per-PR `udp-simulation` CI job and a new nightly
-  `tcp-preread-simulation-sweep` job in `simulation-sweep.yml`).
 
 ### 🔄 Changed
 
@@ -139,31 +211,6 @@ simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
   its first WebSocket frame. It also arms writable readiness for bytes already
   inherited from the H1 mux during upgrade, including a backend frame carried in
   the same read buffer as the `101 Switching Protocols` response.
-- **`fix(pipe)`: stopped truncating in-flight bytes on a frontend half-close**
-  (surfaced by [#1279](https://github.com/sozu-proxy/sozu/issues/1279)). When the
-  frontend read side reached EOF while `frontend_buffer` still held bytes
-  queued for the backend, `Pipe::readable` returned `Close` unconditionally,
-  silently dropping them instead of flushing first — any front-to-back tail
-  still in flight at the exact moment of frontend close was lost. The
-  reproducer that surfaced it was a request payload coalesced with the SNI
-  ClientHello in the same read (TCP passthrough routing above), but the bug
-  was general: any plain-TCP upload racing a frontend close could hit it.
-  `readable` now transitions to the half-closed `WriteOpen` status (matching
-  the existing `WouldBlock`/`Continue` handling), arms backend-writable to
-  drain the queue, and defers the actual teardown to `check_connections`,
-  which only closes once nothing is in flight. The HUP path had the same
-  defect under a heavier load: EPOLLRDHUP can coalesce with the payload tail
-  into a single epoll batch, so `TcpSession::ready_inner` observed `HUP`
-  before its processing loop even ran and called `Pipe::frontend_hup`, which
-  also returned `Close` unconditionally; it now drains in-flight request
-  bytes the same way (`Continue` + backend-writable + retained frontend
-  `READABLE` interest), and `ready_inner` falls through into its
-  same-pass loop on that `Continue` instead of returning immediately, so the
-  drain completes without waiting on a frontend event that — the client
-  already sent FIN — will never arrive. The `splice` fast path's EOF arm
-  (`Pipe::splice_readable`) had the same unconditional close, dropping bytes
-  already spliced into the kernel pipe; it now defers teardown the same way
-  until `splice_backend_writable` drains them.
 
 ### 🤖 CI
 
