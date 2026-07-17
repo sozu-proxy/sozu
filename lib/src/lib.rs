@@ -754,13 +754,16 @@ pub enum AcceptError {
 }
 
 /// returned by the HTTP, HTTPS and TCP listeners
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error)]
 pub enum ListenerError {
     #[error("failed to handle certificate request, got a resolver error, {0}")]
     Resolver(CertificateResolverError),
     #[error("failed to parse pem, {0}")]
     PemParse(String),
-    #[error("failed to parse template {0:?}: {1}")]
+    #[error(
+        "failed to parse template key_bytes={key_bytes}: {1}",
+        key_bytes = .0.len()
+    )]
     TemplateParse(String, TemplateError),
     #[error("failed to build rustls context, {0}")]
     BuildRustls(String),
@@ -787,6 +790,12 @@ pub enum ListenerError {
          contract requires `enabled` whenever the `hsts` block is present"
     )]
     HstsEnabledRequired,
+}
+
+impl fmt::Debug for ListenerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 /// Lift control-plane validation errors into listener-level errors so the
@@ -1655,5 +1664,89 @@ pub mod testing {
             server_scm_socket,
             server_config,
         })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn capture_test_logs(run: impl FnOnce() + Send + 'static) -> String {
+    capture_test_logs_at_level("info", run)
+}
+
+#[cfg(test)]
+pub(crate) fn capture_test_logs_at_level(
+    level: &'static str,
+    run: impl FnOnce() + Send + 'static,
+) -> String {
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("test log receiver must bind to a loopback port");
+    let target = format!(
+        "udp://{}",
+        receiver
+            .local_addr()
+            .expect("test log receiver must have a local address")
+    );
+
+    std::thread::spawn(move || {
+        sozu_command::logging::Logger::init(
+            "log-redaction-test".to_owned(),
+            level,
+            &target,
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("test logger must initialize");
+        run();
+    })
+    .join()
+    .expect("log-producing test thread must not panic");
+
+    receiver
+        .set_nonblocking(true)
+        .expect("test log receiver must become nonblocking");
+    let mut output = String::new();
+    let mut datagram = vec![0; 65_507];
+    loop {
+        match receiver.recv(&mut datagram) {
+            Ok(length) => output.push_str(&String::from_utf8_lossy(&datagram[..length])),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("test log receiver failed: {error}"),
+        }
+    }
+    assert!(!output.is_empty(), "test log capture received no datagrams");
+    output
+}
+
+#[cfg(test)]
+mod log_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn listener_template_parse_error_redacts_custom_answer_key() {
+        const KEY_SECRET: &str = "CUSTOM_ANSWER_KEY_SECRET_SENTINEL";
+
+        let key = format!("{KEY_SECRET}{}", "x".repeat(4096));
+        let key_len = key.len();
+        let error = ListenerError::TemplateParse(key, TemplateError::InvalidType);
+
+        for (label, output) in [
+            ("Display", error.to_string()),
+            ("Debug", format!("{error:?}")),
+        ] {
+            assert!(
+                !output.contains(KEY_SECRET),
+                "ListenerError {label} leaked custom-answer key {KEY_SECRET}"
+            );
+            assert!(
+                output.contains(&format!("key_bytes={key_len}")),
+                "ListenerError {label} omitted the bounded key length: {output}"
+            );
+            assert!(
+                output.len() <= 256,
+                "ListenerError {label} output is not bounded: {} bytes",
+                output.len()
+            );
+        }
     }
 }

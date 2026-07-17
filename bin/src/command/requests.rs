@@ -506,7 +506,7 @@ pub fn query_certificates_from_main(
     filters: QueryCertificatesFilters,
 ) {
     debug!(
-        "querying certificates in the state with filters {}",
+        "querying certificates in the state with filters {:?}",
         filters
     );
 

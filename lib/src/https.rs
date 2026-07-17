@@ -1881,7 +1881,7 @@ impl HttpsProxy {
     }
 
     pub fn query_all_certificates(&mut self) -> Result<Option<ResponseContent>, ProxyError> {
-        let certificates = self
+        let certificates: Vec<CertificatesByAddress> = self
             .listeners
             .values()
             .map(|listener| {
@@ -1904,10 +1904,17 @@ impl HttpsProxy {
             })
             .collect();
 
+        let listeners_count = certificates.len();
+        let certificates_count = certificates
+            .iter()
+            .map(|entry| entry.certificate_summaries.len())
+            .fold(0usize, |total, count| total.saturating_add(count));
+
         info!(
-            "{} got Certificates::All query, answering with {:?}",
+            "{} got Certificates::All query, listeners_count={} certificates_count={}",
             log_module_context!(),
-            certificates
+            listeners_count,
+            certificates_count,
         );
 
         Ok(Some(
@@ -1919,7 +1926,7 @@ impl HttpsProxy {
         &mut self,
         domain: String,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        let certificates = self
+        let certificates: Vec<CertificatesByAddress> = self
             .listeners
             .values()
             .map(|listener| {
@@ -1940,11 +1947,18 @@ impl HttpsProxy {
             })
             .collect();
 
+        let listeners_count = certificates.len();
+        let certificates_count = certificates
+            .iter()
+            .map(|entry| entry.certificate_summaries.len())
+            .fold(0usize, |total, count| total.saturating_add(count));
+
         info!(
-            "{} got Certificates::Domain({}) query, answering with {:?}",
+            "{} got Certificates::Domain query, domain_bytes={} listeners_count={} certificates_count={}",
             log_module_context!(),
-            domain,
-            certificates
+            domain.len(),
+            listeners_count,
+            certificates_count,
         );
 
         Ok(Some(
@@ -2455,10 +2469,10 @@ impl ProxyConfiguration for HttpsProxy {
             RequestType::QueryCertificatesFromWorkers(filters) => {
                 if let Some(domain) = filters.domain {
                     debug!(
-                        "{} {} query certificate for domain {}",
+                        "{} {} query certificate for domain_bytes={}",
                         log_module_context!(),
                         request_id,
-                        domain
+                        domain.len(),
                     );
                     self.query_certificate_for_domain(domain)
                 } else {
@@ -2715,10 +2729,122 @@ pub mod testing {
 mod tests {
     use std::sync::Arc;
 
-    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{CertificateAndKey, SocketAddress},
+    };
 
     use super::*;
     use crate::router::{MethodRule, PathRule, Route, Router, pattern_trie::TrieNode};
+
+    fn proxy_with_certificate_domain(domain: String) -> HttpsProxy {
+        let crate::testing::ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = crate::testing::prebuild_server(16, 16_384, false)
+            .expect("test HTTPS proxy dependencies must initialize");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, crate::testing::provide_port());
+        let config = ListenerBuilder::new_https(address)
+            .to_tls(None)
+            .expect("test HTTPS listener config must build");
+        let mut proxy = HttpsProxy::new(registry, sessions, pool, backends);
+        proxy
+            .add_listener(config, Token(10))
+            .expect("test HTTPS listener must be added");
+        proxy
+            .add_certificate(AddCertificate {
+                address,
+                certificate: CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    certificate_chain: Vec::new(),
+                    versions: Vec::new(),
+                    names: vec![domain],
+                },
+                expired_at: None,
+            })
+            .expect("test certificate must be added");
+        proxy
+    }
+
+    #[test]
+    fn query_all_certificates_log_redacts_response_domains() {
+        const DOMAIN_SECRET: &str = "QUERY_ALL_CERTIFICATE_DOMAIN_SECRET_SENTINEL";
+
+        let domain = format!("{DOMAIN_SECRET}{}", "x".repeat(4096));
+        let output = crate::capture_test_logs(move || {
+            let mut proxy = proxy_with_certificate_domain(domain);
+            proxy
+                .query_all_certificates()
+                .expect("certificate query must succeed");
+        });
+
+        assert!(
+            !output.contains(DOMAIN_SECRET),
+            "Certificates::All log leaked response domain {DOMAIN_SECRET}"
+        );
+        for metadata in ["listeners_count=1", "certificates_count=1"] {
+            assert!(
+                output.contains(metadata),
+                "Certificates::All log omitted bounded metadata {metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 1024,
+            "Certificates::All log capture is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn query_certificate_for_domain_log_redacts_request_and_response_domain() {
+        const DOMAIN_SECRET: &str = "QUERY_ONE_CERTIFICATE_DOMAIN_SECRET_SENTINEL";
+
+        let domain = format!("{DOMAIN_SECRET}{}", "x".repeat(4096));
+        let domain_len = domain.len();
+        let output = crate::capture_test_logs_at_level("debug", move || {
+            let mut proxy = proxy_with_certificate_domain(domain.clone());
+            let response = proxy.notify(WorkerRequest {
+                id: "query-domain-redaction-test".to_owned(),
+                content: RequestType::QueryCertificatesFromWorkers(
+                    sozu_command::proto::command::QueryCertificatesFilters {
+                        domain: Some(domain),
+                        fingerprint: None,
+                    },
+                )
+                .into(),
+            });
+            assert_eq!(
+                response.status,
+                sozu_command::proto::command::ResponseStatus::Ok as i32,
+                "domain certificate query must succeed: {}",
+                response.message
+            );
+        });
+
+        assert!(
+            !output.contains(DOMAIN_SECRET),
+            "Certificates::Domain log leaked request or response domain {DOMAIN_SECRET}"
+        );
+        for metadata in [
+            format!("domain_bytes={domain_len}"),
+            "listeners_count=1".to_owned(),
+            "certificates_count=1".to_owned(),
+        ] {
+            assert!(
+                output.contains(&metadata),
+                "Certificates::Domain log omitted bounded metadata {metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 1024,
+            "Certificates::Domain log capture is not bounded: {} bytes",
+            output.len()
+        );
+    }
 
     /*
     #[test]

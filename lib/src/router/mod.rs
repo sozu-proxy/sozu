@@ -38,15 +38,15 @@ macro_rules! log_module_context {
     }};
 }
 
-#[derive(thiserror::Error, Debug, PartialEq)]
+#[derive(thiserror::Error, PartialEq)]
 pub enum RouterError {
-    #[error("Could not parse rule from frontend path {0:?}")]
+    #[error("Could not parse rule from frontend path, path_bytes={}", .0.len())]
     InvalidPathRule(String),
-    #[error("parsing hostname {hostname} failed")]
+    #[error("parsing hostname failed, hostname_bytes={}", .hostname.len())]
     InvalidDomain { hostname: String },
-    #[error("Could not parse host rewrite {0:?}")]
+    #[error("Could not parse host rewrite, rewrite_host_bytes={}", .0.len())]
     InvalidHostRewrite(String),
-    #[error("Could not parse path rewrite {0:?}")]
+    #[error("Could not parse path rewrite, rewrite_path_bytes={}", .0.len())]
     InvalidPathRewrite(String),
     #[error("Could not add route {0}")]
     AddRoute(String),
@@ -58,6 +58,12 @@ pub enum RouterError {
         path: String,
         method: Method,
     },
+}
+
+impl fmt::Debug for RouterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 pub struct Router {
@@ -1526,11 +1532,24 @@ impl Frontend {
         let deny = match (&cluster_id, redirect) {
             (_, RedirectPolicy::Unauthorized) => true,
             (None, RedirectPolicy::Forward) => {
+                let (domain_kind, domain_bytes) = match &domain_rule {
+                    DomainRule::Any => ("any", 0),
+                    DomainRule::Exact(value) => ("exact", value.len()),
+                    DomainRule::Wildcard(value) => ("wildcard", value.len()),
+                    DomainRule::Regex(value) => ("regex", value.as_str().len()),
+                };
+                let (path_kind, path_bytes) = match &path_rule {
+                    PathRule::Prefix(value) => ("prefix", value.len()),
+                    PathRule::Regex(value) => ("regex", value.as_str().len()),
+                    PathRule::Equals(value) => ("equals", value.len()),
+                };
                 warn!(
-                    "{} Frontend[domain: {:?}, path: {:?}]: forward on clusterless frontends are unauthorized",
+                    "{} Frontend[domain_kind={}, domain_bytes={}, path_kind={}, path_bytes={}]: forward on clusterless frontends are unauthorized",
                     log_module_context!(),
-                    domain_rule,
-                    path_rule,
+                    domain_kind,
+                    domain_bytes,
+                    path_kind,
+                    path_bytes,
                 );
                 true
             }
@@ -1656,10 +1675,9 @@ impl Frontend {
                 // client. Drop the edit rather than guessing a position.
                 HeaderPosition::Unspecified => {
                     warn!(
-                        "{} dropping Header {{ key: {:?}, val: {:?} }} with HEADER_POSITION_UNSPECIFIED",
+                        "{} dropping {:?} with HEADER_POSITION_UNSPECIFIED",
                         log_module_context!(),
-                        header.key,
-                        header.val,
+                        header,
                     );
                 }
             }
@@ -1701,12 +1719,12 @@ impl Frontend {
                 // silently emitting no header — operators inspecting their
                 // dashboards for http.hsts.unrendered will catch the bug.
                 warn!(
-                    "{} HSTS enabled = true on frontend {:?} but render_hsts \
+                    "{} HSTS enabled = true on frontend cluster_id_bytes={:?} but render_hsts \
                      returned None (max_age missing). Frontend will not emit \
                      Strict-Transport-Security; the config layer that built \
                      this HstsConfig must substitute DEFAULT_HSTS_MAX_AGE.",
                     log_module_context!(),
-                    cluster_id,
+                    cluster_id.as_ref().map(String::len),
                 );
                 crate::incr!(names::http::HSTS_UNRENDERED);
             }
@@ -2006,6 +2024,171 @@ impl RouteResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_http_frontend() -> HttpFrontend {
+        HttpFrontend {
+            cluster_id: Some("cluster".to_owned()),
+            address: "127.0.0.1:8080"
+                .parse()
+                .expect("test frontend address must parse"),
+            hostname: "example.com".to_owned(),
+            path: CommandPathRule::prefix("/".to_owned()),
+            method: None,
+            position: RulePosition::Tree,
+            tags: None,
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: Vec::new(),
+            hsts: None,
+        }
+    }
+
+    #[test]
+    fn clusterless_forward_warning_redacts_domain_and_path_rules() {
+        const DOMAIN_SECRET: &str = "clusterless_domain_secret_sentinel";
+        const PATH_SECRET: &str = "CLUSTERLESS_PATH_SECRET_SENTINEL";
+
+        let domain = format!("{DOMAIN_SECRET}{}", "x".repeat(4096));
+        let path = format!("/{PATH_SECRET}{}", "x".repeat(4096));
+        let domain_len = domain.len();
+        let path_len = path.len();
+        let output = crate::capture_test_logs(move || {
+            let mut router = Router::new();
+            let mut front = test_http_frontend();
+            front.cluster_id = None;
+            front.hostname = domain;
+            front.path = CommandPathRule::prefix(path);
+            front.redirect = Some(RedirectPolicy::Forward as i32);
+            router
+                .add_http_front(&front)
+                .expect("clusterless forward must be coerced to unauthorized");
+        });
+
+        for secret in [DOMAIN_SECRET, PATH_SECRET] {
+            assert!(
+                !output.contains(secret),
+                "clusterless-forward warning leaked rule marker {secret}"
+            );
+        }
+        for metadata in [
+            "domain_kind=exact".to_owned(),
+            format!("domain_bytes={domain_len}"),
+            "path_kind=prefix".to_owned(),
+            format!("path_bytes={path_len}"),
+        ] {
+            assert!(
+                output.contains(&metadata),
+                "clusterless-forward warning omitted bounded metadata {metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 512,
+            "clusterless-forward warning is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn malformed_hsts_warning_redacts_cluster_id() {
+        const CLUSTER_SECRET: &str = "MALFORMED_HSTS_CLUSTER_SECRET_SENTINEL";
+
+        let cluster_id = format!("{CLUSTER_SECRET}{}", "x".repeat(4096));
+        let cluster_id_len = cluster_id.len();
+        let output = crate::capture_test_logs(move || {
+            let mut router = Router::new();
+            let mut front = test_http_frontend();
+            front.cluster_id = Some(cluster_id);
+            front.hsts = Some(HstsConfig {
+                enabled: Some(true),
+                max_age: None,
+                include_subdomains: Some(true),
+                preload: Some(true),
+                force_replace_backend: Some(false),
+            });
+            router
+                .add_http_front(&front)
+                .expect("malformed HSTS must preserve routing and omit the header");
+        });
+
+        assert!(
+            !output.contains(CLUSTER_SECRET),
+            "malformed-HSTS warning leaked cluster id {CLUSTER_SECRET}"
+        );
+        assert!(
+            output.contains(&format!("cluster_id_bytes=Some({cluster_id_len})")),
+            "malformed-HSTS warning omitted the bounded cluster id length: {output}"
+        );
+        assert!(
+            output.len() <= 768,
+            "malformed-HSTS warning is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn router_errors_redact_frontend_rule_and_rewrite_fields() {
+        const PATH_SECRET: &str = "ROUTER_ERROR_PATH_SECRET_SENTINEL";
+        const HOSTNAME_SECRET: &str = "ROUTER_ERROR_HOSTNAME_SECRET_SENTINEL";
+        const HOST_REWRITE_SECRET: &str = "ROUTER_ERROR_HOST_REWRITE_SECRET_SENTINEL";
+        const PATH_REWRITE_SECRET: &str = "ROUTER_ERROR_PATH_REWRITE_SECRET_SENTINEL";
+
+        let long_value = |marker: &str| format!("{marker}{}", "x".repeat(4096));
+        let cases = [
+            (
+                "path_bytes",
+                PATH_SECRET,
+                long_value(PATH_SECRET).len(),
+                RouterError::InvalidPathRule(long_value(PATH_SECRET)),
+            ),
+            (
+                "hostname_bytes",
+                HOSTNAME_SECRET,
+                long_value(HOSTNAME_SECRET).len(),
+                RouterError::InvalidDomain {
+                    hostname: long_value(HOSTNAME_SECRET),
+                },
+            ),
+            (
+                "rewrite_host_bytes",
+                HOST_REWRITE_SECRET,
+                long_value(HOST_REWRITE_SECRET).len(),
+                RouterError::InvalidHostRewrite(long_value(HOST_REWRITE_SECRET)),
+            ),
+            (
+                "rewrite_path_bytes",
+                PATH_REWRITE_SECRET,
+                long_value(PATH_REWRITE_SECRET).len(),
+                RouterError::InvalidPathRewrite(long_value(PATH_REWRITE_SECRET)),
+            ),
+        ];
+
+        for (length_label, secret, value_len, error) in cases {
+            for (format_label, output) in [
+                ("Display", error.to_string()),
+                ("Debug", format!("{error:?}")),
+            ] {
+                assert!(
+                    !output.contains(secret),
+                    "RouterError {format_label} leaked frontend marker {secret}"
+                );
+                let metadata = format!("{length_label}={value_len}");
+                assert!(
+                    output.contains(&metadata),
+                    "RouterError {format_label} omitted bounded metadata {metadata}: {output}"
+                );
+                assert!(
+                    output.len() <= 256,
+                    "RouterError {format_label} output is not bounded: {} bytes",
+                    output.len()
+                );
+            }
+        }
+    }
 
     #[test]
     fn render_hsts_max_age_only() {

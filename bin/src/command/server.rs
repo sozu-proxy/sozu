@@ -138,7 +138,7 @@ struct TaskContainer {
 }
 
 /// Default strategy when gathering responses from workers
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct DefaultGatherer {
     /// number of OK responses received from workers
     pub ok: usize,
@@ -148,6 +148,17 @@ pub struct DefaultGatherer {
     pub responses: Vec<(WorkerId, WorkerResponse)>,
     /// number of expected responses, excluding processing responses
     pub expected_responses: usize,
+}
+
+impl fmt::Debug for DefaultGatherer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DefaultGatherer")
+            .field("ok", &self.ok)
+            .field("errors", &self.errors)
+            .field("responses_count", &self.responses.len())
+            .field("expected_responses", &self.expected_responses)
+            .finish()
+    }
 }
 
 #[allow(unused)]
@@ -1490,8 +1501,9 @@ mod tests {
     use sozu_command_lib::{
         config::Config,
         proto::command::{
-            AddBackend, Cluster, RequestHttpFrontend, RequestTcpFrontend, SocketAddress,
-            request::RequestType,
+            AddBackend, CertificateSummary, CertificatesByAddress, Cluster,
+            ListOfCertificatesByAddress, RequestHttpFrontend, RequestTcpFrontend, SocketAddress,
+            WorkerResponse, request::RequestType, response_content::ContentType,
         },
     };
     use sozu_lib::metrics::METRICS;
@@ -1516,6 +1528,69 @@ mod tests {
         let unix_listener = UnixListener::bind(&socket_path).expect("Could not bind socket");
         Server::new(unix_listener, Config::default(), "sozu".to_owned())
             .expect("Could not create server")
+    }
+
+    #[test]
+    fn default_gatherer_debug_bounds_retained_certificate_query_responses() {
+        const DOMAIN_SECRET: &str = "RETAINED_QUERY_DOMAIN_SECRET_SENTINEL";
+        const FINGERPRINT_SECRET: &str = "RETAINED_QUERY_FINGERPRINT_SECRET_SENTINEL";
+        const RESPONSE_ID_SECRET: &str = "RETAINED_QUERY_RESPONSE_ID_SECRET_SENTINEL";
+        const MESSAGE_SECRET: &str = "RETAINED_QUERY_MESSAGE_SECRET_SENTINEL";
+
+        let long_value = |marker: &str| format!("{marker}{}", "x".repeat(4096));
+        let content: ResponseContent =
+            ContentType::CertificatesByAddress(ListOfCertificatesByAddress {
+                certificates: vec![CertificatesByAddress {
+                    address: Default::default(),
+                    certificate_summaries: vec![CertificateSummary {
+                        domain: long_value(DOMAIN_SECRET),
+                        fingerprint: long_value(FINGERPRINT_SECRET),
+                    }],
+                }],
+            })
+            .into();
+        let responses = (0..128)
+            .map(|worker_id| {
+                (
+                    worker_id,
+                    WorkerResponse {
+                        id: long_value(RESPONSE_ID_SECRET),
+                        status: ResponseStatus::Ok as i32,
+                        message: long_value(MESSAGE_SECRET),
+                        content: Some(content.clone()),
+                    },
+                )
+            })
+            .collect();
+        let gatherer = DefaultGatherer {
+            ok: 128,
+            errors: 0,
+            responses,
+            expected_responses: 128,
+        };
+
+        let output = format!("{gatherer:?}");
+
+        for secret in [
+            DOMAIN_SECRET,
+            FINGERPRINT_SECRET,
+            RESPONSE_ID_SECRET,
+            MESSAGE_SECRET,
+        ] {
+            assert!(
+                !output.contains(secret),
+                "DefaultGatherer Debug leaked retained response marker {secret}: {output}"
+            );
+        }
+        assert!(
+            output.contains("responses_count: 128"),
+            "DefaultGatherer Debug omitted the retained response count: {output}"
+        );
+        assert!(
+            output.len() <= 512,
+            "DefaultGatherer Debug output is not cardinality-bounded: {} bytes",
+            output.len()
+        );
     }
 
     #[test]

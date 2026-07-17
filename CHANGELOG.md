@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### 🔐 Security
+
+- **`fix(command)`: redact TLS certificate and private-key material from `Debug` output.**
+  Certificate payloads, runtime certified keys and resolvers, HTTP(S) listeners and listener
+  patches, HTTP frontend configuration, and generated frontend requests now use bounded `Debug`
+  summaries without exposing PEM contents, certificate DER, custom answer bodies, header values,
+  or other raw fields carried by those types through nested requests, retained state, or log
+  statements that use `Debug` formatting. Direct log and failure projections now also replace
+  certificate names, HTTP frontend keys, routing rules, rewrites, cluster IDs, custom-answer keys,
+  runtime SNI names, certificate fingerprints, and certificate-query domains and results with
+  bounded addresses, counts, and byte lengths.
+  Wire, Serde, JSON, raw retained state keys, raw `RouterError` and `ListenerError` variant fields,
+  `RequestHttpFrontend::Display`, and certificate-query response payloads remain unchanged.
+
 ## 2.2.0 - 2026-07-16
 
 Minor release: TCP passthrough routing by TLS SNI + ALPN, HTTP/1

@@ -2581,7 +2581,7 @@ impl FileClusterConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpFrontendConfig {
     pub address: SocketAddr,
@@ -2620,6 +2620,57 @@ pub struct HttpFrontendConfig {
     /// the listener default at frontend-add time in the worker.
     #[serde(default)]
     pub hsts: Option<HstsConfig>,
+}
+
+impl fmt::Debug for HttpFrontendConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let certificate = self.certificate.as_ref().map(|_| "[redacted]");
+        let certificate_len = self.certificate.as_ref().map(String::len);
+        let key = self.key.as_ref().map(|_| "[redacted]");
+        let key_len = self.key.as_ref().map(String::len);
+        let certificate_chain = self.certificate_chain.as_ref().map(|_| "[redacted]");
+        let certificate_chain_count = self.certificate_chain.as_ref().map(Vec::len);
+        let certificate_chain_len = self.certificate_chain.as_ref().map(|chain| {
+            chain
+                .iter()
+                .map(String::len)
+                .fold(0usize, usize::saturating_add)
+        });
+        let method_len = self.method.as_ref().map(String::len);
+        let redirect_template_len = self.redirect_template.as_ref().map(String::len);
+        let rewrite_host_len = self.rewrite_host.as_ref().map(String::len);
+        let rewrite_path_len = self.rewrite_path.as_ref().map(String::len);
+
+        f.debug_struct("HttpFrontendConfig")
+            .field("address", &self.address)
+            .field("hostname_len", &self.hostname.len())
+            .field("path_kind", &self.path.kind)
+            .field("path_len", &self.path.value.len())
+            .field("method_len", &method_len)
+            .field("certificate", &certificate)
+            .field("certificate_len", &certificate_len)
+            .field("key", &key)
+            .field("key_len", &key_len)
+            .field("certificate_chain", &certificate_chain)
+            .field("certificate_chain_count", &certificate_chain_count)
+            .field("certificate_chain_len", &certificate_chain_len)
+            .field("tls_versions_count", &self.tls_versions.len())
+            .field("position", &self.position)
+            .field(
+                "tags_count",
+                &self.tags.as_ref().map(BTreeMap::len).unwrap_or_default(),
+            )
+            .field("redirect", &self.redirect)
+            .field("redirect_scheme", &self.redirect_scheme)
+            .field("redirect_template_len", &redirect_template_len)
+            .field("rewrite_host_len", &rewrite_host_len)
+            .field("rewrite_path_len", &rewrite_path_len)
+            .field("rewrite_port", &self.rewrite_port)
+            .field("required_auth", &self.required_auth)
+            .field("headers_count", &self.headers.len())
+            .field("hsts", &self.hsts)
+            .finish()
+    }
 }
 
 impl HttpFrontendConfig {
@@ -4251,6 +4302,152 @@ mod tests {
     use toml::to_string;
 
     use super::*;
+
+    #[test]
+    fn http_frontend_debug_redacts_pem_material() {
+        const CERTIFICATE_SECRET: &str = "HTTP_FRONTEND_CERTIFICATE_PEM_SECRET_SENTINEL";
+        const CHAIN_SECRET: &str = "HTTP_FRONTEND_CHAIN_PEM_SECRET_SENTINEL";
+        const KEY_SECRET: &str = "HTTP_FRONTEND_KEY_PEM_SECRET_SENTINEL";
+        const HOSTNAME_SECRET: &str = "HTTP_FRONTEND_HOSTNAME_SECRET_SENTINEL";
+        const PATH_SECRET: &str = "HTTP_FRONTEND_PATH_SECRET_SENTINEL";
+        const METHOD_SECRET: &str = "HTTP_FRONTEND_METHOD_SECRET_SENTINEL";
+        const TAG_KEY_SECRET: &str = "HTTP_FRONTEND_TAG_KEY_SECRET_SENTINEL";
+        const TAG_SECRET: &str = "HTTP_FRONTEND_TAG_VALUE_SECRET_SENTINEL";
+        const HEADER_KEY_SECRET: &str = "HTTP_FRONTEND_HEADER_KEY_SECRET_SENTINEL";
+        const HEADER_SECRET: &str = "HTTP_FRONTEND_HEADER_VALUE_SECRET_SENTINEL";
+        const REDIRECT_TEMPLATE_SECRET: &str = "HTTP_FRONTEND_REDIRECT_TEMPLATE_SECRET_SENTINEL";
+        const REWRITE_HOST_SECRET: &str = "HTTP_FRONTEND_REWRITE_HOST_SECRET_SENTINEL";
+        const REWRITE_PATH_SECRET: &str = "HTTP_FRONTEND_REWRITE_PATH_SECRET_SENTINEL";
+
+        let long_value = |marker: &str| format!("{marker}{}", "x".repeat(4096));
+        let certificate = long_value(CERTIFICATE_SECRET);
+        let certificate_chain = long_value(CHAIN_SECRET);
+        let key = long_value(KEY_SECRET);
+        let hostname = long_value(HOSTNAME_SECRET);
+        let path = long_value(PATH_SECRET);
+        let method = long_value(METHOD_SECRET);
+        let redirect_template = long_value(REDIRECT_TEMPLATE_SECRET);
+        let rewrite_host = long_value(REWRITE_HOST_SECRET);
+        let rewrite_path = long_value(REWRITE_PATH_SECRET);
+
+        let frontend = HttpFrontendConfig {
+            address: "127.0.0.1:8443".parse().unwrap(),
+            hostname,
+            path: PathRule::prefix(path),
+            method: Some(method),
+            certificate: Some(certificate),
+            key: Some(key),
+            certificate_chain: Some(vec![certificate_chain]),
+            tls_versions: vec![TlsVersion::TlsV13],
+            position: RulePosition::Tree,
+            tags: Some(BTreeMap::from([(
+                long_value(TAG_KEY_SECRET),
+                long_value(TAG_SECRET),
+            )])),
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: Some(redirect_template),
+            rewrite_host: Some(rewrite_host),
+            rewrite_path: Some(rewrite_path),
+            rewrite_port: None,
+            required_auth: None,
+            headers: vec![Header {
+                position: HeaderPosition::Request as i32,
+                key: long_value(HEADER_KEY_SECRET),
+                val: long_value(HEADER_SECRET),
+            }],
+            hsts: None,
+        };
+
+        let output = format!("{frontend:?}");
+
+        let secrets = [
+            CERTIFICATE_SECRET,
+            CHAIN_SECRET,
+            KEY_SECRET,
+            HOSTNAME_SECRET,
+            PATH_SECRET,
+            METHOD_SECRET,
+            TAG_KEY_SECRET,
+            TAG_SECRET,
+            HEADER_KEY_SECRET,
+            HEADER_SECRET,
+            REDIRECT_TEMPLATE_SECRET,
+            REWRITE_HOST_SECRET,
+            REWRITE_PATH_SECRET,
+        ];
+        for secret in secrets {
+            assert!(
+                !output.contains(secret),
+                "HttpFrontendConfig Debug leaked secret marker {secret}: {output}"
+            );
+        }
+        let expected_metadata = [
+            "address: 127.0.0.1:8443".to_owned(),
+            format!("hostname_len: {}", long_value(HOSTNAME_SECRET).len()),
+            format!("path_kind: {}", PathRule::prefix(String::new()).kind),
+            format!("path_len: {}", long_value(PATH_SECRET).len()),
+            format!("method_len: Some({})", long_value(METHOD_SECRET).len()),
+            "certificate: Some(\"[redacted]\")".to_owned(),
+            format!(
+                "certificate_len: Some({})",
+                long_value(CERTIFICATE_SECRET).len()
+            ),
+            "key: Some(\"[redacted]\")".to_owned(),
+            format!("key_len: Some({})", long_value(KEY_SECRET).len()),
+            "certificate_chain: Some(\"[redacted]\")".to_owned(),
+            "certificate_chain_count: Some(1)".to_owned(),
+            format!(
+                "certificate_chain_len: Some({})",
+                long_value(CHAIN_SECRET).len()
+            ),
+            "tls_versions_count: 1".to_owned(),
+            "tags_count: 1".to_owned(),
+            format!(
+                "redirect_template_len: Some({})",
+                long_value(REDIRECT_TEMPLATE_SECRET).len()
+            ),
+            format!(
+                "rewrite_host_len: Some({})",
+                long_value(REWRITE_HOST_SECRET).len()
+            ),
+            format!(
+                "rewrite_path_len: Some({})",
+                long_value(REWRITE_PATH_SECRET).len()
+            ),
+            "headers_count: 1".to_owned(),
+        ];
+        for safe_metadata in expected_metadata {
+            assert!(
+                output.contains(&safe_metadata),
+                "HttpFrontendConfig Debug omitted safe metadata {safe_metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 1024,
+            "HttpFrontendConfig Debug output is not bounded: {} bytes",
+            output.len()
+        );
+
+        for (index, request) in frontend
+            .generate_requests("safe-cluster-id")
+            .into_iter()
+            .enumerate()
+        {
+            let generated_output = format!("{request:?}");
+            for secret in secrets {
+                assert!(
+                    !generated_output.contains(secret),
+                    "generated frontend request {index} Debug leaked secret marker {secret}: {generated_output}"
+                );
+            }
+            assert!(
+                generated_output.len() <= 2048,
+                "generated frontend request {index} Debug output is not bounded: {} bytes",
+                generated_output.len()
+            );
+        }
+    }
 
     #[test]
     fn hsts_to_proto_enabled_substitutes_default_max_age() {

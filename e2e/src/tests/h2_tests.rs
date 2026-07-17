@@ -421,7 +421,7 @@ fn query_worker_metrics(worker: &mut Worker) -> WorkerMetricSnapshot {
         panic!("metrics query returned no content");
     };
     let ContentType::WorkerMetrics(metrics) = content else {
-        panic!("metrics query returned unexpected content: {content:?}");
+        panic!("metrics query returned an unexpected content variant");
     };
 
     let client_connections = match metrics
