@@ -1687,7 +1687,8 @@ mod backends_test {
             Some(
                 sozu_command_lib::proto::command::response_content::ContentType::WorkerMetrics(wm),
             ) => wm,
-            other => panic!("expected WorkerMetrics, got {other:?}"),
+            Some(_) => panic!("expected WorkerMetrics, got another response variant"),
+            None => panic!("expected WorkerMetrics, got no response content"),
         };
         let cm = cluster_metrics
             .clusters

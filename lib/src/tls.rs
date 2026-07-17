@@ -88,13 +88,33 @@ pub enum CertificateResolverError {
 /// A wrapper around the Rustls
 /// [`CertifiedKey` type](https://docs.rs/rustls/latest/rustls/sign/struct.CertifiedKey.html),
 /// stored and returned by the certificate resolver.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CertifiedKeyWrapper {
     inner: Arc<CertifiedKey>,
     /// domain names, override what can be found in the cert
     names: Vec<String>,
     expiration: i64,
     fingerprint: Fingerprint,
+}
+
+impl fmt::Debug for CertifiedKeyWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names_len = self
+            .names
+            .iter()
+            .map(String::len)
+            .fold(0usize, usize::saturating_add);
+
+        f.debug_struct("CertifiedKeyWrapper")
+            .field("certificate", &"[redacted]")
+            .field("certificate_chain_count", &self.inner.cert.len())
+            .field("private_key", &"[redacted]")
+            .field("names_count", &self.names.len())
+            .field("names_len", &names_len)
+            .field("expiration", &self.expiration)
+            .field("fingerprint_bytes", &self.fingerprint.0.len())
+            .finish()
+    }
 }
 
 /// Convert an AddCertificate request into the Rustls format.
@@ -210,7 +230,7 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
 /// for a given domain name.
 /// Certificates are stored in a hashmap that may contain unreachable certificates if
 /// no domain name points to it.
-#[derive(Default, Debug)]
+#[derive(Default)]
 pub struct CertificateResolver {
     /// routing one domain name to one certificate for fast resolving
     pub domains: TrieNode<Fingerprint>,
@@ -220,6 +240,23 @@ pub struct CertificateResolver {
     /// map of domain_name -> all fingerprints (and expiration) linked to this domain name
     //  the vector of (fingerprint, expiration) is sorted by expiration
     name_fingerprint_idx: HashMap<String, Vec<(Fingerprint, i64)>>,
+}
+
+impl fmt::Debug for CertificateResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let indexed_certificate_links = self
+            .name_fingerprint_idx
+            .values()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+
+        f.debug_struct("CertificateResolver")
+            .field("domains", &"[redacted]")
+            .field("certificates_count", &self.certificates.len())
+            .field("indexed_names_count", &self.name_fingerprint_idx.len())
+            .field("indexed_certificate_links", &indexed_certificate_links)
+            .finish()
+    }
 }
 
 impl CertificateResolver {
@@ -586,10 +623,10 @@ impl ResolvesServerCert for MutexCertificateResolver {
             return None;
         };
         trace!(
-            "{} trying to resolve name: {:?} for signature scheme: {:?}",
+            "{} trying to resolve certificate with name_bytes={} signature_schemes_count={}",
             log_module_context!(),
-            name,
-            sigschemes
+            name.len(),
+            sigschemes.len()
         );
         // Every other site uses blocking `lock()`, and silently falling
         // back to `DEFAULT_CERTIFICATE` on lock
@@ -602,21 +639,20 @@ impl ResolvesServerCert for MutexCertificateResolver {
         // without inventing a new failure mode.
         let resolver = match self.0.lock() {
             Ok(guard) => guard,
-            Err(poisoned) => {
+            Err(_poisoned) => {
                 error!(
-                    "{} cert resolver mutex poisoned, returning default cert: {:?}",
-                    log_module_context!(),
-                    poisoned
+                    "{} cert resolver mutex poisoned, returning default cert",
+                    log_module_context!()
                 );
                 return DEFAULT_CERTIFICATE.clone();
             }
         };
         if let Some((_, fingerprint)) = resolver.domains.domain_lookup(name.as_bytes(), true) {
             trace!(
-                "{} looking for certificate for {:?} with fingerprint {:?}",
+                "{} looking for certificate with name_bytes={} fingerprint_bytes={}",
                 log_module_context!(),
-                name,
-                fingerprint
+                name.len(),
+                fingerprint.0.len()
             );
 
             // Strict-binding invariant: when the SNI trie resolves a name to a
@@ -641,9 +677,9 @@ impl ResolvesServerCert for MutexCertificateResolver {
             );
 
             trace!(
-                "{} found for fingerprint {}: {}",
+                "{} certificate lookup fingerprint_bytes={} found={}",
                 log_module_context!(),
-                fingerprint,
+                fingerprint.0.len(),
                 cert.is_some()
             );
             return cert;
@@ -654,9 +690,9 @@ impl ResolvesServerCert for MutexCertificateResolver {
         // This certificate is used for TLS tunneling with another TLS termination endpoint
         // Note that this is unsafe and you should provide a valid certificate
         debug!(
-            "{} default certificate is used for {}",
+            "{} default certificate is used for name_bytes={}",
             log_module_context!(),
-            name
+            name.len()
         );
         incr!(names::tls::DEFAULT_CERT_USED);
         DEFAULT_CERTIFICATE.clone()
@@ -672,11 +708,10 @@ impl MutexCertificateResolver {
     pub fn names_for_sni(&self, domain: &[u8]) -> Option<Vec<String>> {
         match self.0.lock() {
             Ok(guard) => guard.names_for_sni(domain),
-            Err(poisoned) => {
+            Err(_poisoned) => {
                 error!(
-                    "{} cert resolver mutex poisoned, treating as no SAN match: {:?}",
-                    log_module_context!(),
-                    poisoned
+                    "{} cert resolver mutex poisoned, treating as no SAN match",
+                    log_module_context!()
                 );
                 None
             }
@@ -698,6 +733,8 @@ mod tests {
     use std::{
         collections::HashSet,
         error::Error,
+        io::Cursor,
+        sync::Arc,
         time::{Duration, SystemTime},
     };
 
@@ -706,7 +743,230 @@ mod tests {
         AddCertificate, CertificateAndKey, ReplaceCertificate, SocketAddress,
     };
 
-    use super::CertificateResolver;
+    use super::{CertificateResolver, CertifiedKeyWrapper, MutexCertificateResolver};
+
+    fn drive_client_hello(resolver: Arc<MutexCertificateResolver>, server_name: String) {
+        let provider = Arc::new(crate::crypto::default_provider());
+        let server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("test server provider must support TLS 1.3")
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("test client provider must support TLS 1.3")
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let server_name = rustls::pki_types::ServerName::try_from(server_name)
+            .expect("test SNI must be a valid DNS name");
+        let mut client = rustls::ClientConnection::new(Arc::new(client_config), server_name)
+            .expect("test client connection must initialize");
+        let mut server = rustls::ServerConnection::new(Arc::new(server_config))
+            .expect("test server connection must initialize");
+
+        let mut client_hello = Vec::new();
+        client
+            .write_tls(&mut client_hello)
+            .expect("test client hello must serialize");
+        server
+            .read_tls(&mut Cursor::new(client_hello))
+            .expect("test server must read the client hello");
+        server
+            .process_new_packets()
+            .expect("test server must process the client hello");
+    }
+
+    #[test]
+    fn certificate_resolver_logs_redact_matching_sni_and_fingerprint() {
+        const SNI_SECRET: &str = "resolver-sni-secret.example";
+
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../assets/certificate.pem").to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            names: vec![SNI_SECRET.to_owned()],
+            ..Default::default()
+        };
+        let fingerprint = certificate
+            .fingerprint()
+            .expect("test certificate fingerprint must be computable")
+            .to_string();
+        let output = crate::capture_test_logs_at_level("trace", move || {
+            let resolver = Arc::new(MutexCertificateResolver::default());
+            resolver
+                .0
+                .lock()
+                .expect("test resolver lock must be available")
+                .add_certificate(&AddCertificate {
+                    address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                    certificate,
+                    expired_at: None,
+                })
+                .expect("test certificate must load into the resolver");
+            drive_client_hello(resolver, SNI_SECRET.to_owned());
+        });
+
+        assert!(
+            !output.contains(SNI_SECRET),
+            "TLS resolver logs leaked the matching SNI: {output}"
+        );
+        assert!(
+            !output.contains(&fingerprint),
+            "TLS resolver logs leaked the matching certificate fingerprint: {output}"
+        );
+        for metadata in [
+            format!("name_bytes={}", SNI_SECRET.len()),
+            "fingerprint_bytes=32".to_owned(),
+        ] {
+            assert!(
+                output.contains(&metadata),
+                "TLS resolver logs omitted bounded metadata {metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 4096,
+            "TLS resolver log capture is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn certificate_resolver_logs_redact_fallback_sni() {
+        const SNI_SECRET: &str = "fallback-sni-secret.example";
+
+        let output = crate::capture_test_logs_at_level("trace", move || {
+            drive_client_hello(
+                Arc::new(MutexCertificateResolver::default()),
+                SNI_SECRET.to_owned(),
+            );
+        });
+
+        assert!(
+            !output.contains(SNI_SECRET),
+            "TLS resolver logs leaked the fallback SNI: {output}"
+        );
+        assert!(
+            output.contains(&format!("name_bytes={}", SNI_SECRET.len())),
+            "TLS resolver fallback log omitted bounded SNI metadata: {output}"
+        );
+        assert!(
+            output.len() <= 2048,
+            "TLS resolver fallback log capture is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn certificate_resolver_poison_logs_are_bounded() {
+        const SNI_SECRET: &str = "poison-sni-secret.example";
+        const QUERY_SECRET: &str = "POISON_QUERY_SECRET_SENTINEL";
+
+        let query = format!("{QUERY_SECRET}{}", "x".repeat(4096));
+        let output = crate::capture_test_logs_at_level("trace", move || {
+            let resolver = Arc::new(MutexCertificateResolver::default());
+            let poison_target = resolver.clone();
+            assert!(
+                std::thread::spawn(move || {
+                    let _guard = poison_target
+                        .0
+                        .lock()
+                        .expect("test resolver lock must initially be available");
+                    panic!("intentionally poison the test resolver lock");
+                })
+                .join()
+                .is_err(),
+                "test poison thread must panic"
+            );
+
+            drive_client_hello(resolver.clone(), SNI_SECRET.to_owned());
+            assert!(resolver.names_for_sni(query.as_bytes()).is_none());
+        });
+
+        assert!(
+            !output.contains(SNI_SECRET),
+            "TLS resolver poison log leaked the handshake SNI: {output}"
+        );
+        assert!(
+            !output.contains(QUERY_SECRET),
+            "TLS resolver poison log leaked the 4 KiB direct query: {output}"
+        );
+        assert!(
+            output.len() <= 2048,
+            "TLS resolver poison log capture is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn certified_key_wrapper_debug_redacts_runtime_certificate_material() {
+        const NAME_SECRET: &str = "CERTIFIED_KEY_NAME_SECRET_SENTINEL";
+
+        let add = AddCertificate {
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+            certificate: CertificateAndKey {
+                certificate: include_str!("../assets/certificate.pem").to_owned(),
+                key: include_str!("../assets/key.pem").to_owned(),
+                names: vec![format!("{NAME_SECRET}{}", "x".repeat(4096))],
+                ..Default::default()
+            },
+            expired_at: None,
+        };
+        let certified_key =
+            CertifiedKeyWrapper::try_from(&add).expect("test certificate must parse");
+        let fingerprint = certified_key.fingerprint.to_string();
+        let output = format!("{certified_key:?}");
+
+        assert!(
+            !output.contains(NAME_SECRET),
+            "CertifiedKeyWrapper Debug leaked an overridden certificate name: {output}"
+        );
+        assert!(
+            !output.contains(&fingerprint),
+            "CertifiedKeyWrapper Debug leaked the certificate fingerprint: {output}"
+        );
+        assert!(
+            output.contains("fingerprint_bytes: 32"),
+            "CertifiedKeyWrapper Debug omitted bounded fingerprint metadata: {output}"
+        );
+        assert!(
+            output.contains("[redacted]"),
+            "CertifiedKeyWrapper Debug must make certificate redaction explicit: {output}"
+        );
+        assert!(
+            output.len() <= 1024,
+            "CertifiedKeyWrapper Debug output is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn certificate_resolver_debug_redacts_indexed_names() {
+        const NAME_SECRET: &str = "CERTIFICATE_RESOLVER_NAME_SECRET_SENTINEL";
+
+        let mut resolver = CertificateResolver::default();
+        resolver
+            .add_certificate(&AddCertificate {
+                address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate: CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    names: vec![format!("{NAME_SECRET}{}", "x".repeat(4096))],
+                    ..Default::default()
+                },
+                expired_at: None,
+            })
+            .expect("test certificate must load into the resolver");
+        let output = format!("{resolver:?}");
+
+        assert!(
+            !output.contains(NAME_SECRET),
+            "CertificateResolver Debug leaked an indexed certificate name: {output}"
+        );
+        assert!(
+            output.len() <= 1024,
+            "CertificateResolver Debug output is not bounded: {} bytes",
+            output.len()
+        );
+    }
 
     #[test]
     fn lifecycle() -> Result<(), Box<dyn Error + Send + Sync>> {

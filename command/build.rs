@@ -73,6 +73,28 @@ pub fn main() {
         .field_attribute("TcpListenerConfig.answers", "#[serde(default)]")
         .field_attribute("RequestUdpFrontend.tags", "#[serde(default)]")
         .field_attribute("RequestTcpFrontend.alpn", "#[serde(default)]")
+        .skip_debug([
+            "CertificateAndKey",
+            "CertificateSummary",
+            "CertificatesByAddress",
+            "CertificatesWithFingerprints",
+            "Cluster",
+            "Header",
+            "RequestHttpFrontend",
+            "HttpListenerConfig",
+            "HttpsListenerConfig",
+            "ListOfCertificatesByAddress",
+            "QueryCertificatesFilters",
+            "RemoveCertificate",
+            "ReplaceCertificate",
+            "RequestTcpFrontend",
+            "ResponseContent",
+            "UpdateHttpListenerConfig",
+            "UpdateHttpsListenerConfig",
+            "WorkerRequest",
+            "WorkerResponse",
+            "WorkerResponses",
+        ])
         .enum_attribute(".", "#[serde(rename_all = \"SCREAMING_SNAKE_CASE\")]")
         .enum_attribute(
             "ResponseContent.content_type",

@@ -274,8 +274,9 @@ the OS sends RST/EOF to the peer.
 - `command/src/channel.rs` — `usize`-prefixed wire framing used between
   the supervisor and workers (distinct from the `\n\0` save-state
   framing in `command/src/state.rs:1613, 1630`).
-- `doc/observability.md` — operator-facing description of the audit
-  output, including the field reference.
+- `doc/observability.md` — canonical observability contract, including the
+  audit field reference and the bounded sensitive-value rules for `Debug`,
+  direct logs, retained tasks/state, and TLS runtime objects.
 - `doc/configure_admin_ops.md` — operational worked examples that drive
   this surface from the CLI side.
 - `lib/src/protocol/mux/LIFECYCLE.md` — counterpart inside the workers'

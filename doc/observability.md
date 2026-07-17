@@ -185,6 +185,52 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
   (`kawa_h1/editor.rs:587`) over hand-rolling a `LogContext { ... }`
   struct literal — the helper is the canonical formatter.
 
+### Sensitive-value logging boundary
+
+`Debug` is a production logging projection in Sōzu, not a lossless inspection
+format. Generic log sites format command requests, worker responses, retained
+tasks and state, router/listener errors, and TLS runtime objects with `{:?}`.
+Every type reachable from those paths must therefore produce bounded metadata
+when its fields can contain operator- or customer-controlled material.
+
+The protected material includes certificate and private-key contents, chains,
+certificate names and fingerprints, certificate-query domains and results,
+cluster identifiers, HTTP routing hosts/paths/methods/tags, redirect and
+rewrite values, TCP SNI and ALPN values, custom-answer keys and bodies, and
+header names and values. Their log projections may retain only operationally
+useful metadata such as socket addresses, enum variants, booleans, presence
+flags, collection counts, and aggregate byte lengths. Certificate and key
+slots render as `[redacted]` in addition to their lengths.
+
+Apply the boundary at every layer that can reach a log sink:
+
+- Generated protobuf types that carry sensitive fields are listed in
+  `command/build.rs` via `prost_build::Config::skip_debug`; their bounded
+  implementations live in `command/src/proto/mod.rs`.
+- Configuration, response, retained-state, gatherer, router, listener, and TLS
+  wrappers must summarize their own collections and string-keyed maps rather
+  than relying on an enclosing type to hide them.
+- Direct `debug!`, `info!`, `warn!`, `error!`, and failure-message projections
+  must interpolate the same counts, kinds, addresses, and byte lengths. A safe
+  `Debug` implementation does not protect a log statement that formats a raw
+  field directly.
+- Error and poisoned-lock paths follow the same rule; exceptional control flow
+  is not permission to disclose the rejected value or the retained object.
+
+This is deliberately a logging-only boundary. Protobuf wire encoding,
+Serde/JSON output, retained-state keys, certificate-query response payloads,
+and the raw fields stored in error variants remain unchanged.
+`RequestHttpFrontend::Display`, which is used as an operational/state key, also
+remains lossless. Callers that are explicitly authorized to retrieve these
+values continue to receive them; generic diagnostics do not.
+
+Regression tests use a distinct long sentinel for every protected field and
+assert all three parts of the contract: the sentinel is absent, the expected
+count/length metadata is present, and output stays within a fixed size bound.
+Coverage must include the leaf `Debug` implementation, generic/nested command
+wrappers, retained state or tasks, direct log statements, and runtime TLS and
+error paths as applicable.
+
 ### Per-flood-detector helper macro pattern
 
 When a violation funnel (`H2FloodViolation`, `RustlsError`, `H2Error`) needs a
@@ -471,6 +517,9 @@ Before merging an instrumentation change:
   Consider `impl Drop` for symmetric teardown.
 - [ ] New protocol modules define their own `log_context!` /
   `log_module_context!` with a unique prefix tag.
+- [ ] Types and direct log sites reachable from sensitive command, state,
+  routing, or TLS data expose only bounded counts/lengths/kinds/addresses, with
+  sentinel-absence and fixed-output-bound regression tests.
 - [ ] New access-log fields land on `RequestRecord`, `ProtobufAccessLog`
   (new tag), all four emit sites, and `RequestRecord::duplicate()`.
 - [ ] [`configure.md`](configure.md) is updated in the same changeset.

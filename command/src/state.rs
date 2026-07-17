@@ -76,6 +76,17 @@ pub enum StateError {
     InvalidTcpFrontend { address: SocketAddr, reason: String },
 }
 
+fn frontend_log_summary(front: &RequestHttpFrontend) -> String {
+    format!(
+        "address={}, hostname_bytes={}, path_kind={}, path_bytes={}, method_bytes={:?}",
+        front.address,
+        front.hostname.len(),
+        front.path.kind,
+        front.path.value.len(),
+        front.method.as_ref().map(String::len),
+    )
+}
+
 /// The `ConfigState` represents the state of Sōzu's business, which is to forward traffic
 /// from frontends to backends. Hence, it contains all details about:
 ///
@@ -84,7 +95,7 @@ pub enum StateError {
 /// - backends (to forward connections to)
 /// - clusters (routing rules from frontends to backends)
 /// - TLS certificates
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigState {
     pub clusters: BTreeMap<ClusterId, Cluster>,
     pub backends: BTreeMap<ClusterId, Vec<Backend>>,
@@ -106,6 +117,50 @@ pub struct ConfigState {
     pub certificates: HashMap<SocketAddr, HashMap<Fingerprint, CertificateAndKey>>,
     /// A census of requests that were received. Name of the request -> number of occurences
     pub request_counts: BTreeMap<String, i32>,
+}
+
+impl std::fmt::Debug for ConfigState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let backends_count = self
+            .backends
+            .values()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        let tcp_frontends_count = self
+            .tcp_fronts
+            .values()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        let udp_frontends_count = self
+            .udp_fronts
+            .values()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add);
+        let certificates_count = self
+            .certificates
+            .values()
+            .map(HashMap::len)
+            .fold(0usize, usize::saturating_add);
+
+        f.debug_struct("ConfigState")
+            .field("clusters_count", &self.clusters.len())
+            .field("backend_clusters_count", &self.backends.len())
+            .field("backends_count", &backends_count)
+            .field("http_listeners_count", &self.http_listeners.len())
+            .field("https_listeners_count", &self.https_listeners.len())
+            .field("tcp_listeners_count", &self.tcp_listeners.len())
+            .field("udp_listeners_count", &self.udp_listeners.len())
+            .field("http_frontends_count", &self.http_fronts.len())
+            .field("https_frontends_count", &self.https_fronts.len())
+            .field("tcp_frontend_clusters_count", &self.tcp_fronts.len())
+            .field("tcp_frontends_count", &tcp_frontends_count)
+            .field("udp_frontend_clusters_count", &self.udp_fronts.len())
+            .field("udp_frontends_count", &udp_frontends_count)
+            .field("certificate_addresses_count", &self.certificates.len())
+            .field("certificates_count", &certificates_count)
+            .field("request_counts_count", &self.request_counts.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConfigState {
@@ -992,14 +1047,13 @@ impl ConfigState {
     }
 
     fn add_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
-        let front_as_key = front.to_string();
         let before = self.http_fronts.len();
 
         match self.http_fronts.entry(front.to_string()) {
             BTreeMapEntry::Vacant(e) => {
                 e.insert(front.clone().to_frontend().map_err(|into_error| {
                     StateError::FrontendConversion {
-                        frontend: front_as_key,
+                        frontend: frontend_log_summary(front),
                         error: into_error.to_string(),
                     }
                 })?)
@@ -1012,7 +1066,7 @@ impl ConfigState {
                 );
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpFrontend,
-                    id: front.to_string(),
+                    id: frontend_log_summary(front),
                 });
             }
         };
@@ -1031,14 +1085,13 @@ impl ConfigState {
     }
 
     fn add_https_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
-        let front_as_key = front.to_string();
         let before = self.https_fronts.len();
 
         match self.https_fronts.entry(front.to_string()) {
             BTreeMapEntry::Vacant(e) => {
                 e.insert(front.clone().to_frontend().map_err(|into_error| {
                     StateError::FrontendConversion {
-                        frontend: front_as_key,
+                        frontend: frontend_log_summary(front),
                         error: into_error.to_string(),
                     }
                 })?)
@@ -1051,7 +1104,7 @@ impl ConfigState {
                 );
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpsFrontend,
-                    id: front.to_string(),
+                    id: frontend_log_summary(front),
                 });
             }
         };
@@ -1072,7 +1125,7 @@ impl ConfigState {
         let before = self.http_fronts.len();
         self.http_fronts.remove(&key).ok_or(StateError::NotFound {
             kind: ObjectKind::HttpFrontend,
-            id: front.to_string(),
+            id: frontend_log_summary(front),
         })?;
         debug_assert!(
             !self.http_fronts.contains_key(&key),
@@ -1091,7 +1144,7 @@ impl ConfigState {
         let before = self.https_fronts.len();
         self.https_fronts.remove(&key).ok_or(StateError::NotFound {
             kind: ObjectKind::HttpsFrontend,
-            id: front.to_string(),
+            id: frontend_log_summary(front),
         })?;
         debug_assert!(
             !self.https_fronts.contains_key(&key),
@@ -1119,10 +1172,16 @@ impl ConfigState {
             .map_err(StateError::AddCertificate)?;
 
         if entry.contains_key(&fingerprint) {
+            let names_bytes = add
+                .certificate
+                .names
+                .iter()
+                .fold(0usize, |total, name| total.saturating_add(name.len()));
             info!(
-                "Skip loading of certificate '{}' for domain '{}' on listener '{}', the certificate is already present.",
-                fingerprint,
-                add.certificate.names.join(", "),
+                "Skip loading certificate with fingerprint_bytes={} names_count={} names_bytes={} on listener '{}', the certificate is already present.",
+                fingerprint.0.len(),
+                add.certificate.names.len(),
+                names_bytes,
                 add.address
             );
             return Ok(());
@@ -3088,9 +3147,340 @@ mod tests {
 
     use super::*;
     use crate::proto::command::{
-        CustomHttpAnswers, LoadBalancingParams, RequestHttpFrontend, RequestTcpFrontend,
+        CustomHttpAnswers, Header, HeaderPosition, HstsConfig, LoadBalancingParams, PathRuleKind,
+        RedirectPolicy, RedirectScheme, RequestHttpFrontend, RequestTcpFrontend,
         RequestUdpFrontend, RulePosition, UdpListenerConfig, UpdateUdpListenerConfig,
     };
+
+    fn capture_test_logs(run: impl FnOnce() + Send + 'static) -> String {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0")
+            .expect("test log receiver must bind to a loopback port");
+        let target = format!(
+            "udp://{}",
+            receiver
+                .local_addr()
+                .expect("test log receiver must have a local address")
+        );
+
+        std::thread::spawn(move || {
+            crate::logging::Logger::init(
+                "state-log-redaction-test".to_owned(),
+                "info",
+                &target,
+                false,
+                None,
+                None,
+                None,
+            )
+            .expect("test logger must initialize");
+            run();
+        })
+        .join()
+        .expect("log-producing test thread must not panic");
+
+        receiver
+            .set_nonblocking(true)
+            .expect("test log receiver must become nonblocking");
+        let mut output = String::new();
+        let mut datagram = vec![0; 65_507];
+        loop {
+            match receiver.recv(&mut datagram) {
+                Ok(length) => output.push_str(&String::from_utf8_lossy(&datagram[..length])),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("test log receiver failed: {error}"),
+            }
+        }
+        assert!(!output.is_empty(), "test log capture received no datagrams");
+        output
+    }
+
+    #[test]
+    fn duplicate_certificate_log_redacts_names() {
+        const NAME_SECRET: &str = "DUPLICATE_CERTIFICATE_NAME_SECRET_SENTINEL";
+
+        let name = format!("{NAME_SECRET}{}", "x".repeat(4096));
+        let name_len = name.len();
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../assets/certificate.pem").to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: vec![name],
+        };
+        let fingerprint = certificate
+            .fingerprint()
+            .expect("test certificate fingerprint must be computable")
+            .to_string();
+        let output = capture_test_logs(move || {
+            let mut state = ConfigState::default();
+            let add = AddCertificate {
+                address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate,
+                expired_at: None,
+            };
+
+            state
+                .add_certificate(&add)
+                .expect("first certificate insertion must succeed");
+            state
+                .add_certificate(&add)
+                .expect("duplicate certificate insertion must be skipped");
+        });
+
+        assert!(
+            !output.contains(NAME_SECRET),
+            "duplicate certificate log leaked certificate name {NAME_SECRET}"
+        );
+        assert!(
+            !output.contains(&fingerprint),
+            "duplicate certificate log leaked certificate fingerprint {fingerprint}"
+        );
+        for metadata in [
+            "fingerprint_bytes=32".to_owned(),
+            "names_count=1".to_owned(),
+            format!("names_bytes={name_len}"),
+        ] {
+            assert!(
+                output.contains(&metadata),
+                "duplicate certificate log omitted bounded metadata {metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 512,
+            "duplicate certificate log is not bounded: {} bytes",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn frontend_state_error_redacts_display_key() {
+        const HOSTNAME_SECRET: &str = "STATE_ERROR_HOSTNAME_SECRET_SENTINEL";
+        const PATH_SECRET: &str = "STATE_ERROR_PATH_SECRET_SENTINEL";
+        const METHOD_SECRET: &str = "STATE_ERROR_METHOD_SECRET_SENTINEL";
+
+        let long_value = |marker: &str| format!("{marker}{}", "x".repeat(4096));
+        let front = RequestHttpFrontend {
+            cluster_id: Some("cluster".to_owned()),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            hostname: long_value(HOSTNAME_SECRET),
+            path: PathRule {
+                kind: PathRuleKind::Prefix as i32,
+                value: long_value(PATH_SECRET),
+            },
+            method: Some(long_value(METHOD_SECRET)),
+            position: RulePosition::Tree as i32,
+            tags: BTreeMap::new(),
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: Vec::new(),
+            hsts: None,
+        };
+        let mut state = ConfigState::default();
+        state
+            .add_http_frontend(&front)
+            .expect("first frontend insertion must succeed");
+        assert!(
+            state
+                .http_fronts
+                .keys()
+                .next()
+                .expect("raw state key must be retained")
+                .contains(HOSTNAME_SECRET),
+            "state storage must retain the raw operator-facing frontend key"
+        );
+
+        let error = state
+            .add_http_frontend(&front)
+            .expect_err("duplicate frontend insertion must return StateError::Exists");
+        for (label, output) in [
+            ("Display", error.to_string()),
+            ("Debug", format!("{error:?}")),
+        ] {
+            for secret in [HOSTNAME_SECRET, PATH_SECRET, METHOD_SECRET] {
+                assert!(
+                    !output.contains(secret),
+                    "StateError {label} leaked frontend marker {secret}"
+                );
+            }
+            for metadata in [
+                format!("hostname_bytes={}", long_value(HOSTNAME_SECRET).len()),
+                format!("path_bytes={}", long_value(PATH_SECRET).len()),
+                format!("method_bytes=Some({})", long_value(METHOD_SECRET).len()),
+            ] {
+                assert!(
+                    output.contains(&metadata),
+                    "StateError {label} omitted bounded metadata {metadata}: {output}"
+                );
+            }
+            assert!(
+                output.len() <= 512,
+                "StateError {label} output is not bounded: {} bytes",
+                output.len()
+            );
+        }
+    }
+
+    #[test]
+    fn retained_state_debug_redacts_http_frontend_and_collection_data() {
+        const CLUSTER_SECRET: &str = "RETAINED_CLUSTER_SECRET_SENTINEL";
+        const HOSTNAME_SECRET: &str = "RETAINED_HOSTNAME_SECRET_SENTINEL";
+        const PATH_SECRET: &str = "RETAINED_PATH_SECRET_SENTINEL";
+        const METHOD_SECRET: &str = "RETAINED_METHOD_SECRET_SENTINEL";
+        const TAG_KEY_SECRET: &str = "RETAINED_TAG_KEY_SECRET_SENTINEL";
+        const TAG_VALUE_SECRET: &str = "RETAINED_TAG_VALUE_SECRET_SENTINEL";
+        const REDIRECT_TEMPLATE_SECRET: &str = "RETAINED_REDIRECT_TEMPLATE_SECRET_SENTINEL";
+        const REWRITE_HOST_SECRET: &str = "RETAINED_REWRITE_HOST_SECRET_SENTINEL";
+        const REWRITE_PATH_SECRET: &str = "RETAINED_REWRITE_PATH_SECRET_SENTINEL";
+        const HEADER_KEY_SECRET: &str = "RETAINED_HEADER_KEY_SECRET_SENTINEL";
+        const HEADER_VALUE_SECRET: &str = "RETAINED_HEADER_VALUE_SECRET_SENTINEL";
+        const REQUEST_COUNT_SECRET: &str = "RETAINED_REQUEST_COUNT_SECRET_SENTINEL";
+
+        let long_value = |marker: &str| format!("{marker}{}", "x".repeat(4096));
+        let request = RequestHttpFrontend {
+            cluster_id: Some(long_value(CLUSTER_SECRET)),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+            hostname: long_value(HOSTNAME_SECRET),
+            path: PathRule {
+                kind: PathRuleKind::Regex as i32,
+                value: long_value(PATH_SECRET),
+            },
+            method: Some(long_value(METHOD_SECRET)),
+            position: RulePosition::Tree as i32,
+            tags: BTreeMap::from([(long_value(TAG_KEY_SECRET), long_value(TAG_VALUE_SECRET))]),
+            redirect: Some(RedirectPolicy::PermanentRedirect as i32),
+            redirect_scheme: Some(RedirectScheme::UseHttps as i32),
+            redirect_template: Some(long_value(REDIRECT_TEMPLATE_SECRET)),
+            rewrite_host: Some(long_value(REWRITE_HOST_SECRET)),
+            rewrite_path: Some(long_value(REWRITE_PATH_SECRET)),
+            rewrite_port: Some(9443),
+            required_auth: Some(true),
+            headers: vec![Header {
+                position: HeaderPosition::Both as i32,
+                key: long_value(HEADER_KEY_SECRET),
+                val: long_value(HEADER_VALUE_SECRET),
+            }],
+            hsts: Some(HstsConfig {
+                enabled: Some(true),
+                max_age: Some(31_536_000),
+                include_subdomains: Some(true),
+                preload: Some(false),
+                force_replace_backend: Some(true),
+            }),
+        };
+        let retained = request
+            .clone()
+            .to_frontend()
+            .expect("adversarial frontend must convert");
+        let retained_debug = format!("{retained:?}");
+
+        let mut state = ConfigState::default();
+        state
+            .dispatch(&RequestType::AddHttpFrontend(request).into())
+            .expect("adversarial frontend must be retained");
+        state
+            .request_counts
+            .insert(long_value(REQUEST_COUNT_SECRET), 7);
+        let retained_key = state
+            .http_fronts
+            .keys()
+            .next()
+            .expect("dispatch must retain the frontend's Display key");
+        assert!(retained_key.contains(HOSTNAME_SECRET));
+        assert!(retained_key.contains(PATH_SECRET));
+        assert!(retained_key.contains(METHOD_SECRET));
+        let state_debug = format!("{state:?}");
+
+        let secrets = [
+            CLUSTER_SECRET,
+            HOSTNAME_SECRET,
+            PATH_SECRET,
+            METHOD_SECRET,
+            TAG_KEY_SECRET,
+            TAG_VALUE_SECRET,
+            REDIRECT_TEMPLATE_SECRET,
+            REWRITE_HOST_SECRET,
+            REWRITE_PATH_SECRET,
+            HEADER_KEY_SECRET,
+            HEADER_VALUE_SECRET,
+            REQUEST_COUNT_SECRET,
+        ];
+        for (label, output) in [
+            ("HttpFrontend", &retained_debug),
+            ("ConfigState", &state_debug),
+        ] {
+            for secret in secrets {
+                assert!(
+                    !output.contains(secret),
+                    "{label} Debug leaked retained marker {secret}"
+                );
+            }
+            assert!(
+                output.len() <= 2048,
+                "{label} Debug output is not bounded: {} bytes",
+                output.len()
+            );
+        }
+
+        for metadata in [
+            format!("cluster_id_len: Some({})", long_value(CLUSTER_SECRET).len()),
+            "address: 127.0.0.1:8443".to_owned(),
+            format!("hostname_len: {}", long_value(HOSTNAME_SECRET).len()),
+            "path_kind: 1".to_owned(),
+            format!("path_len: {}", long_value(PATH_SECRET).len()),
+            format!("method_len: Some({})", long_value(METHOD_SECRET).len()),
+            "position: Tree".to_owned(),
+            "tags_count: Some(1)".to_owned(),
+            format!(
+                "tags_len: Some({})",
+                long_value(TAG_KEY_SECRET).len() + long_value(TAG_VALUE_SECRET).len()
+            ),
+            "redirect: Some(4)".to_owned(),
+            "redirect_scheme: Some(2)".to_owned(),
+            format!(
+                "redirect_template_len: Some({})",
+                long_value(REDIRECT_TEMPLATE_SECRET).len()
+            ),
+            format!(
+                "rewrite_host_len: Some({})",
+                long_value(REWRITE_HOST_SECRET).len()
+            ),
+            format!(
+                "rewrite_path_len: Some({})",
+                long_value(REWRITE_PATH_SECRET).len()
+            ),
+            "rewrite_port: Some(9443)".to_owned(),
+            "required_auth: Some(true)".to_owned(),
+            "headers_count: 1".to_owned(),
+            format!(
+                "headers_len: {}",
+                long_value(HEADER_KEY_SECRET).len() + long_value(HEADER_VALUE_SECRET).len()
+            ),
+            "hsts: Some(HstsConfig".to_owned(),
+        ] {
+            assert!(
+                retained_debug.contains(&metadata),
+                "HttpFrontend Debug omitted safe metadata {metadata}: {retained_debug}"
+            );
+        }
+        for metadata in [
+            "http_frontends_count: 1",
+            "backends_count: 0",
+            "tcp_frontends_count: 0",
+            "udp_frontends_count: 0",
+            "certificates_count: 0",
+            "request_counts_count: 2",
+        ] {
+            assert!(
+                state_debug.contains(metadata),
+                "ConfigState Debug omitted count metadata {metadata}: {state_debug}"
+            );
+        }
+    }
 
     #[test]
     fn serialize() {

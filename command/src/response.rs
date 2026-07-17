@@ -24,7 +24,7 @@ impl Response {
 }
 
 /// An HTTP or HTTPS frontend, as used *within* Sōzu
-#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HttpFrontend {
     /// Send a 401, DENY, if cluster_id is None
     pub cluster_id: Option<ClusterId>,
@@ -73,6 +73,53 @@ pub struct HttpFrontend {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hsts: Option<HstsConfig>,
+}
+
+impl fmt::Debug for HttpFrontend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let tags_count = self.tags.as_ref().map(BTreeMap::len);
+        let tags_len = self.tags.as_ref().map(|tags| {
+            tags.iter().fold(0usize, |total, (key, value)| {
+                total.saturating_add(key.len()).saturating_add(value.len())
+            })
+        });
+        let headers_len = self.headers.iter().fold(0usize, |total, header| {
+            total
+                .saturating_add(header.key.len())
+                .saturating_add(header.val.len())
+        });
+
+        f.debug_struct("HttpFrontend")
+            .field("cluster_id_len", &self.cluster_id.as_ref().map(String::len))
+            .field("address", &self.address)
+            .field("hostname_len", &self.hostname.len())
+            .field("path_kind", &self.path.kind)
+            .field("path_len", &self.path.value.len())
+            .field("method_len", &self.method.as_ref().map(String::len))
+            .field("position", &self.position)
+            .field("tags_count", &tags_count)
+            .field("tags_len", &tags_len)
+            .field("redirect", &self.redirect)
+            .field("required_auth", &self.required_auth)
+            .field("redirect_scheme", &self.redirect_scheme)
+            .field(
+                "redirect_template_len",
+                &self.redirect_template.as_ref().map(String::len),
+            )
+            .field(
+                "rewrite_host_len",
+                &self.rewrite_host.as_ref().map(String::len),
+            )
+            .field(
+                "rewrite_path_len",
+                &self.rewrite_path.as_ref().map(String::len),
+            )
+            .field("rewrite_port", &self.rewrite_port)
+            .field("headers_count", &self.headers.len())
+            .field("headers_len", &headers_len)
+            .field("hsts", &self.hsts)
+            .finish_non_exhaustive()
+    }
 }
 
 impl From<HttpFrontend> for RequestHttpFrontend {
