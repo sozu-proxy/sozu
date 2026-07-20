@@ -2747,9 +2747,11 @@ mod tests {
         } = crate::testing::prebuild_server(16, 16_384, false)
             .expect("test HTTPS proxy dependencies must initialize");
         let address = SocketAddress::new_v4(127, 0, 0, 1, crate::testing::provide_port());
-        let config = ListenerBuilder::new_https(address)
+        let mut config = ListenerBuilder::new_https(address)
             .to_tls(None)
             .expect("test HTTPS listener config must build");
+        config.cipher_list = vec!["TLS13_AES_256_GCM_SHA384".to_owned()];
+        config.groups_list = vec!["P-256".to_owned()];
         let mut proxy = HttpsProxy::new(registry, sessions, pool, backends);
         proxy
             .add_listener(config, Token(10))
