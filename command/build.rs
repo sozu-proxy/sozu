@@ -87,6 +87,7 @@ pub fn main() {
             "QueryCertificatesFilters",
             "RemoveCertificate",
             "ReplaceCertificate",
+            "Request",
             "RequestTcpFrontend",
             "ResponseContent",
             "UpdateHttpListenerConfig",

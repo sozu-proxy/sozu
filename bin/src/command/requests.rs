@@ -3753,7 +3753,7 @@ mod audit_format_tests {
     };
     use regex::Regex;
     use rusty_ulid::Ulid;
-    use sozu_command_lib::proto::command::EventKind;
+    use sozu_command_lib::{ObjectKind, proto::command::EventKind, state::StateError};
     use std::time::SystemTime;
 
     /// Minimal stand-in exposing only the `ClientSession` fields and methods
@@ -3918,6 +3918,40 @@ mod audit_format_tests {
         assert!(
             pattern().is_match(&rendered),
             "rendered line with extras did not match.\nrendered: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn state_error_reason_is_bounded_before_entering_the_audit_envelope() {
+        const ERROR_SECRET: &str = "AUDIT_STATE_ERROR_SECRET_SENTINEL";
+
+        let server = sample_server(0);
+        let client = sample_client(Some(42));
+        let request_id = Ulid::generate();
+        let id = format!("{ERROR_SECRET}{}", "x".repeat(4096));
+        let id_len = id.len();
+        let error = StateError::Exists {
+            kind: ObjectKind::Cluster,
+            id,
+        };
+        let mut entry = sample_entry(None);
+        entry.extras.error_code = Some(AuditErrorCode::DispatchError);
+        entry.extras.reason = Some(error.to_string());
+
+        let rendered = audit_log_context!(server, client, &request_id, &entry, AuditResult::Err);
+
+        assert!(
+            !rendered.contains(ERROR_SECRET),
+            "audit reason leaked the StateError payload: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("id_bytes={id_len}")),
+            "audit reason omitted bounded StateError metadata: {rendered}"
+        );
+        assert!(
+            rendered.len() <= 1024,
+            "audit line is not bounded: {} bytes",
+            rendered.len()
         );
     }
 

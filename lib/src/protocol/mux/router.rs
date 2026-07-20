@@ -41,7 +41,7 @@ use crate::metrics::names;
 /// * `log_module_context!($http_context)` — rich form. `$http_context` must be
 ///   `&HttpContext` (or coerce to one). Produces the same
 ///   `[session req cluster backend]` bracket as RUSTLS/PIPE/TCP followed by a
-///   `Session(frontend=..., method=..., authority=...)` block, so router
+///   `Session(frontend=..., method=..., authority_bytes=...)` block, so router
 ///   lines are filterable by session ULID or request ULID. `cluster_id` is
 ///   already carried by the bracket's third slot — not duplicated inside
 ///   `Session(...)`.
@@ -55,7 +55,7 @@ macro_rules! log_module_context {
         let http_ctx: &HttpContext = &$http_context;
         let ctx = http_ctx.log_context();
         format!(
-            "{gray}{ctx}{reset}\t{open}MUX-ROUTER{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend:?}{reset}, {gray}method{reset}={white}{method:?}{reset}, {gray}authority{reset}={white}{authority:?}{reset})\t >>>",
+            "{gray}{ctx}{reset}\t{open}MUX-ROUTER{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend:?}{reset}, {gray}method{reset}={white}{method:?}{reset}, {gray}authority_bytes{reset}={white}{authority_bytes:?}{reset})\t >>>",
             open = open,
             reset = reset,
             grey = grey,
@@ -64,9 +64,46 @@ macro_rules! log_module_context {
             ctx = ctx,
             frontend = http_ctx.session_address,
             method = http_ctx.method,
-            authority = http_ctx.authority,
+            authority_bytes = http_ctx.authority.as_ref().map(String::len),
         )
     }};
+}
+
+fn log_coalescing_accepted(context: &HttpContext, authority: &str, sni: &str, matched_name: &str) {
+    debug!(
+        "{} accepted coalesced authority (authority_bytes={}, sni_bytes={}, matched_san_kind={}, matched_san_bytes={})",
+        log_module_context!(context),
+        authority.len(),
+        sni.len(),
+        if matched_name.starts_with("*.") {
+            "wildcard"
+        } else {
+            "exact"
+        },
+        matched_name.len(),
+    );
+}
+
+fn log_sni_authority_mismatch(
+    context: &HttpContext,
+    authority: &str,
+    sni: &str,
+    certificate_names: Option<&[String]>,
+) {
+    let certificate_sans_count = certificate_names.map_or(0, <[String]>::len);
+    let certificate_sans_bytes = certificate_names
+        .into_iter()
+        .flatten()
+        .map(String::len)
+        .fold(0usize, usize::saturating_add);
+    warn!(
+        "{} rejecting request: TLS cert SANs do not cover authority (authority_bytes={}, sni_bytes={}, certificate_sans_count={}, certificate_sans_bytes={})",
+        log_module_context!(context),
+        authority.len(),
+        sni.len(),
+        certificate_sans_count,
+        certificate_sans_bytes,
+    );
 }
 
 #[derive(Debug)]
@@ -621,22 +658,16 @@ impl Router {
                     // sequential `Host:` reuse as "coalescing".
                     if !authority_matches_sni(host, sni) && context.tls_alpn == Some("h2") {
                         incr!(names::h2::COALESCING_ACCEPTED);
-                        debug!(
-                            "{} accepted coalesced authority {:?} (SNI {:?}, matched SAN {:?})",
-                            log_module_context!(context),
-                            host,
-                            sni,
-                            matched_name,
-                        );
+                        log_coalescing_accepted(context, host, sni, matched_name);
                     }
                 }
                 None => {
                     incr!(names::http::SNI_AUTHORITY_MISMATCH);
-                    warn!(
-                        "{} rejecting request: TLS cert SANs do not cover :authority {:?} (SNI {:?})",
-                        log_module_context!(context),
+                    log_sni_authority_mismatch(
+                        context,
                         host,
                         sni,
+                        context.tls_cert_names.as_deref().map(Vec::as_slice),
                     );
                     return Err(RetrieveClusterError::SniAuthorityMismatch {
                         sni: sni.to_owned(),
@@ -1301,7 +1332,83 @@ pub(crate) fn authority_matched_cert_name<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::authority_matches_sni;
+    use super::{authority_matches_sni, log_coalescing_accepted, log_sni_authority_mismatch};
+    use crate::protocol::http::editor::HttpContext;
+
+    #[test]
+    fn routing_runtime_logs_bound_method_authority_sni_and_certificate_names() {
+        const METHOD_SECRET: &str = "MUX_ROUTE_METHOD_SECRET_SENTINEL";
+        const AUTHORITY_SECRET: &str = "MUX_ROUTE_AUTHORITY_SECRET_SENTINEL";
+        const SNI_SECRET: &str = "MUX_ROUTE_SNI_SECRET_SENTINEL";
+        const SAN_SECRET: &str = "MUX_ROUTE_SAN_SECRET_SENTINEL";
+
+        let long_value = |marker: &str| format!("{marker}{}", "x".repeat(4096));
+        let method = long_value(METHOD_SECRET);
+        let authority = long_value(AUTHORITY_SECRET);
+        let sni = long_value(SNI_SECRET);
+        let san = long_value(SAN_SECRET);
+        let method_len = method.len();
+        let authority_len = authority.len();
+        let sni_len = sni.len();
+        let san_len = san.len();
+
+        let output = crate::capture_test_logs_at_level("debug", move || {
+            let mut context = HttpContext::new(
+                rusty_ulid::Ulid::generate(),
+                rusty_ulid::Ulid::generate(),
+                crate::Protocol::HTTPS,
+                "127.0.0.1:443"
+                    .parse()
+                    .expect("test public address must parse"),
+                Some(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .expect("test session address must parse"),
+                ),
+                String::new(),
+                String::new(),
+                false,
+                false,
+            );
+            context.method = Some(crate::protocol::http::parser::Method::Custom(method));
+            context.authority = Some(authority.clone());
+            context.tls_cert_names = Some(std::sync::Arc::new(vec![san.clone()]));
+
+            log_coalescing_accepted(&context, &authority, &sni, &san);
+            log_sni_authority_mismatch(
+                &context,
+                &authority,
+                &sni,
+                context.tls_cert_names.as_deref().map(Vec::as_slice),
+            );
+        });
+
+        for secret in [METHOD_SECRET, AUTHORITY_SECRET, SNI_SECRET, SAN_SECRET] {
+            assert!(
+                !output.contains(secret),
+                "mux routing runtime log leaked {secret}: {output}"
+            );
+        }
+        for metadata in [
+            format!("bytes={method_len}"),
+            format!("authority_bytes=Some({authority_len})"),
+            format!("authority_bytes={authority_len}"),
+            format!("sni_bytes={sni_len}"),
+            format!("matched_san_bytes={san_len}"),
+            "certificate_sans_count=1".to_owned(),
+            format!("certificate_sans_bytes={san_len}"),
+        ] {
+            assert!(
+                output.contains(&metadata),
+                "mux routing runtime log omitted {metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 2048,
+            "mux routing runtime capture is not bounded: {} bytes",
+            output.len()
+        );
+    }
 
     #[test]
     fn match_exact() {

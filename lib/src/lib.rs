@@ -721,7 +721,7 @@ pub enum BackendConnectionError {
 }
 
 /// used in kawa_h1 module for the Http session state
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error)]
 pub enum RetrieveClusterError {
     #[error("No method given")]
     NoMethod,
@@ -738,8 +738,14 @@ pub enum RetrieveClusterError {
     /// The HTTP `:authority` / `Host` host does not match the TLS SNI that was
     /// negotiated for this connection, which would cross the TLS trust boundary.
     /// Maps to HTTP 421 Misdirected Request (RFC 9110 §15.5.20).
-    #[error("TLS SNI {sni:?} does not match HTTP authority {authority:?}")]
+    #[error("TLS SNI does not match HTTP authority: sni_bytes={} authority_bytes={}", .sni.len(), .authority.len())]
     SniAuthorityMismatch { sni: String, authority: String },
+}
+
+impl fmt::Debug for RetrieveClusterError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 /// Used in sessions
@@ -1745,6 +1751,53 @@ mod log_redaction_tests {
             assert!(
                 output.len() <= 256,
                 "ListenerError {label} output is not bounded: {} bytes",
+                output.len()
+            );
+        }
+    }
+
+    #[test]
+    fn sni_authority_mismatch_retains_inputs_but_bounds_textual_formatting() {
+        const SNI_SECRET: &str = "SNI_MISMATCH_SECRET_SENTINEL";
+        const AUTHORITY_SECRET: &str = "AUTHORITY_MISMATCH_SECRET_SENTINEL";
+
+        let sni = format!("{SNI_SECRET}{}", "x".repeat(4096));
+        let authority = format!("{AUTHORITY_SECRET}{}", "x".repeat(4096));
+        let error = RetrieveClusterError::SniAuthorityMismatch {
+            sni: sni.clone(),
+            authority: authority.clone(),
+        };
+
+        match &error {
+            RetrieveClusterError::SniAuthorityMismatch {
+                sni: retained_sni,
+                authority: retained_authority,
+            } => {
+                assert_eq!(retained_sni, &sni);
+                assert_eq!(retained_authority, &authority);
+            }
+            other => panic!("expected SniAuthorityMismatch, got {other:?}"),
+        }
+
+        for output in [error.to_string(), format!("{error:?}")] {
+            for secret in [SNI_SECRET, AUTHORITY_SECRET] {
+                assert!(
+                    !output.contains(secret),
+                    "SNI mismatch formatting leaked {secret}: {output}"
+                );
+            }
+            for metadata in [
+                format!("sni_bytes={}", sni.len()),
+                format!("authority_bytes={}", authority.len()),
+            ] {
+                assert!(
+                    output.contains(&metadata),
+                    "SNI mismatch formatting omitted {metadata}: {output}"
+                );
+            }
+            assert!(
+                output.len() <= 256,
+                "SNI mismatch formatting is not bounded: {} bytes",
                 output.len()
             );
         }

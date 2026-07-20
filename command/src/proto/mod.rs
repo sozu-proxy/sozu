@@ -44,6 +44,75 @@ impl From<command::request::RequestType> for command::Request {
     }
 }
 
+impl std::fmt::Debug for command::Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut request = f.debug_struct("Request");
+        match self.request_type.as_ref() {
+            Some(request_type) => request.field("request_type", request_type),
+            None => request.field("request_type", &"Unallowed"),
+        };
+        request.finish()
+    }
+}
+
+impl std::fmt::Debug for command::request::RequestType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use command::request::RequestType;
+
+        match self {
+            RequestType::AddCluster(value) => f.debug_tuple("AddCluster").field(value).finish(),
+            RequestType::AddHttpFrontend(value) => {
+                f.debug_tuple("AddHttpFrontend").field(value).finish()
+            }
+            RequestType::RemoveHttpFrontend(value) => {
+                f.debug_tuple("RemoveHttpFrontend").field(value).finish()
+            }
+            RequestType::AddHttpsFrontend(value) => {
+                f.debug_tuple("AddHttpsFrontend").field(value).finish()
+            }
+            RequestType::RemoveHttpsFrontend(value) => {
+                f.debug_tuple("RemoveHttpsFrontend").field(value).finish()
+            }
+            RequestType::AddCertificate(value) => {
+                f.debug_tuple("AddCertificate").field(value).finish()
+            }
+            RequestType::ReplaceCertificate(value) => {
+                f.debug_tuple("ReplaceCertificate").field(value).finish()
+            }
+            RequestType::RemoveCertificate(value) => {
+                f.debug_tuple("RemoveCertificate").field(value).finish()
+            }
+            RequestType::AddTcpFrontend(value) => {
+                f.debug_tuple("AddTcpFrontend").field(value).finish()
+            }
+            RequestType::RemoveTcpFrontend(value) => {
+                f.debug_tuple("RemoveTcpFrontend").field(value).finish()
+            }
+            RequestType::AddHttpListener(value) => {
+                f.debug_tuple("AddHttpListener").field(value).finish()
+            }
+            RequestType::AddHttpsListener(value) => {
+                f.debug_tuple("AddHttpsListener").field(value).finish()
+            }
+            RequestType::UpdateHttpListener(value) => {
+                f.debug_tuple("UpdateHttpListener").field(value).finish()
+            }
+            RequestType::UpdateHttpsListener(value) => {
+                f.debug_tuple("UpdateHttpsListener").field(value).finish()
+            }
+            RequestType::QueryCertificatesFromTheState(value) => f
+                .debug_tuple("QueryCertificatesFromTheState")
+                .field(value)
+                .finish(),
+            RequestType::QueryCertificatesFromWorkers(value) => f
+                .debug_tuple("QueryCertificatesFromWorkers")
+                .field(value)
+                .finish(),
+            other => f.write_str(display::format_request_type(other)),
+        }
+    }
+}
+
 impl std::fmt::Debug for command::CertificateAndKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let certificate_chain_len = self
@@ -782,6 +851,40 @@ mod tests {
         UpdateHttpsListenerConfig, WorkerMetrics, WorkerRequest, WorkerResponse, WorkerResponses,
         filtered_metrics::Inner, request::RequestType, response_content::ContentType,
     };
+
+    #[test]
+    fn request_debug_redacts_string_variant_payloads_directly_and_when_nested() {
+        const PATH_SECRET: &str = "REQUEST_SAVE_STATE_PATH_SECRET_SENTINEL";
+
+        let request_type = RequestType::SaveState(format!("{PATH_SECRET}{}", "x".repeat(4096)));
+        let direct_output = format!("{request_type:?}");
+        let request = Request::from(request_type);
+        let worker_request = WorkerRequest {
+            id: "safe-request-id".to_owned(),
+            content: request.clone(),
+        };
+        let outputs = [
+            direct_output,
+            format!("{request:?}"),
+            format!("{worker_request:?}"),
+        ];
+
+        for output in outputs {
+            assert!(
+                !output.contains(PATH_SECRET),
+                "Request Debug leaked its string variant payload: {output}"
+            );
+            assert!(
+                output.contains("SaveState"),
+                "Request Debug omitted the bounded request kind: {output}"
+            );
+            assert!(
+                output.len() <= 256,
+                "Request Debug output is not bounded: {} bytes",
+                output.len()
+            );
+        }
+    }
 
     #[test]
     fn listener_and_patch_debug_redacts_user_controlled_material() {

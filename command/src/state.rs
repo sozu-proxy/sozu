@@ -3,6 +3,7 @@ use std::{
         BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry as BTreeMapEntry,
         hash_map::DefaultHasher,
     },
+    fmt,
     fs::File,
     hash::{Hash, Hasher},
     io::Write,
@@ -36,7 +37,7 @@ use crate::{
 /// To use throughout Sōzu
 pub type ClusterId = String;
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error)]
 pub enum StateError {
     #[error("Request came in empty")]
     EmptyRequest,
@@ -44,23 +45,21 @@ pub enum StateError {
     NoChange,
     #[error("State can not handle this request")]
     UndispatchableRequest,
-    #[error("Did not find {kind:?} with address or id '{id}'")]
+    #[error("Did not find {kind:?} with address or id_bytes={}", .id.len())]
     NotFound { kind: ObjectKind, id: String },
-    #[error("{kind:?} '{id}' already exists")]
+    #[error("{kind:?} with id_bytes={} already exists", .id.len())]
     Exists { kind: ObjectKind, id: String },
     #[error("Wrong field value: {0}")]
     WrongFieldValue(UnknownEnumValue),
-    #[error("Could not add certificate: {0}")]
+    #[error("Could not add certificate: error_kind={}", certificate_error_kind(.0))]
     AddCertificate(CertificateError),
-    #[error("Could not remove certificate: {0}")]
+    #[error("Could not remove certificate: fingerprint_bytes={}", .0.len())]
     RemoveCertificate(String),
-    #[error("Could not replace certificate: {0}")]
+    #[error("Could not replace certificate: error_bytes={}", .0.len())]
     ReplaceCertificate(String),
-    #[error(
-        "Could not convert the frontend to an insertable one. Frontend: {frontend} error: {error}"
-    )]
+    #[error("Could not convert frontend: frontend_bytes={} error_bytes={}", .frontend.len(), .error.len())]
     FrontendConversion { frontend: String, error: String },
-    #[error("Could not write state to file: {0}")]
+    #[error("Could not write state to file: io_kind={:?} os_code={:?}", .0.kind(), .0.raw_os_error())]
     FileError(std::io::Error),
     #[error("Invalid value for field '{field}': {reason}")]
     InvalidValue {
@@ -72,19 +71,25 @@ pub enum StateError {
     /// same reasons `validate_new_tcp_front` would, so a route never lands
     /// in `ConfigState` only to be NACKed by every worker on the next
     /// fan-out (sozu-proxy/sozu#1290).
-    #[error("invalid TCP frontend for address {address}: {reason}")]
+    #[error("invalid TCP frontend for address {address}: reason_bytes={}", .reason.len())]
     InvalidTcpFrontend { address: SocketAddr, reason: String },
 }
 
-fn frontend_log_summary(front: &RequestHttpFrontend) -> String {
-    format!(
-        "address={}, hostname_bytes={}, path_kind={}, path_bytes={}, method_bytes={:?}",
-        front.address,
-        front.hostname.len(),
-        front.path.kind,
-        front.path.value.len(),
-        front.method.as_ref().map(String::len),
-    )
+impl fmt::Debug for StateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "StateError({self})")
+    }
+}
+
+fn certificate_error_kind(error: &CertificateError) -> &'static str {
+    match error {
+        CertificateError::ParsePEMCertificate(_) => "parse_pem_certificate",
+        CertificateError::ParseX509Certificate(_) => "parse_x509_certificate",
+        CertificateError::InvalidTlsVersion(_) => "invalid_tls_version",
+        CertificateError::InvalidFingerprint(_) => "invalid_fingerprint",
+        CertificateError::LoadFile { .. } => "load_file",
+        CertificateError::DecodeError(_) => "decode_error",
+    }
 }
 
 /// The `ConfigState` represents the state of Sōzu's business, which is to forward traffic
@@ -1047,13 +1052,14 @@ impl ConfigState {
     }
 
     fn add_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
+        let front_as_key = front.to_string();
         let before = self.http_fronts.len();
 
         match self.http_fronts.entry(front.to_string()) {
             BTreeMapEntry::Vacant(e) => {
                 e.insert(front.clone().to_frontend().map_err(|into_error| {
                     StateError::FrontendConversion {
-                        frontend: frontend_log_summary(front),
+                        frontend: front_as_key,
                         error: into_error.to_string(),
                     }
                 })?)
@@ -1066,7 +1072,7 @@ impl ConfigState {
                 );
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpFrontend,
-                    id: frontend_log_summary(front),
+                    id: front.to_string(),
                 });
             }
         };
@@ -1085,13 +1091,14 @@ impl ConfigState {
     }
 
     fn add_https_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
+        let front_as_key = front.to_string();
         let before = self.https_fronts.len();
 
         match self.https_fronts.entry(front.to_string()) {
             BTreeMapEntry::Vacant(e) => {
                 e.insert(front.clone().to_frontend().map_err(|into_error| {
                     StateError::FrontendConversion {
-                        frontend: frontend_log_summary(front),
+                        frontend: front_as_key,
                         error: into_error.to_string(),
                     }
                 })?)
@@ -1104,7 +1111,7 @@ impl ConfigState {
                 );
                 return Err(StateError::Exists {
                     kind: ObjectKind::HttpsFrontend,
-                    id: frontend_log_summary(front),
+                    id: front.to_string(),
                 });
             }
         };
@@ -1125,7 +1132,7 @@ impl ConfigState {
         let before = self.http_fronts.len();
         self.http_fronts.remove(&key).ok_or(StateError::NotFound {
             kind: ObjectKind::HttpFrontend,
-            id: frontend_log_summary(front),
+            id: front.to_string(),
         })?;
         debug_assert!(
             !self.http_fronts.contains_key(&key),
@@ -1144,7 +1151,7 @@ impl ConfigState {
         let before = self.https_fronts.len();
         self.https_fronts.remove(&key).ok_or(StateError::NotFound {
             kind: ObjectKind::HttpsFrontend,
-            id: frontend_log_summary(front),
+            id: front.to_string(),
         })?;
         debug_assert!(
             !self.https_fronts.contains_key(&key),
@@ -1454,7 +1461,14 @@ impl ConfigState {
                 .get_mut(&front_to_remove.cluster_id)
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::TcpFrontend,
-                    id: format!("{front_to_remove:?}"),
+                    id: format!(
+                        "RequestTcpFrontend {{ cluster_id: {:?}, address: {:?}, tags: {:?}, sni: {:?}, alpn: {:?} }}",
+                        front_to_remove.cluster_id,
+                        front_to_remove.address,
+                        front_to_remove.tags,
+                        front_to_remove.sni,
+                        front_to_remove.alpn,
+                    ),
                 })?;
 
         let len = tcp_frontends.len();
@@ -3297,6 +3311,14 @@ mod tests {
         let error = state
             .add_http_frontend(&front)
             .expect_err("duplicate frontend insertion must return StateError::Exists");
+        let raw_frontend_key = front.to_string();
+        match &error {
+            StateError::Exists { id, .. } => assert_eq!(
+                id, &raw_frontend_key,
+                "StateError must preserve the public raw frontend identifier"
+            ),
+            other => panic!("expected StateError::Exists, got {other:?}"),
+        }
         for (label, output) in [
             ("Display", error.to_string()),
             ("Debug", format!("{error:?}")),
@@ -3307,19 +3329,98 @@ mod tests {
                     "StateError {label} leaked frontend marker {secret}"
                 );
             }
-            for metadata in [
-                format!("hostname_bytes={}", long_value(HOSTNAME_SECRET).len()),
-                format!("path_bytes={}", long_value(PATH_SECRET).len()),
-                format!("method_bytes=Some({})", long_value(METHOD_SECRET).len()),
-            ] {
-                assert!(
-                    output.contains(&metadata),
-                    "StateError {label} omitted bounded metadata {metadata}: {output}"
-                );
-            }
+            let metadata = format!("id_bytes={}", raw_frontend_key.len());
+            assert!(
+                output.contains(&metadata),
+                "StateError {label} omitted bounded metadata {metadata}: {output}"
+            );
             assert!(
                 output.len() <= 512,
                 "StateError {label} output is not bounded: {} bytes",
+                output.len()
+            );
+        }
+    }
+
+    #[test]
+    fn state_error_formatting_bounds_every_string_bearing_variant() {
+        const SECRET: &str = "STATE_ERROR_VARIANT_SECRET_SENTINEL";
+
+        let long_value = || format!("{SECRET}{}", "x".repeat(4096));
+        let errors = [
+            StateError::NotFound {
+                kind: ObjectKind::Backend,
+                id: long_value(),
+            },
+            StateError::Exists {
+                kind: ObjectKind::Cluster,
+                id: long_value(),
+            },
+            StateError::AddCertificate(CertificateError::ParsePEMCertificate(long_value())),
+            StateError::RemoveCertificate(long_value()),
+            StateError::ReplaceCertificate(long_value()),
+            StateError::FrontendConversion {
+                frontend: long_value(),
+                error: long_value(),
+            },
+            StateError::FileError(std::io::Error::other(long_value())),
+            StateError::InvalidTcpFrontend {
+                address: "127.0.0.1:443"
+                    .parse()
+                    .expect("test TCP frontend address must parse"),
+                reason: long_value(),
+            },
+        ];
+
+        for error in errors {
+            for (label, output) in [
+                ("Display", error.to_string()),
+                ("Debug", format!("{error:?}")),
+            ] {
+                assert!(
+                    !output.contains(SECRET),
+                    "StateError {label} leaked a string-bearing variant: {output}"
+                );
+                assert!(
+                    output.len() <= 512,
+                    "StateError {label} is not bounded: {} bytes",
+                    output.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_frontend_not_found_error_retains_the_raw_identity() {
+        const TCP_SECRET: &str = "STATE_ERROR_TCP_IDENTITY_SECRET_SENTINEL";
+
+        let long_value = |suffix: &str| format!("{TCP_SECRET}_{suffix}{}", "x".repeat(1024));
+        let frontend = RequestTcpFrontend {
+            cluster_id: long_value("cluster"),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 443),
+            tags: BTreeMap::from([(long_value("tag-key"), long_value("tag-value"))]),
+            sni: Some(long_value("sni")),
+            alpn: vec![long_value("alpn")],
+        };
+        let error = ConfigState::default()
+            .remove_tcp_frontend(&frontend)
+            .expect_err("removing from a missing cluster must return StateError::NotFound");
+
+        match &error {
+            StateError::NotFound { id, .. } => assert!(
+                id.contains(TCP_SECRET),
+                "StateError must retain the raw TCP frontend identity: {id}"
+            ),
+            other => panic!("expected StateError::NotFound, got {other:?}"),
+        }
+        for output in [error.to_string(), format!("{error:?}")] {
+            assert!(
+                !output.contains(TCP_SECRET),
+                "StateError formatting leaked the retained TCP identity: {output}"
+            );
+            assert!(
+                output.len() <= 512,
+                "StateError formatting is not bounded: {} bytes",
                 output.len()
             );
         }

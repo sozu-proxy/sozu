@@ -167,7 +167,7 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
 | `MUX-ROUTER` | `protocol/mux/router.rs` | renders `[session req cluster backend]` via `HttpContext::log_context()` |
 | `MUX-CONN` / `MUX-CONV` / `MUX-PARSER` / `MUX-PKAWA` / `MUX-STREAM` | corresponding files | module-level only (no per-session context) |
 | `KAWA-H1` | `protocol/kawa_h1/mod.rs` | session, frontend, request/response parsing phase |
-| `RUSTLS` | `protocol/rustls.rs` | sni, alpn, version, source, frontend |
+| `RUSTLS` | `protocol/rustls.rs` | SNI/ALPN byte lengths, version, source, frontend |
 | `PIPE` | `protocol/pipe.rs` | addresses, frontend/backend status & readiness |
 | `TCP` | `tcp.rs` | frontend, backend, peer (cached on `SessionTcpStream`) |
 | `SOCKET` | `socket.rs` | session, peer, local, RTT, state |
@@ -202,24 +202,44 @@ useful metadata such as socket addresses, enum variants, booleans, presence
 flags, collection counts, and aggregate byte lengths. Certificate and key
 slots render as `[redacted]` in addition to their lengths.
 
+The canonical `[session request cluster backend]` prefix is the explicit
+correlation envelope and is not a generic object dump: its cluster/backend
+slots remain lossless so operators can join lines for one request. The same
+identifiers must still be bounded when they appear inside `Debug` output,
+retained task/state dumps, error text, or ad-hoc message fields. This exception
+is limited to the named correlation slots; it does not permit raw authority,
+path, method, SNI, ALPN, certificate SAN, or request payload fields in the
+verbose `Session(...)` body.
+
 Apply the boundary at every layer that can reach a log sink:
 
 - Generated protobuf types that carry sensitive fields are listed in
   `command/build.rs` via `prost_build::Config::skip_debug`; their bounded
-  implementations live in `command/src/proto/mod.rs`.
+  implementations live in `command/src/proto/mod.rs`. The top-level
+  `Request` and its `RequestType` enum render only the exhaustive request kind,
+  so string-valued verbs remain bounded both directly and inside
+  `WorkerRequest`.
 - Configuration, response, retained-state, gatherer, router, listener, and TLS
   wrappers must summarize their own collections and string-keyed maps rather
-  than relying on an enclosing type to hide them.
+  than relying on an enclosing type to hide them. `TaskContainer` renders only
+  the concrete task kind and timeout presence; it never delegates to a retained
+  `GatheringTask`'s `Debug` implementation.
 - Direct `debug!`, `info!`, `warn!`, `error!`, and failure-message projections
   must interpolate the same counts, kinds, addresses, and byte lengths. A safe
   `Debug` implementation does not protect a log statement that formats a raw
-  field directly.
+  field directly. TLS preread/handshake and mux routing logs therefore render
+  cluster/authority/SNI/ALPN/SAN counts, match kinds, and aggregate byte lengths
+  rather than individual values.
 - Error and poisoned-lock paths follow the same rule; exceptional control flow
   is not permission to disclose the rejected value or the retained object.
 
 This is deliberately a logging-only boundary. Protobuf wire encoding,
 Serde/JSON output, retained-state keys, certificate-query response payloads,
-and the raw fields stored in error variants remain unchanged.
+and the raw fields stored in `StateError`, `RouterError`, and
+`RetrieveClusterError::SniAuthorityMismatch` remain unchanged. These error
+types bound only `Display`/`Debug`; callers matching their public variants
+still receive the complete identifiers, frontend keys, rejection reasons,
+hosts, paths, methods, SNI values, and authorities.
 `RequestHttpFrontend::Display`, which is used as an operational/state key, also
 remains lossless. Callers that are explicitly authorized to retrieve these
 values continue to receive them; generic diagnostics do not.
