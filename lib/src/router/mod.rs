@@ -48,11 +48,11 @@ pub enum RouterError {
     InvalidHostRewrite(String),
     #[error("Could not parse path rewrite, rewrite_path_bytes={}", .0.len())]
     InvalidPathRewrite(String),
-    #[error("Could not add route {0}")]
+    #[error("Could not add route, route_bytes={}", .0.len())]
     AddRoute(String),
-    #[error("Could not remove route {0}")]
+    #[error("Could not remove route, route_bytes={}", .0.len())]
     RemoveRoute(String),
-    #[error("no route for {method} {host} {path}")]
+    #[error("route_not_found method={method:?} host_bytes={} path_bytes={}", .host.len(), .path.len())]
     RouteNotFound {
         host: String,
         path: String,
@@ -2187,6 +2187,59 @@ mod tests {
                     output.len()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn route_miss_error_retains_inputs_but_bounds_textual_formatting() {
+        const HOST_SECRET: &str = "ROUTE_MISS_HOST_SECRET_SENTINEL";
+        const PATH_SECRET: &str = "ROUTE_MISS_PATH_SECRET_SENTINEL";
+        const METHOD_SECRET: &str = "ROUTE_MISS_METHOD_SECRET_SENTINEL";
+
+        let long_value = |marker: &str| format!("{marker}{}", "x".repeat(4096));
+        let host = long_value(HOST_SECRET);
+        let path = long_value(PATH_SECRET);
+        let method = Method::Custom(long_value(METHOD_SECRET));
+        let error = match Router::new().lookup(&host, &path, &method) {
+            Err(error) => error,
+            Ok(_) => panic!("empty router must return a route miss"),
+        };
+
+        match &error {
+            RouterError::RouteNotFound {
+                host: retained_host,
+                path: retained_path,
+                method: retained_method,
+            } => {
+                assert_eq!(retained_host, &host);
+                assert_eq!(retained_path, &path);
+                assert_eq!(retained_method, &method);
+            }
+            other => panic!("expected RouterError::RouteNotFound, got {other:?}"),
+        }
+
+        for output in [error.to_string(), format!("{error:?}")] {
+            for secret in [HOST_SECRET, PATH_SECRET, METHOD_SECRET] {
+                assert!(
+                    !output.contains(secret),
+                    "route miss formatting leaked {secret}: {output}"
+                );
+            }
+            for metadata in [
+                format!("host_bytes={}", host.len()),
+                format!("path_bytes={}", path.len()),
+                format!("bytes={}", method.as_ref().len()),
+            ] {
+                assert!(
+                    output.contains(&metadata),
+                    "route miss formatting omitted {metadata}: {output}"
+                );
+            }
+            assert!(
+                output.len() <= 256,
+                "route miss formatting is not bounded: {} bytes",
+                output.len()
+            );
         }
     }
 

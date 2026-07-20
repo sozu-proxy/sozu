@@ -33,23 +33,15 @@ macro_rules! log_context {
     ($self:expr) => {{
         let (open, reset, grey, gray, white) = ansi_palette();
         format!(
-            "{gray}{ctx}{reset}\t{open}RUSTLS{reset}\t{grey}Session{reset}({gray}sni{reset}={white}{sni:?}{reset}, {gray}alpn{reset}={white}{alpn}{reset}, {gray}version{reset}={white}{version:?}{reset}, {gray}source{reset}={white}{source:?}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
+            "{gray}{ctx}{reset}\t{open}RUSTLS{reset}\t{grey}Session{reset}({gray}sni_bytes{reset}={white}{sni_bytes:?}{reset}, {gray}alpn_bytes{reset}={white}{alpn_bytes:?}{reset}, {gray}version{reset}={white}{version:?}{reset}, {gray}source{reset}={white}{source:?}{reset}, {gray}frontend{reset}={white}{frontend}{reset}, {gray}readiness{reset}={white}{readiness}{reset})\t >>>",
             open = open,
             reset = reset,
             grey = grey,
             gray = gray,
             white = white,
             ctx = $self.log_context(),
-            sni = $self
-                .session
-                .server_name()
-                .map(|addr| addr.to_string())
-                .unwrap_or_else(|| "<none>".to_string()),
-            alpn = $self
-                .session
-                .alpn_protocol()
-                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-                .unwrap_or_else(|| "<none>".to_string()),
+            sni_bytes = $self.session.server_name().map(str::len),
+            alpn_bytes = $self.session.alpn_protocol().map(|bytes| bytes.len()),
             version = $self.session.protocol_version(),
             source = $self
                 .peer_address

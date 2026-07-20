@@ -34,7 +34,7 @@ pub fn compare_no_case(left: &[u8], right: &[u8]) -> bool {
     })
 }
 
-#[derive(PartialEq, Eq, Debug, Clone)]
+#[derive(PartialEq, Eq, Clone)]
 pub enum Method {
     Get,
     Post,
@@ -45,6 +45,22 @@ pub enum Method {
     Trace,
     Connect,
     Custom(String),
+}
+
+impl fmt::Debug for Method {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Get => f.write_str("Get"),
+            Self::Post => f.write_str("Post"),
+            Self::Head => f.write_str("Head"),
+            Self::Options => f.write_str("Options"),
+            Self::Put => f.write_str("Put"),
+            Self::Delete => f.write_str("Delete"),
+            Self::Trace => f.write_str("Trace"),
+            Self::Connect => f.write_str("Connect"),
+            Self::Custom(custom) => write!(f, "Custom(bytes={})", custom.len()),
+        }
+    }
 }
 
 impl Method {
@@ -205,6 +221,29 @@ fn custom_method_does_not_assume_utf8() {
     let method = Method::new(b"\xFFBAD");
 
     assert_eq!(method, Method::Custom("\u{FFFD}BAD".to_owned()));
+}
+
+#[test]
+fn custom_method_debug_is_bounded() {
+    const METHOD_SECRET: &str = "CUSTOM_METHOD_DEBUG_SECRET_SENTINEL";
+
+    let custom = format!("{METHOD_SECRET}{}", "x".repeat(4096));
+    let custom_len = custom.len();
+    let output = format!("{:?}", Method::Custom(custom));
+
+    assert!(
+        !output.contains(METHOD_SECRET),
+        "custom Method Debug leaked its payload: {output}"
+    );
+    assert!(
+        output.contains(&format!("bytes={custom_len}")),
+        "custom Method Debug omitted its byte length: {output}"
+    );
+    assert!(
+        output.len() <= 128,
+        "custom Method Debug is not bounded: {} bytes",
+        output.len()
+    );
 }
 
 #[test]

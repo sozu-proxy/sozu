@@ -84,6 +84,11 @@ pub trait Gatherer {
 /// Must be satisfied by commands that need to wait for worker responses
 #[allow(unused)]
 pub trait GatheringTask: Debug {
+    /// Return a payload-free identifier suitable for retained-task logs.
+    fn kind(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     /// get access to the client that sent the command (if any)
     fn client_token(&self) -> Option<Token>;
 
@@ -131,10 +136,18 @@ pub enum Timeout {
 }
 
 /// Contains a task and its execution timeout
-#[derive(Debug)]
 struct TaskContainer {
     job: Box<dyn GatheringTask>,
     timeout: Option<Instant>,
+}
+
+impl Debug for TaskContainer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskContainer")
+            .field("task_kind", &self.job.kind())
+            .field("timeout_armed", &self.timeout.is_some())
+            .finish()
+    }
 }
 
 /// Default strategy when gathering responses from workers
@@ -543,7 +556,7 @@ impl CommandHub {
             }
 
             events.clear();
-            trace!("Tasks: {:?}", self.tasks);
+            trace!("Tasks: count={}", self.tasks.len());
             trace!("Sessions to tick: {:?}", sessions_to_tick);
             trace!("Polling timeout: {:?}", poll_timeout);
             match self.poll.poll(&mut events, poll_timeout) {
@@ -1528,6 +1541,66 @@ mod tests {
         let unix_listener = UnixListener::bind(&socket_path).expect("Could not bind socket");
         Server::new(unix_listener, Config::default(), "sozu".to_owned())
             .expect("Could not create server")
+    }
+
+    #[derive(Debug)]
+    struct SecretBearingTask {
+        gatherer: DefaultGatherer,
+        secret: String,
+    }
+
+    impl GatheringTask for SecretBearingTask {
+        fn client_token(&self) -> Option<Token> {
+            None
+        }
+
+        fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+            &mut self.gatherer
+        }
+
+        fn on_finish(
+            self: Box<Self>,
+            _server: &mut Server,
+            _client: &mut OptionalClient,
+            _timed_out: bool,
+        ) {
+        }
+    }
+
+    #[test]
+    fn task_sink_debug_does_not_format_concrete_task_payloads() {
+        const TASK_SECRET: &str = "RETAINED_TASK_PAYLOAD_SECRET_SENTINEL";
+
+        let secret = format!("{TASK_SECRET}{}", "x".repeat(4096));
+        let secret_len = secret.len();
+        let job = SecretBearingTask {
+            gatherer: DefaultGatherer::default(),
+            secret,
+        };
+        assert_eq!(
+            job.secret.len(),
+            secret_len,
+            "fixture must retain the full task payload before logging"
+        );
+        let task = TaskContainer {
+            job: Box::new(job),
+            timeout: None,
+        };
+        let output = format!("Task finish: {task:?}");
+
+        assert!(
+            !output.contains(TASK_SECRET),
+            "task completion sink leaked the concrete task payload: {output}"
+        );
+        assert!(
+            output.contains("SecretBearingTask"),
+            "task completion sink omitted the bounded task kind: {output}"
+        );
+        assert!(
+            output.len() <= 512,
+            "task completion sink output is not bounded: {} bytes",
+            output.len()
+        );
     }
 
     #[test]

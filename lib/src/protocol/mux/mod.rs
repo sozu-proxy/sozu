@@ -105,7 +105,9 @@ macro_rules! log_context_lite {
 ///   `[session req cluster backend]` bracket as RUSTLS/PIPE/TCP followed
 ///   by a `Session(...)` block, so MUX lines emitted from variant match
 ///   arms stay filterable by session ULID or request ULID. Mirrors
-///   `router.rs:log_module_context!($http_context)` (see there).
+///   `router.rs:log_module_context!($http_context)` (see there). Custom
+///   methods render only their byte length, and authority renders only its
+///   byte length.
 macro_rules! log_module_context {
     () => {{
         let (open, reset, _, _, _) = ansi_palette();
@@ -116,7 +118,7 @@ macro_rules! log_module_context {
         let http_ctx: &HttpContext = &$http_context;
         let ctx = http_ctx.log_context();
         format!(
-            "{gray}{ctx}{reset}\t{open}MUX{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend:?}{reset}, {gray}method{reset}={white}{method:?}{reset}, {gray}authority{reset}={white}{authority:?}{reset})\t >>>",
+            "{gray}{ctx}{reset}\t{open}MUX{reset}\t{grey}Session{reset}({gray}frontend{reset}={white}{frontend:?}{reset}, {gray}method{reset}={white}{method:?}{reset}, {gray}authority_bytes{reset}={white}{authority_bytes:?}{reset})\t >>>",
             open = open,
             reset = reset,
             grey = grey,
@@ -125,7 +127,7 @@ macro_rules! log_module_context {
             ctx = ctx,
             frontend = http_ctx.session_address,
             method = http_ctx.method,
-            authority = http_ctx.authority,
+            authority_bytes = http_ctx.authority.as_ref().map(String::len),
         )
     }};
 }

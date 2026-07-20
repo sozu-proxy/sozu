@@ -59,32 +59,6 @@ macro_rules! log_context {
     }};
 }
 
-/// Maximum number of client-offered ALPN protocols the routed info-log
-/// (`handle_output`'s `Output::Routed` arm) renders individually. The wire
-/// parser (`tcp_preread::parser`) already bounds a ClientHello's ALPN offer
-/// to roughly 32K entries within a 64 KiB extension -- far fewer under the
-/// default 16 KiB preread cap -- but this `info!` is always compiled in
-/// (unlike `debug!`/`trace!`), so a hostile hello offering thousands of
-/// tiny protocol names could still make one log line allocate/render
-/// thousands of entries.
-const LOGGED_ALPN_LIMIT: usize = 8;
-
-/// Render at most [`LOGGED_ALPN_LIMIT`] client-offered ALPN protocols as a
-/// debug-list, appending a `"(+N more)"` suffix when the offer was
-/// truncated.
-fn render_alpn_for_log(alpn: &[Vec<u8>]) -> String {
-    let shown: Vec<String> = alpn
-        .iter()
-        .take(LOGGED_ALPN_LIMIT)
-        .map(|p| String::from_utf8_lossy(p).into_owned())
-        .collect();
-    if alpn.len() > LOGGED_ALPN_LIMIT {
-        format!("{shown:?} (+{} more)", alpn.len() - LOGGED_ALPN_LIMIT)
-    } else {
-        format!("{shown:?}")
-    }
-}
-
 /// Captured exactly once, when [`Output::Routed`] first fires. The core's
 /// own `decided` latch guarantees the SAME terminal verdict replays on every
 /// subsequent `handle_input` call, so [`SniPreread::outcome`] never changes
@@ -352,12 +326,17 @@ impl<Front: SocketHandler> SniPreread<Front> {
                     self.outcome.is_none(),
                     "a route must be captured at most once per SniPreread lifetime"
                 );
+                let alpn_bytes = alpn
+                    .iter()
+                    .map(Vec::len)
+                    .fold(0usize, usize::saturating_add);
                 info!(
-                    "{} SNI preread routed to cluster {} (sni={:?}, alpn={})",
+                    "{} SNI preread routed (cluster_id_bytes={}, sni_bytes={}, alpn_count={}, alpn_bytes={})",
                     log_context!(self),
-                    cluster,
-                    sni,
-                    render_alpn_for_log(&alpn)
+                    cluster.len(),
+                    sni.len(),
+                    alpn.len(),
+                    alpn_bytes,
                 );
                 incr!(names::tcp::sni_preread::ROUTED);
                 // Arm backend-writable interest now so the FIRST backend
@@ -458,35 +437,76 @@ mod tests {
         }
     }
 
-    // ---- routed info-log ALPN rendering bound (sozu-proxy/sozu#1290) ----
-
     #[test]
-    fn render_alpn_for_log_shows_everything_within_the_limit() {
-        let alpn: Vec<Vec<u8>> = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        assert_eq!(render_alpn_for_log(&alpn), r#"["h2", "http/1.1"]"#);
-    }
+    fn routed_runtime_log_bounds_cluster_sni_and_alpn() {
+        const CLUSTER_SECRET: &str = "TCP_PREREAD_CLUSTER_SECRET_SENTINEL";
+        const SNI_SECRET: &str = "TCP_PREREAD_SNI_SECRET_SENTINEL";
+        const ALPN_SECRET: &str = "TCP_PREREAD_ALPN_SECRET_SENTINEL";
 
-    #[test]
-    fn render_alpn_for_log_truncates_past_the_limit_with_a_count_suffix() {
-        let alpn: Vec<Vec<u8>> = (0..(LOGGED_ALPN_LIMIT + 5))
-            .map(|i| i.to_string().into_bytes())
-            .collect();
-        let rendered = render_alpn_for_log(&alpn);
+        let cluster = format!("{CLUSTER_SECRET}{}", "x".repeat(4096));
+        let sni = format!("{SNI_SECRET}{}", "x".repeat(4096));
+        let alpn = format!("{ALPN_SECRET}{}", "x".repeat(4096)).into_bytes();
+        let cluster_len = cluster.len();
+        let sni_len = sni.len();
+        let alpn_len = alpn.len();
+        let output = crate::capture_test_logs(move || {
+            use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+
+            use mio::net::TcpStream as MioTcpStream;
+
+            use crate::pool::Pool;
+
+            let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+            let address = listener.local_addr().expect("listener address");
+            let _client = StdTcpStream::connect(address).expect("connect test client");
+            let (server, _) = listener.accept().expect("accept test server");
+            server.set_nonblocking(true).expect("server nonblocking");
+            let mut pool = Pool::with_capacity(1, 1, 16 * 1024);
+            let frontend_buffer = pool.checkout().expect("frontend buffer");
+            let mut preread = SniPreread::new(
+                MioTcpStream::from_std(server),
+                Token(0),
+                Ulid::generate(),
+                frontend_buffer,
+                16 * 1024,
+            );
+
+            assert_eq!(
+                preread.handle_output(Output::Routed {
+                    cluster,
+                    content_offset: 0,
+                    proxy_source: None,
+                    sni: sni.clone(),
+                    alpn: vec![alpn],
+                    matched_sni_pattern: sni,
+                    matched_alpn: AlpnMatcher::Any,
+                }),
+                SessionResult::Continue
+            );
+        });
+
+        for secret in [CLUSTER_SECRET, SNI_SECRET, ALPN_SECRET] {
+            assert!(
+                !output.contains(secret),
+                "SNI preread routed log leaked {secret}: {output}"
+            );
+        }
+        for metadata in [
+            format!("cluster_id_bytes={cluster_len}"),
+            format!("sni_bytes={sni_len}"),
+            "alpn_count=1".to_owned(),
+            format!("alpn_bytes={alpn_len}"),
+        ] {
+            assert!(
+                output.contains(&metadata),
+                "SNI preread routed log omitted {metadata}: {output}"
+            );
+        }
         assert!(
-            rendered.ends_with("(+5 more)"),
-            "expected a truncation suffix for 5 entries past the limit, got {rendered:?}"
+            output.len() <= 512,
+            "SNI preread routed log is not bounded: {} bytes",
+            output.len()
         );
-        // Exactly `LOGGED_ALPN_LIMIT` entries rendered individually before
-        // the suffix -- not the full (limit + 5).
-        let shown_count = alpn
-            .iter()
-            .take(LOGGED_ALPN_LIMIT)
-            .filter(|p| {
-                let s = String::from_utf8_lossy(p).into_owned();
-                rendered.contains(&format!("{s:?}"))
-            })
-            .count();
-        assert_eq!(shown_count, LOGGED_ALPN_LIMIT);
     }
 
     #[test]

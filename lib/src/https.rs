@@ -140,6 +140,14 @@ macro_rules! log_context {
     }};
 }
 
+fn successful_tls_handshake_summary(sni: Option<&str>, alpn: Option<&str>) -> String {
+    format!(
+        "successful TLS handshake (sni_bytes={:?}, alpn_bytes={:?})",
+        sni.map(str::len),
+        alpn.map(str::len),
+    )
+}
+
 pub struct HttpsSession {
     configured_backend_timeout: Duration,
     configured_connect_timeout: Duration,
@@ -410,10 +418,9 @@ impl HttpsSession {
         let alpn = handshake.session.alpn_protocol();
         let alpn = alpn.and_then(|alpn| from_utf8(alpn).ok());
         debug!(
-            "{} successful TLS handshake with, received: {:?} {:?}",
+            "{} {}",
             log_context!(self),
-            sni_owned,
-            alpn
+            successful_tls_handshake_summary(sni_owned.as_deref(), alpn)
         );
 
         // Reject clients that fail to negotiate `h2` when the listener is
@@ -447,9 +454,9 @@ impl HttpsSession {
                 // sum of the labelled buckets.
                 incr!(names::https::ALPN_REJECTED_UNSUPPORTED);
                 error!(
-                    "{} unsupported ALPN protocol: {}",
+                    "{} unsupported ALPN protocol: alpn_bytes={}",
                     log_context!(self),
-                    other
+                    other.len()
                 );
                 return None;
             }
@@ -2736,6 +2743,39 @@ mod tests {
 
     use super::*;
     use crate::router::{MethodRule, PathRule, Route, Router, pattern_trie::TrieNode};
+
+    #[test]
+    fn successful_tls_handshake_log_bounds_sni_and_alpn() {
+        const SNI_SECRET: &str = "HTTPS_HANDSHAKE_SNI_SECRET_SENTINEL";
+        const ALPN_SECRET: &str = "HTTPS_HANDSHAKE_ALPN_SECRET_SENTINEL";
+
+        let sni = format!("{SNI_SECRET}{}", "x".repeat(4096));
+        let alpn = format!("{ALPN_SECRET}{}", "x".repeat(4096));
+        let sni_len = sni.len();
+        let alpn_len = alpn.len();
+        let output = successful_tls_handshake_summary(Some(&sni), Some(&alpn));
+
+        for secret in [SNI_SECRET, ALPN_SECRET] {
+            assert!(
+                !output.contains(secret),
+                "successful TLS handshake log leaked {secret}: {output}"
+            );
+        }
+        for metadata in [
+            format!("sni_bytes=Some({sni_len})"),
+            format!("alpn_bytes=Some({alpn_len})"),
+        ] {
+            assert!(
+                output.contains(&metadata),
+                "successful TLS handshake log omitted {metadata}: {output}"
+            );
+        }
+        assert!(
+            output.len() <= 512,
+            "successful TLS handshake log is not bounded: {} bytes",
+            output.len()
+        );
+    }
 
     fn proxy_with_certificate_domain(domain: String) -> HttpsProxy {
         let crate::testing::ServerParts {

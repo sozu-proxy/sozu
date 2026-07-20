@@ -3334,6 +3334,42 @@ mod accept_telemetry_tests {
 }
 
 #[cfg(test)]
+mod state_error_log_tests {
+    use sozu_command::state::StateError;
+
+    #[test]
+    fn worker_state_dispatch_error_sink_bounds_the_reason() {
+        const REASON_SECRET: &str = "WORKER_STATE_ERROR_REASON_SECRET_SENTINEL";
+
+        let reason = format!("{REASON_SECRET}{}", "x".repeat(4096));
+        let reason_len = reason.len();
+        let output = crate::capture_test_logs(move || {
+            let error = StateError::InvalidTcpFrontend {
+                address: "127.0.0.1:443"
+                    .parse()
+                    .expect("test TCP frontend address must parse"),
+                reason,
+            };
+            error!("Could not execute order on config state: {}", error);
+        });
+
+        assert!(
+            !output.contains(REASON_SECRET),
+            "worker state-error sink leaked the reason: {output}"
+        );
+        assert!(
+            output.contains(&format!("reason_bytes={reason_len}")),
+            "worker state-error sink omitted bounded reason metadata: {output}"
+        );
+        assert!(
+            output.len() <= 512,
+            "worker state-error sink is not bounded: {} bytes",
+            output.len()
+        );
+    }
+}
+
+#[cfg(test)]
 mod eviction_tests {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
