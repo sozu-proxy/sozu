@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### ✨ Added
+
+- **`feat(https)`: mutual TLS (client certificate authentication) on HTTPS listeners** ([#1299](https://github.com/sozu-proxy/sozu/issues/1299)).
+  An HTTPS listener can now require or request a client certificate instead of
+  always disabling client auth. A new per-listener `client_auth` mode
+  (`none` / `optional` / `required`) drives the rustls `WebPkiClientVerifier`:
+  `required` aborts the handshake unless the client presents a certificate
+  chaining to a configured trusted CA, `optional` requests one but still
+  accepts connections that present none (a presented certificate must still
+  validate). New listener fields carry the PEM-encoded trusted CA bundle
+  (`client_ca_certificates`) and optional revocation lists (`client_ca_crls`).
+  Absent config decodes to `none`, preserving the previous behavior and keeping
+  existing state files loadable (new protobuf fields are appended, none
+  reordered, and default to empty when missing from an older record).
+  Configuration fails closed: an unknown `client_auth` value, a non-`none` mode
+  with no trusted CA, an unreadable CA/CRL file, a CA or CRL entry that yields no
+  certificate/revocation list, or an mTLS field set on a non-HTTPS listener is
+  rejected rather than silently accepting unauthenticated or unrevoked clients.
+  CRL expiration is enforced (a CRL past its `nextUpdate` is rejected instead of
+  trusted). In `none` mode CA/CRL paths are ignored entirely, so a stale path
+  never blocks the configuration from loading. `HttpsListenerConfig` gains the
+  `ClientAuthMode` enum and the three fields; `ListenerError::ClientAuth` and
+  `ConfigError::ClientAuthOnNonHttps` report misconfigured input.
+
 ### 🔐 Security
 
 - **`fix(command)`: redact TLS certificate and private-key material from `Debug` output.**
