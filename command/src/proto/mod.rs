@@ -538,6 +538,20 @@ impl std::fmt::Debug for command::HttpsListenerConfig {
             .field("hsts", &self.hsts)
             .field("h2_max_header_fields", &self.h2_max_header_fields)
             .field("h2_stream_refusal_percent", &self.h2_stream_refusal_percent)
+            .field("client_auth", &self.client_auth)
+            .field(
+                "client_ca_certificates_count",
+                &self.client_ca_certificates.len(),
+            )
+            .field(
+                "client_ca_certificates_len",
+                &total_string_len(&self.client_ca_certificates),
+            )
+            .field("client_ca_crls_count", &self.client_ca_crls.len())
+            .field(
+                "client_ca_crls_len",
+                &total_string_len(&self.client_ca_crls),
+            )
             .finish()
     }
 }

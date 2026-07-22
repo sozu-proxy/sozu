@@ -83,6 +83,11 @@ pub fn main() {
         // a record written before it carries no `mode`, which must load as
         // `HTTP` (0), the only probe those records could describe.
         .field_attribute("HealthCheckConfig.mode", "#[serde(default)]")
+        .field_attribute(
+            "HttpsListenerConfig.client_ca_certificates",
+            "#[serde(default)]",
+        )
+        .field_attribute("HttpsListenerConfig.client_ca_crls", "#[serde(default)]")
         .skip_debug([
             "CertificateAndKey",
             "CertificateSummary",
