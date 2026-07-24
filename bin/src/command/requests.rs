@@ -27,12 +27,13 @@ use sozu_command_lib::{
     parser::parse_several_requests,
     proto::command::{
         AggregatedMetrics, AvailableMetrics, CertificatesWithFingerprints, ClusterHashes,
-        ClusterInformations, Event, EventKind, FrontendFilters, HardStop, MetricDetail,
-        MetricDetailStatus, MetricsConfiguration, QueryCertificatesFilters, QueryHealthChecks,
-        QueryMetricsOptions, Request, ResponseContent, ResponseStatus, RunState, SetMetricDetail,
-        SoftStop, Status, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
-        UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest,
-        WorkerResponses, request::RequestType, response_content::ContentType,
+        ClusterInformations, Event, EventKind, FrontendFilters, HardStop, ListenerType,
+        MetricDetail, MetricDetailStatus, MetricsConfiguration, QueryCertificatesFilters,
+        QueryHealthChecks, QueryMetricsOptions, RemoveListener, Request, ResponseContent,
+        ResponseStatus, RunState, SetMetricDetail, SoftStop, Status, UpdateHttpListenerConfig,
+        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerInfo,
+        WorkerInfos, WorkerRequest, WorkerResponses, request::RequestType,
+        response_content::ContentType,
     },
     sd_notify,
 };
@@ -1993,6 +1994,12 @@ struct WorkerTask {
     /// the audit would repopulate one counter, and the "wipes everything"
     /// contract would silently drift by exactly one row per clear.
     clear_master_metrics_on_finish: bool,
+    /// Inverse of the request (sozu#1301 rollback safety-net), computed by
+    /// [`compute_rollback`] before fan-out. When EVERY worker rejects the
+    /// request, [`WorkerTask::on_finish`] applies this to the main process's
+    /// `ConfigState` to revert the committed change. `None` for requests
+    /// without a defined inverse (they keep today's best-effort behavior).
+    rollback: Option<Request>,
 }
 
 /// Carry the per-verb metadata needed to emit a completion-time audit
@@ -2068,6 +2075,50 @@ fn validate_listener_request(request: &RequestType) -> Result<(), String> {
         _ => return Ok(()),
     }
     .map_err(|listener_error| listener_error.to_string())
+}
+
+/// The inverse of a mutating request, used by the fan-out rollback safety-net
+/// (sozu#1301, defense-in-depth on top of `validate_listener_request`).
+///
+/// When the main process commits a request to its `ConfigState` and fans it
+/// out, but **every** worker rejects it, [`WorkerTask::on_finish`] applies this
+/// inverse to revert the main process's own state — so its authoritative
+/// `ConfigState` (the source of truth replayed into restarted or upgraded
+/// workers) never permanently holds an `Add` the whole fleet refused. Because
+/// the trigger is a *unanimous* rejection, no worker applied the change, so
+/// reverting the main process alone reconverges master and workers — there is
+/// nothing to compensate on the worker side.
+///
+/// Only requests whose inverse is unambiguous WITHOUT capturing the prior value
+/// are covered: the non-upsert `Add` verbs — every listener type (inverse
+/// `RemoveListener`) and HTTP/HTTPS frontends (inverse is the same payload under
+/// the `Remove` variant). Upsert verbs (`AddCluster`, `AddBackend`, which
+/// replace a prior value in place) and certificates would need the prior value
+/// captured to revert correctly, so they are deliberately NOT covered and keep
+/// today's best-effort behavior; every other request returns `None`.
+fn compute_rollback(request: &RequestType) -> Option<Request> {
+    let inverse = match request {
+        RequestType::AddHttpListener(config) => RequestType::RemoveListener(RemoveListener {
+            address: config.address,
+            proxy: ListenerType::Http.into(),
+        }),
+        RequestType::AddHttpsListener(config) => RequestType::RemoveListener(RemoveListener {
+            address: config.address,
+            proxy: ListenerType::Https.into(),
+        }),
+        RequestType::AddTcpListener(config) => RequestType::RemoveListener(RemoveListener {
+            address: config.address,
+            proxy: ListenerType::Tcp.into(),
+        }),
+        RequestType::AddUdpListener(config) => RequestType::RemoveListener(RemoveListener {
+            address: config.address,
+            proxy: ListenerType::Udp.into(),
+        }),
+        RequestType::AddHttpFrontend(front) => RequestType::RemoveHttpFrontend(front.clone()),
+        RequestType::AddHttpsFrontend(front) => RequestType::RemoveHttpsFrontend(front.clone()),
+        _ => return None,
+    };
+    Some(inverse.into())
 }
 
 pub fn worker_request(
@@ -2382,6 +2433,12 @@ pub fn worker_request(
 
     client.return_processing("Processing worker request...");
 
+    // sozu#1301 rollback safety-net: compute the inverse of this request now,
+    // while we still hold it, so `on_finish` can revert the main-process state
+    // if every worker rejects the change. `None` for verbs without a defined
+    // inverse (they keep today's best-effort behavior).
+    let rollback = request.request_type.as_ref().and_then(compute_rollback);
+
     server.scatter(
         request,
         Box::new(WorkerTask {
@@ -2392,6 +2449,7 @@ pub fn worker_request(
             inline_audit,
             metric_detail_audit: metric_detail_audit_completion,
             clear_master_metrics_on_finish,
+            rollback,
         }),
         Timeout::Default,
         None,
@@ -2558,6 +2616,35 @@ impl GatheringTask for WorkerTask {
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).clear_local();
             });
+        }
+
+        // sozu#1301 rollback safety-net: if the change committed to ConfigState
+        // was rejected by EVERY worker it was scattered to (a unanimous,
+        // definitive failure — no timeout, at least one worker answered, and
+        // none accepted it), revert the main process's own state with the
+        // precomputed inverse. Because no worker applied the change, reverting
+        // the main process alone reconverges the fleet; there is nothing to
+        // compensate worker-side. A mixed result (some workers accepted) is
+        // deliberately left as-is to avoid diverging the main process from the
+        // workers that did accept.
+        if !timed_out
+            && expected > 0
+            && ok == 0
+            && errors > 0
+            && let Some(rollback) = self.rollback.as_ref()
+        {
+            match server.state.dispatch(rollback) {
+                Ok(()) => warn!(
+                    "sozu#1301 rollback: reverted a change from main-process state after all {} \
+                     worker(s) rejected it",
+                    expected
+                ),
+                Err(revert_error) => error!(
+                    "sozu#1301 rollback: could not revert main-process state after unanimous \
+                     worker rejection: {}",
+                    revert_error
+                ),
+            }
         }
 
         if errors > 0 || timed_out {
@@ -4260,6 +4347,40 @@ mod listener_validation_tests {
         assert!(
             validate_listener_request(&request).is_err(),
             "an unbuildable HTTP listener must be rejected before commit"
+        );
+    }
+
+    #[test]
+    fn rollback_inverse_targets_the_same_listener_and_skips_uncovered_verbs() {
+        use sozu_command_lib::proto::command::ListenerType;
+
+        // sozu#1301 rollback safety-net: a listener add inverts to a
+        // RemoveListener for the SAME address and proxy type, so a unanimous
+        // worker rejection can revert the main-process commit.
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let add = RequestType::AddHttpsListener(https_config(address, true));
+        let inverse = super::compute_rollback(&add).expect("a listener add must have an inverse");
+        match inverse.request_type {
+            Some(RequestType::RemoveListener(remove)) => {
+                assert_eq!(
+                    remove.proxy,
+                    ListenerType::Https as i32,
+                    "inverse must target the HTTPS listener type"
+                );
+                assert_eq!(
+                    remove.address, address,
+                    "inverse must target the same address"
+                );
+            }
+            other => panic!("expected a RemoveListener inverse, got {other:?}"),
+        }
+
+        // Upsert Add verbs (AddCluster/AddBackend) and non-add verbs have no
+        // simple prior-value-free inverse and are deliberately uncovered — they
+        // keep today's best-effort behavior rather than risk a wrong revert.
+        assert!(
+            super::compute_rollback(&RequestType::Logging("info".to_owned())).is_none(),
+            "a non-add verb must have no rollback inverse"
         );
     }
 }
