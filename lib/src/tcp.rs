@@ -2065,6 +2065,18 @@ impl TcpListener {
         })
     }
 
+    /// Validate that a worker can build this TCP listener configuration WITHOUT
+    /// constructing the full listener or binding a socket. TCP listener
+    /// construction has no fallible config today (no rustls context, no answer
+    /// templates; a bad bind surfaces later as an `ActivateListener` failure),
+    /// so this currently always succeeds. It exists for surface parity with the
+    /// HTTP/HTTPS validators the main process calls before committing an
+    /// `Add*Listener` to `ConfigState` and fanning it out (sozu#1301), and is
+    /// the hook for any future TCP-config validation.
+    pub fn validate_config(_config: &TcpListenerConfig) -> Result<(), ListenerError> {
+        Ok(())
+    }
+
     /// Build the [`PrereadConfig`] this listener's `SniPreread` sessions
     /// feed to [`crate::protocol::tcp_preread::SniPrereadCore::handle_input`].
     /// `routes`/`inbound_proxy`/`timeout` come straight from the listener

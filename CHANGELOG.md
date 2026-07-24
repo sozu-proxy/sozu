@@ -20,6 +20,21 @@
   `RetrieveClusterError::SniAuthorityMismatch` variant fields, `RequestHttpFrontend::Display`, and
   certificate-query response payloads remain unchanged.
 
+### 🐛 Fixed
+
+- **`fix(command)`: validate a listener configuration before committing it to the main-process
+  state** ([#1301](https://github.com/sozu-proxy/sozu/issues/1301)). An HTTPS listener whose
+  configuration the worker cannot build (an unusable TLS version/cipher set, or an unparseable
+  answer template) was recorded in the main process's `ConfigState` before the worker rejected it,
+  reserving the address; a corrected reload was then refused with `StateError::Exists` and never
+  reached the workers, so the listener stayed down until an explicit `RemoveListener` or a restart.
+  The main process now validates every `Add{Http,Https,Tcp,Udp}Listener` the way the worker builds
+  it — reusing the worker's own construction check, before `ConfigState` is mutated and fanned out —
+  so an invalid listener never reserves its address and a corrected reload applies cleanly. Invalid
+  listeners in the static config or a loaded state file are likewise skipped without reserving their
+  address. The `StateError::Exists` message now also points at the remedy (remove it first, or apply
+  the corresponding update, instead of re-adding).
+
 ## 2.2.0 - 2026-07-16
 
 Minor release: TCP passthrough routing by TLS SNI + ALPN, HTTP/1
