@@ -33,7 +33,11 @@
   so an invalid listener never reserves its address and a corrected reload applies cleanly. Invalid
   listeners in the static config or a loaded state file are likewise skipped without reserving their
   address. The `StateError::Exists` message now also points at the remedy (remove it first, or apply
-  the corresponding update, instead of re-adding).
+  the corresponding update, instead of re-adding). As defense-in-depth, when a committed change is
+  rejected by *every* worker it was fanned out to, the main process now reverts its own `ConfigState`
+  with the inverse request (listener and HTTP/HTTPS-frontend adds), so its authoritative state — the
+  one replayed into restarted and upgraded workers — never permanently holds an add the whole fleet
+  refused.
 
 ## 2.2.0 - 2026-07-16
 
