@@ -47,7 +47,10 @@ pub enum StateError {
     UndispatchableRequest,
     #[error("Did not find {kind:?} with address or id_bytes={}", .id.len())]
     NotFound { kind: ObjectKind, id: String },
-    #[error("{kind:?} with id_bytes={} already exists", .id.len())]
+    #[error(
+        "{kind:?} with id_bytes={} already exists; remove it first, or apply the corresponding update, instead of re-adding it",
+        .id.len()
+    )]
     Exists { kind: ObjectKind, id: String },
     #[error("Wrong field value: {0}")]
     WrongFieldValue(UnknownEnumValue),
