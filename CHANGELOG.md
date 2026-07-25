@@ -39,6 +39,13 @@
   one replayed into restarted and upgraded workers — never permanently holds an add the whole fleet
   refused.
 
+- **`fix(command)`: report a fan-out timeout as a failure, not a success.** `handle_finishing_task`
+  passed a hard-coded `timed_out = false` into every task completion handler, so a command whose
+  worker fan-out timed out was reported to the operator as `Successfully applied request to all
+  workers` and its audit line mislabeled the `FanoutStatus`/`result`. The real `timed_out` flag is
+  now forwarded, so a timed-out command correctly returns a failure (and the `#1301` rollback
+  safety-net's timeout guard now engages as intended).
+
 ## 2.2.0 - 2026-07-16
 
 Minor release: TCP passthrough routing by TLS SNI + ALPN, HTTP/1

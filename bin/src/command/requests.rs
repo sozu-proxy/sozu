@@ -2266,18 +2266,24 @@ pub fn worker_request(
     // Committing an unbuildable listener first reserves its address, and the
     // corrected reload is then refused with StateError::Exists. Validation is
     // read-only on state and runs first; dispatch happens only if it passes.
+    // Tag the two failure classes distinctly for the audit taxonomy: a rejected
+    // `validate_listener_request` is operator-invalid *input* (bad TLS
+    // versions/ciphers or an unparseable answer template) → `InvalidInput`
+    // (same class as the `set_logging_level` filter check); a rejected
+    // `state.dispatch` is a genuine state conflict → `DispatchError`.
     let apply_result = request
         .request_type
         .as_ref()
         .map_or(Ok(()), validate_listener_request)
+        .map_err(|reason| (AuditErrorCode::InvalidInput, reason))
         .and_then(|()| {
             server
                 .state
                 .dispatch(&request)
-                .map_err(|error| error.to_string())
+                .map_err(|error| (AuditErrorCode::DispatchError, error.to_string()))
         });
 
-    if let Err(reason) = apply_result {
+    if let Err((error_code, reason)) = apply_result {
         // INVARIANT: neither a rejected validation nor a rejected dispatch may
         // mutate persisted state — validation never touches it, and a rejected
         // dispatch is a guaranteed no-op (see ConfigState::dispatch).
@@ -2287,7 +2293,7 @@ pub fn worker_request(
             "a rejected validation or dispatch must leave ConfigState byte-identical (no partial apply)"
         );
         if let Some(mut entry) = audit {
-            entry.extras.error_code = Some(AuditErrorCode::DispatchError);
+            entry.extras.error_code = Some(error_code);
             entry.extras.reason = Some(reason.clone());
             entry.extras.elapsed_ms = Some(elapsed_ms(started_at));
             entry.extras.request_sha256 = Some(request_sha256.clone());
@@ -2304,7 +2310,7 @@ pub fn worker_request(
                 AuditResult::Err,
                 AuditExtras {
                     elapsed_ms: Some(elapsed_ms(started_at)),
-                    error_code: Some(AuditErrorCode::DispatchError),
+                    error_code: Some(error_code),
                     reason: Some(reason.clone()),
                     ..Default::default()
                 },
@@ -2314,7 +2320,7 @@ pub fn worker_request(
             let target = fields.target.clone();
             let mut extras = fields.into_extras();
             extras.elapsed_ms = Some(elapsed_ms(started_at));
-            extras.error_code = Some(AuditErrorCode::DispatchError);
+            extras.error_code = Some(error_code);
             extras.reason = Some(reason.clone());
             audit_emit_inline(
                 server,
