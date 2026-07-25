@@ -692,7 +692,14 @@ impl CommandHub {
             .job
             .client_token()
             .and_then(|token| self.clients.get_mut(&token));
-        task.job.on_finish(&mut self.server, client, false);
+        // Forward the real `timed_out` the two call sites pass (has_finished →
+        // false, timeout expiry → true). A previous hard-coded `false` made
+        // `timed_out` always false in every `on_finish`: it left the audit
+        // `FanoutStatus::Timeout`/`result` branches unreachable (a timed-out
+        // command reported success) and made `WorkerTask`'s `!timed_out`
+        // rollback guard inert (sozu#1301). Pinned by
+        // `handle_finishing_task_forwards_timed_out_flag`.
+        task.job.on_finish(&mut self.server, client, timed_out);
         self.in_flight
             .retain(|_, in_flight_task_id| *in_flight_task_id != task_id);
         // POST-CONDITION: every in-flight entry pointing at this finished task
@@ -1541,6 +1548,68 @@ mod tests {
         let unix_listener = UnixListener::bind(&socket_path).expect("Could not bind socket");
         Server::new(unix_listener, Config::default(), "sozu".to_owned())
             .expect("Could not create server")
+    }
+
+    fn create_test_hub() -> CommandHub {
+        let dir = tempfile::tempdir().expect("Could not create temp dir");
+        let socket_path = dir.path().join("test.sock");
+        let unix_listener = UnixListener::bind(&socket_path).expect("Could not bind socket");
+        CommandHub::new(unix_listener, Config::default(), "sozu".to_owned())
+            .expect("Could not create command hub")
+    }
+
+    /// Regression (sozu#1301): `handle_finishing_task` must forward its
+    /// `timed_out` argument to `GatheringTask::on_finish`, not a hard-coded
+    /// literal. A previous `false` literal made `timed_out` always false in
+    /// every `on_finish` — disabling `WorkerTask`'s `!timed_out` rollback guard
+    /// and leaving the audit `FanoutStatus::Timeout`/`result` branches
+    /// unreachable (a timed-out command reported success).
+    #[test]
+    fn handle_finishing_task_forwards_timed_out_flag() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        #[derive(Debug)]
+        struct RecordingTask {
+            gatherer: DefaultGatherer,
+            seen: Rc<Cell<Option<bool>>>,
+        }
+        impl GatheringTask for RecordingTask {
+            fn client_token(&self) -> Option<Token> {
+                None
+            }
+            fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+                &mut self.gatherer
+            }
+            fn on_finish(
+                self: Box<Self>,
+                _server: &mut Server,
+                _client: &mut OptionalClient,
+                timed_out: bool,
+            ) {
+                self.seen.set(Some(timed_out));
+            }
+        }
+
+        for expected in [false, true] {
+            let mut hub = create_test_hub();
+            let seen = Rc::new(Cell::new(None));
+            let task = TaskContainer {
+                job: Box::new(RecordingTask {
+                    gatherer: DefaultGatherer::default(),
+                    seen: seen.clone(),
+                }),
+                timeout: None,
+            };
+            // task_id 0 is fine: `handle_finishing_task` takes the task by value
+            // and only uses the id to purge in-flight entries (none exist here).
+            hub.handle_finishing_task(0, task, expected);
+            assert_eq!(
+                seen.get(),
+                Some(expected),
+                "handle_finishing_task must forward timed_out={expected} to on_finish"
+            );
+        }
     }
 
     #[derive(Debug)]
