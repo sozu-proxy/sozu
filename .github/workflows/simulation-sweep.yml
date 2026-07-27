@@ -86,8 +86,8 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - name: Install rust 1.91.0
-        uses: dtolnay/rust-toolchain@1.91.0
+      - name: Install rust 1.93.1
+        uses: dtolnay/rust-toolchain@1.93.1
 
       - name: Cache cargo target
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
@@ -128,8 +128,8 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
-      - name: Install rust 1.91.0
-        uses: dtolnay/rust-toolchain@1.91.0
+      - name: Install rust 1.93.1
+        uses: dtolnay/rust-toolchain@1.93.1
 
       - name: Cache cargo target
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
@@ -173,8 +173,8 @@ jobs:
           workspaces: . -> target/
 
       # `+nightly` is REQUIRED here: the repo's `rust-toolchain` file pins
-      # 1.91.0, and that directory override beats the nightly default installed
-      # above. Without the explicit toolchain, `cargo install` runs under 1.91.0
+      # 1.93.1, and that directory override beats the nightly default installed
+      # above. Without the explicit toolchain, `cargo install` runs under 1.93.1
       # and cargo-fuzz's locked dep tree (cargo-platform 0.3.3, rust-version
       # 1.91) fails the MSRV gate. The fuzz step below uses `cargo +nightly`.
       - name: Install cargo-fuzz

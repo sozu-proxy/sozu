@@ -113,7 +113,7 @@ Notes:
 
 ## 3. Running the suites
 
-All commands assume `protoc` is installed and the `1.91.0` toolchain pinned by
+All commands assume `protoc` is installed and the `1.93.1` toolchain pinned by
 `rust-toolchain` (CI exercises stable/beta/nightly on top of that).
 
 ### Full local validation chain

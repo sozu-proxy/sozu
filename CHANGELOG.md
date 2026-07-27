@@ -151,7 +151,7 @@ fixes across the pipe and `splice` paths.
 ### 🤖 CI
 
 - **`fix(ci)`: the release build uses the pinned MSRV toolchain.** The
-  per-target release job installs Rust 1.91.0 with its matrix target, matching
+  per-target release job installs Rust 1.93.1 with its matrix target, matching
   the `rust-toolchain` pin (it still requested 1.88.0 after the MSRV bump).
 - **`fix(ci)`: the release preflight validates every crate version.** The
   drift check covered `bin`/`lib`/`command`/`e2e` only, while `sim/` (a
@@ -212,7 +212,7 @@ fixes across the pipe and `splice` paths.
 
 ## 2.1.1 - 2026-07-10
 
-Patch release: dependency updates, Rust 1.91.0 MSRV alignment, deterministic
+Patch release: dependency updates, Rust 1.93.1 MSRV alignment, deterministic
 simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
 
 ### ✨ Added
@@ -233,7 +233,7 @@ simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
 
 ### 🔄 Changed
 
-- **MSRV bumped 1.88.0 → 1.91.0** (`rust-toolchain` + every crate's
+- **MSRV bumped 1.88.0 → 1.93.1** (`rust-toolchain` + every crate's
   `rust-version`). Required by `moonpool-sim`, which uses `Duration::from_hours`
   /`from_mins` — const-stable only since Rust 1.91. moonpool also needs
   `--cfg tokio_unstable` (it seeds tokio's runtime RNG via the unstable `RngSeed`
@@ -263,7 +263,7 @@ simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
   and the nightly `simulation-sweep` workflow goes deep — seed-bounded to fit the
   45-min cap, since moonpool's per-seed tokio-runtime construction is ~100× slower
   per seed-step than the former pure-sync handmade swarm. All CI toolchain pins
-  move 1.88.0 → 1.91.0.
+  move 1.88.0 → 1.93.1.
 
 ### 🔐 Security
 

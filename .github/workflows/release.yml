@@ -164,9 +164,9 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.tag }}
 
-      - name: Install rust 1.91.0
+      - name: Install rust 1.93.1
         # Release builds must match the MSRV pinned in `rust-toolchain`.
-        uses: dtolnay/rust-toolchain@1.91.0
+        uses: dtolnay/rust-toolchain@1.93.1
         with:
           targets: ${{ matrix.target }}
 

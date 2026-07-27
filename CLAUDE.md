@@ -1,4 +1,4 @@
-Sōzu — a hot-reconfigurable HTTP/1.x + HTTP/2 reverse proxy (AGPL-3.0). Rust 2024 (MSRV 1.91.0, matching the `1.91.0` toolchain pinned in `rust-toolchain`; bumped from 1.88.0 for the `sim/` crate's moonpool-sim dependency). Upstream: `github.com/sozu-proxy/sozu`. The H2 multiplexer rewrite landed on `main` via PR #1209 (merged commit `98c56a4c`); subsequent hardening (parser, command IPC, metrics, audit fixes) builds on it.
+Sōzu — a hot-reconfigurable HTTP/1.x + HTTP/2 reverse proxy (AGPL-3.0). Rust 2024 (MSRV 1.93.1, matching the `1.93.1` toolchain pinned in `rust-toolchain`; bumped from 1.88.0 for the `sim/` crate's moonpool-sim dependency). Upstream: `github.com/sozu-proxy/sozu`. The H2 multiplexer rewrite landed on `main` via PR #1209 (merged commit `98c56a4c`); subsequent hardening (parser, command IPC, metrics, audit fixes) builds on it.
 
 This file is the primary agent instruction for the repo. It is symlinked to `AGENTS.md` so OpenAI Codex picks up the same content. Anthropic's global `~/.claude/CLAUDE.md` conventions (worktree-first, GPG sign-off, commitizen style) still apply and are not duplicated here.
 
@@ -147,7 +147,7 @@ Crypto-provider features (`crypto-ring`, `crypto-aws-lc-rs`, `crypto-openssl`, `
 # Gotchas
 
 - **`protoc` missing** = `command/build.rs` fails before any Rust compiles. CI installs `protobuf-compiler` explicitly.
-- **`rust-toolchain` pins `1.91.0`** — local builds must match (bumped from 1.88.0; `Duration::from_hours`/`from_mins` used transitively via moonpool-sim are const-stable only since 1.91). CI still exercises stable/beta/nightly.
+- **`rust-toolchain` pins `1.93.1`** — local builds must match (bumped from 1.88.0; `Duration::from_hours`/`from_mins` used transitively via moonpool-sim are const-stable only since 1.91). CI still exercises stable/beta/nightly.
 - **Release strips `DEBUG`/`TRACE` logs** unless built with `--features logs-debug,logs-trace`.
 - **Repro for event-loop / zombie bugs**: `worker_count = 1`, `worker_automatic_restart = false`, `RUST_BACKTRACE=1`.
 - **`CHANGELOG.md` follows Keep-a-Changelog.** Update it when a change ships user-visible behavior (config keys, metrics, CLI flags).
