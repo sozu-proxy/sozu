@@ -12,7 +12,7 @@ authors = [
 ]
 categories = ["network-programming", "development-tools::testing"]
 edition = "2024"
-rust-version = "1.91.0"
+rust-version = "1.93.1"
 # Test-only harness crate: never published, never linked by the `sozu` binary.
 publish = false
 
