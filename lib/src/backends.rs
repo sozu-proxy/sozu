@@ -1061,7 +1061,7 @@ impl BackendList {
         self.backends
             .iter_mut()
             .find(|b| b.borrow().sticky_id.as_deref() == Some(sticky_session))
-            .and_then(|b| if b.borrow().can_open() { Some(b) } else { None })
+            .filter(|b| b.borrow().can_open())
     }
 
     pub fn available_backends(&mut self, backup: bool) -> Vec<Rc<RefCell<Backend>>> {

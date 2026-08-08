@@ -1147,7 +1147,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     // If any backend resumes, invalidate the stale readiness
                     // flag so the inner loop continues instead of breaking.
                     let context = &mut self.context;
-                    for (_token, backend) in self.router.backends.iter_mut() {
+                    for backend in self.router.backends.values_mut() {
                         if backend.try_resume_reading(context) {
                             all_backends_readiness_are_empty = false;
                         }

@@ -1868,7 +1868,7 @@ impl HttpsProxy {
     pub fn soft_stop(&mut self) -> Result<(), ProxyError> {
         let listeners: HashMap<_, _> = self.listeners.drain().collect();
         let mut socket_errors = vec![];
-        for (_, l) in listeners.iter() {
+        for l in listeners.values() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
                 debug!("{} deregistering socket {:?}", log_module_context!(), sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {

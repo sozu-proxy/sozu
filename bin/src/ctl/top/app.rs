@@ -1035,12 +1035,12 @@ impl App {
             .or_else(|| gauge_value(m.proxying.get(names::buffer::USAGE_PERCENT)))
             .map(|v| v.min(100))
             .unwrap_or(0);
-        self.overview.saturation_pct.push(saturation as u64);
+        self.overview.saturation_pct.push(saturation);
 
         self.overview.active_sessions =
-            gauge_value(m.proxying.get(names::http::ACTIVE_REQUESTS)).unwrap_or(0) as u64;
+            gauge_value(m.proxying.get(names::http::ACTIVE_REQUESTS)).unwrap_or(0);
         self.overview.client_connections =
-            gauge_value(m.proxying.get(names::client::CONNECTIONS)).unwrap_or(0) as u64;
+            gauge_value(m.proxying.get(names::client::CONNECTIONS)).unwrap_or(0);
     }
 
     /// Append a transport-published `TopEvent` into the recent-events ring.

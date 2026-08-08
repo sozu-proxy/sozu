@@ -133,15 +133,13 @@ pub struct StreamParts<'a> {
 
 impl Stream {
     pub fn new(pool: Weak<RefCell<Pool>>, context: HttpContext, window: u32) -> Option<Self> {
-        let (front_buffer, back_buffer) = match pool.upgrade() {
-            Some(pool) => {
-                let mut pool = pool.borrow_mut();
-                match (pool.checkout(), pool.checkout()) {
-                    (Some(front_buffer), Some(back_buffer)) => (front_buffer, back_buffer),
-                    _ => return None,
-                }
+        let (front_buffer, back_buffer) = {
+            let pool = pool.upgrade()?;
+            let mut pool = pool.borrow_mut();
+            match (pool.checkout(), pool.checkout()) {
+                (Some(front_buffer), Some(back_buffer)) => (front_buffer, back_buffer),
+                _ => return None,
             }
-            None => return None,
         };
         let stream = Self {
             state: StreamState::Idle,

@@ -231,7 +231,7 @@ impl ResponseContent {
 
 impl WorkerResponses {
     fn contain_cluster_infos(&self) -> bool {
-        for (_worker_id, response) in self.map.iter() {
+        for response in self.map.values() {
             if let Some(content_type) = &response.content_type
                 && matches!(content_type, ContentType::Clusters(_))
             {
@@ -242,7 +242,7 @@ impl WorkerResponses {
     }
 
     fn contain_cluster_hashes(&self) -> bool {
-        for (_worker_id, response) in self.map.iter() {
+        for response in self.map.values() {
             if let Some(content_type) = &response.content_type
                 && matches!(content_type, ContentType::ClusterHashes(_))
             {
@@ -631,13 +631,13 @@ fn print_frontends(frontends: &ListedFrontends) -> Result<(), DisplayError> {
 pub fn print_listeners(listeners_list: &ListenersList) -> Result<(), DisplayError> {
     println!("\nHTTP LISTENERS\n================");
 
-    for (_, http_listener) in listeners_list.http_listeners.iter() {
+    for http_listener in listeners_list.http_listeners.values() {
         println!("{http_listener}");
     }
 
     println!("\nHTTPS LISTENERS\n================");
 
-    for (_, https_listener) in listeners_list.https_listeners.iter() {
+    for https_listener in listeners_list.https_listeners.values() {
         println!("{https_listener}");
     }
 
@@ -656,7 +656,7 @@ pub fn print_listeners(listeners_list: &ListenersList) -> Result<(), DisplayErro
             "connect timeout",
             "activated"
         ]);
-        for (_, tcp_listener) in listeners_list.tcp_listeners.iter() {
+        for tcp_listener in listeners_list.tcp_listeners.values() {
             table.add_row(row![
                 format!("{:?}", tcp_listener.address),
                 format!("{:?}", tcp_listener.public_address),
@@ -687,7 +687,7 @@ pub fn print_listeners(listeners_list: &ListenersList) -> Result<(), DisplayErro
             "max flows",
             "activated"
         ]);
-        for (_, udp_listener) in listeners_list.udp_listeners.iter() {
+        for udp_listener in listeners_list.udp_listeners.values() {
             table.add_row(row![
                 format!("{:?}", udp_listener.address),
                 format!("{:?}", udp_listener.public_address),
