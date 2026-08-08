@@ -2822,7 +2822,7 @@ impl ProxyConfiguration for TcpProxy {
                     message.id
                 );
                 let listeners: HashMap<_, _> = self.listeners.drain().collect();
-                for (_, l) in listeners.iter() {
+                for l in listeners.values() {
                     l.borrow_mut()
                         .listener
                         .take()

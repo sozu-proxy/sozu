@@ -1026,8 +1026,8 @@ impl HttpProxy {
 
     pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, MioTcpListener)> {
         self.listeners
-            .iter()
-            .filter_map(|(_, listener)| {
+            .values()
+            .filter_map(|listener| {
                 let mut owned = listener.borrow_mut();
                 if let Some(listener) = owned.listener.take() {
                     // Reset `active` so a subsequent `activate()` re-binds
@@ -1192,7 +1192,7 @@ impl HttpProxy {
     pub fn soft_stop(&mut self) -> Result<(), ProxyError> {
         let listeners: HashMap<_, _> = self.listeners.drain().collect();
         let mut socket_errors = vec![];
-        for (_, l) in listeners.iter() {
+        for l in listeners.values() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
                 debug!("{} deregistering socket {:?}", log_module_context!(), sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {

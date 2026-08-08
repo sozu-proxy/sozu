@@ -641,7 +641,7 @@ fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
             );
             client.finish_ok(format!(
                 "Saved {count} config messages to {}",
-                &path.display()
+                path.display()
             ));
         }
         Err(error) => {

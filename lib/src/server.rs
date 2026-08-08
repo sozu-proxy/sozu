@@ -1161,23 +1161,17 @@ impl Server {
 
                 gauge!(names::client::CONNECTIONS, nb_connections);
                 gauge!(names::client::CONNECTIONS_MAX, max_connections);
-                if max_connections > 0 {
-                    gauge!(
-                        "client.connections_percent",
-                        nb_connections * 100 / max_connections
-                    );
+                if let Some(percent) = (nb_connections * 100).checked_div(max_connections) {
+                    gauge!("client.connections_percent", percent);
                 }
 
                 gauge!(names::slab::ENTRIES, slab_len);
                 gauge!(names::slab::CAPACITY, slab_capacity);
-                if slab_capacity > 0 {
-                    gauge!(names::slab::USAGE_PERCENT, slab_len * 100 / slab_capacity);
+                if let Some(percent) = (slab_len * 100).checked_div(slab_capacity) {
+                    gauge!(names::slab::USAGE_PERCENT, percent);
                 }
-                if accept_threshold > 0 {
-                    gauge!(
-                        "slab.accept_threshold_percent",
-                        slab_len * 100 / accept_threshold
-                    );
+                if let Some(percent) = (slab_len * 100).checked_div(accept_threshold) {
+                    gauge!("slab.accept_threshold_percent", percent);
                 }
             }
             // Buffer pool gauges. `buffer.in_use` replaces the older
@@ -1191,8 +1185,8 @@ impl Server {
                 let capacity = pool.inner.capacity();
                 gauge!(names::buffer::IN_USE, used);
                 gauge!(names::buffer::CAPACITY, capacity);
-                if capacity > 0 {
-                    gauge!(names::buffer::USAGE_PERCENT, used * 100 / capacity);
+                if let Some(percent) = (used * 100).checked_div(capacity) {
+                    gauge!(names::buffer::USAGE_PERCENT, percent);
                 }
             }
             // 1Hz tick for `accept_queue.saturated_seconds`. Increments once
@@ -1966,29 +1960,29 @@ impl Server {
                 ));
                 return;
             }
-            Some(RequestType::QueryCertificatesFromWorkers(filters)) => {
-                if filters.fingerprint.is_some() {
-                    let certs = self.config_state.get_certificates(filters.clone());
-                    let response = if !certs.is_empty() {
-                        WorkerResponse::ok_with_content(
-                            message.id.clone(),
-                            ContentType::CertificatesWithFingerprints(
-                                CertificatesWithFingerprints { certs },
-                            )
-                            .into(),
-                        )
-                    } else {
-                        worker_response_error(
-                            message.id.clone(),
-                            "Could not find certificate for this fingerprint",
-                        )
-                    };
-                    push_queue(response);
-                    return;
-                }
-                // if all certificates are queried, or filtered by domain name,
-                // the request will be handled by the https proxy
+            Some(RequestType::QueryCertificatesFromWorkers(filters))
+                if filters.fingerprint.is_some() =>
+            {
+                let certs = self.config_state.get_certificates(filters.clone());
+                let response = if !certs.is_empty() {
+                    WorkerResponse::ok_with_content(
+                        message.id.clone(),
+                        ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints {
+                            certs,
+                        })
+                        .into(),
+                    )
+                } else {
+                    worker_response_error(
+                        message.id.clone(),
+                        "Could not find certificate for this fingerprint",
+                    )
+                };
+                push_queue(response);
+                return;
             }
+            // if all certificates are queried, or filtered by domain name,
+            // the request will be handled by the https proxy
             _other_request => {}
         }
         self.notify_proxys(message);
