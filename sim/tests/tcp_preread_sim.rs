@@ -72,6 +72,31 @@
 //! A sweep that never exercises one of these classes fails loudly rather than
 //! silently under-covering the core.
 //!
+//! # Swarm configurations (Groce et al., "Swarm Testing", ISSTA 2012)
+//!
+//! Each seed draws a [`SwarmConfig`] from the seeded RNG BEFORE the first
+//! connection: a random subset of the scenario generators (50% inclusion
+//! each, weights renormalized) plus the one genuinely orthogonal
+//! `fragmentation` delivery axis (off -- every delivery is one-shot and the
+//! forced drip generator leaves the pool). `SniPrereadCore` is fresh per
+//! connection, so no generator can suppress another across connections --
+//! the swarm benefit here is the paper's PASSIVE COMPETITION: a seed running
+//! 6 generator classes explores each far deeper within its connection budget
+//! than one running all 25. The other ClientHello axes (SNI shape, ALPN,
+//! GREASE, ECH, multi-record, proxy prefix) are embodied by their carrier
+//! generators -- toggling one inside a directed generator would invalidate
+//! its expected terminal. One seed in four keeps the inclusive all-features
+//! configuration, an all-off draw collapses to it, and the low-probability
+//! buggify byte-flip stays always-on (it is a wire-level fault, not a
+//! grammar feature). The drawn configuration is a pure function of the seed
+//! and is printed as one canonical `swarm-config` line before the
+//! connections run. The per-class coverage gate is asserted on the MERGED
+//! campaign tally (as before): a single swarm seed legitimately cannot reach
+//! every class, but the sweep still must. `SOZU_SIM_SWARM=0` disables the
+//! draw entirely (zero extra RNG consumption -- byte-identical to the
+//! historical all-features grammar) for direct swarm-vs-inclusive campaign
+//! comparison.
+//!
 //! # Replay / sweep ergonomics
 //!
 //! - `SOZU_TCP_PREREAD_SIM_SEED=<u64|0xhex>` -- replay that ONE seed verbosely.
@@ -79,6 +104,8 @@
 //! - `SOZU_TCP_PREREAD_SIM_STEPS=<n>` -- connections simulated PER SEED
 //!   (default 48; kept modest because a connection's cost is dominated by its
 //!   fragmentation schedule, not by a fixed per-step cost like the UDP sim).
+//! - `SOZU_SIM_SWARM=0|1` -- draw per-seed swarm configurations (default `1`;
+//!   `0` pins every seed to the historical all-features configuration).
 //!
 //! [moonpool-sim]: https://crates.io/crates/moonpool-sim
 //! [`udp_simulation.rs`]: ../../sim/tests/udp_simulation.rs
@@ -876,37 +903,185 @@ fn gen_random_mutation_chaos(ctx: &SimContext) -> Scenario {
     s
 }
 
-/// Draw a weighted-random scenario (weights sum to 134). Every required
-/// coverage class has a dedicated, non-zero-weight generator so reachability
-/// never depends on pure luck; `RandomMutationChaos` soaks up the remainder.
-fn generate_scenario(ctx: &SimContext) -> Scenario {
-    match ctx.random().random_range(0..134u32) {
-        0..10 => gen_accept_exact_any(ctx),
-        10..18 => gen_accept_wildcard(ctx),
-        18..26 => gen_accept_alpn_first_pref(ctx),
-        26..32 => gen_accept_alpn_catch_all(ctx),
-        32..37 => gen_accept_no_alpn_catch_all(ctx),
-        37..42 => gen_accept_mixed_case(ctx),
-        42..47 => gen_accept_trailing_dot(ctx),
-        47..51 => gen_accept_with_grease(ctx),
-        51..57 => gen_accept_multi_record(ctx),
-        57..63 => gen_accept_one_byte_drip(ctx),
-        63..69 => gen_sni_unmatched(ctx),
-        69..75 => gen_alpn_unmatched(ctx),
-        75..80 => gen_no_sni(ctx),
-        80..85 => gen_ech_outer_absent(ctx),
-        85..90 => gen_not_tls(ctx),
-        90..93 => gen_malformed_record_oversized(ctx),
-        93..96 => gen_malformed_record_mid_reassembly(ctx),
-        96..100 => gen_malformed_handshake(ctx),
-        100..104 => gen_too_large(ctx),
-        104..108 => gen_complete_over_cap_routes(ctx),
-        108..111 => gen_proxy_header_invalid(ctx),
-        111..115 => gen_proxy_prefixed_valid(ctx),
-        115..120 => gen_fragmented_timeout(ctx),
-        120..124 => gen_front_closed_now(ctx),
-        _ => gen_random_mutation_chaos(ctx),
+/// One scenario generator: display tag, generating function, grammar weight.
+type GeneratorEntry = (&'static str, fn(&SimContext) -> Scenario, u32);
+
+/// The weighted generator grammar (weights sum to 134), in the EXACT dispatch
+/// order of the pre-swarm `0..134` `match`: a cumulative walk over this table
+/// with every generator enabled maps each roll to the same generator the
+/// historical grammar did, so an all-features configuration stays
+/// draw-identical to the pre-swarm harness.
+///
+/// Swarm classification (see `doc/testing.md`): every generator is OPTIONAL
+/// -- `SniPrereadCore` is fresh per connection, so no generator can suppress
+/// another and no generator is load-bearing for a per-seed invariant. The
+/// per-class coverage gate runs on the merged campaign tally, where the
+/// inclusive seeds (1 in 4) plus each generator's ~50% seed population keep
+/// every class reachable many times over. Index 9 (`accept_one_byte_drip`)
+/// additionally requires the `fragmentation` axis (see [`SwarmConfig`]).
+const GENERATOR_TABLE: [GeneratorEntry; 25] = [
+    ("accept_exact_any", gen_accept_exact_any, 10),
+    ("accept_wildcard", gen_accept_wildcard, 8),
+    ("accept_alpn_first_pref", gen_accept_alpn_first_pref, 8),
+    ("accept_alpn_catch_all", gen_accept_alpn_catch_all, 6),
+    ("accept_no_alpn_catch_all", gen_accept_no_alpn_catch_all, 5),
+    ("accept_mixed_case_sni", gen_accept_mixed_case, 5),
+    ("accept_trailing_dot_sni", gen_accept_trailing_dot, 5),
+    ("accept_with_grease", gen_accept_with_grease, 4),
+    ("accept_multi_record", gen_accept_multi_record, 6),
+    ("accept_one_byte_drip", gen_accept_one_byte_drip, 6),
+    ("sni_unmatched", gen_sni_unmatched, 6),
+    ("alpn_unmatched", gen_alpn_unmatched, 6),
+    ("no_sni", gen_no_sni, 5),
+    ("ech_outer_absent", gen_ech_outer_absent, 5),
+    ("not_tls", gen_not_tls, 5),
+    (
+        "malformed_record_oversized",
+        gen_malformed_record_oversized,
+        3,
+    ),
+    (
+        "malformed_record_mid_reassembly",
+        gen_malformed_record_mid_reassembly,
+        3,
+    ),
+    ("malformed_handshake_wrong_type", gen_malformed_handshake, 4),
+    ("too_large", gen_too_large, 4),
+    ("complete_over_cap_routes", gen_complete_over_cap_routes, 4),
+    ("proxy_header_invalid", gen_proxy_header_invalid, 3),
+    ("proxy_prefixed_valid", gen_proxy_prefixed_valid, 4),
+    ("fragmented_timeout", gen_fragmented_timeout, 5),
+    ("front_closed_now", gen_front_closed_now, 4),
+    ("random_mutation_chaos", gen_random_mutation_chaos, 10),
+];
+
+/// Index of `accept_one_byte_drip` in [`GENERATOR_TABLE`] -- the one
+/// generator that depends on the `fragmentation` axis.
+const ONE_BYTE_DRIP_IDX: usize = 9;
+
+/// Per-seed swarm configuration: which scenario generators this seed may
+/// draw, plus the orthogonal fragmentation-delivery axis.
+/// `enabled[i]` mirrors `GENERATOR_TABLE[i]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SwarmConfig {
+    enabled: [bool; 25],
+    /// When `false`, every delivery collapses to [`Delivery::OneShot`] and
+    /// the forced drip generator is excluded from the pool -- the seed
+    /// explores whole-window parsing exclusively.
+    fragmentation: bool,
+}
+
+/// `SOZU_SIM_SWARM=0` disables per-seed swarm draws (every seed then runs the
+/// historical all-features configuration with zero extra RNG consumption);
+/// unset or any other value leaves swarm on.
+fn swarm_enabled() -> bool {
+    !matches!(std::env::var("SOZU_SIM_SWARM"), Ok(v) if v.trim() == "0")
+}
+
+impl SwarmConfig {
+    /// The inclusive all-features configuration (`C_D` in the paper).
+    fn full() -> Self {
+        SwarmConfig {
+            enabled: [true; 25],
+            fragmentation: true,
+        }
     }
+
+    /// Draw this seed's configuration from the seeded RNG. One seed in four
+    /// keeps the inclusive configuration; the rest coin-toss each generator
+    /// and the fragmentation axis at 50%, exclude the drip generator when
+    /// fragmentation is off, and collapse an empty pool back to the full
+    /// configuration (the non-empty-subset rule).
+    fn draw(ctx: &SimContext) -> Self {
+        if ctx.random().random_range(0..4u32) == 0 {
+            return SwarmConfig::full();
+        }
+        let mut enabled = [false; 25];
+        for slot in enabled.iter_mut() {
+            *slot = ctx.random().random_bool(0.5);
+        }
+        let fragmentation = ctx.random().random_bool(0.5);
+        if !fragmentation {
+            enabled[ONE_BYTE_DRIP_IDX] = false;
+        }
+        if !enabled.iter().any(|e| *e) {
+            return SwarmConfig::full();
+        }
+        let cfg = SwarmConfig {
+            enabled,
+            fragmentation,
+        };
+        debug_assert!(cfg.total_weight() > 0, "a drawn pool is never empty");
+        debug_assert!(
+            cfg.fragmentation || !cfg.enabled[ONE_BYTE_DRIP_IDX],
+            "the drip generator requires the fragmentation axis"
+        );
+        cfg
+    }
+
+    /// Renormalized total weight over the enabled generators.
+    fn total_weight(&self) -> u32 {
+        GENERATOR_TABLE
+            .iter()
+            .zip(&self.enabled)
+            .filter(|(_, e)| **e)
+            .map(|((_, _, w), _)| *w)
+            .sum()
+    }
+
+    /// The canonical one-line configuration record, printed before the
+    /// connections run. Byte-identical across replays of the same seed -- a
+    /// failing seed whose configuration is not printed is not reproducible.
+    fn log_line(&self, seed: u64, swarm: bool) -> String {
+        let mode = if !swarm {
+            "off"
+        } else if self.enabled.iter().all(|e| *e) && self.fragmentation {
+            "full"
+        } else {
+            "subset"
+        };
+        let features: Vec<String> = GENERATOR_TABLE
+            .iter()
+            .zip(&self.enabled)
+            .filter(|(_, e)| **e)
+            .map(|((tag, _, w), _)| format!("{tag}:{w}"))
+            .collect();
+        format!(
+            "swarm-config sim=tcp_preread seed={seed:#x} mode={mode} fragmentation={} \
+             features=[{}] total_weight={}",
+            if self.fragmentation { "on" } else { "off" },
+            features.join(","),
+            self.total_weight(),
+        )
+    }
+}
+
+/// Draw a weighted-random scenario among the configuration's enabled
+/// generators: exactly ONE `random_range` draw over the renormalized total,
+/// then a cumulative walk in `GENERATOR_TABLE` order. With every generator
+/// enabled this consumes the same single draw and maps rolls to generators
+/// exactly as the historical `0..134` `match` did. Every required coverage
+/// class has a dedicated, non-zero-weight generator so campaign reachability
+/// never depends on pure luck; `random_mutation_chaos` soaks up the
+/// remainder. With the fragmentation axis off the scenario's delivery
+/// collapses to one-shot.
+fn generate_scenario(ctx: &SimContext, cfg: &SwarmConfig) -> Scenario {
+    let roll = ctx.random().random_range(0..cfg.total_weight());
+    let mut remaining = roll;
+    for ((_, generate, weight), enabled) in GENERATOR_TABLE.iter().zip(&cfg.enabled) {
+        if !enabled {
+            continue;
+        }
+        if remaining < *weight {
+            let mut scenario = generate(ctx);
+            if !cfg.fragmentation {
+                scenario.delivery = Delivery::OneShot;
+            }
+            return scenario;
+        }
+        remaining -= weight;
+    }
+    unreachable!("roll {roll} below the renormalized total always lands on an enabled generator")
 }
 
 // --------------------------------------------------------------------------
@@ -1308,12 +1483,19 @@ fn fold_fingerprint(acc: u64, out: &Output) -> u64 {
 type CoverageSink = Arc<Mutex<CoverageTally>>;
 /// One aggregate per-seed fingerprint pushed here, for the determinism guard.
 type FingerprintSink = Arc<Mutex<Vec<u64>>>;
+/// Optional sink for the swarm-config stability guard: the configuration
+/// drawn for each seed is pushed here so two runs can be compared.
+type ConfigSink = Arc<Mutex<Vec<SwarmConfig>>>;
 
 struct TcpPrereadSimWorkload {
     connections: usize,
     verbose: bool,
     coverage: Option<CoverageSink>,
     fingerprint_sink: Option<FingerprintSink>,
+    /// `true` draws a per-seed [`SwarmConfig`]; `false` pins the historical
+    /// all-features configuration with zero extra RNG consumption.
+    swarm: bool,
+    config_sink: Option<ConfigSink>,
 }
 
 #[async_trait]
@@ -1327,11 +1509,26 @@ impl Workload for TcpPrereadSimWorkload {
         let base = Instant::now();
         let routes = build_route_table();
 
+        // Swarm configuration: drawn from the seeded RNG BEFORE the first
+        // connection (a pure function of the seed), and printed before the
+        // connections run so a failing seed's configuration is always in
+        // the captured output. With swarm off, no RNG draw happens at all —
+        // the run is byte-identical to the historical all-features grammar.
+        let swarm_cfg = if self.swarm {
+            SwarmConfig::draw(ctx)
+        } else {
+            SwarmConfig::full()
+        };
+        eprintln!("{}", swarm_cfg.log_line(seed, self.swarm));
+        if let Some(sink) = &self.config_sink {
+            sink.lock().unwrap().push(swarm_cfg);
+        }
+
         let mut local = CoverageTally::default();
         let mut fp: u64 = 0xcbf29ce484222325;
 
         for i in 0..self.connections {
-            let mut scenario = generate_scenario(ctx);
+            let mut scenario = generate_scenario(ctx, &swarm_cfg);
             // Buggify: low-probability extra adversarial mutation, using
             // moonpool's fault-injection primitive. The directed expectation
             // is cleared unconditionally -- a flipped byte can change which
@@ -1440,12 +1637,14 @@ fn assert_no_failures(report: &SimulationReport) {
 #[test]
 fn tcp_preread_simulation_seed_sweep() {
     let connections = env_usize("SOZU_TCP_PREREAD_SIM_STEPS").unwrap_or(48);
+    let swarm = swarm_enabled();
 
     // Single-seed replay mode: no coverage gate (one seed need not reach
     // every class -- it's a debugging tool, not the sweep).
     if let Some(seed) = env_u64("SOZU_TCP_PREREAD_SIM_SEED") {
         eprintln!(
-            "== TCP preread sim single-seed replay: seed={seed:#x} connections={connections} =="
+            "== TCP preread sim single-seed replay: seed={seed:#x} connections={connections} \
+             swarm={swarm} =="
         );
         let report = SimulationBuilder::new()
             .workload(TcpPrereadSimWorkload {
@@ -1453,6 +1652,8 @@ fn tcp_preread_simulation_seed_sweep() {
                 verbose: true,
                 coverage: None,
                 fingerprint_sink: None,
+                swarm,
+                config_sink: None,
             })
             .set_debug_seeds(vec![seed])
             // Without an explicit iteration count, `SimulationBuilder`
@@ -1475,6 +1676,8 @@ fn tcp_preread_simulation_seed_sweep() {
             verbose: false,
             coverage: Some(coverage.clone()),
             fingerprint_sink: None,
+            swarm,
+            config_sink: None,
         })
         .set_iterations(seeds)
         .run_time_budget(run_budget(connections))
@@ -1489,7 +1692,10 @@ fn tcp_preread_simulation_seed_sweep() {
     tally.assert_full_coverage();
 }
 
-/// Fast smoke test pinning one representative seed.
+/// Fast smoke test pinning one representative seed. Swarm is off so the
+/// pinned trajectory stays byte-identical to the pre-swarm harness (no
+/// config draw touches the RNG stream) and the smoke test keeps exercising
+/// the full grammar.
 #[test]
 fn tcp_preread_simulation_replays_known_seed() {
     let connections = 64;
@@ -1499,6 +1705,8 @@ fn tcp_preread_simulation_replays_known_seed() {
             verbose: false,
             coverage: None,
             fingerprint_sink: None,
+            swarm: false,
+            config_sink: None,
         })
         .set_debug_seeds(vec![0xFEED_ACE5])
         .set_iterations(1)
@@ -1523,6 +1731,10 @@ fn tcp_preread_simulation_is_deterministic() {
                 verbose: false,
                 coverage: None,
                 fingerprint_sink: Some(sink.clone()),
+                // Swarm stays ON here: the guard then also covers the config
+                // draw itself (a nondeterministic draw would fork the trace).
+                swarm: true,
+                config_sink: None,
             })
             .set_debug_seeds(vec![seed])
             .set_iterations(1)
@@ -1539,6 +1751,48 @@ fn tcp_preread_simulation_is_deterministic() {
         a, b,
         "same seed must yield an identical trace (determinism)"
     );
+}
+
+/// Swarm-config stability: the configuration drawn for a seed is a pure
+/// function of that seed. Two fresh runs of the same seed must record the
+/// identical [`SwarmConfig`] (and therefore print a byte-identical
+/// `swarm-config` line -- the replay contract).
+#[test]
+fn tcp_swarm_config_is_stable_across_draws() {
+    fn draw(seed: u64) -> SwarmConfig {
+        let connections = 4;
+        let sink: ConfigSink = Arc::new(Mutex::new(Vec::new()));
+        let report = SimulationBuilder::new()
+            .workload(TcpPrereadSimWorkload {
+                connections,
+                verbose: false,
+                coverage: None,
+                fingerprint_sink: None,
+                swarm: true,
+                config_sink: Some(sink.clone()),
+            })
+            .set_debug_seeds(vec![seed])
+            .set_iterations(1)
+            .run_time_budget(run_budget(connections))
+            .run();
+        assert_no_failures(&report);
+        let v = sink.lock().unwrap();
+        *v.first().expect("workload recorded a swarm config")
+    }
+
+    // Several seeds so both the 1-in-4 full draw and subset draws are hit.
+    for seed in [0x0Au64, 0x0B, 0x5EED_5EED, 0xDEAD_BEEF] {
+        let a = draw(seed);
+        let b = draw(seed);
+        assert_eq!(
+            a, b,
+            "seed={seed:#x}: swarm config must be identical across two draws"
+        );
+        assert!(
+            a.fragmentation || !a.enabled[ONE_BYTE_DRIP_IDX],
+            "seed={seed:#x}: the drip generator must be excluded when fragmentation is off"
+        );
+    }
 }
 
 #[test]

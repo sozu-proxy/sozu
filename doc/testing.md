@@ -159,6 +159,7 @@ The UDP simulator reads three env knobs (`sim/tests/udp_simulation.rs`,
 | `SOZU_UDP_SIM_SEED` | run that ONE seed verbosely (decimal or `0x`-hex) — the replay path |
 | `SOZU_UDP_SIM_SEEDS` | sweep `0..n` seeds instead of the default `0..256` |
 | `SOZU_UDP_SIM_STEPS` | run `n` steps per seed instead of the default `3000` |
+| `SOZU_SIM_SWARM` | `0` pins every seed to the inclusive all-features configuration; default `1` draws a per-seed swarm subset. Shared by BOTH simulators — see §5 "Swarm configurations" |
 
 ```bash
 # Reproduce a CI failure exactly (the panic prints the failing seed + step):
@@ -309,6 +310,71 @@ The engine needs `--cfg tokio_unstable` (tokio `RngSeed` scheduler determinism),
 so the test is `#![cfg(tokio_unstable)]`-gated and its deps sit under
 `[target.'cfg(tokio_unstable)'.dev-dependencies]` — the flag is scoped to the
 `sozu-sim` build, and `cargo test --workspace` builds it as an empty 0-test binary.
+
+### Swarm configurations (Groce et al., ISSTA 2012)
+
+Both simulators run **swarm testing**
+([Groce et al., ISSTA 2012](https://users.cs.utah.edu/~regehr/papers/swarm12.pdf)):
+instead of every seed exercising the single all-features workload grammar, each
+seed draws a random **configuration** — a subset of the generator features —
+from its own seeded RNG *before the first operation*, so the configuration is a
+pure function of the seed. Feature omission pays twice: omitting a *suppressor*
+lets the workload reach states the full grammar repairs too eagerly, and any
+omission concentrates the seed's step budget on the surviving features (the
+paper's active-suppression and passive-competition mechanisms).
+
+**What a feature is here.**
+
+- `udp_simulation.rs`: an entry of the weighted `Action` grammar
+  (`ACTION_TABLE`). Each buggify arm is tied to its sibling feature (a
+  stale-resolution fault makes no sense in a configuration without
+  `BackendResolved`) and is skipped — never redrawn — when that feature is off.
+- `tcp_preread_sim.rs`: a scenario generator (`GENERATOR_TABLE`), plus the one
+  genuinely orthogonal **fragmentation** axis (off → every delivery is
+  one-shot, and the forced drip generator leaves the pool). The other
+  ClientHello axes (SNI shape, ALPN, GREASE, ECH, multi-record, proxy prefix)
+  are embodied by their carrier generators — toggling one inside a directed
+  generator would invalidate its expected terminal. The 2% buggify byte-flip
+  stays always-on: it is a wire-level fault, not a grammar feature.
+
+**Classification.** A feature is MANDATORY (bootstrap/observation the workload
+cannot run without — always retained), OPTIONAL, or a SUPPRESSOR (it repairs
+the very state another bug needs — the paper's `pop` call to a stack-overflow
+bug):
+
+| Simulator | MANDATORY | SUPPRESSOR | OPTIONAL |
+|---|---|---|---|
+| UDP | `ClientDatagram` — the sole flow creator; without it every shadow-model invariant is vacuously green | `Drain`, `CloseAll`, `AbortFlow`, `SetMaxFlows` — each evicts flows, resets the manager, or sheds future admissions, repairing the very full-table state a capacity bug needs | `BackendResolved`, `BackendDatagram`, `AdvanceClock`, `ReconfigCluster`, `SetMaxRx` |
+| TCP preread | none — `SniPrereadCore` is fresh per connection, and the harness machinery (replay checks, coverage tally) is observation, not a feature | none — no state survives a connection, so nothing can suppress across connections; the swarm benefit here is pure passive competition | all 25 generators, plus the fragmentation axis |
+
+**Per-seed draw and campaign composition.** One seed in four keeps the
+inclusive all-features configuration `C_D` (the paper is explicit that swarm
+subsets complement, never replace, it: a bug needing `k` specific features
+together appears in a coin-toss subset with probability `1/2^k`). The other
+seeds include each optional feature with 50% probability, renormalize the
+remaining weights over the survivors, and collapse an all-off draw back to
+`C_D`. Every sweep — the per-PR job (64 UDP / 512 TCP seeds) and the nightly
+deep swarm — is therefore ≈25% inclusive + ≈75% random subsets of the same
+seed budget.
+
+**Replay contract.** The drawn configuration is printed as one canonical
+`swarm-config sim=... seed=... mode=... features=[...] total_weight=...` line
+before the workload runs, byte-identical across replays of the same seed (the
+`*_swarm_config_is_stable_across_draws` tests assert the stability). A failing
+seed replayed with `SOZU_UDP_SIM_SEED` / `SOZU_TCP_PREREAD_SIM_SEED` therefore
+always shows its configuration. `SOZU_SIM_SWARM=0` (shared by both simulators)
+disables the draw entirely — zero extra RNG consumption, byte-identical to the
+pre-swarm grammar — so a swarm campaign and an all-features campaign of
+identical seed count can be compared directly. The pinned
+`*_replays_known_seed` smoke tests run with swarm off for the same reason.
+
+**Coverage gate placement.** The TCP per-class gate
+(`CoverageTally::assert_full_coverage`) is asserted on the MERGED campaign
+tally, never per seed: a single swarm seed legitimately cannot reach every
+`RejectReason` class, but the sweep still must, and still fails loudly when it
+does not. If a swarm subset trips an invariant, that is the point of the
+exercise: report the failing seed and its printed configuration — never weaken
+the assertion or the gate.
 
 ### Recipe: adding a simulator over another sans-io core
 
