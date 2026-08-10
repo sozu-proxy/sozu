@@ -85,11 +85,13 @@
 //! than one running all 25. The other ClientHello axes (SNI shape, ALPN,
 //! GREASE, ECH, multi-record, proxy prefix) are embodied by their carrier
 //! generators -- toggling one inside a directed generator would invalidate
-//! its expected terminal. One seed in four keeps the inclusive all-features
-//! configuration, an all-off draw collapses to it, and the low-probability
-//! buggify byte-flip stays always-on (it is a wire-level fault, not a
-//! grammar feature). The drawn configuration is a pure function of the seed
-//! and is printed as one canonical `swarm-config` line before the
+//! its expected terminal. Seeds divisible by four keep the inclusive
+//! all-features configuration; campaign seeds are fixed to `0..n`, reserving
+//! exactly one inclusive run in each four-seed cohort. Degenerate all-off and
+//! all-on subset draws are repaired to non-empty proper subsets. The
+//! low-probability buggify byte-flip stays always-on (it is a wire-level fault,
+//! not a grammar feature). The drawn configuration is a pure function of the
+//! seed and is printed as one canonical `swarm-config` line before the
 //! connections run. The per-class coverage gate is asserted on the MERGED
 //! campaign tally (as before): a single swarm seed legitimately cannot reach
 //! every class, but the sweep still must. `SOZU_SIM_SWARM=0` disables the
@@ -978,6 +980,14 @@ fn swarm_enabled() -> bool {
     !matches!(std::env::var("SOZU_SIM_SWARM"), Ok(v) if v.trim() == "0")
 }
 
+fn inclusive_seed(seed: u64) -> bool {
+    seed.is_multiple_of(4)
+}
+
+fn campaign_seeds(count: usize) -> Vec<u64> {
+    (0..u64::try_from(count).expect("campaign seed count fits in u64")).collect()
+}
+
 impl SwarmConfig {
     /// The inclusive all-features configuration (`C_D` in the paper).
     fn full() -> Self {
@@ -987,13 +997,12 @@ impl SwarmConfig {
         }
     }
 
-    /// Draw this seed's configuration from the seeded RNG. One seed in four
-    /// keeps the inclusive configuration; the rest coin-toss each generator
+    /// Draw this seed's configuration from the seeded RNG. Seeds divisible by
+    /// four keep the inclusive configuration; the rest coin-toss each generator
     /// and the fragmentation axis at 50%, exclude the drip generator when
-    /// fragmentation is off, and collapse an empty pool back to the full
-    /// configuration (the non-empty-subset rule).
-    fn draw(ctx: &SimContext) -> Self {
-        if ctx.random().random_range(0..4u32) == 0 {
+    /// fragmentation is off, and repair all-off/all-on draws to proper subsets.
+    fn draw(ctx: &SimContext, seed: u64) -> Self {
+        if inclusive_seed(seed) {
             return SwarmConfig::full();
         }
         let mut enabled = [false; 25];
@@ -1005,7 +1014,9 @@ impl SwarmConfig {
             enabled[ONE_BYTE_DRIP_IDX] = false;
         }
         if !enabled.iter().any(|e| *e) {
-            return SwarmConfig::full();
+            enabled[0] = true;
+        } else if fragmentation && enabled.iter().all(|e| *e) {
+            enabled[24] = false;
         }
         let cfg = SwarmConfig {
             enabled,
@@ -1015,6 +1026,10 @@ impl SwarmConfig {
         debug_assert!(
             cfg.fragmentation || !cfg.enabled[ONE_BYTE_DRIP_IDX],
             "the drip generator requires the fragmentation axis"
+        );
+        debug_assert!(
+            !(cfg.fragmentation && cfg.enabled.iter().all(|e| *e)),
+            "a non-reserved seed must use a proper subset"
         );
         cfg
     }
@@ -1515,7 +1530,7 @@ impl Workload for TcpPrereadSimWorkload {
         // the captured output. With swarm off, no RNG draw happens at all —
         // the run is byte-identical to the historical all-features grammar.
         let swarm_cfg = if self.swarm {
-            SwarmConfig::draw(ctx)
+            SwarmConfig::draw(ctx, seed)
         } else {
             SwarmConfig::full()
         };
@@ -1679,6 +1694,7 @@ fn tcp_preread_simulation_seed_sweep() {
             swarm,
             config_sink: None,
         })
+        .set_debug_seeds(campaign_seeds(seeds))
         .set_iterations(seeds)
         .run_time_budget(run_budget(connections))
         .run();
@@ -1780,8 +1796,8 @@ fn tcp_swarm_config_is_stable_across_draws() {
         *v.first().expect("workload recorded a swarm config")
     }
 
-    // Several seeds so both the 1-in-4 full draw and subset draws are hit.
-    for seed in [0x0Au64, 0x0B, 0x5EED_5EED, 0xDEAD_BEEF] {
+    // Several seeds so both the reserved full configuration and subsets are hit.
+    for seed in [0x0Au64, 0x0B, 0x0C, 0x5EED_5EED, 0xDEAD_BEEF] {
         let a = draw(seed);
         let b = draw(seed);
         assert_eq!(
@@ -1792,6 +1808,22 @@ fn tcp_swarm_config_is_stable_across_draws() {
             a.fragmentation || !a.enabled[ONE_BYTE_DRIP_IDX],
             "seed={seed:#x}: the drip generator must be excluded when fragmentation is off"
         );
+        assert_eq!(
+            a.fragmentation && a.enabled.iter().all(|e| *e),
+            inclusive_seed(seed),
+            "seed={seed:#x}: only reserved seeds may use the full grammar"
+        );
+        assert_eq!(a.log_line(seed, true), b.log_line(seed, true));
+    }
+}
+
+#[test]
+fn tcp_campaign_reserves_one_inclusive_seed_per_four() {
+    for count in [1usize, 3, 4, 5, 256] {
+        let seeds = campaign_seeds(count);
+        let inclusive = seeds.iter().filter(|seed| inclusive_seed(**seed)).count();
+        assert_eq!(inclusive, count.div_ceil(4), "count={count}");
+        assert_eq!(seeds.len() - inclusive, count - count.div_ceil(4));
     }
 }
 
