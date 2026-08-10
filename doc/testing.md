@@ -347,15 +347,17 @@ bug):
 | UDP | `ClientDatagram` — the sole flow creator; without it every shadow-model invariant is vacuously green | `Drain`, `CloseAll`, `AbortFlow`, `SetMaxFlows` — each evicts flows, resets the manager, or sheds future admissions, repairing the very full-table state a capacity bug needs | `BackendResolved`, `BackendDatagram`, `AdvanceClock`, `ReconfigCluster`, `SetMaxRx` |
 | TCP preread | none — `SniPrereadCore` is fresh per connection, and the harness machinery (replay checks, coverage tally) is observation, not a feature | none — no state survives a connection, so nothing can suppress across connections; the swarm benefit here is pure passive competition | all 25 generators, plus the fragmentation axis |
 
-**Per-seed draw and campaign composition.** One seed in four keeps the
-inclusive all-features configuration `C_D` (the paper is explicit that swarm
+**Per-seed draw and campaign composition.** Campaigns run the explicit seed
+range `0..n`, and seeds divisible by four keep the inclusive all-features
+configuration `C_D` (the paper is explicit that swarm
 subsets complement, never replace, it: a bug needing `k` specific features
 together appears in a coin-toss subset with probability `1/2^k`). The other
 seeds include each optional feature with 50% probability, renormalize the
-remaining weights over the survivors, and collapse an all-off draw back to
-`C_D`. Every sweep — the per-PR job (64 UDP / 512 TCP seeds) and the nightly
-deep swarm — is therefore ≈25% inclusive + ≈75% random subsets of the same
-seed budget.
+remaining weights over the survivors, and repair an all-off or all-on draw to
+a non-empty proper subset. Every sweep — the per-PR job (64 UDP / 512 TCP
+seeds) and the nightly deep swarm — therefore reserves exactly one inclusive
+run in each four-seed cohort; shorter final cohorts start with their inclusive
+run.
 
 **Replay contract.** The drawn configuration is printed as one canonical
 `swarm-config sim=... seed=... mode=... features=[...] total_weight=...` line

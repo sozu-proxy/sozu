@@ -34,11 +34,14 @@
 //! `CloseAll`, `AbortFlow`, `SetMaxFlows` — each repairs or prevents the very
 //! full-table state a capacity bug needs) lets a seed drive the manager into
 //! states the all-features grammar repairs too eagerly; omitting other
-//! features concentrates the step budget on the survivors. One seed in four
-//! keeps the inclusive all-features configuration (the paper is explicit that
-//! swarm subsets complement, never replace, it: a bug needing `k` features
-//! together appears in a coin-toss subset with probability `1/2^k`), and an
-//! all-off draw collapses to the full configuration. Each buggify arm is
+//! features concentrates the step budget on the survivors. Seeds divisible
+//! by four keep the inclusive all-features configuration (the paper is
+//! explicit that swarm subsets complement, never replace, it: a bug needing
+//! `k` features together appears in a coin-toss subset with probability
+//! `1/2^k`); campaign seeds are fixed to `0..n`, which reserves exactly one
+//! inclusive run in each four-seed cohort. Degenerate all-off and all-on subset
+//! draws are repaired to
+//! non-empty proper subsets. Each buggify arm is
 //! gated by its sibling grammar feature and skipped (never redrawn) when that
 //! feature is disabled. The drawn configuration is a pure function of the
 //! seed and is printed as one canonical `swarm-config` line before the
@@ -251,6 +254,14 @@ fn swarm_enabled() -> bool {
     !matches!(std::env::var("SOZU_SIM_SWARM"), Ok(v) if v.trim() == "0")
 }
 
+fn inclusive_seed(seed: u64) -> bool {
+    seed.is_multiple_of(4)
+}
+
+fn campaign_seeds(count: usize) -> Vec<u64> {
+    (0..u64::try_from(count).expect("campaign seed count fits in u64")).collect()
+}
+
 impl SwarmConfig {
     /// The inclusive all-features configuration (`C_D` in the paper).
     fn full() -> Self {
@@ -259,13 +270,12 @@ impl SwarmConfig {
         }
     }
 
-    /// Draw this seed's configuration from the seeded RNG. One seed in four
-    /// keeps the inclusive configuration; the rest coin-toss each
+    /// Draw this seed's configuration from the seeded RNG. Seeds divisible by
+    /// four keep the inclusive configuration; the rest coin-toss each
     /// OPTIONAL/SUPPRESSOR feature at 50%, always retain the MANDATORY
-    /// `ClientDatagram`, and collapse an all-off draw back to the full
-    /// configuration (the non-empty-subset rule).
-    fn draw(ctx: &SimContext) -> Self {
-        if ctx.random().random_range(0..4u32) == 0 {
+    /// `ClientDatagram`, and repair all-off/all-on draws to proper subsets.
+    fn draw(ctx: &SimContext, seed: u64) -> Self {
+        if inclusive_seed(seed) {
             return SwarmConfig::full();
         }
         let mut enabled = [false; 10];
@@ -274,13 +284,19 @@ impl SwarmConfig {
             *slot = ctx.random().random_bool(0.5);
         }
         if !enabled.iter().skip(1).any(|e| *e) {
-            return SwarmConfig::full();
+            enabled[1] = true;
+        } else if enabled.iter().all(|e| *e) {
+            enabled[9] = false;
         }
         let cfg = SwarmConfig { enabled };
         debug_assert!(cfg.enabled[0], "the MANDATORY feature must stay enabled");
         debug_assert!(
             cfg.total_weight() > ACTION_TABLE[0].1,
             "a drawn subset keeps at least one optional feature"
+        );
+        debug_assert!(
+            !cfg.enabled.iter().all(|e| *e),
+            "a non-reserved seed must use a proper subset"
         );
         cfg
     }
@@ -431,7 +447,7 @@ impl Workload for UdpSimWorkload {
         // captured output. With swarm off, no RNG draw happens at all — the
         // run is byte-identical to the historical all-features grammar.
         let swarm_cfg = if self.swarm {
-            SwarmConfig::draw(ctx)
+            SwarmConfig::draw(ctx, seed)
         } else {
             SwarmConfig::full()
         };
@@ -818,6 +834,7 @@ fn udp_simulation_seed_sweep() {
             swarm,
             config_sink: None,
         })
+        .set_debug_seeds(campaign_seeds(seeds))
         .set_iterations(seeds)
         .run_time_budget(run_budget(steps))
         .run();
@@ -913,8 +930,8 @@ fn udp_swarm_config_is_stable_across_draws() {
         *v.first().expect("workload recorded a swarm config")
     }
 
-    // Several seeds so both the 1-in-4 full draw and subset draws are hit.
-    for seed in [0x0Au64, 0x0B, 0x5EED_5EED, 0xDEAD_BEEF] {
+    // Several seeds so both the reserved full configuration and subsets are hit.
+    for seed in [0x0Au64, 0x0B, 0x0C, 0x5EED_5EED, 0xDEAD_BEEF] {
         let a = draw(seed);
         let b = draw(seed);
         assert_eq!(
@@ -925,6 +942,22 @@ fn udp_swarm_config_is_stable_across_draws() {
             a.is_enabled(Action::ClientDatagram),
             "seed={seed:#x}: the MANDATORY ClientDatagram feature must always be enabled"
         );
+        assert_eq!(
+            a.enabled.iter().all(|e| *e),
+            inclusive_seed(seed),
+            "seed={seed:#x}: only reserved seeds may use the full grammar"
+        );
+        assert_eq!(a.log_line(seed, true), b.log_line(seed, true));
+    }
+}
+
+#[test]
+fn udp_campaign_reserves_one_inclusive_seed_per_four() {
+    for count in [1usize, 3, 4, 5, 256] {
+        let seeds = campaign_seeds(count);
+        let inclusive = seeds.iter().filter(|seed| inclusive_seed(**seed)).count();
+        assert_eq!(inclusive, count.div_ceil(4), "count={count}");
+        assert_eq!(seeds.len() - inclusive, count - count.div_ceil(4));
     }
 }
 

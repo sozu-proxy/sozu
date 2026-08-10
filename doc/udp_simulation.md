@@ -71,10 +71,12 @@ with `BackendResolved` so flows progress to `Established`.
 draws a random subset of this grammar from its own seeded RNG before the first
 step — `ClientDatagram` is MANDATORY and always retained, the others are
 included with 50% probability, and the weights renormalize over the survivors.
-One seed in four keeps the full grammar, and the drawn configuration is
-printed as one `swarm-config` line per seed. `SOZU_SIM_SWARM=0` pins every
-seed to the full grammar (zero extra RNG draws — byte-identical to the
-pre-swarm harness).
+Campaign seeds are the explicit range `0..n`; seeds divisible by four keep the
+full grammar, reserving one inclusive run in every four-seed cohort, while the
+other seeds always use non-empty proper subsets. The drawn configuration is
+printed as one `swarm-config` line per seed. `SOZU_SIM_SWARM=0` pins every seed
+to the full grammar (zero extra RNG draws — byte-identical to the pre-swarm
+harness).
 
 `Drain` is special: the core's `draining` flag is a one-way latch (there is no
 "resume"), mirroring the shell draining a listener and then dropping it. The
