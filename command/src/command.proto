@@ -648,6 +648,23 @@ message HttpsListenerConfig {
     // indexed-reference header bomb, where 1-byte indexed references are
     // amplified into per-entry bookkeeping. Default: 128.
     optional uint32 h2_max_header_fields = 47;
+    // Mutual TLS (client certificate authentication) mode for this listener.
+    // Absent or CLIENT_AUTH_NONE (the field-0 default) keeps the current
+    // behavior: no CertificateRequest is sent and any client certificate is
+    // ignored. OPTIONAL requests a client certificate but still accepts
+    // connections that present none; REQUIRED aborts the handshake when the
+    // client does not present a certificate chaining to a trusted CA.
+    optional ClientAuthMode client_auth = 48;
+    // PEM-encoded trusted CA certificates a client certificate must chain to
+    // for OPTIONAL/REQUIRED modes. Ignored when client_auth is NONE. Multiple
+    // entries build a single root store; each entry may itself hold a
+    // concatenated PEM chain.
+    repeated string client_ca_certificates = 49;
+    // Optional PEM-encoded certificate revocation lists (CRLs). When present,
+    // a presented client certificate is rejected if it (or an intermediate)
+    // appears revoked. Ignored when client_auth is NONE or no trusted CA is
+    // configured.
+    repeated string client_ca_crls = 50;
 }
 
 // details of an TCP listener
@@ -1046,6 +1063,21 @@ enum TlsVersion {
     TLS_V1_1 = 3;
     TLS_V1_2 = 4;
     TLS_V1_3 = 5;
+}
+
+// Mutual TLS client-certificate authentication policy for an HTTPS listener.
+// NONE is field 0 so an absent `client_auth` decodes to the current
+// no-client-auth behavior, keeping legacy state files byte-compatible.
+enum ClientAuthMode {
+    // No CertificateRequest; client certificates are neither requested nor
+    // verified. The historical default.
+    CLIENT_AUTH_NONE = 0;
+    // Request a client certificate but accept connections that present none.
+    // Presented certificates must still chain to a trusted CA.
+    CLIENT_AUTH_OPTIONAL = 1;
+    // Require a client certificate chaining to a trusted CA; abort the
+    // handshake otherwise.
+    CLIENT_AUTH_REQUIRED = 2;
 }
 
 // How a UDP flow is keyed for backend affinity. SOURCE_IP keys on the

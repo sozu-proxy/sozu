@@ -62,7 +62,7 @@ use crate::{
     certificate::split_certificate_chain,
     logging::AccessLogFormat,
     proto::command::{
-        ActivateListener, AddBackend, AddCertificate, CertificateAndKey, Cluster,
+        ActivateListener, AddBackend, AddCertificate, CertificateAndKey, ClientAuthMode, Cluster,
         CustomHttpAnswers, Header, HeaderPosition, HealthCheckConfig, HstsConfig,
         HttpListenerConfig, HttpsListenerConfig, ListenerType, LoadBalancingAlgorithms,
         LoadBalancingParams, LoadMetric, MetricDetail, MetricsConfiguration, PathRule,
@@ -393,6 +393,15 @@ pub enum ConfigError {
          (RFC 6797 §7.2 forbids the header over plaintext HTTP)"
     )]
     HstsOnPlainHttp(String),
+    /// A client-certificate-authentication (mTLS) field was set on a non-HTTPS
+    /// listener. Client auth is a TLS-termination control; HTTP/TCP/UDP
+    /// listeners discard it, so sozu rejects it at load time rather than
+    /// silently starting an unauthenticated listener.
+    #[error(
+        "invalid client auth config at {0}: client_auth / client_ca_certificates / \
+         client_ca_crls are only valid on HTTPS listeners"
+    )]
+    ClientAuthOnNonHttps(String),
     /// A TCP frontend's `hostname` (mapped to the wire `sni` field) is
     /// neither an exact hostname nor a single leading `*.` wildcard label
     /// (sozu-proxy/sozu#1279). Rejects `*.*.example.com`, an embedded `*`
@@ -519,6 +528,30 @@ pub enum ConfigError {
         sni_preread_max_bytes: u32,
         minimum: u32,
     },
+}
+
+/// Config-facing mutual-TLS (client certificate authentication) mode, parsed
+/// from the `client_auth` key of an HTTPS listener's TOML section. Serializes as
+/// lowercase (`"none"` / `"optional"` / `"required"`) so operators write the
+/// documented values rather than the protobuf enum's `SCREAMING_SNAKE_CASE`.
+/// Maps to the wire [`ClientAuthMode`] in [`ListenerBuilder::to_tls`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientAuthConfig {
+    #[default]
+    None,
+    Optional,
+    Required,
+}
+
+impl From<ClientAuthConfig> for ClientAuthMode {
+    fn from(value: ClientAuthConfig) -> Self {
+        match value {
+            ClientAuthConfig::None => ClientAuthMode::ClientAuthNone,
+            ClientAuthConfig::Optional => ClientAuthMode::ClientAuthOptional,
+            ClientAuthConfig::Required => ClientAuthMode::ClientAuthRequired,
+        }
+    }
 }
 
 /// An HTTP, HTTPS or TCP listener as parsed from the `Listeners` section in the toml
@@ -691,6 +724,19 @@ pub struct ListenerBuilder {
     /// not exceed the global `buffer_size` (validated at config-load).
     /// Defaults to [`DEFAULT_SNI_PREREAD_MAX_BYTES`].
     pub sni_preread_max_bytes: Option<u32>,
+    /// HTTPS listener only: mutual TLS (client certificate authentication)
+    /// mode (`none` / `optional` / `required`). Absent and `none` both keep the
+    /// historical no-client-auth behavior.
+    pub client_auth: Option<ClientAuthConfig>,
+    /// HTTPS listener only: filesystem paths to PEM-encoded trusted CA
+    /// certificates a client certificate must chain to. Loaded at
+    /// config-materialization time (like `certificate`/`key`) and inlined as
+    /// PEM into the resulting [`HttpsListenerConfig`].
+    pub client_ca_certificates: Option<Vec<String>>,
+    /// HTTPS listener only: filesystem paths to PEM-encoded CRLs used to
+    /// reject revoked client certificates. Loaded alongside
+    /// `client_ca_certificates`.
+    pub client_ca_crls: Option<Vec<String>>,
 }
 
 pub fn default_sticky_name() -> String {
@@ -785,6 +831,9 @@ impl ListenerBuilder {
             max_flows: None,
             sni_preread_timeout: None,
             sni_preread_max_bytes: None,
+            client_auth: None,
+            client_ca_certificates: None,
+            client_ca_crls: None,
         }
     }
 
@@ -995,6 +1044,28 @@ impl ListenerBuilder {
         self.request_timeout = Some(self.request_timeout.unwrap_or(config.request_timeout));
     }
 
+    /// Reject mTLS fields on a non-HTTPS listener. Client auth is an
+    /// HTTPS-termination control; the HTTP/TCP/UDP conversions have no field to
+    /// carry it, so an operator who sets it there must get a typed error rather
+    /// than a silently unauthenticated listener.
+    fn reject_client_auth_fields(&self, listener_kind: &str) -> Result<(), ConfigError> {
+        let has_mtls = self
+            .client_auth
+            .is_some_and(|m| m != ClientAuthConfig::None)
+            || self
+                .client_ca_certificates
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
+            || self.client_ca_crls.as_ref().is_some_and(|v| !v.is_empty());
+        if has_mtls {
+            return Err(ConfigError::ClientAuthOnNonHttps(format!(
+                "{} listener {}",
+                listener_kind, self.address
+            )));
+        }
+        Ok(())
+    }
+
     /// build an HTTP listener with config timeouts, using defaults if no config is provided
     pub fn to_http(&mut self, config: Option<&Config>) -> Result<HttpListenerConfig, ConfigError> {
         if self.protocol != Some(ListenerProtocol::Http) {
@@ -1003,6 +1074,7 @@ impl ListenerBuilder {
                 found: self.protocol.to_owned(),
             });
         }
+        self.reject_client_auth_fields("HTTP")?;
 
         // RFC 6797 §7.2: `Strict-Transport-Security` MUST NOT appear on
         // plaintext-HTTP responses. Reject an `[hsts]` block on an HTTP
@@ -1181,6 +1253,31 @@ impl ListenerBuilder {
             .map(split_certificate_chain)
             .unwrap_or_default();
 
+        // mTLS: load the trusted-CA and CRL PEM bundles from disk, inlining
+        // their contents (like `certificate`/`key` above). Any unreadable path
+        // aborts materialization: a dropped CA would weaken trust, and a
+        // dropped CRL would silently disable revocation for certificates the
+        // operator meant to reject. Failing closed keeps client auth honest.
+        //
+        // Files are read only for OPTIONAL/REQUIRED. In NONE (the default) the
+        // runtime ignores CA/CRL data, so a stale path left in the config must
+        // not block the whole configuration from loading.
+        let mode = self.client_auth.unwrap_or_default();
+        let client_auth = self
+            .client_auth
+            .map(|mode| ClientAuthMode::from(mode) as i32);
+        let load_pem_paths = |paths: &Option<Vec<String>>| -> Result<Vec<String>, ConfigError> {
+            if mode == ClientAuthConfig::None {
+                return Ok(Vec::new());
+            }
+            paths
+                .as_ref()
+                .map(|list| list.iter().map(|path| Config::load_file(path)).collect())
+                .unwrap_or_else(|| Ok(Vec::new()))
+        };
+        let client_ca_certificates = load_pem_paths(&self.client_ca_certificates)?;
+        let client_ca_crls = load_pem_paths(&self.client_ca_crls)?;
+
         let http_answers = self.get_http_answers()?;
         let answers = self.get_listener_answers()?;
 
@@ -1239,6 +1336,9 @@ impl ListenerBuilder {
                 Some(h) => Some(h.to_proto("listener")?),
                 None => None,
             },
+            client_auth,
+            client_ca_certificates,
+            client_ca_crls,
         };
 
         // POST: the built listener binds the requested address and starts
@@ -1299,6 +1399,7 @@ impl ListenerBuilder {
                 found: self.protocol.to_owned(),
             });
         }
+        self.reject_client_auth_fields("TCP")?;
 
         if let Some(config) = config {
             self.assign_config_timeouts(config);
@@ -1360,6 +1461,7 @@ impl ListenerBuilder {
                 found: self.protocol.to_owned(),
             });
         }
+        self.reject_client_auth_fields("UDP")?;
 
         let mut max_rx_datagram_size = self
             .max_rx_datagram_size
@@ -5893,6 +5995,88 @@ mod tests {
         assert_eq!(
             add_udp_frontend_count, 2,
             "both cluster frontends on the udp listener must emit AddUdpFrontend"
+        );
+    }
+
+    #[test]
+    fn old_state_file_without_client_auth_fields_deserializes() {
+        // A state file written before mTLS landed carries no `client_ca_*`
+        // fields. `#[serde(default)]` (via build.rs) must let it round-trip,
+        // defaulting the new repeated fields to empty rather than erroring on a
+        // missing field.
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let config = ListenerBuilder::new_https(address)
+            .to_tls(None)
+            .expect("default HTTPS listener config");
+
+        let mut json: serde_json::Value =
+            serde_json::to_value(&config).expect("serialize HttpsListenerConfig");
+        let obj = json.as_object_mut().expect("object");
+        obj.remove("client_ca_certificates");
+        obj.remove("client_ca_crls");
+        obj.remove("client_auth");
+
+        let restored: HttpsListenerConfig =
+            serde_json::from_value(json).expect("old state file must deserialize");
+        assert!(restored.client_ca_certificates.is_empty());
+        assert!(restored.client_ca_crls.is_empty());
+        assert_eq!(restored.client_auth, None);
+    }
+
+    #[test]
+    fn client_auth_fields_rejected_on_non_https_listener() {
+        // A TCP listener carrying client_auth must be rejected, not silently
+        // started unauthenticated.
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9000);
+        let mut tcp = ListenerBuilder::new_tcp(address);
+        tcp.client_auth = Some(ClientAuthConfig::Required);
+        assert!(matches!(
+            tcp.to_tcp(None),
+            Err(ConfigError::ClientAuthOnNonHttps(_))
+        ));
+
+        // A CA bundle without an explicit mode is equally a misconfiguration.
+        let mut http = ListenerBuilder::new_http(address);
+        http.client_ca_certificates = Some(vec!["ca.pem".to_string()]);
+        assert!(matches!(
+            http.to_http(None),
+            Err(ConfigError::ClientAuthOnNonHttps(_))
+        ));
+    }
+
+    #[test]
+    fn none_mode_ignores_stale_ca_paths() {
+        // With client auth disabled, an unreadable CA/CRL path must not block
+        // the HTTPS listener from materializing.
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9443);
+        let mut https = ListenerBuilder::new_https(address);
+        https.client_auth = Some(ClientAuthConfig::None);
+        https.client_ca_certificates = Some(vec!["/nonexistent/ca.pem".to_string()]);
+        https.client_ca_crls = Some(vec!["/nonexistent/crl.pem".to_string()]);
+        let config = https.to_tls(None).expect("NONE mode must ignore CA paths");
+        assert!(config.client_ca_certificates.is_empty());
+        assert!(config.client_ca_crls.is_empty());
+    }
+
+    #[test]
+    fn client_auth_config_parses_documented_lowercase_names() {
+        // The documented TOML values (`none`/`optional`/`required`) must parse,
+        // not just the protobuf enum's SCREAMING_SNAKE_CASE.
+        assert_eq!(
+            serde_json::from_str::<ClientAuthConfig>("\"required\"").unwrap(),
+            ClientAuthConfig::Required
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientAuthConfig>("\"optional\"").unwrap(),
+            ClientAuthConfig::Optional
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientAuthConfig>("\"none\"").unwrap(),
+            ClientAuthConfig::None
+        );
+        assert_eq!(
+            ClientAuthMode::from(ClientAuthConfig::Required),
+            ClientAuthMode::ClientAuthRequired
         );
     }
 }

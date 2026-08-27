@@ -372,6 +372,67 @@ Path 2 was added after the initial HSTS rollout to fix a silent skip that affect
 | `http.hsts.listener_default_patched`| counter | A `UpdateHttpsListenerConfig.hsts` patch was applied. Fires once per patch. |
 | `http.hsts.frontend_refreshed`      | counter | An inheriting frontend was refreshed during a listener-default HSTS patch (one increment per refreshed entry). Sum across a patch interval = number of frontends touched by that patch. |
 
+#### mTLS — client certificate authentication
+
+Mutual TLS makes the client prove its identity during the handshake, on top of the server certificate Sōzu already presents. When enabled on an HTTPS listener, Sōzu sends a TLS `CertificateRequest` and validates the certificate the client returns against a listener-scoped bundle of trusted CAs, optionally consulting certificate revocation lists (CRLs).
+
+Three keys drive it, all under an `[[listeners]]` entry with `protocol = "https"`:
+
+```toml
+[[listeners]]
+protocol = "https"
+address  = "0.0.0.0:443"
+
+# "none" (default) | "optional" | "required"
+client_auth = "required"
+
+# Filesystem paths to PEM-encoded CA certificates a client certificate must
+# chain to. Required whenever client_auth is not "none". Each file may hold a
+# concatenated PEM chain; several files may be listed.
+client_ca_certificates = ["/etc/sozu/client-ca.pem"]
+
+# Optional: filesystem paths to PEM-encoded CRLs. When present, a client
+# certificate listed as revoked is rejected.
+client_ca_crls = ["/etc/sozu/client-ca.crl.pem"]
+```
+
+Both path lists are read from disk at config-load and their PEM contents inlined into the listener configuration, so the files are not re-read afterwards. Unlike `certificate` and `key`, whose read errors are logged and skipped, an unreadable CA or CRL path aborts the whole configuration: starting a listener with a reduced trust set or without the revocation data the operator asked for would weaken authentication silently.
+
+##### Modes
+
+| `client_auth` | `CertificateRequest` sent | Client presents no certificate | Client presents a certificate                          |
+|---------------|---------------------------|--------------------------------|--------------------------------------------------------|
+| `"none"` (default) | No                   | Connection proceeds            | Never requested, never inspected                       |
+| `"optional"`  | Yes                       | Connection proceeds            | Fully chain-validated; handshake aborts if it fails    |
+| `"required"`  | Yes                       | **Handshake aborts**           | Fully chain-validated; handshake aborts if it fails    |
+
+`"optional"` is not a bypass: a certificate that *is* presented gets the same validation as under `"required"`. It only tolerates clients that present none, which is the mode to use while migrating a fleet to mTLS.
+
+A state file written before mTLS existed carries none of the three keys and loads unchanged: the absent `client_auth` decodes to `"none"` and the two path lists default to empty.
+
+##### Validation matrix
+
+The configuration is rejected rather than silently degraded in every case below. mTLS that fails open is worse than mTLS that fails to start.
+
+| Configuration                                                        | Outcome                                                                                                                                     |
+|----------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| `client_auth` with a value other than the three above                | **Error** at config-load, from TOML parsing. A typo is never folded to `none`.                                                               |
+| `client_auth = "optional"` / `"required"` with no trusted CA         | **Error** `ListenerError::ClientAuth` when the worker builds the listener — client auth was requested with an empty trust set, which no client could ever satisfy. |
+| A `client_ca_certificates` or `client_ca_crls` path cannot be read   | **Error** at config-materialization. A dropped CA weakens trust; a dropped CRL silently disables revocation.                                 |
+| A CA entry parses to zero certificates (empty file, wrong PEM section) | **Error**. Skipping it would start the listener with a subset of the configured trust anchors, and clients issued by the omitted CA would fail with no visible cause. |
+| A CRL entry parses to zero revocation lists                          | **Error**. Same reasoning: revocation would be silently disabled.                                                                           |
+| `client_auth` / `client_ca_certificates` / `client_ca_crls` on an HTTP, TCP, or UDP listener | **Error** `ConfigError::ClientAuthOnNonHttps` at config-load. Those listeners have no field to carry the policy, so it would be discarded.  |
+| `client_auth = "none"` with stale CA/CRL paths still present         | **Allowed** — the paths are not read at all in `none` mode, so a leftover path never blocks configuration loading.                           |
+| A configured CRL past its `nextUpdate`                               | **Rejected at handshake.** Sōzu enables `enforce_revocation_expiration()`; rustls defaults to ignoring expiration, which would keep trusting a stale CRL. |
+
+The rejections above happen at two distinct stages. Reading the CA/CRL files and refusing mTLS keys on a non-HTTPS listener happen at config-load, in the master. Parsing the PEM bodies and building the verifier happen worker-side, when the listener is created. In both cases the listener is never activated: `create_rustls_context` returns an error, so there is no fallback to an unauthenticated listener.
+
+##### Notes
+
+- The policy is per-listener, not per-frontend. Every frontend served by an HTTPS listener with `client_auth = "required"` requires a client certificate.
+- `UpdateHttpsListenerConfig` carries no mTLS fields, so a hot-reconfig partial update cannot downgrade a running listener's client-auth policy. Changing it means recreating the listener.
+- The verifier is built with the same explicitly selected `CryptoProvider` as the server config, so it works in single-provider builds (`crypto-openssl` only) and in multi-provider builds where no process-default provider is installed.
+
 #### Options specific to Rustls based HTTPS listeners
 
 ##### Cipher suites
@@ -1653,6 +1714,8 @@ immediately after the patch is acknowledged.
 | `alpn_protocols`     | `string[]` | per-handshake    | `["h2","http/1.1"]` | Rebuilds the rustls `ServerConfig`. In-flight handshakes finish on the old config. Pass `--reset-alpn` on the CLI to restore the default. |
 | `strict_sni_binding` | `bool`     | per-handshake    | `true`              | Require `:authority`/`Host` covered by served cert SAN dNSName (RFC 6125 §6.4.3/6.4.4, CWE-346/CWE-444). Default-cert handshakes fall back to legacy SNI exact-match. Miss → 421 (RFC 9110 §15.5.20). |
 | `disable_http11`     | `bool`     | per-handshake    | `false`             | Drop clients that do not negotiate `h2` via ALPN                                                                                          |
+
+The mTLS keys (`client_auth`, `client_ca_certificates`, `client_ca_crls`) are **not** patchable: `UpdateHttpsListenerConfig` carries no mTLS field, so a partial update can never downgrade a running listener's client-auth policy. Changing it means `RemoveListener` + add. See [mTLS — client certificate authentication](#mtls--client-certificate-authentication).
 
 #### TCP listeners
 

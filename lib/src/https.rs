@@ -27,17 +27,20 @@ use mio::{
     unix::SourceFd,
 };
 use rustls::{
-    CipherSuite, ProtocolVersion, ServerConfig as RustlsServerConfig, ServerConnection,
-    SupportedCipherSuite, crypto::CryptoProvider,
+    CipherSuite, ProtocolVersion, RootCertStore, ServerConfig as RustlsServerConfig,
+    ServerConnection, SupportedCipherSuite,
+    crypto::CryptoProvider,
+    pki_types::{CertificateDer, CertificateRevocationListDer, pem::PemObject},
+    server::WebPkiClientVerifier,
 };
 use rusty_ulid::Ulid;
 use sozu_command::{
     certificate::Fingerprint,
     config::{DEFAULT_ALPN_PROTOCOLS, DEFAULT_CIPHER_LIST},
     proto::command::{
-        AddCertificate, CertificateSummary, CertificatesByAddress, Cluster, HttpsListenerConfig,
-        ListOfCertificatesByAddress, ListenerType, RemoveCertificate, RemoveListener,
-        ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion,
+        AddCertificate, CertificateSummary, CertificatesByAddress, ClientAuthMode, Cluster,
+        HttpsListenerConfig, ListOfCertificatesByAddress, ListenerType, RemoveCertificate,
+        RemoveListener, ReplaceCertificate, RequestHttpFrontend, ResponseContent, TlsVersion,
         UpdateHttpsListenerConfig, WorkerRequest, WorkerResponse, request::RequestType,
         response_content::ContentType,
     },
@@ -1505,17 +1508,31 @@ impl HttpsListener {
                 .collect::<Vec<_>>()
         };
 
-        let provider = CryptoProvider {
+        let provider = Arc::new(CryptoProvider {
             cipher_suites: ciphers,
             kx_groups,
             ..default_provider()
+        });
+
+        let builder = RustlsServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&versions[..])
+            .map_err(|err| ListenerError::BuildRustls(err.to_string()))?;
+
+        // mTLS: `client_auth` decodes to `ClientAuthMode` (NONE at field 0).
+        // NONE keeps the historical `.with_no_client_auth()`; OPTIONAL and
+        // REQUIRED install a WebPki client-certificate verifier built from the
+        // listener's trusted CA bundle (and optional CRLs). OPTIONAL differs
+        // only by allowing connections that present no certificate at all. The
+        // verifier is built from the same `provider` as the server config so it
+        // works in single-provider builds (`crypto-openssl`-only) and in
+        // multi-provider builds (`--all-features`) where no process-default
+        // provider is installed.
+        let builder = match Self::client_cert_verifier(config, &provider)? {
+            Some(verifier) => builder.with_client_cert_verifier(verifier),
+            None => builder.with_no_client_auth(),
         };
 
-        let mut server_config = RustlsServerConfig::builder_with_provider(provider.into())
-            .with_protocol_versions(&versions[..])
-            .map_err(|err| ListenerError::BuildRustls(err.to_string()))?
-            .with_no_client_auth()
-            .with_cert_resolver(resolver);
+        let mut server_config = builder.with_cert_resolver(resolver);
         server_config.send_tls13_tickets = config.send_tls13_tickets as usize;
 
         server_config.alpn_protocols = if config.alpn_protocols.is_empty() {
@@ -1532,6 +1549,101 @@ impl HttpsListener {
         };
 
         Ok(server_config)
+    }
+
+    /// Build the rustls client-certificate verifier for a listener's mTLS
+    /// configuration, or `None` when client auth is disabled.
+    ///
+    /// Returns `None` only for [`ClientAuthMode::ClientAuthNone`] (and for an
+    /// absent `client_auth` field, which decodes to that variant), preserving
+    /// the historical `.with_no_client_auth()` path. For OPTIONAL/REQUIRED it
+    /// parses `client_ca_certificates` into a root store and, when present,
+    /// `client_ca_crls` into revocation lists. OPTIONAL additionally allows
+    /// unauthenticated clients (no certificate presented); REQUIRED aborts the
+    /// handshake in that case.
+    ///
+    /// The verifier is built with the caller's `provider` so it never relies on
+    /// a process-default crypto provider (which may be absent or ambiguous). An
+    /// unknown `client_auth` value is rejected rather than treated as NONE, so a
+    /// malformed or future enum value can never silently disable client auth.
+    fn client_cert_verifier(
+        config: &HttpsListenerConfig,
+        provider: &Arc<CryptoProvider>,
+    ) -> Result<Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>, ListenerError> {
+        // Reject unknown enum values instead of failing open to NONE.
+        let raw = config
+            .client_auth
+            .unwrap_or(ClientAuthMode::ClientAuthNone as i32);
+        let mode = ClientAuthMode::try_from(raw).map_err(|_| {
+            ListenerError::ClientAuth(format!("unknown client_auth mode value {raw}"))
+        })?;
+        if mode == ClientAuthMode::ClientAuthNone {
+            return Ok(None);
+        }
+
+        // Parse every trusted-CA PEM entry into the root store. Each entry may
+        // itself hold a concatenated PEM chain, so iterate per entry. An entry
+        // that contributes no certificate (empty text, or PEM carrying another
+        // section type) is rejected rather than skipped: it would start the
+        // listener with only a subset of the configured trust anchors, so
+        // clients issued by the omitted CA would fail with no visible cause.
+        let mut roots = RootCertStore::empty();
+        for pem in &config.client_ca_certificates {
+            let before = roots.len();
+            for cert in CertificateDer::pem_slice_iter(pem.as_bytes()) {
+                let cert =
+                    cert.map_err(|e| ListenerError::ClientAuth(format!("invalid CA PEM: {e}")))?;
+                roots
+                    .add(cert)
+                    .map_err(|e| ListenerError::ClientAuth(format!("untrusted CA: {e}")))?;
+            }
+            if roots.len() == before {
+                return Err(ListenerError::ClientAuth(
+                    "a configured trusted-CA entry contained no certificate".to_string(),
+                ));
+            }
+        }
+        if roots.is_empty() {
+            return Err(ListenerError::ClientAuth(
+                "client auth requested but no trusted CA certificate was provided".to_string(),
+            ));
+        }
+
+        // Parse CRLs per configured entry. An entry that yields zero CRLs (empty
+        // text, or PEM carrying another section type) is a misconfiguration: it
+        // would silently disable revocation, so reject it rather than build a
+        // verifier that skips `with_crls`.
+        let mut crls = Vec::new();
+        for pem in &config.client_ca_crls {
+            let before = crls.len();
+            for crl in CertificateRevocationListDer::pem_slice_iter(pem.as_bytes()) {
+                crls.push(
+                    crl.map_err(|e| ListenerError::ClientAuth(format!("invalid CRL PEM: {e}")))?,
+                );
+            }
+            if crls.len() == before {
+                return Err(ListenerError::ClientAuth(
+                    "a configured CRL entry contained no certificate revocation list".to_string(),
+                ));
+            }
+        }
+
+        let mut builder =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone());
+        if !crls.is_empty() {
+            // rustls defaults to `ExpirationPolicy::Ignore`, which keeps trusting
+            // a CRL past its `nextUpdate`. Enforce expiration so a stale CRL is
+            // rejected rather than silently accepting certificates whose
+            // revocation status is no longer known.
+            builder = builder.with_crls(crls).enforce_revocation_expiration();
+        }
+        if mode == ClientAuthMode::ClientAuthOptional {
+            builder = builder.allow_unauthenticated();
+        }
+        let verifier = builder
+            .build()
+            .map_err(|e| ListenerError::ClientAuth(e.to_string()))?;
+        Ok(Some(verifier))
     }
 
     /// Apply a partial-update patch to this listener's live configuration.
@@ -3148,5 +3260,146 @@ mod tests {
             build(180, Some(0)).get_h2_stream_idle_timeout(),
             Duration::from_secs(1)
         );
+    }
+
+    /// A self-signed cert usable as a CA root anchor in the verifier tests.
+    const TEST_CA_PEM: &str = include_str!("../assets/certificate.pem");
+
+    fn test_crypto_provider() -> Arc<CryptoProvider> {
+        Arc::new(default_provider())
+    }
+
+    fn https_config_with_client_auth(
+        mode: ClientAuthMode,
+        cas: &[&str],
+        crls: &[&str],
+    ) -> HttpsListenerConfig {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1049);
+        let mut config = ListenerBuilder::new_https(address)
+            .to_tls(None)
+            .expect("default HTTPS listener config");
+        config.client_auth = Some(mode as i32);
+        config.client_ca_certificates = cas.iter().map(|s| s.to_string()).collect();
+        config.client_ca_crls = crls.iter().map(|s| s.to_string()).collect();
+        config
+    }
+
+    #[test]
+    fn client_cert_verifier_none_is_disabled() {
+        // NONE (and an absent field) must keep the no-client-auth path.
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(ClientAuthMode::ClientAuthNone, &[], &[]);
+        assert!(
+            HttpsListener::client_cert_verifier(&config, &provider)
+                .expect("verifier build")
+                .is_none()
+        );
+
+        let mut absent = config;
+        absent.client_auth = None;
+        assert!(
+            HttpsListener::client_cert_verifier(&absent, &provider)
+                .expect("verifier build")
+                .is_none(),
+            "absent client_auth must decode to NONE"
+        );
+    }
+
+    #[test]
+    fn client_cert_verifier_rejects_unknown_mode() {
+        // An unknown (future/garbage) enum value must be rejected, never fold
+        // to NONE and silently accept unauthenticated clients.
+        let provider = test_crypto_provider();
+        let mut config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[TEST_CA_PEM], &[]);
+        config.client_auth = Some(999);
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    #[test]
+    fn client_cert_verifier_required_builds_with_ca() {
+        let provider = test_crypto_provider();
+        let config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[TEST_CA_PEM], &[]);
+        assert!(
+            HttpsListener::client_cert_verifier(&config, &provider)
+                .expect("verifier build")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn client_cert_verifier_optional_builds_with_ca() {
+        let provider = test_crypto_provider();
+        let config =
+            https_config_with_client_auth(ClientAuthMode::ClientAuthOptional, &[TEST_CA_PEM], &[]);
+        assert!(
+            HttpsListener::client_cert_verifier(&config, &provider)
+                .expect("verifier build")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn client_cert_verifier_requires_a_trusted_ca() {
+        // A non-NONE mode with an empty CA bundle is a configuration error, not
+        // a silently-permissive listener.
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(ClientAuthMode::ClientAuthRequired, &[], &[]);
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    #[test]
+    fn client_cert_verifier_rejects_malformed_ca() {
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &["not a pem certificate"],
+            &[],
+        );
+        // A CA entry that parses to zero anchors is a configuration error.
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    #[test]
+    fn client_cert_verifier_rejects_empty_ca_entry_among_valid_ones() {
+        // A valid CA followed by an entry contributing no certificate must be
+        // rejected, not silently dropped, so the configured trust set is never
+        // quietly reduced to a subset.
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &[TEST_CA_PEM, "not a certificate"],
+            &[],
+        );
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
+    }
+
+    #[test]
+    fn client_cert_verifier_rejects_empty_crl_entry() {
+        // A configured CRL entry that yields zero CRLs would silently disable
+        // revocation; it must be rejected rather than skipped.
+        let provider = test_crypto_provider();
+        let config = https_config_with_client_auth(
+            ClientAuthMode::ClientAuthRequired,
+            &[TEST_CA_PEM],
+            &["not a crl"],
+        );
+        assert!(matches!(
+            HttpsListener::client_cert_verifier(&config, &provider),
+            Err(ListenerError::ClientAuth(_))
+        ));
     }
 }
