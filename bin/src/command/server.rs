@@ -696,8 +696,10 @@ impl CommandHub {
         // false, timeout expiry → true). A previous hard-coded `false` made
         // `timed_out` always false in every `on_finish`: it left the audit
         // `FanoutStatus::Timeout`/`result` branches unreachable (a timed-out
-        // command reported success) and made `WorkerTask`'s `!timed_out`
-        // rollback guard inert (sozu#1301). Pinned by
+        // command reported success) and neutralised `WorkerTask`'s rollback
+        // decision, which reads this flag (sozu#1301, sozu#1314 — a panicking
+        // worker never answers, so the timeout path is the ONLY way its
+        // rejection is ever observed). Pinned by
         // `handle_finishing_task_forwards_timed_out_flag`.
         task.job.on_finish(&mut self.server, client, timed_out);
         self.in_flight
@@ -1558,12 +1560,18 @@ mod tests {
             .expect("Could not create command hub")
     }
 
-    /// Regression (sozu#1301): `handle_finishing_task` must forward its
-    /// `timed_out` argument to `GatheringTask::on_finish`, not a hard-coded
+    /// Regression (sozu#1301, sozu#1314): `handle_finishing_task` must forward
+    /// its `timed_out` argument to `GatheringTask::on_finish`, not a hard-coded
     /// literal. A previous `false` literal made `timed_out` always false in
-    /// every `on_finish` — disabling `WorkerTask`'s `!timed_out` rollback guard
-    /// and leaving the audit `FanoutStatus::Timeout`/`result` branches
-    /// unreachable (a timed-out command reported success).
+    /// every `on_finish` — neutralising `WorkerTask`'s rollback decision, which
+    /// reads that flag, and leaving the audit `FanoutStatus::Timeout`/`result`
+    /// branches unreachable (a timed-out command reported success).
+    ///
+    /// This is the propagation half of the sozu#1314 guarantee: a panicking
+    /// worker emits no response and no `expected_responses` decrement, so the
+    /// timeout path is the only way its rejection ever reaches
+    /// `should_rollback_fanout` (bin/src/command/requests.rs), whose decision
+    /// table is pinned by `rollback_predicate_tests`.
     #[test]
     fn handle_finishing_task_forwards_timed_out_flag() {
         use std::cell::Cell;

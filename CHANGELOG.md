@@ -83,6 +83,22 @@
   entry says how many. Rejection messages report byte lengths only, never the operator-supplied
   hostname.
 
+- **`fix(command)`: roll back a fanned-out change when the scatter times out with zero worker
+  acknowledgements** ([#1314](https://github.com/sozu-proxy/sozu/issues/1314)). The unanimous-
+  rejection rollback from [#1301](https://github.com/sozu-proxy/sozu/issues/1301) required at least
+  one worker to answer `Failure`, so it was skipped whenever the fan-out timed out instead — and a
+  worker that *panics* answers nothing at all: it emits no synthetic `Failure` and no
+  expected-response decrement, so the task can only end through its timeout. One unpatched worker
+  panicking on a malformed frontend during a rolling upgrade therefore left the malformed entry
+  committed in the main process's `ConfigState` forever, with `SaveState` re-persisting it, even
+  though the operator was already told the command had failed. The revert now fires on either
+  trigger — every scattered worker rejected the change, or the scatter timed out — as long as *no*
+  worker acknowledged it; an entry at least one worker applied is still never reverted. Residual: a
+  slow-but-healthy worker whose `Ok` arrives after the deadline is invisible to the finished task,
+  so it keeps the frontend until its next restart or state replay while the main process reverts —
+  a bounded divergence that self-heals on replay and matches the failure already reported to the
+  client.
+
 - **`fix(command)`: report a fan-out timeout as a failure, not a success.** `handle_finishing_task`
   passed a hard-coded `timed_out = false` into every task completion handler, so a command whose
   worker fan-out timed out was reported to the operator as `Successfully applied request to all

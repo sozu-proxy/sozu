@@ -1999,9 +1999,10 @@ struct WorkerTask {
     /// the audit would repopulate one counter, and the "wipes everything"
     /// contract would silently drift by exactly one row per clear.
     clear_master_metrics_on_finish: bool,
-    /// Inverse of the request (sozu#1301 rollback safety-net), computed by
-    /// [`compute_rollback`] before fan-out. When EVERY worker rejects the
-    /// request, [`WorkerTask::on_finish`] applies this to the main process's
+    /// Inverse of the request (sozu#1301/sozu#1314 rollback safety-net),
+    /// computed by [`compute_rollback`] before fan-out. When NO worker
+    /// acknowledges the request — see [`should_rollback_fanout`] for the two
+    /// triggers — [`WorkerTask::on_finish`] applies this to the main process's
     /// `ConfigState` to revert the committed change. `None` for requests
     /// without a defined inverse (they keep today's best-effort behavior).
     rollback: Option<Request>,
@@ -2136,16 +2137,15 @@ fn validate_request(request: &RequestType) -> Result<(), String> {
 }
 
 /// The inverse of a mutating request, used by the fan-out rollback safety-net
-/// (sozu#1301, defense-in-depth on top of `validate_listener_request`).
+/// (sozu#1301/sozu#1314, defense-in-depth on top of `validate_listener_request`).
 ///
 /// When the main process commits a request to its `ConfigState` and fans it
-/// out, but **every** worker rejects it, [`WorkerTask::on_finish`] applies this
-/// inverse to revert the main process's own state — so its authoritative
+/// out, but **no** worker acknowledges it, [`WorkerTask::on_finish`] applies
+/// this inverse to revert the main process's own state — so its authoritative
 /// `ConfigState` (the source of truth replayed into restarted or upgraded
-/// workers) never permanently holds an `Add` the whole fleet refused. Because
-/// the trigger is a *unanimous* rejection, no worker applied the change, so
-/// reverting the main process alone reconverges master and workers — there is
-/// nothing to compensate on the worker side.
+/// workers) never permanently holds an `Add` no worker confirmed.
+/// [`should_rollback_fanout`] owns the exact triggers and the one residual
+/// divergence they accept.
 ///
 /// Only requests whose inverse is unambiguous WITHOUT capturing the prior value
 /// are covered: the non-upsert `Add` verbs — every listener type (inverse
@@ -2177,6 +2177,43 @@ fn compute_rollback(request: &RequestType) -> Option<Request> {
         _ => return None,
     };
     Some(inverse.into())
+}
+
+/// sozu#1301 / sozu#1314: does the fan-out outcome justify reverting the
+/// main-process `ConfigState` with the precomputed inverse of [`compute_rollback`]?
+///
+/// Two triggers, both requiring ZERO `Ok` answers — an entry a single worker
+/// acknowledged might be good, and is NEVER rolled back:
+///
+/// - unanimous rejection (`!timed_out`): every worker the request was scattered
+///   to answered `Failure`. The original sozu#1301 trigger, unchanged.
+/// - timeout with zero acknowledgements (`timed_out`): not one of the answers
+///   received before the deadline was an `Ok`, and there may have been no
+///   answer at all. A worker that PANICS produces no synthetic `Failure` and
+///   no `expected_responses` decrement, so
+///   `has_finished` (`ok + errors >= expected`) never fires and the task only
+///   ends through the event loop's timeout path; `errors > 0` alone therefore
+///   cannot express "the fleet refused this". Skipping the revert here left the
+///   main process permanently holding — and `SaveState` re-persisting — an entry
+///   no worker ever acknowledged, which is exactly how one unpatched worker
+///   panicking during a rolling upgrade commits a malformed frontend for good
+///   (sozu#1314). The client is already told `Failure` on this same path, so
+///   reverting keeps the authoritative state consistent with the reported
+///   outcome.
+///
+/// `expected == 0` (a local-only fan-out) is never a verdict about anything and
+/// never reverts; it is unreachable through the timeout path anyway, since
+/// `has_finished` is already true at `0 >= 0`.
+///
+/// ACCEPTED RESIDUAL: a slow-but-healthy worker that applies the request and
+/// answers `Ok` AFTER the deadline is invisible — the task is off the in-flight
+/// queue and its late answer is dropped. The main process reverts while that
+/// worker keeps the frontend until its next restart or state replay: a bounded
+/// divergence that self-heals on replay and matches the `Failure` the client
+/// already received. The alternative — today's behavior — permanently commits an
+/// entry no worker confirmed, which is strictly worse for this incident class.
+fn should_rollback_fanout(timed_out: bool, expected: usize, ok: usize, errors: usize) -> bool {
+    expected > 0 && ok == 0 && (errors > 0 || timed_out)
 }
 
 pub fn worker_request(
@@ -2500,10 +2537,10 @@ pub fn worker_request(
 
     client.return_processing("Processing worker request...");
 
-    // sozu#1301 rollback safety-net: compute the inverse of this request now,
-    // while we still hold it, so `on_finish` can revert the main-process state
-    // if every worker rejects the change. `None` for verbs without a defined
-    // inverse (they keep today's best-effort behavior).
+    // sozu#1301/sozu#1314 rollback safety-net: compute the inverse of this
+    // request now, while we still hold it, so `on_finish` can revert the
+    // main-process state if no worker acknowledges the change. `None` for verbs
+    // without a defined inverse (they keep today's best-effort behavior).
     let rollback = request.request_type.as_ref().and_then(compute_rollback);
 
     server.scatter(
@@ -2685,31 +2722,29 @@ impl GatheringTask for WorkerTask {
             });
         }
 
-        // sozu#1301 rollback safety-net: if the change committed to ConfigState
-        // was rejected by EVERY worker it was scattered to (a unanimous,
-        // definitive failure — no timeout, at least one worker answered, and
-        // none accepted it), revert the main process's own state with the
-        // precomputed inverse. Because no worker applied the change, reverting
-        // the main process alone reconverges the fleet; there is nothing to
-        // compensate worker-side. A mixed result (some workers accepted) is
-        // deliberately left as-is to avoid diverging the main process from the
-        // workers that did accept.
-        if !timed_out
-            && expected > 0
-            && ok == 0
-            && errors > 0
+        // sozu#1301 / sozu#1314 rollback safety-net: when NO worker acknowledged
+        // the change committed to ConfigState — every scattered worker rejected
+        // it, or the scatter timed out with zero `Ok` (a panicking worker
+        // answers nothing at all) — revert the main process's own state with the
+        // precomputed inverse. A mixed result (`ok > 0`) is deliberately left
+        // as-is to avoid diverging the main process from the workers that did
+        // accept. See [`should_rollback_fanout`] for both triggers and for the
+        // accepted late-`Ok` residual on the timeout path.
+        if should_rollback_fanout(timed_out, expected, ok, errors)
             && let Some(rollback) = self.rollback.as_ref()
         {
             match server.state.dispatch(rollback) {
+                // Counts only, never request content: a `RequestHttpFrontend`
+                // rendering carries the operator-supplied hostname.
                 Ok(()) => warn!(
-                    "sozu#1301 rollback: reverted a change from main-process state after all {} \
-                     worker(s) rejected it",
-                    expected
+                    "sozu#1301/sozu#1314 rollback: reverted a change from main-process state \
+                     (ok=0, errors={}, expected={}, timed_out={})",
+                    errors, expected, timed_out
                 ),
                 Err(revert_error) => error!(
-                    "sozu#1301 rollback: could not revert main-process state after unanimous \
-                     worker rejection: {}",
-                    revert_error
+                    "sozu#1301/sozu#1314 rollback: could not revert main-process state after an \
+                     unacknowledged fan-out (ok=0, errors={}, expected={}, timed_out={}): {}",
+                    errors, expected, timed_out, revert_error
                 ),
             }
         }
@@ -4311,6 +4346,95 @@ mod mutating_verb_policy_tests {
             "SetMetricDetail is an observability knob, not a state transition; \
              keeping it out of is_mutating_verb prevents RELOADING flap on lease renewal"
         );
+    }
+}
+
+#[cfg(test)]
+mod rollback_predicate_tests {
+    //! sozu#1314: the sozu#1301 rollback safety-net must also fire when the
+    //! scatter TIMES OUT with zero worker acknowledgements — a worker that
+    //! panics answers nothing at all, so `errors` alone never proves the
+    //! fleet refused the change.
+    //!
+    //! `WorkerTask::on_finish` needs a real `&mut Server` and the timeout
+    //! itself lives in the event loop, so the guarantee is composed of two
+    //! locked properties: `handle_finishing_task_forwards_timed_out_flag`
+    //! (bin/src/command/server.rs) pins the propagation of `timed_out` down
+    //! to `on_finish`, and the exhaustive cases below pin the decision the
+    //! flag feeds. Same pattern as sozu#1301, where only `compute_rollback`
+    //! is unit-tested.
+    //!
+    //! To SEE THESE RED (regression proof): restore the pre-fix body of
+    //! [`super::should_rollback_fanout`],
+    //! `!timed_out && expected > 0 && ok == 0 && errors > 0` — the two
+    //! rolls-back-on-timeout expectations below then fail.
+    use super::should_rollback_fanout;
+
+    #[test]
+    fn unanimous_rejection_still_rolls_back() {
+        // sozu#1301, unchanged: every scattered worker answered Failure.
+        assert!(
+            should_rollback_fanout(false, 3, 0, 3),
+            "a unanimous rejection must still revert the main-process commit"
+        );
+    }
+
+    #[test]
+    fn timeout_with_no_answer_at_all_rolls_back() {
+        // The incident shape: a single worker panics on the malformed
+        // hostname, produces no synthetic Failure and no expected_responses
+        // decrement, and the task ends through the timeout path.
+        assert!(
+            should_rollback_fanout(true, 1, 0, 0),
+            "a scatter that timed out with zero answers must revert the commit"
+        );
+    }
+
+    #[test]
+    fn timeout_with_only_failures_rolls_back() {
+        // The rolling-upgrade shape of sozu#1314: the patched workers answer
+        // Failure, the unpatched one panics and stays silent until timeout.
+        assert!(
+            should_rollback_fanout(true, 3, 0, 2),
+            "a timeout whose received answers are all failures must revert the commit"
+        );
+    }
+
+    #[test]
+    fn any_acknowledgement_prevents_a_rollback() {
+        // `ok == 0` is the safety bound: an entry at least one worker applied
+        // is never reverted, timeout or not — reverting it would diverge the
+        // main process from the workers that accepted it.
+        for (timed_out, expected, ok, errors) in
+            [(false, 3, 1, 2), (true, 3, 1, 0), (true, 3, 1, 2)]
+        {
+            assert!(
+                !should_rollback_fanout(timed_out, expected, ok, errors),
+                "an entry acknowledged by a worker must never be rolled back \
+                 (timed_out={timed_out}, expected={expected}, ok={ok}, errors={errors})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clean_fanout_never_rolls_back() {
+        assert!(
+            !should_rollback_fanout(false, 3, 0, 0),
+            "a fan-out that neither failed nor timed out must not be reverted"
+        );
+    }
+
+    #[test]
+    fn a_local_only_fanout_never_rolls_back() {
+        // expected == 0 means nothing was scattered; there is no fleet verdict
+        // to act on. Unreachable through the timeout path anyway (has_finished
+        // is true at 0 >= 0), but the predicate stays safe on its own.
+        for timed_out in [false, true] {
+            assert!(
+                !should_rollback_fanout(timed_out, 0, 0, 0),
+                "a local-only fan-out must not be reverted (timed_out={timed_out})"
+            );
+        }
     }
 }
 
