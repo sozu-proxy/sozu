@@ -30,7 +30,8 @@ use sozu_command::{
 };
 
 use crate::metrics::names;
-use crate::router::pattern_trie::{Key, KeyValue, TrieNode};
+use crate::router::MAX_HOSTNAME_LENGTH;
+use crate::router::pattern_trie::{InsertResult, Key, KeyValue, TrieNode};
 
 /// Module-level prefix used on every log line emitted from this module.
 /// Produces a bold bright-white `TLS-RESOLVER` label (uniform across every
@@ -83,6 +84,8 @@ pub enum CertificateResolverError {
     ParsePem(CertificateError),
     #[error("error parsing overriding names in new certificate: {0}")]
     ParseOverridingNames(CertificateError),
+    #[error("the SNI route table cannot host a certificate name, name_bytes={}", .0.len())]
+    InvalidName(String),
 }
 
 /// A wrapper around the Rustls
@@ -311,6 +314,27 @@ impl CertificateResolver {
             return Ok(cert_to_add.fingerprint);
         }
 
+        // Reject a certificate whose name the SNI route table cannot host
+        // BEFORE mutating any state, by dry-running every name against a
+        // scratch trie (the grammar reasons are the same as in
+        // `router::Router::add_tree_rule`). `TrieNode::insert` reports
+        // such a name as a graceful `InsertResult::Failed`; discarding
+        // that result below would register the certificate while
+        // `self.domains` never learns the name -- a dead SNI route
+        // failing every handshake with no diagnostic. The length bound
+        // mirrors the router's: the trie recurses once per label.
+        {
+            let mut scratch: TrieNode<()> = TrieNode::root();
+            for name in &cert_to_add.names {
+                if name.len() > MAX_HOSTNAME_LENGTH
+                    || scratch.domain_insert(name.to_owned().into_bytes(), ())
+                        == InsertResult::Failed
+                {
+                    return Err(CertificateResolverError::InvalidName(name.to_owned()));
+                }
+            }
+        }
+
         // Past the duplicate guard the fingerprint is genuinely new, so the
         // store will grow by exactly one. Snapshot the count to assert that
         // delta below (ungated `let` — read only inside the debug_assert, so
@@ -347,10 +371,26 @@ impl CertificateResolver {
 
             // update the longest lived certificate in the TriNode
             self.domains.remove(&new_name.to_owned().into_bytes());
-            self.domains.insert(
+            let insert_result = self.domains.insert(
                 new_name.to_owned().into_bytes(),
                 longest_lived_cert.0.to_owned(),
             );
+            // Canary in the same shape as `tcp.rs::insert_sni_route`: the
+            // dry-run above already validated every name, so a `Failed`
+            // here is an internal bug, not a control-plane input error.
+            debug_assert_ne!(
+                insert_result,
+                InsertResult::Failed,
+                "add_certificate's names must already be validated by its dry-run"
+            );
+            if insert_result == InsertResult::Failed {
+                error!(
+                    "{} the SNI trie rejected a certificate name despite passing \
+                     the dry-run validation, name_bytes={}",
+                    log_module_context!(),
+                    new_name.len(),
+                );
+            }
         }
 
         self.certificates
@@ -413,8 +453,25 @@ impl CertificateResolver {
 
                     // reinsert the longest lived certificate in the TrieNode
                     if let Some(longest_lived_cert) = entry.get().last() {
-                        self.domains
+                        let insert_result = self
+                            .domains
                             .insert(name.as_bytes().to_vec(), longest_lived_cert.0.to_owned());
+                        // Same canary as in `add_certificate`: this name
+                        // was dry-run validated when its certificate was
+                        // added, so `Failed` cannot be an input error.
+                        debug_assert_ne!(
+                            insert_result,
+                            InsertResult::Failed,
+                            "remove_certificate re-inserts names that were validated on add"
+                        );
+                        if insert_result == InsertResult::Failed {
+                            error!(
+                                "{} the SNI trie rejected a re-inserted certificate name \
+                                 that was validated on add, name_bytes={}",
+                                log_module_context!(),
+                                name.len(),
+                            );
+                        }
                     }
 
                     // clean up empty index entries to avoid memory leaks
@@ -776,6 +833,43 @@ mod tests {
             .expect("test server must process the client hello");
     }
 
+    /// A certificate carrying a name the SNI route table cannot host must
+    /// be rejected as a whole, BEFORE any resolver state is touched. On
+    /// `main` such a name panicked inside `TrieNode::insert`; once the
+    /// insert reports `InsertResult::Failed` gracefully, silently
+    /// discarding the result would register the certificate while
+    /// `domains` never learns the name -- a dead SNI route failing every
+    /// handshake with no diagnostic on either side.
+    #[test]
+    fn add_certificate_rejects_a_name_the_route_table_cannot_host() {
+        for name in ["sni-secret.example/", ".sni-secret.example"] {
+            let mut resolver = CertificateResolver::default();
+            let result = resolver.add_certificate(&AddCertificate {
+                address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate: CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    names: vec![(*name).to_owned()],
+                    ..Default::default()
+                },
+                expired_at: None,
+            });
+            assert!(result.is_err(), "{name:?} must be rejected, not stored");
+            assert!(
+                resolver.certificates.is_empty(),
+                "{name:?} was rejected but the certificate store was mutated",
+            );
+            assert!(
+                resolver.name_fingerprint_idx.is_empty(),
+                "{name:?} was rejected but the name index was mutated",
+            );
+            assert!(
+                resolver.domains.is_empty(),
+                "{name:?} was rejected but the SNI trie was mutated",
+            );
+        }
+    }
+
     #[test]
     fn certificate_resolver_logs_redact_matching_sni_and_fingerprint() {
         const SNI_SECRET: &str = "resolver-sni-secret.example";
@@ -949,7 +1043,11 @@ mod tests {
                 certificate: CertificateAndKey {
                     certificate: include_str!("../assets/certificate.pem").to_owned(),
                     key: include_str!("../assets/key.pem").to_owned(),
-                    names: vec![format!("{NAME_SECRET}{}", "x".repeat(4096))],
+                    // Below `MAX_HOSTNAME_LENGTH` so the name passes the
+                    // add-time validation and reaches the Debug formatting
+                    // under test; the redaction property is
+                    // length-independent.
+                    names: vec![format!("{NAME_SECRET}{}", "x".repeat(2048))],
                     ..Default::default()
                 },
                 expired_at: None,

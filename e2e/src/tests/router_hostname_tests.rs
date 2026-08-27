@@ -11,10 +11,22 @@
 //! out to every worker, so one such frontend killed all of them at once,
 //! and killed them again on every restart state replay.
 //!
+//! A second class panicked one layer earlier: the unconditional
+//! `DomainRule` parse walked `convert_regex_domain_rule` out of bounds on
+//! a hostname whose last segment is followed by a bare trailing `.`
+//! (`/a/.`), before the trie was ever reached.
+//!
 //! The contract these tests pin: the worker answers
 //! `ResponseStatus::Failure`, stays alive, and its route table is
-//! undisturbed — a subsequent well-formed frontend still installs and
-//! still serves traffic.
+//! undisturbed — a subsequent well-formed frontend still installs on the
+//! same listener.
+//!
+//! Scope note: the harness runs the worker as an in-process thread
+//! (`Worker::start_new_worker_owned`), so a panicking worker fails this
+//! test through the harness's panic on the dropped command channel — fast
+//! and reliable, but the production failure mode (process death, main
+//! fan-out, restart loop, state replay) is out of e2e reach by
+//! construction.
 
 use sozu_command_lib::{
     config::ListenerBuilder,
@@ -25,10 +37,7 @@ use sozu_command_lib::{
 
 use crate::{
     sozu::worker::Worker,
-    tests::{
-        State, repeat_until_error_or,
-        tests::{create_local_address, create_unbound_local_address},
-    },
+    tests::{State, repeat_until_error_or, tests::create_local_address},
 };
 
 /// Every hostname here is refused by `TrieNode::insert_recursive`, one
@@ -47,6 +56,12 @@ const MALFORMED_HOSTNAMES: &[&str] = &[
     // Bare separators.
     "/",
     "///",
+    // Trailing `.` right after a segment: rejected by the `DomainRule`
+    // parse (`convert_regex_domain_rule` used to index out of bounds on
+    // these, a release panic upstream of the trie).
+    "/a/.",
+    "a/b/.",
+    "x./y/.",
 ];
 
 /// Spawn a worker with a single plain-HTTP listener. Mirrors the helper
@@ -77,10 +92,10 @@ fn spawn_worker_with_http_listener(name: &str, front_address: std::net::SocketAd
 
 /// A malformed hostname must come back as `ResponseStatus::Failure` and
 /// leave the worker healthy enough to accept the next request. A panicking
-/// worker fails this test by never answering at all.
+/// worker fails this test through the harness: the worker thread's command
+/// channel drops on unwind and `read_proxy_response` panics on the EOF.
 pub fn try_malformed_hostnames_rejected() -> State {
     let front_address = create_local_address();
-    let _unused_back = create_unbound_local_address();
     let mut worker = spawn_worker_with_http_listener("ROUTER-HOSTNAME", front_address);
 
     worker.send_proxy_request(
@@ -105,6 +120,25 @@ pub fn try_malformed_hostnames_rejected() -> State {
             );
             return State::Fail;
         }
+    }
+
+    // An oversized hostname (the router bounds hostnames to
+    // `MAX_HOSTNAME_LENGTH` = 4096 bytes before parsing, against unbounded
+    // trie recursion and pathological regex compilation) is refused
+    // through the same path.
+    let mut frontend = Worker::default_http_frontend("malformed_hostname_cluster", front_address);
+    frontend.hostname = "a".repeat(4097);
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(frontend));
+    let Some(response) = worker.read_proxy_response() else {
+        eprintln!("worker did not answer the oversized AddHttpFrontend");
+        return State::Fail;
+    };
+    if response.status != ResponseStatus::Failure as i32 {
+        eprintln!(
+            "an oversized hostname must be refused, got status={} message={:?}",
+            response.status, response.message
+        );
+        return State::Fail;
     }
 
     // The worker survived every rejection: a well-formed frontend still
