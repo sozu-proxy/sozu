@@ -876,15 +876,20 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
     for (request_index, message) in config_messages.into_iter().enumerate() {
         let request = message.content;
         // sozu#1301: skip an unbuildable listener at boot without reserving its
-        // address, so a corrected reload can still add it. Fail-open — one bad
-        // listener does not stop the others (matches the dispatch-error skip
-        // below), it just never enters ConfigState.
+        // address, so a corrected reload can still add it. sozu#1313: skip a
+        // frontend the workers' router refuses, so it never enters the state
+        // the master persists and replays. Fail-open — one bad entry does not
+        // stop the others (matches the dispatch-error skip below), it just
+        // never enters ConfigState. The `warn!` is not redundant with the
+        // `return_processing`: at startup there is no client (`client == None`,
+        // see the audit comment above) and the processing line goes nowhere.
         if let Some(reason) = request
             .request_type
             .as_ref()
-            .and_then(|request_type| validate_listener_request(request_type).err())
+            .and_then(|request_type| validate_request(request_type).err())
         {
-            client.return_processing(format!("Skipping invalid listener config: {reason}"));
+            warn!("Skipping invalid config entry: {}", reason);
+            client.return_processing(format!("Skipping invalid config entry: {reason}"));
             continue;
         }
         if let Err(error) = server.state.dispatch(&request) {
@@ -2061,7 +2066,9 @@ impl MetricDetailAuditFields {
 ///
 /// Only listener-add requests are validated; every other request returns `Ok`.
 /// TCP/UDP construction has no fallible config today (see their
-/// `validate_config`), so those arms currently always succeed.
+/// `validate_config`), so those arms currently always succeed. This is one half
+/// of the shared pre-dispatch gate — call [`validate_request`], not this
+/// function, from an apply path.
 fn validate_listener_request(request: &RequestType) -> Result<(), String> {
     match request {
         RequestType::AddHttpListener(config) => {
@@ -2075,6 +2082,57 @@ fn validate_listener_request(request: &RequestType) -> Result<(), String> {
         _ => return Ok(()),
     }
     .map_err(|listener_error| listener_error.to_string())
+}
+
+/// Master-side pre-validation for HTTP/HTTPS frontend-add requests (sozu#1313).
+///
+/// `ConfigState` has no route-grammar check: `add_http_frontend` only converts
+/// the request (the sole failure being an out-of-range `position`), so a
+/// frontend whose hostname every worker's router refuses is still recorded by
+/// the main process. Once recorded it is authoritative — `SaveState` re-
+/// serialises it and every state replay re-injects it, and the replay path has
+/// no rollback at all. Running the worker's OWN insertion path here, against a
+/// disposable empty [`sozu_lib::router::Router`] and BEFORE
+/// `ConfigState::dispatch`, keeps the two in lockstep by construction (same
+/// binary, same code) and stops the poisoned entry at the door. This mirrors
+/// [`validate_listener_request`] (sozu#1301).
+///
+/// The probe costs a `Router::new()` — two empty `Vec`s and a `TrieNode::root()`
+/// — plus exactly the work each worker would have done anyway, bounded by
+/// `MAX_HOSTNAME_LENGTH`. One probe per `Add{Http,Https}Frontend` on the
+/// control plane buys back N rejected fan-outs and N audit lines.
+///
+/// It covers, in the worker's own order: the hostname length bound before any
+/// parse, the path rule, the `DomainRule` parse, the route-table trie grammar
+/// (`RouterError::AddRoute` — trailing `/` with no openable regex segment,
+/// empty labels, non-`.`-anchored regex segments), and the rewrite/header
+/// policy built by `Frontend::new`. Every other request returns `Ok`.
+///
+/// The returned string is a `RouterError` / `RequestError` `Display`, both of
+/// which report byte LENGTHS rather than operator values — never format the
+/// frontend itself into it: `RequestHttpFrontend`'s `Display` (the state map
+/// key) carries the hostname in clear.
+fn validate_frontend_request(request: &RequestType) -> Result<(), String> {
+    let front = match request {
+        RequestType::AddHttpFrontend(front) | RequestType::AddHttpsFrontend(front) => front,
+        _ => return Ok(()),
+    };
+    let front = front
+        .to_owned()
+        .to_frontend()
+        .map_err(|request_error| request_error.to_string())?;
+    let mut probe = sozu_lib::router::Router::new();
+    probe
+        .add_http_front(&front)
+        .map_err(|router_error| router_error.to_string())
+}
+
+/// sozu#1301 + sozu#1313: the single pre-dispatch validation every master apply
+/// path — [`worker_request`], [`load_state`] and [`load_static_config`] — runs
+/// before mutating `ConfigState`.
+fn validate_request(request: &RequestType) -> Result<(), String> {
+    validate_listener_request(request)?;
+    validate_frontend_request(request)
 }
 
 /// The inverse of a mutating request, used by the fan-out rollback safety-net
@@ -2261,20 +2319,23 @@ pub fn worker_request(
     // below, so it is dead code in release but must stay ungated (E0425).
     let state_hash_before = server.state.hash_state();
 
-    // sozu#1301: validate a listener-add config the way the worker will build
-    // it (rustls context + answer templates) BEFORE committing to ConfigState.
-    // Committing an unbuildable listener first reserves its address, and the
-    // corrected reload is then refused with StateError::Exists. Validation is
-    // read-only on state and runs first; dispatch happens only if it passes.
+    // sozu#1301 + sozu#1313: validate the request the way the worker will apply
+    // it BEFORE committing to ConfigState — a listener the way the worker builds
+    // it (rustls context + answer templates), a frontend the way the worker's
+    // router inserts it. Committing an unbuildable listener first reserves its
+    // address, and the corrected reload is then refused with StateError::Exists;
+    // committing a frontend whose hostname the router refuses poisons the state
+    // the master re-persists and replays. Validation is read-only on state and
+    // runs first; dispatch happens only if it passes.
     // Tag the two failure classes distinctly for the audit taxonomy: a rejected
-    // `validate_listener_request` is operator-invalid *input* (bad TLS
-    // versions/ciphers or an unparseable answer template) → `InvalidInput`
-    // (same class as the `set_logging_level` filter check); a rejected
-    // `state.dispatch` is a genuine state conflict → `DispatchError`.
+    // `validate_request` is operator-invalid *input* (bad TLS versions/ciphers,
+    // an unparseable answer template, a malformed frontend hostname) →
+    // `InvalidInput` (same class as the `set_logging_level` filter check); a
+    // rejected `state.dispatch` is a genuine state conflict → `DispatchError`.
     let apply_result = request
         .request_type
         .as_ref()
-        .map_or(Ok(()), validate_listener_request)
+        .map_or(Ok(()), validate_request)
         .map_err(|reason| (AuditErrorCode::InvalidInput, reason))
         .and_then(|()| {
             server
@@ -3281,6 +3342,12 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
 
     let mut buffer = Buffer::with_capacity(200000);
     let mut scatter_request_counter = 0usize;
+    // sozu#1313: entries the pre-dispatch validation refused. Counted here
+    // rather than on `LoadStateTask` because the task is already owned by the
+    // server's queue and `Server` exposes no handle to mutate it afterwards —
+    // the tally only needs to reach the operator, which the `return_processing`
+    // below does.
+    let mut skipped_invalid = 0usize;
 
     let status = loop {
         let previous = buffer.available_data();
@@ -3310,10 +3377,21 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
                     // sozu#1301: skip an unbuildable listener from the saved
                     // state without reserving its address, so a corrected
                     // reload can add it (mirrors the dispatch-failure skip).
+                    // sozu#1313: skip a frontend the workers' router refuses —
+                    // this replay path has NO rollback, so an entry dispatched
+                    // here stays in the main-process state for good and is re-
+                    // persisted by the next `SaveState`. `warn!`, not `debug!`:
+                    // an entry silently dropped from the state the operator
+                    // saved must be visible at the default log level.
                     if let Some(request_type) = &request.content.request_type
-                        && let Err(reason) = validate_listener_request(request_type)
+                        && let Err(reason) = validate_request(request_type)
                     {
-                        debug!("load_state: skipping invalid listener config: {}", reason);
+                        warn!(
+                            "load_state: skipping an entry rejected by pre-dispatch validation: {}",
+                            reason
+                        );
+                        count!("config.load_skipped_invalid", 1);
+                        skipped_invalid += 1;
                         continue;
                     }
                     if server.state.dispatch(&request.content).is_ok() {
@@ -3352,6 +3430,14 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
 
     match status {
         Ok(()) => {
+            if skipped_invalid > 0 {
+                // sozu#1313: the load is deliberately NOT aborted — every valid
+                // entry still applies — but the operator must learn that the
+                // state they reloaded is not the state they saved.
+                client.return_processing(format!(
+                    "load_state: skipped {skipped_invalid} invalid entries — see the main process warnings"
+                ));
+            }
             client.return_processing("Applying state file...");
             // Success audit is emitted from `LoadStateTask::on_finish` once
             // every worker has acknowledged — that's where we know the final
@@ -4387,6 +4473,210 @@ mod listener_validation_tests {
         assert!(
             super::compute_rollback(&RequestType::Logging("info".to_owned())).is_none(),
             "a non-add verb must have no rollback inverse"
+        );
+    }
+}
+
+#[cfg(test)]
+mod frontend_validation_tests {
+    //! sozu#1313: a frontend whose hostname the workers' router refuses must be
+    //! rejected by the main process BEFORE it is committed to `ConfigState`.
+    //! `ConfigState` has no route-grammar check, the replay path has no
+    //! rollback, and `SaveState` re-serialises whatever the state holds — so a
+    //! frontend that gets in stays in, and re-poisons every replay. These
+    //! exercise the production [`validate_frontend_request`] guard and the
+    //! [`validate_request`] entry point all three master apply paths
+    //! (`worker_request`, `load_static_config`, `load_state`) share.
+    //!
+    //! To SEE THESE RED (regression proof): make `validate_frontend_request`
+    //! return `Ok(())` unconditionally — the pre-fix behavior where the main
+    //! process committed frontends without checking the router grammar. The
+    //! `is_err()` assertions below then fail.
+    use super::{validate_frontend_request, validate_request};
+    use sozu_command_lib::{
+        config::ListenerBuilder,
+        proto::command::{
+            PathRule, PathRuleKind, RequestHttpFrontend, RulePosition, SocketAddress,
+            request::RequestType,
+        },
+        state::ConfigState,
+    };
+    use std::collections::BTreeMap;
+
+    /// The hostname that panicked every worker in production: a trailing `/`
+    /// with no openable regex segment. The router's trie grammar refuses it.
+    const INCIDENT_HOSTNAME: &str = "raat-app.cleverapps.io/";
+
+    /// A minimal `Tree`-positioned frontend add for `hostname`, valid in every
+    /// respect except what the caller intends to make invalid.
+    fn frontend(hostname: &str) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: Some("cluster".to_owned()),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            hostname: hostname.to_owned(),
+            path: PathRule {
+                kind: PathRuleKind::Prefix as i32,
+                value: "/".to_owned(),
+            },
+            method: None,
+            position: RulePosition::Tree as i32,
+            tags: BTreeMap::new(),
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: Vec::new(),
+            hsts: None,
+        }
+    }
+
+    #[test]
+    fn config_state_commits_a_frontend_the_router_refuses() {
+        // The pathology this guard defends against, proven at the state layer
+        // so the master-side guard below is demonstrably load-bearing:
+        // `ConfigState::add_http_frontend` only runs `to_frontend()`, whose
+        // sole failure is an out-of-range `position` — no hostname grammar is
+        // checked anywhere. The malformed entry is therefore recorded, and from
+        // there `SaveState` re-persists it and every replay re-injects it.
+        let mut state = ConfigState::new();
+        state
+            .dispatch(&RequestType::AddHttpFrontend(frontend(INCIDENT_HOSTNAME)).into())
+            .expect("ConfigState records the malformed frontend — it has no route-grammar check");
+    }
+
+    #[test]
+    fn malformed_hostnames_are_rejected_before_commit() {
+        // Every shape the workers' router refuses — the same classes
+        // `Router::add_http_front` rejects, reached through the exact code the
+        // worker runs.
+        for hostname in [
+            // The incident: a trailing `/` opens a regex segment that never
+            // closes, so the route-table trie refuses the insert.
+            INCIDENT_HOSTNAME,
+            // Empty label.
+            ".example.com",
+            // A segment that is not a valid regex.
+            "/[/.example.com",
+            // A regex segment that is not `.`-anchored.
+            "abc/[0-9]+/.example.com",
+            // A bare trailing `.` after a completed segment — the release
+            // out-of-bounds `convert_regex_domain_rule` fixed in sozu#1312.
+            "/a/.",
+        ] {
+            let request = RequestType::AddHttpFrontend(frontend(hostname));
+            assert!(
+                validate_frontend_request(&request).is_err(),
+                "a frontend the workers' router refuses must be rejected before commit \
+                 (hostname_bytes={})",
+                hostname.len(),
+            );
+        }
+
+        // Over the pre-parse length bound (`MAX_HOSTNAME_LENGTH`): the trie
+        // recurses once per label and a `/`-segment compiles a regex, so the
+        // router bounds the hostname before parsing anything.
+        let oversized = "a".repeat(sozu_lib::router::MAX_HOSTNAME_LENGTH + 1);
+        assert!(
+            validate_frontend_request(&RequestType::AddHttpFrontend(frontend(&oversized))).is_err(),
+            "a hostname over MAX_HOSTNAME_LENGTH must be rejected before commit"
+        );
+    }
+
+    #[test]
+    fn https_frontend_arm_is_validated_too() {
+        // `AddHttpsFrontend` carries the same `RequestHttpFrontend` payload and
+        // reaches the same router insert on the worker; the guard must not
+        // cover only the plaintext arm.
+        let request = RequestType::AddHttpsFrontend(frontend(INCIDENT_HOSTNAME));
+        assert!(
+            validate_frontend_request(&request).is_err(),
+            "a malformed hostname must be rejected on the HTTPS arm too"
+        );
+    }
+
+    #[test]
+    fn rejection_message_carries_no_operator_value() {
+        // The failure string flows into the audit `reason` column and the
+        // client failure message. `RouterError`'s Display reports byte lengths
+        // only — a hostname leaking here would undo the redaction work of the
+        // Security section this release ships.
+        let request = RequestType::AddHttpFrontend(frontend(INCIDENT_HOSTNAME));
+        let reason = validate_frontend_request(&request)
+            .expect_err("the incident hostname must be rejected");
+        assert!(
+            !reason.contains(INCIDENT_HOSTNAME),
+            "the rejection reason must not carry the operator-supplied hostname: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn valid_frontends_pass_validation() {
+        for hostname in [
+            "example.com",
+            "*.example.com",
+            // A well-formed `.`-anchored regex segment.
+            "/ab+c/.example.com",
+        ] {
+            let request = RequestType::AddHttpFrontend(frontend(hostname));
+            assert!(
+                validate_frontend_request(&request).is_ok(),
+                "a frontend the workers' router accepts must pass validation \
+                 (hostname_bytes={}): {:?}",
+                hostname.len(),
+                validate_frontend_request(&request),
+            );
+        }
+
+        // The rewrite/header policy path (`Frontend::new`) is exercised too:
+        // valid capture templates pass...
+        let mut rewritten = frontend("example.com");
+        rewritten.rewrite_host = Some("$HOST[0]".to_owned());
+        rewritten.rewrite_path = Some("/prefix$PATH[0]".to_owned());
+        let request = RequestType::AddHttpFrontend(rewritten.clone());
+        assert!(
+            validate_frontend_request(&request).is_ok(),
+            "a frontend with valid rewrites must pass validation: {:?}",
+            validate_frontend_request(&request),
+        );
+
+        // ...and an out-of-range capture index (an `Exact` domain produces one
+        // capture) is refused before commit like any other invalid frontend.
+        rewritten.rewrite_host = Some("$HOST[9]".to_owned());
+        assert!(
+            validate_frontend_request(&RequestType::AddHttpFrontend(rewritten)).is_err(),
+            "a rewrite referencing a capture the router cannot fill must be rejected"
+        );
+    }
+
+    #[test]
+    fn non_frontend_verbs_pass_and_invalid_listeners_still_fail() {
+        // The frontend guard is a no-op on every other verb...
+        assert!(
+            validate_frontend_request(&RequestType::Logging("info".to_owned())).is_ok(),
+            "a non-frontend verb must not be touched by the frontend guard"
+        );
+
+        // ...and the shared entry point still enforces sozu#1301 (an
+        // unbuildable listener answer template) as well as sozu#1313.
+        let mut cfg = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8085))
+            .to_http(None)
+            .expect("default HTTP listener config");
+        cfg.answers
+            .insert("404".to_owned(), "not a valid http response".to_owned());
+        assert!(
+            validate_request(&RequestType::AddHttpListener(cfg)).is_err(),
+            "validate_request must keep rejecting an unbuildable listener (sozu#1301)"
+        );
+        assert!(
+            validate_request(&RequestType::AddHttpFrontend(frontend(INCIDENT_HOSTNAME))).is_err(),
+            "validate_request must reject a malformed frontend (sozu#1313)"
+        );
+        assert!(
+            validate_request(&RequestType::AddHttpFrontend(frontend("example.com"))).is_ok(),
+            "validate_request must accept a well-formed frontend"
         );
     }
 }
