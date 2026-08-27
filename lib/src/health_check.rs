@@ -510,7 +510,7 @@ impl HealthChecker {
         // Sort indices in descending order so swap_remove doesn't invalidate
         // later indices — it moves the last element to the removed position,
         // which has already been processed or is beyond our range.
-        completed.sort_by(|a, b| b.0.cmp(&a.0));
+        completed.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         // We never schedule the same slot for removal twice, and never more
         // removals than there are in-flight checks.
         debug_assert!(

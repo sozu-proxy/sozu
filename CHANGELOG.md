@@ -44,6 +44,32 @@
   `RetrieveClusterError::SniAuthorityMismatch` variant fields, `RequestHttpFrontend::Display`, and
   certificate-query response payloads remain unchanged.
 
+### 🐛 Fixed
+
+- **`fix(command)`: validate a listener configuration before committing it to the main-process
+  state** ([#1301](https://github.com/sozu-proxy/sozu/issues/1301)). An HTTPS listener whose
+  configuration the worker cannot build (an unusable TLS version/cipher set, or an unparseable
+  answer template) was recorded in the main process's `ConfigState` before the worker rejected it,
+  reserving the address; a corrected reload was then refused with `StateError::Exists` and never
+  reached the workers, so the listener stayed down until an explicit `RemoveListener` or a restart.
+  The main process now validates every `Add{Http,Https,Tcp,Udp}Listener` the way the worker builds
+  it — reusing the worker's own construction check, before `ConfigState` is mutated and fanned out —
+  so an invalid listener never reserves its address and a corrected reload applies cleanly. Invalid
+  listeners in the static config or a loaded state file are likewise skipped without reserving their
+  address. The `StateError::Exists` message now also points at the remedy (remove it first, or apply
+  the corresponding update, instead of re-adding). As defense-in-depth, when a committed change is
+  rejected by *every* worker it was fanned out to, the main process now reverts its own `ConfigState`
+  with the inverse request (listener and HTTP/HTTPS-frontend adds), so its authoritative state — the
+  one replayed into restarted and upgraded workers — never permanently holds an add the whole fleet
+  refused.
+
+- **`fix(command)`: report a fan-out timeout as a failure, not a success.** `handle_finishing_task`
+  passed a hard-coded `timed_out = false` into every task completion handler, so a command whose
+  worker fan-out timed out was reported to the operator as `Successfully applied request to all
+  workers` and its audit line mislabeled the `FanoutStatus`/`result`. The real `timed_out` flag is
+  now forwarded, so a timed-out command correctly returns a failure (and the `#1301` rollback
+  safety-net's timeout guard now engages as intended).
+
 ## 2.2.0 - 2026-07-16
 
 Minor release: TCP passthrough routing by TLS SNI + ALPN, HTTP/1
@@ -149,7 +175,7 @@ fixes across the pipe and `splice` paths.
 ### 🤖 CI
 
 - **`fix(ci)`: the release build uses the pinned MSRV toolchain.** The
-  per-target release job installs Rust 1.91.0 with its matrix target, matching
+  per-target release job installs Rust 1.93.1 with its matrix target, matching
   the `rust-toolchain` pin (it still requested 1.88.0 after the MSRV bump).
 - **`fix(ci)`: the release preflight validates every crate version.** The
   drift check covered `bin`/`lib`/`command`/`e2e` only, while `sim/` (a
@@ -210,7 +236,7 @@ fixes across the pipe and `splice` paths.
 
 ## 2.1.1 - 2026-07-10
 
-Patch release: dependency updates, Rust 1.91.0 MSRV alignment, deterministic
+Patch release: dependency updates, Rust 1.93.1 MSRV alignment, deterministic
 simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
 
 ### ✨ Added
@@ -231,7 +257,7 @@ simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
 
 ### 🔄 Changed
 
-- **MSRV bumped 1.88.0 → 1.91.0** (`rust-toolchain` + every crate's
+- **MSRV bumped 1.88.0 → 1.93.1** (`rust-toolchain` + every crate's
   `rust-version`). Required by `moonpool-sim`, which uses `Duration::from_hours`
   /`from_mins` — const-stable only since Rust 1.91. moonpool also needs
   `--cfg tokio_unstable` (it seeds tokio's runtime RNG via the unstable `RngSeed`
@@ -261,7 +287,7 @@ simulation CI migration, and WebSocket/WSS upgrade-path buffering fixes.
   and the nightly `simulation-sweep` workflow goes deep — seed-bounded to fit the
   45-min cap, since moonpool's per-seed tokio-runtime construction is ~100× slower
   per seed-step than the former pure-sync handmade swarm. All CI toolchain pins
-  move 1.88.0 → 1.91.0.
+  move 1.88.0 → 1.93.1.
 
 ### 🔐 Security
 

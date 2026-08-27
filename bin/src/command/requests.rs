@@ -27,12 +27,13 @@ use sozu_command_lib::{
     parser::parse_several_requests,
     proto::command::{
         AggregatedMetrics, AvailableMetrics, CertificatesWithFingerprints, ClusterHashes,
-        ClusterInformations, Event, EventKind, FrontendFilters, HardStop, MetricDetail,
-        MetricDetailStatus, MetricsConfiguration, QueryCertificatesFilters, QueryHealthChecks,
-        QueryMetricsOptions, Request, ResponseContent, ResponseStatus, RunState, SetMetricDetail,
-        SoftStop, Status, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
-        UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest,
-        WorkerResponses, request::RequestType, response_content::ContentType,
+        ClusterInformations, Event, EventKind, FrontendFilters, HardStop, ListenerType,
+        MetricDetail, MetricDetailStatus, MetricsConfiguration, QueryCertificatesFilters,
+        QueryHealthChecks, QueryMetricsOptions, RemoveListener, Request, ResponseContent,
+        ResponseStatus, RunState, SetMetricDetail, SoftStop, Status, UpdateHttpListenerConfig,
+        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerInfo,
+        WorkerInfos, WorkerRequest, WorkerResponses, request::RequestType,
+        response_content::ContentType,
     },
     sd_notify,
 };
@@ -640,7 +641,7 @@ fn save_state(server: &mut Server, client: &mut ClientSession, path: &str) {
             );
             client.finish_ok(format!(
                 "Saved {count} config messages to {}",
-                &path.display()
+                path.display()
             ));
         }
         Err(error) => {
@@ -874,6 +875,18 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
 
     for (request_index, message) in config_messages.into_iter().enumerate() {
         let request = message.content;
+        // sozu#1301: skip an unbuildable listener at boot without reserving its
+        // address, so a corrected reload can still add it. Fail-open — one bad
+        // listener does not stop the others (matches the dispatch-error skip
+        // below), it just never enters ConfigState.
+        if let Some(reason) = request
+            .request_type
+            .as_ref()
+            .and_then(|request_type| validate_listener_request(request_type).err())
+        {
+            client.return_processing(format!("Skipping invalid listener config: {reason}"));
+            continue;
+        }
         if let Err(error) = server.state.dispatch(&request) {
             client.return_processing(format!("Could not execute request on state: {error:#}"));
             continue;
@@ -1981,6 +1994,12 @@ struct WorkerTask {
     /// the audit would repopulate one counter, and the "wipes everything"
     /// contract would silently drift by exactly one row per clear.
     clear_master_metrics_on_finish: bool,
+    /// Inverse of the request (sozu#1301 rollback safety-net), computed by
+    /// [`compute_rollback`] before fan-out. When EVERY worker rejects the
+    /// request, [`WorkerTask::on_finish`] applies this to the main process's
+    /// `ConfigState` to revert the committed change. `None` for requests
+    /// without a defined inverse (they keep today's best-effort behavior).
+    rollback: Option<Request>,
 }
 
 /// Carry the per-verb metadata needed to emit a completion-time audit
@@ -2025,6 +2044,81 @@ impl MetricDetailAuditFields {
             ..Default::default()
         }
     }
+}
+
+/// Master-side pre-validation for listener-add requests (sozu#1301).
+///
+/// A worker rejects an unbuildable listener configuration only when it
+/// constructs the listener (building the rustls context / parsing the answer
+/// templates) — but by then the main process has already committed the listener
+/// to its `ConfigState` and reserved the address, so a corrected reload is
+/// refused with `StateError::Exists` and never reaches the workers. Running the
+/// worker's OWN construction check here, BEFORE `ConfigState::dispatch`, keeps
+/// the two in lockstep (same binary, same crypto provider) and lets an invalid
+/// listener be rejected without ever reserving its address. This mirrors the
+/// existing `SetMetricDetail` pre-validation in [`worker_request`]: fail fast
+/// before fan-out rather than amplifying a bad input across every worker.
+///
+/// Only listener-add requests are validated; every other request returns `Ok`.
+/// TCP/UDP construction has no fallible config today (see their
+/// `validate_config`), so those arms currently always succeed.
+fn validate_listener_request(request: &RequestType) -> Result<(), String> {
+    match request {
+        RequestType::AddHttpListener(config) => {
+            sozu_lib::http::HttpListener::validate_config(config)
+        }
+        RequestType::AddHttpsListener(config) => {
+            sozu_lib::https::HttpsListener::validate_config(config)
+        }
+        RequestType::AddTcpListener(config) => sozu_lib::tcp::TcpListener::validate_config(config),
+        RequestType::AddUdpListener(config) => sozu_lib::udp::UdpListener::validate_config(config),
+        _ => return Ok(()),
+    }
+    .map_err(|listener_error| listener_error.to_string())
+}
+
+/// The inverse of a mutating request, used by the fan-out rollback safety-net
+/// (sozu#1301, defense-in-depth on top of `validate_listener_request`).
+///
+/// When the main process commits a request to its `ConfigState` and fans it
+/// out, but **every** worker rejects it, [`WorkerTask::on_finish`] applies this
+/// inverse to revert the main process's own state — so its authoritative
+/// `ConfigState` (the source of truth replayed into restarted or upgraded
+/// workers) never permanently holds an `Add` the whole fleet refused. Because
+/// the trigger is a *unanimous* rejection, no worker applied the change, so
+/// reverting the main process alone reconverges master and workers — there is
+/// nothing to compensate on the worker side.
+///
+/// Only requests whose inverse is unambiguous WITHOUT capturing the prior value
+/// are covered: the non-upsert `Add` verbs — every listener type (inverse
+/// `RemoveListener`) and HTTP/HTTPS frontends (inverse is the same payload under
+/// the `Remove` variant). Upsert verbs (`AddCluster`, `AddBackend`, which
+/// replace a prior value in place) and certificates would need the prior value
+/// captured to revert correctly, so they are deliberately NOT covered and keep
+/// today's best-effort behavior; every other request returns `None`.
+fn compute_rollback(request: &RequestType) -> Option<Request> {
+    let inverse = match request {
+        RequestType::AddHttpListener(config) => RequestType::RemoveListener(RemoveListener {
+            address: config.address,
+            proxy: ListenerType::Http.into(),
+        }),
+        RequestType::AddHttpsListener(config) => RequestType::RemoveListener(RemoveListener {
+            address: config.address,
+            proxy: ListenerType::Https.into(),
+        }),
+        RequestType::AddTcpListener(config) => RequestType::RemoveListener(RemoveListener {
+            address: config.address,
+            proxy: ListenerType::Tcp.into(),
+        }),
+        RequestType::AddUdpListener(config) => RequestType::RemoveListener(RemoveListener {
+            address: config.address,
+            proxy: ListenerType::Udp.into(),
+        }),
+        RequestType::AddHttpFrontend(front) => RequestType::RemoveHttpFrontend(front.clone()),
+        RequestType::AddHttpsFrontend(front) => RequestType::RemoveHttpsFrontend(front.clone()),
+        _ => return None,
+    };
+    Some(inverse.into())
 }
 
 pub fn worker_request(
@@ -2167,16 +2261,39 @@ pub fn worker_request(
     // below, so it is dead code in release but must stay ungated (E0425).
     let state_hash_before = server.state.hash_state();
 
-    if let Err(error) = server.state.dispatch(&request) {
-        // INVARIANT: a rejected dispatch must not mutate persisted state.
+    // sozu#1301: validate a listener-add config the way the worker will build
+    // it (rustls context + answer templates) BEFORE committing to ConfigState.
+    // Committing an unbuildable listener first reserves its address, and the
+    // corrected reload is then refused with StateError::Exists. Validation is
+    // read-only on state and runs first; dispatch happens only if it passes.
+    // Tag the two failure classes distinctly for the audit taxonomy: a rejected
+    // `validate_listener_request` is operator-invalid *input* (bad TLS
+    // versions/ciphers or an unparseable answer template) → `InvalidInput`
+    // (same class as the `set_logging_level` filter check); a rejected
+    // `state.dispatch` is a genuine state conflict → `DispatchError`.
+    let apply_result = request
+        .request_type
+        .as_ref()
+        .map_or(Ok(()), validate_listener_request)
+        .map_err(|reason| (AuditErrorCode::InvalidInput, reason))
+        .and_then(|()| {
+            server
+                .state
+                .dispatch(&request)
+                .map_err(|error| (AuditErrorCode::DispatchError, error.to_string()))
+        });
+
+    if let Err((error_code, reason)) = apply_result {
+        // INVARIANT: neither a rejected validation nor a rejected dispatch may
+        // mutate persisted state — validation never touches it, and a rejected
+        // dispatch is a guaranteed no-op (see ConfigState::dispatch).
         debug_assert_eq!(
             server.state.hash_state(),
             state_hash_before,
-            "a dispatch that returns Err must leave ConfigState byte-identical (no partial apply)"
+            "a rejected validation or dispatch must leave ConfigState byte-identical (no partial apply)"
         );
-        let reason = error.to_string();
         if let Some(mut entry) = audit {
-            entry.extras.error_code = Some(AuditErrorCode::DispatchError);
+            entry.extras.error_code = Some(error_code);
             entry.extras.reason = Some(reason.clone());
             entry.extras.elapsed_ms = Some(elapsed_ms(started_at));
             entry.extras.request_sha256 = Some(request_sha256.clone());
@@ -2193,7 +2310,7 @@ pub fn worker_request(
                 AuditResult::Err,
                 AuditExtras {
                     elapsed_ms: Some(elapsed_ms(started_at)),
-                    error_code: Some(AuditErrorCode::DispatchError),
+                    error_code: Some(error_code),
                     reason: Some(reason.clone()),
                     ..Default::default()
                 },
@@ -2203,7 +2320,7 @@ pub fn worker_request(
             let target = fields.target.clone();
             let mut extras = fields.into_extras();
             extras.elapsed_ms = Some(elapsed_ms(started_at));
-            extras.error_code = Some(AuditErrorCode::DispatchError);
+            extras.error_code = Some(error_code);
             extras.reason = Some(reason.clone());
             audit_emit_inline(
                 server,
@@ -2217,7 +2334,7 @@ pub fn worker_request(
             );
         }
         client.finish_failure(format!(
-            "could not dispatch request on the main process state: {error}",
+            "could not apply request on the main process state: {reason}",
         ));
         return;
     }
@@ -2322,6 +2439,12 @@ pub fn worker_request(
 
     client.return_processing("Processing worker request...");
 
+    // sozu#1301 rollback safety-net: compute the inverse of this request now,
+    // while we still hold it, so `on_finish` can revert the main-process state
+    // if every worker rejects the change. `None` for verbs without a defined
+    // inverse (they keep today's best-effort behavior).
+    let rollback = request.request_type.as_ref().and_then(compute_rollback);
+
     server.scatter(
         request,
         Box::new(WorkerTask {
@@ -2332,6 +2455,7 @@ pub fn worker_request(
             inline_audit,
             metric_detail_audit: metric_detail_audit_completion,
             clear_master_metrics_on_finish,
+            rollback,
         }),
         Timeout::Default,
         None,
@@ -2498,6 +2622,35 @@ impl GatheringTask for WorkerTask {
             METRICS.with(|metrics| {
                 (*metrics.borrow_mut()).clear_local();
             });
+        }
+
+        // sozu#1301 rollback safety-net: if the change committed to ConfigState
+        // was rejected by EVERY worker it was scattered to (a unanimous,
+        // definitive failure — no timeout, at least one worker answered, and
+        // none accepted it), revert the main process's own state with the
+        // precomputed inverse. Because no worker applied the change, reverting
+        // the main process alone reconverges the fleet; there is nothing to
+        // compensate worker-side. A mixed result (some workers accepted) is
+        // deliberately left as-is to avoid diverging the main process from the
+        // workers that did accept.
+        if !timed_out
+            && expected > 0
+            && ok == 0
+            && errors > 0
+            && let Some(rollback) = self.rollback.as_ref()
+        {
+            match server.state.dispatch(rollback) {
+                Ok(()) => warn!(
+                    "sozu#1301 rollback: reverted a change from main-process state after all {} \
+                     worker(s) rejected it",
+                    expected
+                ),
+                Err(revert_error) => error!(
+                    "sozu#1301 rollback: could not revert main-process state after unanimous \
+                     worker rejection: {}",
+                    revert_error
+                ),
+            }
         }
 
         if errors > 0 || timed_out {
@@ -3154,6 +3307,15 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
                 offset = buffer.data().offset(i);
 
                 for request in requests {
+                    // sozu#1301: skip an unbuildable listener from the saved
+                    // state without reserving its address, so a corrected
+                    // reload can add it (mirrors the dispatch-failure skip).
+                    if let Some(request_type) = &request.content.request_type
+                        && let Err(reason) = validate_listener_request(request_type)
+                    {
+                        debug!("load_state: skipping invalid listener config: {}", reason);
+                        continue;
+                    }
                     if server.state.dispatch(&request.content).is_ok() {
                         // INVARIANT: the scatter request_id advances by
                         // exactly one per dispatched request. `scatter_on`
@@ -4062,6 +4224,169 @@ mod mutating_verb_policy_tests {
             !is_mutating_verb(&req),
             "SetMetricDetail is an observability knob, not a state transition; \
              keeping it out of is_mutating_verb prevents RELOADING flap on lease renewal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod listener_validation_tests {
+    //! sozu#1301: an invalid listener config must be rejected by the main
+    //! process BEFORE it is committed to `ConfigState`, so it never reserves
+    //! its address and blocks a corrected reload with `StateError::Exists`.
+    //! These exercise the production [`validate_listener_request`] guard that
+    //! all three master apply paths (`worker_request`, `load_static_config`,
+    //! `load_state`) share.
+    //!
+    //! To SEE THESE RED (regression proof): make `validate_listener_request`
+    //! return `Ok(())` unconditionally — the pre-fix behavior where the main
+    //! process committed listener configs without validating them. The
+    //! `is_err()` assertions below then fail.
+    use super::validate_listener_request;
+    use sozu_command_lib::{
+        config::ListenerBuilder,
+        proto::command::{HttpsListenerConfig, SocketAddress, request::RequestType},
+        state::{ConfigState, StateError},
+    };
+
+    /// A default HTTPS listener config for `address`. When `valid` is false, a
+    /// malformed answer template is injected so the worker's construction
+    /// (`HttpsListener::validate_config` → `HttpAnswers::new`) rejects it. That
+    /// trigger is deterministic AND crypto-provider independent, unlike a
+    /// `BuildRustls` "no usable cipher suites" message which varies across the
+    /// ring / aws-lc-rs / openssl / fips CI cells.
+    fn https_config(address: SocketAddress, valid: bool) -> HttpsListenerConfig {
+        let mut cfg = ListenerBuilder::new_https(address)
+            .to_tls(None)
+            .expect("default HTTPS listener config");
+        if !valid {
+            cfg.answers
+                .insert("404".to_owned(), "not a valid http response".to_owned());
+        }
+        cfg
+    }
+
+    #[test]
+    fn invalid_https_listener_rejected_before_commit_unblocks_corrected_reload() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+
+        // The pathology this guard defends against: `ConfigState` itself has no
+        // buildability check — it records an unbuildable listener and reserves
+        // its address, after which a corrected reload is refused with
+        // `StateError::Exists`. Prove it at the state layer so the master-side
+        // guard below is demonstrably load-bearing.
+        {
+            let mut state = ConfigState::new();
+            let bad = RequestType::AddHttpsListener(https_config(address, false));
+            state
+                .dispatch(&bad.into())
+                .expect("ConfigState records the bad listener — it has no buildability check");
+            let good = RequestType::AddHttpsListener(https_config(address, true));
+            let err = state
+                .dispatch(&good.into())
+                .expect_err("a reserved address blocks the corrected reload");
+            assert!(
+                matches!(err, StateError::Exists { .. }),
+                "expected StateError::Exists, got {err:?}"
+            );
+        }
+
+        // The fix: the main process validates a listener-add the way the worker
+        // will build it BEFORE dispatch, so the unbuildable config is rejected
+        // and never reaches `ConfigState`.
+        let bad = RequestType::AddHttpsListener(https_config(address, false));
+        assert!(
+            validate_listener_request(&bad).is_err(),
+            "an unbuildable HTTPS listener must be rejected before commit"
+        );
+
+        // With the bad listener correctly never committed, the corrected reload
+        // validates and applies cleanly — no `StateError::Exists` blocker.
+        let mut state = ConfigState::new();
+        let good = RequestType::AddHttpsListener(https_config(address, true));
+        assert!(
+            validate_listener_request(&good).is_ok(),
+            "a valid HTTPS listener must pass validation"
+        );
+        state
+            .dispatch(&good.into())
+            .expect("corrected reload applies when the bad listener never reserved the address");
+    }
+
+    #[test]
+    fn valid_listener_adds_of_every_type_pass_validation() {
+        let http = RequestType::AddHttpListener(
+            ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8080))
+                .to_http(None)
+                .expect("default HTTP listener config"),
+        );
+        let https = RequestType::AddHttpsListener(https_config(
+            SocketAddress::new_v4(127, 0, 0, 1, 8081),
+            true,
+        ));
+        let tcp = RequestType::AddTcpListener(
+            ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, 8082))
+                .to_tcp(None)
+                .expect("default TCP listener config"),
+        );
+        let udp = RequestType::AddUdpListener(
+            ListenerBuilder::new_udp(SocketAddress::new_v4(127, 0, 0, 1, 8083))
+                .to_udp(None)
+                .expect("default UDP listener config"),
+        );
+        for request in [http, https, tcp, udp] {
+            assert!(
+                validate_listener_request(&request).is_ok(),
+                "a valid listener add must pass validation: {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_http_listener_is_rejected_before_commit() {
+        // The HTTP path is fallible through answer-template parsing too.
+        let mut cfg = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8084))
+            .to_http(None)
+            .expect("default HTTP listener config");
+        cfg.answers
+            .insert("404".to_owned(), "not a valid http response".to_owned());
+        let request = RequestType::AddHttpListener(cfg);
+        assert!(
+            validate_listener_request(&request).is_err(),
+            "an unbuildable HTTP listener must be rejected before commit"
+        );
+    }
+
+    #[test]
+    fn rollback_inverse_targets_the_same_listener_and_skips_uncovered_verbs() {
+        use sozu_command_lib::proto::command::ListenerType;
+
+        // sozu#1301 rollback safety-net: a listener add inverts to a
+        // RemoveListener for the SAME address and proxy type, so a unanimous
+        // worker rejection can revert the main-process commit.
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+        let add = RequestType::AddHttpsListener(https_config(address, true));
+        let inverse = super::compute_rollback(&add).expect("a listener add must have an inverse");
+        match inverse.request_type {
+            Some(RequestType::RemoveListener(remove)) => {
+                assert_eq!(
+                    remove.proxy,
+                    ListenerType::Https as i32,
+                    "inverse must target the HTTPS listener type"
+                );
+                assert_eq!(
+                    remove.address, address,
+                    "inverse must target the same address"
+                );
+            }
+            other => panic!("expected a RemoveListener inverse, got {other:?}"),
+        }
+
+        // Upsert Add verbs (AddCluster/AddBackend) and non-add verbs have no
+        // simple prior-value-free inverse and are deliberately uncovered — they
+        // keep today's best-effort behavior rather than risk a wrong revert.
+        assert!(
+            super::compute_rollback(&RequestType::Logging("info".to_owned())).is_none(),
+            "a non-add verb must have no rollback inverse"
         );
     }
 }

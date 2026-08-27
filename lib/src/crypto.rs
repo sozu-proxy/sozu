@@ -211,45 +211,45 @@ pub fn cipher_suite_by_name(name: &str) -> Option<rustls::SupportedCipherSuite> 
     resolved
 }
 
-/// Compile-time precedence-chain assertion: encodes the `fips > ring >
+/// Compile-time precedence-chain assertions: encode the `fips > ring >
 /// aws-lc-rs > openssl` resolution that the `#[cfg(...)]` gates on the
-/// `pub use` blocks above implement, expressed via the `cfg!()` macro so it
-/// is evaluated against the *enabled feature set* rather than restating the
-/// type system. Called from the runtime provider lookups so a feature-gate
-/// regression (e.g. dropping a `not(feature = "fips")` guard) trips a
-/// `debug_assert!` in tests instead of silently linking the wrong provider.
+/// `pub use` blocks above implement. Called from the runtime provider lookups
+/// so the assertions stay coupled to those entry points.
 ///
-/// The `cfg!(...)` calls are const-folded, so in release this whole function
-/// collapses to nothing.
+/// Rust evaluates the `const` block while compiling, so the checks add no
+/// runtime work in either debug or release builds.
 #[inline]
 fn debug_assert_provider_precedence() {
-    // At least one provider feature is enabled — mirrors the `compile_error!`
-    // guard at the top of the module, but as a runtime-checkable invariant.
-    debug_assert!(
-        cfg!(feature = "crypto-ring")
-            || cfg!(feature = "crypto-aws-lc-rs")
-            || cfg!(feature = "crypto-openssl"),
-        "at least one crypto provider feature must be enabled"
-    );
-    // `fips` implies `crypto-aws-lc-rs` (the Cargo manifest wires this), so a
-    // FIPS build always has aws-lc-rs available as its backing provider.
-    debug_assert!(
-        !cfg!(feature = "fips") || cfg!(feature = "crypto-aws-lc-rs"),
-        "the `fips` feature must imply `crypto-aws-lc-rs`"
-    );
-    // The aws-lc-rs `pub use` is selected only when neither `fips` nor
-    // `crypto-ring` wins ahead of it — i.e. ring outranks aws-lc-rs, which
-    // outranks openssl. Assert the openssl arm only activates when every
-    // higher-precedence provider feature is absent.
-    debug_assert!(
-        !cfg!(all(
-            feature = "crypto-openssl",
-            not(feature = "fips"),
-            not(feature = "crypto-ring"),
-            not(feature = "crypto-aws-lc-rs")
-        )) || cfg!(feature = "crypto-openssl"),
-        "the openssl provider arm is only reachable with openssl enabled"
-    );
+    const {
+        // At least one provider feature is enabled — mirrors the
+        // `compile_error!` guard at the top of the module.
+        assert!(
+            cfg!(feature = "crypto-ring")
+                || cfg!(feature = "crypto-aws-lc-rs")
+                || cfg!(feature = "crypto-openssl"),
+            "at least one crypto provider feature must be enabled"
+        );
+        // `fips` implies `crypto-aws-lc-rs` (the Cargo manifest wires this),
+        // so a FIPS build always has aws-lc-rs available as its backing
+        // provider.
+        assert!(
+            !cfg!(feature = "fips") || cfg!(feature = "crypto-aws-lc-rs"),
+            "the `fips` feature must imply `crypto-aws-lc-rs`"
+        );
+        // The aws-lc-rs `pub use` is selected only when neither `fips` nor
+        // `crypto-ring` wins ahead of it — i.e. ring outranks aws-lc-rs,
+        // which outranks openssl. Assert the openssl arm only activates when
+        // every higher-precedence provider feature is absent.
+        assert!(
+            !cfg!(all(
+                feature = "crypto-openssl",
+                not(feature = "fips"),
+                not(feature = "crypto-ring"),
+                not(feature = "crypto-aws-lc-rs")
+            )) || cfg!(feature = "crypto-openssl"),
+            "the openssl provider arm is only reachable with openssl enabled"
+        );
+    }
 }
 
 #[cfg(test)]

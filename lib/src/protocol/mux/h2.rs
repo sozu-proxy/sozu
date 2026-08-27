@@ -659,18 +659,18 @@ fn distribute_overhead(
         // Last stream gets all remaining overhead to avoid losing remainder bytes
         // from integer division across earlier streams.
         *overhead_bin
-    } else if total_bytes.0 > 0 {
+    } else if let Some(share) = (*overhead_bin * stream_bytes.0).checked_div(total_bytes.0) {
         // Clamp to remaining overhead — integer division rounding across multiple
         // streams can cause accumulated shares to exceed the total.
-        (*overhead_bin * stream_bytes.0 / total_bytes.0).min(*overhead_bin)
+        share.min(*overhead_bin)
     } else {
         // No stream has transferred any inbound bytes — fall back to even split.
         *overhead_bin / active_streams.max(1)
     };
     let share_out = if is_last_stream {
         *overhead_bout
-    } else if total_bytes.1 > 0 {
-        (*overhead_bout * stream_bytes.1 / total_bytes.1).min(*overhead_bout)
+    } else if let Some(share) = (*overhead_bout * stream_bytes.1).checked_div(total_bytes.1) {
+        share.min(*overhead_bout)
     } else {
         // No stream has transferred any outbound bytes — fall back to even split.
         *overhead_bout / active_streams.max(1)

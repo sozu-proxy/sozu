@@ -264,6 +264,18 @@ impl UdpListener {
         })
     }
 
+    /// Validate that a worker can build this UDP listener configuration WITHOUT
+    /// constructing the full listener or binding a socket. UDP listener
+    /// construction has no fallible config today (no rustls context, no answer
+    /// templates; a bad bind surfaces later as an `ActivateListener` failure),
+    /// so this currently always succeeds. It exists for surface parity with the
+    /// HTTP/HTTPS validators the main process calls before committing an
+    /// `Add*Listener` to `ConfigState` and fanning it out (sozu#1301), and is
+    /// the hook for any future UDP-config validation.
+    pub fn validate_config(_config: &UdpListenerConfig) -> Result<(), ListenerError> {
+        Ok(())
+    }
+
     /// Bind (or adopt an SCM-passed) socket and register it `READABLE`. The
     /// READABLE registration is what drives `Server::ready` for this listener —
     /// there is no accept path.
@@ -852,7 +864,7 @@ impl UdpProxy {
                 }
                 self.listener_sessions.clear();
                 let listeners: HashMap<_, _> = self.listeners.drain().collect();
-                for (_, l) in listeners.iter() {
+                for l in listeners.values() {
                     l.borrow_mut()
                         .socket
                         .take()

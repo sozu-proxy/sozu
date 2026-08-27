@@ -1354,18 +1354,7 @@ impl HttpsListener {
 
         let server_config = Arc::new(Self::create_rustls_context(&config, resolver.to_owned())?);
 
-        let answers = {
-            // Reconcile the legacy `http_answers` per-status fields with
-            // the new template map: the new map wins on collision, the
-            // legacy fields fill in any status the operator hasn't yet
-            // migrated.
-            let mut answers_map = config.answers.clone();
-            if let Some(ref legacy) = config.http_answers {
-                crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
-            }
-            HttpAnswers::new(&answers_map)
-                .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?
-        };
+        let answers = Self::build_answers(&config)?;
 
         Ok(HttpsListener {
             listener: None,
@@ -1379,6 +1368,41 @@ impl HttpsListener {
             token,
             tags: BTreeMap::new(),
         })
+    }
+
+    /// Build the listener's HTTP answer templates from its config, reconciling
+    /// the legacy `http_answers` per-status fields with the new `answers`
+    /// template map (the new map wins on collision; legacy fields fill any
+    /// status not yet migrated). Shared by [`Self::try_new`] and
+    /// [`Self::validate_config`] so the master-side pre-commit check cannot
+    /// drift from worker construction.
+    fn build_answers(config: &HttpsListenerConfig) -> Result<HttpAnswers, ListenerError> {
+        let mut answers_map = config.answers.clone();
+        if let Some(ref legacy) = config.http_answers {
+            crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
+        }
+        HttpAnswers::new(&answers_map)
+            .map_err(|(name, error)| ListenerError::TemplateParse(name, error))
+    }
+
+    /// Validate that a worker can build this HTTPS listener configuration — the
+    /// rustls context and the answer templates — WITHOUT constructing the full
+    /// listener or binding a socket. Runs the exact fallible steps of
+    /// [`Self::try_new`] (via the shared [`Self::create_rustls_context`] /
+    /// [`Self::build_answers`] helpers), so master-side validation is faithful
+    /// to what the worker will do.
+    ///
+    /// The main process calls this before committing an `AddHttpsListener` to
+    /// its `ConfigState` and fanning it out, so an invalid listener never
+    /// reserves its address and blocks a corrected reload (sozu#1301).
+    pub fn validate_config(config: &HttpsListenerConfig) -> Result<(), ListenerError> {
+        // An empty resolver matches `try_new`: the default certificate is added
+        // later via `AddCertificate`, so only the config-level TLS parameters
+        // (versions, ciphers, groups, ALPN) and the answer templates are
+        // exercised here.
+        Self::create_rustls_context(config, Arc::new(MutexCertificateResolver::default()))?;
+        Self::build_answers(config)?;
+        Ok(())
     }
 
     pub fn activate(
@@ -1956,7 +1980,7 @@ impl HttpsProxy {
     pub fn soft_stop(&mut self) -> Result<(), ProxyError> {
         let listeners: HashMap<_, _> = self.listeners.drain().collect();
         let mut socket_errors = vec![];
-        for (_, l) in listeners.iter() {
+        for l in listeners.values() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
                 debug!("{} deregistering socket {:?}", log_module_context!(), sock);
                 if let Err(e) = self.registry.deregister(&mut sock) {

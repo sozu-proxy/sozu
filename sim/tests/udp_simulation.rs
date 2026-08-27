@@ -25,11 +25,38 @@
 //! `Instant`s relatively, so the absolute base is irrelevant and observable
 //! outputs stay a pure function of the seed.
 //!
+//! # Swarm configurations (Groce et al., "Swarm Testing", ISSTA 2012)
+//!
+//! Each seed draws a [`SwarmConfig`] from the seeded RNG BEFORE the first
+//! operation: a random subset of the OPTIONAL/SUPPRESSOR grammar features
+//! (50% inclusion each), with the MANDATORY `ClientDatagram` always retained
+//! and the remaining weights renormalized. Omitting a SUPPRESSOR (`Drain`,
+//! `CloseAll`, `AbortFlow`, `SetMaxFlows` — each repairs or prevents the very
+//! full-table state a capacity bug needs) lets a seed drive the manager into
+//! states the all-features grammar repairs too eagerly; omitting other
+//! features concentrates the step budget on the survivors. Seeds divisible
+//! by four keep the inclusive all-features configuration (the paper is
+//! explicit that swarm subsets complement, never replace, it: a bug needing
+//! `k` features together appears in a coin-toss subset with probability
+//! `1/2^k`); campaign seeds are fixed to `0..n`, which reserves exactly one
+//! inclusive run in each four-seed cohort. Degenerate all-off and all-on subset
+//! draws are repaired to
+//! non-empty proper subsets. Each buggify arm is
+//! gated by its sibling grammar feature and skipped (never redrawn) when that
+//! feature is disabled. The drawn configuration is a pure function of the
+//! seed and is printed as one canonical `swarm-config` line before the
+//! workload runs, so any failing seed's configuration is always in the
+//! captured output. `SOZU_SIM_SWARM=0` disables the draw entirely (zero extra
+//! RNG consumption — byte-identical to the historical all-features grammar)
+//! for direct swarm-vs-inclusive campaign comparison.
+//!
 //! # Replay / sweep ergonomics
 //!
 //! - `SOZU_UDP_SIM_SEED=<u64|0xhex>` — replay that ONE seed verbosely.
 //! - `SOZU_UDP_SIM_SEEDS=<n>` — sweep `n` iterations (default 256).
 //! - `SOZU_UDP_SIM_STEPS=<n>` — steps per seed (default 3000).
+//! - `SOZU_SIM_SWARM=0|1` — draw per-seed swarm configurations (default `1`;
+//!   `0` pins every seed to the historical all-features configuration).
 //!
 //! On a hard invariant violation the panic carries the failing seed (via
 //! `current_sim_seed`) + step; moonpool also records it in the report's
@@ -174,7 +201,7 @@ impl Model {
 // Workload grammar.
 // --------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     ClientDatagram,
     BackendDatagram,
@@ -188,22 +215,153 @@ enum Action {
     CloseAll,
 }
 
-/// Draw a weighted-random action (weights sum to 100), mirroring the handmade
-/// grammar so coverage is preserved.
-fn pick_action(ctx: &SimContext) -> Action {
-    let roll = ctx.random().random_range(0..100u32);
-    match roll {
-        0..34 => Action::ClientDatagram,
-        34..50 => Action::BackendResolved,
-        50..64 => Action::BackendDatagram,
-        64..78 => Action::AdvanceClock,
-        78..84 => Action::ReconfigCluster,
-        84..89 => Action::SetMaxFlows,
-        89..93 => Action::AbortFlow,
-        93..96 => Action::SetMaxRx,
-        96..98 => Action::Drain,
-        _ => Action::CloseAll,
+/// The weighted action grammar (weights sum to 100), in the EXACT dispatch
+/// order of the pre-swarm `0..100` `match`: a cumulative walk over this table
+/// with every feature enabled maps each roll to the same action the
+/// historical grammar did, so an all-features configuration stays
+/// draw-identical to the pre-swarm harness.
+///
+/// Swarm classification (see `doc/testing.md`): index 0 (`ClientDatagram`) is
+/// MANDATORY — it is the sole flow creator, and without it every shadow-model
+/// invariant is vacuously green. `Drain`, `CloseAll`, `AbortFlow`, and
+/// `SetMaxFlows` are SUPPRESSORS — each evicts flows, resets the manager, or
+/// sheds future admissions, repairing or preventing the very full-table state
+/// a capacity bug needs. The rest are OPTIONAL grammar features.
+const ACTION_TABLE: [(Action, u32); 10] = [
+    (Action::ClientDatagram, 34),
+    (Action::BackendResolved, 16),
+    (Action::BackendDatagram, 14),
+    (Action::AdvanceClock, 14),
+    (Action::ReconfigCluster, 6),
+    (Action::SetMaxFlows, 5),
+    (Action::AbortFlow, 4),
+    (Action::SetMaxRx, 3),
+    (Action::Drain, 2),
+    (Action::CloseAll, 2),
+];
+
+/// Per-seed swarm configuration: which grammar features this seed may draw.
+/// `enabled[i]` mirrors `ACTION_TABLE[i]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SwarmConfig {
+    enabled: [bool; 10],
+}
+
+/// `SOZU_SIM_SWARM=0` disables per-seed swarm draws (every seed then runs the
+/// historical all-features configuration with zero extra RNG consumption);
+/// unset or any other value leaves swarm on.
+fn swarm_enabled() -> bool {
+    !matches!(std::env::var("SOZU_SIM_SWARM"), Ok(v) if v.trim() == "0")
+}
+
+fn inclusive_seed(seed: u64) -> bool {
+    seed.is_multiple_of(4)
+}
+
+fn campaign_seeds(count: usize) -> Vec<u64> {
+    (0..u64::try_from(count).expect("campaign seed count fits in u64")).collect()
+}
+
+impl SwarmConfig {
+    /// The inclusive all-features configuration (`C_D` in the paper).
+    fn full() -> Self {
+        SwarmConfig {
+            enabled: [true; 10],
+        }
     }
+
+    /// Draw this seed's configuration from the seeded RNG. Seeds divisible by
+    /// four keep the inclusive configuration; the rest coin-toss each
+    /// OPTIONAL/SUPPRESSOR feature at 50%, always retain the MANDATORY
+    /// `ClientDatagram`, and repair all-off/all-on draws to proper subsets.
+    fn draw(ctx: &SimContext, seed: u64) -> Self {
+        if inclusive_seed(seed) {
+            return SwarmConfig::full();
+        }
+        let mut enabled = [false; 10];
+        enabled[0] = true; // ClientDatagram is MANDATORY.
+        for slot in enabled.iter_mut().skip(1) {
+            *slot = ctx.random().random_bool(0.5);
+        }
+        if !enabled.iter().skip(1).any(|e| *e) {
+            enabled[1] = true;
+        } else if enabled.iter().all(|e| *e) {
+            enabled[9] = false;
+        }
+        let cfg = SwarmConfig { enabled };
+        debug_assert!(cfg.enabled[0], "the MANDATORY feature must stay enabled");
+        debug_assert!(
+            cfg.total_weight() > ACTION_TABLE[0].1,
+            "a drawn subset keeps at least one optional feature"
+        );
+        debug_assert!(
+            !cfg.enabled.iter().all(|e| *e),
+            "a non-reserved seed must use a proper subset"
+        );
+        cfg
+    }
+
+    fn is_enabled(&self, action: Action) -> bool {
+        ACTION_TABLE
+            .iter()
+            .zip(&self.enabled)
+            .find(|((a, _), _)| *a == action)
+            .is_some_and(|(_, e)| *e)
+    }
+
+    /// Renormalized total weight over the enabled features.
+    fn total_weight(&self) -> u32 {
+        ACTION_TABLE
+            .iter()
+            .zip(&self.enabled)
+            .filter(|(_, e)| **e)
+            .map(|((_, w), _)| *w)
+            .sum()
+    }
+
+    /// The canonical one-line configuration record, printed before the
+    /// workload runs. Byte-identical across replays of the same seed — a
+    /// failing seed whose configuration is not printed is not reproducible.
+    fn log_line(&self, seed: u64, swarm: bool) -> String {
+        let mode = if !swarm {
+            "off"
+        } else if self.enabled.iter().all(|e| *e) {
+            "full"
+        } else {
+            "subset"
+        };
+        let features: Vec<String> = ACTION_TABLE
+            .iter()
+            .zip(&self.enabled)
+            .filter(|(_, e)| **e)
+            .map(|((a, w), _)| format!("{a:?}:{w}"))
+            .collect();
+        format!(
+            "swarm-config sim=udp seed={seed:#x} mode={mode} features=[{}] total_weight={}",
+            features.join(","),
+            self.total_weight(),
+        )
+    }
+}
+
+/// Draw a weighted-random action among the configuration's enabled features:
+/// exactly ONE `random_range` draw over the renormalized total, then a
+/// cumulative walk in `ACTION_TABLE` order. With every feature enabled this
+/// consumes the same single draw and maps rolls to actions exactly as the
+/// historical `0..100` `match` did.
+fn pick_action(ctx: &SimContext, cfg: &SwarmConfig) -> Action {
+    let roll = ctx.random().random_range(0..cfg.total_weight());
+    let mut remaining = roll;
+    for ((action, weight), enabled) in ACTION_TABLE.iter().zip(&cfg.enabled) {
+        if !enabled {
+            continue;
+        }
+        if remaining < *weight {
+            return *action;
+        }
+        remaining -= weight;
+    }
+    unreachable!("roll {roll} below the renormalized total always lands on an enabled action")
 }
 
 /// A randomized cluster config (non-empty cluster name unless `allow_empty`).
@@ -256,11 +414,18 @@ fn random_payload(ctx: &SimContext, max_rx: usize) -> Vec<u8> {
 /// Optional sink for the determinism guard: the final `(created, evicted, shed)`
 /// tally is pushed here so two runs of the same seed can be compared.
 type FingerprintSink = Arc<Mutex<Vec<(u64, u64, u64)>>>;
+/// Optional sink for the swarm-config stability guard: the configuration
+/// drawn for each seed is pushed here so two runs can be compared.
+type ConfigSink = Arc<Mutex<Vec<SwarmConfig>>>;
 
 struct UdpSimWorkload {
     steps: usize,
     verbose: bool,
     sink: Option<FingerprintSink>,
+    /// `true` draws a per-seed [`SwarmConfig`]; `false` pins the historical
+    /// all-features configuration with zero extra RNG consumption.
+    swarm: bool,
+    config_sink: Option<ConfigSink>,
 }
 
 #[async_trait]
@@ -276,6 +441,21 @@ impl Workload for UdpSimWorkload {
         let base = Instant::now();
         let now = |ctx: &SimContext| base + ctx.time().now();
 
+        // Swarm configuration: drawn from the seeded RNG BEFORE the first
+        // operation (a pure function of the seed), and printed before the
+        // workload runs so a failing seed's configuration is always in the
+        // captured output. With swarm off, no RNG draw happens at all — the
+        // run is byte-identical to the historical all-features grammar.
+        let swarm_cfg = if self.swarm {
+            SwarmConfig::draw(ctx, seed)
+        } else {
+            SwarmConfig::full()
+        };
+        eprintln!("{}", swarm_cfg.log_line(seed, self.swarm));
+        if let Some(sink) = &self.config_sink {
+            sink.lock().unwrap().push(swarm_cfg);
+        }
+
         let initial_cap = ctx.random().random_range(1..32usize);
         let initial_max_rx = 1500usize;
         let cluster = random_cluster(ctx, false);
@@ -288,7 +468,7 @@ impl Workload for UdpSimWorkload {
         model.check(&mut mgr, 0, "init");
 
         for step in 1..=self.steps {
-            let action = pick_action(ctx);
+            let action = pick_action(ctx, &swarm_cfg);
             if self.verbose && step % 500 == 0 {
                 eprintln!(
                     "seed={seed:#x} step={step} action={action:?} flows={} created={} evicted={}",
@@ -452,47 +632,59 @@ impl Workload for UdpSimWorkload {
             }
 
             // Buggify: low-probability extra adversarial events, using
-            // moonpool's fault-injection primitive.
+            // moonpool's fault-injection primitive. Each arm is gated by its
+            // sibling grammar feature so a swarm subset omits the fault along
+            // with the feature; a disabled arm is skipped (never redrawn),
+            // keeping the draw sequence a pure function of (seed, config).
             if buggify_with_prob!(0.02) {
-                match ctx.random().random_range(0..4u8) {
-                    0 => {
-                        let flow = ctx.random().random_range(0..128usize);
-                        let (backend, addr) = pooled_backend(ctx);
-                        mgr.handle_input(
-                            ManagerInput::BackendResolved {
-                                flow,
-                                backend,
-                                addr,
-                            },
-                            now(ctx),
-                        );
-                    }
-                    1 => {
-                        for _ in 0..ctx.random().random_range(2..6u8) {
-                            let cfg = random_cluster(ctx, true);
+                let arm = ctx.random().random_range(0..4u8);
+                let arm_feature = match arm {
+                    0 => Action::BackendResolved,
+                    1 => Action::ReconfigCluster,
+                    2 => Action::SetMaxFlows,
+                    _ => Action::AdvanceClock,
+                };
+                if swarm_cfg.is_enabled(arm_feature) {
+                    match arm {
+                        0 => {
+                            let flow = ctx.random().random_range(0..128usize);
+                            let (backend, addr) = pooled_backend(ctx);
                             mgr.handle_input(
-                                ManagerInput::Config(ConfigEvent::SetCluster(cfg)),
+                                ManagerInput::BackendResolved {
+                                    flow,
+                                    backend,
+                                    addr,
+                                },
                                 now(ctx),
                             );
                         }
-                    }
-                    2 => {
-                        let n = ctx.random().random_range(0..2usize);
-                        model.cap_high_water = model.cap_high_water.max(n);
-                        mgr.handle_input(
-                            ManagerInput::Config(ConfigEvent::SetMaxFlows(n)),
-                            now(ctx),
-                        );
-                    }
-                    _ => {
-                        // Giant jump relative to the 5s max idle timeout (so it
-                        // mass-reaps), but bounded so the run stays within
-                        // moonpool's simulated-time budget over a deep sweep.
-                        let _ = ctx
-                            .time()
-                            .sleep(Duration::from_secs(ctx.random().random_range(10..60)))
-                            .await;
-                        mgr.handle_timeout(now(ctx));
+                        1 => {
+                            for _ in 0..ctx.random().random_range(2..6u8) {
+                                let cfg = random_cluster(ctx, true);
+                                mgr.handle_input(
+                                    ManagerInput::Config(ConfigEvent::SetCluster(cfg)),
+                                    now(ctx),
+                                );
+                            }
+                        }
+                        2 => {
+                            let n = ctx.random().random_range(0..2usize);
+                            model.cap_high_water = model.cap_high_water.max(n);
+                            mgr.handle_input(
+                                ManagerInput::Config(ConfigEvent::SetMaxFlows(n)),
+                                now(ctx),
+                            );
+                        }
+                        _ => {
+                            // Giant jump relative to the 5s max idle timeout (so it
+                            // mass-reaps), but bounded so the run stays within
+                            // moonpool's simulated-time budget over a deep sweep.
+                            let _ = ctx
+                                .time()
+                                .sleep(Duration::from_secs(ctx.random().random_range(10..60)))
+                                .await;
+                            mgr.handle_timeout(now(ctx));
+                        }
                     }
                 }
             }
@@ -606,17 +798,27 @@ fn assert_no_failures(report: &SimulationReport) {
 #[test]
 fn udp_simulation_seed_sweep() {
     let steps = env_usize("SOZU_UDP_SIM_STEPS").unwrap_or(3_000);
+    let swarm = swarm_enabled();
 
     // Single-seed replay mode.
     if let Some(seed) = env_u64("SOZU_UDP_SIM_SEED") {
-        eprintln!("== UDP sim single-seed replay: seed={seed:#x} steps={steps} ==");
+        eprintln!("== UDP sim single-seed replay: seed={seed:#x} steps={steps} swarm={swarm} ==");
         let report = SimulationBuilder::new()
             .workload(UdpSimWorkload {
                 steps,
                 verbose: true,
                 sink: None,
+                swarm,
+                config_sink: None,
             })
             .set_debug_seeds(vec![seed])
+            // Without an explicit iteration count, `SimulationBuilder`
+            // defaults to `UntilCoverageStable` (up to 1000 iterations) and
+            // would keep drawing FRESH random seeds after this one — fixing
+            // it to 1 is what actually makes this "replay that ONE seed",
+            // matching the documented `SOZU_UDP_SIM_SEED` contract (the
+            // TCP preread sim's replay path carries the same fix).
+            .set_iterations(1)
             .run_time_budget(run_budget(steps))
             .run();
         assert_no_failures(&report);
@@ -629,14 +831,20 @@ fn udp_simulation_seed_sweep() {
             steps,
             verbose: false,
             sink: None,
+            swarm,
+            config_sink: None,
         })
+        .set_debug_seeds(campaign_seeds(seeds))
         .set_iterations(seeds)
         .run_time_budget(run_budget(steps))
         .run();
     assert_no_failures(&report);
 }
 
-/// Fast smoke test pinning one representative seed.
+/// Fast smoke test pinning one representative seed. Swarm is off so the
+/// pinned trajectory stays byte-identical to the pre-swarm harness (no
+/// config draw touches the RNG stream) and the smoke test keeps exercising
+/// the full grammar.
 #[test]
 fn udp_simulation_replays_known_seed() {
     let steps = 4_000;
@@ -645,8 +853,12 @@ fn udp_simulation_replays_known_seed() {
             steps,
             verbose: false,
             sink: None,
+            swarm: false,
+            config_sink: None,
         })
         .set_debug_seeds(vec![0x5E_ED_C0_DE])
+        // Pin the run to exactly this seed (see the replay-path comment).
+        .set_iterations(1)
         .run_time_budget(run_budget(steps))
         .run();
     assert_no_failures(&report);
@@ -665,8 +877,14 @@ fn udp_simulation_is_deterministic() {
                 steps,
                 verbose: false,
                 sink: Some(sink.clone()),
+                // Swarm stays ON here: the guard then also covers the config
+                // draw itself (a nondeterministic draw would fork the trace).
+                swarm: true,
+                config_sink: None,
             })
             .set_debug_seeds(vec![seed])
+            // Pin the run to exactly this seed (see the replay-path comment).
+            .set_iterations(1)
             .run_time_budget(run_budget(steps))
             .run();
         assert_no_failures(&report);
@@ -684,6 +902,63 @@ fn udp_simulation_is_deterministic() {
         a.0, a.1,
         "final close_all must evict everything created (no leak)"
     );
+}
+
+/// Swarm-config stability: the configuration drawn for a seed is a pure
+/// function of that seed. Two fresh runs of the same seed must record the
+/// identical [`SwarmConfig`] (and therefore print a byte-identical
+/// `swarm-config` line — the replay contract).
+#[test]
+fn udp_swarm_config_is_stable_across_draws() {
+    fn draw(seed: u64) -> SwarmConfig {
+        let steps = 8;
+        let sink: ConfigSink = Arc::new(Mutex::new(Vec::new()));
+        let report = SimulationBuilder::new()
+            .workload(UdpSimWorkload {
+                steps,
+                verbose: false,
+                sink: None,
+                swarm: true,
+                config_sink: Some(sink.clone()),
+            })
+            .set_debug_seeds(vec![seed])
+            .set_iterations(1)
+            .run_time_budget(run_budget(steps))
+            .run();
+        assert_no_failures(&report);
+        let v = sink.lock().unwrap();
+        *v.first().expect("workload recorded a swarm config")
+    }
+
+    // Several seeds so both the reserved full configuration and subsets are hit.
+    for seed in [0x0Au64, 0x0B, 0x0C, 0x5EED_5EED, 0xDEAD_BEEF] {
+        let a = draw(seed);
+        let b = draw(seed);
+        assert_eq!(
+            a, b,
+            "seed={seed:#x}: swarm config must be identical across two draws"
+        );
+        assert!(
+            a.is_enabled(Action::ClientDatagram),
+            "seed={seed:#x}: the MANDATORY ClientDatagram feature must always be enabled"
+        );
+        assert_eq!(
+            a.enabled.iter().all(|e| *e),
+            inclusive_seed(seed),
+            "seed={seed:#x}: only reserved seeds may use the full grammar"
+        );
+        assert_eq!(a.log_line(seed, true), b.log_line(seed, true));
+    }
+}
+
+#[test]
+fn udp_campaign_reserves_one_inclusive_seed_per_four() {
+    for count in [1usize, 3, 4, 5, 256] {
+        let seeds = campaign_seeds(count);
+        let inclusive = seeds.iter().filter(|seed| inclusive_seed(**seed)).count();
+        assert_eq!(inclusive, count.div_ceil(4), "count={count}");
+        assert_eq!(seeds.len() - inclusive, count - count.div_ceil(4));
+    }
 }
 
 #[test]

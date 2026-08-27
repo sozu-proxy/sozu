@@ -15,7 +15,7 @@ authors = [
 ]
 categories = ["network-programming"]
 edition = "2024"
-rust-version = "1.91.0"
+rust-version = "1.93.1"
 include = ["README.md", "Cargo.toml", "build.rs", "src/**/*"]
 
 [lib]

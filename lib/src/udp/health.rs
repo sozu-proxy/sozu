@@ -482,7 +482,7 @@ impl UdpHealthChecker {
             completed.push((idx, success));
         }
 
-        completed.sort_by(|a, b| b.0.cmp(&a.0));
+        completed.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         for (idx, success) in completed {
             let mut probe = self.in_flight.swap_remove(idx);
             probe.socket.deregister(registry);

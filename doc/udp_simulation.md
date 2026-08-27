@@ -66,6 +66,18 @@ folding each `Output` into a shadow model (tracking `FlowCreated` / `FlowEvicted
 for active-flow accounting) and honouring a subset of `SelectBackend` requests
 with `BackendResolved` so flows progress to `Established`.
 
+**Swarm configurations** (Groce et al., ISSTA 2012 — see
+`doc/testing.md` §5 "Swarm configurations" for the full doctrine): each seed
+draws a random subset of this grammar from its own seeded RNG before the first
+step — `ClientDatagram` is MANDATORY and always retained, the others are
+included with 50% probability, and the weights renormalize over the survivors.
+Campaign seeds are the explicit range `0..n`; seeds divisible by four keep the
+full grammar, reserving one inclusive run in every four-seed cohort, while the
+other seeds always use non-empty proper subsets. The drawn configuration is
+printed as one `swarm-config` line per seed. `SOZU_SIM_SWARM=0` pins every seed
+to the full grammar (zero extra RNG draws — byte-identical to the pre-swarm
+harness).
+
 `Drain` is special: the core's `draining` flag is a one-way latch (there is no
 "resume"), mirroring the shell draining a listener and then dropping it. The
 simulator therefore treats `Drain` as a self-contained **listener-lifecycle
@@ -77,7 +89,9 @@ manager — so the long run keeps admitting afterwards.
 `buggify_with_prob!(p)` is moonpool's [FoundationDB `buggify`][fdb-buggify]
 primitive: with low per-call probability it injects an *extra* adversarial event
 (stale `BackendResolved`, a reconfig burst, a `max_flows` shrink to a tiny value,
-a giant clock jump). It only ever runs under simulation.
+a giant clock jump). It only ever runs under simulation. Each arm is gated by
+its sibling grammar feature: a swarm configuration that omits a feature omits
+its fault as well (the arm is skipped, never redrawn).
 
 ## Invariants
 
@@ -128,6 +142,7 @@ RUSTFLAGS="--cfg tokio_unstable" SOZU_UDP_SIM_SEEDS=1024 SOZU_UDP_SIM_STEPS=5000
 | `SOZU_UDP_SIM_SEED`   | run that ONE seed with verbose tracing (replay)       |
 | `SOZU_UDP_SIM_SEEDS`  | sweep `n` seeds instead of the default                |
 | `SOZU_UDP_SIM_STEPS`  | run `n` steps per seed instead of the default         |
+| `SOZU_SIM_SWARM`      | `0` pins every seed to the full grammar; default `1` draws per-seed swarm subsets (shared with the TCP preread sim) |
 
 A failing seed is surfaced in moonpool's `SimulationReport` (and the panicking
 invariant prints the seed + step), so the run reproduces via the

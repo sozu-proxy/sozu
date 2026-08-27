@@ -3,25 +3,25 @@ members = ["lib", "command", "bin", "e2e", "sim"]
 resolver = "2" # consistent with rust edition 2024, see https://doc.rust-lang.org/cargo/reference/resolver.html#features
 
 [workspace.dependencies]
-anyhow = "^1.0.103"
-async-trait = "^0.1.89"
-base64 = "^0.22.1"
-clap = "^4.6.1"
+anyhow = "^1.0.104"
+async-trait = "^0.1.91"
+base64 = "^0.23.1"
+clap = "^4.6.6"
 cookie-factory = "^0.3.3"
 flate2 = "^1.1.9"
-futures = "^0.3.32"
-hdrhistogram = "^7.5.4"
+futures = "^0.3.33"
+hdrhistogram = "^7.6.0"
 hex = "^0.4.3"
 loona-hpack = "^0.4.3"
 http-body-util = "^0.1.4"
-hyper = "^1.10.1"
+hyper = "^1.11.0"
 hyper-rustls = { version = "^0.27.9", default-features = false }
 hyper-util = "^0.1.20"
 idna = "^1.1.0"
 itoa = "^1.0.18"
 jemallocator = "^0.5.4"
 kawa = { version = "^0.7.1", default-features = false }
-libc = "^0.2.186"
+libc = "^0.2.189"
 log = "^0.4.33"
 memchr = "^2.8.3"
 mio = "^1.2.2"
@@ -38,17 +38,17 @@ prost-build = "^0.14.4"
 criterion = { version = "^0.8.2", features = ["html_reports"] }
 quickcheck = "^1.1.0"
 rand = "^0.10.2"
-regex = "^1.13.0"
+regex = "^1.13.1"
 rustls-openssl = { version = "^0.3.1", default-features = false, features = ["tls12"] }
-rustls = { version = "^0.23.42", default-features = false, features = [
+rustls = { version = "^0.23.43", default-features = false, features = [
   "logging",
   "std",
   "tls12",
 ] }
-rusty_ulid = "^2.0.0"
-serde = "^1.0.228"
-serde_json = "^1.0.150"
-serial_test = "^3.5.0"
+rusty_ulid = "^2.0.1"
+serde = "^1.0.229"
+serde_json = "^1.0.151"
+serial_test = "^4.0.1"
 sha2 = "^0.11.0"
 slab = "^0.4.12"
 socket2 = "^0.6.5"
@@ -57,11 +57,11 @@ sozu-lib = { version = "^2.2.0", path = "lib", default-features = false }
 subtle = "^2.6.1"
 tempfile = "^3.27.0"
 termion = "^4.0.6"
-thiserror = "^2.0.18"
-time = "^0.3.53"
+thiserror = "^2.0.20"
+time = "^0.3.55"
 tiny_http = "^0.12.0"
-tokio = "^1.52.3"
-toml = { version = "^1.1.3", features = ["preserve_order"] }
+tokio = "^1.53.1"
+toml = { version = "^1.1.4", features = ["preserve_order"] }
 x509-parser = "^0.18.1"
 
 # Dependencies for the `sozu top` TUI subcommand. All gated behind the
@@ -75,10 +75,10 @@ ctrlc                = "^3.5.2"
 ratatui              = { version = "^0.30.2", default-features = false }
 throbber-widgets-tui = "^0.11.1"
 tui-big-text         = "^0.8.8"
-tui-input            = "^0.15.3"
+tui-input            = "^0.15.4"
 tui-popup            = "^0.7.6"
 tui-scrollview       = "^0.6.7"
-tui-tree-widget      = "^0.24.0"
+tui-tree-widget      = "^0.24.1"
 
 [profile.release]
 lto = true
