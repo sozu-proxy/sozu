@@ -31,6 +31,23 @@
   plane, so an `AddHttpFrontend` carrying one panicked every worker the main process fanned the
   request out to — and panicked them again on each restart state replay. `add_tree_rule` now
   surfaces the rejection as `RouterError::AddRoute`, so the worker answers `Failure` and stays up.
+  Three sibling holes in the same input class are closed with it: `convert_regex_domain_rule`
+  indexed one byte past the end of a hostname whose last segment is followed by a bare trailing
+  `.` (`/a/.`) — a release panic reached through the unconditional `DomainRule` parse, upstream of
+  the trie; hostnames are now bounded to `MAX_HOSTNAME_LENGTH` (4096 bytes) before any parse, since
+  the trie recurses once per label (a ~100k-label hostname aborted the worker with an uncatchable
+  stack overflow) and a `/`-segment compiles a control-plane-supplied regex whose compilation time
+  grows with the pattern; and `CertificateResolver::add_certificate` now validates every
+  certificate name against the same trie grammar up front — with the insert no longer panicking, a
+  discarded `InsertResult::Failed` would have registered the certificate while the SNI trie never
+  learned the name, silently failing every handshake for it.
+  With workers answering `Failure` instead of dying, the unanimous-rejection rollback from
+  [#1301](https://github.com/sozu-proxy/sozu/issues/1301) also becomes reachable for this class on
+  the live fan-out path, so the main process's `ConfigState` is reverted and no phantom route
+  persists. Two replay holes remain open and are tracked as follow-ups: the `LoadState` path has no
+  rollback at all (a poisoned saved state re-injects the entry and `SaveState` re-persists it), and
+  the rollback is skipped when the scatter times out — a single unpatched worker panicking during a
+  rolling upgrade commits the malformed entry permanently.
 
 - **`fix(command)`: validate a listener configuration before committing it to the main-process
   state** ([#1301](https://github.com/sozu-proxy/sozu/issues/1301)). An HTTPS listener whose

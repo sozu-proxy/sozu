@@ -38,6 +38,21 @@ macro_rules! log_module_context {
     }};
 }
 
+/// Upper bound (in bytes) on a frontend hostname accepted by the router,
+/// checked by [`Router::add_http_front_with_hsts_origin`] and
+/// [`Router::remove_http_front`] before anything parses the hostname.
+///
+/// RFC 1035 caps a domain name at 255 octets; Sōzu's regex-segment
+/// grammar (`/re/.example.com`) can legitimately exceed that, so this is
+/// a deliberately generous safety net rather than a strict RFC bound. It
+/// exists because the route-table trie recurses once per label — a
+/// hostname with ~100k labels aborts the worker with an uncatchable
+/// stack overflow — and because the regex compilation a `/`-segment
+/// triggers costs time linear in the pattern size (a 2 MiB hostname
+/// stalls the single-threaded worker for ~855 ms before the regex size
+/// limit rejects it).
+pub const MAX_HOSTNAME_LENGTH: usize = 4096;
+
 #[derive(thiserror::Error, PartialEq)]
 pub enum RouterError {
     #[error("Could not parse rule from frontend path, path_bytes={}", .0.len())]
@@ -230,6 +245,15 @@ impl Router {
         front: &HttpFrontend,
         hsts_origin: HstsOrigin,
     ) -> Result<(), RouterError> {
+        // Bounded BEFORE any parse: the `DomainRule` parse below compiles
+        // control-plane-supplied regex segments, and the trie recurses
+        // once per label (see `MAX_HOSTNAME_LENGTH`).
+        if front.hostname.len() > MAX_HOSTNAME_LENGTH {
+            return Err(RouterError::InvalidDomain {
+                hostname: front.hostname.clone(),
+            });
+        }
+
         let path_rule = PathRule::from_config(front.path.clone())
             .ok_or(RouterError::InvalidPathRule(front.path.to_string()))?;
 
@@ -302,6 +326,14 @@ impl Router {
     }
 
     pub fn remove_http_front(&mut self, front: &HttpFrontend) -> Result<(), RouterError> {
+        // Same bound as `add_http_front_with_hsts_origin`: the Pre/Post
+        // arms below re-parse the hostname into a `DomainRule`.
+        if front.hostname.len() > MAX_HOSTNAME_LENGTH {
+            return Err(RouterError::InvalidDomain {
+                hostname: front.hostname.clone(),
+            });
+        }
+
         let path_rule = PathRule::from_config(front.path.clone())
             .ok_or(RouterError::InvalidPathRule(front.path.to_string()))?;
 
@@ -395,10 +427,12 @@ impl Router {
                     // empty label (`.example.com`).
                     if insert_result == InsertResult::Failed {
                         // Redacted like every other router log site: the
-                        // shape is what matters, and the hostname is echoed
-                        // back to the control plane through
-                        // `RouterError::AddRoute` (whose `HttpFrontend`
-                        // Debug is itself redacting) rather than the log.
+                        // shape is what matters here. `RouterError::AddRoute`
+                        // is redacting too (`route_bytes=<len>`), so the
+                        // hostname itself is only visible where the main
+                        // process audit-logs the request it fanned out
+                        // (`bin/src/command/requests.rs`) -- correlate by
+                        // timestamp to identify the offending frontend.
                         error!(
                             "{} the route table rejected a malformed hostname, hostname_bytes={}",
                             log_module_context!(),
@@ -808,6 +842,14 @@ fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
     let s = hostname.as_bytes();
     let mut index = 0;
     loop {
+        // A bare trailing `.` after a completed segment (`/a/.`, `x./y/.`)
+        // leaves `index` one past the end through the `index += 1` in the
+        // loop tail; indexing `s[index]` here would then panic (slice
+        // bounds checks never compile out of release). The grammar
+        // requires a label after every `.`, so reject instead.
+        if index >= s.len() {
+            return None;
+        }
         if s[index] == b'/' {
             let mut found = false;
             for i in index + 1..s.len() {
@@ -2077,7 +2119,10 @@ mod tests {
         const DOMAIN_SECRET: &str = "clusterless_domain_secret_sentinel";
         const PATH_SECRET: &str = "CLUSTERLESS_PATH_SECRET_SENTINEL";
 
-        let domain = format!("{DOMAIN_SECRET}{}", "x".repeat(4096));
+        // The hostname stays below `MAX_HOSTNAME_LENGTH` so it reaches the
+        // code under test instead of the pre-parse bound; the redaction
+        // property being asserted is length-independent.
+        let domain = format!("{DOMAIN_SECRET}{}", "x".repeat(2048));
         let path = format!("/{PATH_SECRET}{}", "x".repeat(4096));
         let domain_len = domain.len();
         let path_len = path.len();
@@ -3236,6 +3281,91 @@ mod tests {
             Err(RouterError::AddRoute(_))
         ));
         assert!(router.tree.is_empty());
+
+        // A hostname whose last segment is followed by a bare trailing `.`
+        // is rejected one layer earlier still, by the unconditional
+        // `DomainRule` parse -- which used to walk out of bounds on it
+        // (see `domain_rule_rejects_a_trailing_dot_after_a_regex_segment`).
+        for hostname in ["/a/.", "a/b/.", "x./y/."] {
+            let mut router = Router::new();
+            let front = HttpFrontend {
+                hostname: (*hostname).to_owned(),
+                ..test_http_frontend()
+            };
+            assert!(
+                matches!(
+                    router.add_http_front(&front),
+                    Err(RouterError::InvalidDomain { .. })
+                ),
+                "{hostname:?} must be rejected as an invalid domain, not panic",
+            );
+            assert!(router.tree.is_empty());
+        }
+    }
+
+    /// `convert_regex_domain_rule` used to walk one byte past the end of a
+    /// hostname whose last segment is followed by a bare trailing `.`
+    /// (`/a/.`, `a/b/.`, `x./y/.`): the `.` arm of the loop tail advances
+    /// `index` to `s.len()` and the next iteration indexed `s[index]` out
+    /// of bounds -- a release panic (slice bounds checks never compile
+    /// out) reachable from the control plane through the unconditional
+    /// `DomainRule` parse in `add_http_front`, sidestepping every trie
+    /// guard.
+    #[test]
+    fn domain_rule_rejects_a_trailing_dot_after_a_regex_segment() {
+        for hostname in ["/a/.", "a/b/.", "/[/.", "x./y/."] {
+            assert!(
+                hostname.parse::<DomainRule>().is_err(),
+                "{hostname:?} must be rejected, not panic",
+            );
+        }
+        // The guard must not disturb the legitimate `.`-anchored
+        // regex-segment grammar.
+        assert!("abc./[0-9]+/.example.com".parse::<DomainRule>().is_ok());
+    }
+
+    /// The trie recurses once per label and the regex-segment grammar
+    /// compiles control-plane-supplied patterns, so both add and remove
+    /// bound the hostname to [`MAX_HOSTNAME_LENGTH`] before parsing
+    /// anything: a ~100k-label hostname otherwise aborts the worker with
+    /// an uncatchable stack overflow, and regex compilation time grows
+    /// with the pattern (a 2 MiB hostname stalls the single-threaded
+    /// worker for hundreds of milliseconds before rejection).
+    #[test]
+    fn add_http_front_rejects_an_oversized_hostname() {
+        // At the bound: accepted.
+        let mut router = Router::new();
+        let front = HttpFrontend {
+            hostname: "a".repeat(MAX_HOSTNAME_LENGTH),
+            ..test_http_frontend()
+        };
+        assert!(router.add_http_front(&front).is_ok());
+
+        // One byte over: rejected on add AND on remove, before any parse.
+        let mut router = Router::new();
+        let front = HttpFrontend {
+            hostname: "a".repeat(MAX_HOSTNAME_LENGTH + 1),
+            ..test_http_frontend()
+        };
+        assert!(matches!(
+            router.add_http_front(&front),
+            Err(RouterError::InvalidDomain { .. })
+        ));
+        assert!(matches!(
+            router.remove_http_front(&front),
+            Err(RouterError::InvalidDomain { .. })
+        ));
+        assert!(router.tree.is_empty());
+
+        // A label-count bomb is caught by the same byte bound.
+        let front = HttpFrontend {
+            hostname: "a.".repeat(MAX_HOSTNAME_LENGTH),
+            ..test_http_frontend()
+        };
+        assert!(matches!(
+            router.add_http_front(&front),
+            Err(RouterError::InvalidDomain { .. })
+        ));
     }
 
     #[test]

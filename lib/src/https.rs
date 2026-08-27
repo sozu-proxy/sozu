@@ -2840,7 +2840,10 @@ mod tests {
     fn query_all_certificates_log_redacts_response_domains() {
         const DOMAIN_SECRET: &str = "QUERY_ALL_CERTIFICATE_DOMAIN_SECRET_SENTINEL";
 
-        let domain = format!("{DOMAIN_SECRET}{}", "x".repeat(4096));
+        // Below `router::MAX_HOSTNAME_LENGTH` so the certificate passes
+        // add-time name validation; the redaction property under test is
+        // length-independent.
+        let domain = format!("{DOMAIN_SECRET}{}", "x".repeat(2048));
         let output = crate::capture_test_logs(move || {
             let mut proxy = proxy_with_certificate_domain(domain);
             proxy
@@ -2869,7 +2872,9 @@ mod tests {
     fn query_certificate_for_domain_log_redacts_request_and_response_domain() {
         const DOMAIN_SECRET: &str = "QUERY_ONE_CERTIFICATE_DOMAIN_SECRET_SENTINEL";
 
-        let domain = format!("{DOMAIN_SECRET}{}", "x".repeat(4096));
+        // Below `router::MAX_HOSTNAME_LENGTH` -- see
+        // `query_all_certificates_log_redacts_response_domains`.
+        let domain = format!("{DOMAIN_SECRET}{}", "x".repeat(2048));
         let domain_len = domain.len();
         let output = crate::capture_test_logs_at_level("debug", move || {
             let mut proxy = proxy_with_certificate_domain(domain.clone());
