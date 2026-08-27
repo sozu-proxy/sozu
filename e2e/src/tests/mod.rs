@@ -43,6 +43,7 @@ mod metrics_lifecycle_tests;
 mod mux_tests;
 mod protocol_pair_matrix;
 mod redirect_rewrite_auth_tests;
+mod router_hostname_tests;
 mod tcp_sni_tests;
 mod tcp_tests;
 mod tests;

@@ -22,6 +22,16 @@
 
 ### 🐛 Fixed
 
+- **`fix(router)`: reject a malformed frontend hostname instead of panicking the worker.**
+  `TrieNode::insert` asserted that its recursive insert never reports `InsertResult::Failed`, but
+  the route-table grammar rejects a whole class of hostnames the two cheap guards above the assert
+  let through: a host ending in `/` with no openable regex segment (`example.com/`), a regex
+  segment that is not `.`-anchored (`abc/[0-9]+/.example.com`), a segment that is not a valid regex
+  (`/[/.example.com`), and an empty label (`.example.com`). Those hostnames arrive from the control
+  plane, so an `AddHttpFrontend` carrying one panicked every worker the main process fanned the
+  request out to — and panicked them again on each restart state replay. `add_tree_rule` now
+  surfaces the rejection as `RouterError::AddRoute`, so the worker answers `Failure` and stays up.
+
 - **`fix(command)`: validate a listener configuration before committing it to the main-process
   state** ([#1301](https://github.com/sozu-proxy/sozu/issues/1301)). An HTTPS listener whose
   configuration the worker cannot build (an unusable TLS version/cipher set, or an unparseable

@@ -21,7 +21,7 @@ use sozu_command::{
 use crate::metrics::names;
 use crate::{
     protocol::{http::editor::HeaderEditMode, http::parser::Method},
-    router::pattern_trie::{TrieMatches, TrieNode, TrieSubMatch},
+    router::pattern_trie::{InsertResult, TrieMatches, TrieNode, TrieSubMatch},
     sozu_command::logging::ansi_palette,
 };
 
@@ -378,10 +378,34 @@ impl Router {
                     // domain. Ungated `let` (read only inside the gated
                     // assert) → dropped by the optimizer in release.
                     let inserted_host = hostname.clone().into_bytes();
-                    self.tree.domain_insert(
+                    let insert_result = self.tree.domain_insert(
                         hostname.into_bytes(),
                         vec![(path.to_owned(), method.to_owned(), cluster.to_owned())],
                     );
+                    // A malformed hostname reaches us straight from the
+                    // control plane (`AddHttpFrontend` over the command
+                    // socket, or a `LoadState` replay), so the route table
+                    // rejecting it is an expected outcome, not a Sozu bug:
+                    // report the failure and let the caller answer the
+                    // request with an error. Shapes the trie rejects
+                    // include a host ending in `/` with no openable regex
+                    // segment (`example.com/`), a regex segment that is not
+                    // `.`-anchored (`abc/[0-9]+/.example.com`), a segment
+                    // that is not a valid regex (`/[/.example.com`), and an
+                    // empty label (`.example.com`).
+                    if insert_result == InsertResult::Failed {
+                        // Redacted like every other router log site: the
+                        // shape is what matters, and the hostname is echoed
+                        // back to the control plane through
+                        // `RouterError::AddRoute` (whose `HttpFrontend`
+                        // Debug is itself redacting) rather than the log.
+                        error!(
+                            "{} the route table rejected a malformed hostname, hostname_bytes={}",
+                            log_module_context!(),
+                            inserted_host.len(),
+                        );
+                        return false;
+                    }
                     // A fresh domain must now be reachable, carrying the
                     // single rule just inserted. Use `domain_lookup_mut`
                     // (not the immutable `domain_lookup`): only the `_mut`
@@ -3151,6 +3175,67 @@ mod tests {
             router.lookup("api.sozu.io", "/api", &Method::Get),
             Ok(RouteResult::forward("api".to_string()))
         );
+    }
+
+    /// A malformed hostname arriving from the control plane
+    /// (`AddHttpFrontend` over the command socket, or a `LoadState`
+    /// replay) must be REJECTED, never panic the worker. `TrieNode::insert`
+    /// used to `assert_ne!` on `InsertResult::Failed`, so a frontend whose
+    /// hostname ended in `/` killed every worker the master fanned the
+    /// request out to -- and killed them again on each restart replay.
+    #[test]
+    fn add_tree_rule_rejects_malformed_hostnames_without_panicking() {
+        // Every shape here reached `InsertResult::Failed` (or an empty
+        // `partial_key`) inside `insert_recursive`.
+        for hostname in [
+            &b"example.com/"[..],
+            b"www.example.com/",
+            b"foo/",
+            b"a/*/",
+            b"/",
+            b"///",
+            b"abc/[0-9]+/.example.com",
+            b"/[/.example.com",
+            b".example.com",
+            b".a.b",
+            b"..",
+        ] {
+            let mut router = Router::new();
+            assert!(
+                !router.add_tree_rule(
+                    hostname,
+                    &PathRule::Prefix("/".to_string()),
+                    &MethodRule::new(Some("GET".to_string())),
+                    &Route::ClusterId("cluster".to_string()),
+                ),
+                "{:?} must be rejected, not inserted",
+                String::from_utf8_lossy(hostname),
+            );
+            // A rejected add must leave NO trace: the route table is
+            // exactly as empty as it was before the attempt.
+            assert!(
+                router.tree.is_empty(),
+                "{:?} was rejected but still mutated the route table",
+                String::from_utf8_lossy(hostname),
+            );
+        }
+    }
+
+    /// The same rejection, one layer up: `add_http_front` must surface a
+    /// `RouterError::AddRoute` so the worker answers the master with a
+    /// failure instead of dying.
+    #[test]
+    fn add_http_front_surfaces_a_malformed_hostname_as_an_error() {
+        let mut router = Router::new();
+        let front = HttpFrontend {
+            hostname: "example.com/".to_owned(),
+            ..test_http_frontend()
+        };
+        assert!(matches!(
+            router.add_http_front(&front),
+            Err(RouterError::AddRoute(_))
+        ));
+        assert!(router.tree.is_empty());
     }
 
     #[test]

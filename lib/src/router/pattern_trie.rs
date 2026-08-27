@@ -124,11 +124,25 @@ impl<V: Debug + Clone> TrieNode<V> {
         let before = self.count_values();
 
         let insert_result = self.insert_recursive(&key, &key, value);
-        assert_ne!(insert_result, InsertResult::Failed);
 
-        // Post: the value count grows by exactly one on a fresh insert
-        // and is unchanged when the key already existed. `Failed` is
-        // ruled out above, so these two are the only reachable cases.
+        // Post: the value count grows by exactly one on a fresh insert,
+        // is unchanged when the key already existed, and is ALSO unchanged
+        // on `Failed` -- every mutating step in `insert_recursive`
+        // (`children.insert`, `regexps.push`) is guarded by an `Ok` from
+        // the level below, so a rejected key can never leave a half-built
+        // branch behind.
+        //
+        // `Failed` is NOT an internal-invariant break: the two cheap guards
+        // above only rule out the empty key and a bare `.`, while
+        // `insert_recursive` rejects a much wider class of malformed
+        // domains (a key ending in `/` with no openable regex segment, a
+        // regex segment that is not `.`-anchored, a segment that is not a
+        // valid regex, an empty label from a leading or doubled `.`).
+        // Those keys arrive from the control plane -- an `AddHttpFrontend`
+        // over the command socket, or a `LoadState` replay -- so this must
+        // stay a graceful rejection the caller reports. It used to be an
+        // `assert_ne!`, which turned a malformed hostname into a worker
+        // panic (and, on state replay, a restart loop).
         #[cfg(debug_assertions)]
         {
             let after = self.count_values();
@@ -142,9 +156,10 @@ impl<V: Debug + Clone> TrieNode<V> {
                     after, before,
                     "an Existing insert must not change the trie value count",
                 ),
-                InsertResult::Failed => {
-                    unreachable!("insert_recursive returned Failed after key validation")
-                }
+                InsertResult::Failed => debug_assert_eq!(
+                    after, before,
+                    "a failed insert must leave the trie value count untouched",
+                ),
             }
             self.check_invariants();
         }
@@ -154,7 +169,14 @@ impl<V: Debug + Clone> TrieNode<V> {
 
     pub fn insert_recursive(&mut self, partial_key: &[u8], key: &Key, value: V) -> InsertResult {
         //println!("insert_rec: key == {}", std::str::from_utf8(partial_key).unwrap());
-        assert_ne!(partial_key, &b""[..]);
+        // An empty `partial_key` means the caller handed us a key with an
+        // empty label -- a leading `.` (`.example.com`) or a doubled one --
+        // which the dot-split recursion below cannot consume any further.
+        // Reject it like any other malformed domain instead of panicking:
+        // this input comes from the control plane, not from Sozu itself.
+        if partial_key.is_empty() {
+            return InsertResult::Failed;
+        }
         // `partial_key` is always a suffix of the full `key` being
         // inserted — the recursion only ever shrinks the head, never
         // rewrites the tail.
@@ -909,6 +931,73 @@ mod tests {
     /// segment whose prefix satisfied the pattern, silently widening the
     /// routing surface. This regression test exercises the exact-match
     /// invariant that anchoring guarantees.
+    /// `insert` must REJECT a malformed domain, never panic. These keys
+    /// come from the control plane (`AddHttpFrontend`, or a `LoadState`
+    /// replay), so an `assert_ne!(_, Failed)` here -- which is what this
+    /// used to be -- turned a bad hostname into a worker crash, repeated
+    /// on every restart replay. A rejected key must also leave the trie
+    /// completely untouched.
+    #[test]
+    fn insert_rejects_malformed_keys_without_panicking() {
+        for key in [
+            &b""[..],
+            b".",
+            b"..",
+            b"...",
+            b"/",
+            b"///",
+            b"a/",
+            b".a",
+            b".a.b",
+            b"example.com/",
+            b"www.example.com/",
+            // A regex segment must be `.`-anchored on its left.
+            b"abc/[0-9]+/.example.com",
+            // ... and must actually compile as a regex.
+            b"/[/.example.com",
+            b"a/*/",
+        ] {
+            let mut root: TrieNode<u8> = TrieNode::root();
+            assert_eq!(
+                root.insert(key.to_vec(), 1),
+                InsertResult::Failed,
+                "{:?} must be rejected",
+                String::from_utf8_lossy(key),
+            );
+            assert!(
+                root.is_empty(),
+                "{:?} was rejected but still mutated the trie",
+                String::from_utf8_lossy(key),
+            );
+            assert_eq!(root.domain_lookup(key, false), None);
+            assert_eq!(root.domain_lookup(key, true), None);
+        }
+    }
+
+    /// A rejected key must not disturb the entries already in the trie
+    /// either -- the failed insert has to be a no-op on a populated table.
+    #[test]
+    fn a_rejected_insert_leaves_existing_entries_intact() {
+        let mut root: TrieNode<u8> = TrieNode::root();
+        assert_eq!(
+            root.insert(b"www.example.com".to_vec(), 1),
+            InsertResult::Ok
+        );
+        assert_eq!(root.insert(b"*.wild.com".to_vec(), 2), InsertResult::Ok);
+        assert_eq!(
+            root.insert(b"www.example.com/".to_vec(), 3),
+            InsertResult::Failed
+        );
+        assert_eq!(
+            root.domain_lookup(b"www.example.com", false),
+            Some(&(b"www.example.com".to_vec(), 1))
+        );
+        assert_eq!(
+            root.domain_lookup(b"any.wild.com", true),
+            Some(&(b"*.wild.com".to_vec(), 2))
+        );
+    }
+
     #[test]
     fn segment_regex_rejects_partial_matches() {
         let mut root: TrieNode<u8> = TrieNode::root();
