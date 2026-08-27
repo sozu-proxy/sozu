@@ -66,6 +66,23 @@
   one replayed into restarted and upgraded workers — never permanently holds an add the whole fleet
   refused.
 
+- **`fix(command)`: validate HTTP/HTTPS frontends before committing them to the main-process
+  state** ([#1313](https://github.com/sozu-proxy/sozu/issues/1313)). `ConfigState` has no
+  route-grammar check — `add_http_frontend` only reparses the address and maps the position — so an
+  `Add{Http,Https}Frontend` whose hostname every worker's router refuses was still recorded by the
+  main process. That state is authoritative: `SaveState` re-serialised the malformed entry and every
+  replay re-injected it, and the replay path (`LoadState`, static-config load) has no rollback at
+  all, so the entry survived a unanimous worker rejection and poisoned each subsequent restart. The
+  main process now runs the worker's own insertion path — the same `Router::add_http_front`, against
+  a disposable empty router — before `ConfigState` is mutated, on all three apply paths: a live
+  `Add{Http,Https}Frontend` is answered with a failure and never fanned out, and a malformed entry
+  in a saved state file or the static configuration is skipped without entering the state, so it
+  can never be re-persisted. Skipped entries (frontends and, as before, unbuildable listeners) are
+  now reported at `warn!` instead of `debug!` — an entry silently dropped from the state the
+  operator saved must be visible at the default log level — and a `state load` that skipped any
+  entry says how many. Rejection messages report byte lengths only, never the operator-supplied
+  hostname.
+
 - **`fix(command)`: report a fan-out timeout as a failure, not a success.** `handle_finishing_task`
   passed a hard-coded `timed_out = false` into every task completion handler, so a command whose
   worker fan-out timed out was reported to the operator as `Successfully applied request to all
