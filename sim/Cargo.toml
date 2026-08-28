@@ -3,7 +3,7 @@ name = "sozu-sim"
 description = "Deterministic-simulation harness (moonpool-sim) for sozu's sans-io cores"
 repository = "https://github.com/sozu-proxy/sozu"
 homepage = "https://sozu.io"
-version = "2.2.0"
+version = "2.2.1"
 license = "AGPL-3.0"
 authors = [
   "Eloi Demolis <eloi.demolis@clever-cloud.com>",

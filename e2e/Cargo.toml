@@ -1,6 +1,6 @@
 [package]
 name = "sozu-e2e"
-version = "2.2.0"
+version = "2.2.1"
 rust-version = "1.93.1"
 edition = "2024"
 publish = false

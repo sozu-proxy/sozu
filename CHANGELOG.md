@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## 2.2.1 - 2026-08-28
+
+Patch release: the main process validates listeners and HTTP/HTTPS
+frontends before committing them to its state and rolls back unanimously
+rejected or unacknowledged fan-outs, the router rejects malformed
+frontend hostnames instead of panicking workers, and a full dependency
+refresh re-enables TLS 1.2 + ECDSA under `crypto-openssl`.
+
 ### 🔐 Security
 
 - **`fix(command)`: redact TLS certificate and private-key material from `Debug` output.**
@@ -105,6 +113,17 @@
   workers` and its audit line mislabeled the `FanoutStatus`/`result`. The real `timed_out` flag is
   now forwarded, so a timed-out command correctly returns a failure (and the `#1301` rollback
   safety-net's timeout guard now engages as intended).
+
+### 🔄 Changed
+
+- **`chore`: refresh every workspace dependency requirement to its latest published version**
+  ([#1317](https://github.com/sozu-proxy/sozu/pull/1317)). `Cargo.toml` requirements move to
+  explicit `^x.y.z` form: async-trait `^0.1.92`, flate2 `^1.1.10`, futures `^0.3.34`,
+  http-body-util `^0.1.5`, log `^0.4.34`, rustls-openssl `^0.4.0`, and tui-big-text `^0.8.9`,
+  with both lockfiles regenerated (`cargo audit` reports no advisory; the transitive h2 0.4.19
+  closing RUSTSEC-2026-0258 had already landed on `main`). rustls-openssl 0.4.0 fixes the
+  TLS 1.2 + ECDSA handshake regression that 0.3.x carried, so `test_tls_1_2_ecdsa` runs under
+  `crypto-openssl` again and that CI cell is back to full parity with the other providers.
 
 ## 2.2.0 - 2026-07-16
 
