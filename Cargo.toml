@@ -4,16 +4,16 @@ resolver = "2" # consistent with rust edition 2024, see https://doc.rust-lang.or
 
 [workspace.dependencies]
 anyhow = "^1.0.104"
-async-trait = "^0.1.91"
+async-trait = "^0.1.92"
 base64 = "^0.23.1"
 clap = "^4.6.6"
 cookie-factory = "^0.3.3"
-flate2 = "^1.1.9"
-futures = "^0.3.33"
+flate2 = "^1.1.10"
+futures = "^0.3.34"
 hdrhistogram = "^7.6.0"
 hex = "^0.4.3"
 loona-hpack = "^0.4.3"
-http-body-util = "^0.1.4"
+http-body-util = "^0.1.5"
 hyper = "^1.11.0"
 hyper-rustls = { version = "^0.27.9", default-features = false }
 hyper-util = "^0.1.20"
@@ -22,7 +22,7 @@ itoa = "^1.0.18"
 jemallocator = "^0.5.4"
 kawa = { version = "^0.7.1", default-features = false }
 libc = "^0.2.189"
-log = "^0.4.33"
+log = "^0.4.34"
 memchr = "^2.8.3"
 mio = "^1.2.2"
 moonpool-sim = "^0.8.0"
@@ -39,7 +39,7 @@ criterion = { version = "^0.8.2", features = ["html_reports"] }
 quickcheck = "^1.1.0"
 rand = "^0.10.2"
 regex = "^1.13.1"
-rustls-openssl = { version = "^0.3.1", default-features = false, features = ["tls12"] }
+rustls-openssl = { version = "^0.4.0", default-features = false, features = ["tls12"] }
 rustls = { version = "^0.23.43", default-features = false, features = [
   "logging",
   "std",
@@ -74,7 +74,7 @@ crossterm            = { version = "^0.29.0", default-features = false }
 ctrlc                = "^3.5.2"
 ratatui              = { version = "^0.30.2", default-features = false }
 throbber-widgets-tui = "^0.11.1"
-tui-big-text         = "^0.8.8"
+tui-big-text         = "^0.8.9"
 tui-input            = "^0.15.4"
 tui-popup            = "^0.7.6"
 tui-scrollview       = "^0.6.7"
