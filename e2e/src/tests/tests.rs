@@ -2799,19 +2799,7 @@ fn test_tls_1_2_rsa() {
     );
 }
 
-// TLS 1.2 + ECDSA handshakes on `rustls-openssl 0.3.x` reliably fail
-// with `General("OpenSSL error: OpenSSL error")` on the proxy side
-// (`Could not perform handshake` log line on cargo CI). The same
-// handshake succeeds for ring and aws-lc-rs against the identical
-// listener config + ECDSA cert. Mark the test ignored under
-// `crypto-openssl` so CI's matrix can stay green; tracked as an
-// upstream `rustls-openssl` issue. Re-enable after a `rustls-openssl`
-// release that resolves the regression.
 #[test]
-#[cfg_attr(
-    feature = "crypto-openssl",
-    ignore = "rustls-openssl 0.3.x reports General(\"OpenSSL error\") on TLS 1.2 + ECDSA handshake; tracked upstream"
-)]
 fn test_tls_1_2_ecdsa() {
     assert_eq!(
         repeat_until_error_or(
@@ -2820,36 +2808,6 @@ fn test_tls_1_2_ecdsa() {
             try_tls_1_2_ecdsa
         ),
         State::Success
-    );
-}
-
-// Companion probe to `test_tls_1_2_ecdsa`. Compiled only when the
-// `crypto-openssl` feature is on, this asserts that the very same
-// handshake the upstream regression breaks STILL fails. As soon as
-// `rustls-openssl` ships a fix, the handshake will succeed and this
-// probe will flip red — at that point:
-//
-//   1. delete this probe
-//   2. drop the `#[cfg_attr(feature = "crypto-openssl", ignore = ...)]`
-//      from `test_tls_1_2_ecdsa` above so the real test runs on every
-//      cell again
-//
-// One iteration is enough because the upstream failure is deterministic
-// (`General("OpenSSL error: OpenSSL error")` on the proxy-side
-// handshake — see the comment on `test_tls_1_2_ecdsa`).
-#[test]
-#[cfg(feature = "crypto-openssl")]
-fn test_tls_1_2_ecdsa_openssl_regression_probe() {
-    assert_ne!(
-        repeat_until_error_or(
-            1,
-            "Probe: TLS 1.2 ECDSA must still fail under crypto-openssl",
-            try_tls_1_2_ecdsa
-        ),
-        State::Success,
-        "rustls-openssl's TLS 1.2 + ECDSA handshake regression appears \
-         resolved — un-ignore `test_tls_1_2_ecdsa` for crypto-openssl \
-         and remove this probe."
     );
 }
 
