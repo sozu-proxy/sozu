@@ -172,7 +172,8 @@ impl CommandManager {
                     https,
                     tcp,
                     domain,
-                } => self.list_frontends(http, https, tcp, domain),
+                    cluster_id,
+                } => self.list_frontends(http, https, tcp, domain, cluster_id),
             },
             SubCmd::Listener { cmd } => match cmd {
                 ListenerCmd::Http { cmd } => self.http_listener_command(cmd),

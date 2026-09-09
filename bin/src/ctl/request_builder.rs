@@ -94,6 +94,7 @@ impl CommandManager {
         https: bool,
         tcp: bool,
         domain: Option<String>,
+        cluster_id: Option<String>,
     ) -> Result<(), CtlError> {
         debug!("Listing frontends");
 
@@ -103,6 +104,7 @@ impl CommandManager {
                 https,
                 tcp,
                 domain,
+                cluster_id,
             })
             .into(),
         )

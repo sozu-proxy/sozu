@@ -635,6 +635,12 @@ pub enum FrontendCmd {
             help = "filter by domain name (for http & https frontends)"
         )]
         domain: Option<String>,
+        #[clap(
+            short = 'i',
+            long = "cluster-id",
+            help = "filter by cluster id (frontends that deny traffic never match)"
+        )]
+        cluster_id: Option<String>,
     },
 }
 

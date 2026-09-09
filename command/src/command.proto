@@ -939,12 +939,15 @@ message RequestUdpFrontend {
     map<string, string> tags = 3;
 }
 
-// list the frontends, filtered by protocol and/or domain
+// list the frontends, filtered by protocol, domain and/or cluster id
 message FrontendFilters {
     required bool http = 1;
     required bool https = 2;
     required bool tcp = 3;
     optional string domain = 4;
+    // only list frontends routing to this cluster id. A frontend with no
+    // cluster (a `Deny` rule) never matches.
+    optional string cluster_id = 5;
 }
 
 // A filter for the path of incoming requests

@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### ✨ Added
+
+- **`feat(ctl)`: filter `sozu frontend list` by cluster id.**
+  `FrontendFilters` gains an optional `cluster_id` field (proto tag `5`), surfaced as
+  `sozu frontend list -i/--cluster-id <id>`. `ConfigState::list_frontends` applies it to HTTP,
+  HTTPS, TCP and UDP frontends, ANDed with the existing `--domain` and protocol filters. An
+  HTTP/HTTPS frontend that denies traffic carries no cluster id and therefore never matches the
+  filter. Answering "which frontends — and which access-log tags — belong to this cluster?" no
+  longer requires dumping the whole frontend list and filtering client-side.
+
 ## 2.2.1 - 2026-08-28
 
 Patch release: the main process validates listeners and HTTP/HTTPS
