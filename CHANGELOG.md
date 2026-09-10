@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### 🐛 Fixed
+
+- **`fix(pipe)`: stop dropping the READABLE event on a pipe-full `splice(2)` EAGAIN.**
+  On `Protocol::TCP` listeners built with the `splice` feature, `splice_backend_readable` and
+  `splice_readable` treated every `EAGAIN` from `splice_in` as a drained socket and cleared the
+  READABLE event. `splice(2)` also reports `EAGAIN` when the *pipe* has no free slot: a pipe holds
+  `capacity / PAGE_SIZE` slots, every spliced skb fragment takes one whatever its length, and a
+  partially drained slot stays occupied — so the slots run out while the byte accounting is still
+  below `capacity` (MSS-sized segments from a remote backend fill the 16 slots of the default
+  64 KiB pipe at ~23 KiB). Edge-triggered epoll never re-signals bytes already queued in the
+  socket, so the tail of a response stayed in the kernel receive queue and the client hung at the
+  end of the transfer. Both paths now keep the READABLE event on an `EAGAIN` observed with bytes
+  still pending in the pipe, park the READABLE interest, and arm the peer writable so the drain
+  re-arms the read, mirroring the existing byte-capacity guard. `splice_backend_writable` now also
+  re-arms the frontend read after a *partial* drain, as `splice_writable` already did for the
+  backend read, so a slow backend no longer turns uploads into stop-and-wait. Unit-guarded in both
+  directions with a single-slot pipe and a partial drain (seen red).
+
 ## 2.2.1 - 2026-08-28
 
 Patch release: the main process validates listeners and HTTP/HTTPS
