@@ -6,14 +6,14 @@
 //! by the audit envelope so reused PIDs cannot impersonate another
 //! command source. Long-form lifecycle: `bin/src/command/LIFECYCLE.md`.
 
-use std::{fmt::Debug, sync::Arc, time::SystemTime};
+use std::{collections::VecDeque, fmt::Debug, sync::Arc, time::SystemTime};
 
 use libc::pid_t;
 use mio::Token;
 use prost::Message;
 use rusty_ulid::Ulid;
 use sozu_command_lib::{
-    channel::Channel,
+    channel::{Channel, ChannelError},
     proto::command::{
         Request, Response, ResponseContent, ResponseStatus, RunState, WorkerInfo, WorkerRequest,
         WorkerResponse,
@@ -376,6 +376,21 @@ impl MessageClient for OptionalClient<'_> {
 pub struct WorkerSession {
     pub channel: Channel<WorkerRequest, WorkerResponse>,
     pub id: WorkerId,
+    /// sozu#1313: requests accepted for delivery that did not fit in the
+    /// channel back buffer, in scatter order. A BULK sender (`load_state`,
+    /// `load_static_config`) queues every entry inside ONE event-loop
+    /// iteration, so the buffer reaches `max_buffer_size` long before mio ever
+    /// reports WRITABLE; the overflow waits here and is drained from the
+    /// WRITABLE path by [`WorkerSession::flush_pending`]. Nothing blocks, and
+    /// no entry is dropped. Bounded by the size of the bulk send in flight —
+    /// for a replay, the state file the master already holds in its own
+    /// `ConfigState`.
+    ///
+    /// ACCEPTED RESIDUAL: a queue that outlives its task's deadline is still
+    /// delivered, so a worker can apply an entry the master already reverted.
+    /// That is the same bounded divergence `should_rollback_fanout` documents
+    /// for a late `Ok`, and it self-heals on the worker's next state replay.
+    pending: VecDeque<WorkerRequest>,
     pub pid: pid_t,
     pub run_state: RunState,
     /// meant to send listeners to the worker upon start
@@ -391,6 +406,21 @@ pub enum WorkerResult {
     CloseSession,
 }
 
+/// sozu#1313: is this write failure "no room in the back buffer RIGHT NOW"?
+///
+/// `MessageTooLarge` covers two different situations: a frame that fits under
+/// the channel ceiling but not in what is left of the buffer — transient, the
+/// request is parked and written after the next drain — and a frame bigger than
+/// the ceiling itself, which no amount of draining will ever admit. Parking the
+/// second would hang its task forever, so it stays a hard error and becomes a
+/// synthetic `Failure` for the owning task.
+fn is_transient_overflow(error: &ChannelError) -> bool {
+    matches!(
+        error,
+        ChannelError::MessageTooLarge { message_len, max, .. } if message_len <= max
+    )
+}
+
 impl WorkerSession {
     pub fn new(
         mut channel: Channel<WorkerRequest, WorkerResponse>,
@@ -403,6 +433,7 @@ impl WorkerSession {
         Self {
             channel,
             id,
+            pending: VecDeque::new(),
             pid,
             run_state: RunState::Running,
             scm_socket,
@@ -410,13 +441,44 @@ impl WorkerSession {
         }
     }
 
-    /// queue a request for the worker (the event loop does the send)
-    pub fn send(&mut self, request: &WorkerRequest) {
+    /// accept a request for delivery to the worker (the event loop does the
+    /// send)
+    ///
+    /// sozu#1313, two halves:
+    ///
+    /// - a HARD channel error used to be logged and forgotten while the caller
+    ///   still counted the worker in `expected_responses`, so a request that
+    ///   never left the master left its task waiting for an answer that could
+    ///   not come — with `Timeout::None` (the bulk replay paths), forever. It
+    ///   is returned now, so
+    ///   [`crate::command::server::Server::scatter_on`] can account the
+    ///   (entry, worker) pair as a `Failure`.
+    /// - a back buffer at `max_buffer_size` is NOT an error: the request is
+    ///   parked in [`Self::pending`] and returns `Ok`, because it IS accepted
+    ///   for delivery. Raising the ceiling would only move the cliff (it exists
+    ///   to bound memory), and flushing the socket synchronously here would
+    ///   block the single-threaded supervisor — no client, no worker and no
+    ///   task deadline is served while a bulk send is in progress, so the very
+    ///   deadline this fix arms could not even be observed.
+    pub fn send(&mut self, request: &WorkerRequest) -> Result<(), ChannelError> {
         trace!("Sending to worker: {:?}", request);
-        if let Err(e) = self.channel.write_message(request) {
-            error!("Could not send request to worker: {}", e);
-            self.channel.readiness = Ready::ERROR;
-            return;
+        // Ordering: once one request is parked, every later one is parked too,
+        // so the worker applies the replay in the order the master scattered it.
+        if !self.pending.is_empty() {
+            self.pending.push_back(request.clone());
+            self.channel.interest.insert(Ready::WRITABLE);
+            return Ok(());
+        }
+        match self.channel.write_message(request) {
+            Ok(()) => {}
+            Err(e) if is_transient_overflow(&e) => {
+                self.pending.push_back(request.clone());
+            }
+            Err(e) => {
+                error!("Could not send request to worker {}: {}", self.id, e);
+                self.channel.readiness = Ready::ERROR;
+                return Err(e);
+            }
         }
         self.channel.interest.insert(Ready::WRITABLE);
         // POST-CONDITION: a successfully queued request leaves the channel
@@ -427,6 +489,47 @@ impl WorkerSession {
             self.channel.interest.is_writable(),
             "send must arm WRITABLE interest so the queued request gets flushed"
         );
+        Ok(())
+    }
+
+    /// sozu#1313: refill the back buffer from [`Self::pending`] once
+    /// [`Channel::writable`] has drained it onto the socket.
+    ///
+    /// Stops at the first request that no longer fits (the buffer is full
+    /// again) and keeps WRITABLE armed, so the next writability event resumes
+    /// exactly where this one stopped. A hard channel error marks the session
+    /// for closing; the requests still parked here are in `Server::in_flight`
+    /// and are answered by `CommandHub::fail_in_flight_requests_of_worker`.
+    fn flush_pending(&mut self) {
+        while let Some(request) = self.pending.pop_front() {
+            match self.channel.write_message(&request) {
+                Ok(()) => {}
+                Err(e) if is_transient_overflow(&e) => {
+                    self.pending.push_front(request);
+                    break;
+                }
+                Err(e) => {
+                    error!(
+                        "Could not send a parked request to worker {}: {}",
+                        self.id, e
+                    );
+                    self.pending.push_front(request);
+                    self.channel.readiness = Ready::ERROR;
+                    break;
+                }
+            }
+        }
+        if !self.pending.is_empty() {
+            // INVARIANT: requests are only left parked because the back buffer
+            // is full (or the channel is dying), so there is always something
+            // for the event loop to flush — `wants_to_tick` and mio's
+            // writability event both key on that buffered data.
+            debug_assert!(
+                self.channel.back_buf.available_data() > 0 || self.channel.readiness.is_error(),
+                "a parked request must leave data for the event loop to flush"
+            );
+            self.channel.interest.insert(Ready::WRITABLE);
+        }
     }
 
     pub fn update_readiness(&mut self, events: Ready) {
@@ -437,6 +540,7 @@ impl WorkerSession {
     pub fn ready(&mut self) -> WorkerResult {
         let status = self.channel.writable();
         trace!("Worker writable: {:?}", status);
+        self.flush_pending();
         let responses = extract_messages(&mut self.channel);
         if !responses.is_empty() {
             return WorkerResult::NewResponses(responses);

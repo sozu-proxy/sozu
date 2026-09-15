@@ -499,7 +499,11 @@ surfaces:
    `SubscribeEvents`, `SaveState`, and `LoadState` completion — emit a
    single audit line carrying `result` and (when applicable)
    `error_code` + `reason`. `LoadState` and `SaveState` embed
-   `ok:<n> errors:<n>` counts in `target=file:<path>`.
+   `ok:<n> errors:<n>` counts in `target=file:<path>`; `LoadState` adds
+   `reverted:<n>`, the number of replayed entries no worker acknowledged
+   that were rolled back out of the main-process state (sozu#1313), and
+   carries `error_code=worker_timeout` when the replay hit its bounded
+   deadline, `worker_failure` when workers rejected entries.
 
    Bracket slots follow the `[session_ulid request_ulid cluster_id|- backend_id|-]`
    convention shared with `MUX` / `MUX-ROUTER` / `RUSTLS` / `PIPE` / `TCP` lines.
