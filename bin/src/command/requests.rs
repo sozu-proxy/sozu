@@ -904,6 +904,9 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
             continue;
         }
         if let Err(error) = server.state.dispatch(&request) {
+            // `warn!` as well as `return_processing`: at startup there is no
+            // client, so the log line is the only trace of the skipped entry.
+            warn!("Skipping a config entry the state refused: {:#}", error);
             client.return_processing(format!("Could not execute request on state: {error:#}"));
             continue;
         }
@@ -2401,7 +2404,16 @@ impl Gatherer for PerEntryGatherer {
                 let entry = self.entries.entry(request_index).or_default();
                 match ResponseStatus::try_from(message.status) {
                     Ok(ResponseStatus::Ok) => entry.ok += 1,
-                    Ok(ResponseStatus::Failure) => entry.errors += 1,
+                    Ok(ResponseStatus::Failure) => {
+                        entry.errors += 1;
+                        // One line per rejection, before the tally decides
+                        // the rollback: the worker message is already
+                        // redacted on its side, so it is safe to relay.
+                        warn!(
+                            "worker {} rejected replay entry {}: {}",
+                            worker_id, request_index, message.message
+                        );
+                    }
                     // Processing is not terminal, an undecodable status is
                     // reported by the inner gatherer.
                     Ok(ResponseStatus::Processing) | Err(_) => {}
@@ -3638,7 +3650,13 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
                         skipped_invalid += 1;
                         continue;
                     }
-                    if server.state.dispatch(&request.content).is_ok() {
+                    if let Err(error) = server.state.dispatch(&request.content) {
+                        // The entry never enters ConfigState and is never
+                        // scattered; say so, because at startup there is no
+                        // client to carry the reason.
+                        warn!("load_state: skipping an entry the state refused: {}", error);
+                        count!("config.load_skipped_invalid", 1);
+                    } else {
                         // INVARIANT: the scatter request_id advances by
                         // exactly one per dispatched request. `scatter_on`
                         // embeds it in the per-worker request id, so a stale
