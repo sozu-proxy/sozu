@@ -2863,20 +2863,67 @@ mod tests {
         );
     }
 
-    /// Frontend-direction twin of the test above: `splice_readable` must
-    /// keep the READABLE event on a pipe-full EAGAIN, and a *partial*
-    /// `splice_backend_writable` drain must re-arm the frontend read (the
-    /// response direction already did so via `splice_writable`).
     #[cfg(all(target_os = "linux", feature = "splice"))]
-    #[test]
-    fn splice_readable_keeps_readable_event_when_pipe_slots_are_exhausted() {
-        use std::os::unix::io::AsRawFd;
+    fn exercise_splice_readable_pipe_full_recovery(force_growth_refusal: bool) -> bool {
+        use std::{io::Read, os::unix::io::AsRawFd};
 
         fn unread_bytes(socket: &TcpStream) -> usize {
             let mut n: libc::c_int = 0;
             let ret = unsafe { libc::ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut n) };
             assert_eq!(ret, 0, "FIONREAD must succeed");
             n as usize
+        }
+
+        fn discard_in_pipe(pipe: &mut Pipe<TcpStream, TestListener>) {
+            let pending = pipe.splice_in_pending();
+            let pipe_read_end = pipe.splice_pipe.as_ref().unwrap().in_pipe[0];
+            let mut discarded = vec![0_u8; pending];
+            let mut offset = 0;
+            while offset < pending {
+                // SAFETY: `pipe_read_end` remains owned by `pipe`, and the
+                // writable slice covers exactly the bytes still requested.
+                let read = unsafe {
+                    libc::read(
+                        pipe_read_end,
+                        discarded[offset..].as_mut_ptr().cast(),
+                        pending - offset,
+                    )
+                };
+                assert!(
+                    read > 0,
+                    "read must drain the populated pipe: {}",
+                    std::io::Error::last_os_error()
+                );
+                offset += read as usize;
+            }
+            pipe.splice_pipe.as_mut().unwrap().in_pipe_pending = 0;
+        }
+
+        fn request_pipe_capacity(
+            fd: libc::c_int,
+            requested: usize,
+            force_growth_refusal: bool,
+        ) -> usize {
+            // SAFETY: `fd` is a live pipe descriptor owned by the test's
+            // `SplicePipe`; fcntl neither retains the descriptor nor a pointer.
+            let requested = if force_growth_refusal {
+                -1
+            } else {
+                libc::c_int::try_from(requested).expect("requested pipe size must fit c_int")
+            };
+            let set_ret = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, requested) };
+            if force_growth_refusal {
+                assert_eq!(set_ret, -1, "negative pipe growth must be refused");
+            } else if set_ret < 0 {
+                eprintln!(
+                    "F_SETPIPE_SZ({requested}) unavailable for test pipe: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            // SAFETY: same live pipe descriptor as above.
+            let actual = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+            assert!(actual > 0, "F_GETPIPE_SZ must succeed");
+            actual as usize
         }
 
         fn set_buffer(socket: &impl AsRawFd, opt: libc::c_int, bytes: libc::c_int) {
@@ -2944,7 +2991,7 @@ mod tests {
         }
 
         let (mut frontend_peer, frontend_socket) = connected_pair();
-        let (_backend_peer, backend_socket) = tiny_backend_pair();
+        let (mut backend_peer, backend_socket) = tiny_backend_pair();
 
         let mut pool = Pool::with_capacity(2, 2, 4096);
         let backend_buffer = pool.checkout().expect("backend buffer");
@@ -2989,7 +3036,9 @@ mod tests {
             splice_pipe.capacity = slot;
         }
 
-        let payload = vec![0x5a_u8; 2 * slot];
+        // The mandatory drain/retry consumes at most two slots in total. A
+        // third keeps bytes queued for the independent multi-slot phase.
+        let payload = vec![0x5a_u8; 3 * slot];
         frontend_peer
             .write_all(&payload)
             .expect("write frontend payload");
@@ -3036,23 +3085,92 @@ mod tests {
             "the backend must be armed writable to drain the pipe"
         );
 
-        // Grow the pipe back to 64 KiB and fill it well past what the
-        // backend leg can absorb (tiny pinned SO_SNDBUF + SO_RCVBUF, a few
-        // KiB in total), so that a drain can only move part of it.
-        let big = 65_536usize;
-        {
-            let splice_pipe = pipe.splice_pipe.as_mut().unwrap();
-            for fd in [splice_pipe.in_pipe[0], splice_pipe.out_pipe[0]] {
-                let ret = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, big as libc::c_int) };
-                assert_eq!(ret, big as libc::c_int, "F_SETPIPE_SZ(64 KiB) must succeed");
+        // Mandatory recovery: drain through the production path until the
+        // single slot is free. This must re-arm the frontend read while the
+        // READABLE event preserved above drives the retry, with no readiness
+        // injected by the test.
+        let mut backend_buf = [0_u8; 16 * 1024];
+        for _ in 0..1000 {
+            assert_ne!(
+                pipe.splice_backend_writable(&mut metrics),
+                SessionResult::Close
+            );
+            loop {
+                match backend_peer.read(&mut backend_buf) {
+                    Ok(0) => panic!("backend peer closed while draining the pipe"),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("failed to read drained pipe bytes: {error}"),
+                }
             }
-            splice_pipe.capacity = big;
+            if pipe.splice_in_pending() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
+        assert_eq!(
+            pipe.splice_in_pending(),
+            0,
+            "the single-slot pipe must fully drain"
+        );
+        assert!(
+            pipe.frontend_readiness.interest.is_readable()
+                && pipe.frontend_readiness.event.is_readable(),
+            "the real backend drain must re-arm the preserved frontend read"
+        );
+        let unread_before_retry = unread_bytes(pipe.frontend.socket_ref());
+        assert_eq!(unread_before_retry, still_queued);
+        assert_ne!(pipe.splice_readable(&mut metrics), SessionResult::Close);
+        let unread_after_retry = unread_bytes(pipe.frontend.socket_ref());
+        assert!(
+            unread_after_retry < unread_before_retry,
+            "the preserved READABLE event must resume frontend progress after the drain \
+             ({unread_before_retry} before, {unread_after_retry} after)"
+        );
+        assert!(pipe.splice_in_pending() > 0);
+
+        // Empty the recovered slot before starting the independent partial-
+        // drain phase, then request sixteen page-derived slots. Pipe growth is
+        // a capability rather than a production requirement, so use the
+        // realised size and skip only this phase when the kernel denies it.
+        discard_in_pipe(&mut pipe);
+        let requested_capacity = slot.checked_mul(16).expect("pipe size must fit usize");
+        let capacity = {
+            let splice_pipe = pipe.splice_pipe.as_mut().unwrap();
+            let in_capacity = request_pipe_capacity(
+                splice_pipe.in_pipe[0],
+                requested_capacity,
+                force_growth_refusal,
+            );
+            let out_capacity = request_pipe_capacity(
+                splice_pipe.out_pipe[0],
+                requested_capacity,
+                force_growth_refusal,
+            );
+            let capacity = in_capacity.min(out_capacity);
+            splice_pipe.capacity = capacity;
+            capacity
+        };
+        let minimum_capacity = slot
+            .checked_mul(2)
+            .expect("minimum pipe size must fit usize")
+            .max(32 * 1024);
+        if capacity < minimum_capacity {
+            eprintln!(
+                "skipping multi-slot partial-drain phase: realised capacity {capacity} is below \
+                 required {minimum_capacity}"
+            );
+            return false;
+        }
+
+        // Fill the pipe well past what the backend leg can absorb (tiny
+        // pinned SO_SNDBUF + SO_RCVBUF, a few KiB in total), so that a drain
+        // can only move part of it.
         frontend_peer
-            .write_all(&vec![0x5a_u8; big])
+            .write_all(&vec![0x5a_u8; capacity])
             .expect("write more frontend payload");
         for _ in 0..1000 {
-            if pipe.splice_in_pending() >= big / 2 {
+            if pipe.splice_in_pending() >= capacity / 2 {
                 break;
             }
             pipe.frontend_readiness.interest.insert(Ready::READABLE);
@@ -3061,8 +3179,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(
-            pipe.splice_in_pending() >= big / 2,
-            "the pipe must hold at least 32 KiB (got {})",
+            pipe.splice_in_pending() >= capacity / 2,
+            "the pipe must hold at least half its realised capacity (got {})",
             pipe.splice_in_pending()
         );
         pipe.frontend_readiness.interest.remove(Ready::READABLE);
@@ -3089,10 +3207,51 @@ mod tests {
             pipe.frontend_readiness.interest.is_readable(),
             "a partial drain of the pipe must re-arm the frontend read"
         );
-        assert_ne!(pipe.splice_readable(&mut metrics), SessionResult::Close);
+
+        // Re-arming is the partial-drain contract. Data progress is a separate
+        // assertion: release every occupied slot first, then compare FIONREAD
+        // immediately around the retry so no stale pre-write baseline is used.
+        discard_in_pipe(&mut pipe);
+        for _ in 0..1000 {
+            if unread_bytes(pipe.frontend.socket_ref()) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let unread_before_retry = unread_bytes(pipe.frontend.socket_ref());
         assert!(
-            unread_bytes(pipe.frontend.socket_ref()) < still_queued,
-            "the remaining request bytes must start leaving the frontend socket"
+            unread_before_retry > 0,
+            "request bytes must remain queued for the free-slot retry"
         );
+        assert!(
+            pipe.frontend_readiness.interest.is_readable()
+                && pipe.frontend_readiness.event.is_readable(),
+            "the partial backend drain must leave the frontend retry runnable"
+        );
+        assert_ne!(pipe.splice_readable(&mut metrics), SessionResult::Close);
+        let unread_after_retry = unread_bytes(pipe.frontend.socket_ref());
+        assert!(
+            unread_after_retry < unread_before_retry,
+            "a retry with free pipe slots must consume request bytes \
+             ({unread_before_retry} before, {unread_after_retry} after)"
+        );
+        assert!(pipe.splice_in_pending() > 0);
+        true
+    }
+
+    /// Frontend-direction twin of the test above: `splice_readable` must
+    /// keep the READABLE event on a pipe-full EAGAIN, and a *partial*
+    /// `splice_backend_writable` drain must re-arm the frontend read (the
+    /// response direction already did so via `splice_writable`).
+    #[cfg(all(target_os = "linux", feature = "splice"))]
+    #[test]
+    fn splice_readable_keeps_readable_event_when_pipe_slots_are_exhausted() {
+        exercise_splice_readable_pipe_full_recovery(false);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "splice"))]
+    #[test]
+    fn splice_readable_recovers_when_pipe_growth_is_refused() {
+        assert!(!exercise_splice_readable_pipe_full_recovery(true));
     }
 }
