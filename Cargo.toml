@@ -6,7 +6,7 @@ resolver = "2" # consistent with rust edition 2024, see https://doc.rust-lang.or
 anyhow = "^1.0.104"
 async-trait = "^0.1.92"
 base64 = "^0.23.1"
-clap = "^4.6.6"
+clap = "^4.6.7"
 cookie-factory = "^0.3.3"
 flate2 = "^1.1.10"
 futures = "^0.3.34"
@@ -14,7 +14,7 @@ hdrhistogram = "^7.6.0"
 hex = "^0.4.3"
 loona-hpack = "^0.4.3"
 http-body-util = "^0.1.5"
-hyper = "^1.11.0"
+hyper = "^1.11.1"
 hyper-rustls = { version = "^0.27.9", default-features = false }
 hyper-util = "^0.1.20"
 idna = "^1.1.0"
@@ -24,7 +24,7 @@ kawa = { version = "^0.7.1", default-features = false }
 libc = "^0.2.189"
 log = "^0.4.34"
 memchr = "^2.8.3"
-mio = "^1.2.2"
+mio = "^1.2.3"
 moonpool-sim = "^0.8.0"
 nix = "^0.31.3"
 nom = "^8.0.0"
@@ -39,8 +39,8 @@ criterion = { version = "^0.8.2", features = ["html_reports"] }
 quickcheck = "^1.1.0"
 rand = "^0.10.2"
 regex = "^1.13.1"
-rustls-openssl = { version = "^0.4.0", default-features = false, features = ["tls12"] }
-rustls = { version = "^0.23.43", default-features = false, features = [
+rustls-openssl = { version = "^0.4.1", default-features = false, features = ["tls12"] }
+rustls = { version = "^0.23.45", default-features = false, features = [
   "logging",
   "std",
   "tls12",
@@ -61,15 +61,15 @@ thiserror = "^2.0.20"
 time = "^0.3.55"
 tiny_http = "^0.12.0"
 tokio = "^1.53.1"
-toml = { version = "^1.1.4", features = ["preserve_order"] }
+toml = { version = "^1.1.6", features = ["preserve_order"] }
 x509-parser = "^0.18.1"
 
 # Dependencies for the `sozu top` TUI subcommand. All gated behind the
 # opt-in `tui` Cargo feature on `bin/`; default `sozu` builds do not pull
-# any of them in. Versions pinned 2026-05-10 against crates.io HEAD; bump
+# any of them in. Versions pinned 2026-09-15 against crates.io HEAD; bump
 # the patch component locally if cargo update lands a fix.
 color-eyre           = "^0.6.5"
-crossbeam-channel    = "^0.5.16"
+crossbeam-channel    = "^0.5.17"
 crossterm            = { version = "^0.29.0", default-features = false }
 ctrlc                = "^3.5.2"
 ratatui              = { version = "^0.30.2", default-features = false }
