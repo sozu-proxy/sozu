@@ -2683,12 +2683,7 @@ impl ConfigState {
         }
 
         if (filters.tcp || list_all) && filters.domain.is_none() {
-            for tcp_frontend in self
-                .tcp_fronts
-                .iter()
-                .filter(|(cluster_id, _)| matches_cluster(Some(cluster_id.as_str())))
-                .flat_map(|(_, v)| v.iter())
-            {
+            for tcp_frontend in fronts_of_cluster(&self.tcp_fronts, filters.cluster_id.as_deref()) {
                 listed_frontends
                     .tcp_frontends
                     .push(tcp_frontend.to_owned().into())
@@ -2701,12 +2696,7 @@ impl ConfigState {
         // Datagram frontends carry no hostname, so a `domain` filter excludes
         // them (matching the TCP branch).
         if (filters.tcp || list_all) && filters.domain.is_none() {
-            for udp_frontend in self
-                .udp_fronts
-                .iter()
-                .filter(|(cluster_id, _)| matches_cluster(Some(cluster_id.as_str())))
-                .flat_map(|(_, v)| v.iter())
-            {
+            for udp_frontend in fronts_of_cluster(&self.udp_fronts, filters.cluster_id.as_deref()) {
                 listed_frontends
                     .udp_frontends
                     .push(udp_frontend.to_owned().into())
@@ -3033,6 +3023,20 @@ pub fn validate_sozu_id_header(value: &str) -> Result<(), StateError> {
         }
     }
     Ok(())
+}
+
+/// TCP and UDP frontends are keyed by cluster id: with a cluster filter, look
+/// the single entry up instead of scanning every cluster; without one, yield
+/// every frontend.
+fn fronts_of_cluster<'a, F>(
+    fronts: &'a HashMap<ClusterId, Vec<F>>,
+    cluster_id: Option<&str>,
+) -> impl Iterator<Item = &'a F> {
+    let (one, all) = match cluster_id {
+        Some(cluster_id) => (fronts.get(cluster_id), None),
+        None => (None, Some(fronts.values())),
+    };
+    one.into_iter().chain(all.into_iter().flatten()).flatten()
 }
 
 fn domain_check(
