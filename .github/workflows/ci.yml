@@ -169,6 +169,20 @@ jobs:
       - name: Test sozu
         run: cargo test -p sozu --locked ${{ matrix.flags }} --verbose
 
+      # The `bin/tests/*_e2e.rs` process-level tests spawn a real master (and
+      # for the replay suite a real worker) over a unix socket in a temp dir,
+      # and bind ephemeral loopback ports. No root, no fixed port, no TTY — a
+      # GitHub runner serves them fine. They stay `#[ignore]`d so a
+      # contributor's `cargo test` stays fast, and this step is what runs them;
+      # before it existed they never ran anywhere. `sozu_top_e2e` is
+      # deliberately absent: it is `#![cfg(feature = "tui")]` and no matrix cell
+      # enables that feature, so its target compiles to an empty binary here.
+      - name: Test sozu (process-level e2e)
+        run: |
+          cargo test -p sozu --locked ${{ matrix.flags }} --test load_state_rollback_e2e -- --ignored
+          cargo test -p sozu --locked ${{ matrix.flags }} --test frontend_validate_before_commit_e2e -- --ignored
+          cargo test -p sozu --locked ${{ matrix.flags }} --test listener_validate_before_commit_e2e -- --ignored
+
       # `tests::fuzz_tests::*` is `#[ignore]`d here and exercised in
       # the dedicated `fuzz` job below. Skipping it keeps the e2e
       # step from rebuilding the fuzz/ crate under aws-lc-rs / fips

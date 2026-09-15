@@ -17,8 +17,9 @@
 //! and drives it over its unix command socket with `sozu state load` /
 //! `sozu state save`.
 //!
-//! `#[ignore]`d by default because it spawns a master and writes to a temp dir.
-//! Run manually with:
+//! `#[ignore]`d so a contributor's `cargo test` stays fast: it spawns a master
+//! and writes to a temp dir. CI runs it from its own process-level e2e step
+//! (`.github/workflows/ci.yml`); run it by hand with:
 //!
 //! ```bash
 //! cargo test -p sozu --test frontend_validate_before_commit_e2e -- --ignored
@@ -51,7 +52,7 @@ fn free_port() -> u16 {
 }
 
 #[test]
-#[ignore = "manual: spawns a real master over a unix socket; run with --ignored (see module docs)"]
+#[ignore = "process-level: spawns a real master over a unix socket; run from the dedicated CI step or with --ignored (see module docs)"]
 fn replaying_a_poisoned_state_file_does_not_re_persist_the_frontend() {
     let temp = tempfile::tempdir().expect("tempdir");
     let socket_path = temp.path().join("sozu.sock");

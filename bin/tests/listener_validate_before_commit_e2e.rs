@@ -13,8 +13,9 @@
 //! template file — a deterministic, crypto-provider-independent trigger (it
 //! fails `HttpAnswers::new`, not the rustls build).
 //!
-//! `#[ignore]`d by default because it spawns a master, writes to a temp dir and
-//! binds an ephemeral port. Run manually with:
+//! `#[ignore]`d so a contributor's `cargo test` stays fast: it spawns a master,
+//! writes to a temp dir and binds an ephemeral port. CI runs it from its own
+//! process-level e2e step (`.github/workflows/ci.yml`); run it by hand with:
 //!
 //! ```bash
 //! cargo test -p sozu --test listener_validate_before_commit_e2e -- --ignored
@@ -38,7 +39,7 @@ fn free_port() -> u16 {
 }
 
 #[test]
-#[ignore = "manual: spawns a real master over a unix socket + binds a port; run with --ignored (see module docs)"]
+#[ignore = "process-level: spawns a real master over a unix socket + binds an ephemeral port; run from the dedicated CI step or with --ignored (see module docs)"]
 fn corrected_https_listener_add_succeeds_after_invalid_one() {
     let temp = tempfile::tempdir().expect("tempdir");
     let socket_path = temp.path().join("sozu.sock");
