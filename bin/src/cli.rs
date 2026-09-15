@@ -424,6 +424,14 @@ pub enum ClusterCmd {
         #[clap(short = 'i', long = "id", help = "cluster id")]
         id: String,
     },
+    #[clap(
+        name = "tags",
+        about = "Show the access-log tags carried by a cluster's frontends (for instance owner_id)"
+    )]
+    Tags {
+        #[clap(short = 'i', long = "id", help = "cluster id")]
+        id: String,
+    },
     #[clap(name = "add", about = "Add a cluster")]
     Add {
         #[clap(short = 'i', long = "id", help = "cluster id")]
@@ -635,6 +643,12 @@ pub enum FrontendCmd {
             help = "filter by domain name (for http & https frontends)"
         )]
         domain: Option<String>,
+        #[clap(
+            short = 'i',
+            long = "cluster-id",
+            help = "filter by cluster id (frontends that deny traffic never match)"
+        )]
+        cluster_id: Option<String>,
     },
 }
 

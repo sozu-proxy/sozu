@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fs::File, io::Read as IoRead, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io::Read as IoRead,
+    path::PathBuf,
+};
 
 use sozu_command_lib::{
     certificate::{
@@ -8,15 +13,16 @@ use sozu_command_lib::{
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, AlpnProtocols, Cluster, CountRequests,
         CustomHttpAnswers, DeactivateListener, FrontendFilters, HardStop, HealthCheckConfig,
-        ListListeners, ListenerType, LoadBalancingParams, MetricsConfiguration, PathRule,
-        ProxyProtocolConfig, QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes,
-        QueryHealthChecks, QueryMaxConnectionsPerIp, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
-        RequestUdpFrontend, RulePosition, SetHealthCheck, SocketAddress, SoftStop, Status,
-        SubscribeEvents, TlsVersion, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
-        UpdateTcpListenerConfig, UpdateUdpListenerConfig, request::RequestType,
-        response_content::ContentType,
+        ListListeners, ListedFrontends, ListenerType, LoadBalancingParams, MetricsConfiguration,
+        PathRule, ProxyProtocolConfig, QueryCertificatesFilters, QueryClusterByDomain,
+        QueryClustersHashes, QueryHealthChecks, QueryMaxConnectionsPerIp, RemoveBackend,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        RequestTcpFrontend, RequestUdpFrontend, ResponseContent, RulePosition, SetHealthCheck,
+        SocketAddress, SoftStop, Status, SubscribeEvents, TlsVersion, UpdateHttpListenerConfig,
+        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig,
+        request::RequestType, response_content::ContentType,
     },
+    proto::display::print_json_response,
 };
 
 use super::CtlError;
@@ -94,18 +100,34 @@ impl CommandManager {
         https: bool,
         tcp: bool,
         domain: Option<String>,
+        cluster_id: Option<String>,
     ) -> Result<(), CtlError> {
         debug!("Listing frontends");
 
-        self.send_request(
-            RequestType::ListFrontends(FrontendFilters {
-                http,
-                https,
-                tcp,
-                domain,
-            })
-            .into(),
-        )
+        let request = RequestType::ListFrontends(FrontendFilters {
+            http,
+            https,
+            tcp,
+            domain,
+            cluster_id: cluster_id.to_owned(),
+        })
+        .into();
+
+        let Some(cluster_id) = cluster_id else {
+            return self.send_request(request);
+        };
+
+        // A main process older than `FrontendFilters.cluster_id` skips the
+        // unknown field and answers with every cluster's frontends. Filter the
+        // reply here too, so a mixed-version CLI never lists other clusters.
+        let mut response = self.send_request_get_response(request, true)?;
+        if let Some(ResponseContent {
+            content_type: Some(ContentType::FrontendList(frontends)),
+        }) = response.content.as_mut()
+        {
+            retain_cluster_frontends(frontends, &cluster_id);
+        }
+        response.display(self.json).map_err(CtlError::Display)
     }
 
     pub fn events(&mut self) -> Result<(), CtlError> {
@@ -248,6 +270,7 @@ impl CommandManager {
                 )
             }
             ClusterCmd::Remove { id } => self.send_request(RequestType::RemoveCluster(id).into()),
+            ClusterCmd::Tags { id } => self.cluster_tags(id),
             ClusterCmd::H2 { cmd } => self.cluster_h2_command(cmd),
             ClusterCmd::HealthCheck { cmd } => self.health_check_command(cmd),
             ClusterCmd::List {
@@ -284,6 +307,76 @@ impl CommandManager {
                 self.send_request(request)
             }
         }
+    }
+
+    /// Show the access-log tags carried by every frontend of a cluster.
+    ///
+    /// Tags belong to frontends, not to clusters: `owner_id`, `env` and the
+    /// like are attached with `frontend {http,https,tcp,udp} add --tags`, and
+    /// are what ends up in the `tags` map of an access log. A cluster is
+    /// usually fronted by several frontends, so this folds their tags into a
+    /// single `key -> values` view, and reports a key whose value differs
+    /// between frontends by listing every value it takes.
+    ///
+    /// The main process filters the frontends by cluster, so the reply only
+    /// carries this cluster's frontends and stays far below
+    /// `max_command_buffer_size` however many frontends the proxy has. The
+    /// fold still filters by cluster: a main process predating the
+    /// `cluster_id` filter ignores it and answers with every frontend.
+    pub fn cluster_tags(&mut self, cluster_id: String) -> Result<(), CtlError> {
+        let response = self.send_request_get_response(
+            RequestType::ListFrontends(FrontendFilters {
+                cluster_id: Some(cluster_id.to_owned()),
+                ..Default::default()
+            })
+            .into(),
+            true,
+        )?;
+
+        let cluster_tags = match response
+            .content
+            .as_ref()
+            .and_then(|c| c.content_type.as_ref())
+        {
+            Some(ContentType::FrontendList(frontends)) => fold_cluster_tags(frontends, cluster_id),
+            _ => return Err(CtlError::WrongResponse(response)),
+        };
+        let ClusterTags {
+            cluster_id,
+            frontend_count,
+            tags,
+        } = &cluster_tags;
+
+        if self.json {
+            return print_json_response(&cluster_tags).map_err(CtlError::Display);
+        }
+
+        if *frontend_count == 0 {
+            println!("no frontend routes to cluster \"{cluster_id}\"");
+            return Ok(());
+        }
+        if tags.is_empty() {
+            println!(
+                "{frontend_count} frontend(s) route to cluster \"{cluster_id}\", none of them \
+                 carries an access-log tag"
+            );
+            return Ok(());
+        }
+
+        println!(
+            "access-log tags of the {frontend_count} frontend(s) of cluster \"{cluster_id}\":"
+        );
+        let width = tags.keys().map(String::len).max().unwrap_or_default();
+        for (key, values) in tags {
+            let values = values
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("  {key:<width$}  {values}");
+        }
+
+        Ok(())
     }
 
     pub fn cluster_h2_command(&mut self, cmd: ClusterH2Cmd) -> Result<(), CtlError> {
@@ -1338,6 +1431,64 @@ impl CommandManager {
     }
 }
 
+/// JSON shape of `sozu -j cluster tags -i <id>`: the union of the access-log
+/// tags carried by the frontends routing to that cluster. A key maps to every
+/// distinct value it takes across those frontends, so a disagreement between
+/// two frontends is visible rather than silently collapsed.
+/// Fold the access-log tags of every frontend routing to `cluster_id` into a
+/// single `key -> values` view.
+///
+/// An HTTP/HTTPS frontend with no cluster id is a `Deny` rule: it routes to no
+/// cluster at all, so it can never belong to the queried one.
+fn fold_cluster_tags(frontends: &ListedFrontends, cluster_id: String) -> ClusterTags {
+    let mut tags: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut frontend_count = 0usize;
+    let mut record = |frontend_tags: &BTreeMap<String, String>| {
+        frontend_count += 1;
+        for (key, value) in frontend_tags {
+            tags.entry(key.to_owned())
+                .or_default()
+                .insert(value.to_owned());
+        }
+    };
+
+    for frontend in frontends
+        .http_frontends
+        .iter()
+        .chain(frontends.https_frontends.iter())
+        .filter(|frontend| frontend.cluster_id.as_deref() == Some(cluster_id.as_str()))
+    {
+        record(&frontend.tags);
+    }
+    for frontend in frontends
+        .tcp_frontends
+        .iter()
+        .filter(|frontend| frontend.cluster_id == cluster_id)
+    {
+        record(&frontend.tags);
+    }
+    for frontend in frontends
+        .udp_frontends
+        .iter()
+        .filter(|frontend| frontend.cluster_id == cluster_id)
+    {
+        record(&frontend.tags);
+    }
+
+    ClusterTags {
+        cluster_id,
+        frontend_count,
+        tags,
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ClusterTags {
+    cluster_id: String,
+    frontend_count: usize,
+    tags: BTreeMap<String, BTreeSet<String>>,
+}
+
 fn find_cluster_configuration(content_type: ContentType, cluster_id: &str) -> Option<Cluster> {
     match content_type {
         ContentType::Clusters(infos) => infos
@@ -1804,12 +1955,32 @@ fn build_http_answers(
     }))
 }
 
+/// Keep only the frontends routing to `cluster_id`, mirroring the main
+/// process's `FrontendFilters.cluster_id` semantics.
+///
+/// An HTTP/HTTPS frontend with no cluster id is a `Deny` rule: it routes to no
+/// cluster at all, so it never matches.
+fn retain_cluster_frontends(frontends: &mut ListedFrontends, cluster_id: &str) {
+    frontends
+        .http_frontends
+        .retain(|frontend| frontend.cluster_id.as_deref() == Some(cluster_id));
+    frontends
+        .https_frontends
+        .retain(|frontend| frontend.cluster_id.as_deref() == Some(cluster_id));
+    frontends
+        .tcp_frontends
+        .retain(|frontend| frontend.cluster_id == cluster_id);
+    frontends
+        .udp_frontends
+        .retain(|frontend| frontend.cluster_id == cluster_id);
+}
+
 #[cfg(test)]
 mod tests {
     use sozu_command_lib::proto::command::{
-        ClusterInformation, ClusterInformations, LoadBalancingAlgorithms, ResponseContent,
-        WorkerResponses,
+        ClusterInformation, ClusterInformations, LoadBalancingAlgorithms, WorkerResponses,
     };
+    use sozu_command_lib::state::ConfigState;
 
     use super::*;
 
@@ -1954,5 +2125,197 @@ mod tests {
         assert!(!looks_like_authorized_hash(
             "admin user:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
         ));
+    }
+
+    fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    fn listed_frontends() -> ListedFrontends {
+        ListedFrontends {
+            http_frontends: vec![
+                RequestHttpFrontend {
+                    cluster_id: Some("wanted".to_owned()),
+                    hostname: "wanted.example.com".to_owned(),
+                    tags: tags(&[("owner_id", "MyOrganisation"), ("env", "prod")]),
+                    ..Default::default()
+                },
+                RequestHttpFrontend {
+                    cluster_id: Some("other".to_owned()),
+                    hostname: "other.example.com".to_owned(),
+                    tags: tags(&[("owner_id", "SomeoneElse")]),
+                    ..Default::default()
+                },
+                // a `Deny` frontend: no cluster id at all
+                RequestHttpFrontend {
+                    cluster_id: None,
+                    hostname: "denied.example.com".to_owned(),
+                    tags: tags(&[("owner_id", "NoOne")]),
+                    ..Default::default()
+                },
+            ],
+            https_frontends: vec![RequestHttpFrontend {
+                cluster_id: Some("wanted".to_owned()),
+                hostname: "wanted.example.com".to_owned(),
+                // same key, different value than the HTTP frontend above
+                tags: tags(&[("owner_id", "MyOrganisation"), ("env", "staging")]),
+                ..Default::default()
+            }],
+            tcp_frontends: vec![RequestTcpFrontend {
+                cluster_id: "wanted".to_owned(),
+                tags: tags(&[("proto", "tcp")]),
+                ..Default::default()
+            }],
+            udp_frontends: vec![RequestUdpFrontend {
+                cluster_id: "other".to_owned(),
+                tags: tags(&[("proto", "udp")]),
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// The fold must gather every protocol's frontends for the queried cluster,
+    /// keep every distinct value a key takes, and leave the other clusters —
+    /// and the `Deny` frontend, which routes nowhere — out of the result.
+    #[test]
+    fn fold_cluster_tags_gathers_every_protocol() {
+        let folded = fold_cluster_tags(&listed_frontends(), "wanted".to_owned());
+
+        assert_eq!(folded.cluster_id, "wanted");
+        assert_eq!(
+            folded.frontend_count, 3,
+            "one http, one https and one tcp frontend route to `wanted`"
+        );
+        assert_eq!(
+            folded.tags.get("owner_id"),
+            Some(&BTreeSet::from(["MyOrganisation".to_owned()]))
+        );
+        assert_eq!(
+            folded.tags.get("env"),
+            Some(&BTreeSet::from(["prod".to_owned(), "staging".to_owned()])),
+            "a key whose value differs between frontends must list every value"
+        );
+        assert_eq!(
+            folded.tags.get("proto"),
+            Some(&BTreeSet::from(["tcp".to_owned()])),
+            "the udp frontend belongs to `other` and must not be folded in"
+        );
+        assert!(
+            !folded
+                .tags
+                .values()
+                .any(|values| values.contains("SomeoneElse") || values.contains("NoOne")),
+            "no other cluster's tag, and no `Deny` frontend's tag, may leak in"
+        );
+    }
+
+    /// A cluster nothing routes to folds to an empty result rather than an
+    /// error — the CLI reports "no frontend routes to …".
+    #[test]
+    fn fold_cluster_tags_of_unknown_cluster_is_empty() {
+        let folded = fold_cluster_tags(&listed_frontends(), "nope".to_owned());
+
+        assert_eq!(folded.frontend_count, 0);
+        assert!(folded.tags.is_empty());
+    }
+
+    /// A frontend with no tag at all still counts as a frontend of the cluster:
+    /// "one untagged frontend" and "no frontend" are different answers.
+    #[test]
+    fn fold_cluster_tags_counts_untagged_frontends() {
+        let frontends = ListedFrontends {
+            http_frontends: vec![RequestHttpFrontend {
+                cluster_id: Some("bare".to_owned()),
+                hostname: "bare.example.com".to_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let folded = fold_cluster_tags(&frontends, "bare".to_owned());
+        assert_eq!(folded.frontend_count, 1);
+        assert!(folded.tags.is_empty());
+    }
+
+    /// A main process that predates `FrontendFilters.cluster_id` decodes the
+    /// request without it and lists every cluster. The CLI-side fallback must
+    /// turn that reply into exactly what an up-to-date main process returns.
+    #[test]
+    fn retain_cluster_frontends_matches_main_process_filter() {
+        let mut state = ConfigState::default();
+        for (cluster_id, hostname, port) in [
+            (Some("wanted"), "wanted.example.com", 6379u16),
+            (Some("other"), "other.example.com", 6380),
+            // a `Deny` frontend: routes to no cluster
+            (None, "denied.example.com", 6381),
+        ] {
+            for request in [
+                RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: cluster_id.map(ToOwned::to_owned),
+                    hostname: hostname.to_owned(),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                }),
+                RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                    cluster_id: cluster_id.map(ToOwned::to_owned),
+                    hostname: hostname.to_owned(),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                }),
+            ] {
+                state
+                    .dispatch(&request.into())
+                    .expect("add http(s) frontend");
+            }
+            let Some(cluster_id) = cluster_id else {
+                continue;
+            };
+            for request in [
+                RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: cluster_id.to_owned(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, port),
+                    ..Default::default()
+                }),
+                RequestType::AddUdpFrontend(RequestUdpFrontend {
+                    cluster_id: cluster_id.to_owned(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, port + 1000),
+                    ..Default::default()
+                }),
+            ] {
+                state
+                    .dispatch(&request.into())
+                    .expect("add tcp/udp frontend");
+            }
+        }
+
+        // what an old main process answers: tag 5 is dropped on decode
+        let mut old_reply = state.list_frontends(FrontendFilters::default());
+        assert_eq!(
+            old_reply.http_frontends.len(),
+            3,
+            "the old reply must carry other clusters' and `Deny` frontends"
+        );
+        retain_cluster_frontends(&mut old_reply, "wanted");
+
+        let new_reply = state.list_frontends(FrontendFilters {
+            cluster_id: Some("wanted".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(old_reply, new_reply);
+        for count in [
+            new_reply.http_frontends.len(),
+            new_reply.https_frontends.len(),
+            new_reply.tcp_frontends.len(),
+            new_reply.udp_frontends.len(),
+        ] {
+            assert_eq!(count, 1, "one frontend of `wanted` per protocol");
+        }
     }
 }

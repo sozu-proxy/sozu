@@ -2649,15 +2649,22 @@ impl ConfigState {
         // if no http / https / tcp filter is provided, list all of them
         let list_all = !filters.http && !filters.https && !filters.tcp;
 
+        // an HTTP/HTTPS frontend with no cluster is a `Deny` rule: it routes
+        // to no cluster at all, so a cluster filter never matches it.
+        let matches_cluster = |cluster_id: Option<&str>| match &filters.cluster_id {
+            Some(wanted) => cluster_id == Some(wanted.as_str()),
+            None => true,
+        };
+        let matches_domain = |hostname: &str| match &filters.domain {
+            Some(domain) => hostname.contains(domain),
+            None => true,
+        };
+
         let mut listed_frontends = ListedFrontends::default();
 
         if filters.http || list_all {
             for http_frontend in self.http_fronts.iter().filter(|f| {
-                if let Some(domain) = &filters.domain {
-                    f.1.hostname.contains(domain)
-                } else {
-                    true
-                }
+                matches_domain(&f.1.hostname) && matches_cluster(f.1.cluster_id.as_deref())
             }) {
                 listed_frontends
                     .http_frontends
@@ -2667,11 +2674,7 @@ impl ConfigState {
 
         if filters.https || list_all {
             for https_frontend in self.https_fronts.iter().filter(|f| {
-                if let Some(domain) = &filters.domain {
-                    f.1.hostname.contains(domain)
-                } else {
-                    true
-                }
+                matches_domain(&f.1.hostname) && matches_cluster(f.1.cluster_id.as_deref())
             }) {
                 listed_frontends
                     .https_frontends
@@ -2680,7 +2683,7 @@ impl ConfigState {
         }
 
         if (filters.tcp || list_all) && filters.domain.is_none() {
-            for tcp_frontend in self.tcp_fronts.values().flat_map(|v| v.iter()) {
+            for tcp_frontend in fronts_of_cluster(&self.tcp_fronts, filters.cluster_id.as_deref()) {
                 listed_frontends
                     .tcp_frontends
                     .push(tcp_frontend.to_owned().into())
@@ -2693,7 +2696,7 @@ impl ConfigState {
         // Datagram frontends carry no hostname, so a `domain` filter excludes
         // them (matching the TCP branch).
         if (filters.tcp || list_all) && filters.domain.is_none() {
-            for udp_frontend in self.udp_fronts.values().flat_map(|v| v.iter()) {
+            for udp_frontend in fronts_of_cluster(&self.udp_fronts, filters.cluster_id.as_deref()) {
                 listed_frontends
                     .udp_frontends
                     .push(udp_frontend.to_owned().into())
@@ -3020,6 +3023,20 @@ pub fn validate_sozu_id_header(value: &str) -> Result<(), StateError> {
         }
     }
     Ok(())
+}
+
+/// TCP and UDP frontends are keyed by cluster id: with a cluster filter, look
+/// the single entry up instead of scanning every cluster; without one, yield
+/// every frontend.
+fn fronts_of_cluster<'a, F>(
+    fronts: &'a HashMap<ClusterId, Vec<F>>,
+    cluster_id: Option<&str>,
+) -> impl Iterator<Item = &'a F> {
+    let (one, all) = match cluster_id {
+        Some(cluster_id) => (fronts.get(cluster_id), None),
+        None => (None, Some(fronts.values())),
+    };
+    one.into_iter().chain(all.into_iter().flatten()).flatten()
 }
 
 fn domain_check(
@@ -5324,6 +5341,134 @@ mod tests {
         });
         assert!(domain_filtered.tcp_frontends.is_empty());
         assert!(domain_filtered.udp_frontends.is_empty());
+    }
+
+    /// `list_frontends` must honour the `cluster_id` filter on every protocol,
+    /// combine it with the `domain` filter, and never match a `Deny` frontend
+    /// (one with no cluster id at all).
+    #[test]
+    fn list_frontends_filters_by_cluster_id() {
+        let http_addr = SocketAddress::new_v4(0, 0, 0, 0, 8080);
+        let https_addr = SocketAddress::new_v4(0, 0, 0, 0, 8443);
+        let mut state = ConfigState::default();
+        for (cluster_id, hostname) in [
+            (Some(String::from("wanted")), "wanted.example.com"),
+            (Some(String::from("other")), "other.example.com"),
+            // a `Deny` frontend: routes to no cluster
+            (None, "denied.example.com"),
+        ] {
+            state
+                .dispatch(
+                    &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                        cluster_id: cluster_id.clone(),
+                        hostname: hostname.to_string(),
+                        path: PathRule::prefix(String::from("/")),
+                        address: http_addr,
+                        position: RulePosition::Tree.into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("could not add http frontend");
+            state
+                .dispatch(
+                    &RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                        cluster_id,
+                        hostname: hostname.to_string(),
+                        path: PathRule::prefix(String::from("/")),
+                        address: https_addr,
+                        position: RulePosition::Tree.into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("could not add https frontend");
+        }
+        // TCP/UDP frontends are keyed by address, so each cluster gets its own
+        for (cluster_id, port) in [("wanted", 6379u16), ("other", 6380)] {
+            state
+                .dispatch(
+                    &RequestType::AddTcpFrontend(RequestTcpFrontend {
+                        cluster_id: cluster_id.to_string(),
+                        address: SocketAddress::new_v4(0, 0, 0, 0, port),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("could not add tcp frontend");
+            state
+                .dispatch(
+                    &RequestType::AddUdpFrontend(RequestUdpFrontend {
+                        cluster_id: cluster_id.to_string(),
+                        address: SocketAddress::new_v4(0, 0, 0, 0, port + 1000),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("could not add udp frontend");
+        }
+
+        // no filter → everything, including the `Deny` frontends
+        let all = state.list_frontends(FrontendFilters::default());
+        assert_eq!(all.http_frontends.len(), 3);
+        assert_eq!(all.https_frontends.len(), 3);
+        assert_eq!(all.tcp_frontends.len(), 2);
+        assert_eq!(all.udp_frontends.len(), 2);
+
+        // cluster filter alone → one frontend of each protocol, and only the
+        // wanted one (positive AND negative space)
+        let wanted = state.list_frontends(FrontendFilters {
+            cluster_id: Some("wanted".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(wanted.http_frontends.len(), 1);
+        assert_eq!(wanted.https_frontends.len(), 1);
+        assert_eq!(wanted.tcp_frontends.len(), 1);
+        assert_eq!(wanted.udp_frontends.len(), 1);
+        assert_eq!(
+            wanted.http_frontends[0].cluster_id.as_deref(),
+            Some("wanted")
+        );
+        assert_eq!(wanted.tcp_frontends[0].cluster_id, "wanted");
+        assert_eq!(wanted.udp_frontends[0].cluster_id, "wanted");
+        assert!(
+            wanted
+                .http_frontends
+                .iter()
+                .chain(wanted.https_frontends.iter())
+                .all(|f| f.hostname == "wanted.example.com"),
+            "no frontend of another cluster may leak through the filter"
+        );
+
+        // an unknown cluster id matches nothing at all
+        let unknown = state.list_frontends(FrontendFilters {
+            cluster_id: Some("nope".to_string()),
+            ..Default::default()
+        });
+        assert!(unknown.http_frontends.is_empty());
+        assert!(unknown.https_frontends.is_empty());
+        assert!(unknown.tcp_frontends.is_empty());
+        assert!(unknown.udp_frontends.is_empty());
+
+        // `cluster_id` and `domain` are ANDed, not ORed
+        let conflicting = state.list_frontends(FrontendFilters {
+            cluster_id: Some("wanted".to_string()),
+            domain: Some("other.example.com".to_string()),
+            ..Default::default()
+        });
+        assert!(conflicting.http_frontends.is_empty());
+        assert!(conflicting.https_frontends.is_empty());
+
+        // the cluster filter composes with a protocol filter
+        let https_only = state.list_frontends(FrontendFilters {
+            https: true,
+            cluster_id: Some("wanted".to_string()),
+            ..Default::default()
+        });
+        assert!(https_only.http_frontends.is_empty());
+        assert_eq!(https_only.https_frontends.len(), 1);
+        assert!(https_only.tcp_frontends.is_empty());
+        assert!(https_only.udp_frontends.is_empty());
     }
 
     // ── update_https_listener ──────────────────────────────────────────────────
