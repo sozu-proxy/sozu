@@ -20,6 +20,8 @@
   their tags into one `key -> values` view; a key whose value differs between
   two frontends lists every value it takes rather than silently collapsing. `-j/--json` emits
   `{"cluster_id", "frontend_count", "tags"}`.
+  Against a main process that predates the field (mid hot-upgrade), the CLI applies the same
+  cluster filter to the reply, so other clusters' frontends are never listed.
 
 ## 2.2.1 - 2026-08-28
 
