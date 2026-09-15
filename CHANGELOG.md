@@ -11,6 +11,15 @@
   HTTP/HTTPS frontend that denies traffic carries no cluster id and therefore never matches the
   filter. Answering "which frontends — and which access-log tags — belong to this cluster?" no
   longer requires dumping the whole frontend list and filtering client-side.
+- **`feat(ctl)`: `sozu cluster tags -i <id>` shows the access-log tags of a cluster's frontends.**
+  Tags such as `owner_id` are attached to frontends (`frontend {http,https,tcp,udp} add --tags`),
+  not to clusters, and a cluster is usually fronted by several of them — so recovering "which
+  organisation owns this cluster?" meant listing every frontend and reading the `tags` column by
+  hand. The new subcommand asks the main process for that cluster's frontends only (the
+  `cluster_id` frontend filter, so the reply stays small whatever the number of frontends) and folds
+  their tags into one `key -> values` view; a key whose value differs between
+  two frontends lists every value it takes rather than silently collapsing. `-j/--json` emits
+  `{"cluster_id", "frontend_count", "tags"}`.
   Against a main process that predates the field (mid hot-upgrade), the CLI applies the same
   cluster filter to the reply, so other clusters' frontends are never listed.
 
