@@ -11,6 +11,8 @@
   HTTP/HTTPS frontend that denies traffic carries no cluster id and therefore never matches the
   filter. Answering "which frontends — and which access-log tags — belong to this cluster?" no
   longer requires dumping the whole frontend list and filtering client-side.
+  Against a main process that predates the field (mid hot-upgrade), the CLI applies the same
+  cluster filter to the reply, so other clusters' frontends are never listed.
 
 ## 2.2.1 - 2026-08-28
 

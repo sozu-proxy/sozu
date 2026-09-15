@@ -8,14 +8,14 @@ use sozu_command_lib::{
     proto::command::{
         ActivateListener, AddBackend, AddCertificate, AlpnProtocols, Cluster, CountRequests,
         CustomHttpAnswers, DeactivateListener, FrontendFilters, HardStop, HealthCheckConfig,
-        ListListeners, ListenerType, LoadBalancingParams, MetricsConfiguration, PathRule,
-        ProxyProtocolConfig, QueryCertificatesFilters, QueryClusterByDomain, QueryClustersHashes,
-        QueryHealthChecks, QueryMaxConnectionsPerIp, RemoveBackend, RemoveCertificate,
-        RemoveListener, ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend,
-        RequestUdpFrontend, RulePosition, SetHealthCheck, SocketAddress, SoftStop, Status,
-        SubscribeEvents, TlsVersion, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
-        UpdateTcpListenerConfig, UpdateUdpListenerConfig, request::RequestType,
-        response_content::ContentType,
+        ListListeners, ListedFrontends, ListenerType, LoadBalancingParams, MetricsConfiguration,
+        PathRule, ProxyProtocolConfig, QueryCertificatesFilters, QueryClusterByDomain,
+        QueryClustersHashes, QueryHealthChecks, QueryMaxConnectionsPerIp, RemoveBackend,
+        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
+        RequestTcpFrontend, RequestUdpFrontend, ResponseContent, RulePosition, SetHealthCheck,
+        SocketAddress, SoftStop, Status, SubscribeEvents, TlsVersion, UpdateHttpListenerConfig,
+        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig,
+        request::RequestType, response_content::ContentType,
     },
 };
 
@@ -98,16 +98,30 @@ impl CommandManager {
     ) -> Result<(), CtlError> {
         debug!("Listing frontends");
 
-        self.send_request(
-            RequestType::ListFrontends(FrontendFilters {
-                http,
-                https,
-                tcp,
-                domain,
-                cluster_id,
-            })
-            .into(),
-        )
+        let request = RequestType::ListFrontends(FrontendFilters {
+            http,
+            https,
+            tcp,
+            domain,
+            cluster_id: cluster_id.to_owned(),
+        })
+        .into();
+
+        let Some(cluster_id) = cluster_id else {
+            return self.send_request(request);
+        };
+
+        // A main process older than `FrontendFilters.cluster_id` skips the
+        // unknown field and answers with every cluster's frontends. Filter the
+        // reply here too, so a mixed-version CLI never lists other clusters.
+        let mut response = self.send_request_get_response(request, true)?;
+        if let Some(ResponseContent {
+            content_type: Some(ContentType::FrontendList(frontends)),
+        }) = response.content.as_mut()
+        {
+            retain_cluster_frontends(frontends, &cluster_id);
+        }
+        response.display(self.json).map_err(CtlError::Display)
     }
 
     pub fn events(&mut self) -> Result<(), CtlError> {
@@ -1806,12 +1820,32 @@ fn build_http_answers(
     }))
 }
 
+/// Keep only the frontends routing to `cluster_id`, mirroring the main
+/// process's `FrontendFilters.cluster_id` semantics.
+///
+/// An HTTP/HTTPS frontend with no cluster id is a `Deny` rule: it routes to no
+/// cluster at all, so it never matches.
+fn retain_cluster_frontends(frontends: &mut ListedFrontends, cluster_id: &str) {
+    frontends
+        .http_frontends
+        .retain(|frontend| frontend.cluster_id.as_deref() == Some(cluster_id));
+    frontends
+        .https_frontends
+        .retain(|frontend| frontend.cluster_id.as_deref() == Some(cluster_id));
+    frontends
+        .tcp_frontends
+        .retain(|frontend| frontend.cluster_id == cluster_id);
+    frontends
+        .udp_frontends
+        .retain(|frontend| frontend.cluster_id == cluster_id);
+}
+
 #[cfg(test)]
 mod tests {
     use sozu_command_lib::proto::command::{
-        ClusterInformation, ClusterInformations, LoadBalancingAlgorithms, ResponseContent,
-        WorkerResponses,
+        ClusterInformation, ClusterInformations, LoadBalancingAlgorithms, WorkerResponses,
     };
+    use sozu_command_lib::state::ConfigState;
 
     use super::*;
 
@@ -1956,5 +1990,84 @@ mod tests {
         assert!(!looks_like_authorized_hash(
             "admin user:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
         ));
+    }
+
+    /// A main process that predates `FrontendFilters.cluster_id` decodes the
+    /// request without it and lists every cluster. The CLI-side fallback must
+    /// turn that reply into exactly what an up-to-date main process returns.
+    #[test]
+    fn retain_cluster_frontends_matches_main_process_filter() {
+        let mut state = ConfigState::default();
+        for (cluster_id, hostname, port) in [
+            (Some("wanted"), "wanted.example.com", 6379u16),
+            (Some("other"), "other.example.com", 6380),
+            // a `Deny` frontend: routes to no cluster
+            (None, "denied.example.com", 6381),
+        ] {
+            for request in [
+                RequestType::AddHttpFrontend(RequestHttpFrontend {
+                    cluster_id: cluster_id.map(ToOwned::to_owned),
+                    hostname: hostname.to_owned(),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                }),
+                RequestType::AddHttpsFrontend(RequestHttpFrontend {
+                    cluster_id: cluster_id.map(ToOwned::to_owned),
+                    hostname: hostname.to_owned(),
+                    path: PathRule::prefix(String::from("/")),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, 8443),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                }),
+            ] {
+                state
+                    .dispatch(&request.into())
+                    .expect("add http(s) frontend");
+            }
+            let Some(cluster_id) = cluster_id else {
+                continue;
+            };
+            for request in [
+                RequestType::AddTcpFrontend(RequestTcpFrontend {
+                    cluster_id: cluster_id.to_owned(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, port),
+                    ..Default::default()
+                }),
+                RequestType::AddUdpFrontend(RequestUdpFrontend {
+                    cluster_id: cluster_id.to_owned(),
+                    address: SocketAddress::new_v4(0, 0, 0, 0, port + 1000),
+                    ..Default::default()
+                }),
+            ] {
+                state
+                    .dispatch(&request.into())
+                    .expect("add tcp/udp frontend");
+            }
+        }
+
+        // what an old main process answers: tag 5 is dropped on decode
+        let mut old_reply = state.list_frontends(FrontendFilters::default());
+        assert_eq!(
+            old_reply.http_frontends.len(),
+            3,
+            "the old reply must carry other clusters' and `Deny` frontends"
+        );
+        retain_cluster_frontends(&mut old_reply, "wanted");
+
+        let new_reply = state.list_frontends(FrontendFilters {
+            cluster_id: Some("wanted".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(old_reply, new_reply);
+        for count in [
+            new_reply.http_frontends.len(),
+            new_reply.https_frontends.len(),
+            new_reply.tcp_frontends.len(),
+            new_reply.udp_frontends.len(),
+        ] {
+            assert_eq!(count, 1, "one frontend of `wanted` per protocol");
+        }
     }
 }
