@@ -62,11 +62,49 @@ pub type TaskId = usize;
 pub type WorkerId = u32;
 pub type RequestId = String;
 
+/// The `(worker_id, task_id, request_index)` triple [`Server::scatter_on`]
+/// embeds in every per-worker request id, `"{worker_id}-{task_id}-{request_index}"`.
+///
+/// The id carries no request name: a name would be a free-form prefix nothing
+/// reads back (the request itself is logged next to the id), and it is exactly
+/// what would make this parse ambiguous. `None` for any id that was not built
+/// by `scatter_on` (`INITIAL-STATUS-<worker>`, a worker-initiated event), which
+/// callers treat as "not attributable".
+pub fn parse_scatter_request_id(request_id: &str) -> Option<(WorkerId, TaskId, usize)> {
+    let mut segments = request_id.split('-');
+    let worker_id = segments.next()?.parse().ok()?;
+    let task_id = segments.next()?.parse().ok()?;
+    let request_index = segments.next()?.parse().ok()?;
+    // POSTCONDITION: exactly three segments. A longer id is some other
+    // producer's and must not be attributed to a scattered entry.
+    if segments.next().is_some() {
+        return None;
+    }
+    Some((worker_id, task_id, request_index))
+}
+
 /// Gather messages and notifies when there are no more left to read.
 #[allow(unused)]
 pub trait Gatherer {
     /// increment how many responses we expect
     fn inc_expected_responses(&mut self, count: usize);
+
+    /// Called once per [`Server::scatter_on`] fan-out, BEFORE any response
+    /// arrives.
+    ///
+    /// The default implementation only grows the expected-response budget,
+    /// which is all a single-request task ever needs. A BULK task — the state
+    /// replay and the static-configuration reload, which scatter hundreds of
+    /// entries onto the SAME gatherer — overrides it to keep a per-entry
+    /// budget keyed by `request_id` (the index `scatter_on` embeds in every
+    /// per-worker request id), plus whatever it must derive from the request
+    /// itself: sozu#1313 keeps the inverse used to revert an entry no worker
+    /// acknowledged, which is only reachable here, while the request is still
+    /// in hand.
+    fn on_scatter(&mut self, request_id: usize, worker_count: usize, request: &Request) {
+        let _ = (request_id, request);
+        self.inc_expected_responses(worker_count);
+    }
 
     /// Return true if enough responses has been gathered
     fn has_finished(&self) -> bool;
@@ -616,7 +654,21 @@ impl CommandHub {
                                         self.handle_worker_response(worker_id, response);
                                     }
                                 }
-                                WorkerResult::CloseSession => self.handle_worker_close(&token),
+                                WorkerResult::CloseSession => {
+                                    // Only the FIRST close of a given worker
+                                    // synthesises failures: the session stays
+                                    // registered after `close_worker` and can
+                                    // report `CloseSession` again on the next
+                                    // poll, which would double-count.
+                                    let was_active = self
+                                        .workers
+                                        .get(&token)
+                                        .is_some_and(WorkerSession::is_active);
+                                    self.handle_worker_close(&token);
+                                    if was_active {
+                                        self.fail_in_flight_requests_of_worker(worker_id);
+                                    }
+                                }
                             }
                         }
                     }
@@ -665,21 +717,96 @@ impl CommandHub {
             return;
         };
 
-        let task = match self.tasks.get_mut(&task_id) {
-            Some(task) => task,
-            None => {
-                warn!("Got a response for an unknown task");
-                return;
-            }
+        // sozu#1313: a task scattered during THIS event-loop iteration is
+        // still parked in `Server::queued_tasks` — it only migrates into
+        // `self.tasks` at the top of the next iteration. A synthetic failure
+        // raised in the same iteration as the scatter (a worker closing while
+        // its requests are in flight) must reach it all the same, so both maps
+        // are searched. The container is taken OUT of its map because
+        // `on_message` needs `&mut self.server`, which `queued_tasks` is part
+        // of; it is put back verbatim below.
+        let (mut container, was_queued) = match self.tasks.remove(&task_id) {
+            Some(task) => (task, false),
+            None => match self.server.queued_tasks.remove(&task_id) {
+                Some(task) => (task, true),
+                None => {
+                    warn!("Got a response for an unknown task");
+                    return;
+                }
+            },
         };
 
-        let client = &mut task
+        // sozu#1313: a TERMINAL answer retires its in-flight entry right away.
+        // The entry used to live until the whole task finished, so a worker
+        // that answered the first entries of a bulk replay and then closed had
+        // every one of its ids re-fed as a synthetic `Failure` by
+        // `fail_in_flight_requests_of_worker` — phantom rejections that failed
+        // a replay the fleet had applied. `Processing` is not terminal: the
+        // real answer is still owed. `handle_finishing_task`'s `retain` stays
+        // as the safety net for entries nobody ever answered.
+        let terminal = matches!(
+            ResponseStatus::try_from(response.status),
+            Ok(ResponseStatus::Ok | ResponseStatus::Failure)
+        );
+        if terminal {
+            self.server.in_flight.remove(&response.id);
+        }
+
+        let client = &mut container
             .job
             .client_token()
             .and_then(|token| self.clients.get_mut(&token));
-        task.job
+        container
+            .job
             .get_gatherer()
             .on_message(&mut self.server, client, worker_id, response);
+
+        if was_queued {
+            self.server.queued_tasks.insert(task_id, container);
+        } else {
+            self.tasks.insert(task_id, container);
+        }
+    }
+
+    /// sozu#1313: answer every request still in flight on a worker that just
+    /// closed with a synthetic `Failure`.
+    ///
+    /// A closed worker never answers. Without this, `ok + errors` can never
+    /// reach `expected_responses`, so `has_finished` never fires and the task
+    /// only ends through its deadline — which, on the bulk replay paths that
+    /// used to scatter with `Timeout::None`, meant never: the client waited
+    /// forever. Routed through [`Self::handle_worker_response`] so the
+    /// accounting, the per-entry attribution and the rollback decision are the
+    /// ones a real rejection would have produced.
+    fn fail_in_flight_requests_of_worker(&mut self, worker_id: WorkerId) {
+        let orphaned: Vec<RequestId> = self
+            .server
+            .in_flight
+            .keys()
+            .filter(|request_id| {
+                parse_scatter_request_id(request_id).is_some_and(|(id, ..)| id == worker_id)
+            })
+            .cloned()
+            .collect();
+        if orphaned.is_empty() {
+            return;
+        }
+        info!(
+            "Worker {} closed with {} requests in flight, accounting them as failures",
+            worker_id,
+            orphaned.len()
+        );
+        for id in orphaned {
+            self.handle_worker_response(
+                worker_id,
+                WorkerResponse {
+                    id,
+                    status: ResponseStatus::Failure.into(),
+                    message: format!("worker {worker_id} closed before answering"),
+                    content: None,
+                },
+            );
+        }
     }
 
     fn handle_finishing_task(&mut self, task_id: TaskId, task: TaskContainer, timed_out: bool) {
@@ -987,10 +1114,15 @@ impl Server {
 
         // TODO: make sure the worker is registered as NotAnswering,
         // and create a task that will pass it to Running when it respond OK to this request:
-        worker_session.send(&WorkerRequest {
+        if let Err(send_error) = worker_session.send(&WorkerRequest {
             id: format!("INITIAL-STATUS-{worker_id}"),
             content: RequestType::Status(Status {}).into(),
-        });
+        }) {
+            error!(
+                "could not send the initial status request to worker {}: {}",
+                worker_id, send_error
+            );
+        }
 
         Ok(worker_session)
     }
@@ -1119,6 +1251,32 @@ impl Server {
             .ok_or(ServerError::WorkerNotFound)
     }
 
+    /// Resolve a [`Timeout`] into the absolute instant the event loop compares
+    /// against. Shared by [`Self::new_task`] and [`Self::rearm_task_timeout`]
+    /// so both express the same policy once.
+    fn deadline(&self, timeout: Timeout) -> Option<Instant> {
+        match timeout {
+            Timeout::None => None,
+            Timeout::Default => Some(Duration::from_secs(self.config.worker_timeout as u64)),
+            Timeout::Custom(duration) => Some(duration),
+        }
+        .map(|duration| Instant::now() + duration)
+    }
+
+    /// sozu#1313: re-arm the deadline of a task that is still queued.
+    ///
+    /// A bulk replay only learns how many entries it scattered once the state
+    /// file is fully parsed, and its deadline must start counting from the END
+    /// of the fan-out: a long parse would otherwise eat the whole budget
+    /// before the first worker was even asked.
+    pub fn rearm_task_timeout(&mut self, task_id: TaskId, timeout: Timeout) {
+        let deadline = self.deadline(timeout);
+        match self.queued_tasks.get_mut(&task_id) {
+            Some(task) => task.timeout = deadline,
+            None => error!("no queued task found with id {}", task_id),
+        }
+    }
+
     /// Add a task in a queue to make it accessible until the next tick
     pub fn new_task(&mut self, job: Box<dyn GatheringTask>, timeout: Timeout) -> TaskId {
         let task_id = self.next_task_id();
@@ -1129,12 +1287,7 @@ impl Server {
             "new_task must allocate a fresh, unused task id"
         );
         let queued_before = self.queued_tasks.len();
-        let timeout = match timeout {
-            Timeout::None => None,
-            Timeout::Default => Some(Duration::from_secs(self.config.worker_timeout as u64)),
-            Timeout::Custom(duration) => Some(duration),
-        }
-        .map(|duration| Instant::now() + duration);
+        let timeout = self.deadline(timeout);
         self.queued_tasks
             .insert(task_id, TaskContainer { job, timeout });
         // INVARIANT: exactly one task was queued, retrievable by the id we
@@ -1171,15 +1324,19 @@ impl Server {
         request_id: usize,
         target: Option<WorkerId>,
     ) {
-        let task = match self.queued_tasks.get_mut(&task_id) {
-            Some(task) => task,
-            None => {
-                error!("no task found with id {}", task_id);
-                return;
-            }
-        };
+        if !self.queued_tasks.contains_key(&task_id) {
+            error!("no task found with id {}", task_id);
+            return;
+        }
 
         let mut worker_count = 0;
+        // sozu#1313: every (entry, worker) pair whose request could not even be
+        // queued on the worker channel. It is still counted in `worker_count`
+        // — and therefore in the expected-response budget — then answered with
+        // a synthetic `Failure` below, so `has_finished` can fire and the
+        // rollback attribution sees the rejection. Dropping it silently, as
+        // before, made `ok + errors` unreachable and hung the task.
+        let mut write_failures: Vec<(WorkerId, RequestId)> = Vec::new();
         let mut worker_request = WorkerRequest {
             id: String::new(),
             content: request,
@@ -1199,30 +1356,63 @@ impl Server {
                 .unwrap_or(w.run_state != RunState::Stopped)
         }) {
             worker_count += 1;
-            worker_request.id = format!(
-                "{}-{}-{}-{}",
-                worker_request.content.short_name(),
-                worker.id,
-                task_id,
-                request_id,
-            );
+            worker_request.id = format!("{}-{}-{}", worker.id, task_id, request_id);
             debug!("scattering to worker {}: {:?}", worker.id, worker_request);
-            worker.send(&worker_request);
-            self.in_flight.insert(worker_request.id, task_id);
+            match worker.send(&worker_request) {
+                Ok(()) => {
+                    self.in_flight.insert(worker_request.id.clone(), task_id);
+                }
+                // No response can ever arrive for a request that never left the
+                // master, so no in-flight entry is registered for it.
+                Err(_) => write_failures.push((worker.id, worker_request.id.clone())),
+            }
         }
-        task.job.get_gatherer().inc_expected_responses(worker_count);
+        if let Some(task) = self.queued_tasks.get_mut(&task_id) {
+            task.job
+                .get_gatherer()
+                .on_scatter(request_id, worker_count, &worker_request.content);
+        }
 
         // INVARIANT: every worker we scattered to within this call has a
         // distinct request id (the id embeds the unique worker id, plus the
         // task and request indices), so the in-flight map must have grown by
-        // exactly `worker_count`. A smaller delta would mean an id collision
-        // overwrote an in-flight entry, which would silently lose a worker's
-        // response and hang the task until timeout.
+        // exactly the number of requests we managed to queue. A smaller delta
+        // would mean an id collision overwrote an in-flight entry, which would
+        // silently lose a worker's response and hang the task until timeout.
         debug_assert_eq!(
             self.in_flight.len(),
-            in_flight_before + worker_count,
-            "scatter_on must register exactly one in-flight entry per scattered worker"
+            in_flight_before + worker_count - write_failures.len(),
+            "scatter_on must register exactly one in-flight entry per successfully queued request"
         );
+
+        if write_failures.is_empty() {
+            return;
+        }
+        // Take the task out of the queue so `&mut self` is free for
+        // `on_message` — the very method the event loop uses for a real worker
+        // answer, so a write failure is accounted through exactly one path.
+        // The task is still QUEUED here (it only migrates into
+        // `CommandHub::tasks` at the top of the next iteration), which is why
+        // the synthetic failure is delivered here rather than through
+        // `CommandHub::handle_worker_response`.
+        let Some(mut container) = self.queued_tasks.remove(&task_id) else {
+            return;
+        };
+        for (worker_id, failed_request_id) in write_failures {
+            let response = WorkerResponse {
+                id: failed_request_id,
+                status: ResponseStatus::Failure.into(),
+                // No operator value: the channel error carries buffer sizes
+                // only and is already logged by `WorkerSession::send`.
+                message: format!("could not queue the request on worker {worker_id}"),
+                content: None,
+            };
+            container
+                .job
+                .get_gatherer()
+                .on_message(self, &mut None, worker_id, response);
+        }
+        self.queued_tasks.insert(task_id, container);
     }
 
     pub fn cancel_task(&mut self, task_id: TaskId) {
@@ -1818,5 +2008,263 @@ mod tests {
         assert_eq!(read_gauge(names::configuration::CLUSTERS), Some(1));
         assert_eq!(read_gauge(names::configuration::BACKENDS), Some(3));
         assert_eq!(read_gauge(names::configuration::FRONTENDS), Some(2));
+    }
+    /// Register a worker whose channel is capped at `max_buffer_size`, so the
+    /// test controls exactly when a queued request stops fitting.
+    fn register_test_worker(
+        server: &mut Server,
+        worker_id: WorkerId,
+        buffer_size: u64,
+        max_buffer_size: u64,
+    ) -> (
+        Channel<WorkerResponse, WorkerRequest>,
+        std::os::unix::net::UnixStream,
+    ) {
+        let (main_sock, worker_sock) = UnixStream::pair().expect("could not create a socket pair");
+        let main_side: Channel<WorkerRequest, WorkerResponse> =
+            Channel::new(main_sock, buffer_size, max_buffer_size);
+        // The worker end reads with a comfortable ceiling: only the master's
+        // back buffer is under test here.
+        let worker_side: Channel<WorkerResponse, WorkerRequest> =
+            Channel::new(worker_sock, 4096, 65536);
+        // `ScmSocket` borrows the descriptor; the stream is returned so it
+        // outlives the worker session.
+        let (scm_main, _scm_worker) =
+            std::os::unix::net::UnixStream::pair().expect("could not create an scm pair");
+        let scm_socket = ScmSocket::new(scm_main.as_raw_fd()).expect("could not create scm socket");
+        server
+            .register_worker(worker_id, 0, main_side, scm_socket)
+            .expect("could not register the test worker");
+        (worker_side, scm_main)
+    }
+
+    /// A task that records its final tally, so a test can assert what the
+    /// gatherer accounted without reaching into a boxed `dyn GatheringTask`.
+    #[derive(Debug)]
+    struct TallyTask {
+        gatherer: DefaultGatherer,
+        seen: std::rc::Rc<std::cell::Cell<(usize, usize, usize)>>,
+    }
+
+    impl GatheringTask for TallyTask {
+        fn client_token(&self) -> Option<Token> {
+            None
+        }
+        fn get_gatherer(&mut self) -> &mut dyn Gatherer {
+            &mut self.gatherer
+        }
+        fn on_finish(
+            self: Box<Self>,
+            _server: &mut Server,
+            _client: &mut OptionalClient,
+            _timed_out: bool,
+        ) {
+            self.seen.set((
+                self.gatherer.ok,
+                self.gatherer.errors,
+                self.gatherer.expected_responses,
+            ));
+        }
+    }
+
+    /// Regression (sozu#1313): a request that can NEVER be delivered on a
+    /// worker channel must be accounted as a `Failure` for the owning task.
+    ///
+    /// `scatter_on` counted every targeted worker in `expected_responses`
+    /// whether or not the write succeeded, and `WorkerSession::send` only
+    /// logged the error. `ok + errors` could therefore never reach `expected`,
+    /// `has_finished` never fired, and on the bulk replay paths — which
+    /// scattered with `Timeout::None` — the task and the client waiting on it
+    /// hung forever, which is the "no responses at all" half of the incident.
+    ///
+    /// The frame here is larger than the channel ceiling itself, so no amount
+    /// of draining will ever admit it: unlike a transient overflow it is NOT
+    /// parked in `pending` (parking it would hang the task just as thoroughly),
+    /// it fails immediately. See `sessions.rs::is_transient_overflow`.
+    ///
+    /// To SEE THIS RED: make `WorkerSession::send` swallow the error again
+    /// (`return Ok(())` instead of `Err(e)`), or drop the synthetic-failure
+    /// block at the end of `scatter_on` — `has_finished` is then false and the
+    /// tally stays `(0, 0, 1)`.
+    #[test]
+    fn a_request_that_cannot_be_queued_is_accounted_as_a_failure() {
+        let mut hub = create_test_hub();
+        // An 8-byte ceiling cannot hold even the length prefix plus payload of
+        // the smallest request, at any time.
+        let (_worker_side, _scm) = register_test_worker(&mut hub.server, 0, 8, 8);
+
+        let seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let task_id = hub.server.new_task(
+            Box::new(TallyTask {
+                gatherer: DefaultGatherer::default(),
+                seen: seen.clone(),
+            }),
+            Timeout::None,
+        );
+        hub.server
+            .scatter_on(RequestType::Status(Status {}).into(), task_id, 1, None);
+
+        assert!(
+            hub.server.in_flight.is_empty(),
+            "a request that never left the master must register no in-flight entry"
+        );
+        let mut container = hub
+            .server
+            .queued_tasks
+            .remove(&task_id)
+            .expect("the task must still be queued");
+        assert!(
+            container.job.get_gatherer().has_finished(),
+            "a write failure must complete the fan-out instead of hanging it"
+        );
+        hub.handle_finishing_task(task_id, container, false);
+        assert_eq!(
+            seen.get(),
+            (0, 1, 1),
+            "the unqueueable request must be accounted as exactly one failure"
+        );
+    }
+
+    /// Regression (sozu#1313): closing a worker must only fail the requests
+    /// that are STILL in flight on it, never the ones it already answered.
+    ///
+    /// `in_flight` was purged only when the whole task finished, so a worker
+    /// that answered the first entries of a bulk replay and then crashed had
+    /// EVERY one of its ids re-fed as a synthetic `Failure`. A replay the fleet
+    /// actually applied was then reported to the client — and to the audit
+    /// trail — as failed, and the per-entry rollback saw phantom rejections.
+    ///
+    /// To SEE THIS RED: drop the terminal-response `in_flight.remove` from
+    /// `handle_worker_response` — the tally below becomes `(1, 1, 2)` and the
+    /// task reports itself finished before worker 1 ever answered.
+    #[test]
+    fn closing_a_worker_only_fails_its_unanswered_requests() {
+        let mut hub = create_test_hub();
+        let (_worker_0, _scm_0) = register_test_worker(&mut hub.server, 0, 4096, 65536);
+        let (_worker_1, _scm_1) = register_test_worker(&mut hub.server, 1, 4096, 65536);
+
+        let seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let task_id = hub.server.new_task(
+            Box::new(TallyTask {
+                gatherer: DefaultGatherer::default(),
+                seen: seen.clone(),
+            }),
+            Timeout::None,
+        );
+        hub.server
+            .scatter_on(RequestType::Status(Status {}).into(), task_id, 1, None);
+        assert_eq!(
+            hub.server.in_flight.len(),
+            2,
+            "the entry must be in flight on both workers"
+        );
+
+        // Worker 0 applies the entry...
+        hub.handle_worker_response(
+            0,
+            WorkerResponse {
+                id: format!("0-{task_id}-1"),
+                status: ResponseStatus::Ok.into(),
+                message: String::new(),
+                content: None,
+            },
+        );
+        assert_eq!(
+            hub.server.in_flight.len(),
+            1,
+            "an answered request must leave the in-flight map immediately"
+        );
+        // ...and then dies. Only worker 1 is still owed an answer.
+        hub.fail_in_flight_requests_of_worker(0);
+
+        let mut container = hub
+            .server
+            .queued_tasks
+            .remove(&task_id)
+            .expect("the task must still be queued");
+        assert!(
+            !container.job.get_gatherer().has_finished(),
+            "the task must still wait for the worker that has not answered"
+        );
+        hub.handle_finishing_task(task_id, container, false);
+        assert_eq!(
+            seen.get(),
+            (1, 0, 2),
+            "a dead worker's already-answered requests must not be re-counted as failures"
+        );
+    }
+
+    /// Regression (sozu#1313): a bulk scatter larger than the channel back
+    /// buffer must be delivered in full and in order, not truncated at the
+    /// ceiling.
+    ///
+    /// `load_state` queues every saved entry onto every worker inside ONE
+    /// event-loop iteration, with no flush in between. Past `max_buffer_size`
+    /// (2 MB by default) `write_delimited_message` refused the frame and the
+    /// entry was dropped — while still being counted in `expected_responses`,
+    /// so the task hung. The overflow now goes to the per-worker `pending`
+    /// queue and is drained from the WRITABLE path, which is exactly what this
+    /// test drives: no synchronous flush, no sleep, no blocked event loop.
+    ///
+    /// To SEE THIS RED: make `WorkerSession::send` return the
+    /// `MessageTooLarge` error instead of queueing (and drop `flush_pending`)
+    /// — only the handful of requests that fit under the ceiling arrive.
+    #[test]
+    fn a_bulk_scatter_larger_than_the_back_buffer_is_fully_delivered() {
+        const ENTRIES: usize = 500;
+
+        let mut hub = create_test_hub();
+        // 4 KiB ceiling: 500 queued requests overflow it many times over,
+        // exactly as a large state file overflows the 2 MB default.
+        let (mut worker_side, _scm) = register_test_worker(&mut hub.server, 0, 512, 4096);
+
+        let seen = std::rc::Rc::new(std::cell::Cell::new((0, 0, 0)));
+        let task_id = hub.server.new_task(
+            Box::new(TallyTask {
+                gatherer: DefaultGatherer::default(),
+                seen: seen.clone(),
+            }),
+            Timeout::None,
+        );
+        for request_id in 1..=ENTRIES {
+            hub.server.scatter_on(
+                RequestType::Status(Status {}).into(),
+                task_id,
+                request_id,
+                None,
+            );
+        }
+
+        assert_eq!(
+            hub.server.in_flight.len(),
+            ENTRIES,
+            "every entry must be accepted for delivery, none dropped at the ceiling"
+        );
+
+        // Drive the event loop's WRITABLE path: `ready()` drains the back
+        // buffer onto the socket and refills it from `pending`, exactly as the
+        // supervisor does on each mio writability event. The worker end reads
+        // in between, as a live worker would.
+        let mut received = vec![];
+        for _ in 0..(ENTRIES * 4) {
+            for worker in hub.server.workers.values_mut() {
+                worker.update_readiness(Ready::WRITABLE);
+                let _ = worker.ready();
+            }
+            worker_side.handle_events(Ready::READABLE);
+            received.extend(crate::command::sessions::extract_messages(&mut worker_side));
+            if received.len() == ENTRIES {
+                break;
+            }
+        }
+
+        let ids: Vec<String> = received.into_iter().map(|request| request.id).collect();
+        let expected: Vec<String> = (1..=ENTRIES)
+            .map(|request_id| format!("0-{task_id}-{request_id}"))
+            .collect();
+        assert_eq!(
+            ids, expected,
+            "every scattered entry must reach the worker, in order, past the back buffer ceiling"
+        );
     }
 }
