@@ -590,28 +590,29 @@ jobs:
         run: python bench_logs.py
 
   # ┌──────────────────────────────────────────────────────────────┐
-  # │ Group E — Publish (kept as-is)                                │
+  # │ Group E — Docker validation and main publication              │
   # └──────────────────────────────────────────────────────────────┘
   dockerhub:
     name: Docker build and push to Docker Hub
     # Tag pushes are handled by `.github/workflows/release.yml`, which
     # publishes `clevercloud/sozu:${VERSION}` and `:latest` (stable tags
-    # only). This job continues to publish `:${SHA}` aliases for branch
-    # pushes and same-repo `pull_request` events; fork PRs cannot push
-    # because they have no access to `secrets.DOCKERHUB_TOKEN`.
+    # only). Pull requests still validate the complete Docker build, but
+    # registry authentication and the `:${SHA}` push are restricted to
+    # publication-triggering pushes on `main`.
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8  # v4
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4
+      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
         with:
           context: .
-          push: 'true'
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           tags: clevercloud/sozu:${{ github.sha }}
 ...
