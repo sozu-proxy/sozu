@@ -171,6 +171,36 @@ uses a `\n\0` separator (see `command/src/state.rs:1613, 1630` cited in
 `bin/README.md`); this is distinct from the `usize`-prefixed framing the
 command channel itself uses (see `command/src/channel.rs:611`).
 
+`load_state` and `load_static_config` are the two BULK apply paths: they
+scatter hundreds of independent entries onto ONE `GatheringTask`. Both
+gather through `PerEntryGatherer` (`requests.rs`), which keeps the
+fleet-wide `DefaultGatherer` tally AND a per-entry breakdown keyed by the
+scatter `request_id` embedded in every per-worker request id
+(`{worker_id}-{task_id}-{request_id}`, parsed by
+`server.rs::parse_scatter_request_id`). On completion each entry is
+judged on its own by `should_rollback_fanout`, the same predicate the live
+single-request path uses: an entry NO worker acknowledged is reverted from
+the master's `ConfigState` with the inverse `compute_rollback` captured at
+scatter time, so `SaveState` cannot re-persist it and the next replay
+cannot re-inject it (sozu#1313).
+
+Both also arm a bounded deadline (`bulk_replay_timeout`: one
+`worker_timeout` plus 10 ms per scattered entry, capped at ten
+`worker_timeout`s) instead of the former `Timeout::None`, and report a
+deadline as a failure. A request that can never be delivered on a worker channel
+(`Server::scatter_on`) and every request still in flight on a worker that
+closes (`CommandHub::fail_in_flight_requests_of_worker`) are accounted as
+synthetic `Failure`s, so `ok + errors` always reaches
+`expected_responses`; a terminal answer retires its `in_flight` entry
+immediately, so a worker that answers and then dies is not re-counted as a
+rejection. A bulk sender that fills a worker's back buffer past
+`max_buffer_size` parks the overflow in the per-worker
+`WorkerSession::pending` queue and drains it from the WRITABLE path
+(`WorkerSession::flush_pending`), in scatter order: nothing is dropped and
+the single-threaded supervisor never blocks on a socket, so clients,
+workers and task deadlines keep being served while a large replay is on
+the wire.
+
 ### 3.3 Worker channels and FD passing
 
 Workers communicate with the master over `mio::net::UnixStream` channels

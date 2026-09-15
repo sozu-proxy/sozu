@@ -160,6 +160,15 @@ jobs:
       - name: Test sozu-lib
         run: cargo test -p sozu-lib --locked ${{ matrix.flags }} --verbose
 
+      # The `sozu` binary crate carries the master-side command-server unit
+      # tests (command/requests.rs, command/server.rs): the rollback, response
+      # accounting and channel backpressure guarantees of sozu#1301/#1313/#1314
+      # live there and were never exercised by CI. The `#[ignore]`d
+      # `bin/tests/*_e2e.rs` process-level tests still stay out (they spawn a
+      # real master); run them manually with `-- --ignored`.
+      - name: Test sozu
+        run: cargo test -p sozu --locked ${{ matrix.flags }} --verbose
+
       # `tests::fuzz_tests::*` is `#[ignore]`d here and exercised in
       # the dedicated `fuzz` job below. Skipping it keeps the e2e
       # step from rebuilding the fuzz/ crate under aws-lc-rs / fips

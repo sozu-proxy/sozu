@@ -12,7 +12,7 @@ use std::{
     fs::File,
     io::{ErrorKind, Read},
     path::PathBuf,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use mio::Token;
@@ -32,7 +32,7 @@ use sozu_command_lib::{
         QueryHealthChecks, QueryMetricsOptions, RemoveListener, Request, ResponseContent,
         ResponseStatus, RunState, SetMetricDetail, SoftStop, Status, UpdateHttpListenerConfig,
         UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerInfo,
-        WorkerInfos, WorkerRequest, WorkerResponses, request::RequestType,
+        WorkerInfos, WorkerRequest, WorkerResponse, WorkerResponses, request::RequestType,
         response_content::ContentType,
     },
     sd_notify,
@@ -42,7 +42,7 @@ use sozu_lib::metrics::METRICS;
 use crate::command::{
     server::{
         DefaultGatherer, Gatherer, GatheringTask, MessageClient, Server, ServerState, Timeout,
-        WorkerId,
+        WorkerId, parse_scatter_request_id,
     },
     sessions::{ClientSession, OptionalClient, sanitize_for_audit, sanitize_for_audit_kv},
     upgrade::{upgrade_main, upgrade_worker},
@@ -815,19 +815,13 @@ impl GatheringTask for QueryClustersTask {
 
 #[derive(Debug)]
 struct LoadStaticConfigTask {
-    gatherer: DefaultGatherer,
+    /// sozu#1313: per-entry accounting, so an entry no worker acknowledged is
+    /// reverted instead of staying in the main-process state.
+    gatherer: PerEntryGatherer,
     client_token: Option<Token>,
 }
 
 pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path: Option<&str>) {
-    let task_id = server.new_task(
-        Box::new(LoadStaticConfigTask {
-            gatherer: DefaultGatherer::default(),
-            client_token: client.as_ref().map(|c| c.token),
-        }),
-        Timeout::None,
-    );
-
     let new_config;
 
     let config = match path {
@@ -853,6 +847,11 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
     let config_messages = match config.generate_config_messages() {
         Ok(messages) => messages,
         Err(config_err) => {
+            // No task is created before this point on purpose: a task created
+            // and never scattered to would be released on the next tick with
+            // `expected_responses == 0` and answer the client a second time,
+            // contradicting the failure below.
+
             // Only attribute the audit event when a client triggered the
             // reload — at startup (`client == None`) there is no actor.
             if let Some(client_ref) = client.as_deref() {
@@ -872,6 +871,18 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
             return;
         }
     };
+
+    // sozu#1313: bounded deadline, scaled to the number of entries this reload
+    // is about to scatter. `Timeout::None` left the task — and the client —
+    // waiting forever on an answer a killed worker could never send.
+    let timeout = bulk_replay_timeout(server.config.worker_timeout, config_messages.len());
+    let task_id = server.new_task(
+        Box::new(LoadStaticConfigTask {
+            gatherer: PerEntryGatherer::default(),
+            client_token: client.as_ref().map(|c| c.token),
+        }),
+        timeout,
+    );
 
     for (request_index, message) in config_messages.into_iter().enumerate() {
         let request = message.content;
@@ -934,20 +945,26 @@ impl GatheringTask for LoadStaticConfigTask {
         self: Box<Self>,
         server: &mut Server,
         client: &mut OptionalClient,
-        _timed_out: bool,
+        timed_out: bool,
     ) {
-        // PRECONDITION: `load_static_config` scatters with `Timeout::None`,
-        // so the task is released only once every expected worker answered.
+        // PRECONDITION: the gatherer ran to completion — either every expected
+        // worker answered, or the bounded deadline of `bulk_replay_timeout`
+        // fired.
         debug_assert!(
-            self.gatherer.ok + self.gatherer.errors >= self.gatherer.expected_responses,
-            "LoadStaticConfigTask::on_finish: every expected worker must have answered (no timeout)"
+            timed_out || self.gatherer.has_finished(),
+            "LoadStaticConfigTask::on_finish: must be finished (ok+errors >= expected) unless timed out"
         );
+        // sozu#1313: revert every entry NO worker acknowledged before reporting.
+        // The reload path had the same hole as the replay path — an entry the
+        // whole fleet rejected stayed in the main-process state and was
+        // re-persisted by the next `SaveState`.
+        let reverted = self.gatherer.revert_unacknowledged(server, timed_out);
         // Snapshot the failure tally before the loop consumes `responses`; the
         // failure-message list built below must contain exactly one entry per
         // counted error. Read only inside the post-loop assert (ungated, E0425).
-        let errors_before = self.gatherer.errors;
+        let errors_before = self.gatherer.inner.errors;
         let mut messages = vec![];
-        for (worker_id, response) in self.gatherer.responses {
+        for (worker_id, response) in self.gatherer.inner.responses {
             match ResponseStatus::try_from(response.status) {
                 Ok(ResponseStatus::Failure) => {
                     messages.push(format!("worker {worker_id}: {}", response.message))
@@ -967,17 +984,22 @@ impl GatheringTask for LoadStaticConfigTask {
             "LoadStaticConfig failure-message count must equal the gatherer error tally"
         );
 
-        if self.gatherer.errors > 0 {
+        // A timeout is a failure, never a success: some workers were never
+        // heard from, so the reload did not provably apply everywhere.
+        if self.gatherer.inner.errors > 0 || timed_out {
             client.finish_failure(format!(
-                "\nloading static configuration failed: {} OK, {} errors:\n- {}",
-                self.gatherer.ok,
-                self.gatherer.errors,
+                "\nloading static configuration failed: {} OK, {} errors, timed_out: {}, \
+                 reverted entries: {}:\n- {}",
+                self.gatherer.inner.ok,
+                self.gatherer.inner.errors,
+                timed_out,
+                reverted,
                 messages.join("\n- ")
             ));
         } else {
             client.finish_ok(format!(
                 "Successfully loaded the config: {} ok, {} errors",
-                self.gatherer.ok, self.gatherer.errors,
+                self.gatherer.inner.ok, self.gatherer.inner.errors,
             ));
         }
 
@@ -2216,6 +2238,184 @@ fn should_rollback_fanout(timed_out: bool, expected: usize, ok: usize, errors: u
     expected > 0 && ok == 0 && (errors > 0 || timed_out)
 }
 
+/// Extra deadline granted per scattered entry by [`bulk_replay_timeout`].
+const BULK_TIMEOUT_PER_ENTRY: Duration = Duration::from_millis(10);
+
+/// Ceiling of [`bulk_replay_timeout`], expressed in `worker_timeout` units.
+const BULK_TIMEOUT_MAX_MULTIPLIER: u32 = 10;
+
+/// sozu#1313: the bounded deadline of a BULK apply path — [`load_state`] and
+/// [`load_static_config`].
+///
+/// Both used to scatter with [`Timeout::None`], so their task ended only once
+/// every expected worker had answered. One answer that never comes — a worker
+/// killed mid-replay, a request that could not be queued on a saturated
+/// channel — left the task in flight forever, and the client waiting on it with
+/// no answer at all. `Timeout::None` also made [`should_rollback_fanout`]'s
+/// timeout trigger unreachable on these paths.
+///
+/// `Timeout::Default` (one `worker_timeout`) is the budget for ONE request, not
+/// for a replay that queues N entries onto every worker, each to be serialised,
+/// written, parsed and applied. The budget is therefore one `worker_timeout` of
+/// fan-out slack plus [`BULK_TIMEOUT_PER_ENTRY`] per scattered entry, capped at
+/// [`BULK_TIMEOUT_MAX_MULTIPLIER`] × `worker_timeout` so an unresponsive fleet
+/// can never hold the client longer than a bounded, documented window. With the
+/// default 10 s `worker_timeout`: 10 s for a small state file, at most 100 s for
+/// any file at all.
+fn bulk_replay_timeout(worker_timeout_secs: u32, entries: usize) -> Timeout {
+    // `Config::default()` leaves `worker_timeout` at zero (tests, upgrade
+    // fixtures); a zero-second deadline would expire the task before the first
+    // worker could answer.
+    let base = Duration::from_secs(worker_timeout_secs.max(1) as u64);
+    let cap = base.saturating_mul(BULK_TIMEOUT_MAX_MULTIPLIER);
+    let scaled = base.saturating_add(
+        BULK_TIMEOUT_PER_ENTRY.saturating_mul(u32::try_from(entries).unwrap_or(u32::MAX)),
+    );
+    // POSTCONDITION: bounded above by the cap and never below one
+    // `worker_timeout` — the two properties `load_state` relies on.
+    let timeout = scaled.min(cap);
+    debug_assert!(
+        timeout <= cap && timeout >= base,
+        "a bulk replay deadline must stay within [worker_timeout, cap]"
+    );
+    Timeout::Custom(timeout)
+}
+
+/// sozu#1313: response accounting for the two BULK apply paths.
+///
+/// [`load_state`] and [`load_static_config`] scatter hundreds of INDEPENDENT
+/// entries onto a SINGLE task, so the fleet-wide `ok`/`errors` tally of a
+/// [`DefaultGatherer`] says nothing about any particular entry: one entry every
+/// worker rejected is invisible behind a hundred entries they accepted. The
+/// main process therefore kept — and `SaveState` re-persisted — entries no
+/// worker ever acknowledged, and the poisoned file re-injected them on the next
+/// replay.
+///
+/// This gatherer keeps the `DefaultGatherer` behaviour verbatim (it owns one)
+/// and adds a per-entry breakdown keyed by the scatter `request_id`, plus the
+/// inverse request from [`compute_rollback`] captured while the request is
+/// still in hand. [`Self::revert_unacknowledged`] then applies the very
+/// predicate the live fan-out uses, [`should_rollback_fanout`], to each entry
+/// on its own.
+#[derive(Debug, Default)]
+struct PerEntryGatherer {
+    /// fleet-wide tally, `has_finished` and the response log
+    inner: DefaultGatherer,
+    /// per scatter `request_id` breakdown
+    entries: BTreeMap<usize, ScatteredEntry>,
+}
+
+/// What one entry of a bulk apply path scattered, and what came back for it.
+#[derive(Debug, Default)]
+struct ScatteredEntry {
+    expected: usize,
+    ok: usize,
+    errors: usize,
+    /// inverse of the scattered request; `None` when it has no unambiguous one
+    /// (see [`compute_rollback`])
+    rollback: Option<Request>,
+}
+
+impl PerEntryGatherer {
+    /// Revert every entry NO worker acknowledged, and return how many were
+    /// reverted from the main-process `ConfigState`.
+    ///
+    /// Same safety bound as the live fan-out: an entry at least one worker
+    /// applied is never reverted, and an entry whose verb has no unambiguous
+    /// inverse keeps today's best-effort behaviour.
+    fn revert_unacknowledged(&self, server: &mut Server, timed_out: bool) -> usize {
+        let mut reverted = 0usize;
+        for entry in self.entries.values() {
+            if !should_rollback_fanout(timed_out, entry.expected, entry.ok, entry.errors) {
+                continue;
+            }
+            let Some(rollback) = entry.rollback.as_ref() else {
+                continue;
+            };
+            // Counts only, never request content: a `RequestHttpFrontend`
+            // rendering carries the operator-supplied hostname.
+            match server.state.dispatch(rollback) {
+                Ok(()) => reverted += 1,
+                Err(revert_error) => error!(
+                    "sozu#1313 rollback: could not revert an unacknowledged replay entry \
+                     (ok=0, errors={}, expected={}, timed_out={}): {}",
+                    entry.errors, entry.expected, timed_out, revert_error
+                ),
+            }
+        }
+        if reverted > 0 {
+            warn!(
+                "sozu#1313 rollback: reverted {} replay entries no worker acknowledged \
+                 (of {} scattered, timed_out={})",
+                reverted,
+                self.entries.len(),
+                timed_out
+            );
+        }
+        reverted
+    }
+}
+
+impl Gatherer for PerEntryGatherer {
+    fn inc_expected_responses(&mut self, count: usize) {
+        self.inner.inc_expected_responses(count);
+    }
+
+    fn has_finished(&self) -> bool {
+        self.inner.has_finished()
+    }
+
+    fn on_scatter(&mut self, request_id: usize, worker_count: usize, request: &Request) {
+        let entry = self.entries.entry(request_id).or_default();
+        let expected_before = entry.expected;
+        entry.expected += worker_count;
+        // The bulk paths allocate a fresh `request_id` per entry, so the first
+        // scatter is the one that carries the request. Keeping the first
+        // inverse also keeps this idempotent if an entry is ever re-scattered.
+        if entry.rollback.is_none() {
+            entry.rollback = request.request_type.as_ref().and_then(compute_rollback);
+        }
+        // INVARIANT: the per-entry budget advances by exactly `worker_count`,
+        // in lockstep with the fleet-wide one. A drift either way would make
+        // `should_rollback_fanout` read a fan-out that never happened.
+        debug_assert_eq!(
+            self.entries[&request_id].expected,
+            expected_before + worker_count,
+            "on_scatter must grow the per-entry budget by exactly worker_count"
+        );
+        self.inner.inc_expected_responses(worker_count);
+    }
+
+    fn on_message(
+        &mut self,
+        server: &mut Server,
+        client: &mut OptionalClient,
+        worker_id: WorkerId,
+        message: WorkerResponse,
+    ) {
+        // Attribute BEFORE handing the message to the inner gatherer, which
+        // consumes it. The id is the one `scatter_on` built, so its last
+        // segment is the entry index.
+        match parse_scatter_request_id(&message.id) {
+            Some((_, _, request_index)) => {
+                let entry = self.entries.entry(request_index).or_default();
+                match ResponseStatus::try_from(message.status) {
+                    Ok(ResponseStatus::Ok) => entry.ok += 1,
+                    Ok(ResponseStatus::Failure) => entry.errors += 1,
+                    // Processing is not terminal, an undecodable status is
+                    // reported by the inner gatherer.
+                    Ok(ResponseStatus::Processing) | Err(_) => {}
+                }
+            }
+            // Never reached for a response to a scattered request; an
+            // unattributable answer still counts fleet-wide below, it just
+            // cannot protect its entry from the rollback.
+            None => warn!("could not attribute a worker response to a replay entry"),
+        }
+        self.inner.on_message(server, client, worker_id, message);
+    }
+}
+
 pub fn worker_request(
     server: &mut Server,
     client: &mut ClientSession,
@@ -3311,7 +3511,10 @@ impl GatheringTask for QueryMetricsTask {
 struct LoadStateTask {
     /// this task may be called by the main process, without a client
     pub client_token: Option<Token>,
-    pub gatherer: DefaultGatherer,
+    /// sozu#1313: per-entry accounting, so an entry no worker acknowledged is
+    /// reverted from the main-process state instead of being re-persisted by
+    /// the next `SaveState` and re-injected by every later replay.
+    pub gatherer: PerEntryGatherer,
     path: String,
 }
 
@@ -3366,13 +3569,19 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
 
     client.return_processing(format!("Parsing state file from {path}..."));
 
+    // sozu#1313: a bounded deadline from the start — the entry count is only
+    // known once the file is parsed, so this initial budget covers the
+    // degenerate cases (empty or unparseable file) and is re-armed below with
+    // the real count, which also restarts the countdown at the END of the
+    // fan-out rather than at the beginning of a long parse.
+    let worker_timeout = server.config.worker_timeout;
     let task_id = server.new_task(
         Box::new(LoadStateTask {
             client_token: client.as_ref().map(|c| c.token),
-            gatherer: DefaultGatherer::default(),
+            gatherer: PerEntryGatherer::default(),
             path: path.to_owned(),
         }),
-        Timeout::None,
+        bulk_replay_timeout(worker_timeout, 0),
     );
 
     let mut buffer = Buffer::with_capacity(200000);
@@ -3465,6 +3674,10 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
 
     match status {
         Ok(()) => {
+            server.rearm_task_timeout(
+                task_id,
+                bulk_replay_timeout(worker_timeout, scatter_request_counter),
+            );
             if skipped_invalid > 0 {
                 // sozu#1313: the load is deliberately NOT aborted — every valid
                 // entry still applies — but the operator must learn that the
@@ -3514,34 +3727,40 @@ impl GatheringTask for LoadStateTask {
         self: Box<Self>,
         server: &mut Server,
         client: &mut OptionalClient,
-        _timed_out: bool,
+        timed_out: bool,
     ) {
-        let DefaultGatherer {
-            ok,
-            errors,
-            expected_responses,
-            ..
-        } = self.gatherer;
-        // PRECONDITION: `load_state` scatters with `Timeout::None`, so the
-        // task is only released once every worker has answered — never on a
-        // timeout. The ok/err tally must therefore cover the full expected
-        // fan-out.
+        let Self { gatherer, path, .. } = *self;
+        let ok = gatherer.inner.ok;
+        let errors = gatherer.inner.errors;
+        // PRECONDITION: the gatherer ran to completion — either every expected
+        // worker answered, or the bounded deadline of `bulk_replay_timeout`
+        // fired. Before sozu#1313 this path scattered with `Timeout::None` and
+        // could only end the first way, which is exactly why a worker killed
+        // mid-replay hung `sozu state load` with no answer at all.
         debug_assert!(
-            ok + errors >= expected_responses,
-            "LoadStateTask::on_finish: every expected worker must have answered (no timeout path)"
+            timed_out || gatherer.has_finished(),
+            "LoadStateTask::on_finish: must be finished (ok+errors >= expected) unless timed out"
         );
+        // sozu#1313: revert every replayed entry NO worker acknowledged, so the
+        // main process does not keep — and `SaveState` does not re-persist — an
+        // entry the whole fleet refused. Runs before `update_counts` so the
+        // frontend/backend gauges reflect the reverted state.
+        let reverted = gatherer.revert_unacknowledged(server, timed_out);
         server.update_counts();
-        let result = if errors == 0 {
-            AuditResult::Ok
-        } else {
+        // A timeout is a failure, never a success: entries were left
+        // unacknowledged, and the reverts above already assume as much.
+        let failed = errors > 0 || timed_out;
+        let result = if failed {
             AuditResult::Err
+        } else {
+            AuditResult::Ok
         };
-        // INVARIANT: the audit result matches the error tally — an `ok:N
-        // errors:0` line must be tagged Ok, any error tagged Err.
+        // INVARIANT: the audit result matches the outcome — an `ok:N errors:0`
+        // line that did not time out must be tagged Ok, anything else Err.
         debug_assert_eq!(
             matches!(result, AuditResult::Ok),
-            errors == 0,
-            "LoadStateTask audit result must agree with the worker error tally"
+            errors == 0 && !timed_out,
+            "LoadStateTask audit result must agree with the worker error tally and the deadline"
         );
         if let Some(client_ref) = client.as_deref() {
             let (verb, counter) = audit_verb!("state_loaded");
@@ -3551,19 +3770,28 @@ impl GatheringTask for LoadStateTask {
                 EventKind::StateLoaded,
                 verb,
                 counter,
-                format!("file:{} ok:{ok} errors:{errors}", self.path),
+                format!("file:{path} ok:{ok} errors:{errors} reverted:{reverted}"),
                 result,
-                AuditExtras::default(),
+                AuditExtras {
+                    error_code: failed.then_some(if timed_out {
+                        AuditErrorCode::WorkerTimeout
+                    } else {
+                        AuditErrorCode::WorkerFailure
+                    }),
+                    ..Default::default()
+                },
             );
         }
-        if errors == 0 {
+        if !failed {
             client.finish_ok(format!(
-                "Successfully loaded state from path {}, {} ok messages, {} errors",
-                self.path, ok, errors
+                "Successfully loaded state from path {path}, {ok} ok messages, {errors} errors"
             ));
             return;
         }
-        client.finish_failure(format!("loading state: {ok} ok messages, {errors} errors"));
+        client.finish_failure(format!(
+            "loading state: {ok} ok messages, {errors} errors, timed out: {timed_out}, \
+             reverted entries: {reverted}"
+        ));
     }
 }
 
@@ -4801,6 +5029,498 @@ mod frontend_validation_tests {
         assert!(
             validate_request(&RequestType::AddHttpFrontend(frontend("example.com"))).is_ok(),
             "validate_request must accept a well-formed frontend"
+        );
+    }
+}
+
+#[cfg(test)]
+mod load_state_rollback_tests {
+    //! sozu#1313: the two BULK apply paths — [`super::load_state`] (the
+    //! saved-state replay) and [`super::load_static_config`] — must revert PER
+    //! ENTRY every entry no worker acknowledged, must end on a bounded
+    //! deadline instead of waiting forever, and must report that deadline as a
+    //! failure.
+    //!
+    //! Before the fix both tasks only tallied the fleet-wide `ok`/`errors` of a
+    //! `DefaultGatherer` and never touched `server.state`. An entry every
+    //! worker answered `Failure` to therefore stayed in the main-process
+    //! `ConfigState`, was re-persisted by the next `SaveState` and re-injected
+    //! on every later replay — the poisoned-state loop of sozu#1313. The live
+    //! single-request path (`worker_request` → `WorkerTask::on_finish`) already
+    //! reverted; the replay path is where the same guarantee was missing.
+    //!
+    //! To SEE THESE RED (regression proof), restore the pre-fix behaviour:
+    //! - delete the `revert_unacknowledged` call from
+    //!   `LoadStateTask::on_finish` / `LoadStaticConfigTask::on_finish` — every
+    //!   revert expectation below fails;
+    //! - restore `let failed = errors > 0;` (without `|| timed_out`) in
+    //!   `LoadStateTask::on_finish` — the timeout test fails on the reported
+    //!   status;
+    //! - make `bulk_replay_timeout` return `Timeout::None`, what both load
+    //!   paths passed before — the deadline test fails.
+    //!
+    //! The response-accounting and channel-backpressure halves of the same fix
+    //! are locked in `bin/src/command/server.rs`
+    //! (`a_request_that_cannot_be_queued_is_accounted_as_a_failure`,
+    //! `closing_a_worker_only_fails_its_unanswered_requests`,
+    //! `a_bulk_scatter_larger_than_the_back_buffer_is_fully_delivered`):
+    //! `Server::queued_tasks` and `Server::in_flight` are private to that
+    //! module, so the accounting is not observable from here.
+    use std::sync::Arc;
+
+    use prost::Message as _;
+    use sozu_command_lib::{
+        channel::{Channel, delimiter_size},
+        config::ListenerBuilder,
+        proto::command::{
+            PathRule, PathRuleKind, Request, RequestHttpFrontend, Response, ResponseStatus,
+            RulePosition, SocketAddress, request::RequestType,
+        },
+    };
+
+    use super::{
+        LoadStateTask, LoadStaticConfigTask, PerEntryGatherer, Server, Timeout, bulk_replay_timeout,
+    };
+    use crate::command::{
+        server::{CommandHub, GatheringTask, PeerCred, parse_scatter_request_id},
+        sessions::ClientSession,
+    };
+    use mio::{Token, net::UnixListener};
+    use sozu_command_lib::config::Config;
+    use std::collections::BTreeMap;
+
+    fn create_test_hub() -> (CommandHub, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("Could not create temp dir");
+        let socket_path = dir.path().join("test.sock");
+        let unix_listener = UnixListener::bind(&socket_path).expect("Could not bind socket");
+        let hub = CommandHub::new(unix_listener, Config::default(), "sozu".to_owned())
+            .expect("Could not create command hub");
+        // The TempDir is returned so the socket outlives the hub.
+        (hub, dir)
+    }
+
+    /// A minimal `Tree`-positioned frontend add for `hostname` — same fixture
+    /// shape as `frontend_validation_tests`, valid in every respect.
+    fn frontend(hostname: &str, port: u16) -> RequestHttpFrontend {
+        RequestHttpFrontend {
+            cluster_id: Some("cluster".to_owned()),
+            address: SocketAddress::new_v4(127, 0, 0, 1, port),
+            hostname: hostname.to_owned(),
+            path: PathRule {
+                kind: PathRuleKind::Prefix as i32,
+                value: "/".to_owned(),
+            },
+            method: None,
+            position: RulePosition::Tree as i32,
+            tags: BTreeMap::new(),
+            redirect: None,
+            redirect_scheme: None,
+            redirect_template: None,
+            rewrite_host: None,
+            rewrite_path: None,
+            rewrite_port: None,
+            required_auth: None,
+            headers: Vec::new(),
+            hsts: None,
+        }
+    }
+
+    /// One entry of a fan-out: which scatter `request_id` carried it, the
+    /// request itself, how many workers it was scattered to, and how many
+    /// answered `Ok` / `Failure`.
+    struct Fanout {
+        request_id: usize,
+        request: RequestType,
+        expected: usize,
+        ok: usize,
+        errors: usize,
+    }
+
+    /// Build the gatherer state a bulk fan-out would have left behind, through
+    /// the production [`Gatherer`] API: `on_scatter` for what was asked, then
+    /// one real `WorkerResponse` per answer carrying the very id
+    /// `Server::scatter_on` builds. Hand-filling the counters would let the
+    /// fixture drift from the accounting it is meant to lock.
+    fn fan_out(server: &mut Server, entries: Vec<Fanout>) -> PerEntryGatherer {
+        use crate::command::server::Gatherer;
+        use sozu_command_lib::proto::command::WorkerResponse;
+
+        let mut gatherer = PerEntryGatherer::default();
+        for fanout in entries {
+            assert!(
+                fanout.ok + fanout.errors <= fanout.expected,
+                "a fan-out cannot gather more answers than it expects"
+            );
+            let content = Request::from(fanout.request);
+            gatherer.on_scatter(fanout.request_id, fanout.expected, &content);
+            let statuses = std::iter::repeat_n(ResponseStatus::Ok, fanout.ok)
+                .chain(std::iter::repeat_n(ResponseStatus::Failure, fanout.errors));
+            for (worker_id, status) in statuses.enumerate() {
+                let worker_id = worker_id as u32;
+                let response = WorkerResponse {
+                    id: format!("{}-0-{}", worker_id, fanout.request_id),
+                    status: status.into(),
+                    message: String::from("rejected by the worker"),
+                    content: None,
+                };
+                gatherer.on_message(server, &mut None, worker_id, response);
+            }
+        }
+        gatherer
+    }
+
+    type ClientPair = (ClientSession, Channel<Request, Response>);
+
+    fn test_client() -> ClientPair {
+        let (client_channel, peer) =
+            Channel::<Response, Request>::generate_nonblocking(4096, 40960)
+                .expect("could not create a channel pair");
+        let client = ClientSession::new(
+            client_channel,
+            0,
+            Token(1),
+            PeerCred {
+                uid: None,
+                gid: None,
+                pid: None,
+            },
+            None,
+            None,
+            Arc::from("test.sock"),
+        );
+        (client, peer)
+    }
+
+    /// Decode every framed `Response` queued on a client's back buffer: a
+    /// nonblocking `write_message` only fills that buffer (the event loop is
+    /// what flushes it), so this is where `finish_ok` / `finish_failure` land.
+    fn queued_responses(client: &ClientSession) -> Vec<Response> {
+        let data = client.channel.back_buf.data();
+        let delimiter = delimiter_size();
+        let mut responses = vec![];
+        let mut offset = 0usize;
+        while offset + delimiter <= data.len() {
+            let mut length = [0u8; std::mem::size_of::<usize>()];
+            length.copy_from_slice(&data[offset..offset + delimiter]);
+            let frame_len = usize::from_le_bytes(length);
+            assert!(
+                frame_len >= delimiter && offset + frame_len <= data.len(),
+                "the client back buffer must hold whole frames"
+            );
+            responses.push(
+                Response::decode(&data[offset + delimiter..offset + frame_len])
+                    .expect("a queued client response must decode"),
+            );
+            offset += frame_len;
+        }
+        responses
+    }
+
+    #[test]
+    fn an_entry_no_worker_acknowledged_is_reverted_while_an_acknowledged_one_stays() {
+        let (mut hub, _dir) = create_test_hub();
+        let rejected = RequestType::AddHttpFrontend(frontend("rejected.example.com", 8080));
+        let partially_accepted =
+            RequestType::AddHttpFrontend(frontend("accepted.example.com", 8080));
+        for request in [&rejected, &partially_accepted] {
+            hub.server
+                .state
+                .dispatch(&request.clone().into())
+                .expect("ConfigState records the frontend");
+        }
+        assert_eq!(
+            hub.server.state.count_frontends(),
+            2,
+            "both replayed frontends must start in the main-process state"
+        );
+
+        // Entry 1: every worker refused it. Entry 2: one worker applied it —
+        // `ok > 0` is the safety bound, it is never reverted.
+        let task = LoadStateTask {
+            client_token: None,
+            gatherer: fan_out(
+                &mut hub.server,
+                vec![
+                    Fanout {
+                        request_id: 1,
+                        request: rejected,
+                        expected: 3,
+                        ok: 0,
+                        errors: 3,
+                    },
+                    Fanout {
+                        request_id: 2,
+                        request: partially_accepted,
+                        expected: 3,
+                        ok: 1,
+                        errors: 2,
+                    },
+                ],
+            ),
+            path: "/tmp/replayed.state".to_owned(),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut None, false);
+
+        let hostnames: Vec<&str> = hub
+            .server
+            .state
+            .http_fronts
+            .values()
+            .map(|front| front.hostname.as_str())
+            .collect();
+        assert_eq!(
+            hostnames,
+            vec!["accepted.example.com"],
+            "only the entry no worker acknowledged must be reverted"
+        );
+        assert_eq!(hub.server.state.count_frontends(), 1);
+    }
+
+    #[test]
+    fn a_timed_out_replay_reverts_the_unacknowledged_entry_and_reports_failure() {
+        let (mut hub, _dir) = create_test_hub();
+        let unanswered = RequestType::AddHttpFrontend(frontend("silent.example.com", 8080));
+        hub.server
+            .state
+            .dispatch(&unanswered.clone().into())
+            .expect("ConfigState records the frontend");
+
+        let (mut client, _peer) = test_client();
+        // The incident shape: the deadline fired with not one answer for this
+        // entry — a worker killed mid-replay answers nothing at all, so
+        // `errors` alone can never express "the fleet never took it".
+        let task = LoadStateTask {
+            client_token: Some(client.token),
+            gatherer: fan_out(
+                &mut hub.server,
+                vec![Fanout {
+                    request_id: 1,
+                    request: unanswered,
+                    expected: 2,
+                    ok: 0,
+                    errors: 0,
+                }],
+            ),
+            path: "/tmp/replayed.state".to_owned(),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut Some(&mut client), true);
+
+        assert_eq!(
+            hub.server.state.count_frontends(),
+            0,
+            "a replay that timed out with zero acknowledgements must revert the entry"
+        );
+        let responses = queued_responses(&client);
+        let last = responses
+            .last()
+            .expect("the client must be answered exactly once");
+        assert_eq!(
+            last.status,
+            ResponseStatus::Failure as i32,
+            "a timed-out replay must be reported as a failure, never as a success: {last:?}"
+        );
+        assert!(
+            last.message.contains("timed out: true"),
+            "the failure must name the deadline: {}",
+            last.message
+        );
+    }
+
+    #[test]
+    fn per_entry_attribution_reverts_only_the_rejected_entry() {
+        let (mut hub, _dir) = create_test_hub();
+        let listener = |port: u16| {
+            RequestType::AddHttpListener(
+                ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, port))
+                    .to_http(None)
+                    .expect("default HTTP listener config"),
+            )
+        };
+        let rejected = listener(8081);
+        let accepted = listener(8082);
+        for request in [&rejected, &accepted] {
+            hub.server
+                .state
+                .dispatch(&request.clone().into())
+                .expect("ConfigState records the listener");
+        }
+        assert_eq!(hub.server.state.list_listeners().http_listeners.len(), 2);
+
+        // Both entries are on the SAME task and the same fleet-wide tally
+        // (3 ok, 3 errors): only the per-entry breakdown can tell them apart.
+        let task = LoadStateTask {
+            client_token: None,
+            gatherer: fan_out(
+                &mut hub.server,
+                vec![
+                    Fanout {
+                        request_id: 1,
+                        request: rejected,
+                        expected: 3,
+                        ok: 0,
+                        errors: 3,
+                    },
+                    Fanout {
+                        request_id: 2,
+                        request: accepted,
+                        expected: 3,
+                        ok: 3,
+                        errors: 0,
+                    },
+                ],
+            ),
+            path: "/tmp/replayed.state".to_owned(),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut None, false);
+
+        let listeners = hub.server.state.list_listeners();
+        assert_eq!(
+            listeners.http_listeners.len(),
+            1,
+            "exactly the unanimously rejected listener must be reverted"
+        );
+        assert!(
+            listeners.http_listeners.contains_key("127.0.0.1:8082"),
+            "the accepted listener must survive: {:?}",
+            listeners.http_listeners.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_static_config_reload_reverts_an_unacknowledged_entry_too() {
+        let (mut hub, _dir) = create_test_hub();
+        let rejected = RequestType::AddHttpsFrontend(frontend("rejected.example.com", 8443));
+        hub.server
+            .state
+            .dispatch(&rejected.clone().into())
+            .expect("ConfigState records the frontend");
+
+        let task = LoadStaticConfigTask {
+            client_token: None,
+            gatherer: fan_out(
+                &mut hub.server,
+                vec![Fanout {
+                    request_id: 0,
+                    request: rejected,
+                    expected: 2,
+                    ok: 0,
+                    errors: 2,
+                }],
+            ),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut None, false);
+
+        assert_eq!(
+            hub.server.state.count_frontends(),
+            0,
+            "the reload path must revert an entry no worker acknowledged, like the replay path"
+        );
+    }
+
+    #[test]
+    fn only_scatter_built_response_ids_are_attributed() {
+        // `scatter_on` builds exactly `{worker_id}-{task_id}-{request_id}`.
+        assert_eq!(parse_scatter_request_id("2-7-42"), Some((2, 7, 42)));
+        // Every other producer on the same channel must parse to None rather
+        // than be attributed to some entry: `launch_new_worker`'s initial
+        // status probe, and anything with a name-shaped prefix.
+        for foreign in [
+            "INITIAL-STATUS-0",
+            "AddHttpFrontend-2-7-42",
+            "Status",
+            "2-7",
+            "2-7-42-1",
+        ] {
+            assert_eq!(
+                parse_scatter_request_id(foreign),
+                None,
+                "an id that was not built by scatter_on must not be attributed: {foreign}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_entry_tallies_follow_the_scatter_request_ids() {
+        use crate::command::server::Gatherer;
+        use sozu_command_lib::proto::command::WorkerResponse;
+
+        let (mut hub, _dir) = create_test_hub();
+        let mut per_entry = PerEntryGatherer::default();
+        let first = Request::from(RequestType::AddHttpFrontend(frontend(
+            "a.example.com",
+            8080,
+        )));
+        let second = Request::from(RequestType::AddHttpFrontend(frontend(
+            "b.example.com",
+            8080,
+        )));
+        per_entry.on_scatter(1, 2, &first);
+        per_entry.on_scatter(2, 2, &second);
+
+        let answer = |id: &str, status: ResponseStatus| WorkerResponse {
+            id: id.to_owned(),
+            status: status.into(),
+            message: String::new(),
+            content: None,
+        };
+        // Entry 1 rejected by both workers, entry 2 accepted by both.
+        for (id, status) in [
+            ("0-3-1", ResponseStatus::Failure),
+            ("1-3-1", ResponseStatus::Failure),
+            ("0-3-2", ResponseStatus::Ok),
+            ("1-3-2", ResponseStatus::Ok),
+        ] {
+            per_entry.on_message(&mut hub.server, &mut None, 0, answer(id, status));
+        }
+
+        assert!(
+            per_entry.has_finished(),
+            "four answers for four expected responses must finish the task"
+        );
+        assert_eq!(
+            (per_entry.entries[&1].ok, per_entry.entries[&1].errors),
+            (0, 2)
+        );
+        assert_eq!(
+            (per_entry.entries[&2].ok, per_entry.entries[&2].errors),
+            (2, 0)
+        );
+        assert!(
+            per_entry.entries[&1].rollback.is_some(),
+            "an AddHttpFrontend entry must carry its inverse"
+        );
+    }
+
+    #[test]
+    fn a_bulk_replay_arms_a_bounded_deadline() {
+        // `Timeout::None` is what hung `sozu state load`: the task ended only
+        // when every expected worker answered, and an answer that never comes
+        // (a killed worker, a request that could not be queued) never ended it.
+        let small = bulk_replay_timeout(10, 0);
+        let large = bulk_replay_timeout(10, 100_000);
+        let (small, large) = match (small, large) {
+            (Timeout::Custom(small), Timeout::Custom(large)) => (small, large),
+            _ => panic!("a bulk replay must arm a bounded, custom deadline"),
+        };
+        assert_eq!(
+            small,
+            std::time::Duration::from_secs(10),
+            "an empty replay gets exactly one worker_timeout of slack"
+        );
+        assert_eq!(
+            large,
+            std::time::Duration::from_secs(100),
+            "a huge replay is capped at 10 x worker_timeout"
+        );
+        assert!(
+            small < large,
+            "the deadline must scale with the number of scattered entries"
+        );
+        // `Config::default()` leaves worker_timeout at 0; a zero deadline would
+        // expire the task before any worker could answer.
+        assert!(
+            matches!(bulk_replay_timeout(0, 0), Timeout::Custom(d) if d >= std::time::Duration::from_secs(1)),
+            "a zero worker_timeout must not produce a zero deadline"
         );
     }
 }

@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+### 🐛 Fixed
+
+- **`fix(command)`: roll back replayed state entries no worker acknowledged, and stop the replay
+  from hanging.** `LoadState` (`sozu state load`) and `ReloadConfiguration` scatter every entry of
+  the file onto a single task and used to judge the whole batch by one fleet-wide `ok`/`errors`
+  tally, with no rollback at all. An entry the main process accepted but every worker rejected — a
+  frontend on an address with no listener, a certificate a worker refuses — therefore stayed in the
+  master's `ConfigState`, was written straight back out by the next `SaveState`, and was re-injected
+  on every later replay. Both paths now gather per entry: each one is attributed by the scatter id
+  the master embeds in its per-worker requests, judged by the same `should_rollback_fanout`
+  predicate the live single-request path uses, and reverted on its own with the inverse computed at
+  scatter time. An entry at least one worker acknowledged is still never reverted. This closes the
+  first of the two replay holes left open by
+  [#1301](https://github.com/sozu-proxy/sozu/issues/1301) /
+  [#1314](https://github.com/sozu-proxy/sozu/issues/1314), reported as
+  [#1313](https://github.com/sozu-proxy/sozu/issues/1313).
+
+  The same report's second symptom — `sozu state load` returning nothing at all on a large state
+  file — is fixed with it. Three accounting holes could leave `ok + errors` permanently short of
+  `expected_responses`, and both load paths scattered with `Timeout::None`, so the task and the
+  client waiting on it never ended: a request that could not be queued on a worker channel was
+  logged and dropped while still being counted as expected; a worker closed with requests in flight
+  answered nothing and decremented nothing; and a bulk sender that filled a worker's back buffer
+  past `max_buffer_size` had its entries refused frame by frame. Undeliverable requests and the
+  requests still in flight on a closing worker are now accounted as `Failure`s (which also makes the
+  live `WorkerTask` rollback reachable for them) — a request a worker already answered is retired
+  from the in-flight map immediately, so a worker that answers and then dies no longer turns a
+  successful replay into a failed one. A bulk sender parks what does not fit in a per-worker queue
+  and drains it, in order, from the event loop's writability path instead of dropping the entry: the
+  supervisor never blocks on a worker socket, so clients, workers and task deadlines keep being
+  served while a large replay is on the wire. Both load paths arm a bounded deadline — one
+  `worker_timeout` plus 10 ms per scattered entry, capped at ten `worker_timeout`s — reported to the
+  client as a failure, never as a success. The `max_command_buffer_size` ceiling is unchanged.
+
+  `LoadState`'s completion audit line gains a `reverted:<n>` count in its `target` and an
+  `error_code` (`worker_timeout` / `worker_failure`) on failure.
+
 ## 2.2.1 - 2026-08-28
 
 Patch release: the main process validates listeners and HTTP/HTTPS
