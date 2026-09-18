@@ -863,7 +863,7 @@ impl UdpProxy {
                     session.borrow_mut().close_all_flows(now);
                 }
                 self.listener_sessions.clear();
-                let listeners: HashMap<_, _> = self.listeners.drain().collect();
+                let listeners = std::mem::take(&mut self.listeners);
                 for l in listeners.values() {
                     l.borrow_mut()
                         .socket
@@ -882,8 +882,7 @@ impl UdpProxy {
                     session.borrow_mut().close_all_flows(now);
                 }
                 self.listener_sessions.clear();
-                let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
-                for (_, l) in listeners.drain() {
+                for (_, l) in std::mem::take(&mut self.listeners) {
                     l.borrow_mut()
                         .socket
                         .take()
@@ -1302,7 +1301,32 @@ impl UdpListenerSession {
         // unbounded here.
         let upstream_token = {
             let mut s = self.sessions.borrow_mut();
-            let listener_session = s.slab[self.listener_token.0].clone();
+            // The listener token indexes a slab slot this session does not
+            // own: `notify_deactivate_listener` frees it (`slab.remove`)
+            // without this session ever being told. Indexing a freed key
+            // panics the whole worker, so read it fallibly and shed the flow
+            // instead — an upstream socket registered under a slot nothing
+            // can demux back is unusable anyway.
+            let Some(listener_session) = s.slab.get(self.listener_token.0).cloned() else {
+                drop(s);
+                error!(
+                    "{} listener token {:?} is no longer in the slab; shedding flow {}",
+                    log_context!(self),
+                    self.listener_token,
+                    flow
+                );
+                // No `udp.flows.shed`: that counter documents new flows
+                // dropped at the `max_flows` cap or under fd pressure
+                // (doc/configure.md), which this is not. Same choice as the
+                // registration-failure path just below, which also aborts
+                // without touching it. Like it, abort the flow the manager
+                // already counted so its `max_flows` slot frees now
+                // (FlowEvicted balances the gauge).
+                self.manager
+                    .borrow_mut()
+                    .abort_flow(flow, now, CloseReason::Aborted);
+                return;
+            };
             let entry = s.slab.vacant_entry();
             let token = Token(entry.key());
             entry.insert(listener_session);
@@ -1994,5 +2018,76 @@ mod tests {
         assert!(emptied);
         assert!(q.is_empty());
         assert!(sock.consumed.borrow().is_empty());
+    }
+
+    /// `on_open_upstream` clones the listener session out of the slab to
+    /// register the new flow's upstream socket under a second token (the
+    /// multi-token pattern). That slot belongs to the SERVER, not to this
+    /// session: `notify_deactivate_listener` frees it with `slab.remove` and
+    /// tells the session nothing. Indexing a freed slab key panics, and this
+    /// one runs on the datagram path of a listener the operator just touched.
+    ///
+    /// No datagram sequence reaches the pairing on its own -- `Server::ready`
+    /// will not dispatch to a session whose slab entry is gone, so the flow
+    /// that would call this never starts -- which is exactly why the slot is
+    /// read fallibly rather than trusted: nothing else re-validates
+    /// `listener_token` for the whole life of the session. The state is
+    /// synthesized here directly.
+    ///
+    /// To SEE THIS RED: restore `s.slab[self.listener_token.0].clone()` in
+    /// `on_open_upstream` -- this test then panics with "invalid key".
+    #[test]
+    fn opening_an_upstream_without_a_listener_slab_entry_sheds_the_flow() {
+        use crate::testing::{ServerParts, prebuild_server, provide_port};
+
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+
+        let address =
+            sozu_command::proto::command::SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = sozu_command::config::ListenerBuilder::new_udp(address)
+            .to_udp(None)
+            .expect("could not build a UdpListenerConfig for the test");
+
+        let listener_token = {
+            let mut session_manager = sessions.borrow_mut();
+            let entry = session_manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::UDPListen,
+            })));
+            token
+        };
+
+        let mut proxy = UdpProxy::new(registry, sessions.clone(), pool, backends, 16, 16384);
+        proxy
+            .add_listener(config, listener_token)
+            .expect("could not add the test UDP listener");
+        proxy
+            .activate_listener(&address.into(), None)
+            .expect("could not activate the test UDP listener");
+        let session = proxy
+            .build_session(listener_token)
+            .expect("could not build the test UDP listener session");
+
+        // The deactivate that frees the slot behind the session's back.
+        sessions.borrow_mut().slab.remove(listener_token.0);
+
+        let slab_len = sessions.borrow().slab.len();
+        session.borrow_mut().on_open_upstream(
+            0,
+            SocketAddr::from(([127, 0, 0, 1], provide_port())),
+            Instant::now(),
+        );
+        assert_eq!(
+            sessions.borrow().slab.len(),
+            slab_len,
+            "a shed flow must not leave an upstream slab slot behind"
+        );
     }
 }

@@ -1267,10 +1267,23 @@ impl TcpSession {
     /// stall until an unrelated readiness event re-entered `ready_inner`.
     ///
     /// A no-op whenever `back_connected() != NotConnected` (already
-    /// attempted, or backend already up) or the state is a NOT-YET-ROUTED
+    /// attempted, or backend already up), the state is a NOT-YET-ROUTED
     /// `SniPreread` (the cluster -- and therefore the backend to dial -- is
-    /// unknown until `SniPrereadCore` decides), so this changes nothing for
-    /// any pre-existing state/path.
+    /// unknown until `SniPrereadCore` decides), or the state is still
+    /// `ExpectProxyProtocol` (see below), so this changes nothing for any
+    /// other pre-existing state/path.
+    ///
+    /// `ExpectProxyProtocol` has NO backend side at all: `back_readiness`
+    /// returns `None` for it and `set_back_socket` panics outright ("We
+    /// should not set the back socket for the expect proxy protocol"). The
+    /// backend is dialed from the `Pipe` that `upgrade_expect` installs once
+    /// the inbound PROXY header has been parsed -- the same `ready()` pass
+    /// re-enters `ready_inner` after the upgrade, so nothing is deferred
+    /// beyond the header. Without this arm the top-of-`ready_inner` connect
+    /// gate fired on the FIRST readiness event of a freshly accepted socket
+    /// (the WRITABLE epoll reports before the client has sent a byte) and
+    /// drove `connect_to_backend` straight into that panic, killing the
+    /// worker and every other session on it.
     fn attempt_backend_connect_if_needed(
         &mut self,
         session: &Rc<RefCell<dyn ProxySession>>,
@@ -1279,6 +1292,9 @@ impl TcpSession {
             return None;
         }
         if matches!(&self.state, TcpStateMachine::SniPreread(preread) if !preread.is_routed()) {
+            return None;
+        }
+        if matches!(&self.state, TcpStateMachine::ExpectProxyProtocol(_)) {
             return None;
         }
 
@@ -1307,7 +1323,24 @@ impl TcpSession {
 
         let back_connected = self.back_connected();
         if back_connected.is_connecting() {
-            if self.back_readiness().unwrap().event.is_hup() && !self.test_back_socket() {
+            // A `Connecting` backend always carries a backend readiness:
+            // `connect_to_backend` is the only writer of that status, and it
+            // never runs for the two states `back_readiness` has none for
+            // (`ExpectProxyProtocol`, guarded in
+            // `attempt_backend_connect_if_needed`; `FailedUpgrade`, which
+            // `close()` short-circuits at its `state.failed()` gate). Read it
+            // once instead of unwrapping twice, and treat the impossible
+            // `None` as the broken invariant it is: a backend handshake with
+            // no readiness slot can never complete, so close rather than
+            // panic the worker.
+            let Some(back_event) = self.back_readiness().map(|readiness| readiness.event) else {
+                error!(
+                    "{} backend is connecting but the session state carries no backend readiness, closing",
+                    log_context!(self)
+                );
+                return SessionResult::Close;
+            };
+            if back_event.is_hup() && !self.test_back_socket() {
                 //retry connecting the backend
                 debug!(
                     "{} error connecting to backend, trying again",
@@ -1339,7 +1372,7 @@ impl TcpSession {
                 if let Some(state_result) = handle_connection_result(connection_result) {
                     return state_result;
                 }
-            } else if self.back_readiness().unwrap().event != Ready::EMPTY {
+            } else if back_event != Ready::EMPTY {
                 self.connection_attempt = 0;
                 self.set_back_connected(BackendConnectionStatus::Connected);
             }
@@ -2821,7 +2854,7 @@ impl ProxyConfiguration for TcpProxy {
                     log_module_context!(),
                     message.id
                 );
-                let listeners: HashMap<_, _> = self.listeners.drain().collect();
+                let listeners = std::mem::take(&mut self.listeners);
                 for l in listeners.values() {
                     l.borrow_mut()
                         .listener
@@ -2832,8 +2865,7 @@ impl ProxyConfiguration for TcpProxy {
             }
             RequestType::HardStop(_) => {
                 info!("{} {} hard shutdown", log_module_context!(), message.id);
-                let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
-                for (_, l) in listeners.drain() {
+                for (_, l) in std::mem::take(&mut self.listeners) {
                     l.borrow_mut()
                         .listener
                         .take()
@@ -4815,5 +4847,260 @@ mod sni_routing_tests {
         );
 
         drop(client);
+    }
+
+    /// A complete PROXY-v2 `PROXY` command header for IPv4, the exact shape
+    /// `ExpectProxyProtocol::readable` accepts (28 bytes: 12-byte magic,
+    /// version+command, family, address-block length, then the two addresses
+    /// and ports).
+    fn proxy_protocol_v2_ipv4_header() -> [u8; 28] {
+        [
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54,
+            0x0A, // PROXY-v2 magic
+            0x21, // version 2, command PROXY
+            0x11, // AF_INET over STREAM
+            0x00, 0x0C, // address block length = 12
+            127, 0, 0, 1, // source address
+            127, 0, 0, 1, // destination address
+            0x1F, 0x90, // source port 8080
+            0x10, 0x68, // destination port 4200
+        ]
+    }
+
+    /// A live `ExpectHeader` session plus everything that must outlive it:
+    /// dropping either listener would break the connect the tests drive.
+    struct ExpectProxyFixture {
+        session: Rc<RefCell<TcpSession>>,
+        /// The same session, type-erased -- `ready()` takes the handle the
+        /// server dispatches with, and `connect_to_backend` inserts a clone
+        /// of it under the backend token.
+        proxy_session: Rc<RefCell<dyn ProxySession>>,
+        frontend_token: Token,
+        client: std::net::TcpStream,
+        _frontend_listener: std::net::TcpListener,
+        _backend_listener: std::net::TcpListener,
+    }
+
+    /// Build a session for a TCP cluster configured with `expect_proxy = true`
+    /// (`ProxyProtocolConfig::ExpectHeader`), wired to a real bound backend and a real accepted
+    /// frontend socket, and registered in the slab exactly like
+    /// `create_session` does (the frontend slot is reserved BEFORE the
+    /// session exists, so `connect_to_backend`'s backend token lands on a
+    /// different key -- `set_back_token` asserts the two differ).
+    fn expect_proxy_fixture() -> ExpectProxyFixture {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+
+        let backend_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind test backend");
+        let backend_address = backend_listener
+            .local_addr()
+            .expect("test backend local addr");
+        backends.borrow_mut().add_backend(
+            "cluster-expect",
+            Backend::new("cluster-expect-1", backend_address, None, None, None),
+        );
+
+        let proxy = Rc::new(RefCell::new(TcpProxy::new(
+            registry,
+            sessions.clone(),
+            pool.clone(),
+            backends,
+        )));
+        let listener = Rc::new(RefCell::new(test_listener()));
+
+        let frontend_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind test frontend listener");
+        let frontend_address = frontend_listener
+            .local_addr()
+            .expect("test frontend local addr");
+        let client = std::net::TcpStream::connect(frontend_address).expect("connect test client");
+        let (frontend, _) = frontend_listener
+            .accept()
+            .expect("accept the client connection");
+        frontend
+            .set_nonblocking(true)
+            .expect("frontend socket nonblocking");
+
+        let (frontend_buffer, backend_buffer) = {
+            let mut pool = pool.borrow_mut();
+            (
+                pool.checkout().expect("front buffer checkout must succeed"),
+                pool.checkout().expect("back buffer checkout must succeed"),
+            )
+        };
+
+        let frontend_token = {
+            let mut session_manager = sessions.borrow_mut();
+            let entry = session_manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::TCPListen,
+            })));
+            token
+        };
+
+        let session = Rc::new(RefCell::new(TcpSession::new(
+            backend_buffer,
+            None,
+            Some("cluster-expect".to_owned()),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            frontend_buffer,
+            frontend_token,
+            listener,
+            Some(ProxyProtocolConfig::ExpectHeader),
+            proxy,
+            MioTcpStream::from_std(frontend),
+            Duration::from_millis(0),
+        )));
+        let proxy_session: Rc<RefCell<dyn ProxySession>> = session.clone();
+        sessions.borrow_mut().slab[frontend_token.0] = proxy_session.clone();
+
+        assert!(
+            matches!(
+                session.borrow().state,
+                TcpStateMachine::ExpectProxyProtocol(_)
+            ),
+            "an ExpectHeader cluster must start its session in the expect state"
+        );
+
+        ExpectProxyFixture {
+            session,
+            proxy_session,
+            frontend_token,
+            client,
+            _frontend_listener: frontend_listener,
+            _backend_listener: backend_listener,
+        }
+    }
+
+    /// A TCP cluster configured with `expect_proxy = true`
+    /// (`ProxyProtocolConfig::ExpectHeader`) starts its sessions
+    /// in [`TcpStateMachine::ExpectProxyProtocol`], a state with NO backend
+    /// side at all: `back_readiness` returns `None` and `set_back_socket`
+    /// panics outright ("We should not set the back socket for the expect
+    /// proxy protocol"). The backend may only be dialed once the inbound
+    /// header has been parsed and `upgrade_expect` has swapped in a `Pipe`.
+    ///
+    /// `ready_inner`'s top-of-function connect gate, however, fires on the
+    /// FIRST readiness event of a freshly accepted socket -- including the
+    /// WRITABLE epoll reports for a socket that has sent no byte yet. Without
+    /// the `ExpectProxyProtocol` arm of `attempt_backend_connect_if_needed`'s
+    /// guard, completing the TCP handshake was enough to drive
+    /// `connect_to_backend` into that panic, killing the worker and every
+    /// other session on it.
+    ///
+    /// To SEE THIS RED: delete the `TcpStateMachine::ExpectProxyProtocol(_)`
+    /// arm from `attempt_backend_connect_if_needed`'s early-return guard.
+    /// The first `ready()` below then panics inside `connect_to_backend` ->
+    /// `set_back_socket` before any assertion is reached.
+    #[test]
+    fn expect_proxy_dials_the_backend_only_after_the_header_is_parsed() {
+        use std::io::Write as _;
+
+        let mut fixture = expect_proxy_fixture();
+        let (session, proxy_session, frontend_token) = (
+            fixture.session.clone(),
+            fixture.proxy_session.clone(),
+            fixture.frontend_token,
+        );
+
+        // The handshake alone: epoll reports the accepted socket WRITABLE
+        // before the client has sent a single byte.
+        session
+            .borrow_mut()
+            .update_readiness(frontend_token, Ready::WRITABLE);
+        let closed = session.borrow_mut().ready(proxy_session.clone());
+        assert!(
+            !closed,
+            "a session still waiting for its PROXY header must stay open"
+        );
+        {
+            let session = session.borrow();
+            assert!(
+                matches!(session.state, TcpStateMachine::ExpectProxyProtocol(_)),
+                "the session must still be expecting its PROXY header"
+            );
+            assert_eq!(
+                session.back_connected(),
+                BackendConnectionStatus::NotConnected,
+                "no backend may be dialed while the PROXY header is still unparsed"
+            );
+            assert!(
+                session.backend_token.is_none(),
+                "no backend token may be wired while the PROXY header is still unparsed"
+            );
+        }
+
+        // The header lands: NOW the session upgrades out of the expect state
+        // and that very same connect gate is allowed to dial.
+        fixture
+            .client
+            .write_all(&proxy_protocol_v2_ipv4_header())
+            .expect("write the PROXY-v2 header");
+        fixture.client.flush().ok();
+        session
+            .borrow_mut()
+            .update_readiness(frontend_token, Ready::READABLE);
+        let _ = session.borrow_mut().ready(proxy_session.clone());
+        {
+            let session = session.borrow();
+            assert!(
+                !matches!(session.state, TcpStateMachine::ExpectProxyProtocol(_)),
+                "a parsed PROXY header must move the session out of the expect state"
+            );
+            assert_ne!(
+                session.back_connected(),
+                BackendConnectionStatus::NotConnected,
+                "the backend must be dialed once the header has been parsed"
+            );
+            assert!(
+                session.backend_token.is_some(),
+                "a dialed backend must own its backend token"
+            );
+        }
+    }
+
+    /// Structural safety for `ready_inner`'s `Connecting` branch: it reads
+    /// the backend readiness, which `back_readiness` has none of for
+    /// `ExpectProxyProtocol` (and `unreachable!`s on for `FailedUpgrade`).
+    ///
+    /// No input sequence reaches this pairing -- `connect_to_backend` is the
+    /// only writer of `Connecting` and can no longer run in the expect state
+    /// (see the test above), and no transition ever enters
+    /// `ExpectProxyProtocol` from another state -- so the state is
+    /// synthesized here directly. The branch must degrade to a logged close
+    /// rather than take the whole worker down with it: a backend handshake
+    /// with no readiness slot can never complete.
+    ///
+    /// To SEE THIS RED: restore either `self.back_readiness().unwrap()` in
+    /// `ready_inner`'s `Connecting` branch -- the `None` this test installs
+    /// then panics with "called `Option::unwrap()` on a `None` value".
+    #[test]
+    fn connecting_backend_without_readiness_closes_instead_of_panicking() {
+        let fixture = expect_proxy_fixture();
+        let (session, proxy_session) = (fixture.session.clone(), fixture.proxy_session.clone());
+
+        // The invariant break itself: `Connecting` while the state still has
+        // no backend side.
+        session.borrow_mut().backend_connected =
+            BackendConnectionStatus::Connecting(Instant::now());
+        assert!(
+            session.borrow_mut().back_readiness().is_none(),
+            "the expect state must have no backend readiness -- the premise of this test"
+        );
+
+        let closed = session.borrow_mut().ready(proxy_session.clone());
+        assert!(
+            closed,
+            "a connecting backend with no readiness slot must close the session"
+        );
     }
 }

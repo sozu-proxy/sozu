@@ -25,6 +25,33 @@
 
 ### 🐛 Fixed
 
+- **`fix(tcp)`: stop dialing the backend before the inbound PROXY header is parsed.**
+  A TCP cluster configured with `expect_proxy = true` (`ProxyProtocolConfig::ExpectHeader`) starts
+  its sessions in the expect state, which has no backend side at all: `set_back_socket` is a hard `panic!` there, and the
+  backend is meant to be dialed from the `Pipe` the upgrade installs once the header has been
+  parsed. `ready_inner`'s top-of-function connect gate, however, fires on the FIRST readiness event
+  of a freshly accepted socket — the WRITABLE epoll reports before the client has sent a single
+  byte — so merely completing the TCP handshake against such a cluster panicked the worker and
+  every other session on it. The connect gate now skips a session still expecting its header,
+  exactly as it already skipped a not-yet-routed SNI preread; the same `ready()` pass dials as soon
+  as the upgrade lands, so nothing is deferred beyond the header itself. The `Connecting` branch
+  that reads the backend readiness no longer unwraps it either: a connecting backend with no
+  readiness slot can never complete its handshake, so it closes the session instead of aborting the
+  worker. Both seen red.
+- **`fix(server)`: drop a deactivated listener's pending accept instead of indexing a freed slab
+  slot.** `ready()` queues a listen token in `accept_ready` whenever its listener is readable but
+  the worker cannot accept (buffer-pool backpressure), and only `accept()` — which never runs while
+  `can_accept` is false — takes it back out. `DeactivateListener` freed the listener's slab entry
+  without purging that queue, so the next deferred-accept pass indexed a vacant key and panicked
+  the worker; had the freed slot been reused meanwhile, that pass would instead have spun on the
+  same token forever, since `accept()` only removes a token on `WouldBlock`/error. The four
+  deactivate arms now purge the token, and the deferred pass reads the slab fallibly and drops a
+  listen token that no longer has a session. Seen red.
+- **`fix(udp)`: shed the flow instead of panicking when the listener's slab slot is gone.**
+  `on_open_upstream` cloned the listener session out of a slab slot the server owns and
+  `DeactivateListener` frees, with nothing re-validating that token for the whole life of the
+  session. It now reads the slot fallibly and aborts the flow — freeing its `max_flows` slot
+  immediately — rather than indexing a freed key and taking the worker down. Seen red.
 - **`fix(pipe)`: stop dropping the READABLE event on a pipe-full `splice(2)` EAGAIN.**
   On `Protocol::TCP` listeners built with the `splice` feature, `splice_backend_readable` and
   `splice_readable` treated every `EAGAIN` from `splice_in` as a drained socket and cleared the
