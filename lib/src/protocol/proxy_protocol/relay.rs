@@ -72,9 +72,11 @@ pub struct RelayProxyProtocol<Front: SocketHandler> {
     pub header_size: Option<usize>,
     pub request_id: Ulid,
     /// Parsed PROXY-v2 address pair captured from the inbound header.
-    /// `None` until the parser succeeds, or for headers that carry
-    /// `Command::Local` (no encapsulated addresses). The pipe phase
-    /// uses `ProxyAddr::source()` here to attribute the real client
+    /// `None` until the parser succeeds, and `Some(ProxyAddr::AfUnspec)` for a
+    /// header that declared AF_UNSPEC or carried `Command::Local` — whose
+    /// address block `parse_v2_header` discards per the HAProxy PROXY protocol
+    /// specification §2.2, whatever that block actually held on the wire. The
+    /// pipe phase uses `ProxyAddr::source()` here to attribute the real client
     /// instead of the upstream PROXY-emitter's `peer_addr`.
     pub addresses: Option<ProxyAddr>,
 }
@@ -281,8 +283,11 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
         // PROXY-v2 source over the TCP `peer_addr`. In Relay mode the
         // upstream emitter is also the TCP peer, so without this fix
         // the pipe phase records the LB / edge proxy instead of the
-        // real client. Falls back when the header was `Command::Local`
-        // (no addresses) or when the parser ran with `AddressFamily::Unspec`.
+        // real client. Falls back whenever `self.addresses` is `AfUnspec` —
+        // a header that declared AF_UNSPEC, or one that carried
+        // `Command::Local`, whose address block the parser discards per the
+        // HAProxy PROXY protocol specification §2.2 even when the wire block
+        // was populated.
         let addr = self
             .addresses
             .as_ref()
@@ -316,5 +321,147 @@ impl<Front: SocketHandler> RelayProxyProtocol<Front> {
         }
 
         pipe
+    }
+}
+
+#[cfg(test)]
+mod relay_test {
+    use std::{
+        io::Write,
+        net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream as StdTcpStream},
+        sync::{Arc, Barrier},
+        thread::{self, JoinHandle},
+        time::{Duration, Instant},
+    };
+
+    use mio::net::TcpListener;
+    use rusty_ulid::Ulid;
+
+    use super::*;
+    use crate::{
+        pool::Pool,
+        protocol::proxy_protocol::header::{Command, HeaderV2},
+    };
+
+    /// Address pair the upfront middleware encapsulates. Under
+    /// `Command::Local` these are the *forged* values a crafted peer would
+    /// send: the wire format lets a `LOCAL` header carry a fully populated
+    /// address block.
+    fn header_src() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(125, 25, 10, 1)), 8080)
+    }
+
+    fn header_dst() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200)
+    }
+
+    /// Drives `RelayProxyProtocol::readable` against a real loopback
+    /// connection carrying one PROXY-v2 header, and returns the source address
+    /// `into_pipe` would attribute to the client, i.e.
+    /// `self.addresses.as_ref().and_then(|pa| pa.source())` -- `None` meaning
+    /// `into_pipe` falls back to the front socket's `peer_addr`.
+    fn attributed_source_for(command: Command) -> Option<SocketAddr> {
+        setup_test_logger!();
+        let listener = TcpListener::bind("127.0.0.1:0".parse().expect("parse address error"))
+            .expect("could not bind the relay listener");
+        let relay_addr = listener
+            .local_addr()
+            .expect("the relay listener must expose its address");
+        let barrier = Arc::new(Barrier::new(2));
+
+        let upfront = start_upfront_middleware(relay_addr, barrier.clone(), command);
+
+        barrier.wait();
+        let session_stream = loop {
+            if let Ok((stream, _addr)) = listener.accept() {
+                break stream;
+            }
+        };
+
+        let mut pool = Pool::with_capacity(1, 2, 16_384);
+        let front_buf = pool.checkout().expect("the pool must hand out a buffer");
+        let mut relay =
+            RelayProxyProtocol::new(session_stream, Token(0), Ulid::generate(), None, front_buf);
+
+        let mut session_metrics = SessionMetrics::new(None);
+        // The front socket is non-blocking, so `readable` legitimately returns
+        // without progress until the peer's bytes land. The bound is wall-clock
+        // rather than an iteration count: a spin count turns a scheduling stall
+        // under load into a spurious failure, whereas this only fires if the
+        // header genuinely never arrives. It mirrors the 10s frontend timeout
+        // the expect state uses.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while relay.header_size.is_none() {
+            assert_eq!(
+                relay.readable(&mut session_metrics),
+                SessionResult::Continue,
+                "the relay must keep reading until a complete header is parsed"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the relay never parsed a complete PROXY-v2 header within 10s"
+            );
+        }
+
+        upfront.join().expect("should join");
+
+        relay.addresses.as_ref().and_then(ProxyAddr::source)
+    }
+
+    #[test]
+    fn a_proxy_command_header_attributes_the_encapsulated_source() {
+        assert_eq!(
+            attributed_source_for(Command::Proxy),
+            Some(header_src()),
+            "a PROXY header still carries the real client through to the pipe phase"
+        );
+    }
+
+    /// The PROXY protocol `LOCAL` command (ver/cmd `0x20`) describes a
+    /// connection the upstream proxy originated itself -- typically a health
+    /// check -- and the HAProxy PROXY protocol specification §2.2 requires the
+    /// receiver to discard its address block. Nothing on the wire pairs
+    /// `LOCAL` with `AF_UNSPEC`; only HAProxy's own emitter happens to. The
+    /// header written below is exactly what `HeaderV2::new(Command::Local, ..)`
+    /// emits: ver/cmd `0x20`, family `0x11`, and a populated 12-byte `AF_INET`
+    /// block.
+    ///
+    /// `into_pipe` prefers `self.addresses.source()` over the socket's
+    /// `peer_addr`, so before the fix that forged pair became the client
+    /// address in the access logs, in `X-Real-IP` and in the
+    /// `max_connections_per_ip` counters. The header bytes themselves are
+    /// still relayed verbatim to the backend either way -- `back_writable`
+    /// forwards the buffered prefix, it never re-serializes `addresses`.
+    ///
+    /// To SEE THIS RED: in `parse_v2_header`
+    /// (`lib/src/protocol/proxy_protocol/parser.rs`), replace the
+    /// `Command::Local => ProxyAddr::AfUnspec` arm of the `addr` binding with
+    /// `parsed_addr` -- this then yields `Some(125.25.10.1:8080)`.
+    #[test]
+    fn a_local_command_header_attributes_no_source_address() {
+        assert_eq!(
+            attributed_source_for(Command::Local),
+            None,
+            "a LOCAL header must attribute no source, so into_pipe falls back to peer_addr"
+        );
+    }
+
+    // Connect to the relay and send one proxy protocol header.
+    fn start_upfront_middleware(
+        relay_addr: SocketAddr,
+        barrier: Arc<Barrier>,
+        command: Command,
+    ) -> JoinHandle<()> {
+        thread::spawn(move || {
+            let proxy_protocol = HeaderV2::new(command, header_src(), header_dst()).into_bytes();
+
+            barrier.wait();
+            match StdTcpStream::connect(relay_addr) {
+                Ok(mut stream) => {
+                    stream.write_all(&proxy_protocol).unwrap();
+                }
+                Err(e) => panic!("could not connect to the relay: {e}"),
+            };
+        })
     }
 }

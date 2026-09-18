@@ -1097,6 +1097,68 @@ mod tests {
         }
     }
 
+    /// A PROXY-v2 `LOCAL` header (ver/cmd `0x20`) describes a connection the
+    /// upstream proxy originated itself; the HAProxy PROXY protocol
+    /// specification §2.2 requires its address block to be discarded. Nothing
+    /// on the wire forces `LOCAL` to be paired with `AF_UNSPEC`, so a crafted
+    /// peer can send `LOCAL` with a fully populated `AF_INET` block -- here the
+    /// very bytes `HeaderV2::new(Command::Local, ..)` emits (ver/cmd `0x20`,
+    /// family `0x11`, 12 address bytes).
+    ///
+    /// `on_bytes` used to hand `header.addr.source()` straight to
+    /// `Output::Routed`, and `TcpSession` takes that as the client
+    /// (`tcp.rs`: `proxy_source.or(self.frontend_address)`), so the forged
+    /// address reached the access logs, `X-Real-IP` and the
+    /// `max_connections_per_ip` counters. `proxy_source` must be `None` so the
+    /// session falls back to the real `peer_addr`.
+    ///
+    /// To SEE THIS RED: in `parse_v2_header`
+    /// (`lib/src/protocol/proxy_protocol/parser.rs`), replace the
+    /// `Command::Local => ProxyAddr::AfUnspec` arm of the `addr` binding with
+    /// `parsed_addr` -- `proxy_source` is then `Some(203.0.113.7:51234)`.
+    #[test]
+    fn proxy_v2_local_command_attributes_no_source() {
+        let mut routes = TrieNode::root();
+        routes.domain_insert(
+            b"example.com".to_vec(),
+            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+        );
+        let mut proxy_cfg = cfg(&routes);
+        proxy_cfg.inbound_proxy = true;
+
+        let forged_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 51234);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 443);
+        let proxy_header = HeaderV2::new(Command::Local, forged_src, dst).into_bytes();
+        // Same 28 bytes on the wire as the PROXY case: only the command nibble
+        // differs, so the framing assertions below stay meaningful.
+        assert_eq!(proxy_header.len(), 28);
+        assert_eq!(proxy_header[12], 0x20, "ver/cmd must be LOCAL");
+        assert_eq!(proxy_header[13], 0x11, "family must be AF_INET over STREAM");
+
+        let mut wire = proxy_header.clone();
+        wire.extend_from_slice(&hello_no_alpn("example.com"));
+
+        let mut core = SniPrereadCore::new();
+        match feed(&mut core, &proxy_cfg, &wire) {
+            Output::Routed {
+                cluster,
+                content_offset,
+                proxy_source,
+                ..
+            } => {
+                // Routing and framing are untouched: the header is still
+                // consumed whole, only its address block is dropped.
+                assert_eq!(cluster, "cluster-a");
+                assert_eq!(content_offset, proxy_header.len());
+                assert_eq!(
+                    proxy_source, None,
+                    "a LOCAL header must attribute no source, so TcpSession falls back to peer_addr"
+                );
+            }
+            other => panic!("expected Routed behind a PROXY-v2 LOCAL header, got {other:?}"),
+        }
+    }
+
     #[test]
     fn proxy_v2_prefix_drip_feed_needs_more_until_complete() {
         let mut routes = TrieNode::root();

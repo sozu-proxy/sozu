@@ -69,7 +69,10 @@ source_ip)` pairs. On session accept + cluster resolution:
 
 1. Resolve the source IP: PROXY-protocol header IP if present
    (`ExpectHeader` and `RelayHeader` modes both preserve the parsed
-   source through the pipe phase), else `peer_addr`.
+   source through the pipe phase), else `peer_addr`. A `LOCAL`-command
+   header carries no client identity: a TCP listener falls back to
+   `peer_addr`, an HTTP / HTTPS listener closes the session before it
+   ever reaches this step — see §3.6.
 2. Look up `count` for `(cluster_id, source_ip)`.
 3. Compare against `cluster.max_connections_per_ip.unwrap_or(global)`.
 4. If `count >= cap`, reject; else increment and proceed.
@@ -117,11 +120,59 @@ custom templates can opt into keep-alive by omitting the
 
 ### 3.6 Source IP selection
 
-| PROXY-protocol mode | Source IP used                                       |
-| ------------------- | ---------------------------------------------------- |
-| `ExpectHeader`      | Parsed from PP-v2                                    |
-| `RelayHeader`       | Parsed from PP-v2 (preserved through the pipe phase) |
-| No PROXY-protocol   | `peer_addr` (TCP-level)                              |
+| PROXY-protocol mode                  | Source IP used                                          |
+| ------------------------------------ | ------------------------------------------------------- |
+| `ExpectHeader`                       | Parsed from PP-v2                                       |
+| `RelayHeader`                        | Parsed from PP-v2 (preserved through the pipe phase)    |
+| PP-v2 `LOCAL`, TCP listener          | `peer_addr` (TCP-level) — address block discarded       |
+| PP-v2 `LOCAL`, HTTP / HTTPS listener | none — the session is closed before cluster resolution  |
+| No PROXY-protocol                    | `peer_addr` (TCP-level)                                 |
+
+The two `LOCAL` rows are a security property, not a convenience: the HAProxy PROXY
+protocol specification §2.2 says a `LOCAL` header (ver/cmd `0x20`) describes a
+connection the upstream proxy originated itself, typically a health check, and
+its address block must be ignored. The wire format does not require that block
+to be empty — only HAProxy's own emitter pairs `LOCAL` with `AF_UNSPEC` — so an
+attacker may send `LOCAL` with a fully populated `AF_INET` block. `parse_v2_header`
+discards it, otherwise any peer able to reach a PROXY-enabled listener could
+pick the IP its connections are counted against and evade
+`max_connections_per_ip` at will.
+
+Discarding yields `ProxyAddr::AfUnspec`, and the two listener families resolve
+that differently, which is why the table needs two `LOCAL` rows. The four TCP
+consumers all fall back to `peer_addr`, so the connection is still counted, just
+against the socket peer:
+
+- `TcpSession::effective_session_address` (`lib/src/tcp.rs:373`) — **this is the
+  function that resolves step 1 above for raw TCP**. It reads
+  `ExpectProxyProtocol::addresses` / `RelayProxyProtocol::addresses` and the
+  preread outcome directly, folds the raw socket peer over them with
+  `.or(self.frontend_address)` (`lib/src/tcp.rs:385`; `frontend_address =
+  socket.peer_addr().ok()`, `lib/src/tcp.rs:183` and `:305`), and is called from
+  the per-(cluster, source-IP) gate at `lib/src/tcp.rs:1638`.
+- `ExpectProxyProtocol::into_pipe`
+  (`lib/src/protocol/proxy_protocol/expect.rs:302`) and
+  `RelayProxyProtocol::into_pipe`
+  (`lib/src/protocol/proxy_protocol/relay.rs:294`) — they set
+  `Pipe::session_address`, which `effective_session_address` then returns for
+  the post-upgrade `Pipe` state.
+- the SNI preread's `proxy_source` (`lib/src/protocol/tcp_preread/mod.rs:284`,
+  resolved against the socket at `lib/src/tcp.rs:908`).
+
+The two HTTP consumers do not:
+`upgrade_expect` (`lib/src/http.rs:316`, `lib/src/https.rs:334`) needs both a
+source and a destination, `ProxyAddr::AfUnspec` yields neither
+(`lib/src/protocol/proxy_protocol/header.rs:303, 311`), so it returns `None` and
+`upgrade` reports `SessionIsToBeClosed` (`lib/src/http.rs:254`). An HTTP or
+HTTPS session that presents a `LOCAL` header is therefore closed at the expect
+stage and never reaches §3.2's counter at all.
+
+That close is not a regression for legitimate traffic: HAProxy pairs `LOCAL`
+with `AF_UNSPEC`, which already parsed to `ProxyAddr::AfUnspec`, so an HTTP or
+HTTPS session from a health-checking upstream already closed here before the
+change. What the discard alters is only the forged case — a `LOCAL` header
+carrying a populated address block — which used to upgrade with attacker-chosen
+addresses and now closes, which is the correct outcome.
 
 The ExpectHeader / RelayHeader paths were updated to be
 address-aware in this PR — both modes now carry the parsed source IP
