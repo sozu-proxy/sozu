@@ -69,7 +69,6 @@ use crate::{
     socket::{FrontRustls, server_bind},
     timer::TimeoutContainer,
     tls::MutexCertificateResolver,
-    util::UnwrapLog,
 };
 
 StateMachineBuilder! {
@@ -146,6 +145,35 @@ fn successful_tls_handshake_summary(sni: Option<&str>, alpn: Option<&str>) -> St
         sni.map(str::len),
         alpn.map(str::len),
     )
+}
+
+/// Render an SNI trie key as the `domain` of a [`CertificateSummary`].
+///
+/// Unreachable in practice: every key enters the trie as
+/// `String::into_bytes()` (`tls.rs` `add_certificate`/`remove_certificate`),
+/// so it is always valid UTF-8. `TrieNode`'s key type is `Vec<u8>` though, and
+/// a read-only certificate listing must degrade rather than abort the worker.
+///
+/// The degradation is not silent: `CertificateSummary::domain` is a protobuf
+/// `string`, so a non-UTF-8 name has no faithful rendering, and the U+FFFD
+/// substitutions mean the name handed to the operator will NOT match a later
+/// `RemoveCertificate` for that certificate. That is worth an `error!` rather
+/// than a quietly mangled row. The log carries byte counts only — never the
+/// key — to stay inside the redaction bound the `query_*` log tests assert.
+fn certificate_summary_domain(key: &[u8]) -> String {
+    match from_utf8(key) {
+        Ok(domain) => domain.to_owned(),
+        Err(error) => {
+            error!(
+                "{} certificate domain is not valid UTF-8; the reported name is lossy and will not \
+                 match a later RemoveCertificate, domain_bytes={} valid_up_to={}",
+                log_module_context!(),
+                key.len(),
+                error.valid_up_to(),
+            );
+            String::from_utf8_lossy(key).into_owned()
+        }
+    }
 }
 
 pub struct HttpsSession {
@@ -1866,7 +1894,7 @@ impl HttpsProxy {
     }
 
     pub fn soft_stop(&mut self) -> Result<(), ProxyError> {
-        let listeners: HashMap<_, _> = self.listeners.drain().collect();
+        let listeners = std::mem::take(&mut self.listeners);
         let mut socket_errors = vec![];
         for l in listeners.values() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
@@ -1889,7 +1917,7 @@ impl HttpsProxy {
     }
 
     pub fn hard_stop(&mut self) -> Result<(), ProxyError> {
-        let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
+        let mut listeners = std::mem::take(&mut self.listeners);
         let mut socket_errors = vec![];
         for (_, l) in listeners.drain() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
@@ -1912,28 +1940,36 @@ impl HttpsProxy {
     }
 
     pub fn query_all_certificates(&mut self) -> Result<Option<ResponseContent>, ProxyError> {
-        let certificates: Vec<CertificatesByAddress> = self
+        let certificates = self
             .listeners
             .values()
             .map(|listener| {
                 let owned = listener.borrow();
-                let resolver = unwrap_msg!(owned.resolver.0.lock());
+                // Same handling as the `add`/`remove`/`replace` siblings: a
+                // poisoned resolver is reported as `ProxyError::Lock`, never
+                // unwrapped. A read-only query must not be the one control-
+                // plane request that kills the worker.
+                let resolver = owned
+                    .resolver
+                    .0
+                    .lock()
+                    .map_err(|e| ProxyError::Lock(e.to_string()))?;
                 let certificate_summaries = resolver
                     .domains
                     .to_hashmap()
                     .drain()
                     .map(|(k, fingerprint)| CertificateSummary {
-                        domain: String::from_utf8(k).unwrap(),
+                        domain: certificate_summary_domain(&k),
                         fingerprint: fingerprint.to_string(),
                     })
                     .collect();
 
-                CertificatesByAddress {
+                Ok(CertificatesByAddress {
                     address: owned.address.into(),
                     certificate_summaries,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<CertificatesByAddress>, ProxyError>>()?;
 
         let listeners_count = certificates.len();
         let certificates_count = certificates
@@ -1957,26 +1993,32 @@ impl HttpsProxy {
         &mut self,
         domain: String,
     ) -> Result<Option<ResponseContent>, ProxyError> {
-        let certificates: Vec<CertificatesByAddress> = self
+        let certificates = self
             .listeners
             .values()
             .map(|listener| {
                 let owned = listener.borrow();
-                let resolver = unwrap_msg!(owned.resolver.0.lock());
+                // See `query_all_certificates`: lock like the
+                // `add`/`remove`/`replace` siblings do.
+                let resolver = owned
+                    .resolver
+                    .0
+                    .lock()
+                    .map_err(|e| ProxyError::Lock(e.to_string()))?;
                 let mut certificate_summaries = vec![];
 
                 if let Some((k, fingerprint)) = resolver.domain_lookup(domain.as_bytes(), true) {
                     certificate_summaries.push(CertificateSummary {
-                        domain: String::from_utf8(k.to_vec()).unwrap(),
+                        domain: certificate_summary_domain(k),
                         fingerprint: fingerprint.to_string(),
                     });
                 }
-                CertificatesByAddress {
+                Ok(CertificatesByAddress {
                     address: owned.address.into(),
                     certificate_summaries,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<CertificatesByAddress>, ProxyError>>()?;
 
         let listeners_count = certificates.len();
         let certificates_count = certificates
@@ -2834,6 +2876,107 @@ mod tests {
             })
             .expect("test certificate must be added");
         proxy
+    }
+
+    /// The two `query_*` paths take the resolver mutex with `unwrap_msg!`,
+    /// while every `add`/`remove`/`replace` sibling takes it with
+    /// `.lock().map_err(|e| ProxyError::Lock(e.to_string()))?`
+    /// (https.rs `add_certificate`/`remove_certificate`/`replace_certificate`).
+    /// That asymmetry is the finding: a poisoned resolver — any earlier panic
+    /// while the lock was held — turns a read-only `QueryCertificates`
+    /// control-plane request into a worker kill instead of an error response.
+    ///
+    /// To SEE THIS RED: put `unwrap_msg!(owned.resolver.0.lock())` back in
+    /// `query_all_certificates` and `query_certificate_for_domain` (restoring
+    /// the `util::UnwrapLog` import the removal made unused) — both calls
+    /// below then panic with `PoisonError` instead of returning
+    /// `ProxyError::Lock`.
+    #[test]
+    fn a_poisoned_resolver_fails_the_certificate_queries_instead_of_the_worker() {
+        let mut proxy = proxy_with_certificate_domain("lolcatho.st".to_owned());
+
+        let resolver = proxy
+            .listeners
+            .values()
+            .next()
+            .expect("the test proxy has one listener")
+            .borrow()
+            .resolver()
+            .clone();
+
+        // Poison the mutex exactly as a panic inside the worker would: hold
+        // the guard, unwind. `join` swallows the unwind so the test process
+        // survives to observe the poisoned state.
+        let poisoner = resolver.clone();
+        let unwound = std::thread::spawn(move || {
+            let _guard = poisoner.0.lock().expect("first lock is not poisoned");
+            panic!("simulated worker panic while holding the resolver lock");
+        })
+        .join();
+        assert!(unwound.is_err(), "the poisoning thread must have unwound");
+        assert!(
+            resolver.0.lock().is_err(),
+            "the resolver mutex must now be poisoned"
+        );
+
+        assert!(
+            matches!(proxy.query_all_certificates(), Err(ProxyError::Lock(_))),
+            "Certificates::All on a poisoned resolver must report a lock error"
+        );
+        assert!(
+            matches!(
+                proxy.query_certificate_for_domain("lolcatho.st".to_owned()),
+                Err(ProxyError::Lock(_))
+            ),
+            "Certificates::Domain on a poisoned resolver must report a lock error"
+        );
+    }
+
+    /// `String::from_utf8(trie_key).unwrap()` in `query_all_certificates` is a
+    /// second unconditional panic on a value the function does not own. The
+    /// control plane cannot currently reach it — `AddCertificate.names` is
+    /// `Vec<String>` and `tls.rs::add_certificate` inserts
+    /// `String::into_bytes()`, while `TrieNode::to_hashmap` clones the stored
+    /// key back verbatim — so this is an invariant, and the red below is BY
+    /// MUTATION of the trie: `TrieNode<Fingerprint>` is `pub` and its key type
+    /// is `Vec<u8>`, so the type permits what the control plane does not. A
+    /// certificate listing must not be able to kill the worker over a key it
+    /// merely echoes.
+    ///
+    /// To SEE THIS RED: put `String::from_utf8(k).unwrap()` back in
+    /// `query_all_certificates` — this test then panics with
+    /// `FromUtf8Error`.
+    #[test]
+    fn a_non_utf8_resolver_key_is_listed_lossily_not_panicked() {
+        let mut proxy = proxy_with_certificate_domain("lolcatho.st".to_owned());
+
+        let resolver = proxy
+            .listeners
+            .values()
+            .next()
+            .expect("the test proxy has one listener")
+            .borrow()
+            .resolver()
+            .clone();
+        {
+            let mut owned = resolver.0.lock().expect("resolver lock");
+            let inserted = owned
+                .domains
+                .insert(vec![0xff, 0xfe], Fingerprint(vec![0x01, 0x02]));
+            assert_ne!(
+                inserted,
+                crate::router::pattern_trie::InsertResult::Failed,
+                "the SNI trie must accept the non-UTF-8 key this test relies on"
+            );
+        }
+
+        let response = proxy
+            .query_all_certificates()
+            .expect("a non-UTF-8 trie key must not fail the query");
+        assert!(
+            response.is_some(),
+            "Certificates::All must still answer with a listing"
+        );
     }
 
     #[test]

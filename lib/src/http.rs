@@ -1190,7 +1190,7 @@ impl HttpProxy {
     }
 
     pub fn soft_stop(&mut self) -> Result<(), ProxyError> {
-        let listeners: HashMap<_, _> = self.listeners.drain().collect();
+        let listeners = std::mem::take(&mut self.listeners);
         let mut socket_errors = vec![];
         for l in listeners.values() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {
@@ -1213,7 +1213,7 @@ impl HttpProxy {
     }
 
     pub fn hard_stop(&mut self) -> Result<(), ProxyError> {
-        let mut listeners: HashMap<_, _> = self.listeners.drain().collect();
+        let mut listeners = std::mem::take(&mut self.listeners);
         let mut socket_errors = vec![];
         for (_, l) in listeners.drain() {
             if let Some(mut sock) = l.borrow_mut().listener.take() {

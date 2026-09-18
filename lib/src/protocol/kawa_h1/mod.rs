@@ -1254,10 +1254,15 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             self.context.backend_id.as_deref(),
             self.get_route(),
         );
-        // The answer engine only ever resolves to a template whose status line
-        // parsed as a 3-digit HTTP code (`Template::new` enforces it); a value
-        // outside `100..=999` here would mean a malformed template slipped
-        // through and the bytes on the wire would carry a bogus status.
+        // The answer engine can only resolve a template selected by a built-in
+        // code name ("301" … "507"), each pinned to its code by the
+        // `InvalidStatusCode` guard in `HttpAnswers::template`, or the bundled
+        // fallback — NOT because `Template::new` validates a range, which it
+        // deliberately does not (an answer under an unrecognised name takes
+        // the `status: None` arm and may carry any code, it is simply never
+        // selectable). A value outside `100..=999` here would mean that
+        // selection path was broken and the bytes on the wire would carry a
+        // bogus status.
         debug_assert!(
             (100..=999).contains(&resolved_status),
             "default answer must resolve to a 3-digit HTTP status, got {resolved_status}"
@@ -2523,15 +2528,14 @@ fn handle_connection_result(
 /// only carries `Some(status)` so the `else` branch is unnecessary here.
 fn save_http_status_metric(status: Option<u16>, context: LogContext) {
     if let Some(status) = status {
-        // Every status reaching this bucketer originates either from a parsed
-        // backend response status line or a validated answer template, both of
-        // which are 3-digit HTTP codes. A value outside `100..=999` would fall
-        // into the `STATUS_OTHER` catch-all below and signal a status that was
-        // never a real HTTP code — a logic bug upstream, not hostile traffic.
-        debug_assert!(
-            (100..=999).contains(&status),
-            "save_http_status_metric got a non-3-digit status: {status}"
-        );
+        // No precondition on the range: a status reaching this bucketer on the
+        // H1 path comes off the backend socket. kawa reads it with `take(3)`
+        // plus `str::parse::<u16>()` and applies no range check, so any three
+        // ASCII digits parse — `HTTP/1.1 000 …` yields `0`. Codes below 100
+        // are therefore wire-reachable, never a Sōzu-side logic bug, and the
+        // `STATUS_OTHER` catch-all below is what handles them. Asserting the
+        // range here would panic the worker on backend input in every debug,
+        // test, e2e and fuzz build (sozu#1279).
         match status {
             100..=199 => {
                 incr!(
@@ -2577,5 +2581,75 @@ fn save_http_status_metric(status: Option<u16>, context: LogContext) {
         if let Some(per_code) = crate::metrics::http_status_code_metric_name(status) {
             incr!(per_code, context.cluster_id, context.backend_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use kawa::Buffer;
+
+    use super::*;
+
+    /// A backend response status line is wire data, not a Sōzu-side invariant.
+    ///
+    /// kawa 0.7.1 reads the status with `take(3)` followed by
+    /// `str::parse::<u16>()` and applies no range check
+    /// (`kawa/src/protocol/h1/parser/primitives.rs:194-203`); the
+    /// `Kind::Response` arm stores the resulting `code` verbatim
+    /// (`.../h1/parser/mod.rs:249-258`). `"000".parse::<u16>()` is `Ok(0)`, so
+    /// a backend that answers `HTTP/1.1 000 …` drives `code == 0` through
+    /// [`HttpContext::on_response_headers`] into `context.status` and then into
+    /// [`super::save_http_status_metric`], which buckets it as
+    /// `http.status.other` — exactly what the catch-all arm is for.
+    ///
+    /// To SEE THIS RED: restore the deleted precondition at the top of
+    /// [`super::save_http_status_metric`],
+    /// `debug_assert!((100..=999).contains(&status), "save_http_status_metric
+    /// got a non-3-digit status: {status}")` — this test then panics with
+    /// `save_http_status_metric got a non-3-digit status: 0`, i.e. a panic on
+    /// network input in every debug, test, e2e and fuzz build (sozu#1279).
+    #[test]
+    fn a_backend_status_line_below_100_is_bucketed_not_asserted() {
+        const RESPONSE: &[u8] = b"HTTP/1.1 000 Nope\r\nContent-Length: 0\r\n\r\n";
+
+        let mut pool = Pool::with_capacity(1, 1, 4096);
+        let checkout = pool.checkout().expect("test buffer checkout");
+        let mut response_stream: GenericHttpStream =
+            kawa::Kawa::new(kawa::Kind::Response, Buffer::new(checkout));
+        let space = response_stream.storage.space();
+        space[..RESPONSE.len()].copy_from_slice(RESPONSE);
+        response_stream.storage.fill(RESPONSE.len());
+
+        let mut context = HttpContext::new(
+            Ulid::generate(),
+            Ulid::generate(),
+            Protocol::HTTP,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                54321,
+            )),
+            "SERVERID".to_owned(),
+            "Sozu-Id".to_owned(),
+            false,
+            false,
+        );
+
+        kawa::h1::parse(&mut response_stream, &mut context);
+
+        // Reachability: the value handed to the metric bucketer came off the
+        // wire through the real parser and the real response-header callback,
+        // not from a hand-written `Some(0)`.
+        assert_eq!(
+            context.status,
+            Some(0),
+            "kawa must surface the backend's out-of-range status verbatim"
+        );
+
+        // The call itself is the assertion: with the precondition in place
+        // this panics instead of incrementing `http.status.other`.
+        save_http_status_metric(context.status, context.log_context());
     }
 }

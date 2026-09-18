@@ -183,16 +183,18 @@ impl Template {
         } else {
             return Err(TemplateError::InvalidType);
         };
-        // Post (status validity): a template that reached `is_main_phase()`
-        // above carries a syntactically valid response status line. HTTP
-        // status codes are exactly 3 digits (RFC 9110 §15), so the parsed
-        // code is bounded to `100..=999`. Downstream `save_http_status_metric`
-        // buckets on this range; an out-of-band code would silently fall into
-        // the `STATUS_OTHER` bucket.
-        debug_assert!(
-            (100..=999).contains(&resolved_status),
-            "parsed template status must be a 3-digit HTTP code, got {resolved_status}"
-        );
+        // No post-condition on the range. A named template ("301", "302",
+        // "308", "400" … "507") is pinned by the `InvalidStatusCode` guard
+        // just above, but the `_ =>` arm of `HttpAnswers::template` passes
+        // `status: None`, so an answer under any other name skips that guard
+        // entirely — and both its name and its body come from the operator's
+        // `BTreeMap<String, String>`, over the command socket via a listener
+        // patch. kawa reads the status line with `take(3)` plus
+        // `str::parse::<u16>()` and applies no range check, so `HTTP/1.1 000 x`
+        // compiles to status `0`. Asserting the range here would panic the
+        // worker on a control-plane request in every debug, test, e2e and fuzz
+        // build. Such a code simply lands in `save_http_status_metric`'s
+        // `STATUS_OTHER` bucket, which is what that catch-all is for.
         let buf = kawa.storage.buffer();
         let mut blocks = VecDeque::new();
         let mut header_replacements = Vec::new();
@@ -1453,11 +1455,19 @@ impl HttpAnswers {
             .and_then(|answers| answers.get(name))
             .or_else(|| self.listener_answers.get(name))
             .unwrap_or(&self.fallback);
-        // Post (resolved status validity): the template we selected was
-        // validated to carry a 3-digit status at `Template::new` time; the
-        // lookup chain (per-cluster → listener → fallback) can never produce a
-        // template with an out-of-range status. The returned code feeds
-        // `self.context.status` and `save_http_status_metric`.
+        // Post (resolved status validity). NOT inherited from `Template::new`,
+        // which deliberately validates no range: an answer compiled under an
+        // unrecognised name goes through the `_ =>` arm with `status: None`
+        // and may legitimately carry any code. The invariant here comes from
+        // the *selection* path instead — `name` above is derived from the
+        // `DefaultAnswer` variant, so the lookup chain (per-cluster → listener
+        // → fallback) can only ever resolve a built-in code name ("301" …
+        // "507"), each pinned by the `InvalidStatusCode` guard in
+        // `Self::template`, or the bundled `fallback`. An operator's custom
+        // answer is compiled into the map but is never selectable. Locked by
+        // `an_unrecognised_custom_answer_may_carry_an_out_of_range_status`.
+        // The returned code feeds `self.context.status` and
+        // `save_http_status_metric`.
         debug_assert!(
             (100..=999).contains(&template.status),
             "resolved answer status must be a 3-digit HTTP code, got {}",
@@ -1494,6 +1504,74 @@ mod tests {
     fn default_templates_all_parse() {
         HttpAnswers::new(&BTreeMap::new())
             .expect("every bundled default template + fallback must parse");
+    }
+
+    /// `HttpAnswers::template`'s `_ =>` arm (answers.rs:1128) builds an
+    /// unrecognised answer name with `Template::new(None, …)`, so the
+    /// `InvalidStatusCode` guard that protects every named template
+    /// ("301", "302", "308", "400" … "507") never runs for it. The map
+    /// `HttpAnswers::templates` iterates is `BTreeMap<String, String>` taken
+    /// straight from the listener configuration and from a listener patch over
+    /// the command socket, so both the key and the body are operator input
+    /// arriving as a control-plane request.
+    ///
+    /// kawa applies no range check to a status line (`take(3)` then
+    /// `str::parse::<u16>()`), so a custom answer whose body starts
+    /// `HTTP/1.1 000 x` resolves to status `0` — same root cause as
+    /// `kawa_h1::save_http_status_metric`, reached from the control plane
+    /// instead of from a backend socket.
+    ///
+    /// To SEE THIS RED: restore the deleted post-condition after
+    /// `resolved_status` in `Template::new`,
+    /// `debug_assert!((100..=999).contains(&resolved_status), "parsed template
+    /// status must be a 3-digit HTTP code, got {resolved_status}")` — this test
+    /// then panics with `parsed template status must be a 3-digit HTTP code,
+    /// got 0` in every debug, test, e2e and fuzz build.
+    #[test]
+    fn an_unrecognised_custom_answer_may_carry_an_out_of_range_status() {
+        let mut answers = BTreeMap::new();
+        answers.insert(
+            "foo".to_owned(),
+            "HTTP/1.1 000 x\r\nConnection: close\r\n\r\n".to_owned(),
+        );
+
+        let templates = HttpAnswers::templates(&answers)
+            .expect("an unrecognised answer name must not fail template compilation");
+
+        let template = templates
+            .get("foo")
+            .expect("the custom answer must be compiled under its own name");
+        assert_eq!(
+            template.status, 0,
+            "the out-of-range status must be carried verbatim, not asserted away"
+        );
+
+        // …and it is compiled into the registry without ever becoming
+        // selectable: `HttpAnswers::get` derives its lookup key from the
+        // `DefaultAnswer` variant, so only the built-in code names ("301" …
+        // "507") and the bundled fallback can be resolved. This is what keeps
+        // the two remaining range post-conditions downstream — `get`'s own and
+        // `kawa_h1::mod`'s `default_answer` one — genuine invariants after the
+        // `Template::new` post-condition above was removed.
+        let registry = HttpAnswers::new(&answers)
+            .expect("an unrecognised answer name must not fail registry construction");
+        let (resolved_status, _keep_alive, _stream) = registry.get(
+            DefaultAnswer::Answer400 {
+                message: "test".to_owned(),
+                phase: kawa::ParsingPhaseMarker::StatusLine,
+                successfully_parsed: "0".to_owned(),
+                partially_parsed: "0".to_owned(),
+                invalid: "0".to_owned(),
+            },
+            "request-id".to_owned(),
+            None,
+            None,
+            "GET example.com/".to_owned(),
+        );
+        assert_eq!(
+            resolved_status, 400,
+            "an unrecognised custom answer must never be selected by the answer engine"
+        );
     }
 
     fn body_route() -> TemplateVariable {
