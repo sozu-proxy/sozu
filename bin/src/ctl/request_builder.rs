@@ -495,11 +495,15 @@ impl CommandManager {
                 })
                 .into(),
             ),
-            UdpFrontendCmd::Remove { id, address } => self.send_request(
+            // `remove_udp_frontend` keys on (cluster_id, address, tags), the
+            // very identity `add_udp_frontend` admits, so the tags travel with
+            // the removal exactly as `--sni` / `--alpn` do on the TCP remove
+            // above.
+            UdpFrontendCmd::Remove { id, address, tags } => self.send_request(
                 RequestType::RemoveUdpFrontend(RequestUdpFrontend {
                     cluster_id: id,
                     address: address.into(),
-                    ..Default::default()
+                    tags: tags.unwrap_or_default(),
                 })
                 .into(),
             ),

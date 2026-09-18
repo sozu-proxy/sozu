@@ -2233,15 +2233,18 @@ fn compute_rollback(request: &RequestType) -> Option<Request> {
         // evicts exactly the frontend the add inserted. Leaving it out kept
         // sozu#1313's poisoned-state loop open for every TCP frontend.
         //
-        // `AddUdpFrontend` is deliberately NOT here: `add_udp_frontend` dedups
-        // on the full `UdpFrontend { cluster_id, address, tags }` while
-        // `remove_udp_frontend` retains on the address alone, so
-        // `RemoveUdpFrontend` is coarser than its add and would evict every
-        // acknowledged same-address sibling along with the unacknowledged entry.
-        // Pinned by `a_udp_frontend_add_has_no_rollback_inverse` below and by
-        // `remove_udp_frontend_evicts_same_address_siblings` in
+        // `AddUdpFrontend` inverts the same way now that `remove_udp_frontend`
+        // keys on the (cluster_id, address, tags) identity `add_udp_frontend`
+        // admits -- same `INV:` comment and same "drops exactly one entry"
+        // assertion -- so the inverse evicts exactly the unacknowledged entry
+        // and leaves every acknowledged same-address sibling in place. While
+        // the removal key was the address alone it was coarser than its add and
+        // stayed out for that reason. Pinned by
+        // `a_udp_frontend_add_inverts_to_its_exact_removal` below and by
+        // `remove_udp_frontend_spares_same_address_siblings` in
         // `command/src/state.rs`.
         RequestType::AddTcpFrontend(front) => RequestType::RemoveTcpFrontend(front.clone()),
+        RequestType::AddUdpFrontend(front) => RequestType::RemoveUdpFrontend(front.clone()),
         _ => return None,
     };
     Some(inverse.into())
@@ -4919,40 +4922,45 @@ mod listener_validation_tests {
         );
     }
 
-    /// `AddUdpFrontend` has NO rollback inverse, and must not grow one until
-    /// `ConfigState`'s UDP removal key is fixed.
+    /// `AddUdpFrontend` inverts to the `RemoveUdpFrontend` carrying the very
+    /// request the add carried, exactly as the HTTP, HTTPS and TCP adds do.
     ///
     /// `add_udp_frontend` (`command/src/state.rs`) dedups on the FULL
-    /// `UdpFrontend { cluster_id, address, tags }`, so two frontends at the same
-    /// (cluster, address) that differ only in their access-log tags legitimately
-    /// coexist. `remove_udp_frontend` retains on `front.address != …` — the
-    /// ADDRESS ALONE, with no tags in the key and no "drops exactly one entry"
-    /// assertion. `RemoveUdpFrontend` is therefore coarser than
-    /// `AddUdpFrontend`: using it as an inverse would revert one unacknowledged
-    /// add by evicting every acknowledged same-address sibling from the
-    /// main-process `ConfigState`, which the next `SaveState` then persists —
-    /// main/worker drift, the exact class sozu#1313 exists to prevent,
-    /// reintroduced by its own fix on a path no human triggers.
-    /// `remove_tcp_frontend` mirrors its add key exactly, which is why the TCP
-    /// inverse above is safe and this one is not.
+    /// `UdpFrontend { cluster_id, address, tags }`, so two frontends at the
+    /// same (cluster, address) that differ only in their access-log tags
+    /// legitimately coexist. `remove_udp_frontend` now retains on that SAME
+    /// (cluster, address, tags) identity — the bucket scopes `cluster_id`, and
+    /// its own `INV:` comment plus its "drops exactly one entry" assertion pin
+    /// the mirror, just like `remove_tcp_frontend`'s (address, sni, alpn) key.
+    /// The inverse therefore evicts exactly the frontend the add inserted and
+    /// leaves every acknowledged sibling in place, which is what kept this verb
+    /// out of `compute_rollback` while the removal key was coarser. Leaving it
+    /// out now would keep sozu#1313's poisoned-state loop open for every UDP
+    /// frontend.
     ///
-    /// To SEE THIS RED: add
+    /// To SEE THIS RED: remove the
     /// `RequestType::AddUdpFrontend(front) => RequestType::RemoveUdpFrontend(front.clone())`
-    /// back to [`super::compute_rollback`]. The collateral eviction it causes is
-    /// pinned by `remove_udp_frontend_evicts_same_address_siblings` in
+    /// arm from [`super::compute_rollback`]. That the inverse is collateral-free
+    /// is pinned separately by
+    /// `remove_udp_frontend_spares_same_address_siblings` in
     /// `command/src/state.rs`.
     #[test]
-    fn a_udp_frontend_add_has_no_rollback_inverse() {
+    fn a_udp_frontend_add_inverts_to_its_exact_removal() {
         let udp_front = RequestUdpFrontend {
             cluster_id: "cluster".to_owned(),
             address: SocketAddress::new_v4(127, 0, 0, 1, 8091),
-            tags: BTreeMap::new(),
+            tags: BTreeMap::from([("owner".to_owned(), "team-a".to_owned())]),
         };
-        assert!(
-            super::compute_rollback(&RequestType::AddUdpFrontend(udp_front)).is_none(),
-            "a UDP frontend add must stay uncovered while RemoveUdpFrontend's key is coarser \
-             than AddUdpFrontend's"
-        );
+        match super::compute_rollback(&RequestType::AddUdpFrontend(udp_front.clone()))
+            .expect("a UDP frontend add must have an inverse")
+            .request_type
+        {
+            Some(RequestType::RemoveUdpFrontend(remove)) => assert_eq!(
+                remove, udp_front,
+                "the UDP inverse must target the very frontend that was added, tags included"
+            ),
+            other => panic!("expected a RemoveUdpFrontend inverse, got {other:?}"),
+        }
     }
 }
 
@@ -5194,9 +5202,10 @@ mod load_state_rollback_tests {
     //!   test keeps the frontend no worker acknowledged, which is sozu#1313's
     //!   poisoned-state loop for that verb
     //!   (`rollback_inverse_targets_the_same_listener_and_skips_uncovered_verbs`
-    //!   in `listener_validation_tests` fails on the same mutation). The UDP
-    //!   verb stays uncovered on purpose; see
-    //!   `a_udp_frontend_add_has_no_rollback_inverse`.
+    //!   in `listener_validation_tests` fails on the same mutation). The
+    //!   `AddUdpFrontend` arm inverts the same way now that
+    //!   `remove_udp_frontend` mirrors its add key; see
+    //!   `a_udp_frontend_add_inverts_to_its_exact_removal`.
     //!
     //! The response-accounting and channel-backpressure halves of the same fix
     //! are locked in `bin/src/command/server.rs`
@@ -5212,8 +5221,9 @@ mod load_state_rollback_tests {
         channel::{Channel, delimiter_size},
         config::ListenerBuilder,
         proto::command::{
-            PathRule, PathRuleKind, Request, RequestHttpFrontend, RequestTcpFrontend, Response,
-            ResponseStatus, RulePosition, SocketAddress, request::RequestType,
+            PathRule, PathRuleKind, Request, RequestHttpFrontend, RequestTcpFrontend,
+            RequestUdpFrontend, Response, ResponseStatus, RulePosition, SocketAddress,
+            request::RequestType,
         },
     };
 
@@ -5427,11 +5437,12 @@ mod load_state_rollback_tests {
         // `RemoveTcpFrontend` exactly like `RemoveHttpFrontend`, so a TCP
         // frontend no worker took had an unambiguous inverse all along — it was
         // simply missing from `compute_rollback`, which left the poisoned-state
-        // loop open for `AddTcpFrontend`. `AddUdpFrontend` stayed open too, and
-        // stays open deliberately: `remove_udp_frontend` keys on the address
-        // alone while `add_udp_frontend` keys on (cluster, address, tags), so
-        // its inverse would evict same-address siblings. See
-        // `a_udp_frontend_add_has_no_rollback_inverse`.
+        // loop open for `AddTcpFrontend`. `AddUdpFrontend` stayed open too,
+        // because `remove_udp_frontend` then keyed on the address alone while
+        // `add_udp_frontend` keyed on (cluster, address, tags), so its inverse
+        // would have evicted same-address siblings. The removal key now mirrors
+        // the add key, and the verb is covered; see
+        // `a_udp_frontend_add_inverts_to_its_exact_removal`.
         let (mut hub, _dir) = create_test_hub();
         let rejected = RequestType::AddTcpFrontend(tcp_frontend("rejected-cluster", 8090));
         let accepted = RequestType::AddTcpFrontend(tcp_frontend("accepted-cluster", 8091));
@@ -5484,6 +5495,100 @@ mod load_state_rollback_tests {
             surviving,
             vec!["accepted-cluster"],
             "only the TCP frontend no worker acknowledged must be reverted"
+        );
+    }
+
+    /// A same-address, same-cluster UDP frontend distinguished only by its
+    /// `owner` tag — the shape `add_udp_frontend` admits, and the shape a
+    /// removal key coarser than the add key used to collapse.
+    fn udp_frontend(owner: &str) -> RequestUdpFrontend {
+        RequestUdpFrontend {
+            cluster_id: "udp-cluster".to_owned(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 9100),
+            tags: BTreeMap::from([("owner".to_owned(), owner.to_owned())]),
+        }
+    }
+
+    /// The UDP twin of the TCP replay revert above, and the end-to-end half
+    /// `a_udp_frontend_add_inverts_to_its_exact_removal` cannot reach: that
+    /// test asserts the SHAPE [`super::compute_rollback`] returns, this one
+    /// drives `revert_unacknowledged` against a real `ConfigState` and proves
+    /// the inverse spares the acknowledged sibling at the same address.
+    ///
+    /// Both entries sit at one (cluster, address) and differ only in their
+    /// access-log tags, which `add_udp_frontend` admits. Entry 1 every worker
+    /// refused and must be reverted; entry 2 one worker applied, so `ok > 0`
+    /// protects it.
+    ///
+    /// To SEE THIS RED: restore the address-only retain in
+    /// `ConfigState::remove_udp_frontend` (`command/src/state.rs`) — reduce
+    /// `matches_removal` to `|front| front.address == remove_address`. In a
+    /// build with `debug_assertions` the production guard fires first, inside
+    /// the revert's own `dispatch`:
+    /// `remove_udp_frontend drops exactly one entry, left: 0, right: 1`.
+    /// Strip that `debug_assert_eq!` and its companion too — the complete
+    /// pre-fix body — and the failure lands on the assertion below instead,
+    /// `left: [], right: ["team-b"]`, with the task logging
+    /// `reverted entries: 1`: one revert, both frontends gone. That is
+    /// sozu#1313's main/worker drift reintroduced by the rollback itself, and
+    /// precisely why this verb stayed out of [`super::compute_rollback`] until
+    /// the removal key mirrored the add key.
+    #[test]
+    fn a_udp_frontend_no_worker_acknowledged_is_reverted_while_its_sibling_stays() {
+        let (mut hub, _dir) = create_test_hub();
+        let rejected = RequestType::AddUdpFrontend(udp_frontend("team-a"));
+        let accepted = RequestType::AddUdpFrontend(udp_frontend("team-b"));
+        for request in [&rejected, &accepted] {
+            hub.server
+                .state
+                .dispatch(&request.clone().into())
+                .expect("ConfigState records the UDP frontend");
+        }
+
+        // Entry 1: every worker refused it. Entry 2: one worker applied it —
+        // `ok > 0` is the safety bound, it is never reverted.
+        let task = LoadStateTask {
+            client_token: None,
+            gatherer: fan_out(
+                &mut hub.server,
+                vec![
+                    Fanout {
+                        request_id: 1,
+                        request: rejected,
+                        expected: 3,
+                        ok: 0,
+                        errors: 3,
+                    },
+                    Fanout {
+                        request_id: 2,
+                        request: accepted,
+                        expected: 3,
+                        ok: 1,
+                        errors: 2,
+                    },
+                ],
+            ),
+            path: "/tmp/replayed.state".to_owned(),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut None, false);
+
+        let surviving: Vec<&str> = hub
+            .server
+            .state
+            .udp_fronts
+            .get("udp-cluster")
+            .map(|fronts| {
+                fronts
+                    .iter()
+                    .filter_map(|front| front.tags.get("owner").map(String::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            surviving,
+            vec!["team-b"],
+            "only the UDP frontend no worker acknowledged must be reverted; its same-address \
+             sibling must survive"
         );
     }
 

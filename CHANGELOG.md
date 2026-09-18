@@ -82,14 +82,35 @@
   `remove_tcp_frontend` matches on the very (address, sni, alpn) key `add_tcp_frontend` admitted, so
   the inverse evicts exactly the entry the add inserted, exactly as the HTTP and HTTPS inverses the
   rollback already covered do.
-  `AddUdpFrontend` stays deliberately uncovered, alongside the upsert verbs (`AddCluster`,
-  `AddBackend`) and the non-add verbs: `add_udp_frontend` dedups on the full
-  `UdpFrontend { cluster_id, address, tags }` — two frontends at one (cluster, address) differing
-  only in tags legitimately coexist — while `remove_udp_frontend` retains on the address alone and
-  so evicts every sibling at that address. Reverting a UDP add with it would drop entries workers
-  acknowledged. That asymmetry is now pinned by a committed-red `#[ignore]`d regression test,
-  `remove_udp_frontend_evicts_same_address_siblings`; narrowing the removal key changes the
-  observable semantics of a live control-plane verb and is left as an explicit decision.
+  `AddUdpFrontend` is covered too, by the UDP removal-key fix below. The upsert verbs
+  (`AddCluster`, `AddBackend`) and the non-add verbs stay deliberately uncovered.
+- **`fix(command)`: `RemoveUdpFrontend` no longer evicts same-address siblings.**
+  `add_udp_frontend` dedups on the full `UdpFrontend { cluster_id, address, tags }` — two frontends
+  at one (cluster, address) differing only in their access-log tags legitimately coexist — while
+  `remove_udp_frontend` retained on the address alone, with no tags in the key and no "drops
+  exactly one entry" assertion. One removal therefore dropped every frontend at that address,
+  including entries the caller never named, and the next `SaveState` persisted the loss.
+  `remove_udp_frontend` now retains on that same (cluster, address, tags) identity — the bucket
+  already scopes `cluster_id` — and carries the `INV:` comment plus the "drops exactly one entry"
+  and "nothing matching survives" assertions `remove_tcp_frontend` has always had for its own
+  (address, sni, alpn) key.
+  This changes the observable semantics of a live control-plane verb: the tags are part of the
+  removal identity, so a remove carrying no tags no longer clears a tagged frontend at that
+  address, it matches nothing and answers `NoChange`. `sozu frontend udp remove` therefore gains
+  `--tags`, mirroring `--sni` / `--alpn` on the TCP remove; a frontend added with `--tags` is
+  removed by repeating them. The saved-state diff replay was already sending the full frontend, so
+  it is unaffected other than by no longer over-evicting.
+  A refused removal costs nothing beyond the refusal: all three apply paths reject a request the
+  state refuses BEFORE fanning it out, so no worker sees it and no listener stops routing.
+  Separately, and unchanged by this fix, the worker (`UdpProxy::remove_udp_front`) holds one cluster
+  and tag set per listener address and so cannot represent the same-address siblings
+  `add_udp_frontend` admits; aligning the two models is its own decision and is deliberately not
+  part of this change.
+  With the two keys mirrored, `compute_rollback` gains its `AddUdpFrontend => RemoveUdpFrontend`
+  inverse, closing sozu#1313's poisoned-state loop for the last frontend verb
+  (`a_udp_frontend_add_inverts_to_its_exact_removal`). The previously committed-red `#[ignore]`d
+  regression test is now un-ignored and green as
+  `remove_udp_frontend_spares_same_address_siblings`.
 - **`fix(command)`: `FilteredTimeSerie`'s `Display` no longer indexes past a short series.**
   `last_minute` and `last_hour` are prost `repeated uint32`, i.e. `Vec<u32>` and not `[u32; 60]`, but
   the impl sliced each with six fixed 10-wide windows — an index panic on any series holding fewer

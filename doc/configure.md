@@ -764,6 +764,28 @@ max_flows      = 0
 > below.) UDP listeners also have no `connect_timeout` (there is no connect
 > handshake) and no `request_timeout`.
 
+##### UDP frontend identity
+
+A UDP frontend is identified by its **cluster id, address and access-log tags**
+together, in both directions. `frontend udp add` admits two frontends at the
+same (cluster, address) when their `--tags` differ, so `frontend udp remove`
+takes the same `--tags` to name which one to drop — exactly as the TCP remove
+takes `--sni` / `--alpn`:
+
+```bash
+sozu --config /etc/sozu/config.toml frontend udp add --id dns --address 0.0.0.0:53 --tags owner=team-a
+sozu --config /etc/sozu/config.toml frontend udp remove --id dns --address 0.0.0.0:53 --tags owner=team-a
+```
+
+A removal drops exactly one frontend and leaves every sibling at that address
+in place.
+
+The tags are part of the identity, so omitting `--tags` on the remove does
+**not** clear a frontend that was added with them: the request matches nothing
+and answers `NoChange`. It is a clean no-op — the main process refuses a request
+it cannot apply *before* fanning it out, so no worker ever sees it and no
+listener stops routing. Repeat the `--tags` the frontend was added with.
+
 <a id="udp-limitations"></a>
 
 ##### UDP limitations
