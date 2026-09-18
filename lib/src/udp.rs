@@ -509,6 +509,21 @@ impl UdpProxy {
         listener.borrow_mut().activate(&self.registry, udp_socket)
     }
 
+    /// The slab token reserved for the listener at `address`, if this proxy
+    /// holds one.
+    ///
+    /// A listener owns exactly one slab slot for its whole `AddListener` ->
+    /// `RemoveListener` lifetime, and no `remove_listener` implementation
+    /// touches the session slab. `Server` therefore reads the token here
+    /// BEFORE dropping the listener, so that reserved slot is released exactly
+    /// once, at the end of the lifetime.
+    pub fn listener_token(&self, address: SocketAddr) -> Option<Token> {
+        self.listeners
+            .iter()
+            .find(|(_, listener)| listener.borrow().address == address)
+            .map(|(token, _)| *token)
+    }
+
     /// Build the [`UdpListenerSession`] that drives this listener's datagrams.
     /// The server inserts the returned session into the slab **at the listener
     /// token**, replacing the `ListenSession` placeholder, so the generic
@@ -1302,8 +1317,11 @@ impl UdpListenerSession {
         let upstream_token = {
             let mut s = self.sessions.borrow_mut();
             // The listener token indexes a slab slot this session does not
-            // own: `notify_deactivate_listener` frees it (`slab.remove`)
-            // without this session ever being told. Indexing a freed key
+            // own: `RemoveListener` frees it (`server.rs`'s `slab.try_remove`)
+            // without this session ever being told. A deactivate does NOT —
+            // it re-arms the slot with the inert `ListenSession` placeholder
+            // (`Server::reserve_listen_token`) — so `RemoveListener` is the
+            // only path that empties the key under us. Indexing a freed key
             // panics the whole worker, so read it fallibly and shed the flow
             // instead — an upstream socket registered under a slot nothing
             // can demux back is unusable anyway.
@@ -2023,9 +2041,11 @@ mod tests {
     /// `on_open_upstream` clones the listener session out of the slab to
     /// register the new flow's upstream socket under a second token (the
     /// multi-token pattern). That slot belongs to the SERVER, not to this
-    /// session: `notify_deactivate_listener` frees it with `slab.remove` and
-    /// tells the session nothing. Indexing a freed slab key panics, and this
-    /// one runs on the datagram path of a listener the operator just touched.
+    /// session: `RemoveListener` frees it with `slab.try_remove` and tells the
+    /// session nothing (a deactivate does not — it re-arms the slot with the
+    /// inert placeholder, see `Server::reserve_listen_token`). Indexing a freed
+    /// slab key panics, and this one runs on the datagram path of a listener
+    /// the operator just touched.
     ///
     /// No datagram sequence reaches the pairing on its own -- `Server::ready`
     /// will not dispatch to a session whose slab entry is gone, so the flow
@@ -2075,7 +2095,7 @@ mod tests {
             .build_session(listener_token)
             .expect("could not build the test UDP listener session");
 
-        // The deactivate that frees the slot behind the session's back.
+        // The `RemoveListener` that frees the slot behind the session's back.
         sessions.borrow_mut().slab.remove(listener_token.0);
 
         let slab_len = sessions.borrow().slab.len();
