@@ -33,10 +33,15 @@ impl<W: Write> MultiLineWriter<W> {
 
     fn flush_buf(&mut self, flush_entire_buffer: bool) -> io::Result<()> {
         let mut written = 0;
+        // `last_newline` is stale whenever the buffer is empty: `flush_buf`
+        // resets it to 0, which is also a valid index, so a partial flush of an
+        // EMPTY buffer used to slice `..1` out of a zero-length `Vec` and panic
+        // in release. `write` takes exactly that path for a record larger than
+        // the capacity, and access-log records are network-influenced.
         let len = if flush_entire_buffer {
             self.buf.len()
         } else {
-            self.last_newline + 1
+            (self.last_newline + 1).min(self.buf.len())
         };
 
         let mut ret = Ok(());
@@ -144,3 +149,107 @@ impl<W: Write> Drop for BufWriter<W> {
   }
 }
 */
+
+#[cfg(test)]
+mod tests {
+    //! `MultiLineWriter::write` must never index past its own buffer. The
+    //! `file://` logger backend (`command/src/logging/logs.rs`) and
+    //! `MetricsWriter` (`lib/src/metrics/writer.rs`) both wrap one of these
+    //! around network-influenced records, so a record larger than the 4096-byte
+    //! capacity is reachable from traffic — and it panics in RELEASE, where a
+    //! slice index is not a `debug_assert!`.
+    //!
+    //! To SEE THESE RED (regression proof): restore the pre-fix body of
+    //! [`super::MultiLineWriter::flush_buf`]'s partial branch, `self.last_newline + 1`
+    //! without the `.min(self.buf.len())` clamp — the two oversized-record
+    //! expectations below then panic with
+    //! `range end index 1 out of range for slice of length 0`.
+    use super::MultiLineWriter;
+    use std::io::Write;
+
+    /// Capacity of the writer under test. The production default is 4096
+    /// (`MultiLineWriter::new`); the bug is a function of `record > capacity`,
+    /// not of the capacity's value, so a small one keeps the fixtures readable.
+    const CAPACITY: usize = 16;
+
+    #[test]
+    fn an_oversized_record_on_a_fresh_writer_does_not_panic() {
+        // `last_newline == 0` with an EMPTY buffer is the initial state: the
+        // partial flush computed `len = 1` against a zero-length `Vec`.
+        let mut writer = MultiLineWriter::with_capacity(CAPACITY, Vec::new());
+        let record = vec![b'a'; CAPACITY * 4];
+
+        let written = writer
+            .write(&record)
+            .expect("a record larger than the capacity is written straight through");
+
+        assert_eq!(
+            written,
+            record.len(),
+            "the oversized record must be handed to the inner writer whole"
+        );
+        assert_eq!(
+            writer.get_ref(),
+            &record,
+            "the inner writer must receive exactly the oversized record"
+        );
+    }
+
+    #[test]
+    fn an_oversized_record_after_a_flush_does_not_panic() {
+        // The same empty-buffer/`last_newline == 0` state, reached the way a
+        // live logger reaches it: any previous `flush()` leaves it behind.
+        let mut writer = MultiLineWriter::with_capacity(CAPACITY, Vec::new());
+        writer.write_all(b"x\n").expect("a short line is buffered");
+        writer.flush().expect("the flush empties the buffer");
+        assert_eq!(
+            writer.get_ref(),
+            b"x\n",
+            "the short line reached the inner writer"
+        );
+
+        let record = vec![b'b'; CAPACITY * 4];
+        let written = writer
+            .write(&record)
+            .expect("a record larger than the capacity is written straight through");
+
+        assert_eq!(written, record.len());
+        assert_eq!(
+            &writer.get_ref()[2..],
+            &record[..],
+            "the oversized record must follow the already-flushed line"
+        );
+    }
+
+    #[test]
+    fn a_partial_flush_still_stops_at_the_last_newline() {
+        // The clamp must not change the path it was NOT meant to touch: with a
+        // non-empty buffer, a partial flush still writes up to and including
+        // the last newline and keeps the unterminated tail buffered.
+        let mut writer = MultiLineWriter::with_capacity(CAPACITY, Vec::new());
+        writer
+            .write_all(b"aaaa\nbb")
+            .expect("buffered below capacity");
+        assert!(
+            writer.get_ref().is_empty(),
+            "nothing reaches the inner writer before a flush is triggered"
+        );
+
+        // 7 + 10 > 16 triggers the partial flush of the completed line only.
+        writer
+            .write_all(b"cccccccccc")
+            .expect("triggers a partial flush");
+        assert_eq!(
+            writer.get_ref(),
+            b"aaaa\n",
+            "a partial flush writes up to and including the last newline"
+        );
+
+        writer.flush().expect("the final flush drains the tail");
+        assert_eq!(
+            writer.get_ref(),
+            b"aaaa\nbbcccccccccc",
+            "the buffered tail must survive the partial flush"
+        );
+    }
+}

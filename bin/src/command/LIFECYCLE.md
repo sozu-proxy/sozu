@@ -182,7 +182,27 @@ judged on its own by `should_rollback_fanout`, the same predicate the live
 single-request path uses: an entry NO worker acknowledged is reverted from
 the master's `ConfigState` with the inverse `compute_rollback` captured at
 scatter time, so `SaveState` cannot re-persist it and the next replay
-cannot re-inject it (sozu#1313).
+cannot re-inject it (sozu#1313). `compute_rollback` covers the four listener
+adds (inverted to `RemoveListener` on the same address and proxy type) and
+three of the four frontend adds — HTTP, HTTPS and TCP — each inverted to its
+`Remove*Frontend` counterpart carrying the very request message the add
+carried. Those three removals match on the very key their add admitted, so
+the inverse evicts exactly the entry the add inserted.
+
+`AddUdpFrontend`, upsert verbs (`AddCluster`, `AddBackend`) and non-add verbs
+are deliberately uncovered: they keep the best-effort behaviour rather than
+risk a wrong revert. UDP is uncovered for a specific reason — its removal key
+is COARSER than its add key. `add_udp_frontend` dedups on the full
+`UdpFrontend { cluster_id, address, tags }`, so two frontends at one (cluster,
+address) differing only in tags legitimately coexist, while
+`remove_udp_frontend` retains on the address alone and therefore drops every
+sibling at that address. Using it as an inverse would revert one unacknowledged
+add by evicting acknowledged siblings from the master's `ConfigState` — the
+main/worker drift sozu#1313 exists to prevent. The asymmetry is pinned red and
+`#[ignore]`d by `remove_udp_frontend_evicts_same_address_siblings`
+(`command/src/state.rs`); narrowing the removal key changes a live verb's
+observable semantics and is an explicit product decision, so the inverse stays
+out until then.
 
 Both also arm a bounded deadline (`bulk_replay_timeout`: one
 `worker_timeout` plus 10 ms per scattered entry, capped at ten

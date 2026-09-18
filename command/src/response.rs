@@ -549,23 +549,22 @@ impl fmt::Display for WorkerResponse {
 
 impl fmt::Display for FilteredTimeSerie {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "FilteredTimeSerie {{\nlast_second: {},\nlast_minute:\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\nlast_hour:\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n}}",
-            self.last_second,
-            &self.last_minute[0..10],
-            &self.last_minute[10..20],
-            &self.last_minute[20..30],
-            &self.last_minute[30..40],
-            &self.last_minute[40..50],
-            &self.last_minute[50..60],
-            &self.last_hour[0..10],
-            &self.last_hour[10..20],
-            &self.last_hour[20..30],
-            &self.last_hour[30..40],
-            &self.last_hour[40..50],
-            &self.last_hour[50..60]
-        )
+        // `last_minute` / `last_hour` are prost `repeated uint32`, so they are
+        // `Vec<u32>` and not `[u32; 60]`: six fixed 10-wide windows indexed a
+        // series that holds fewer samples out of range. `chunks(10)` renders
+        // the exact same six windows for a full series and simply stops early
+        // for a short one.
+        writeln!(f, "FilteredTimeSerie {{")?;
+        writeln!(f, "last_second: {},", self.last_second)?;
+        writeln!(f, "last_minute:")?;
+        for window in self.last_minute.chunks(10) {
+            writeln!(f, "{window:?}")?;
+        }
+        writeln!(f, "last_hour:")?;
+        for window in self.last_hour.chunks(10) {
+            writeln!(f, "{window:?}")?;
+        }
+        write!(f, "}}")
     }
 }
 
@@ -580,4 +579,65 @@ fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
         "socketaddr_cmp is Equal iff ip and port both match"
     );
     ordering
+}
+
+#[cfg(test)]
+mod tests {
+    //! `FilteredTimeSerie::last_minute` / `last_hour` are prost
+    //! `repeated uint32` (`command.proto`), i.e. `Vec<u32>` and NOT
+    //! `[u32; 60]` — nothing in the type or the wire format guarantees the 60
+    //! samples the `Display` impl used to slice with six fixed 10-wide windows.
+    //!
+    //! To SEE THESE RED (regression proof): restore the pre-fix body of
+    //! `FilteredTimeSerie`'s [`std::fmt::Display`] impl, the six
+    //! `&self.last_minute[0..10] … [50..60]` / `&self.last_hour[..]` fixed
+    //! windows — the short-series expectation below then panics with
+    //! `range end index 10 out of range for slice of length 3`.
+    use crate::proto::command::FilteredTimeSerie;
+
+    #[test]
+    fn a_series_shorter_than_sixty_samples_renders_instead_of_panicking() {
+        let serie = FilteredTimeSerie {
+            last_second: 42,
+            last_minute: vec![1, 2, 3],
+            last_hour: vec![],
+        };
+
+        let rendered = serie.to_string();
+
+        assert!(
+            rendered.contains("last_second: 42"),
+            "the rendering must keep its header, got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("[1, 2, 3]"),
+            "a partial minute window must render the samples it has, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_full_series_still_renders_six_windows_per_serie() {
+        // The layout the six fixed windows produced must not drift: one header
+        // line, one label per serie, six 10-sample windows each, one closing
+        // brace.
+        let serie = FilteredTimeSerie {
+            last_second: 7,
+            last_minute: (0..60).collect(),
+            last_hour: (0..60).collect(),
+        };
+
+        let rendered = serie.to_string();
+        let lines: Vec<&str> = rendered.lines().collect();
+
+        assert_eq!(
+            lines.len(),
+            17,
+            "1 header + 1 label + 6 windows + 1 label + 6 windows + 1 brace, got {rendered:?}"
+        );
+        assert_eq!(lines[2], "last_minute:");
+        assert_eq!(lines[3], "[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]");
+        assert_eq!(lines[8], "[50, 51, 52, 53, 54, 55, 56, 57, 58, 59]");
+        assert_eq!(lines[9], "last_hour:");
+        assert_eq!(lines[16], "}");
+    }
 }

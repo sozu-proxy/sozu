@@ -827,9 +827,37 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
     let config = match path {
         Some(path) if !path.is_empty() => {
             info!("loading static configuration at path {}", path);
-            new_config = Config::load_from_path(path)
-                .unwrap_or_else(|_| panic!("cannot load configuration from '{path}'"));
-            &new_config
+            match Config::load_from_path(path) {
+                Ok(loaded) => {
+                    new_config = loaded;
+                    &new_config
+                }
+                Err(config_err) => {
+                    // The path comes from `sozu reload --file <path>`, i.e. from
+                    // the client. Panicking on it took the MAIN process down and
+                    // orphaned every worker over an unreadable or malformed file.
+                    // Report it the way the `generate_config_messages` failure
+                    // below already does: audit the attempt when a client made
+                    // it, then fail that client and leave the fleet untouched.
+                    let reason = format!("cannot load configuration from '{path}': {config_err}");
+                    error!("{}", reason);
+                    if let Some(client_ref) = client.as_deref() {
+                        let (verb, counter) = audit_verb!("configuration_reloaded");
+                        audit_emit_inline(
+                            server,
+                            client_ref,
+                            EventKind::ConfigurationReloaded,
+                            verb,
+                            counter,
+                            format!("config:{path}"),
+                            AuditResult::Err,
+                            AuditExtras::default(),
+                        );
+                    }
+                    client.finish_failure(reason);
+                    return;
+                }
+            }
         }
         _ => {
             info!("reloading static configuration");
@@ -2199,6 +2227,21 @@ fn compute_rollback(request: &RequestType) -> Option<Request> {
         }),
         RequestType::AddHttpFrontend(front) => RequestType::RemoveHttpFrontend(front.clone()),
         RequestType::AddHttpsFrontend(front) => RequestType::RemoveHttpsFrontend(front.clone()),
+        // `remove_tcp_frontend` matches on the very (address, sni, alpn) key
+        // `add_tcp_frontend` admitted — its own `INV:` comment and its
+        // "drops exactly one entry" assertion pin that mirror — so this inverse
+        // evicts exactly the frontend the add inserted. Leaving it out kept
+        // sozu#1313's poisoned-state loop open for every TCP frontend.
+        //
+        // `AddUdpFrontend` is deliberately NOT here: `add_udp_frontend` dedups
+        // on the full `UdpFrontend { cluster_id, address, tags }` while
+        // `remove_udp_frontend` retains on the address alone, so
+        // `RemoveUdpFrontend` is coarser than its add and would evict every
+        // acknowledged same-address sibling along with the unacknowledged entry.
+        // Pinned by `a_udp_frontend_add_has_no_rollback_inverse` below and by
+        // `remove_udp_frontend_evicts_same_address_siblings` in
+        // `command/src/state.rs`.
+        RequestType::AddTcpFrontend(front) => RequestType::RemoveTcpFrontend(front.clone()),
         _ => return None,
     };
     Some(inverse.into())
@@ -3656,6 +3699,10 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
                         // client to carry the reason.
                         warn!("load_state: skipping an entry the state refused: {}", error);
                         count!("config.load_skipped_invalid", 1);
+                        // The tally the operator is shown below covers BOTH skip
+                        // branches: an entry the state refused is just as absent
+                        // from the loaded state as one validation refused.
+                        skipped_invalid += 1;
                     } else {
                         // INVARIANT: the scatter request_id advances by
                         // exactly one per dispatched request. `scatter_on`
@@ -4700,9 +4747,13 @@ mod listener_validation_tests {
     use super::validate_listener_request;
     use sozu_command_lib::{
         config::ListenerBuilder,
-        proto::command::{HttpsListenerConfig, SocketAddress, request::RequestType},
+        proto::command::{
+            HttpsListenerConfig, RequestTcpFrontend, RequestUdpFrontend, SocketAddress,
+            request::RequestType,
+        },
         state::{ConfigState, StateError},
     };
+    use std::collections::BTreeMap;
 
     /// A default HTTPS listener config for `address`. When `valid` is false, a
     /// malformed answer template is injected so the worker's construction
@@ -4837,12 +4888,70 @@ mod listener_validation_tests {
             other => panic!("expected a RemoveListener inverse, got {other:?}"),
         }
 
+        // sozu#1313: the TCP frontend verbs invert the same way the HTTP ones
+        // do — `remove_tcp_frontend` matches on the very (address, sni, alpn)
+        // key `add_tcp_frontend` admitted, so the inverse evicts exactly the
+        // frontend the add inserted and nothing else.
+        let tcp_front = RequestTcpFrontend {
+            cluster_id: "cluster".to_owned(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8090),
+            tags: BTreeMap::new(),
+            sni: None,
+            alpn: Vec::new(),
+        };
+        match super::compute_rollback(&RequestType::AddTcpFrontend(tcp_front.clone()))
+            .expect("a TCP frontend add must have an inverse")
+            .request_type
+        {
+            Some(RequestType::RemoveTcpFrontend(remove)) => assert_eq!(
+                remove, tcp_front,
+                "the TCP inverse must target the very frontend that was added"
+            ),
+            other => panic!("expected a RemoveTcpFrontend inverse, got {other:?}"),
+        }
+
         // Upsert Add verbs (AddCluster/AddBackend) and non-add verbs have no
         // simple prior-value-free inverse and are deliberately uncovered — they
         // keep today's best-effort behavior rather than risk a wrong revert.
         assert!(
             super::compute_rollback(&RequestType::Logging("info".to_owned())).is_none(),
             "a non-add verb must have no rollback inverse"
+        );
+    }
+
+    /// `AddUdpFrontend` has NO rollback inverse, and must not grow one until
+    /// `ConfigState`'s UDP removal key is fixed.
+    ///
+    /// `add_udp_frontend` (`command/src/state.rs`) dedups on the FULL
+    /// `UdpFrontend { cluster_id, address, tags }`, so two frontends at the same
+    /// (cluster, address) that differ only in their access-log tags legitimately
+    /// coexist. `remove_udp_frontend` retains on `front.address != …` — the
+    /// ADDRESS ALONE, with no tags in the key and no "drops exactly one entry"
+    /// assertion. `RemoveUdpFrontend` is therefore coarser than
+    /// `AddUdpFrontend`: using it as an inverse would revert one unacknowledged
+    /// add by evicting every acknowledged same-address sibling from the
+    /// main-process `ConfigState`, which the next `SaveState` then persists —
+    /// main/worker drift, the exact class sozu#1313 exists to prevent,
+    /// reintroduced by its own fix on a path no human triggers.
+    /// `remove_tcp_frontend` mirrors its add key exactly, which is why the TCP
+    /// inverse above is safe and this one is not.
+    ///
+    /// To SEE THIS RED: add
+    /// `RequestType::AddUdpFrontend(front) => RequestType::RemoveUdpFrontend(front.clone())`
+    /// back to [`super::compute_rollback`]. The collateral eviction it causes is
+    /// pinned by `remove_udp_frontend_evicts_same_address_siblings` in
+    /// `command/src/state.rs`.
+    #[test]
+    fn a_udp_frontend_add_has_no_rollback_inverse() {
+        let udp_front = RequestUdpFrontend {
+            cluster_id: "cluster".to_owned(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8091),
+            tags: BTreeMap::new(),
+        };
+        assert!(
+            super::compute_rollback(&RequestType::AddUdpFrontend(udp_front)).is_none(),
+            "a UDP frontend add must stay uncovered while RemoveUdpFrontend's key is coarser \
+             than AddUdpFrontend's"
         );
     }
 }
@@ -5076,6 +5185,18 @@ mod load_state_rollback_tests {
     //!   status;
     //! - make `bulk_replay_timeout` return `Timeout::None`, what both load
     //!   paths passed before — the deadline test fails.
+    //! - restore `Config::load_from_path(path).unwrap_or_else(|_| panic!(...))`
+    //!   in `load_static_config` — the unloadable-path test panics instead of
+    //!   reporting a failure, exactly as the main process did.
+    //! - drop the `skipped_invalid += 1` from `load_state`'s state-refused
+    //!   branch — the skipped-tally test finds no tally line at all.
+    //! - drop the `AddTcpFrontend` arm from `compute_rollback` — the TCP replay
+    //!   test keeps the frontend no worker acknowledged, which is sozu#1313's
+    //!   poisoned-state loop for that verb
+    //!   (`rollback_inverse_targets_the_same_listener_and_skips_uncovered_verbs`
+    //!   in `listener_validation_tests` fails on the same mutation). The UDP
+    //!   verb stays uncovered on purpose; see
+    //!   `a_udp_frontend_add_has_no_rollback_inverse`.
     //!
     //! The response-accounting and channel-backpressure halves of the same fix
     //! are locked in `bin/src/command/server.rs`
@@ -5091,13 +5212,14 @@ mod load_state_rollback_tests {
         channel::{Channel, delimiter_size},
         config::ListenerBuilder,
         proto::command::{
-            PathRule, PathRuleKind, Request, RequestHttpFrontend, Response, ResponseStatus,
-            RulePosition, SocketAddress, request::RequestType,
+            PathRule, PathRuleKind, Request, RequestHttpFrontend, RequestTcpFrontend, Response,
+            ResponseStatus, RulePosition, SocketAddress, request::RequestType,
         },
     };
 
     use super::{
-        LoadStateTask, LoadStaticConfigTask, PerEntryGatherer, Server, Timeout, bulk_replay_timeout,
+        LoadStateTask, LoadStaticConfigTask, PerEntryGatherer, Server, Timeout,
+        bulk_replay_timeout, load_state, load_static_config,
     };
     use crate::command::{
         server::{CommandHub, GatheringTask, PeerCred, parse_scatter_request_id},
@@ -5105,7 +5227,9 @@ mod load_state_rollback_tests {
     };
     use mio::{Token, net::UnixListener};
     use sozu_command_lib::config::Config;
+    use sozu_command_lib::proto::command::WorkerRequest;
     use std::collections::BTreeMap;
+    use std::{fs::File, io::Write as _};
 
     fn create_test_hub() -> (CommandHub, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("Could not create temp dir");
@@ -5232,6 +5356,157 @@ mod load_state_rollback_tests {
             offset += frame_len;
         }
         responses
+    }
+
+    #[test]
+    fn an_entry_the_state_refused_is_counted_in_the_skipped_tally() {
+        // `load_state` has two skip branches: one for an entry pre-dispatch
+        // validation refuses, one for an entry `ConfigState` itself refuses.
+        // Both `warn!` and `count!`, but only the first used to increment
+        // `skipped_invalid` — and that tally is the ONLY thing the operator is
+        // told, so a state file full of entries the state refused reported a
+        // clean load.
+        let (mut hub, _dir) = create_test_hub();
+        let (mut client, _peer) = test_client();
+
+        // The SAME frontend twice: the first dispatch commits it, the second is
+        // refused by `ConfigState` with `StateError::Exists`. Both pass
+        // pre-dispatch validation, so the other branch's increment — the one
+        // that already worked — can not account for the tally.
+        let duplicate = Request::from(RequestType::AddHttpFrontend(frontend(
+            "dup.example.com",
+            8080,
+        )));
+        let state_path = _dir.path().join("duplicate.state");
+        {
+            let mut state_file = File::create(&state_path).expect("a temporary state file");
+            for counter in 0..2 {
+                // Same framing `ConfigState::write_requests_to_file` produces.
+                let message = WorkerRequest::new(format!("SAVE-{counter}"), duplicate.clone());
+                let serialized = serde_json::to_string(&message).expect("a serializable request");
+                state_file
+                    .write_all(serialized.as_bytes())
+                    .expect("writing the state entry");
+                state_file
+                    .write_all(b"\n\0")
+                    .expect("writing the delimiter");
+            }
+        }
+
+        load_state(
+            &mut hub.server,
+            Some(&mut client),
+            state_path.to_str().expect("a UTF-8 temp path"),
+        );
+
+        let responses = queued_responses(&client);
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.message.contains("skipped 1 invalid entries")),
+            "the entry the state refused must be reported in the skipped tally, got {responses:?}"
+        );
+    }
+
+    /// A minimal no-SNI, no-ALPN TCP frontend for `cluster_id` on `port`.
+    /// Distinct ports keep two of them from colliding on the listener-wide
+    /// catch-all rule `add_tcp_frontend` enforces.
+    fn tcp_frontend(cluster_id: &str, port: u16) -> RequestTcpFrontend {
+        RequestTcpFrontend {
+            cluster_id: cluster_id.to_owned(),
+            address: SocketAddress::new_v4(127, 0, 0, 1, port),
+            tags: BTreeMap::new(),
+            sni: None,
+            alpn: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_tcp_frontend_no_worker_acknowledged_is_reverted_while_an_acknowledged_one_stays() {
+        // sozu#1313 for the TCP verbs: `ConfigState` dispatches
+        // `RemoveTcpFrontend` exactly like `RemoveHttpFrontend`, so a TCP
+        // frontend no worker took had an unambiguous inverse all along — it was
+        // simply missing from `compute_rollback`, which left the poisoned-state
+        // loop open for `AddTcpFrontend`. `AddUdpFrontend` stayed open too, and
+        // stays open deliberately: `remove_udp_frontend` keys on the address
+        // alone while `add_udp_frontend` keys on (cluster, address, tags), so
+        // its inverse would evict same-address siblings. See
+        // `a_udp_frontend_add_has_no_rollback_inverse`.
+        let (mut hub, _dir) = create_test_hub();
+        let rejected = RequestType::AddTcpFrontend(tcp_frontend("rejected-cluster", 8090));
+        let accepted = RequestType::AddTcpFrontend(tcp_frontend("accepted-cluster", 8091));
+        for request in [&rejected, &accepted] {
+            hub.server
+                .state
+                .dispatch(&request.clone().into())
+                .expect("ConfigState records the TCP frontend");
+        }
+
+        // Entry 1: every worker refused it. Entry 2: one worker applied it —
+        // `ok > 0` is the safety bound, it is never reverted.
+        let task = LoadStateTask {
+            client_token: None,
+            gatherer: fan_out(
+                &mut hub.server,
+                vec![
+                    Fanout {
+                        request_id: 1,
+                        request: rejected,
+                        expected: 3,
+                        ok: 0,
+                        errors: 3,
+                    },
+                    Fanout {
+                        request_id: 2,
+                        request: accepted,
+                        expected: 3,
+                        ok: 1,
+                        errors: 2,
+                    },
+                ],
+            ),
+            path: "/tmp/replayed.state".to_owned(),
+        };
+        Box::new(task).on_finish(&mut hub.server, &mut None, false);
+
+        // `remove_tcp_frontend` leaves the cluster bucket in place when it
+        // empties it, so count the frontends, not the buckets.
+        let mut surviving: Vec<&str> = hub
+            .server
+            .state
+            .tcp_fronts
+            .iter()
+            .filter(|(_, fronts)| !fronts.is_empty())
+            .map(|(cluster_id, _)| cluster_id.as_str())
+            .collect();
+        surviving.sort_unstable();
+        assert_eq!(
+            surviving,
+            vec!["accepted-cluster"],
+            "only the TCP frontend no worker acknowledged must be reverted"
+        );
+    }
+
+    #[test]
+    fn an_unloadable_static_config_path_fails_the_client_instead_of_the_main_process() {
+        // `sozu reload --file <bad path>` used to take the whole main process
+        // down with it — `unwrap_or_else(|_| panic!(...))` — orphaning every
+        // worker over a typo in a path only the client controls.
+        let (mut hub, _dir) = create_test_hub();
+        let (mut client, _peer) = test_client();
+        let missing = _dir.path().join("there-is-no-such-config.toml");
+        let missing = missing.to_str().expect("a UTF-8 temp path");
+
+        load_static_config(&mut hub.server, Some(&mut client), Some(missing));
+
+        let responses = queued_responses(&client);
+        assert!(
+            responses
+                .iter()
+                .any(|response| response.status == ResponseStatus::Failure as i32
+                    && response.message.contains(missing)),
+            "an unloadable config path must be reported to the client as a failure, got {responses:?}"
+        );
     }
 
     #[test]
