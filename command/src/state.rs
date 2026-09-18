@@ -1527,10 +1527,36 @@ impl ConfigState {
                 })?;
 
         let len = udp_frontends.len();
-        udp_frontends.retain(|front| front.address != front_to_remove.address.into());
-        if udp_frontends.len() == len {
+        let remove_address: SocketAddr = front_to_remove.address.into();
+        // INV: removal identity mirrors add_udp_frontend's
+        // (cluster_id, address, tags) key -- the bucket this `get_mut`
+        // returned already scopes `cluster_id`, exactly as
+        // `tcp_frontend_matches` leaves it to `remove_tcp_frontend`'s own
+        // bucket lookup. Removing one tagged frontend on a listener must not
+        // also evict a sibling frontend at the same address carrying
+        // different access-log tags, which `add_udp_frontend` admits because
+        // it dedups on the FULL `UdpFrontend { cluster_id, address, tags }`.
+        let matches_removal = |front: &UdpFrontend| {
+            front.address == remove_address && front.tags == front_to_remove.tags
+        };
+        udp_frontends.retain(|front| !matches_removal(front));
+        let after = udp_frontends.len();
+        if after == len {
             return Err(StateError::NoChange);
         }
+        // `retain` may drop more than one entry only if duplicates on the same
+        // (cluster_id, address, tags) ever existed; `add_udp_frontend` forbids
+        // that, so a successful removal must drop exactly one and leave none
+        // matching.
+        debug_assert_eq!(
+            after,
+            len - 1,
+            "remove_udp_frontend drops exactly one entry"
+        );
+        debug_assert!(
+            !udp_frontends.iter().any(matches_removal),
+            "remove_udp_frontend must leave no frontend matching the removed (address, tags)"
+        );
         Ok(())
     }
 
@@ -5955,37 +5981,50 @@ mod tests {
             .expect("SetMetricDetail must traverse dispatch without UndispatchableRequest");
     }
 
-    /// `remove_udp_frontend`'s key is COARSER than `add_udp_frontend`'s, so one
-    /// removal evicts frontends the caller never named.
+    /// `remove_udp_frontend` removes ONLY the frontend the caller named: its
+    /// key mirrors `add_udp_frontend`'s, exactly as the TCP pair does.
     ///
     /// [`ConfigState::add_udp_frontend`] dedups on the full
     /// `UdpFrontend { cluster_id, address, tags }`: two frontends at the same
     /// (cluster, address) that differ only in their access-log tags are both
     /// admitted, and this test asserts that first so the premise cannot rot.
-    /// [`ConfigState::remove_udp_frontend`] then retains on
-    /// `front.address != front_to_remove.address` — the ADDRESS ALONE — so it
-    /// drops every sibling at that address whatever its tags, and unlike
-    /// `remove_tcp_frontend` it carries no "drops exactly one entry" assertion
-    /// to catch it. `remove_tcp_frontend` matches on the very (address, sni,
-    /// alpn) key `add_tcp_frontend` admitted; the UDP pair has no such mirror.
+    /// [`ConfigState::remove_udp_frontend`] retains on that same
+    /// (cluster, address, tags) identity — the bucket already scopes
+    /// `cluster_id` — so a removal drops exactly one entry and leaves every
+    /// sibling at that address alone. This is the mirror
+    /// `remove_tcp_frontend` has always had for its own (address, sni, alpn)
+    /// key, and it is what makes `RemoveUdpFrontend` a true inverse of
+    /// `AddUdpFrontend` for `compute_rollback` (`bin/src/command/requests.rs`,
+    /// `a_udp_frontend_add_inverts_to_its_exact_removal`).
     ///
-    /// This is a PRE-EXISTING defect of a live control-plane verb, not a
-    /// regression of the change that added this test, and it is why
-    /// `compute_rollback` (`bin/src/command/requests.rs`) deliberately gives
-    /// `AddUdpFrontend` no inverse: reverting an unacknowledged UDP add with
-    /// `RemoveUdpFrontend` would evict every acknowledged same-address sibling
-    /// from the main-process state, which the next `SaveState` persists.
+    /// The tags are part of the key in BOTH directions, so a remove carrying
+    /// no tags no longer clears a tagged frontend — the observable semantics
+    /// change this test also pins. `sozu frontend udp remove --tags` carries
+    /// them, mirroring `--sni` / `--alpn` on the TCP remove.
     ///
-    /// Narrowing the removal key changes the observable semantics of
-    /// `RemoveUdpFrontend` for every existing operator — a tagless remove that
-    /// today clears an address would then match nothing — so the fix is an
-    /// explicit product decision, not a maintenance edit. The test is therefore
-    /// committed RED and `#[ignore]`d as a tracked follow-up: run it with
-    /// `cargo test -p sozu-command-lib -- --ignored` to see the current
-    /// behaviour.
+    /// To SEE THIS RED, one mutation per half:
+    ///
+    /// - The SIBLING half: restore the address-only retain in
+    ///   [`ConfigState::remove_udp_frontend`] by reducing `matches_removal` to
+    ///   `|front: &UdpFrontend| front.address == remove_address`. In a build
+    ///   with `debug_assertions` the production guard fires first --
+    ///   `remove_udp_frontend drops exactly one entry, left: 0, right: 1` --
+    ///   which is the TCP-twin assertion doing its job. Strip that
+    ///   `debug_assert_eq!` and its companion too, the complete pre-fix body,
+    ///   and the failure lands on the `surviving == ["team-b"]` assertion
+    ///   instead.
+    /// - The TAGLESS half, which the mutation above never reaches: make an
+    ///   empty tag set a wildcard, the plausible design alternative in which a
+    ///   bare remove still clears an address --
+    ///   `front.address == remove_address
+    ///        && (front_to_remove.tags.is_empty() || front.tags == front_to_remove.tags)`.
+    ///   The tagged removal still drops exactly one entry, so the sibling half
+    ///   and both production assertions pass; the ONLY failure is the
+    ///   `expect_err("a tagless remove must not match a tagged UDP frontend")`
+    ///   below. That half is what existing operator scripts hit, so it is
+    ///   pinned on its own rather than shadowed by the sibling assertion.
     #[test]
-    #[ignore = "tracked follow-up, committed red: remove_udp_frontend keys on the address alone while add_udp_frontend keys on (cluster, address, tags), so one removal evicts same-address siblings; narrowing the removal key changes a live verb's semantics and is an explicit product decision"]
-    fn remove_udp_frontend_evicts_same_address_siblings() {
+    fn remove_udp_frontend_spares_same_address_siblings() {
         let address = SocketAddress::new_v4(127, 0, 0, 1, 9100);
         let front = |owner: &str| RequestUdpFrontend {
             cluster_id: "udp_cluster".to_string(),
@@ -6027,6 +6066,27 @@ mod tests {
             surviving,
             vec!["team-b"],
             "removing one UDP frontend must not evict its same-address sibling"
+        );
+
+        // The other half of the narrowed key: tags belong to the removal
+        // identity in BOTH directions, so a remove carrying none matches
+        // nothing at that address instead of clearing every frontend on it.
+        let tagless = RequestUdpFrontend {
+            cluster_id: "udp_cluster".to_string(),
+            address,
+            tags: BTreeMap::new(),
+        };
+        let err = state
+            .dispatch(&RequestType::RemoveUdpFrontend(tagless).into())
+            .expect_err("a tagless remove must not match a tagged UDP frontend");
+        assert!(
+            matches!(err, StateError::NoChange),
+            "expected NoChange, got: {err}"
+        );
+        assert_eq!(
+            state.udp_fronts.get("udp_cluster").map(Vec::len),
+            Some(1usize),
+            "the tagless remove must leave the surviving tagged frontend in place"
         );
     }
 }

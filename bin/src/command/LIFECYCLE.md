@@ -183,26 +183,27 @@ single-request path uses: an entry NO worker acknowledged is reverted from
 the master's `ConfigState` with the inverse `compute_rollback` captured at
 scatter time, so `SaveState` cannot re-persist it and the next replay
 cannot re-inject it (sozu#1313). `compute_rollback` covers the four listener
-adds (inverted to `RemoveListener` on the same address and proxy type) and
-three of the four frontend adds — HTTP, HTTPS and TCP — each inverted to its
+adds (inverted to `RemoveListener` on the same address and proxy type) and all
+four frontend adds — HTTP, HTTPS, TCP and UDP — each inverted to its
 `Remove*Frontend` counterpart carrying the very request message the add
-carried. Those three removals match on the very key their add admitted, so
+carried. Each of those removals matches on the very key its add admitted, so
 the inverse evicts exactly the entry the add inserted.
 
-`AddUdpFrontend`, upsert verbs (`AddCluster`, `AddBackend`) and non-add verbs
-are deliberately uncovered: they keep the best-effort behaviour rather than
-risk a wrong revert. UDP is uncovered for a specific reason — its removal key
-is COARSER than its add key. `add_udp_frontend` dedups on the full
-`UdpFrontend { cluster_id, address, tags }`, so two frontends at one (cluster,
-address) differing only in tags legitimately coexist, while
-`remove_udp_frontend` retains on the address alone and therefore drops every
-sibling at that address. Using it as an inverse would revert one unacknowledged
-add by evicting acknowledged siblings from the master's `ConfigState` — the
-main/worker drift sozu#1313 exists to prevent. The asymmetry is pinned red and
-`#[ignore]`d by `remove_udp_frontend_evicts_same_address_siblings`
-(`command/src/state.rs`); narrowing the removal key changes a live verb's
-observable semantics and is an explicit product decision, so the inverse stays
-out until then.
+UDP was uncovered until its removal key was narrowed. `add_udp_frontend` dedups
+on the full `UdpFrontend { cluster_id, address, tags }`, so two frontends at one
+(cluster, address) differing only in tags legitimately coexist, while
+`remove_udp_frontend` used to retain on the address alone and therefore dropped
+every sibling at that address — reverting one unacknowledged add would have
+evicted acknowledged siblings from the master's `ConfigState`, the main/worker
+drift sozu#1313 exists to prevent. `remove_udp_frontend` now retains on that
+same (cluster, address, tags) identity, with the `INV:` comment and the
+"drops exactly one entry" assertion `remove_tcp_frontend` carries for its own
+(address, sni, alpn) key. `remove_udp_frontend_spares_same_address_siblings`
+(`command/src/state.rs`) pins the mirror; `sozu frontend udp remove --tags`
+carries the tags the identity now needs.
+
+Upsert verbs (`AddCluster`, `AddBackend`) and non-add verbs stay deliberately
+uncovered: they keep the best-effort behaviour rather than risk a wrong revert.
 
 Both also arm a bounded deadline (`bulk_replay_timeout`: one
 `worker_timeout` plus 10 ms per scattered entry, capped at ten

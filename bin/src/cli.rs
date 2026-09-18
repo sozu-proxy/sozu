@@ -896,6 +896,12 @@ pub enum UdpFrontendCmd {
             help = "frontend address, format: IP:port"
         )]
         address: SocketAddr,
+        #[clap(
+            long = "tags",
+            help = "the tags the frontend was added with; they are part of its identity, so a frontend added with --tags is only removed by repeating them (example: 'key=value, other-key=other-value')",
+            value_parser = parse_tags
+        )]
+        tags: Option<BTreeMap<String, String>>,
     },
 }
 
