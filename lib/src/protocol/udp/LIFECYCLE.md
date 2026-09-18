@@ -341,6 +341,14 @@ Worker requests reach UDP via `UdpProxy::notify` (`udp.rs:790`), routed from
   `notify_add_udp_listener` (`server.rs:2087`); `activate_listener` (`udp.rs:483`)
   then `build_session` (`udp.rs:502`) — UDP replaces the accept/create-session
   step with a single long-lived `UdpListenerSession` per listener (`server.rs:2266-2271`).
+  That install happens once per *activation*, not once per request: `activate`
+  short-circuits on the listener's own `active` flag and answers with the same
+  token for a listener that is already up, and `ConfigState` accepts the repeat
+  and replays one `ActivateListener` per active listener, so the server arm calls
+  `build_session` only when `UdpProxy::has_listener_session` says none is
+  installed. Rebuilding on a repeat would displace the live session while the
+  proxy kept the shared `UdpManager` and its flow table, leaving every in-flight
+  flow unforwardable and its upstream slab slot unreleasable.
 - **Front add/remove**: `add_udp_front` (`udp.rs:628`) / `remove_udp_front`
   (`udp.rs:662`).
 - **Cluster knobs**: `apply_cluster` (`udp.rs:717`) → `apply_udp_knobs`
