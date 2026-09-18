@@ -2584,6 +2584,11 @@ impl Server {
                         info!("removed listen token {:?}", token);
                     }
                 }
+                // The listen token may still be queued for a deferred accept
+                // (`ready()` enqueues it whenever the listener is readable but
+                // `can_accept` is false). Its slab entry is gone now, so
+                // `handle_remaining_readiness` must not find it there.
+                self.accept_ready.remove(&ListenToken(token.0));
 
                 if deactivate.to_scm {
                     self.unblock_scm_socket();
@@ -2628,6 +2633,9 @@ impl Server {
                     self.sessions.borrow_mut().slab.remove(token.0);
                     info!("removed listen token {:?}", token);
                 }
+                // See the HTTP arm: a token queued for a deferred accept must
+                // not outlive the slab entry it indexes.
+                self.accept_ready.remove(&ListenToken(token.0));
 
                 if deactivate.to_scm {
                     self.unblock_scm_socket();
@@ -2670,6 +2678,9 @@ impl Server {
                     self.sessions.borrow_mut().slab.remove(token.0);
                     info!("removed listen token {:?}", token);
                 }
+                // See the HTTP arm: a token queued for a deferred accept must
+                // not outlive the slab entry it indexes.
+                self.accept_ready.remove(&ListenToken(token.0));
 
                 if deactivate.to_scm {
                     self.unblock_scm_socket();
@@ -2712,6 +2723,12 @@ impl Server {
                     self.sessions.borrow_mut().slab.remove(token.0);
                     info!("removed listen token {:?}", token);
                 }
+                // A UDP listen token never reaches `accept_ready` (`ready()`
+                // only enqueues the three accept-driven listen protocols), but
+                // the removal keeps the rule uniform across the four arms:
+                // dropping a listen token's slab entry drops its pending
+                // accept as well.
+                self.accept_ready.remove(&ListenToken(token.0));
 
                 if deactivate.to_scm {
                     self.unblock_scm_socket();
@@ -3137,7 +3154,28 @@ impl Server {
                 .next()
                 .map(|token| ListenToken(token.0))
             {
-                let protocol = self.sessions.borrow().slab[token.0].borrow().protocol();
+                // A listen token queued here while `can_accept` was false
+                // outlives its slab entry when the listener is deactivated
+                // meanwhile (`notify_deactivate_listener` removes the entry).
+                // Indexing the slab with it panicked the worker. Purging it
+                // HERE as well as in the deactivate arms is what keeps the
+                // loop finite: `accept()` below only removes the token on
+                // `WouldBlock`/error, so a `continue` without the removal
+                // would hand `iter().next()` the same stale token forever.
+                let protocol = self
+                    .sessions
+                    .borrow()
+                    .slab
+                    .get(token.0)
+                    .map(|session| session.borrow().protocol());
+                let Some(protocol) = protocol else {
+                    error!(
+                        "accept_ready holds listen token {:?}, which no longer has a session; dropping it",
+                        token
+                    );
+                    self.accept_ready.remove(&token);
+                    continue;
+                };
                 self.accept(token, protocol);
                 if !self.sessions.borrow().can_accept || self.accept_ready.is_empty() {
                     break;
@@ -3423,5 +3461,152 @@ mod eviction_tests {
 
         assert_eq!(selected.len(), 1);
         assert!(selected.contains(&Token(1)));
+    }
+}
+
+#[cfg(test)]
+mod accept_ready_tests {
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{DeactivateListener, ListenerType, SocketAddress},
+    };
+
+    use super::*;
+    use crate::testing::{ServerParts, prebuild_server, provide_port};
+
+    /// A worker holding one activated TCP listener, reachable through the very
+    /// same `Server` surface the event loop drives. The listen token carries a
+    /// `ListenSession` placeholder in the slab, exactly like
+    /// `tcp::testing::start_tcp_worker` installs it.
+    fn server_with_tcp_listener() -> (Server, Token, SocketAddress) {
+        let ServerParts {
+            event_loop,
+            registry,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        // `send_scm = true`: `Server::new` ends on a BLOCKING
+        // `receive_listeners()`, so the client side must have queued its
+        // (empty) listener set first -- exactly what
+        // `tcp::testing::start_tcp_worker` does.
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (_command_channel, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listener_config = ListenerBuilder::new_tcp(address)
+            .to_tcp(None)
+            .expect("could not build a TcpListenerConfig for the test");
+
+        let listen_token = {
+            let mut session_manager = sessions.borrow_mut();
+            let entry = session_manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::TCPListen,
+            })));
+            token
+        };
+
+        let mut tcp_proxy =
+            tcp::TcpProxy::new(registry, sessions.clone(), pool.clone(), backends.clone());
+        tcp_proxy
+            .add_listener(listener_config, listen_token)
+            .expect("could not add the test TCP listener");
+        tcp_proxy
+            .activate_listener(&address.into(), None)
+            .expect("could not activate the test TCP listener");
+
+        let server = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            Some(tcp_proxy),
+            server_config,
+            None,
+            false,
+        )
+        .expect("could not build the test server");
+
+        // `_command_channel` is dropped here on purpose: nothing in these
+        // tests reads the worker's side of the channel.
+        (server, listen_token, address)
+    }
+
+    /// `ready()` queues a listen token in `accept_ready` whenever its listener
+    /// is readable but the worker cannot accept (buffer-pool backpressure), and
+    /// only `accept()` — which never runs while `can_accept` is false — takes
+    /// it back out. Deactivating that listener removes its slab entry, so
+    /// without this purge the token outlived the slot it indexes and the next
+    /// deferred accept pass indexed a vacant key.
+    ///
+    /// To SEE THIS RED: drop `self.accept_ready.remove(&ListenToken(token.0))`
+    /// from `notify_deactivate_listener`'s TCP arm — the first assertion below
+    /// fails, and the `handle_remaining_readiness` call after it panics with
+    /// "invalid key".
+    #[test]
+    fn deactivating_a_listener_drops_its_pending_accept_token() {
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+
+        // The backpressure state: readable listener, worker at capacity.
+        server.accept_ready.insert(ListenToken(listen_token.0));
+
+        let response = server.notify_deactivate_listener(
+            "test-deactivate",
+            &DeactivateListener {
+                address,
+                proxy: ListenerType::Tcp as i32,
+                to_scm: false,
+            },
+        );
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "deactivating an activated TCP listener must succeed: {response:?}"
+        );
+        assert!(
+            !server.sessions.borrow().slab.contains(listen_token.0),
+            "deactivating a listener must free its slab entry — the premise of this test"
+        );
+        assert!(
+            !server.accept_ready.contains(&ListenToken(listen_token.0)),
+            "a deactivated listener must not stay queued for a deferred accept"
+        );
+
+        // The pass that used to panic.
+        server.handle_remaining_readiness();
+    }
+
+    /// Structural safety for the deferred-accept pass itself: whatever else
+    /// ever drops a listen token's slab entry, indexing the slab with a token
+    /// that is no longer there must not take the worker down. Dropping the
+    /// stale token is also what keeps THIS branch finite: `accept()` only
+    /// removes a token on `WouldBlock`/error, so re-entering the loop without
+    /// the removal would spin on the same vacant slot forever.
+    ///
+    /// To SEE THIS RED: restore `self.sessions.borrow().slab[token.0]` in
+    /// `handle_remaining_readiness` — this test then panics with
+    /// "invalid key".
+    #[test]
+    fn a_stale_accept_token_is_dropped_instead_of_panicking() {
+        let (mut server, listen_token, _address) = server_with_tcp_listener();
+
+        server.sessions.borrow_mut().slab.remove(listen_token.0);
+        server.accept_ready.insert(ListenToken(listen_token.0));
+
+        server.handle_remaining_readiness();
+
+        assert!(
+            server.accept_ready.is_empty(),
+            "a listen token with no session must be dropped from accept_ready"
+        );
     }
 }
