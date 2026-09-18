@@ -766,25 +766,92 @@ max_flows      = 0
 
 ##### UDP frontend identity
 
-A UDP frontend is identified by its **cluster id, address and access-log tags**
-together, in both directions. `frontend udp add` admits two frontends at the
-same (cluster, address) when their `--tags` differ, so `frontend udp remove`
-takes the same `--tags` to name which one to drop — exactly as the TCP remove
-takes `--sni` / `--alpn`:
+**One UDP frontend per address, across every cluster.** A UDP frontend is
+stored under its **cluster id, address and tags** together, but the *address*
+alone is exclusive: `frontend udp add` refuses an address another frontend
+already holds, whatever cluster that frontend belongs to.
+
+UDP has no routing discriminator. A datagram carries no SNI, no `Host` header
+and no path, so the listener address **is** the entire routing key and no
+attribute of an incoming datagram could pick between two frontends bound to it.
+A TCP listener legitimately hosts several frontends because `(address, sni,
+alpn)` discriminates between them; UDP has no equivalent. The worker agrees by
+construction — it keeps exactly one cluster and one tag set per listener
+address — so a second frontend on one address was never a routed alternative,
+it silently replaced the first.
 
 ```bash
 sozu --config /etc/sozu/config.toml frontend udp add --id dns --address 0.0.0.0:53 --tags owner=team-a
 sozu --config /etc/sozu/config.toml frontend udp remove --id dns --address 0.0.0.0:53 --tags owner=team-a
 ```
 
-A removal drops exactly one frontend and leaves every sibling at that address
-in place.
+A second claim on `0.0.0.0:53` — from `dns` with different tags, or from any
+other cluster — is refused with `UDP frontend address <addr> is already claimed
+by another frontend`. Remove the frontend holding the address first, then add
+the new one; `sozu frontend list` shows which frontend currently holds it. (The
+message reports the contested address plus byte-length metadata rather than the
+current owner's cluster id and tags: cluster identifiers and tags are redacted
+from error text under the [sensitive-value logging
+boundary](./observability.md#sensitive-value-logging-boundary).)
 
-The tags are part of the identity, so omitting `--tags` on the remove does
-**not** clear a frontend that was added with them: the request matches nothing
-and answers `NoChange`. It is a clean no-op — the main process refuses a request
-it cannot apply *before* fanning it out, so no worker ever sees it and no
-listener stops routing. Repeat the `--tags` the frontend was added with.
+The tags stay part of the **removal** identity, so omitting `--tags` on the
+remove does **not** clear a frontend that was added with them: the request
+matches nothing and answers `NoChange`. It is a clean no-op — the main process
+refuses a request it cannot apply *before* fanning it out, so no worker ever
+sees it and no listener stops routing. Repeat the `--tags` the frontend was
+added with.
+
+> **Note:** UDP emits no access log today, and nothing in the UDP datapath reads
+> a frontend's tags. On a UDP frontend `--tags` is identity and metadata only —
+> it is carried by `sozu frontend list` and `sozu cluster tags`, and it names
+> which frontend a `frontend udp remove` drops.
+
+###### Upgrading from a configuration with two frontends on one UDP address
+
+Earlier versions admitted two UDP frontends on one address and left the
+datapath to collapse them. The effective cluster for such an address **can
+change** when you reload or replay a state that contains such a pair:
+
+- Before, the *last* entry applied won — each `AddUdpFrontend` overwrote the
+  listener's cluster and tags. For two entries in **different clusters** the
+  outcome was not even stable: the main process emits its saved entries by
+  iterating a hash map whose order differs per process, so which cluster ended
+  up serving the address could flip between restarts of the same saved state.
+- Now the *first* entry applied wins and every later claim on that address is
+  refused, so the address serves one defined cluster.
+
+Nothing aborts. `LoadState` and a static-configuration reload both skip an
+entry the state refuses, log
+`skipping an entry the state refused` / `Skipping a config entry the state
+refused` at `warn`, and count it — `LoadState` reports
+`load_state: skipped N invalid entries`. Every other entry still applies.
+
+**Delete the duplicate before you upgrade the main process.** A hot main-process
+upgrade (`sozu upgrade main`) does not re-validate the state: the new main
+process inherits the serialized state verbatim, so an existing pair arrives
+intact. What happens next depends on the build:
+
+- A **release** build carries it until the next reload, state replay or live
+  `frontend udp add` refuses it — the behaviour described above.
+- A build with **debug assertions** aborts the main process instead. Saving the
+  state, and forking a worker, both replay the generated requests into a fresh
+  state and assert that every one of them applies; the pair's second entry no
+  longer does, so the next `sozu state save` — or the next worker fork — fails
+  with `every request from generate_requests must replay cleanly`. The
+  assertion is right: a state holding such a pair cannot round-trip through
+  `state save` / `state load`, and it says so.
+
+So check for UDP addresses claimed more than once *before* upgrading — `sozu
+frontend list` lists every UDP frontend with its address and cluster — and
+delete the frontend you do not want to keep. The surviving cluster is then your
+choice rather than an artefact of replay order, and no inherited pair reaches
+the generated-request replay.
+
+Sōzu deliberately does not resolve an inherited pair for you. An upgrade
+re-attaches the running worker processes rather than restarting them, so the
+new main process cannot know which of the two the workers are already serving;
+picking one itself would silently resolve — and could invert — the very
+ambiguity this rule exists to reject.
 
 <a id="udp-limitations"></a>
 

@@ -2237,11 +2237,14 @@ fn compute_rollback(request: &RequestType) -> Option<Request> {
         // keys on the (cluster_id, address, tags) identity `add_udp_frontend`
         // admits -- same `INV:` comment and same "drops exactly one entry"
         // assertion -- so the inverse evicts exactly the unacknowledged entry
-        // and leaves every acknowledged same-address sibling in place. While
-        // the removal key was the address alone it was coarser than its add and
-        // stayed out for that reason. Pinned by
+        // and leaves every other acknowledged frontend in place. While the
+        // removal key was the address alone it was coarser than its add and
+        // stayed out for that reason. Since `add_udp_frontend` admits one
+        // frontend per address across every cluster, the entry this inverse
+        // removes is the only one on its address, which is what makes the
+        // eviction unambiguous. Pinned by
         // `a_udp_frontend_add_inverts_to_its_exact_removal` below and by
-        // `remove_udp_frontend_spares_same_address_siblings` in
+        // `remove_udp_frontend_drops_exactly_the_frontend_its_tags_name` in
         // `command/src/state.rs`.
         RequestType::AddTcpFrontend(front) => RequestType::RemoveTcpFrontend(front.clone()),
         RequestType::AddUdpFrontend(front) => RequestType::RemoveUdpFrontend(front.clone()),
@@ -4925,24 +4928,23 @@ mod listener_validation_tests {
     /// `AddUdpFrontend` inverts to the `RemoveUdpFrontend` carrying the very
     /// request the add carried, exactly as the HTTP, HTTPS and TCP adds do.
     ///
-    /// `add_udp_frontend` (`command/src/state.rs`) dedups on the FULL
-    /// `UdpFrontend { cluster_id, address, tags }`, so two frontends at the
-    /// same (cluster, address) that differ only in their access-log tags
-    /// legitimately coexist. `remove_udp_frontend` now retains on that SAME
+    /// `add_udp_frontend` (`command/src/state.rs`) stores a full
+    /// `UdpFrontend { cluster_id, address, tags }` and admits one frontend per
+    /// address across every cluster. `remove_udp_frontend` retains on that SAME
     /// (cluster, address, tags) identity — the bucket scopes `cluster_id`, and
     /// its own `INV:` comment plus its "drops exactly one entry" assertion pin
     /// the mirror, just like `remove_tcp_frontend`'s (address, sni, alpn) key.
     /// The inverse therefore evicts exactly the frontend the add inserted and
-    /// leaves every acknowledged sibling in place, which is what kept this verb
-    /// out of `compute_rollback` while the removal key was coarser. Leaving it
-    /// out now would keep sozu#1313's poisoned-state loop open for every UDP
-    /// frontend.
+    /// leaves every other acknowledged frontend in place, which is what kept
+    /// this verb out of `compute_rollback` while the removal key was coarser.
+    /// Leaving it out now would keep sozu#1313's poisoned-state loop open for
+    /// every UDP frontend.
     ///
     /// To SEE THIS RED: remove the
     /// `RequestType::AddUdpFrontend(front) => RequestType::RemoveUdpFrontend(front.clone())`
     /// arm from [`super::compute_rollback`]. That the inverse is collateral-free
     /// is pinned separately by
-    /// `remove_udp_frontend_spares_same_address_siblings` in
+    /// `remove_udp_frontend_drops_exactly_the_frontend_its_tags_name` in
     /// `command/src/state.rs`.
     #[test]
     fn a_udp_frontend_add_inverts_to_its_exact_removal() {
@@ -5498,13 +5500,14 @@ mod load_state_rollback_tests {
         );
     }
 
-    /// A same-address, same-cluster UDP frontend distinguished only by its
-    /// `owner` tag — the shape `add_udp_frontend` admits, and the shape a
-    /// removal key coarser than the add key used to collapse.
-    fn udp_frontend(owner: &str) -> RequestUdpFrontend {
+    /// A UDP frontend in a fixed cluster, distinguished by its `owner` tag and
+    /// placed at the caller's port. `add_udp_frontend` admits one frontend per
+    /// address across every cluster, so two of these must be given two ports;
+    /// the tag is what a removal key coarser than the add key used to collapse.
+    fn udp_frontend(owner: &str, port: u16) -> RequestUdpFrontend {
         RequestUdpFrontend {
             cluster_id: "udp-cluster".to_owned(),
-            address: SocketAddress::new_v4(127, 0, 0, 1, 9100),
+            address: SocketAddress::new_v4(127, 0, 0, 1, port),
             tags: BTreeMap::from([("owner".to_owned(), owner.to_owned())]),
         }
     }
@@ -5513,31 +5516,30 @@ mod load_state_rollback_tests {
     /// `a_udp_frontend_add_inverts_to_its_exact_removal` cannot reach: that
     /// test asserts the SHAPE [`super::compute_rollback`] returns, this one
     /// drives `revert_unacknowledged` against a real `ConfigState` and proves
-    /// the inverse spares the acknowledged sibling at the same address.
+    /// the inverse spares the acknowledged sibling.
     ///
-    /// Both entries sit at one (cluster, address) and differ only in their
-    /// access-log tags, which `add_udp_frontend` admits. Entry 1 every worker
-    /// refused and must be reverted; entry 2 one worker applied, so `ok > 0`
-    /// protects it.
+    /// The two entries share a cluster and sit at DIFFERENT addresses, the
+    /// only shape `add_udp_frontend` admits: a UDP listener address is the
+    /// whole routing key, so one frontend holds it across every cluster.
+    /// Entry 1 every worker refused and must be reverted; entry 2 one worker
+    /// applied, so `ok > 0` protects it.
     ///
-    /// To SEE THIS RED: restore the address-only retain in
-    /// `ConfigState::remove_udp_frontend` (`command/src/state.rs`) — reduce
-    /// `matches_removal` to `|front| front.address == remove_address`. In a
-    /// build with `debug_assertions` the production guard fires first, inside
-    /// the revert's own `dispatch`:
+    /// To SEE THIS RED: widen `matches_removal` in
+    /// `ConfigState::remove_udp_frontend` (`command/src/state.rs`) to the
+    /// whole bucket, `|_front| true`. In a build with `debug_assertions` the
+    /// production guard fires first, inside the revert's own `dispatch`:
     /// `remove_udp_frontend drops exactly one entry, left: 0, right: 1`.
-    /// Strip that `debug_assert_eq!` and its companion too — the complete
-    /// pre-fix body — and the failure lands on the assertion below instead,
-    /// `left: [], right: ["team-b"]`, with the task logging
-    /// `reverted entries: 1`: one revert, both frontends gone. That is
-    /// sozu#1313's main/worker drift reintroduced by the rollback itself, and
-    /// precisely why this verb stayed out of [`super::compute_rollback`] until
-    /// the removal key mirrored the add key.
+    /// Strip that `debug_assert_eq!` and its companion too and the failure
+    /// lands on the assertion below instead, `left: [], right: ["team-b"]`,
+    /// with the task logging `reverted entries: 1`: one revert, both
+    /// frontends gone. That is sozu#1313's main/worker drift reintroduced by
+    /// the rollback itself, and precisely why this verb stayed out of
+    /// [`super::compute_rollback`] until the removal key mirrored the add key.
     #[test]
     fn a_udp_frontend_no_worker_acknowledged_is_reverted_while_its_sibling_stays() {
         let (mut hub, _dir) = create_test_hub();
-        let rejected = RequestType::AddUdpFrontend(udp_frontend("team-a"));
-        let accepted = RequestType::AddUdpFrontend(udp_frontend("team-b"));
+        let rejected = RequestType::AddUdpFrontend(udp_frontend("team-a", 9100));
+        let accepted = RequestType::AddUdpFrontend(udp_frontend("team-b", 9101));
         for request in [&rejected, &accepted] {
             hub.server
                 .state
@@ -5587,8 +5589,8 @@ mod load_state_rollback_tests {
         assert_eq!(
             surviving,
             vec!["team-b"],
-            "only the UDP frontend no worker acknowledged must be reverted; its same-address \
-             sibling must survive"
+            "only the UDP frontend no worker acknowledged must be reverted; its sibling in the \
+             same cluster must survive"
         );
     }
 

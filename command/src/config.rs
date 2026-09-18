@@ -5846,8 +5846,15 @@ mod tests {
     /// it carries no `sni`/`alpn` on the wire and must not participate in
     /// the TCP-only mixing-ban / ALPN-overlap invariants. Two "tcp"
     /// clusters at the same UDP-listener address, one with `hostname` set
-    /// and one without, must load successfully rather than spuriously
-    /// tripping `TcpListenerMixesSniAndNoSni`.
+    /// and one without, must build and emit their messages rather than
+    /// spuriously tripping `TcpListenerMixesSniAndNoSni`.
+    ///
+    /// Message GENERATION is all this asserts. A UDP address is claimed by
+    /// exactly one frontend (`ConfigState::add_udp_frontend`), so at apply
+    /// time `load_static_config` admits the first of these two and skips the
+    /// second with `Skipping a config entry the state refused`. That is the
+    /// config-file face of the same collision, and it is deliberately not
+    /// asserted here: this test owns the SNI invariants, not admission.
     #[test]
     fn udp_routed_tcp_frontends_are_excluded_from_sni_invariants() {
         let toml_content = r#"
