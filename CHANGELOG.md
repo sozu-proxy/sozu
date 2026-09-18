@@ -74,6 +74,38 @@
 
   `LoadState`'s completion audit line gains a `reverted:<n>` count in its `target` and an
   `error_code` (`worker_timeout` / `worker_failure`) on failure.
+- **`fix(http)`: stop asserting a 3-digit range on a backend-supplied status code.**
+  `save_http_status_metric` carried a `debug_assert!((100..=999).contains(&status))` justified by
+  the claim that every status it sees is either a parsed backend response status line or a
+  validated answer template, and that anything else is an upstream logic bug rather than hostile
+  traffic. A backend response status line is wire data: kawa reads the status with `take(3)` then
+  `str::parse::<u16>()` and applies no range check, so a backend answering `HTTP/1.1 000 …` yields
+  code `0`. The assertion therefore panicked the worker on backend input in every debug, test, e2e
+  and fuzz build — the shape of
+  [#1279](https://github.com/sozu-proxy/sozu/issues/1279). The precondition is removed; the
+  `http.status.other` catch-all already buckets such codes, and no emitted counter changes. Locked
+  by a test that drives `HTTP/1.1 000 Nope` through the real H1 parser and response-header
+  callback (seen red).
+
+  The same-shaped post-condition in `Template::new` (`answers.rs`) is removed with it. A *named*
+  answer template ("301", "302", "308", "400" … "507") is pinned to its code by the
+  `InvalidStatusCode` guard, but `HttpAnswers::template`'s catch-all arm compiles an answer under
+  any other name with `status: None` and skips that guard — and both the name and the body come
+  from the operator's `BTreeMap<String, String>`, which a listener patch carries over the command
+  socket. A custom answer whose body started `HTTP/1.1 000 x` therefore panicked the worker on a
+  control-plane request in every debug, test, e2e and fuzz build. Locked by a test that compiles
+  such an answer through `HttpAnswers::templates` (seen red).
+- **`fix(https)`: do not kill the worker on a `QueryCertificates` request.**
+  `query_all_certificates` and `query_certificate_for_domain` took the resolver mutex with
+  `unwrap_msg!` and turned each SNI trie key into a `String` with `String::from_utf8(...).unwrap()`,
+  while their `add_certificate` / `remove_certificate` / `replace_certificate` siblings already map
+  a poisoned lock to `ProxyError::Lock`. A resolver poisoned by any earlier panic therefore made a
+  read-only control-plane query the request that takes the worker down. Both query paths now report
+  the lock error like their siblings and render trie keys lossily, so a certificate listing degrades
+  instead of aborting. The degradation is not silent: `CertificateSummary.domain` is a protobuf
+  `string`, so a lossy name carries U+FFFD and will not match a later `RemoveCertificate` — that
+  now emits an `error!` carrying byte counts only, never the key. Locked by a poisoned-resolver
+  test and a non-UTF-8 trie-key test (both seen red).
 
 ## 2.2.1 - 2026-08-28
 
