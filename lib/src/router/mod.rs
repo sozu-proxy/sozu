@@ -1051,11 +1051,18 @@ impl PathRule {
     }
 }
 
+/// `Regex` carries no `PartialEq`, so the comparison is written by hand
+/// and compares patterns by `as_str()`. Every variant must answer for
+/// itself: without an `Equals` arm the catch-all made two identical
+/// `PathRule::Equals` unequal — not even reflexive — and the router's
+/// bookkeeping (`add_*_rule` dedup, `remove_*_rule` eviction) silently
+/// lost every `--path-equals` frontend, reporting success either way.
 impl std::cmp::PartialEq for PathRule {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (PathRule::Prefix(s1), PathRule::Prefix(s2)) => s1 == s2,
             (PathRule::Regex(r1), PathRule::Regex(r2)) => r1.as_str() == r2.as_str(),
+            (PathRule::Equals(s1), PathRule::Equals(s2)) => s1 == s2,
             _ => false,
         }
     }
@@ -3555,5 +3562,59 @@ mod tests {
             &MethodRule::new(Some("GET".to_string()))
         ));
         assert!(!router.has_hostname("www.example.com"));
+    }
+    /// `PathRule`'s `PartialEq` carried no `(Equals, Equals)` arm, so two
+    /// identical `PathRule::Equals` compared unequal — an equality that is
+    /// not even reflexive. Every router bookkeeping path is written against
+    /// it: `add_tree_rule` could not see the rule it had just pushed (so the
+    /// same `--path-equals` frontend was stored again on every re-add
+    /// instead of being refused), `remove_tree_rule`'s `retain` kept the
+    /// entry it was asked to drop, and `remove_http_front` still answered
+    /// `Ok` for a route it had not removed.
+    ///
+    /// To SEE THIS RED: drop the
+    /// `(PathRule::Equals(s1), PathRule::Equals(s2)) => s1 == s2` arm from
+    /// `impl std::cmp::PartialEq for PathRule` so the catch-all `_ => false`
+    /// answers again — the reflexivity assertion below is the first statement
+    /// and fails on `left: Equals("/exact") / right: Equals("/exact")`.
+    /// Without that assertion a debug build panics one line later, inside
+    /// `add_http_front`, on "a freshly inserted tree domain must resolve to
+    /// its inserted rule".
+    #[test]
+    fn an_equals_path_frontend_is_deduplicated_and_removable() {
+        assert_eq!(
+            PathRule::Equals("/exact".to_owned()),
+            PathRule::Equals("/exact".to_owned()),
+            "PathRule equality must be reflexive for the Equals variant",
+        );
+
+        let mut router = Router::new();
+        let mut front = test_http_frontend();
+        front.path = CommandPathRule::equals("/exact".to_owned());
+
+        router
+            .add_http_front(&front)
+            .expect("an Equals frontend must be added");
+        assert!(
+            router.lookup("example.com", "/exact", &Method::Get).is_ok(),
+            "the Equals frontend must resolve once added",
+        );
+
+        // The identical frontend is already stored, so the router must
+        // refuse it instead of pushing a second, unremovable copy.
+        assert!(
+            matches!(router.add_http_front(&front), Err(RouterError::AddRoute(_))),
+            "re-adding the same Equals frontend must be refused, not duplicated",
+        );
+
+        router
+            .remove_http_front(&front)
+            .expect("an Equals frontend must be removable");
+        assert!(
+            router
+                .lookup("example.com", "/exact", &Method::Get)
+                .is_err(),
+            "the Equals frontend must no longer resolve once removed",
+        );
     }
 }
