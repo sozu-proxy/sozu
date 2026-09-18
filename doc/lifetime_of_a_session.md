@@ -222,11 +222,37 @@ even when a misbehaving client is hammering the handshake
 When a frontend is configured to expect a HAProxy PROXY-protocol
 header (typically because Sōzu sits behind a Layer-4 load balancer)
 the session starts in a small `ExpectProxyProtocol` state
-(`lib/src/http.rs:141`,
-`lib/src/protocol/proxy_protocol/expect.rs:117`). That state reads the
+(`lib/src/http.rs:142`,
+`lib/src/protocol/proxy_protocol/expect.rs:118`). That state reads the
 v1 / v2 header off the front socket, extracts the real client address,
 and then transitions the session into the downstream protocol
-(HTTP/1.1, HTTP/2, or raw TCP relay).
+(HTTP/1.1, HTTP/2, or raw TCP relay). A v2 header carrying the `LOCAL`
+command (ver/cmd `0x20`) is the exception: it describes a connection the
+upstream proxy originated itself, so its address block is discarded per the
+HAProxy PROXY protocol specification §2.2 and no client address is
+extracted at all.
+
+What happens next depends on the listener, because the two families
+resolve the resulting `ProxyAddr::AfUnspec` differently. A **TCP**
+listener keeps the front socket's own `peer_addr`: `into_pipe`
+(`lib/src/protocol/proxy_protocol/expect.rs:302`,
+`lib/src/protocol/proxy_protocol/relay.rs:294`), the SNI preread
+(`lib/src/tcp.rs:908`) and `TcpSession::effective_session_address`
+(`lib/src/tcp.rs:373`, which feeds the raw-TCP `max_connections_per_ip`
+gate) all fall back to it. An **HTTP or HTTPS**
+listener instead refuses the upgrade: `upgrade_expect`
+(`lib/src/http.rs:316`, `lib/src/https.rs:334`) needs both a source and
+a destination to build the session, `AfUnspec` supplies neither, so it
+returns `None` and `upgrade` reports `SessionIsToBeClosed`
+(`lib/src/http.rs:254`) — the session is closed at the expect stage,
+before any request is read.
+
+That close is not a regression for legitimate traffic. HAProxy pairs
+`LOCAL` with `AF_UNSPEC`, which already parsed to `AfUnspec`, so an
+HTTP or HTTPS session from a health-checking upstream already closed
+here. The only behaviour the discard changes is the forged case — a
+`LOCAL` header carrying a populated address block — which used to
+upgrade with attacker-chosen addresses and now closes instead.
 
 The full lifecycle of the three sub-state-machines (`expect`, `relay`,
 `send`) is documented in
@@ -424,7 +450,7 @@ Linux the subsequent `close()` then sends a TCP RST instead of a FIN,
 destroying any data still in the send buffer — including the TLS
 records the drain loop just flushed. `Shutdown::Write` sends FIN only
 after the send buffer drains, preserving the response. The plaintext
-TCP path (`lib/src/tcp.rs:867-870, 1011-1016`) keeps `Shutdown::Both`
+TCP path (`lib/src/tcp.rs:1563-1567, 1830-1835`) keeps `Shutdown::Both`
 because it has no encrypted send-buffer to truncate; the comment
 flags that a future TLS upgrade on TCP would need to switch modes.
 

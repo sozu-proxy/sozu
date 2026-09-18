@@ -2,6 +2,56 @@
 
 ## [Unreleased]
 
+### 🔐 Security
+
+- **`fix(proxy-protocol)`: discard the address block of a PROXY-v2 `LOCAL` header.**
+  The PROXY-v2 command nibble distinguishes `PROXY` (ver/cmd `0x21`) from `LOCAL` (`0x20`).
+  `parse_v2_header` decoded it into `HeaderV2::command`, but no consumer ever read that field, and
+  `parse_addr_v2` switched on the address-family nibble alone — so a header declaring `LOCAL` with
+  family `0x11` and a populated 12-byte `AF_INET` block was parsed into a full address pair. Six
+  sites consume that pair, and all six took it at face value, so any peer able to reach a listener
+  with `expect_proxy = true` (or a relay/preread PROXY listener) could **forge the source address
+  Sōzu attributes to it**: the IP written to the access logs, injected as `X-Real-IP`, and counted
+  against `max_connections_per_ip`, which it could therefore evade by picking a fresh address per
+  connection. Four are TCP-side: `ExpectProxyProtocol::into_pipe`
+  (`lib/src/protocol/proxy_protocol/expect.rs:302`), `RelayProxyProtocol::into_pipe`
+  (`lib/src/protocol/proxy_protocol/relay.rs:294`), the TCP SNI preread
+  (`Output::Routed { proxy_source }`, `lib/src/protocol/tcp_preread/mod.rs:284`), and
+  `TcpSession::effective_session_address` (`lib/src/tcp.rs:373`), which reads
+  `ExpectProxyProtocol::addresses` / `RelayProxyProtocol::addresses` itself rather than through
+  `into_pipe` and is what feeds the raw-TCP `max_connections_per_ip` gate (`lib/src/tcp.rs:1638`).
+  The two `into_pipe` sites carried a comment claiming the fallback to `peer_addr` already happened
+  "when the header carried `Command::Local` (no encapsulated addresses)"; the parenthetical was
+  false — the wire format does not tie `LOCAL` to `AF_UNSPEC`, only HAProxy's own emitter pairs
+  them — and both comments have been corrected. The SNI preread carried no such comment and its
+  production code is unchanged; only its regression test is new.
+  Per the HAProxy PROXY protocol specification §2.2, a `LOCAL` header describes a connection the
+  upstream proxy originated on its own behalf (typically a health check) and its address block must
+  be ignored in favour of the real socket endpoints. `parse_v2_header` now yields
+  `ProxyAddr::AfUnspec` for every `LOCAL` header, one choke point for all six consumers — but the
+  two listener families resolve `AfUnspec` differently, and operators should know which they run.
+  The four TCP-side consumers named above fall back to the front socket's `peer_addr`: the session
+  proceeds, attributed to the real socket peer. The two HTTP-side consumers do **not** fall back —
+  `HttpSession::upgrade_expect` (`lib/src/http.rs:316`) and `HttpsSession::upgrade_expect`
+  (`lib/src/https.rs:334`) each require both a source and a destination, `AfUnspec` supplies
+  neither (`lib/src/protocol/proxy_protocol/header.rs:303, 311`), and the refused upgrade becomes
+  `SessionIsToBeClosed` (`lib/src/http.rs:254`) — so an HTTP or HTTPS session presenting a `LOCAL`
+  header is closed at the expect stage, before any request is read.
+  That close is not a regression for legitimate traffic: HAProxy pairs `LOCAL` with `AF_UNSPEC`,
+  which already parsed to `ProxyAddr::AfUnspec`, so those sessions already closed. The only case
+  whose behaviour changes is the forged one — a `LOCAL` header with a populated address block —
+  which went from "upgrade with attacker-chosen addresses" to "close", the correct outcome.
+  Framing and validation are unchanged: the block is still parsed, so a malformed or unknown family
+  is still rejected and the declared length still delimits the header, and the `family` byte is
+  still reported as read.
+  A `PROXY` header carrying the same block is still honoured, and the guards for that were seen red
+  under the opposite mutation. Seen red at the parser in IPv4 and IPv6, and in IPv4 at the three
+  TCP-side consumers that carry a dedicated guard (`effective_session_address` is covered through
+  the same `addresses` field, with no guard of its own); the HTTP-side close was confirmed by
+  flipping the `expect_proxy` e2e emitter to `Command::Local`, which turns
+  `test_x_real_ip_send_and_elide` red with "backend received no request".
+  (The PROXY protocol has no RFC; the normative text is HAProxy's `doc/proxy-protocol.txt`.)
+
 ### ✨ Added
 
 - **`feat(ctl)`: filter `sozu frontend list` by cluster id.**

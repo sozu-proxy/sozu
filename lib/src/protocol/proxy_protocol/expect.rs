@@ -289,9 +289,13 @@ impl<Front: SocketHandler> ExpectProxyProtocol<Front> {
         // the TCP `peer_addr` so the pipe phase records the real client
         // — `peer_addr` here is the upstream PROXY-emitter (an LB / edge
         // proxy / health-check probe), not the originating client.
-        // Falls back to `peer_addr` when the header carried `Command::Local`
-        // (no encapsulated addresses) or when the parser ran with
-        // `AddressFamily::Unspec`.
+        // Falls back to `peer_addr` whenever `self.addresses` is `AfUnspec`:
+        // either the header declared AF_UNSPEC, or it carried
+        // `Command::Local`, whose address block `parse_v2_header` discards per
+        // the HAProxy PROXY protocol specification §2.2. A `LOCAL` header is
+        // NOT required by the wire format to leave that block empty — only
+        // HAProxy's own emitter pairs the two — so the discard happens in the
+        // parser and is what makes this fallback true.
         let addr = self
             .addresses
             .as_ref()
@@ -455,27 +459,86 @@ mod expect_test {
     use super::*;
     use crate::protocol::proxy_protocol::header::*;
 
+    /// Address pair the upfront middleware encapsulates in its header. Under
+    /// `Command::Local` these are the *forged* values a crafted peer would
+    /// send: the wire format lets a `LOCAL` header carry a fully populated
+    /// address block.
+    fn header_src() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(125, 25, 10, 1)), 8080)
+    }
+
+    fn header_dst() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200)
+    }
+
     // Flow diagram of the test below
     //                [connect]   [send proxy protocol]
     //upfront proxy  ----------------------X
     //              /     |           |
     //  sozu     ---------v-----------v----X
-    #[test]
-    fn middleware_should_receive_proxy_protocol_header_from_an_upfront_middleware() {
+    //
+    // Drives a full `readable` loop against a real loopback connection and
+    // returns the source address `into_pipe` would attribute to the client,
+    // i.e. `self.addresses.as_ref().and_then(|pa| pa.source())` -- `None`
+    // meaning `into_pipe` falls back to the front socket's `peer_addr`.
+    fn attributed_source_for(command: Command) -> Option<SocketAddr> {
         setup_test_logger!();
-        let middleware_addr: SocketAddr = "127.0.0.1:3500".parse().expect("parse address error");
+        let listener = TcpListener::bind("127.0.0.1:0".parse().expect("parse address error"))
+            .expect("could not bind the middleware listener");
+        let middleware_addr = listener
+            .local_addr()
+            .expect("the middleware listener must expose its address");
         let barrier = Arc::new(Barrier::new(2));
 
-        let upfront = start_upfront_middleware(middleware_addr, barrier.clone());
-        start_middleware(middleware_addr, barrier);
+        let upfront = start_upfront_middleware(middleware_addr, barrier.clone(), command);
+        let addresses = start_middleware(listener, barrier);
 
         upfront.join().expect("should join");
+
+        addresses.as_ref().and_then(ProxyAddr::source)
+    }
+
+    #[test]
+    fn middleware_should_receive_proxy_protocol_header_from_an_upfront_middleware() {
+        assert_eq!(
+            attributed_source_for(Command::Proxy),
+            Some(header_src()),
+            "a PROXY header still carries the real client through to the pipe phase"
+        );
+    }
+
+    /// The PROXY protocol `LOCAL` command (ver/cmd `0x20`) describes a
+    /// connection the upstream proxy originated itself -- typically a health
+    /// check -- and the HAProxy PROXY protocol specification §2.2 requires the
+    /// receiver to discard its address block. Nothing on the wire pairs
+    /// `LOCAL` with `AF_UNSPEC`; only HAProxy's own emitter happens to. The
+    /// header written by the upfront middleware below is exactly what
+    /// `HeaderV2::new(Command::Local, ..)` emits: ver/cmd `0x20`, family
+    /// `0x11`, and a populated 12-byte `AF_INET` block.
+    ///
+    /// `into_pipe` prefers `self.addresses.source()` over the socket's
+    /// `peer_addr`, so before the fix that forged pair became the client
+    /// address in the access logs, in `X-Real-IP` and in the
+    /// `max_connections_per_ip` counters.
+    ///
+    /// To SEE THIS RED: in `parse_v2_header`
+    /// (`lib/src/protocol/proxy_protocol/parser.rs`), replace the
+    /// `Command::Local => ProxyAddr::AfUnspec` arm of the `addr` binding with
+    /// `parsed_addr` -- this then yields `Some(125.25.10.1:8080)`.
+    #[test]
+    fn a_local_command_header_attributes_no_source_address() {
+        assert_eq!(
+            attributed_source_for(Command::Local),
+            None,
+            "a LOCAL header must attribute no source, so into_pipe falls back to peer_addr"
+        );
     }
 
     // Accept connection from an upfront proxy and expect to read a proxy protocol header in this stream.
-    fn start_middleware(middleware_addr: SocketAddr, barrier: Arc<Barrier>) {
-        let upfront_middleware_conn_listener = TcpListener::bind(middleware_addr)
-            .expect("could not accept upfront middleware connection");
+    fn start_middleware(
+        upfront_middleware_conn_listener: TcpListener,
+        barrier: Arc<Barrier>,
+    ) -> Option<ProxyAddr> {
         let session_stream;
         barrier.wait();
 
@@ -504,17 +567,18 @@ mod expect_test {
         if res != SessionResult::Upgrade {
             panic!("Should receive a complete proxy protocol header, res = {res:?}");
         };
+
+        expect_pp.addresses
     }
 
     // Connect to the next middleware and send a proxy protocol header
     fn start_upfront_middleware(
         next_middleware_addr: SocketAddr,
         barrier: Arc<Barrier>,
+        command: Command,
     ) -> JoinHandle<()> {
         thread::spawn(move || {
-            let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(125, 25, 10, 1)), 8080);
-            let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
-            let proxy_protocol = HeaderV2::new(Command::Local, src_addr, dst_addr).into_bytes();
+            let proxy_protocol = HeaderV2::new(command, header_src(), header_dst()).into_bytes();
 
             barrier.wait();
             match StdTcpStream::connect(next_middleware_addr) {
