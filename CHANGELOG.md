@@ -114,6 +114,68 @@
   that change is renamed `a_deactivated_udp_listeners_key_is_not_handed_to_another_session`: it
   reactivates only after a deactivate, so it never exercised the short-circuit and stayed green
   against this bug — its name claimed the guarantee its body does not make.
+- **`fix(h2)`: aggregate `h2.streams.ready_incremental.by_urgency` instead of clobbering it.**
+  The metric was emitted from `write_streams` as an absolute `gauge!` set on a process-global key,
+  once per connection per write pass, so what a dashboard read was whatever connection wrote last.
+  That is the same last-writer-wins failure the three `h2.connection.*` gauges were converted away
+  from in `d19f6a8e`, reintroduced by a site added afterwards in the old style. Nothing ever
+  subtracted it either, so a closed connection's count stayed in the aggregate for the rest of the
+  worker's life.
+  The count is now connection state (`ConnectionH2::ready_incremental_streams`) and a fourth
+  component of `last_gauge_snapshot`, emitted by `gauge_connection_state` as a signed `gauge_add!`
+  delta and released by `impl Drop for ConnectionH2` — the same funnel and the same teardown
+  guarantee as its three siblings, with no new emit site. The key is unchanged on the wire, so
+  existing dashboards keep resolving it; only the value changes, from one connection's sample to a
+  sum across live connections. `doc/configure.md` says so now.
+  Where the sample is taken is load-bearing. `gauge_connection_state` is called once near the top
+  of `write_streams`, *before* `ready_incremental_by_urgency` is built, so sampling there would
+  publish the previous pass's number. The field is written at the tail of the pass, where the
+  bucket map is final, and published by a second `gauge_connection_state` call placed immediately
+  after the converter's `&mut self.encoder` borrow ends and before the function's two early
+  returns. The entry call keeps emitting a zero delta for this component, because the field has not
+  changed since the snapshot it diffs against.
+  Seen red at the release arm: `left: 3, right: 0`.
+
+- **`fix(metrics)`: every metric key in `lib/src` now names a `metrics::names` constant.**
+  `lib/src/metrics/names.rs` has stated since `4ef506e3` that "every metric string emitted by Sōzu
+  and consumed by the StatsD/Prometheus/TUI surface should reference a constant declared here
+  rather than being repeated as a literal", but 32 call sites across eight files still spelled
+  their key out inline — including the `ready_incremental` gauge above, whose key appeared nowhere
+  in `names.rs` and was therefore invisible to anyone auditing the metric surface from that file.
+  The 22 distinct keys behind those sites are now declared (new `connections`, `process` and
+  `server` submodules; additions to `backend`, `client`, `h2`, `health_check`, `http` and `slab`)
+  and referenced at their emission sites. Every constant carries its original string byte-for-byte,
+  so no metric name changes on the wire.
+  `lib/tests/metric_names.rs` is the gate that keeps it that way: it masks comments and literal
+  contents so a macro named in prose is never mistaken for a call, then fails on any
+  `gauge!`/`gauge_add!`/`incr!`/`count!`/`decr!` whose first argument is a string literal, in any
+  of its forms — `"k"`, `b"k"`, `r"k"`, `br#"k"#`, `r##"k"##`. It has no allowlist and was red on
+  all 32 sites before this change.
+  Its scope is `sozu-lib`'s own `src`, not the repository: `bin/` and `command/` are not scanned,
+  and `bin/src/command/requests.rs` still emits `config.load_skipped_invalid` as a literal with no
+  `names.rs` entry. Keys assembled by `concat!` inside a helper macro (`reject_metric_key!`,
+  `h2_error_metric_key!`), keys reached through a local binding, and non-parenthesised macro
+  invocations also pass it. The test header enumerates all of it; the gate closes the dominant
+  shape rather than making a literal key impossible.
+
+- **`docs(observability)`: stop citing a production incident that does not exist.**
+  `d2f01ed4` was cited as a past gauge-underflow incident in `lib/src/protocol/mux/h2.rs`,
+  `lib/src/protocol/mux/router.rs` and `doc/observability.md`. `git cat-file -t d2f01ed4` answers
+  "Not a valid object name" and no ref in the repository reaches it. Its co-citation `a650ad69`
+  does resolve, but only from side branches: it is not an ancestor of `main`. Both belong to the
+  pre-rebase lineage those comments were written against — `a650ad69` and `main`'s `ff401b54` have
+  the identical `git patch-id` — which is how `d2f01ed4` came to be lost rather than mistyped.
+  The three sites now cite the `main`-reachable commits: `ff401b54` (`fix(mux): prevent gauge
+  underflow and error counter inflation`, 2026-03-12) and `aadb3fa4` (`fix(metrics): prevent
+  connections_per_backend gauge underflow`, 2026-04-16), the only gauge-underflow fix on `main`
+  between `ff401b54` and the commits that wrote those comments. The claim they support is corrected
+  with them: `ff401b54` fixed both shapes in one commit — a `-1` for streams that never ran the
+  `+1`, and a `-1` that ran twice on the same stream (100-Continue, and an H2 reset followed by
+  close) — while `aadb3fa4` was the doubled `-1` alone, let through by an early return. `Drop`
+  closes both: it is the only decrement site, and taking `last_gauge_snapshot` makes a second call
+  a no-op.
+  Other commit citations elsewhere in the tree are also off-`main` or dangling; they are out of
+  scope here and deliberately untouched.
 
 - **`fix(server)`: a deactivated listener is deaf after being activated again.**
   The four proxies keep a listener's slab token inside the listener itself: `give_back_listener`

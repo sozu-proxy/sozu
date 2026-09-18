@@ -863,7 +863,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         backend_borrow.address
                                     );
                                     incr!(
-                                        "backend.up",
+                                        names::backend::UP,
                                         Some(cluster_id),
                                         Some(&backend_borrow.backend_id)
                                     );
@@ -986,7 +986,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 let already_unavailable = backend_borrow.retry_policy.is_down();
                                 backend_borrow.retry_policy.fail();
                                 incr!(
-                                    "backend.connections.error",
+                                    names::backend::CONNECTIONS_ERROR,
                                     Some(cluster_id),
                                     Some(&backend_borrow.backend_id)
                                 );
@@ -998,7 +998,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         backend_borrow.address
                                     );
                                     incr!(
-                                        "backend.down",
+                                        names::backend::DOWN,
                                         Some(cluster_id),
                                         Some(&backend_borrow.backend_id)
                                     );

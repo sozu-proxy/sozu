@@ -795,8 +795,14 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `rst_sent` path (`h2.rs` ~2412-2425) and the mid-loop
     `completed_streams.push` path (`h2.rs` ~2481) both `saturating_sub(1)` their
     urgency bucket so later same-urgency peers do not read the stale snapshot.
-    Post-loop the connection emits `h2.streams.ready_incremental.by_urgency` as
-    a gauge. Guarded by e2e test
+    Post-loop the connection stores the bucket total in
+    `ready_incremental_streams` and publishes it through
+    `gauge_connection_state`, which emits
+    `h2.streams.ready_incremental.by_urgency` as a signed `gauge_add!` delta so
+    the aggregate sums across live connections; `impl Drop for ConnectionH2`
+    subtracts the contribution on teardown. The sample is taken at the END of
+    `write_streams` because the entry call to `gauge_connection_state` runs
+    before `ready_incremental_by_urgency` is built. Guarded by e2e test
     `test_h2_rfc9218_incremental_multi_bucket_drains_sequentially` and by the
     scalar unit tests
     `ready_incremental_bucket_decrement_reduces_same_urgency_only` /

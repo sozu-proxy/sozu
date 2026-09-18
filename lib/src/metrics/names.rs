@@ -51,6 +51,14 @@ pub mod backend {
     pub const RESPONSE_TIME: &str = "backend_response_time";
     pub const REQUESTS: &str = "requests";
     pub const FAIL_OPEN: &str = "backends.fail_open";
+
+    // Connection-lifecycle transition counters, emitted per
+    // `(cluster_id, backend_id)` from all three proxies: `kawa_h1` (H1), the
+    // H2 mux, and raw TCP.
+    pub const UP: &str = "backend.up";
+    pub const DOWN: &str = "backend.down";
+    pub const CONNECTIONS_ERROR: &str = "backend.connections.error";
+    pub const CONNECT_RETRIES_EXHAUSTED: &str = "backend.connect.retries_exhausted";
 }
 
 /// Buffer-pool gauges and counters.
@@ -64,6 +72,7 @@ pub mod buffer {
 pub mod client {
     pub const CONNECTIONS: &str = "client.connections";
     pub const CONNECTIONS_MAX: &str = "client.connections_max";
+    pub const CONNECTIONS_PERCENT: &str = "client.connections_percent";
 }
 
 /// Per-cluster aggregate gauges.
@@ -82,6 +91,12 @@ pub mod configuration {
     pub const FRONTENDS: &str = "configuration.frontends";
 }
 
+/// Per-source connection-admission counters. Distinct from `client`, which
+/// gauges the worker-wide connection population.
+pub mod connections {
+    pub const REJECTED_PER_CLUSTER_IP: &str = "connections.rejected_per_cluster_ip";
+}
+
 /// Event-loop timing counters.
 pub mod event_loop {
     pub const EPOLL_TIME: &str = "epoll_time";
@@ -98,6 +113,7 @@ pub mod health_check {
     pub const DOWN: &str = "health_check.down";
     pub const SUCCESS: &str = "health_check.success";
     pub const FAILURE: &str = "health_check.failure";
+    pub const HEALTHY_BACKENDS: &str = "health_check.healthy_backends";
 }
 
 /// H1 protocol counters.
@@ -122,6 +138,14 @@ pub mod h2 {
     pub const STREAMS_REAPED_IDLE_TIMEOUT: &str = "h2.streams.reaped.idle_timeout";
     pub const STREAMS_REAPED_WINDOW_STALL: &str = "h2.streams.reaped.window_stall";
     pub const STREAMS_REAPED_STALL_BUDGET: &str = "h2.streams.reaped.stall_budget";
+
+    /// Streams that were ready to emit AND marked incremental (RFC 9218 §4),
+    /// summed over the urgency buckets of one write pass and aggregated across
+    /// every live H2 connection. Emitted as a signed `gauge_add!` delta from
+    /// `ConnectionH2::gauge_connection_state` with the matching teardown in
+    /// `impl Drop`, exactly like the `CONNECTION_*` trio below it.
+    pub const STREAMS_READY_INCREMENTAL_BY_URGENCY: &str =
+        "h2.streams.ready_incremental.by_urgency";
 
     // Frame-TX counters (frame type fanout).
     pub const FRAMES_TX_CONTINUATION: &str = "h2.frames.tx.continuation";
@@ -174,7 +198,21 @@ pub mod h2 {
 /// variants and `h2` for H2-frame-level counters.
 pub mod http {
     pub const ERR_400: &str = "http.400.errors";
+    pub const ERR_401: &str = "http.401.errors";
     pub const ERR_404: &str = "http.404.errors";
+    pub const ERR_408: &str = "http.408.errors";
+    pub const ERR_413: &str = "http.413.errors";
+    pub const ERR_421: &str = "http.421.errors";
+    pub const ERR_502: &str = "http.502.errors";
+    pub const ERR_503: &str = "http.503.errors";
+    pub const ERR_504: &str = "http.504.errors";
+    pub const ERR_507: &str = "http.507.errors";
+    /// Catch-all for the default answers that have no dedicated `ERR_*`
+    /// bucket; incremented alongside the per-code counter where one exists.
+    pub const ERRORS: &str = "http.errors";
+    pub const REDIRECTION_301: &str = "http.301.redirection";
+    pub const REDIRECTION_302: &str = "http.302.redirection";
+    pub const REDIRECTION_308: &str = "http.308.redirection";
     pub const ACTIVE_REQUESTS: &str = "http.active_requests";
     pub const ALPN_H2: &str = "http.alpn.h2";
     pub const ALPN_HTTP11: &str = "http.alpn.http11";
@@ -258,6 +296,11 @@ pub mod pipe {
     pub const ERRORS: &str = "pipe.errors";
 }
 
+/// Worker-process runtime gauges.
+pub mod process {
+    pub const UPTIME_SECONDS: &str = "process.uptime_seconds";
+}
+
 /// Protocol-type counters that increment once per session and track which
 /// protocol carried it end-to-end.
 pub mod protocol {
@@ -285,6 +328,11 @@ pub mod rustls {
     pub const WRITE_INFINITE_LOOP_ERROR: &str = "rustls.write.infinite_loop.error";
 }
 
+/// Worker liveness gauge, emitted by the server tick.
+pub mod server {
+    pub const LIVE: &str = "server.live";
+}
+
 /// Generic session-level counters.
 pub mod sessions {
     pub const EVICTED: &str = "sessions.evicted";
@@ -292,6 +340,7 @@ pub mod sessions {
 
 /// Slab-allocator gauges.
 pub mod slab {
+    pub const ACCEPT_THRESHOLD_PERCENT: &str = "slab.accept_threshold_percent";
     pub const CAPACITY: &str = "slab.capacity";
     pub const ENTRIES: &str = "slab.entries";
     pub const USAGE_PERCENT: &str = "slab.usage_percent";

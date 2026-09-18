@@ -67,11 +67,26 @@ metric that is incremented from more than one emit site.** The H2 connection
 gauges (`h2.connection.{active_streams,window_bytes,pending_window_updates}`)
 were converted to `gauge_add!` lifecycle deltas plus `impl Drop` symmetric
 teardown after this exact bug went unnoticed for a while.
+`h2.streams.ready_incremental.by_urgency` was added later in the old style and
+repeated it verbatim — a per-connection `gauge!` on a global key — and now
+rides the same delta funnel as a fourth component of that snapshot. The
+structural guard against the next one is `lib/tests/metric_names.rs`: every
+metric key in `lib/src` must be a `metrics::names` constant, so a new key is
+visible in one file instead of being spelled out at its single emit site. Read
+that test's header before relying on it — it scans `sozu-lib`'s own `src` and
+nothing else, so `bin/` and `command/` are ungated (`config.load_skipped_invalid`
+in `bin/src/command/requests.rs` is still a literal), and a key assembled by
+`concat!` inside a helper macro is invisible to it by construction. It closes
+the shape that has actually bitten us, not every shape.
 
 ### Gauge underflow
 
-Past production incidents (`a650ad69`, `d2f01ed4`) all came from
-`gauge_add!(-1)` running without a paired `+1` having run earlier. Both
+Past production incidents (`ff401b54`, `aadb3fa4`) came from a `gauge_add!(-1)`
+reaching the metric unpaired. `ff401b54` had both shapes in one commit: a `-1`
+for streams that never ran the `+1` (idle timeouts, TLS failures, malformed
+requests), and a `-1` that ran twice on the same stream (100-Continue, and an
+H2 reset followed by close). `aadb3fa4` was the doubled `-1` alone, let through
+by an early return. Both
 `MetricValue::update` and `AggregatedMetric::update` saturate the value to
 0 and emit a single `error!` log line on underflow, in both debug and
 release builds; neither panics. The metric is still wrong on the next

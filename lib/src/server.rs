@@ -1162,7 +1162,7 @@ impl Server {
                 gauge!(names::client::CONNECTIONS, nb_connections);
                 gauge!(names::client::CONNECTIONS_MAX, max_connections);
                 if let Some(percent) = (nb_connections * 100).checked_div(max_connections) {
-                    gauge!("client.connections_percent", percent);
+                    gauge!(names::client::CONNECTIONS_PERCENT, percent);
                 }
 
                 gauge!(names::slab::ENTRIES, slab_len);
@@ -1171,7 +1171,7 @@ impl Server {
                     gauge!(names::slab::USAGE_PERCENT, percent);
                 }
                 if let Some(percent) = (slab_len * 100).checked_div(accept_threshold) {
-                    gauge!("slab.accept_threshold_percent", percent);
+                    gauge!(names::slab::ACCEPT_THRESHOLD_PERCENT, percent);
                 }
             }
             // Buffer pool gauges. `buffer.in_use` replaces the older
@@ -1207,7 +1207,7 @@ impl Server {
             // batch as `client.connections` so dashboards see them update in
             // lock-step.
             gauge!(
-                "process.uptime_seconds",
+                names::process::UPTIME_SECONDS,
                 self.started_at.elapsed().as_secs() as usize
             );
             // `server.live` flips to 0 once a graceful shutdown is requested,
@@ -1215,7 +1215,7 @@ impl Server {
             // (HAProxy / cloud LBs) can poll this gauge to drain a worker
             // before the OS-level termination signal lands.
             gauge!(
-                "server.live",
+                names::server::LIVE,
                 if self.shutting_down.is_some() { 0 } else { 1 }
             );
             METRICS.with(|metrics| {

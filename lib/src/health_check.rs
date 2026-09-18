@@ -691,7 +691,7 @@ impl HealthChecker {
         );
         if total > 0 {
             gauge!(
-                "health_check.healthy_backends",
+                names::health_check::HEALTHY_BACKENDS,
                 healthy,
                 Some(cluster_id),
                 None

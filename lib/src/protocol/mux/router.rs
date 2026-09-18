@@ -156,7 +156,7 @@ impl Router {
             .push(DebugEvent::Str(stream.context.get_route()));
         if stream.attempts >= CONN_RETRIES {
             incr!(
-                "backend.connect.retries_exhausted",
+                names::backend::CONNECT_RETRIES_EXHAUSTED,
                 stream.context.cluster_id.as_deref(),
                 stream.context.backend_id.as_deref()
             );
@@ -513,7 +513,7 @@ impl Router {
             // `connection.rs::pre_close_client_bookkeeping` (graceful close)
             // and `mod.rs::close_backend` (session teardown). Symmetric
             // pairing with both decrement sites is the only defence against
-            // the gauge underflow class of bug fixed by a650ad69 / d2f01ed4.
+            // the gauge underflow class of bug fixed by ff401b54 / aadb3fa4.
             gauge_add!(names::backend::POOL_SIZE, 1);
             gauge_add!(
                 names::backend::CONNECTIONS_PER_BACKEND,
