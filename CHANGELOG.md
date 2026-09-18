@@ -162,7 +162,8 @@
   (`AddCluster`, `AddBackend`) and the non-add verbs stay deliberately uncovered.
 - **`fix(command)`: `RemoveUdpFrontend` no longer evicts same-address siblings.**
   `add_udp_frontend` dedups on the full `UdpFrontend { cluster_id, address, tags }` — two frontends
-  at one (cluster, address) differing only in their access-log tags legitimately coexist — while
+  at one (cluster, address) differing only in their tags were both admitted at the time, a shape the
+  `UdpFrontendAddressTaken` entry below now refuses outright — while
   `remove_udp_frontend` retained on the address alone, with no tags in the key and no "drops
   exactly one entry" assertion. One removal therefore dropped every frontend at that address,
   including entries the caller never named, and the next `SaveState` persisted the loss.
@@ -179,14 +180,88 @@
   A refused removal costs nothing beyond the refusal: all three apply paths reject a request the
   state refuses BEFORE fanning it out, so no worker sees it and no listener stops routing.
   Separately, and unchanged by this fix, the worker (`UdpProxy::remove_udp_front`) holds one cluster
-  and tag set per listener address and so cannot represent the same-address siblings
-  `add_udp_frontend` admits; aligning the two models is its own decision and is deliberately not
-  part of this change.
+  and tag set per listener address and so could not represent the same-address siblings
+  `add_udp_frontend` then admitted; aligning the two models was left as its own decision, which the
+  `UdpFrontendAddressTaken` entry below now takes by making the address exclusive.
   With the two keys mirrored, `compute_rollback` gains its `AddUdpFrontend => RemoveUdpFrontend`
   inverse, closing sozu#1313's poisoned-state loop for the last frontend verb
   (`a_udp_frontend_add_inverts_to_its_exact_removal`). The previously committed-red `#[ignore]`d
   regression test is now un-ignored and green as
-  `remove_udp_frontend_spares_same_address_siblings`.
+  `remove_udp_frontend_drops_exactly_the_frontend_its_tags_name`.
+- **`fix(command)`: a UDP frontend address is claimed by exactly one frontend.**
+  `add_udp_frontend` dedups on the full `UdpFrontend { cluster_id, address, tags }`
+  *inside one cluster's bucket*, so it admitted two shapes the datapath cannot represent: two
+  frontends at one (cluster, address) differing only in their tags, and — with no check whatsoever,
+  because the scan never left `front.cluster_id`'s own bucket — two DIFFERENT clusters claiming one
+  address.
+  UDP has no routing discriminator. A datagram carries no SNI, no `Host` header and no path, so the
+  listener address **is** the entire routing key and no attribute of an incoming datagram could pick
+  between two frontends bound to it. This is not an unimplemented feature, it is an unanswerable
+  question; a TCP listener hosts several frontends only because `(address, sni, alpn)`
+  discriminates. The worker says the same thing in code: `UdpProxy::add_udp_front`
+  (`lib/src/udp.rs`) overwrites `listener.cluster_id` and `listener.set_tags(address, ...)`, and
+  `cluster_for_listener: HashMap<Token, ClusterId>` holds strictly one cluster per listener token,
+  one listener per address. `add_udp_frontend` now performs the same listener-wide scan across ALL
+  clusters `add_tcp_frontend` performs for its own key, before touching `udp_fronts` — the
+  `entry(...).or_default()` that used to open a bucket first now runs only once admission has
+  passed, so a refusal is a true no-op. It carries the `INV:` comment and the "appends exactly one
+  entry" / "exactly one frontend per address across all clusters" assertions `add_tcp_frontend` and
+  `remove_udp_frontend` already have.
+  A second claim answers the new `StateError::UdpFrontendAddressTaken`, which carries the contested
+  address plus the claimant's and the current owner's cluster id and tags. The identifiers are
+  lossless in the variant's typed fields and bounded in its `Display`/`Debug` — cluster identifiers
+  and tags are protected material in error text under `doc/observability.md`'s sensitive-value
+  logging boundary — so the message names the address and the operator finds the owner with `sozu
+  frontend list`. An exact re-add of an identity already stored still answers `StateError::Exists`,
+  the same split `add_tcp_frontend` makes between a duplicate key and a structural conflict.
+  **This changes which cluster serves a contested address.** Before, the LAST entry applied won,
+  because every `AddUdpFrontend` overwrote the listener's cluster and tags; now the FIRST wins and
+  every later claim is refused. For two entries in different clusters the old outcome was not even
+  stable — `generate_requests` emits saved entries by iterating `udp_fronts`, a `HashMap` whose
+  `RandomState` differs per process (the same property `fork_main_into_new_main` documents for its
+  own round-trip check), so which cluster ended up serving the address could flip between restarts
+  of one saved state. The change therefore defines a previously undefined situation rather than
+  merely tightening a check. Nothing aborts: `load_state` and `load_static_config` both skip an
+  entry `ConfigState` refuses, `warn!` it, and count it into the
+  `load_state: skipped N invalid entries` tally, so every other entry still applies. **Delete a duplicate BEFORE
+  upgrading the main process.** A hot main-process upgrade does not re-validate the state: the new
+  main deserializes the whole `ConfigState` out of the handed-over `UpgradeData`
+  (`bin/src/upgrade.rs`), the one path that bypasses `add_udp_frontend`, so an inherited pair
+  arrives intact. In a release build it then survives until the next reload, replay or live add
+  refuses it. In a build with **debug assertions** it does not: `generate_requests` replays its own
+  output into a fresh `ConfigState` under `#[cfg(debug_assertions)]` and asserts every request
+  dispatches cleanly (`command/src/state.rs`), and the pair's second entry is now refused there —
+  so the next `SaveState` (`write_requests_to_file`) or the next worker fork
+  (`write_initial_state_to_file`, via `produce_initial_state`) aborts the main process with
+  `every request from generate_requests must replay cleanly`. The assertion is correct: such a
+  state genuinely cannot round-trip through SaveState/LoadState, and it is reporting that. Release
+  builds are unaffected — `[profile.release]` sets `debug = true` for symbols but does not enable
+  `debug-assertions`. Audit UDP addresses with `sozu frontend list` and delete the frontend you do
+  not want *before* upgrading, so the survivor is your choice rather than an artefact of replay
+  order, and no inherited pair can reach `generate_requests`. Reconciling an inherited pair
+  automatically is deliberately not attempted here: the main process cannot know which entry the
+  already-running workers are serving (an upgrade re-attaches the existing worker processes rather
+  than restarting them), and picking one by iteration order would silently resolve — and possibly
+  invert — the ambiguity this change exists to declare unanswerable.
+  This also closes the main/worker divergence the `RemoveUdpFrontend` fix above could only narrow.
+  The worker's `UdpProxy::remove_udp_front` keys on the ADDRESS alone — `set_tags(address, None)`,
+  `cluster_id.take()`, `SetCluster(ClusterConfig::default())` — so while two same-address siblings
+  were admitted, removing one stopped the worker routing that address ALTOGETHER while
+  `ConfigState` still held the other, and the next `SaveState` persisted the drift. With one
+  frontend per address the two removal models agree.
+  Unchanged and worth stating: UDP emits no access log and nothing in the UDP datapath reads a
+  frontend's tags (`UdpListener::get_tags` has no caller there), so on a UDP frontend `--tags` is
+  identity and metadata only. The tags stay part of the REMOVAL key, so a tagless
+  `frontend udp remove` still answers `NoChange`.
+  Seen red: `add_udp_frontend_refuses_a_second_frontend_on_a_taken_address` and
+  `a_refused_udp_frontend_names_the_cluster_already_holding_the_address` against the restored
+  pre-fix body, the latter also against a generic `StateError::Exists`;
+  `a_saved_state_holding_one_udp_frontend_per_address_replays_unchanged` against a port-only scan.
+  Two tests whose premise this change invalidates were re-based on one frontend per address rather
+  than relaxed: `remove_udp_frontend_spares_same_address_siblings` is now
+  `remove_udp_frontend_drops_exactly_the_frontend_its_tags_name` (both halves re-seen red under
+  their own mutations), and `a_udp_frontend_no_worker_acknowledged_is_reverted_while_its_sibling_stays`
+  now places its two frontends at two addresses.
 - **`fix(command)`: `FilteredTimeSerie`'s `Display` no longer indexes past a short series.**
   `last_minute` and `last_hour` are prost `repeated uint32`, i.e. `Vec<u32>` and not `[u32; 60]`, but
   the impl sliced each with six fixed 10-wide windows — an index panic on any series holding fewer

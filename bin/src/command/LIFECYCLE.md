@@ -189,18 +189,23 @@ four frontend adds — HTTP, HTTPS, TCP and UDP — each inverted to its
 carried. Each of those removals matches on the very key its add admitted, so
 the inverse evicts exactly the entry the add inserted.
 
-UDP was uncovered until its removal key was narrowed. `add_udp_frontend` dedups
-on the full `UdpFrontend { cluster_id, address, tags }`, so two frontends at one
-(cluster, address) differing only in tags legitimately coexist, while
-`remove_udp_frontend` used to retain on the address alone and therefore dropped
-every sibling at that address — reverting one unacknowledged add would have
-evicted acknowledged siblings from the master's `ConfigState`, the main/worker
-drift sozu#1313 exists to prevent. `remove_udp_frontend` now retains on that
-same (cluster, address, tags) identity, with the `INV:` comment and the
-"drops exactly one entry" assertion `remove_tcp_frontend` carries for its own
-(address, sni, alpn) key. `remove_udp_frontend_spares_same_address_siblings`
+UDP was uncovered until its removal key was narrowed. `add_udp_frontend` stores
+a full `UdpFrontend { cluster_id, address, tags }`, and it used to admit two
+frontends at one (cluster, address) differing only in tags, while
+`remove_udp_frontend` retained on the address alone and therefore dropped every
+sibling at that address — reverting one unacknowledged add would have evicted
+acknowledged siblings from the master's `ConfigState`, the main/worker drift
+sozu#1313 exists to prevent. `remove_udp_frontend` now retains on that same
+(cluster, address, tags) identity, with the `INV:` comment and the "drops
+exactly one entry" assertion `remove_tcp_frontend` carries for its own
+(address, sni, alpn) key.
+`add_udp_frontend` has since made the address exclusive — one frontend per
+address across every cluster, because a datagram carries no SNI, host or path
+to discriminate on — so the entry an inverse removes is the only one on its
+address and the eviction is unambiguous.
+`remove_udp_frontend_drops_exactly_the_frontend_its_tags_name`
 (`command/src/state.rs`) pins the mirror; `sozu frontend udp remove --tags`
-carries the tags the identity now needs.
+carries the tags the identity needs.
 
 Upsert verbs (`AddCluster`, `AddBackend`) and non-add verbs stay deliberately
 uncovered: they keep the best-effort behaviour rather than risk a wrong revert.

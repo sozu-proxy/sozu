@@ -76,6 +76,36 @@ pub enum StateError {
     /// fan-out (sozu-proxy/sozu#1290).
     #[error("invalid TCP frontend for address {address}: reason_bytes={}", .reason.len())]
     InvalidTcpFrontend { address: SocketAddr, reason: String },
+    /// A UDP listener address is the WHOLE routing key. A datagram carries no
+    /// SNI, no `Host` header and no path, so no attribute of an incoming
+    /// datagram could pick between two frontends bound to one address --
+    /// which is why this is not an unimplemented feature but an unanswerable
+    /// question, and why TCP legitimately hosts several frontends per address
+    /// while UDP cannot. The worker agrees by construction:
+    /// `UdpProxy::add_udp_front` (`lib/src/udp.rs`) overwrites
+    /// `listener.cluster_id` and the listener's tags, and
+    /// `cluster_for_listener` maps one listener token to exactly one cluster.
+    ///
+    /// `current_cluster_id` and `current_tags` name the frontend already
+    /// holding `address`, so a caller matching this variant can tell the
+    /// operator which frontend to remove first. Per `doc/observability.md`'s
+    /// sensitive-value logging boundary a cluster identifier and a frontend's
+    /// tags are protected material in error text, so the `Display`/`Debug`
+    /// projection renders only the address and bounded metadata; the raw
+    /// fields stay lossless for callers, exactly as that boundary specifies.
+    #[error(
+        "UDP frontend address {address} is already claimed by another frontend: \
+         cluster_id_bytes={} current_cluster_id_bytes={} current_tag_count={}",
+        .cluster_id.len(),
+        .current_cluster_id.len(),
+        .current_tags.len()
+    )]
+    UdpFrontendAddressTaken {
+        address: SocketAddr,
+        cluster_id: ClusterId,
+        current_cluster_id: ClusterId,
+        current_tags: BTreeMap<String, String>,
+    },
 }
 
 impl fmt::Debug for StateError {
@@ -349,7 +379,7 @@ impl ConfigState {
         let raw_frontends = self.http_fronts.len()
             + self.https_fronts.len()
             + self.count_tcp_frontends_raw()
-            + self.udp_fronts.values().map(|v| v.len()).sum::<usize>();
+            + self.count_udp_frontends_raw();
         debug_assert_eq!(
             self.count_frontends(),
             raw_frontends,
@@ -372,6 +402,10 @@ impl ConfigState {
     /// referenced there breaks the release/bench build.
     fn count_tcp_frontends_raw(&self) -> usize {
         self.tcp_fronts.values().map(|v| v.len()).sum()
+    }
+
+    fn count_udp_frontends_raw(&self) -> usize {
+        self.udp_fronts.values().map(|v| v.len()).sum()
     }
 
     /// Increments the count for this request type
@@ -1495,22 +1529,98 @@ impl ConfigState {
         Ok(())
     }
 
+    /// Admits at most ONE UDP frontend per address, across every cluster.
+    ///
+    /// UDP has no routing discriminator: a datagram carries no SNI, no `Host`
+    /// header and no path, so the listener address IS the entire routing key
+    /// and no attribute of an incoming datagram could pick between two
+    /// frontends bound to it. TCP legitimately hosts several frontends per
+    /// address because `(address, sni, alpn)` discriminates; UDP has no
+    /// equivalent.
+    ///
+    /// The worker cannot represent a second claim either:
+    /// `UdpProxy::add_udp_front` (`lib/src/udp.rs`) overwrites
+    /// `listener.cluster_id` and `listener.set_tags(address, ...)`, and
+    /// `cluster_for_listener: HashMap<Token, ClusterId>` holds strictly one
+    /// cluster per listener token, one listener per address. So the state used
+    /// to admit two shapes the datapath silently collapsed to whichever
+    /// frontend was applied LAST: two frontends at one (cluster, address)
+    /// differing only in their tags, and -- with no check at all, because the
+    /// scan never left `front.cluster_id`'s own bucket -- two DIFFERENT
+    /// clusters claiming one address.
+    ///
+    /// Both are refused here instead, which is the same listener-wide
+    /// admission [`Self::add_tcp_frontend`] performs for its own key. Every
+    /// check runs BEFORE `self.udp_fronts` is touched, so an early `Err`
+    /// return is a true no-op on `self` -- the `entry(...).or_default()` that
+    /// used to open the bucket first now runs only once admission has passed.
     fn add_udp_frontend(&mut self, front: &RequestUdpFrontend) -> Result<(), StateError> {
-        let udp_frontends = self.udp_fronts.entry(front.cluster_id.clone()).or_default();
-
+        let address: SocketAddr = front.address.into();
         let udp_frontend = UdpFrontend {
             cluster_id: front.cluster_id.clone(),
-            address: front.address.into(),
+            address,
             tags: front.tags.clone(),
         };
-        if udp_frontends.contains(&udp_frontend) {
-            return Err(StateError::Exists {
-                kind: ObjectKind::UdpFrontend,
-                id: format!("{udp_frontend:?}"),
+
+        let total_before = self.count_udp_frontends_raw();
+
+        // Listener-wide scan across ALL clusters' buckets at this address, as
+        // `add_tcp_frontend` does: the previous check only walked
+        // `front.cluster_id`'s own bucket, so a second cluster claiming the
+        // same address never met a check at all.
+        if let Some(current) = self
+            .udp_fronts
+            .values()
+            .flatten()
+            .find(|existing| existing.address == address)
+        {
+            // An exact re-add of the identity `add_udp_frontend` already
+            // admitted stays `Exists`, the answer every other add gives for
+            // its own key and the one whose message tells the operator to
+            // remove it first or send the corresponding update.
+            if *current == udp_frontend {
+                return Err(StateError::Exists {
+                    kind: ObjectKind::UdpFrontend,
+                    id: format!("{udp_frontend:?}"),
+                });
+            }
+            return Err(StateError::UdpFrontendAddressTaken {
+                address,
+                cluster_id: front.cluster_id.clone(),
+                current_cluster_id: current.cluster_id.clone(),
+                current_tags: current.tags.clone(),
             });
         }
 
+        // POST: every admission check above either returned `Err` or fell
+        // through -- none of them may mutate `self`, so the total frontend
+        // count observed before the scan must still hold at this point.
+        debug_assert_eq!(
+            self.count_udp_frontends_raw(),
+            total_before,
+            "add_udp_frontend must not mutate udp_fronts before every admission check has passed"
+        );
+
+        let udp_frontends = self.udp_fronts.entry(front.cluster_id.clone()).or_default();
+        let before = udp_frontends.len();
         udp_frontends.push(udp_frontend);
+        debug_assert_eq!(
+            udp_frontends.len(),
+            before + 1,
+            "add_udp_frontend appends exactly one entry"
+        );
+        // INV: a UDP listener address is the ENTIRE routing key, so exactly
+        // one frontend may hold it across every cluster -- the model the
+        // worker's one-cluster-per-listener-token datapath can represent.
+        debug_assert_eq!(
+            self.udp_fronts
+                .values()
+                .flatten()
+                .filter(|existing| existing.address == address)
+                .count(),
+            1,
+            "add_udp_frontend must leave exactly one frontend on an address, across all clusters"
+        );
         Ok(())
     }
 
@@ -1532,10 +1642,11 @@ impl ConfigState {
         // (cluster_id, address, tags) key -- the bucket this `get_mut`
         // returned already scopes `cluster_id`, exactly as
         // `tcp_frontend_matches` leaves it to `remove_tcp_frontend`'s own
-        // bucket lookup. Removing one tagged frontend on a listener must not
-        // also evict a sibling frontend at the same address carrying
-        // different access-log tags, which `add_udp_frontend` admits because
-        // it dedups on the FULL `UdpFrontend { cluster_id, address, tags }`.
+        // bucket lookup. The tags stay load-bearing now that
+        // `add_udp_frontend` admits one frontend per address across every
+        // cluster: a remove that omits them matches only a frontend stored
+        // with no tags, so against a TAGGED frontend on that address it must
+        // answer `NoChange` rather than clear it.
         let matches_removal = |front: &UdpFrontend| {
             front.address == remove_address && front.tags == front_to_remove.tags
         };
@@ -3391,6 +3502,14 @@ mod tests {
                     .parse()
                     .expect("test TCP frontend address must parse"),
                 reason: long_value(),
+            },
+            StateError::UdpFrontendAddressTaken {
+                address: "127.0.0.1:5353"
+                    .parse()
+                    .expect("test UDP frontend address must parse"),
+                cluster_id: long_value(),
+                current_cluster_id: long_value(),
+                current_tags: BTreeMap::from([(long_value(), long_value())]),
             },
         ];
 
@@ -5984,63 +6103,59 @@ mod tests {
     /// `remove_udp_frontend` removes ONLY the frontend the caller named: its
     /// key mirrors `add_udp_frontend`'s, exactly as the TCP pair does.
     ///
-    /// [`ConfigState::add_udp_frontend`] dedups on the full
-    /// `UdpFrontend { cluster_id, address, tags }`: two frontends at the same
-    /// (cluster, address) that differ only in their access-log tags are both
-    /// admitted, and this test asserts that first so the premise cannot rot.
-    /// [`ConfigState::remove_udp_frontend`] retains on that same
+    /// [`ConfigState::add_udp_frontend`] stores a full
+    /// `UdpFrontend { cluster_id, address, tags }` and admits one frontend per
+    /// address across every cluster, so the entries a bucket holds sit at
+    /// DIFFERENT addresses — this test asserts that premise first so it cannot
+    /// rot. [`ConfigState::remove_udp_frontend`] retains on that same
     /// (cluster, address, tags) identity — the bucket already scopes
     /// `cluster_id` — so a removal drops exactly one entry and leaves every
-    /// sibling at that address alone. This is the mirror
+    /// other frontend in the bucket alone. This is the mirror
     /// `remove_tcp_frontend` has always had for its own (address, sni, alpn)
     /// key, and it is what makes `RemoveUdpFrontend` a true inverse of
     /// `AddUdpFrontend` for `compute_rollback` (`bin/src/command/requests.rs`,
     /// `a_udp_frontend_add_inverts_to_its_exact_removal`).
     ///
     /// The tags are part of the key in BOTH directions, so a remove carrying
-    /// no tags no longer clears a tagged frontend — the observable semantics
-    /// change this test also pins. `sozu frontend udp remove --tags` carries
-    /// them, mirroring `--sni` / `--alpn` on the TCP remove.
+    /// no tags does not clear a tagged frontend — the observable semantics
+    /// this test also pins. `sozu frontend udp remove --tags` carries them,
+    /// mirroring `--sni` / `--alpn` on the TCP remove.
     ///
     /// To SEE THIS RED, one mutation per half:
     ///
-    /// - The SIBLING half: restore the address-only retain in
-    ///   [`ConfigState::remove_udp_frontend`] by reducing `matches_removal` to
-    ///   `|front: &UdpFrontend| front.address == remove_address`. In a build
-    ///   with `debug_assertions` the production guard fires first --
-    ///   `remove_udp_frontend drops exactly one entry, left: 0, right: 1` --
-    ///   which is the TCP-twin assertion doing its job. Strip that
-    ///   `debug_assert_eq!` and its companion too, the complete pre-fix body,
-    ///   and the failure lands on the `surviving == ["team-b"]` assertion
-    ///   instead.
-    /// - The TAGLESS half, which the mutation above never reaches: make an
-    ///   empty tag set a wildcard, the plausible design alternative in which a
-    ///   bare remove still clears an address --
-    ///   `front.address == remove_address
-    ///        && (front_to_remove.tags.is_empty() || front.tags == front_to_remove.tags)`.
-    ///   The tagged removal still drops exactly one entry, so the sibling half
-    ///   and both production assertions pass; the ONLY failure is the
+    /// - The SIBLING half: widen `matches_removal` in
+    ///   [`ConfigState::remove_udp_frontend`] to the whole bucket,
+    ///   `|_front: &UdpFrontend| true`. In a build with `debug_assertions` the
+    ///   production guard fires first — `remove_udp_frontend drops exactly one
+    ///   entry, left: 0, right: 1` — which is the TCP-twin assertion doing its
+    ///   job. Strip that `debug_assert_eq!` and its companion too and the
+    ///   failure lands on the `surviving == ["team-b"]` assertion instead.
+    /// - The TAGLESS half, which the mutation above never reaches: restore the
+    ///   pre-fix address-only retain by reducing `matches_removal` to
+    ///   `|front: &UdpFrontend| front.address == remove_address`. The tagged
+    ///   removal still drops exactly one entry, so the sibling half and both
+    ///   production assertions pass; the ONLY failure is the
     ///   `expect_err("a tagless remove must not match a tagged UDP frontend")`
     ///   below. That half is what existing operator scripts hit, so it is
     ///   pinned on its own rather than shadowed by the sibling assertion.
     #[test]
-    fn remove_udp_frontend_spares_same_address_siblings() {
-        let address = SocketAddress::new_v4(127, 0, 0, 1, 9100);
-        let front = |owner: &str| RequestUdpFrontend {
+    fn remove_udp_frontend_drops_exactly_the_frontend_its_tags_name() {
+        let team_a_address = SocketAddress::new_v4(127, 0, 0, 1, 9100);
+        let team_b_address = SocketAddress::new_v4(127, 0, 0, 1, 9101);
+        let front = |owner: &str, address| RequestUdpFrontend {
             cluster_id: "udp_cluster".to_string(),
             address,
             tags: BTreeMap::from([("owner".to_string(), owner.to_string())]),
         };
         let mut state = ConfigState::new();
 
-        // The premise: same cluster, same address, different tags — both are
-        // admitted, because the add key includes the tags.
-        for owner in ["team-a", "team-b"] {
+        // The premise: one cluster, two addresses — one frontend per address
+        // is what `add_udp_frontend` admits and what the worker's
+        // one-cluster-per-listener datapath can represent.
+        for (owner, address) in [("team-a", team_a_address), ("team-b", team_b_address)] {
             state
-                .dispatch(&RequestType::AddUdpFrontend(front(owner)).into())
-                .expect(
-                    "two same-address UDP frontends differing only in tags must both be admitted",
-                );
+                .dispatch(&RequestType::AddUdpFrontend(front(owner, address)).into())
+                .expect("one UDP frontend per address must be admitted");
         }
         assert_eq!(
             state.udp_fronts.get("udp_cluster").map(Vec::len),
@@ -6049,7 +6164,7 @@ mod tests {
         );
 
         state
-            .dispatch(&RequestType::RemoveUdpFrontend(front("team-a")).into())
+            .dispatch(&RequestType::RemoveUdpFrontend(front("team-a", team_a_address)).into())
             .expect("removing one of the two must succeed");
 
         let surviving: Vec<&str> = state
@@ -6065,15 +6180,15 @@ mod tests {
         assert_eq!(
             surviving,
             vec!["team-b"],
-            "removing one UDP frontend must not evict its same-address sibling"
+            "removing one UDP frontend must not evict the rest of its cluster's bucket"
         );
 
         // The other half of the narrowed key: tags belong to the removal
         // identity in BOTH directions, so a remove carrying none matches
-        // nothing at that address instead of clearing every frontend on it.
+        // nothing at that address instead of clearing the frontend on it.
         let tagless = RequestUdpFrontend {
             cluster_id: "udp_cluster".to_string(),
-            address,
+            address: team_b_address,
             tags: BTreeMap::new(),
         };
         let err = state
@@ -6087,6 +6202,283 @@ mod tests {
             state.udp_fronts.get("udp_cluster").map(Vec::len),
             Some(1usize),
             "the tagless remove must leave the surviving tagged frontend in place"
+        );
+    }
+
+    fn udp_front(cluster_id: &str, address: SocketAddress, owner: &str) -> RequestUdpFrontend {
+        RequestUdpFrontend {
+            cluster_id: cluster_id.to_string(),
+            address,
+            tags: BTreeMap::from([("owner".to_string(), owner.to_string())]),
+        }
+    }
+
+    /// A UDP listener address is the ENTIRE routing key — no SNI, no `Host`
+    /// header, no path — so [`ConfigState::add_udp_frontend`] admits at most
+    /// one frontend per address, across every cluster.
+    ///
+    /// Both shapes refused here were admitted before and neither could be
+    /// represented by the worker: `UdpProxy::add_udp_front` (`lib/src/udp.rs`)
+    /// overwrites `listener.cluster_id` and the listener's tags, and
+    /// `cluster_for_listener: HashMap<Token, ClusterId>` maps one listener
+    /// token to exactly one cluster. The second of a same-address pair simply
+    /// replaced the first on the datapath.
+    ///
+    /// - The SAME-CLUSTER half: two frontends at one (cluster, address)
+    ///   differing only in their access-log tags. The old dedup compared the
+    ///   FULL `UdpFrontend { cluster_id, address, tags }`, so a different tag
+    ///   set walked straight past it.
+    /// - The CROSS-CLUSTER half: a second cluster claiming the address. The
+    ///   old scan never left `front.cluster_id`'s own bucket, so this met no
+    ///   check whatsoever.
+    ///
+    /// To SEE THESE RED (regression proof): restore the pre-fix body of
+    /// [`ConfigState::add_udp_frontend`] — open the bucket first with
+    /// `let udp_frontends = self.udp_fronts.entry(front.cluster_id.clone()).or_default();`
+    /// and replace the listener-wide `find` and both its `Err` returns with
+    /// the bucket-local
+    /// `if udp_frontends.contains(&udp_frontend) { return Err(StateError::Exists { .. }); }`.
+    /// Both `expect_err`s below then fail with
+    /// `a second UDP frontend on a taken address must be refused: ()`.
+    /// The DIFFERENT-address add and the add → remove → add sequence stay
+    /// green under that mutation — they are here to pin that the check refuses
+    /// only a genuine collision and leaks no state once the address is freed.
+    #[test]
+    fn add_udp_frontend_refuses_a_second_frontend_on_a_taken_address() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 5353);
+        let other_address = SocketAddress::new_v4(127, 0, 0, 1, 5354);
+        let mut state = ConfigState::new();
+
+        state
+            .dispatch(&RequestType::AddUdpFrontend(udp_front("dns", address, "team-a")).into())
+            .expect("the first claim on an address must be admitted");
+
+        // SAME cluster, same address, different tags.
+        state
+            .dispatch(&RequestType::AddUdpFrontend(udp_front("dns", address, "team-b")).into())
+            .expect_err("a second UDP frontend on a taken address must be refused");
+
+        // DIFFERENT cluster, same address — the case with no check at all
+        // before: it landed in another bucket.
+        state
+            .dispatch(&RequestType::AddUdpFrontend(udp_front("syslog", address, "team-c")).into())
+            .expect_err("a second UDP frontend on a taken address must be refused");
+
+        assert_eq!(
+            state.count_udp_frontends_raw(),
+            1,
+            "a refused claim must leave the state holding only the admitted frontend"
+        );
+        assert!(
+            state.udp_fronts.get("syslog").is_none_or(Vec::is_empty),
+            "a refused cross-cluster claim must not leave an opened bucket behind"
+        );
+
+        // A different address is a different listener: still admitted.
+        state
+            .dispatch(
+                &RequestType::AddUdpFrontend(udp_front("syslog", other_address, "team-c")).into(),
+            )
+            .expect("a UDP frontend on a free address must still be admitted");
+
+        // add -> remove -> add on the same address: the check must read live
+        // state, never a residue of the frontend that has been removed.
+        state
+            .dispatch(&RequestType::RemoveUdpFrontend(udp_front("dns", address, "team-a")).into())
+            .expect("removing the frontend holding the address must succeed");
+        state
+            .dispatch(&RequestType::AddUdpFrontend(udp_front("syslog", address, "team-c")).into())
+            .expect("a freed address must be claimable again, by any cluster");
+
+        assert_eq!(
+            state.count_udp_frontends_raw(),
+            2,
+            "the freed address must now be held by exactly one frontend, beside the other address"
+        );
+    }
+
+    /// The refusal names the frontend already holding the address, so an
+    /// operator can remove it without dumping the whole state.
+    ///
+    /// `doc/observability.md`'s sensitive-value logging boundary lists cluster
+    /// identifiers and access-log tags as protected material in error text, so
+    /// the identifiers travel in the variant's typed fields — lossless for a
+    /// caller that matches it — while `Display`/`Debug` render the address and
+    /// bounded metadata only. That is the same split `StateError::Exists` and
+    /// `StateError::InvalidTcpFrontend` already make.
+    ///
+    /// To SEE THIS RED: make the cross-cluster arm of
+    /// [`ConfigState::add_udp_frontend`] answer the generic
+    /// `StateError::Exists { kind: ObjectKind::UdpFrontend, id: format!("{udp_frontend:?}") }`
+    /// instead of `StateError::UdpFrontendAddressTaken`. The `match` below
+    /// fails with `expected UdpFrontendAddressTaken, got StateError(...)`, and
+    /// with it the operator's only pointer to the current owner.
+    #[test]
+    fn a_refused_udp_frontend_names_the_cluster_already_holding_the_address() {
+        const OWNER_SECRET: &str = "UDP_ADDRESS_OWNER_SECRET_SENTINEL";
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 5353);
+        let owner_cluster = format!("{OWNER_SECRET}-dns");
+        let owner_tag = format!("{OWNER_SECRET}-team-a");
+        let mut state = ConfigState::new();
+
+        state
+            .dispatch(
+                &RequestType::AddUdpFrontend(udp_front(&owner_cluster, address, &owner_tag)).into(),
+            )
+            .expect("the first claim on an address must be admitted");
+
+        let error = state
+            .dispatch(&RequestType::AddUdpFrontend(udp_front("syslog", address, "team-c")).into())
+            .expect_err("a second UDP frontend on a taken address must be refused");
+
+        match &error {
+            StateError::UdpFrontendAddressTaken {
+                address: refused_address,
+                cluster_id,
+                current_cluster_id,
+                current_tags,
+            } => {
+                assert_eq!(
+                    *refused_address,
+                    SocketAddr::from(address),
+                    "the refusal must name the contested address"
+                );
+                assert_eq!(cluster_id, "syslog", "the refusal must name the claimant");
+                assert_eq!(
+                    current_cluster_id, &owner_cluster,
+                    "the refusal must name the cluster already holding the address"
+                );
+                assert_eq!(
+                    current_tags.get("owner"),
+                    Some(&owner_tag),
+                    "the refusal must carry the current owner's access-log tags"
+                );
+            }
+            other => panic!("expected UdpFrontendAddressTaken, got {other:?}"),
+        }
+
+        // The logging projection stays inside the sensitive-value boundary:
+        // the address is lossless, the identifiers are metadata only.
+        for (label, output) in [
+            ("Display", error.to_string()),
+            ("Debug", format!("{error:?}")),
+        ] {
+            assert!(
+                output.contains("127.0.0.1:5353"),
+                "StateError {label} must name the contested address: {output}"
+            );
+            assert!(
+                !output.contains(OWNER_SECRET),
+                "StateError {label} leaked a protected identifier: {output}"
+            );
+            assert!(
+                output.contains(&format!("current_cluster_id_bytes={}", owner_cluster.len())),
+                "StateError {label} omitted the bounded owner metadata: {output}"
+            );
+            assert!(
+                output.contains("current_tag_count=1"),
+                "StateError {label} omitted the bounded owner tag count: {output}"
+            );
+        }
+    }
+
+    /// A configuration holding one UDP frontend per address is what the new
+    /// admission rule accepts, and `SaveState` -> `LoadState` must carry it
+    /// through byte-for-byte: every entry the file holds is dispatched again
+    /// without a single refusal.
+    ///
+    /// This drives the real file format — `write_requests_to_file`'s
+    /// `\n\0`-separated JSON `WorkerRequest` records, read back through
+    /// `parse_several_requests`, the exact pair
+    /// `bin/src/command/requests.rs::{save_state, load_state}` uses — rather
+    /// than an in-memory `generate_requests` replay.
+    ///
+    /// To SEE THIS RED: key the listener-wide scan in
+    /// [`ConfigState::add_udp_frontend`] on the PORT alone,
+    /// `existing.address.port() == address.port()`, the plausible over-broad
+    /// reading of "one frontend per listener". The two frontends below share
+    /// port 5353 on different IPs, so the over-broad check refuses the second
+    /// while the state is being built and the test fails on
+    /// `one UDP frontend per address must be admitted: StateError(UDP frontend
+    /// address 127.0.0.2:5353 is already claimed by another frontend:
+    /// cluster_id_bytes=6 current_cluster_id_bytes=3 current_tag_count=1)` --
+    /// before it ever reaches the replay assertion, which is the point: an
+    /// address-keyed check must let two listeners share a port.
+    #[test]
+    fn a_saved_state_holding_one_udp_frontend_per_address_replays_unchanged() {
+        use std::io::Read;
+
+        use crate::parser::parse_several_requests;
+
+        let first = SocketAddress::new_v4(127, 0, 0, 1, 5353);
+        let second = SocketAddress::new_v4(127, 0, 0, 2, 5353);
+
+        let mut state = ConfigState::new();
+        for (cluster_id, address) in [("dns", first), ("syslog", second)] {
+            state
+                .dispatch(&RequestType::AddUdpListener(make_udp_listener(address, true)).into())
+                .expect("could not add udp listener");
+            state
+                .dispatch(
+                    &RequestType::ActivateListener(ActivateListener {
+                        address,
+                        proxy: ListenerType::Udp.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                )
+                .expect("could not activate udp listener");
+            state
+                .dispatch(
+                    &RequestType::AddUdpFrontend(udp_front(cluster_id, address, "team-a")).into(),
+                )
+                .expect("one UDP frontend per address must be admitted");
+        }
+
+        let directory = tempfile::tempdir().expect("a temporary directory for the state file");
+        let path = directory.path().join("udpaddr-roundtrip.state");
+        let mut file = File::create(&path).expect("the state file must be creatable");
+        let written = state
+            .write_requests_to_file(&mut file)
+            .expect("SaveState must serialise the state");
+        drop(file);
+
+        let mut saved = Vec::new();
+        File::open(&path)
+            .expect("the state file must be readable")
+            .read_to_end(&mut saved)
+            .expect("the state file must be readable");
+
+        let (remainder, requests) =
+            parse_several_requests::<WorkerRequest>(&saved).expect("the state file must parse");
+        assert!(
+            remainder.is_empty(),
+            "load_state would report leftover bytes: {} unparsed",
+            remainder.len()
+        );
+        assert_eq!(
+            requests.len(),
+            written,
+            "every record write_requests_to_file emitted must parse back"
+        );
+
+        let mut replayed = ConfigState::new();
+        for request in &requests {
+            replayed
+                .dispatch(&request.content)
+                .expect("every saved UDP entry must replay into a fresh state");
+        }
+
+        let logical = |s: &ConfigState| {
+            let mut c = s.clone();
+            c.request_counts.clear();
+            c
+        };
+        assert_eq!(
+            logical(&state),
+            logical(&replayed),
+            "a SaveState -> LoadState round trip must reconstruct the UDP configuration"
         );
     }
 }
