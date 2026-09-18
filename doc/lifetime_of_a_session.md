@@ -85,6 +85,21 @@ never see traffic again. It would also let the slab hand that key to an
 ordinary session, which the UDP activation path would then overwrite.
 `Server::reserve_listen_token` (`lib/src/server.rs`) holds this invariant.
 
+Reserving the slot settles where the key may be *handed*, not what the
+UDP activation path may *write* into it. UDP is the one protocol that
+replaces the placeholder with a real session (`UdpListenerSession`), and
+`activate-listener` is not a once-per-listener request: `UdpListener::activate`
+short-circuits on its own `active` flag and answers with the same token for a
+listener that is already up, `ConfigState::activate_listener` accepts the
+repeat, and `load_state` re-emits one `activate-listener` per *active* listener
+on every replay. The activation arm therefore installs its session only when
+one is not installed already — the proxy's `listener_sessions` map is the
+record — and answers `ok` for a repeat without touching anything. Rebuilding on
+a repeat would drop the live session while the proxy kept the shared
+`UdpManager` and its flow table, so every in-flight flow would stop forwarding
+and its upstream slab slot could never be released. `close()` is a
+`ProxySession` method, not `Drop`, so a displaced session runs no teardown.
+
 A single session typically occupies *two* slab entries while it is
 forwarding traffic: one for the frontend token (registered when the
 client connection was accepted) and one for the backend token

@@ -2600,35 +2600,80 @@ impl Server {
                         // registration drives `Server::ready`'s generic path
                         // into `UdpListenerSession::update_readiness`.
                         //
-                        // The slot is reserved for the listener's whole
-                        // lifetime (`reserve_listen_token`), so it is present
-                        // and holds nothing but this listener's own
-                        // placeholder — the overwrite can never land on a live
-                        // session. Both failures below are therefore invariant
-                        // breaks; report them instead of returning `ok` for a
-                        // listener whose socket is registered under a token
-                        // `Server::ready` would ignore.
-                        let session = match self.udp.borrow_mut().build_session(token) {
-                            Some(session) => session,
-                            None => {
-                                return worker_response_error(
-                                    req_id,
-                                    format!(
-                                        "Could not build the UDP listener session for {address}"
-                                    ),
-                                );
-                            }
-                        };
-                        let mut sessions = self.sessions.borrow_mut();
-                        match sessions.slab.get_mut(token.0) {
-                            Some(slot) => *slot = session,
-                            None => {
-                                return worker_response_error(
-                                    req_id,
-                                    format!(
-                                        "UDP listener {address} has no session slot at {token:?}"
-                                    ),
-                                );
+                        // Install it once per ACTIVATION, not once per request.
+                        // `Ok(token)` does not mean this call activated
+                        // anything: `UdpListener::activate` short-circuits on
+                        // its own `active` flag and answers `Ok(self.token)` for
+                        // a listener that is already up. Nothing upstream
+                        // filters that repeat out either —
+                        // `ConfigState::activate_listener` sets `active = true`
+                        // and answers `Ok(())` however often it is asked, so the
+                        // main process forwards a second
+                        // `sozu listener udp activate`, and
+                        // `ConfigState::generate_requests` re-emits
+                        // `ActivateListener` for every active listener on each
+                        // state replay.
+                        //
+                        // Rebuilding on a repeat would therefore overwrite a
+                        // LIVE session: the proxy keeps the shared `UdpManager`
+                        // and its flow table, but the replacement session starts
+                        // with empty `upstream_sockets` / `upstream_to_flow` /
+                        // `flow_to_upstream`, so every in-flight flow stops
+                        // forwarding and its upstream slab slot can never be
+                        // released (`on_close_flow` reaches it only through
+                        // `flow_to_upstream`). `close()` is a `ProxySession`
+                        // method and not `Drop`, so dropping the displaced
+                        // session runs no teardown on the way out.
+                        //
+                        // `has_listener_session` is the precise "already
+                        // installed" test — `build_session` is its only
+                        // producer, and deactivate / remove / soft+hard stop are
+                        // its only consumers — paired with the reserved slab
+                        // slot still being present, so a slot that vanished
+                        // still falls through to the invariant-break report
+                        // below. It deliberately tracks the INSTALLED session
+                        // and not the listener's `active` flag: the SCM
+                        // hand-off's `give_back_listeners` clears `active` and
+                        // takes the socket without removing the session, and
+                        // skipping the rebuild there is right — the retained
+                        // session reaches the freshly bound socket through the
+                        // shared `Rc<RefCell<UdpListener>>`, so its flows
+                        // survive the re-exec instead of being orphaned. A repeat then answers `ok` having touched
+                        // nothing: the listener is active and its session is in
+                        // the slab, which is exactly what the caller asked for,
+                        // and it matches what the HTTP/HTTPS/TCP arms already
+                        // answer for their own repeats.
+                        let session_installed = self.udp.borrow().has_listener_session(token)
+                            && self.sessions.borrow().slab.contains(token.0);
+                        if !session_installed {
+                            // The slot is reserved for the listener's whole
+                            // lifetime (`reserve_listen_token`), so both failures
+                            // below are invariant breaks; report them instead of
+                            // returning `ok` for a listener whose socket is
+                            // registered under a token `Server::ready` would
+                            // ignore.
+                            let session = match self.udp.borrow_mut().build_session(token) {
+                                Some(session) => session,
+                                None => {
+                                    return worker_response_error(
+                                        req_id,
+                                        format!(
+                                            "Could not build the UDP listener session for {address}"
+                                        ),
+                                    );
+                                }
+                            };
+                            let mut sessions = self.sessions.borrow_mut();
+                            match sessions.slab.get_mut(token.0) {
+                                Some(slot) => *slot = session,
+                                None => {
+                                    return worker_response_error(
+                                        req_id,
+                                        format!(
+                                            "UDP listener {address} has no session slot at {token:?}"
+                                        ),
+                                    );
+                                }
                             }
                         }
                         WorkerResponse::ok(req_id)
@@ -3718,16 +3763,22 @@ mod accept_ready_tests {
 /// the design and the alternative it rejects.
 #[cfg(test)]
 mod listener_lifecycle_tests {
+    use std::net::UdpSocket as StdUdpSocket;
+
     use sozu_command::{
         config::ListenerBuilder,
         proto::command::{
-            ActivateListener, DeactivateListener, ListenerType, RemoveListener, SocketAddress,
+            ActivateListener, DeactivateListener, ListenerType, LoadBalancingParams,
+            RemoveListener, RequestUdpFrontend, SocketAddress, filtered_metrics,
         },
     };
 
     use super::accept_ready_tests::server_with_tcp_listener;
     use super::*;
-    use crate::testing::{ServerParts, prebuild_server, provide_port};
+    use crate::{
+        metrics::{METRICS, names},
+        testing::{ServerParts, prebuild_server, provide_port},
+    };
 
     /// A worker with no listener at all, driven through `Server`'s own request
     /// surface. Same shape as `accept_ready_tests::server_with_tcp_listener`,
@@ -3906,8 +3957,17 @@ mod listener_lifecycle_tests {
     /// assigned — overwrote that live session with its listener session.
     ///
     /// The reserved slot is never vacant, so `vacant_entry()` can no longer
-    /// return it. This test pins that: the session created while the listener
-    /// is deactivated must land on a different key and survive the reactivate.
+    /// return it. This test pins that, and ONLY that: the session created while
+    /// the listener is deactivated must land on a different key and survive the
+    /// reactivate. It says nothing about what the activate arm writes into the
+    /// listener's OWN key, because the reactivate here follows a deactivate and
+    /// so takes the full activation path. The repeat with no deactivate in
+    /// between — where the arm's answer is `Ok(token)` from
+    /// `UdpListener::activate`'s `active` short-circuit and the listener's own
+    /// key holds a LIVE `UdpListenerSession` — is FAILURE MODE 3, pinned by
+    /// `a_duplicate_udp_activate_keeps_the_live_listener_session` and the three
+    /// tests beside it. Naming this one for "a live session" hid that gap: it
+    /// stayed green throughout.
     ///
     /// To SEE THIS RED: in `notify_deactivate_listener`'s UDP arm, replace
     /// `self.reserve_listen_token(token, Protocol::UDPListen);` with
@@ -3915,7 +3975,7 @@ mod listener_lifecycle_tests {
     /// then takes the listener's key and the `assert_ne!` below fails with
     /// "a deactivated listener's key must not be handed to another session".
     #[test]
-    fn reactivating_a_udp_listener_cannot_overwrite_a_live_session() {
+    fn a_deactivated_udp_listeners_key_is_not_handed_to_another_session() {
         let mut server = bare_server();
         let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
         let listen_token = add_udp_listener(&mut server, address);
@@ -3944,6 +4004,365 @@ mod listener_lifecycle_tests {
             slot_state(&server, interloper),
             Some((Protocol::Channel, true)),
             "reactivating a listener must not overwrite another session's slot"
+        );
+    }
+
+    /// The cluster every UDP data-path test in this module routes through.
+    const UDP_FLOW_CLUSTER: &str = "udp-duplicate-activate";
+
+    /// The session Rc currently occupying `token`. Identity (`Rc::ptr_eq`)
+    /// across an operation is the direct statement that the operation did not
+    /// replace the live session — `UdpListenerSession`'s per-flow maps are
+    /// private to `udp.rs`, so identity plus an end-to-end datagram are what
+    /// this module can observe.
+    fn slab_session(server: &Server, token: Token) -> Rc<RefCell<dyn ProxySession>> {
+        server
+            .sessions
+            .borrow()
+            .slab
+            .get(token.0)
+            .expect("the listener must own a slab slot")
+            .clone()
+    }
+
+    /// The current value of the `udp.active_flows` gauge for this test thread.
+    /// `METRICS` is a `thread_local!` and libtest gives each test its own
+    /// thread, so this reads only what the test itself emitted.
+    fn active_flows_gauge() -> i64 {
+        METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(names::udp::ACTIVE_FLOWS)
+                .and_then(|metric| match metric.inner {
+                    Some(filtered_metrics::Inner::Gauge(value)) => Some(value as i64),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// A worker holding one activated UDP listener, a frontend and one backend,
+    /// plus the real client and backend sockets. The UDP data path is driven for
+    /// real on loopback because the orphaning these tests pin — the shell's
+    /// `upstream_to_flow` / `flow_to_upstream` / `upstream_sockets` maps going
+    /// empty under a live `UdpManager` — is only observable end to end.
+    fn udp_worker_with_backend(
+        server: &mut Server,
+        address: SocketAddress,
+    ) -> (StdUdpSocket, StdUdpSocket) {
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-udp-front".to_owned(),
+            content: RequestType::AddUdpFrontend(RequestUdpFrontend {
+                cluster_id: UDP_FLOW_CLUSTER.to_owned(),
+                address,
+                tags: Default::default(),
+            })
+            .into(),
+        });
+
+        let backend_socket =
+            StdUdpSocket::bind("127.0.0.1:0").expect("could not bind the test UDP backend");
+        backend_socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("could not set the backend read timeout");
+        let backend_address = backend_socket
+            .local_addr()
+            .expect("the test UDP backend must have a local address");
+
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-udp-backend".to_owned(),
+            content: RequestType::AddBackend(AddBackend {
+                cluster_id: UDP_FLOW_CLUSTER.to_owned(),
+                backend_id: format!("{UDP_FLOW_CLUSTER}-0"),
+                address: backend_address.into(),
+                load_balancing_parameters: Some(LoadBalancingParams::default()),
+                sticky_id: None,
+                backup: None,
+            })
+            .into(),
+        });
+
+        let client_socket =
+            StdUdpSocket::bind("127.0.0.1:0").expect("could not bind the test UDP client");
+        (client_socket, backend_socket)
+    }
+
+    /// Send one datagram from `client` to the listener and drive a single
+    /// READABLE event through `Server::ready`, exactly as the event loop does.
+    /// Returns what reached the backend within its read timeout, or `None` when
+    /// nothing was forwarded. Loopback `send_to` has already queued the datagram
+    /// on the listener socket by the time it returns, so one pass is enough.
+    fn forward_one(
+        server: &mut Server,
+        listen_token: Token,
+        listen_address: SocketAddress,
+        client: &StdUdpSocket,
+        backend: &StdUdpSocket,
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
+        let target: std::net::SocketAddr = listen_address.into();
+        client
+            .send_to(payload, target)
+            .expect("the test client must reach the UDP listener");
+        server.ready(listen_token, Ready::READABLE);
+
+        let mut received = [0u8; 64];
+        backend
+            .recv_from(&mut received)
+            .ok()
+            .map(|(len, _)| received[..len].to_vec())
+    }
+
+    /// FAILURE MODE 3, the residual of the listener-slot change: a SECOND
+    /// `ActivateListener` for a listener that is already active must not rebuild
+    /// its session.
+    ///
+    /// `UdpListener::activate` short-circuits on its own `active` flag and
+    /// answers `Ok(self.token)` without doing any work, so `Ok(token)` does not
+    /// mean this call activated anything — and the arm used to run
+    /// `build_session` + `*slot = session` on that answer regardless.
+    ///
+    /// To SEE THIS RED: in `notify_activate_listener`'s UDP arm, drop the
+    /// `if !session_installed` guard so `build_session` and the slab write run
+    /// unconditionally again — the second activate then installs a fresh
+    /// session and the `Rc::ptr_eq` assertion fails with "a repeated
+    /// ActivateListener must not replace the live UDP listener session".
+    #[test]
+    fn a_duplicate_udp_activate_keeps_the_live_listener_session() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listen_token = add_udp_listener(&mut server, address);
+        activate(&mut server, address, ListenerType::Udp);
+
+        let installed = slab_session(&server, listen_token);
+
+        let response = server.notify_activate_listener(
+            "test-activate-twice",
+            &ActivateListener {
+                address,
+                proxy: ListenerType::Udp as i32,
+                from_scm: false,
+            },
+        );
+        // The response an already-active listener must get. `ok` and not an
+        // error: `ConfigState::activate_listener` answers `Ok(())` for the same
+        // repeat, `generate_activate_requests` re-emits one per active listener
+        // on every state replay, and the HTTP/HTTPS/TCP arms all answer `ok`
+        // for their own repeats. Erroring here would fail an ordinary replay and
+        // make the worker disagree with the state the main process persisted.
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "a repeated ActivateListener on an active UDP listener must answer ok: {response:?}"
+        );
+        assert_eq!(
+            slot_state(&server, listen_token),
+            Some((Protocol::UDPListen, false)),
+            "the real UdpListenerSession must still be the one in the slab"
+        );
+        assert!(
+            Rc::ptr_eq(&installed, &slab_session(&server, listen_token)),
+            "a repeated ActivateListener must not replace the live UDP listener session"
+        );
+    }
+
+    /// The consequence of that rebuild, end to end. The displaced session took
+    /// the whole shell side of every flow with it — `upstream_sockets`,
+    /// `upstream_to_flow`, `flow_to_upstream` — while the proxy kept the shared
+    /// `UdpManager` and its flow table. `close()` is a `ProxySession` method and
+    /// not `Drop`, so nothing tore those flows down; they simply stopped
+    /// forwarding while `udp.active_flows` went on counting them.
+    ///
+    /// To SEE THIS RED: in `notify_activate_listener`'s UDP arm, drop the
+    /// `if !session_installed` guard — the datagram sent after the duplicate
+    /// activate then never reaches the backend and the assertion fails with
+    /// "an in-flight UDP flow must survive a repeated ActivateListener".
+    #[test]
+    fn in_flight_udp_flows_survive_a_duplicate_udp_activate() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listen_token = add_udp_listener(&mut server, address);
+        activate(&mut server, address, ListenerType::Udp);
+        let (client, backend) = udp_worker_with_backend(&mut server, address);
+
+        assert_eq!(
+            forward_one(
+                &mut server,
+                listen_token,
+                address,
+                &client,
+                &backend,
+                b"before"
+            )
+            .as_deref(),
+            Some(&b"before"[..]),
+            "the flow must be established before the duplicate activate"
+        );
+        assert_eq!(
+            active_flows_gauge(),
+            1,
+            "one established flow must be on the gauge"
+        );
+
+        activate(&mut server, address, ListenerType::Udp);
+
+        // The gauge counts what the manager holds, and the manager is retained
+        // across the rebuild — so the gauge alone cannot tell a live flow from
+        // an orphaned one. Assert both together: the flow the gauge claims must
+        // still be a flow the data path can serve.
+        assert_eq!(
+            active_flows_gauge(),
+            1,
+            "a repeated ActivateListener must neither open nor evict a flow"
+        );
+        assert_eq!(
+            forward_one(
+                &mut server,
+                listen_token,
+                address,
+                &client,
+                &backend,
+                b"after"
+            )
+            .as_deref(),
+            Some(&b"after"[..]),
+            "an in-flight UDP flow must survive a repeated ActivateListener"
+        );
+    }
+
+    /// The resource the rebuild strands for good. Every flow holds one extra
+    /// slab slot for its upstream socket, and `on_close_flow` reaches that slot
+    /// only through `flow_to_upstream`. A replacement session's map is empty, so
+    /// the eventual manager-driven teardown frees the flow, balances the gauge —
+    /// and leaves the upstream slot allocated for the worker's whole life.
+    ///
+    /// To SEE THIS RED: in `notify_activate_listener`'s UDP arm, drop the
+    /// `if !session_installed` guard — the deactivate then leaves the upstream
+    /// slot behind and the assertion fails with "tearing the listener down must
+    /// release every per-flow slab slot".
+    #[test]
+    fn a_duplicate_udp_activate_strands_no_upstream_slab_slot() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listen_token = add_udp_listener(&mut server, address);
+        activate(&mut server, address, ListenerType::Udp);
+        let (client, backend) = udp_worker_with_backend(&mut server, address);
+
+        // Baseline AFTER the listener exists: its own reserved slot is part of
+        // `base_sessions_count` and is not what this test measures.
+        let baseline = server.sessions.borrow().slab.len();
+
+        assert!(
+            forward_one(
+                &mut server,
+                listen_token,
+                address,
+                &client,
+                &backend,
+                b"flow"
+            )
+            .is_some(),
+            "the flow must be established before the duplicate activate"
+        );
+        assert_eq!(
+            server.sessions.borrow().slab.len(),
+            baseline + 1,
+            "an established flow owns exactly one upstream slab slot"
+        );
+
+        activate(&mut server, address, ListenerType::Udp);
+        deactivate(&mut server, address, ListenerType::Udp);
+
+        assert_eq!(
+            server.sessions.borrow().slab.len(),
+            baseline,
+            "tearing the listener down must release every per-flow slab slot"
+        );
+        assert_eq!(
+            active_flows_gauge(),
+            0,
+            "tearing the listener down must return the active-flows gauge to zero"
+        );
+    }
+
+    /// The path that reaches this arm without anyone typing a command:
+    /// `load_state` replays the state the main process persisted, and
+    /// `ConfigState::generate_activate_requests` emits one `ActivateListener`
+    /// per ACTIVE listener. For a worker whose listener is already up, that
+    /// replay is a duplicate activate by construction — the ordinary case, not
+    /// an operator mistake, which is why this arm answers `ok` instead of
+    /// surfacing the repeat as an error.
+    ///
+    /// Driven through the real `ConfigState` rather than a hand-written
+    /// `ActivateListener`, so the test breaks if that emission ever changes.
+    ///
+    /// To SEE THIS RED: in `notify_activate_listener`'s UDP arm, drop the
+    /// `if !session_installed` guard — the replay then rebuilds the session and
+    /// the `Rc::ptr_eq` assertion fails with "replaying ActivateListener must
+    /// leave the live UDP listener session in place".
+    #[test]
+    fn replaying_activate_listener_is_a_clean_no_op_for_an_active_udp_listener() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listener_config = ListenerBuilder::new_udp(address)
+            .to_udp(None)
+            .expect("could not build a UdpListenerConfig for the test");
+
+        // Through `notify_proxys` so the worker's own `ConfigState` records the
+        // listener and its activation, exactly as a live worker's does.
+        server.notify_proxys(WorkerRequest {
+            id: "test-add-udp".to_owned(),
+            content: RequestType::AddUdpListener(listener_config).into(),
+        });
+        server.notify_proxys(WorkerRequest {
+            id: "test-activate".to_owned(),
+            content: RequestType::ActivateListener(ActivateListener {
+                address,
+                proxy: ListenerType::Udp as i32,
+                from_scm: false,
+            })
+            .into(),
+        });
+        let listen_token = server
+            .udp
+            .borrow()
+            .listener_token(address.into())
+            .expect("the added UDP listener must own a token");
+        let installed = slab_session(&server, listen_token);
+
+        let replayed: Vec<ActivateListener> = server
+            .config_state
+            .generate_activate_requests()
+            .into_iter()
+            .filter_map(|request| match request.request_type {
+                Some(RequestType::ActivateListener(activate)) => Some(activate),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replayed.len(),
+            1,
+            "an active UDP listener must be replayed exactly once: {replayed:?}"
+        );
+
+        for activate in &replayed {
+            let response = server.notify_activate_listener("test-replay", activate);
+            assert_eq!(
+                response.status,
+                ResponseStatus::Ok as i32,
+                "a replayed ActivateListener must answer ok: {response:?}"
+            );
+        }
+
+        assert_eq!(
+            slot_state(&server, listen_token),
+            Some((Protocol::UDPListen, false)),
+            "the replay must leave the real UdpListenerSession in the slab"
+        );
+        assert!(
+            Rc::ptr_eq(&installed, &slab_session(&server, listen_token)),
+            "replaying ActivateListener must leave the live UDP listener session in place"
         );
     }
 

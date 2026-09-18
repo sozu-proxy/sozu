@@ -509,6 +509,20 @@ impl UdpProxy {
         listener.borrow_mut().activate(&self.registry, udp_socket)
     }
 
+    /// Whether the real [`UdpListenerSession`] for `token` is already
+    /// installed, i.e. [`build_session`](Self::build_session) has run for it
+    /// and no teardown has removed it since.
+    ///
+    /// `listener_sessions` is populated by `build_session` alone and emptied by
+    /// `give_back_listener` (deactivate), `remove_listener` and soft/hard stop,
+    /// so membership tracks the installed session exactly. `Server` reads it to
+    /// tell a first `ActivateListener` from a repeat: `UdpListener::activate`
+    /// answers `Ok(token)` for an already-active listener without doing any
+    /// work, and rebuilding on that answer would destroy the live session.
+    pub fn has_listener_session(&self, token: Token) -> bool {
+        self.listener_sessions.contains_key(&token)
+    }
+
     /// The slab token reserved for the listener at `address`, if this proxy
     /// holds one.
     ///

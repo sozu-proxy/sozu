@@ -75,6 +75,46 @@
 
 ### 🐛 Fixed
 
+- **`fix(udp)`: a repeated `activate-listener` destroyed the live listener session.**
+  Residual of the listener-slot change immediately below, which landed the same day — not a new
+  regression, and the reserved slot it introduced is sound. That change left the UDP activation arm
+  running `build_session` + `*slot = session` on every `Ok(token)`, under a comment asserting the
+  slot "holds nothing but this listener's own placeholder — the overwrite can never land on a live
+  session". True the first time and false every time after: `UdpListener::activate`
+  (`lib/src/udp.rs:287`) short-circuits on its own `active` flag and answers `Ok(self.token)`
+  without doing any work, so a second `activate-listener` for a listener that is already up reached
+  that assignment with a live `UdpListenerSession` in the slot — the overwrite the change claimed to
+  have removed "by construction rather than by check". Reserving the slot settles which key the slab
+  may hand out; it does not constrain what the activation arm writes into the listener's own key.
+  It needed no operator mistake. `ConfigState::activate_listener` (`command/src/state.rs:1012`) sets
+  `active = true` and answers `Ok(())` however often it is asked, so the main process forwards a
+  second `sozu listener udp activate`; and `ConfigState::generate_requests`
+  (`command/src/state.rs:1684`) and `generate_activate_requests` (`command/src/state.rs:1820`) emit
+  one `ActivateListener` per *active* listener, so an ordinary `load-state` replay triggered it on
+  its own.
+  The replacement session shares the proxy's `UdpManager` — and therefore its flow table — but
+  starts with empty `upstream_sockets`, `upstream_to_flow` and `flow_to_upstream`. `close()` is a
+  `ProxySession` method and not `Drop` (`lib/src/udp.rs:1824`), so the displaced session ran no
+  teardown on the way out. Every in-flight flow stopped forwarding on the spot: the manager still
+  resolved the client to its flow and emitted `SendToBackend`, and the new session had no upstream
+  socket to send it on. The flow's upstream slab slot was stranded for the worker's lifetime —
+  `on_close_flow` (`lib/src/udp.rs:1659`) reaches that slot only through `flow_to_upstream`, so the
+  eventual teardown could no longer free it. The request answered `ok` throughout.
+  The `udp.active_flows` gauge did *not* drift: the retained manager is its sole author, so
+  `FlowEvicted` still fired once per flow at the eventual teardown. What the gauge lost was its
+  meaning — it went on counting flows the data path could no longer serve.
+  The arm now installs the session only when one is not installed already, using the proxy's own
+  `listener_sessions` record (`UdpProxy::has_listener_session`) paired with the reserved slab slot
+  still being present, so a vanished slot still falls through to the invariant-break report. A
+  repeat answers `ok` having touched nothing: the listener is active and its session is in the slab,
+  which is what the caller asked for, it is what `ConfigState` already recorded, and it is what the
+  HTTP/HTTPS/TCP arms have always answered for their own repeats — those call only `accept()`, which
+  re-drains the backlog and writes nothing to the slab, so none of the three had this failure.
+  Four new tests, all seen red. `reactivating_a_udp_listener_cannot_overwrite_a_live_session` from
+  that change is renamed `a_deactivated_udp_listeners_key_is_not_handed_to_another_session`: it
+  reactivates only after a deactivate, so it never exercised the short-circuit and stayed green
+  against this bug — its name claimed the guarantee its body does not make.
+
 - **`fix(server)`: a deactivated listener is deaf after being activated again.**
   The four proxies keep a listener's slab token inside the listener itself: `give_back_listener`
   hands the same token back on `deactivate-listener`, and a later `activate-listener` re-registers
