@@ -25,6 +25,32 @@
 
 ### 🐛 Fixed
 
+- **`fix(server)`: a deactivated listener is deaf after being activated again.**
+  The four proxies keep a listener's slab token inside the listener itself: `give_back_listener`
+  hands the same token back on `deactivate-listener`, and a later `activate-listener` re-registers
+  the socket under it. `deactivate-listener`, however, freed that slab slot, and `Server::ready`
+  drops any event whose token the slab does not contain — so a reactivated HTTP, HTTPS or TCP
+  listener served only the backlog its activation drained and then went silent, while the request
+  had answered `ok`. UDP failed harder still: its activation installs a real `UdpListenerSession`
+  at the listen token, guarded by a `slab.contains` check that was now false, so the socket was
+  registered with no session behind it at all and every datagram was dropped. Worse, once the key
+  had been handed to an ordinary session that check read *true* and the assignment overwrote that
+  live session.
+  A listener now owns exactly one slab slot for its whole `add-listener` -> `remove-listener`
+  lifetime: deactivating puts back the same inert `ListenSession` placeholder that adding
+  installed, instead of freeing the slot. The retained token therefore stays valid, and the slab
+  can no longer hand that key to a session, which removes the overwrite by construction rather
+  than by check.
+  `remove-listener` is now the release point, which also closes a leak that was already there: no
+  proxy's `remove_listener` touches the session slab, and the deactivation arms were the only code
+  that ever freed a listener's slot, so removing a listener that had not been deactivated first
+  already stranded one slab key per add/remove cycle while `base_sessions_count` was decremented
+  anyway. For UDP the stranded entry was worse than a key: it held the last `UdpListenerSession`
+  reference, which kept the listener's `UdpSocket` open and kept `Server::ready` dispatching to a
+  listener the control plane had removed.
+  The UDP activation path no longer answers `ok` when it cannot install its session. All four seen
+  red.
+
 - **`fix(tcp)`: stop dialing the backend before the inbound PROXY header is parsed.**
   A TCP cluster configured with `expect_proxy = true` (`ProxyProtocolConfig::ExpectHeader`) starts
   its sessions in the expect state, which has no backend side at all: `set_back_socket` is a hard `panic!` there, and the

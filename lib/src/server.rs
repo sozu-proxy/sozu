@@ -2117,13 +2117,36 @@ impl Server {
                     "removing a listener with base_sessions_count == 0 would underflow"
                 );
                 self.base_sessions_count -= 1;
-                let response = match ListenerType::try_from(remove.proxy) {
+                let listener_type = ListenerType::try_from(remove.proxy);
+                // `RemoveListener` is the sole release point of the slab slot
+                // `AddListener` reserved (see `reserve_listen_token`): no
+                // proxy's `remove_listener` touches the session slab, so
+                // without this the slot leaks one slab key per add/remove
+                // cycle — and `base_sessions_count`, decremented just above,
+                // drifts below the number of reserved slots. Read the token
+                // BEFORE the proxy drops the listener that holds it.
+                let address: std::net::SocketAddr = remove.address.into();
+                let listen_token = match listener_type {
+                    Ok(ListenerType::Http) => self.http.borrow().listener_token(address),
+                    Ok(ListenerType::Https) => self.https.borrow().listener_token(address),
+                    Ok(ListenerType::Tcp) => self.tcp.borrow().listener_token(address),
+                    Ok(ListenerType::Udp) => self.udp.borrow().listener_token(address),
+                    Err(_) => None,
+                };
+                let response = match listener_type {
                     Ok(ListenerType::Http) => self.http.borrow_mut().notify(request),
                     Ok(ListenerType::Https) => self.https.borrow_mut().notify(request),
                     Ok(ListenerType::Tcp) => self.tcp.borrow_mut().notify(request),
                     Ok(ListenerType::Udp) => self.udp.borrow_mut().notify(request),
                     Err(_) => WorkerResponse::error(req_id, "Wrong variant ListenerType"),
                 };
+                if let Some(token) = listen_token {
+                    self.sessions.borrow_mut().slab.try_remove(token.0);
+                    // Same rule as the deactivate arms: a listen token with no
+                    // slab slot must not stay queued for a deferred accept.
+                    self.accept_ready.remove(&ListenToken(token.0));
+                    info!("released listen token {:?}", token);
+                }
                 push_queue(response);
             }
             Some(RequestType::ActivateListener(ref activate)) => {
@@ -2418,6 +2441,57 @@ impl Server {
         }
     }
 
+    /// Re-arm a deactivated listener's slab slot with the inert
+    /// [`ListenSession`] placeholder that `AddListener` first installed there.
+    ///
+    /// DESIGN (2026-09-18) — a listener owns exactly one slab slot for its
+    /// whole `AddListener` -> `RemoveListener` lifetime, activated or not.
+    /// The alternative was to stop retaining the token across a deactivate and
+    /// allocate a fresh slab key on every activate; it was rejected because
+    /// the token is the *identity* of a listener in all four proxies — their
+    /// `listeners` maps (plus UDP's `managers`, `cluster_for_listener` and
+    /// `listener_sessions`) are keyed by it, `give_back_listener` hands the
+    /// same token back and `activate()` returns it again — so a fresh key
+    /// would mean rekeying five maps across four proxies on every activate,
+    /// far more machinery than the defect warrants.
+    ///
+    /// Reserving the slot is what makes the retained token honest, and it
+    /// closes both halves of the defect at once:
+    ///
+    /// * the slot is never vacant, so `Server::ready` keeps dispatching the
+    ///   listen token after a deactivate/activate cycle. Freeing it left the
+    ///   socket re-registered under a token with no slab entry — `ready()`
+    ///   silently drops the event, and the reactivated listener was deaf
+    ///   while `ActivateListener` had reported success;
+    /// * the slab can never hand that key to another session, so the UDP
+    ///   activate path can no longer overwrite a live session with its
+    ///   listener session. Mode 2 is gone by construction, not by check.
+    ///
+    /// `RemoveListener` is the sole release point (see `notify_proxys`). No
+    /// proxy's `remove_listener` touches the session slab, so before this
+    /// change the deactivate arms were the ONLY code that ever freed a
+    /// listener's slot — removing a listener that had not been deactivated
+    /// first already stranded its slab key (and, for UDP, the last
+    /// `UdpListenerSession` reference, hence the listener's open `UdpSocket`).
+    /// Reserving the slot here makes that release mandatory rather than
+    /// incidental.
+    fn reserve_listen_token(&mut self, token: Token, protocol: Protocol) {
+        let mut sessions = self.sessions.borrow_mut();
+        match sessions.slab.get_mut(token.0) {
+            Some(slot) => {
+                *slot = Rc::new(RefCell::new(ListenSession { protocol }));
+                info!("reserved listen token {:?} for {:?}", token, protocol);
+            }
+            // Unreachable while the lifetime above holds: `AddListener`
+            // inserted the slot and only `RemoveListener` frees it. Loud
+            // rather than silent, because the listener is deaf if it happens.
+            None => error!(
+                "listen token {:?} ({:?}) has no slab slot to reserve; the listener would not be reachable if reactivated",
+                token, protocol
+            ),
+        }
+    }
+
     fn notify_activate_listener(
         &mut self,
         req_id: &str,
@@ -2525,10 +2599,36 @@ impl Server {
                         // the real `UdpListenerSession` so the READABLE
                         // registration drives `Server::ready`'s generic path
                         // into `UdpListenerSession::update_readiness`.
-                        if let Some(session) = self.udp.borrow_mut().build_session(token) {
-                            let mut sessions = self.sessions.borrow_mut();
-                            if sessions.slab.contains(token.0) {
-                                sessions.slab[token.0] = session;
+                        //
+                        // The slot is reserved for the listener's whole
+                        // lifetime (`reserve_listen_token`), so it is present
+                        // and holds nothing but this listener's own
+                        // placeholder — the overwrite can never land on a live
+                        // session. Both failures below are therefore invariant
+                        // breaks; report them instead of returning `ok` for a
+                        // listener whose socket is registered under a token
+                        // `Server::ready` would ignore.
+                        let session = match self.udp.borrow_mut().build_session(token) {
+                            Some(session) => session,
+                            None => {
+                                return worker_response_error(
+                                    req_id,
+                                    format!(
+                                        "Could not build the UDP listener session for {address}"
+                                    ),
+                                );
+                            }
+                        };
+                        let mut sessions = self.sessions.borrow_mut();
+                        match sessions.slab.get_mut(token.0) {
+                            Some(slot) => *slot = session,
+                            None => {
+                                return worker_response_error(
+                                    req_id,
+                                    format!(
+                                        "UDP listener {address} has no session slot at {token:?}"
+                                    ),
+                                );
                             }
                         }
                         WorkerResponse::ok(req_id)
@@ -2577,17 +2677,16 @@ impl Server {
                     );
                 }
 
-                {
-                    let mut sessions = self.sessions.borrow_mut();
-                    if sessions.slab.contains(token.0) {
-                        sessions.slab.remove(token.0);
-                        info!("removed listen token {:?}", token);
-                    }
-                }
+                // The slot stays RESERVED for the deactivated listener — see
+                // `reserve_listen_token`. It carries the same inert placeholder
+                // `AddListener` installed, so a later `ActivateListener` finds
+                // its token still valid and no other session can take the key.
+                self.reserve_listen_token(token, Protocol::HTTPListen);
                 // The listen token may still be queued for a deferred accept
                 // (`ready()` enqueues it whenever the listener is readable but
-                // `can_accept` is false). Its slab entry is gone now, so
-                // `handle_remaining_readiness` must not find it there.
+                // `can_accept` is false). The listener has just given its
+                // socket back, so `handle_remaining_readiness` must not call
+                // `accept()` on it.
                 self.accept_ready.remove(&ListenToken(token.0));
 
                 if deactivate.to_scm {
@@ -2629,12 +2728,9 @@ impl Server {
                         deactivate, e
                     );
                 }
-                if self.sessions.borrow().slab.contains(token.0) {
-                    self.sessions.borrow_mut().slab.remove(token.0);
-                    info!("removed listen token {:?}", token);
-                }
-                // See the HTTP arm: a token queued for a deferred accept must
-                // not outlive the slab entry it indexes.
+                // See the HTTP arm: the slot stays reserved, and a
+                // socket-less listener must not stay queued for an accept.
+                self.reserve_listen_token(token, Protocol::HTTPSListen);
                 self.accept_ready.remove(&ListenToken(token.0));
 
                 if deactivate.to_scm {
@@ -2674,12 +2770,9 @@ impl Server {
                         deactivate, e
                     );
                 }
-                if self.sessions.borrow().slab.contains(token.0) {
-                    self.sessions.borrow_mut().slab.remove(token.0);
-                    info!("removed listen token {:?}", token);
-                }
-                // See the HTTP arm: a token queued for a deferred accept must
-                // not outlive the slab entry it indexes.
+                // See the HTTP arm: the slot stays reserved, and a
+                // socket-less listener must not stay queued for an accept.
+                self.reserve_listen_token(token, Protocol::TCPListen);
                 self.accept_ready.remove(&ListenToken(token.0));
 
                 if deactivate.to_scm {
@@ -2719,15 +2812,14 @@ impl Server {
                         deactivate, e
                     );
                 }
-                if self.sessions.borrow().slab.contains(token.0) {
-                    self.sessions.borrow_mut().slab.remove(token.0);
-                    info!("removed listen token {:?}", token);
-                }
+                // See the HTTP arm. For UDP this ALSO drops the live
+                // `UdpListenerSession` the activate path installed here,
+                // putting the slot back to the placeholder — the flows it owned
+                // were already torn down by `give_back_listener`.
+                self.reserve_listen_token(token, Protocol::UDPListen);
                 // A UDP listen token never reaches `accept_ready` (`ready()`
                 // only enqueues the three accept-driven listen protocols), but
-                // the removal keeps the rule uniform across the four arms:
-                // dropping a listen token's slab entry drops its pending
-                // accept as well.
+                // the removal keeps the rule uniform across the four arms.
                 self.accept_ready.remove(&ListenToken(token.0));
 
                 if deactivate.to_scm {
@@ -3154,14 +3246,22 @@ impl Server {
                 .next()
                 .map(|token| ListenToken(token.0))
             {
-                // A listen token queued here while `can_accept` was false
-                // outlives its slab entry when the listener is deactivated
-                // meanwhile (`notify_deactivate_listener` removes the entry).
-                // Indexing the slab with it panicked the worker. Purging it
-                // HERE as well as in the deactivate arms is what keeps the
-                // loop finite: `accept()` below only removes the token on
-                // `WouldBlock`/error, so a `continue` without the removal
-                // would hand `iter().next()` the same stale token forever.
+                // A listen token queued here while `can_accept` was false can
+                // outlive its slab entry. `notify_deactivate_listener` no
+                // longer frees that entry — it RESERVES the slot, re-arming it
+                // with the inert `ListenSession` placeholder (see
+                // `reserve_listen_token`) — so after a deactivate the lookup
+                // below still succeeds and it is the `accept_ready` purge in
+                // those arms that keeps a socket-less listener out of
+                // `accept()`. `RemoveListener` is the sole release point of the
+                // slot (`notify_proxys`), and it purges the token too, so a
+                // token reaching this loop with no slab entry means those
+                // purges were bypassed. Indexing the slab with it panicked the
+                // worker, hence the fallible `get`. Purging it HERE as well as
+                // at those sites is what keeps the loop finite: `accept()`
+                // below only removes the token on `WouldBlock`/error, so a
+                // `continue` without the removal would hand `iter().next()` the
+                // same stale token forever.
                 let protocol = self
                     .sessions
                     .borrow()
@@ -3478,7 +3578,7 @@ mod accept_ready_tests {
     /// same `Server` surface the event loop drives. The listen token carries a
     /// `ListenSession` placeholder in the slab, exactly like
     /// `tcp::testing::start_tcp_worker` installs it.
-    fn server_with_tcp_listener() -> (Server, Token, SocketAddress) {
+    pub(super) fn server_with_tcp_listener() -> (Server, Token, SocketAddress) {
         let ServerParts {
             event_loop,
             registry,
@@ -3544,14 +3644,14 @@ mod accept_ready_tests {
     /// `ready()` queues a listen token in `accept_ready` whenever its listener
     /// is readable but the worker cannot accept (buffer-pool backpressure), and
     /// only `accept()` — which never runs while `can_accept` is false — takes
-    /// it back out. Deactivating that listener removes its slab entry, so
-    /// without this purge the token outlived the slot it indexes and the next
-    /// deferred accept pass indexed a vacant key.
+    /// it back out. Deactivating that listener hands its socket back, so
+    /// without this purge the deferred accept pass called `accept()` on a
+    /// socket-less listener (and, before the slot was reserved for the
+    /// listener's whole lifetime, indexed a vacant slab key).
     ///
     /// To SEE THIS RED: drop `self.accept_ready.remove(&ListenToken(token.0))`
-    /// from `notify_deactivate_listener`'s TCP arm — the first assertion below
-    /// fails, and the `handle_remaining_readiness` call after it panics with
-    /// "invalid key".
+    /// from `notify_deactivate_listener`'s TCP arm — the last assertion below
+    /// fails.
     #[test]
     fn deactivating_a_listener_drops_its_pending_accept_token() {
         let (mut server, listen_token, address) = server_with_tcp_listener();
@@ -3573,8 +3673,10 @@ mod accept_ready_tests {
             "deactivating an activated TCP listener must succeed: {response:?}"
         );
         assert!(
-            !server.sessions.borrow().slab.contains(listen_token.0),
-            "deactivating a listener must free its slab entry — the premise of this test"
+            server.sessions.borrow().slab.contains(listen_token.0),
+            "deactivating a listener must KEEP its slab slot reserved — see \
+             `reserve_listen_token`; the accept purge below is what stops the \
+             deferred pass from accepting on a socket-less listener"
         );
         assert!(
             !server.accept_ready.contains(&ListenToken(listen_token.0)),
@@ -3608,5 +3710,297 @@ mod accept_ready_tests {
             server.accept_ready.is_empty(),
             "a listen token with no session must be dropped from accept_ready"
         );
+    }
+}
+/// The listener slab slot is reserved for a listener's whole `AddListener` ->
+/// `RemoveListener` lifetime. These tests pin both ends of that lifetime and
+/// the deactivate/reactivate cycle in between; see `reserve_listen_token` for
+/// the design and the alternative it rejects.
+#[cfg(test)]
+mod listener_lifecycle_tests {
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{
+            ActivateListener, DeactivateListener, ListenerType, RemoveListener, SocketAddress,
+        },
+    };
+
+    use super::accept_ready_tests::server_with_tcp_listener;
+    use super::*;
+    use crate::testing::{ServerParts, prebuild_server, provide_port};
+
+    /// A worker with no listener at all, driven through `Server`'s own request
+    /// surface. Same shape as `accept_ready_tests::server_with_tcp_listener`,
+    /// minus the pre-installed listener — `Server::new` builds its own UDP
+    /// proxy, which is the one these tests exercise.
+    fn bare_server() -> Server {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (_command_channel, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+
+        Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            None,
+            false,
+        )
+        .expect("could not build the test server")
+    }
+
+    fn add_udp_listener(server: &mut Server, address: SocketAddress) -> Token {
+        let listener_config = ListenerBuilder::new_udp(address)
+            .to_udp(None)
+            .expect("could not build a UdpListenerConfig for the test");
+        let response = server.notify_add_udp_listener("test-add-udp", listener_config);
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "adding a UDP listener must succeed: {response:?}"
+        );
+        server
+            .udp
+            .borrow()
+            .listener_token(address.into())
+            .expect("the added UDP listener must own a token")
+    }
+
+    fn activate(server: &mut Server, address: SocketAddress, proxy: ListenerType) {
+        let response = server.notify_activate_listener(
+            "test-activate",
+            &ActivateListener {
+                address,
+                proxy: proxy as i32,
+                from_scm: false,
+            },
+        );
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "activating a {proxy:?} listener must succeed: {response:?}"
+        );
+    }
+
+    fn deactivate(server: &mut Server, address: SocketAddress, proxy: ListenerType) {
+        let response = server.notify_deactivate_listener(
+            "test-deactivate",
+            &DeactivateListener {
+                address,
+                proxy: proxy as i32,
+                to_scm: false,
+            },
+        );
+        assert_eq!(
+            response.status,
+            ResponseStatus::Ok as i32,
+            "deactivating a {proxy:?} listener must succeed: {response:?}"
+        );
+    }
+
+    /// The protocol recorded in the slab slot at `token`, and whether that slot
+    /// holds the inert `ListenSession` placeholder. `ListenSession` reports
+    /// `Token(0)` as its frontend token while a real `UdpListenerSession`
+    /// reports its own listen token — the only way to tell the two apart, since
+    /// both answer `Protocol::UDPListen`.
+    fn slot_state(server: &Server, token: Token) -> Option<(Protocol, bool)> {
+        let sessions = server.sessions.borrow();
+        let session = sessions.slab.get(token.0)?;
+        let session = session.borrow();
+        Some((session.protocol(), session.frontend_token() == Token(0)))
+    }
+
+    /// FAILURE MODE 1, the whole point of this change: a deactivated listener
+    /// that is activated again must be reachable from the event loop.
+    ///
+    /// The proxies retain the listener's token across a deactivate
+    /// (`give_back_listener` and `activate()` both hand back the same one), and
+    /// `Server::ready` ignores any token the slab does not contain. Freeing the
+    /// slot on deactivate therefore left `ActivateListener` re-registering the
+    /// socket under a dead token: the request answered `ok` and the listener
+    /// never saw another readiness event.
+    ///
+    /// `can_accept` is forced to `false` so `ready()` parks the token in
+    /// `accept_ready` instead of immediately draining it in `accept()` —
+    /// membership there is the observable proof that the event reached the
+    /// listener's dispatch path at all.
+    ///
+    /// To SEE THIS RED: in `notify_deactivate_listener`'s TCP arm, replace
+    /// `self.reserve_listen_token(token, Protocol::TCPListen);` with
+    /// `self.sessions.borrow_mut().slab.remove(token.0);` — the reactivated
+    /// listener's readiness event is then dropped, and the assertion fails
+    /// with "a reactivated listener must still be dispatched by `ready()`".
+    #[test]
+    fn a_reactivated_tcp_listener_is_reachable_from_the_event_loop() {
+        let (mut server, listen_token, address) = server_with_tcp_listener();
+
+        deactivate(&mut server, address, ListenerType::Tcp);
+        activate(&mut server, address, ListenerType::Tcp);
+
+        server.sessions.borrow_mut().can_accept = false;
+        server.ready(listen_token, Ready::READABLE);
+
+        assert!(
+            server.accept_ready.contains(&ListenToken(listen_token.0)),
+            "a reactivated listener must still be dispatched by `ready()`"
+        );
+    }
+
+    /// The UDP half of failure mode 1. UDP never accepts, so its activate path
+    /// installs a real `UdpListenerSession` at the listen token instead — which
+    /// it skipped outright when the slot had been freed, leaving the socket
+    /// registered against the placeholder-less token and every datagram
+    /// unread, while the request still answered `ok`.
+    ///
+    /// To SEE THIS RED: in `notify_deactivate_listener`'s UDP arm, replace
+    /// `self.reserve_listen_token(token, Protocol::UDPListen);` with
+    /// `self.sessions.borrow_mut().slab.remove(token.0);` — the activate arm
+    /// then returns an error response ("has no session slot"), so `activate()`
+    /// panics on the status assertion.
+    #[test]
+    fn a_reactivated_udp_listener_gets_its_session_back() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listen_token = add_udp_listener(&mut server, address);
+
+        assert_eq!(
+            slot_state(&server, listen_token),
+            Some((Protocol::UDPListen, true)),
+            "an added, not-yet-activated UDP listener holds the placeholder"
+        );
+
+        activate(&mut server, address, ListenerType::Udp);
+        assert_eq!(
+            slot_state(&server, listen_token),
+            Some((Protocol::UDPListen, false)),
+            "activating must install the real UdpListenerSession"
+        );
+
+        deactivate(&mut server, address, ListenerType::Udp);
+        activate(&mut server, address, ListenerType::Udp);
+
+        assert_eq!(
+            slot_state(&server, listen_token),
+            Some((Protocol::UDPListen, false)),
+            "reactivating must reinstall the real UdpListenerSession"
+        );
+    }
+
+    /// FAILURE MODE 2, now impossible by construction: while the slot was
+    /// freed on deactivate, the slab was free to hand that key to the next
+    /// session, and the UDP activate path — which found `contains` true and
+    /// assigned — overwrote that live session with its listener session.
+    ///
+    /// The reserved slot is never vacant, so `vacant_entry()` can no longer
+    /// return it. This test pins that: the session created while the listener
+    /// is deactivated must land on a different key and survive the reactivate.
+    ///
+    /// To SEE THIS RED: in `notify_deactivate_listener`'s UDP arm, replace
+    /// `self.reserve_listen_token(token, Protocol::UDPListen);` with
+    /// `self.sessions.borrow_mut().slab.remove(token.0);` — the interloper
+    /// then takes the listener's key and the `assert_ne!` below fails with
+    /// "a deactivated listener's key must not be handed to another session".
+    #[test]
+    fn reactivating_a_udp_listener_cannot_overwrite_a_live_session() {
+        let mut server = bare_server();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let listen_token = add_udp_listener(&mut server, address);
+        activate(&mut server, address, ListenerType::Udp);
+        deactivate(&mut server, address, ListenerType::Udp);
+
+        // Whatever the worker admits next takes the slab's next vacant key.
+        // `Protocol::Channel` is just a marker no listener ever reports.
+        let interloper = {
+            let mut sessions = server.sessions.borrow_mut();
+            let entry = sessions.slab.vacant_entry();
+            let key = entry.key();
+            entry.insert(Rc::new(RefCell::new(ListenSession {
+                protocol: Protocol::Channel,
+            })));
+            Token(key)
+        };
+        assert_ne!(
+            interloper, listen_token,
+            "a deactivated listener's key must not be handed to another session"
+        );
+
+        activate(&mut server, address, ListenerType::Udp);
+
+        assert_eq!(
+            slot_state(&server, interloper),
+            Some((Protocol::Channel, true)),
+            "reactivating a listener must not overwrite another session's slot"
+        );
+    }
+
+    /// The other end of the lifetime. Reserving the slot across a deactivate is
+    /// only sound if something releases it: no proxy's `remove_listener`
+    /// touches the session slab, so `RemoveListener` is the sole release point.
+    /// Without it each add/remove cycle would strand one slab key — and
+    /// `base_sessions_count`, decremented on every `RemoveListener`, would
+    /// drift below the number of occupied slots, so a soft stop would wait for
+    /// sessions that do not exist.
+    ///
+    /// Three full cycles, because a leak is only visible as growth, and every
+    /// other one removes the listener while it is still ACTIVATED: that path
+    /// drops a live `UdpListenerSession` out of the slab — the Rc that, left
+    /// there, also pinned the listener's `UdpSocket` open and kept `ready()`
+    /// dispatching to a removed listener.
+    ///
+    /// To SEE THIS RED: drop the `if let Some(token) = listen_token` block from
+    /// `notify_proxys`'s `RemoveListener` arm — the slab then grows by one slot
+    /// per cycle and the assertion fails with "cycle 0: removing a listener
+    /// must release its reserved slot".
+    #[test]
+    fn removing_a_listener_releases_its_reserved_slab_slot() {
+        let mut server = bare_server();
+        let baseline = server.sessions.borrow().slab.len();
+        let base_sessions_count = server.base_sessions_count;
+
+        for cycle in 0..3 {
+            let address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+            let listen_token = add_udp_listener(&mut server, address);
+            activate(&mut server, address, ListenerType::Udp);
+            if cycle % 2 == 0 {
+                deactivate(&mut server, address, ListenerType::Udp);
+            }
+
+            server.notify_proxys(WorkerRequest {
+                id: "test-remove".to_owned(),
+                content: RequestType::RemoveListener(RemoveListener {
+                    address,
+                    proxy: ListenerType::Udp as i32,
+                })
+                .into(),
+            });
+
+            assert!(
+                !server.sessions.borrow().slab.contains(listen_token.0),
+                "cycle {cycle}: removing a listener must release its reserved slot"
+            );
+            assert_eq!(
+                server.sessions.borrow().slab.len(),
+                baseline,
+                "cycle {cycle}: the slab must return to its baseline occupancy"
+            );
+            assert_eq!(
+                server.base_sessions_count, base_sessions_count,
+                "cycle {cycle}: base_sessions_count must track the reserved slots"
+            );
+        }
     }
 }

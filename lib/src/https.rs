@@ -2059,6 +2059,21 @@ impl HttpsProxy {
             })
     }
 
+    /// The slab token reserved for the listener at `address`, if this proxy
+    /// holds one.
+    ///
+    /// A listener owns exactly one slab slot for its whole `AddListener` ->
+    /// `RemoveListener` lifetime, and no `remove_listener` implementation
+    /// touches the session slab. `Server` therefore reads the token here
+    /// BEFORE dropping the listener, so that reserved slot is released exactly
+    /// once, at the end of the lifetime.
+    pub fn listener_token(&self, address: StdSocketAddr) -> Option<Token> {
+        self.listeners
+            .iter()
+            .find(|(_, listener)| listener.borrow().address == address)
+            .map(|(token, _)| *token)
+    }
+
     pub fn give_back_listeners(&mut self) -> Vec<(StdSocketAddr, MioTcpListener)> {
         self.listeners
             .values()

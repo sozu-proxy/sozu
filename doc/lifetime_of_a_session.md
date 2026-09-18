@@ -72,6 +72,19 @@ accept_threshold_percent}` and `buffer.{in_use,capacity,usage_percent}`,
 all sampled once per run-loop iteration in
 `Server::run` (`lib/src/server.rs`).
 
+Listeners live in that same slab, but on a different clock. A listener
+is given one slab slot by `add-listener`, and it keeps that exact slot —
+and therefore that exact token — until `remove-listener`. `deactivate-listener`
+does *not* give the slot back: it puts the inert `ListenSession` placeholder
+back in it, because the proxies keep the token inside the listener and hand
+the very same one back out of a later `activate-listener`. A slot released on
+deactivation would leave the reactivated socket registered under a token the
+slab no longer knows, and `Server::ready` silently drops an event whose token
+has no slab entry — the listener would report a successful activation and then
+never see traffic again. It would also let the slab hand that key to an
+ordinary session, which the UDP activation path would then overwrite.
+`Server::reserve_listen_token` (`lib/src/server.rs`) holds this invariant.
+
 A single session typically occupies *two* slab entries while it is
 forwarding traffic: one for the frontend token (registered when the
 client connection was accepted) and one for the backend token
