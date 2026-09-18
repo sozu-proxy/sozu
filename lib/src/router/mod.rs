@@ -3248,6 +3248,9 @@ mod tests {
             b"///",
             b"abc/[0-9]+/.example.com",
             b"/[/.example.com",
+            // Named as rejected in `doc/configure.md`'s regex-hostname
+            // section: a leading `.` before a regex segment is an empty label.
+            b"./test[0-9]/.example.com",
             b".example.com",
             b".a.b",
             b"..",
@@ -3563,6 +3566,765 @@ mod tests {
         ));
         assert!(!router.has_hostname("www.example.com"));
     }
+    /// The operator-visible half of the trie's leftmost-regex insert gap.
+    /// A frontend whose leftmost host segment is a regex
+    /// (`/test[0-9]/.example.com`) could not be added once a DEEPER
+    /// frontend sharing that segment (`foo./test[0-9]/.example.com`) had
+    /// already opened it: `TrieNode::insert_recursive` answered `Existing`
+    /// for a host it stored nowhere.
+    ///
+    /// The two profiles failed differently, which is why this test asserts
+    /// the STORE rather than the return code alone. In debug the
+    /// post-insert reachability `debug_assert!` below `domain_insert`
+    /// killed the worker outright — "a freshly inserted tree domain must
+    /// resolve to its inserted rule" — on a control-plane `AddHttpFrontend`
+    /// (and again on every `LoadState` replay). In release that assert is
+    /// compiled out, so `add_tree_rule` returned `true`, the CLI reported
+    /// OK and `sozu query frontends` listed the route, while the trie never
+    /// served it.
+    ///
+    /// To SEE THIS RED: in the `pos == 0` arm of the dedup loop in
+    /// `TrieNode::insert_recursive` (`router/pattern_trie.rs`), replace
+    /// `return t.1.insert_own_value(key, value);` with
+    /// `return InsertResult::Existing;`. In release the `lookup` assertion
+    /// below fails with `Err(route_not_found …)`; in debug the
+    /// `debug_assert!` in `add_tree_rule` panics first at
+    /// "a freshly inserted tree domain must resolve to its inserted rule"
+    /// — comment that `debug_assert!` out and debug lands on the same
+    /// `lookup` assertion release does.
+    #[test]
+    fn a_leftmost_regex_frontend_is_addable_after_a_deeper_sibling() {
+        let path = PathRule::Prefix("/".to_string());
+        let method = MethodRule::new(Some("GET".to_string()));
+
+        // Order A: deeper frontend first — the order that used to lose the
+        // leftmost host.
+        let mut router = Router::new();
+        assert!(router.add_tree_rule(
+            b"foo./test[0-9]/.example.com",
+            &path,
+            &method,
+            &Route::ClusterId("deeper".to_string()),
+        ));
+        assert!(
+            router.add_tree_rule(
+                b"/test[0-9]/.example.com",
+                &path,
+                &method,
+                &Route::ClusterId("leftmost".to_string()),
+            ),
+            "a leftmost-regex frontend must be accepted after a deeper sibling",
+        );
+        assert_eq!(
+            router.lookup("test4.example.com", "/", &Method::Get),
+            Ok(RouteResult::forward("leftmost".to_string())),
+            "the leftmost-regex frontend must actually route, not just report OK",
+        );
+        assert_eq!(
+            router.lookup("foo.test4.example.com", "/", &Method::Get),
+            Ok(RouteResult::forward("deeper".to_string())),
+            "the deeper frontend must still route",
+        );
+
+        // Order B: leftmost frontend first — the order that already worked.
+        let mut router = Router::new();
+        assert!(router.add_tree_rule(
+            b"/test[0-9]/.example.com",
+            &path,
+            &method,
+            &Route::ClusterId("leftmost".to_string()),
+        ));
+        assert!(router.add_tree_rule(
+            b"foo./test[0-9]/.example.com",
+            &path,
+            &method,
+            &Route::ClusterId("deeper".to_string()),
+        ));
+        assert_eq!(
+            router.lookup("test4.example.com", "/", &Method::Get),
+            Ok(RouteResult::forward("leftmost".to_string())),
+        );
+        assert_eq!(
+            router.lookup("foo.test4.example.com", "/", &Method::Get),
+            Ok(RouteResult::forward("deeper".to_string())),
+        );
+
+        // And removal through the public surface still takes exactly one.
+        assert!(router.remove_tree_rule(b"/test[0-9]/.example.com", &path, &method));
+        assert!(
+            router
+                .lookup("test4.example.com", "/", &Method::Get)
+                .is_err()
+        );
+        assert_eq!(
+            router.lookup("foo.test4.example.com", "/", &Method::Get),
+            Ok(RouteResult::forward("deeper".to_string())),
+        );
+    }
+
+    /// `add_tree_rule` returning `true` is a claim that the route table now
+    /// serves the rule. The trie's leftmost-regex gap broke exactly that
+    /// contract in RELEASE builds, where the post-insert reachability
+    /// `debug_assert!` is compiled out: the control plane reported success
+    /// and the data plane never routed the host.
+    ///
+    /// This pins the contract itself, so it fails in a release build too —
+    /// no `debug_assert` is involved in the assertion. Every shape here is
+    /// one the trie stores through a different arm (literal, wildcard,
+    /// leftmost regex, deeper regex, regex opened by a deeper sibling), and
+    /// each is checked BOTH ways round: a reported success must route, and
+    /// a reported failure must leave nothing behind.
+    ///
+    /// To SEE THIS RED: in the `pos == 0` arm of the dedup loop in
+    /// `TrieNode::insert_recursive`, replace
+    /// `return t.1.insert_own_value(key, value);` with
+    /// `return InsertResult::Existing;`. The `/test[0-9]/.example.com` row
+    /// added after `foo./test[0-9]/.example.com` then reports `true` while
+    /// `lookup` answers `Err(route_not_found …)`, failing the
+    /// "reported success but does not route" assertion in release. In debug
+    /// the `debug_assert!` in `add_tree_rule` fires first with
+    /// "a freshly inserted tree domain must resolve to its inserted rule".
+    #[test]
+    fn add_tree_rule_never_reports_success_for_a_rule_it_did_not_store() {
+        let path = PathRule::Prefix("/".to_string());
+        let method = MethodRule::new(Some("GET".to_string()));
+
+        // (hostname to add, hostname that must then route)
+        let sequence: &[(&[u8], &str)] = &[
+            (b"www.example.com", "www.example.com"),
+            (b"*.wild.example.com", "any.wild.example.com"),
+            (b"foo./test[0-9]/.example.com", "foo.test4.example.com"),
+            // Opened above by its deeper sibling: the regression.
+            (b"/test[0-9]/.example.com", "test4.example.com"),
+            (b"bar./test[0-9]/.example.com", "bar.test7.example.com"),
+        ];
+
+        let mut router = Router::new();
+        for (index, (hostname, routable)) in sequence.iter().enumerate() {
+            let cluster = format!("cluster{index}");
+            let added =
+                router.add_tree_rule(hostname, &path, &method, &Route::ClusterId(cluster.clone()));
+            let resolved = router.lookup(routable, "/", &Method::Get);
+            assert!(
+                added,
+                "{:?} must be accepted",
+                String::from_utf8_lossy(hostname),
+            );
+            assert_eq!(
+                resolved,
+                Ok(RouteResult::forward(cluster)),
+                "add_tree_rule reported success for {:?} but it does not route",
+                String::from_utf8_lossy(hostname),
+            );
+        }
+
+        // The converse half of the contract: a REJECTED add must not be
+        // reported as stored either, and must leave no route behind.
+        for hostname in [
+            &b"example.com/"[..],
+            b".example.com",
+            b"abc/[0-9]+/.example.com",
+        ] {
+            let mut router = Router::new();
+            assert!(
+                !router.add_tree_rule(
+                    hostname,
+                    &path,
+                    &method,
+                    &Route::ClusterId("rejected".to_string()),
+                ),
+                "{:?} must be rejected",
+                String::from_utf8_lossy(hostname),
+            );
+            assert!(
+                router.tree.is_empty(),
+                "{:?} was rejected but still mutated the route table",
+                String::from_utf8_lossy(hostname),
+            );
+        }
+    }
+
+    // ---- Rule-ordering contract (`doc/configure.md`, "When declaration order
+    // decides"). The path rules of one hostname are a flat `Vec` at the trie
+    // leaf, scanned once in declaration order: `Regex`/`Equals` RETURN on the
+    // first match, while `Prefix` accumulates the longest. Nothing pinned any
+    // of that, and the documented rule has been wrong three times, so each
+    // ordering below is its own case.
+
+    /// Declare one tree rule for `www.example.com`. `method` is a PARAMETER,
+    /// never a constant: whether a rule carries one decides if it ends the
+    /// lookup scan early, so holding it fixed hides half the orderings below.
+    fn add_path_rule(
+        router: &mut Router,
+        path: PathRule,
+        method: Option<&str>,
+        cluster: &str,
+    ) -> bool {
+        router.add_tree_rule(
+            b"www.example.com",
+            &path,
+            &MethodRule::new(method.map(str::to_owned)),
+            &Route::ClusterId(cluster.to_owned()),
+        )
+    }
+
+    /// The cluster a `GET` for `path` on `www.example.com` resolves to.
+    fn routed_cluster(router: &Router, path: &str) -> Option<String> {
+        router
+            .lookup("www.example.com", path, &Method::Get)
+            .ok()
+            .and_then(|result| result.cluster_id)
+    }
+
+    /// Declare `first` then `second` — each with its own `method` — and resolve
+    /// `path`. Declaration order is the variable under test, so callers assert
+    /// both orders.
+    fn winner_of(
+        first: (PathRule, Option<&str>, &str),
+        second: (PathRule, Option<&str>, &str),
+        path: &str,
+    ) -> Option<String> {
+        let mut router = Router::new();
+        assert!(add_path_rule(&mut router, first.0, first.1, first.2));
+        assert!(add_path_rule(&mut router, second.0, second.1, second.2));
+        routed_cluster(&router, path)
+    }
+
+    /// `Some("GET")` — a rule whose method matches the request, so it ends the
+    /// scan. Spelled out at every call site so the axis stays visible.
+    const GET: Option<&str> = Some("GET");
+    /// `None` — a rule with no method. It matches every request but does NOT
+    /// end the scan.
+    const NO_METHOD: Option<&str> = None;
+    /// `Some("POST")` against a `GET` request — a method that is PRESENT and
+    /// does NOT match, i.e. `MethodRuleResult::None`. The third value of the
+    /// method axis: such a rule is skipped entirely, whatever its `path_type`.
+    /// Covering only `GET` and `NO_METHOD` left every claim about this value
+    /// untested, which is how two false sentences reached the documentation.
+    const WRONG_METHOD: Option<&str> = Some("POST");
+
+    /// Among `PREFIX` path rules the LONGEST match wins, and that is the one
+    /// genuinely order-independent case in the router.
+    ///
+    /// To SEE THIS RED: in `Router::lookup`'s path-rule loop, replace the
+    /// `PathRuleResult::Prefix(size) => { if size >= prefix_length {` guard
+    /// with `if matched.is_none() {` so the FIRST matching prefix wins instead
+    /// of the longest. The `SHORT`-first case below then resolves to `SHORT`.
+    #[test]
+    fn the_longest_prefix_wins_whichever_prefix_is_declared_first() {
+        let short = || PathRule::Prefix("/a".to_owned());
+        let long = || PathRule::Prefix("/ab".to_owned());
+
+        assert_eq!(
+            winner_of((short(), GET, "SHORT"), (long(), GET, "LONG"), "/abc").as_deref(),
+            Some("LONG"),
+            "the longer prefix must win even when the shorter one was declared first",
+        );
+        assert_eq!(
+            winner_of((long(), GET, "LONG"), (short(), GET, "SHORT"), "/abc").as_deref(),
+            Some("LONG"),
+            "the longer prefix must win when it was declared first too",
+        );
+    }
+
+    /// Two `PREFIX` rules can only tie on length by carrying the SAME prefix
+    /// string and differing on `method` — `add_tree_rule` dedups on
+    /// `(path, method)`, so that pair coexists. The scan keeps the LAST such
+    /// rule, because the guard is `size >= prefix_length`, not `>`.
+    ///
+    /// This is the subtlest ordering in the router and the easiest to "fix"
+    /// by accident: tightening `>=` to `>` looks like a harmless no-op that
+    /// stops a rule overwriting an equally-good one, and silently flips which
+    /// cluster serves the request.
+    ///
+    /// To SEE THIS RED: change `if size >= prefix_length {` to
+    /// `if size > prefix_length {` in `Router::lookup`'s path-rule loop. Both
+    /// assertions below then resolve to the FIRST declared rule.
+    #[test]
+    fn equal_length_prefixes_differing_only_by_method_resolve_to_the_last_declared() {
+        let declare = |first_is_get: bool| {
+            let mut router = Router::new();
+            let get = (
+                MethodRule::new(Some("GET".to_owned())),
+                Route::ClusterId("GET-RULE".to_owned()),
+            );
+            let all = (
+                MethodRule::new(None),
+                Route::ClusterId("ALL-RULE".to_owned()),
+            );
+            let (a, b) = if first_is_get { (get, all) } else { (all, get) };
+            for (method, route) in [a, b] {
+                assert!(router.add_tree_rule(
+                    b"www.example.com",
+                    &PathRule::Prefix("/ab".to_owned()),
+                    &method,
+                    &route,
+                ));
+            }
+            routed_cluster(&router, "/abc")
+        };
+
+        assert_eq!(
+            declare(true).as_deref(),
+            Some("ALL-RULE"),
+            "the LAST equal-length prefix declared must win (`>=`, not `>`)",
+        );
+        assert_eq!(
+            declare(false).as_deref(),
+            Some("GET-RULE"),
+            "the LAST equal-length prefix declared must win in the other order too",
+        );
+    }
+
+    /// Two overlapping `REGEX` path rules are decided by declaration order:
+    /// the scan returns on the first match, and nothing weighs one pattern as
+    /// more specific than another. A wider pattern declared first therefore
+    /// shadows a narrower one declared later.
+    ///
+    /// To SEE THIS RED: in `Router::lookup`'s path-rule loop, replace the
+    /// `MethodRuleResult::Equals => { return Ok(RouteResult::new_with_trie(..)) }`
+    /// arm under `PathRuleResult::Regex | PathRuleResult::Equals` with the
+    /// non-returning body its `MethodRuleResult::All` sibling uses
+    /// (`prefix_length = path_b.len(); matched = Some((rule, route));`). Losing
+    /// the early return makes the LAST match win, so both assertions flip.
+    #[test]
+    fn with_a_matching_method_the_first_declared_regex_path_rule_wins() {
+        let wide = || PathRule::Regex(Regex::new("/a.*").expect("test regex must compile"));
+        let narrow = || PathRule::Regex(Regex::new("/ab.*").expect("test regex must compile"));
+
+        assert_eq!(
+            winner_of((wide(), GET, "WIDE"), (narrow(), GET, "NARROW"), "/abc").as_deref(),
+            Some("WIDE"),
+            "the first-declared regex must win even though the later one is narrower",
+        );
+        assert_eq!(
+            winner_of((narrow(), GET, "NARROW"), (wide(), GET, "WIDE"), "/abc").as_deref(),
+            Some("NARROW"),
+            "reversing the declaration order reverses the winner",
+        );
+    }
+
+    /// `EQUALS` holds no priority over `REGEX`: they share one match arm and
+    /// the scan returns on whichever comes first. An exact-match rule does NOT
+    /// outrank a pattern that was declared before it.
+    ///
+    /// To SEE THIS RED: the same mutation as
+    /// `with_a_matching_method_the_first_declared_regex_path_rule_wins`
+    /// — drop the early `return` from the `MethodRuleResult::Equals` arm under
+    /// `PathRuleResult::Regex | PathRuleResult::Equals`. Both assertions flip
+    /// to the last declared rule.
+    #[test]
+    fn with_a_matching_method_neither_equals_nor_regex_outranks_the_other() {
+        let equals = || PathRule::Equals("/abc".to_owned());
+        let regex = || PathRule::Regex(Regex::new("/a.*").expect("test regex must compile"));
+
+        assert_eq!(
+            winner_of((equals(), GET, "EQUALS"), (regex(), GET, "REGEX"), "/abc").as_deref(),
+            Some("EQUALS"),
+            "EQUALS declared first must win",
+        );
+        assert_eq!(
+            winner_of((regex(), GET, "REGEX"), (equals(), GET, "EQUALS"), "/abc").as_deref(),
+            Some("REGEX"),
+            "REGEX declared first must win — EQUALS has no inherent priority",
+        );
+    }
+
+    /// A matching `EQUALS` or `REGEX` beats a `PREFIX` rule in either order,
+    /// even when the prefix is the longer, more specific pattern: the early
+    /// return short-circuits the scan before any prefix accumulation is read.
+    /// This is the one cross-type precedence the router really does have.
+    ///
+    /// To SEE THIS RED: the same mutation again — drop the early `return` from
+    /// the `MethodRuleResult::Equals` arm under
+    /// `PathRuleResult::Regex | PathRuleResult::Equals`. That arm's
+    /// replacement sets `prefix_length = path_b.len()`, so the equally-long
+    /// `PREFIX` rule then satisfies `size >= prefix_length` and overwrites it;
+    /// the `PREFIX`-declared-second cases below resolve to `PREFIX`.
+    #[test]
+    fn with_a_matching_method_equals_or_regex_beats_a_longer_prefix_either_order() {
+        let prefix = || PathRule::Prefix("/abc".to_owned());
+        let regex = || PathRule::Regex(Regex::new("/a.*").expect("test regex must compile"));
+        let equals = || PathRule::Equals("/abc".to_owned());
+
+        assert_eq!(
+            winner_of((prefix(), GET, "PREFIX"), (regex(), GET, "REGEX"), "/abc").as_deref(),
+            Some("REGEX"),
+            "a regex must beat a longer prefix declared before it",
+        );
+        assert_eq!(
+            winner_of((regex(), GET, "REGEX"), (prefix(), GET, "PREFIX"), "/abc").as_deref(),
+            Some("REGEX"),
+            "a regex must beat a longer prefix declared after it",
+        );
+        assert_eq!(
+            winner_of((prefix(), GET, "PREFIX"), (equals(), GET, "EQUALS"), "/abc").as_deref(),
+            Some("EQUALS"),
+            "an exact match must beat an equally long prefix declared before it",
+        );
+        assert_eq!(
+            winner_of((equals(), GET, "EQUALS"), (prefix(), GET, "PREFIX"), "/abc").as_deref(),
+            Some("EQUALS"),
+            "an exact match must beat an equally long prefix declared after it",
+        );
+    }
+
+    /// Without a `method`, an `EQUALS` or `REGEX` rule does NOT end the scan:
+    /// its match is only recorded, and a later match overwrites it. So the
+    /// ordering is the exact REVERSE of the matching-method case — the LAST
+    /// declared wins.
+    ///
+    /// This is the dimension the first six ordering tests all missed, because
+    /// their helper hard-coded `Some("GET")`. `HttpFrontend.method` is an
+    /// `Option<String>` and both production call sites build the rule with
+    /// `MethodRule::new(front.method.clone())`, so a frontend declared without
+    /// a method lands here — it is the default shape, not an exotic one.
+    ///
+    /// To SEE THIS RED: in `Router::lookup`'s path-rule loop, give the
+    /// `MethodRuleResult::All` arm under `PathRuleResult::Regex |
+    /// PathRuleResult::Equals` the early `return` its `MethodRuleResult::Equals`
+    /// sibling has. Method-less rules then short-circuit too and both
+    /// assertions flip to the FIRST declared.
+    #[test]
+    fn without_a_method_the_last_declared_regex_or_equals_wins_not_the_first() {
+        let wide = || PathRule::Regex(Regex::new("/a.*").expect("test regex must compile"));
+        let narrow = || PathRule::Regex(Regex::new("/ab.*").expect("test regex must compile"));
+        let equals = || PathRule::Equals("/abc".to_owned());
+
+        assert_eq!(
+            winner_of(
+                (wide(), NO_METHOD, "WIDE"),
+                (narrow(), NO_METHOD, "NARROW"),
+                "/abc"
+            )
+            .as_deref(),
+            Some("NARROW"),
+            "without a method the LAST declared regex must win",
+        );
+        assert_eq!(
+            winner_of(
+                (narrow(), NO_METHOD, "NARROW"),
+                (wide(), NO_METHOD, "WIDE"),
+                "/abc"
+            )
+            .as_deref(),
+            Some("WIDE"),
+            "reversing the order reverses the winner — still the last declared",
+        );
+        assert_eq!(
+            winner_of(
+                (equals(), NO_METHOD, "EQUALS"),
+                (wide(), NO_METHOD, "REGEX"),
+                "/abc"
+            )
+            .as_deref(),
+            Some("REGEX"),
+            "without a method an EQUALS declared first loses to a later REGEX",
+        );
+        assert_eq!(
+            winner_of(
+                (wide(), NO_METHOD, "REGEX"),
+                (equals(), NO_METHOD, "EQUALS"),
+                "/abc"
+            )
+            .as_deref(),
+            Some("EQUALS"),
+            "and the reverse order reverses that too",
+        );
+    }
+
+    /// Without a `method`, a matching `EQUALS`/`REGEX` does not reliably outrank
+    /// a `PREFIX` either — the documented cross-type precedence INVERTS. Because
+    /// the non-returning arm records `prefix_length = path_b.len()`, a `PREFIX`
+    /// declared afterwards overwrites it exactly when its prefix covers the
+    /// WHOLE request path; a shorter prefix cannot clear that bar and leaves the
+    /// regex standing.
+    ///
+    /// "Whole request path" means the request-target as it arrives, QUERY
+    /// STRING INCLUDED — kawa's `parse_origin_form` hands the router
+    /// `/index.html?k=v#h` verbatim. So the identical configuration routes the
+    /// opposite way once the client appends `?x=1`: `/abc` no longer spans
+    /// `/abc?x=1`, the prefix stops clearing the bar, and the regex wins. The
+    /// last case below pins that, because the worked example in
+    /// `doc/configure.md` would otherwise teach `/abc` as "the whole path".
+    ///
+    /// To SEE THIS RED: in `Router::lookup`'s path-rule loop, change the
+    /// `MethodRuleResult::All` arm under `PathRuleResult::Regex |
+    /// PathRuleResult::Equals` from `prefix_length = path_b.len();` to
+    /// `prefix_length = 0;`. The first two assertions still pass; the third
+    /// fails first, with `left: Some("SHORT-PREFIX"), right: Some("REGEX")`,
+    /// because the shorter `/a` prefix now clears the bar. That one mutation
+    /// also breaks the query-string case below it — delete the third assertion
+    /// and the fourth fails with `left: Some("PREFIX"), right: Some("REGEX")`,
+    /// the prefix having overwritten the regex it should no longer span.
+    #[test]
+    fn without_a_method_only_a_whole_path_prefix_declared_later_beats_a_regex() {
+        let regex = || PathRule::Regex(Regex::new("/a.*").expect("test regex must compile"));
+        let whole_path = || PathRule::Prefix("/abc".to_owned());
+        let shorter = || PathRule::Prefix("/a".to_owned());
+
+        assert_eq!(
+            winner_of(
+                (regex(), NO_METHOD, "REGEX"),
+                (whole_path(), NO_METHOD, "PREFIX"),
+                "/abc"
+            )
+            .as_deref(),
+            Some("PREFIX"),
+            "a whole-path prefix declared after a method-less regex must overwrite it",
+        );
+        assert_eq!(
+            winner_of(
+                (whole_path(), NO_METHOD, "PREFIX"),
+                (regex(), NO_METHOD, "REGEX"),
+                "/abc"
+            )
+            .as_deref(),
+            Some("REGEX"),
+            "declared before it, the same prefix loses — the last writer wins",
+        );
+        assert_eq!(
+            winner_of(
+                (regex(), NO_METHOD, "REGEX"),
+                (shorter(), NO_METHOD, "SHORT-PREFIX"),
+                "/abc"
+            )
+            .as_deref(),
+            Some("REGEX"),
+            "a prefix shorter than the request path must NOT displace the regex",
+        );
+
+        // Same rules, same declaration order — only the request gains a query
+        // string, and the winner inverts. The request path the router matches
+        // is `/abc?x=1`, which `/abc` no longer covers.
+        assert_eq!(
+            winner_of(
+                (regex(), NO_METHOD, "REGEX"),
+                (whole_path(), NO_METHOD, "PREFIX"),
+                "/abc?x=1"
+            )
+            .as_deref(),
+            Some("REGEX"),
+            "with a query string the prefix no longer spans the request path, so the regex wins",
+        );
+    }
+
+    /// A rule carrying a matching `method` beats a method-less one in either
+    /// declaration order: the matching rule returns immediately, and when the
+    /// method-less rule runs first it has only recorded a candidate that the
+    /// return then overrides.
+    ///
+    /// To SEE THIS RED: drop the early `return` from the
+    /// `MethodRuleResult::Equals` arm under `PathRuleResult::Regex |
+    /// PathRuleResult::Equals` in `Router::lookup` (the same mutation the
+    /// matching-method tests name). Both rules then merely record, so the last
+    /// declared wins and the first assertion below fails with
+    /// `left: Some("ANY-REGEX"), right: Some("GET-REGEX")`.
+    #[test]
+    fn a_rule_with_a_matching_method_beats_a_method_less_rule_in_either_order() {
+        let any = || PathRule::Regex(Regex::new("/a.*").expect("test regex must compile"));
+        let getr = || PathRule::Regex(Regex::new("/ab.*").expect("test regex must compile"));
+
+        assert_eq!(
+            winner_of(
+                (getr(), GET, "GET-REGEX"),
+                (any(), NO_METHOD, "ANY-REGEX"),
+                "/abc"
+            )
+            .as_deref(),
+            Some("GET-REGEX"),
+            "a matching-method rule declared first must win",
+        );
+        assert_eq!(
+            winner_of(
+                (any(), NO_METHOD, "ANY-REGEX"),
+                (getr(), GET, "GET-REGEX"),
+                "/abc"
+            )
+            .as_deref(),
+            Some("GET-REGEX"),
+            "a matching-method rule declared second must still win",
+        );
+    }
+
+    /// A rule whose `method` is PRESENT but does not match the request
+    /// (`MethodRuleResult::None`) is skipped outright, so it never competes on
+    /// path length at all. Both consequences contradict the unqualified
+    /// "longest prefix wins" reading: a LONGER prefix loses to a shorter one
+    /// when its method mismatches, and an equal-length tie goes to the FIRST
+    /// declared rather than the last, because the later one is skipped before
+    /// the `size >= prefix_length` comparison is ever reached.
+    ///
+    /// To SEE THIS RED: in `Router::lookup`'s path-rule loop, make the
+    /// `MethodRuleResult::None` arm under `PathRuleResult::Prefix(size)`
+    /// behave like its `MethodRuleResult::All` sibling
+    /// (`prefix_length = size; matched = Some((rule, route));`). Non-matching
+    /// methods then compete: the first assertion resolves to `LONG-POST` and
+    /// the second to `SECOND-POST`.
+    #[test]
+    fn a_prefix_whose_method_does_not_match_is_skipped_so_it_cannot_win_on_length() {
+        assert_eq!(
+            winner_of(
+                (PathRule::Prefix("/a".to_owned()), GET, "SHORT-GET"),
+                (
+                    PathRule::Prefix("/ab".to_owned()),
+                    WRONG_METHOD,
+                    "LONG-POST"
+                ),
+                "/abc",
+            )
+            .as_deref(),
+            Some("SHORT-GET"),
+            "a longer prefix whose method mismatches must not beat a shorter matching one",
+        );
+        assert_eq!(
+            winner_of(
+                (PathRule::Prefix("/ab".to_owned()), GET, "FIRST-GET"),
+                (
+                    PathRule::Prefix("/ab".to_owned()),
+                    WRONG_METHOD,
+                    "SECOND-POST"
+                ),
+                "/abc",
+            )
+            .as_deref(),
+            Some("FIRST-GET"),
+            "an equal-length tie goes to the FIRST when the later rule's method mismatches",
+        );
+    }
+
+    /// The same third method value, one tier up: an `EQUALS`/`REGEX` rule whose
+    /// method mismatches does not short-circuit and does not even register as a
+    /// candidate, so a `PREFIX` that would otherwise lose to it wins.
+    ///
+    /// To SEE THIS RED: in `Router::lookup`'s path-rule loop, make the
+    /// `MethodRuleResult::None` arm under
+    /// `PathRuleResult::Regex | PathRuleResult::Equals` behave like its
+    /// `MethodRuleResult::All` sibling
+    /// (`prefix_length = path_b.len(); matched = Some((rule, route));`). The
+    /// mismatching regex then takes the request and the assertion resolves to
+    /// `WRONG-METHOD-REGEX`.
+    #[test]
+    fn a_regex_whose_method_does_not_match_never_beats_a_matching_prefix() {
+        assert_eq!(
+            winner_of(
+                (
+                    PathRule::Regex(Regex::new("/a.*").expect("test regex must compile")),
+                    WRONG_METHOD,
+                    "WRONG-METHOD-REGEX",
+                ),
+                (PathRule::Prefix("/a".to_owned()), GET, "MATCHING-PREFIX"),
+                "/abc",
+            )
+            .as_deref(),
+            Some("MATCHING-PREFIX"),
+            "a regex whose method mismatches must not short-circuit the scan",
+        );
+    }
+
+    /// `path_type = "REGEX"` is NOT anchored. `PathRule::from_config` compiles
+    /// the configured value verbatim and `regex::bytes::Regex::is_match` is a
+    /// substring search, so a pattern matches anywhere in the request path.
+    /// `doc/configure.md` used to claim the `\A...\z` anchoring of v2.0.0
+    /// applied here; that work was hostname-segment only. Whether path regexes
+    /// SHOULD be anchored is open as sozu#1350 — this test pins today's
+    /// behaviour so the answer is a deliberate change, not a silent one.
+    ///
+    /// The rule is built through `PathRule::from_config`, the path every
+    /// configured frontend takes, so anchoring there is what this pins.
+    ///
+    /// To SEE THIS RED: anchor in `PathRule::from_config` — replace
+    /// `Regex::new(&rule.value)` with
+    /// `Regex::new(&format!("\\A{}\\z", rule.value))`. The assertion then fails
+    /// with `left: None, right: Some("SUBSTRING")`.
+    #[test]
+    fn a_path_regex_is_unanchored_and_matches_anywhere_in_the_request_path() {
+        let rule = PathRule::from_config(CommandPathRule::regex("bc".to_owned()))
+            .expect("a valid regex path rule must build");
+        let mut router = Router::new();
+        assert!(add_path_rule(&mut router, rule, GET, "SUBSTRING"));
+        assert_eq!(
+            routed_cluster(&router, "/abcd").as_deref(),
+            Some("SUBSTRING"),
+            "an unanchored path regex must match in the middle of the request path",
+        );
+    }
+
+    /// One level up from the path rules, two overlapping regex HOSTNAME
+    /// segments follow the same first-declared-wins rule: a trie node holds
+    /// its regex segments in an ordered list, `lookup` returns on the first
+    /// that matches, and a new segment is appended.
+    ///
+    /// To SEE THIS RED: in `TrieNode::lookup_with_path`
+    /// (`router/pattern_trie.rs`), iterate the regex segments in reverse —
+    /// `for (regexp, child) in self.regexps.iter().rev()`. The last declared
+    /// segment then answers and both assertions below flip.
+    #[test]
+    fn the_first_declared_regex_hostname_segment_wins_over_a_later_overlapping_one() {
+        // Both patterns match the segment `test4`.
+        let numbered: &[u8] = b"/test[0-9]/.example.com";
+        let any_suffixed: &[u8] = b"/[a-z]+[0-9]/.example.com";
+
+        let declare = |first: &[u8], first_cluster: &str, second: &[u8], second_cluster: &str| {
+            let mut router = Router::new();
+            for (hostname, cluster) in [(first, first_cluster), (second, second_cluster)] {
+                assert!(router.add_tree_rule(
+                    hostname,
+                    &PathRule::Prefix("/".to_owned()),
+                    &MethodRule::new(Some("GET".to_owned())),
+                    &Route::ClusterId(cluster.to_owned()),
+                ));
+            }
+            router
+                .lookup("test4.example.com", "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+        };
+
+        assert_eq!(
+            declare(numbered, "NUMBERED", any_suffixed, "ANY-SUFFIXED").as_deref(),
+            Some("NUMBERED"),
+            "the first-declared regex hostname segment must win",
+        );
+        assert_eq!(
+            declare(any_suffixed, "ANY-SUFFIXED", numbered, "NUMBERED").as_deref(),
+            Some("ANY-SUFFIXED"),
+            "reversing the declaration order reverses the winner",
+        );
+
+        // The worked example in `doc/configure.md` promises `/test[0-9]/`
+        // matches `test4` "and not testAB". `[0-9]` is a SINGLE digit and the
+        // segment is `\A`-`\z` anchored, so `test44` and `xtest4` must miss
+        // too — the anchoring is pinned generally by
+        // `segment_regex_rejects_partial_matches`, this pins the doc's own
+        // example.
+        let mut router = Router::new();
+        assert!(router.add_tree_rule(
+            numbered,
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(Some("GET".to_owned())),
+            &Route::ClusterId("REGIONAL".to_owned()),
+        ));
+        assert_eq!(
+            router
+                .lookup("test4.example.com", "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+                .as_deref(),
+            Some("REGIONAL"),
+        );
+        for miss in [
+            "testAB.example.com",
+            "test44.example.com",
+            "xtest4.example.com",
+        ] {
+            assert!(
+                router.lookup(miss, "/", &Method::Get).is_err(),
+                "{miss} must not match the single-digit anchored segment",
+            );
+        }
+    }
+
     /// `PathRule`'s `PartialEq` carried no `(Equals, Equals)` arm, so two
     /// identical `PathRule::Equals` compared unequal — an equality that is
     /// not even reflexive. Every router bookkeeping path is written against

@@ -111,6 +111,28 @@ impl<V: Debug + Clone> TrieNode<V> {
             && self.children.is_empty()
     }
 
+    /// Store `value` in THIS node's own `key_value` slot: the value of a
+    /// domain whose every segment the recursion has already consumed.
+    ///
+    /// Exact dual of the empty-`partial_key` arm of
+    /// [`TrieNode::remove_recursive`], which clears the same slot. A free
+    /// slot takes the value (`Ok`); an occupied one is `Existing`.
+    ///
+    /// Always ASK the slot, never infer it from how the node was built.
+    /// A regex subtree opened by the `pos > 0` create-path of
+    /// `insert_recursive` is a valueless [`TrieNode::root`] carrying only a
+    /// deeper domain, while one opened by its `pos == 0` path is a
+    /// value-bearing [`TrieNode::new`]. Both are reachable at the same
+    /// `regexps` entry, so the two cannot be told apart from the outside.
+    fn insert_own_value(&mut self, key: &Key, value: V) -> InsertResult {
+        if self.key_value.is_none() {
+            self.key_value = Some((key.to_vec(), value));
+            InsertResult::Ok
+        } else {
+            InsertResult::Existing
+        }
+    }
+
     pub fn insert(&mut self, key: Key, value: V) -> InsertResult {
         //println!("insert: key == {}", std::str::from_utf8(&key).unwrap());
         if key.is_empty() {
@@ -174,6 +196,19 @@ impl<V: Debug + Clone> TrieNode<V> {
         // which the dot-split recursion below cannot consume any further.
         // Reject it like any other malformed domain instead of panicking:
         // this input comes from the control plane, not from Sozu itself.
+        //
+        // Only TWO paths can deliver an empty `partial_key`, and both mean
+        // "empty label": the dot-split recursing on `partial_key[..pos]`
+        // with `pos == 0` (`.example.com`, `..`), and the regex arm
+        // recursing on `partial_key[..pos - 1]` with `pos == 1`, i.e. a
+        // leading `.` before the segment (`./test[0-9]/.example.com`).
+        //
+        // So this arm is INPUT VALIDATION, not "the value belongs to this
+        // node". Do not reroute a legitimate insert through it -- the
+        // leftmost-regex case looks like it wants an empty key (that is how
+        // `remove_recursive` reaches its own `key_value`), but taking it
+        // here would make every leading-dot hostname insertable. It calls
+        // `insert_own_value` directly instead.
         if partial_key.is_empty() {
             return InsertResult::Failed;
         }
@@ -205,18 +240,41 @@ impl<V: Debug + Clone> TrieNode<V> {
                             // before this regex segment; recurse on it
                             // (dropping the leading `.` via `pos - 1`).
                             // `pos == 0`: the regex is the leftmost/only
-                            // segment, so its subtree is already a
-                            // value-bearing leaf (the create-path below
-                            // built it via `TrieNode::new`); re-inserting
-                            // the same host is `Existing`. The pre-fix code
-                            // did `partial_key[..pos - 1]` unconditionally,
+                            // segment, so the value belongs to THIS
+                            // subtree's own `key_value` slot -- ask the
+                            // slot via `insert_own_value`, the dual of the
+                            // empty-key arm `remove_recursive` reaches for
+                            // the very same host.
+                            //
+                            // Do NOT assume the subtree is value-bearing
+                            // here. A `regexps` entry is ALSO opened by the
+                            // `pos > 0` create-path below, which builds a
+                            // valueless `TrieNode::root()` holding only the
+                            // deeper domain. So inserting
+                            // `foo./test[0-9]/.example.com` and then
+                            // `/test[0-9]/.example.com` lands on this arm
+                            // with `key_value == None`: answering `Existing`
+                            // unconditionally (as this arm used to) stored
+                            // nothing while reporting the host as already
+                            // present, leaving it permanently un-insertable.
+                            // In debug the router's post-insert reachability
+                            // check (`router/mod.rs`) then killed the worker
+                            // on an `AddHttpFrontend`; in release
+                            // `add_tree_rule` returned `true` and
+                            // `sozu query frontends` listed a route the trie
+                            // never served -- control plane diverging from
+                            // data plane, silently. The reverse insertion
+                            // order always worked, which is why the gap
+                            // stayed invisible.
+                            //
+                            // Older still, this arm did
+                            // `partial_key[..pos - 1]` unconditionally,
                             // underflowing to `usize::MAX` and panicking on
                             // `pos == 0` (same latent bug as `lookup_mut`).
                             if pos > 0 {
                                 return t.1.insert_recursive(&partial_key[..pos - 1], key, value);
-                            } else {
-                                return InsertResult::Existing;
                             }
+                            return t.1.insert_own_value(key, value);
                         }
                     }
 
@@ -252,6 +310,18 @@ impl<V: Debug + Clone> TrieNode<V> {
         let pos = find_last_dot(partial_key);
         match pos {
             None => {
+                // Answering `Existing` off a bare `contains_key` is the
+                // same shape as the regex arm above, and is sound only
+                // because the two `children.insert` sites use DISJOINT key
+                // spaces: this arm keys a `TrieNode::new` (value-bearing)
+                // by a dotless `partial_key`, while the dot-split arm keys
+                // a `TrieNode::root()` by `partial_key[pos..]`, which
+                // always starts with `.`. A dotless probe therefore can
+                // only ever find a value-bearing leaf, and such a leaf
+                // never gains children (nothing recurses into it) nor
+                // outlives its value (`remove_recursive` prunes it once
+                // emptied). Break that disjointness and this arm acquires
+                // the regex arm's bug.
                 if self.children.contains_key(partial_key) {
                     InsertResult::Existing
                 } else if partial_key == &b"*"[..] {
@@ -362,8 +432,12 @@ impl<V: Debug + Clone> TrieNode<V> {
                     // recurse on the prefix, dropping the separating `.`
                     // via `pos - 1`. `pos == 0`: the regex is the
                     // leftmost/only segment and the value IS that
-                    // subtree's own `key_value` (the create-path built it
-                    // with `TrieNode::new`), reached with an empty key.
+                    // subtree's own `key_value`, reached with an empty key.
+                    // That slot is asked, never assumed: a subtree opened
+                    // by the `pos > 0` create-path of `insert_recursive` is
+                    // a valueless `TrieNode::root()`, so the empty-key arm
+                    // correctly answers `NotFound` for a leftmost host that
+                    // only ever existed as a deeper domain's segment.
                     //
                     // Either way exactly one value goes. Dropping the
                     // whole `regexps` entry instead — which the `pos == 0`
@@ -592,9 +666,16 @@ impl<V: Debug + Clone> TrieNode<V> {
                     for t in self.regexps.iter_mut() {
                         if t.0.as_str() == anchored_s {
                             // `pos == 0` means the regex is the leftmost
-                            // segment and its subtree is a value-bearing
-                            // leaf, reachable via the empty-prefix recursion
-                            // (`lookup_mut(b"")` returns `key_value`). The
+                            // segment, so the value is that subtree's own
+                            // `key_value`, reached via the empty-prefix
+                            // recursion (`lookup_mut(b"")` returns
+                            // `key_value`). The subtree is NOT necessarily
+                            // value-bearing — the `pos > 0` create-path of
+                            // `insert_recursive` opens a valueless
+                            // `TrieNode::root()` — but nothing here assumes
+                            // it is: the empty-key arm returns the `Option`
+                            // as it finds it, which is `None` exactly when
+                            // the leftmost host was never stored. The
                             // pre-fix `partial_key[..pos - 1]` underflowed to
                             // `usize::MAX` and panicked on `pos == 0` — the
                             // same latent bug as the insert dedup loop. Drop
@@ -1345,9 +1426,14 @@ mod tests {
     /// Regression: a hostname whose LEFTMOST segment is a regex
     /// (`/test[0-9]/.example.com`) used to underflow `pos - 1` (to
     /// `usize::MAX`) and panic on the second insert (the dedup loop) and
-    /// on any `lookup_mut`. Both paths now special-case `pos == 0`
-    /// (regex is the leftmost/only segment → value-bearing leaf). This
-    /// asserts the panic is gone and the entry resolves correctly.
+    /// on any `lookup_mut`. Both paths now special-case `pos == 0` (the
+    /// regex is the leftmost/only segment, so the value is that subtree's
+    /// own `key_value` — asked for, never inferred from how the subtree
+    /// was built). This asserts the panic is gone and the entry resolves
+    /// correctly. Here the subtree IS value-bearing because this test
+    /// inserts the leftmost host first;
+    /// `inserting_a_leftmost_regex_host_after_a_deeper_sibling_succeeds`
+    /// covers the order where it is not.
     #[test]
     fn leftmost_regex_segment_reinsert_and_lookup_mut_do_not_panic() {
         let mut root: TrieNode<u8> = TrieNode::root();
@@ -1387,6 +1473,220 @@ mod tests {
         );
         assert_eq!(root.domain_lookup(b"test4.example.com", false), None);
     }
+    /// A hostname whose leftmost segment is a regex and a DEEPER hostname
+    /// sharing that segment live in the same `(regex, subtree)` entry: the
+    /// first as the subtree's own `key_value`, the second as one of its
+    /// children. Whichever arrives first OPENS the entry, so the second
+    /// insert always lands on `insert_recursive`'s dedup loop — and when
+    /// the deeper one opened it, the subtree is a valueless
+    /// `TrieNode::root()` with a free `key_value` slot.
+    ///
+    /// That arm used to answer `InsertResult::Existing` unconditionally,
+    /// on the (false) premise that a matched entry was necessarily built
+    /// value-bearing by `TrieNode::new`. The leftmost host was then stored
+    /// nowhere while being reported as already present — permanently
+    /// un-insertable. The reverse order, which
+    /// `removing_a_leftmost_regex_host_keeps_its_sibling_domains` uses,
+    /// always worked, which is why the gap stayed invisible.
+    ///
+    /// To SEE THIS RED: in the `pos == 0` arm of the dedup loop in
+    /// `TrieNode::insert_recursive`, replace
+    /// `return t.1.insert_own_value(key, value);` with
+    /// `return InsertResult::Existing;`. The second `assert_eq!` below then
+    /// reports `left: Existing, right: Ok`, and the lookup after it returns
+    /// `None`. Both fail in debug AND in release: nothing here depends on a
+    /// `debug_assert`.
+    #[test]
+    fn inserting_a_leftmost_regex_host_after_a_deeper_sibling_succeeds() {
+        let mut root: TrieNode<u8> = TrieNode::root();
+
+        // The DEEPER domain opens the `(regex, subtree)` entry, leaving the
+        // subtree's own `key_value` slot free.
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"foo./test[0-9]/.example.com"[..]), 2),
+            InsertResult::Ok
+        );
+        // The leftmost-regex host now claims that free slot.
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"/test[0-9]/.example.com"[..]), 1),
+            InsertResult::Ok,
+            "a leftmost-regex host must be insertable after a deeper sibling opened its segment",
+        );
+
+        // BOTH must resolve. The store, not the return value, is what the
+        // data plane serves.
+        assert_eq!(
+            root.domain_lookup(b"test4.example.com", false),
+            Some(&(b"/test[0-9]/.example.com"[..].to_vec(), 1)),
+            "the leftmost-regex host must resolve to the rule just inserted",
+        );
+        assert_eq!(
+            root.domain_lookup(b"foo.test4.example.com", false),
+            Some(&(b"foo./test[0-9]/.example.com"[..].to_vec(), 2)),
+            "the deeper sibling must survive the second insert",
+        );
+
+        // A genuine duplicate is still `Existing`, and must not overwrite.
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"/test[0-9]/.example.com"[..]), 9),
+            InsertResult::Existing
+        );
+        assert_eq!(
+            root.domain_lookup(b"test4.example.com", false),
+            Some(&(b"/test[0-9]/.example.com"[..].to_vec(), 1)),
+            "an Existing insert must not overwrite the stored value",
+        );
+    }
+
+    /// The insertion order that ALREADY worked before the `pos == 0` fix —
+    /// leftmost-regex host first, deeper sibling second — must not regress.
+    /// Here the entry is opened by `TrieNode::new`, so the subtree's
+    /// `key_value` is occupied when the deeper insert walks past it.
+    ///
+    /// To SEE THIS RED: make `TrieNode::insert_own_value` unconditional —
+    /// `self.key_value = Some((key.to_vec(), value)); InsertResult::Ok`. In a
+    /// debug build the production guard in `insert()` fires first, on
+    /// "a fresh insert must add exactly one value to the trie, left: 2,
+    /// right: 3" — the overwriting duplicate reported `Ok` without growing
+    /// the value count. Strip that `debug_assert_eq!` too and the failure
+    /// lands on the duplicate assertion below instead,
+    /// `left: Ok, right: Existing`, which is the form a release build sees.
+    #[test]
+    fn inserting_a_deeper_sibling_after_a_leftmost_regex_host_still_works() {
+        let mut root: TrieNode<u8> = TrieNode::root();
+
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"/test[0-9]/.example.com"[..]), 1),
+            InsertResult::Ok
+        );
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"foo./test[0-9]/.example.com"[..]), 2),
+            InsertResult::Ok
+        );
+
+        assert_eq!(
+            root.domain_lookup(b"test4.example.com", false),
+            Some(&(b"/test[0-9]/.example.com"[..].to_vec(), 1))
+        );
+        assert_eq!(
+            root.domain_lookup(b"foo.test4.example.com", false),
+            Some(&(b"foo./test[0-9]/.example.com"[..].to_vec(), 2))
+        );
+
+        // Re-inserting either one is `Existing`, not a second value.
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"/test[0-9]/.example.com"[..]), 8),
+            InsertResult::Existing
+        );
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"foo./test[0-9]/.example.com"[..]), 8),
+            InsertResult::Existing
+        );
+    }
+
+    /// Removal must still behave once BOTH hosts are reachable, whichever
+    /// order opened the segment and whichever order empties it. This guards
+    /// the `remove_recursive` fix (which only ever saw the leftmost-first
+    /// order) against the new insert path, and pins the `regexps` prune: the
+    /// entry must disappear only when its last value is gone.
+    ///
+    /// To SEE THIS RED (insert side): in the `pos == 0` arm of
+    /// `TrieNode::insert_recursive` replace
+    /// `return t.1.insert_own_value(key, value);` with
+    /// `return InsertResult::Existing;`. The test never reaches a
+    /// `domain_remove` at all — its own deeper-first setup fails first, on
+    /// the leftmost `assert_eq!(root.domain_insert(..), InsertResult::Ok)`,
+    /// with `left: Existing, right: Ok`. No production guard fires on the
+    /// way there: `insert()` returns `Existing`, whose postcondition asserts
+    /// `after == before`, and that holds precisely because nothing was
+    /// stored. That silence is the bug — which is why this test pins the
+    /// insert, and not only the removals it is named for.
+    ///
+    /// To SEE THIS RED (remove side): restore the pre-fix `pos == 0` arm of
+    /// `remove_recursive`, ahead of the `rest` binding:
+    /// `let len = self.regexps.len();
+    ///  self.regexps.retain(|(r, _)| r.as_str() != anchored_s);
+    ///  if len > self.regexps.len() { return RemoveResult::Ok; }`
+    /// The production guard in `remove()` fires first, on "a successful
+    /// remove must drop exactly one value from the trie, left: 1, right: 2"
+    /// — dropping the whole `regexps` entry took the sibling with it. Strip
+    /// that `debug_assert_eq!` too and the failure lands on this test's own
+    /// "the other host under the same regex segment must survive".
+    #[test]
+    fn removing_regex_segment_hosts_behaves_in_either_insertion_order() {
+        // Insertion order A: deeper first (the order the insert fix opened).
+        for remove_leftmost_first in [true, false] {
+            let mut root: TrieNode<u8> = TrieNode::root();
+            assert_eq!(
+                root.domain_insert(Vec::from(&b"foo./test[0-9]/.example.com"[..]), 2),
+                InsertResult::Ok
+            );
+            assert_eq!(
+                root.domain_insert(Vec::from(&b"/test[0-9]/.example.com"[..]), 1),
+                InsertResult::Ok
+            );
+            assert_regex_segment_pair_removes_cleanly(&mut root, remove_leftmost_first);
+        }
+
+        // Insertion order B: leftmost first (the pre-existing order).
+        for remove_leftmost_first in [true, false] {
+            let mut root: TrieNode<u8> = TrieNode::root();
+            assert_eq!(
+                root.domain_insert(Vec::from(&b"/test[0-9]/.example.com"[..]), 1),
+                InsertResult::Ok
+            );
+            assert_eq!(
+                root.domain_insert(Vec::from(&b"foo./test[0-9]/.example.com"[..]), 2),
+                InsertResult::Ok
+            );
+            assert_regex_segment_pair_removes_cleanly(&mut root, remove_leftmost_first);
+        }
+    }
+
+    /// Remove both hosts sharing a regex segment, one order or the other:
+    /// each removal takes exactly its own host, the survivor still resolves,
+    /// and the emptied trie is pruned back to a root with no `regexps` entry.
+    fn assert_regex_segment_pair_removes_cleanly(
+        root: &mut TrieNode<u8>,
+        remove_leftmost_first: bool,
+    ) {
+        let leftmost = Vec::from(&b"/test[0-9]/.example.com"[..]);
+        let deeper = Vec::from(&b"foo./test[0-9]/.example.com"[..]);
+
+        let (first, second) = if remove_leftmost_first {
+            (&leftmost, &deeper)
+        } else {
+            (&deeper, &leftmost)
+        };
+        let (first_host, second_host): (&[u8], &[u8]) = if remove_leftmost_first {
+            (b"test4.example.com", b"foo.test4.example.com")
+        } else {
+            (b"foo.test4.example.com", b"test4.example.com")
+        };
+
+        assert_eq!(root.domain_remove(first), RemoveResult::Ok);
+        assert_eq!(
+            root.domain_lookup(first_host, false),
+            None,
+            "the removed host must be gone",
+        );
+        assert!(
+            root.domain_lookup(second_host, false).is_some(),
+            "the other host under the same regex segment must survive",
+        );
+        // A second removal of an absent host is NotFound, never a silent Ok
+        // that takes the survivor with it.
+        assert_eq!(root.domain_remove(first), RemoveResult::NotFound);
+        assert!(root.domain_lookup(second_host, false).is_some());
+
+        assert_eq!(root.domain_remove(second), RemoveResult::Ok);
+        assert_eq!(root.domain_lookup(second_host, false), None);
+        assert!(
+            root.is_empty(),
+            "the emptied regex subtree must be pruned back to an empty root",
+        );
+    }
+
     /// Removing a leftmost-regex host must drop that one host and nothing
     /// else. The `pos == 0` arm of `remove_recursive` used to `retain` the
     /// whole `(regex, subtree)` entry out of `regexps`, which also deleted
