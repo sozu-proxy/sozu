@@ -120,13 +120,23 @@ pub fn fork_main_into_new_main(
 
     // The serialized payload must round-trip: deserializing what we are about
     // to write back into `UpgradeData` and re-serializing must reproduce the
-    // exact same bytes. `UpgradeData` field order is fixed by declaration, so
-    // a stable serializer yields a canonical string — a mismatch would mean a
-    // (de)serialization bug that would silently corrupt the recovered master
-    // state on the other side of the re-exec. This is the cheap, in-process
-    // half of the write->read round-trip that `begin_new_main_process`
-    // completes after exec. (Guarded both let + assert: the re-parse only
-    // exists for the check, so it is dead code stripped in release.)
+    // same DOCUMENT — a mismatch would mean a (de)serialization bug that would
+    // silently corrupt the recovered master state on the other side of the
+    // re-exec. This is the cheap, in-process half of the write->read
+    // round-trip that `begin_new_main_process` completes after exec. (Guarded
+    // both let + assert: the re-parse only exists for the check, so it is dead
+    // code stripped in release.)
+    //
+    // Compared as parsed JSON, never byte-for-byte: `UpgradeData` owns a
+    // `ConfigState`, whose `tcp_fronts`, `udp_fronts` and `certificates` are
+    // `HashMap`s. Every `HashMap` instance gets its own `RandomState` keys, so
+    // the re-parsed maps iterate — and serialize — in a different order than
+    // the originals, and a byte comparison failed on a perfectly CORRECT
+    // upgrade as soon as one of those maps held more than one entry (measured:
+    // 18 of 20 rounds with four TCP frontends). `serde_json::Map` is
+    // BTreeMap-backed here (no `preserve_order` feature in the lockfile), so
+    // comparing `Value`s is key-order-insensitive while still catching every
+    // value-level corruption the check exists for.
     #[cfg(debug_assertions)]
     {
         match serde_json::from_str::<UpgradeData>(&upgrade_data_string) {
@@ -143,8 +153,11 @@ pub fn fork_main_into_new_main(
                 let reserialized = serde_json::to_string(&reparsed)
                     .expect("re-serializing already-parsed upgrade data cannot fail");
                 debug_assert_eq!(
-                    reserialized, upgrade_data_string,
-                    "upgrade data must serialize->deserialize->serialize identically (canonical round-trip)"
+                    serde_json::from_str::<serde_json::Value>(&reserialized)
+                        .expect("re-serialized upgrade data is valid JSON"),
+                    serde_json::from_str::<serde_json::Value>(&upgrade_data_string)
+                        .expect("the upgrade data we just serialized is valid JSON"),
+                    "upgrade data must serialize->deserialize->serialize to the same document"
                 );
             }
             Err(e) => debug_assert!(

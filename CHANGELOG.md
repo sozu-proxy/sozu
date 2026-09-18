@@ -52,6 +52,58 @@
   `DeactivateListener` frees, with nothing re-validating that token for the whole life of the
   session. It now reads the slot fallibly and aborts the flow — freeing its `max_flows` slot
   immediately — rather than indexing a freed key and taking the worker down. Seen red.
+- **`fix(command)`: stop panicking in release on a log or metrics record larger than the writer's buffer.**
+  `MultiLineWriter::flush_buf` computed its partial-flush end as `last_newline + 1` with no clamp to
+  the buffer's length. `Write::write` takes that partial-flush path exactly when the incoming record
+  does not fit the remaining capacity, so a single record larger than the capacity — 4096 bytes for
+  `MultiLineWriter::new` — reached it with an EMPTY buffer and `last_newline` at `0`, the state any
+  previous `flush()` leaves behind, and sliced `..1` out of a zero-length `Vec`. That is a slice
+  index, not a `debug_assert!`: it panicked in release builds too. The `file://` logger backend and
+  the UDP `MetricsWriter` both wrap one of these around network-influenced records, so an access-log
+  line above 4 KiB took the writer down. The end is now clamped to the buffer's length; the
+  partial-flush path for a non-empty buffer, and its `last_newline` bookkeeping, are unchanged.
+- **`fix(command)`: `sozu reload --file <path>` no longer kills the main process on an unloadable path.**
+  `load_static_config` unwrapped `Config::load_from_path` with `unwrap_or_else(|_| panic!(...))`, so a
+  path that does not exist, cannot be read, or does not parse — a path the CLIENT supplies — aborted
+  the supervisor and orphaned every worker. The failure is now reported to the client the way an
+  unbuildable config already was: an `error!` line, a `ConfigurationReloaded` audit event with
+  `AuditResult::Err`, and a `Failure` response carrying the underlying `ConfigError`. The fleet is
+  left untouched.
+- **`fix(command)`: count an entry `ConfigState` refused in `load_state`'s skipped tally.**
+  `load_state` skips an entry for two reasons — pre-dispatch validation refuses it, or `ConfigState`
+  itself refuses it — but only the first incremented `skipped_invalid`, and that tally is what gates
+  the single `load_state: skipped N invalid entries` line the operator is shown. A state file whose
+  entries the state refused therefore reported a clean load while silently dropping them. Both
+  branches now count.
+- **`fix(command)`: revert an unacknowledged TCP frontend from the main-process state.**
+  `compute_rollback` had no inverse for `AddTcpFrontend`, so sozu#1313's poisoned-state loop stayed
+  open for that verb: a TCP frontend no worker ever acknowledged stayed in the main-process
+  `ConfigState`, was re-persisted by the next `SaveState` and re-injected on every later replay.
+  `remove_tcp_frontend` matches on the very (address, sni, alpn) key `add_tcp_frontend` admitted, so
+  the inverse evicts exactly the entry the add inserted, exactly as the HTTP and HTTPS inverses the
+  rollback already covered do.
+  `AddUdpFrontend` stays deliberately uncovered, alongside the upsert verbs (`AddCluster`,
+  `AddBackend`) and the non-add verbs: `add_udp_frontend` dedups on the full
+  `UdpFrontend { cluster_id, address, tags }` — two frontends at one (cluster, address) differing
+  only in tags legitimately coexist — while `remove_udp_frontend` retains on the address alone and
+  so evicts every sibling at that address. Reverting a UDP add with it would drop entries workers
+  acknowledged. That asymmetry is now pinned by a committed-red `#[ignore]`d regression test,
+  `remove_udp_frontend_evicts_same_address_siblings`; narrowing the removal key changes the
+  observable semantics of a live control-plane verb and is left as an explicit decision.
+- **`fix(command)`: `FilteredTimeSerie`'s `Display` no longer indexes past a short series.**
+  `last_minute` and `last_hour` are prost `repeated uint32`, i.e. `Vec<u32>` and not `[u32; 60]`, but
+  the impl sliced each with six fixed 10-wide windows — an index panic on any series holding fewer
+  than 60 samples. It renders through `chunks(10)` now, byte-identical for a full series and simply
+  stopping early for a short one.
+- **`fix(upgrade)`: stop asserting byte-identical JSON across the upgrade-data round-trip.**
+  The `debug_assert!` guarding `fork_main_into_new_main`'s serialize → deserialize → serialize check
+  compared the two strings byte-for-byte. `UpgradeData` owns a `ConfigState`, whose `tcp_fronts`,
+  `udp_fronts` and `certificates` are `HashMap`s: each instance gets its own `RandomState` keys, so
+  the re-parsed maps serialize their entries in a different order and the assert fired on a
+  perfectly correct upgrade (measured: 18 of 20 rounds with four TCP frontends) in every build with
+  `debug_assertions` on. The comparison is now made on parsed `serde_json::Value`s, which are
+  BTreeMap-backed and therefore key-order-insensitive, so the check still catches every value-level
+  corruption it exists for.
 - **`fix(pipe)`: stop dropping the READABLE event on a pipe-full `splice(2)` EAGAIN.**
   On `Protocol::TCP` listeners built with the `splice` feature, `splice_backend_readable` and
   `splice_readable` treated every `EAGAIN` from `splice_in` as a drained socket and cleared the

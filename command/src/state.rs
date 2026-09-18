@@ -1054,11 +1054,21 @@ impl ConfigState {
         }
     }
 
-    fn add_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
+    /// Insert `front` under its route key in `fronts`, or refuse a duplicate.
+    ///
+    /// The HTTP and HTTPS frontend adds differ only by the map they index and
+    /// the [`ObjectKind`] they report, so they share this body: a second copy
+    /// of the admission logic is a second place for the route-key identity to
+    /// drift.
+    fn add_frontend_to(
+        fronts: &mut BTreeMap<String, HttpFrontend>,
+        front: &RequestHttpFrontend,
+        kind: ObjectKind,
+    ) -> Result<(), StateError> {
         let front_as_key = front.to_string();
-        let before = self.http_fronts.len();
+        let before = fronts.len();
 
-        match self.http_fronts.entry(front.to_string()) {
+        match fronts.entry(front.to_string()) {
             BTreeMapEntry::Vacant(e) => {
                 e.insert(front.clone().to_frontend().map_err(|into_error| {
                     StateError::FrontendConversion {
@@ -1069,12 +1079,12 @@ impl ConfigState {
             }
             BTreeMapEntry::Occupied(_) => {
                 debug_assert_eq!(
-                    self.http_fronts.len(),
+                    fronts.len(),
                     before,
-                    "a rejected duplicate add_http_frontend must not mutate the map"
+                    "a rejected duplicate {kind:?} add must not mutate the map"
                 );
                 return Err(StateError::Exists {
-                    kind: ObjectKind::HttpFrontend,
+                    kind,
                     id: front.to_string(),
                 });
             }
@@ -1082,90 +1092,56 @@ impl ConfigState {
         // On the conversion-error path the `?` already returned, so reaching
         // here means exactly one entry was inserted under the route key.
         debug_assert!(
-            self.http_fronts.contains_key(&front.to_string()),
-            "add_http_frontend must insert the route key on success"
+            fronts.contains_key(&front.to_string()),
+            "adding a {kind:?} must insert the route key on success"
         );
         debug_assert_eq!(
-            self.http_fronts.len(),
+            fronts.len(),
             before + 1,
-            "add_http_frontend inserts exactly one entry on success"
+            "adding a {kind:?} inserts exactly one entry on success"
         );
         Ok(())
+    }
+
+    /// Evict `front`'s route key from `fronts`. Shared by the HTTP and HTTPS
+    /// frontend removals for the same reason [`Self::add_frontend_to`] is.
+    fn remove_frontend_from(
+        fronts: &mut BTreeMap<String, HttpFrontend>,
+        front: &RequestHttpFrontend,
+        kind: ObjectKind,
+    ) -> Result<(), StateError> {
+        let key = front.to_string();
+        let before = fronts.len();
+        fronts.remove(&key).ok_or(StateError::NotFound {
+            kind,
+            id: front.to_string(),
+        })?;
+        debug_assert!(
+            !fronts.contains_key(&key),
+            "removing a frontend must evict the route key"
+        );
+        debug_assert_eq!(
+            fronts.len(),
+            before - 1,
+            "removing a frontend drops exactly one entry"
+        );
+        Ok(())
+    }
+
+    fn add_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
+        Self::add_frontend_to(&mut self.http_fronts, front, ObjectKind::HttpFrontend)
     }
 
     fn add_https_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
-        let front_as_key = front.to_string();
-        let before = self.https_fronts.len();
-
-        match self.https_fronts.entry(front.to_string()) {
-            BTreeMapEntry::Vacant(e) => {
-                e.insert(front.clone().to_frontend().map_err(|into_error| {
-                    StateError::FrontendConversion {
-                        frontend: front_as_key,
-                        error: into_error.to_string(),
-                    }
-                })?)
-            }
-            BTreeMapEntry::Occupied(_) => {
-                debug_assert_eq!(
-                    self.https_fronts.len(),
-                    before,
-                    "a rejected duplicate add_https_frontend must not mutate the map"
-                );
-                return Err(StateError::Exists {
-                    kind: ObjectKind::HttpsFrontend,
-                    id: front.to_string(),
-                });
-            }
-        };
-        debug_assert!(
-            self.https_fronts.contains_key(&front.to_string()),
-            "add_https_frontend must insert the route key on success"
-        );
-        debug_assert_eq!(
-            self.https_fronts.len(),
-            before + 1,
-            "add_https_frontend inserts exactly one entry on success"
-        );
-        Ok(())
+        Self::add_frontend_to(&mut self.https_fronts, front, ObjectKind::HttpsFrontend)
     }
 
     fn remove_http_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
-        let key = front.to_string();
-        let before = self.http_fronts.len();
-        self.http_fronts.remove(&key).ok_or(StateError::NotFound {
-            kind: ObjectKind::HttpFrontend,
-            id: front.to_string(),
-        })?;
-        debug_assert!(
-            !self.http_fronts.contains_key(&key),
-            "remove_http_frontend must evict the route key"
-        );
-        debug_assert_eq!(
-            self.http_fronts.len(),
-            before - 1,
-            "remove_http_frontend drops exactly one entry"
-        );
-        Ok(())
+        Self::remove_frontend_from(&mut self.http_fronts, front, ObjectKind::HttpFrontend)
     }
 
     fn remove_https_frontend(&mut self, front: &RequestHttpFrontend) -> Result<(), StateError> {
-        let key = front.to_string();
-        let before = self.https_fronts.len();
-        self.https_fronts.remove(&key).ok_or(StateError::NotFound {
-            kind: ObjectKind::HttpsFrontend,
-            id: front.to_string(),
-        })?;
-        debug_assert!(
-            !self.https_fronts.contains_key(&key),
-            "remove_https_frontend must evict the route key"
-        );
-        debug_assert_eq!(
-            self.https_fronts.len(),
-            before - 1,
-            "remove_https_frontend drops exactly one entry"
-        );
-        Ok(())
+        Self::remove_frontend_from(&mut self.https_fronts, front, ObjectKind::HttpsFrontend)
     }
 
     fn add_certificate(&mut self, add: &AddCertificate) -> Result<(), StateError> {
@@ -5977,5 +5953,80 @@ mod tests {
         state
             .dispatch(&req)
             .expect("SetMetricDetail must traverse dispatch without UndispatchableRequest");
+    }
+
+    /// `remove_udp_frontend`'s key is COARSER than `add_udp_frontend`'s, so one
+    /// removal evicts frontends the caller never named.
+    ///
+    /// [`ConfigState::add_udp_frontend`] dedups on the full
+    /// `UdpFrontend { cluster_id, address, tags }`: two frontends at the same
+    /// (cluster, address) that differ only in their access-log tags are both
+    /// admitted, and this test asserts that first so the premise cannot rot.
+    /// [`ConfigState::remove_udp_frontend`] then retains on
+    /// `front.address != front_to_remove.address` — the ADDRESS ALONE — so it
+    /// drops every sibling at that address whatever its tags, and unlike
+    /// `remove_tcp_frontend` it carries no "drops exactly one entry" assertion
+    /// to catch it. `remove_tcp_frontend` matches on the very (address, sni,
+    /// alpn) key `add_tcp_frontend` admitted; the UDP pair has no such mirror.
+    ///
+    /// This is a PRE-EXISTING defect of a live control-plane verb, not a
+    /// regression of the change that added this test, and it is why
+    /// `compute_rollback` (`bin/src/command/requests.rs`) deliberately gives
+    /// `AddUdpFrontend` no inverse: reverting an unacknowledged UDP add with
+    /// `RemoveUdpFrontend` would evict every acknowledged same-address sibling
+    /// from the main-process state, which the next `SaveState` persists.
+    ///
+    /// Narrowing the removal key changes the observable semantics of
+    /// `RemoveUdpFrontend` for every existing operator — a tagless remove that
+    /// today clears an address would then match nothing — so the fix is an
+    /// explicit product decision, not a maintenance edit. The test is therefore
+    /// committed RED and `#[ignore]`d as a tracked follow-up: run it with
+    /// `cargo test -p sozu-command-lib -- --ignored` to see the current
+    /// behaviour.
+    #[test]
+    #[ignore = "tracked follow-up, committed red: remove_udp_frontend keys on the address alone while add_udp_frontend keys on (cluster, address, tags), so one removal evicts same-address siblings; narrowing the removal key changes a live verb's semantics and is an explicit product decision"]
+    fn remove_udp_frontend_evicts_same_address_siblings() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 9100);
+        let front = |owner: &str| RequestUdpFrontend {
+            cluster_id: "udp_cluster".to_string(),
+            address,
+            tags: BTreeMap::from([("owner".to_string(), owner.to_string())]),
+        };
+        let mut state = ConfigState::new();
+
+        // The premise: same cluster, same address, different tags — both are
+        // admitted, because the add key includes the tags.
+        for owner in ["team-a", "team-b"] {
+            state
+                .dispatch(&RequestType::AddUdpFrontend(front(owner)).into())
+                .expect(
+                    "two same-address UDP frontends differing only in tags must both be admitted",
+                );
+        }
+        assert_eq!(
+            state.udp_fronts.get("udp_cluster").map(Vec::len),
+            Some(2usize),
+            "both tagged UDP frontends must be in the state before the removal"
+        );
+
+        state
+            .dispatch(&RequestType::RemoveUdpFrontend(front("team-a")).into())
+            .expect("removing one of the two must succeed");
+
+        let surviving: Vec<&str> = state
+            .udp_fronts
+            .get("udp_cluster")
+            .map(|fronts| {
+                fronts
+                    .iter()
+                    .filter_map(|f| f.tags.get("owner").map(String::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            surviving,
+            vec!["team-b"],
+            "removing one UDP frontend must not evict its same-address sibling"
+        );
     }
 }
