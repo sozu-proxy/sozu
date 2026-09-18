@@ -356,22 +356,45 @@ impl<V: Debug + Clone> TrieNode<V> {
 
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
                     let anchored_s = format!("\\A{s}\\z");
-                    if pos > 0 {
-                        let mut remove_result = RemoveResult::NotFound;
-                        for t in self.regexps.iter_mut() {
-                            if t.0.as_str() == anchored_s
-                                && t.1.remove_recursive(&partial_key[..pos - 1]) == RemoveResult::Ok
-                            {
-                                remove_result = RemoveResult::Ok;
-                            }
-                        }
-                        return remove_result;
+                    // Mirror of `insert_recursive`. `pos > 0`: a
+                    // `.`-separated prefix precedes the regex segment, so
+                    // the value sits deeper in that segment's subtree —
+                    // recurse on the prefix, dropping the separating `.`
+                    // via `pos - 1`. `pos == 0`: the regex is the
+                    // leftmost/only segment and the value IS that
+                    // subtree's own `key_value` (the create-path built it
+                    // with `TrieNode::new`), reached with an empty key.
+                    //
+                    // Either way exactly one value goes. Dropping the
+                    // whole `regexps` entry instead — which the `pos == 0`
+                    // arm used to do with `retain` — also deletes every
+                    // deeper domain sharing the segment, and reports `Ok`
+                    // for a host that was never stored.
+                    let rest: &[u8] = if pos > 0 {
+                        &partial_key[..pos - 1]
                     } else {
-                        let len = self.regexps.len();
-                        self.regexps.retain(|(r, _)| r.as_str() != anchored_s);
-                        if len > self.regexps.len() {
-                            return RemoveResult::Ok;
+                        &partial_key[..0]
+                    };
+                    // `check_invariants` keeps the anchored patterns
+                    // unique per node, so at most one entry can match.
+                    // `Vec::remove` (never `swap_remove`): `lookup` takes
+                    // the FIRST matching regex, so the order of `regexps`
+                    // is routing behaviour.
+                    if let Some(index) = self
+                        .regexps
+                        .iter()
+                        .position(|(r, _)| r.as_str() == anchored_s)
+                        && self.regexps[index].1.remove_recursive(rest) == RemoveResult::Ok
+                    {
+                        // An emptied regex subtree must be pruned here,
+                        // exactly like an emptied `children` subtree
+                        // below: left behind it strands a valueless node
+                        // and keeps every ancestor non-empty, so nothing
+                        // above it could be pruned either.
+                        if self.regexps[index].1.is_empty() {
+                            self.regexps.remove(index);
                         }
+                        return RemoveResult::Ok;
                     }
                 }
             }
@@ -1363,5 +1386,106 @@ mod tests {
             RemoveResult::Ok
         );
         assert_eq!(root.domain_lookup(b"test4.example.com", false), None);
+    }
+    /// Removing a leftmost-regex host must drop that one host and nothing
+    /// else. The `pos == 0` arm of `remove_recursive` used to `retain` the
+    /// whole `(regex, subtree)` entry out of `regexps`, which also deleted
+    /// every deeper domain registered under the same segment — and it
+    /// reported `Ok` even when the leftmost host itself had never been
+    /// stored. The value lives in that subtree's own `key_value`, so the
+    /// removal must recurse into it with an empty key, exactly like the
+    /// `pos > 0` arm recurses on the remaining prefix.
+    ///
+    /// To SEE THIS RED: restore the pre-fix `pos == 0` arm of
+    /// `TrieNode::remove_recursive`:
+    /// `let len = self.regexps.len();
+    ///  self.regexps.retain(|(r, _)| r.as_str() != anchored_s);
+    ///  if len > self.regexps.len() { return RemoveResult::Ok; }`
+    /// — the sibling lookup below then returns `None`, and in a debug build
+    /// `remove()` panics first on "a successful remove must drop exactly one
+    /// value from the trie".
+    #[test]
+    fn removing_a_leftmost_regex_host_keeps_its_sibling_domains() {
+        let mut root: TrieNode<u8> = TrieNode::root();
+
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"/test[0-9]/.example.com"[..]), 1),
+            InsertResult::Ok
+        );
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"foo./test[0-9]/.example.com"[..]), 2),
+            InsertResult::Ok
+        );
+        assert_eq!(
+            root.domain_lookup(b"test4.example.com", false),
+            Some(&(b"/test[0-9]/.example.com"[..].to_vec(), 1))
+        );
+        assert_eq!(
+            root.domain_lookup(b"foo.test4.example.com", false),
+            Some(&(b"foo./test[0-9]/.example.com"[..].to_vec(), 2))
+        );
+
+        assert_eq!(
+            root.domain_remove(&Vec::from(&b"/test[0-9]/.example.com"[..])),
+            RemoveResult::Ok
+        );
+        assert_eq!(
+            root.domain_lookup(b"test4.example.com", false),
+            None,
+            "the removed leftmost-regex host must be gone",
+        );
+        assert_eq!(
+            root.domain_lookup(b"foo.test4.example.com", false),
+            Some(&(b"foo./test[0-9]/.example.com"[..].to_vec(), 2)),
+            "a sibling domain under the same regex segment must survive",
+        );
+
+        // A leftmost-regex host that is not stored is `NotFound`, not a
+        // silent `Ok` that takes the surviving sibling with it.
+        assert_eq!(
+            root.domain_remove(&Vec::from(&b"/test[0-9]/.example.com"[..])),
+            RemoveResult::NotFound
+        );
+        assert_eq!(
+            root.domain_lookup(b"foo.test4.example.com", false),
+            Some(&(b"foo./test[0-9]/.example.com"[..].to_vec(), 2))
+        );
+    }
+
+    /// An emptied regex subtree must be pruned from `regexps`, exactly like
+    /// an emptied `children` subtree is pruned from `children`. The `pos > 0`
+    /// arm of `remove_recursive` recursed into the subtree and returned `Ok`
+    /// without ever dropping the now valueless `(regex, subtree)` entry,
+    /// stranding a node that keeps its whole parent chain reachable and
+    /// non-empty. `insert_remove_through_regex` never empties the subtree,
+    /// which is why the leak went unnoticed.
+    ///
+    /// To SEE THIS RED: delete the
+    /// `if … .is_empty() { self.regexps.remove(index); }` prune from the
+    /// regex arm of `TrieNode::remove_recursive` — in a debug build the trie
+    /// panics first on "a retained child subtree must still hold at least one
+    /// value", and in release `root.is_empty()` stays false.
+    #[test]
+    fn removing_the_last_host_under_a_regex_segment_prunes_the_subtree() {
+        let mut root: TrieNode<u8> = TrieNode::root();
+
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"www./.*/.com"[..]), 1),
+            InsertResult::Ok
+        );
+        assert_eq!(
+            root.domain_lookup(b"www.sozu.com", false),
+            Some(&(b"www./.*/.com"[..].to_vec(), 1))
+        );
+
+        assert_eq!(
+            root.domain_remove(&Vec::from(&b"www./.*/.com"[..])),
+            RemoveResult::Ok
+        );
+        assert_eq!(root.domain_lookup(b"www.sozu.com", false), None);
+        assert!(
+            root.is_empty(),
+            "dropping the last host under a regex segment must leave an empty trie",
+        );
     }
 }

@@ -104,6 +104,34 @@
   `debug_assertions` on. The comparison is now made on parsed `serde_json::Value`s, which are
   BTreeMap-backed and therefore key-order-insensitive, so the check still catches every value-level
   corruption it exists for.
+- **`fix(router)`: a `--path-equals` frontend could never be deduplicated nor removed.**
+  `PathRule`'s hand-written `PartialEq` (`Regex` has none, so the impl is manual) had arms for
+  `Prefix` and `Regex` only, and the catch-all answered `false` for everything else — so two
+  identical `PathRule::Equals` compared unequal and the equality was not even reflexive. Every
+  router bookkeeping path is written against it: `add_tree_rule`/`add_pre_rule`/`add_post_rule`
+  never recognised the rule they had just stored, so re-adding the same `--path-equals` frontend
+  pushed a second, unreachable copy instead of being refused. Removal never fired either:
+  `remove_tree_rule`'s `retain` kept the entry it was asked to evict yet still reported success, so
+  `remove_http_front` answered `Ok` for a frontend it had left in place and routing, while
+  `remove_pre_rule`/`remove_post_rule` found no position to drop and failed the request outright.
+  Prefix and regex frontends were unaffected, which is why no existing test caught it. The missing
+  `(Equals, Equals)` arm is added; `PathRule` claims neither `Eq` nor `Hash` and is used as no map
+  key, so nothing else had to change. Regression-tested through `add_http_front` /
+  `remove_http_front` (seen red).
+- **`fix(router)`: removing a regex-segment domain destroyed its siblings, or stranded its subtree.**
+  In the pattern trie a domain whose leftmost label is a regex (`/test[0-9]/.example.com`) and a
+  deeper domain sharing that segment (`foo./test[0-9]/.example.com`) live in the SAME
+  `(regex, subtree)` entry — the first as the subtree's own value, the second as a child of it.
+  `remove_recursive` handled the two positions with two different bodies and both were wrong: the
+  leftmost case (`pos == 0`) `retain`ed the whole entry out of the node, deleting every deeper
+  domain under the same segment with it and reporting `Ok` even for a host that had never been
+  stored, while the deeper case (`pos > 0`) recursed correctly but never dropped the entry once its
+  subtree had been emptied, stranding a valueless node that keeps its whole ancestor chain
+  reachable so nothing above it could be pruned either. Both cases now take one path: recurse into
+  the matching subtree (with an empty key for `pos == 0`, with the remaining prefix for `pos > 0`)
+  and prune the entry only once that subtree is empty, mirroring how an emptied `children` subtree
+  is already pruned. Regression-tested for sibling survival, for the never-stored `NotFound`, and
+  for the prune (seen red).
 - **`fix(pipe)`: stop dropping the READABLE event on a pipe-full `splice(2)` EAGAIN.**
   On `Protocol::TCP` listeners built with the `splice` feature, `splice_backend_readable` and
   `splice_readable` treated every `EAGAIN` from `splice_in` as a drained socket and cleared the
