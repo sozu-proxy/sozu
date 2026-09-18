@@ -153,7 +153,7 @@ against the socket peer:
 - `ExpectProxyProtocol::into_pipe`
   (`lib/src/protocol/proxy_protocol/expect.rs:302`) and
   `RelayProxyProtocol::into_pipe`
-  (`lib/src/protocol/proxy_protocol/relay.rs:294`) — they set
+  (`lib/src/protocol/proxy_protocol/relay.rs:408`) — they set
   `Pipe::session_address`, which `effective_session_address` then returns for
   the post-upgrade `Pipe` state.
 - the SNI preread's `proxy_source` (`lib/src/protocol/tcp_preread/mod.rs:284`,

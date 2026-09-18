@@ -251,7 +251,7 @@ What happens next depends on the listener, because the two families
 resolve the resulting `ProxyAddr::AfUnspec` differently. A **TCP**
 listener keeps the front socket's own `peer_addr`: `into_pipe`
 (`lib/src/protocol/proxy_protocol/expect.rs:302`,
-`lib/src/protocol/proxy_protocol/relay.rs:294`), the SNI preread
+`lib/src/protocol/proxy_protocol/relay.rs:408`), the SNI preread
 (`lib/src/tcp.rs:908`) and `TcpSession::effective_session_address`
 (`lib/src/tcp.rs:373`, which feeds the raw-TCP `max_connections_per_ip`
 gate) all fall back to it. An **HTTP or HTTPS**
