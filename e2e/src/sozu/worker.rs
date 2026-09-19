@@ -9,7 +9,7 @@ use sozu::server::Server;
 use sozu_command::{
     channel::Channel,
     config::{ConfigBuilder, FileConfig},
-    logging::setup_default_logging,
+    logging::{Logger, setup_default_logging},
     proto::command::{
         AddBackend, Cluster, HardStop, LoadBalancingParams, PathRule, Request, RequestHttpFrontend,
         RequestTcpFrontend, ReturnListenSockets, RulePosition, ServerConfig, SoftStop,
@@ -129,13 +129,81 @@ impl Worker {
         (scm_main_to_worker, cmd_main_to_worker, server)
     }
 
+    /// Start a worker whose thread-local logger is configured exactly as every
+    /// worker in this suite has always configured it: `setup_default_logging(
+    /// false, "error", &thread_name)`, i.e. target `"stdout"` at level
+    /// `"error"`, with `RUST_LOG` still able to override the level.
+    ///
+    /// To read back what a worker logged, use
+    /// [`Worker::start_new_worker_with_logging`] instead.
     pub fn start_new_worker<S: Into<String>>(
         name: S,
         config: ServerConfig,
         listeners: &Listeners,
         state: ConfigState,
     ) -> Self {
-        let name = name.into();
+        Self::spawn_worker(name.into(), config, listeners, state, None)
+    }
+
+    /// [`Worker::start_new_worker`] with the worker thread's log target and
+    /// level chosen by the caller, so a test can assert on what the worker
+    /// actually logged.
+    ///
+    /// `log_target` is a `target_to_backend` string
+    /// (`command/src/logging/logs.rs`): `"stdout"`, `"file:///absolute/path"`,
+    /// `"udp://addr"`, `"tcp://addr"` or `"unix://path"`. Prefer `file://` with
+    /// [`WorkerLogCapture`](crate::sozu::log_capture::WorkerLogCapture): the
+    /// UDP backend drops datagrams once the kernel socket buffer fills, which
+    /// an H2 conversation at `trace` does reach, and a file has no loss mode.
+    ///
+    /// `log_spec` is a `parse_logging_spec` string: either a bare level
+    /// (`"error"`) or a comma-separated list where each `module=level`
+    /// directive is matched against the call site's `module_path!()` by
+    /// prefix — `"error,sozu_lib::protocol::mux=trace"` traces the mux and
+    /// leaves the rest of the worker at `error`.
+    ///
+    /// The target must be chosen HERE rather than by the test thread: `LOGGER`
+    /// is a `thread_local!` with a one-shot `initialized` guard, so the only
+    /// logger this worker will ever have is the one installed by the first
+    /// call made on its own thread — the one in [`Worker::spawn_worker`]. The
+    /// flip side is that each worker owns its own logger, so a per-worker
+    /// target needs no serialisation between tests.
+    ///
+    /// Unlike [`Worker::start_new_worker`], this path installs the spec with
+    /// `Logger::init` rather than `setup_logging`, so `RUST_LOG` does NOT
+    /// override it. A capture test asks for a level precisely in order to
+    /// assert on what that level emits; an ambient `RUST_LOG=error` silently
+    /// emptying the capture would be a failure about the environment rather
+    /// than about the code. `lib/src/lib.rs`'s `capture_test_logs_at_level`
+    /// calls `Logger::init` directly for the same reason.
+    pub fn start_new_worker_with_logging<S: Into<String>>(
+        name: S,
+        config: ServerConfig,
+        listeners: &Listeners,
+        state: ConfigState,
+        log_target: &str,
+        log_spec: &str,
+    ) -> Self {
+        Self::spawn_worker(
+            name.into(),
+            config,
+            listeners,
+            state,
+            Some((log_target.to_owned(), log_spec.to_owned())),
+        )
+    }
+
+    /// Shared body of [`Worker::start_new_worker`] and
+    /// [`Worker::start_new_worker_with_logging`]. `logging` is `None` for the
+    /// historical `setup_default_logging(false, "error", ...)` call and
+    /// `Some((target, spec))` for an explicit override.
+    fn spawn_worker(
+        name: String,
+        config: ServerConfig,
+        listeners: &Listeners,
+        state: ConfigState,
+        logging: Option<(String, String)>,
+    ) -> Self {
         let (scm_main_to_worker, scm_worker_to_main) =
             UnixStream::pair().expect("could not create unix stream pair");
         let (cmd_main_to_worker, cmd_worker_to_main) =
@@ -161,7 +229,19 @@ impl Worker {
         println!("Setting up logging");
 
         let server_job = thread::spawn(move || {
-            if let Err(e) = setup_default_logging(false, "error", &thread_name) {
+            let logging_setup = match logging {
+                None => setup_default_logging(false, "error", &thread_name),
+                Some((target, spec)) => Logger::init(
+                    thread_name.to_owned(),
+                    &spec,
+                    &target,
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
+            };
+            if let Err(e) = logging_setup {
                 println!("could not setup logging: {e}");
             }
             let mut server = Server::try_new_from_config(
@@ -195,6 +275,23 @@ impl Worker {
         state: ConfigState,
     ) -> Self {
         let worker = Self::start_new_worker(name, config, &listeners, state);
+        listeners.close();
+        worker
+    }
+
+    /// [`Worker::start_new_worker_owned`] with the logging override of
+    /// [`Worker::start_new_worker_with_logging`].
+    pub fn start_new_worker_owned_with_logging<S: Into<String>>(
+        name: S,
+        config: ServerConfig,
+        listeners: Listeners,
+        state: ConfigState,
+        log_target: &str,
+        log_spec: &str,
+    ) -> Self {
+        let worker = Self::start_new_worker_with_logging(
+            name, config, &listeners, state, log_target, log_spec,
+        );
         listeners.close();
         worker
     }

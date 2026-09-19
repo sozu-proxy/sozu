@@ -487,6 +487,22 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   is dead in every binary. New findings of this kind belong in
   `e2e/COVERAGE.md > Out of e2e reach by construction`, with the mechanism, not
   just the conclusion.
+- **A worker's own log output IS readable — name the level.** It was not until
+  `Worker::start_new_worker_with_logging` / `start_new_worker_owned_with_logging`
+  (`e2e/src/sozu/worker.rs`) and `WorkerLogCapture` (`e2e/src/sozu/log_capture.rs`):
+  pass a `file://` target under `tempfile` plus a `parse_logging_spec` level, and
+  read the lines back after `wait_for_server_stop` (that join is what flushes the
+  backend). The plain `start_new_worker*` entry points are untouched and still log
+  to stdout at `error`. Two traps. A HEALTHY session emits no `MUX-*` line at
+  `error` — every `log_context!` expansion on a clean path is a `trace!` — so
+  raise the level, scoped (`"error,sozu_lib::protocol::mux=trace"`), or provoke an
+  error path on purpose. And do NOT reuse the UDP drain from
+  `capture_test_logs_at_level` (`lib/src/lib.rs`): it reads only after the run and
+  silently drops datagrams at H2 volume, which is a load-sensitive flake, whereas
+  a file has no loss mode. Worked example:
+  `tests::h2_log_context_tests::test_h2_proxy_protocol_peer_is_the_advertised_client`.
+  Full cost and residue in
+  `e2e/COVERAGE.md > Out of e2e reach by construction`.
 - **A clock refactor is not wire-falsifiable; the behaviour it drives is.**
   Changing *which* clock a deadline reads — e.g. the H2 core sampling
   `Context::now` once per `Mux::ready` pass instead of calling `Instant::now()`
