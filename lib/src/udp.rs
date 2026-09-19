@@ -1080,8 +1080,19 @@ pub struct UdpListenerSession {
     /// Reusable recv scratch buffer, sized to `max_rx_datagram_size`.
     recv_buf: Vec<u8>,
     /// The currently-armed `TIMER` handle, so a re-arm cancels the previous
-    /// deadline instead of leaking timer-slab entries (the manager only emits a
-    /// fresh `ArmTimer` when the deadline actually changes).
+    /// deadline instead of leaking timer-slab entries.
+    ///
+    /// `None` whenever nothing is armed, which includes the moment an expiry is
+    /// delivered: `Timer::poll` removes the entry from its slab. `timeout`
+    /// clears it there so the field means what it says locally, rather than
+    /// holding a handle that is merely harmless. Harmless it is —
+    /// `cancel_timeout` rejects a delivered handle outright, because
+    /// `set_timeout_at` clamps every new entry past `self.tick` while a
+    /// delivered one sat at or below it, so no successor in that slab slot can
+    /// ever match its tick
+    /// (`test_a_delivered_timeout_handle_cannot_cancel_its_slot_successor`,
+    /// `lib/src/timer.rs`). Keeping the invariant local beats resting on that
+    /// two-hop argument from another module.
     timer_handle: Option<crate::timer::Timeout>,
 }
 
@@ -1647,8 +1658,9 @@ impl UdpListenerSession {
         TIMER.with(|timer| {
             let mut timer = timer.borrow_mut();
             // Cancel the previous deadline so re-arming does not leak timer-slab
-            // entries. The manager only emits a fresh `ArmTimer` on a real
-            // deadline change, so cancellations are rare.
+            // entries. This is the re-arm-while-still-armed path (a datagram
+            // pushed the deadline back); on the expiry path `timeout` has
+            // already cleared the handle, because the entry it named is gone.
             if let Some(old) = self.timer_handle.take() {
                 let _ = timer.cancel_timeout(&old);
             }
@@ -1764,9 +1776,9 @@ impl UdpListenerSession {
         self.manager.borrow_mut().close_all(now);
         self.drain_outputs(now);
         // After `close_all`, the manager's flow table is empty and it armed no
-        // new timer (`reschedule` emits `ArmTimer` only on a real deadline
-        // change, and an empty table has no deadline). Cancel any residual shell
-        // timer so it can't fire against a now-flowless listener.
+        // new timer (an empty table has no deadline, so `reschedule` emits
+        // nothing). Cancel any residual shell timer so it can't fire against a
+        // now-flowless listener.
         if let Some(handle) = self.timer_handle.take() {
             TIMER.with(|timer| {
                 let _ = timer.borrow_mut().cancel_timeout(&handle);
@@ -1812,11 +1824,21 @@ impl ProxySession for UdpListenerSession {
     fn timeout(&mut self, token: Token) -> SessionIsToBeClosed {
         if token == self.listener_token {
             let now = Instant::now();
+            // The wheel entry that fired is CONSUMED: `Timer::poll` removed it
+            // from the timer's slab. Say so, so the field is true on its own
+            // terms rather than by an argument made in `timer.rs` — a handle
+            // left here is inert (`cancel_timeout`'s tick guard can never match
+            // a delivered entry) but claims an arming that does not exist.
+            self.timer_handle = None;
             self.manager.borrow_mut().handle_timeout(now);
+            // Re-arm: `handle_timeout` cleared the manager's `armed_deadline`
+            // for the same reason, so `reschedule` emits a fresh ArmTimer
+            // whenever a flow is still scheduled — including when this expiry
+            // found nothing due, which is the common case for an entry the
+            // wheel delivered early (`crate::timer` rounds to the nearest
+            // tick). `drain_outputs` applies it. Never close the listener on a
+            // flow timeout.
             self.drain_outputs(now);
-            // Re-arm: the manager emits a fresh ArmTimer via poll_output if a
-            // flow is still scheduled (handled inside drain_outputs). Nothing
-            // to do here. Never close the listener on a flow timeout.
         }
         false
     }
@@ -2068,6 +2090,234 @@ mod tests {
     /// `listener_token` for the whole life of the session. The state is
     /// synthesized here directly.
     ///
+    /// The lost wakeup end to end: a real `TIMER` wheel, a real
+    /// `UdpListenerSession`, a real `UdpManager` — and an idle flow that must
+    /// actually be evicted.
+    ///
+    /// `crate::timer` rounds a delay to the NEAREST tick, so the listener's
+    /// single wheel entry is delivered up to 50 ms BEFORE the flow's idle
+    /// deadline (`test_timeout_fires_up_to_half_a_tick_early`,
+    /// `lib/src/timer.rs`), and the delivery CONSUMES the entry.
+    /// `UdpListenerSession::timeout` then runs `handle_timeout` at a `now`
+    /// short of the deadline: nothing is due, nothing closes. Unless the
+    /// manager re-arms on a fire it did not act on, no wheel entry exists any
+    /// more and this flow is never reaped — it holds its `max_flows` slot, its
+    /// upstream socket, its slab slot and its `udp.active_flows` count until
+    /// some *other* flow's deadline happens to move the manager's minimum.
+    ///
+    /// The early fire is forced, not hoped for. The wheel sits on a fixed
+    /// 100 ms grid anchored at the thread-local `TIMER`'s private `start`, so
+    /// the test first parks a throwaway entry to read one grid point out of the
+    /// wheel, then places the flow's deadline 30 ms past a later grid point.
+    /// 30 ms rounds down, so the entry is delivered at that grid point — 30 ms
+    /// early — and the assertions below check that against the wheel rather
+    /// than assuming it.
+    ///
+    /// To SEE THIS RED: remove `self.armed_deadline = None;` from the top of
+    /// `UdpManager::handle_timeout` (`lib/src/protocol/udp/manager.rs`). The
+    /// `wheel re-armed after the early fire` assertion fails first, reporting a
+    /// `next wheel date` of `tv_sec: 18446744073760881` — the `TICK_MAX`
+    /// sentinel every slot carries when the wheel holds nothing — and with that
+    /// assertion removed the final one fails with `the idle flow was never
+    /// evicted, left: 1  right: 0`.
+    ///
+    /// The other half of the rule, `self.timer_handle = None;` below, is NOT
+    /// covered by this test and no test here forces it red — nor could one:
+    /// a delivered handle is already inert, since `cancel_timeout`'s tick guard
+    /// can never match the successor in its slab slot
+    /// (`test_a_delivered_timeout_handle_cannot_cancel_its_slot_successor`,
+    /// `lib/src/timer.rs`, pins that). Clearing it is hygiene — it keeps the
+    /// field's meaning local instead of load-bearing on `timer.rs` internals —
+    /// not a fix for a reachable defect.
+    #[test]
+    fn an_early_wheel_fire_still_evicts_the_idle_flow() {
+        use crate::backends::Backend;
+        use crate::testing::{ServerParts, prebuild_server, provide_port};
+
+        /// Park the thread until `at`. The wheel is driven by real time here on
+        /// purpose: the whole defect lives in the gap between the wheel's tick
+        /// grid and the manager's deadline, and a mocked clock cannot show it.
+        fn sleep_until(at: Instant) {
+            let now = Instant::now();
+            if at > now {
+                std::thread::sleep(at - now);
+            }
+        }
+
+        const CLUSTER: &str = "udp-idle-eviction";
+
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+
+        // A reachable backend so the flow is admitted and established rather
+        // than aborted by `on_select_backend`'s no-backend path.
+        backends.borrow_mut().add_backend(
+            CLUSTER,
+            Backend::new(
+                "backend-1",
+                SocketAddr::from(([127, 0, 0, 1], provide_port())),
+                None,
+                None,
+                None,
+            ),
+        );
+
+        let address =
+            sozu_command::proto::command::SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let config = sozu_command::config::ListenerBuilder::new_udp(address)
+            .to_udp(None)
+            .expect("could not build a UdpListenerConfig for the test");
+
+        let listener_token = {
+            let mut session_manager = sessions.borrow_mut();
+            let entry = session_manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::UDPListen,
+            })));
+            token
+        };
+
+        let mut proxy = UdpProxy::new(registry, sessions.clone(), pool, backends, 16, 16384);
+        proxy
+            .add_listener(config, listener_token)
+            .expect("could not add the test UDP listener");
+        proxy
+            .activate_listener(&address.into(), None)
+            .expect("could not activate the test UDP listener");
+        let session = proxy
+            .build_session(listener_token)
+            .expect("could not build the test UDP listener session");
+
+        // A ruler for the wheel: park a throwaway entry, read the absolute
+        // instant the wheel would fire it, and leave it there to be consumed
+        // below (cancelling it would leave a stale `next_tick` behind).
+        let probe_token = Token(usize::MAX);
+        let grid = TIMER.with(|timer| {
+            let mut timer = timer.borrow_mut();
+            timer.set_timeout(Duration::from_millis(0), probe_token);
+            timer
+                .next_poll_date()
+                .expect("the probe must put a date on the wheel")
+        });
+
+        // The grid point the flow's entry will be delivered at: strictly after
+        // the probe's (so they land in different wheel slots) and far enough
+        // ahead that the flow is armed before it.
+        let now = Instant::now();
+        let mut fires_at = grid + Duration::from_millis(100);
+        while fires_at < now + Duration::from_millis(60) {
+            fires_at += Duration::from_millis(100);
+        }
+        // 30 ms past a grid point rounds DOWN to it: delivered 30 ms early.
+        let idle_timeout = (fires_at - now) + Duration::from_millis(30);
+
+        {
+            let session = session.borrow_mut();
+            let mut manager = session.manager.borrow_mut();
+            manager.handle_input(
+                ManagerInput::Config(ConfigEvent::SetCluster(ClusterConfig {
+                    cluster: CLUSTER.to_owned(),
+                    front_timeout: idle_timeout,
+                    back_timeout: idle_timeout,
+                    ..Default::default()
+                })),
+                now,
+            );
+            manager.handle_input(
+                ManagerInput::ClientDatagram {
+                    src: SocketAddr::from(([127, 0, 0, 1], 41000)),
+                    payload: b"query",
+                },
+                now,
+            );
+        }
+        // The real shell: this is what arms the wheel, via `Output::ArmTimer`.
+        session.borrow_mut().drain_outputs(now);
+        assert_eq!(
+            session.borrow().manager.borrow().flow_count(),
+            1,
+            "the datagram must admit exactly one flow"
+        );
+
+        // Consume the ruler. Its slot is reset by the poll, so the wheel is
+        // clean and `next_poll_date` now reports the flow's entry alone.
+        sleep_until(grid + Duration::from_millis(5));
+        assert_eq!(
+            TIMER.with(|timer| timer.borrow_mut().poll()),
+            Some(probe_token),
+            "the probe entry must be delivered first"
+        );
+
+        // The early fire, measured against the real wheel rather than assumed.
+        let wheel_at = TIMER
+            .with(|timer| timer.borrow().next_poll_date())
+            .expect("the listener's wheel entry must be armed");
+        let deadline = session
+            .borrow()
+            .manager
+            .borrow()
+            .poll_timeout()
+            .expect("the manager must have armed an idle deadline");
+        assert!(
+            wheel_at < deadline,
+            "precondition: the wheel must fire EARLY — wheel {wheel_at:?} < deadline \
+             {deadline:?} (grid {grid:?}, expected fire {fires_at:?})"
+        );
+
+        // The early fire itself, exactly as `Server`'s run loop drives it.
+        sleep_until(wheel_at + Duration::from_millis(5));
+        assert_eq!(
+            TIMER.with(|timer| timer.borrow_mut().poll()),
+            Some(listener_token),
+            "the listener's wheel entry must be delivered at the wheel's date"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the fire must land before the flow's deadline for this test to mean anything"
+        );
+        session.borrow_mut().timeout(listener_token);
+
+        // Nothing was due, so nothing closed — and the wheel entry is gone.
+        assert_eq!(
+            session.borrow().manager.borrow().flow_count(),
+            1,
+            "nothing was due at the early fire: the flow must survive it"
+        );
+        // The wheel must hold a real, imminent entry again. `next_poll_date`
+        // mins over every slot and an empty wheel's slots all read `TICK_MAX`,
+        // so it is `Some` even with nothing armed — the bound is what makes this
+        // an assertion. The re-armed entry lands one tick past the deadline: the
+        // manager asks for `deadline`, which is 30 ms past a grid point the wheel
+        // has already passed, so `set_timeout_at` pushes it to the next one.
+        let rearmed = TIMER
+            .with(|timer| timer.borrow().next_poll_date())
+            .expect("next_poll_date always reports a date");
+        assert!(
+            rearmed <= deadline + Duration::from_millis(100),
+            "wheel re-armed after the early fire: an expiry the manager did not \
+             act on still consumed the entry, so it owes a fresh ArmTimer \
+             (next wheel date {rearmed:?}, deadline {deadline:?})"
+        );
+
+        // Past the real deadline AND past the grid point the re-arm rounded up
+        // to, the run loop drains the wheel again.
+        sleep_until(deadline + Duration::from_millis(150));
+        while let Some(token) = TIMER.with(|timer| timer.borrow_mut().poll()) {
+            session.borrow_mut().timeout(token);
+        }
+        assert_eq!(
+            session.borrow().manager.borrow().flow_count(),
+            0,
+            "an early fire must not lose the wakeup: the idle flow was never evicted"
+        );
+    }
+
     /// To SEE THIS RED: restore `s.slab[self.listener_token.0].clone()` in
     /// `on_open_upstream` -- this test then panics with "invalid key".
     #[test]

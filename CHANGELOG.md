@@ -253,6 +253,56 @@
   a no-op.
   Other commit citations elsewhere in the tree are also off-`main` or dangling; they are out of
   scope here and deliberately untouched.
+- **`fix(udp)`: an idle UDP flow was never evicted after an early timer-wheel fire.**
+  `Timer::duration_to_tick` (`lib/src/timer.rs:496`) rounds a requested delay to the **nearest**
+  tick, not up — despite its own comment saying otherwise — so with the 100 ms default tick an
+  entry whose deadline falls in `[100N-50, 100N+50)` is delivered at tick `N`, up to **50 ms
+  early**, and `Timer::poll` removes it from the wheel as it does so. The UDP listener owns exactly
+  one wheel entry for all its flows. On such an early fire `UdpListenerSession::timeout`
+  (`lib/src/udp.rs:1798`) called `UdpManager::handle_timeout`, which found no flow past its
+  deadline, closed nothing, and called `reschedule` — and `reschedule`
+  (`lib/src/protocol/udp/manager.rs:600`) emits `ArmTimer` only when the minimum deadline *changes*.
+  Nothing had changed, so nothing was emitted, the consumed entry was never replaced, and the wheel
+  was left empty: the flow was never reaped. It pinned its `max_flows` slot, its upstream socket,
+  its slab slot and its `udp.active_flows` count until some *other* flow's deadline happened to move
+  the manager's minimum — which on a listener carrying a single idle flow never happens, so the flow
+  survived indefinitely and `udp.active_flows` drifted upward.
+  The fix is one rule, **consume-then-reschedule**: an expiry consumes the wheel entry whether or
+  not it acted on it, so the manager clears `armed_deadline`
+  (`lib/src/protocol/udp/manager.rs:534`) before any `reschedule` runs — including the ones
+  `close_flow` triggers — which makes an unchanged deadline re-emit `ArmTimer` instead of being
+  memoized away. `handle_timeout` is only ever called from a wheel expiry, so this is the truthful
+  state on entry rather than a special case. The shell drops its now-dangling `timer_handle` in the
+  same place (`lib/src/udp.rs:1810`); that half is **hygiene, not a second fix**. A delivered handle
+  is already inert: `set_timeout_at` clamps every new entry past `self.tick`, a delivered one sat at
+  or below it, and `self.tick` never decreases, so `cancel_timeout`'s tick guard can never match the
+  successor that reuses its slab slot — the slot really is reused, and the cancel really is refused
+  (`test_a_delivered_timeout_handle_cannot_cancel_its_slot_successor`). Clearing it keeps the
+  field's meaning local instead of resting on that argument in another module.
+  **Behaviour change:** this adds **one extra wheel wakeup per early-fired idle expiry** —
+  roughly half of them, since the rounding is symmetric, and so roughly half of every lone idle
+  flow's expiries. The re-armed entry lands on the next tick, so an idle flow is now reaped up to
+  one tick (100 ms) after its deadline instead of never. The extra wakeup is a single wheel entry
+  and one `handle_timeout` pass over the flow table, per listener, not per flow.
+  An expiry that closes **several** flows at once additionally emits an intermediate `ArmTimer` per
+  `close_flow` whose recomputed minimum differs from the previous one: with two flows due together
+  and a third due later, two are emitted where HEAD emitted one (measured). These do not become
+  extra wakeups — `drain_outputs` is synchronous and `arm_timer` cancels the previous entry before
+  arming the next, so they collapse into wheel insert/cancel churn within the one drain.
+  The rounding itself is unchanged: it is a deliberate design choice, and the defect was reading an
+  expiry as "my deadline arrived" rather than "my entry is gone". It is now pinned explicitly by
+  `test_timeout_fires_up_to_half_a_tick_early` and `test_maximum_earliness_is_a_full_half_tick`
+  (`lib/src/timer.rs`) so the intuitive but wrong "a timer never fires early" assumption cannot be
+  re-derived; the rounding interval is closed on the early side, so the attained maximum earliness
+  is a full 50 ms and it is *lateness* that is capped at 49 ms. Seen red at all three levels: the
+  manager's re-arm (`early_expiry_that_finds_nothing_due_still_rearms`,
+  `repeated_early_expiries_each_rearm`) and the eviction itself against a real wheel, a real
+  `UdpListenerSession` and a real `UdpManager` (`an_early_wheel_fire_still_evicts_the_idle_flow`,
+  `lib/src/udp.rs`), which forces the early fire deterministically instead of waiting for the tick
+  phase to line up. Neither the deterministic simulator nor the e2e suite could see this: the
+  simulator calls `handle_timeout` straight off a virtual clock with no wheel in the loop, and the
+  e2e UDP suite has no idle-eviction test. `lib/src/protocol/udp/LIFECYCLE.md` §7 and §12 carry the
+  rule.
 
 - **`fix(server)`: a deactivated listener is deaf after being activated again.**
   The four proxies keep a listener's slab token inside the listener itself: `give_back_listener`
