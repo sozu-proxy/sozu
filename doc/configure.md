@@ -1389,16 +1389,38 @@ empty-prefix frontend on `example-main`. Per-frontend `certificate` / `key` /
 frontend entry.
 
 When multiple frontends share the same `(address, hostname)` tuple and differ
-only on `path` / `path_type`, the lookup picks the most specific rule using this
-fixed precedence:
+only on `path` / `path_type`, the lookup resolves them in one pass over the
+rules in declaration order. Exactly one thing ends that pass early, and whether
+a rule does so depends on its `method` as much as its `path_type`:
 
-1. `path_type = "EQUALS"` — exact match wins first.
-2. `path_type = "REGEX"` — anchored at both ends (`\A...\z`) since v2.0.0;
-   longer literal substrings within the regex are not weighted, so multiple
-   regex rules competing on the same authority produce undefined ordering
-   between them.
-3. `path_type = "PREFIX"` — fall-through default. Longest prefix wins among
-   PREFIX rules.
+1. An `EQUALS` or `REGEX` rule that **also carries a `method` matching the
+   request** answers immediately. It beats any `PREFIX`, however long, and any
+   rule declared without a `method`, in either declaration order. This is the
+   only short-circuit in the scan. Between two such rules the **first declared**
+   answers: neither exact-match nor pattern outranks the other, and longer
+   literal substrings within a regex are not weighted.
+2. Everything else is accumulated rather than returned, and a later match
+   replaces an earlier one. Among `PREFIX` rules that resolves to longest-wins;
+   for `EQUALS` and `REGEX` rules declared **without** a `method` it resolves to
+   last-declared-wins — the opposite of the case above.
+
+A `path_type = "REGEX"` pattern is **not anchored**. It is compiled verbatim
+(`Regex::new` on the configured value) and matched with `is_match`, so it
+matches anywhere in the request path: the pattern `bc` matches `/abcd`. The
+`\A...\z` anchoring introduced in v2.0.0 applies to regex *hostname* segments
+only — see "Regex hostname segments" below — and never to `path`. Write your own
+anchors if you need them (`^/abc$`). Whether `path` regexes should be anchored
+too is open as sozu#1350; until it is decided, assume unanchored.
+
+Throughout this section, **request path** means the request-target as it arrives
+on the wire, *including any query string*: a `GET /abc?x=1` is matched against
+`/abc?x=1`, not `/abc`. That bites `EQUALS` first — a `path_type = "EQUALS"`
+rule for `/abc` does **not** match a request carrying a query string — and it
+changes which rule wins in the whole-path case below.
+
+`method` is optional on a frontend, so tier 2 is the default shape unless you
+set one; declaration order is load-bearing in more cases than it looks. See
+"When declaration order decides" below.
 
 Operators wanting to route `/.well-known/acme-challenge` separately from `/` on
 the same hostname should declare:
@@ -1418,9 +1440,179 @@ path_type = "PREFIX"
 ```
 
 Both PREFIX rules match a request, but the longer prefix
-(`/.well-known/acme-challenge`) wins per the longest-match rule above.
-**Configuration order does not affect routing**: lookup is by trie specificity,
-not declaration order.
+(`/.well-known/acme-challenge`) wins per the longest-match rule above — and note
+*why* that example is safe to declare in any order: it is built from `PREFIX`
+rules only. That is a property of `PREFIX`, not a general guarantee.
+
+### When declaration order decides
+
+Everything below describes the ordinary hostname-routed frontends this document
+covers — those matched through the routing trie, which is the default. The two
+other rule positions sit outside it entirely: a `Pre` frontend is consulted
+*before* the trie and answers first whatever the rules here say, and a `Post`
+frontend is consulted *after* it, answering only requests the trie matched
+nothing for.
+
+The `path` rules of one hostname are not resolved by trie structure. They are a
+flat list held at the trie leaf, in the order they were added, and scanned once.
+Whether a rule **ends** that scan decides everything, and that depends on its
+`method`, which has three cases and not two: it may match the request, be
+absent, or be set to something the request does not match. The third case
+removes the rule from the contest altogether, whatever its `path_type`. Note
+that matching is case-insensitive only for the eight methods Sōzu knows
+(`GET`, `POST`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`, `TRACE`, `CONNECT`) — any
+other value is compared verbatim, so `method = "patch"` does **not** match a
+`PATCH` request and lands silently in that third case. Write unknown methods in
+the exact case the client sends. So:
+
+- **`EQUALS` / `REGEX` carrying a `method` that matches the request** — ends the
+  scan on the spot, so the **first declared wins**. Nothing compares two
+  patterns for specificity and `EQUALS` holds no priority over `REGEX`. The same
+  early exit is why such a rule beats a `PREFIX` of any length, and any
+  method-less rule, declared before or after it.
+- **`EQUALS` / `REGEX` declared without a `method`** — does **not** end the
+  scan. The match is only recorded, and a later match overwrites it, so here the
+  **last declared wins** — the reverse of the case above. A `PREFIX` declared
+  afterwards overwrites it too, but only if its prefix covers the **whole**
+  request path — query string included, per the definition above. A shorter
+  prefix leaves it standing, and so does the *same* prefix once the request
+  carries a query string: `/abc` covers all of `GET /abc`, but not of
+  `GET /abc?x=1`, so adding `?x=1` to the request flips the winner back to the
+  regex with no configuration change at all.
+- **`PREFIX`** — among the rules whose `method` matches the request, the
+  **longest match wins**, whatever the declaration order. The qualifier is
+  load-bearing: a rule whose `method` is set but does **not** match the request
+  is skipped entirely, so a longer prefix can lose to a shorter one. `/a` for
+  `GET` declared alongside `/ab` for `POST` sends `GET /abc` to `/a` — the
+  longer rule never competes. (Two `PREFIX` rules tie on length only by carrying
+  the same prefix string and differing on `method`. If both methods match the
+  request the tie goes to the **last** declared; if one of them does not match
+  it is skipped, so `/ab` for `GET` then `/ab` for `POST` sends `GET /abc` to
+  the **first**.)
+- **regex hostname segments** — one level up in the routing trie, and not
+  method-sensitive at all: the trie returns on the first segment that matches
+  the host, so the **first declared wins** (see "Regex hostname segments"
+  below).
+
+The method dependence is easiest to see side by side. On `www.example.com`, for
+`GET /abc`, with a regex `/a.*` and the whole-path prefix `/abc`:
+
+| the two rules carry | declared first | wins     |
+|---------------------|----------------|----------|
+| `method = "GET"`    | regex          | regex    |
+| `method = "GET"`    | prefix         | regex    |
+| no `method`         | regex          | **prefix** |
+| no `method`         | prefix         | regex    |
+
+So a method-less `REGEX` or `EQUALS` does **not** reliably outrank a `PREFIX`:
+it loses to one declared after it that covers the whole path. Since `method` is
+optional on a frontend, that is the default shape unless you set one.
+
+The table's third row is the fragile one. It holds for `GET /abc` and inverts
+for `GET /abc?x=1`, where the prefix no longer spans the request path and the
+regex wins instead. Read "whole path" as "the entire request-target the client
+sent", not as the path you wrote in the configuration file.
+
+Keep overlapping `REGEX`/`EQUALS` path rules either mutually exclusive or
+deliberately ordered. "Most specific first" is the right instinct only for rules
+that carry a matching `method`; without one, a later rule wins, so the order to
+write is most specific *last*. Only `PREFIX`-against-`PREFIX` sorts itself out.
+
+None of that carries over to hostnames. Declaration order settles an overlap
+between two regex *segments* (below) and nothing else: any other overlapping
+pair — a `*` wildcard against a regex segment, an exact name against either — is
+resolved by the shape of the routing trie, and reordering the frontends does not
+change which one answers. So the advice above does not work here. Keep hostname
+patterns mutually exclusive. (See also sozu#1351.)
+
+### Regex hostname segments
+
+A `hostname` may carry a regex in any one of its dot-separated segments by
+wrapping that segment in slashes. The pattern is anchored with `\A...\z` at
+insert time (see the 2.0.0 upgrade note), so it matches that whole segment and
+nothing else:
+
+```toml
+[[clusters.regional.frontends]]
+address  = "0.0.0.0:443"
+hostname = "/test[0-9]/.example.com"      # test4.example.com, not testAB
+
+[[clusters.regional-foo.frontends]]
+address  = "0.0.0.0:443"
+hostname = "foo./test[0-9]/.example.com"  # foo.test4.example.com
+```
+
+The two frontends above share one regex segment, and the order in which they
+are declared or added does not matter: either may be declared first, and both
+resolve.
+
+Two regex segments that **overlap** are decided by declaration order, under the
+same first-declared-wins rule as `REGEX` path rules above: a node holds its
+regex segments in an ordered list, a lookup returns on the first that matches,
+and a new segment is appended. With both of these declared, `test4.example.com`
+routes to whichever came first:
+
+```toml
+[[clusters.numbered.frontends]]
+address  = "0.0.0.0:443"
+hostname = "/test[0-9]/.example.com"
+
+[[clusters.any-suffixed.frontends]]
+address  = "0.0.0.0:443"
+hostname = "/[a-z]+[0-9]/.example.com"   # also matches `test4`
+```
+
+Declaring `numbered` first sends `test4.example.com` to `numbered`; declaring
+`any-suffixed` first sends it to `any-suffixed`.
+
+Before the fix shipped in the current release, declaring the deeper
+`foo./test[0-9]/.example.com` first made the leftmost
+`/test[0-9]/.example.com` un-addable for as long as the worker lived:
+`sozu frontend http add` reported success and `sozu query frontends` listed it,
+but the routing trie never served it, so requests for `test4.example.com`
+missed the route.
+
+**The next worker restart makes such a route live, and no operator action is
+needed to get there.** The main process validates a frontend against a *fresh,
+empty* router probe, which by construction cannot see an ordering conflict, and
+then commits it to its `ConfigState` before fanning it out to the workers. In a
+release build the worker reported success, so the safety net that reverts an add
+no worker acknowledged never fired — it only triggers when *no* worker answers
+`Ok`. The frontend is therefore recorded in the main process's authoritative
+state, which is exactly why `sozu query frontends` lists it, and that state is
+what is replayed into every worker at launch.
+
+That replay walks the frontends in map-key order, and the key begins with the
+address and hostname — so `/test[0-9]/.example.com` is replayed **before**
+`foo./test[0-9]/.example.com`, which is the insertion order that always worked.
+That is why the divergence never survives a restart: it lasts exactly as long as
+the worker that took the adds in the unlucky order. A `sozu worker upgrade`, a
+`sozu upgrade`, an automatic respawn after a worker death, or a full restart all
+heal it, on the fixed build and on an older one alike. Upgrading is simply one
+way to restart, not the thing that activates the route. Re-adding the frontend
+is **not** required, and doing nothing does **not** leave it dormant.
+
+(A debug build behaved differently and loudly: the worker panicked on the add
+instead of reporting success, so nothing was recorded and there is nothing to
+inherit.)
+
+To find the shape before that restart: an HTTP/HTTPS frontend whose hostname
+carries a regex segment, that `sozu query frontends` lists, and that is not
+actually serving traffic. Each one will start routing at the next restart, so
+remove the ones you do not want live — that is the only way to keep them off.
+**Confirm each candidate before deleting it.** That predicate cannot tell a
+route dormant because of this bug from one that is simply idle, and the fact
+that separates them — that a deeper sibling sharing the regex segment was added
+to that worker first — is not recoverable from `sozu query frontends`. A quiet
+but healthy route looks identical.
+
+A segment regex must occupy a complete segment. `abc/[0-9]+/.example.com` is
+rejected, because the regex does not start at a `.` boundary, as is a hostname
+with an empty label such as `.example.com` or `./test[0-9]/.example.com`. A
+rejected frontend is reported as an error and leaves the route table unchanged.
+
+Captured segments are addressable from `rewrite_host` / `rewrite_path` as
+`$HOST[n]` — see the redirect and rewrite section below.
 
 ### Regex limitations — no look-around
 

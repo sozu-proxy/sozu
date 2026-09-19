@@ -483,6 +483,125 @@
   and prune the entry only once that subtree is empty, mirroring how an emptied `children` subtree
   is already pruned. Regression-tested for sibling survival, for the never-stored `NotFound`, and
   for the prune (seen red).
+- **`fix(router)`: a regex-segment domain became un-insertable when a deeper sibling arrived first.**
+  In the pattern trie a domain whose leftmost label is a regex (`/test[0-9]/.example.com`) and a
+  deeper domain sharing that segment (`foo./test[0-9]/.example.com`) live in the SAME
+  `(regex, subtree)` entry — the first as the subtree's own value, the second as a child of it.
+  Whichever arrives first OPENS the entry, so the second insert always lands on the dedup loop of
+  `insert_recursive`, whose leftmost case (`pos == 0`) returned `InsertResult::Existing`
+  unconditionally. That rested on the premise that a matched entry was necessarily built
+  value-bearing by `TrieNode::new`; the premise is false, because the deeper case (`pos > 0`)
+  opens the very same entry with a VALUELESS `TrieNode::root()`. Inserting the deeper domain and
+  then the leftmost one therefore stored nothing while reporting the host as already present,
+  leaving it permanently un-insertable. The reverse order always worked, which is why no existing
+  test caught it.
+  The two builds failed differently, and the release one silently. In a debug build the router's
+  post-insert reachability check turned a control-plane `AddHttpFrontend` into a worker panic —
+  `a freshly inserted tree domain must resolve to its inserted rule` — and again on every
+  `LoadState` replay. In a release build that check is compiled out, so `add_tree_rule` returned
+  `true`, `sozu frontend http add` reported OK and `sozu query frontends` listed the frontend,
+  while the trie never routed it: the control plane and the data plane diverged with no diagnostic
+  on either side.
+  The `pos == 0` arm now asks the subtree's own `key_value` slot through a small
+  `insert_own_value` helper — free slot takes the value (`Ok`), occupied slot is `Existing` — which
+  is the exact dual of the empty-key arm `remove_recursive` reaches for the same host. It
+  deliberately does NOT reroute through `insert_recursive`'s empty-`partial_key` arm even though
+  that is where removal's dual lives: on the insert side that arm is input validation for an empty
+  label, and taking it would make every leading-dot hostname (`.example.com`, `..`,
+  `./test[0-9]/.example.com`) insertable. That blast radius is not confined to routing:
+  `CertificateResolver::add_certificate` dry-runs every certificate name through a scratch
+  `TrieNode` and rejects on `InsertResult::Failed` (`lib/src/tls.rs:326-336`), so the same shortcut
+  would also have admitted a leading-dot TLS SNI certificate name. Taken literally it turns four
+  tests red, one of them `add_certificate_rejects_a_name_the_route_table_cannot_host`. Both
+  constraints are now pinned by tests, and the
+  surrounding comments that repeated the false `TrieNode::new` premise — in the dedup loop, in
+  `remove_recursive`, and in `lookup_mut` — have been corrected; the sibling `contains_key` arm
+  that answers `Existing` for a literal segment is sound for a different reason (dotted and
+  dotless child keys occupy disjoint key spaces) and now says so.
+  This is a pre-existing defect, not a regression: `insert_recursive` is byte-identical across the
+  changeset that fixed `remove_recursive` and `PathRule`'s `PartialEq`, which was scoped to
+  removal. It does supersede the parenthetical in the 2.x entry "pattern-trie arithmetic-underflow
+  panic on regex-leading hostnames", which described the `pos == 0` subtree as "already a
+  value-bearing leaf" — that underflow fix was correct, its justification was not.
+  **The next worker restart makes such a route live, and it requires no operator action.** Because
+  the release-build worker reported success, the main process kept the frontend in its authoritative
+  `ConfigState` — the pre-dispatch validation probes a fresh, empty `Router`
+  (`bin/src/command/requests.rs:2169-2181`), which cannot see an ordering conflict, and the
+  unacknowledged-add rollback only fires when no worker answers `Ok`
+  (`bin/src/command/requests.rs:2286`). That state is replayed into every worker at launch
+  (`ConfigState::generate_requests`, `command/src/state.rs:1702-1704`), walking a `BTreeMap` keyed
+  `{address};{hostname};P{path}` (`command/src/state.rs:120`, `command/src/request.rs:259-278`) — so
+  `/test[0-9]/.example.com` replays BEFORE `foo./test[0-9]/.example.com`, the insertion order that
+  always worked. The divergence therefore lasts exactly as long as the worker that took the adds in
+  the unlucky order: a worker upgrade, an automatic respawn or a full restart heals it on the fixed
+  build and on an older one alike, and upgrading is merely one way to restart rather than the thing
+  that activates the route. Operators who want such a frontend to stay dark must remove it, and
+  should confirm each candidate first — "listed but not serving traffic" cannot distinguish a route
+  dormant from this bug from one that is simply idle. A debug build panicked the worker instead of
+  reporting success, so nothing was recorded there and there is nothing to inherit.
+  Separately, `doc/configure.md` now documents regex hostname segments and, in one place, every case
+  where declaration order IS routing behaviour: `REGEX` and `EQUALS` path rules and overlapping regex
+  hostname segments all return on the FIRST match in declaration order, while only `PREFIX` path
+  rules are order-independent (longest wins; two that tie by differing solely on `method` resolve to
+  the last declared). The neighbouring claim that configuration order never affects routing was
+  false for all of those and has been corrected rather than narrowed.
+- **`docs(router)`: the documented path-rule precedence was wrong on two counts.** If you learned the
+  rule from `doc/configure.md`, re-read it: the "fixed precedence" list claimed that
+  `path_type = "EQUALS"` "wins first" over `path_type = "REGEX"`, and that several competing regexes
+  "produce undefined ordering between them". Neither is what the router does. `EQUALS` and `REGEX`
+  share one match arm in `Router::lookup` and the scan RETURNS on whichever matches first, so between
+  them the FIRST DECLARED wins — an exact-match rule does not outrank a pattern declared before it —
+  and competing regexes are not undefined but deterministically first-declared-wins. What the list
+  got right, and what is now stated as the only cross-type precedence, is that a matching `EQUALS` or
+  `REGEX` does beat a `PREFIX` rule in either declaration order, even a longer and more specific one,
+  because that same early return short-circuits the prefix accumulation. `PREFIX` against `PREFIX`
+  remains longest-wins and order-independent, with one exception now documented: two prefix rules can
+  tie on length only by carrying the same prefix string and differing on `method`, and the guard is
+  `size >= prefix_length`, so the LAST declared wins that tie.
+  The precedence is also `method`-dependent, which the old list did not mention and which inverts
+  two of the rules above. The short-circuit fires only on `MethodRuleResult::Equals`: an `EQUALS` or
+  `REGEX` rule declared WITHOUT a `method` does not return, it merely records the match with
+  `prefix_length = path_b.len()` and the scan continues. So among method-less rules the LAST declared
+  wins, not the first, and a `PREFIX` declared after one wins whenever its prefix covers the whole
+  request path (a shorter prefix does not displace it). `HttpFrontend.method` is an `Option<String>`
+  (`command/src/response.rs:38`) and both production sites build the rule with
+  `MethodRule::new(front.method.clone())` (`lib/src/router/mod.rs:260`, `:340`), so a frontend
+  declared without a method takes this path — it is the default shape, not an exotic one. A rule
+  carrying a matching `method` beats a method-less one in either declaration order.
+  None of this was pinned by a test, which is how the documentation drifted from the code. Nine
+  regression tests at the `Router` surface now pin every ordering above — each seen red under a
+  named one-character or one-statement mutation of the scan (`>=` to `>`, the longest-prefix guard
+  to a first-match guard, the early `return` lifted out of its match arm or added to its method-less
+  sibling, `prefix_length = path_b.len()` zeroed, and the trie's regex-segment scan reversed).
+  Dropping the early return, and reversing the segment scan, were each caught by no pre-existing test
+  at all. The tests take `method` as a parameter rather than a constant, across all THREE of its
+  values — matching, absent, and present-but-not-matching. Holding it fixed is precisely what let
+  earlier drafts of this documentation state the method-less behaviour backwards, and then the
+  method-mismatch behaviour backwards again, while every test stayed green.
+  Two further corrections to the same section, both measured. `MethodRuleResult::None` — a rule whose
+  `method` is set but does not match the request — removes that rule from the contest entirely,
+  before any path comparison: a LONGER `PREFIX` therefore loses to a shorter matching one (`/a` for
+  `GET` beats `/ab` for `POST` on `GET /abc`), and an equal-length tie goes to the FIRST declared,
+  not the last, because the later rule is skipped before the `size >= prefix_length` comparison is
+  reached. And the matched "request path" is the request-target as it arrives, query string included
+  — kawa's `parse_origin_form` yields `/index.html?k=v#h` verbatim — so a `PREFIX` that spans the
+  whole path of `GET /abc` does not span `GET /abc?x=1`, and the identical configuration routes the
+  opposite way; a `path_type = "EQUALS"` rule likewise does not match a request carrying a query
+  string at all.
+- **`docs(router)`: `path_type = "REGEX"` is not anchored, and the documentation said it was.**
+  `doc/configure.md` carried "REGEX is anchored at both ends (`\A...\z`) since v2.0.0" inside its
+  `path`/`path_type` section. That v2.0.0 work was regex HOSTNAME segments only.
+  `PathRule::from_config` compiles the configured value verbatim (`Regex::new(&rule.value)`) and
+  `regex::bytes::Regex::is_match` is a substring search, so a `path` regex matches anywhere in the
+  request path: the pattern `bc` matches `/abcd`. The documentation now says so, tells operators to
+  write their own anchors, and points at sozu#1350 for whether `path` regexes should be anchored —
+  a behaviour change, not a documentation fix, so it is not decided here. Today's behaviour is now
+  pinned by a test built through `PathRule::from_config`, so anchoring it later is a deliberate
+  change that turns a named test red rather than a silent one.
+  Regression-tested at the trie in both insertion orders, at the public `Router` surface asserting
+  `lookup` actually returns the rule, for removal of each host in both insertion and both removal
+  orders, and with a contract test that `add_tree_rule` never reports success for a rule it did not
+  store. Seen red in debug and, through an integration target, in release.
 - **`fix(pipe)`: stop dropping the READABLE event on a pipe-full `splice(2)` EAGAIN.**
   On `Protocol::TCP` listeners built with the `splice` feature, `splice_backend_readable` and
   `splice_readable` treated every `EAGAIN` from `splice_in` as a drained socket and cleared the
