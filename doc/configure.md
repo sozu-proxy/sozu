@@ -1404,19 +1404,91 @@ a rule does so depends on its `method` as much as its `path_type`:
    for `EQUALS` and `REGEX` rules declared **without** a `method` it resolves to
    last-declared-wins — the opposite of the case above.
 
-A `path_type = "REGEX"` pattern is **not anchored**. It is compiled verbatim
-(`Regex::new` on the configured value) and matched with `is_match`, so it
-matches anywhere in the request path: the pattern `bc` matches `/abcd`. The
-`\A...\z` anchoring introduced in v2.0.0 applies to regex *hostname* segments
-only — see "Regex hostname segments" below — and never to `path`. Write your own
-anchors if you need them (`^/abc$`). Whether `path` regexes should be anchored
-too is open as sozu#1350; until it is decided, assume unanchored.
+A `path_type = "REGEX"` pattern is **anchored at both ends**. The configured
+value is wrapped as `\A(?:…)\z` when the frontend is registered, so it must
+match the **whole** request path: the pattern `bc` does **not** match `/abcd`,
+and `/ab` does not match `/abcd` either. That is the same both-ends anchoring
+regex *hostname* segments have carried since v2.0.0 — see "Regex hostname
+segments" below. Every branch of an alternation is anchored, not just the first
+and last: `/a|/b` matches `/a` and `/b` and neither `/axx` nor `/xx/b`.
+
+**This is a behaviour change, and it narrows existing rules** (sozu#1350). Up to
+and including 2.2.1 the value was compiled verbatim and matched with `is_match`,
+which is a substring search, so every `REGEX` path rule also matched in the
+middle of a path. If you were relying on that, make the wildcards explicit —
+and put them on the side the pattern is **open** on:
+
+| the rule you have       | used to match     | after anchoring         | write instead                       |
+|-------------------------|-------------------|-------------------------|-------------------------------------|
+| `bc` (substring)        | `/abcd`           | only the path `bc`      | `.*bc.*`                            |
+| `/api` (prefix-shaped)  | `/api/v1`         | only `/api`             | `/api.*`, or `path_type = "PREFIX"` |
+| `\.js$` (suffix-shaped) | `/static/app.js`  | nothing a client sends  | `.*\.js$`                           |
+
+**The third row is the one that breaks silently, and a trailing `.*` does not
+fix it.** Extension routing — `\.js$`, `\.(js|css)$`, a trailing `/v1$` — is
+open at the *start*, so it needs a **leading** `.*`. Measured on this release:
+`\.js$` no longer matches `/static/app.js`, `\.(js|css)$` no longer matches
+`/a/b/style.css`, and `/v1$` no longer matches `/api/v1`. The remediation from
+the other two rows makes it no better — `\.js.*` still does not match
+`/static/app.js`, and `/v1.*` still does not match `/api/v1` — while
+`.*\.js$`, `.*\.(js|css)$` and `.*/v1$` all match again.
+
+An end-anchored pattern with nothing before it can now only match a path that
+*is* its own suffix. For `\.js$` that is the literal path `.js`, which no
+origin-form request-target ever is, since those begin with `/`: the rule stops
+matching anything a client can send. `/v1$` is less dramatic and no less
+broken — it still matches `/v1`, and no longer matches `/api/v1`.
+
+An empty `REGEX` value used as a catch-all matched every path and now matches
+only the empty path.
+
+The narrowing applies to **deny rules**, and that is where it bites hardest. A
+frontend with no `cluster_id`, and one carrying `redirect = "unauthorized"`,
+both answer 401 for the paths their rule matches, through the very same
+`path`/`path_type` matching. A loosely written `REGEX` deny that used to cover a
+whole family of paths now covers exactly one: a `REGEX` deny of `/admin` still
+denies `/admin`, but no longer denies `/admin/secret` or `/administrator` —
+those requests fall through to whatever else matches, which may be a frontend
+that serves them. **Audit every deny-shaped `REGEX` frontend before upgrading**
+and widen the ones meant as a subtree (`/admin.*`).
+
+Anchors written by hand keep working and are never stripped: in the `regex`
+crate's default mode `^` and `$` are exactly `\A` and `\z`, so an already
+anchored `^/abc$` is unchanged by the wrapping. A **half**-written one gains the
+anchor it was missing, and that cuts both ways. `^/abc` gains the end and stops
+matching `/abcd` — a narrowing. `\.js$` gains the **start** and stops matching
+every path that merely ends in `.js`; measured, `/static/app.js` no longer
+matches. That second direction is the destructive one, and it is the suffix row
+of the table above.
+
+A pattern that does not compile is still rejected at frontend registration, and
+anchoring never turns an invalid pattern into a valid one: the configured value
+is compiled on its own first, precisely so that the wrapper's own parentheses
+cannot balance an unbalanced pattern. The reverse is possible, though rare — a
+pattern that compiles bare can be **rejected** once wrapped, because the
+appended `)\z` has to survive whatever the pattern left open. Two measured
+cases: `(?x)/api/v1 # v1 only` compiles bare and fails wrapped with
+`error: unclosed group`, the appended `)` having landed inside the `#` comment
+that `(?x)` mode enables; and a 249-deep nested group compiles bare and fails
+wrapped with `error: exceed the maximum number of nested parentheses/brackets
+(250)`. Both surface like any other bad pattern — `RouterError::InvalidPathRule`
+at frontend registration, refused by the main process before any worker sees it,
+so the outcome is a loudly rejected frontend and never a silently mis-routing
+one.
 
 Throughout this section, **request path** means the request-target as it arrives
 on the wire, *including any query string*: a `GET /abc?x=1` is matched against
 `/abc?x=1`, not `/abc`. That bites `EQUALS` first — a `path_type = "EQUALS"`
-rule for `/abc` does **not** match a request carrying a query string — and it
-changes which rule wins in the whole-path case below.
+rule for `/abc` does **not** match a request carrying a query string — and now
+it bites `REGEX` the same way, because the pattern is anchored: a `REGEX` of
+`/abc` does not match `GET /abc?x=1` either. Append `.*` when the rule has to
+survive a query string — on the side the pattern is open on, per the table
+above. After a `$` it does nothing: measured, `^/abc$.*` does not match
+`/abc?x=1`. A suffix rule that must tolerate a query string has to spell it
+out, `.*\.js([?].*)?`, which matches `/static/app.js` and `/static/app.js?v=2`
+and not `/static/app.json`. That last point is not new — `\.js$` did not match
+`/static/app.js?v=2` before this release either. It also changes which rule
+wins in the whole-path case below.
 
 `method` is optional on a frontend, so tier 2 is the default shape unless you
 set one; declaration order is load-bearing in more cases than it looks. See
@@ -1477,8 +1549,17 @@ the exact case the client sends. So:
   request path — query string included, per the definition above. A shorter
   prefix leaves it standing, and so does the *same* prefix once the request
   carries a query string: `/abc` covers all of `GET /abc`, but not of
-  `GET /abc?x=1`, so adding `?x=1` to the request flips the winner back to the
-  regex with no configuration change at all.
+  `GET /abc?x=1`, so adding `?x=1` to the request can flip the winner back to
+  the regex with no configuration change at all. **Since path regexes are
+  anchored, that flip now needs the regex to span the query string too** — it
+  is a property of the regex, not of the query string. Measured with both rules
+  declared method-less: with the regex `/a.*`, `GET /abc` goes to the prefix and
+  `GET /abc?x=1` flips to the regex, as it always did. With the regex `/abc`,
+  which after anchoring does not match `/abc?x=1` at all, **both** requests go
+  to the prefix — the prefix still matches as a prefix, it has merely lost its
+  rival, so adding `?x=1` changes nothing. The regex does not simply lose here,
+  it stops being a candidate: declared alone, `/abc` answers `GET /abc` and
+  leaves `GET /abc?x=1` unrouted.
 - **`PREFIX`** — among the rules whose `method` matches the request, the
   **longest match wins**, whatever the declaration order. The qualifier is
   load-bearing: a rule whose `method` is set but does **not** match the request
@@ -1510,8 +1591,10 @@ optional on a frontend, that is the default shape unless you set one.
 
 The table's third row is the fragile one. It holds for `GET /abc` and inverts
 for `GET /abc?x=1`, where the prefix no longer spans the request path and the
-regex wins instead. Read "whole path" as "the entire request-target the client
-sent", not as the path you wrote in the configuration file.
+regex wins instead — the table's `/a.*` spans the query string, which is what
+lets it win; a regex that does not is the case covered in the bullet above.
+Read "whole path" as "the entire request-target the client sent", not as the
+path you wrote in the configuration file.
 
 Keep overlapping `REGEX`/`EQUALS` path rules either mutually exclusive or
 deliberately ordered. "Most specific first" is the right instinct only for rules

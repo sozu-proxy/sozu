@@ -1041,10 +1041,61 @@ impl PathRule {
         }
     }
 
+    /// Compile a configured `path_type = "REGEX"` value anchored at both ends,
+    /// so it matches the WHOLE request path and nothing else — the behaviour
+    /// `doc/configure.md` has documented since v2.0.0 and the code did not
+    /// implement (sozu#1350). `regex::bytes::Regex::is_match` is a substring
+    /// search, so the previous bare `Regex::new(&rule.value)` let `bc` match
+    /// `/abcd`.
+    ///
+    /// `\A` … `\z` is the form the hostname side already uses, in
+    /// [`convert_regex_domain_rule`] and in `pattern_trie.rs`'s
+    /// `format!("\\A{s}\\z")` at segment-insert time.
+    ///
+    /// The non-capturing group is NOT decoration, and is the one place this
+    /// deliberately goes further than the hostname sites: `|` binds looser
+    /// than concatenation, so the ungrouped `\Aa|b\z` parses as
+    /// `(\Aa)|(b\z)` and each branch keeps only one anchor — measured, it
+    /// still matches `axx`. `\A(?:a|b)\z` does not. `(?:` … `)` is
+    /// non-capturing, so `captures_len` and therefore every `$PATH[n]`
+    /// rewrite index are unchanged.
+    ///
+    /// The configured value is compiled ON ITS OWN first and only a value
+    /// that compiles is wrapped. The wrapper supplies one `(` and one `)`, so
+    /// an unbalanced pattern can be balanced BY the wrapping: `a)(b` is
+    /// rejected by `Regex::new`, yet `\A(?:a)(b)\z` compiles and matches
+    /// `ab`. Without the first compile, anchoring would silently promote a
+    /// rule the router rejects today into a live rule matching something the
+    /// operator never wrote.
+    ///
+    /// This closes invalid-becomes-valid only. The opposite direction is NOT
+    /// closed and is not claimed to be: a pattern that compiles bare can be
+    /// rejected once wrapped, because the appended `)\z` has to survive
+    /// whatever the pattern left open. Measured: `(?x)/api/v1 # v1 only`
+    /// compiles bare and fails wrapped with `unclosed group` — `(?x)` enables
+    /// `#` comments, and the appended `)` lands inside one — and a 249-deep
+    /// nested group compiles bare and fails wrapped against the crate's
+    /// 250-nesting limit. Both land in the `None` arm of `from_config` and
+    /// surface as [`RouterError::InvalidPathRule`] at frontend registration,
+    /// which `bin/src/command/requests.rs`'s `validate_frontend_request` runs
+    /// through this very same `add_http_front` before fanning out: the
+    /// frontend is refused loudly and identically in main and worker, never
+    /// silently mis-routed.
+    ///
+    /// Anchors the operator wrote by hand are harmless and are left alone:
+    /// `regex`'s `^`/`$` are `\A`/`\z` in the default (non-multi-line) mode —
+    /// `$` does not match before a trailing `\n` — so the repeated zero-width
+    /// assertions in `\A(?:^/abc$)\z` collapse. Measured: that pattern matches
+    /// `/abc` and not `/xabcd`, exactly as `\A(?:/abc)\z` does.
+    fn anchored_regex(value: &str) -> Option<Regex> {
+        Regex::new(value).ok()?;
+        Regex::new(&format!("\\A(?:{value})\\z")).ok()
+    }
+
     pub fn from_config(rule: CommandPathRule) -> Option<Self> {
         match PathRuleKind::try_from(rule.kind) {
             Ok(PathRuleKind::Prefix) => Some(PathRule::Prefix(rule.value)),
-            Ok(PathRuleKind::Regex) => Regex::new(&rule.value).ok().map(PathRule::Regex),
+            Ok(PathRuleKind::Regex) => Self::anchored_regex(&rule.value).map(PathRule::Regex),
             Ok(PathRuleKind::Equals) => Some(PathRule::Equals(rule.value)),
             Err(_) => None,
         }
@@ -4222,31 +4273,1050 @@ mod tests {
         );
     }
 
-    /// `path_type = "REGEX"` is NOT anchored. `PathRule::from_config` compiles
-    /// the configured value verbatim and `regex::bytes::Regex::is_match` is a
-    /// substring search, so a pattern matches anywhere in the request path.
-    /// `doc/configure.md` used to claim the `\A...\z` anchoring of v2.0.0
-    /// applied here; that work was hostname-segment only. Whether path regexes
-    /// SHOULD be anchored is open as sozu#1350 — this test pins today's
-    /// behaviour so the answer is a deliberate change, not a silent one.
-    ///
-    /// The rule is built through `PathRule::from_config`, the path every
-    /// configured frontend takes, so anchoring there is what this pins.
-    ///
-    /// To SEE THIS RED: anchor in `PathRule::from_config` — replace
-    /// `Regex::new(&rule.value)` with
-    /// `Regex::new(&format!("\\A{}\\z", rule.value))`. The assertion then fails
-    /// with `left: None, right: Some("SUBSTRING")`.
-    #[test]
-    fn a_path_regex_is_unanchored_and_matches_anywhere_in_the_request_path() {
-        let rule = PathRule::from_config(CommandPathRule::regex("bc".to_owned()))
-            .expect("a valid regex path rule must build");
+    /// Declare one regex path rule built the way a configured frontend builds
+    /// it — through `PathRule::from_config`, which is where the anchoring
+    /// lives — and resolve `path`.
+    fn regex_rule_routes(pattern: &str, path: &str) -> Option<String> {
+        let rule = PathRule::from_config(CommandPathRule::regex(pattern.to_owned()))
+            .unwrap_or_else(|| panic!("the regex path rule {pattern:?} must build"));
         let mut router = Router::new();
-        assert!(add_path_rule(&mut router, rule, GET, "SUBSTRING"));
+        assert!(add_path_rule(&mut router, rule, GET, "REGEX"));
+        routed_cluster(&router, path)
+    }
+
+    /// Resolve a table of `(pattern, request path, must route)` triples
+    /// through [`regex_rule_routes`]. Each row names itself in the failure
+    /// message, so a red run says which triple broke rather than which
+    /// assertion index did.
+    fn assert_regex_routing(cases: &[(&str, &str, bool)]) {
+        let verdict = |routes: bool| if routes { "match" } else { "no match" };
+        for &(pattern, path, must_route) in cases {
+            let routes = regex_rule_routes(pattern, path).is_some();
+            assert_eq!(
+                routes,
+                must_route,
+                "path regex {pattern:?} against request path {path:?}: \
+                 expected {}, measured {}",
+                verdict(must_route),
+                verdict(routes),
+            );
+        }
+    }
+
+    /// `path_type = "REGEX"` is anchored at both ends: the configured pattern
+    /// must match the WHOLE request path, not a substring of it.
+    ///
+    /// This test is the INVERSION of
+    /// `a_path_regex_is_unanchored_and_matches_anywhere_in_the_request_path`,
+    /// added by #1352 to pin the opposite. That test was correct about the
+    /// code and is now deliberately obsolete: sozu#1350 asked whether
+    /// `doc/configure.md` (which has promised `\A...\z` since v2.0.0) or
+    /// `PathRule::from_config` (a bare `Regex::new` against the substring
+    /// search `regex::bytes::Regex::is_match`) was the thing to change, and
+    /// the answer was the code. The old test's own comment said it existed so
+    /// that the answer would be "a deliberate change, not a silent one" —
+    /// this is that deliberate change, kept visible by rewriting the test
+    /// rather than deleting it.
+    ///
+    /// `bc` matching `/abcd` is sozu#1350's own example, so it is the case
+    /// kept here.
+    ///
+    /// To SEE THIS RED: remove the anchoring in `PathRule::anchored_regex` —
+    /// make the body `Regex::new(value).ok()`. The first assertion then fails
+    /// with `left: Some("REGEX"), right: None`.
+    #[test]
+    fn a_path_regex_is_anchored_at_both_ends_and_must_match_the_whole_request_path() {
         assert_eq!(
-            routed_cluster(&router, "/abcd").as_deref(),
-            Some("SUBSTRING"),
-            "an unanchored path regex must match in the middle of the request path",
+            regex_rule_routes("bc", "/abcd"),
+            None,
+            "an anchored path regex must not match in the middle of the request path",
+        );
+        assert_eq!(
+            regex_rule_routes("/ab[cd]", "/abc").as_deref(),
+            Some("REGEX"),
+            "a regex spanning the whole request path must still match",
+        );
+        assert_eq!(
+            regex_rule_routes("/ab[cd]", "/abcd"),
+            None,
+            "the trailing `\\z` must reject a longer path with a matching head",
+        );
+        assert_eq!(
+            regex_rule_routes("/ab[cd]", "/x/abc"),
+            None,
+            "the leading `\\A` must reject a path with a matching tail",
+        );
+
+        // The matched "request path" is the request-target as it arrives,
+        // query string included, so anchoring bites a query string the way it
+        // already bit `path_type = "EQUALS"` — the consequence
+        // `doc/configure.md` now states.
+        assert_eq!(
+            regex_rule_routes("/ab[cd]", "/abc?x=1"),
+            None,
+            "an anchored regex must not match a path carrying a query string \
+             unless the pattern accounts for it",
+        );
+        assert_eq!(
+            regex_rule_routes("/ab[cd].*", "/abc?x=1").as_deref(),
+            Some("REGEX"),
+            "appending `.*` is what makes such a rule survive a query string",
+        );
+    }
+
+    /// The narrowing reaches the degenerate pattern too: an empty `REGEX`
+    /// value compiles (it always has) and used to match every request path,
+    /// because an empty match at offset 0 is a match. Anchored, it matches the
+    /// empty path and nothing else. An operator using `path_type = "REGEX"`
+    /// with an empty `path` as a catch-all loses every request to it.
+    ///
+    /// To SEE THIS RED: remove the anchoring in `PathRule::anchored_regex` —
+    /// make the body `Regex::new(value).ok()`. The assertion then fails with
+    /// `left: Some("REGEX"), right: None`.
+    #[test]
+    fn an_empty_path_regex_no_longer_matches_every_request_path() {
+        assert!(
+            Regex::new("").is_ok(),
+            "the empty pattern must stay a VALID regex — this test is about \
+             what it matches, not about rejecting it",
+        );
+        assert_eq!(
+            regex_rule_routes("", "/abcd"),
+            None,
+            "an anchored empty path regex must not match a non-empty path",
+        );
+        // "matched every path", measured against the BARE regex of 2.2.1 — a
+        // control. An empty match at offset 0 is a match, so `is_match`
+        // succeeded on every input; that is what made an empty `REGEX` value
+        // usable as a catch-all in the first place.
+        let bare_empty = Regex::new("").expect("the empty pattern compiles");
+        for every_path in ["/anything", "/abcd", "/", ""] {
+            assert!(
+                bare_empty.is_match(every_path.as_bytes()),
+                "up to 2.2.1 the unwrapped empty pattern matched {every_path:?}, \
+                 as it matched every path",
+            );
+        }
+
+        assert_eq!(
+            regex_rule_routes("", "").as_deref(),
+            Some("REGEX"),
+            "\"matches only the empty path\" is half a claim without the path \
+             it does still match",
+        );
+    }
+
+    /// Anchors an operator wrote by hand keep working, and are neither
+    /// detected nor stripped: `regex`'s `^`/`$` ARE `\A`/`\z` outside
+    /// multi-line mode, so the repeated zero-width assertions in
+    /// `\A(?:^/abc$)\z` collapse to one at each end. Measured rather than
+    /// assumed — that is what the pattern-string assertion below pins.
+    ///
+    /// The third case is the one that changes: a HALF-anchored pattern
+    /// (`^/abc`, start only) used to match `/abcd` and no longer does. An
+    /// operator who wrote the leading anchor on the strength of the old
+    /// unanchored behaviour gets the missing end supplied for them.
+    ///
+    /// To SEE THIS RED: remove the anchoring in `PathRule::anchored_regex` —
+    /// make the body `Regex::new(value).ok()`. The half-anchored case then
+    /// fails with `left: Some("REGEX"), right: None`, and the pattern-string
+    /// assertion fails too. To see ONLY the pattern-string assertion red,
+    /// strip a leading `^`/`\A` and a trailing `$`/`\z` from `value` before
+    /// wrapping it.
+    #[test]
+    fn a_hand_written_path_anchor_is_kept_and_double_anchoring_is_harmless() {
+        for hand_anchored in ["^/abc$", "\\A/abc\\z", "^/abc"] {
+            assert_eq!(
+                regex_rule_routes(hand_anchored, "/abc").as_deref(),
+                Some("REGEX"),
+                "{hand_anchored} must still match the path it was written for",
+            );
+            assert_eq!(
+                regex_rule_routes(hand_anchored, "/abcd"),
+                None,
+                "{hand_anchored} must not match a longer path",
+            );
+            assert_eq!(
+                regex_rule_routes(hand_anchored, "/x/abc"),
+                None,
+                "{hand_anchored} must not match a path with a matching tail",
+            );
+        }
+
+        assert_eq!(
+            PathRule::anchored_regex("^/abc$")
+                .expect("a hand-anchored pattern must compile")
+                .as_str(),
+            "\\A(?:^/abc$)\\z",
+            "the configured value is wrapped verbatim; no anchor is stripped",
+        );
+
+        // `CHANGELOG.md` and `PathRule::anchored_regex` both quote `/xabcd`
+        // as the path `\A(?:^/abc$)\z` must not match. It is a positive
+        // control rather than a reddenable row — `^/abc$` excludes it with or
+        // without the wrapping — but the quoted example was asserted nowhere.
+        assert_eq!(
+            regex_rule_routes("^/abc$", "/xabcd"),
+            None,
+            "the example `CHANGELOG.md` quotes verbatim must hold",
+        );
+
+        // The load-bearing half of "`^`/`$` ARE `\A`/`\z`": in the `regex`
+        // crate's default mode `$` is `\z` and NOT `\Z`, so it does not
+        // match before a trailing `\n`. Were it `\Z`, the claim that an
+        // already-anchored `^/abc$` is unchanged by the wrapping would be
+        // false for exactly one input — a path ending in a newline. Whether a
+        // client can drive such a request-target past the parser is NOT
+        // established here, and deliberately so: the wrapping claim has to
+        // hold on the bytes the router is handed, whatever produced them.
+        // Measured against the crate directly, so it is a control.
+        assert!(
+            !Regex::new("^/abc$")
+                .expect("the hand-anchored pattern compiles")
+                .is_match(b"/abc\n"),
+            "`$` must be `\\z` and not `\\Z`, or wrapping a hand-anchored \
+             pattern would not be the no-op this test claims",
+        );
+        assert_eq!(
+            regex_rule_routes("^/abc$", "/abc\n"),
+            None,
+            "and the wrapped rule must agree with it",
+        );
+    }
+
+    /// The anchoring wraps the configured value in a NON-CAPTURING GROUP, and
+    /// that group is load-bearing: `|` binds looser than concatenation, so the
+    /// ungrouped `\A/a|/b\z` parses as `(\A/a)|(/b\z)` and leaves each branch
+    /// anchored at one end only. `/a` would still match `/axx`.
+    ///
+    /// Two branches only ever exercise the FIRST and LAST branch, so the
+    /// three-branch case below is what makes `doc/configure.md`'s "every
+    /// branch […] not just the first and last" a testable sentence: ungrouped,
+    /// a MIDDLE branch keeps neither anchor and matches as a bare substring
+    /// anywhere in the path — worse than the half-anchored ends.
+    ///
+    /// This is the one point where the path side deliberately goes further
+    /// than the hostname sites (`convert_regex_domain_rule`, and
+    /// `pattern_trie.rs`'s `format!("\\A{s}\\z")` feeding
+    /// `regexp.is_match(segment)` at `pattern_trie.rs:575`), which wrap
+    /// ungrouped and carry the same gap. Measured on this tree: the hostname
+    /// `/a|b/.example.com` matches `axx.example.com` AND `xxb.example.com`.
+    /// That is the hostname path's own defect, with its own operator impact,
+    /// and is deliberately NOT changed here.
+    ///
+    /// To SEE THIS RED: drop the group in `PathRule::anchored_regex` — wrap as
+    /// `format!("\\A{value}\\z")`, the ungrouped hostname form. The `/axx`
+    /// assertion then fails with `left: Some("REGEX"), right: None`; with the
+    /// two-branch rows removed, the three-branch table fails on
+    /// `"/a|/b|/c"` against `"zzz/bzzz"` with `left: true, right: false`, the
+    /// middle branch matching in the middle of the path.
+    #[test]
+    fn every_branch_of_an_alternating_path_regex_is_anchored() {
+        for whole in ["/a", "/b"] {
+            assert_eq!(
+                regex_rule_routes("/a|/b", whole).as_deref(),
+                Some("REGEX"),
+                "{whole} is a whole-path match for one branch and must route",
+            );
+        }
+        assert_eq!(
+            regex_rule_routes("/a|/b", "/axx"),
+            None,
+            "the first branch must be anchored at its END too",
+        );
+        assert_eq!(
+            regex_rule_routes("/a|/b", "/xx/b"),
+            None,
+            "the last branch must be anchored at its START too",
+        );
+        assert_eq!(
+            PathRule::anchored_regex("/a|/b")
+                .expect("an alternation must compile")
+                .captures_len(),
+            1,
+            "the wrapping group must be non-capturing, so `$PATH[n]` indices \
+             are untouched",
+        );
+
+        // The exact wrapper string, so "grouped" is asserted and not merely
+        // implied by the three routing verdicts above.
+        assert_eq!(
+            PathRule::anchored_regex("/a|/b")
+                .expect("an alternation must compile")
+                .as_str(),
+            "\\A(?:/a|/b)\\z",
+            "the wrapper must be the NON-capturing group form",
+        );
+
+        // The control for all of the above, built by hand against the `regex`
+        // crate rather than through `anchored_regex`: the UNGROUPED wrapper —
+        // the form the hostname sites use — parses as `(\A/a)|(/b\z)` and
+        // still matches `/axx`. No mutation of `anchored_regex` can move this
+        // assertion, which is the point: it measures why the group is there.
+        let ungrouped = Regex::new("\\A/a|/b\\z").expect("the ungrouped wrapper compiles");
+        assert!(
+            ungrouped.is_match(b"/axx"),
+            "{} leaves the first branch anchored at its start only",
+            ungrouped.as_str(),
+        );
+        assert!(
+            ungrouped.is_match(b"/xx/b"),
+            "{} leaves the last branch anchored at its end only",
+            ungrouped.as_str(),
+        );
+
+        // Two branches cannot show what `doc/configure.md` actually claims —
+        // "every branch of an alternation is anchored, NOT JUST THE FIRST AND
+        // LAST" — because with two branches there is no other kind. A third
+        // branch has one, and it is strictly worse than the half-anchored
+        // ends above: ungrouped, the MIDDLE branch keeps NEITHER anchor, so
+        // `/b` matches as a bare substring anywhere in the path. Control,
+        // measured against the crate.
+        let three = Regex::new("\\A/a|/b|/c\\z").expect("the ungrouped wrapper compiles");
+        for anywhere in ["zzz/bzzz", "/xx/b/yy", "xx/byy"] {
+            assert!(
+                three.is_match(anywhere.as_bytes()),
+                "{} leaves the MIDDLE branch unanchored at BOTH ends, so it \
+                 matches {anywhere} anywhere in the path",
+                three.as_str(),
+            );
+        }
+
+        // The grouped form the router actually builds refuses all three, and
+        // still matches each branch whole. This half IS production.
+        assert_regex_routing(&[
+            ("/a|/b|/c", "/a", true),
+            ("/a|/b|/c", "/b", true),
+            ("/a|/b|/c", "/c", true),
+            ("/a|/b|/c", "zzz/bzzz", false),
+            ("/a|/b|/c", "/xx/b/yy", false),
+            ("/a|/b|/c", "xx/byy", false),
+            ("/a|/b|/c", "/axx", false),
+            ("/a|/b|/c", "/xx/c", false),
+        ]);
+        assert_eq!(
+            PathRule::anchored_regex("/a|/b|/c")
+                .expect("a three-branch alternation must compile")
+                .as_str(),
+            "\\A(?:/a|/b|/c)\\z",
+            "a middle branch needs the group as much as the outer two do",
+        );
+    }
+
+    /// Anchoring must not rescue a pattern the router rejects today. The
+    /// wrapper supplies one `(` and one `)`, so an unbalanced value can be
+    /// balanced BY the wrapping — `a)(b` is not a regex, yet `\A(?:a)(b)\z`
+    /// is, and it matches `ab`. `PathRule::anchored_regex` therefore compiles
+    /// the configured value on its own before wrapping it.
+    ///
+    /// This test covers that one direction. The converse is NOT guarded and
+    /// is not asserted here: wrapping can reject a pattern that compiles
+    /// bare, measured on `(?x)/api/v1 # v1 only` (the appended `)` lands in
+    /// the `#` comment `(?x)` enables) and on a 249-deep nested group (the
+    /// crate's 250-nesting limit). Both are refused at frontend registration
+    /// as [`RouterError::InvalidPathRule`], so they cost a loud rejection and
+    /// not a mis-route — see `PathRule::anchored_regex`.
+    ///
+    /// To SEE THIS RED: delete the `Regex::new(value).ok()?;` validation line
+    /// in `PathRule::anchored_regex`. The `a)(b` assertion then fails — the
+    /// rule builds, and matches `ab`.
+    #[test]
+    fn anchoring_never_turns_a_rejected_path_regex_into_an_accepted_one() {
+        // The hazard is real, not hypothetical. Both patterns are assembled
+        // at run time rather than written as literals because
+        // `clippy::invalid_regex` rejects an invalid literal at a `Regex::new`
+        // call site — and the invalidity is the whole point here, so the
+        // literal is what moves, not the lint.
+        let unbalanced = format!("a{}b", ")(");
+        assert!(
+            Regex::new(&unbalanced).is_err(),
+            "{unbalanced:?} must be an invalid regex for this test to mean anything",
+        );
+        let wrapped = Regex::new(&format!("\\A(?:{unbalanced})\\z")).expect(
+            "the wrapped form of the unbalanced pattern compiles — that balancing \
+             is what the pre-validation exists to defeat",
+        );
+        assert!(
+            wrapped.is_match(b"ab"),
+            "{} matches `ab`, which the operator never wrote",
+            wrapped.as_str(),
+        );
+
+        for invalid in [unbalanced.as_str(), "(", ")", "[a-", "*"] {
+            assert_eq!(
+                PathRule::from_config(CommandPathRule::regex(invalid.to_owned())),
+                None,
+                "{invalid:?} must stay rejected once the value is anchored",
+            );
+        }
+    }
+
+    /// Anchoring narrows `Route::Deny` exactly as it narrows a forward, and
+    /// that is the dangerous edge of the change: a deny rule written loosely
+    /// stops covering the family of paths it used to cover. `/admin` denied
+    /// `/admin`, `/admin/secret` and `/administrator`; anchored it denies
+    /// `/admin` alone and the rest fall through to whatever else matches.
+    ///
+    /// Both rules carry a matching `method`, so the deny is tier 1 in
+    /// `doc/configure.md`'s precedence list and ends the scan when it matches
+    /// — the fall-through below is the deny genuinely not matching, not the
+    /// prefix outranking it.
+    ///
+    /// To SEE THIS RED: remove the anchoring in `PathRule::anchored_regex` —
+    /// make the body `Regex::new(value).ok()`. Both fall-through assertions
+    /// then fail with `left: None, right: Some("FALLBACK")`.
+    #[test]
+    fn anchoring_narrows_a_deny_path_regex_to_the_exact_path() {
+        let mut router = Router::new();
+        let deny = PathRule::from_config(CommandPathRule::regex("/admin".to_owned()))
+            .expect("the deny regex path rule must build");
+        assert!(router.add_tree_rule(
+            b"www.example.com",
+            &deny,
+            &MethodRule::new(Some("GET".to_owned())),
+            &Route::Deny,
+        ));
+        assert!(add_path_rule(
+            &mut router,
+            PathRule::Prefix("/".to_owned()),
+            GET,
+            "FALLBACK",
+        ));
+
+        let resolve = |path: &str| {
+            router
+                .lookup("www.example.com", path, &Method::Get)
+                .expect("every path below is covered by the `/` prefix rule")
+        };
+
+        let denied = resolve("/admin");
+        assert_eq!(
+            denied.redirect,
+            RedirectPolicy::Unauthorized,
+            "the exact path the deny regex spells must still be denied",
+        );
+        assert_eq!(denied.cluster_id, None);
+
+        for still_reaching_the_backend in ["/admin/secret", "/administrator"] {
+            let result = resolve(still_reaching_the_backend);
+            assert_eq!(
+                result.cluster_id.as_deref(),
+                Some("FALLBACK"),
+                "BREAKING: the anchored deny no longer covers \
+                 {still_reaching_the_backend}, which now reaches the backend",
+            );
+            assert_eq!(result.redirect, RedirectPolicy::Forward);
+        }
+    }
+
+    /// `doc/configure.md`'s remediation table, rows one and two: a
+    /// SUBSTRING-shaped or PREFIX-shaped pattern narrows to the exact path it
+    /// spells, and a TRAILING `.*` is what gives it back — those two shapes
+    /// are open at the END, so that is the side the wildcard goes on.
+    ///
+    /// `bc` against `/abcd` is sozu#1350's own example and is pinned whole in
+    /// `a_path_regex_is_anchored_at_both_ends_and_must_match_the_whole_request_path`;
+    /// it is repeated here as the table's first row, beside its remediation.
+    /// The table answers the prefix-shaped row twice, with `.*` or with
+    /// `path_type = "PREFIX"`; only the regex answer is a regex claim, so only
+    /// that one is asserted.
+    ///
+    /// To SEE THIS RED: remove the anchoring in `PathRule::anchored_regex` —
+    /// make the body `Regex::new(value).ok()`. Every narrowing row below flips
+    /// to a match; the first failure is `"bc"` against `"/abcd"`.
+    #[test]
+    fn a_substring_or_prefix_shaped_path_regex_narrows_to_the_path_it_spells() {
+        assert_regex_routing(&[
+            // What the two shapes lose.
+            ("bc", "/abcd", false),
+            ("/ab", "/abcd", false),
+            ("/api", "/api/v1", false),
+            // …and what they keep: the path they spell whole.
+            ("/api", "/api", true),
+            // The table says `bc` now matches "only the path `bc`"; that is
+            // two claims, and this is the half the narrowing rows do not
+            // cover.
+            ("bc", "bc", true),
+            // The documented remediation, on the side each pattern is open on.
+            (".*bc.*", "/abcd", true),
+            ("/api.*", "/api/v1", true),
+            ("/api.*", "/api", true),
+        ]);
+
+        // The table's "used to match" column, measured. These go through the
+        // BARE, unwrapped regex — the 2.2.1 code — so they are controls: no
+        // mutation of `anchored_regex` can move them, and that is exactly
+        // what makes them evidence for what the release took away. Without
+        // them the whole first column is prose.
+        for (pattern, used_to_match) in [("bc", "/abcd"), ("/api", "/api/v1")] {
+            assert!(
+                Regex::new(pattern)
+                    .expect("the bare pattern compiles")
+                    .is_match(used_to_match.as_bytes()),
+                "up to 2.2.1 the unwrapped {pattern:?} matched {used_to_match:?} \
+                 as a substring — that is the behaviour this release removes",
+            );
+        }
+    }
+
+    /// **The row that breaks silently.** A SUFFIX-shaped pattern is open at
+    /// the START, so it needs a LEADING `.*`; the trailing one that answers
+    /// the substring and prefix shapes does nothing for it. Extension routing
+    /// is plausibly the commonest real use of a path regex, and it does not
+    /// narrow — it stops matching.
+    ///
+    /// Every verdict below is `doc/configure.md`'s third table row and the two
+    /// paragraphs under it, measured.
+    ///
+    /// To SEE THIS RED: remove the anchoring in `PathRule::anchored_regex` —
+    /// make the body `Regex::new(value).ok()`. `"\.js$"` against
+    /// `"/static/app.js"` fails first, and every other `false` row above the
+    /// leading-`.*` ones fails with it.
+    #[test]
+    fn a_suffix_shaped_path_regex_needs_a_leading_wildcard_not_a_trailing_one() {
+        assert_regex_routing(&[
+            // The three the documentation names, all silently dead.
+            (r"\.js$", "/static/app.js", false),
+            (r"\.(js|css)$", "/a/b/style.css", false),
+            ("/v1$", "/api/v1", false),
+            // `/v1$` is the less dramatic half: it still matches its own path.
+            ("/v1$", "/v1", true),
+            // The trailing `.*` that rescues the other two shapes does NOT
+            // rescue this one.
+            (r"\.js.*", "/static/app.js", false),
+            ("/v1.*", "/api/v1", false),
+            // The leading one does.
+            (r".*\.js$", "/static/app.js", true),
+            (r".*\.(js|css)$", "/a/b/style.css", true),
+            (".*/v1$", "/api/v1", true),
+        ]);
+
+        // "…matches nothing a client can send": an end-anchored pattern with
+        // nothing in front of it can only match a path that IS its own
+        // suffix, which for `\.js$` is the literal path `.js`. An origin-form
+        // request-target always begins with `/`, so no client can send it.
+        assert_regex_routing(&[(r"\.js$", ".js", true)]);
+
+        // The table's third "used to match" cell, measured against the BARE
+        // regex of 2.2.1 — a control, like the two in
+        // `a_substring_or_prefix_shaped_path_regex_narrows_to_the_path_it_spells`.
+        // This is the cell that matters most: it is the one whose loss is
+        // silent.
+        assert!(
+            Regex::new(r"\.js$")
+                .expect("the bare suffix pattern compiles")
+                .is_match(b"/static/app.js"),
+            "up to 2.2.1 the unwrapped `\\.js$` DID match `/static/app.js` — \
+             losing that is the silent break this release documents",
+        );
+        for origin_form in ["/", "/.js", "/app.js", "/static/app.js"] {
+            assert!(
+                regex_rule_routes(r"\.js$", origin_form).is_none(),
+                "an origin-form request-target begins with `/`, and {origin_form} \
+                 must not match the end-anchored `\\.js$`",
+            );
+        }
+    }
+
+    /// **The `$PATH[n]` regression test.** The anchoring group is `(?:` … `)`
+    /// and not `(` … `)` precisely so it adds no capture. `Router::lookup`
+    /// collects path captures as `caps.iter().skip(1)` and `Frontend::new`
+    /// sizes the buffer from `PathRule::Regex(regex) => regex.captures_len()`,
+    /// so a CAPTURING wrapper would bump that cap and shift every configured
+    /// `$PATH[n]` by one: a frontend asking for its first group would start
+    /// receiving the whole request path, and keep serving traffic while doing
+    /// it. This is the one property here that corrupts silently rather than
+    /// stops matching.
+    ///
+    /// Asserted three ways: `captures_len()` parity against the bare pattern
+    /// for zero, one and two groups; end to end, that `rewrite_path` of
+    /// `$PATH[1]` still receives the first group's text; and that the CAP
+    /// itself did not grow, by pinning that a `$PATH[n]` one past the last
+    /// group the operator wrote is still refused.
+    ///
+    /// To SEE THIS RED: make the wrapper capturing in
+    /// `PathRule::anchored_regex` — `format!("\\A({value})\\z")`. The parity
+    /// assertion fails first with `left: 2, right: 1` on the group-less
+    /// pattern; with that loop deleted the rewrite yields `/api/v2/users`
+    /// instead of `v2`, and the out-of-range `$PATH[2]` registers instead of
+    /// being refused.
+    #[test]
+    fn the_anchoring_group_is_non_capturing_so_path_rewrite_indices_do_not_shift() {
+        for pattern in ["/api/v2/.*", "/api/(v[0-9]+)/.*", "/api/(v[0-9]+)/(.*)"] {
+            let bare = Regex::new(pattern).expect("the bare pattern must compile");
+            let anchored =
+                PathRule::anchored_regex(pattern).expect("the anchored pattern must compile");
+            assert_eq!(
+                anchored.captures_len(),
+                bare.captures_len(),
+                "anchoring {pattern:?} must not add a capture group",
+            );
+        }
+
+        let rewriting_frontend = |pattern: &str, rewrite: &str| {
+            let mut front = test_http_frontend();
+            front.hostname = "www.example.com".to_owned();
+            front.path = CommandPathRule::regex(pattern.to_owned());
+            front.rewrite_path = Some(rewrite.to_owned());
+            front
+        };
+        let rewritten = |pattern: &str, rewrite: &str, path: &str| {
+            let mut router = Router::new();
+            router
+                .add_http_front(&rewriting_frontend(pattern, rewrite))
+                .expect("the rewriting frontend must register");
+            router
+                .lookup("www.example.com", path, &Method::Get)
+                .expect("the request must route")
+                .rewritten_path
+        };
+
+        assert_eq!(
+            rewritten("/api/(v[0-9]+)/.*", "$PATH[1]", "/api/v2/users").as_deref(),
+            Some("v2"),
+            "`$PATH[1]` must still be the FIRST group the operator wrote, not \
+             the anchoring wrapper",
+        );
+        assert_eq!(
+            rewritten("/api/(v[0-9]+)/(.*)", "/$PATH[2]", "/api/v2/users").as_deref(),
+            Some("/users"),
+            "`$PATH[2]` must still be the SECOND group the operator wrote",
+        );
+        assert_eq!(
+            rewritten("/api/(v[0-9]+)/.*", "$PATH[0]", "/api/v2/users").as_deref(),
+            Some("/api/v2/users"),
+            "`$PATH[0]` stays the whole request path",
+        );
+
+        let mut router = Router::new();
+        assert!(
+            matches!(
+                router.add_http_front(&rewriting_frontend("/api/(v[0-9]+)/.*", "$PATH[2]")),
+                Err(RouterError::InvalidPathRewrite(_)),
+            ),
+            "the capture CAP is `captures_len()` too: a `$PATH[n]` past the \
+             last group the operator wrote must stay refused",
+        );
+    }
+
+    /// The pre-validation in `PathRule::anchored_regex` closes
+    /// invalid-becomes-valid only. The opposite direction is real, documented
+    /// and NOT closed: a pattern that compiles BARE can be refused once
+    /// wrapped, because the appended `)\z` has to survive whatever the pattern
+    /// left open.
+    ///
+    /// Both halves are asserted for each case — `Regex::new(value).is_ok()`
+    /// AND `from_config(…).is_none()` — because the second alone would not
+    /// show the wrapping is what rejected it.
+    ///
+    /// The `249` both `CHANGELOG.md` and `doc/configure.md` quote is measured
+    /// here rather than derived from the crate's documented limit, and it is
+    /// the SMALLEST depth with this property: on `regex` 1.13.1 depth 248
+    /// still survives the wrapping, depth 249 does not, and depth 251 no
+    /// longer compiles bare either.
+    ///
+    /// To SEE THIS RED: remove the anchoring in `PathRule::anchored_regex` —
+    /// make the body `Regex::new(value).ok()`. Both `from_config` assertions
+    /// fail, each rule building instead of being refused. (The `Regex::new`
+    /// rows are controls measuring the crate directly and do not move.)
+    #[test]
+    fn a_path_regex_that_compiles_bare_can_be_refused_once_it_is_anchored() {
+        // `(?x)` turns on extended mode, in which `#` starts a comment that
+        // runs to end of line — and the wrapper's `)` lands inside it.
+        let extended_mode_comment = "(?x)/api/v1 # v1 only".to_owned();
+        let nested = |depth: usize| format!("{}{}", "(".repeat(depth), ")".repeat(depth));
+
+        for (value, expected_error) in [
+            (extended_mode_comment, "unclosed group"),
+            (
+                nested(249),
+                "exceed the maximum number of nested parentheses/brackets (250)",
+            ),
+        ] {
+            assert!(
+                Regex::new(&value).is_ok(),
+                "this case only means something while the BARE pattern compiles",
+            );
+            let error = Regex::new(&format!("\\A(?:{value})\\z"))
+                .expect_err("the WRAPPED pattern is the one that must fail");
+            assert!(
+                error.to_string().contains(expected_error),
+                "the documentation quotes {expected_error:?}; the wrapping \
+                 actually failed with: {error}",
+            );
+            assert_eq!(
+                PathRule::from_config(CommandPathRule::regex(value)),
+                None,
+                "a value only the WRAPPING rejects must still be refused",
+            );
+        }
+
+        // The boundary itself, so the quoted 249 cannot drift unnoticed.
+        assert!(
+            Regex::new(&format!("\\A(?:{})\\z", nested(248))).is_ok(),
+            "depth 248 must still survive the wrapping, or 249 is not the boundary",
+        );
+        assert!(
+            Regex::new(&nested(250)).is_ok() && Regex::new(&nested(251)).is_err(),
+            "the BARE limit must still sit between 250 and 251, or the wrapper \
+             is no longer what makes depth 249 fail",
+        );
+    }
+
+    /// Every pattern `PathRule::from_config` refuses — bare-invalid or
+    /// invalid-only-once-wrapped — surfaces at the public registration
+    /// surface as [`RouterError::InvalidPathRule`]. That is the same
+    /// `Router::add_http_front` the main process runs through
+    /// `validate_frontend_request` (`bin/src/command/requests.rs`) before
+    /// fanning a frontend out, which is what makes such a pattern a loudly
+    /// rejected frontend and never a main/worker divergence.
+    ///
+    /// To SEE THIS RED: remove the anchoring in `PathRule::anchored_regex` —
+    /// make the body `Regex::new(value).ok()`. The last two rows then
+    /// register successfully. To redden the FIRST row instead, delete the
+    /// `Regex::new(value).ok()?;` validation line: the wrapper balances
+    /// `a)(b` and the frontend registers.
+    #[test]
+    fn a_refused_path_regex_surfaces_as_an_invalid_path_rule_at_registration() {
+        // Assembled rather than written as a literal: `clippy::invalid_regex`
+        // rejects an invalid literal at a `Regex::new` call site, and the
+        // invalidity is the point.
+        let unbalanced = format!("a{}b", ")(");
+        for value in [
+            unbalanced,
+            "(?x)/api/v1 # v1 only".to_owned(),
+            format!("{}{}", "(".repeat(249), ")".repeat(249)),
+        ] {
+            let mut router = Router::new();
+            let mut front = test_http_frontend();
+            front.path = CommandPathRule::regex(value.clone());
+            assert!(
+                matches!(
+                    router.add_http_front(&front),
+                    Err(RouterError::InvalidPathRule(_))
+                ),
+                "the path regex {value:?} must be refused as an invalid path rule",
+            );
+        }
+    }
+
+    /// The FIRST of the two 401 shapes `doc/configure.md` names: a frontend
+    /// with no `cluster_id`. It narrows exactly as the
+    /// `redirect = "unauthorized"` shape does, which is the substance of
+    /// "both answer 401 … through the very same `path`/`path_type` matching".
+    ///
+    /// Asserted through `Router::add_http_front`, because that is where the
+    /// shape becomes a route and the claim is about the FRONTEND, not about
+    /// `Route::Deny`. The two sub-shapes take different branches and both are
+    /// covered here: a bare clusterless frontend sets no policy field, so
+    /// `add_http_front`'s `has_policy` is false and it maps to `Route::Deny`
+    /// directly; one that spells `redirect = "forward"` flips `has_policy`,
+    /// runs `Frontend::new`, and is coerced to unauthorized there instead.
+    /// Nothing in the anchoring cares which — that is the point.
+    ///
+    /// To SEE THIS RED: remove the anchoring in `PathRule::anchored_regex` —
+    /// make the body `Regex::new(value).ok()`. The unanchored `/admin` covers
+    /// the family again and both fall-through assertions fail with
+    /// `left: None, right: Some("FALLBACK")`.
+    #[test]
+    fn a_clusterless_regex_frontend_denies_through_the_same_anchored_path_rule() {
+        for spells_forward in [false, true] {
+            let mut router = Router::new();
+            let mut clusterless = test_http_frontend();
+            clusterless.hostname = "www.example.com".to_owned();
+            clusterless.cluster_id = None;
+            clusterless.path = CommandPathRule::regex("/admin".to_owned());
+            clusterless.method = Some("GET".to_owned());
+            if spells_forward {
+                clusterless.redirect = Some(RedirectPolicy::Forward as i32);
+            }
+            router
+                .add_http_front(&clusterless)
+                .expect("a clusterless frontend must register as a deny");
+            assert!(add_path_rule(
+                &mut router,
+                PathRule::Prefix("/".to_owned()),
+                GET,
+                "FALLBACK",
+            ));
+
+            let resolve = |path: &str| {
+                router
+                    .lookup("www.example.com", path, &Method::Get)
+                    .expect("every path below is covered by the `/` prefix rule")
+            };
+
+            let denied = resolve("/admin");
+            assert_eq!(
+                denied.redirect,
+                RedirectPolicy::Unauthorized,
+                "a clusterless frontend must still deny the path it spells \
+                 (spells_forward={spells_forward})",
+            );
+            assert_eq!(denied.cluster_id, None);
+
+            for now_reaching_the_backend in ["/admin/secret", "/administrator"] {
+                assert_eq!(
+                    resolve(now_reaching_the_backend).cluster_id.as_deref(),
+                    Some("FALLBACK"),
+                    "BREAKING: the anchored clusterless deny no longer covers \
+                     {now_reaching_the_backend} (spells_forward={spells_forward})",
+                );
+            }
+        }
+    }
+
+    /// The documented remediation for the deny narrowing: a deny-shaped
+    /// `REGEX` meant as a subtree is widened with a trailing `.*` and covers
+    /// the family again. It is a regex and not a path-segment rule, so
+    /// `/admin.*` takes `/administrator` back with `/admin/secret` — widening
+    /// is not surgical, and that is worth seeing.
+    ///
+    /// Declared through `Router::add_http_front` carrying
+    /// `redirect = "unauthorized"`, which is the SECOND of the two 401 shapes
+    /// `doc/configure.md` names. The first — a frontend with no `cluster_id` —
+    /// is covered by
+    /// `a_clusterless_regex_frontend_denies_through_the_same_anchored_path_rule`.
+    /// `anchoring_narrows_a_deny_path_regex_to_the_exact_path` covers NEITHER
+    /// frontend shape: it builds `Route::Deny` directly through
+    /// `add_tree_rule`, which is the route those two shapes resolve TO, and
+    /// says nothing about either resolving to it.
+    ///
+    /// To SEE THIS RED: the anchoring mutation does NOT redden this test, and
+    /// cannot — `/admin.*` covers these paths anchored or not, which is
+    /// exactly why it is the remediation. Break the wildcard instead: take the
+    /// configured value literally in `PathRule::anchored_regex`, as
+    /// `Regex::new(&format!("\\A(?:{})\\z", regex::escape(value)))`. Every
+    /// denied path below then falls through to `FALLBACK`.
+    #[test]
+    fn widening_a_deny_path_regex_with_a_trailing_wildcard_covers_the_subtree_again() {
+        let mut router = Router::new();
+        let mut deny = test_http_frontend();
+        deny.hostname = "www.example.com".to_owned();
+        deny.cluster_id = Some("DENIED".to_owned());
+        deny.path = CommandPathRule::regex("/admin.*".to_owned());
+        deny.method = Some("GET".to_owned());
+        deny.redirect = Some(RedirectPolicy::Unauthorized as i32);
+        router
+            .add_http_front(&deny)
+            .expect("the widened deny frontend must register");
+        assert!(add_path_rule(
+            &mut router,
+            PathRule::Prefix("/".to_owned()),
+            GET,
+            "FALLBACK",
+        ));
+
+        let resolve = |path: &str| {
+            router
+                .lookup("www.example.com", path, &Method::Get)
+                .expect("every path below is covered by the `/` prefix rule")
+        };
+
+        for denied in ["/admin", "/admin/secret", "/administrator"] {
+            assert_eq!(
+                resolve(denied).redirect,
+                RedirectPolicy::Unauthorized,
+                "the widened deny must cover {denied} again",
+            );
+        }
+        assert_eq!(
+            resolve("/other").cluster_id.as_deref(),
+            Some("FALLBACK"),
+            "widening the deny must not turn it into a catch-all",
+        );
+        assert_eq!(
+            resolve("/other").redirect,
+            RedirectPolicy::Forward,
+            "a path outside the widened family must still be forwarded",
+        );
+    }
+
+    /// The matched request path is the request-target as it arrives, QUERY
+    /// STRING INCLUDED, so anchoring bites a query string the way it already
+    /// bit `path_type = "EQUALS"`. A trailing `.*` answers that only for a
+    /// pattern open at the END: after a `$` it is dead text, because nothing
+    /// can follow end-of-text. A suffix rule that must tolerate a query string
+    /// has to spell it out.
+    ///
+    /// To SEE THIS RED: remove the anchoring in `PathRule::anchored_regex` —
+    /// make the body `Regex::new(value).ok()`. `"/abc"` against `"/abc?x=1"`
+    /// fails first, and `".*\.js([?].*)?"` against `"/static/app.json"` fails
+    /// with it, the optional group matching empty after a substring `.js`.
+    #[test]
+    fn an_anchored_path_regex_must_span_the_query_string_it_is_matched_against() {
+        assert_regex_routing(&[
+            ("/abc", "/abc", true),
+            ("/abc", "/abc?x=1", false),
+            // Appending `.*` after a `$` does nothing at all.
+            ("^/abc$.*", "/abc", true),
+            ("^/abc$.*", "/abc?x=1", false),
+            // What a suffix rule surviving a query string has to look like.
+            (r".*\.js([?].*)?", "/static/app.js", true),
+            (r".*\.js([?].*)?", "/static/app.js?v=2", true),
+            (r".*\.js([?].*)?", "/static/app.json", false),
+        ]);
+
+        // "not a regression": the plain suffix rule did not match a
+        // query-string request before the anchoring either. Measured against
+        // the BARE, unwrapped regex — the 2.2.1 behaviour — so this row is a
+        // control and does not move when `anchored_regex` does.
+        assert!(
+            !Regex::new(r"\.js$")
+                .expect("the bare suffix pattern compiles")
+                .is_match(b"/static/app.js?v=2"),
+            "the unanchored `\\.js$` of 2.2.1 did not match a query-string \
+             request either, so that half is not a regression",
+        );
+    }
+
+    /// Precedence between a method-less `REGEX` and a method-less `PREFIX`
+    /// turns on whether the regex matches the request path AT ALL, and
+    /// anchoring changes that once a query string is involved.
+    ///
+    /// `doc/configure.md`'s third table row is the `/a.*` case: `GET /abc`
+    /// goes to the prefix, and `GET /abc?x=1` flips to the regex, because
+    /// `/abc` no longer spans the request path while `/a.*` still does. With
+    /// the regex `/abc`, which anchored does not match `/abc?x=1` at all, the
+    /// flip does NOT happen and both requests go to the prefix — the prefix
+    /// has merely lost its rival. The regex did not lose the contest, it
+    /// stopped entering it: declared alone it leaves `GET /abc?x=1` unrouted.
+    /// That distinction is stated in prose and is what these six cases pin.
+    ///
+    /// Both rules are method-less and the regex is declared FIRST, the exact
+    /// shape the documented table measures; the regex is built through
+    /// `PathRule::from_config`, so the anchoring is in play.
+    ///
+    /// To SEE THIS RED: remove the anchoring in `PathRule::anchored_regex` —
+    /// make the body `Regex::new(value).ok()`. The unanchored `/abc` matches
+    /// `/abc?x=1` as a substring and becomes a candidate again: the
+    /// both-go-to-the-prefix case fails with
+    /// `left: Some("REGEX"), right: Some("PREFIX")` and the declared-alone
+    /// case fails with `left: Some("REGEX"), right: None`.
+    #[test]
+    fn an_anchored_regex_that_cannot_span_the_query_string_stops_being_a_candidate() {
+        let configured = |pattern: &str| {
+            PathRule::from_config(CommandPathRule::regex(pattern.to_owned()))
+                .unwrap_or_else(|| panic!("the regex path rule {pattern:?} must build"))
+        };
+        let against_the_whole_path_prefix = |pattern: &str, path: &str| {
+            winner_of(
+                (configured(pattern), NO_METHOD, "REGEX"),
+                (PathRule::Prefix("/abc".to_owned()), NO_METHOD, "PREFIX"),
+                path,
+            )
+        };
+
+        // A regex that spans the query string: the documented flip, unchanged.
+        assert_eq!(
+            against_the_whole_path_prefix("/a.*", "/abc").as_deref(),
+            Some("PREFIX"),
+            "the whole-path prefix declared after the regex must still win",
+        );
+        assert_eq!(
+            against_the_whole_path_prefix("/a.*", "/abc?x=1").as_deref(),
+            Some("REGEX"),
+            "with a query string `/abc` no longer spans the request path, so \
+             a regex that does wins",
+        );
+
+        // A regex that does not span it: the flip disappears entirely.
+        assert_eq!(
+            against_the_whole_path_prefix("/abc", "/abc").as_deref(),
+            Some("PREFIX"),
+            "the prefix wins here exactly as it does against `/a.*`",
+        );
+        assert_eq!(
+            against_the_whole_path_prefix("/abc", "/abc?x=1").as_deref(),
+            Some("PREFIX"),
+            "an anchored `/abc` cannot match `/abc?x=1`, so adding a query \
+             string changes nothing and the prefix keeps the request",
+        );
+
+        // …and the reason is candidacy, not defeat.
+        assert_eq!(
+            regex_rule_routes("/abc", "/abc").as_deref(),
+            Some("REGEX"),
+            "declared alone, the regex answers the request it spells",
+        );
+        assert_eq!(
+            regex_rule_routes("/abc", "/abc?x=1"),
+            None,
+            "declared alone, it leaves the query-string request UNROUTED — it \
+             is not a candidate any more",
+        );
+    }
+
+    /// The hostname side wraps each regex SEGMENT ungrouped —
+    /// `pattern_trie.rs`'s `format!("\\A{s}\\z")` at insert time, and
+    /// `convert_regex_domain_rule`'s single leading `\A` — so it still carries
+    /// the alternation gap that `PathRule::anchored_regex`'s `(?:` … `)`
+    /// closes on the path side. `anchored_regex`'s own comment calls that out
+    /// as measured on this tree and deliberately left alone; nothing asserted
+    /// the measurement, so it could rot into a false comment silently.
+    ///
+    /// This pins the DEFECT, not a desirable behaviour: the segment `/a|b/`
+    /// parses as `(\Aa)|(b\z)`, so it matches any host label starting with
+    /// `a` and any label ending with `b`. A three-branch hostname segment
+    /// would be worse still, its middle branch keeping neither anchor — see
+    /// `every_branch_of_an_alternating_path_regex_is_anchored`, which
+    /// measures that on the path side.
+    ///
+    /// Filed as sozu#1356. Fixing the hostname side is a separate change with
+    /// its own operator impact, so when it lands **INVERT this test, do not
+    /// delete it**: rename it to
+    /// `an_alternating_regex_hostname_segment_is_anchored_on_every_branch`,
+    /// flip the two leak assertions to `None`, and cite this name in the new
+    /// test's comment — exactly as
+    /// `a_path_regex_is_anchored_at_both_ends_and_must_match_the_whole_request_path`
+    /// cites the `a_path_regex_is_unanchored_and_matches_anywhere_in_the_request_path`
+    /// it replaced. A deleted test leaves no trace that the behaviour ever
+    /// changed; an inverted one is the record.
+    ///
+    /// To SEE THIS RED: group the hostname segment wrapper too — make
+    /// `pattern_trie.rs`'s four `format!("\\A{s}\\z")` sites build
+    /// `format!("\\A(?:{s})\\z")`. `a.example.com` still resolves, and the
+    /// `axx.example.com` assertion fails with
+    /// `left: None, right: Some("ALTERNATION")` — the leak closing is what
+    /// makes it red.
+    #[test]
+    fn an_alternating_regex_hostname_segment_is_still_anchored_at_one_end_only() {
+        let mut router = Router::new();
+        assert!(router.add_tree_rule(
+            b"/a|b/.example.com",
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(Some("GET".to_owned())),
+            &Route::ClusterId("ALTERNATION".to_owned()),
+        ));
+
+        let resolve = |hostname: &str| {
+            router
+                .lookup(hostname, "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+        };
+
+        assert_eq!(
+            resolve("a.example.com").as_deref(),
+            Some("ALTERNATION"),
+            "the segment must still match what it was written for",
+        );
+        assert_eq!(
+            resolve("axx.example.com").as_deref(),
+            Some("ALTERNATION"),
+            "the first branch keeps only `\\A`, so a label merely STARTING \
+             with `a` matches — the gap the path side closes",
+        );
+        assert_eq!(
+            resolve("xxb.example.com").as_deref(),
+            Some("ALTERNATION"),
+            "the last branch keeps only `\\z`, so a label merely ENDING with \
+             `b` matches too",
+        );
+        assert_eq!(
+            resolve("xx.example.com"),
+            None,
+            "a label matching neither branch must still miss",
         );
     }
 

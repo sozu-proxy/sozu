@@ -648,6 +648,9 @@
   a behaviour change, not a documentation fix, so it is not decided here. Today's behaviour is now
   pinned by a test built through `PathRule::from_config`, so anchoring it later is a deliberate
   change that turns a named test red rather than a silent one.
+  **Superseded inside this same release**: sozu#1350 was then decided in favour of anchoring the
+  code, so `path` regexes ARE anchored — see the BREAKING entry under 🔄 Changed. The
+  documentation text described here, and the test named here, were both replaced by that change.
   Regression-tested at the trie in both insertion orders, at the public `Router` surface asserting
   `lookup` actually returns the rule, for removal of each host in both insertion and both removal
   orders, and with a contract test that `add_tree_rule` never reports success for a rule it did not
@@ -733,6 +736,86 @@
   `string`, so a lossy name carries U+FFFD and will not match a later `RemoveCertificate` — that
   now emits an `error!` carrying byte counts only, never the key. Locked by a poisoned-resolver
   test and a non-UTF-8 trie-key test (both seen red).
+
+### 🔄 Changed
+
+- **BREAKING — `path_type = "REGEX"` frontends now match the WHOLE request path, not a substring of it.**
+  `doc/configure.md` has promised "REGEX is anchored at both ends (`\A...\z`)" since v2.0.0, and
+  `PathRule::from_config` (`lib/src/router/mod.rs`) did not implement it: it compiled the configured
+  value verbatim with `Regex::new(&rule.value)`, and `regex::bytes::Regex::is_match` is a substring
+  search, so `bc` matched `/abcd`. That divergence was filed as sozu#1350 with two ways out —
+  correct the documentation, or anchor the code. The code is what is wrong: 2.x is not yet broadly
+  in production, path regexes are not an exposed feature, and the documented behaviour is the one
+  operators expect, so a minor break now is cheaper than a permanently false documented guarantee.
+  The configured value is now wrapped as `\A(?:…)\z`, the same both-ends anchoring regex HOSTNAME
+  segments have carried since v2.0.0 (`convert_regex_domain_rule`, and `pattern_trie.rs`'s
+  `format!("\\A{s}\\z")` at segment-insert time).
+  **An operator relying on substring matching must add `.*` to their patterns**, on the side the
+  pattern is open on: `bc` becomes `.*bc.*`, a prefix-shaped `/api` becomes `/api.*` — or
+  `path_type = "PREFIX"`, which is what that second case is for.
+  **A SUFFIX-shaped pattern needs the `.*` in FRONT, and this is the case that breaks silently.**
+  Extension routing is plausibly the commonest real use of a path regex and it does not narrow, it
+  stops matching: measured, `\.js$` no longer matches `/static/app.js`, `\.(js|css)$` no longer
+  matches `/a/b/style.css`, and `/v1$` no longer matches `/api/v1`. The trailing `.*` from the
+  cases above does not rescue any of them — `\.js.*` still misses `/static/app.js` and `/v1.*`
+  still misses `/api/v1` — while `.*\.js$`, `.*\.(js|css)$` and `.*/v1$` all match again. An
+  end-anchored pattern with nothing in front of it can only match a path that IS its own suffix,
+  which for `\.js$` means the literal path `.js`, and an origin-form request-target always begins
+  with `/`: the rule matches nothing a client can send. `/v1$` is less dramatic and no less broken —
+  it still matches `/v1` and no longer matches `/api/v1`.
+  An empty `REGEX` value used as a catch-all matched every path and now matches only the empty path.
+  And because the matched request path is the request-target as it arrives, query string included,
+  an anchored `/abc` also stops matching `GET /abc?x=1` — the trap `path_type = "EQUALS"` already
+  had. A trailing `.*` answers that one, but only for a pattern open at the end: appending it after
+  a `$` does nothing, measured (`^/abc$.*` does not match `/abc?x=1`), and a suffix rule that must
+  tolerate a query string has to spell it out as `.*\.js([?].*)?`. That last shape is not a
+  regression — `\.js$` did not match `/static/app.js?v=2` before this release either.
+  **The narrowing applies to `Route::Deny`, and that is the dangerous edge.** A frontend with no
+  `cluster_id` and a frontend carrying `redirect = "unauthorized"` both answer 401 through this very
+  same `PathRule` matching, so a loosely written `REGEX` deny that covered a family of paths now
+  covers exactly one. A `REGEX` deny of `/admin` still denies `/admin`, but no longer denies
+  `/admin/secret` or `/administrator` — those requests fall through to whatever else matches, which
+  may be a frontend that serves them. **Audit every deny-shaped `REGEX` frontend before upgrading**
+  and widen the ones meant as a subtree (`/admin.*`).
+  Two properties of the wrapping were measured rather than reasoned about, and both are pinned by
+  tests. The non-capturing group is load-bearing: `|` binds looser than concatenation, so the
+  ungrouped `\A/a|/b\z` parses as `(\A/a)|(/b\z)` and leaves each branch anchored at one end only —
+  it still matches `/axx`. `\A(?:/a|/b)\z` does not. The group is non-capturing, so `captures_len`
+  and every `$PATH[n]` rewrite index are unchanged. And the configured value is compiled ON ITS OWN
+  before being wrapped, because the wrapper supplies one `(` and one `)` and can therefore balance
+  an unbalanced pattern: `a)(b` is rejected by `Regex::new`, yet `\A(?:a)(b)\z` compiles and matches
+  `ab`. Without that first compile, anchoring would promote a rule the router rejects today into a
+  live rule matching something the operator never wrote. That guard closes invalid-becomes-valid
+  only; the opposite direction is real and is not claimed to be closed. A pattern that compiles bare
+  can be REJECTED once wrapped, because the appended `)\z` has to survive whatever the pattern left
+  open — measured, `(?x)/api/v1 # v1 only` compiles bare and fails wrapped with
+  `error: unclosed group`, the appended `)` having landed inside the `#` comment that `(?x)` mode
+  enables, and a 249-deep nested group compiles bare and fails wrapped with
+  `error: exceed the maximum number of nested parentheses/brackets (250)`. Both are refused as
+  `RouterError::InvalidPathRule` at frontend registration, and the main process validates through
+  the same `Router::add_http_front` (`bin/src/command/requests.rs`) before fanning out, so such a
+  pattern costs a loudly rejected frontend with no main/worker divergence — never a silent
+  mis-route.
+  Anchors written by hand are kept, not stripped: `^` and `$` ARE `\A` and `\z` in the `regex`
+  crate's default mode (`$` does not match before a trailing `\n`), so the repeated zero-width
+  assertions in `\A(?:^/abc$)\z` collapse and an already-anchored pattern is unaffected — measured,
+  `\A(?:^/abc$)\z` matches `/abc` and not `/xabcd`. A HALF-written one gains the anchor it was
+  missing, in whichever direction it was missing it: `^/abc` gains the end and stops matching
+  `/abcd`, and `\.js$` gains the START and stops matching `/static/app.js`.
+  **One existing test had its meaning inverted by this change, deliberately and in the open.**
+  `a_path_regex_is_unanchored_and_matches_anywhere_in_the_request_path`, added by
+  [#1352](https://github.com/sozu-proxy/sozu/pull/1352) to pin the unanchored behaviour so that
+  anchoring it later "is a deliberate change, not a silent one", is red under exactly this change.
+  It is now
+  `a_path_regex_is_anchored_at_both_ends_and_must_match_the_whole_request_path`, asserting the
+  opposite on the same sozu#1350 example, with its `To SEE THIS RED:` block rewritten for the new
+  mutation (removing the anchoring). Its old name is cited in the new test's comment so the
+  inversion stays findable. Nothing was weakened to reach green: no test was deleted, ignored or
+  loosened, and every new test was seen red under its named mutation before it was allowed
+  to pass.
+  `doc/configure.md`'s "Path matching precedence within a frontend" section, rewritten by #1352 to
+  say path regexes are NOT anchored, is corrected in the same changeset; the "write your own
+  anchors" advice is gone.
 
 ## 2.2.1 - 2026-08-28
 
