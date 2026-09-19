@@ -137,6 +137,44 @@ Each feature × cell pair runs in `repeat_until_error_or(2, ...)` so a
 single transient failure surfaces as a stable fail — the harness
 matches the existing redirect/auth tests' retry budget.
 
+## Out of e2e reach by construction
+
+Not every gap is a backfill. Some code cannot be reached from this suite
+at all, and the reason is structural rather than a missing helper — a
+test written against it would pass for the wrong reason. The mechanism
+is recorded here so the next person does not re-derive it.
+
+- **`protocol::kawa_h1::Http`, and everything only it reaches**,
+  including `kawa_h1::save_http_status_metric`. No session state machine
+  has a variant that holds it: `HttpStateMachine` is
+  `Expect | Mux | WebSocket` (`lib/src/http.rs:63`) and
+  `HttpsStateMachine` is `Expect | Handshake | Mux | WebSocket`
+  (`lib/src/https.rs:81`). H1 proxying runs through `protocol/mux`
+  (`MuxClear` / `MuxTls`), not through `kawa_h1`. `Http::new` has zero
+  code callers in the workspace; the only compiled reference to the type
+  is the `pub use` re-export at `lib/src/protocol/mod.rs:23`, and the
+  only other mentions are prose
+  (`lib/src/protocol/kawa_h1/LIFECYCLE.md:62`) and two `assert_size!`
+  lines sitting inside block comments (`lib/src/http.rs:1892`,
+  `lib/src/https.rs:3084`). It is therefore unreachable in **any**
+  binary, not merely under e2e — measured by planting an unconditional
+  `panic!` at the top of `save_http_status_metric` and running the HTTP
+  e2e tests, which still passed.
+
+  The rest of the module is *not* dead and *is* e2e-reachable:
+  `kawa_h1::editor::HttpContext`, `kawa_h1::answers` and
+  `kawa_h1::parser` are what `mux` builds on. Only the `Http` session
+  state and the helpers nothing else calls are stranded.
+
+  Consequence for coverage: a status-handling defect on that path can
+  only be guarded by a unit test —
+  `kawa_h1::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`.
+  Its control-plane-reachable sibling, an operator answer template
+  carrying an out-of-range status, *is* e2e-covered by
+  `tests::h1_security_tests::test_h1_custom_answer_with_out_of_range_status_does_not_kill_the_worker`.
+  Do not write an e2e test that drives a backend status line and claim
+  it guards `save_http_status_metric`: it passes either way.
+
 ## Backend-TLS expansion (preview)
 
 When backend TLS lands ([#1218](https://github.com/sozu-proxy/sozu/issues/1218)),
