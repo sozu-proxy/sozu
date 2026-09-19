@@ -493,8 +493,18 @@ impl<T> Default for Timer<T> {
     }
 }
 
+/// Map a duration onto the wheel's tick grid, rounding to the NEAREST tick.
+///
+/// Not rounding UP: `elapsed` in `[tick_ms*N - tick_ms/2, tick_ms*N + tick_ms/2)`
+/// yields tick `N`, so a timeout can be delivered up to half a tick — 50 ms at
+/// the 100 ms default — BEFORE the caller asked for it. That is deliberate (it
+/// halves the worst-case error instead of always overshooting), and it is why
+/// every consumer must treat an expiry as "my entry was consumed" rather than
+/// "my deadline arrived": `Timer::poll` removes the entry either way, and
+/// nothing re-arms it on the consumer's behalf. See
+/// `test_timeout_fires_up_to_half_a_tick_early` below, and the
+/// consume-then-reschedule rule in `lib/src/protocol/udp/LIFECYCLE.md` §7.
 fn duration_to_tick(elapsed: Duration, tick_ms: u64) -> Tick {
-    // Calculate tick rounding up to the closest one
     let elapsed_ms = convert::millis(elapsed);
     elapsed_ms.saturating_add(tick_ms / 2) / tick_ms
 }
@@ -542,6 +552,148 @@ mod test {
         assert_eq!(None, t.poll_to(tick));
 
         assert_eq!(count(&t), 0);
+    }
+
+    /// The wheel rounds a requested delay to the NEAREST tick
+    /// ([`duration_to_tick`]) — it does not round up, despite what that
+    /// function's own comment says. With the default 100 ms tick a delay in
+    /// `[100N - 50, 100N + 50)` lands in tick `N`, so an entry can be delivered
+    /// up to 50 ms BEFORE the caller's deadline, and the delivery CONSUMES the
+    /// slab entry either way.
+    ///
+    /// Every consumer of this wheel must therefore read a wakeup as "my entry
+    /// is gone", never as "my deadline has arrived", and re-arm on its own if
+    /// it still wants one. `UdpManager::handle_timeout`
+    /// (`lib/src/protocol/udp/manager.rs`) clears `armed_deadline` on entry for
+    /// exactly this reason; `early_expiry_that_finds_nothing_due_still_rearms`
+    /// there is this test's other half.
+    ///
+    /// This pins the rounding deliberately so nobody re-derives the intuitive
+    /// but wrong "a timer never fires early" assumption. The rounding itself is
+    /// a design choice and is NOT the bug.
+    ///
+    /// To SEE THIS RED: make the rounding round up in [`duration_to_tick`] —
+    /// replace `elapsed_ms.saturating_add(tick_ms / 2) / tick_ms` with
+    /// `elapsed_ms.div_ceil(tick_ms)`. The 149 ms entry then lands in tick 2,
+    /// `poll_to` at tick 1 returns `None`, and the first assertion fails with
+    /// `left: Some("early")  right: None`.
+    #[test]
+    pub fn test_timeout_fires_up_to_half_a_tick_early() {
+        let mut t = timer();
+
+        // 149 ms against a 100 ms tick: (149 + 50) / 100 == 1.
+        t.set_timeout_at(Duration::from_millis(149), "early");
+
+        // Tick 1 is 100 ms — 49 ms BEFORE the requested deadline — and it fires.
+        assert_eq!(
+            Some("early"),
+            t.poll_to(ms_to_tick(&t, 100)),
+            "a 149ms delay must be delivered at the 100ms tick"
+        );
+
+        // ...and the entry is gone. Polling again at the real deadline yields
+        // nothing: the wheel does not re-arm on the caller's behalf. This is the
+        // lost wakeup every consumer has to handle.
+        assert_eq!(None, t.poll_to(ms_to_tick(&t, 149)));
+        assert_eq!(0, count(&t));
+
+        // The complementary half: 150 ms rounds up to tick 2, so it is NOT
+        // early. 50 ms is the exact boundary, so the maximum earliness is 50 ms.
+        let mut late = timer();
+        late.set_timeout_at(Duration::from_millis(150), "late");
+        assert_eq!(None, late.poll_to(ms_to_tick(&late, 100)));
+        assert_eq!(Some("late"), late.poll_to(ms_to_tick(&late, 200)));
+    }
+
+    /// A DELIVERED `Timeout` handle can never cancel the entry that reuses its
+    /// slab slot. The slot really is reused — `poll_to` does
+    /// `self.entries.remove(...)` — so the only thing standing between a stale
+    /// handle and someone else's timeout is `cancel_timeout`'s tick guard, and
+    /// that guard is exact rather than probabilistic:
+    ///
+    /// - [`insert`](Timer::insert) has exactly one caller,
+    ///   [`set_timeout_at`](Timer::set_timeout_at), which clamps every new entry
+    ///   to `tick > self.tick`;
+    /// - `self.tick` never decreases (`poll_to` only increments it, and floors
+    ///   `target_tick` at it);
+    /// - delivery requires `links.tick <= self.tick`.
+    ///
+    /// So a delivered handle's tick is `<= self.tick`, and every entry created
+    /// afterwards has a tick `> self.tick` — they can never be equal, whatever
+    /// the slab does with the slot. `TIMER` is a thread-local shared by every
+    /// session in a worker, so this is what makes a forgotten handle merely
+    /// untidy rather than a cross-session cancel.
+    ///
+    /// To SEE THIS RED: delete the `if links.tick != timeout.tick { return
+    /// None; }` sanity check from [`Timer::cancel_timeout`]. The stale handle
+    /// then cancels the unrelated entry occupying its slot and this fails with
+    /// `a delivered handle must not cancel the entry that reused its slot`.
+    #[test]
+    pub fn test_a_delivered_timeout_handle_cannot_cancel_its_slot_successor() {
+        let mut t = timer();
+
+        let stale = t.set_timeout_at(Duration::from_millis(100), "first");
+        assert_eq!(Some("first"), t.poll_to(ms_to_tick(&t, 100)));
+        assert_eq!(0, count(&t), "delivery must free the slab slot");
+
+        // The successor lands in the very slot the delivered entry vacated...
+        let successor = t.set_timeout_at(Duration::from_millis(300), "second");
+        assert_eq!(
+            stale.token, successor.token,
+            "precondition: the slab must reuse the delivered entry's slot"
+        );
+        // ...but never at the same tick, because `set_timeout_at` clamps every
+        // new entry past `self.tick` and the delivered one was at or below it.
+        assert!(
+            successor.tick > stale.tick,
+            "a new entry must outrank a delivered one: {} > {}",
+            successor.tick,
+            stale.tick
+        );
+
+        assert_eq!(
+            None,
+            t.cancel_timeout(&stale),
+            "a delivered handle must not cancel the entry that reused its slot"
+        );
+        assert_eq!(
+            Some("second"),
+            t.poll_to(ms_to_tick(&t, 300)),
+            "the successor must survive the stale cancel and still fire"
+        );
+    }
+
+    /// The attained maximum earliness is a full half-tick — 50 ms at the 100 ms
+    /// default — not 49 ms. The rounding interval `[100N-50, 100N+50)` is closed
+    /// on the EARLY side and open on the late side, so a 50 ms delay lands in
+    /// tick 1 and is delivered at 100 ms, while 150 ms is pushed out to tick 2.
+    /// Lateness is what is capped at 49 ms.
+    ///
+    /// To SEE THIS RED: change the rounding in [`duration_to_tick`] from
+    /// `saturating_add(tick_ms / 2)` to `saturating_add(tick_ms / 2 - 1)`. The
+    /// 50 ms entry then lands in tick 0, is clamped to tick 1 by
+    /// `set_timeout_at`'s "at least one tick in the future" rule, and still
+    /// fires at 100 ms — so the first assertion holds; it is the 149 ms case in
+    /// `test_timeout_fires_up_to_half_a_tick_early` that goes red. Use that test
+    /// for the rounding and this one for the boundary.
+    #[test]
+    pub fn test_maximum_earliness_is_a_full_half_tick() {
+        let mut t = timer();
+
+        // 50 ms: (50 + 50) / 100 == 1. Delivered at 100 ms — exactly 50 ms early.
+        t.set_timeout_at(Duration::from_millis(50), "half-tick-early");
+        assert_eq!(
+            Some("half-tick-early"),
+            t.poll_to(ms_to_tick(&t, 100)),
+            "a 50ms delay must be delivered at the 100ms tick: 50ms early"
+        );
+
+        // 49 ms is the far side of the same interval for tick 0, which
+        // `set_timeout_at` clamps up to tick 1 — the wheel never fires in the
+        // past, so sub-half-tick delays are the one case that is always LATE.
+        let mut clamped = timer();
+        clamped.set_timeout_at(Duration::from_millis(49), "clamped");
+        assert_eq!(Some("clamped"), clamped.poll_to(ms_to_tick(&clamped, 100)));
     }
 
     #[test]

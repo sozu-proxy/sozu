@@ -238,16 +238,57 @@ A flow is reaped on the **first** of these (`CloseReason`, `flow.rs:19`):
 
 **Idle is a single armed deadline + generation tokens, not a per-flow timer.**
 The manager only ever asks the shell to arm **one** deadline (`armed_deadline`,
-`ArmTimer`, `reschedule` at `manager.rs:580`); the shell owns the actual `TIMER`
-wheel (`udp.rs:1574` `arm_timer`, `server::TIMER`). Each flow carries a
+`ArmTimer`, `reschedule` at `manager.rs:600`); the shell owns the actual `TIMER`
+wheel (`udp.rs:1631` `arm_timer`, `server::TIMER`). Each flow carries a
 `timer_gen` token (`flow.rs:84`) bumped on every `touch()` (`flow.rs:114-138`).
 A wheel expiry only closes a flow whose deadline is still `<= now`
-(`handle_timeout`, `manager.rs:518-530`); a flow that saw traffic has been
-rescheduled, so the stale expiry is a no-op. A debug **strict-advance guard**
-(`manager.rs:540-548`) asserts the next armed deadline is strictly `> now` after
+(`handle_timeout`, `manager.rs:527`); a flow that saw traffic has been
+rescheduled, so it survives the expiry. A debug **strict-advance guard**
+(`manager.rs:558-566`) asserts the next armed deadline is strictly `> now` after
 a firing — this is the canonical sans-io busy-loop defence and the real reason
 the generation tokens exist. (`prop_generation_token_defeats_stale_close`,
-`manager.rs:1686`, fuzzes this.)
+`manager.rs:1806`, fuzzes this.)
+
+**Consume-then-reschedule: an expiry that closes nothing is NOT a no-op.**
+`crate::timer` rounds a requested delay to the *nearest* tick
+(`duration_to_tick`, `timer.rs:496`), not up: with the 100 ms default tick an
+entry whose deadline lies in `[100N-50, 100N+50)` is delivered at tick `N`, so
+the shell can be woken as much as **50 ms early**
+(`test_timeout_fires_up_to_half_a_tick_early`, `timer.rs`). `Timer::poll` then
+*removes* that entry from its slab. So on every expiry, whether or not a flow
+was due:
+
+- the manager clears `armed_deadline` (`manager.rs:534`) **before** any
+  `reschedule`, so a recomputed deadline equal to the old one is still emitted
+  as a fresh `ArmTimer` instead of being memoized away — this is the
+  load-bearing half;
+- the shell drops its `timer_handle` (`udp.rs:1810`), which is hygiene rather
+  than a fix: a delivered handle is already inert, because `set_timeout_at`
+  clamps every new entry past `self.tick` while a delivered one sat at or below
+  it, so `cancel_timeout`'s tick guard can never match the successor that reuses
+  its slab slot
+  (`test_a_delivered_timeout_handle_cannot_cancel_its_slot_successor`,
+  `timer.rs`). Clearing it keeps the field's meaning local instead of resting on
+  a two-hop argument about clamping and monotonicity in another module.
+
+Skipping the first step is a **lost wakeup**: an early expiry finds nothing due,
+`reschedule` sees an unchanged minimum and emits nothing, the wheel is empty,
+and the flow is never reaped — it pins its `max_flows` slot, upstream socket,
+slab slot and `udp.active_flows` count until some *other* flow's deadline
+happens to move the minimum. The cost of the rule is one extra wheel wakeup per
+early-fired expiry, which is the right trade: a wheel entry is cheap, a flow
+that never dies is not.
+
+An expiry that closes **several** flows at once now also emits an intermediate
+`ArmTimer` per `close_flow` whose recomputed minimum differs from the last
+(two flows due together plus a later third emit two where HEAD emitted one).
+`drain_outputs` is synchronous and `arm_timer` cancels before it arms, so these
+coalesce into wheel insert/cancel churn inside the one drain and never reach the
+event loop as extra wakeups.
+(`early_expiry_that_finds_nothing_due_still_rearms` and
+`repeated_early_expiries_each_rearm`, `manager.rs`;
+`an_early_wheel_fire_still_evicts_the_idle_flow`, `udp.rs`, drives the real
+wheel end to end.)
 
 Every close path emits `FlowEvicted` then `CloseFlow` (`close_flow`,
 `manager.rs:598`); the shell's `on_close_flow` (`udp.rs:1588`) closes the
@@ -403,9 +444,11 @@ model.
    (`arm_upstream_writable` `udp.rs:1413`, `drain_upstream_queue` `udp.rs:1444`;
    client side `udp.rs:1506`/`1547`) is the UDP analog of `signal_pending_write`
    on the edge-triggered loop.
-5. **No busy-loop, no stale close.** Generation tokens + the strict-advance
-   guard (§7, `manager.rs:540-548`) guarantee the timer always advances past a
-   firing.
+5. **No busy-loop, no stale close, no lost wakeup.** Generation tokens + the
+   strict-advance guard (§7, `manager.rs:558-566`) guarantee the timer always
+   advances past a firing; consume-then-reschedule (§7) guarantees an expiry
+   that closed nothing still re-arms, so an early wheel fire cannot strand a
+   flow that nothing will ever reap.
 6. **Gauge correctness on every path.** `udp.active_flows` is balanced on every
    close — idle, responses/requests reached, drain, soft/hard-stop, listener
    remove/deactivate, and upstream-open failure (`abort_flow`, `manager.rs:205`;

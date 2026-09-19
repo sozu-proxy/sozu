@@ -80,7 +80,9 @@ pub struct UdpManager<E: FlowKeyExtractor = SourceTupleExtractor> {
     /// FIFO of outputs the shell drains via [`poll_output`].
     outputs: VecDeque<Output>,
     /// The single armed manager-wide deadline currently reflected to the shell
-    /// via the last `ArmTimer`. `None` means no timer is armed.
+    /// via the last `ArmTimer`. `None` means no timer is armed — which
+    /// [`handle_timeout`](Self::handle_timeout) sets on entry, because the
+    /// expiry that called it consumed the shell's wheel entry.
     armed_deadline: Option<Instant>,
 
     /// High-water mark of every `max_flows` cap ever set (construction +
@@ -511,7 +513,26 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
     /// closed if its generation token still matches the scheduled deadline —
     /// generation mismatch means the flow saw traffic and was rescheduled, so
     /// the stale expiry is ignored (defeats the busy-loop / stale-close bug).
+    ///
+    /// Called ONLY from a wheel expiry: the shell's single timer entry has just
+    /// been delivered and consumed. `now` is therefore the wheel's tick date,
+    /// not the deadline — `crate::timer` rounds a delay to the nearest tick, so
+    /// with a 100 ms tick the entry arrives up to 50 ms EARLY and no flow need
+    /// be due at all. Either way the shell now holds nothing, so
+    /// `armed_deadline` is cleared on entry and [`reschedule`](Self::reschedule)
+    /// re-emits `ArmTimer` even when the minimum deadline has not moved.
+    /// Without that, an early expiry is a LOST WAKEUP: nothing is closed,
+    /// nothing is re-armed, and the flow is never reaped until some other
+    /// flow's deadline happens to change the minimum. This is the
+    /// consume-then-reschedule rule, and its cost is one extra wheel wakeup per
+    /// early-fired expiry.
     pub fn handle_timeout(&mut self, now: Instant) {
+        // The wheel entry that brought us here is gone. Record that BEFORE any
+        // `reschedule` — including the ones `close_flow` runs below — so a
+        // recomputed deadline equal to the old one is still emitted as a fresh
+        // `ArmTimer` instead of being memoized away.
+        self.armed_deadline = None;
+
         // Collect due flow ids first to avoid borrowing the slab while mutating.
         let due: Vec<FlowId> = self
             .flows
@@ -577,7 +598,15 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
     // ---- internals ---------------------------------------------------------
 
     /// Recompute the earliest flow deadline and emit `ArmTimer` only when it
-    /// changes, so the shell re-arms its wheel exactly once per real change.
+    /// differs from `armed_deadline`, so the shell re-arms its wheel exactly
+    /// once per real change.
+    ///
+    /// The memoization is against what the SHELL currently holds, not against
+    /// the previous minimum: [`handle_timeout`](Self::handle_timeout) clears
+    /// `armed_deadline` on entry because the expiry consumed that wheel entry,
+    /// so an unchanged minimum is re-emitted there rather than swallowed. A
+    /// memoization against the minimum alone would be a lost wakeup on every
+    /// expiry the wheel delivered early.
     fn reschedule(&mut self) {
         let next = self
             .flows
@@ -1141,6 +1170,135 @@ mod tests {
         let outs = drain(&mut mgr);
         assert!(outs.iter().any(|o| matches!(o, Output::CloseFlow(_))));
         assert_eq!(mgr.flow_count(), 0);
+        assert!(mgr.poll_timeout().is_none());
+    }
+
+    /// An expiry that finds NOTHING due must still re-arm.
+    ///
+    /// The shell's wheel (`crate::timer`) rounds a delay to the nearest tick, so
+    /// with a 100 ms tick it delivers an entry up to 50 ms EARLY
+    /// (`test_timeout_fires_up_to_half_a_tick_early`, `lib/src/timer.rs`). The
+    /// shell then calls `handle_timeout` at a `now` that has not reached any
+    /// flow's deadline: no flow is due, nothing closes, the minimum deadline is
+    /// unchanged — yet the wheel entry has been CONSUMED. If `reschedule` keeps
+    /// memoizing on "the deadline changed" it emits no `ArmTimer`, the shell
+    /// never re-arms, and the flow is never reaped. `handle_timeout` is by
+    /// contract only ever called from a wheel expiry, so on entry the shell has
+    /// no armed timer and `armed_deadline` must say so.
+    ///
+    /// To SEE THIS RED: remove `self.armed_deadline = None;` from the top of
+    /// [`UdpManager::handle_timeout`]. `reschedule` then finds `next ==
+    /// self.armed_deadline`, emits nothing, and the ArmTimer assertion fails
+    /// with `left: []  right: [Instant { .. }]`.
+    #[test]
+    fn early_expiry_that_finds_nothing_due_still_rearms() {
+        let mut cfg = cluster("dns");
+        cfg.front_timeout = Duration::from_secs(10);
+        let mut mgr = UdpManager::new(cfg, 16, 65535, 7);
+        let now = Instant::now();
+        mgr.handle_input(
+            ManagerInput::ClientDatagram {
+                src: client(1, 1000),
+                payload: b"q",
+            },
+            now,
+        );
+        drain(&mut mgr);
+        let deadline = mgr.poll_timeout().expect("timer armed on admission");
+
+        // The wheel fires before the deadline. One second early here rather than
+        // the wheel's real ~50 ms so the test does not encode the tick size.
+        let early = deadline - Duration::from_secs(1);
+        mgr.handle_timeout(early);
+        let outs = drain(&mut mgr);
+
+        assert_eq!(
+            mgr.flow_count(),
+            1,
+            "nothing was due at the early expiry: the flow must survive"
+        );
+        assert!(
+            !outs.iter().any(|o| matches!(
+                o,
+                Output::CloseFlow(_) | Output::Metric(MetricEvent::FlowEvicted)
+            )),
+            "nothing was due: no flow may be closed, got {outs:?}"
+        );
+
+        let armed: Vec<Instant> = outs
+            .iter()
+            .filter_map(|o| match o {
+                Output::ArmTimer(d) => Some(*d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            armed,
+            vec![deadline],
+            "an expiry that found nothing due must re-arm the consumed wheel \
+             entry with the (unchanged) deadline"
+        );
+        assert_eq!(
+            mgr.poll_timeout(),
+            Some(deadline),
+            "the flow's deadline itself must not move"
+        );
+    }
+
+    /// The re-arm is not a one-shot: a second early expiry must re-arm again.
+    /// The shell holds exactly one wheel entry for the whole listener, so every
+    /// consumed entry owes exactly one `ArmTimer` for as long as a flow is live.
+    ///
+    /// To SEE THIS RED: the same mutation as
+    /// `early_expiry_that_finds_nothing_due_still_rearms` — remove
+    /// `self.armed_deadline = None;` from the top of
+    /// [`UdpManager::handle_timeout`]. Both expiries then emit nothing and this
+    /// fails with `left: 0  right: 1` on the first `assert_eq!`.
+    #[test]
+    fn repeated_early_expiries_each_rearm() {
+        let mut cfg = cluster("dns");
+        cfg.front_timeout = Duration::from_secs(10);
+        let mut mgr = UdpManager::new(cfg, 16, 65535, 7);
+        let now = Instant::now();
+        mgr.handle_input(
+            ManagerInput::ClientDatagram {
+                src: client(1, 1000),
+                payload: b"q",
+            },
+            now,
+        );
+        drain(&mut mgr);
+        let deadline = mgr.poll_timeout().expect("timer armed on admission");
+
+        let count_arms = |outs: &[Output]| {
+            outs.iter()
+                .filter(|o| matches!(o, Output::ArmTimer(_)))
+                .count()
+        };
+
+        mgr.handle_timeout(deadline - Duration::from_secs(2));
+        let first = drain(&mut mgr);
+        assert_eq!(count_arms(&first), 1, "first early expiry must re-arm");
+
+        mgr.handle_timeout(deadline - Duration::from_secs(1));
+        let second = drain(&mut mgr);
+        assert_eq!(
+            count_arms(&second),
+            1,
+            "second early expiry must re-arm too"
+        );
+
+        // The flow survived both and is still reaped at its real deadline.
+        assert_eq!(mgr.flow_count(), 1);
+        mgr.handle_timeout(deadline);
+        let outs = drain(&mut mgr);
+        assert!(outs.iter().any(|o| matches!(o, Output::CloseFlow(_))));
+        assert_eq!(mgr.flow_count(), 0);
+        assert_eq!(
+            count_arms(&outs),
+            0,
+            "the last flow is gone: nothing left to arm"
+        );
         assert!(mgr.poll_timeout().is_none());
     }
 
