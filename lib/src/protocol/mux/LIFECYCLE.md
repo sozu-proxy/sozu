@@ -452,8 +452,9 @@ slot can be popped.
 ## 7. Timeouts
 
 There are four timer surfaces, fired by the proxy's central timer wheel and
-funneled into `Mux::timeout` (`mod.rs:1175`). Their `duration` is configured per
-listener.
+funneled into `Mux::timeout` (`mod.rs:1406`). Their `duration` is configured per
+listener. All four are evaluated against the per-pass clock snapshot of §7.5,
+not against a fresh `Instant::now()`.
 
 ### 7.1 Connection-level (frontend) idle timeout
 
@@ -463,9 +464,9 @@ listener.
   (`mod.rs:519`) while any stream is live, or the shorter `request_timeout`
   until the first `Link` transition (`mod.rs:1042-1044`).
 - Reset: on meaningful activity — HEADERS for an existing stream, DATA bytes —
-  see `h2.rs:1646` and `h2.rs:1884`. Control frames (PING, WINDOW_UPDATE,
+  see `h2.rs:5440` and `h2.rs:5302`. Control frames (PING, WINDOW_UPDATE,
   SETTINGS) deliberately do **not** reset it so a misbehaving peer cannot pin
-  the session with keepalive noise (`h2.rs:1630-1636`).
+  the session with keepalive noise (`h2.rs:2492-2500`).
 - Handling: `Mux::timeout` inspects each stream's state (`mod.rs:1193`) and
   either writes a default 408/503/504 answer, forcefully terminates, or keeps
   draining.
@@ -484,8 +485,9 @@ listener.
 
 Two independent per-stream deadlines, both bounded by
 `ConnectionH2.stream_idle_timeout` and reaped by
-`ConnectionH2::cancel_timed_out_streams`, which unions them (deduped) via the
-unit-testable free function `collect_timed_out_streams`:
+`ConnectionH2::cancel_timed_out_streams` (`h2.rs:4247`), which unions them
+(deduped) via the unit-testable free function `collect_timed_out_streams`. Both
+deadlines are compared against `ConnectionH2.now` (§7.5):
 
 - **Bidirectional-silence guard** — `ConnectionH2.stream_last_activity_at:
   HashMap<StreamId, Instant>`. Refreshed on every non-empty inbound DATA frame,
@@ -511,7 +513,7 @@ unit-testable free function `collect_timed_out_streams`:
   open window OR once `stream_fc_stalled_progress` reaches `FC_STALL_CLEAR_FLOOR`
   (16 KiB = one max DATA frame). A `WINDOW_UPDATE(+1)` drip that trickles ~1 byte
   per idle period — on the main write loop **and** on the socket-backpressure
-  resume path (`h2.rs:2387`) — therefore never reaches the floor, so the deadline
+  resume path (`h2.rs:2852`) — therefore never reaches the floor, so the deadline
   ages out and the stream is reaped (the HTTP/2 window-stall / `WINDOW_UPDATE`-drip
   vector is closed). The progress accumulator is kept in lockstep with
   `stream_fc_stalled_since` at every arm/clear/evict site.
@@ -561,13 +563,89 @@ unit-testable free function `collect_timed_out_streams`:
 
 1. `readable()` entry runs `cancel_timed_out_streams` first (§7.2).
 2. Then it optionally fires `goaway(SettingsTimeout)` if the SETTINGS ACK is
-   overdue (`h2.rs:1619-1628`).
+   overdue (`h2.rs:2482-2491`).
 3. Then it consumes the frame / payload.
-4. `writable()` mirrors this check (`h2.rs:2309-2318`).
+4. `writable()` mirrors this check, via `flush_pending_control_frames`
+   (`h2.rs:3663-3673`).
 5. If the frontend timer fires while streams are linked, the timeout logic in
-   `mod.rs:1175` decides per-stream; backend timer fires independently.
-6. Loop budget (`MAX_LOOP_ITERATIONS = 10_000`) is a hard backstop at
-   `mod.rs:1014`.
+   `mod.rs:1406` decides per-stream; backend timer fires independently.
+6. Loop budget (`MAX_LOOP_ITERATIONS = 10_000`, `mod.rs:188`) is a hard backstop
+   at `mod.rs:1216`. `counter` is declared at `mod.rs:793`, above BOTH loops, so
+   the budget is shared across every outer iteration of one `ready()` call.
+
+Steps 1-4 all run inside one `readable()`/`writable()` call and therefore all
+read the same `ConnectionH2.now` — see §7.5.
+
+### 7.5 Clock sampling — one snapshot per pass
+
+Every deadline above is evaluated against a snapshot, not against a fresh
+`Instant::now()`. **`Mux` is the only clock sampler in the mux.** It writes
+`Context.now` (`mod.rs:450`) at three points:
+
+- once per **outer** `Mux::ready` pass (`mod.rs:841`), so that the inner loop
+  deliberately shares one instant — that is the property the snapshot exists
+  for, not a claim about how long a sweep takes. `MAX_LOOP_ITERATIONS` is a
+  count and bounds iterations, not wall clock, and `counter` (`mod.rs:793`)
+  sits above both loops, so one `ready()` call can spend the whole budget
+  under a single snapshot;
+- at the top of `Mux::timeout` (`mod.rs:1426`);
+- at the top of `Mux::shutting_down` (`mod.rs:1929`), which runs outside
+  `ready()` entirely. That line is load-bearing, not belt-and-braces:
+  `drive_frontend_shutdown_io` (`mod.rs:722`) always reaches `readable()` for
+  an H2 frontend — `force_h2_read` is unconditionally true, so the early
+  return above it cannot fire — and `readable` mirrors `context.now` into
+  `ConnectionH2::now` before the forced-close check runs. Drop it and a
+  silent draining session propagates its last `ready()` snapshot forever.
+  Pinned by `shutting_down_refreshes_the_snapshot_so_the_drain_budget_expires`.
+
+The H2 core reads `ConnectionH2.now` (`h2.rs:1867`), a mirror assigned from
+`context.now` at each public entry point — `readable` (`h2.rs:2468`),
+`writable` (`h2.rs:3795`), `cancel_timed_out_streams` (`h2.rs:4247`) and
+`start_stream` (`h2.rs:6660`) — from the `now` parameter of `graceful_goaway`
+(`h2.rs:4740`), and directly by `Mux::shutting_down`. It is a field rather than
+a threaded parameter because the read sites are unreachable from a `context`:
+`handle_ping_frame` takes no context at all, and the ten
+`check_flood_or_return!` sites are spread across six frame handlers.
+`H2FloodDetector` likewise takes `now` as a parameter
+(`check_flood`, `h2.rs:1213`; `maybe_reset_window`, `h2.rs:1157`) and keeps
+`window_start` (`h2.rs:1015`) private, so nothing can advance the rate window
+against a clock the connection is not reading.
+
+**Consequence.** Every deadline armed or evaluated inside a pass is accurate to
+within that pass, **in either direction**. The error is not one-sided, and the
+asymmetry that produces it is architectural:
+
+- An **arm** site runs at an arbitrary depth into its pass — the liveness
+  refreshes at `h2.rs:5302` (DATA) and `h2.rs:5440` (HEADERS), the
+  outbound-byte refreshes at `h2.rs:2852` / `h2.rs:3205`, the fc-stall arm at
+  `h2.rs:3240` — and stamps the snapshot taken at the START of that pass. The
+  stored instant is therefore OLDER than the event it records.
+- An **eval** site runs near the top of a pass: `cancel_timed_out_streams` is
+  the first thing `readable` does (§7.4 step 1), and the SETTINGS-ACK check
+  (`h2.rs:2483` in `readable`, `h2.rs:3665` in `flush_pending_control_frames`)
+  is step 2.
+- The measured age is therefore inflated by the arm site's depth, so a deadline
+  can fire up to one pass **early** as well as one pass late. Worked against the
+  strict `>` predicate in `collect_timed_out_streams`: pass P has snapshot `T`;
+  at real `T+Δ` a DATA frame stores `T`; pass Q has snapshot `T+deadline+δ` and
+  computes `deadline+δ > deadline`, so it reaps — while true elapsed is
+  `deadline+δ−Δ < deadline` whenever `Δ > δ`. At base both ends read the real
+  clock and the comparison was exact. This is the cost of the snapshot, and it
+  is bounded by one pass.
+
+The flood window (`h2.rs:1157`) and the RFC 9113 §5.1.2 back-pressure window
+(`h2.rs:4517`) are the one asymmetric case, and they **fail closed**: `now` is
+constant for the whole pass, so a window cannot decay part-way through one. A
+burst arriving during a pass is weighed in full against the window that was open
+when the pass started, where before the change a long pass could halve the
+counters under the burst. The window BOUNDARY still carries the same one-pass
+error in either direction as every other deadline.
+
+Two clocks are deliberately left alone. `SessionMetrics` stays on the real
+clock — metrics want true elapsed time, not a quantised one. `TimeoutContainer`
+and the thread-local timer wheel stay on the real clock too: the container is
+the embedder's timer, and the H2 core never reads it (it only calls
+`triggered()` / re-arms it).
 
 ---
 
@@ -663,20 +741,27 @@ shutdown or listener reload. It:
 
 1. Initiates the double-GOAWAY (`mod.rs:1627`).
 2. Drives frontend I/O outside the epoll loop (`drive_frontend_shutdown_io`,
-   `mod.rs:562`) — H2 needs extra passes for the peer's END_STREAM and final TLS
+   `mod.rs:722`) — H2 needs extra passes for the peer's END_STREAM and final TLS
    flush.
 3. Checks the graceful-shutdown forced-close deadline: when
-   `Connection::graceful_shutdown_deadline_elapsed` returns `true` (i.e.
-   `drain.started_at + drain.graceful_shutdown_deadline <= Instant::now`) the
-   session returns `true` immediately so the server loop can tear the connection
-   down even with Linked streams still in flight.
+   `Connection::graceful_shutdown_deadline_elapsed` (`h2.rs:4806`) returns
+   `true` (i.e. `drain.started_at + drain.graceful_shutdown_deadline <=
+   ConnectionH2.now`) the session returns `true` immediately so the server loop
+   can tear the connection down even with Linked streams still in flight. The
+   comparison is against the connection's snapshot, which `shutting_down`
+   refreshes unconditionally at its top (§7.5) — including on the
+   already-draining path, which never reaches `graceful_goaway`. Without that
+   unconditional refresh a silent draining session would freeze `now` at its
+   last `ready()` pass and the budget would never expire.
 4. Marks `front_received_end_of_stream` on streams whose request is already
    complete and consumed.
 5. Returns `true` when no `Linked` or non-quiesced `Unlinked` streams remain.
 
-The forced-close deadline is armed the first time `graceful_goaway` transitions
-`drain.draining` to `true` (see `h2.rs`): that site sets
-`drain.started_at = Some(Instant::now())`. The budget itself comes from the
+The forced-close deadline is armed the first time `graceful_goaway`
+(`h2.rs:4740`) transitions `drain.draining` to `true`: that site sets
+`drain.started_at = Some(now)` from the caller's snapshot — `now` is
+`graceful_goaway`'s one parameter precisely because its caller,
+`Mux::shutting_down`, runs outside the pass that last refreshed the mirror. The budget itself comes from the
 listener knob `h2_graceful_shutdown_deadline_seconds` (proto field
 `h2_graceful_shutdown_deadline_seconds`, defaulting to 5 s). Setting the knob to
 `0` maps to `graceful_shutdown_deadline = None`, which disables the forced-close
@@ -836,6 +921,38 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     / `test_converter_yields_before_trailing_flags_without_end_stream` /
     `test_converter_yields_before_chunk_block`; end-to-end guard
     `test_h2_incremental_round_robin_closes_every_stream`.
+20. **Only `Mux` samples the clock.** No code under `ConnectionH2` calls
+    `Instant::now()` or `.elapsed()`; every time-based decision reads
+    `ConnectionH2.now`, and `H2FloodDetector` takes `now` as a parameter (§7.5).
+    The one sanctioned exception is `ConnectionH2::new`, which takes a single
+    sample because a connection is constructed at accept / backend-connect time,
+    outside any pass — it seeds `now`, `refuse_window_start` and the flood
+    detector's `window_start` from that one value. The reviewer check is
+    `grep -nE 'Instant::now|SystemTime::now|\.elapsed\(\)' lib/src/protocol/mux/h2.rs`.
+    Every hit must be inside `#[cfg(test)] mod tests` (`h2.rs:6739` onward),
+    that one constructor, or `impl Default for H2FloodDetector` (test-only —
+    `Default` cannot express a caller's snapshot). The exact form matters:
+    parentheses are dropped after `now` so a bare function reference matches —
+    `.or_insert_with(Instant::now)` is a real clock read that
+    `grep 'Instant::now()'` does NOT find, and it was one of the 21 sites this
+    changeset converted. `SystemTime` is included because it is a clock too,
+    and `-n` rather than `-c` because the criterion is about WHERE each hit
+    lives, which a bare count cannot show. One missed call site leaves a dual
+    clock, which is invisible in production because both clocks are correct.
+
+    A grep alone is a weak guard, so the property is also pinned by tests that
+    advance the snapshot WITHOUT advancing the real clock and observe the
+    decision move:
+    `graceful_shutdown_deadline_is_evaluated_against_the_connection_snapshot`,
+    `backpressure_window_rolls_over_on_the_connection_snapshot`,
+    `settings_ack_deadline_is_evaluated_against_the_connection_snapshot`, and
+    `per_stream_liveness_reaping_is_evaluated_against_the_connection_snapshot`
+    (which also covers the `cancel_timed_out_streams` entry-point mirror).
+    `Mux::shutting_down`'s own sampling point is pinned at the `Mux` level by
+    `shutting_down_refreshes_the_snapshot_so_the_drain_budget_expires`, because
+    no `ConnectionH2`-level test enters that handler. The flood-window
+    half-decay is pinned on an injected instant rather than a sleep in
+    `test_flood_detector_half_decay_on_window_expiry`.
 
 ---
 

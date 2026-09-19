@@ -327,10 +327,12 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
-    pub(super) fn graceful_goaway(&mut self) -> MuxResult {
+    /// `now` is the caller's clock snapshot; H2 arms the graceful-shutdown
+    /// budget from it. H1 has no multiplex to drain and ignores it.
+    pub(super) fn graceful_goaway(&mut self, now: Instant) -> MuxResult {
         match self {
             Connection::H1(_) => MuxResult::Continue,
-            Connection::H2(c) => c.graceful_goaway(),
+            Connection::H2(c) => c.graceful_goaway(now),
         }
     }
 

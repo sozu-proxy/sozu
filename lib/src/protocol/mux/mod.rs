@@ -430,6 +430,39 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// per-stream [`HttpContext`]. `None` for plaintext listeners or when
     /// no ALPN was negotiated.
     pub tls_alpn: Option<&'static str>,
+    /// Clock snapshot for the pass currently executing.
+    ///
+    /// [`Mux`] is the only clock sampler in the mux: it refreshes this field
+    /// once per outer [`Mux::ready`] pass and at the top of [`Mux::timeout`]
+    /// and [`Mux::shutting_down`]. Every time-based decision in the H2 core
+    /// reads this snapshot — mirrored into
+    /// [`h2::ConnectionH2::now`] at each public entry point — instead of
+    /// calling [`Instant::now`] itself, so one pass sees one consistent
+    /// "now". Every deadline armed or evaluated inside a pass is therefore
+    /// accurate to within that pass — **in either direction**. The error is
+    /// not one-sided: an arm site runs at an arbitrary depth into its pass
+    /// (a DATA or HEADERS refresh, an outbound-byte refresh) and stamps the
+    /// snapshot taken at the START of that pass, so the stored instant is
+    /// older than the event it records; an eval site runs near the top of a
+    /// pass (`cancel_timed_out_streams` is the first thing
+    /// [`h2::ConnectionH2::readable`] does). The measured age is therefore
+    /// inflated by the arm site's depth, and a deadline can fire up to one
+    /// pass EARLY as well as one pass late. At base both ends read the real
+    /// clock and the comparison was exact; this is the cost of the snapshot.
+    ///
+    /// The flood and back-pressure windows are the one asymmetric case, and
+    /// they fail closed: `now` is constant for the whole pass, so a window
+    /// cannot decay part-way through one. A burst arriving during a pass is
+    /// weighed in full against the window that was open when the pass
+    /// started, where before the change a long pass could decay the counters
+    /// under the burst. The window BOUNDARY still carries the same
+    /// one-pass error in either direction as every other deadline.
+    ///
+    /// Note that [`crate::SessionMetrics`] and [`crate::timer::TimeoutContainer`]
+    /// deliberately stay on the real clock: metrics want true elapsed time,
+    /// and the timeout container is the embedder's timer, which the H2 core
+    /// never reads.
+    pub now: Instant,
 }
 
 impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
@@ -466,6 +499,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             tls_version: None,
             tls_cipher: None,
             tls_alpn: None,
+            now: Instant::now(),
         }
     }
 
@@ -787,6 +821,24 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         ));
         trace!("{} {:?}", log_context!(self), start);
         loop {
+            // The mux's clock sample for this pass. Everything time-based
+            // below — flood and back-pressure windows, the SETTINGS-ACK
+            // deadline, per-stream liveness and flow-control-stall deadlines
+            // — reads `context.now` (mirrored into `ConnectionH2::now` at
+            // each entry point) rather than calling `Instant::now()` itself.
+            //
+            // Sampled per OUTER iteration so the inner loop DELIBERATELY
+            // shares one instant: that is the property the snapshot exists
+            // for — every frame processed in one inner sweep is weighed
+            // against the same "now", so a burst cannot decay a rate window
+            // out from under itself mid-sweep. It is not a bound on how long
+            // the sweep may take: `MAX_LOOP_ITERATIONS` is a count, and a
+            // count bounds iterations, not wall clock. `counter` is declared
+            // above BOTH loops, so that budget is shared across every outer
+            // iteration of one `ready()` call rather than reset per pass.
+            // `start` above stays a separate sample so the trace reports the
+            // true entry instant.
+            self.context.now = Instant::now();
             self.context.debug.push(DebugEvent::LoopStart);
             loop {
                 self.context.debug.push(DebugEvent::LoopIteration(counter));
@@ -1373,6 +1425,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
     fn timeout(&mut self, token: Token, _metrics: &mut SessionMetrics) -> StateResult {
         trace!("{} MuxState::timeout({:?})", log_context!(self), token);
+        // `timeout` runs outside `ready()`, so it is its own sampling point.
+        // `cancel_timed_out_streams` below reaps on this snapshot.
+        self.context.now = Instant::now();
         let front_is_h2 = match self.frontend {
             Connection::H1(_) => false,
             Connection::H2(_) => true,
@@ -1859,13 +1914,26 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 
     fn shutting_down(&mut self) -> SessionIsToBeClosed {
+        // `shut_down_sessions()` drives this outside `ready()`, so it is its
+        // own sampling point, and it is load-bearing rather than belt-and-braces.
+        // The chain is: this line refreshes `context.now`;
+        // `drive_frontend_shutdown_io` below always reaches `readable()` for an
+        // H2 frontend (`force_h2_read` is unconditionally true, so the
+        // early return above it cannot fire), and `readable` mirrors
+        // `context.now` into `ConnectionH2::now`; the forced-close check that
+        // follows then reads a fresh snapshot. Drop this line and a silent
+        // draining session propagates the snapshot of its last `ready()` pass
+        // forever, so the graceful-shutdown budget never expires. Pinned by
+        // `shutting_down_refreshes_the_snapshot_so_the_drain_budget_expires`.
+        let now = Instant::now();
+        self.context.now = now;
         // RFC 9113 §6.8: initiate graceful shutdown with double-GOAWAY pattern.
         // Only send the initial GOAWAY once. The final GOAWAY (with the real
         // last_stream_id) is handled by finalize_write() when all streams drain.
         // Calling graceful_goaway() again would send the final GOAWAY
         // prematurely and force-disconnect before in-flight streams complete.
         if !self.frontend.is_draining() {
-            match self.frontend.graceful_goaway() {
+            match self.frontend.graceful_goaway(now) {
                 MuxResult::CloseSession => return true,
                 MuxResult::Continue => {
                     // graceful_goaway() queued a GOAWAY frame. Flush it directly
@@ -1989,9 +2057,212 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     }
 }
 
+/// Minimal listener + `Mux` scaffolding shared by the `mod.rs` and `h2.rs`
+/// test modules. Lives here rather than in either test module because
+/// `Context<L>` is generic over the listener and both need the same `L`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::{
+        cell::RefCell,
+        collections::BTreeMap,
+        net::{SocketAddr, TcpListener as StdTcpListener},
+        rc::Rc,
+    };
+
+    use sozu_command::logging::CachedTags;
+
+    use super::*;
+    use crate::{
+        FrontendFromRequestError, L7ListenerHandler, ListenerHandler, Protocol,
+        protocol::http::{answers::HttpAnswers, parser::Method},
+        router::RouteResult,
+    };
+
+    /// Implements exactly the nine required methods of `ListenerHandler` +
+    /// `L7ListenerHandler`; every other knob keeps its trait default.
+    pub(crate) struct TestListener {
+        address: SocketAddr,
+        answers: Rc<RefCell<HttpAnswers>>,
+    }
+
+    impl TestListener {
+        pub(crate) fn new() -> Self {
+            Self {
+                address: "127.0.0.1:1".parse().expect("test address must parse"),
+                answers: Rc::new(RefCell::new(
+                    HttpAnswers::new(&BTreeMap::new()).expect("default answers must build"),
+                )),
+            }
+        }
+    }
+
+    impl ListenerHandler for TestListener {
+        fn get_addr(&self) -> &SocketAddr {
+            &self.address
+        }
+        fn get_tags(&self, _key: &str) -> Option<&CachedTags> {
+            None
+        }
+        fn set_tags(&mut self, _key: String, _tags: Option<BTreeMap<String, String>>) {}
+        fn protocol(&self) -> Protocol {
+            Protocol::HTTP
+        }
+        fn public_address(&self) -> SocketAddr {
+            self.address
+        }
+    }
+
+    impl L7ListenerHandler for TestListener {
+        fn get_sticky_name(&self) -> &str {
+            "SOZUBALANCEID"
+        }
+        fn get_connect_timeout(&self) -> u32 {
+            10
+        }
+        fn frontend_from_request(
+            &self,
+            _host: &str,
+            _uri: &str,
+            _method: &Method,
+        ) -> Result<RouteResult, FrontendFromRequestError> {
+            Err(FrontendFromRequestError::InvalidCharsAfterHost(
+                "test listener routes nothing".to_owned(),
+            ))
+        }
+        fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>> {
+            &self.answers
+        }
+    }
+
+    /// A live, connected, non-blocking loopback socket. Reads return
+    /// `WouldBlock` rather than `ECONNREFUSED`, so a `readable()` pass over it
+    /// is a no-op instead of a forced disconnect. The accepted peer is returned
+    /// so the caller can keep it alive for the duration of the test.
+    pub(crate) fn connected_socket() -> (mio::net::TcpStream, std::net::TcpStream) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener local addr");
+        let client = mio::net::TcpStream::connect(address).expect("connect test client");
+        let (peer, _) = listener.accept().expect("accept test peer");
+        peer.set_nonblocking(true).expect("peer nonblocking");
+        (client, peer)
+    }
+
+    /// A `Context` backed by [`TestListener`] and a small buffer pool.
+    pub(crate) fn test_context(pool: &Rc<RefCell<Pool>>) -> Context<TestListener> {
+        Context::new(
+            Ulid::generate(),
+            Rc::downgrade(pool),
+            Rc::new(RefCell::new(TestListener::new())),
+            None,
+            "127.0.0.1:1".parse().expect("public address must parse"),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{connected_socket, test_context};
     use super::*;
+    use crate::{
+        pool::Pool,
+        protocol::mux::h2::{ConnectionH2, H2ConnectionConfig, H2FloodConfig, H2State},
+        timer::TimeoutContainer,
+    };
+
+    /// `Mux::shutting_down` runs outside `ready()`, driven by
+    /// `shut_down_sessions()`. It is therefore its own clock-sampling point,
+    /// and that sample is load-bearing: it refreshes `context.now`, which
+    /// `drive_frontend_shutdown_io` -> `readable()` mirrors into
+    /// `ConnectionH2::now`, which the forced-close check then reads.
+    ///
+    /// A silent draining session gets no read/write events, so nothing else
+    /// refreshes the snapshot. Without this sample the connection would carry
+    /// the snapshot of its last `ready()` pass forever and the
+    /// graceful-shutdown budget would never expire — the session would hang
+    /// past the operator-configured SLA, which is the exact failure the
+    /// forced-close deadline exists to prevent.
+    ///
+    /// The frontend is already draining, so `graceful_goaway` is NOT called on
+    /// this path — that is what makes the test discriminating, because the
+    /// `now` parameter of `graceful_goaway` cannot cover it.
+    ///
+    /// To SEE THIS RED: delete `self.context.now = now;` from
+    /// `Mux::shutting_down` (keeping `let now` so `graceful_goaway(now)` still
+    /// compiles). `readable()` then mirrors the frozen snapshot, the budget
+    /// reads as 0s elapsed against a 5s deadline, and the final assertion fails
+    /// with `assertion failed: mux.shutting_down()`.
+    #[test]
+    fn shutting_down_refreshes_the_snapshot_so_the_drain_budget_expires() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (socket, _peer) = connected_socket();
+        let deadline = Duration::from_secs(5);
+
+        let mut h2 = ConnectionH2::new(
+            Ulid::generate(),
+            socket,
+            Position::Server,
+            Rc::downgrade(&pool),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            Some(deadline),
+            TimeoutContainer::new_empty(Duration::from_secs(30)),
+            None,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+
+        // A connection that already sent its initial GOAWAY and armed the
+        // budget well over the deadline ago. `shutting_down` takes the
+        // already-draining branch, which never calls `graceful_goaway`.
+        let armed_at = Instant::now() - Duration::from_secs(60);
+        h2.state = H2State::Header;
+        h2.drain.draining = true;
+        h2.drain.started_at = Some(armed_at);
+        let mut frontend = Connection::H2(h2);
+
+        let mut context = test_context(&pool);
+        // Freeze the snapshot at the instant the budget was armed, as a
+        // session that has seen no event since then would carry it.
+        context.now = armed_at;
+        // One live stream, so `can_stop` stays false and the forced-close
+        // deadline is the only path that can return `true`.
+        let stream_id = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        context.streams[stream_id].state = StreamState::Linked(Token(1));
+        // Give the connection a live WIRE stream too: with an empty
+        // `ConnectionH2::streams`, `finalize_write` sends the FINAL GOAWAY and
+        // force-disconnects, so `drive_frontend_shutdown_io` would return true
+        // and short-circuit `shutting_down` before the deadline check. The
+        // per-stream activity maps are deliberately left empty so
+        // `cancel_timed_out_streams` early-returns and cannot queue an RST.
+        let Connection::H2(h2) = &mut frontend else {
+            unreachable!("frontend was built as H2")
+        };
+        h2.streams.insert(1, stream_id);
+
+        let mut mux = Mux {
+            configured_frontend_timeout: Duration::from_secs(30),
+            frontend_token: Token(0),
+            frontend,
+            router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
+            context,
+            session_ulid: Ulid::generate(),
+        };
+
+        assert!(
+            mux.frontend.is_draining(),
+            "precondition: the frontend must already be draining, so this test \
+             exercises the branch that never reaches graceful_goaway"
+        );
+
+        assert!(
+            mux.shutting_down(),
+            "shutting_down must refresh the clock snapshot itself, so a silent \
+             draining session's forced-close budget still expires"
+        );
+    }
 
     #[test]
     fn update_readiness_after_read_closed_keeps_writable() {

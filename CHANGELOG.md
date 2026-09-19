@@ -739,6 +739,52 @@
 
 ### 🔄 Changed
 
+- **`refactor(h2)`: the H2 core now reads one clock snapshot per pass instead of calling
+  `Instant::now()` at twenty-one separate sites.**
+  `Mux` is the only clock sampler in the multiplexer. It writes `Context.now`
+  (`lib/src/protocol/mux/mod.rs:450`) once per **outer** `Mux::ready` pass (`mod.rs:821`) and at the
+  top of `Mux::timeout` (`mod.rs:1406`) and `Mux::shutting_down` (`mod.rs:1904`); the H2 core reads
+  the mirror `ConnectionH2.now` (`lib/src/protocol/mux/h2.rs:1867`), assigned at each public entry
+  point. `H2FloodDetector::check_flood` and `::new` take `now` as a parameter and
+  `H2FloodDetector::window_start` is now private, so nothing can advance the rate window against a
+  clock the connection is not reading. `Instant` stays the type — there is no clock trait and no
+  newtype; this is HAProxy's `now_ms` localized to the struct.
+  The sample sits on the outer loop so the inner loop deliberately shares one instant — that is the
+  property the snapshot exists for. It is not a bound on how long a sweep may take:
+  `MAX_LOOP_ITERATIONS = 10_000` (`mod.rs:188`) is a count, a count bounds iterations rather than
+  wall clock, and `counter` (`mod.rs:793`) sits above both loops, so one `ready()` call can spend
+  the whole budget under a single snapshot.
+  **Behaviour change: every deadline armed or evaluated inside a pass is now accurate to within that
+  pass, in EITHER direction.** The error is not one-sided:
+  - An **arm** site runs at arbitrary depth into its pass (`h2.rs:5302` DATA, `h2.rs:5440` HEADERS,
+    `h2.rs:2852` / `h2.rs:3205` outbound bytes, `h2.rs:3240` fc-stall) and stamps the snapshot taken
+    at the START of that pass, so the stored instant is older than the event it records. An **eval**
+    site runs near the top of a pass — `cancel_timed_out_streams` is the first thing `readable` does,
+    and the SETTINGS-ACK check (`h2.rs:2483`, mirrored at `h2.rs:3665`) is next. The measured age is
+    inflated by the arm site's depth, so a deadline can fire up to one pass **early** as well as one
+    pass late. Worked against the strict `>` predicate in `collect_timed_out_streams`: pass P has
+    snapshot `T`; at real `T+Δ` a DATA frame stores `T`; pass Q has snapshot `T+deadline+δ` and
+    computes `deadline+δ > deadline`, so it reaps, while true elapsed is `deadline+δ−Δ < deadline`
+    whenever `Δ > δ`. At base both ends read the real clock and the comparison was exact; this is
+    the cost of the snapshot, and it is bounded by one pass.
+  - The flood window (`h2.rs:1157`) and the RFC 9113 §5.1.2 back-pressure window (`h2.rs:4517`) are
+    the one asymmetric case, and they **fail closed**: `now` is constant for the whole pass, so a
+    window cannot decay part-way through one. A burst arriving during a pass is weighed in full
+    against the window that was open when the pass started, where before a long pass could halve the
+    counters under the burst. The window boundary still carries the same one-pass error either way.
+  `graceful_goaway` (`h2.rs:4740`) takes `now` as its one new parameter, because its caller
+  `Mux::shutting_down` runs outside `ready()`. That handler also takes its own sample
+  (`mod.rs:1929`), which is load-bearing rather than belt-and-braces: `drive_frontend_shutdown_io`
+  (`mod.rs:722`) always reaches `readable()` for an H2 frontend, and `readable` mirrors
+  `context.now` into `ConnectionH2::now` before the forced-close check runs. Without that sample a
+  silent draining session would propagate its last `ready()` snapshot forever and the
+  graceful-shutdown budget would never expire — including on the already-draining path, which never
+  reaches `graceful_goaway` at all.
+  `SessionMetrics` and `TimeoutContainer` deliberately stay on the real clock: metrics want true
+  elapsed time, and the timeout container is the embedder's timer, which the H2 core never reads.
+  No configuration key, metric, CLI flag or wire behaviour changes. `lib/src/protocol/mux/LIFECYCLE.md`
+  §7.5 and invariant 20 document the rule and its reviewer check.
+
 - **BREAKING — `path_type = "REGEX"` frontends now match the WHOLE request path, not a substring of it.**
   `doc/configure.md` has promised "REGEX is anchored at both ends (`\A...\z`)" since v2.0.0, and
   `PathRule::from_config` (`lib/src/router/mod.rs`) did not implement it: it compiled the configured

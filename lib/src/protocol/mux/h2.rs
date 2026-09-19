@@ -136,7 +136,7 @@ macro_rules! log_module_context {
     }};
 }
 
-/// `if let Some(violation) = self.flood_detector.check_flood() { return self.handle_flood_violation(violation); }`
+/// `if let Some(violation) = self.flood_detector.check_flood(self.now) { return self.handle_flood_violation(violation); }`
 /// pattern wrapped as a single statement. Pure dispatch — the actual flood
 /// thresholds and counters live inside `H2FloodDetector::check_flood` and
 /// `ConnectionH2::handle_flood_violation`, which the macro does not touch.
@@ -144,7 +144,7 @@ macro_rules! log_module_context {
 /// uniform and a future grep for "flood-check forgot to return" finds zero.
 macro_rules! check_flood_or_return {
     ($self:expr) => {
-        if let Some(violation) = $self.flood_detector.check_flood() {
+        if let Some(violation) = $self.flood_detector.check_flood($self.now) {
             return $self.handle_flood_violation(violation);
         }
     };
@@ -1005,20 +1005,34 @@ pub struct H2FloodDetector {
     pub(super) accumulated_header_size: u32,
     /// General anomaly counter
     pub(super) glitch_count: u32,
-    /// Window start for rate-based counters
-    pub(super) window_start: Instant,
+    /// Window start for rate-based counters.
+    ///
+    /// Private: the detector never samples the clock itself, so this field is
+    /// only ever advanced from a `now` the caller supplies to
+    /// [`Self::check_flood`]. Exposing it would let a caller reset the window
+    /// against a clock the connection is not reading, which is exactly the
+    /// dual-clock hazard the injected `now` removes.
+    window_start: Instant,
     /// Configurable thresholds for flood detection
     pub(super) config: H2FloodConfig,
 }
 
 impl Default for H2FloodDetector {
+    /// Test-only convenience. `Default` cannot express "the connection's
+    /// clock snapshot", so it is the one place in this module that still
+    /// samples the clock outside a constructor the mux drives. The
+    /// production path builds the detector in
+    /// [`ConnectionH2::new`], which threads its own single sample in.
     fn default() -> Self {
-        Self::new(H2FloodConfig::default())
+        Self::new(H2FloodConfig::default(), Instant::now())
     }
 }
 
 impl H2FloodDetector {
-    pub fn new(config: H2FloodConfig) -> Self {
+    /// `now` is the caller's clock snapshot — the detector never samples the
+    /// clock itself. It seeds the first rate window, which
+    /// [`Self::check_flood`] then advances from the `now` it is handed.
+    pub fn new(config: H2FloodConfig, now: Instant) -> Self {
         // Pre-condition: thresholds are already validated (clamped to >= 1 by
         // `H2FloodConfig::new`). A zero per-window threshold would trip on the
         // first counted frame; assert it here so a config that bypassed `new`
@@ -1045,7 +1059,7 @@ impl H2FloodDetector {
             continuation_count: 0,
             accumulated_header_size: 0,
             glitch_count: 0,
-            window_start: Instant::now(),
+            window_start: now,
             config,
         }
     }
@@ -1135,8 +1149,13 @@ impl H2FloodDetector {
 
     /// Half-decay rate-based counters if the current window has expired.
     /// Uses half-window decay instead of full reset to catch burst-then-wait attacks.
-    fn maybe_reset_window(&mut self) {
-        if self.window_start.elapsed() >= FLOOD_WINDOW_DURATION {
+    ///
+    /// `now` is the caller's snapshot rather than a fresh `Instant::now()`, so
+    /// a window cannot decay part-way through a pass: a burst that arrives in
+    /// one pass is weighed in full against the window that was open when the
+    /// pass started. That is the fail-closed direction.
+    fn maybe_reset_window(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.window_start) >= FLOOD_WINDOW_DURATION {
             let (rst_before, ping_before, settings_before) =
                 (self.rst_stream_count, self.ping_count, self.settings_count);
             let (empty_before, wu0_before, glitch_before) = (
@@ -1150,7 +1169,7 @@ impl H2FloodDetector {
             self.empty_data_count /= 2;
             self.window_update_stream0_count /= 2;
             self.glitch_count /= 2;
-            self.window_start = Instant::now();
+            self.window_start = now;
             // Half-decay invariant: each rate-based counter is exactly halved
             // (integer division), never increased. Catching burst-then-wait
             // attacks relies on the counter shrinking but not vanishing — a
@@ -1177,8 +1196,8 @@ impl H2FloodDetector {
             // the never-decaying ceilings. Guard against a future edit decaying
             // them by accident.
             debug_assert!(
-                self.window_start.elapsed() < FLOOD_WINDOW_DURATION,
-                "window_start must be refreshed to (approximately) now after decay"
+                now.saturating_duration_since(self.window_start) < FLOOD_WINDOW_DURATION,
+                "window_start must be refreshed to the caller's now after decay"
             );
         }
     }
@@ -1186,8 +1205,13 @@ impl H2FloodDetector {
     /// Check all flood counters. Returns a [`H2FloodViolation`] when a threshold
     /// is exceeded; the caller is responsible for logging with session context
     /// and escalating to GOAWAY.
-    pub fn check_flood(&mut self) -> Option<H2FloodViolation> {
-        self.maybe_reset_window();
+    ///
+    /// `now` is the caller's clock snapshot — in production
+    /// [`ConnectionH2::now`], refreshed by [`Mux`](super::Mux) once per pass.
+    /// The detector never reads the clock itself, so the ten
+    /// `check_flood_or_return!` sites all weigh a burst against one instant.
+    pub fn check_flood(&mut self, now: Instant) -> Option<H2FloodViolation> {
+        self.maybe_reset_window(now);
 
         fn flag(
             reason: &'static str,
@@ -1825,6 +1849,30 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// on sustained abuse — a single halving per connection is sufficient to
     /// signal back-pressure; further bursts trigger `EnhanceYourCalm`.
     mcs_backpressure_applied: bool,
+    /// Clock snapshot for the pass currently executing — this connection's
+    /// mirror of [`Context::now`](super::Context::now).
+    ///
+    /// Every time-based decision in this module reads this field. The only
+    /// code below [`Mux`](super::Mux) that calls [`Instant::now`] is
+    /// [`Self::new`], which takes one sample to seed this field,
+    /// `refuse_window_start` and the flood detector's window — a connection
+    /// is constructed outside any pass, so there is no snapshot to inherit.
+    /// (`impl Default for H2FloodDetector` also samples, but is test-only.)
+    ///
+    /// Assigned from `context.now` at each public entry point
+    /// ([`Self::readable`], [`Self::writable`],
+    /// [`Self::cancel_timed_out_streams`], [`Self::start_stream`]) and from
+    /// the `now` parameter of [`Self::graceful_goaway`]. `Mux::shutting_down`
+    /// reaches it indirectly: it refreshes `Context::now`, and the
+    /// `readable()` call inside `drive_frontend_shutdown_io` mirrors that into
+    /// this field before the forced-close deadline is evaluated.
+    ///
+    /// A field rather than a threaded parameter because the read sites are
+    /// unreachable from a `context`: [`Self::handle_ping_frame`] takes no
+    /// context at all, and the ten `check_flood_or_return!` sites are spread
+    /// across six frame handlers. The macro reads `$self.now`, so those ten
+    /// call sites stay as they were.
+    pub(super) now: Instant,
 }
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1913,6 +1961,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let buffer = pool
             .upgrade()
             .and_then(|pool| pool.borrow_mut().checkout())?;
+        // The one clock sample this module takes outside `Mux`'s sampling
+        // points. A connection is constructed at accept / backend-connect
+        // time, outside any `ready()` pass, so there is no snapshot to
+        // inherit; everything downstream of here reads `self.now`, which
+        // `Mux` refreshes from its next pass onward.
+        let now = Instant::now();
         let local_settings = H2Settings {
             settings_max_concurrent_streams: connection_config.max_concurrent_streams,
             ..H2Settings::default()
@@ -1962,7 +2016,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 overhead_bin: 0,
                 overhead_bout: 0,
             },
-            flood_detector: H2FloodDetector::new(flood_config),
+            flood_detector: H2FloodDetector::new(flood_config, now),
             settings_sent_at: None,
             pending_rst_streams: Vec::new(),
             rst_sent: std::collections::HashSet::new(),
@@ -1978,8 +2032,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             stream_fc_stalled_progress: HashMap::new(),
             stream_idle_timeout,
             refuse_count_window: 0,
-            refuse_window_start: Instant::now(),
+            refuse_window_start: now,
             mcs_backpressure_applied: false,
+            now,
         })
     }
 
@@ -2423,6 +2478,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        // Entry point: adopt the mux's snapshot for this pass.
+        self.now = context.now;
         self.prune_inactive_streams_while_closing(context);
         // Pass 4 Medium #3: per-stream idle guard. Slow-multiplex Slowloris
         // sends one byte or a control frame per stream just often enough to
@@ -2431,7 +2488,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
         if let Some(sent_at) = self.settings_sent_at
-            && sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT
+            && self.now.saturating_duration_since(sent_at) >= SETTINGS_ACK_TIMEOUT
         {
             warn!(
                 "{} SETTINGS ACK timeout: no SETTINGS ACK observed within {:?}",
@@ -2585,7 +2642,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         kawa.storage.fill(size);
                         incr!(names::h2::FRAMES_TX_SETTINGS);
                         // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
-                        self.settings_sent_at = Some(Instant::now());
+                        self.settings_sent_at = Some(self.now);
                     }
                     Err(error) => {
                         error!(
@@ -2800,7 +2857,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // even when the peer sends no inbound frames.
             if resume_bytes > 0 {
                 if let Some(t) = self.stream_last_activity_at.get_mut(&stream_id) {
-                    *t = Instant::now();
+                    *t = self.now;
                 }
                 // Clear the flow-control-stall deadline ONLY when the effective
                 // send window is genuinely open — that alone is a real un-stall.
@@ -3153,7 +3210,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             if stream_bytes > 0
                 && let Some(t) = self.stream_last_activity_at.get_mut(&stream_id)
             {
-                *t = Instant::now();
+                *t = self.now;
             }
             // Arm/age the dedicated flow-control-stall deadline that catches a
             // window-stalled stream — a buffered RESPONSE to a slow frontend
@@ -3188,7 +3245,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 FcStallAction::Arm { progress } => {
                     self.stream_fc_stalled_since
                         .entry(stream_id)
-                        .or_insert_with(Instant::now);
+                        .or_insert(self.now);
                     self.stream_fc_stalled_progress.insert(stream_id, progress);
                 }
             }
@@ -3303,7 +3360,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return if self.streams.is_empty() {
                 self.goaway(H2Error::NoError)
             } else {
-                self.graceful_goaway()
+                self.graceful_goaway(self.now)
             };
         }
         self.finalize_write(socket_write, total_bytes_written, context)
@@ -3543,7 +3600,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // RFC 9113 §6.8: if draining and all streams have completed,
         // send the final GOAWAY with the actual last_stream_id
         if self.drain.draining && self.streams.is_empty() {
-            return self.graceful_goaway();
+            return self.graceful_goaway(self.now);
         }
 
         if self.socket.socket_wants_write() {
@@ -3613,7 +3670,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
         if let Some(sent_at) = self.settings_sent_at
-            && sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT
+            && self.now.saturating_duration_since(sent_at) >= SETTINGS_ACK_TIMEOUT
         {
             warn!(
                 "{} SETTINGS ACK timeout: no SETTINGS ACK observed within {:?}",
@@ -3748,6 +3805,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        // Entry point: adopt the mux's snapshot for this pass.
+        self.now = context.now;
         self.prune_inactive_streams_while_closing(context);
 
         if let Some(result) = self.flush_pending_control_frames() {
@@ -3822,7 +3881,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         kawa.storage.fill(size);
                         incr!(names::h2::FRAMES_TX_SETTINGS);
                         // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
-                        self.settings_sent_at = Some(Instant::now());
+                        self.settings_sent_at = Some(self.now);
                     }
                     Err(error) => {
                         error!(
@@ -4198,6 +4257,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        // Entry point: `Mux::timeout` reaches this directly, without going
+        // through `readable`, so adopt the mux's snapshot here too.
+        self.now = context.now;
         // Per-connection scratch Vecs (`converter_buf`, `lowercase_buf`,
         // `cookie_buf`, `priorities_buf`) grow to a
         // high-water mark and never shrink. On a long-lived idle H2
@@ -4228,7 +4290,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         {
             return;
         }
-        let now = Instant::now();
+        let now = self.now;
         let deadline = self.stream_idle_timeout;
         // Two independent per-stream guards reap on the same deadline — see
         // `collect_timed_out_streams`. The flow-control-stall guard
@@ -4461,9 +4523,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// still promote the situation to `EnhanceYourCalm` via the flood
     /// detector.
     fn record_refusal_for_backpressure(&mut self) {
-        if self.refuse_window_start.elapsed() >= BACKPRESSURE_WINDOW_DURATION {
+        if self.now.saturating_duration_since(self.refuse_window_start)
+            >= BACKPRESSURE_WINDOW_DURATION
+        {
             self.refuse_count_window = 0;
-            self.refuse_window_start = Instant::now();
+            self.refuse_window_start = self.now;
         }
         self.refuse_count_window = self.refuse_count_window.saturating_add(1);
         if !self.mcs_backpressure_applied
@@ -4675,7 +4739,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// When `draining` is already true (second invocation), sends the final GOAWAY
     /// with the actual `highest_peer_stream_id` so the peer knows which streams
     /// were processed.
-    pub fn graceful_goaway(&mut self) -> MuxResult {
+    ///
+    /// `now` is the caller's clock snapshot and is what arms the forced-close
+    /// budget. It is a parameter rather than a read of [`Self::now`] because
+    /// the caller that matters — `Mux::shutting_down` — runs outside
+    /// `ready()` and therefore outside the pass that last refreshed the
+    /// mirror. In-module callers pass `self.now`.
+    pub fn graceful_goaway(&mut self, now: Instant) -> MuxResult {
         if self.drain.draining {
             // Second GOAWAY: send with the real last_stream_id
             return self.goaway(H2Error::NoError);
@@ -4689,7 +4759,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // `Mux::shutting_down` samples it against `graceful_shutdown_deadline`
         // and returns `true` once the budget is exhausted so the session loop
         // tears the connection down instead of waiting forever.
-        self.drain.started_at = Some(Instant::now());
+        self.drain.started_at = Some(now);
         // Keep expect_read as-is: existing streams should continue reading
         // data during the drain window opened by the initial GOAWAY. Only
         // the final GOAWAY (via `goaway()`) removes READABLE.
@@ -4743,7 +4813,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// - or the elapsed time is still within the configured budget.
     pub fn graceful_shutdown_deadline_elapsed(&self) -> bool {
         match (self.drain.started_at, self.drain.graceful_shutdown_deadline) {
-            (Some(started_at), Some(deadline)) => started_at.elapsed() >= deadline,
+            (Some(started_at), Some(deadline)) => {
+                self.now.saturating_duration_since(started_at) >= deadline
+            }
             _ => false,
         }
     }
@@ -4872,8 +4944,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         )?;
         self.last_stream_id = (stream_id + 2) & !1;
         self.streams.insert(stream_id, global_stream_id);
-        self.stream_last_activity_at
-            .insert(stream_id, Instant::now());
+        self.stream_last_activity_at.insert(stream_id, self.now);
         // Post-conditions: the stream is now reachable in both indices, the
         // active count grew by exactly one (the id was not already present —
         // `handle_header_state` rejects re-used ids), and `last_stream_id` is
@@ -5236,7 +5307,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if content_len > 0
             && let Some(t) = self.stream_last_activity_at.get_mut(&data.stream_id)
         {
-            *t = Instant::now();
+            *t = self.now;
         }
 
         if is_unlinked {
@@ -5374,7 +5445,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // on an existing stream). Initial HEADERS that create the stream already
         // set the timestamp in create_stream().
         if let Some(t) = self.stream_last_activity_at.get_mut(&stream_id) {
-            *t = Instant::now();
+            *t = self.now;
         }
 
         if let Some(priority) = &headers.priority
@@ -6594,10 +6665,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, _context: &mut Context<L>) -> bool
+    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>) -> bool
     where
         L: ListenerHandler + L7ListenerHandler,
     {
+        // Entry point: a backend connection reaches this from the router
+        // without necessarily having had `readable`/`writable` called on it
+        // this pass, so adopt the mux's snapshot before arming the new
+        // stream's liveness deadline below.
+        self.now = context.now;
         // RFC 9113 §6.8: reject new streams on a draining connection
         if self.drain.draining {
             error!(
@@ -6658,12 +6734,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     );
                 }
             }
-            self.graceful_goaway();
+            self.graceful_goaway(self.now);
             return false;
         };
         self.streams.insert(stream_id, stream);
-        self.stream_last_activity_at
-            .insert(stream_id, Instant::now());
+        self.stream_last_activity_at.insert(stream_id, self.now);
         self.readiness.arm_writable();
         true
     }
@@ -6674,17 +6749,28 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use super::*;
-    use crate::{pool::Pool, protocol::kawa_h1::editor::HttpContext};
+    use crate::{
+        pool::Pool,
+        protocol::{
+            kawa_h1::editor::HttpContext,
+            mux::{
+                connection::EndpointClient,
+                router::Router,
+                test_support::{connected_socket, test_context},
+            },
+        },
+    };
 
     // ── H2FloodDetector ──────────────────────────────────────────────────
 
     #[test]
     fn test_flood_detector_no_flood_below_threshold() {
+        let base = Instant::now();
         let config = H2FloodConfig::default();
-        let mut detector = H2FloodDetector::new(config);
+        let mut detector = H2FloodDetector::new(config, base);
 
         // All counters at zero -> no flood
-        assert!(detector.check_flood().is_none());
+        assert!(detector.check_flood(base).is_none());
 
         // Increment each counter to exactly the threshold (not exceeding)
         detector.rst_stream_count = config.max_rst_stream_per_window;
@@ -6694,17 +6780,18 @@ mod tests {
         detector.continuation_count = config.max_continuation_frames;
         detector.glitch_count = config.max_glitch_count;
         // At threshold but not exceeding -> no flood
-        assert!(detector.check_flood().is_none());
+        assert!(detector.check_flood(base).is_none());
     }
 
     #[test]
     fn test_flood_detector_detects_rapid_reset() {
+        let base = Instant::now();
         let config = H2FloodConfig::default();
-        let mut detector = H2FloodDetector::new(config);
+        let mut detector = H2FloodDetector::new(config, base);
 
         detector.rst_stream_count = config.max_rst_stream_per_window + 1;
         assert!(matches!(
-            detector.check_flood(),
+            detector.check_flood(base),
             Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 ..
@@ -6714,12 +6801,13 @@ mod tests {
 
     #[test]
     fn test_flood_detector_detects_ping_flood() {
+        let base = Instant::now();
         let config = H2FloodConfig::default();
-        let mut detector = H2FloodDetector::new(config);
+        let mut detector = H2FloodDetector::new(config, base);
 
         detector.ping_count = config.max_ping_per_window + 1;
         assert!(matches!(
-            detector.check_flood(),
+            detector.check_flood(base),
             Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 ..
@@ -6729,12 +6817,13 @@ mod tests {
 
     #[test]
     fn test_flood_detector_detects_settings_flood() {
+        let base = Instant::now();
         let config = H2FloodConfig::default();
-        let mut detector = H2FloodDetector::new(config);
+        let mut detector = H2FloodDetector::new(config, base);
 
         detector.settings_count = config.max_settings_per_window + 1;
         assert!(matches!(
-            detector.check_flood(),
+            detector.check_flood(base),
             Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 ..
@@ -6744,12 +6833,13 @@ mod tests {
 
     #[test]
     fn test_flood_detector_detects_empty_data_flood() {
+        let base = Instant::now();
         let config = H2FloodConfig::default();
-        let mut detector = H2FloodDetector::new(config);
+        let mut detector = H2FloodDetector::new(config, base);
 
         detector.empty_data_count = config.max_empty_data_per_window + 1;
         assert!(matches!(
-            detector.check_flood(),
+            detector.check_flood(base),
             Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 ..
@@ -6759,12 +6849,13 @@ mod tests {
 
     #[test]
     fn test_flood_detector_detects_continuation_flood() {
+        let base = Instant::now();
         let config = H2FloodConfig::default();
-        let mut detector = H2FloodDetector::new(config);
+        let mut detector = H2FloodDetector::new(config, base);
 
         detector.continuation_count = config.max_continuation_frames + 1;
         assert!(matches!(
-            detector.check_flood(),
+            detector.check_flood(base),
             Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 ..
@@ -6774,12 +6865,13 @@ mod tests {
 
     #[test]
     fn test_flood_detector_detects_header_size_flood() {
+        let base = Instant::now();
         let config = H2FloodConfig::default();
-        let mut detector = H2FloodDetector::new(config);
+        let mut detector = H2FloodDetector::new(config, base);
 
         detector.accumulated_header_size = MAX_HEADER_LIST_SIZE as u32 + 1;
         assert!(matches!(
-            detector.check_flood(),
+            detector.check_flood(base),
             Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 ..
@@ -6789,12 +6881,13 @@ mod tests {
 
     #[test]
     fn test_flood_detector_detects_glitch_flood() {
+        let base = Instant::now();
         let config = H2FloodConfig::default();
-        let mut detector = H2FloodDetector::new(config);
+        let mut detector = H2FloodDetector::new(config, base);
 
         detector.glitch_count = config.max_glitch_count + 1;
         assert!(matches!(
-            detector.check_flood(),
+            detector.check_flood(base),
             Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 ..
@@ -6804,6 +6897,7 @@ mod tests {
 
     #[test]
     fn test_flood_detector_custom_thresholds() {
+        let base = Instant::now();
         let config = H2FloodConfig {
             max_rst_stream_per_window: 5,
             max_ping_per_window: 10,
@@ -6813,16 +6907,16 @@ mod tests {
             max_glitch_count: 15,
             ..H2FloodConfig::default()
         };
-        let mut detector = H2FloodDetector::new(config);
+        let mut detector = H2FloodDetector::new(config, base);
 
         // Below custom threshold -> no flood
         detector.rst_stream_count = 5;
-        assert!(detector.check_flood().is_none());
+        assert!(detector.check_flood(base).is_none());
 
         // Above custom threshold -> flood
         detector.rst_stream_count = 6;
         assert!(matches!(
-            detector.check_flood(),
+            detector.check_flood(base),
             Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 ..
@@ -6832,8 +6926,9 @@ mod tests {
 
     #[test]
     fn test_flood_detector_reset_continuation() {
+        let base = Instant::now();
         let config = H2FloodConfig::default();
-        let mut detector = H2FloodDetector::new(config);
+        let mut detector = H2FloodDetector::new(config, base);
 
         detector.continuation_count = 15;
         detector.accumulated_header_size = 30000;
@@ -6846,8 +6941,9 @@ mod tests {
 
     #[test]
     fn test_flood_detector_half_decay_on_window_expiry() {
+        let base = Instant::now();
         let config = H2FloodConfig::default();
-        let mut detector = H2FloodDetector::new(config);
+        let mut detector = H2FloodDetector::new(config, base);
 
         detector.rst_stream_count = 80;
         detector.ping_count = 60;
@@ -6856,11 +6952,16 @@ mod tests {
         detector.window_update_stream0_count = 90;
         detector.glitch_count = 50;
 
-        // Force window expiry by setting window_start to the past
-        detector.window_start = Instant::now() - FLOOD_WINDOW_DURATION;
-
-        // check_flood calls maybe_reset_window which halves counters
-        let _ = detector.check_flood();
+        // Expiry is expressed as the instant the caller hands in, not by
+        // back-dating the detector's own window: the detector no longer reads
+        // a clock, so `base + FLOOD_WINDOW_DURATION` IS the next window.
+        // No sleep, no wall-clock dependency.
+        //
+        // To SEE THIS RED: in `maybe_reset_window`, change the guard to
+        // `> FLOOD_WINDOW_DURATION` (strict). The boundary instant then no
+        // longer expires the window, nothing decays, and all six asserts
+        // below fail with the undecayed values (80/60/40/20/90/50).
+        let _ = detector.check_flood(base + FLOOD_WINDOW_DURATION);
 
         assert_eq!(detector.rst_stream_count, 40);
         assert_eq!(detector.ping_count, 30);
@@ -6872,20 +6973,21 @@ mod tests {
 
     #[test]
     fn test_flood_detector_window_update_stream0_trips_at_threshold() {
+        let base = Instant::now();
         let config = H2FloodConfig {
             max_window_update_stream0_per_window: 5,
             ..H2FloodConfig::default()
         };
-        let mut detector = H2FloodDetector::new(config);
+        let mut detector = H2FloodDetector::new(config, base);
 
         // At threshold — no flood yet (strict greater-than, matches existing counters).
         detector.window_update_stream0_count = 5;
-        assert!(detector.check_flood().is_none());
+        assert!(detector.check_flood(base).is_none());
 
         // Above threshold — flood with the correct violation reason + metric key.
         detector.window_update_stream0_count = 6;
         let violation = detector
-            .check_flood()
+            .check_flood(base)
             .expect("WINDOW_UPDATE stream-0 flood must trip above threshold");
         assert_eq!(violation.error, H2Error::EnhanceYourCalm);
         assert_eq!(violation.reason, "WINDOW_UPDATE stream 0");
@@ -6911,30 +7013,35 @@ mod tests {
 
     #[test]
     fn test_flood_detector_decay_prevents_flood() {
+        let base = Instant::now();
         let config = H2FloodConfig {
             max_rst_stream_per_window: 10,
             ..H2FloodConfig::default()
         };
-        let mut detector = H2FloodDetector::new(config);
+        let mut detector = H2FloodDetector::new(config, base);
 
         // Set counter just above threshold
         detector.rst_stream_count = 12;
 
         // Without decay -> flood
         assert!(matches!(
-            detector.check_flood(),
+            detector.check_flood(base),
             Some(H2FloodViolation {
                 error: H2Error::EnhanceYourCalm,
                 ..
             })
         ));
 
-        // Reset and simulate window expiry
+        // Reset and cross into the next window via the injected instant.
         detector.rst_stream_count = 12;
-        detector.window_start = Instant::now() - FLOOD_WINDOW_DURATION;
 
-        // After decay: 12/2 = 6, which is below threshold 10 -> no flood
-        assert!(detector.check_flood().is_none());
+        // After decay: 12/2 = 6, which is below threshold 10 -> no flood.
+        //
+        // To SEE THIS RED: make `maybe_reset_window` take `Instant::now()`
+        // instead of its `now` parameter. The injected future instant is then
+        // ignored, the window never expires, the count stays 12 > 10 and this
+        // assert trips on the flood it should have decayed away.
+        assert!(detector.check_flood(base + FLOOD_WINDOW_DURATION).is_none());
     }
 
     #[test]
@@ -7025,16 +7132,21 @@ mod tests {
 
     #[test]
     fn test_flood_detector_emitted_rst_counter_does_not_decay() {
+        let base = Instant::now();
         // Unlike the windowed rst_stream_count, the emitted lifetime counter
         // is strictly monotonic — a patient attacker cannot reset it by
         // waiting out a window. maybe_reset_window must NOT touch it.
-        let mut detector = H2FloodDetector::default();
+        let mut detector = H2FloodDetector::new(H2FloodConfig::default(), base);
         for _ in 0..10 {
             detector.record_rst_emitted();
         }
-        detector.window_start = Instant::now() - FLOOD_WINDOW_DURATION;
-        // Force a window reset through check_flood.
-        let _ = detector.check_flood();
+        // Force a window reset through the injected instant.
+        //
+        // To SEE THIS RED: add `self.total_rst_streams_emitted_lifetime /= 2;`
+        // to the decay block in `maybe_reset_window`. The counter halves to 5
+        // and this assert fails — which is the MadeYouReset ceiling (CVE-2025-8671)
+        // becoming evadable by waiting out a window.
+        let _ = detector.check_flood(base + FLOOD_WINDOW_DURATION);
         assert_eq!(detector.total_rst_streams_emitted_lifetime, 10);
     }
 
@@ -7066,11 +7178,15 @@ mod tests {
         }
 
         // Helper: drive a single `check_flood` counter past its threshold.
+        // A nested `fn` cannot capture, so it takes its own snapshot; seeding
+        // the window and checking it at the same instant means no decay can
+        // interfere with the threshold this helper is probing.
         fn key_from_check_flood(setup: impl FnOnce(&mut H2FloodDetector)) -> &'static str {
-            let mut detector = H2FloodDetector::default();
+            let now = Instant::now();
+            let mut detector = H2FloodDetector::new(H2FloodConfig::default(), now);
             setup(&mut detector);
             detector
-                .check_flood()
+                .check_flood(now)
                 .expect("setup should always trip a flood")
                 .metric_key
         }
@@ -7232,8 +7348,9 @@ mod tests {
 
     #[test]
     fn test_flood_detector_default_matches_new_default() {
+        let base = Instant::now();
         let from_default = H2FloodDetector::default();
-        let from_new = H2FloodDetector::new(H2FloodConfig::default());
+        let from_new = H2FloodDetector::new(H2FloodConfig::default(), base);
 
         assert_eq!(from_default.rst_stream_count, from_new.rst_stream_count);
         assert_eq!(from_default.ping_count, from_new.ping_count);
@@ -8768,6 +8885,243 @@ mod tests {
             before,
             "Drop must subtract exactly the contribution the connection made, \
              returning the aggregate to its prior value"
+        );
+    }
+
+    // ── Clock hygiene: every deadline reads `ConnectionH2::now` ──────────
+    //
+    // `Mux` is the only clock sampler; the H2 core reads the snapshot it
+    // mirrors into `ConnectionH2::now`. A reintroduced `Instant::now()` in
+    // the core would still "work" in production — it would just be reading a
+    // second clock — so these two tests advance ONLY the connection's
+    // snapshot and prove the decision moves with it. Neither sleeps.
+
+    /// Build a bare server-side `ConnectionH2` for tests that only exercise
+    /// connection-level bookkeeping. The socket is never read or written.
+    ///
+    /// Returns the accepted peer alongside it; keep it alive for the duration
+    /// of the test so the socket stays connected and reads answer `WouldBlock`
+    /// instead of `ECONNREFUSED`.
+    fn test_h2_connection(
+        pool: &Rc<RefCell<Pool>>,
+        graceful_shutdown_deadline: Option<Duration>,
+    ) -> (ConnectionH2<mio::net::TcpStream>, std::net::TcpStream) {
+        let (socket, peer) = connected_socket();
+        let connection = ConnectionH2::new(
+            Ulid::generate(),
+            socket,
+            Position::Server,
+            Rc::downgrade(pool),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            graceful_shutdown_deadline,
+            TimeoutContainer::new_empty(Duration::from_secs(30)),
+            Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        (connection, peer)
+    }
+
+    /// The graceful-shutdown budget is armed from the `now` handed to
+    /// `graceful_goaway` and evaluated against `ConnectionH2::now` — not
+    /// against the real clock at either end.
+    ///
+    /// `armed_at` is deliberately 100 s in the future relative to the
+    /// connection's construction snapshot. That gap is what makes the test
+    /// discriminating: a `graceful_goaway` that armed `started_at` from
+    /// `Instant::now()` would put it ~100 s in the PAST relative to
+    /// `armed_at`, and the "not yet elapsed" assertion would trip.
+    ///
+    /// To SEE THIS RED: restore either half of the old behaviour.
+    /// (a) `self.drain.started_at = Some(Instant::now());` in
+    ///     `graceful_goaway` — the `assert_eq!` on `drain.started_at` fails:
+    ///     ``assertion `left == right` failed: graceful_goaway must arm the
+    ///     budget from its `now` parameter / left: Some(Instant { tv_sec:
+    ///     107343, .. }) / right: Some(Instant { tv_sec: 107443, .. })`` —
+    ///     the two differing by exactly the 100 s offset above.
+    /// (b) `started_at.elapsed() >= deadline` in
+    ///     `graceful_shutdown_deadline_elapsed` — the LAST assertion fails with
+    ///     `advancing only the connection snapshot past the budget must force
+    ///     close`, because no real time passes in this test, so the forced-close
+    ///     budget never expires however far the connection's clock is moved.
+    #[test]
+    fn graceful_shutdown_deadline_is_evaluated_against_the_connection_snapshot() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let deadline = Duration::from_secs(5);
+        let (mut connection, _peer) = test_h2_connection(&pool, Some(deadline));
+
+        // Nothing armed yet: `started_at` is None, so the budget cannot expire.
+        assert!(
+            !connection.graceful_shutdown_deadline_elapsed(),
+            "an unarmed drain must never report its budget as elapsed"
+        );
+
+        let armed_at = connection.now + Duration::from_secs(100);
+        connection.graceful_goaway(armed_at);
+        assert_eq!(
+            connection.drain.started_at,
+            Some(armed_at),
+            "graceful_goaway must arm the budget from its `now` parameter"
+        );
+
+        // One millisecond short of the budget, measured on the connection's
+        // clock. Real elapsed time here is microseconds.
+        connection.now = armed_at + deadline - Duration::from_millis(1);
+        assert!(
+            !connection.graceful_shutdown_deadline_elapsed(),
+            "the budget must not expire before `started_at + deadline` on the \
+             connection's own clock"
+        );
+
+        connection.now = armed_at + deadline;
+        assert!(
+            connection.graceful_shutdown_deadline_elapsed(),
+            "advancing only the connection snapshot past the budget must force close"
+        );
+    }
+
+    /// The RFC 9113 §5.1.2 back-pressure window is driven by
+    /// `ConnectionH2::now`, so a refusal burst is weighed against the window
+    /// that was open when the pass started — it cannot decay mid-pass.
+    ///
+    /// To SEE THIS RED: restore
+    /// `if self.refuse_window_start.elapsed() >= BACKPRESSURE_WINDOW_DURATION`
+    /// in `record_refusal_for_backpressure`. The window then never rolls over
+    /// (no real time passes) and the 50th refusal lands in the same window as
+    /// the first 49, so the `refuse_count_window` assertion fails first:
+    /// ``assertion `left == right` failed: a refusal in a new window must
+    /// restart the count, not top up the old one / left: 50 / right: 1``. The
+    /// two assertions after it would also fail — `mcs_backpressure_applied`
+    /// becomes true and `settings_max_concurrent_streams` is halved off a burst
+    /// that actually spanned two windows.
+    #[test]
+    fn backpressure_window_rolls_over_on_the_connection_snapshot() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let advertised = connection.local_settings.settings_max_concurrent_streams;
+
+        // One short of the burst threshold, all inside the first window.
+        for _ in 0..BACKPRESSURE_REFUSAL_THRESHOLD - 1 {
+            connection.record_refusal_for_backpressure();
+        }
+        assert_eq!(
+            connection.refuse_count_window,
+            BACKPRESSURE_REFUSAL_THRESHOLD - 1
+        );
+        assert!(
+            !connection.mcs_backpressure_applied,
+            "back-pressure must not apply below the refusal threshold"
+        );
+
+        // Cross into the next window on the connection's clock alone.
+        connection.now += BACKPRESSURE_WINDOW_DURATION;
+        connection.record_refusal_for_backpressure();
+
+        assert_eq!(
+            connection.refuse_count_window, 1,
+            "a refusal in a new window must restart the count, not top up the old one"
+        );
+        assert!(
+            !connection.mcs_backpressure_applied,
+            "two refusals spread across two windows are not a burst"
+        );
+        assert_eq!(
+            connection.local_settings.settings_max_concurrent_streams, advertised,
+            "MAX_CONCURRENT_STREAMS must be untouched when no burst occurred"
+        );
+    }
+
+    /// The RFC 9113 §6.5 SETTINGS-ACK deadline is evaluated against
+    /// `ConnectionH2::now`. `flush_pending_control_frames` is the `writable`
+    /// half of the pair; the `readable` half at `h2.rs` shares the predicate.
+    ///
+    /// To SEE THIS RED: restore `sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT` in
+    /// `flush_pending_control_frames`. No real time passes in this test, so the
+    /// deadline never fires however far the connection's clock is advanced, and
+    /// the third assertion fails with `advancing only the connection snapshot
+    /// to the deadline must emit GOAWAY`.
+    #[test]
+    fn settings_ack_deadline_is_evaluated_against_the_connection_snapshot() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+
+        let sent_at = connection.now;
+        connection.settings_sent_at = Some(sent_at);
+
+        // One millisecond short of the budget on the connection's clock.
+        connection.now = sent_at + SETTINGS_ACK_TIMEOUT - Duration::from_millis(1);
+        assert!(
+            connection.flush_pending_control_frames().is_none(),
+            "the SETTINGS-ACK deadline must not fire before SETTINGS_ACK_TIMEOUT \
+             on the connection's own clock"
+        );
+        assert_eq!(
+            connection.settings_sent_at,
+            Some(sent_at),
+            "a deadline that has not fired must leave the ACK timer armed"
+        );
+
+        // At the budget: GOAWAY(SETTINGS_TIMEOUT).
+        connection.now = sent_at + SETTINGS_ACK_TIMEOUT;
+        assert!(
+            connection.flush_pending_control_frames().is_some(),
+            "advancing only the connection snapshot to the deadline must emit GOAWAY"
+        );
+        assert_eq!(
+            connection.settings_sent_at, None,
+            "goaway must disarm the ACK timer so the timeout cannot re-fire"
+        );
+    }
+
+    /// The per-stream liveness guard reaps against `ConnectionH2::now`, and
+    /// `cancel_timed_out_streams` adopts `context.now` on entry — this pins
+    /// both the entry-point mirror and the deadline arithmetic in
+    /// `collect_timed_out_streams`.
+    ///
+    /// To SEE THIS RED: restore `let now = Instant::now();` in
+    /// `cancel_timed_out_streams` (in place of `let now = self.now;`). The
+    /// injected instant is then ignored, no stream is ever old enough to reap
+    /// because no real time passes, and the reap assertion fails with
+    /// `advancing only the mux snapshot past the idle deadline must reap the
+    /// stream`. Deleting the `self.now = context.now;` entry-point assignment
+    /// turns the same assertion red, with the same message, for the same reason.
+    #[test]
+    fn per_stream_liveness_reaping_is_evaluated_against_the_connection_snapshot() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let idle_timeout = connection.stream_idle_timeout;
+        let armed_at = connection.now;
+        let gid = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        connection.streams.insert(1, gid);
+        connection.stream_last_activity_at.insert(1, armed_at);
+
+        // Exactly at the deadline: the predicate is a strict `>`, so the stream
+        // survives.
+        context.now = armed_at + idle_timeout;
+        connection.cancel_timed_out_streams(&mut context, &mut EndpointClient(&mut router));
+        assert!(
+            connection.pending_rst_streams.is_empty(),
+            "a stream exactly at its idle deadline must not be reaped"
+        );
+
+        // One millisecond past it: reaped with RST_STREAM(CANCEL).
+        context.now = armed_at + idle_timeout + Duration::from_millis(1);
+        connection.cancel_timed_out_streams(&mut context, &mut EndpointClient(&mut router));
+        assert!(
+            !connection.pending_rst_streams.is_empty(),
+            "advancing only the mux snapshot past the idle deadline must reap the stream"
+        );
+        assert_eq!(
+            connection.pending_rst_streams[0],
+            (1, H2Error::Cancel),
+            "the reaper must queue RST_STREAM(CANCEL) for the timed-out stream"
         );
     }
 

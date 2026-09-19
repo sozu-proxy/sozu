@@ -175,6 +175,50 @@ is recorded here so the next person does not re-derive it.
   Do not write an e2e test that drives a backend status line and claim
   it guards `save_http_status_metric`: it passes either way.
 
+## Clock-driven behaviour: what the wire can falsify
+
+A deadline or a rate window has no wire representation of its own — only
+its *consequences* do. That makes a whole class of change untestable from
+e2e by construction, and a neighbouring class very testable, and the two
+are easy to confuse.
+
+**Not falsifiable end-to-end: which clock a deadline reads.** The H2 core
+samples `Context::now` once per `Mux::ready` pass and `ConnectionH2`
+mirrors it into `self.now`, so a burst of frames is weighed against ONE
+instant instead of one `Instant::now()` per frame. Reverting any of those
+reads to a fresh `Instant::now()` yields the same elapsed time to within
+an event-loop pass, so every e2e test stays green. A test claiming to
+guard that property guards nothing; the single-snapshot invariant belongs
+to the unit tests that inject an instant
+(`h2.rs::tests::{graceful_shutdown_deadline_is_evaluated_against_the_connection_snapshot,
+settings_ack_deadline_is_evaluated_against_the_connection_snapshot}`).
+
+**Falsifiable end-to-end: the behaviour the clock drives.** Four
+properties of a deadline show on the wire, and each has a one-line
+production mutation that reddens the test:
+
+| Property | Covered by | Reddened by |
+| --- | --- | --- |
+| A rate window really decays | `h2_clock_tests.rs::test_h2_flood_window_decays_between_bursts` | `FLOOD_WINDOW_DURATION` → one hour: 120 sub-threshold PINGs accumulate and the 101st draws `GOAWAY(ENHANCE_YOUR_CALM)` |
+| A deadline fires at all | `h2_clock_tests.rs::test_h2_settings_ack_timeout_goaways_the_frontend` | `SETTINGS_ACK_TIMEOUT` → one hour: no GOAWAY in 25 s |
+| It does not fire early | same test's early probe | flipping either `>= SETTINGS_ACK_TIMEOUT` guard to `<`: GOAWAY at 2.5 s |
+| It carries the right error code | same test | any GOAWAY reason other than `SETTINGS_TIMEOUT` (0x4) |
+
+The flood tests in `h2_tests.rs` (CVE-2019-9512 PING, CVE-2019-9515
+SETTINGS, CVE-2024-27316 CONTINUATION) only ever prove a threshold
+*trips*. Their negative space — a peer that stays under the threshold in
+every window but exceeds it cumulatively — is what catches a window that
+stopped advancing, which is the false-positive half of the CVE control
+and the failure mode a frozen clock produces.
+
+**A deadline needs an event to be observed.** The SETTINGS-ACK watchdog
+is evaluated inside `readable()` and `flush_pending_control_frames()`
+only, so a silent connection is never re-examined and the GOAWAY does not
+arrive on its own. The test pokes with a PING every 500 ms past the
+budget; a test that merely waits on a quiet socket would time out and
+read as a missing deadline. Check where a deadline is evaluated before
+concluding it did not fire.
+
 ## Backend-TLS expansion (preview)
 
 When backend TLS lands ([#1218](https://github.com/sozu-proxy/sozu/issues/1218)),
