@@ -2009,3 +2009,135 @@ fn test_h1_smuggling_auth_bypass() {
         State::Success,
     );
 }
+
+// =========================================================================
+// Test: an operator answer carrying an out-of-range status does not kill the
+// worker
+//
+// `HttpListenerConfig.answers` is a `map<string, string>` whose keys AND
+// bodies are operator input arriving over the command socket. Seventeen names
+// ("301", "302", "308", "400" … "507") are pinned to their code by
+// `HttpAnswers::template`'s `InvalidStatusCode` guard, but its `_ =>` arm
+// builds an answer under any OTHER name with `Template::new(None, …)`, so that
+// guard never runs for it. kawa reads a status line with `take(3)` plus
+// `str::parse::<u16>()` and applies no range check, so a body starting
+// `HTTP/1.1 000 x` compiles to status `0` — and `Template::new` used to
+// `debug_assert!` the `100..=999` range, panicking the worker on a
+// control-plane request in every debug, test, e2e and fuzz build.
+//
+// The compiled answer must stay UNSELECTABLE: selection keys off the
+// `DefaultAnswer` variant, so an unrouted request must still get the builtin
+// 404, never the operator's `000`.
+//
+// Scope note: the sibling half of that fix, the same range assertion on a
+// status parsed from the BACKEND's response line
+// (`kawa_h1::save_http_status_metric`), is NOT reachable from this suite — an
+// unconditional `panic!` planted at the top of that function does not fire for
+// any e2e HTTP session, because H1 proxying runs through `protocol/mux`, not
+// `protocol/kawa_h1`. It stays covered by
+// `kawa_h1::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`.
+// =========================================================================
+
+/// To SEE THIS RED: in `lib/src/protocol/kawa_h1/answers.rs`, restore the
+/// deleted post-condition at the end of `Template::new`:
+/// `debug_assert!((100..=999).contains(&resolved_status), "parsed template status must be a 3-digit HTTP code, got {resolved_status}");`
+/// The worker then panics while compiling the listener's answer map, the
+/// `AddHttpListener` is never answered, and the harness fails on the command
+/// channel the dead worker dropped.
+fn try_h1_custom_answer_with_out_of_range_status_does_not_kill_the_worker() -> State {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+
+    let (config, mut listeners, state) = Worker::empty_config();
+    attach_reserved_http_listener(&mut listeners, front_address);
+    let mut worker = Worker::start_new_worker_owned("H1-BAD-ANSWER", config, listeners, state);
+
+    let mut listener_config = ListenerBuilder::new_http(front_address.into())
+        .to_http(None)
+        .expect("could not build the http listener config");
+    // An UNRECOGNISED name, so `HttpAnswers::template` takes its `_ =>` arm
+    // with `status: None` and the `InvalidStatusCode` guard never runs.
+    listener_config.answers.insert(
+        "operator_custom".to_owned(),
+        "HTTP/1.1 000 x\r\nContent-Length: 0\r\n\r\n".to_owned(),
+    );
+
+    worker.send_proxy_request_type(RequestType::AddHttpListener(listener_config));
+    // No `None` arm: `read_proxy_response` (`e2e/src/sozu/worker.rs:267`)
+    // `.expect()`s on the command channel and always returns `Some`, so a
+    // `State::Fail` branch here would be unreachable code dressed up as error
+    // handling. That `.expect()` IS this test's failure path: a worker that
+    // died compiling the answer map drops its end of the channel, and the read
+    // panics with "Could not read message on command channel" — which is
+    // exactly the red this test was seen producing.
+    let add_response = worker
+        .read_proxy_response()
+        .expect("read_proxy_response never yields None");
+    let listener_added =
+        add_response.status == sozu_command_lib::proto::command::ResponseStatus::Ok as i32;
+    println!(
+        "H1-BAD-ANSWER: AddHttpListener status={}",
+        add_response.status
+    );
+
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.into(),
+        proxy: ListenerType::Http.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpFrontend(Worker::default_http_frontend(
+        "cluster_0",
+        front_address,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    let mut backend = SyncBackend::new("BACKEND_0", back_address, http_ok_response("pong"));
+    backend.connect();
+
+    // The listener compiled the answer and still serves ordinary traffic.
+    let still_serving = verify_sozu_healthy(front_address, &mut backend, false);
+
+    // The custom answer is compiled in but unselectable: a request for an
+    // unknown host must still get the builtin 404, never the operator's `000`.
+    let mut stray = raw_connect(front_address);
+    stray
+        .write_all(b"GET /api HTTP/1.1\r\nHost: unrouted.example.com\r\nConnection: close\r\n\r\n")
+        .expect("write the unrouted request");
+    let stray_answer = raw_read_all(&mut stray);
+    let builtin_answer_selected =
+        stray_answer.starts_with("HTTP/1.1 404") && !stray_answer.contains("000");
+    println!("H1-BAD-ANSWER: unrouted request got {stray_answer:?}");
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!(
+        "H1-BAD-ANSWER: listener_added={listener_added} still_serving={still_serving} builtin_answer_selected={builtin_answer_selected} stopped={stopped}"
+    );
+    if listener_added && still_serving && builtin_answer_selected && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h1_custom_answer_with_out_of_range_status_does_not_kill_the_worker() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1 security: an operator answer carrying a status outside 100..=999 does not kill the worker",
+            try_h1_custom_answer_with_out_of_range_status_does_not_kill_the_worker,
+        ),
+        State::Success,
+    );
+}

@@ -474,6 +474,19 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   `aggregator.rs`. Setup helpers (`setup_sync_test`, `setup_async_test`,
   `create_local_address`, `repeat_until_error_or`) are in `e2e/src/tests/mod.rs`
   and `e2e/src/tests/tests.rs`.
+- **Know what e2e cannot reach, and write it down.** Some code is unreachable
+  from a real worker for structural reasons, so a test aimed at it passes for
+  the wrong reason and guards nothing. Before adding a test for a defect on a
+  quiet path, confirm a session actually gets there — planting a temporary
+  unconditional `panic!` in the target function and running the suite settles
+  it in one run. The standing case is `protocol::kawa_h1::Http`: neither
+  `HttpStateMachine` (`Expect | Mux | WebSocket`, `lib/src/http.rs:63`) nor
+  `HttpsStateMachine` (`Expect | Handshake | Mux | WebSocket`,
+  `lib/src/https.rs:81`) has a variant holding it and `Http::new` has no code
+  caller, so H1 runs through `protocol/mux` and `kawa_h1::save_http_status_metric`
+  is dead in every binary. New findings of this kind belong in
+  `e2e/COVERAGE.md > Out of e2e reach by construction`, with the mechanism, not
+  just the conclusion.
 - **One e2e test exercises external conformance:** `test_h2spec_conformance`
   (`e2e/src/tests/tests.rs`) runs ~145 RFC 9113 scenarios via the `h2spec`
   binary; CI installs it. It skips cleanly when `h2spec` is absent from `PATH`.

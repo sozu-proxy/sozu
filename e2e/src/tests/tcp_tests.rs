@@ -963,3 +963,152 @@ fn test_tcp_soft_stop_with_active_sessions() {
         State::Success,
     );
 }
+
+// =========================================================================
+// Test: an `ExpectHeader` TCP cluster survives a client that sends nothing
+//
+// A cluster configured with `proxy_protocol = ExpectHeader` puts its session
+// in `TcpStateMachine::ExpectProxyProtocol`, which has NO backend side at all:
+// `back_readiness` returns `None` for it and `set_back_socket` is a bare
+// `panic!`. `ready_inner`'s connect gate used to dial unconditionally from
+// there, and the frontend is registered `READABLE | WRITABLE`, so epoll
+// reports WRITABLE on a freshly accepted socket and the gate ran before the
+// peer had sent a single byte — one unauthenticated connection that merely
+// completed the TCP handshake took the worker down, and every other session
+// on it. `attempt_backend_connect_if_needed` now refuses to dial while the
+// state is `ExpectProxyProtocol`.
+//
+// The silent client is held open for the whole test so its session cannot be
+// reaped before the second, well-behaved session proves the worker is intact.
+// =========================================================================
+
+/// Set up a Sozu worker whose CLUSTER expects an inbound PROXY-v2 header
+/// (`ProxyProtocolConfig::ExpectHeader`), as opposed to
+/// [`setup_tcp_proxy_protocol_test`], which sets `expect_proxy` on the
+/// LISTENER. The cluster flag is what selects `TcpStateMachine::ExpectProxyProtocol`.
+fn setup_tcp_expect_header_cluster_test(name: &str) -> (Worker, SocketAddr, SocketAddr) {
+    let front_address = create_local_address();
+    let back_address = create_local_address();
+    let (config, listeners, state) = Worker::empty_tcp_config(front_address);
+    let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddTcpListener(
+        ListenerBuilder::new_tcp(front_address.into())
+            .to_tcp(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.into(),
+        proxy: ListenerType::Tcp.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(
+        sozu_command_lib::proto::command::Cluster {
+            proxy_protocol: Some(
+                sozu_command_lib::proto::command::ProxyProtocolConfig::ExpectHeader as i32,
+            ),
+            ..Worker::default_cluster("cluster_0")
+        },
+    ));
+    worker.send_proxy_request_type(RequestType::AddTcpFrontend(Worker::default_tcp_frontend(
+        "cluster_0",
+        front_address,
+    )));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address,
+        None,
+    )));
+    worker.read_to_last();
+
+    (worker, front_address, back_address)
+}
+
+/// To SEE THIS RED: in `lib/src/tcp.rs`, delete the
+/// `if matches!(&self.state, TcpStateMachine::ExpectProxyProtocol(_)) { return None; }`
+/// guard from `attempt_backend_connect_if_needed`. The silent connection then
+/// drives `connect_to_backend` into `set_back_socket`'s
+/// "We should not set the back socket for the expect proxy protocol" panic:
+/// the worker thread dies, the second session gets no answer, and the harness
+/// fails on the dead command channel.
+fn try_tcp_expect_proxy_zero_bytes_keeps_the_worker_alive() -> State {
+    let (mut worker, front_address, back_address) =
+        setup_tcp_expect_header_cluster_test("TCP-EXPECT-SILENT");
+
+    // A client that completes the handshake and sends NOTHING. Held open for
+    // the rest of the test.
+    let silent = TcpStream::connect(front_address).expect("could not open the silent connection");
+    silent
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("set read timeout");
+
+    // An exposure window, not a synchronisation point: this waits for the
+    // defect to have its chance to fire, and the thing being waited for is
+    // that NOTHING observable happens (the pre-fix worker dies here, on the
+    // WRITABLE epoll reports for a socket that sent no byte). There is no
+    // condition to poll for, which is why `doc/testing.md` §7's "prefer
+    // deadlines over sleep" rule does not apply — a deadline loop would poll
+    // for the absence of an event. The worker's death is observed by the
+    // assertions below, not by this wait.
+    thread::sleep(Duration::from_millis(300));
+
+    // A second, well-behaved session must still work end to end.
+    let backend_handle = thread::spawn(move || {
+        let listener = bind_std_listener(back_address, "tcp expect-header backend");
+        let (mut stream, _) = listener.accept().expect("backend accept failed");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set read timeout");
+        let received = super::h2_utils::read_at_least(&mut stream, 7, Duration::from_secs(2));
+        stream
+            .write_all(b"expect-header-response")
+            .expect("backend write failed");
+        received
+    });
+
+    let mut stream = raw_connect(front_address);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set read timeout");
+    stream
+        .write_all(&pp_v2_proxy_ipv4(54321, front_address.port()))
+        .expect("write PP header");
+    stream.write_all(b"payload").expect("write TCP payload");
+
+    let response = raw_read_all(&mut stream);
+    let backend_received = backend_handle.join().expect("backend thread panicked");
+    // The backend must see the payload with the PROXY header stripped, which
+    // is what proves the expect upgrade ran rather than being bypassed.
+    let second_session_ok = response.as_slice() == b"expect-header-response".as_slice()
+        && backend_received.as_slice() == b"payload".as_slice();
+
+    println!(
+        "TCP expect-header: backend received {:?}, client received {} bytes",
+        String::from_utf8_lossy(&backend_received),
+        response.len()
+    );
+
+    drop(silent);
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+
+    println!("TCP expect-header: second_session_ok={second_session_ok} stopped={stopped}");
+    if second_session_ok && stopped {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_tcp_expect_proxy_zero_bytes_keeps_the_worker_alive() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "TCP expect-header: a client that sends zero bytes does not kill the worker",
+            try_tcp_expect_proxy_zero_bytes_keeps_the_worker_alive,
+        ),
+        State::Success,
+    );
+}
