@@ -116,16 +116,64 @@ PROXY phase and the downstream protocol.
 
 ### 2.2 `RelayProxyProtocol`
 
-- Type: `RelayProxyProtocol<Front: SocketHandler>` (`relay.rs:63`).
+- Type: `RelayProxyProtocol<Front: SocketHandler>` (`relay.rs:67`).
 - Used when Sōzu sits between two PROXY-aware peers: read the inbound
   header, then write those exact bytes (and only those bytes) to the
   backend before any user-payload byte.
-- Entry points: `readable` (`relay.rs:116`) feeds the parser; on a complete
+- Entry points: `readable` (`relay.rs:120`) feeds the parser; on a complete
   parse it flips `frontend_readiness.interest` to drop READABLE and arms
-  the backend WRITABLE bit (`relay.rs:159-160`). `back_writable`
-  (`relay.rs:199`) drains the captured prefix on the backend socket and
-  returns `SessionResult::Upgrade` once the cursor reaches the recorded
-  `header_size`.
+  the backend WRITABLE bit (`relay.rs:163-164`). It then records
+  `header_size` and consumes **nothing**: those buffered bytes are the only
+  copy of the header, since this state never re-serializes `addresses`.
+  `back_writable` (`relay.rs:229`) drains exactly the first `header_size`
+  bytes of `frontend_buffer` onto the backend socket and returns
+  `SessionResult::Upgrade` once the cursor reaches them.
+- Anything the client pipelined into the same read stays in
+  `frontend_buffer` for the pipe phase, and `into_pipe` (`relay.rs:390`)
+  hands that same `Checkout` to `Pipe::new`. Note where the surviving
+  wake-up actually comes from: `Pipe::new`'s own
+  `arm_inherited_buffer_writes` is immediately overwritten by the restored
+  event words, so it is `into_pipe`'s `restore_readiness_events` — which
+  restores both words and THEN re-runs that arm — that leaves the backend
+  WRITABLE readiness set. Never replace it with a bare
+  `pipe.backend_readiness.event = …` pair; `tcp.rs`'s
+  `build_pipe_from_preread` and `upgrade_send` carry the same warning for
+  the same reason. The relay must also never widen its write past the
+  header tail, and never consume past what it forwarded — either would
+  silently drop client payload.
+- Three yield-instead-of-spin guards, all of the same class:
+  - A zero-length **write** drops the backend WRITABLE event and breaks.
+    Without it the loop spins: a connected non-blocking socket answers
+    `write(&[])` with `Ok(0)` indefinitely, `cursor_header` never advances,
+    and `MAX_LOOP_ITERATIONS` bounds only the outer `tcp.rs::ready_inner`
+    dispatch loop, so the worker burns 100% CPU with its event loop
+    starved.
+  - A zero-length **read** in `readable` drops the frontend READABLE event,
+    as `expect.rs:183` does. `tcp_socket_read` returns
+    `(0, SocketResult::Continue)` for an empty slice, which is what
+    `space()` yields once the buffer is full, so without the guard a client
+    that declares a large `len` and stalls has `ready_inner` re-enter until
+    the outer bound trips.
+  - `back_writable`'s `Err` arm distinguishes the retryable kinds.
+    `WouldBlock` clears only the stale WRITABLE **event** and keeps the
+    interest (as `send.rs::back_writable` does); `Interrupted` touches
+    neither word so `ready_inner` retries under its own bound. Only a
+    genuine error resets both words. Clearing `interest` on backpressure
+    would mean no later epoll edge is ever acted on, stranding a
+    half-written header on the backend until the frontend timeout, and
+    clearing the `event` on EINTR would strand it the same way — a signal
+    is not a socket state change, so edge-triggered epoll owes no new edge
+    for it. The `Interrupted` arm is defensive and unreachable in
+    production: the backend socket comes from `mio::net::TcpStream::connect`
+    (`backends.rs:332`), so it is always non-blocking and its `send` answers
+    EAGAIN, never EINTR. Exercising it takes a deliberately blocking
+    socketpair — see
+    `back_writable_keeps_its_readiness_when_a_signal_interrupts_the_write`.
+- `relay.rs` places **no** upper bound on header size, unlike `expect.rs`'s
+  fixed 232-byte staging array: a v2 header is `16 + len` with `len: u16`,
+  and this state reads into a pool `Checkout`, so a declared `len` larger
+  than the session buffer stalls until the frontend timeout. Bounded and
+  non-spinning since the zero-read guard, but still unbounded in size.
 
 ### 2.3 `SendProxyProtocol`
 

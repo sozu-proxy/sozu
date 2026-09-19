@@ -5119,3 +5119,104 @@ mod sni_routing_tests {
         );
     }
 }
+
+/// Coverage for the `RelayProxyProtocol` -> `Pipe` handoff. It lives here
+/// rather than in `relay.rs`'s own `relay_test` because `into_pipe` demands an
+/// `Rc<RefCell<TcpListener>>` and every field of that struct — plus its
+/// constructor — is private to this module, so the relay's test module cannot
+/// build one. A separate module (rather than the `tests` module above) avoids
+/// that module's `use std::net::TcpListener` shadowing `super::TcpListener`.
+#[cfg(test)]
+mod relay_upgrade_tests {
+    use std::net::TcpListener as StdTcpListener;
+
+    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
+
+    use super::*;
+    use crate::{pool::Pool, testing::provide_port};
+
+    fn test_listener() -> TcpListener {
+        let config = ListenerBuilder::new_tcp(SocketAddress::new_v4(127, 0, 0, 1, provide_port()))
+            .to_tcp(None)
+            .expect("could not build a TcpListenerConfig for the test");
+        TcpListener::new(config, Token(0)).expect("could not build a bare TcpListener for the test")
+    }
+
+    fn connected_pair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind the test listener");
+        let address = listener
+            .local_addr()
+            .expect("the test listener must expose its address");
+        let local = std::net::TcpStream::connect(address).expect("connect the test pair");
+        let (peer, _addr) = listener.accept().expect("accept the test pair");
+        local
+            .set_nonblocking(true)
+            .expect("the local end must be non-blocking");
+        peer.set_nonblocking(true)
+            .expect("the peer end must be non-blocking");
+        (local, peer)
+    }
+
+    /// `Pipe::new` ends with `arm_inherited_buffer_writes`, which arms the
+    /// backend WRITABLE readiness when the inherited `frontend_buffer` is
+    /// non-empty. `build_pipe_from_preread` carries a comment stating outright
+    /// that a bare `pipe.backend_readiness.event = ..` pair must NOT be used
+    /// in its place, because the drain of that buffer must not depend on the
+    /// restored event carrying WRITABLE itself — and `upgrade_send` re-runs the
+    /// arm for the same reason (sozu-proxy/sozu#1279's close-before-flush
+    /// truncation). `RelayProxyProtocol::into_pipe` was the one pipe-entry path
+    /// still using the bare pair. That was harmless only while the relay's
+    /// buffer was always empty at upgrade time; now that the relay leaves
+    /// pipelined client payload in it, this path joins the class those comments
+    /// describe, and the surviving wake-up must be by construction rather than
+    /// by the accident that `back_writable` happens to be entered with WRITABLE
+    /// already set.
+    ///
+    /// To SEE THIS RED: in `relay.rs::into_pipe`, replace the
+    /// `pipe.restore_readiness_events(..)` call with the bare pair
+    /// `pipe.frontend_readiness.event = self.frontend_readiness.event;` /
+    /// `pipe.backend_readiness.event = self.backend_readiness.event;`.
+    #[test]
+    fn into_pipe_rearms_the_backend_write_for_pipelined_payload() {
+        let listener = Rc::new(RefCell::new(test_listener()));
+        let (frontend, _front_peer) = connected_pair();
+        let (backend, _backend_peer) = connected_pair();
+
+        let mut pool = Pool::with_capacity(2, 2, 4096);
+        let mut frontend_buffer = pool.checkout().expect("frontend buffer");
+        let backend_buffer = pool.checkout().expect("backend buffer");
+        // What the relay leaves behind once the header is forwarded: the
+        // payload the client pipelined into the same read.
+        let payload = b"pipelined-payload";
+        frontend_buffer.space()[..payload.len()].copy_from_slice(payload);
+        frontend_buffer.fill(payload.len());
+
+        let mut relay = RelayProxyProtocol::new(
+            MioTcpStream::from_std(frontend),
+            Token(0),
+            Ulid::generate(),
+            Some(MioTcpStream::from_std(backend)),
+            frontend_buffer,
+        );
+        // `into_pipe` never reads this, but a relay only ever upgrades with a
+        // fully forwarded header, so leave the state coherent.
+        relay.header_size = Some(28);
+        relay.set_back_token(Token(1));
+        // The case the `build_pipe_from_preread` comment names explicitly: the
+        // readiness word restored from the previous state need not itself carry
+        // WRITABLE, and the inherited drain must not depend on it.
+        relay.backend_readiness.event = Ready::EMPTY;
+        relay.frontend_readiness.event = Ready::EMPTY;
+
+        let pipe = relay.into_pipe(backend_buffer, listener);
+
+        assert!(
+            pipe.backend_readiness.event.is_writable(),
+            "a non-empty inherited frontend buffer must leave a backend WRITABLE event queued, or the pipelined payload is never flushed"
+        );
+        assert!(
+            pipe.backend_readiness.interest.is_writable(),
+            "the inherited-write arm must also hold the backend WRITABLE interest"
+        );
+    }
+}

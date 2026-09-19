@@ -4,6 +4,83 @@
 
 ### 🔐 Security
 
+- **`fix(proxy-protocol)`: forward the PROXY-v2 header a `RelayHeader` cluster was never sending.**
+  `RelayProxyProtocol::readable` consumed every byte it had just read — the header included —
+  before `back_writable` had forwarded any of it
+  (`lib/src/protocol/proxy_protocol/relay.rs:190`, as it stood). One line, two defects.
+  The first is a correctness defect: a `RelayHeader` cluster exists precisely so the backend
+  receives the client's **own** PROXY-v2 header verbatim, and it was receiving nothing at all.
+  The second is that `back_writable` could not then terminate. With the buffer emptied it looped on
+  `socket.write(&[])`, which a connected non-blocking socket answers `Ok(0)`: `cursor_header += 0`
+  never reached `header_size`, so that exit was unreachable and the loop's only other exit was its
+  `Err` arm. The loop sits inside a single `back_writable` call, and `MAX_LOOP_ITERATIONS`
+  (`lib/src/tcp.rs:1403`) bounds the **outer** dispatch loop in `ready_inner`, not this inner one.
+  The state is reached by a cluster configured with both `expect_proxy` and `send_proxy`, which
+  yields `ProxyProtocolConfig::RelayHeader` (`command/src/config.rs:2480`,
+  `bin/src/ctl/request_builder.rs:187`) and builds `TcpStateMachine::RelayProxyProtocol`
+  (`lib/src/tcp.rs:194-197`), dispatched at `lib/src/tcp.rs:567`.
+  This state re-serializes nothing —
+  `back_writable` forwards the buffered prefix, it never rebuilds a header from `addresses` — so
+  consuming that prefix destroyed the only copy of it. The comment at the parse site asserted the
+  opposite ("The header bytes themselves are still forwarded verbatim onto the backend by
+  `back_writable`") and has been corrected.
+  Not a recent regression — and not merely pre-existing either: `51aedab9` (2018-10-18, "use a
+  pool of Buffer instead of a pool of BufferQueue") **introduced** it, and it has shipped in every
+  release since 0.10.0. The `BufferQueue` that commit replaced kept the parse cursor and the
+  output queue as two separate things, so `readable` ran `consume_parsed_data(sz)` **and**
+  `slice_output(sz)`: the header was retired as parsed input while those same bytes were queued
+  for output, and `back_writable` drained them back out with `next_output_data()` /
+  `consume_output_data(sz)`. The refactor flattened the buffer to a single cursor and collapsed
+  both calls into one `consume(sz)`, silently dropping the output half — `next_output_data()`
+  became `data()`, which from then on pointed at an already-consumed window. This fix restores the
+  pre-2018 behaviour on the single-cursor buffer: `readable` consumes nothing, and `back_writable`
+  consumes exactly as it forwards.
+  `readable` now consumes nothing. The parsed header stays at the front of `frontend_buffer` and
+  `back_writable` drains exactly its first `header_size` bytes, forwarding the header byte for
+  byte. Bytes the client pipelined into the same read are deliberately left in place for the pipe
+  phase: `into_pipe` hands that same `Checkout` to `Pipe::new`, whose
+  `arm_inherited_buffer_writes` (`lib/src/protocol/pipe.rs:217`) arms the backend WRITABLE
+  readiness exactly when it is non-empty, so the tail is flushed rather than dropped. A
+  zero-length write now drops the backend WRITABLE event and yields, matching how
+  `send.rs::back_writable` answers `WouldBlock` and `expect.rs::readable` answers a zero-length
+  read; the write is additionally clamped to the unsent header tail, so a future read path that
+  consumed the header again would cost one wasted syscall instead of a wedged worker.
+  Three adjacent defects in the same two functions are fixed with it, because the forwarding fix
+  is what makes the first two reachable. (1) `back_writable`'s `Err` arm reset **both** readiness
+  words to empty for every error kind. While the buffer was always empty that arm was dead — the
+  loop only ever called `write(&[])` and got `Ok(0)` — but a relay that really writes can be
+  backpressured, and a v2 header is `16 + len` with `len: u16`, so it can be far larger than a
+  socket send queue. `WouldBlock` now clears only the stale WRITABLE event and keeps the interest,
+  as `send.rs::back_writable` does, so the next epoll edge resumes a half-written header instead of
+  the session dying at the frontend timeout with a truncated PROXY header already on the backend;
+  `Interrupted` leaves both words untouched so `ready_inner` retries under its own bound. (2)
+  `RelayProxyProtocol::into_pipe` restored the readiness with a bare
+  `pipe.backend_readiness.event = ..` pair, which overwrites the backend-writable arm `Pipe::new`
+  had just set for a non-empty inherited buffer — the exact pattern `tcp.rs`'s
+  `build_pipe_from_preread` comment forbids, and the last of the three pipe-entry paths still using
+  it. Harmless while the relay's buffer was always empty at upgrade; not once it carries pipelined
+  payload. It now calls `restore_readiness_events`, matching `upgrade_send` and
+  `build_pipe_from_preread`. (3) `readable` had no zero-length-read guard: `tcp_socket_read`
+  returns `(0, SocketResult::Continue)` as soon as the slice it is handed is empty, which is what
+  `space()` yields once the buffer is full, so a client that declares a large `len` and then stalls
+  left READABLE set in both words and had `ready_inner` re-enter until `MAX_LOOP_ITERATIONS` —
+  CPU amplification and a spurious close rather than a wedge, but the same missing guard one
+  function up. It now drops the READABLE event, as `expect.rs::readable` does.
+  The SNI-preread `RelayHeader` path was never affected and is unchanged: `upgrade_sni_preread`
+  routes it straight to `build_pipe_from_preread` (`lib/src/tcp.rs:877`) without consuming the
+  header and never builds a `RelayProxyProtocol`, which is why e2e's
+  `try_tcp_sni_relay_proxy_forwards_header_verbatim` covered that path and not this one.
+  `RelayProxyProtocol`'s own forwarding had no test coverage whatsoever; it now has eight. Seven
+  live in `relay.rs`'s `relay_test` — `back_writable_returns_instead_of_spinning`,
+  `back_writable_forwards_the_header_verbatim`,
+  `back_writable_leaves_pipelined_payload_for_the_pipe_phase`,
+  `a_zero_length_write_yields_instead_of_spinning`,
+  `back_writable_parks_the_session_on_a_backpressured_backend`,
+  `readable_yields_on_a_zero_length_read` and
+  `back_writable_keeps_its_readiness_when_a_signal_interrupts_the_write` — and the eighth,
+  `into_pipe_rearms_the_backend_write_for_pipelined_payload`, lives in `lib/src/tcp.rs` because the
+  upgrade needs a `TcpListener`, whose constructor and fields are private to that module.
+
 - **`fix(proxy-protocol)`: discard the address block of a PROXY-v2 `LOCAL` header.**
   The PROXY-v2 command nibble distinguishes `PROXY` (ver/cmd `0x21`) from `LOCAL` (`0x20`).
   `parse_v2_header` decoded it into `HeaderV2::command`, but no consumer ever read that field, and
@@ -15,7 +92,7 @@
   against `max_connections_per_ip`, which it could therefore evade by picking a fresh address per
   connection. Four are TCP-side: `ExpectProxyProtocol::into_pipe`
   (`lib/src/protocol/proxy_protocol/expect.rs:302`), `RelayProxyProtocol::into_pipe`
-  (`lib/src/protocol/proxy_protocol/relay.rs:294`), the TCP SNI preread
+  (`lib/src/protocol/proxy_protocol/relay.rs:408`), the TCP SNI preread
   (`Output::Routed { proxy_source }`, `lib/src/protocol/tcp_preread/mod.rs:284`), and
   `TcpSession::effective_session_address` (`lib/src/tcp.rs:373`), which reads
   `ExpectProxyProtocol::addresses` / `RelayProxyProtocol::addresses` itself rather than through
