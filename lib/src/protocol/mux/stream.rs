@@ -328,7 +328,7 @@ impl Stream {
             // emission in `kawa_h1::log_request_error` for the cardinality
             // contract (`metrics::filter_labels_for_detail`).
             incr!(
-                "http.errors",
+                names::http::ERRORS,
                 context.cluster_id.as_deref(),
                 context.backend_id.as_deref()
             );

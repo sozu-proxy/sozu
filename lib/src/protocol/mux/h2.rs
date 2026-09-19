@@ -1757,16 +1757,27 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// Maximum pending WINDOW_UPDATE entries before dropping.
     /// Derived from `connection_config.max_concurrent_streams` at construction.
     max_pending_window_updates: usize,
-    /// Last `(connection_window, active_streams, pending_window_updates)` snapshot
-    /// emitted by [`Self::gauge_connection_state`]. The snapshot represents this
-    /// connection's *contribution* to the three `h2.connection.*` aggregate
-    /// gauges; each call emits the signed delta against this snapshot via
-    /// [`gauge_add!`] so the gauge sums across connections.
+    /// Ready incremental streams observed on the last completed write pass,
+    /// summed across urgency buckets (RFC 9218 §4). Sampled at the END of
+    /// `write_streams`, where `ready_incremental_by_urgency` is final: the
+    /// entry call to [`Self::gauge_connection_state`] runs *before* that map
+    /// is built, so sampling there would publish the previous pass's value.
+    ///
+    /// Carried as connection state rather than emitted inline because the
+    /// aggregate it feeds must be a signed delta, not an absolute set — see
+    /// [`Self::gauge_connection_state`].
+    ready_incremental_streams: usize,
+    /// Last `(connection_window, active_streams, pending_window_updates,
+    /// ready_incremental_streams)` snapshot emitted by
+    /// [`Self::gauge_connection_state`]. The snapshot represents this
+    /// connection's *contribution* to the four aggregate gauges; each call
+    /// emits the signed delta against this snapshot via [`gauge_add!`] so the
+    /// gauges sum across connections.
     ///
     /// Stays `None` until the first emission. [`Drop`] applies the negative of
     /// this snapshot so the connection's contribution is always rebalanced to
     /// zero on teardown — independent of which close path runs.
-    last_gauge_snapshot: Option<(usize, usize, usize)>,
+    last_gauge_snapshot: Option<(usize, usize, usize, usize)>,
     /// Per-stream wall-clock timestamp of last meaningful activity (DATA or
     /// HEADERS frame receipt). Used to cancel streams that make no forward
     /// progress within [`Self::stream_idle_timeout`] — mitigates slow-multiplex
@@ -1833,17 +1844,23 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     }
 }
 
-/// Symmetric tear-down for the three `h2.connection.*` aggregate gauges:
-/// whatever positive contribution this connection made via
-/// [`ConnectionH2::gauge_connection_state`] is subtracted back out when the
-/// connection is dropped.
+/// Symmetric tear-down for the four aggregate gauges
+/// [`ConnectionH2::gauge_connection_state`] feeds — the three
+/// `h2.connection.*` metrics and `h2.streams.ready_incremental.by_urgency`:
+/// whatever positive contribution this connection made is subtracted back out
+/// when the connection is dropped.
 ///
 /// Using `Drop` (rather than wiring decrements into every close path —
 /// `graceful_goaway`, `force_disconnect`, `handle_goaway_frame`, `Mux::close`,
 /// stream-id exhaustion, panic-unwind) is what guarantees the gauge is
 /// arithmetically symmetric regardless of which path teardown took. Past
-/// underflow incidents (commits a650ad69, d2f01ed4) have all been
-/// missing-decrement bugs that `Drop` makes structurally impossible.
+/// underflow incidents (commits ff401b54, aadb3fa4) were increment/decrement
+/// asymmetries. `ff401b54` carried both shapes at once: a `-1` for streams that
+/// never ran the `+1`, AND a `-1` that ran twice on one stream (100-Continue,
+/// and an H2 reset followed by close). `aadb3fa4` was the doubled `-1` alone,
+/// let through by an early return. `Drop` closes both shapes — it is the sole
+/// decrement site, and taking `last_gauge_snapshot` makes a second call a
+/// no-op.
 impl<Front: SocketHandler> Drop for ConnectionH2<Front> {
     fn drop(&mut self) {
         self.release_connection_gauges();
@@ -1954,6 +1971,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             close_notify_sent: false,
             max_pending_window_updates: 1 + connection_config.max_concurrent_streams as usize * 4,
             connection_config,
+            ready_incremental_streams: 0,
             last_gauge_snapshot: None,
             stream_last_activity_at: HashMap::new(),
             stream_fc_stalled_since: HashMap::new(),
@@ -2648,7 +2666,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// current contribution, expressed as a signed delta against the last
     /// snapshot we emitted.
     ///
-    /// The three metrics are emitted via [`gauge_add!`] (lifecycle deltas) so
+    /// The four metrics are emitted via [`gauge_add!`] (lifecycle deltas) so
     /// that the dashboard sees the **sum across all live H2 connections**:
     ///
     /// - `h2.connection.window_bytes` — sum of available connection-level
@@ -2658,6 +2676,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///   every H2 connection.
     /// - `h2.connection.pending_window_updates` — sum of queued (un-flushed)
     ///   per-stream WINDOW_UPDATE entries across every H2 connection.
+    /// - `h2.streams.ready_incremental.by_urgency` — sum of
+    ///   [`Self::ready_incremental_streams`] across every H2 connection.
     ///
     /// Called from the write hot path; emits nothing when the snapshot is
     /// unchanged so the steady state stays cheap. The paired decrement for
@@ -2671,15 +2691,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.flow_control.window.max(0) as usize,
             self.streams.len(),
             self.flow_control.pending_window_updates.len(),
+            self.ready_incremental_streams,
         );
         if self.last_gauge_snapshot == Some(snapshot) {
             return;
         }
-        let prev = self.last_gauge_snapshot.unwrap_or((0, 0, 0));
+        let prev = self.last_gauge_snapshot.unwrap_or((0, 0, 0, 0));
         // Diff in i64 — usize cannot represent the negative side of the delta.
         let dw = snapshot.0 as i64 - prev.0 as i64;
         let ds = snapshot.1 as i64 - prev.1 as i64;
         let du = snapshot.2 as i64 - prev.2 as i64;
+        let dr = snapshot.3 as i64 - prev.3 as i64;
         if dw != 0 {
             gauge_add!(names::h2::CONNECTION_WINDOW_BYTES, dw);
         }
@@ -2689,18 +2711,22 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if du != 0 {
             gauge_add!(names::h2::CONNECTION_PENDING_WINDOW_UPDATES, du);
         }
+        if dr != 0 {
+            gauge_add!(names::h2::STREAMS_READY_INCREMENTAL_BY_URGENCY, dr);
+        }
         self.last_gauge_snapshot = Some(snapshot);
     }
 
-    /// Subtract this connection's contribution from the three aggregate
-    /// `h2.connection.*` gauges. Idempotent: clears `last_gauge_snapshot` so a
-    /// second call (or a [`Drop`] on top of an explicit reset) is a no-op.
+    /// Subtract this connection's contribution from the four aggregate gauges
+    /// [`Self::gauge_connection_state`] feeds. Idempotent: clears
+    /// `last_gauge_snapshot` so a second call (or a [`Drop`] on top of an
+    /// explicit reset) is a no-op.
     ///
     /// Pairs with every prior call to [`Self::gauge_connection_state`]; called
     /// from [`Drop`] so the symmetry is guaranteed regardless of the close
     /// path.
     fn release_connection_gauges(&mut self) {
-        if let Some((w, s, u)) = self.last_gauge_snapshot.take() {
+        if let Some((w, s, u, r)) = self.last_gauge_snapshot.take() {
             if w != 0 {
                 gauge_add!(names::h2::CONNECTION_WINDOW_BYTES, -(w as i64));
             }
@@ -2709,6 +2735,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             if u != 0 {
                 gauge_add!(names::h2::CONNECTION_PENDING_WINDOW_UPDATES, -(u as i64));
+            }
+            if r != 0 {
+                gauge_add!(names::h2::STREAMS_READY_INCREMENTAL_BY_URGENCY, -(r as i64));
             }
         }
     }
@@ -3210,13 +3239,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
             }
         }
-        gauge!(
-            "h2.streams.ready_incremental.by_urgency",
-            ready_incremental_by_urgency
-                .values()
-                .copied()
-                .sum::<usize>()
-        );
+        // Sample the pass's final bucket totals. Publication is deferred to
+        // the `gauge_connection_state` call below: `converter` still borrows
+        // `self.encoder` here, and the value must reach the gauge in the SAME
+        // pass that computed it — the entry call at the top of `write_streams`
+        // runs before `ready_incremental_by_urgency` exists.
+        self.ready_incremental_streams = ready_incremental_by_urgency
+            .values()
+            .copied()
+            .sum::<usize>();
         // Reclaim the converter's reusable buffers before any &mut self calls,
         // since the converter borrows self.encoder.
         let converter_out = std::mem::take(&mut converter.out);
@@ -3232,6 +3263,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if size_update_emitted {
             self.pending_table_size_update = None;
         }
+        // Publish `ready_incremental_streams` (and any window/stream drift the
+        // pass produced) now that the converter borrow is released, and before
+        // the two early returns below, so no pass samples without emitting.
+        self.gauge_connection_state();
         // Account every RST that the converter emitted during this pass
         // (pre-prepare gate + post-prepare HPACK over-budget abort) so
         // the global tx counter, the per-error breakdown, and the
@@ -8638,6 +8673,101 @@ mod tests {
             map.get(&1),
             Some(&3),
             "non-incremental transitions must not touch the bucket"
+        );
+    }
+
+    // ── h2.streams.ready_incremental.by_urgency aggregate ────────────────
+
+    /// Read the process-local `h2.streams.ready_incremental.by_urgency` gauge,
+    /// treating an absent key as 0. `dump_local_proxy_metrics` is a
+    /// non-draining filter over the proxy `MetricsMap`, so repeated reads are
+    /// side-effect free and the key is the raw metric name.
+    fn ready_incremental_gauge() -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(names::h2::STREAMS_READY_INCREMENTAL_BY_URGENCY)
+                .and_then(|fm| fm.inner.as_ref())
+                .and_then(|inner| match inner {
+                    Inner::Gauge(v) => Some(*v as i64),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// `h2.streams.ready_incremental.by_urgency` is an aggregate across every
+    /// live H2 connection, so a connection must hand back exactly what it
+    /// contributed, on every close path. [`Drop`] is the single decrement
+    /// site; this pins the round trip.
+    ///
+    /// Before this was folded into `last_gauge_snapshot`, the metric was an
+    /// absolute `gauge!` set from inside `write_streams`: connection B
+    /// overwrote connection A's value, nothing was ever released, and the
+    /// dashboard read "whatever the last writer wrote" instead of a sum.
+    ///
+    /// `METRICS` is a thread-local, so this asserts the DELTA around one
+    /// connection's lifetime — robust to any starting value.
+    ///
+    /// To SEE THIS RED: delete the
+    /// `if r != 0 { gauge_add!(names::h2::STREAMS_READY_INCREMENTAL_BY_URGENCY, -(r as i64)); }`
+    /// arm from [`ConnectionH2::release_connection_gauges`]. The live-delta
+    /// assertion still passes; the post-drop one fails with `left: 3, right: 0`
+    /// — the connection's contribution outliving the connection, which is the
+    /// aggregate drifting upward by 3 for the rest of the worker's life.
+    #[test]
+    fn dropping_a_connection_releases_its_ready_incremental_contribution() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+
+        // A non-blocking connect to a (likely unused) loopback port returns a
+        // real socket handle immediately, regardless of whether the connection
+        // completes; nothing below reads or writes it.
+        let socket = mio::net::TcpStream::connect(
+            format!("127.0.0.1:{}", crate::testing::provide_port())
+                .parse()
+                .expect("loopback address must parse"),
+        )
+        .expect("mio connect must return a socket handle");
+
+        let before = ready_incremental_gauge();
+
+        let mut connection = ConnectionH2::new(
+            Ulid::generate(),
+            socket,
+            Position::Server,
+            Rc::downgrade(&pool),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            TimeoutContainer::new_empty(Duration::from_secs(30)),
+            Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+
+        // What the tail of `write_streams` writes once the pass's bucket map
+        // is final, published by the `gauge_connection_state` call that
+        // follows it.
+        connection.ready_incremental_streams = 3;
+        connection.gauge_connection_state();
+
+        assert_eq!(
+            ready_incremental_gauge() - before,
+            3,
+            "gauge_connection_state must add this connection's ready-incremental \
+             count to the aggregate as a signed delta"
+        );
+
+        drop(connection);
+
+        assert_eq!(
+            ready_incremental_gauge(),
+            before,
+            "Drop must subtract exactly the contribution the connection made, \
+             returning the aggregate to its prior value"
         );
     }
 

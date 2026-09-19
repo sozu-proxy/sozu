@@ -1077,7 +1077,7 @@ impl TcpSession {
 
                 if backend.retry_policy.is_down() {
                     incr!(
-                        "backend.up",
+                        names::backend::UP,
                         self.cluster_id.as_deref(),
                         self.metrics.backend_id.as_deref()
                     );
@@ -1142,7 +1142,7 @@ impl TcpSession {
             let already_unavailable = backend.retry_policy.is_down();
             backend.retry_policy.fail();
             incr!(
-                "backend.connections.error",
+                names::backend::CONNECTIONS_ERROR,
                 self.cluster_id.as_deref(),
                 self.metrics.backend_id.as_deref()
             );
@@ -1154,7 +1154,7 @@ impl TcpSession {
                     backend.address
                 );
                 incr!(
-                    "backend.down",
+                    names::backend::DOWN,
                     self.cluster_id.as_deref(),
                     self.metrics.backend_id.as_deref()
                 );
@@ -1636,7 +1636,7 @@ impl TcpSession {
 
         if self.connection_attempt >= CONN_RETRIES {
             incr!(
-                "backend.connect.retries_exhausted",
+                names::backend::CONNECT_RETRIES_EXHAUSTED,
                 self.cluster_id.as_deref(),
                 self.metrics.backend_id.as_deref()
             );

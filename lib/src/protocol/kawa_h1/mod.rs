@@ -1160,7 +1160,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         // setups still see the same proxy-wide counter — no double-counting,
         // no surprise cardinality.
         incr!(
-            "http.errors",
+            names::http::ERRORS,
             self.context.cluster_id.as_deref(),
             self.context.backend_id.as_deref()
         );
@@ -1183,64 +1183,64 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
         } else {
             match answer {
                 DefaultAnswer::Answer301 { .. } => incr!(
-                    "http.301.redirection",
+                    names::http::REDIRECTION_301,
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
                 DefaultAnswer::Answer302 { .. } => incr!(
-                    "http.302.redirection",
+                    names::http::REDIRECTION_302,
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
                 DefaultAnswer::Answer308 { .. } => incr!(
-                    "http.308.redirection",
+                    names::http::REDIRECTION_308,
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
                 DefaultAnswer::Answer400 { .. } => incr!(names::http::ERR_400),
                 DefaultAnswer::Answer401 { .. } => incr!(
-                    "http.401.errors",
+                    names::http::ERR_401,
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
                 DefaultAnswer::Answer404 { .. } => incr!(names::http::ERR_404),
                 DefaultAnswer::Answer408 { .. } => incr!(
-                    "http.408.errors",
+                    names::http::ERR_408,
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
                 DefaultAnswer::Answer413 { .. } => incr!(
-                    "http.413.errors",
+                    names::http::ERR_413,
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
                 DefaultAnswer::Answer421 { .. } => incr!(
-                    "http.421.errors",
+                    names::http::ERR_421,
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
                 DefaultAnswer::Answer429 { .. } => incr!(
-                    "connections.rejected_per_cluster_ip",
+                    names::connections::REJECTED_PER_CLUSTER_IP,
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
                 DefaultAnswer::Answer502 { .. } => incr!(
-                    "http.502.errors",
+                    names::http::ERR_502,
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
                 DefaultAnswer::Answer503 { .. } => incr!(
-                    "http.503.errors",
+                    names::http::ERR_503,
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
                 DefaultAnswer::Answer504 { .. } => incr!(
-                    "http.504.errors",
+                    names::http::ERR_504,
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
                 DefaultAnswer::Answer507 { .. } => incr!(
-                    "http.507.errors",
+                    names::http::ERR_507,
                     self.context.cluster_id.as_deref(),
                     self.context.backend_id.as_deref()
                 ),
@@ -1447,7 +1447,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
     fn check_circuit_breaker(&mut self) -> Result<(), BackendConnectionError> {
         if self.connection_attempts >= CONN_RETRIES {
             incr!(
-                "backend.connect.retries_exhausted",
+                names::backend::CONNECT_RETRIES_EXHAUSTED,
                 self.context.cluster_id.as_deref(),
                 self.context.backend_id.as_deref()
             );
@@ -1838,7 +1838,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
 
                 if backend.retry_policy.is_down() {
                     incr!(
-                        "backend.up",
+                        names::backend::UP,
                         self.context.cluster_id.as_deref(),
                         metrics.backend_id.as_deref()
                     );
@@ -1885,7 +1885,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
             let already_unavailable = backend.retry_policy.is_down();
             backend.retry_policy.fail();
             incr!(
-                "backend.connections.error",
+                names::backend::CONNECTIONS_ERROR,
                 self.context.cluster_id.as_deref(),
                 metrics.backend_id.as_deref()
             );
@@ -1899,7 +1899,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Http<Front, L
                 );
 
                 incr!(
-                    "backend.down",
+                    names::backend::DOWN,
                     self.context.cluster_id.as_deref(),
                     metrics.backend_id.as_deref()
                 );
