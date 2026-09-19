@@ -487,6 +487,22 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   is dead in every binary. New findings of this kind belong in
   `e2e/COVERAGE.md > Out of e2e reach by construction`, with the mechanism, not
   just the conclusion.
+- **A clock refactor is not wire-falsifiable; the behaviour it drives is.**
+  Changing *which* clock a deadline reads — e.g. the H2 core sampling
+  `Context::now` once per `Mux::ready` pass instead of calling `Instant::now()`
+  per frame — produces the same elapsed time to within an event-loop pass, so
+  every e2e test stays green by construction. Do not write one and claim it
+  guards the refactor; inject an instant in a unit test instead. What a wire
+  test *can* falsify is the behaviour: that a rate window decays, that a
+  deadline fires, that it does not fire early, and that it carries the right
+  error code. `e2e/src/tests/h2_clock_tests.rs` covers those four for the H2
+  flood window and the RFC 9113 §6.5 SETTINGS-ACK watchdog, and each
+  `To SEE THIS RED:` there names a mutation that breaks the behaviour rather
+  than the plumbing. Note also that a deadline evaluated only inside
+  `readable()` / `writable()` needs an event to be observed: poke the
+  connection past the budget, or a quiet socket reads as a missing deadline.
+  The mechanism and the mutation table live in
+  `e2e/COVERAGE.md > Clock-driven behaviour: what the wire can falsify`.
 - **One e2e test exercises external conformance:** `test_h2spec_conformance`
   (`e2e/src/tests/tests.rs`) runs ~145 RFC 9113 scenarios via the `h2spec`
   binary; CI installs it. It skips cleanly when `h2spec` is absent from `PATH`.
