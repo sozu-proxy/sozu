@@ -773,6 +773,8 @@ pub enum ListenerError {
     TemplateParse(String, TemplateError),
     #[error("failed to build rustls context, {0}")]
     BuildRustls(String),
+    #[error("failed to configure client certificate authentication (mTLS): {0}")]
+    ClientAuth(String),
     #[error("could not activate listener with address {address:?}: {error}")]
     Activation { address: SocketAddr, error: String },
     #[error("Could not register listener socket: {0}")]

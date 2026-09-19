@@ -73,6 +73,11 @@ pub fn main() {
         .field_attribute("TcpListenerConfig.answers", "#[serde(default)]")
         .field_attribute("RequestUdpFrontend.tags", "#[serde(default)]")
         .field_attribute("RequestTcpFrontend.alpn", "#[serde(default)]")
+        .field_attribute(
+            "HttpsListenerConfig.client_ca_certificates",
+            "#[serde(default)]",
+        )
+        .field_attribute("HttpsListenerConfig.client_ca_crls", "#[serde(default)]")
         .skip_debug([
             "CertificateAndKey",
             "CertificateSummary",
