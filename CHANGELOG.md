@@ -152,6 +152,56 @@
 
 ### 🐛 Fixed
 
+- **`fix(h2)`: the `MUX-H2` log lines rendered `peer=None` once the peer had reset, and named the
+  load balancer instead of the client behind PROXY protocol.**
+  **This changes rendered log content.** If you alert, dashboard or grep on the `peer=` slot of a
+  `MUX-H2` line, read the operator note at the end of this entry before upgrading. It is a fix, not
+  a regression, but it is a visible one.
+  Both `log_context!` (`lib/src/protocol/mux/h2.rs:73`) and its per-stream variant
+  `log_context_stream!` (`:104`) built their `peer=` slot from
+  `$self.socket.socket_ref().peer_addr().ok()` — a live `getpeername(2)` on every expansion, on two
+  separate lines. The kernel answers `ENOTCONN` from the moment the peer sends a RST, so the slot
+  collapsed to `None` on exactly the `error!` lines an operator reads during an incident: the
+  address was rendered while nothing was wrong and dropped the instant it mattered. `log_context!`
+  is the live one, expanding at 110 callsites in that file, so the cost was also one syscall per
+  expansion on paths that are otherwise a thread-local read and one `format!`.
+  `log_context_stream!` currently has no callers — it is `#[allow(unused_macros)]` — and is
+  corrected in the same pass so the two cannot render different peers once it gains one.
+  The same read caused a second, independent defect. On a PROXY-protocol frontend,
+  `HttpsSession::upgrade_expect` adopts the PROXY-advertised source as the session's peer
+  (`lib/src/https.rs:372`), and that is the value the `HTTPS` line and the mux `Context` carry. The
+  H2 macros consulted the socket instead, so one and the same request id produced an `HTTPS` line
+  naming the real client and a `MUX-H2` line naming the load balancer. The plaintext side had
+  already threaded the advertised address into `SessionTcpStream::configured_peer`
+  (`lib/src/http.rs:330`) and its `SOCKET` lines have rendered it ever since; the TLS side carried
+  no such cache at all until this change.
+  `SocketHandler` gains a `peer_addr` method returning the address the handler snapshotted at
+  construction, falling back to the live lookup only when it holds none — the preference
+  `log_socket_module_prefix` already applied to every `SessionTcpStream` (`lib/src/socket.rs:177`),
+  now reachable from the mux. `FrontRustls` gains the matching `configured_peer` field, seeded from
+  `HttpsSession::peer_address` and deliberately **not** from `stream.peer_addr()`: the latter
+  compiles, passes all 878 other unit tests, and silently preserves the PROXY-protocol split. That
+  one-word choice is pinned by
+  `https::tests::front_rustls_peer_snapshot_is_the_session_peer_not_the_accepted_socket`.
+  No wire byte, metric, control-flow decision or log *layout* changes; `lib/tests/log_layout.rs`
+  makes no `peer` assertion and is unaffected.
+  **Operator note — three rendered changes, every one of them on a `MUX-H2` line.** (1) A `MUX-H2`
+  line emitted after the peer reset now carries the cached address where it previously carried
+  `peer=None`; a rule matching `peer=None` to detect resets will stop firing. (2) On a
+  PROXY-protocol HTTPS frontend, `peer=` now shows the PROXY-advertised client instead of the load
+  balancer, so it agrees with the `HTTPS` line for the same request id; a dashboard grouping H2
+  sessions by `peer=` will switch from a handful of balancer addresses to the real client
+  population, which may be a large cardinality increase. (3) A backend-facing H2 connection renders
+  the cluster-configured backend address (`lib/src/protocol/mux/router.rs:449`) where a failed
+  `connect()` previously left `peer=None` — `getpeername(2)` answers `ENOTCONN` in that state,
+  which is precisely when the backend's identity is worth reading.
+  Nothing changes on a plaintext frontend, and an operator watching one should not go looking.
+  `Connection::new_h2_server` has exactly one caller, `lib/src/https.rs:702`, on the TLS ALPN
+  branch, and h2c is deliberately unimplemented on the cleartext listener
+  (`lib/src/http.rs:710-728`), so a `MuxClear` session has no `MUX-H2` frontend line to change. Its
+  frontend renders through `MUX-H1` (`lib/src/protocol/mux/h1.rs:54`, `:83`), which still performs
+  a live lookup and is untouched here.
+
 - **`fix(udp)`: a repeated `activate-listener` destroyed the live listener session.**
   Residual of the listener-slot change immediately below, which landed the same day — not a new
   regression, and the reserved slot it introduced is sound. That change left the UDP activation arm

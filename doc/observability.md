@@ -177,7 +177,7 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
 | Prefix | File | Carries |
 |---|---|---|
 | `MUX` | `protocol/mux/mod.rs` | session ULID, peer/local, frontend, backend list |
-| `MUX-H2` | `protocol/mux/h2.rs` | …plus position, state, total RST counts, draining |
+| `MUX-H2` | `protocol/mux/h2.rs` | …plus position, state, total RST counts, draining. `peer` is a snapshot (see below), not a live lookup |
 | `MUX-H1` | `protocol/mux/h1.rs` | …plus stream id, parked, close_notify |
 | `MUX-ROUTER` | `protocol/mux/router.rs` | renders `[session req cluster backend]` via `HttpContext::log_context()` |
 | `MUX-CONN` / `MUX-CONV` / `MUX-PARSER` / `MUX-PKAWA` / `MUX-STREAM` | corresponding files | module-level only (no per-session context) |
@@ -192,6 +192,33 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
 - Use the macro defined in the file. Do not call `log::info!`/`log::error!`
   directly from protocol code — the prefix tag is load-bearing for
   log-search.
+- The `peer` slot of a `MUX-H2` line is a snapshot taken when the socket
+  handler was built (`SocketHandler::peer_addr`, `lib/src/socket.rs`), not
+  a live `getpeername(2)`. Two consequences an operator should expect.
+  First, it stays populated after the peer resets — `getpeername(2)`
+  answers `ENOTCONN` there, so a live lookup renders `peer=None` on exactly
+  the error lines being read during an incident. Do not match `peer=None`
+  on a `MUX-H2` line to detect a reset. Second, on a PROXY-protocol TLS
+  frontend it is the source the PROXY header advertised, so it names the
+  client and agrees with the `HTTPS` line for the same request id rather
+  than naming the load balancer. (A `MUX-H2` frontend line only ever
+  exists on a TLS frontend: `Connection::new_h2_server` is called once,
+  from the ALPN branch of `https.rs`, and h2c is unimplemented on the
+  cleartext listener.)
+  `MUX` (`protocol/mux/mod.rs`) and `MUX-H1` (`protocol/mux/h1.rs`) still
+  render a live `getpeername(2)` and are unchanged. For `SOCKET` the
+  answer depends on the handler, not on the layer: a `SessionTcpStream`
+  — every plaintext frontend and every backend socket — renders through
+  `log_socket_module_prefix` (`socket.rs:177`), which has always preferred
+  `configured_peer`, while a TLS frontend renders through
+  `log_socket_context!` (`socket.rs:133`), which still does a live lookup.
+  So on a PROXY-protocol TLS frontend the `MUX-H2` line names the client
+  while the `SOCKET` line names the load balancer. That is an artefact of
+  `FrontRustls` having carried no cached address until now, not a
+  deliberate split between layers. Aligning `socket.rs:133` is a
+  follow-up needing its own test: nothing currently asserts the `peer=`
+  slot of a `SOCKET` line, so changing it would be an unguarded
+  behaviour change on a second log prefix.
 - Tier severity by intent: `debug!`/`trace!` for expected idle closes,
   timeouts, noisy state. `warn!`/`error!` for real protocol errors or
   invariant breaks. (See `feedback_log_context_before_theorising` for the

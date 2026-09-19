@@ -175,6 +175,65 @@ is recorded here so the next person does not re-derive it.
   Do not write an e2e test that drives a backend status line and claim
   it guards `save_http_status_metric`: it passes either way.
 
+- **Rendered log content, including the `peer=` slot of a `MUX-H2` line.**
+  The e2e harness cannot observe a worker's log output at all, so a test
+  asserting on one would have to assert on something else and would pass
+  whatever the log said. Three independent mechanisms, each sufficient on
+  its own. The worker's log target is the hardcoded string `"stdout"`:
+  `Worker::start_new_worker` calls `setup_default_logging(false, "error",
+  &thread_name)` (`e2e/src/sozu/worker.rs:164`) and that helper is
+  `setup_logging("stdout", ...)` (`command/src/logging/logs.rs:680`), with
+  no parameter and no environment override — `RUST_LOG` is consulted for
+  the *level* only (`logs.rs:711`). `LoggerBackend::Stdout` writes through
+  a `std::io::Stdout` handle (`logs.rs:280`), not the `print!` path
+  libtest captures, so even `--nocapture` yields the test no `String`.
+  And `LOGGER` is a `thread_local!` (`logs.rs:24`) with a one-shot
+  `initialized` guard (`logs.rs:191`), so the worker thread's logger is
+  not the test thread's: the two `setup_default_logging` calls that do run
+  on the test thread (`e2e/src/tests/tests.rs:1570`, `:2109`) configure
+  only the test's own `info!` output. A grep of `e2e/src/` for
+  `set_logger|LoggerBackend|capture_test_logs` returns nothing: there is no
+  channel-, buffer- or file-backed logger anywhere in the harness, and no
+  test reads a log file.
+
+  This one is *reachable in principle*, unlike the entry above — the
+  falsifying change is small and named here so nobody has to re-derive it:
+  give `Worker::start_new_worker` a log-target *and level* parameter
+  feeding `setup_logging` instead of `setup_default_logging`, and write to
+  a `file://` target under `tempfile` (already a regular `e2e`
+  dependency), draining it after the worker stops. `target_to_backend`
+  (`command/src/logging/logs.rs:731`) accepts `udp://`, `file://`,
+  `tcp://` and `unix://`.
+
+  Two traps in that recipe, both worth the sentence they cost. Do **not**
+  reuse the UDP-receiver drain from `capture_test_logs_at_level`
+  (`lib/src/lib.rs:1682`): it drains only once the run has finished and so
+  depends on the kernel socket buffer having held every datagram, which is
+  true for the handful of lines a unit test emits and false under an H2
+  conversation — it would silently drop lines and produce exactly the kind
+  of load-sensitive flake this suite already has a family of. `file://`
+  has no loss mode. And `worker.rs:164` hardcodes the *level* `"error"` as
+  well as the target, while a large share of `MUX-H2` expansions are
+  `debug!` / `trace!`; retargeting alone would capture the error and warn
+  lines only. The target must be chosen at worker-spawn time because of
+  the `initialized` guard.
+
+  Consequence for coverage: a defect whose *only* observable is a log line
+  — the `peer=` snapshot of `SocketHandler::peer_addr` is exactly that,
+  it moves no wire byte, no metric and no control-flow decision — is
+  guarded by unit tests that render the macro directly:
+  `protocol::mux::h2::tests::log_context_renders_the_cached_peer_not_a_live_lookup`,
+  its `log_context_stream` sibling, and
+  `https::tests::front_rustls_peer_snapshot_is_the_session_peer_not_the_accepted_socket`
+  for the PROXY-protocol seeding. The wire choreography those lines
+  describe *is* e2e-covered, by
+  `tests::h2_tests::test_h2_with_proxy_protocol_v2`
+  (`e2e/src/tests/h2_tests.rs:6443`) and the
+  `tests::proxy_protocol_local_tests` pair. Do not extend one of those
+  with a `peer=` claim and call it a guard: nothing in the harness can
+  read the line, so it would pass against a socket-reading macro exactly
+  as it passes against a snapshot-reading one.
+
 ## Clock-driven behaviour: what the wire can falsify
 
 A deadline or a rate window has no wire representation of its own — only

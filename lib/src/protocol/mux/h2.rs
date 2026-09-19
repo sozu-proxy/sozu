@@ -52,7 +52,11 @@ use crate::{
 /// Fields included in the session block (chosen to surface the most common
 /// H2 troubleshooting axes — flow stall, leaked stream, draining state,
 /// peer-side gap, reset-flood exposure):
-/// - `peer` — peer address (or `None` if the socket is gone)
+/// - `peer` — peer address via [`SocketHandler::peer_addr`](crate::socket::SocketHandler::peer_addr):
+///   the snapshot the handler cached, not a live `getpeername(2)`. It therefore
+///   survives the peer's RST (which is when these lines are read) and, on a
+///   PROXY-protocol frontend, names the advertised client rather than the load
+///   balancer — matching the `HTTPS`/`HTTP` line for the same request id
 /// - `position` — `Server` / `Client(...)` orientation
 /// - `state` — current [`H2State`]
 /// - `streams` — number of in-flight streams on this connection
@@ -77,7 +81,7 @@ macro_rules! log_context {
             gray = gray,
             white = white,
             ulid = $self.session_ulid,
-            peer = $self.socket.socket_ref().peer_addr().ok(),
+            peer = $self.socket.peer_addr(),
             position = $self.position,
             state = $self.state,
             streams = $self.streams.len(),
@@ -111,7 +115,7 @@ macro_rules! log_context_stream {
             req = $http_context.id,
             cluster = $http_context.cluster_id.as_deref().unwrap_or("-"),
             backend = $http_context.backend_id.as_deref().unwrap_or("-"),
-            peer = $self.socket.socket_ref().peer_addr().ok(),
+            peer = $self.socket.peer_addr(),
             position = $self.position,
             state = $self.state,
             streams = $self.streams.len(),
@@ -9286,6 +9290,145 @@ mod tests {
             "forcefully_terminate_answer must set the WRITABLE event bit — \
              without this, filter_interest() = 0 under edge-triggered epoll \
              and writable() is never scheduled (h2spec Gap A)"
+        );
+    }
+
+    // ── peer-address snapshot in the MUX-H2 log envelope ─────────────────
+    //
+    // `log_context!` / `log_context_stream!` render `peer=` from
+    // `SocketHandler::peer_addr`, which is a snapshot the handler cached, not a
+    // live `getpeername(2)`. Both tests below make the two answers differ on
+    // purpose: the socket is genuinely connected to a loopback listener, so the
+    // live lookup succeeds and would print `127.0.0.1:<port>`; only a macro
+    // reading the snapshot can print `10.0.0.42:12345`.
+    //
+    // That gap is the PROXY-protocol symptom in miniature — the frontend's real
+    // peer is the load balancer while the cache holds the advertised client —
+    // and the same read is what keeps the slot populated after the peer's RST,
+    // when `getpeername(2)` answers ENOTCONN and the live lookup collapses to
+    // `None` on exactly the error lines an operator is reading.
+
+    /// A live, established loopback connection plus the address
+    /// `getpeername(2)` reports for it. The listener is returned so the
+    /// connection stays up for the whole test: these tests assert the snapshot
+    /// wins even while the live lookup is perfectly healthy, so a half-dead
+    /// socket would weaken them rather than strengthen them.
+    fn connected_loopback_stream() -> (
+        std::net::TcpListener,
+        mio::net::TcpStream,
+        std::net::SocketAddr,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let live_peer = listener
+            .local_addr()
+            .expect("test listener must report its local address");
+        let stream =
+            std::net::TcpStream::connect(live_peer).expect("loopback connect must complete");
+        stream
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        (listener, mio::net::TcpStream::from_std(stream), live_peer)
+    }
+
+    /// Address the handler caches. Deliberately non-loopback so it cannot
+    /// collide with whatever ephemeral port the live lookup would report.
+    const CACHED_PEER: &str = "10.0.0.42:12345";
+
+    /// Build a server-side H2 connection whose frontend handler caches
+    /// [`CACHED_PEER`] while its socket is really connected to `live_peer`.
+    fn connection_with_cached_peer(
+        pool: &Rc<RefCell<Pool>>,
+        stream: mio::net::TcpStream,
+    ) -> ConnectionH2<crate::socket::SessionTcpStream> {
+        let session_ulid = Ulid::generate();
+        let socket = crate::socket::SessionTcpStream::new(
+            stream,
+            session_ulid,
+            Some(
+                CACHED_PEER
+                    .parse()
+                    .expect("the cached peer literal must parse"),
+            ),
+        );
+        ConnectionH2::new(
+            session_ulid,
+            socket,
+            Position::Server,
+            Rc::downgrade(pool),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            TimeoutContainer::new_empty(Duration::from_secs(30)),
+            Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection")
+    }
+
+    /// To SEE THIS RED: in `log_context!` (h2.rs), put
+    /// `peer = $self.socket.socket_ref().peer_addr().ok(),` back in place of
+    /// `peer = $self.socket.peer_addr(),`. The rendered line then carries the
+    /// loopback address the socket is really connected to, so the first
+    /// assertion fails on the missing cached address.
+    #[test]
+    fn log_context_renders_the_cached_peer_not_a_live_lookup() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (_listener, stream, live_peer) = connected_loopback_stream();
+        let connection = connection_with_cached_peer(&pool, stream);
+
+        // Premise of the test: the live lookup is healthy and disagrees with the
+        // cache. Without this the assertions below could pass for the wrong
+        // reason (both answers happening to be the same address).
+        assert_eq!(
+            connection.socket.socket_ref().peer_addr().ok(),
+            Some(live_peer),
+            "the test socket must be genuinely connected, so a live lookup succeeds"
+        );
+
+        let rendered = log_context!(connection);
+
+        assert!(
+            rendered.contains(&format!("peer=Some({CACHED_PEER})")),
+            "MUX-H2 context must render the cached peer: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&live_peer.to_string()),
+            "MUX-H2 context must not fall back to the live getpeername(2) answer: {rendered}"
+        );
+    }
+
+    /// To SEE THIS RED: in `log_context_stream!` (h2.rs), put
+    /// `peer = $self.socket.socket_ref().peer_addr().ok(),` back in place of
+    /// `peer = $self.socket.peer_addr(),`. The per-stream envelope then
+    /// diverges from the connection envelope, which is worse than either being
+    /// wrong alone: the same session renders two different peers depending on
+    /// whether a stream happened to be in scope at the callsite.
+    #[test]
+    fn log_context_stream_renders_the_cached_peer_not_a_live_lookup() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (_listener, stream, live_peer) = connected_loopback_stream();
+        let connection = connection_with_cached_peer(&pool, stream);
+        let mux_stream = make_stream_for_invariant_16(&pool, connection.session_ulid);
+        let http_context = &mux_stream.context;
+
+        assert_eq!(
+            connection.socket.socket_ref().peer_addr().ok(),
+            Some(live_peer),
+            "the test socket must be genuinely connected, so a live lookup succeeds"
+        );
+
+        let rendered = log_context_stream!(connection, http_context);
+
+        assert!(
+            rendered.contains(&format!("peer=Some({CACHED_PEER})")),
+            "per-stream MUX-H2 context must render the cached peer: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&live_peer.to_string()),
+            "per-stream MUX-H2 context must not fall back to the live \
+             getpeername(2) answer: {rendered}"
         );
     }
 }

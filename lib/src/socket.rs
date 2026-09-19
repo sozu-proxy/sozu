@@ -67,6 +67,21 @@ pub trait SocketHandler {
     fn socket_close(&mut self) {}
     fn socket_ref(&self) -> &TcpStream;
     fn socket_mut(&mut self) -> &mut TcpStream;
+    /// Peer address of this connection, preferring a snapshot taken when the
+    /// handler was built over a live `getpeername(2)`.
+    ///
+    /// `getpeername(2)` fails with `ENOTCONN` the moment the peer resets, so a
+    /// live lookup renders `peer=None` on exactly the error lines an operator
+    /// reads during an incident. It also reports the transport peer, which on a
+    /// PROXY-protocol frontend is the load balancer rather than the client the
+    /// rest of the session is logged against.
+    ///
+    /// Implementations that cache an address ([`SessionTcpStream`],
+    /// [`FrontRustls`]) return it and fall back to the live lookup only when
+    /// they have none; the raw [`TcpStream`] impl carries no context and has
+    /// nothing but the live lookup. Deliberately has no default body: a new
+    /// handler must state which of the two it is.
+    fn peer_addr(&self) -> Option<SocketAddr>;
     fn protocol(&self) -> TransportProtocol;
     fn read_error(&self);
     fn write_error(&self);
@@ -90,9 +105,12 @@ pub trait SocketHandler {
 /// comes from [`sozu_command::logging::ansi_palette`] — single source of
 /// truth for every `log_*_context!` macro in the proxy.
 ///
-/// `peer` is a live `getpeername(2)` lookup (this macro is used by
-/// [`FrontRustls`] where the accepted-socket peer is reliable; backend-facing
-/// sockets carry a cache via [`log_socket_module_prefix`]). `local`, `rtt`,
+/// `peer` is a live `getpeername(2)` lookup: the SOCKET layer reports the
+/// kernel's view of the transport. The cached alternative is
+/// [`SocketHandler::peer_addr`], which [`log_socket_module_prefix`] and the
+/// `MUX-H2` context use instead. On a PROXY-protocol frontend the two
+/// deliberately differ — this slot shows the connection's peer, `peer_addr`
+/// shows the advertised client. `local`, `rtt`,
 /// `state` render per [`log_socket_module_prefix`]'s description.
 macro_rules! log_socket_context {
     ($self:expr) => {{
@@ -403,6 +421,15 @@ impl SocketHandler for TcpStream {
         self
     }
 
+    /// No context to cache: a bare stream is all there is, so this is the live
+    /// lookup and renders `None` once the peer has reset. Call sites that need
+    /// a surviving address use [`SessionTcpStream`] or [`FrontRustls`].
+    /// Fully-qualified so it reads as the inherent `mio` method, not a
+    /// recursive call into the trait method being defined.
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        TcpStream::peer_addr(self).ok()
+    }
+
     fn protocol(&self) -> TransportProtocol {
         TransportProtocol::Tcp
     }
@@ -487,6 +514,15 @@ impl SocketHandler for SessionTcpStream {
         &mut self.stream
     }
 
+    /// Same preference order as `log_socket_module_prefix` (private, so not
+    /// linked), which this type's
+    /// I/O helpers already feed `configured_peer` into — one address for both
+    /// the `SOCKET` and `MUX-*` renderings of the same connection.
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.configured_peer
+            .or_else(|| self.stream.peer_addr().ok())
+    }
+
     fn protocol(&self) -> TransportProtocol {
         TransportProtocol::Tcp
     }
@@ -517,6 +553,14 @@ pub struct FrontRustls {
     /// Connection/session ULID propagated from the enclosing mux session.
     /// Rendered into SOCKET-layer error logs via [`Self::session_ulid`].
     pub session_ulid: Ulid,
+    /// Peer address snapshot, same role as [`SessionTcpStream::configured_peer`]
+    /// and same name so the two handlers read alike. Seeded from
+    /// `HttpsSession::peer_address`, which is the PROXY-advertised source on an
+    /// expect-proxy frontend and the accepted socket's peer otherwise — NOT
+    /// from `stream.peer_addr()`, which would be the load balancer in the first
+    /// case and would die with `ENOTCONN` in both. Read through
+    /// [`SocketHandler::peer_addr`].
+    pub configured_peer: Option<SocketAddr>,
 }
 
 impl std::fmt::Debug for FrontRustls {
@@ -1095,6 +1139,20 @@ impl SocketHandler for FrontRustls {
         &mut self.stream
     }
 
+    /// The fallback is reachable, and only the expect-proxy route makes it
+    /// look otherwise. There, `upgrade_expect` returns `None` unless both
+    /// PROXY addresses parse, so `peer_address` really is `Some` by the time
+    /// a handshake exists. The direct route has no such guarantee:
+    /// `HttpsSession::new` seeds `peer_address` with a best-effort
+    /// `sock.peer_addr().ok()` at accept (`https.rs`), an `Option` precisely
+    /// because that `getpeername(2)` can fail. Do not delete this arm —
+    /// `https::tests::front_rustls_peer_addr_falls_back_to_the_live_lookup`
+    /// fails without it.
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.configured_peer
+            .or_else(|| self.stream.peer_addr().ok())
+    }
+
     fn protocol(&self) -> TransportProtocol {
         self.session
             .protocol_version()
@@ -1583,6 +1641,114 @@ pub mod stats {
         println!(
             "rtt: {}",
             sozu_command::logging::LogDuration(socket_rtt(&sock))
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Address a handler caches. Deliberately non-loopback so it can never
+    /// collide with the ephemeral address a live `getpeername(2)` reports for
+    /// the test connection.
+    const CACHED_PEER: &str = "10.0.0.42:12345";
+
+    /// A live, established loopback connection plus the address
+    /// `getpeername(2)` reports for it. The listener is returned so the
+    /// connection stays up for the whole test: the property under test is that
+    /// the snapshot wins even while the live lookup is perfectly healthy, and a
+    /// half-dead socket would weaken that rather than strengthen it.
+    ///
+    /// Using a genuinely connected socket instead of an aborted `connect()` is
+    /// also what makes these tests deterministic: whether a nonblocking connect
+    /// to a closed port has already collected its RST — and therefore whether
+    /// `getpeername(2)` has started answering `ENOTCONN` — is a race against the
+    /// kernel, not something a test may assert on.
+    fn connected_loopback_stream() -> (std::net::TcpListener, TcpStream, SocketAddr) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let live_peer = listener
+            .local_addr()
+            .expect("test listener must report its local address");
+        let stream =
+            std::net::TcpStream::connect(live_peer).expect("loopback connect must complete");
+        stream
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        (listener, TcpStream::from_std(stream), live_peer)
+    }
+
+    /// The cache is the whole point of the snapshot: on a PROXY-protocol
+    /// frontend it holds the advertised client while the socket's own peer is
+    /// the load balancer, and on a backend socket it holds the configured
+    /// backend while `getpeername(2)` answers `ENOTCONN` after a failed
+    /// `connect()`. A handler that consults the kernel first has neither.
+    ///
+    /// To SEE THIS RED: in `impl SocketHandler for SessionTcpStream`, replace
+    /// the body of `peer_addr` with `self.stream.peer_addr().ok()`. The cached
+    /// address disappears and the loopback address takes its place.
+    #[test]
+    fn session_tcp_stream_peer_addr_prefers_the_cached_address() {
+        let (_listener, stream, live_peer) = connected_loopback_stream();
+        let cached: SocketAddr = CACHED_PEER
+            .parse()
+            .expect("the cached peer literal must parse");
+        let handler = SessionTcpStream::new(stream, Ulid::generate(), Some(cached));
+
+        // Premise: the live lookup is healthy and disagrees with the cache, so
+        // the assertion below cannot pass for the wrong reason.
+        assert_eq!(
+            handler.socket_ref().peer_addr().ok(),
+            Some(live_peer),
+            "the test socket must be genuinely connected, so a live lookup succeeds"
+        );
+        assert_ne!(
+            cached, live_peer,
+            "the cached and live addresses must differ for this test to discriminate"
+        );
+
+        assert_eq!(
+            handler.peer_addr(),
+            Some(cached),
+            "a cached peer address must win over a live getpeername(2)"
+        );
+    }
+
+    /// The fallback arm. Without it a handler built with no snapshot would
+    /// render `peer=None` on every line rather than degrading to the live
+    /// lookup that was there before the cache existed.
+    ///
+    /// To SEE THIS RED: in `impl SocketHandler for SessionTcpStream`, drop the
+    /// `.or_else(|| self.stream.peer_addr().ok())` from `peer_addr`. The
+    /// handler then answers `None` for a perfectly healthy connection.
+    #[test]
+    fn session_tcp_stream_peer_addr_falls_back_to_the_live_lookup() {
+        let (_listener, stream, live_peer) = connected_loopback_stream();
+        let handler = SessionTcpStream::new(stream, Ulid::generate(), None);
+
+        assert_eq!(
+            handler.peer_addr(),
+            Some(live_peer),
+            "with nothing cached, peer_addr must degrade to getpeername(2)"
+        );
+    }
+
+    /// A bare `TcpStream` carries no session context and therefore nothing to
+    /// cache; its `peer_addr` is the live lookup and nothing else. Pinned so
+    /// that a later attempt to give `SocketHandler::peer_addr` a default body
+    /// has to confront this impl explicitly.
+    ///
+    /// To SEE THIS RED: in `impl SocketHandler for TcpStream`, replace the body
+    /// of `peer_addr` with `None`.
+    #[test]
+    fn raw_tcp_stream_peer_addr_is_the_live_lookup() {
+        let (_listener, stream, live_peer) = connected_loopback_stream();
+
+        assert_eq!(
+            SocketHandler::peer_addr(&stream),
+            Some(live_peer),
+            "the contextless handler must report the kernel's answer"
         );
     }
 }

@@ -552,6 +552,14 @@ impl HttpsSession {
             peer_disconnected: false,
             peer_reset: false,
             session_ulid,
+            // `self.peer_address`, NOT `stream.peer_addr()`. On an expect-proxy
+            // frontend `upgrade_expect` has already adopted the PROXY-advertised
+            // source here, while the socket's own peer is the load balancer: the
+            // raw lookup compiles, passes, and silently makes the `MUX-*` lines
+            // name a different host than the `HTTPS` line for the same request
+            // id. This is the same value handed to `Context::new` below, so the
+            // two halves of the session agree by construction.
+            configured_peer: self.peer_address,
         };
         let router = mux::Router::new(
             self.configured_backend_timeout,
@@ -2823,7 +2831,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::router::{MethodRule, PathRule, Route, Router, pattern_trie::TrieNode};
+    use crate::{
+        router::{MethodRule, PathRule, Route, Router, pattern_trie::TrieNode},
+        socket::SocketHandler,
+    };
 
     #[test]
     fn successful_tls_handshake_log_bounds_sni_and_alpn() {
@@ -3310,6 +3321,235 @@ mod tests {
         assert_eq!(
             build(180, Some(0)).get_h2_stream_idle_timeout(),
             Duration::from_secs(1)
+        );
+    }
+
+    // ── FrontRustls peer snapshot (the PROXY-protocol seeding decision) ──
+
+    /// Source address a PROXY v2 header advertises. Non-loopback so it can
+    /// never collide with the address of the connection the test really opens.
+    const PROXY_ADVERTISED_PEER: &str = "10.0.0.42:12345";
+
+    /// The peer snapshot handed to [`FrontRustls`] is the session's known peer
+    /// address — on an expect-proxy frontend, the source the PROXY header
+    /// advertised — and NOT `getpeername(2)` on the accepted socket, which on
+    /// such a frontend is the load balancer.
+    ///
+    /// This is the one substitution a future editor is most likely to make
+    /// here. Hoisting `let raw_peer = handshake.stream.peer_addr().ok();` above
+    /// the struct literal and seeding from that compiles, passes every other
+    /// test in this file, and silently restores the split this change exists to
+    /// remove: the `HTTPS` line naming the client while the `MUX-*` lines name
+    /// the load balancer, for one and the same request id.
+    ///
+    /// The test drives the real `upgrade_handshake`, so it pins the seeding
+    /// site rather than the accessor. `session.peer_address` is set the way
+    /// `upgrade_expect` sets it (https.rs, `self.peer_address =
+    /// Some(session_address)` on the PROXY-header branch) instead of feeding a
+    /// real PROXY header — that adoption already has its own `debug_assert_eq!`
+    /// in `upgrade_expect` and its own e2e coverage; what is unguarded, and
+    /// what this test guards, is the hand-off from there into the socket
+    /// handler. `handshake.peer_address` is set to the same value because
+    /// `upgrade_expect` passes `self.peer_address` straight into
+    /// `TlsHandshake::new`: in production the two are always equal, so the test
+    /// must not be able to pass or fail on the difference between them.
+    ///
+    /// To SEE THIS RED: in `upgrade_handshake`, put
+    /// `let raw_peer = handshake.stream.peer_addr().ok();` before the
+    /// `FrontRustls` literal and replace `configured_peer: self.peer_address,`
+    /// with `configured_peer: raw_peer,`. (Reading `handshake.stream` inside
+    /// the literal itself does not compile — the `stream:` field has already
+    /// moved it — which is the only reason the mutation needs the hoist.)
+    #[test]
+    fn front_rustls_peer_snapshot_is_the_session_peer_not_the_accepted_socket() {
+        let advertised: StdSocketAddr = PROXY_ADVERTISED_PEER
+            .parse()
+            .expect("the advertised peer literal must parse");
+
+        let proxy = proxy_with_certificate_domain("lolcatho.st".to_owned());
+        let listener = proxy
+            .listeners
+            .values()
+            .next()
+            .expect("the test proxy has one listener")
+            .clone();
+        let pool = Rc::downgrade(&proxy.pool);
+        let rustls_details = ServerConnection::new(listener.borrow().rustls_details.clone())
+            .expect("a test rustls server session must be created");
+        let public_address = *listener.borrow().get_addr();
+        let proxy = Rc::new(RefCell::new(proxy));
+
+        // A genuinely established loopback connection stands in for the one the
+        // load balancer opened. `getpeername(2)` on it answers the balancer's
+        // address and keeps answering it — the point being that the snapshot
+        // must disagree with a live lookup that is perfectly healthy.
+        let balancer = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let balancer_peer = balancer
+            .local_addr()
+            .expect("test listener must report its local address");
+        let stream =
+            std::net::TcpStream::connect(balancer_peer).expect("loopback connect must complete");
+        stream
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        let stream = MioTcpStream::from_std(stream);
+
+        let mut session = HttpsSession::new(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            // Built on the direct route so the session owns exactly one stream
+            // and one rustls session; the PROXY adoption is then applied below.
+            false,
+            listener,
+            pool,
+            proxy,
+            public_address,
+            rustls_details,
+            stream,
+            Token(0),
+            Duration::from_secs(0),
+        );
+
+        assert_eq!(
+            session.peer_address,
+            Some(balancer_peer),
+            "a direct-route session starts out with the accepted socket's peer"
+        );
+
+        let mut handshake = match session.state.take() {
+            HttpsStateMachine::Handshake(handshake) => handshake,
+            _ => panic!("a non-expect-proxy session must start in the TLS handshake state"),
+        };
+
+        // What `upgrade_expect` does once the PROXY header parses.
+        session.peer_address = Some(advertised);
+        handshake.peer_address = Some(advertised);
+        assert_ne!(
+            advertised, balancer_peer,
+            "the advertised and connection peers must differ for this test to discriminate"
+        );
+
+        let upgraded = session
+            .upgrade_handshake(handshake)
+            .expect("the handshake must upgrade to a mux session");
+        // Borrowed rather than moved out: `ConnectionH2` implements `Drop`, so
+        // its `socket` field cannot leave the connection.
+        let (snapshot, live_lookup) = match &upgraded {
+            HttpsStateMachine::Mux(mux) => match &mux.frontend {
+                mux::Connection::H1(connection) => (
+                    connection.socket.peer_addr(),
+                    connection.socket.socket_ref().peer_addr().ok(),
+                ),
+                mux::Connection::H2(connection) => (
+                    connection.socket.peer_addr(),
+                    connection.socket.socket_ref().peer_addr().ok(),
+                ),
+            },
+            _ => panic!("a completed TLS handshake must upgrade into the mux state"),
+        };
+
+        // Premise: the live lookup is healthy and still reports the balancer,
+        // so the assertion below cannot pass for the wrong reason.
+        assert_eq!(
+            live_lookup,
+            Some(balancer_peer),
+            "the frontend socket must still be connected to the stand-in balancer"
+        );
+        assert_eq!(
+            snapshot,
+            Some(advertised),
+            "FrontRustls must carry the PROXY-advertised source, not the accepted socket's peer"
+        );
+    }
+
+    /// The `or_else` arm of [`FrontRustls::peer_addr`] is reachable, and this
+    /// is the route that reaches it. On the direct (non-expect-proxy) route
+    /// `HttpsSession::new` seeds `peer_address` from a best-effort
+    /// `sock.peer_addr().ok()` at accept — an `Option` because that
+    /// `getpeername(2)` can fail — so a session can legitimately hand the
+    /// handler `None`. Without the fallback the `peer=` slot would then be
+    /// blank for the whole connection even though the socket is healthy and
+    /// the kernel would answer, which is strictly worse than the live lookup
+    /// this change replaced.
+    ///
+    /// `SessionTcpStream`'s identical arm has had
+    /// `socket::tests::session_tcp_stream_peer_addr_falls_back_to_the_live_lookup`
+    /// since it was written; this is the missing twin for `FrontRustls`.
+    ///
+    /// To SEE THIS RED: in `impl SocketHandler for FrontRustls`, drop the
+    /// `.or_else(|| self.stream.peer_addr().ok())` from `peer_addr`. The
+    /// handler then answers `None` for a perfectly healthy connection.
+    #[test]
+    fn front_rustls_peer_addr_falls_back_to_the_live_lookup() {
+        let proxy = proxy_with_certificate_domain("lolcatho.st".to_owned());
+        let listener = proxy
+            .listeners
+            .values()
+            .next()
+            .expect("the test proxy has one listener")
+            .clone();
+        let pool = Rc::downgrade(&proxy.pool);
+        let rustls_details = ServerConnection::new(listener.borrow().rustls_details.clone())
+            .expect("a test rustls server session must be created");
+        let public_address = *listener.borrow().get_addr();
+        let proxy = Rc::new(RefCell::new(proxy));
+
+        let peer = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let live_peer = peer
+            .local_addr()
+            .expect("test listener must report its local address");
+        let stream =
+            std::net::TcpStream::connect(live_peer).expect("loopback connect must complete");
+        stream
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        let stream = MioTcpStream::from_std(stream);
+
+        let mut session = HttpsSession::new(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            false,
+            listener,
+            pool,
+            proxy,
+            public_address,
+            rustls_details,
+            stream,
+            Token(0),
+            Duration::from_secs(0),
+        );
+
+        let mut handshake = match session.state.take() {
+            HttpsStateMachine::Handshake(handshake) => handshake,
+            _ => panic!("a non-expect-proxy session must start in the TLS handshake state"),
+        };
+
+        // What the direct route leaves behind when `getpeername(2)` failed at
+        // accept: the session knows no peer, and the handler must fall back.
+        session.peer_address = None;
+        handshake.peer_address = None;
+
+        let upgraded = session
+            .upgrade_handshake(handshake)
+            .expect("the handshake must upgrade to a mux session");
+        let snapshot = match &upgraded {
+            HttpsStateMachine::Mux(mux) => match &mux.frontend {
+                mux::Connection::H1(connection) => connection.socket.peer_addr(),
+                mux::Connection::H2(connection) => connection.socket.peer_addr(),
+            },
+            _ => panic!("a completed TLS handshake must upgrade into the mux state"),
+        };
+
+        assert_eq!(
+            snapshot,
+            Some(live_peer),
+            "with nothing cached, FrontRustls::peer_addr must degrade to getpeername(2)"
         );
     }
 }
