@@ -36,5 +36,12 @@ fuzz/coverage/
 # lowercase-hex name, so seed files are unaffected.
 fuzz/corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]
 
+### Python ###
+# `.github/scripts/check_doc_citations.py` is the only Python in the tree.
+# Running it leaves no cache — CPython never caches `__main__` — but
+# importing it does, which is what any editor, linter or REPL poking at it
+# will do.
+__pycache__/
+
 ### Claude/Codex ###
 tasks/

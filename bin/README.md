@@ -18,11 +18,11 @@ be defined by the `command_socket` option in the TOML configuration file.
 
 Messages on the live command channel are length-delimited binary protobuf: each
 frame is preceded by a native-`usize` length prefix that the parser reads via
-`Channel::read_message_*` (`command/src/channel.rs:611`). This is **not** a
+`Channel::read_message_*` (`command/src/channel.rs`). This is **not** a
 0-byte separator — the only place the legacy `\n\0` separator is still in use is
 the on-disk state-file format produced by `save_state` and consumed by
 `load_state`, which writes one JSON record per line followed by a NUL byte
-(`command/src/state.rs:1613, 1630`). Treat the two delimiters as distinct
+(`ConfigState::write_requests_to_file`, `command/src/state.rs`). Treat the two delimiters as distinct
 schemes; the live channel is binary-only.
 
 Message types are defined in `../command/src/command.proto`. The

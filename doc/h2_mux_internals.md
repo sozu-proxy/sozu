@@ -663,7 +663,8 @@ this branch. The large-asset suite in `e2e/src/tests/h2_correctness_tests.rs`
 locks those fixes in:
 
 - `test_h2_php_apache_chunked_flush_drains_fully` — 312 KiB chunked body with
-  per-chunk flush cadence exercising `mux/h1.rs:341-346, 351-357` (C1).
+  per-chunk flush cadence exercising the peer-readiness re-arm in
+  `ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs:440-446`) (C1).
 - `test_h2_slow_backend_idle_timeout_cancels` — 64 KiB chunked body streamed
   over 4 s, exercising the outbound refresh of `stream_last_activity_at` (C2).
 - `test_h2_chunked_backend_crash_mid_stream_rsts` — verifies the chunked-EOF
@@ -686,10 +687,10 @@ locks those fixes in:
 
 `H2FloodDetector` caps stream-0 `WINDOW_UPDATE` frames at
 `DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW = 100` per sliding window
-(`lib/src/protocol/mux/h2.rs:259`, enforcement at `:856`). The drain helper
-refreshes per-stream windows only; the one-shot conn-level bump during
-`h2_handshake_chromium_146` is the single stream-0 `WINDOW_UPDATE` emitted
-during the test.
+(`lib/src/protocol/mux/h2.rs`, enforced by `H2FloodDetector::check_flood`). The
+drain helper refreshes per-stream windows only; the one-shot conn-level bump
+during `h2_handshake_chromium_146` is the single stream-0 `WINDOW_UPDATE`
+emitted during the test.
 
 ### Safety properties
 

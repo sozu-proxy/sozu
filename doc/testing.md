@@ -234,8 +234,8 @@ introduce and expensive to debug from a symptom.
 
 `lib/src/protocol/udp/{manager,flow}.rs` is the reference. `flow.rs` carries 12
 `debug_assert`s and `manager.rs` carries 45, including the full
-`check_invariants()` sweep. The invariants `check_invariants()` enforces
-(`manager.rs:683`):
+`check_invariants()` sweep. The invariants `UdpManager::check_invariants`
+enforces (`lib/src/protocol/udp/manager.rs`):
 
 1. **Table → slab consistency** — every `FlowId` in the routing table points at a
    live slab slot (no dangling keys).
@@ -448,16 +448,16 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 
 - **Never hardcode ports.** Allocate through the port registry
   (`e2e/src/port_registry.rs`). Use `tests::create_local_address()`
-  (`e2e/src/tests/tests.rs:85`), which draws a free localhost port from the
+  (`e2e/src/tests/tests.rs`), which draws a free localhost port from the
   registry. Hardcoded ports collide under parallel test execution.
 - **Always drain with a `loop_read_*` helper when asserting on TCP responses.** A
   single `read()` sees one TCP segment under load — your assertion races the
   network. Use the looping readers (`Client::receive_until_eof`,
-  `e2e/src/mock/client.rs:136`, and the UDP analogue in `e2e/src/mock/udp_client.rs`)
+  `e2e/src/mock/client.rs`, and the UDP analogue in `e2e/src/mock/udp_client.rs`)
   that drain until EOF or a deadline. Commits exist *only* to paper over this
   rule being skipped — do not add to them.
 - **Prefer deadlines / repeat-until-error over `sleep`.** Use
-  `repeat_until_error_or` (`e2e/src/tests/mod.rs:232`) or an explicit deadline for
+  `repeat_until_error_or` (`e2e/src/tests/mod.rs`) or an explicit deadline for
   timing-sensitive assertions. A fixed `sleep` is both slow and flaky.
 - **Assert a status by decoding it, never by scanning a field block for its
   digits.** An HPACK block is not text. `payload.windows(3).any(|w| w == b"421")`
@@ -551,9 +551,9 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   quiet path, confirm a session actually gets there — planting a temporary
   unconditional `panic!` in the target function and running the suite settles
   it in one run. The worked example is `protocol::kawa_h1::Http`: neither
-  `HttpStateMachine` (`Expect | Mux | WebSocket`, `lib/src/http.rs:63`) nor
+  `HttpStateMachine` (`Expect | Mux | WebSocket`, `lib/src/http.rs`) nor
   `HttpsStateMachine` (`Expect | Handshake | Mux | WebSocket`,
-  `lib/src/https.rs:81`) had a variant holding it and `Http::new` had no code
+  `lib/src/https.rs`) had a variant holding it and `Http::new` had no code
   caller under either module spelling, so H1 runs through `protocol/mux` and
   the whole session — including `kawa_h1::save_http_status_metric` — was dead
   in every binary. It was deleted on 2026-09-20 (sozu#1346); the unit test

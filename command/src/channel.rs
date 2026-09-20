@@ -2,9 +2,11 @@
 //!
 //! Implements the master ↔ worker / master ↔ CLI message channel: each
 //! payload is preceded by a native `usize` length prefix (NOT a NUL
-//! separator — that scheme belongs to the state-file save format in
-//! `command/src/state.rs:1613`-`1630`). Bounded by the per-channel
-//! `max_buffer_size` (`channel.rs:71`) checked before payload allocation.
+//! separator — that scheme belongs to the state-file save format written
+//! by `ConfigState::write_requests_to_file` in `command/src/state.rs`).
+//! Bounded by the per-channel `Channel::max_buffer_size`, checked against
+//! the declared length in `try_read_delimited_message` before any payload
+//! byte is allocated.
 
 use std::{
     cmp::min,
