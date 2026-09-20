@@ -517,8 +517,9 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
     /// Called ONLY from a wheel expiry: the shell's single timer entry has just
     /// been delivered and consumed. `now` is therefore the wheel's tick date,
     /// not the deadline — `crate::timer` rounds a delay to the nearest tick, so
-    /// with a 100 ms tick the entry arrives up to 50 ms EARLY and no flow need
-    /// be due at all. Either way the shell now holds nothing, so
+    /// with a 100 ms tick the entry arrives up to 50 ms EARLY on the tick grid
+    /// (up to 99 ms off it; see `duration_to_tick`) and no flow need be due at
+    /// all. Either way the shell now holds nothing, so
     /// `armed_deadline` is cleared on entry and [`reschedule`](Self::reschedule)
     /// re-emits `ArmTimer` even when the minimum deadline has not moved.
     /// Without that, an early expiry is a LOST WAKEUP: nothing is closed,
@@ -1176,8 +1177,9 @@ mod tests {
     /// An expiry that finds NOTHING due must still re-arm.
     ///
     /// The shell's wheel (`crate::timer`) rounds a delay to the nearest tick, so
-    /// with a 100 ms tick it delivers an entry up to 50 ms EARLY
-    /// (`test_timeout_fires_up_to_half_a_tick_early`, `lib/src/timer.rs`). The
+    /// with a 100 ms tick it delivers an entry up to 50 ms EARLY on the grid
+    /// (`test_timeout_fires_up_to_half_a_tick_early`, `lib/src/timer.rs`) and
+    /// up to 99 ms off it (see `duration_to_tick`). The
     /// shell then calls `handle_timeout` at a `now` that has not reached any
     /// flow's deadline: no flow is due, nothing closes, the minimum deadline is
     /// unchanged — yet the wheel entry has been CONSUMED. If `reschedule` keeps
@@ -1207,7 +1209,9 @@ mod tests {
         let deadline = mgr.poll_timeout().expect("timer armed on admission");
 
         // The wheel fires before the deadline. One second early here rather than
-        // the wheel's real ~50 ms so the test does not encode the tick size.
+        // the wheel's real earliness — up to 50 ms on the tick grid, up to 99 ms
+        // off it (see `duration_to_tick`) — so the test does not encode the
+        // tick size.
         let early = deadline - Duration::from_secs(1);
         mgr.handle_timeout(early);
         let outs = drain(&mut mgr);

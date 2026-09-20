@@ -344,6 +344,79 @@
   the method fall-through; `command/src/state.rs` pins the replay order the upgrade note rests on. `doc/configure.md` states the order under "Hostname precedence".
   Reported in [#1351](https://github.com/sozu-proxy/sozu/issues/1351).
 
+- **`fix(mux)`: a mux session could be torn down up to a full timer tick before its configured
+  timeout.**
+  `crate::timer`'s wheel is duration-based and rounds a requested delay to the NEAREST tick
+  (`duration_to_tick`: `(elapsed_ms + tick_ms / 2) / tick_ms`), then `Timer::poll` recomputes
+  `current_tick` from the real clock and fires everything whose tick has come. An entry armed for
+  deadline `D` is therefore delivered from `tick * round(D / tick) - tick/2` onwards: the earliness
+  is `(D_ms + 50) mod 100` with the worker's default 100 ms tick, spanning **[0, 99] ms** — a full
+  tick minus a millisecond, not half a tick. The `<= 50 ms` half is unconditional (`next_poll_date`
+  returns the tick grid point); the further `<= 49 ms` needs the loop to poll inside
+  `[100T - 50, 100T)`, which it reaches through another session's earlier wheel entry plus loop
+  latency, or through the `Token(1)` arm.
+  `Mux::timeout` took every delivery at face value: it called `TimeoutContainer::triggered()` and
+  ran the timeout body, so a 60 s `front_timeout` could write a 408 and close a live session at
+  **59.901 s**, and a `backend_timeout` could 504 a backend that still had time left. Small in wall
+  clock, but it is a session closed before the operator's configured deadline, and it is the same
+  class of bug as the UDP shell's early-expiry handling.
+  `TimeoutContainer` now records the absolute instant each armed entry is meant to fire at —
+  the mirror of the wheel entry the wheel itself does not keep, stamped at exactly the sites that
+  touch the wheel — and exposes it as `deadline()`. `Mux::timeout` re-validates every delivery
+  against that instant through the new `consume_timer_entry` helper, on both the frontend and the
+  backend branch.
+  An early delivery is put back **at the same absolute deadline** (`TimeoutContainer::set_at`), not
+  re-armed for a fresh full duration: re-arming with `set` would push a 60 s timeout out to ~120 s
+  on every early delivery, and *not* re-arming at all would be strictly worse — the wheel entry is
+  already consumed, so rejecting the firing without putting it back is a **lost wakeup**, the exact
+  bug fixed for the UDP shell in `UdpManager::handle_timeout`. Those three steps (consume,
+  re-validate, put back) are one operation and must move together; `consume_timer_entry` carries
+  that requirement in its documentation.
+  A container with no recorded deadline fails **open** and is reported due, which is the behaviour
+  of every release before this one — an immortal session would be a worse outcome than the
+  early close being fixed here.
+  Operator-visible: nothing changes on a healthy session. A timing out session now reaches its
+  `front_timeout` / `backend_timeout` / `connect_timeout` exactly rather than up to one timer tick
+  early, so a test that measured a close at 59.901 s will now measure it at 60 s or just after.
+  `Mux::shutting_down` is unaffected: `shut_down_sessions()` drives it directly and it compares
+  `context.now` against `drain.started_at` rather than consuming a wheel delivery.
+  Pinned by `an_early_wheel_delivery_is_put_back_at_the_same_deadline`,
+  `a_delivery_past_the_deadline_runs_the_timeout_body`,
+  `a_firing_with_no_recorded_deadline_is_treated_as_due` and
+  `timeout_container_mirrors_the_deadline_of_its_armed_entry`.
+  Documented in `lib/src/protocol/mux/LIFECYCLE.md` §7.6 and invariant 21.
+
+- **`docs(mux)`: settle the unverified backend re-arm question on the mux timeout path.**
+  In the backend-token branch of `Mux::timeout` the backend's timer is consumed unconditionally but
+  re-armed only when `!should_close`, while the shared tail can still return `Continue` — through
+  the `should_write` writable loop, or through `delay_close_for_frontend_flush("timeout")` — having
+  re-armed only the *frontend* container. Whether a backend could reach that tail still carrying
+  live work had never been traced. It cannot, though the chain is one link longer than it looks.
+  The branch calls `Connection::end_stream` for every id in `context.backend_streams[&token]`,
+  unconditionally at the bottom of the loop. `ConnectionH2::end_stream` then begins with
+  `Context::unlink_stream` — but `ConnectionH1::end_stream` does NOT: it guards
+  `self.stream != Some(stream)` and returns early first. That guard cannot reject a stream this loop
+  passes it, because an H1 connection carries at most one linked stream and it equals `self.stream`
+  (`self.stream = Some(..)` only in `start_stream`, paired with `link_stream`; `self.stream = None`
+  only inside `end_stream`, after the unlink). `Context::unlink_stream` is the eviction point this
+  path relies on, not the only one in the module — `remove_backend_stream` has direct callers in
+  `h1.rs` and `h2.rs` too, and extra eviction only strengthens the conclusion. Work attached to the backend afterwards re-arms the container itself, because
+  `TimeoutContainer::triggered` deliberately keeps its token and the `reset()` calls at the top of
+  `ConnectionH1::{readable,writable}` / `ConnectionH2::{write_streams,handle_headers_frame}` then
+  re-arm — which matters because the pool-reuse branch of `Router::connect`, unlike the fresh-dial
+  branch, never calls `timeout_container().set(token)`.
+  No behaviour change: the reasoning is recorded at the site and backed by a `debug_assert!` that
+  fires if the impossible becomes possible, plus
+  `a_backend_timeout_leaves_no_linked_stream_behind_on_the_close_path` and
+  `a_completed_backend_response_timeout_unlinks_through_end_stream_alone`. Both tests set
+  `h1.stream = Some(0)` by hand, so they exercise `ConnectionH1::end_stream`'s matched path only;
+  the mismatch arm is guarded by `debug_assert_h1_owns_stream`, a new `debug_assert!` that runs
+  immediately before every `end_stream` call in `Mux::timeout` and fires if `backend_streams` and
+  `ConnectionH1::stream` ever drift. It is at the call site rather than inside
+  `ConnectionH1::end_stream` on purpose: that function's mismatch arm is an `error!`, not an
+  `unreachable!`, and is reachable from `EndpointServer`/`EndpointClient` paths this proof never
+  traced, so asserting there would promote a logged anomaly into a debug abort outside the claim.
+
 - **`fix(h2)`: the `MUX-H2` log lines rendered `peer=None` once the peer had reset, and named the
   load balancer instead of the client behind PROXY protocol.**
   **This changes rendered log content.** If you alert, dashboard or grep on the `peer=` slot of a
@@ -496,10 +569,14 @@
   Other commit citations elsewhere in the tree are also off-`main` or dangling; they are out of
   scope here and deliberately untouched.
 - **`fix(udp)`: an idle UDP flow was never evicted after an early timer-wheel fire.**
-  `Timer::duration_to_tick` (`lib/src/timer.rs:496`) rounds a requested delay to the **nearest**
+  `Timer::duration_to_tick` (`lib/src/timer.rs`) rounds a requested delay to the **nearest**
   tick, not up — despite its own comment saying otherwise — so with the 100 ms default tick an
-  entry whose deadline falls in `[100N-50, 100N+50)` is delivered at tick `N`, up to **50 ms
-  early**, and `Timer::poll` removes it from the wheel as it does so. The UDP listener owns exactly
+  entry whose deadline falls in `[100N-50, 100N+50)` is delivered at tick `N`, and `Timer::poll`
+  removes it from the wheel as it does so. That is up to **50 ms early** when the poll lands on the
+  tick grid, which is what `Timer::next_poll_date` schedules; `Timer::poll` recomputes
+  `current_tick` from the real clock, so a poll anywhere in `[100N-50, 100N)` already sees tick `N`
+  and the bound a consumer must tolerate is `(delay_ms + 50) mod 100`, i.e. up to **99 ms** — a
+  full tick minus a millisecond. Either figure is fatal here: the hazard is any earliness at all. The UDP listener owns exactly
   one wheel entry for all its flows. On such an early fire `UdpListenerSession::timeout`
   (`lib/src/udp.rs:1798`) called `UdpManager::handle_timeout`, which found no flow past its
   deadline, closed nothing, and called `reschedule` — and `reschedule`
@@ -536,7 +613,9 @@
   `test_timeout_fires_up_to_half_a_tick_early` and `test_maximum_earliness_is_a_full_half_tick`
   (`lib/src/timer.rs`) so the intuitive but wrong "a timer never fires early" assumption cannot be
   re-derived; the rounding interval is closed on the early side, so the attained maximum earliness
-  is a full 50 ms and it is *lateness* that is capped at 49 ms. Seen red at all three levels: the
+  **on the tick grid** is a full 50 ms and it is *lateness* that is capped at 49 ms. Those two
+  tests poll at grid points and measure the grid mapping; off-grid delivery reaches 99 ms, as their
+  doc comments and `duration_to_tick` now spell out. Seen red at all three levels: the
   manager's re-arm (`early_expiry_that_finds_nothing_due_still_rearms`,
   `repeated_early_expiries_each_rearm`) and the eviction itself against a real wheel, a real
   `UdpListenerSession` and a real `UdpManager` (`an_early_wheel_fire_still_evicts_the_idle_flow`,

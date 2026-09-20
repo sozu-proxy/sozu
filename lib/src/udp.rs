@@ -2096,8 +2096,10 @@ mod tests {
     ///
     /// `crate::timer` rounds a delay to the NEAREST tick, so the listener's
     /// single wheel entry is delivered up to 50 ms BEFORE the flow's idle
-    /// deadline (`test_timeout_fires_up_to_half_a_tick_early`,
-    /// `lib/src/timer.rs`), and the delivery CONSUMES the entry.
+    /// deadline when the poll lands on the tick grid
+    /// (`test_timeout_fires_up_to_half_a_tick_early`, `lib/src/timer.rs`) and
+    /// up to 99 ms off-grid (see `duration_to_tick`), and the delivery
+    /// CONSUMES the entry. Any earliness at all is enough for what follows.
     /// `UdpListenerSession::timeout` then runs `handle_timeout` at a `now`
     /// short of the deadline: nothing is due, nothing closes. Unless the
     /// manager re-arms on a fire it did not act on, no wheel entry exists any

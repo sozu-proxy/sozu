@@ -84,6 +84,36 @@ pub struct TimeoutContainer {
     timeout: Option<Timeout>,
     duration: Duration,
     token: Option<Token>,
+    /// Absolute instant the currently armed wheel entry is meant to fire at,
+    /// recorded at arm time; `None` whenever no entry is armed.
+    ///
+    /// The wheel is duration-based and rounds a delay to the NEAREST tick
+    /// ([`duration_to_tick`]), so an entry armed for deadline `D` is delivered
+    /// from `tick * round(D / tick) - tick/2` onwards. With the default 100 ms
+    /// tick the earliness is `(D_ms + 50) mod 100`, i.e. up to **99 ms** — a
+    /// full tick minus a millisecond, not half a tick. A holder that wants to
+    /// distinguish "the deadline really elapsed"
+    /// from "the wheel rounded down" needs the absolute instant the wheel
+    /// itself does not keep. That is the whole purpose of this field: it is
+    /// the mirror of what the wheel holds, not a second clock, and it is
+    /// stamped with [`Instant::now`] at exactly the sites that touch the
+    /// wheel, so it cannot drift from the entry it describes.
+    ///
+    /// It is deliberately cleared by [`Self::triggered`]: the expiry that made
+    /// the caller run consumed the wheel entry, so the container holds nothing
+    /// until it is armed again. Callers that memoize on "the deadline has not
+    /// moved" depend on that clearing — without it, an early delivery is a
+    /// lost wakeup.
+    deadline: Option<Instant>,
+}
+
+/// `now + duration`, saturating at the far end of the [`Instant`] range
+/// instead of panicking. A duration large enough to overflow can only come
+/// from a configuration value, and a session that never times out is a far
+/// better outcome than a worker that aborts.
+fn deadline_from(duration: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(duration).unwrap_or(now)
 }
 
 impl TimeoutContainer {
@@ -93,6 +123,7 @@ impl TimeoutContainer {
             timeout: Some(timeout),
             duration,
             token: Some(token),
+            deadline: Some(deadline_from(duration)),
         }
     }
 
@@ -101,6 +132,7 @@ impl TimeoutContainer {
             timeout: None,
             duration,
             token: None,
+            deadline: None,
         }
     }
 
@@ -109,12 +141,14 @@ impl TimeoutContainer {
             timeout: self.timeout.take(),
             duration: self.duration,
             token: self.token.take(),
+            deadline: self.deadline.take(),
         }
     }
 
     /// must be called when a timeout was triggered, to prevent errors when canceling
     pub fn triggered(&mut self) {
         let _ = self.timeout.take();
+        self.deadline = None;
     }
 
     pub fn set(&mut self, token: Token) {
@@ -126,6 +160,33 @@ impl TimeoutContainer {
 
         self.timeout = Some(timeout);
         self.token = Some(token);
+        self.deadline = Some(deadline_from(self.duration));
+    }
+
+    /// Arm the entry so it fires at `deadline` rather than one full
+    /// [`Self::duration`] from now, leaving the configured duration untouched.
+    ///
+    /// This is what a holder uses to put an entry BACK after the wheel handed
+    /// it over early: re-arming with [`Self::set`] would push the deadline out
+    /// by a fresh full duration, so an entry delivered 50 ms before a 60 s
+    /// timeout would fire at ~120 s — silently doubling the operator's
+    /// configured timeout on every early delivery.
+    ///
+    /// A deadline that has already passed arms the shortest entry the wheel
+    /// can express (`set_timeout_at` forces at least one tick ahead), so the
+    /// caller is called back promptly rather than never — and, because that
+    /// clamp exists, never spins: a zero-length delay still costs a whole tick.
+    pub fn set_at(&mut self, token: Token, deadline: Instant) {
+        if let Some(timeout) = self.timeout.take() {
+            TIMER.with(|timer| timer.borrow_mut().cancel_timeout(&timeout));
+        }
+
+        let delay = deadline.saturating_duration_since(Instant::now());
+        let timeout = TIMER.with(|timer| timer.borrow_mut().set_timeout(delay, token));
+
+        self.timeout = Some(timeout);
+        self.token = Some(token);
+        self.deadline = Some(deadline);
     }
 
     /// warning: this does not reset the timer
@@ -139,6 +200,9 @@ impl TimeoutContainer {
         if let Some(token) = self.token {
             self.timeout =
                 Some(TIMER.with(|timer| timer.borrow_mut().set_timeout(self.duration, token)));
+            self.deadline = Some(deadline_from(self.duration));
+        } else {
+            self.deadline = None;
         }
     }
 
@@ -146,7 +210,16 @@ impl TimeoutContainer {
         self.duration
     }
 
+    /// The absolute instant the armed entry is meant to fire at, or `None`
+    /// when nothing is armed. See the field documentation: this is the mirror
+    /// of the wheel entry, and the only way to tell an early delivery from a
+    /// real expiry.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
     pub fn cancel(&mut self) -> bool {
+        self.deadline = None;
         match self.timeout.take() {
             None => {
                 //error!("cannot cancel non existing timeout");
@@ -170,6 +243,7 @@ impl TimeoutContainer {
                     );
                 } else {
                     //error!("cannot reset non existing timeout");
+                    self.deadline = None;
                     return false;
                 }
             }
@@ -178,6 +252,7 @@ impl TimeoutContainer {
                     TIMER.with(|timer| timer.borrow_mut().reset_timeout(&timeout, self.duration));
             }
         };
+        self.deadline = self.timeout.is_some().then(|| deadline_from(self.duration));
         self.timeout.is_some()
     }
 }
@@ -497,7 +572,17 @@ impl<T> Default for Timer<T> {
 ///
 /// Not rounding UP: `elapsed` in `[tick_ms*N - tick_ms/2, tick_ms*N + tick_ms/2)`
 /// yields tick `N`, so a timeout can be delivered up to half a tick — 50 ms at
-/// the 100 ms default — BEFORE the caller asked for it. That is deliberate (it
+/// the 100 ms default — BEFORE the caller asked for it *when the poll lands on
+/// the grid*, which is what [`Timer::next_poll_date`] schedules (it returns
+/// `start + tick_ms * tick`, the grid point itself).
+///
+/// The DELIVERY bound is wider, because `Timer::poll` recomputes
+/// `current_tick` from the real clock and fires everything whose tick has come:
+/// a poll anywhere in `[tick_ms*N - tick_ms/2, tick_ms*N)` already sees tick
+/// `N`. An event loop reaches that window routinely — another session's earlier
+/// entry plus loop latency, or a non-timer wakeup. Total earliness is therefore
+/// `(delay_ms + tick_ms/2) mod tick_ms`, spanning `[0, tick_ms - 1]`: up to
+/// **99 ms** at the default tick. Reason with 99 ms, not 50. That is deliberate (it
 /// halves the worst-case error instead of always overshooting), and it is why
 /// every consumer must treat an expiry as "my entry was consumed" rather than
 /// "my deadline arrived": `Timer::poll` removes the entry either way, and
@@ -598,7 +683,11 @@ mod test {
         assert_eq!(0, count(&t));
 
         // The complementary half: 150 ms rounds up to tick 2, so it is NOT
-        // early. 50 ms is the exact boundary, so the maximum earliness is 50 ms.
+        // early. 50 ms is the exact boundary for a poll that lands ON the grid,
+        // which is what this test does (`poll_to(ms_to_tick(..))`) and what
+        // `next_poll_date` schedules. A poll inside `[100N - 50, 100N)` already
+        // sees tick `N`, so the earliness a CONSUMER must tolerate is up to
+        // 99 ms — see `duration_to_tick`.
         let mut late = timer();
         late.set_timeout_at(Duration::from_millis(150), "late");
         assert_eq!(None, late.poll_to(ms_to_tick(&late, 100)));
@@ -827,6 +916,66 @@ mod test {
         tick = ms_to_tick(&t, 200);
         assert_eq!(Some("c"), t.poll_to(tick));
         assert_eq!(0, count(&t));
+    }
+
+    /// `TimeoutContainer` mirrors the absolute instant its armed wheel entry
+    /// is meant to fire at, because the wheel itself keeps only a rounded
+    /// tick. Three properties, all load-bearing for the mux timeout path:
+    ///
+    /// * arming records a deadline (`set` one duration out, `set_at` at the
+    ///   caller's instant, leaving `duration` alone);
+    /// * `triggered` CLEARS it — the expiry consumed the entry, so the
+    ///   container holds nothing. A holder that memoizes on "the deadline has
+    ///   not moved" depends on this clearing; without it, an early delivery is
+    ///   a lost wakeup;
+    /// * `cancel` clears it too.
+    ///
+    /// To SEE THIS RED: drop `self.deadline = None;` from
+    /// [`TimeoutContainer::triggered`] — the `triggered` assertion below then
+    /// still reports the stale deadline.
+    #[test]
+    fn timeout_container_mirrors_the_deadline_of_its_armed_entry() {
+        let token = Token(7);
+        let duration = Duration::from_secs(60);
+        let mut container = TimeoutContainer::new_empty(duration);
+        assert_eq!(
+            container.deadline(),
+            None,
+            "an empty container arms nothing"
+        );
+
+        let before = Instant::now();
+        container.set(token);
+        let armed = container.deadline().expect("set must record a deadline");
+        assert!(
+            armed >= before + duration,
+            "set must record now + duration, got {armed:?} against {before:?} + {duration:?}"
+        );
+
+        let explicit = before + Duration::from_secs(5);
+        container.set_at(token, explicit);
+        assert_eq!(
+            container.deadline(),
+            Some(explicit),
+            "set_at must record the caller's instant verbatim"
+        );
+        assert_eq!(
+            container.duration(),
+            duration,
+            "set_at must not disturb the configured duration"
+        );
+
+        container.triggered();
+        assert_eq!(
+            container.deadline(),
+            None,
+            "a consumed entry leaves the container holding nothing"
+        );
+
+        container.set(token);
+        assert!(container.deadline().is_some(), "re-armed after triggered");
+        container.cancel();
+        assert_eq!(container.deadline(), None, "cancel releases the deadline");
     }
 
     const TICK: u64 = 100;

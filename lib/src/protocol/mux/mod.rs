@@ -159,6 +159,7 @@ use crate::{
     retry::RetryPolicy,
     server::push_event,
     socket::{FrontRustls, SessionTcpStream, SocketHandler, SocketResult, stats::socket_rtt},
+    timer::TimeoutContainer,
 };
 
 pub(crate) use crate::protocol::mux::answers::{
@@ -187,6 +188,120 @@ pub use crate::protocol::mux::{
 /// Prevents infinite loops from consuming the single-threaded worker.
 const MAX_LOOP_ITERATIONS: i32 = 10_000;
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Consume the wheel entry that delivered a timeout and say whether it was
+/// really due, re-arming it in place when it was not.
+///
+/// `crate::timer`'s wheel is duration-based and rounds a delay to the NEAREST
+/// tick (`timer.rs` `duration_to_tick`: `(elapsed_ms + tick_ms / 2) /
+/// tick_ms`), so an entry armed for deadline `D` lands in tick
+/// `round(D / tick)` and is delivered by the first `Timer::poll` at or after
+/// `tick * round(D / tick) - tick/2`. With the worker's default 100 ms tick
+/// that is up to **99 ms** early, not 50: the earliness is
+/// `(D_ms + 50) mod 100`, which spans `[0, 99]`.
+///
+/// The `<= 50 ms` half is unconditional — it is what `next_poll_date` alone
+/// produces, since that returns the tick GRID point `tick * T`. The further
+/// `<= 49 ms` needs the loop to poll inside `[100T - 50, 100T)`, which it
+/// reaches through another session's earlier wheel entry plus loop latency, or
+/// through the `Token(1)` arm. Both are ordinary, so the bound to reason with
+/// is 99 ms.
+///
+/// Before this function existed, `Mux::timeout` took every delivery at face
+/// value and tore the session down on the spot, so a 60 s `front_timeout`
+/// could close a live session at 59.901 s.
+///
+/// Three things happen here, in this order, and all three are load-bearing:
+///
+/// 1. the entry is marked consumed ([`TimeoutContainer::triggered`]), because
+///    the wheel has already handed it over and the container must not try to
+///    cancel it later;
+/// 2. the recorded deadline — captured BEFORE `triggered` clears it — is
+///    compared against the caller's clock snapshot;
+/// 3. an early delivery is put back **at the same absolute deadline** via
+///    [`TimeoutContainer::set_at`], never re-armed for a fresh full duration,
+///    which would silently double the operator's configured timeout on every
+///    early delivery.
+///
+/// Step 3 is what keeps re-validation from becoming a LOST WAKEUP. Rejecting
+/// a firing without re-arming consumes the only wheel entry the session had
+/// and leaves nothing to wake it again — the exact bug fixed for the UDP
+/// shell in `UdpManager::handle_timeout` (`lib/src/protocol/udp/manager.rs`),
+/// where `reschedule` memoized on "the deadline has not moved" and therefore
+/// emitted nothing after an early expiry. Whoever moves this logic must move
+/// all three steps together.
+///
+/// A container with no recorded deadline fails **open** and is reported due:
+/// that is the behaviour of every release before this one, and it keeps a
+/// container armed through a path that does not record a deadline from
+/// silently becoming immortal.
+fn consume_timer_entry(container: &mut TimeoutContainer, token: Token, now: Instant) -> bool {
+    let deadline = container.deadline();
+    container.triggered();
+    match deadline {
+        Some(deadline) if now < deadline => {
+            container.set_at(token, deadline);
+            false
+        }
+        _ => true,
+    }
+}
+
+/// Debug tripwire for the one-active-stream invariant that
+/// `ConnectionH1::end_stream`'s early-return guard rests on.
+///
+/// `Mux::timeout` retires streams through `Connection::end_stream`, and its
+/// proof that no linked stream survives (LIFECYCLE invariant 22) depends on
+/// that call actually unlinking. `ConnectionH2::end_stream` always does.
+/// `ConnectionH1::end_stream` does NOT: it guards `self.stream != Some(stream)`
+/// and returns early, skipping the `Context::unlink_stream`. The guard is safe
+/// only because an H1 connection carries at most one linked stream and it
+/// equals `self.stream` — `self.stream = Some(..)` occurs only in
+/// `ConnectionH1::start_stream`, paired with `Context::link_stream`, and
+/// `self.stream = None` only inside `end_stream` itself, after the unlink.
+///
+/// This is the tripwire for that invariant: a drift between
+/// `context.backend_streams` (or a stream's `StreamState::Linked`) and
+/// `ConnectionH1::stream` fires here, in every debug / test / e2e build,
+/// instead of silently leaving a stream in the reverse index with no backend
+/// timer.
+///
+/// To SEE THIS FIRE: in
+/// `a_backend_timeout_leaves_no_linked_stream_behind_on_the_close_path`, set
+/// `h1.stream = Some(1)` instead of `Some(0)` while still linking stream 0 to
+/// the backend.
+///
+/// Deliberately at the CALL SITE rather than inside `ConnectionH1::end_stream`,
+/// and the reason is scope, not risk. That function has around a dozen callers
+/// reaching it through `Connection::end_stream` and the two `Endpoint`
+/// adaptors, and the H2-driven ones are precisely the ones this proof never
+/// traced: `ConnectionH2::close` and `ConnectionH2::end_stream` iterate their
+/// OWN wire map (`for global_stream_id in self.streams.values()`, `h2.rs`) and
+/// hand each `StreamState::Linked` gid to the peer, which on an H2-frontend /
+/// H1-backend session is a `ConnectionH1`. Add the reset and HUP paths and the
+/// set is wider than the claim.
+///
+/// Asserting inside the function would therefore assert something broader than
+/// what was traced. Note what does NOT justify the placement: running the full
+/// e2e suite with a `debug_assert_eq!` in that mismatch arm passes with zero
+/// hits, and green e2e shows absence of COVERAGE, not absence of the path. The
+/// claim is about the two `Mux::timeout` loops, so the assertion is too.
+#[cfg(debug_assertions)]
+fn debug_assert_h1_owns_stream<Front: SocketHandler>(
+    connection: &Connection<Front>,
+    stream_id: GlobalStreamId,
+) {
+    if let Connection::H1(h1) = connection {
+        debug_assert_eq!(
+            h1.stream,
+            Some(stream_id),
+            "ConnectionH1::end_stream would skip its unlink: the connection's \
+             active stream is {:?}, not the {stream_id} Mux::timeout is ending \
+             — the backend index and ConnectionH1::stream have drifted",
+            h1.stream,
+        );
+    }
+}
 
 /// Generic Http representation using the Kawa crate using the Checkout of Sozu as buffer
 type GenericHttpStream = kawa::Kawa<Checkout>;
@@ -1441,7 +1556,17 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 log_context!(self),
                 self.frontend
             );
-            self.frontend.timeout_container().triggered();
+            // The wheel can hand an entry over up to half a tick before its
+            // deadline; putting an early delivery straight back (at the same
+            // absolute deadline) is the only thing standing between
+            // re-validation and a lost wakeup. See `consume_timer_entry`.
+            if !consume_timer_entry(self.frontend.timeout_container(), token, self.context.now) {
+                trace!(
+                    "{} MuxState::timeout_frontend: early wheel delivery, re-armed",
+                    log_context!(self)
+                );
+                return StateResult::Continue;
+            }
             // The per-stream reaper (bidirectional-idle + outbound
             // flow-control-stall guards) normally runs only from `readable()`,
             // but a fully-silent peer never triggers a read event. Run it on the
@@ -1560,6 +1685,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 .collect();
             for (stream_id, back_token) in linked_streams {
                 if let Some(backend) = self.router.backends.get_mut(&back_token) {
+                    #[cfg(debug_assertions)]
+                    debug_assert_h1_owns_stream(backend, stream_id);
                     backend.end_stream(stream_id, &mut self.context);
                 }
             }
@@ -1569,7 +1696,14 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 log_context_lite!(self),
                 backend
             );
-            backend.timeout_container().triggered();
+            // Same early-delivery re-validation as the frontend branch above.
+            if !consume_timer_entry(backend.timeout_container(), token, self.context.now) {
+                trace!(
+                    "{} MuxState::timeout_backend: early wheel delivery, re-armed",
+                    log_context_lite!(self)
+                );
+                return StateResult::Continue;
+            }
             let front_readiness = self.frontend.readiness_mut();
             let linked_ids: Vec<GlobalStreamId> = self
                 .context
@@ -1612,11 +1746,79 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     forcefully_terminate_answer(stream, front_readiness, H2Error::InternalError);
                     should_write = true;
                 }
+                #[cfg(debug_assertions)]
+                debug_assert_h1_owns_stream(backend, stream_id);
                 backend.end_stream(stream_id, &mut self.context);
             }
             // Re-arm the backend timeout if the session stays alive (draining streams).
             // Without this, the timeout is consumed and the session becomes immortal
             // until the zombie checker runs.
+            //
+            // The `!should_close` condition looks like a hole, and is not. On
+            // `should_close`, control falls through to the shared tail below,
+            // which can still return `Continue` — through the `should_write`
+            // writable loop, or through `delay_close_for_frontend_flush` —
+            // having re-armed only the FRONTEND container. That would be a
+            // lost wakeup if this backend could still be carrying work with no
+            // timer of its own. It cannot, and the chain is four links, all in
+            // this file and `connection.rs`/`h1.rs`/`h2.rs`:
+            //
+            // 1. the loop above iterates `context.backend_streams[&token]` —
+            //    every stream currently linked to this backend, and nothing
+            //    else — and calls `Connection::end_stream` on EVERY iteration,
+            //    outside the if/else chain, so no arm can skip it;
+            // 2. `ConnectionH2::end_stream` (`h2.rs`) starts with
+            //    `context.unlink_stream(...)` unconditionally.
+            //    `ConnectionH1::end_stream` (`h1.rs`) does NOT: it first guards
+            //    `if self.stream != Some(stream) { error!(..); return; }` and
+            //    that early return skips the unlink. The two are dispatched by
+            //    `Connection::end_stream` in `connection.rs`;
+            // 3. the H1 guard cannot reject a stream this loop passes it,
+            //    because an H1 connection carries at most one linked stream and
+            //    it is exactly `self.stream`. That holds because
+            //    `self.stream = Some(..)` occurs only in
+            //    `ConnectionH1::start_stream`, paired with
+            //    `Context::link_stream`, and `self.stream = None` occurs only
+            //    inside `end_stream` itself, after the unlink has run. So while
+            //    `backend_streams[&token]` names a stream, `self.stream` names
+            //    the same one — and `debug_assert_h1_owns_stream`, called
+            //    just above every `end_stream` in this function, is the
+            //    tripwire that fires if it ever stops being true;
+            // 4. so by the time the tail runs, this backend has no linked
+            //    stream left. The index-consistency `assert_eq!` at the end of
+            //    `Mux::ready` pins the other direction (`backend_streams` is
+            //    exactly the set of `StreamState::Linked` streams).
+            //
+            // `Context::unlink_stream` is the eviction point this path relies
+            // on, not the only one in the module: `remove_backend_stream` also
+            // has direct callers in `h1.rs` and `h2.rs`. Extra eviction can
+            // only strengthen the conclusion, but the premise is "this loop
+            // evicts", not "nothing else can".
+            //
+            // Work attached to this backend AFTERWARDS re-arms the container
+            // itself and does not depend on this site: `TimeoutContainer::
+            // triggered` deliberately keeps `token`, so the `reset()` at the
+            // top of `ConnectionH1::{readable,writable}` and in
+            // `ConnectionH2::{write_streams,handle_headers_frame}` re-arms a
+            // reused pool connection on its first pass. That matters because
+            // the pool-reuse branch of `Router::connect` — unlike the fresh-dial
+            // branch — never calls `timeout_container().set(token)`.
+            //
+            // The assertion below is the cheap tripwire for link 3: if the
+            // impossible becomes possible (a new arm that skips `end_stream`,
+            // or an `end_stream` that stops unlinking), it fires here rather
+            // than as an immortal backend in production.
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                self.context
+                    .backend_streams
+                    .get(&token)
+                    .is_none_or(|ids| ids.is_empty()),
+                "backend {token:?} still holds linked streams {:?} after its \
+                 timeout reaped them: on the should_close path nothing re-arms \
+                 its container, so those streams would have no backend timer",
+                self.context.backend_streams.get(&token),
+            );
             if !should_close {
                 backend.timeout_container().set(token);
             }
@@ -2277,5 +2479,325 @@ mod tests {
         assert!(!readiness.event.is_readable());
         assert!(readiness.event.is_writable());
         assert!(readiness.event.is_hup());
+    }
+
+    /// Build a minimal H1 frontend `Mux` with one `Idle` stream and a frontend
+    /// timeout container that has never been armed. The returned peer socket
+    /// must be kept alive for the duration of the test, otherwise the loopback
+    /// connection is torn down and `readable()` sees a forced disconnect.
+    ///
+    /// An H1 frontend is deliberate: the `StreamState::Idle` arm of
+    /// `Mux::timeout` writes a 408 and stamps
+    /// `stream.context.access_log_message = Some("client_timeout")`, which is
+    /// the crispest available witness that the timeout BODY ran. The H2 `Idle`
+    /// arm is silently ignored and would witness nothing.
+    fn h1_mux_with_idle_stream(
+        pool: &Rc<RefCell<Pool>>,
+        frontend_timeout: Duration,
+    ) -> (
+        Mux<mio::net::TcpStream, test_support::TestListener>,
+        std::net::TcpStream,
+    ) {
+        let (socket, peer) = connected_socket();
+        let frontend = Connection::new_h1_server(
+            Ulid::generate(),
+            socket,
+            TimeoutContainer::new_empty(frontend_timeout),
+        );
+        let mut context = test_context(pool);
+        context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        let mux = Mux {
+            configured_frontend_timeout: frontend_timeout,
+            frontend_token: Token(0),
+            frontend,
+            router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
+            context,
+            session_ulid: Ulid::generate(),
+        };
+        (mux, peer)
+    }
+
+    /// The timer wheel rounds a delay to the NEAREST tick, so an entry armed
+    /// for deadline `D` is handed over from `D - tick/2` onwards — up to 50 ms
+    /// early with the default 100 ms tick. `Mux::timeout` must recognise that
+    /// delivery as early, leave the session alone, and put the entry BACK at
+    /// the same absolute deadline.
+    ///
+    /// Both halves of that sentence are asserted, because each without the
+    /// other is a bug:
+    ///
+    /// * not re-validating closes a live session before its configured
+    ///   `front_timeout` (the 408 witness fires);
+    /// * re-validating without re-arming consumes the session's only wheel
+    ///   entry and leaves nothing to wake it — a LOST WAKEUP. That is the bug
+    ///   fixed for the UDP shell in `UdpManager::handle_timeout`;
+    /// * re-arming with `set` rather than `set_at` would push the deadline out
+    ///   by a fresh full duration, silently doubling the operator's timeout.
+    ///
+    /// To SEE THIS RED: in `Mux::timeout`, replace the
+    /// `if !consume_timer_entry(...) { return StateResult::Continue; }` guard
+    /// in the frontend branch with a bare
+    /// `self.frontend.timeout_container().triggered();`. The body then runs on
+    /// an early delivery and the first assertion fails with
+    /// `access_log_message == Some("client_timeout")`.
+    #[test]
+    fn an_early_wheel_delivery_is_put_back_at_the_same_deadline() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let mut metrics = SessionMetrics::new(None);
+
+        // Arm the frontend entry a minute out, then deliver it immediately:
+        // that is an early delivery, exaggerated so the test cannot be flaky.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        mux.frontend.timeout_container().set_at(Token(0), deadline);
+
+        let result = mux.timeout(Token(0), &mut metrics);
+
+        assert_eq!(
+            result,
+            StateResult::Continue,
+            "an early delivery must leave the session running"
+        );
+        assert_eq!(
+            mux.context.streams[0].context.access_log_message, None,
+            "the timeout body must not run for a delivery before the deadline: \
+             a 408 here is a session closed before its configured front_timeout"
+        );
+        assert_eq!(
+            mux.frontend.timeout_container().deadline(),
+            Some(deadline),
+            "the early delivery must be put back at the SAME deadline — None is \
+             a lost wakeup, a later instant is a silently doubled timeout"
+        );
+    }
+
+    /// The mirror of the test above: a delivery at or past the recorded
+    /// deadline is a real expiry and must run the timeout body. Without this,
+    /// "re-validate everything as early" would pass the test above and never
+    /// time anything out.
+    ///
+    /// To SEE THIS RED: make `consume_timer_entry` return `false`
+    /// unconditionally. The 408 witness then never appears.
+    #[test]
+    fn a_delivery_past_the_deadline_runs_the_timeout_body() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let mut metrics = SessionMetrics::new(None);
+
+        // A deadline already in the past: the wheel is late, not early.
+        let deadline = Instant::now() - Duration::from_secs(1);
+        mux.frontend.timeout_container().set_at(Token(0), deadline);
+
+        let _ = mux.timeout(Token(0), &mut metrics);
+
+        assert_eq!(
+            mux.context.streams[0].context.access_log_message,
+            Some("client_timeout"),
+            "a delivery at or past the deadline is a real expiry and must run \
+             the timeout body"
+        );
+    }
+
+    /// The loose end flagged as UNVERIFIED in the `poll_timeout` series: in the
+    /// backend-token branch of `Mux::timeout`, the backend container is
+    /// consumed unconditionally but re-armed only when `!should_close`, while
+    /// the shared tail can still return `Continue`. If a backend could reach
+    /// that tail still holding linked streams, those streams would be left
+    /// with no backend timer at all — a lost wakeup.
+    ///
+    /// It cannot, and this pins the reason: the branch calls
+    /// `Connection::end_stream` for every id in `context.backend_streams`.
+    /// `ConnectionH2::end_stream` starts with `Context::unlink_stream`;
+    /// `ConnectionH1::end_stream` guards on `self.stream != Some(stream)` and
+    /// returns early first, which is safe only because an H1 connection carries
+    /// at most one linked stream and it equals `self.stream` (see the comment
+    /// at the re-arm site). This test sets `h1.stream = Some(0)` by hand, so it
+    /// exercises the MATCHED path only — the mismatch arm is unreached here. It
+    /// is covered by that invariant plus the `debug_assert_h1_owns_stream`
+    /// tripwire at every `end_stream` call in `Mux::timeout`, not by a test
+    /// that drives the arm itself. This drives the exact
+    /// shape the issue asked for —
+    /// a backend stalled after a PARTIAL response (`back.consumed`, not
+    /// terminated), which is the arm that sets `should_write` while leaving
+    /// `should_close` true, i.e. the arm that skips the re-arm.
+    ///
+    /// To SEE THIS RED: delete the `self.context.unlink_stream(stream_id);`
+    /// from the "forcefully terminate it" arm AND the `backend.end_stream(
+    /// stream_id, &mut self.context);` at the bottom of that loop — this arm
+    /// evicts through both, so either alone still clears the index. The stream
+    /// then stays in the reverse index and the first assertion fails (in a
+    /// debug build the `debug_assert!` guarding the re-arm site fires first,
+    /// which is the point of it). The companion test
+    /// `a_completed_backend_response_timeout_unlinks_through_end_stream_alone`
+    /// covers the arm where `end_stream` IS the sole eviction, so deleting it
+    /// alone is caught there.
+    #[test]
+    fn a_backend_timeout_leaves_no_linked_stream_behind_on_the_close_path() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let mut metrics = SessionMetrics::new(None);
+        let backend_token = Token(1);
+
+        // A backend carrying one stream whose response started but never
+        // finished: `back.consumed` with no terminated/error phase is the
+        // "forcefully terminate" arm, which sets `should_write` and leaves
+        // `should_close` true.
+        let (backend_socket, _backend_peer) = connected_socket();
+        let backend_address = "127.0.0.1:2".parse().expect("backend address must parse");
+        let backend = Rc::new(RefCell::new(Backend::new(
+            "test-backend",
+            backend_address,
+            None,
+            None,
+            None,
+        )));
+        let mut connection = Connection::new_h1_client(
+            Ulid::generate(),
+            SessionTcpStream::new(backend_socket, mux.session_ulid, Some(backend_address)),
+            "test-cluster".to_owned(),
+            backend,
+            TimeoutContainer::new_empty(Duration::from_secs(30)),
+        );
+        let Connection::H1(h1) = &mut connection else {
+            unreachable!("new_h1_client builds an H1 connection")
+        };
+        h1.stream = Some(0);
+        // Due, not early: the entry really elapsed.
+        connection
+            .timeout_container()
+            .set_at(backend_token, Instant::now() - Duration::from_secs(1));
+        mux.router.backends.insert(backend_token, connection);
+
+        mux.context.link_stream(0, backend_token);
+        mux.context.streams[0].back.consumed = true;
+        assert_eq!(
+            mux.context
+                .backend_streams
+                .get(&backend_token)
+                .map(Vec::len),
+            Some(1),
+            "precondition: the backend carries exactly one linked stream"
+        );
+
+        let _ = mux.timeout(backend_token, &mut metrics);
+
+        assert!(
+            mux.context
+                .backend_streams
+                .get(&backend_token)
+                .is_none_or(|ids| ids.is_empty()),
+            "every stream linked to a timed-out backend must be unlinked before              the shared tail runs, because the tail may return Continue with              only the frontend container re-armed"
+        );
+        assert_eq!(
+            mux.context.streams[0].context.access_log_message,
+            Some("backend_response_timeout"),
+            "precondition: this is the partial-response arm, the one that              leaves should_close true and therefore skips the backend re-arm"
+        );
+    }
+
+    /// The other half of the loose-end proof. In the "response terminated and
+    /// fully proxied" arm of the backend-timeout branch there is no
+    /// `unlink_stream` call of its own: the only thing that evicts the stream
+    /// from `context.backend_streams` on this arm is the unconditional
+    /// `backend.end_stream(...)` at the bottom of the loop. As above, this test
+    /// sets `h1.stream = Some(0)` so `ConnectionH1::end_stream` takes its
+    /// matched path; the mismatch arm is unreached, and guarded by
+    /// `debug_assert_h1_owns_stream` rather than by a test. That arm also
+    /// leaves `should_close` true and `should_write` false, which is exactly
+    /// the `delay_close_for_frontend_flush("timeout")` path the issue named as
+    /// the one that can return `Continue` with only the frontend re-armed.
+    ///
+    /// To SEE THIS RED: delete `backend.end_stream(stream_id, &mut
+    /// self.context);` from the bottom of that loop.
+    #[test]
+    fn a_completed_backend_response_timeout_unlinks_through_end_stream_alone() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let mut metrics = SessionMetrics::new(None);
+        let backend_token = Token(1);
+
+        let (backend_socket, _backend_peer) = connected_socket();
+        let backend_address = "127.0.0.1:2".parse().expect("backend address must parse");
+        let backend = Rc::new(RefCell::new(Backend::new(
+            "test-backend",
+            backend_address,
+            None,
+            None,
+            None,
+        )));
+        let mut connection = Connection::new_h1_client(
+            Ulid::generate(),
+            SessionTcpStream::new(backend_socket, mux.session_ulid, Some(backend_address)),
+            "test-cluster".to_owned(),
+            backend,
+            TimeoutContainer::new_empty(Duration::from_secs(30)),
+        );
+        let Connection::H1(h1) = &mut connection else {
+            unreachable!("new_h1_client builds an H1 connection")
+        };
+        h1.stream = Some(0);
+        connection
+            .timeout_container()
+            .set_at(backend_token, Instant::now() - Duration::from_secs(1));
+        mux.router.backends.insert(backend_token, connection);
+
+        mux.context.link_stream(0, backend_token);
+        // Terminated AND fully proxied: the arm that does nothing but fall
+        // through to `end_stream`.
+        mux.context.streams[0].back.consumed = true;
+        mux.context.streams[0].back.parsing_phase = kawa::ParsingPhase::Terminated;
+        assert!(
+            mux.context.streams[0].back.is_terminated()
+                && mux.context.streams[0].back.is_completed(),
+            "precondition: this test needs the terminated-and-completed arm"
+        );
+
+        let _ = mux.timeout(backend_token, &mut metrics);
+
+        assert!(
+            mux.context
+                .backend_streams
+                .get(&backend_token)
+                .is_none_or(|ids| ids.is_empty()),
+            "end_stream is the sole eviction point on this arm; without it the \
+             backend reaches the shared tail still holding a linked stream and \
+             with no timer of its own"
+        );
+        assert_eq!(
+            mux.context.streams[0].context.access_log_message, None,
+            "precondition: a fully proxied response is not a timeout outcome, \
+             so this arm leaves should_write false and reaches \
+             delay_close_for_frontend_flush"
+        );
+    }
+
+    /// A container that was armed through a path which records no deadline
+    /// must fail OPEN — reported due — rather than being re-validated away.
+    /// Failing closed there would make every such session immortal, which is
+    /// strictly worse than the pre-existing up-to-50 ms-early close.
+    ///
+    /// To SEE THIS RED: change `consume_timer_entry`'s fallback arm from `_ =>
+    /// true` to `_ => false`.
+    #[test]
+    fn a_firing_with_no_recorded_deadline_is_treated_as_due() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let mut metrics = SessionMetrics::new(None);
+
+        assert_eq!(
+            mux.frontend.timeout_container().deadline(),
+            None,
+            "precondition: the container was never armed"
+        );
+
+        let _ = mux.timeout(Token(0), &mut metrics);
+
+        assert_eq!(
+            mux.context.streams[0].context.access_log_message,
+            Some("client_timeout"),
+            "a firing with no recorded deadline must fail open and run the body"
+        );
     }
 }

@@ -885,8 +885,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         );
         context.unlink_stream(stream);
         // Post: whatever backend token this stream was Linked to no longer
-        // lists it in the reverse index — `unlink_stream` is the single
-        // eviction point, so a subsequent end/close cannot double-remove it.
+        // lists it in the reverse index. `unlink_stream` is idempotent — it
+        // evicts only while the stream is still `Linked` — so a subsequent
+        // end/close cannot double-remove it. It is NOT the module's only
+        // eviction point: `remove_backend_stream` has direct callers here and
+        // in `h2.rs`. Extra eviction is harmless; what this post-condition
+        // claims is that THIS path evicted.
         // (The `state` field is still `Linked` here; the arms below retire it.)
         #[cfg(debug_assertions)]
         if let StreamState::Linked(token) = context.streams[stream].state {
