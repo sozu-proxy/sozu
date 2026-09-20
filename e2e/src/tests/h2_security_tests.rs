@@ -68,8 +68,8 @@ use super::h2_utils::{
     collect_response_frames, contains_goaway, contains_goaway_with_error,
     contains_headers_response, contains_rst_stream, h2_handshake, h2_handshake_with_initial_window,
     log_frames, parse_h2_frames, raw_h2_connection, read_all_available,
-    rejected_with_goaway_or_rst, setup_h2_listener_only, setup_h2_test, teardown,
-    verify_sozu_alive,
+    rejected_with_goaway_or_rst, setup_h2_listener_only, setup_h2_test, stream_status_matches,
+    teardown, verify_sozu_alive,
 };
 use crate::{
     mock::{
@@ -572,12 +572,11 @@ fn try_h2_missing_pseudo_headers() -> State {
     let got_rst = contains_rst_stream(&frames);
     let got_goaway = contains_goaway(&frames);
 
-    // Check for a 400 response: look for HEADERS frame on stream 1 containing
-    // HPACK-encoded ":status 400". In HPACK static table, index 13 = :status 400,
-    // so indexed representation is 0x8D.
-    let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    });
+    // Check for a 400 response by decoding the `:status` field of a HEADERS
+    // frame on stream 1. The scan that used to stand here looked for the byte
+    // `0x8D`, which is HPACK static index 13 — `:status 404`, not 400 (issue
+    // #1374). See [`stream_status_matches`].
+    let got_400 = stream_status_matches(&frames, 1, 400);
 
     println!(
         "Missing pseudo-headers - RST_STREAM: {got_rst}, GOAWAY: {got_goaway}, 400 response: {got_400}"
@@ -655,10 +654,9 @@ fn try_h2_uppercase_header_name() -> State {
     let got_rst = contains_rst_stream(&frames);
     let got_goaway = contains_goaway(&frames);
 
-    // Check for 400 status (HPACK static table index 13 = :status 400 = 0x8D).
-    let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    });
+    // Check for 400 status by decoding `:status`; the `0x8D` byte scan this
+    // replaces named HPACK static index 13, which is `:status 404` (#1374).
+    let got_400 = stream_status_matches(&frames, 1, 400);
 
     println!(
         "Uppercase header name - RST_STREAM: {got_rst}, GOAWAY: {got_goaway}, 400 response: {got_400}"
@@ -740,13 +738,9 @@ fn try_h2_desync_authority_host_conflict() -> State {
     // - Silent connection close (0 frames) — stricter validation drops the
     //   connection before emitting any H2 error frame
     let got_rejection = rejected_with_goaway_or_rst(&frames);
-    let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    });
+    let got_400 = stream_status_matches(&frames, 1, 400);
     // A 200 response is acceptable if sozu correctly normalizes (uses :authority)
-    let got_200 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x88)
-    });
+    let got_200 = stream_status_matches(&frames, 1, 200);
 
     println!(
         "Desync authority/host - rejected: {got_rejection}, 400: {got_400}, 200 (normalized): {got_200}"
@@ -810,9 +804,7 @@ fn try_h2_desync_path_no_leading_slash() -> State {
 
     // Must be rejected: RST_STREAM, GOAWAY, 400, or silent connection close
     let rejected = rejected_with_goaway_or_rst(&frames);
-    let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    });
+    let got_400 = stream_status_matches(&frames, 1, 400);
 
     println!("Desync path no leading slash - rejected: {rejected}, 400: {got_400}");
 
@@ -878,9 +870,7 @@ fn try_h2_desync_path_with_fragment() -> State {
     log_frames("Desync path with fragment", &frames);
 
     let rejected = rejected_with_goaway_or_rst(&frames);
-    let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    });
+    let got_400 = stream_status_matches(&frames, 1, 400);
 
     println!("Desync path with fragment - rejected: {rejected}, 400: {got_400}");
 
@@ -938,9 +928,7 @@ fn try_h2_duplicate_pseudo_headers() -> State {
     log_frames("Duplicate pseudo-headers", &frames);
 
     let rejected = rejected_with_goaway_or_rst(&frames);
-    let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    });
+    let got_400 = stream_status_matches(&frames, 1, 400);
 
     println!("Duplicate pseudo-headers - rejected: {rejected}, 400: {got_400}");
 
@@ -1015,9 +1003,7 @@ fn try_h2_connection_specific_headers() -> State {
 
         let frames = collect_response_frames(&mut tls, 500, 3, 500);
         let rejected = rejected_with_goaway_or_rst(&frames);
-        let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-            *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-        });
+        let got_400 = stream_status_matches(&frames, 1, 400);
 
         // Stream-scope violation (RFC 9113 §8.1.2.2): sozu must emit RST/GOAWAY or 400.
         let this_rejected = rejected || got_400;
@@ -1097,9 +1083,7 @@ fn try_h2_pseudo_headers_after_regular() -> State {
     log_frames("Pseudo-header after regular header", &frames);
 
     let rejected = rejected_with_goaway_or_rst(&frames);
-    let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    });
+    let got_400 = stream_status_matches(&frames, 1, 400);
 
     println!("Pseudo-header after regular - rejected: {rejected}, 400: {got_400}");
 
@@ -1383,9 +1367,7 @@ fn try_h2_content_length_format_fuzzing() -> State {
 
         let frames = collect_response_frames(&mut tls, 500, 3, 500);
         let rejected = rejected_with_goaway_or_rst(&frames);
-        let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-            *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-        });
+        let got_400 = stream_status_matches(&frames, 1, 400);
 
         // Partial tighten post eager-RST: the three clearly dangerous
         // values (comma-separated CL, negative CL) are stream-scope
@@ -2661,9 +2643,7 @@ fn try_h2_cl_te_conflict() -> State {
     // Must be rejected: transfer-encoding is a connection-specific header
     // forbidden in H2, and the CL/TE combination is a smuggling vector.
     let rejected = rejected_with_goaway_or_rst(&frames);
-    let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    });
+    let got_400 = stream_status_matches(&frames, 1, 400);
 
     println!("CL/TE conflict - rejected: {rejected}, 400: {got_400}");
 
@@ -2728,9 +2708,7 @@ fn try_h2_empty_content_length() -> State {
     log_frames("Empty Content-Length", &frames);
 
     let rejected = rejected_with_goaway_or_rst(&frames);
-    let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    });
+    let got_400 = stream_status_matches(&frames, 1, 400);
 
     println!("Empty Content-Length - rejected: {rejected}, 400: {got_400}");
 
@@ -2810,9 +2788,7 @@ fn try_h2_content_length_integer_overflow() -> State {
     log_frames("Content-Length integer overflow", &frames);
 
     let rejected = rejected_with_goaway_or_rst(&frames);
-    let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    });
+    let got_400 = stream_status_matches(&frames, 1, 400);
 
     println!("CL integer overflow - rejected: {rejected}, 400: {got_400}");
 
@@ -2889,9 +2865,7 @@ fn try_h2_multiple_content_length_values() -> State {
     log_frames("Multiple Content-Length values", &frames);
 
     let rejected = rejected_with_goaway_or_rst(&frames);
-    let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    });
+    let got_400 = stream_status_matches(&frames, 1, 400);
 
     println!("Multiple CL values - rejected: {rejected}, 400: {got_400}");
 
@@ -2960,9 +2934,7 @@ fn try_h2_authority_injection_crlf() -> State {
     log_frames("Authority CRLF injection", &frames);
 
     let rejected = rejected_with_goaway_or_rst(&frames);
-    let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    });
+    let got_400 = stream_status_matches(&frames, 1, 400);
 
     println!("Authority CRLF injection - rejected: {rejected}, 400: {got_400}");
 
@@ -3031,9 +3003,7 @@ fn try_h2_zero_length_header_name() -> State {
     log_frames("Zero-length header name", &frames);
 
     let rejected = rejected_with_goaway_or_rst(&frames);
-    let got_400 = frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    });
+    let got_400 = stream_status_matches(&frames, 1, 400);
 
     println!("Zero-length header name - rejected: {rejected}, 400: {got_400}");
 
@@ -4231,5 +4201,108 @@ fn e2e_h2_flood_window_update_on_closed_stream() {
             try_h2_flood_window_update_on_closed_stream
         ),
         State::Success
+    );
+}
+
+// ============================================================================
+// Guard: the `got_400` terms above decode `:status`, they do not scan bytes
+// ============================================================================
+
+/// Rebuild the `:status 200` response HEADERS block Sōzu emits for a
+/// proxied request: `88` (indexed static 8 = `:status 200`), `0f 0d 01 '8'`
+/// (`content-length: 8`), then `40 07 "sozu-id" 1a <26-byte ULID>` — the
+/// `Sozu-Id` correlation header of
+/// `lib/src/protocol/kawa_h1/editor.rs:1131`. Same byte sequence as
+/// `captured_200_headers` in `h2_security_sni.rs`, which carries the
+/// capture's provenance; Kawa's HPACK encoder never sets the Huffman bit,
+/// so every literal value reaches the block as plain ASCII.
+fn synthetic_200_headers() -> Vec<u8> {
+    const SOZU_ID: &[u8] = b"01M2Z5AGKT7QM9MFQY89EJMJ9X";
+    let mut payload = vec![0x88, 0x0f, 0x0d, 0x01, b'8', 0x40, 0x07];
+    payload.extend_from_slice(b"sozu-id");
+    payload.push(SOZU_ID.len() as u8);
+    payload.extend_from_slice(SOZU_ID);
+    payload
+}
+
+/// Closes the `0x8D` half of issue #1374. Every `got_400` term in this file
+/// must come from the stream's decoded `:status`, never from the byte `0x8D`
+/// occurring somewhere in the field block.
+///
+/// `0x8D` is an indexed HPACK field whose static index is 13, which RFC 7541
+/// Appendix A lists as `:status 404`; 400 is index 12, `0x8C`. Both fixtures
+/// below are wire-reachable, not hypothetical:
+///
+/// * `routed_404` is exactly what Sōzu answers when the router finds no
+///   cluster for a request — `try_h2_default_answer_terminates_stream`
+///   (`h2_tests.rs`) asserts that shape, and the `asterisk-with-OPTIONS`
+///   case of `test_h2_path_syntax_enforced` produced it on 2026-09-20
+///   (`HEADERS flags=0x04 stream=7 len=48 status=404`). Under the byte scan
+///   a request Sōzu *accepted and routed* read back as a protocol rejection,
+///   which is the failure mode every `rejected || got_400` here would have
+///   swallowed.
+/// * `long_value_200` is an ordinary 200 carrying a 268-byte header value.
+///   RFC 7541 §5.1 writes that length as `7f 8d 01` — prefix `0x7f`, then
+///   `(141 % 128) + 128 = 0x8D`, then `141 / 128 = 0x01` — so the needle
+///   lands in a length octet with no `:status` anywhere near it. A
+///   `Location`, `Set-Cookie` or CSP header reaches that size routinely.
+///
+/// To SEE THIS RED: give [`stream_status_matches`] its historical body,
+/// `*ft == H2_FRAME_HEADERS && *sid == stream_id && payload.contains(&0x8D)`,
+/// ignoring `status`. Exactly the two `!stream_status_matches(.., 400)`
+/// assertions fail — measured 2026-09-20, one per fixture, the second
+/// reached by temporarily skipping the first. The positive assertions stay
+/// green under that mutation precisely because the scan answers "yes" to
+/// every status, which is the defect: run both halves before believing a
+/// `To SEE THIS RED:` that names one.
+#[test]
+fn h2_400_terms_decode_the_status_field_not_the_0x8d_byte() {
+    // A routed 404 default answer: indexed static entry 13.
+    let mut routed = synthetic_200_headers();
+    routed[0] = 0x8d;
+    let routed_404 = vec![(H2_FRAME_HEADERS, 0x04, 1u32, routed)];
+    assert!(
+        routed_404[0].3.contains(&0x8d),
+        "fixture must carry the byte the historical scan keyed on"
+    );
+    assert!(
+        !stream_status_matches(&routed_404, 1, 400),
+        "a routed `:status 404` default answer is not a 400 rejection"
+    );
+    assert!(
+        stream_status_matches(&routed_404, 1, 404),
+        "a `:status 404` block must decode as 404"
+    );
+
+    // An ordinary 200 whose 268-byte header value encodes its length as
+    // `7f 8d 01`.
+    let mut long_value = synthetic_200_headers();
+    long_value.push(0x00); // literal without indexing, new name
+    long_value.push(0x08);
+    long_value.extend_from_slice(b"location");
+    long_value.push(0x7f); // 7-bit prefix exhausted
+    long_value.push(0x8d); // (268 - 127) % 128 + 128
+    long_value.push(0x01); // (268 - 127) / 128
+    long_value.extend(std::iter::repeat_n(b'a', 268));
+    let long_value_200 = vec![(H2_FRAME_HEADERS, 0x04, 1u32, long_value)];
+    assert!(
+        long_value_200[0].3.contains(&0x8d),
+        "fixture must carry the byte the historical scan keyed on"
+    );
+    assert!(
+        !stream_status_matches(&long_value_200, 1, 400),
+        "a length octet that happens to be `0x8D` is not a 400 response"
+    );
+    assert!(
+        stream_status_matches(&long_value_200, 1, 200),
+        "only the first field decides the status: a trailing length octet \
+         must not displace the real `:status 200`"
+    );
+
+    // The stream scope is part of the contract: the security suites assert
+    // on one stream and a frame from another must not answer for it.
+    assert!(
+        !stream_status_matches(&routed_404, 3, 404),
+        "a HEADERS frame on stream 1 must not answer for stream 3"
     );
 }

@@ -1853,6 +1853,66 @@
   "about tests" test fails it — and a second pass with fixture-local tables that proves an
   allowlisted name passes, a rename with a live target passes, and a rename whose target is itself
   gone is still reported.
+- **`test(e2e)`: decode `:status` in every H2 status assertion, assert the positive outcome where
+  `rejection || !got_200` accepted a silent worker, and derive the issue-810 shutdown budget from
+  the timer's own tick.** Three defects of one shape: a test that passes while proving less than
+  its name says.
+  Seventeen assertions across `e2e/src/tests/h2_security_tests.rs` and
+  `e2e/src/tests/h2_security_header_injection.rs` scanned a HEADERS payload for the byte `0x8D`
+  under the name `got_400` and a comment calling index 13 `:status 400`
+  ([#1374](https://github.com/sozu-proxy/sozu/issues/1374)). RFC 7541's static table puts
+  `:status 400` at index 12 (`0x8C`) and `:status 404` at 13, and sōzu really does answer an
+  indexed `0x8d` 404 when the router finds no cluster — so a request sōzu **accepted and routed**
+  satisfied a term named `got_400` and reported itself as a rejection. A byte scan also fires on a
+  length octet: RFC 7541 §5.1 writes a 268-byte header value as `7f 8d 01`, which is
+  [#1353](https://github.com/sozu-proxy/sozu/issues/1353)'s mechanism aimed at a security
+  assertion. All nineteen probes — the two `contains(&0x88)` 200-detectors included — are now one
+  helper, `stream_status_matches`, built on the existing `decode_status`, which reads the first
+  field of the block so neither a later field nor a length octet can answer for the status.
+  The label was right and the byte was wrong at every site: each of those tests sends a malformed
+  request and documents RFC 9113's "stream error or 400" contract, so every one decodes **400**
+  and the comments are corrected rather than the assertions retargeted at 404. Measured before
+  converting: every iteration of all fifteen `h2_security_tests.rs` sites reports `400: false` and
+  produces no HEADERS frame at all — RST_STREAM only — so the term was dead under either reading.
+  **One site was not dead.** The `asterisk-with-OPTIONS` case of `test_h2_path_syntax_enforced` —
+  its deliberately *accepted* case — answers `HEADERS stream=7 status=404`, and its inner
+  `protocol_error` probe read that as a 400. It stayed green only because the outer `rejected`
+  probe was hardcoded to stream 1 while the case runs on stream 7; both are stream-scoped and
+  decoded now. `h2_400_terms_decode_the_status_field_not_the_0x8d_byte` is the negative half, with
+  a routed-404 fixture and a 200 carrying a `7f 8d 01` length octet. Restoring the byte scan reddens
+  exactly its two negative assertions, one per fixture, and leaves the positive ones green, because
+  a scan that ignores its status argument answers yes to every status.
+  Separately, two assertions written `rejection || !got_200` passed when the worker returned
+  **nothing** ([#1381](https://github.com/sozu-proxy/sozu/issues/1381)): `got_200` is derived from
+  frames that may never arrive, so a silent reset, a timeout collecting zero frames or a worker
+  that died between phases all read as success, and a regression turning a clean rejection into a
+  crash read as a pass. `try_strict_sni_binding_toggle`
+  (`e2e/src/tests/listener_update_tests.rs`) asserts the positive outcome its own comment always
+  claimed, `got_rejection_or_421 && !got_200`, and narrows that term from `contains_goaway` to
+  `rejected_with_goaway_or_rst`: phase 1 ends with `GOAWAY error_code=0x0`, the graceful close
+  riding behind the 421, so the wide form accepted a 502 followed by that same close — precisely
+  the distinction the issue says these assertions cannot make. `try_h2_invalid_status_rejected`
+  (`e2e/src/tests/h2_security_header_injection.rs`) asserts
+  `got_frames && (protocol_rejection || got_502) && !got_200`, requiring frames to have arrived at
+  all. Sōzu answers 502 on that path — measured on all four malformed upstream `:status` values.
+  Finally, `test_issue_810_timeout` (`e2e/src/tests/tests.rs`) asserted a zero-slack 100 ms
+  shutdown budget 100 times over and reddened on contended runners while every failing iteration
+  still proxied correctly ([#1376](https://github.com/sozu-proxy/sozu/issues/1376)). 100 ms is not
+  a margin there, it is exactly one tick of the two grids the shutdown path runs on:
+  `Server::reset_loop_time_and_get_timeout` clamps the poll timeout to a 100 ms `shutdown_tick`
+  while `shutting_down.is_some()` and `shut_down_sessions` runs once per loop iteration, so any
+  iteration after the first costs a full `poll()` block; and the timer wheel's default `tick_ms`
+  is 100 ms with `duration_to_tick` rounding to the NEAREST tick, displacing a timer-driven step by
+  `(delay_ms + tick_ms / 2) mod tick_ms` ∈ `[0, 99]` ms. `ISSUE_810_SHUTDOWN_BUDGET` is three of
+  those ticks — one re-poll, one grid displacement, one scheduler quantum — still 1/33 of
+  `DEFAULT_REQUEST_TIMEOUT` and 1/200 of `DEFAULT_FRONT_TIMEOUT`, so a shutdown that waits for a
+  session timeout misses it by two orders of magnitude. The same test now asserts the four exchange
+  counters it used to print and never check, so an iteration whose client never received its
+  response can no longer be timed as though it had.
+  `e2e/COVERAGE.md` carries the byte-scan inventory, the 404-vs-400 decision and the tick
+  derivation; `frames.is_empty()` as an accepted outcome is deliberately untouched and stays open
+  on #1374.
+
 - **`ci(doc)`: every `file.rs:NNN` citation in `doc/` and the module `LIFECYCLE.md` files is now
   resolved on each pull request, and the ones in `doc/` were re-read against the code first.**
   A line number carries no anchor, so a citation rots the moment anyone edits the file it points

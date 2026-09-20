@@ -338,6 +338,31 @@ every window but exceeds it cumulatively — is what catches a window that
 stopped advancing, which is the false-positive half of the CVE control
 and the failure mode a frozen clock produces.
 
+**A wall-clock budget is quantised — spend the quantum, do not round it.**
+`test_issue_810_timeout` asserted that a soft-stop with one idle
+keep-alive session completes inside 100 ms, repeated 100 times, one
+breach failing the run. It reddened on GitHub runners while every failing
+iteration still reported a correct proxy exchange (#1376). 100 ms is not
+a margin here, it is exactly one tick of the two grids the shutdown path
+runs on: `Server::reset_loop_time_and_get_timeout` clamps the poll
+timeout to a 100 ms `shutdown_tick` while `shutting_down.is_some()` and
+`shut_down_sessions` runs once per loop iteration, so any iteration after
+the first costs up to a full 100 ms `poll()` block; and the timer wheel's
+default `tick_ms` is 100 ms with `duration_to_tick` rounding to the
+NEAREST tick, displacing a timer-driven step by
+`(delay_ms + tick_ms / 2) mod tick_ms` ∈ `[0, 99]` ms. The budget is now
+`ISSUE_810_SHUTDOWN_BUDGET`, three ticks — one for the re-poll, one for
+grid displacement, one for scheduler slack on a contended 4-vCPU host —
+and it is still 1/33 of `DEFAULT_REQUEST_TIMEOUT` and 1/200 of
+`DEFAULT_FRONT_TIMEOUT`, so it keeps discriminating what issue 810 is
+about: a shutdown that waits for a session timeout misses it by two
+orders of magnitude, not by a tick. Derive such a bound from the
+mechanism's own quantum; a number raised until CI goes green tells you
+nothing about what it still catches. The same commit asserts the four
+exchange counters that iteration printed and never checked, so an
+iteration where the client never got its response can no longer be timed
+as if it had.
+
 **A deadline needs an event to be observed.** The SETTINGS-ACK watchdog
 is evaluated inside `readable()` and `flush_pending_control_frames()`
 only, so a silent connection is never re-examined and the GOAWAY does not
@@ -384,10 +409,13 @@ suite, which assert on a wall-clock budget rather than on content.
 
 **The dangerous copy was not the one in the reported test.**
 `try_strict_sni_binding_toggle` (`e2e/src/tests/listener_update_tests.rs`)
-ran the same scan and fed its result into
-`got_rejection_or_421 = got_421 || contains_goaway(..)`, which gates
-`phase1_ok` — the assertion that a `strict_sni_binding=true` listener
-*rejects* a mismatched `:authority`. A ULID false positive there turns a
+ran the same scan and fed its result into `got_rejection_or_421`, which
+gates `phase1_ok` — the assertion that a `strict_sni_binding=true`
+listener
+*rejects* a mismatched `:authority`. (That term then read
+`got_421 || contains_goaway(..)`; see the `#1381` section below for why
+the `contains_goaway` arm had to be narrowed too.) A ULID false positive
+there turns a
 security assertion silently green rather than red. Direction matters when
 pricing one of these: #1353 cost a re-run, this one would have cost the
 guard. Both are decoded now, along with `h2_tests.rs`, whose status check used
@@ -424,27 +452,84 @@ a 263-byte `Location`, `Set-Cookie` or CSP header was enough to make the
 old scan report a 2xx on a 421. The narrow claim — `0x88` cannot occur
 inside an unhuffmanned ASCII *value* — is the only true one.
 
-**Still scanning, and no longer rated low risk.** Measured on
-2026-09-20, 19 indexed-status byte probes remain: 2 × `contains(&0x88)`
-and 17 × `contains(&0x8D)`, in `e2e/src/tests/h2_security_header_injection.rs`
-(3) and `e2e/src/tests/h2_security_tests.rs` (16). They are the same
-class as #1353 and carry the same exposure — a 268-byte value writes
-`7f 8d 01` — and several of them sit on the permissive side of an `||`
-(`rejected = got_rst || got_goaway || got_400`,
-`h2_security_tests.rs:589`), which is the inverted direction again.
-Converting them to `decode_status` is a follow-up, not chased here.
+**Converted on 2026-09-20 — and one of them was live.** The 19
+indexed-status byte probes that stood here (2 × `contains(&0x88)`, 17 ×
+`contains(&0x8D)`, in `e2e/src/tests/h2_security_header_injection.rs`
+(3) and `e2e/src/tests/h2_security_tests.rs` (16)) all read
+`stream_status_matches(frames, stream_id, status)` now, which decodes
+`:status` through `decode_status` (issues #1374 and #1381). No live byte
+probe is left under `e2e/src/tests/`; the literal survives only in
+comments recording what was there.
 
-Two things to settle before that conversion. First, `0x8D` is static
-index **13 = `:status 404`**, not 400: `:status 400` is index 12 =
-`0x8C`. Every one of those 17 sites, and the comments above them
-(`h2_security_tests.rs:577`, `:658`,
-`h2_security_header_injection.rs:73`, `:542`), names it 400, and the
-variable is `got_400` at all 15 sites in `h2_security_tests.rs`. So
-either the assertion or its label is wrong at every one of them, and a
-mechanical `headers_status_matches(.., b"400")` rewrite would change
-behaviour rather than preserve it. Second, `decode_status` returns
-`None` on a size-update-prefixed block, which is fail-closed for a
-`got_X` used positively and fail-**open** for one used as `|| !got_X`.
+**The label was right and the byte was wrong, at every site.** `0x8D` is
+static index **13 = `:status 404`**; `:status 400` is index 12 = `0x8C`.
+All 17 sites and the comments above them named it 400, and the variable
+was `got_400` at all 15 sites in `h2_security_tests.rs`. Each of those
+tests sends a *malformed request* and documents RFC 9113's "stream error
+or 400" contract, so the conversion is to a decoded **400** everywhere
+and the comments are corrected rather than the assertions retargeted at
+404. What settled the direction empirically: on 2026-09-20 every
+iteration of every one of the fifteen `h2_security_tests.rs` sites
+reported `400: false` and produced no HEADERS frame at all — RST_STREAM
+only, once or twice per case (`CL/TE conflict` answers two, error codes
+`0x1` then `0x5`) — so the term was dead under either reading and no test
+was quietly depending on a 404.
+
+**The one site that was not dead is the one that proves the class.** The
+`asterisk-with-OPTIONS` case of `test_h2_path_syntax_enforced` — its
+deliberately *accepted* case — answers `HEADERS flags=0x04 stream=7
+len=48 status=404`, whose indexed HPACK byte is exactly the `0x8D` the
+scan keyed on. Its inner `protocol_error` probe therefore read a request
+sōzu had accepted and routed as "sōzu emitted a 400". It stayed green
+only because the outer `rejected` probe was hardcoded to stream 1 while
+the case runs on stream 7: two wrongs in opposite directions. Both are
+`stream_status_matches(.., stream_id, 400)` now — the scope is right
+*and* a 404 no longer answers for a 400.
+
+**Keep the negative half — and know which half it is.**
+`h2_400_terms_decode_the_status_field_not_the_0x8d_byte`
+(`h2_security_tests.rs`) is it, with two wire-reachable fixtures: a
+routed 404 default answer, and an ordinary 200 whose 268-byte header
+value writes its length as `7f 8d 01` — prefix `0x7f`, then
+`(141 % 128) + 128 = 0x8D`, then `141 / 128 = 0x01`. Restoring the byte
+scan as the helper body reddens exactly its two *negative* assertions,
+one per fixture, measured 2026-09-20; the positive ones stay green under
+that mutation because a scan that ignores the status argument answers
+"yes" to every status. That is the same lesson as the `0x88` fixture
+above: run every mutation a `To SEE THIS RED:` names, and check which
+assertion it actually moves.
+
+`decode_status` still returns `None` on a size-update-prefixed block,
+which is fail-closed for a `got_X` used positively and fail-**open** for
+one used as `|| !got_X`. Both sites that carried that exposure are gone
+(#1381): `try_strict_sni_binding_toggle` asserts
+`got_rejection_or_421 && !got_200` and `try_h2_invalid_status_rejected`
+asserts `got_frames && (protocol_rejection || got_502) && !got_200`.
+Each used to be written `rejection || !got_200` and passed on a worker
+that returned nothing at all — a regression turning a clean 421 or 502
+into a crash read as success. Both were run against a shadowed empty
+frame list on 2026-09-20: the strengthened forms fail on the first
+iteration, the historical forms pass the identical fault.
+
+**Half of that `||` was still too wide, and it is the half the issue
+names.** `got_rejection_or_421` read `got_421 || contains_goaway(..)`,
+and `contains_goaway` matches ANY GOAWAY — including the
+`error_code=0x0` graceful close that rides along behind the 421 in this
+very test (`SNI-TOGGLE strict=true - received 8 frames … frame 7: GOAWAY
+error_code=0x0`). A 502 or a 503 followed by that same close would have
+answered "a 421 or GOAWAY was observed", which is exactly the
+"cannot distinguish a correct 421 from any other non-200" the issue
+quotes. It reads `got_421 || rejected_with_goaway_or_rst(..)` now, whose
+GOAWAY arm requires an error code other than `NO_ERROR`. Tighten the
+term the positive assertion rests on, not only the shape of the
+expression around it.
+
+**`frames.is_empty()` as an accepted outcome is untouched** and stays
+open (#1374). It still sits in `try_h2_desync_authority_host_conflict`'s
+`got_rejection || got_400 || got_200 || frames.is_empty()` and in the
+non-dangerous arm of `try_h2_content_length_format_fuzzing`, where it is
+deliberate, documented policy. Tightening either is a behavioural change
+needing its own evidence, not a by-product of decoding a status.
 
 ## Backend-TLS expansion (preview)
 
