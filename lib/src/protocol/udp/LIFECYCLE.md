@@ -27,7 +27,8 @@ bound `mio::net::UdpSocket` (`UdpListener`, `udp.rs`) serves every client.
 A readable event means "datagrams are waiting", **not** "a new connection"
 (`udp.rs:11-13`). There is no accept loop and no `create_session()` call: a
 `Protocol::UDP` listener falls through `Server::ready`'s generic arm into
-`ProxySession::ready` (`udp.rs:25-27`, `lib/src/server.rs:3252-3257`). Because there is no
+`ProxySession::ready` (`udp.rs:25-27`, `Server::ready`'s generic session arm,
+`lib/src/server.rs`). Because there is no
 kernel-level connection, Sōzu reconstructs the notion of a "connection" itself —
 a **virtual flow** keyed on the client source address. That flow table is, in
 effect, a **userland UDP conntrack** living inside the single-threaded worker
@@ -191,7 +192,7 @@ client ──dgram──▶ front UDP socket ──▶ ingest_client (udp.rs)
 
 ```
 backend ──dgram──▶ connected upstream socket ──▶ ingest_upstream (udp.rs)
-                          │  upstream_token → FlowId  (udp.rs:1218)
+                          │  upstream_token → FlowId  (ingest_upstream, udp.rs)
                           ▼
               UdpManager::handle_input(BackendDatagram { flow })  (on_backend_datagram, manager.rs)
                           │  on_backend_datagram: count response, refresh idle
@@ -214,7 +215,7 @@ address" (`connect(2)`), so its fd **is** the return-4-tuple demux key (the
 `udp_connect` doc comment states the same invariant): the kernel delivers the
 backend's reply onto exactly that socket. The shell registers it with mio
 under a fresh `upstream_token` and records `upstream_token -> FlowId`
-(`udp.rs:1378-1398`). When the socket becomes readable, `ingest_upstream`
+(`on_open_upstream`, `udp.rs`). When the socket becomes readable, `ingest_upstream`
 (`udp.rs`) resolves the owning flow from the token and re-emits to the real
 client via the front socket — restoring the pre-NAT client address that
 `UdpFlow::client` (`flow.rs`) preserved at admission.
@@ -271,7 +272,7 @@ was due:
   `reschedule`, so a recomputed deadline equal to the old one is still emitted
   as a fresh `ArmTimer` instead of being memoized away — this is the
   load-bearing half;
-- the shell drops its `timer_handle` (`udp.rs:1832`), which is hygiene rather
+- the shell drops its `timer_handle` (`UdpListenerSession::close`, `udp.rs`), which is hygiene rather
   than a fix: a delivered handle is already inert, because `set_timeout_at`
   clamps every new entry past `self.tick` while a delivered one sat at or below
   it, so `cancel_timeout`'s tick guard can never match the successor that reuses
@@ -304,7 +305,8 @@ Every close path emits `FlowEvicted` then `CloseFlow` (`UdpManager::close_flow`,
 upstream socket, drops the token maps, frees the slab slot and decrements
 `udp.active_flows` **exactly once**. `abort_flow` / `close_all` reuse the same
 path, so the gauge cannot leak on listener remove / deactivate / soft-stop
-(`udp.rs:491`, `udp.rs:600`, `udp.rs:892`, `close_all_flows` `udp.rs`). Idempotent:
+(`UdpProxy::remove_listener` / `give_back_listener` / `notify`'s stop arms, `udp.rs`,
+all through `close_all_flows`). Idempotent:
 a missing or already-`Closing` flow is a no-op — no double-evict, no underflow.
 
 ---
@@ -376,8 +378,8 @@ Results feed `Backend::health` through rise/fall hysteresis
 (`HealthState`), steering only **new** selections — a flow already pinned to a
 now-unhealthy backend stays until idle-timeout (the flow table pins it). Probes
 run **non-blocking in the event loop** (`UdpProxy::health_poll` `udp.rs`,
-driven from `lib/src/server.rs:1140`; `health_owns_token`/`health_ready` route readiness,
-`udp.rs`, `lib/src/server.rs:1114-1116`). No background threads — consistent with the
+driven from `Server::run`'s health tick, `lib/src/server.rs`; `health_owns_token`/`health_ready` route readiness,
+`udp.rs`, `Server::ready`'s UDP health arm, `lib/src/server.rs`). No background threads — consistent with the
 single-threaded worker model.
 
 ---
@@ -390,7 +392,8 @@ Worker requests reach UDP via `UdpProxy::notify` (`udp.rs`), routed from
 - **Add / activate listener**: `UdpProxy::add_listener` (`udp.rs`) →
   `notify_add_udp_listener` (`lib/src/server.rs`); `UdpProxy::activate_listener` (`udp.rs`)
   then `UdpProxy::build_session` (`udp.rs`) — UDP replaces the accept/create-session
-  step with a single long-lived `UdpListenerSession` per listener (`lib/src/server.rs:2646-2678`).
+  step with a single long-lived `UdpListenerSession` per listener
+  (`notify_activate_listener`'s UDP arm, `lib/src/server.rs`).
   That install happens once per *activation*, not once per request: `activate`
   short-circuits on the listener's own `active` flag and answers with the same
   token for a listener that is already up, and `ConfigState` accepts the repeat
@@ -411,16 +414,35 @@ Worker requests reach UDP via `UdpProxy::notify` (`udp.rs`), routed from
 - **Listener update**: `UdpProxy::update_listener` (`udp.rs`) keeps three things in
   agreement — the listener config, the manager (`SetMaxFlows` / `SetMaxRxDatagramSize`),
   and the session's `recv_buf`, which is re-sized via `resize_recv_buf`
-  (`udp.rs`, called at `udp.rs:666`) so `recv_from` cannot truncate after a
+  (`udp.rs`, called at `UdpProxy::update_listener`, `udp.rs`) so `recv_from` cannot truncate after a
   size bump.
 - **SCM fd hand-off across re-exec**: `give_back_listeners` / `give_back_listener`
   (`udp.rs`) return the raw `UdpSocket`; the hand-off is fd-type-agnostic
   (only `UdpSocket::from_raw_fd` on the receiving side is UDP-specific). The
-  re-exec'd worker re-binds via the passed fd and rebuilds its session.
+  re-exec'd worker adopts the passed fd and rebuilds its session. `Server::new`
+  (`lib/src/server.rs`) takes the SCM listeners **before** it applies the initial
+  state, which is what makes the adoption happen: that state carries one
+  `ActivateListener` per active listener, and until 2026-09-20 it ran first, so
+  `UdpListener::activate` took the `udp_bind` branch — succeeding only because of
+  `SO_REUSEPORT` — and the inherited descriptor, with everything already queued in
+  its receive buffer, was dropped unused (sozu#1342). `Server::notify_activate_listener`
+  additionally asks `UdpProxy::inherited_socket_fate` (`udp.rs`) before
+  `Listeners::get_udp` (`command/src/scm_socket.rs`), so a descriptor leaves the SCM
+  table only when a listener will actually take it. With no listener yet at the
+  address it stays in the table for a later `AddListener` + `ActivateListener`.
+  With one already active it is closed deliberately instead of by a dropped
+  wrapper — a deliberate trade, not an impossibility: a deactivate plus
+  reactivate would adopt it, but its queued datagrams decay while an unaccepted
+  socket in the address's `SO_REUSEPORT` group is expected to go on taking a
+  share of new datagrams for as long as it stays open. That expectation follows
+  from `SO_REUSEPORT` load-balancing semantics; nothing here measures it.
 - **Hot-upgrade resets flows.** Only the **listener fd** is handed off — flow
-  state is **not** migrated (`udp.rs:593-601`, `close_all_flows` on hand-off).
-  In-flight flows reset on upgrade. This is a deliberate phase-1 limitation and
-  the key difference from a kernel conntrack, which would survive.
+  state is **not** migrated (`UdpProxy::give_back_listener`'s `close_all_flows` on
+  hand-off, `udp.rs`). In-flight flows reset on upgrade. This is a deliberate
+  phase-1 limitation and the key difference from a kernel conntrack, which would
+  survive. Adopting the inherited fd preserves only what the kernel holds on it,
+  i.e. datagrams already queued in its receive buffer; it migrates no flow state
+  and does not change this limitation.
 
 ---
 
@@ -445,7 +467,7 @@ model.
    analog of kernel conntrack-table exhaustion.
 3. **Bounded rx.** `max_rx_datagram_size` is clamped to `buffer_size`
    (`clamp_max_rx`, `udp.rs`); the `recv_buf` is sized `max_rx + 1`
-   (`udp.rs:1131-1138`) so an over-size datagram is detected (read longer than
+   (`UdpListenerSession::new`'s `recv_buf` sizing, `udp.rs`) so an over-size datagram is detected (read longer than
    `max_rx`) and dropped as `Truncated` rather than silently cut.
 4. **Bounded egress write queue.** A stalled backend cannot balloon memory: the
    per-flow upstream write queue (`WriteQueue`, `udp.rs`) has a small cap;
