@@ -2029,13 +2029,14 @@ fn test_h1_smuggling_auth_bypass() {
 // `DefaultAnswer` variant, so an unrouted request must still get the builtin
 // 404, never the operator's `000`.
 //
-// Scope note: the sibling half of that fix, the same range assertion on a
-// status parsed from the BACKEND's response line
-// (`kawa_h1::save_http_status_metric`), is NOT reachable from this suite — an
-// unconditional `panic!` planted at the top of that function does not fire for
-// any e2e HTTP session, because H1 proxying runs through `protocol/mux`, not
-// `protocol/kawa_h1`. It stays covered by
-// `kawa_h1::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`.
+// Scope note: the sibling half of that fix is the same range assertion on a
+// status parsed from the BACKEND's response line. It used to live in
+// `kawa_h1::save_http_status_metric`, which an unconditional planted `panic!`
+// proved unreachable from this suite — H1 proxying runs through
+// `protocol/mux`, not through the `kawa_h1` session, which was removed on
+// 2026-09-20 (sozu#1346). The assertion now guards the live bucketer and is
+// covered by
+// `mux::stream::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`.
 // =========================================================================
 
 /// To SEE THIS RED: in `lib/src/protocol/kawa_h1/answers.rs`, restore the

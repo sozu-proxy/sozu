@@ -913,6 +913,62 @@
   say path regexes are NOT anchored, is corrected in the same changeset; the "write your own
   anchors" advice is gone.
 
+### ➖ Removed
+
+- **BREAKING (library API) — `refactor(kawa_h1)`: delete the unreachable `Http` session state
+  machine, closing [#1346](https://github.com/sozu-proxy/sozu/issues/1346) and
+  [#1347](https://github.com/sozu-proxy/sozu/issues/1347).**
+  `sozu_lib::protocol::kawa_h1::Http<Front, L>` — re-exported as
+  `sozu_lib::protocol::http::Http` and, until now, as `sozu_lib::protocol::Http` — is gone, with
+  its `SessionState` impl, `TimeoutStatus`, `ResponseStream`, `save_http_status_metric`, the
+  module-local `handle_connection_result` (`tcp.rs` keeps its own separate copy), this module's
+  `log_context!` macro, and the whole `kawa_h1::diagnostics` module
+  (`diagnostic_400_502`, `diagnostic_413_507`). No binary could reach any of it: `HttpStateMachine`
+  (`lib/src/http.rs`) is `Expect | Mux | WebSocket` and `HttpsStateMachine` (`lib/src/https.rs`) is
+  `Expect | Handshake | Mux | WebSocket`, neither holds one, and `Http::new` had zero code callers
+  under **either** module spelling — a grep on one spelling undercounts, because
+  `lib/src/protocol/mod.rs` re-exports `kawa_h1 as http`. Measured rather than inferred: an
+  unconditional `panic!("PROBEALWAYS …")` planted at the top of `Http::new` and
+  `save_http_status_metric` fired 0 times across four real proxied HTTP/HTTPS e2e sessions, while
+  the same planted binary panicked immediately under the function's own unit test (the positive
+  control). H1 has run through `protocol/mux` in H1 mode since the mux migration.
+  This is **breaking for downstream `sozu-lib` consumers**, not for operators: nothing on the wire,
+  no metric, no log line, no configuration key and no CLI flag changes, but a crate that named
+  `sozu_lib::protocol::Http`, `::protocol::http::Http`, `::protocol::kawa_h1::Http`,
+  `::protocol::kawa_h1::{TimeoutStatus, ResponseStream}` or `::protocol::kawa_h1::diagnostics::*`
+  no longer compiles. There is no migration target: the type implemented a session state machine no
+  Sōzu binary instantiated. The `Http` name is no longer re-exported at
+  `sozu_lib::protocol::Http`.
+  #1347 — a frontend timeout consumed by `container_frontend_timeout.triggered()` and never
+  re-armed, leaving the session alive until the 30-minute `zombie_check` — lived inside that
+  `impl`. It is **closed by the removal, not fixed**: after this change there is no code left to
+  redden, so it gets no regression test. The equivalent live defect class is already handled in the
+  mux, which re-arms explicitly under `if !should_close` / `if result == StateResult::Continue`
+  (`lib/src/protocol/mux/mod.rs`).
+  Nothing was weakened to reach green. Exactly one test was orphaned,
+  `kawa_h1::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`, which asserted that a
+  backend status line outside `100..=999` is bucketed as `http.status.other` rather than asserted
+  away. `mux::stream::generate_access_log` is the live implementation of the same concern and had
+  no such assertion, so the test was **ported, not deleted**, as
+  `mux::stream::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`; it was seen red
+  against the live path by planting the forbidden `debug_assert!((100..=999).contains(&status))` in
+  the bucket arm, which reproduces `generate_access_log got a non-3-digit status: 0`.
+  Also removed: the two commented-out `size_test` blocks in `lib/src/http.rs` and
+  `lib/src/https.rs`, which `assert_size!`d `Http<..>` — and, in the HTTPS one, OpenSSL types that
+  left the tree several releases ago. #1346 cited them as live references to the type; they were
+  inside `/* … */`.
+  `kawa_h1` itself stays: `answers::{HttpAnswers, DefaultAnswerStream, merge_legacy_into_map}`,
+  `editor::{HttpContext, HeaderEditMode, HeaderEditSnapshot}`, `parser::{Method, hostname_and_port,
+  compare_no_case}`, the `DefaultAnswer` enum and the crate's only
+  `impl kawa::AsBuffer for Checkout` are all live and consumed by `mux`. `answers.rs` was assessed
+  item by item and **nothing** in it became dead. `lib/src/protocol/kawa_h1/LIFECYCLE.md` has been
+  rewritten from "H1 session lifecycle" to "the H1 vocabulary the mux builds on", with its
+  citations refreshed; `doc/lifetime_of_a_session.md` §6.1, `doc/testing.md`, `doc/observability.md`
+  (the `KAWA-H1` log tag no longer exists), `doc/configure.md`, `doc/benchmark.md` (a pre-mux
+  profiler capture, kept verbatim with a note), `e2e/COVERAGE.md`, `lib/README.md`,
+  `lib/src/protocol/proxy_protocol/LIFECYCLE.md` and `CLAUDE.md` are updated in the same changeset.
+  Net: `lib/src` goes from 87 973 to 85 415 lines of Rust — 2 712 removed, 154 added, −2 558.
+
 ## 2.2.1 - 2026-08-28
 
 Patch release: the main process validates listeners and HTTP/HTTPS

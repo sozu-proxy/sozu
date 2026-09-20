@@ -1884,19 +1884,6 @@ mod tests {
         response::{Backend, HttpFrontend},
     };
 
-    /*
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn size_test() {
-      assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
-      assert_size!(Http<mio::net::TcpStream>, 1232);
-      assert_size!(Pipe<mio::net::TcpStream>, 272);
-      assert_size!(State, 1240);
-      // fails depending on the platform?
-      assert_size!(Session, 1592);
-    }
-    */
-
     #[test]
     fn round_trip() {
         setup_test_logger!();

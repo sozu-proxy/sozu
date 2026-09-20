@@ -53,8 +53,8 @@ pub mod backend {
     pub const FAIL_OPEN: &str = "backends.fail_open";
 
     // Connection-lifecycle transition counters, emitted per
-    // `(cluster_id, backend_id)` from all three proxies: `kawa_h1` (H1), the
-    // H2 mux, and raw TCP.
+    // `(cluster_id, backend_id)` from both proxies: the mux (H1 and H2) and
+    // raw TCP.
     pub const UP: &str = "backend.up";
     pub const DOWN: &str = "backend.down";
     pub const CONNECTIONS_ERROR: &str = "backend.connections.error";

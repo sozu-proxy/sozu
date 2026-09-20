@@ -1,8 +1,9 @@
 # PROXY Protocol — Session Workflow
 
 Reference document for maintainers of `lib/src/protocol/proxy_protocol/`.
-Companion to `lib/src/protocol/kawa_h1/LIFECYCLE.md` (downstream H1) and
-`lib/src/protocol/mux/LIFECYCLE.md` (downstream H2).
+Companion to `lib/src/protocol/mux/LIFECYCLE.md` (the downstream H1/H2
+datapath) and `lib/src/protocol/kawa_h1/LIFECYCLE.md` (the H1 vocabulary it
+builds on).
 
 Every claim is anchored to a concrete `file.rs:LINE`; line numbers were last
 refreshed against the `docs/feat-h2-mux-audit` branch tip on 2026-04-26.
@@ -229,8 +230,8 @@ Close                │       │
 
 The `Pipe` (`lib/src/protocol/pipe.rs`) is the typical downstream — it owns
 the bidirectional byte-stream forwarding for TCP listeners. For HTTP(S)
-listeners the downstream is built from `Http<Front, L>` + the mux
-`Connection` enum, depending on the negotiated protocol.
+listeners the downstream is the mux `Connection` enum (`ConnectionH1` or
+`ConnectionH2`, depending on the negotiated protocol).
 
 ---
 
@@ -271,10 +272,10 @@ which makes it an attractive target. These rules are load-bearing.
 ## 5. Cross-References
 
 - `lib/src/protocol/pipe.rs` — the typical downstream after `expect`.
-- `lib/src/protocol/kawa_h1/LIFECYCLE.md` — H1 frontend that follows
-  PROXY-v2 ingress on HTTP listeners.
-- `lib/src/protocol/mux/LIFECYCLE.md` — H2 mux that follows PROXY-v2
-  ingress on HTTPS listeners.
+- `lib/src/protocol/mux/LIFECYCLE.md` — the H1/H2 mux that follows PROXY-v2
+  ingress on HTTP and HTTPS listeners.
+- `lib/src/protocol/kawa_h1/LIFECYCLE.md` — the H1 vocabulary that mux
+  builds on (default answers, `HttpContext`, `Method`).
 - `bin/src/command/LIFECYCLE.md` — how listener configuration (incl.
   `expect_proxy`, `send_proxy`) is delivered from the supervisor.
 - HAProxy upstream spec: <https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt>

@@ -3086,23 +3086,6 @@ mod tests {
         );
     }
 
-    /*
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn size_test() {
-      assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
-      assert_size!(TlsHandshake, 240);
-      assert_size!(Http<SslStream<mio::net::TcpStream>>, 1232);
-      assert_size!(Pipe<SslStream<mio::net::TcpStream>>, 272);
-      assert_size!(State, 1240);
-      // fails depending on the platform?
-      assert_size!(Session, 1672);
-
-      assert_size!(SslStream<mio::net::TcpStream>, 16);
-      assert_size!(Ssl, 8);
-    }
-    */
-
     #[test]
     fn frontend_from_request_test() {
         let cluster_id1 = "cluster_1".to_owned();

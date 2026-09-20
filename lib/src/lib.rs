@@ -720,7 +720,8 @@ pub enum BackendConnectionError {
     TooManyConnectionsPerIp { cluster_id: String },
 }
 
-/// used in kawa_h1 module for the Http session state
+/// Route-extraction failures raised by `kawa_h1::editor::HttpContext` and
+/// consumed by the mux router.
 #[derive(thiserror::Error)]
 pub enum RetrieveClusterError {
     #[error("No method given")]

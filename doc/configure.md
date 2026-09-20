@@ -2129,9 +2129,9 @@ closed (operator-visible API once shipped):
 
 | Token                            | Trigger                                                                                                                                                                                                                                                                                                                                       | Status seen by client                      |
 | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `client_timeout`                 | Frontend timer fired while waiting for the request to arrive (`TimeoutStatus::Request` in the H1 path; `StreamState::Idle` in the mux path)                                                                                                                                                                                                   | `408 Request Timeout`                      |
+| `client_timeout`                 | Frontend timer fired while waiting for the request to arrive (`StreamState::Idle` in the mux path, which serves both H1 and H2)                                                                                                                                                                                                   | `408 Request Timeout`                      |
 | `client_timeout_during_response` | Frontend timer fired while the backend was still composing the response — ambiguous case where timeout responsibility should already have switched. Mapped to gateway-timeout for client clarity                                                                                                                                              | `504 Gateway Timeout`                      |
-| `backend_timeout`                | Backend timer fired before any response byte arrived — connection-level slowness or backend stuck pre-headers. The H1 invariant-break arm (`TimeoutStatus::Request` on the backend) collapses into the same token because the operator-visible cause is identical; the internal `error!` log keeps the diagnostic signal for sozu maintainers | `504 Gateway Timeout`                      |
+| `backend_timeout`                | Backend timer fired before any response byte arrived — connection-level slowness or backend stuck pre-headers. The invariant-break arm (an idle stream on the backend side) collapses into the same token because the operator-visible cause is identical; the internal `error!` log keeps the diagnostic signal for sozu maintainers | `504 Gateway Timeout`                      |
 | `backend_response_timeout`       | Backend timer fired while the response body was streaming — partial response in flight. Mux replies with `RST_STREAM` (`H2Error::InternalError`); H1 forcibly closes the session because no default-answer can replace an in-flight response body                                                                                             | `RST_STREAM` (mux) / connection close (H1) |
 
 Non-timeout default-answer paths (e.g. 503 from `Router::route_from_request`,
@@ -2399,7 +2399,7 @@ registered.
 | `cluster.total_backends`        | gauge   | cluster | Backends configured for the cluster, regardless of state. Pairs with `cluster.available_backends` so dashboards can compute health ratios per cluster                                                                                                                                         |
 | `cluster.no_available_backends` | counter | cluster | Incremented exactly once per `Available → AllDown` transition. Pairs with the existing `EventKind::NoAvailableBackends` event and the `error!` log line `cluster X: all N backends are down`                                                                                                  |
 | `cluster.available_recovered`   | counter | cluster | Incremented exactly once per `AllDown → Available` transition. Pairs with `EventKind::ClusterRecovered` (proto tag 29) and the `info!` log line `cluster X: backends recovered (i/N available)`                                                                                               |
-| `backend.available`             | gauge   | backend | `1` when the backend passes `is_available()` (health + retry policy + status), `0` after a transition to unavailable. Emitted at the up/down transition sites in `health_check.rs`, `kawa_h1`, `mux`, and `tcp` — not per-request, so the cardinality cost is bounded by transition frequency |
+| `backend.available`             | gauge   | backend | `1` when the backend passes `is_available()` (health + retry policy + status), `0` after a transition to unavailable. Emitted at the up/down transition sites in `health_check.rs`, `mux`, and `tcp` — not per-request, so the cardinality cost is bounded by transition frequency |
 
 The `health_check.healthy_backends` gauge is now labelled with `cluster_id`;
 prior emissions overwrote each other across clusters because the unlabelled key
@@ -2414,7 +2414,6 @@ health-check tick. Clusters that have **not** configured a
 retry policy as TCP connect attempts succeed or fail.
 
 - Every TCP connect failure on the data path (`lib/src/tcp.rs`,
-  `lib/src/protocol/kawa_h1/mod.rs::fail_backend_connection`,
   `lib/src/protocol/mux/mod.rs`) calls `Backend::retry_policy.fail()`, arming an
   exponential-backoff window. After `max_tries` consecutive failures (default
   `6`) the policy reports `is_down() == true`. When every backend in the cluster
@@ -2867,7 +2866,7 @@ milliseconds and the helper multiplies by 1000 before exposing the same
 
 | Access-log field | Wire tag                                               | Populated on                                                                             |
 | ---------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
-| `client_rtt`     | `ProtobufAccessLog.client_rtt` #9 (`optional uint64`)  | every protocol path: H1 (`kawa_h1`), H2 (`mux`), Pipe (TCP/WS), TCP frontend             |
+| `client_rtt`     | `ProtobufAccessLog.client_rtt` #9 (`optional uint64`)  | every protocol path: H1 and H2 (`mux`), Pipe (TCP/WS), TCP frontend                      |
 | `server_rtt`     | `ProtobufAccessLog.server_rtt` #10 (`optional uint64`) | every protocol path that has a backend socket; `None` for the TCP frontend (no upstream) |
 
 Capture is at access-log emission time and is cheap (one `getsockopt(TCP_INFO)`

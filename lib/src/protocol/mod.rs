@@ -1,8 +1,11 @@
 //! Protocol-state surface area.
 //!
 //! Defines the [`SessionState`] trait that every front-end protocol
-//! implementation (`kawa_h1`, `mux`, `pipe`, `proxy_protocol`, `rustls`)
-//! plugs into the mio worker loop. State implementations decide how to
+//! implementation (`mux`, `pipe`, `proxy_protocol`, `rustls`, `tcp_preread`)
+//! plugs into the mio worker loop. `kawa_h1` is no longer one of them: it
+//! keeps the H1 vocabulary (`DefaultAnswer`, `HttpContext`, `Method`) that
+//! `mux` builds on, and its own session state machine was removed on
+//! 2026-09-20 (sozu#1346). State implementations decide how to
 //! react to readiness events, manage timeouts, render their internal state
 //! for debugging, and signal whether the session can be torn down.
 
@@ -20,8 +23,7 @@ use mio::Token;
 use sozu_command::ready::Ready;
 
 pub use crate::protocol::{
-    http::Http, kawa_h1 as http, pipe::Pipe, proxy_protocol::send::SendProxyProtocol,
-    rustls::TlsHandshake,
+    kawa_h1 as http, pipe::Pipe, proxy_protocol::send::SendProxyProtocol, rustls::TlsHandshake,
 };
 use crate::{
     L7Proxy, ProxySession, SessionIsToBeClosed, SessionMetrics, SessionResult, StateResult,
