@@ -133,11 +133,31 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
 
         let x509 = parse_x509(&pem.contents).map_err(CertificateResolverError::ParseX509)?;
 
+        // ASCII-lowercase every name at the single point where the set
+        // is built, so the SNI trie key, the name index, the removal
+        // walk and the SAN snapshot all agree by construction.
+        //
+        // The lookup side is already lowercase and there is nothing we
+        // can do about it: rustls lowercases the SNI inside
+        // `process_client_hello` (`DnsName::to_lowercase_owned`) before
+        // `ResolvesServerCert::resolve` ever sees it, so a name stored
+        // with uppercase — an X.509 SAN carrying it (RFC 5280 does not
+        // forbid it) or an operator `names` override — was reachable by
+        // no SNI at all and every handshake for it fell back to
+        // `DEFAULT_CERTIFICATE`. DNS names compare case-insensitively
+        // (RFC 4343), so normalising loses nothing.
         let overriding_names = if add.certificate.names.is_empty() {
             get_cn_and_san_attributes(&x509)
         } else {
             add.certificate.names.clone()
         };
+        let overriding_names: Vec<String> = overriding_names
+            .into_iter()
+            .map(|mut name| {
+                name.make_ascii_lowercase();
+                name
+            })
+            .collect();
 
         let expiration = add
             .expired_at
@@ -1629,5 +1649,74 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// The SNI half of the same add/lookup case asymmetry, with the two
+    /// sides swapped.
+    ///
+    /// RFC 4343 makes DNS names compare case-insensitively, and rustls
+    /// hands `ResolvesServerCert::resolve` an SNI it has ALREADY
+    /// lowercased: `rustls::server::hs::process_client_hello` stores
+    /// `dns_name.to_lowercase_owned()` (rustls 0.23,
+    /// `rustls-pki-types`' `DnsName::to_lowercase_owned` is an
+    /// `to_ascii_lowercase`), and `ClientHello::server_name()` surfaces
+    /// that field. The ADD side had no such normalisation: a SAN read off
+    /// the X.509 (`command/src/certificate.rs`'s
+    /// `get_cn_and_san_attributes`) or an operator-supplied `names`
+    /// override went into the SNI trie and the name index verbatim.
+    ///
+    /// So a certificate carrying `MiXeD.Example.COM` was reachable by no
+    /// SNI at all — every handshake for that name fell through to the
+    /// `DEFAULT_CERTIFICATE` arm of `MutexCertificateResolver::resolve`,
+    /// which also increments `names::tls::DEFAULT_CERT_USED`, while the
+    /// certificate stayed recorded and queryable.
+    ///
+    /// To SEE THIS RED: in `CertifiedKeyWrapper::try_from`, delete the
+    /// `let overriding_names: Vec<String> = overriding_names …` rebind
+    /// that maps `|mut name| { name.make_ascii_lowercase(); name }`, so
+    /// the names reach the trie as written. The FIRST assertion below
+    /// fails — `domain_lookup(b"mixed.example.com", true)` is `None`, so
+    /// the test panics there and the later ones are never reached.
+    #[test]
+    fn a_mixed_case_certificate_name_resolves_for_the_lowercased_sni() {
+        const MIXED: &str = "MiXeD.Example.COM";
+        const LOWER: &str = "mixed.example.com";
+
+        let mut resolver = CertificateResolver::default();
+        let fingerprint = resolver
+            .add_certificate(&AddCertificate {
+                address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate: CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    names: vec![MIXED.to_owned()],
+                    ..Default::default()
+                },
+                expired_at: None,
+            })
+            .expect("the mixed-case certificate must load");
+
+        assert!(
+            resolver.domain_lookup(LOWER.as_bytes(), true).is_some(),
+            "rustls only ever asks for the lowercased SNI, so that is the \
+             only key the trie can usefully hold",
+        );
+        assert_eq!(
+            resolver.names_for_sni(LOWER.as_bytes()),
+            Some(vec![LOWER.to_owned()]),
+            "the SAN snapshot feeding the H2 `:authority` binding must \
+             carry the normalised name",
+        );
+
+        // Removal walks the certificate's stored names, so it stays
+        // symmetric with the add path by construction: normalise once at
+        // the single point where `names` is built and both verbs agree.
+        resolver
+            .remove_certificate(&fingerprint)
+            .expect("the mixed-case certificate must be removable");
+        assert!(
+            resolver.domain_lookup(LOWER.as_bytes(), true).is_none(),
+            "removing the certificate must retire its normalised trie key",
+        );
     }
 }

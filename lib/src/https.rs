@@ -2010,6 +2010,13 @@ impl HttpsProxy {
         &mut self,
         domain: String,
     ) -> Result<Option<ResponseContent>, ProxyError> {
+        // The resolver keys its SNI trie on ASCII-lowercased certificate
+        // names (`CertifiedKeyWrapper::try_from`), because that is the
+        // only form rustls ever asks it for. An operator query has to
+        // ask the same question a handshake does, or
+        // `sozu query certificates --domain Example.COM` reports the
+        // certificate missing while the proxy happily serves it.
+        let domain_key = domain.to_ascii_lowercase();
         let certificates = self
             .listeners
             .values()
@@ -2024,7 +2031,8 @@ impl HttpsProxy {
                     .map_err(|e| ProxyError::Lock(e.to_string()))?;
                 let mut certificate_summaries = vec![];
 
-                if let Some((k, fingerprint)) = resolver.domain_lookup(domain.as_bytes(), true) {
+                if let Some((k, fingerprint)) = resolver.domain_lookup(domain_key.as_bytes(), true)
+                {
                     certificate_summaries.push(CertificateSummary {
                         domain: certificate_summary_domain(k),
                         fingerprint: fingerprint.to_string(),
@@ -3542,6 +3550,60 @@ mod tests {
             snapshot,
             Some(live_peer),
             "with nothing cached, FrontRustls::peer_addr must degrade to getpeername(2)"
+        );
+    }
+
+    /// `sozu query certificates --domain <d>` must ask the resolver the
+    /// same question a TLS handshake asks it.
+    ///
+    /// The resolver keys its SNI trie on ASCII-lowercased certificate
+    /// names (`CertifiedKeyWrapper::try_from`, `lib/src/tls.rs`), because
+    /// rustls hands `ResolvesServerCert::resolve` an SNI it has already
+    /// lowercased and no other key can ever be looked up at handshake
+    /// time. The operator query has to be normalised the same way, or
+    /// `sozu query certificates --domain MiXeD.Example.COM` reports the
+    /// certificate missing while the proxy is serving it on every
+    /// handshake for that name.
+    ///
+    /// To SEE THIS RED: in `query_certificate_for_domain`, look the
+    /// domain up with `domain.as_bytes()` instead of
+    /// `domain_key.as_bytes()`. The two case-varying queries return zero
+    /// summaries.
+    #[test]
+    fn query_certificate_for_domain_answers_any_spelling_of_the_name() {
+        let mut proxy = proxy_with_certificate_domain("MiXeD.Example.COM".to_owned());
+
+        let mut summaries_for = |query: &str| {
+            let response = proxy
+                .query_certificate_for_domain(query.to_owned())
+                .expect("the domain certificate query must succeed")
+                .expect("the domain certificate query must return content");
+            match response.content_type {
+                Some(ContentType::CertificatesByAddress(list)) => list
+                    .certificates
+                    .iter()
+                    .map(|entry| entry.certificate_summaries.len())
+                    .sum::<usize>(),
+                _ => panic!("the domain query must answer with CertificatesByAddress"),
+            }
+        };
+
+        for query in [
+            "MiXeD.Example.COM",
+            "mixed.example.com",
+            "MIXED.EXAMPLE.COM",
+        ] {
+            assert_eq!(
+                summaries_for(query),
+                1,
+                "querying {query:?} must find the certificate stored as MiXeD.Example.COM",
+            );
+        }
+
+        assert_eq!(
+            summaries_for("other.example.com"),
+            0,
+            "normalising the query must not make an unrelated domain match",
         );
     }
 }

@@ -1637,6 +1637,65 @@ shape of the trie. (Before the fix, an exact name added *after* a regex segment
 that matched it attached its rule to that segment instead of getting its own
 node, and the whole regex family served it — sozu#1351.)
 
+### Hostname case
+
+A `hostname` is matched **case-insensitively**, per RFC 9110 §4.2.3. The route
+table stores every configured hostname ASCII-lowercased, and the incoming
+`Host:` header / HTTP/2 `:authority` is normalised the same way before the
+lookup, so all of these reach the same frontend:
+
+```
+hostname = "case.example.com"
+
+Host: case.example.com        -> routed
+Host: CASE.EXAMPLE.COM        -> routed
+Host: CaSe.ExAmPlE.cOm        -> routed
+Host: CASE.EXAMPLE.COM:80     -> routed (the port is stripped first)
+Host: other.example.com       -> 404, as before
+```
+
+Writing the frontend itself in uppercase changes nothing — `hostname =
+"CASE.EXAMPLE.COM"` is stored as `case.example.com` and answers the same four
+requests. There is no configuration that makes hostname matching
+case-*sensitive*.
+
+Normalisation happens to the key *before* the precedence search above runs, so
+the two compose in one direction only: case never decides which candidate wins.
+`CASE.EXAMPLE.COM` picks the same exact / regex-segment / wildcard tier that
+`case.example.com` picks, and reordering frontends still changes nothing
+outside overlapping regex segments.
+
+Consequences worth knowing:
+
+- **A regex hostname segment is matched against the normalised host.** An
+  uppercase literal inside one — `/API[0-9]/.example.com` — therefore matches
+  `api7.example.com` as well as `API7.example.com`. Do not use a character
+  class to distinguish case in a hostname segment; it cannot work, and a
+  `Tree`-position frontend has always had its whole pattern lowercased at
+  insert time anyway.
+- **`$HOST[n]` captures carry the normalised host**, so a `rewrite_host`
+  template emits lowercase regardless of what the client typed.
+- **The value the client sent is not lost.** The normalisation happens inside
+  the route lookup and nowhere else: the parsed authority every other consumer
+  reads — the access log, the `X-Forwarded-Host` header a `rewrite_host`
+  frontend injects, the redirect `Location:` — is untouched. The observable
+  case is the builtin 404 answer, whose `route` field echoes the client's
+  spelling (`GET OTHER.EXAMPLE.COM/`, not the lowercased key), because that is
+  the diagnostic you need when a route misses.
+- **A trailing dot is not yet handled.** `Host: case.example.com.` is the legal
+  absolute form of the same name (RFC 1034 §3.1), but it does **not** reach a
+  frontend declared as `case.example.com` — the trailing dot survives
+  normalisation and the trie sees an extra empty label. The TLS side already
+  strips one trailing dot (`lib/src/https.rs`'s post-handshake SNI and
+  `lib/src/protocol/tcp_preread/mod.rs`'s `normalize_sni`); HTTP routing does
+  not. Declare the absolute form as a second frontend if you need it.
+
+Certificate names follow the same rule on the TLS side: the worker
+ASCII-lowercases every SAN / `names` entry before it enters the SNI lookup
+table, because rustls hands the resolver an SNI it has already lowercased. A
+certificate carrying `MiXeD.Example.COM` therefore serves `mixed.example.com`
+instead of silently falling through to the default certificate.
+
 ### Regex hostname segments
 
 A `hostname` may carry a regex in any one of its dot-separated segments by
