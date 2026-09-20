@@ -5,8 +5,12 @@ Companion to `lib/src/protocol/mux/LIFECYCLE.md` (the downstream H1/H2
 datapath) and `lib/src/protocol/kawa_h1/LIFECYCLE.md` (the H1 vocabulary it
 builds on).
 
-Every claim is anchored to a concrete `file.rs:LINE`; line numbers were last
-refreshed against the `docs/feat-h2-mux-audit` branch tip on 2026-04-26.
+Every claim is anchored to code. Where the prose names an item — a function, a
+method, a struct, an enum — the anchor is that item plus its file, with no line
+number, because a line number does not survive an edit above it. A `file.rs:LINE`
+or `file.rs:LINE-LINE` anchor is kept only where the claim is about a specific
+statement or branch inside an item; those were refreshed against `main` at
+`0cb1e2a7` on 2026-09-20.
 
 ---
 
@@ -20,24 +24,24 @@ Two wire versions exist:
 
 - **v1** is text-only. Lines have the shape
   `PROXY TCP4 src_ip dst_ip src_port dst_port\r\n` (or `TCP6` /
-  `UNKNOWN\r\n`). See `HeaderV1` (`lib/src/protocol/proxy_protocol/header.rs:56-60`)
+  `UNKNOWN\r\n`). See `HeaderV1` (`lib/src/protocol/proxy_protocol/header.rs`)
   and the comment at `header.rs:47` flagging that **v1 is never used inside
   Sōzu** — only v2 is parsed or emitted on the wire. The v1 serializer
-  (`HeaderV1::into_bytes`, `header.rs:81`) survives as dead weight pending the
+  (`HeaderV1::into_bytes`, `header.rs`) survives as dead weight pending the
   documented removal.
 - **v2** is binary. The wire frame is a 12-byte signature
   (`0x0D 0x0A 0x0D 0x0A 0x00 0x0D 0x0A 0x51 0x55 0x49 0x54 0x0A`, see
   `header.rs:186-188`) followed by version+command, family, address-block
   length (big-endian `u16`), and the address block. `HeaderV2`
-  (`header.rs:150`) carries the parsed shape; `HeaderV2::into_bytes`
-  (`header.rs:181`) emits it.
+  (`header.rs`) carries the parsed shape; `HeaderV2::into_bytes`
+  (`header.rs`) emits it.
 
-Address families are modelled by `ProxyAddr` (`header.rs:249`): `Ipv4Addr`,
+Address families are modelled by `ProxyAddr` (`header.rs`): `Ipv4Addr`,
 `Ipv6Addr`, `UnixAddr` (108 bytes per side per the AF_UNIX socket-path
 limit), and `AfUnspec` for unknown/legacy.
 
 The v2 parser lives in `lib/src/protocol/proxy_protocol/parser.rs`; the
-public entry point is `parse_v2_header` (`parser.rs:40`). It uses `nom` and
+public entry point is `parse_v2_header` (`parser.rs`). It uses `nom` and
 returns either a complete `HeaderV2`, an `Incomplete` request for more
 bytes, or a parse error.
 
@@ -52,8 +56,8 @@ populated `AF_INET` / `AF_INET6` block. `parse_v2_header` therefore parses that
 block (so a malformed or unknown family is still rejected, and the declared
 length still delimits the header) and then yields `ProxyAddr::AfUnspec` for it.
 Discarding at the parse boundary is what makes the fallback in the four
-TCP-side consumers — `expect.rs`, `relay.rs`, `tcp_preread/mod.rs`, and
-`TcpSession::effective_session_address` (`lib/src/tcp.rs:373`), which reads
+TCP-side consumers — `expect.rs`, `relay.rs`, `lib/src/protocol/tcp_preread/mod.rs`, and
+`TcpSession::effective_session_address` (`lib/src/tcp.rs`), which reads
 `ExpectProxyProtocol::addresses` / `RelayProxyProtocol::addresses` directly
 rather than through `into_pipe`, all of which attribute `ProxyAddr::source()`
 to the client — hold: none of them reads `command` or `family`, and none
@@ -61,12 +65,13 @@ re-serializes the parsed header. The `family` byte is still reported as it was
 read off the wire.
 
 Those four are not the only consumers of the parsed pair, and the other two
-do not fall back. `HttpSession::upgrade_expect` (`lib/src/http.rs:316`) and
-`HttpsSession::upgrade_expect` (`lib/src/https.rs:334`) each need a source
+do not fall back. `HttpSession::upgrade_expect` (`lib/src/http.rs`) and
+`HttpsSession::upgrade_expect` (`lib/src/https.rs`) each need a source
 **and** a destination to build the downstream session; `ProxyAddr::AfUnspec`
-returns `None` from both accessors (`header.rs:303, 311`), so the upgrade is
-refused and `upgrade` reports `SessionIsToBeClosed` (`lib/src/http.rs:254`). An
-HTTP or HTTPS session that presents a `LOCAL` header is closed here, not
+returns `None` from both accessors (`ProxyAddr::source` /
+`ProxyAddr::destination` in `header.rs`), so the upgrade is
+refused and `HttpSession::upgrade` reports `SessionIsToBeClosed`
+(`lib/src/http.rs`). An HTTP or HTTPS session that presents a `LOCAL` header is closed here, not
 re-attributed to `peer_addr`. That is unchanged for the `AF_UNSPEC` block
 HAProxy actually pairs with `LOCAL` — those sessions already closed — and is
 the intended outcome for a forged populated block.
@@ -85,18 +90,18 @@ the intended outcome for a forged populated block.
 | `send`   | `send.rs`      | `HUP\|ERROR`           | `HUP\|ERROR`          | Synthesise a v2 header describing the original client and emit it on the backend socket. |
 
 All three carry a per-connection ULID (`request_id`) used by the log
-context macros (`log_context!` in each module: `expect.rs:54`,
-`relay.rs:45`, `send.rs:47`) so a session is grep-correlatable across the
+context macros (`log_context!` in each module: `expect.rs`,
+`relay.rs`, `send.rs`) so a session is grep-correlatable across the
 PROXY phase and the downstream protocol.
 
 ### 2.1 `ExpectProxyProtocol`
 
-- Type: `ExpectProxyProtocol<Front: SocketHandler>` (`expect.rs:80`).
+- Type: `ExpectProxyProtocol<Front: SocketHandler>` (`expect.rs`).
 - Buffer: `frontend_buffer: [u8; 232]` — the maximum legal v2 header size
   (Unix-socket family carries 2 × 108 bytes of address plus header overhead).
   Hard-bounded to defend against a malicious peer that opens TCP and never
   finishes the header.
-- Entry point: `readable` (`expect.rs:118`).
+- Entry point: `ExpectProxyProtocol::readable` (`expect.rs`).
   - `header_len` (`expect.rs:119-123`) tracks the expected read window;
     starts at the v4 size (28 bytes), bumps to v6 (52) and finally Unix
     (232) if `parse_v2_header` returns `Incomplete` after the prior cap.
@@ -110,27 +115,27 @@ PROXY phase and the downstream protocol.
     `proxy_protocol.errors` metric and close.
   - Successful parse (`expect.rs:219-236`) stores the `ProxyAddr` into
     `self.addresses` and returns `SessionResult::Upgrade`; the proxy then
-    swaps the session for a `Pipe` via `into_pipe` (`expect.rs:280`), which
+    swaps the session for a `Pipe` via `ExpectProxyProtocol::into_pipe` (`expect.rs`), which
     prefers `ProxyAddr::source()` and falls back to the front socket's
     `peer_addr` when it is `AfUnspec` — including for every `LOCAL` header
     (§1).
 
 ### 2.2 `RelayProxyProtocol`
 
-- Type: `RelayProxyProtocol<Front: SocketHandler>` (`relay.rs:67`).
+- Type: `RelayProxyProtocol<Front: SocketHandler>` (`relay.rs`).
 - Used when Sōzu sits between two PROXY-aware peers: read the inbound
   header, then write those exact bytes (and only those bytes) to the
   backend before any user-payload byte.
-- Entry points: `readable` (`relay.rs:120`) feeds the parser; on a complete
+- Entry points: `RelayProxyProtocol::readable` (`relay.rs`) feeds the parser; on a complete
   parse it flips `frontend_readiness.interest` to drop READABLE and arms
   the backend WRITABLE bit (`relay.rs:163-164`). It then records
   `header_size` and consumes **nothing**: those buffered bytes are the only
   copy of the header, since this state never re-serializes `addresses`.
-  `back_writable` (`relay.rs:229`) drains exactly the first `header_size`
+  `RelayProxyProtocol::back_writable` (`relay.rs`) drains exactly the first `header_size`
   bytes of `frontend_buffer` onto the backend socket and returns
   `SessionResult::Upgrade` once the cursor reaches them.
 - Anything the client pipelined into the same read stays in
-  `frontend_buffer` for the pipe phase, and `into_pipe` (`relay.rs:390`)
+  `frontend_buffer` for the pipe phase, and `RelayProxyProtocol::into_pipe` (`relay.rs`)
   hands that same `Checkout` to `Pipe::new`. Note where the surviving
   wake-up actually comes from: `Pipe::new`'s own
   `arm_inherited_buffer_writes` is immediately overwritten by the restored
@@ -166,10 +171,11 @@ PROXY phase and the downstream protocol.
     is not a socket state change, so edge-triggered epoll owes no new edge
     for it. The `Interrupted` arm is defensive and unreachable in
     production: the backend socket comes from `mio::net::TcpStream::connect`
-    (`backends.rs:332`), so it is always non-blocking and its `send` answers
+    (`lib/src/backends.rs:332`), so it is always non-blocking and its `send` answers
     EAGAIN, never EINTR. Exercising it takes a deliberately blocking
     socketpair — see
-    `back_writable_keeps_its_readiness_when_a_signal_interrupts_the_write`.
+    `back_writable_keeps_its_readiness_when_a_signal_interrupts_the_write`
+    (`relay.rs`).
 - `relay.rs` places **no** upper bound on header size, unlike `expect.rs`'s
   fixed 232-byte staging array: a v2 header is `16 + len` with `len: u16`,
   and this state reads into a pool `Checkout`, so a declared `len` larger
@@ -178,12 +184,12 @@ PROXY phase and the downstream protocol.
 
 ### 2.3 `SendProxyProtocol`
 
-- Type: `SendProxyProtocol<Front: SocketHandler>` (`send.rs:65`).
+- Type: `SendProxyProtocol<Front: SocketHandler>` (`send.rs`).
 - Used when the front-end accepted a non-PROXY connection but the
   downstream backend expects PROXY-v2. Sōzu synthesises a header from the
   TCP peer pair captured on the frontend socket
-  (`peer_addr` / `local_addr` at `send.rs:117-124`).
-- Entry point: `back_writable` (`send.rs:110`). On first call it builds the
+  (`peer_addr` / `local_addr` at `send.rs:118-120`).
+- Entry point: `SendProxyProtocol::back_writable` (`send.rs`). On first call it builds the
   header lazily (`send.rs:117-140`). The drain loop (`send.rs:145-192`)
   writes until the cursor reaches `header.len()` and returns
   `SessionResult::Upgrade`; partial writes set `WouldBlock` and yield to

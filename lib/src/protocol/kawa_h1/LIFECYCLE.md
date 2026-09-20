@@ -133,7 +133,7 @@ Notable security-relevant fields on `HttpContext`:
 
 ### 2.1 CL.TE framing guard (`on_request_headers`)
 
-The very first thing `on_request_headers` does (`editor.rs:561-621`, before
+The very first thing `HttpContext::on_request_headers` does (`editor.rs`, before
 capturing `:method`/authority/path) is reject requests whose Transfer-Encoding
 framing is ambiguous (RFC 9110 §7.6 / RFC 9112 §6.1; reopen of
 [#726](https://github.com/sozu-proxy/sozu/issues/726)). An intermediary must not
