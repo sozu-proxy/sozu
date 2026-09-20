@@ -222,6 +222,35 @@ is recorded here so the next person does not re-derive it.
   it measures 27 `peer=` slots, 0 advertised, 26 raw and one `peer=None`
   — the `ENOTCONN` rendering the fix also removes.
 
+  Second worked example, taking the other branch of cost 1 below:
+  `tests::socket_log_context_tests::test_tls_socket_log_peer_is_the_advertised_client`
+  pins the `peer=` slot of a `SOCKET` line on the same kind of frontend.
+  Every `log_socket_context!` expansion in `lib/src/socket.rs` is an
+  `error!`, and each needs an abnormal condition, so a healthy TLS
+  session emits no `SOCKET` line at ANY level and raising one cannot
+  help. That test therefore stays at plain `"error"` and provokes
+  instead: it establishes the session, then writes one undecryptable TLS
+  record straight onto the TCP socket, which reaches
+  `FrontRustls::socket_read`'s `process_new_packets` arm while the
+  connection underneath is still `ESTABLISHED`. Keeping the connection
+  healthy is the point — it makes `getpeername(2)` succeed and answer the
+  wrong address, which is the half of the defect that is not `ENOTCONN`.
+  Under the pre-fix macro it measures 1 `SOCKET` line, 0 advertised, 1
+  raw. Keeping the connection alive is load-bearing for WHICH half is
+  proven rather than for redness: a dead-socket provocation would still
+  redden the test, since `peer=None` also fails the "every slot names the
+  advertised client" check; what only a live connection buys is the
+  negative assertion that no slot names the raw TCP peer. The `ENOTCONN`
+  half is pinned by the unit test
+  `socket::tests::log_socket_context_renders_the_cached_peer_when_the_live_lookup_fails`
+  instead, staged with a never-connected socket because only that refuses
+  `getpeername(2)` deterministically.
+  One claim here is reasoned, not measured, and is flagged as such in the
+  test's own module note: that a corrupt record sent before the server
+  has read the client's `Finished` would fail inside `protocol/rustls.rs`
+  and log `RUSTLS` rather than `SOCKET`. That is read off the state
+  machine; no test drives it.
+
   **What it costs.** Four things, all measured:
 
   1. *The level.* A HEALTHY H2 session emits no `MUX-H2` line at

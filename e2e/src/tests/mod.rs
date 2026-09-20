@@ -49,6 +49,7 @@ mod proxy_protocol_local_tests;
 mod redirect_rewrite_auth_tests;
 mod router_hostname_tests;
 mod router_path_rule_tests;
+mod socket_log_context_tests;
 mod tcp_sni_tests;
 mod tcp_tests;
 mod tests;

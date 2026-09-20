@@ -422,6 +422,65 @@
   `ConnectionH1::end_stream` on purpose: that function's mismatch arm is an `error!`, not an
   `unreachable!`, and is reachable from `EndpointServer`/`EndpointClient` paths this proof never
   traced, so asserting there would promote a logged anomaly into a debug abort outside the claim.
+- **`fix(socket)`: a `SOCKET` log line on a TLS frontend named the load balancer, not the client
+  behind PROXY protocol.**
+  **This changes rendered log content.** If you alert, dashboard or grep on the `peer=` slot of a
+  `SOCKET` line, read the operator note at the end of this entry before upgrading.
+  `log_socket_context!` (`lib/src/socket.rs:128`) built its `peer=` slot from
+  `$self.socket_ref().peer_addr().ok()` — a live `getpeername(2)` — while its module-level twin
+  `log_socket_module_prefix` (`:190`) already preferred the address the handler had cached. The two
+  renderers of one log prefix therefore disagreed, and the split fell exactly along the handler:
+  `log_socket_context!` has one production caller, `impl SocketHandler for FrontRustls`, whose
+  thirteen expansions are every `SOCKET` line a TLS frontend emits, while every plaintext frontend
+  and every backend socket reaches the free function through `SessionTcpStream`.
+  So on a PROXY-protocol HTTPS frontend the `MUX-H2` line named the client and the `SOCKET` line
+  named the load balancer, for one and the same connection. That was an artefact of `FrontRustls`
+  having carried no cached address before `SocketHandler::peer_addr` and
+  `FrontRustls::configured_peer` landed, not a deliberate split between layers; it was documented
+  as a follow-up in `doc/observability.md` rather than fixed, because nothing asserted the `peer=`
+  slot of a `SOCKET` line and changing it would have been an unguarded behaviour change.
+  The slot is now `SocketHandler::peer_addr`, the same accessor with the same
+  cached-then-live preference the rest of the stack uses. It is written fully qualified to
+  foreclose a latent hazard, not to fix a present one: the unqualified `$self.peer_addr()`
+  compiles clean today and passes every test, because no current expansion sits on a raw
+  `mio::TcpStream` and `FrontRustls` has no inherent `peer_addr` for method resolution to prefer.
+  Add an expansion on a bare `TcpStream`, though, and the unqualified form silently picks mio's
+  inherent method — measured on a throwaway probe, that slot renders `peer=Ok(127.0.0.1:33587)`
+  beside `local=Some(..)`, an `io::Result` where every other expansion renders an `Option`. The
+  qualification makes that impossible rather than merely unlikely.
+  `local`, `rtt`, `state` and `protocol` are untouched, and no wire byte, metric, control-flow
+  decision or log *layout* changes.
+  The missing assertions are the substance of this change, and there are three.
+  `e2e::tests::socket_log_context_tests::test_tls_socket_log_peer_is_the_advertised_client` drives a
+  real PROXY-v2 header through the real accept path and asserts on the `SOCKET` lines the worker
+  actually wrote. It has to provoke an error path rather than raise a level — the opposite of its
+  `MUX-H2` sibling — because every `log_socket_context!` expansion is an `error!` and a healthy TLS
+  session emits no `SOCKET` line at any level; it corrupts one TLS record after the mux is
+  established, which reaches the macro while the TCP connection is still `ESTABLISHED` — a
+  condition the test asserts rather than assumes, because it is what makes the negative half
+  discriminate: only while `getpeername(2)` still succeeds can a slot name the raw TCP peer at all.
+  Under the pre-fix macro it measures one `SOCKET` line, zero naming the advertised client and one
+  naming the connection's raw TCP source. Two unit tests pin the macro's slot directly, one per half of the
+  defect: `socket::tests::log_socket_context_renders_the_cached_peer_not_a_live_lookup` covers a
+  live lookup that SUCCEEDS and disagrees with the cache, and also asserts `local=` is still
+  `getsockname(2)`; `socket::tests::log_socket_context_renders_the_cached_peer_when_the_live_lookup_fails`
+  covers a live lookup that FAILS, staged with a never-connected socket because only that refuses
+  `getpeername(2)` deterministically — a socket waiting on an RST is a race the suite already
+  refuses to assert on. Against the pre-fix macro the second renders `peer=None`.
+  **Operator note.** On a PROXY-protocol HTTPS frontend, the `peer=` slot of a `SOCKET` line now
+  shows the PROXY-advertised client instead of the load balancer, so it agrees with the `MUX-H2`
+  and `HTTPS` lines for the same connection; a dashboard grouping by that slot will switch from a
+  handful of balancer addresses to the real client population, which may be a large cardinality
+  increase. And wherever `getpeername(2)` would refuse — after a peer reset it answers `ENOTCONN` —
+  the slot now carries the cached address instead of collapsing to `peer=None`, so a rule matching
+  `peer=None` on a `SOCKET` line to detect a reset will stop firing. What is measured there is the
+  rendering once the socket refuses, not the reset itself: no e2e test provokes a `SOCKET` line
+  after an RST, because the reset-related error kinds (`ConnectionReset`, `ConnectionAborted`,
+  `BrokenPipe`) are precisely the arms of `FrontRustls::socket_read`/`socket_write` that set
+  `peer_reset` and emit no log line at all. The arms that DO log are the `_ =>` catch-alls for
+  unexpected kinds, which is why the e2e test provokes a decrypt failure rather than a reset. Both are the changes the `MUX-H2` entry below already described,
+  now reaching the second prefix. Nothing changes for a plaintext frontend or a backend socket:
+  those render through `log_socket_module_prefix`, which already preferred the cache.
 
 - **`fix(h2)`: the `MUX-H2` log lines rendered `peer=None` once the peer had reset, and named the
   load balancer instead of the client behind PROXY protocol.**
@@ -448,7 +507,7 @@
   no such cache at all until this change.
   `SocketHandler` gains a `peer_addr` method returning the address the handler snapshotted at
   construction, falling back to the live lookup only when it holds none — the preference
-  `log_socket_module_prefix` already applied to every `SessionTcpStream` (`lib/src/socket.rs:177`),
+  `log_socket_module_prefix` already applied to every `SessionTcpStream` (`lib/src/socket.rs:190`),
   now reachable from the mux. `FrontRustls` gains the matching `configured_peer` field, seeded from
   `HttpsSession::peer_address` and deliberately **not** from `stream.peer_addr()`: the latter
   compiles, passes all 878 other unit tests, and silently preserves the PROXY-protocol split. That
