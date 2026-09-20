@@ -565,6 +565,90 @@
   `lib/src/protocol/tcp_preread/mod.rs` lowercases and strips a trailing dot on lookup), and the
   `:authority`-versus-SNI 421 check (`authority_matches_sni` /
   `authority_matched_cert_name` in `lib/src/protocol/mux/router.rs`, ASCII-folding both sides).
+- **`fix(upgrade)`: a worker upgrade closed every inherited listener socket unused.**
+  On a worker upgrade the retiring worker hands its listening sockets to its replacement over
+  `SCM_RIGHTS`. The replacement was throwing all of them away, on all four protocols.
+  `Server::new` applied the initial state — which `ConfigState::generate_requests`
+  (`ConfigState::generate_requests`, `command/src/state.rs`) builds as one `AddXxxListener` immediately followed by one
+  `ActivateListener` per **active** listener — before it called `receive_listeners()`.
+  `scm_listeners` was therefore still `None` for the whole initial state, so every
+  `ActivateListener` took the `server_bind` / `udp_bind` branch of `XxxListener::activate`
+  (`lib/src/http.rs`, `lib/src/https.rs`, `lib/src/tcp.rs`, `lib/src/udp.rs`)
+  and the listener came up `active` on a socket it had bound itself. That bind succeeds only
+  because `server_bind` / `udp_bind` set `SO_REUSEPORT` (`lib/src/socket.rs`), which
+  is also why this never showed up as an outage: the address kept being served throughout.
+  What was lost is the point of the hand-off. The inherited descriptors arrived immediately
+  afterwards, and `UpgradeWorkerTask` then scattered `generate_activate_requests()` to the new
+  worker (`UpgradeWorkerTask::receive_listen_sockets`, `bin/src/command/upgrade.rs`). Each repeat pulled its descriptor out of the SCM
+  table — `Listeners::get_http` and friends **remove** the entry as they hand it over
+  (`Listeners::get_*`, `command/src/scm_socket.rs`) — wrapped it in an owning `MioTcpListener` /
+  `MioUdpSocket` (`lib/src/server.rs`, `notify_activate_listener`), and handed it to an `activate()`
+  that returns on `XxxListener::activate`'s `if self.active` guard (`lib/src/http.rs`,
+  `lib/src/https.rs`, `lib/src/tcp.rs`, `lib/src/udp.rs`) before it can consume it. The wrapper dropped, the
+  descriptor closed, once per listener per upgrade: the accept backlog for TCP/HTTP/HTTPS, so a
+  connection that had completed its handshake against the old socket got an RST instead of being
+  served, and the receive buffer for UDP.
+  `Server::new` now receives the SCM listeners **before** it applies the initial state, so the very
+  first `ActivateListener` adopts the inherited descriptor and the later repeats find nothing left
+  to discard. No socket is replaced under a live listener: at that point the listener was created
+  by the `AddXxxListener` on the line above and holds no socket at all. The relocated call is the
+  same blocking read as before, only earlier — the sole production caller of
+  `fork_main_into_worker`, `CommandServer::launch_new_worker` (`bin/src/command/server.rs`),
+  always passes `Some(listeners)` and always sends a manifest, so a fresh start receives an empty
+  one immediately and every listener binds its own socket exactly as it always did.
+  Ownership of the descriptor is now settled before it leaves the table rather than after. Each arm
+  of `notify_activate_listener` asks the proxy `inherited_socket_fate(&address)`, which answers one
+  of three things. `Adopted` — a listener exists at the address and is not active — takes the
+  descriptor, which is the upgrade path. `Refused` — a listener is there and already active on a
+  socket of its own — takes it and closes it **deliberately**, with a `warn!` naming the address.
+  Not because it could never be adopted: `give_back_listener` clears `active` and keeps the
+  listener object, so `DeactivateListener` followed by `ActivateListener` — an operator-reachable
+  feature covered by `e2e/src/tests/listener_reactivation_tests.rs` — brings that address back to
+  `Adopted`, and since `scm_listeners` is filled once in `Server::new` and never refilled, the
+  close is irreversible. It is a deliberate trade: the only thing the descriptor carries is the
+  connections queued on it at hand-off, and their value decays as those peers time out or reset
+  while the address is served by the listener's own socket, whereas the cost of keeping it is
+  continuous — it is the retiring worker's listening socket, still bound with `SO_REUSEPORT` and
+  registered with no event loop, so it is expected to keep taking a share of new connections that
+  nothing accepts. (That expectation follows from `SO_REUSEPORT` load-balancing semantics; nothing
+  in this changeset measures it, and the code comments and log lines say so too.) A decaying
+  backlog is not worth an indefinite share of new connections.
+  `Unclaimed` — no listener at the address at all — leaves it in the table, because an
+  `AddListener` + `ActivateListener` pair can still arrive and adopt it; that is exactly the shape
+  of an upgrade whose initial state carries the listeners inactive and activates them afterwards,
+  so closing leftovers at the end of startup would destroy the case this entry fixes. There is no
+  point during startup at which a leftover is provably unclaimable, so retention stays open-ended
+  and `Server::new` instead reports what it kept: `info` for an address whose listener exists and
+  has yet to be activated, `warn` for an address with no listener at all, which is the one an
+  operator needs to see.
+  A second copy of the same close lived on the registration-error path. `activate()` moved the
+  socket into a local to register it and propagated a `Registry::register` failure straight from
+  there, so the `?` dropped the local and closed a descriptor `Listeners::get_*` had already removed
+  from the table. `register` answers `EEXIST` for a descriptor already registered on the same epoll
+  instance, which is what `notify_deactivate_listener` leaves behind when its `deregister` only
+  logs. All four `activate()` implementations now park that socket and reuse it on the next attempt
+  instead of binding a second one. It is parked in a **new** `parked_listener` / `parked_socket`
+  field, not in the listener's live socket field: every other consumer reads that field's `Some` as
+  "registered and live" — `give_back_listener` hands it back as an activated socket and answers
+  `Ok`, `soft_stop` / `hard_stop` deregister it and fold a failure into `ProxyError::SoftStop` /
+  `HardStop`, `accept` accepts on it — so parking there would have made a listener that never came
+  up look activated, and a registration failure that leaves the socket unregistered would have made
+  `deregister` answer `ENOENT` and report a failed shutdown. If an inherited socket and a parked one
+  ever coexist, the loser is closed explicitly and logged rather than dropped by an assignment.
+  Covered by four tests in `scm_listener_handoff_tests` (`lib/src/server.rs`), each red on its own
+  mutation and on no other, for each of the four protocols independently:
+  `inherited_listener_sockets_are_adopted_by_the_initial_activation` hands a worker one queued
+  connection per TCP-family protocol and one queued datagram for UDP and asserts all four survive
+  the hand-off; `a_repeated_activation_closes_the_descriptor_it_cannot_adopt_now` asserts a
+  descriptor this activation cannot adopt is taken out of the table and closed;
+  `an_inherited_descriptor_with_no_listener_yet_is_adopted_by_a_later_activation` asserts the
+  opposite case survives an early activation and is then adopted, backlog and all, by the
+  `AddListener` + `ActivateListener` that follows; and
+  `a_failed_registration_does_not_close_the_socket_it_was_handed` pre-registers a descriptor so
+  `register` answers `EEXIST` and asserts the socket outlives the failure; and
+  `a_socket_parked_by_a_failed_registration_is_not_mistaken_for_a_live_one` asserts that after that
+  failure `give_back_listener` still answers `ProxyError::UnactivatedListener` and a stop still
+  succeeds. Reported as sozu#1342.
 
 - **`fix(h2)`: the `MUX-H2` log lines rendered `peer=None` once the peer had reset, and named the
   load balancer instead of the client behind PROXY protocol.**
@@ -622,7 +706,7 @@
   running `build_session` + `*slot = session` on every `Ok(token)`, under a comment asserting the
   slot "holds nothing but this listener's own placeholder — the overwrite can never land on a live
   session". True the first time and false every time after: `UdpListener::activate`
-  (`lib/src/udp.rs:287`) short-circuits on its own `active` flag and answers `Ok(self.token)`
+  (`lib/src/udp.rs:302`) short-circuits on its own `active` flag and answers `Ok(self.token)`
   without doing any work, so a second `activate-listener` for a listener that is already up reached
   that assignment with a live `UdpListenerSession` in the slot — the overwrite the change claimed to
   have removed "by construction rather than by check". Reserving the slot settles which key the slab
@@ -635,11 +719,11 @@
   its own.
   The replacement session shares the proxy's `UdpManager` — and therefore its flow table — but
   starts with empty `upstream_sockets`, `upstream_to_flow` and `flow_to_upstream`. `close()` is a
-  `ProxySession` method and not `Drop` (`lib/src/udp.rs:1824`), so the displaced session ran no
+  `ProxySession` method and not `Drop` (`UdpListenerSession::close`, `lib/src/udp.rs`), so the displaced session ran no
   teardown on the way out. Every in-flight flow stopped forwarding on the spot: the manager still
   resolved the client to its flow and emitted `SendToBackend`, and the new session had no upstream
   socket to send it on. The flow's upstream slab slot was stranded for the worker's lifetime —
-  `on_close_flow` (`lib/src/udp.rs:1659`) reaches that slot only through `flow_to_upstream`, so the
+  `on_close_flow` (`lib/src/udp.rs:1749`) reaches that slot only through `flow_to_upstream`, so the
   eventual teardown could no longer free it. The request answered `ok` throughout.
   The `udp.active_flows` gauge did *not* drift: the retained manager is its sole author, so
   `FlowEvicted` still fired once per flow at the eventual teardown. What the gauge lost was its
@@ -727,7 +811,7 @@
   and the bound a consumer must tolerate is `(delay_ms + 50) mod 100`, i.e. up to **99 ms** — a
   full tick minus a millisecond. Either figure is fatal here: the hazard is any earliness at all. The UDP listener owns exactly
   one wheel entry for all its flows. On such an early fire `UdpListenerSession::timeout`
-  (`lib/src/udp.rs:1798`) called `UdpManager::handle_timeout`, which found no flow past its
+  (`lib/src/udp.rs`) called `UdpManager::handle_timeout`, which found no flow past its
   deadline, closed nothing, and called `reschedule` — and `reschedule`
   (`lib/src/protocol/udp/manager.rs:600`) emits `ArmTimer` only when the minimum deadline *changes*.
   Nothing had changed, so nothing was emitted, the consumed entry was never replaced, and the wheel
@@ -741,7 +825,7 @@
   `close_flow` triggers — which makes an unchanged deadline re-emit `ArmTimer` instead of being
   memoized away. `handle_timeout` is only ever called from a wheel expiry, so this is the truthful
   state on entry rather than a special case. The shell drops its now-dangling `timer_handle` in the
-  same place (`lib/src/udp.rs:1810`); that half is **hygiene, not a second fix**. A delivered handle
+  same place (`lib/src/udp.rs:1900`); that half is **hygiene, not a second fix**. A delivered handle
   is already inert: `set_timeout_at` clamps every new entry past `self.tick`, a delivered one sat at
   or below it, and `self.tick` never decreases, so `cancel_timeout`'s tick guard can never match the
   successor that reuses its slab slot — the slot really is reused, and the cancel really is refused

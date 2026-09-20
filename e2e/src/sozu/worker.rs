@@ -312,10 +312,18 @@ impl Worker {
         self.soft_stop();
 
         // Deactivate listeners in the state clone so that produce_initial_state()
-        // won't generate ActivateListener requests. The initial state is processed
-        // BEFORE SCM listeners are received by the worker, so activating without
-        // the SCM FDs would fall back to server_bind() and fail or create duplicates.
-        // Activation is handled explicitly below via generate_activate_requests().
+        // won't generate ActivateListener requests: activation is a single
+        // explicit step below, via generate_activate_requests().
+        //
+        // This is no longer a workaround for the worker. `Server::new` receives
+        // the SCM listeners BEFORE it applies the initial state (sozu#1342), so
+        // an initial state that still marks the listeners active would adopt the
+        // inherited descriptors rather than fall back to server_bind(). Both
+        // sequences are correct; this one keeps activation observable as its own
+        // set of ACTIVATE_ requests, which every scenario below reads back, and
+        // the worker keeps a descriptor whose address has no listener yet
+        // (`InheritedSocketFate::Unclaimed`) exactly so the ACTIVATE_ requests
+        // below still find it.
         let mut upgrade_state = self.state.to_owned();
         for listener in upgrade_state.http_listeners.values_mut() {
             listener.active = false;

@@ -521,10 +521,19 @@ impl Listeners {
     }
 
     pub fn get_udp(&mut self, addr: &SocketAddr) -> Option<RawFd> {
-        self.udp
-            .iter()
-            .position(|(front, _)| front == addr)
-            .map(|pos| self.udp.remove(pos).1)
+        let before = self.udp.len();
+        let pos = self.udp.iter().position(|(front, _)| front == addr);
+        let result = pos.map(|pos| self.udp.remove(pos).1);
+        debug_assert_eq!(
+            self.udp.len(),
+            before - result.is_some() as usize,
+            "udp listener table shrinks by exactly one iff an address matched"
+        );
+        debug_assert!(
+            result.is_none() || !self.udp.iter().any(|(front, _)| front == addr),
+            "the matched udp address must no longer be present after removal"
+        );
+        result
     }
 
     /// Deactivate all listeners by closing their file descriptors

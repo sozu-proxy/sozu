@@ -34,7 +34,7 @@ registers every socket — listen sockets, frontend, backend, metrics,
 unix command-channel pair — with that single poller, then loops
 reading events out of `Events` and dispatching them to the correct
 session. Loop time is observable via the `epoll_time` time! metric
-(`lib/src/server.rs:1047-1051`).
+(`names::event_loop::EPOLL_TIME` in `Server::run`, `lib/src/server.rs`).
 
 ### 2.2 Edge-triggered readiness and the writable invariant
 
@@ -579,7 +579,7 @@ set to read a session's life from a dashboard:
   attribution (the `metric_for_goaway_sent` family in
   `lib/src/protocol/mux/h2.rs`).
 - `epoll_time` — `Poll::poll` wall-clock, useful for worker saturation
-  (`lib/src/server.rs:1047-1051`).
+  (`names::event_loop::EPOLL_TIME` in `Server::run`, `lib/src/server.rs`).
 
 ## 12. Removed and migrated APIs
 

@@ -26,7 +26,7 @@
 //! listener. It is well-formed, so it passes the master's pre-dispatch
 //! `validate_request` (sozu#1301/#1313 guards) and is committed to
 //! `ConfigState`; the worker refuses it with `ProxyError::NoListenerFound`
-//! (`lib/src/http.rs:1151`) and answers `Failure`. A malformed certificate is
+//! (`HttpProxy::add_http_frontend`, `lib/src/http.rs`) and answers `Failure`. A malformed certificate is
 //! also refused by workers, but `compute_rollback` has no unambiguous inverse
 //! for `AddCertificate`, so it could not prove anything here.
 //!

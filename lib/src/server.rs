@@ -5,7 +5,7 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     io::Error as IoError,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    os::unix::io::{AsRawFd, FromRawFd},
+    os::unix::io::{AsRawFd, FromRawFd, RawFd},
     rc::Rc,
     str::FromStr,
     sync::LazyLock,
@@ -954,6 +954,52 @@ impl Server {
             )),
         };
 
+        // Take the retiring worker's listening sockets BEFORE applying the
+        // initial state, because that state is what adopts them.
+        //
+        // `fork_main_into_worker` (`bin/src/worker.rs`) sends the descriptors
+        // over the SCM socket right after the fork — before the main process
+        // sends the initial `Status` request — and
+        // `ConfigState::produce_initial_state` carries one `ActivateListener`
+        // per active listener. Receiving them afterwards left `scm_listeners`
+        // empty for the whole initial state, so every `ActivateListener` took
+        // the `server_bind` / `udp_bind` branch (which succeeds only because
+        // of `SO_REUSEPORT`), the listener came up `active`, and the inherited
+        // descriptor was then dropped unused by the next, short-circuiting
+        // `activate()` — discarding the accept backlog (TCP/HTTP/HTTPS) and
+        // the receive buffer (UDP) the hand-off exists to preserve (sozu#1342).
+        //
+        // Blocking here is the same blocking read as before, only earlier: the
+        // sole production caller of `fork_main_into_worker`,
+        // `CommandServer::launch_new_worker`, always passes `Some(listeners)`,
+        // so a fresh start receives an empty manifest immediately and every
+        // listener binds its own socket exactly as it always did.
+        info!("will try to receive listeners");
+        server
+            .scm
+            .set_blocking(true)
+            .map_err(|scm_err| ServerError::ScmSocket {
+                msg: "Could not set the scm socket to blocking".to_string(),
+                scm_err,
+            })?;
+        let listeners =
+            server
+                .scm
+                .receive_listeners()
+                .map_err(|scm_err| ServerError::ScmSocket {
+                    msg: "could not receive listeners from the scm socket".to_string(),
+                    scm_err,
+                })?;
+        server
+            .scm
+            .set_blocking(false)
+            .map_err(|scm_err| ServerError::ScmSocket {
+                msg: "Could not set the scm socket to unblocking".to_string(),
+                scm_err,
+            })?;
+        info!("received listeners: {:?}", listeners);
+        server.scm_listeners = Some(listeners);
+
         // initialize the worker with the state we got from a file
         if let Some(state) = initial_state {
             for request in state.requests {
@@ -966,6 +1012,8 @@ impl Server {
                 (*queue.borrow_mut()).clear();
             });
         }
+
+        server.report_unclaimed_inherited_sockets();
 
         if expects_initial_status {
             // the main process sends a Status message, so we can notify it
@@ -992,32 +1040,6 @@ impl Server {
             }
             server.unblock_channel();
         }
-
-        info!("will try to receive listeners");
-        server
-            .scm
-            .set_blocking(true)
-            .map_err(|scm_err| ServerError::ScmSocket {
-                msg: "Could not set the scm socket to blocking".to_string(),
-                scm_err,
-            })?;
-        let listeners =
-            server
-                .scm
-                .receive_listeners()
-                .map_err(|scm_err| ServerError::ScmSocket {
-                    msg: "could not receive listeners from the scm socket".to_string(),
-                    scm_err,
-                })?;
-        server
-            .scm
-            .set_blocking(false)
-            .map_err(|scm_err| ServerError::ScmSocket {
-                msg: "Could not set the scm socket to unblocking".to_string(),
-                scm_err,
-            })?;
-        info!("received listeners: {:?}", listeners);
-        server.scm_listeners = Some(listeners);
 
         Ok(server)
     }
@@ -2492,11 +2514,70 @@ impl Server {
         }
     }
 
+    /// Say what the initial state left unclaimed in the SCM table.
+    ///
+    /// A descriptor is kept whenever no listener exists at its address yet,
+    /// because an `AddListener` + `ActivateListener` pair can still arrive and
+    /// adopt it — `UpgradeWorkerTask` (`bin/src/command/upgrade.rs`) scatters
+    /// `generate_activate_requests()` only after `Server::new` has returned, so
+    /// there is no point during startup at which a leftover is provably
+    /// unclaimable. Retention is therefore open-ended, and the one thing this
+    /// worker can do is make it visible.
+    ///
+    /// An address that already has a listener is the expected shape (an initial
+    /// state carrying the listeners inactive, activated straight afterwards) and
+    /// is reported at `info`. An address with no listener at all is the one an
+    /// operator needs to see: nothing in this worker's state mentions it, so the
+    /// descriptor is the retiring worker's listening socket, still bound with
+    /// `SO_REUSEPORT` and registered with no event loop, which is expected to
+    /// keep taking a share of new connections that nothing accepts. (That
+    /// expectation follows from `SO_REUSEPORT` load-balancing semantics; nothing
+    /// here measures it.) That is reported at `warn`.
+    fn report_unclaimed_inherited_sockets(&self) {
+        let Some(scm_listeners) = self.scm_listeners.as_ref() else {
+            return;
+        };
+        let leftovers: [(&str, &Vec<(SocketAddr, RawFd)>); 4] = [
+            ("HTTP", &scm_listeners.http),
+            ("HTTPS", &scm_listeners.tls),
+            ("TCP", &scm_listeners.tcp),
+            ("UDP", &scm_listeners.udp),
+        ];
+        for (label, table) in leftovers {
+            for (address, fd) in table {
+                let has_listener = match label {
+                    "HTTP" => self.http.borrow().listener_token(*address).is_some(),
+                    "HTTPS" => self.https.borrow().listener_token(*address).is_some(),
+                    "TCP" => self.tcp.borrow().listener_token(*address).is_some(),
+                    _ => self.udp.borrow().listener_token(*address).is_some(),
+                };
+                if has_listener {
+                    info!(
+                        "inherited {} listening socket for {} (fd {}) is held for an \
+                         ActivateListener this worker has not processed yet",
+                        label, address, fd
+                    );
+                } else {
+                    warn!(
+                        "inherited {} listening socket for {} (fd {}) is held with no listener \
+                         at that address: until an AddListener plus ActivateListener for {} \
+                         adopts it, it is expected to keep taking a share of new connections \
+                         that nothing accepts (inferred from SO_REUSEPORT semantics, not \
+                         measured here)",
+                        label, address, fd, address
+                    );
+                }
+            }
+        }
+    }
+
     fn notify_activate_listener(
         &mut self,
         req_id: &str,
         activate: &ActivateListener,
     ) -> WorkerResponse {
+        use crate::InheritedSocketFate;
+
         debug!(
             "{} activate {:?} listener {:?}",
             req_id, activate.proxy, activate
@@ -2506,15 +2587,30 @@ impl Server {
 
         match ListenerType::try_from(activate.proxy) {
             Ok(ListenerType::Http) => {
-                let listener = self
-                    .scm_listeners
-                    .as_mut()
-                    .and_then(|s| s.get_http(&address))
-                    // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
-                    // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
-                    // `ScmListeners` map removes it on `get_http`. Ownership transfers to
-                    // the mio wrapper, whose `Drop` closes the descriptor.
-                    .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
+                let listener = match self.http.borrow().inherited_socket_fate(&address) {
+                    InheritedSocketFate::Adopted => self
+                        .scm_listeners
+                        .as_mut()
+                        .and_then(|listeners| listeners.get_http(&address))
+                        // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
+                        // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
+                        // `Listeners` table removes it on `get_http`. Ownership transfers to
+                        // the mio wrapper, whose `Drop` closes the descriptor.
+                        .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) }),
+                    InheritedSocketFate::Refused => {
+                        discard_inherited_socket::<MioTcpListener>(
+                            self.scm_listeners
+                                .as_mut()
+                                .and_then(|listeners| listeners.get_http(&address)),
+                            &address,
+                            "HTTP",
+                        );
+                        None
+                    }
+                    // Left in the SCM table on purpose: a later `AddListener` +
+                    // `ActivateListener` for this address can still adopt it.
+                    InheritedSocketFate::Unclaimed => None,
+                };
 
                 let activated_token = self.http.borrow_mut().activate_listener(&address, listener);
                 match activated_token {
@@ -2529,15 +2625,30 @@ impl Server {
                 }
             }
             Ok(ListenerType::Https) => {
-                let listener = self
-                    .scm_listeners
-                    .as_mut()
-                    .and_then(|s| s.get_https(&address))
-                    // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
-                    // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
-                    // `ScmListeners` map removes it on `get_https`. Ownership transfers to
-                    // the mio wrapper, whose `Drop` closes the descriptor.
-                    .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
+                let listener = match self.https.borrow().inherited_socket_fate(&address) {
+                    InheritedSocketFate::Adopted => self
+                        .scm_listeners
+                        .as_mut()
+                        .and_then(|listeners| listeners.get_https(&address))
+                        // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
+                        // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
+                        // `Listeners` table removes it on `get_https`. Ownership transfers to
+                        // the mio wrapper, whose `Drop` closes the descriptor.
+                        .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) }),
+                    InheritedSocketFate::Refused => {
+                        discard_inherited_socket::<MioTcpListener>(
+                            self.scm_listeners
+                                .as_mut()
+                                .and_then(|listeners| listeners.get_https(&address)),
+                            &address,
+                            "HTTPS",
+                        );
+                        None
+                    }
+                    // Left in the SCM table on purpose: a later `AddListener` +
+                    // `ActivateListener` for this address can still adopt it.
+                    InheritedSocketFate::Unclaimed => None,
+                };
 
                 let activated_token = self
                     .https
@@ -2555,15 +2666,30 @@ impl Server {
                 }
             }
             Ok(ListenerType::Tcp) => {
-                let listener = self
-                    .scm_listeners
-                    .as_mut()
-                    .and_then(|s| s.get_tcp(&address))
-                    // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
-                    // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
-                    // `ScmListeners` map removes it on `get_tcp`. Ownership transfers to
-                    // the mio wrapper, whose `Drop` closes the descriptor.
-                    .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) });
+                let listener = match self.tcp.borrow().inherited_socket_fate(&address) {
+                    InheritedSocketFate::Adopted => self
+                        .scm_listeners
+                        .as_mut()
+                        .and_then(|listeners| listeners.get_tcp(&address))
+                        // SAFETY: `fd` was just received from the supervisor via SCM_RIGHTS
+                        // (see `command/src/scm_socket.rs`) and is not owned elsewhere — the
+                        // `Listeners` table removes it on `get_tcp`. Ownership transfers to
+                        // the mio wrapper, whose `Drop` closes the descriptor.
+                        .map(|fd| unsafe { MioTcpListener::from_raw_fd(fd) }),
+                    InheritedSocketFate::Refused => {
+                        discard_inherited_socket::<MioTcpListener>(
+                            self.scm_listeners
+                                .as_mut()
+                                .and_then(|listeners| listeners.get_tcp(&address)),
+                            &address,
+                            "TCP",
+                        );
+                        None
+                    }
+                    // Left in the SCM table on purpose: a later `AddListener` +
+                    // `ActivateListener` for this address can still adopt it.
+                    InheritedSocketFate::Unclaimed => None,
+                };
 
                 let listener_token = self.tcp.borrow_mut().activate_listener(&address, listener);
                 match listener_token {
@@ -2578,18 +2704,33 @@ impl Server {
                 }
             }
             Ok(ListenerType::Udp) => {
-                let socket = self
-                    .scm_listeners
-                    .as_mut()
-                    .and_then(|s| s.get_udp(&address))
-                    // SAFETY: `fd` was just received from the supervisor via
-                    // SCM_RIGHTS (see `command/src/scm_socket.rs`) and is not
-                    // owned elsewhere — `ScmListeners::get_udp` removes it from
-                    // the map. Ownership transfers to the mio `UdpSocket`
-                    // wrapper, whose `Drop` closes the descriptor. `O_NONBLOCK`
-                    // + `SO_REUSE*` are file-description flags preserved across
-                    // SCM + exec.
-                    .map(|fd| unsafe { MioUdpSocket::from_raw_fd(fd) });
+                let socket = match self.udp.borrow().inherited_socket_fate(&address) {
+                    InheritedSocketFate::Adopted => self
+                        .scm_listeners
+                        .as_mut()
+                        .and_then(|listeners| listeners.get_udp(&address))
+                        // SAFETY: `fd` was just received from the supervisor via
+                        // SCM_RIGHTS (see `command/src/scm_socket.rs`) and is not
+                        // owned elsewhere — `Listeners::get_udp` removes it from
+                        // the table. Ownership transfers to the mio `UdpSocket`
+                        // wrapper, whose `Drop` closes the descriptor. `O_NONBLOCK`
+                        // + `SO_REUSE*` are file-description flags preserved across
+                        // SCM + exec.
+                        .map(|fd| unsafe { MioUdpSocket::from_raw_fd(fd) }),
+                    InheritedSocketFate::Refused => {
+                        discard_inherited_socket::<MioUdpSocket>(
+                            self.scm_listeners
+                                .as_mut()
+                                .and_then(|listeners| listeners.get_udp(&address)),
+                            &address,
+                            "UDP",
+                        );
+                        None
+                    }
+                    // Left in the SCM table on purpose: a later `AddListener` +
+                    // `ActivateListener` for this address can still adopt it.
+                    InheritedSocketFate::Unclaimed => None,
+                };
 
                 let activated_token = self.udp.borrow_mut().activate_listener(&address, socket);
                 match activated_token {
@@ -3399,6 +3540,43 @@ impl Server {
     }
 }
 
+/// Close an inherited listening socket this worker is not going to use, and
+/// say so.
+///
+/// Reached only for [`crate::InheritedSocketFate::Refused`]: a listener is
+/// already up at `address` on a socket of its own, so `activate()`
+/// short-circuits and nothing consumes this descriptor. That is a statement
+/// about now, not about the lifetime — `DeactivateListener` then
+/// `ActivateListener` would bring the address back to `Adopted`, and because
+/// `scm_listeners` is filled once and never refilled, closing here means such a
+/// reactivation binds a fresh socket. See [`crate::InheritedSocketFate::Refused`]
+/// for why that trade is taken: a queued backlog decays, whereas an unaccepted
+/// socket in the address's `SO_REUSEPORT` group is expected to go on taking a
+/// share of new connections for as long as it stays open. That expectation
+/// follows from `SO_REUSEPORT` load-balancing semantics; nothing here measures
+/// it.
+///
+/// The close is explicit rather than a dropped wrapper falling out of scope: it
+/// is the same syscall either way, but this one is deliberate, attributable and
+/// logged, which is precisely what sozu#1342 was missing.
+fn discard_inherited_socket<T: FromRawFd>(fd: Option<RawFd>, address: &SocketAddr, protocol: &str) {
+    let Some(fd) = fd else {
+        return;
+    };
+    warn!(
+        "closing the inherited {} listening socket for {}: this worker already has an active \
+         listener there, so nothing will adopt this descriptor unless that listener is \
+         deactivated and reactivated, and until then it is expected to keep taking a share of \
+         new connections that nothing accepts (inferred from SO_REUSEPORT semantics, not \
+         measured here)",
+        protocol, address
+    );
+    // SAFETY: `fd` was just removed from the SCM table by `Listeners::get_*`,
+    // which hands over ownership, so no other owner survives. The wrapper is
+    // built only to be dropped: `Drop` is what performs the close.
+    drop(unsafe { T::from_raw_fd(fd) });
+}
+
 /// log the error together with the request id
 /// create a WorkerResponse
 fn worker_response_error<S: ToString, T: ToString>(request_id: S, error: T) -> WorkerResponse {
@@ -3633,10 +3811,10 @@ mod accept_ready_tests {
             server_scm_socket,
             server_config,
             ..
-        // `send_scm = true`: `Server::new` ends on a BLOCKING
-        // `receive_listeners()`, so the client side must have queued its
-        // (empty) listener set first -- exactly what
-        // `tcp::testing::start_tcp_worker` does.
+        // `send_scm = true`: `Server::new` makes a BLOCKING
+        // `receive_listeners()` call before it applies the initial state, so
+        // the client side must have queued its (empty) listener set first --
+        // exactly what `tcp::testing::start_tcp_worker` does.
         } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
         let (_command_channel, proxy_channel) =
             Channel::generate(1000, 10000).expect("could not generate a test channel");
@@ -4421,5 +4599,929 @@ mod listener_lifecycle_tests {
                 "cycle {cycle}: base_sessions_count must track the reserved slots"
             );
         }
+    }
+}
+
+/// The SCM hand-off a worker upgrade performs: the retiring worker's listening
+/// sockets travel to the new worker over the SCM socket, and the new worker
+/// must ADOPT them instead of binding fresh ones.
+#[cfg(test)]
+mod scm_listener_handoff_tests {
+    use std::{
+        net::{TcpStream as StdTcpStream, UdpSocket as StdUdpSocket},
+        os::fd::{IntoRawFd, RawFd},
+    };
+
+    use sozu_command::{config::ListenerBuilder, proto::command::SocketAddress};
+
+    use super::*;
+    use crate::{
+        ProxyError,
+        socket::{server_bind, udp_bind},
+        testing::{ServerParts, prebuild_server, provide_port},
+    };
+
+    /// A `ConfigState` holding one ACTIVE listener per protocol, i.e. what the
+    /// main process carries into `produce_initial_state` for a worker upgrade.
+    fn state_with_four_active_listeners(
+        http_address: SocketAddress,
+        https_address: SocketAddress,
+        tcp_address: SocketAddress,
+        udp_address: SocketAddress,
+    ) -> ConfigState {
+        let mut state = ConfigState::new();
+        let adds: Vec<(Request, SocketAddress, ListenerType)> = vec![
+            (
+                RequestType::AddHttpListener(
+                    ListenerBuilder::new_http(http_address)
+                        .to_http(None)
+                        .expect("could not build the test HTTP listener config"),
+                )
+                .into(),
+                http_address,
+                ListenerType::Http,
+            ),
+            (
+                RequestType::AddHttpsListener(
+                    ListenerBuilder::new_https(https_address)
+                        .to_tls(None)
+                        .expect("could not build the test HTTPS listener config"),
+                )
+                .into(),
+                https_address,
+                ListenerType::Https,
+            ),
+            (
+                RequestType::AddTcpListener(
+                    ListenerBuilder::new_tcp(tcp_address)
+                        .to_tcp(None)
+                        .expect("could not build the test TCP listener config"),
+                )
+                .into(),
+                tcp_address,
+                ListenerType::Tcp,
+            ),
+            (
+                RequestType::AddUdpListener(
+                    ListenerBuilder::new_udp(udp_address)
+                        .to_udp(None)
+                        .expect("could not build the test UDP listener config"),
+                )
+                .into(),
+                udp_address,
+                ListenerType::Udp,
+            ),
+        ];
+        for (add, address, proxy) in adds {
+            state.dispatch(&add).expect("could not add the listener");
+            state
+                .dispatch(
+                    &RequestType::ActivateListener(ActivateListener {
+                        address,
+                        proxy: proxy.into(),
+                        from_scm: false,
+                    })
+                    .into(),
+                )
+                .expect("could not mark the listener active");
+        }
+        state
+    }
+
+    /// The SCM table for `label`, so a test can assert on retention per protocol.
+    fn inherited_table<'a>(server: &'a Server, label: &str) -> &'a Vec<(SocketAddr, RawFd)> {
+        let scm_listeners = server
+            .scm_listeners
+            .as_ref()
+            .expect("scm_listeners must be present");
+        match label {
+            "HTTP" => &scm_listeners.http,
+            "HTTPS" => &scm_listeners.tls,
+            "TCP" => &scm_listeners.tcp,
+            "UDP" => &scm_listeners.udp,
+            other => panic!("unknown protocol label {other}"),
+        }
+    }
+
+    /// Whether `fd` is still the listening socket bound to `port`.
+    ///
+    /// Deliberately identity-aware rather than a bare "is it open" check: the
+    /// test binary runs its tests in parallel, so a descriptor closed here can
+    /// be handed straight back out to an unrelated file opened by another test
+    /// and a liveness-only probe would call that "still open". Every port in
+    /// these tests comes from `provide_port()` and is therefore unique to one
+    /// test, so `getsockname` answering with that exact port is proof the
+    /// descriptor is still the same socket.
+    fn descriptor_is_socket_on_port(fd: RawFd, port: u16) -> bool {
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        // SAFETY: `getsockname` writes at most `length` bytes into `storage`
+        // and updates `length`; both outlive the call. A closed, reused or
+        // non-socket descriptor answers -1, which is the answer under test.
+        let result = unsafe {
+            libc::getsockname(
+                fd,
+                (&raw mut storage).cast::<libc::sockaddr>(),
+                &raw mut length,
+            )
+        };
+        if result != 0 || storage.ss_family != libc::AF_INET as libc::sa_family_t {
+            return false;
+        }
+        // SAFETY: the family check above proves the kernel filled a
+        // `sockaddr_in`, which `sockaddr_storage` is aligned and sized for.
+        let inet = unsafe { &*(&raw const storage).cast::<libc::sockaddr_in>() };
+        u16::from_be(inet.sin_port) == port
+    }
+
+    /// The datagram queued on the inherited UDP socket before the hand-off.
+    const QUEUED_DATAGRAM: &[u8] = b"queued-before-the-handoff";
+
+    /// A worker that inherits its predecessor's listening sockets must adopt
+    /// them, not bind its own and leave the inherited descriptors unused.
+    ///
+    /// `fork_main_into_worker` (`bin/src/worker.rs`) sends the retiring
+    /// worker's descriptors over the SCM socket immediately after the fork,
+    /// before the main process sends anything else, and
+    /// `ConfigState::produce_initial_state` carries one `ActivateListener` per
+    /// active listener. `Server::new` must therefore have received those
+    /// descriptors BEFORE it applies the initial state: otherwise every
+    /// `ActivateListener` takes the `server_bind` / `udp_bind` branch — which
+    /// succeeds only because of `SO_REUSEPORT` — and the inherited descriptor
+    /// is dropped unused, discarding the accept backlog (TCP/HTTP/HTTPS) and
+    /// the receive buffer (UDP) the hand-off exists to preserve.
+    ///
+    /// The three TCP-family assertions read `accept_queue`, which
+    /// `notify_activate_listener` fills through `Server::accept` right after a
+    /// successful activation; the UDP assertion reads the listener's own
+    /// socket, since UDP has no accept path.
+    ///
+    /// To SEE THIS RED: in `Server::new`, move the `receive_listeners()` block
+    /// back below the `if let Some(state) = initial_state` block. All four
+    /// assertions fail — each listener binds its own socket, and the queued
+    /// connections and datagram stay on the abandoned descriptors.
+    #[test]
+    fn inherited_listener_sockets_are_adopted_by_the_initial_activation() {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            client_scm_socket,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, false).expect("could not prebuild a test server");
+        let (_command_channel, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let https_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let tcp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let udp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+
+        // The retiring worker's sockets, bound exactly the way a live worker
+        // binds them.
+        let http_listener =
+            server_bind(http_address.into()).expect("could not bind the inherited HTTP socket");
+        let https_listener =
+            server_bind(https_address.into()).expect("could not bind the inherited HTTPS socket");
+        let tcp_listener =
+            server_bind(tcp_address.into()).expect("could not bind the inherited TCP socket");
+        let udp_socket =
+            udp_bind(udp_address.into()).expect("could not bind the inherited UDP socket");
+
+        // Queue on each inherited socket exactly what the hand-off exists to
+        // preserve: a completed connection in the accept backlog, and a
+        // datagram in the receive buffer. The clients stay alive for the whole
+        // test so the connections are not closed from under the backlog.
+        let _http_client = StdTcpStream::connect::<SocketAddr>(http_address.into())
+            .expect("could not queue a connection on the inherited HTTP socket");
+        let _https_client = StdTcpStream::connect::<SocketAddr>(https_address.into())
+            .expect("could not queue a connection on the inherited HTTPS socket");
+        let _tcp_client = StdTcpStream::connect::<SocketAddr>(tcp_address.into())
+            .expect("could not queue a connection on the inherited TCP socket");
+        let datagram_sender =
+            StdUdpSocket::bind("127.0.0.1:0").expect("could not bind the test datagram sender");
+        datagram_sender
+            .send_to(QUEUED_DATAGRAM, SocketAddr::from(udp_address))
+            .expect("could not queue a datagram on the inherited UDP socket");
+
+        // The main process's side of the hand-off: send the descriptors, then
+        // close its own copies, exactly as `fork_main_into_worker` does.
+        let listeners = Listeners {
+            http: vec![(http_address.into(), http_listener.into_raw_fd())],
+            tls: vec![(https_address.into(), https_listener.into_raw_fd())],
+            tcp: vec![(tcp_address.into(), tcp_listener.into_raw_fd())],
+            udp: vec![(udp_address.into(), udp_socket.into_raw_fd())],
+        };
+        client_scm_socket
+            .send_listeners(&listeners)
+            .expect("could not send the inherited listeners");
+        listeners.close();
+
+        // The state the main process writes for the new worker. Built through
+        // `ConfigState` and `produce_initial_state` rather than hand-rolled, so
+        // the emission order under test is the real generator's: this breaks if
+        // `generate_requests` ever stops pairing each `AddXxxListener` with the
+        // `ActivateListener` that follows it.
+        let initial_state =
+            state_with_four_active_listeners(http_address, https_address, tcp_address, udp_address)
+                .produce_initial_state();
+        assert_eq!(
+            initial_state.requests.len(),
+            8,
+            "the generator must emit one Add and one Activate per active listener"
+        );
+
+        let server = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            Some(initial_state),
+            false,
+        )
+        .expect("could not build the test server");
+
+        let accepted: Vec<Protocol> = server
+            .accept_queue
+            .iter()
+            .map(|(_, _, protocol, _, _)| *protocol)
+            .collect();
+        assert!(
+            accepted.contains(&Protocol::HTTPListen),
+            "the connection queued on the inherited HTTP socket must survive the hand-off, got {accepted:?}"
+        );
+        assert!(
+            accepted.contains(&Protocol::HTTPSListen),
+            "the connection queued on the inherited HTTPS socket must survive the hand-off, got {accepted:?}"
+        );
+        assert!(
+            accepted.contains(&Protocol::TCPListen),
+            "the connection queued on the inherited TCP socket must survive the hand-off, got {accepted:?}"
+        );
+
+        let (_, adopted_udp_socket) = server
+            .udp
+            .borrow_mut()
+            .give_back_listeners()
+            .pop()
+            .expect("the UDP listener must hold a socket after activation");
+        let mut buffer = [0u8; 64];
+        let received = adopted_udp_socket.recv_from(&mut buffer);
+        match received {
+            Ok((length, _)) => assert_eq!(
+                &buffer[..length],
+                QUEUED_DATAGRAM,
+                "the datagram queued on the inherited UDP socket must survive the hand-off"
+            ),
+            Err(error) => panic!(
+                "the datagram queued on the inherited UDP socket must survive the hand-off, got {error:?}"
+            ),
+        }
+    }
+
+    /// An `ActivateListener` for a listener that is ALREADY active must dispose
+    /// of the inherited descriptor deliberately, not leave it in the table.
+    ///
+    /// `activate()` short-circuits on `if self.active`, so nothing adopts that
+    /// descriptor while the listener holds the address — a deactivate plus
+    /// reactivate would, which is why `InheritedSocketFate::Refused` documents
+    /// the close as a trade rather than an impossibility. Leaving it in the SCM
+    /// table is not neutral either: it is the retiring worker's listening
+    /// socket, still bound with `SO_REUSEPORT` and registered with no event
+    /// loop, which is expected to keep taking a share of new connections that
+    /// nothing accepts. Nothing here measures that expectation — the assertion
+    /// below checks only that the descriptor is gone from the table and closed.
+    ///
+    /// Receiving the SCM listeners before the initial state means the ordinary
+    /// upgrade no longer reaches this state, so the test constructs it directly.
+    ///
+    /// To SEE THIS RED: make any arm's `InheritedSocketFate::Refused` branch
+    /// return `None` without discarding — that protocol's descriptor stays in the
+    /// table and open, and both assertions below fail. This guards the
+    /// retain-everything regression; the ORIGINAL defect closed the descriptor
+    /// here too, by dropping the wrapper, and is guarded by
+    /// `inherited_listener_sockets_are_adopted_by_the_initial_activation`
+    /// instead.
+    #[test]
+    fn a_repeated_activation_closes_the_descriptor_it_cannot_adopt_now() {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (_command_channel, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let https_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let tcp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let udp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+
+        // A worker whose four listeners are up on their OWN sockets: the initial
+        // state activates them and `scm_listeners` is empty, every ordinary start.
+        let initial_state =
+            state_with_four_active_listeners(http_address, https_address, tcp_address, udp_address)
+                .produce_initial_state();
+        let mut server = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            Some(initial_state),
+            false,
+        )
+        .expect("could not build the test server");
+
+        // Now hand that already-active worker a descriptor per address.
+        let http_fd = server_bind(http_address.into())
+            .expect("could not bind the spare HTTP socket")
+            .into_raw_fd();
+        let https_fd = server_bind(https_address.into())
+            .expect("could not bind the spare HTTPS socket")
+            .into_raw_fd();
+        let tcp_fd = server_bind(tcp_address.into())
+            .expect("could not bind the spare TCP socket")
+            .into_raw_fd();
+        let udp_fd = udp_bind(udp_address.into())
+            .expect("could not bind the spare UDP socket")
+            .into_raw_fd();
+        {
+            let scm_listeners = server
+                .scm_listeners
+                .as_mut()
+                .expect("Server::new must have populated scm_listeners");
+            scm_listeners.http.push((http_address.into(), http_fd));
+            scm_listeners.tls.push((https_address.into(), https_fd));
+            scm_listeners.tcp.push((tcp_address.into(), tcp_fd));
+            scm_listeners.udp.push((udp_address.into(), udp_fd));
+        }
+
+        for (address, proxy) in [
+            (http_address, ListenerType::Http),
+            (https_address, ListenerType::Https),
+            (tcp_address, ListenerType::Tcp),
+            (udp_address, ListenerType::Udp),
+        ] {
+            let response = server.notify_activate_listener(
+                "test-repeat",
+                &ActivateListener {
+                    address,
+                    proxy: proxy.into(),
+                    from_scm: false,
+                },
+            );
+            assert_eq!(
+                response.status,
+                ResponseStatus::Ok as i32,
+                "a repeated {proxy:?} activation must still answer ok: {response:?}"
+            );
+        }
+
+        let scm_listeners = server
+            .scm_listeners
+            .as_ref()
+            .expect("scm_listeners must still be present");
+        for (label, table, fd, port) in [
+            (
+                "HTTP",
+                &scm_listeners.http,
+                http_fd,
+                http_address.port as u16,
+            ),
+            (
+                "HTTPS",
+                &scm_listeners.tls,
+                https_fd,
+                https_address.port as u16,
+            ),
+            ("TCP", &scm_listeners.tcp, tcp_fd, tcp_address.port as u16),
+            ("UDP", &scm_listeners.udp, udp_fd, udp_address.port as u16),
+        ] {
+            assert!(
+                !table.iter().any(|(_, entry)| *entry == fd),
+                "the inherited {label} descriptor this activation cannot adopt must leave the SCM table"
+            );
+            assert!(
+                !descriptor_is_socket_on_port(fd, port),
+                "the inherited {label} descriptor this activation cannot adopt must be closed, \
+                 not left bound in the address's SO_REUSEPORT group, where it is expected — \
+                 inferred, not measured here — to go on taking a share of new connections"
+            );
+        }
+    }
+
+    /// An inherited descriptor whose address has NO listener yet must stay in
+    /// the SCM table, and a later `AddListener` + `ActivateListener` must adopt
+    /// it — backlog and all.
+    ///
+    /// This is a real upgrade shape, not a hypothetical: `Worker::upgrade`
+    /// (`e2e/src/sozu/worker.rs`) hands the new worker a state whose listeners
+    /// are inactive and sends `generate_activate_requests()` afterwards, and
+    /// `UpgradeWorkerTask` (`bin/src/command/upgrade.rs`) scatters those
+    /// requests only once `Server::new` has returned. Closing leftovers at the
+    /// end of the initial state would destroy exactly this case, which is why
+    /// `InheritedSocketFate::Unclaimed` keeps them.
+    ///
+    /// To SEE THIS RED: make any arm's `InheritedSocketFate::Unclaimed` branch
+    /// take the descriptor out of the table like the other two — the first
+    /// activation consumes and closes it, so the listener added afterwards binds
+    /// its own socket and that protocol's assertions fail.
+    #[test]
+    fn an_inherited_descriptor_with_no_listener_yet_is_adopted_by_a_later_activation() {
+        let ServerParts {
+            event_loop,
+            sessions,
+            pool,
+            backends,
+            server_scm_socket,
+            server_config,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+        let (_command_channel, proxy_channel) =
+            Channel::generate(1000, 10000).expect("could not generate a test channel");
+
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let https_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let tcp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let udp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+
+        let mut server = Server::new(
+            event_loop,
+            proxy_channel,
+            server_scm_socket,
+            sessions,
+            pool,
+            backends,
+            None,
+            None,
+            None,
+            server_config,
+            None,
+            false,
+        )
+        .expect("could not build the test server");
+
+        // Four inherited descriptors and no listener anywhere. The TCP-family
+        // ones each carry a completed connection so the adoption can be shown to
+        // preserve the backlog, not merely the descriptor.
+        let http_listener =
+            server_bind(http_address.into()).expect("could not bind the inherited HTTP socket");
+        let https_listener =
+            server_bind(https_address.into()).expect("could not bind the inherited HTTPS socket");
+        let tcp_listener =
+            server_bind(tcp_address.into()).expect("could not bind the inherited TCP socket");
+        let udp_socket =
+            udp_bind(udp_address.into()).expect("could not bind the inherited UDP socket");
+        let _http_client = StdTcpStream::connect::<SocketAddr>(http_address.into())
+            .expect("could not queue a connection on the inherited HTTP socket");
+        let _https_client = StdTcpStream::connect::<SocketAddr>(https_address.into())
+            .expect("could not queue a connection on the inherited HTTPS socket");
+        let _tcp_client = StdTcpStream::connect::<SocketAddr>(tcp_address.into())
+            .expect("could not queue a connection on the inherited TCP socket");
+        let (http_fd, https_fd, tcp_fd, udp_fd) = (
+            http_listener.into_raw_fd(),
+            https_listener.into_raw_fd(),
+            tcp_listener.into_raw_fd(),
+            udp_socket.into_raw_fd(),
+        );
+        {
+            let scm_listeners = server
+                .scm_listeners
+                .as_mut()
+                .expect("Server::new must have populated scm_listeners");
+            scm_listeners.http.push((http_address.into(), http_fd));
+            scm_listeners.tls.push((https_address.into(), https_fd));
+            scm_listeners.tcp.push((tcp_address.into(), tcp_fd));
+            scm_listeners.udp.push((udp_address.into(), udp_fd));
+        }
+
+        let add_requests =
+            state_with_four_active_listeners(http_address, https_address, tcp_address, udp_address);
+        let cases = [
+            ("HTTP", http_address, ListenerType::Http, http_fd),
+            ("HTTPS", https_address, ListenerType::Https, https_fd),
+            ("TCP", tcp_address, ListenerType::Tcp, tcp_fd),
+            ("UDP", udp_address, ListenerType::Udp, udp_fd),
+        ];
+
+        // No listener at any of the addresses: every activation fails, and every
+        // descriptor must survive it untouched.
+        for (label, address, proxy, fd) in cases {
+            let response = server.notify_activate_listener(
+                "test-early",
+                &ActivateListener {
+                    address,
+                    proxy: proxy.into(),
+                    from_scm: false,
+                },
+            );
+            assert_ne!(
+                response.status,
+                ResponseStatus::Ok as i32,
+                "activating {label} with no listener must fail: {response:?}"
+            );
+            assert!(
+                inherited_table(&server, label)
+                    .iter()
+                    .any(|(_, e)| *e == fd),
+                "the {label} descriptor must stay in the SCM table while no listener owns \
+                 its address"
+            );
+            assert!(
+                descriptor_is_socket_on_port(fd, address.port as u16),
+                "the {label} descriptor must stay open while no listener owns its address"
+            );
+        }
+
+        // The listeners arrive, then their activations: every descriptor is
+        // adopted, so nothing is left in the table and nothing was closed unused.
+        for request in add_requests.produce_initial_state().requests {
+            server.notify_proxys(request);
+        }
+        for (label, _address, _proxy, fd) in cases {
+            assert!(
+                !inherited_table(&server, label)
+                    .iter()
+                    .any(|(_, e)| *e == fd),
+                "the retained {label} descriptor must be adopted by the later activation"
+            );
+        }
+        let accepted: Vec<Protocol> = server
+            .accept_queue
+            .iter()
+            .map(|(_, _, protocol, _, _)| *protocol)
+            .collect();
+        for expected in [
+            Protocol::HTTPListen,
+            Protocol::HTTPSListen,
+            Protocol::TCPListen,
+        ] {
+            assert!(
+                accepted.contains(&expected),
+                "the connection queued on the retained {expected:?} descriptor must be served \
+                 by the later activation, got {accepted:?}"
+            );
+        }
+    }
+
+    /// A socket parked by a failed registration must not be mistaken for a
+    /// live, registered one.
+    ///
+    /// Every consumer of the listener's socket field reads its `Some` as
+    /// "registered and live": `give_back_listener` hands it back as an
+    /// activated socket and answers `Ok`, `soft_stop` / `hard_stop` deregister
+    /// it and fold a failure into `ProxyError::SoftStop` / `HardStop`, `accept`
+    /// accepts on it. Parking there made a listener that had simply never come
+    /// up look activated — and, for a registration failure that leaves the
+    /// socket unregistered, made `deregister` answer `ENOENT` and report a
+    /// failed shutdown. The park therefore lives in its own `parked_listener` /
+    /// `parked_socket` field, which nothing but `activate()` reads.
+    ///
+    /// `give_back_listener` is the assertion that falsifies the mutation:
+    /// `ProxyError::UnactivatedListener` keys on the live field being `None`,
+    /// so parking into it turns the answer into `Ok`. The stop assertions ride
+    /// along to pin the shutdown behaviour, but they cannot redden on this
+    /// repro — the EEXIST it uses means the descriptor IS registered (under
+    /// another token), so `deregister` succeeds either way.
+    ///
+    /// To SEE THIS RED: in any `activate()`, replace
+    /// `self.parked_listener = Some(listener)` (or `self.parked_socket = Some(socket)`)
+    /// with `self.listener = Some(listener)` / `self.socket = Some(socket)` —
+    /// that protocol's `give_back_listener` assertion fails.
+    #[test]
+    fn a_socket_parked_by_a_failed_registration_is_not_mistaken_for_a_live_one() {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+
+        let token_for = |protocol: Protocol| {
+            let mut manager = sessions.borrow_mut();
+            let entry = manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(ListenSession { protocol })));
+            token
+        };
+        // A socket whose descriptor is already registered on the same epoll
+        // instance, so `activate()`'s own `register` answers EEXIST and parks.
+        let pre_registered = |address: SocketAddress| {
+            let mut socket =
+                server_bind(address.into()).expect("could not bind the test listening socket");
+            registry
+                .register(&mut socket, Token(usize::MAX - 2), Interest::READABLE)
+                .expect("could not pre-register the test socket");
+            socket
+        };
+
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let mut http_proxy = http::HttpProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+        );
+        http_proxy
+            .add_listener(
+                ListenerBuilder::new_http(http_address)
+                    .to_http(None)
+                    .expect("could not build the test HTTP listener config"),
+                token_for(Protocol::HTTPListen),
+            )
+            .expect("could not add the test HTTP listener");
+        assert!(
+            http_proxy
+                .activate_listener(&http_address.into(), Some(pre_registered(http_address)))
+                .is_err(),
+            "the pre-registered descriptor must make the HTTP registration fail"
+        );
+        assert!(
+            matches!(
+                http_proxy.give_back_listener(http_address.into()),
+                Err(ProxyError::UnactivatedListener)
+            ),
+            "an HTTP listener holding only a parked socket must not answer as activated"
+        );
+        assert!(
+            http_proxy.soft_stop().is_ok(),
+            "a parked socket must not fail an HTTP soft stop"
+        );
+
+        let https_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let mut https_proxy = https::HttpsProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+        );
+        https_proxy
+            .add_listener(
+                ListenerBuilder::new_https(https_address)
+                    .to_tls(None)
+                    .expect("could not build the test HTTPS listener config"),
+                token_for(Protocol::HTTPSListen),
+            )
+            .expect("could not add the test HTTPS listener");
+        assert!(
+            https_proxy
+                .activate_listener(&https_address.into(), Some(pre_registered(https_address)))
+                .is_err(),
+            "the pre-registered descriptor must make the HTTPS registration fail"
+        );
+        assert!(
+            matches!(
+                https_proxy.give_back_listener(https_address.into()),
+                Err(ProxyError::UnactivatedListener)
+            ),
+            "an HTTPS listener holding only a parked socket must not answer as activated"
+        );
+        assert!(
+            https_proxy.hard_stop().is_ok(),
+            "a parked socket must not fail an HTTPS hard stop"
+        );
+
+        let tcp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let mut tcp_proxy = tcp::TcpProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+        );
+        tcp_proxy
+            .add_listener(
+                ListenerBuilder::new_tcp(tcp_address)
+                    .to_tcp(None)
+                    .expect("could not build the test TCP listener config"),
+                token_for(Protocol::TCPListen),
+            )
+            .expect("could not add the test TCP listener");
+        assert!(
+            tcp_proxy
+                .activate_listener(&tcp_address.into(), Some(pre_registered(tcp_address)))
+                .is_err(),
+            "the pre-registered descriptor must make the TCP registration fail"
+        );
+        assert!(
+            matches!(
+                tcp_proxy.give_back_listener(tcp_address.into()),
+                Err(ProxyError::UnactivatedListener)
+            ),
+            "a TCP listener holding only a parked socket must not answer as activated"
+        );
+
+        let udp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let mut udp_proxy = udp::UdpProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+            16,
+            16384,
+        );
+        udp_proxy
+            .add_listener(
+                ListenerBuilder::new_udp(udp_address)
+                    .to_udp(None)
+                    .expect("could not build the test UDP listener config"),
+                token_for(Protocol::UDP),
+            )
+            .expect("could not add the test UDP listener");
+        let mut udp_socket =
+            udp_bind(udp_address.into()).expect("could not bind the test UDP socket");
+        registry
+            .register(&mut udp_socket, Token(usize::MAX - 2), Interest::READABLE)
+            .expect("could not pre-register the test UDP socket");
+        assert!(
+            udp_proxy
+                .activate_listener(&udp_address.into(), Some(udp_socket))
+                .is_err(),
+            "the pre-registered descriptor must make the UDP registration fail"
+        );
+        assert!(
+            matches!(
+                udp_proxy.give_back_listener(udp_address.into()),
+                Err(ProxyError::UnactivatedListener)
+            ),
+            "a UDP listener holding only a parked socket must not answer as activated"
+        );
+    }
+
+    /// A failed mio registration must not close the socket it was handed.
+    ///
+    /// `activate()` moves the socket into a local to register it. Propagating a
+    /// registration error straight from that local drops it — and closes a
+    /// descriptor `Listeners::get_*` has already removed from the SCM table,
+    /// which is the sozu#1342 close in a second place. `Registry::register`
+    /// answers `EEXIST` for a descriptor already registered on the same epoll
+    /// instance, which is what the test arranges and what a `deactivate` whose
+    /// `deregister` only logged leaves behind.
+    ///
+    /// To SEE THIS RED: in any `activate()`, go back to
+    /// `registry.register(..).map_err(..)?` followed by `self.listener = Some(listener)`
+    /// — the `?` drops the local and that protocol's assertion fails.
+    #[test]
+    fn a_failed_registration_does_not_close_the_socket_it_was_handed() {
+        let ServerParts {
+            registry,
+            sessions,
+            pool,
+            backends,
+            ..
+        } = prebuild_server(16, 16384, true).expect("could not prebuild a test server");
+
+        let token_for = |protocol: Protocol| {
+            let mut manager = sessions.borrow_mut();
+            let entry = manager.slab.vacant_entry();
+            let token = Token(entry.key());
+            entry.insert(Rc::new(RefCell::new(ListenSession { protocol })));
+            token
+        };
+
+        // Hand each proxy a socket whose descriptor is ALREADY registered on the
+        // same epoll instance, so `activate()`'s own `register` answers EEXIST.
+        let handed_out = |address: SocketAddress| {
+            let mut socket =
+                server_bind(address.into()).expect("could not bind the test listening socket");
+            registry
+                .register(&mut socket, Token(usize::MAX - 1), Interest::READABLE)
+                .expect("could not pre-register the test socket");
+            let fd = socket.as_raw_fd();
+            (socket, fd)
+        };
+
+        let http_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let token = token_for(Protocol::HTTPListen);
+        let mut http_proxy = http::HttpProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+        );
+        http_proxy
+            .add_listener(
+                ListenerBuilder::new_http(http_address)
+                    .to_http(None)
+                    .expect("could not build the test HTTP listener config"),
+                token,
+            )
+            .expect("could not add the test HTTP listener");
+        let (socket, http_fd) = handed_out(http_address);
+        let result = http_proxy.activate_listener(&http_address.into(), Some(socket));
+        assert!(
+            result.is_err(),
+            "the pre-registered descriptor must make the HTTP registration fail"
+        );
+        assert!(
+            descriptor_is_socket_on_port(http_fd, http_address.port as u16),
+            "a failed HTTP registration must not close the socket it was handed"
+        );
+
+        let tcp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let token = token_for(Protocol::TCPListen);
+        let mut tcp_proxy = tcp::TcpProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+        );
+        tcp_proxy
+            .add_listener(
+                ListenerBuilder::new_tcp(tcp_address)
+                    .to_tcp(None)
+                    .expect("could not build the test TCP listener config"),
+                token,
+            )
+            .expect("could not add the test TCP listener");
+        let (socket, tcp_fd) = handed_out(tcp_address);
+        let result = tcp_proxy.activate_listener(&tcp_address.into(), Some(socket));
+        assert!(
+            result.is_err(),
+            "the pre-registered descriptor must make the TCP registration fail"
+        );
+        assert!(
+            descriptor_is_socket_on_port(tcp_fd, tcp_address.port as u16),
+            "a failed TCP registration must not close the socket it was handed"
+        );
+
+        let https_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let token = token_for(Protocol::HTTPSListen);
+        let mut https_proxy = https::HttpsProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+        );
+        https_proxy
+            .add_listener(
+                ListenerBuilder::new_https(https_address)
+                    .to_tls(None)
+                    .expect("could not build the test HTTPS listener config"),
+                token,
+            )
+            .expect("could not add the test HTTPS listener");
+        let (socket, https_fd) = handed_out(https_address);
+        let result = https_proxy.activate_listener(&https_address.into(), Some(socket));
+        assert!(
+            result.is_err(),
+            "the pre-registered descriptor must make the HTTPS registration fail"
+        );
+        assert!(
+            descriptor_is_socket_on_port(https_fd, https_address.port as u16),
+            "a failed HTTPS registration must not close the socket it was handed"
+        );
+
+        let udp_address = SocketAddress::new_v4(127, 0, 0, 1, provide_port());
+        let token = token_for(Protocol::UDP);
+        let mut udp_proxy = udp::UdpProxy::new(
+            registry.try_clone().expect("could not clone the registry"),
+            sessions.clone(),
+            pool.clone(),
+            backends.clone(),
+            16,
+            16384,
+        );
+        udp_proxy
+            .add_listener(
+                ListenerBuilder::new_udp(udp_address)
+                    .to_udp(None)
+                    .expect("could not build the test UDP listener config"),
+                token,
+            )
+            .expect("could not add the test UDP listener");
+        let mut socket = udp_bind(udp_address.into()).expect("could not bind the test UDP socket");
+        registry
+            .register(&mut socket, Token(usize::MAX - 1), Interest::READABLE)
+            .expect("could not pre-register the test UDP socket");
+        let udp_fd = socket.as_raw_fd();
+        let result = udp_proxy.activate_listener(&udp_address.into(), Some(socket));
+        assert!(
+            result.is_err(),
+            "the pre-registered descriptor must make the UDP registration fail"
+        );
+        assert!(
+            descriptor_is_socket_on_port(udp_fd, udp_address.port as u16),
+            "a failed UDP registration must not close the socket it was handed"
+        );
     }
 }
