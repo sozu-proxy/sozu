@@ -79,9 +79,11 @@ fn filter_labels_for_detail<'a>(
 /// codes return `None` so the bucket counter (`http.status.{1xx,…,other}`)
 /// remains the sole emission and metric cardinality stays bounded.
 ///
-/// Hoisted out of the protocol modules so H1 (`kawa_h1::save_http_status_metric`)
-/// and H2 (`mux::stream::generate_access_log`) cannot drift on which codes
-/// get a per-code counter.
+/// Hoisted out of the protocol modules so every emission site
+/// (`mux::stream::generate_access_log`, shared by the H1 and H2 mux paths)
+/// cannot drift on which codes get a per-code counter. It was shared with
+/// `kawa_h1::save_http_status_metric` until that unreachable H1 session was
+/// removed on 2026-09-20 (sozu#1346).
 pub(crate) fn http_status_code_metric_name(status: u16) -> Option<&'static str> {
     match status {
         200 => Some("http.status.200"),

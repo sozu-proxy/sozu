@@ -1011,10 +1011,11 @@ mod tests {
 
     #[test]
     fn receive_and_yield_cluster_metrics() {
-        // Mirrors what `kawa_h1::log_request_error` and
-        // `mux::stream::generate_access_log` emit when `metrics.detail` is
+        // Mirrors what `mux::stream::generate_access_log`
+        // (`lib/src/protocol/mux/stream.rs:331`) emits when `metrics.detail` is
         // `cluster`: the dotted metric name `http.errors` aggregated under
-        // the cluster (with the backend label dropped centrally).
+        // the cluster (with the backend label dropped centrally). Since
+        // sozu#1346 that is the only site emitting this key.
         let mut local_drain = LocalDrain::new("prefix".to_string());
         for _ in 0..2 {
             local_drain.receive_metric(

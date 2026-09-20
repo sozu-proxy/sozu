@@ -9,8 +9,8 @@ boundary is drawn, and which files to read next.
 
 For deep per-protocol detail, follow the `LIFECYCLE.md` siblings:
 
-- HTTP/2 mux: [`lib/src/protocol/mux/LIFECYCLE.md`](../lib/src/protocol/mux/LIFECYCLE.md)
-- HTTP/1.1 (Kawa-backed): [`lib/src/protocol/kawa_h1/LIFECYCLE.md`](../lib/src/protocol/kawa_h1/LIFECYCLE.md)
+- HTTP/1.1 and HTTP/2 mux: [`lib/src/protocol/mux/LIFECYCLE.md`](../lib/src/protocol/mux/LIFECYCLE.md)
+- H1 vocabulary shared with the mux (`DefaultAnswer`, answer templates, `HttpContext`, `Method`): [`lib/src/protocol/kawa_h1/LIFECYCLE.md`](../lib/src/protocol/kawa_h1/LIFECYCLE.md)
 - PROXY-protocol pre-flight: [`lib/src/protocol/proxy_protocol/LIFECYCLE.md`](../lib/src/protocol/proxy_protocol/LIFECYCLE.md)
 - UDP datagram flows (connectionless; sits outside the per-session model): [`lib/src/protocol/udp/LIFECYCLE.md`](../lib/src/protocol/udp/LIFECYCLE.md)
 - Master/worker supervisor: [`bin/src/command/LIFECYCLE.md`](../bin/src/command/LIFECYCLE.md)
@@ -50,7 +50,7 @@ through a `Readiness` tracker (`lib/src/protocol/mux/connection.rs:200,
   another kernel wake-up.
 
 If new code queues output bytes from a readable path and forgets to
-call `arm_writable` (mux) or `signal_pending_write` (kawa_h1 / pipe),
+call `arm_writable` (mux) or `signal_pending_write` (pipe),
 the session "stalls" — bytes sit in the buffer and the next epoll
 event never arrives. Past truncation bugs on this branch all
 originated here. The `mux::answers` module documents this as the
@@ -281,37 +281,39 @@ Once the session has gone through any TLS and PROXY-protocol
 pre-flight, control transfers to one of three protocol state machines
 that own the rest of the session.
 
-### 6.1 HTTP/1.1 (Kawa-backed)
+### 6.1 HTTP/1.1 (mux in H1 mode)
 
-The HTTP/1.1 path is the historical core of Sōzu and is now backed by
-the [Kawa](https://github.com/CleverCloud/kawa) HTTP parser.
-Conceptually the lifecycle is:
+The HTTP/1.1 path is the historical core of Sōzu and is backed by the
+[Kawa](https://github.com/CleverCloud/kawa) HTTP parser. Since the mux
+migration it does **not** run through a protocol module of its own:
+`HttpStateMachine` and `HttpsStateMachine` carry a `Mux` variant only, so
+H1 and H2 share `lib/src/protocol/mux/` and differ in their connection
+type (`ConnectionH1` in `mux/h1.rs`, `ConnectionH2` in `mux/h2.rs`). The
+standalone `kawa_h1::Http` session that used to own this path was removed
+on 2026-09-20 (sozu#1346) after a planted `panic!` proved no binary
+constructed it. Conceptually the lifecycle is:
 
 1. **Parse the request** out of the front buffer using Kawa, in
-   `lib/src/protocol/kawa_h1/mod.rs`.
-2. **Route the request** to a cluster via
-   `cluster_id_from_request` (`lib/src/protocol/kawa_h1/mod.rs:1340`).
-3. **Pick a backend** via `backend_from_request`
-   (`lib/src/protocol/kawa_h1/mod.rs:1397`) and
-   **connect to it** via `connect_to_backend`
-   (`lib/src/protocol/kawa_h1/mod.rs:1462`). A previously-opened
-   keep-alive socket may be reused after a liveness probe
-   (`check_backend_connection`,
-   `lib/src/protocol/kawa_h1/mod.rs:1288`).
-4. **Forward bytes** in both directions through the front/back Kawa
-   buffer pair, registering writable interest as needed
-   (`lib/src/protocol/kawa_h1/mod.rs:1545, 1566`).
-5. **Close or reset** when the response completes. If the request and
-   response both indicate keep-alive, the session is "reset" rather
-   than destroyed and waits for the next request on the same front
-   socket; the back socket may be released or kept depending on the
-   cluster decision (`close_backend`,
-   `lib/src/protocol/kawa_h1/mod.rs:1198`).
+   `ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs`), driven by the
+   `HttpContext` callbacks in `lib/src/protocol/kawa_h1/editor.rs`.
+2. **Route the request** to a cluster via `Router::route_from_request`
+   (`lib/src/protocol/mux/router.rs`).
+3. **Pick a backend** via `Router::backend_from_request` and **connect to
+   it** via `Router::connect` (same file). A previously-opened keep-alive
+   socket may be reused after a liveness probe.
+4. **Forward bytes** in both directions through the per-`Stream`
+   front/back Kawa buffer pair (`lib/src/protocol/mux/stream.rs`),
+   registering writable interest with `arm_writable` as needed.
+5. **Close or reset** when the response completes, emitting the access log
+   and the status metrics from `Stream::generate_access_log`.
 
-The full state diagram, including the parser back-pressure rules,
-the H1 → WebSocket upgrade path, the H1 → H2 mux transition, and the
-keep-alive vs close attribution, lives in
-[`lib/src/protocol/kawa_h1/LIFECYCLE.md`](../lib/src/protocol/kawa_h1/LIFECYCLE.md).
+The full state diagram, including the parser back-pressure rules, the
+H1 → WebSocket upgrade path, the H1 → H2 transition, and the keep-alive vs
+close attribution, lives in
+[`lib/src/protocol/mux/LIFECYCLE.md`](../lib/src/protocol/mux/LIFECYCLE.md).
+[`lib/src/protocol/kawa_h1/LIFECYCLE.md`](../lib/src/protocol/kawa_h1/LIFECYCLE.md)
+now documents only the H1 vocabulary that module still provides
+(`DefaultAnswer`, `HttpAnswers`, `HttpContext`, `Method`).
 
 ### 6.2 HTTP/2 (mux)
 
@@ -513,15 +515,15 @@ Use this map as the entry point when you want to read source.
 | `HttpsProxy`, TLS listener, ALPN dispatch, write-only shutdown | `lib/src/https.rs`, `lib/src/tls.rs` |
 | `TcpProxy` (plaintext byte relay) | `lib/src/tcp.rs` |
 | TLS handshake (rustls glue), handshake metrics | `lib/src/protocol/rustls.rs` |
-| HTTP/1.1 session (parser, editor, router, backend connect, keep-alive) | `lib/src/protocol/kawa_h1/` |
-| HTTP/2 mux (connection, frames, HPACK, priorities, scheduler, flood detector) | `lib/src/protocol/mux/` |
+| H1 vocabulary (`DefaultAnswer`, answer templates, `HttpContext` editor, `Method`) | `lib/src/protocol/kawa_h1/` |
+| HTTP/1.1 and HTTP/2 mux (connection, frames, HPACK, priorities, scheduler, flood detector, router, backend connect, keep-alive) | `lib/src/protocol/mux/` |
 | WebSocket / TCP pass-through after upgrade | `lib/src/protocol/pipe.rs` |
 | PROXY-protocol pre-flight (expect / relay / send) | `lib/src/protocol/proxy_protocol/` |
 | Routing and load balancing | `lib/src/router/`, `lib/src/load_balancing.rs`, `lib/src/backends.rs` |
 | Metrics emission | `lib/src/metrics/mod.rs` |
 | Master/worker supervisor, command socket, hot upgrade | `bin/src/command/`, `bin/src/upgrade.rs` |
 | Config knobs (buffer_size, ALPN, H2 timeouts, flood thresholds, sticky sessions) | `command/src/config.rs` |
-| Per-protocol log macros (`MUX-H2`, `RUSTLS`, `KAWA-H1`, `PIPE`, `TCP`, `HTTPS`, …) | each module's `log_context!` family |
+| Per-protocol log macros (`MUX-H1`, `MUX-H2`, `RUSTLS`, `PIPE`, `TCP`, `HTTPS`, …) | each module's `log_context!` family |
 
 ## 11.5 Where metrics fire along the path
 
@@ -565,9 +567,11 @@ embedded) cited two modules that no longer exist on `feat/h2-mux`:
   replacements are `lib/src/https.rs` (proxy + listener) and
   `lib/src/protocol/rustls.rs` (per-session handshake state machine).
 - `lib/src/protocol/http/mod.rs` — the pre-Kawa HTTP/1.1 state
-  machine; the canonical replacement is `lib/src/protocol/kawa_h1/`
-  (with its sibling
-  [`LIFECYCLE.md`](../lib/src/protocol/kawa_h1/LIFECYCLE.md)).
+  machine. Its Kawa-backed successor, `kawa_h1::Http`, was itself
+  removed on 2026-09-20 (sozu#1346) once it became unreachable; the
+  canonical replacement for the H1 datapath is now
+  `lib/src/protocol/mux/` (with its sibling
+  [`LIFECYCLE.md`](../lib/src/protocol/mux/LIFECYCLE.md)).
 
 A stale reference to either path elsewhere in `doc/` is a defect —
 update it against current sources rather than copying the obsolete

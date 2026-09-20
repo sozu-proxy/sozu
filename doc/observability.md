@@ -181,7 +181,6 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
 | `MUX-H1` | `protocol/mux/h1.rs` | …plus stream id, parked, close_notify |
 | `MUX-ROUTER` | `protocol/mux/router.rs` | renders `[session req cluster backend]` via `HttpContext::log_context()` |
 | `MUX-CONN` / `MUX-CONV` / `MUX-PARSER` / `MUX-PKAWA` / `MUX-STREAM` | corresponding files | module-level only (no per-session context) |
-| `KAWA-H1` | `protocol/kawa_h1/mod.rs` | session, frontend, request/response parsing phase |
 | `RUSTLS` | `protocol/rustls.rs` | SNI/ALPN byte lengths, version, source, frontend |
 | `PIPE` | `protocol/pipe.rs` | addresses, frontend/backend status & readiness |
 | `TCP` | `tcp.rs` | frontend, backend, peer (cached on `SessionTcpStream`) |
@@ -331,8 +330,7 @@ a field requires:
 2. Field on `ProtobufAccessLog` (proto, append a new optional tag — never
    reuse or reorder existing tags).
 3. Populate at every emit site:
-   - H1: `lib/src/protocol/kawa_h1/mod.rs::log_request`
-   - H2 mux: `lib/src/protocol/mux/stream.rs::generate_access_log`
+   - H1 and H2 mux: `lib/src/protocol/mux/stream.rs::generate_access_log`
    - TCP: `lib/src/tcp.rs::log_request`
    - WS / WSS post-upgrade pipe: `lib/src/protocol/pipe.rs::log_request`
 4. Update `RequestRecord::duplicate()` in `access_logs.rs` so the protobuf

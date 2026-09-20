@@ -190,7 +190,8 @@ fn default_answer_for_code(
 /// Replace the content of the kawa message with a default Sozu answer for a given status code.
 ///
 /// Uses the listener's `HttpAnswers` templates to produce responses matching the configured
-/// custom answers, preserving backward compatibility with the kawa_h1 code path.
+/// custom answers, so an operator's `answer_NNN` overrides keep rendering exactly as they did
+/// before the mux took over the H1 datapath.
 pub(crate) fn set_default_answer(
     stream: &mut Stream,
     readiness: &mut Readiness,

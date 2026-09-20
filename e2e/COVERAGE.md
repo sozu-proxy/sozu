@@ -144,36 +144,42 @@ at all, and the reason is structural rather than a missing helper — a
 test written against it would pass for the wrong reason. The mechanism
 is recorded here so the next person does not re-derive it.
 
-- **`protocol::kawa_h1::Http`, and everything only it reaches**,
-  including `kawa_h1::save_http_status_metric`. No session state machine
-  has a variant that holds it: `HttpStateMachine` is
-  `Expect | Mux | WebSocket` (`lib/src/http.rs:63`) and
-  `HttpsStateMachine` is `Expect | Handshake | Mux | WebSocket`
-  (`lib/src/https.rs:81`). H1 proxying runs through `protocol/mux`
-  (`MuxClear` / `MuxTls`), not through `kawa_h1`. `Http::new` has zero
-  code callers in the workspace; the only compiled reference to the type
-  is the `pub use` re-export at `lib/src/protocol/mod.rs:23`, and the
-  only other mentions are prose
-  (`lib/src/protocol/kawa_h1/LIFECYCLE.md:62`) and two `assert_size!`
-  lines sitting inside block comments (`lib/src/http.rs:1892`,
-  `lib/src/https.rs:3084`). It is therefore unreachable in **any**
-  binary, not merely under e2e — measured by planting an unconditional
-  `panic!` at the top of `save_http_status_metric` and running the HTTP
-  e2e tests, which still passed.
+- **`protocol::kawa_h1::Http` — resolved by deletion on 2026-09-20, kept
+  here as the worked example.** The `Http` session state machine, its
+  `SessionState` impl, `TimeoutStatus`, `ResponseStream`,
+  `save_http_status_metric`, `handle_connection_result` and the whole
+  `kawa_h1::diagnostics` module were unreachable in **any** binary: no
+  session state machine had a variant holding one — `HttpStateMachine` is
+  `Expect | Mux | WebSocket` (`lib/src/http.rs`) and `HttpsStateMachine`
+  is `Expect | Handshake | Mux | WebSocket` (`lib/src/https.rs`) — and
+  `Http::new` had zero code callers under either module spelling
+  (`crate::protocol::kawa_h1::` and the `crate::protocol::http::`
+  re-export). That was measured, not inferred: an unconditional
+  `panic!("PROBEALWAYS …")` planted at the top of both
+  `save_http_status_metric` and `Http::new` fired 0 times across four real
+  proxied HTTP/HTTPS e2e sessions, while the same planted binary panicked
+  immediately under the function's own unit test (the positive control).
+  sozu#1346 removed all of it; sozu#1347, a frontend timeout consumed
+  without re-arming, was closed by that removal rather than patched.
 
   The rest of the module is *not* dead and *is* e2e-reachable:
-  `kawa_h1::editor::HttpContext`, `kawa_h1::answers` and
-  `kawa_h1::parser` are what `mux` builds on. Only the `Http` session
-  state and the helpers nothing else calls are stranded.
+  `kawa_h1::editor::HttpContext`, `kawa_h1::answers` (`HttpAnswers`,
+  `DefaultAnswerStream`, `merge_legacy_into_map`), `kawa_h1::parser`
+  (`Method`, `hostname_and_port`) and the `DefaultAnswer` enum are what
+  `mux` builds on.
 
-  Consequence for coverage: a status-handling defect on that path can
-  only be guarded by a unit test —
-  `kawa_h1::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`.
-  Its control-plane-reachable sibling, an operator answer template
-  carrying an out-of-range status, *is* e2e-covered by
+  Consequence for coverage, and the reusable lesson: the unit test that
+  guarded the dead bucketer,
+  `kawa_h1::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`,
+  was ported onto the live path as
+  `mux::stream::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`
+  rather than deleted with the code — a unit test on an unreachable
+  function reads as protocol coverage and is not. Its
+  control-plane-reachable sibling, an operator answer template carrying an
+  out-of-range status, *is* e2e-covered by
   `tests::h1_security_tests::test_h1_custom_answer_with_out_of_range_status_does_not_kill_the_worker`.
-  Do not write an e2e test that drives a backend status line and claim
-  it guards `save_http_status_metric`: it passes either way.
+  Before writing a test for a defect on a quiet path, plant the `panic!`
+  and run the suite: it settles reachability in one run.
 
 - **Rendered log content, including the `peer=` slot of a `MUX-H2` line
   — no longer out of reach.** This entry used to say the harness could

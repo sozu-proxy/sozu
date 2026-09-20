@@ -193,8 +193,9 @@ impl Template {
         // `str::parse::<u16>()` and applies no range check, so `HTTP/1.1 000 x`
         // compiles to status `0`. Asserting the range here would panic the
         // worker on a control-plane request in every debug, test, e2e and fuzz
-        // build. Such a code simply lands in `save_http_status_metric`'s
-        // `STATUS_OTHER` bucket, which is what that catch-all is for.
+        // build. Such a code simply lands in the `STATUS_OTHER` bucket of
+        // `mux::stream::generate_access_log`, which is what that catch-all is
+        // for.
         let buf = kawa.storage.buffer();
         let mut blocks = VecDeque::new();
         let mut header_replacements = Vec::new();
@@ -1466,8 +1467,8 @@ impl HttpAnswers {
         // `Self::template`, or the bundled `fallback`. An operator's custom
         // answer is compiled into the map but is never selectable. Locked by
         // `an_unrecognised_custom_answer_may_carry_an_out_of_range_status`.
-        // The returned code feeds `self.context.status` and
-        // `save_http_status_metric`.
+        // The returned code feeds `HttpContext::status` and the status
+        // bucketer in `mux::stream::generate_access_log`.
         debug_assert!(
             (100..=999).contains(&template.status),
             "resolved answer status must be a 3-digit HTTP code, got {}",
@@ -1517,9 +1518,9 @@ mod tests {
     ///
     /// kawa applies no range check to a status line (`take(3)` then
     /// `str::parse::<u16>()`), so a custom answer whose body starts
-    /// `HTTP/1.1 000 x` resolves to status `0` — same root cause as
-    /// `kawa_h1::save_http_status_metric`, reached from the control plane
-    /// instead of from a backend socket.
+    /// `HTTP/1.1 000 x` resolves to status `0` — same root cause as the status
+    /// bucketer in `mux::stream::generate_access_log`, reached from the
+    /// control plane instead of from a backend socket.
     ///
     /// To SEE THIS RED: restore the deleted post-condition after
     /// `resolved_status` in `Template::new`,
@@ -1550,9 +1551,10 @@ mod tests {
         // selectable: `HttpAnswers::get` derives its lookup key from the
         // `DefaultAnswer` variant, so only the built-in code names ("301" …
         // "507") and the bundled fallback can be resolved. This is what keeps
-        // the two remaining range post-conditions downstream — `get`'s own and
-        // `kawa_h1::mod`'s `default_answer` one — genuine invariants after the
-        // `Template::new` post-condition above was removed.
+        // the one remaining range post-condition downstream — `get`'s own — a
+        // genuine invariant after the `Template::new` post-condition above was
+        // removed. (`kawa_h1::Http::set_answer` carried a second copy until
+        // the unreachable H1 session was removed, sozu#1346.)
         let registry = HttpAnswers::new(&answers)
             .expect("an unrecognised answer name must not fail registry construction");
         let (resolved_status, _keep_alive, _stream) = registry.get(

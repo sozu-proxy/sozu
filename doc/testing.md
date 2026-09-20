@@ -479,12 +479,15 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   the wrong reason and guards nothing. Before adding a test for a defect on a
   quiet path, confirm a session actually gets there — planting a temporary
   unconditional `panic!` in the target function and running the suite settles
-  it in one run. The standing case is `protocol::kawa_h1::Http`: neither
+  it in one run. The worked example is `protocol::kawa_h1::Http`: neither
   `HttpStateMachine` (`Expect | Mux | WebSocket`, `lib/src/http.rs:63`) nor
   `HttpsStateMachine` (`Expect | Handshake | Mux | WebSocket`,
-  `lib/src/https.rs:81`) has a variant holding it and `Http::new` has no code
-  caller, so H1 runs through `protocol/mux` and `kawa_h1::save_http_status_metric`
-  is dead in every binary. New findings of this kind belong in
+  `lib/src/https.rs:81`) had a variant holding it and `Http::new` had no code
+  caller under either module spelling, so H1 runs through `protocol/mux` and
+  the whole session — including `kawa_h1::save_http_status_metric` — was dead
+  in every binary. It was deleted on 2026-09-20 (sozu#1346); the unit test
+  that guarded it was ported onto the live `mux::stream` path instead of being
+  deleted with it. New findings of this kind belong in
   `e2e/COVERAGE.md > Out of e2e reach by construction`, with the mechanism, not
   just the conclusion.
 - **A worker's own log output IS readable — name the level.** It was not until

@@ -21,7 +21,10 @@ use crate::{
     Protocol, RetrieveClusterError,
     pool::Checkout,
     protocol::{
-        http::{GenericHttpStream, Method, parser::compare_no_case},
+        http::{
+            GenericHttpStream,
+            parser::{Method, compare_no_case},
+        },
         pipe::WebSocketContext,
     },
 };
@@ -411,7 +414,7 @@ pub struct HttpContext {
     pub redirect_status: Option<u16>,
     /// Stable, structured discriminator surfaced as the access-log
     /// `message` field when the session terminates on a timeout. Set by
-    /// the timeout handlers in `kawa_h1::timeout` and `MuxState::timeout`
+    /// the `MuxState::timeout` handler
     /// **before** the default-answer or `forcefully_terminate_answer`
     /// path consumes it. The vocabulary is operator-visible API once
     /// shipped — see the access-log section of `doc/configure.md` for

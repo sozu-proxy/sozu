@@ -1,159 +1,114 @@
-# Kawa H1 — Session Workflow and Per-Stream Lifecycle
+# Kawa H1 — Shared HTTP/1.1 Vocabulary
 
-Reference document for maintainers of the HTTP/1.1 frontend / backend pairing
-under `lib/src/protocol/kawa_h1/`. Companion to `lib/src/protocol/mux/LIFECYCLE.md`
-(H2) and `lib/src/protocol/proxy_protocol/LIFECYCLE.md` (PROXY-v2 ingress).
+Reference document for maintainers of `lib/src/protocol/kawa_h1/`. Companion to
+`lib/src/protocol/mux/LIFECYCLE.md` (the H1/H2 datapath that consumes this
+module) and `lib/src/protocol/proxy_protocol/LIFECYCLE.md` (PROXY-v2 ingress).
 
 Every claim is anchored to a concrete `file.rs:LINE`. Line numbers were last
-refreshed against the `docs/feat-h2-mux-audit` branch tip on 2026-04-26 — when
-a refactor moves them, please update the citations in the same changeset; stale
-pointers here are treated as broken documentation.
+refreshed on 2026-09-20 — when a refactor moves them, please update the
+citations in the same changeset; stale pointers here are treated as broken
+documentation.
 
-Scope: the server-side Kawa H1 session is the primary subject. Where the
-behaviour diverges between an H1 frontend and the H1 backend connection wired
-underneath an H2 frontend (via the mux), the difference is called out.
+**Scope changed on 2026-09-20.** This module used to own an `Http<Front, L>`
+session state machine and this document used to describe its lifecycle. That
+session was removed (sozu#1346): neither `HttpStateMachine` (`lib/src/http.rs`,
+`Expect | Mux | WebSocket`) nor `HttpsStateMachine` (`lib/src/https.rs`,
+`Expect | Handshake | Mux | WebSocket`) had a variant holding one, and
+`Http::new` had no code caller under either module spelling
+(`crate::protocol::kawa_h1::` or the `crate::protocol::http::` re-export
+declared at `lib/src/protocol/mod.rs:25-27`). An unconditional
+`panic!("PROBEALWAYS …")` planted at the top of `Http::new` and
+`save_http_status_metric` fired 0 times across four real proxied e2e sessions,
+while the same binary panicked immediately under the function's own unit test.
+`TimeoutStatus`, `ResponseStream`, `save_http_status_metric`, **this module's**
+`handle_connection_result` (`lib/src/tcp.rs:2426` keeps its own separate copy,
+which is live), this module's `log_context!` macro (and with it the `KAWA-H1`
+log tag) and the whole `diagnostics.rs` module went with it, because nothing
+else reached them. sozu#1347 — a frontend timeout consumed without
+re-arming — was closed by that removal rather than patched.
+
+**For the H1 session lifecycle read `lib/src/protocol/mux/LIFECYCLE.md`.**
+Accept, request parsing, routing, backend connect, response streaming,
+keep-alive, timeouts and access logs all live in `lib/src/protocol/mux/`
+(`ConnectionH1` in `mux/h1.rs`, `Router` in `mux/router.rs`, `Stream` in
+`mux/stream.rs`).
 
 ---
 
-## 1. Architecture Overview
+## 1. What this module still provides
 
-### 1.1 Where Kawa H1 sits
+`kawa_h1` is the HTTP/1.1 vocabulary the mux builds on: the parser callbacks
+that rewrite headers, the answer templates, the method enum, and the catalogue
+of synthesised replies. It has no `SessionState` implementation.
 
-Kawa H1 owns the HTTP/1.1 wire-level state machine plus the request/response
-mutation pipeline. It is consumed by:
+### 1.1 Consumers
 
-- the standalone H1 frontend (`lib/src/http.rs`, `lib/src/https.rs` after TLS
-  handshake completes with ALPN `http/1.1` or no ALPN);
-- the H2 mux backend path (`lib/src/protocol/mux/h1.rs`), which speaks H1 to
-  origin servers regardless of the frontend protocol — Sōzu currently does
-  not speak H2 to backends.
+| Item | Consumed by |
+|---|---|
+| `editor::HttpContext` | `mux/stream.rs`, `mux/router.rs`, `mux/answers.rs`, `mux/h2.rs` |
+| `editor::HeaderEditMode`, `editor::HeaderEditSnapshot` | `mux/shared.rs`, `mux/router.rs`, `router/mod.rs` |
+| `answers::HttpAnswers` | `lib/src/http.rs`, `lib/src/https.rs`, `mux/answers.rs` |
+| `answers::DefaultAnswerStream`, `answers::merge_legacy_into_map` | `mux/answers.rs`, `lib/src/http.rs`, `lib/src/https.rs` |
+| `parser::Method`, `parser::hostname_and_port`, `parser::compare_no_case` | `lib/src/https.rs`, `lib/src/http.rs`, `mux/auth.rs`, `router/mod.rs` |
+| `DefaultAnswer` (in `mod.rs`) | `protocol/pipe.rs`, `lib/src/http.rs`, `mux/answers.rs` |
 
 ### 1.2 Module layout
 
-| Module                | Path                                                     | Responsibility                                                 |
-|-----------------------|----------------------------------------------------------|----------------------------------------------------------------|
-| `mod.rs`              | `lib/src/protocol/kawa_h1/mod.rs`                        | `Http<Front, L>` session state + `SessionState` impl + readiness pumping |
-| `editor.rs`           | `lib/src/protocol/kawa_h1/editor.rs`                     | `HttpContext`, header rewrites (`Forwarded`, `X-Forwarded-*`, `Sozu-Id`), `log_context()` |
-| `parser.rs`           | `lib/src/protocol/kawa_h1/parser.rs`                     | `Method` enum, hostname/port helper, tolerant-vs-strict charset split |
-| `answers.rs`          | `lib/src/protocol/kawa_h1/answers.rs`                    | `Template`, `HttpAnswers`, `DefaultAnswerStream` for synthesised 4xx/5xx replies |
-| `diagnostics.rs`      | `lib/src/protocol/kawa_h1/diagnostics.rs`                | Hex-dump + phase rendering for parse-failure access logs       |
+| Module       | Path                                      | Responsibility                                                                             |
+|--------------|-------------------------------------------|--------------------------------------------------------------------------------------------|
+| `mod.rs`     | `lib/src/protocol/kawa_h1/mod.rs`          | `DefaultAnswer` catalogue, its `u16` mapping, the `GenericHttpStream` alias and the crate's single `kawa::AsBuffer for Checkout` impl |
+| `editor.rs`  | `lib/src/protocol/kawa_h1/editor.rs`       | `HttpContext`, header rewrites (`Forwarded`, `X-Forwarded-*`, `Sozu-Id`), `log_context()`     |
+| `parser.rs`  | `lib/src/protocol/kawa_h1/parser.rs`       | `Method` enum, hostname/port helper, tolerant-vs-strict charset split                        |
+| `answers.rs` | `lib/src/protocol/kawa_h1/answers.rs`      | `Template`, `HttpAnswers`, `DefaultAnswerStream` for synthesised 3xx/4xx/5xx replies          |
 
 ### 1.3 Key types
 
-| Type                  | Declaration                                              | Purpose                                                        |
-|-----------------------|----------------------------------------------------------|----------------------------------------------------------------|
-| `Http<Front, L>`      | `lib/src/protocol/kawa_h1/mod.rs:189`                    | Top-level H1 session state                                     |
-| `DefaultAnswer`       | `lib/src/protocol/kawa_h1/mod.rs:111`                    | Catalogue of synthesised replies (301/400/404/413/502/503/504/507) |
-| `ResponseStream`      | `lib/src/protocol/kawa_h1/mod.rs:183`                    | `BackendAnswer(Kawa<…>)` vs `DefaultAnswer(…)` split            |
-| `TimeoutStatus`       | `lib/src/protocol/kawa_h1/mod.rs:176`                    | Used by the supervisor to attribute idle vs response timeouts  |
-| `HttpContext`         | `lib/src/protocol/kawa_h1/editor.rs:116`                 | Per-request mutable state used by Kawa parser callbacks         |
-| `Method`              | `lib/src/protocol/kawa_h1/parser.rs:39`                  | Owned-string-free method enum                                   |
-| `HttpAnswers`         | `lib/src/protocol/kawa_h1/answers.rs:339`                | Listener + cluster template registry                           |
-| `DefaultAnswerStream` | `lib/src/protocol/kawa_h1/answers.rs:36`                 | `Kawa<SharedBuffer>` carrying a rendered default answer         |
+| Type                  | Declaration                                   | Purpose                                                            |
+|-----------------------|-----------------------------------------------|--------------------------------------------------------------------|
+| `DefaultAnswer`       | `lib/src/protocol/kawa_h1/mod.rs:40`          | Catalogue of synthesised replies (301/302/308/400/401/404/408/413/421/429/502/503/504/507) |
+| `GenericHttpStream`   | `lib/src/protocol/kawa_h1/mod.rs:28`          | `kawa::Kawa<Checkout>` — the pooled-buffer parser stream            |
+| `HttpContext`         | `lib/src/protocol/kawa_h1/editor.rs:230`      | Per-request mutable state used by Kawa parser callbacks             |
+| `HeaderEditMode` / `HeaderEditSnapshot` | `lib/src/protocol/kawa_h1/editor.rs:446` / `:471` | Per-frontend header-edit programme and its pre-edit snapshot |
+| `Method`              | `lib/src/protocol/kawa_h1/parser.rs:38`       | Owned-string-free method enum                                       |
+| `HttpAnswers`         | `lib/src/protocol/kawa_h1/answers.rs:503`     | Listener + cluster template registry                                |
+| `DefaultAnswerStream` | `lib/src/protocol/kawa_h1/answers.rs:44`      | `Kawa<SharedBuffer>` carrying a rendered default answer             |
+
+Note that `mod.rs`'s `impl kawa::AsBuffer for Checkout` (`mod.rs:30`) is the
+crate's only impl **for `Checkout`** — the orphan rule permits no second copy —
+so `mux` depends on it even though `mux` declares its own `GenericHttpStream`
+alias. (`answers.rs:34` carries a separate `impl AsBuffer for SharedBuffer`, the
+storage behind a rendered default answer.)
 
 ---
 
-## 2. Per-Stream Lifecycle
+## 2. Editor — `HttpContext` and the parser callbacks
 
-### 2.1 Accept and session creation
-
-A new H1 session is constructed by the proxy layer (`lib/src/http.rs`,
-`lib/src/https.rs`) once a TCP/TLS connection has produced a Kawa pair of
-front/back buffers and a `HttpContext`. `Http::new` (`lib/src/protocol/kawa_h1/mod.rs:228`)
-seeds the session with:
-
-- `frontend_readiness.interest = READABLE | HUP | ERROR`;
-- `backend_readiness.interest = HUP | ERROR` (no backend yet);
-- `request_stream` / `response_stream` Kawa parsers in their initial phase;
-- the `container_frontend_timeout` driving idle disconnect.
-
-`reset()` (`lib/src/protocol/kawa_h1/mod.rs:299`) is the keep-alive entry
-point — it reuses the same `Http` instance across pipelined requests, clearing
-the per-request fields while preserving connection-level state.
-
-### 2.2 Request parsing
-
-`Http::readable` (`lib/src/protocol/kawa_h1/mod.rs:355`) is invoked when the
-event loop sees the frontend socket as readable. It:
-
-1. Resets the frontend timeout (`mod.rs:357`); failure to reset is logged but
-   not fatal.
-2. Refuses to read while a `DefaultAnswer` is already queued
-   (`mod.rs:367-376`) — the only legal next step is `writable` to flush the
-   synthesised reply.
-3. Detects a full request buffer and either pushes the parser forward (if we
-   are mid-body) or escalates to a `DefaultAnswer::Answer413`
-   (`mod.rs:379-392`).
-4. Calls `socket_read` and feeds the bytes to the Kawa request parser.
-
-When the request transitions out of the parsing phase, the parser callbacks in
-`HttpContext` (see §3) capture the `:method`, authority, path, and rewrite the
-`Forwarded` / `X-Forwarded-*` header chain.
-
-### 2.3 Routing — `cluster_id_from_request`
-
-`cluster_id_from_request` (`lib/src/protocol/kawa_h1/mod.rs:1340`) extracts the
-authority and path from the Kawa stream and calls back into the listener
-(`L7ListenerHandler`) to resolve the request to a `cluster_id`. It is also the
-gate that:
-
-- enforces the served-cert-SAN-vs-`:authority` binding when `tls_server_name`
-  is present (`HttpContext::strict_sni_binding`, see `editor.rs:189`): the
-  routing layer matches the request authority against `HttpContext::tls_cert_names`
-  with RFC 6125 §6.4.3 wildcard handling, accepting H2/H1 connection coalescing
-  per RFC 7540 §9.1.1 / RFC 9113 §9.1.1 (the same behaviour Firefox / Chrome
-  implement). Misses yield a **421 Misdirected Request** default answer
-  (RFC 9110 §15.5.20) rather than a backend connection (CWE-346 / CWE-444);
-- turns route-not-found into `DefaultAnswer::Answer404`.
-
-### 2.4 Backend connect — `connect_to_backend`
-
-`connect_to_backend` (`lib/src/protocol/kawa_h1/mod.rs:1462`) reuses the
-existing backend when the cluster has not changed and the TCP connection is
-healthy (`mod.rs:1485-1500`); otherwise it allocates a fresh socket via
-`backend_from_request` (`mod.rs:1397`). The resulting `BackendConnectAction`
-is bubbled back to the supervisor so it can register the new socket with mio.
-
-### 2.5 Response streaming and keep-alive
-
-After the backend handshake completes, `Http::backend_writable`
-(`mod.rs:701`) flushes the request body and `Http::backend_readable`
-(`mod.rs:773`) ingests the response. Once `response_stream.parsing_phase`
-reaches the terminal phase and the body is fully consumed:
-
-- if both sides set `Connection: keep-alive` (`HttpContext.keep_alive_frontend`
-  + `keep_alive_backend`), `Http::reset` (`mod.rs:299`) is called and the
-  session waits for the next request on the same TCP/TLS connection;
-- otherwise the session shuts down (see §6).
-
----
-
-## 3. Editor — `HttpContext` and the parser callbacks
-
-`HttpContext` (`lib/src/protocol/kawa_h1/editor.rs:116`) is the per-request
+`HttpContext` (`lib/src/protocol/kawa_h1/editor.rs:230`) is the per-request
 mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
-(`editor.rs:217`) fires:
+(`editor.rs:477`) fires:
 
-- `on_headers` (`editor.rs:218`) — split between request and response by
+- `on_headers` (`editor.rs:478`) — split between request and response by
   `stream.kind`;
-- `on_request_headers` (`editor.rs:287`) — captures the `:method`, authority,
+- `on_request_headers` (`editor.rs:561`) — captures the `:method`, authority,
   path; copies `X-Forwarded-For` into `xff_chain` for the access log; appends
   the configured `Forwarded`/`X-Forwarded-*` hop; injects the `Sozu-Id`
   correlation header named by `sozu_id_header`;
-- `on_response_headers` (`editor.rs:574`) — captures `:status`, `:reason`,
+- `on_response_headers` (`editor.rs:1049`) — captures `:status`, `:reason`,
   optionally rewrites `Set-Cookie` for sticky sessions.
 
-`HttpContext::log_context` (`editor.rs:687`) is the canonical helper for
-producing the `LogContext { session_id, request_id, cluster_id, backend_id }`
-record consumed by every `log_context!` macro in this module — prefer it over
-hand-rolling a struct literal (per repo `CLAUDE.md`).
+`HttpContext::extract_route` (`editor.rs:1217`) hands the mux router the
+authority, path and method it needs, and `HttpContext::log_context`
+(`editor.rs:1260`) is the canonical helper for producing the
+`LogContext { session_id, request_id, cluster_id, backend_id }` record consumed
+by every `log_context!` macro that has an `HttpContext` in scope — prefer it
+over hand-rolling a struct literal (per repo `CLAUDE.md`).
 
 Notable security-relevant fields on `HttpContext`:
 
-- `tls_server_name` (`editor.rs:188`) — SNI captured at handshake (lowercased,
+- `tls_server_name` (`editor.rs:302`) — SNI captured at handshake (lowercased,
   trailing dot stripped). Used for logging and as a fallback exact-match check
   when `tls_cert_names` is unavailable.
-- `tls_cert_names` (`editor.rs:200`) — `Option<Arc<Vec<String>>>` snapshot of
+- `tls_cert_names` (`editor.rs:313`) — `Option<Arc<Vec<String>>>` snapshot of
   the SAN dNSName entries of the certificate Sōzu actually served on this TLS
   session (RFC 6125 §6.4.4: when the SAN extension contains at least one
   dNSName entry, those entries are authoritative and the Common Name is
@@ -166,19 +121,19 @@ Notable security-relevant fields on `HttpContext`:
   CWE-346 / CWE-444 trust boundary (operator-defined SAN scope). `None` when
   the resolver fell back to the default cert — routing then fall-backs to
   legacy SNI exact-match.
-- `strict_sni_binding` (`editor.rs:195`) — mirrors
+- `strict_sni_binding` (`editor.rs:320`) — mirrors
   `HttpsListenerConfig::strict_sni_binding`; gates the `tls_cert_names` check
   on/off. Defends against cross-tenant authority spoofing (CWE-346 / CWE-444).
-- `xff_chain` (`editor.rs:147`) — verbatim upstream `X-Forwarded-For` snapshot
+- `xff_chain` (`editor.rs:261`) — verbatim upstream `X-Forwarded-For` snapshot
   taken before Sōzu appends its own hop, so the access log records the
   attested chain even when Sōzu mutates the live header.
-- `x_request_id` (`editor.rs:141`) — universal correlation token; populated
+- `x_request_id` (`editor.rs:255`) — universal correlation token; populated
   unconditionally in `on_request_headers` so the access log always has a
   cross-component join key.
 
-### 3.1 CL.TE framing guard (`on_request_headers`)
+### 2.1 CL.TE framing guard (`on_request_headers`)
 
-The very first thing `on_request_headers` does (`editor.rs:558-597`, before
+The very first thing `on_request_headers` does (`editor.rs:561-621`, before
 capturing `:method`/authority/path) is reject requests whose Transfer-Encoding
 framing is ambiguous (RFC 9110 §7.6 / RFC 9112 §6.1; reopen of
 [#726](https://github.com/sozu-proxy/sozu/issues/726)). An intermediary must not
@@ -191,85 +146,104 @@ field line independently — a leading `Transfer-Encoding: chunked` line latches
 `body_size = Chunked`, but a second, later TE line (e.g. `identity`) that does
 not itself end in `chunked` is left in place (kawa only `warn!`s), so gating the
 scan on `body_size != Chunked` alone would let that second line ride through.
-The guard therefore counts every non-elided `Transfer-Encoding` header in
-`request.blocks` (`te_count`) and rejects when either:
+
+The guard therefore folds over every non-elided `Transfer-Encoding` header in
+`request.blocks` (`editor.rs:586-606`), producing `te_count` and
+`te_all_suffix_chunked` — the latter true only when EVERY such value's literal
+trailing bytes are `chunked` (`compare_no_case` over the last seven bytes). The
+rejection predicate is exactly (`editor.rs:607-610`):
+
+```rust
+te_count > 1
+    || (te_count == 1
+        && (!te_all_suffix_chunked || request.body_size != kawa::BodySize::Chunked))
+```
+
+which rejects three distinct shapes:
 
 - `te_count > 1` — more than one non-elided TE header. RFC 9112 §6.1 requires
   `chunked` be applied once and be the final coding; multiple TE field lines
   cannot be safely reconciled here, and it is exactly the shape that lets a
   `Chunked` latch from an earlier line mask a later, differently-framed line
-  (the multi-line CL.TE bypass this guard was hardened against); or
-- `te_count >= 1 && body_size != BodySize::Chunked` — a TE header is present
-  but kawa did not adopt chunked framing (e.g. `chunked\t`, trailing OWS, or
-  `chunked` not the final coding on a single line).
+  (the multi-line CL.TE bypass this guard was hardened against). Covered by the
+  `multi-line-chunked-then-identity` case in `e2e`'s `TE_SMUGGLING_CASES`;
+- one surviving TE header whose final coding is not `chunked`
+  (`!te_all_suffix_chunked`), e.g. `Transfer-Encoding: chunked, gzip` — the
+  `not-final-coding` case;
+- one surviving TE header while kawa did not adopt chunked framing
+  (`body_size != BodySize::Chunked`).
 
-If either condition holds, the guard increments
+**An OWS-obfuscated coding is NOT rejected by this guard.** kawa >= 0.7.1
+excludes leading/trailing OWS from every field value (RFC 9112 §5), so
+`chunked\t` and `chunked ` read as `chunked`: `te_all_suffix_chunked` stays
+true, kawa frames the message as chunked and elides the Content-Length, and the
+request is legal. What keeps it safe is that the coding sozu framed on is the
+coding it forwards — the obfuscated spelling never reaches the backend — which
+`e2e`'s `test_h1_te_ows_forwarded_canonically` pins on the forwarded bytes.
+(kawa 0.7.0 framed on the trimmed reading but forwarded the raw field line; a
+backend that did not itself trim then saw no recognised coding and no length,
+and read the chunked body as a pipelined request. That is the TE.TE desync
+`chunked\t` used to be refused for.) The `trailing-tab` / `trailing-space`
+entries in `TE_SMUGGLING_CASES` still 400, but for their invalid chunked
+**body** — `Hello` is not a chunk — not through this predicate.
+
+If the predicate holds, the guard increments
 `names::http::FRONTEND_TE_SMUGGLING`, logs a `warn!`, and calls
 `request.parsing_phase.error(...)` before returning early. It does **not**
 short-circuit anything else in kawa — the very next line back in
 `kawa::h1::parse`'s loop re-checks `parsing_phase`, sees `Error`, and returns.
 
-Both `HttpContext` consumers observe the resulting `ParsingPhase::Error`
-identically, since they share the same `HttpContext`/`ParserCallbacks` impl
-(`crate::protocol::http` is a `pub use ... kawa_h1 as http` re-export, not a
-separate type):
-
-- the standalone `Http` session (`mod.rs:529-567`) turns it into
-  `DefaultAnswer::Answer400` via `set_answer`;
-- the mux H1 connection (`lib/src/protocol/mux/h1.rs:313-336`) checks
-  `kawa.is_error()` immediately after `kawa::h1::parse` and, on the server
-  side, calls `set_default_answer(..., 400, ...)` and returns — before routing
-  or the per-frontend Basic-auth check (`mux/router.rs:834`,
-  `mux/auth.rs::check_basic`) run, so an ambiguously-framed request is rejected
-  before it reaches routing.
+The resulting `ParsingPhase::Error` is observed by the mux H1 connection
+(`lib/src/protocol/mux/h1.rs:314`), which checks `kawa.is_error()` immediately
+after `kawa::h1::parse` and, on the server side, calls
+`set_default_answer(..., 400, ...)` and returns — before routing or the
+per-frontend Basic-auth check (`mux/router.rs:865`,
+`mux/auth.rs::check_basic`) run, so an ambiguously-framed request is rejected
+before it reaches routing. Note that `crate::protocol::http` is a
+`pub use ... kawa_h1 as http` re-export, not a separate type, so a grep for
+consumers must search both spellings.
 
 Mirrors the equivalent HTTP/2 → H1 defense, `RejectReason::ClTeConflict`
 (`lib/src/protocol/mux/pkawa.rs:287`).
 
 ---
 
-## 4. Default Answers
+## 3. Default Answers
 
-Synthesised 4xx/5xx responses are not handcrafted byte buffers — they are
+Synthesised 3xx/4xx/5xx responses are not handcrafted byte buffers — they are
 template-rendered Kawa streams. The relevant pieces:
 
-- `DefaultAnswer` enum (`lib/src/protocol/kawa_h1/mod.rs:111`) lists every
-  variant Sōzu can emit (301 redirect, 400, 404, 413, 502, 503, 504, 507) and
-  carries the per-call diagnostic strings.
-- `Template` (`answers.rs:78`), `Replacement` (`answers.rs:72`), and
-  `TemplateVariable` (`answers.rs:57`) drive the substitution engine:
+- `DefaultAnswer` enum (`lib/src/protocol/kawa_h1/mod.rs:40`) lists every
+  variant Sōzu can emit (301/302/308 redirects, 400, 401, 404, 408, 413, 421,
+  429, 502, 503, 504, 507) and carries the per-call diagnostic strings.
+- `Template` (`answers.rs:89`), `Replacement` (`answers.rs:83`), and
+  `TemplateVariable` (`answers.rs:67`) drive the substitution engine:
   variables can be plain (text) or typed (URL/path/integer) — typed
   substitutions go through the corresponding sanitizer to avoid log /
   header injection.
-- `HttpAnswers` (`answers.rs:339`) holds the per-listener registry; the
-  ListenerAnswers / ClusterAnswers split (`answers.rs:307`/`:334`) allows a
-  cluster to override a listener-level template.
-- `Http::set_answer` (`mod.rs:1055`) is the one chokepoint that promotes a
-  `ResponseStream::BackendAnswer` to `ResponseStream::DefaultAnswer` and
-  arms the readiness flags so `writable` flushes the synthesised reply
-  next.
+- `HttpAnswers` (`answers.rs:503`) holds the registry; its `cluster_answers` /
+  `listener_answers` split (`answers.rs:504-505`) lets a cluster override a
+  listener-level template. `HttpAnswers::get` (`answers.rs:1302`) is the
+  selection chokepoint: its lookup key is derived from the `DefaultAnswer`
+  variant, so only the built-in code names ("301" … "507") and the bundled
+  fallback are ever selectable — an operator's custom answer under an
+  unrecognised name is compiled but never chosen.
+- `mux::answers::set_default_answer` (`lib/src/protocol/mux/answers.rs:195`)
+  is the one chokepoint that queues a rendered answer onto a `Stream` and arms
+  the readiness flags so the writable pass flushes it. The mux fills the
+  parse-detail fields (`message`, `phase`, `successfully_parsed`, …) with
+  neutral placeholders (`default_answer_for_code`, `mux/answers.rs:134`): it
+  has no H1 parse state to report, which is why the `kawa_h1::diagnostics`
+  hex-dump renderer had no live consumer and was removed with the `Http`
+  session on 2026-09-20.
 
-Status mapping `DefaultAnswer → u16` lives at `mod.rs:157`.
-
----
-
-## 5. Diagnostics and Error Envelope
-
-`diagnostics::diagnostic_400_502` (`lib/src/protocol/kawa_h1/diagnostics.rs:49`)
-and `diagnostic_413_507` (`diagnostics.rs:95`) render the parsing phase, the
-charset rule (`diagnostics.rs:14-17`, switches on the `tolerant-http1-parser`
-feature), and a hex-dump window into the offending buffer region. Their output
-is what populates the `message` field on `DefaultAnswer::Answer400` and is
-echoed to the access log so a parse failure is debuggable without a packet
-capture.
-
-`Http::log_request` (`mod.rs:992`) is the canonical access-log emitter; the
-`log_request_success` / `log_default_answer_success` / `log_request_error`
-shortcuts (`mod.rs:1036`/`:1041`/`:1044`) categorise the call site.
+Status mapping `DefaultAnswer → u16` lives at `mod.rs:110`, and the status
+bucket / per-code metrics are emitted once, from
+`mux::stream::generate_access_log` (`lib/src/protocol/mux/stream.rs:356-380`).
 
 ---
 
-## 6. Invariants
+## 4. Invariants
 
 These rules are load-bearing — break them and you risk a truncated response,
 a wedged session, or a security regression.
@@ -277,61 +251,57 @@ a wedged session, or a security regression.
 1. **Never panic on network-facing input.** Parser failures, oversized bodies,
    bad TLS handshake state, lost backends — all funnel into `DefaultAnswer` +
    metric + log. `unwrap`/`expect`/`panic!` are reserved for hard internal
-   invariants. Per repo `CLAUDE.md`, the H1 parser, editor, default-answer,
-   and diagnostics paths are explicitly listed under
-   "no panic on network-facing input".
+   invariants. Per repo `CLAUDE.md`, the H1 parser, editor and default-answer
+   paths are explicitly listed under "no panic on network-facing input". A
+   status line is wire data, not an invariant: kawa parses `HTTP/1.1 000 …`
+   into status `0` with no range check, so no bucketer may assert a
+   `100..=999` range — locked by
+   `mux::stream::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`
+   and `answers::tests::an_unrecognised_custom_answer_may_carry_an_out_of_range_status`.
 
 2. **Write-only shutdown on TLS frontends.** Closing the frontend socket with
    `Shutdown::Both` discards any unread receive data and elicits a TCP RST,
    truncating the already-queued response. The canonical write-up lives at
-   `lib/src/https.rs:650-655`. Backends speak plaintext H1 today, so
-   `Shutdown::Both` is permitted on the backend socket — but the
-   `// SAFETY (TLS-truncation invariant)` comment at
-   `lib/src/protocol/kawa_h1/mod.rs:1219-1225` flags the migration to
-   `Shutdown::Write` when backend TLS lands.
+   `lib/src/https.rs:1008-1015`. Backends speak plaintext H1 today, so
+   `Shutdown::Both` is permitted on the backend socket; that carve-out must be
+   revisited when backend TLS lands.
 
-3. **Readiness lifecycle is owned by the editor, not the supervisor.** The
-   per-stream readiness pumping (`frontend_readiness.interest.insert(WRITABLE)`,
-   `backend_readiness.interest.insert(READABLE)`, etc.) is driven from
-   `Http::readable` / `writable` / `backend_readable` / `backend_writable`
-   (`mod.rs:355` / `:520` / `:773` / `:701`). The mux-style
-   `signal_pending_write` discipline does NOT apply to Kawa H1 — H1 sessions
-   own a single in-flight request at a time, and the readable/writable
-   methods toggle interest directly under the mio level-triggered semantics
-   the H1 listener uses.
-
-4. **Default answer is one-shot per session.** Once `set_answer` promotes
-   `response_stream` to `ResponseStream::DefaultAnswer`, `readable` refuses to
-   accept further bytes (`mod.rs:367-376`). The next legal transition is
-   `writable` followed by either `reset` (keep-alive) or close.
-
-5. **`tolerant-http1-parser` is opt-in.** The strict parser is the default;
+3. **`tolerant-http1-parser` is opt-in.** The strict parser is the default;
    the tolerant variant is enabled only via the `tolerant-http1-parser`
-   feature on `sozu-lib` and `sozu-bin` (`lib/Cargo.toml:86`,
-   `bin/Cargo.toml`). Tolerant mode relaxes hostname charset rules
-   (`parser.rs:110-123`) and switches the diagnostics charset label
-   (`diagnostics.rs:14-17`). It must not be enabled in security-sensitive
+   feature on `sozu-lib` and `sozu-bin` (`lib/Cargo.toml:121`,
+   `bin/Cargo.toml:100`). Tolerant mode relaxes the hostname charset rules
+   (`parser.rs:120-143`). It must not be enabled in security-sensitive
    deployments without measuring the risk against the upstream backends'
    strictness.
 
-6. **`HttpContext` outlives a single request when keep-alive is in play.**
-   `reset` clears the per-request fields but preserves the per-connection
-   ULID (`session_id`), the SNI-derived TLS state, and the rendered
-   `sozu_id_header` label. The `request_id` (`HttpContext::id`,
-   `editor.rs:161`) IS rotated per request to keep the access log
-   correlatable.
+4. **`HttpContext` outlives a single request when keep-alive is in play.**
+   `HttpContext::reset` (`editor.rs:1150`) clears the per-request fields but
+   preserves the per-connection ULID (`session_id`, `editor.rs:273`), the
+   SNI-derived TLS state, and the rendered `sozu_id_header` label
+   (`editor.rs:360`). The `request_id` (`HttpContext::id`, `editor.rs:275`) IS
+   rotated per request to keep the access log correlatable.
+
+5. **`impl kawa::AsBuffer for Checkout` is unique to this module.** It lives at
+   `mod.rs:30`; the orphan rule permits no second impl **for `Checkout`**, so
+   `mux` depends on this one through its own `GenericHttpStream` alias. Do not
+   move it without moving every `kawa::Kawa<Checkout>` user with it. The
+   sibling `impl AsBuffer for SharedBuffer` (`answers.rs:34`) is a different
+   type and unaffected.
 
 ---
 
-## 7. Cross-References
+## 5. Cross-References
 
-- `lib/src/protocol/mux/LIFECYCLE.md` — H2 frontend lifecycle. The H2 mux
-  speaks H1 to the backend via this very module.
+- `lib/src/protocol/mux/LIFECYCLE.md` — the H1 and H2 session lifecycle. Every
+  question this document used to answer about accept, parse, route, connect,
+  forward and close now belongs there.
 - `lib/src/protocol/proxy_protocol/LIFECYCLE.md` — PROXY-v2 ingress that
-  precedes H1 on PROXY-aware listeners.
+  precedes the mux on PROXY-aware listeners.
 - `bin/src/command/LIFECYCLE.md` — supervisor view; explains how listener
   reloads (which can swap `HttpAnswers` templates) propagate into running
   sessions.
 - `doc/lifetime_of_a_session.md` — operator-facing prose introduction; this
   document is the maintainer-facing deep dive it links into.
 - `doc/configure.md` — listener / cluster / answer configuration reference.
+- `e2e/COVERAGE.md > Out of e2e reach by construction` — the reachability
+  measurement that retired the `Http` session, kept as the worked example.
