@@ -39,8 +39,8 @@ use sozu_command_lib::{
 use tempfile::NamedTempFile;
 
 use super::h2_utils::{
-    H2_ERROR_ENHANCE_YOUR_CALM, H2_FRAME_HEADERS, H2Frame, collect_response_frames,
-    contains_goaway, contains_goaway_with_error, contains_headers_response, h2_handshake,
+    H2_ERROR_ENHANCE_YOUR_CALM, H2Frame, collect_response_frames, contains_goaway,
+    contains_goaway_with_error, contains_headers_response, h2_handshake, headers_status_matches,
     log_frames, raw_h2_connection, raw_h2_connection_with_sni, read_all_available,
     verify_sozu_alive,
 };
@@ -507,14 +507,26 @@ fn try_strict_sni_binding_toggle() -> State {
     let frames_strict = collect_response_frames(&mut tls_strict, 500, 3, 500);
     log_frames("SNI-TOGGLE strict=true", &frames_strict);
 
-    // 421 is encoded as 0xBD (literal indexed) or literal 0x34, 0x32, 0x31 ("421")
-    let got_421 = frames_strict.iter().any(|(ft, _, _, payload)| {
-        *ft == H2_FRAME_HEADERS
-            && (payload.windows(3).any(|w| w == b"421") || payload.windows(4).any(|w| w == b":421"))
-    });
-    let got_200 = frames_strict
-        .iter()
-        .any(|(ft, _, _, p)| *ft == H2_FRAME_HEADERS && p.contains(&0x88));
+    // Decode `:status` rather than hunting its digits. The scan that used to
+    // stand here matched `b"421"` anywhere in the field block, and every
+    // response carries a `Sozu-Id` ULID whose alphabet holds every decimal
+    // digit — so an ordinary 200 answered "yes" about once in 1400 responses
+    // and `phase1_ok` below went green on a listener that had stopped
+    // rejecting. That is issue #1353's mechanism aimed at a security
+    // assertion instead of a liveness one.
+    //
+    // `got_200` is NOT a strict improvement, and the direction matters here.
+    // The `payload.contains(&0x88)` probe it replaces had no false negative
+    // for a Sōzu 200; `decode_status` returns `None` — hence `got_200 =
+    // false` — for a block prefixed with an HPACK dynamic table size update
+    // (`lib/src/protocol/mux/converter.rs:112`). Because `got_200` enters
+    // `phase1_ok` below as `|| !got_200`, that false negative is
+    // fail-**open** at this call site, not fail-closed. Unreachable today:
+    // this test drives `h2_handshake`, which sends empty SETTINGS, so Sōzu
+    // never arms an update. Pointing a size-updating client at this test
+    // means teaching `decode_status` to skip a leading update first.
+    let got_421 = headers_status_matches(&frames_strict, b"421");
+    let got_200 = headers_status_matches(&frames_strict, b"200");
     let got_rejection_or_421 = got_421 || contains_goaway(&frames_strict);
     println!("SNI-TOGGLE strict=true: got_421={got_421}, got_200={got_200}");
     drop(tls_strict);

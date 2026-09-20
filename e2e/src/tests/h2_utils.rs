@@ -1422,6 +1422,89 @@ pub(crate) fn contains_headers_response(frames: &[(u8, u8, u32, Vec<u8>)]) -> bo
     frames.iter().any(|(t, _, _, _)| *t == H2_FRAME_HEADERS)
 }
 
+/// Decode the `:status` pseudo-header of a response HEADERS block.
+///
+/// RFC 9113 §8.3.2 makes `:status` the first field of a response field
+/// block, and Kawa's encoder emits it in exactly two shapes: an indexed
+/// static entry (`1xxxxxxx` over indices 8..=14, the seven `:status` rows
+/// of the RFC 7541 static table) when that table carries the status, or a
+/// literal over one of those same name indices for every other status.
+/// Only the first field is read, so no later field — header name, header
+/// value, or a second pseudo-header — can be mistaken for the status.
+///
+/// Returns `None` for a block that does not start with a `:status` field,
+/// which includes a trailers block and a block opening with a dynamic
+/// table size update. That last case is real, not hypothetical:
+/// `H2BlockConverter::emit_pending_size_update_if_new_block`
+/// (`lib/src/protocol/mux/converter.rs:112`, armed at
+/// `lib/src/protocol/mux/h2.rs:5838`) prepends a `001xxxxx` update when a
+/// peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e call sites do
+/// send one — `h2_security_tests.rs:2440` with value 0, and
+/// `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
+/// `h2_correctness_tests.rs:3559` and `:3663`. None of the three decodes a
+/// status, and `h2_handshake` sends empty SETTINGS, so no assertion meets
+/// the update today. The first one that does gets `None`, which reads as
+/// "no status" — fail-closed for `headers_status_matches`, but see the
+/// `got_200` caveat in `listener_update_tests.rs`, where a `None` lands on
+/// the permissive side of a `||`. Teach this helper to skip a leading
+/// update before pointing a new assertion at a size-updating client.
+pub(crate) fn decode_status(payload: &[u8]) -> Option<u16> {
+    /// RFC 7541 Appendix A, static indices 8..=14.
+    const INDEXED_STATUS: [u16; 7] = [200, 204, 206, 304, 400, 404, 500];
+
+    let first = *payload.first()?;
+    if first & 0x80 != 0 {
+        // Indexed Header Field (RFC 7541 §6.1): name *and* value come from
+        // the table, so the index alone carries the status.
+        return INDEXED_STATUS
+            .get(usize::from(first & 0x7f).checked_sub(8)?)
+            .copied();
+    }
+    // Literal Header Field (RFC 7541 §6.2): `01xxxxxx` with incremental
+    // indexing carries a 6-bit name index, `0000xxxx` without indexing and
+    // `0001xxxx` never-indexed carry a 4-bit one. `001xxxxx` is a dynamic
+    // table size update, not a field at all.
+    if first & 0xe0 == 0x20 {
+        return None;
+    }
+    let name_index = if first & 0xc0 == 0x40 {
+        first & 0x3f
+    } else {
+        first & 0x0f
+    };
+    if !(8..=14).contains(&name_index) {
+        return None;
+    }
+    let length_byte = *payload.get(1)?;
+    // Kawa never sets the Huffman bit; a coded value would need the full
+    // Huffman table to read and cannot be compared byte-wise.
+    if length_byte & 0x80 != 0 {
+        return None;
+    }
+    let value = payload.get(2..2 + usize::from(length_byte & 0x7f))?;
+    str::from_utf8(value).ok()?.parse().ok()
+}
+
+/// Whether any response in `frames` carried this 3-digit status, decoded
+/// from its `:status` field (see [`decode_status`]).
+///
+/// A byte scan cannot do this job, and three copies of one used to try.
+/// Every Sōzu response carries a `Sozu-Id` correlation header
+/// (`lib/src/protocol/kawa_h1/editor.rs:1131`) holding the session's
+/// 26-character Crockford base-32 ULID, written with the Huffman bit
+/// clear, so it reaches the field block as plain ASCII over an alphabet
+/// that contains every decimal digit. A 3-digit needle therefore matches
+/// an ordinary 200 about once in 1400 responses (issue #1353).
+pub(crate) fn headers_status_matches(frames: &[(u8, u8, u32, Vec<u8>)], code: &[u8]) -> bool {
+    let wanted: u16 = str::from_utf8(code)
+        .ok()
+        .and_then(|code| code.parse().ok())
+        .expect("status needle must be a decimal status code");
+    frames.iter().any(|(ft, _fl, _sid, payload)| {
+        *ft == H2_FRAME_HEADERS && decode_status(payload) == Some(wanted)
+    })
+}
+
 /// Check if frames contain a DATA frame on any stream.
 #[allow(dead_code)]
 pub(crate) fn contains_data_frame(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {

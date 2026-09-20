@@ -27,9 +27,9 @@ use super::h2_utils::{
     H2_ERROR_ENHANCE_YOUR_CALM, H2_ERROR_FLOW_CONTROL_ERROR, H2_ERROR_FRAME_SIZE_ERROR,
     H2_ERROR_REFUSED_STREAM, H2_FLAG_END_STREAM, H2_FRAME_GOAWAY, H2Frame, collect_response_frames,
     contains_goaway, contains_goaway_with_error, contains_rst_stream, extract_rst_streams,
-    goaway_error_code, h2_handshake, log_frames, parse_h2_frames, raw_h2_connection,
-    raw_h2_connection_with_sni, read_all_available, setup_h2_listener_only, setup_h2_test,
-    verify_sozu_alive,
+    goaway_error_code, h2_handshake, headers_status_matches, log_frames, parse_h2_frames,
+    raw_h2_connection, raw_h2_connection_with_sni, read_all_available, setup_h2_listener_only,
+    setup_h2_test, verify_sozu_alive,
 };
 use crate::{
     mock::{
@@ -84,18 +84,6 @@ fn minimal_h2_get_headers(authority: &str) -> Vec<u8> {
     ];
     block.extend_from_slice(authority.as_bytes());
     block
-}
-
-fn h2_headers_status_matches(frames: &[(u8, u8, u32, Vec<u8>)], code: &[u8]) -> bool {
-    frames.iter().any(|(ft, _flags, _sid, payload)| {
-        *ft == 0x1 && payload.windows(code.len()).any(|window| window == code)
-    })
-}
-
-fn h2_payload_matches(frames: &[(u8, u8, u32, Vec<u8>)], needle: &[u8]) -> bool {
-    frames
-        .iter()
-        .any(|(_ft, _flags, _sid, payload)| payload.windows(needle.len()).any(|w| w == needle))
 }
 
 fn h2_stream_has_end_stream(frames: &[(u8, u8, u32, Vec<u8>)], stream_id: u32) -> bool {
@@ -6595,8 +6583,10 @@ fn try_h2_default_answer_terminates_stream() -> State {
     let frames = collect_response_frames(&mut tls, 100, 4, 50);
     log_frames("H2 default answer end stream", &frames);
 
-    let got_404 = h2_headers_status_matches(&frames, b"404")
-        || h2_payload_matches(&frames, br#""status_code": 404"#);
+    // Decoded `:status` alone. The answer-body disjunct that used to stand
+    // here widened the needle rather than guarding it, and the indexed
+    // `0x8d` arm carries this assertion on its own (issue #1353).
+    let got_404 = headers_status_matches(&frames, b"404");
     let got_end_stream = h2_stream_has_end_stream(&frames, 1);
     let got_goaway = contains_goaway(&frames);
 
