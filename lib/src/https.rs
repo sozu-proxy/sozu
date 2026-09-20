@@ -689,7 +689,7 @@ impl HttpsSession {
                 mux::Connection::new_h1_server(
                     session_ulid,
                     front_stream,
-                    handshake.container_frontend_timeout,
+                    handshake.container_frontend_timeout.duration(),
                 )
             }
             AlpnProtocol::H2 => {
@@ -703,7 +703,7 @@ impl HttpsSession {
                     session_ulid,
                     front_stream,
                     self.pool.clone(),
-                    handshake.container_frontend_timeout,
+                    handshake.container_frontend_timeout.duration(),
                     flood_config,
                     connection_config,
                     stream_idle_timeout,
@@ -748,6 +748,10 @@ impl HttpsSession {
             context,
             router,
             session_ulid,
+            // Carry the already-armed handshake entry into the adapter rather
+            // than dropping it and arming a fresh one: the session's request
+            // timeout started when the socket was accepted.
+            timeouts: HashMap::from([(self.frontend_token, handshake.container_frontend_timeout)]),
         }))
     }
 
@@ -763,22 +767,26 @@ impl HttpsSession {
         // http.active_requests was already decremented by generate_access_log()
         // in h1.rs before MuxResult::Upgrade was returned to us.
 
-        let (frontend_readiness, frontend_socket, mut container_frontend_timeout) =
-            match mux.frontend {
-                mux::Connection::H1(mux::ConnectionH1 {
-                    readiness,
-                    socket,
-                    timeout_container,
-                    ..
-                }) => (readiness, socket, timeout_container),
-                mux::Connection::H2(_) => {
-                    error!(
-                        "{} only h1<->h1 connections can upgrade to websocket",
-                        log_context!(self)
-                    );
-                    return None;
-                }
-            };
+        // The cores no longer own a wheel handle; the `Mux` adapter does. Take
+        // the frontend's out of the adapter map before dismantling the
+        // connection, so the WebSocket `Pipe` inherits the same live entry it
+        // used to inherit from `ConnectionH1`.
+        let mut container_frontend_timeout = mux
+            .timeouts
+            .remove(&mux.frontend_token)
+            .unwrap_or_else(|| TimeoutContainer::new_empty(mux.configured_frontend_timeout));
+        let (frontend_readiness, frontend_socket) = match mux.frontend {
+            mux::Connection::H1(mux::ConnectionH1 {
+                readiness, socket, ..
+            }) => (readiness, socket),
+            mux::Connection::H2(_) => {
+                error!(
+                    "{} only h1<->h1 connections can upgrade to websocket",
+                    log_context!(self)
+                );
+                return None;
+            }
+        };
 
         let mux::StreamState::Linked(back_token) = stream.state else {
             error!(
@@ -795,31 +803,32 @@ impl HttpsSession {
             );
             return None;
         };
-        let (cluster_id, backend, backend_readiness, backend_socket, mut container_backend_timeout) =
-            match backend {
-                mux::Connection::H1(mux::ConnectionH1 {
-                    position:
-                        mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
-                    readiness,
-                    socket,
-                    timeout_container,
-                    ..
-                }) => (cluster_id, backend, readiness, socket, timeout_container),
-                mux::Connection::H1(_) => {
-                    error!(
-                        "{} the backend disconnected just after upgrade, abort",
-                        log_context!(self)
-                    );
-                    return None;
-                }
-                mux::Connection::H2(_) => {
-                    error!(
-                        "{} only h1<->h1 connections can upgrade to websocket",
-                        log_context!(self)
-                    );
-                    return None;
-                }
-            };
+        let mut container_backend_timeout = mux
+            .timeouts
+            .remove(&back_token)
+            .unwrap_or_else(|| TimeoutContainer::new_empty(mux.router.configured_backend_timeout));
+        let (cluster_id, backend, backend_readiness, backend_socket) = match backend {
+            mux::Connection::H1(mux::ConnectionH1 {
+                position: mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
+                readiness,
+                socket,
+                ..
+            }) => (cluster_id, backend, readiness, socket),
+            mux::Connection::H1(_) => {
+                error!(
+                    "{} the backend disconnected just after upgrade, abort",
+                    log_context!(self)
+                );
+                return None;
+            }
+            mux::Connection::H2(_) => {
+                error!(
+                    "{} only h1<->h1 connections can upgrade to websocket",
+                    log_context!(self)
+                );
+                return None;
+            }
+        };
 
         let ws_context = stream.context.websocket_context();
 

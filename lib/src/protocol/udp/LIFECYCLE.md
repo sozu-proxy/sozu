@@ -251,11 +251,16 @@ the generation tokens exist. (`prop_generation_token_defeats_stale_close`,
 
 **Consume-then-reschedule: an expiry that closes nothing is NOT a no-op.**
 `crate::timer` rounds a requested delay to the *nearest* tick
-(`duration_to_tick`, `timer.rs:496`), not up: with the 100 ms default tick an
+(`duration_to_tick` in `timer.rs`), not up: with the 100 ms default tick an
 entry whose deadline lies in `[100N-50, 100N+50)` is delivered at tick `N`, so
-the shell can be woken as much as **50 ms early**
-(`test_timeout_fires_up_to_half_a_tick_early`, `timer.rs`). `Timer::poll` then
-*removes* that entry from its slab. So on every expiry, whether or not a flow
+the shell can be woken as much as **50 ms early** when the poll lands on the
+tick grid — which is what `Timer::next_poll_date` schedules, and what
+`test_timeout_fires_up_to_half_a_tick_early` (`timer.rs`) measures. `Timer::poll`
+recomputes `current_tick` from the real clock, so a poll anywhere in
+`[100N-50, 100N)` already sees tick `N`: the bound a consumer must tolerate is
+`(delay_ms + 50) mod 100`, i.e. up to **99 ms** — a full tick minus a
+millisecond. Either figure is enough for what follows; the hazard is any
+earliness at all. `Timer::poll` then *removes* that entry from its slab. So on every expiry, whether or not a flow
 was due:
 
 - the manager clears `armed_deadline` (`manager.rs:534`) **before** any

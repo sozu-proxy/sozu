@@ -19,7 +19,7 @@ use std::{
     cell::RefCell,
     fmt::Debug,
     rc::{Rc, Weak},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use mio::{Token, net::TcpStream};
@@ -34,7 +34,7 @@ use super::{
 use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Readiness, backends::Backend, pool::Pool,
-    socket::SocketHandler, timer::TimeoutContainer,
+    socket::SocketHandler,
 };
 
 /// Module-level prefix used on every log line emitted from this module.
@@ -85,7 +85,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub fn new_h1_server(
         session_ulid: Ulid,
         front_stream: Front,
-        timeout_container: TimeoutContainer,
+        timeout_duration: Duration,
     ) -> Connection<Front> {
         Connection::H1(ConnectionH1 {
             socket: front_stream,
@@ -96,7 +96,8 @@ impl<Front: SocketHandler> Connection<Front> {
             },
             requests: 0,
             stream: Some(0),
-            timeout_container,
+            timeout_duration,
+            timeout_deadline: Instant::now().checked_add(timeout_duration),
             parked_on_buffer_pressure: false,
             close_notify_sent: false,
             session_ulid,
@@ -107,7 +108,7 @@ impl<Front: SocketHandler> Connection<Front> {
         front_stream: Front,
         cluster_id: String,
         backend: Rc<RefCell<Backend>>,
-        timeout_container: TimeoutContainer,
+        timeout_duration: Duration,
     ) -> Connection<Front> {
         Connection::H1(ConnectionH1 {
             socket: front_stream,
@@ -122,7 +123,8 @@ impl<Front: SocketHandler> Connection<Front> {
             },
             stream: None,
             requests: 0,
-            timeout_container,
+            timeout_duration,
+            timeout_deadline: Instant::now().checked_add(timeout_duration),
             parked_on_buffer_pressure: false,
             close_notify_sent: false,
             session_ulid,
@@ -134,7 +136,7 @@ impl<Front: SocketHandler> Connection<Front> {
         session_ulid: Ulid,
         front_stream: Front,
         pool: Weak<RefCell<Pool>>,
-        timeout_container: TimeoutContainer,
+        timeout_duration: Duration,
         flood_config: h2::H2FloodConfig,
         connection_config: h2::H2ConnectionConfig,
         stream_idle_timeout: std::time::Duration,
@@ -149,7 +151,7 @@ impl<Front: SocketHandler> Connection<Front> {
             connection_config,
             stream_idle_timeout,
             graceful_shutdown_deadline,
-            timeout_container,
+            timeout_duration,
             Some((H2StreamId::Zero, h2::CLIENT_PREFACE_SIZE)),
             Ready::READABLE | Ready::HUP | Ready::ERROR,
         )?))
@@ -162,7 +164,7 @@ impl<Front: SocketHandler> Connection<Front> {
         cluster_id: String,
         backend: Rc<RefCell<Backend>>,
         pool: Weak<RefCell<Pool>>,
-        timeout_container: TimeoutContainer,
+        timeout_duration: Duration,
         flood_config: h2::H2FloodConfig,
         connection_config: h2::H2ConnectionConfig,
         stream_idle_timeout: std::time::Duration,
@@ -192,7 +194,7 @@ impl<Front: SocketHandler> Connection<Front> {
             connection_config,
             stream_idle_timeout,
             graceful_shutdown_deadline,
-            timeout_container,
+            timeout_duration,
             None,
             Ready::WRITABLE | Ready::HUP | Ready::ERROR,
         )?))
@@ -222,8 +224,61 @@ impl<Front: SocketHandler> Connection<Front> {
             Connection::H2(c) => c.socket.socket_mut(),
         }
     }
-    pub fn timeout_container(&mut self) -> &mut TimeoutContainer {
-        forward!(&mut self, timeout_container)
+    /// The next instant this connection wants `timeout()` called at, or
+    /// `None` for "no timer".
+    ///
+    /// This replaced `timeout_container()`, which handed the caller the wheel
+    /// handle itself. The cores no longer own one: they publish a deadline and
+    /// the `Mux` adapter owns every `TimeoutContainer`, so there is exactly one
+    /// place that talks to `crate::timer` and exactly one place that can get
+    /// the arm / re-arm discipline wrong. See `LIFECYCLE.md` §7.7.
+    pub fn poll_timeout(&self) -> Option<Instant> {
+        match self {
+            Connection::H1(c) => c.poll_timeout(),
+            Connection::H2(c) => c.poll_timeout(),
+        }
+    }
+
+    /// The configured idle timeout, carried so the adapter's container keeps a
+    /// current `duration()` for whoever inherits it (the WebSocket upgrade
+    /// hands it to `Pipe`, which re-arms from it).
+    pub fn timeout_duration(&self) -> Duration {
+        match self {
+            Connection::H1(c) => c.timeout_duration,
+            Connection::H2(c) => c.timeout_duration,
+        }
+    }
+
+    /// Push the deadline one full duration out from `now`. Replaces
+    /// `timeout_container().set(token)` / `.reset()` at the adapter's sites.
+    pub fn arm_timeout(&mut self, now: Instant) {
+        match self {
+            Connection::H1(c) => c.arm_timeout(now),
+            // `ConnectionH2::arm_timeout` reads the connection's own snapshot,
+            // which the adapter has not necessarily mirrored yet at the sites
+            // that call this; re-arm against the caller's `now` instead.
+            Connection::H2(c) => {
+                let duration = c.timeout_duration;
+                c.set_timeout_duration(duration, now)
+            }
+        }
+    }
+
+    /// Ask for no timer at all. Replaces `timeout_container().cancel()`.
+    pub fn clear_timeout(&mut self) {
+        match self {
+            Connection::H1(c) => c.clear_timeout(),
+            Connection::H2(c) => c.clear_timeout(),
+        }
+    }
+
+    /// Adopt a new configured duration and re-arm from `now`. Replaces
+    /// `timeout_container().set_duration(d)`.
+    pub fn set_timeout_duration(&mut self, duration: Duration, now: Instant) {
+        match self {
+            Connection::H1(c) => c.set_timeout_duration(duration, now),
+            Connection::H2(c) => c.set_timeout_duration(duration, now),
+        }
     }
 
     /// Returns connection-level byte overhead (bin, bout) for H2, (0, 0) for H1.
