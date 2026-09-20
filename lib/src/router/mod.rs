@@ -831,12 +831,67 @@ pub enum DomainRule {
     Regex(Regex),
 }
 
+/// Build the whole-host regex for a `hostname` carrying one or more
+/// slash-delimited regex segments (`/cdn[0-9]+/.example.com`). Each regex
+/// segment is emitted as a non-capturing group, each literal label is
+/// emitted through [`regex::escape`], the `.` separators are escaped, and the
+/// result is anchored at both ends.
+///
+/// The anchors and the groups answer two different failures and both are
+/// required:
+///
+/// - `\A` … `\z` because `Regex::is_match` is a substring search. Without
+///   them `/example\.com/` matches any hostname CONTAINING `example.com`
+///   (e.g. `attacker.example.com.evil.org`), letting an attacker-controlled
+///   domain reach a frontend that should only serve `example.com`.
+/// - `(?:` … `)` around each regex segment because `|` binds looser than
+///   concatenation, so an ungrouped segment splits the anchors between its
+///   branches: `\Aa|b\.example\.com\z` parses as
+///   `(\Aa)|(b\.example\.com\z)`. Measured, that matches
+///   `axx.example.com` and `xxb.example.com`; with three branches the middle
+///   one keeps NEITHER anchor and matches anywhere at all. The group is
+///   non-capturing, so `captures_len` — and therefore every `$HOST[n]`
+///   rewrite index, read from `caps.iter().skip(1)` in
+///   `RouteResult::new_no_trie` — is unchanged. A literal label carrying a
+///   `|` split the anchors the same way and is closed by the escaping
+///   below: `/a/.x|y.com` assembled to `\A(?:a)\.x|y\.com\z`, which
+///   matched `a.xZZZ` and `ZZZy.com`.
+///
+/// A label the operator did NOT wrap in slashes is a literal, and the two
+/// arms must not be confused: grouping it would confine an alternation but
+/// leave `+`, `?`, `*`, `^` and `$` live inside it, so `b+c` would still
+/// match `bbbc`. [`regex::escape`] is the treatment that matches the
+/// grammar. It is a no-op in matching behaviour for every label a real
+/// hostname can carry — an LDH label is `[A-Za-z0-9-]`, of which `escape`
+/// touches only `-`, and `\-` is `-` outside a character class. Two
+/// deliberate behaviour changes fall out of it for labels that are NOT
+/// valid hostname labels, both narrowing and both measured:
+/// `*./x/.example.com` assembled to `\A*\.(?:x)\.example\.com\z`, whose
+/// `\A*` is a repetition of a zero-width assertion and therefore matches
+/// empty anywhere — it took `evil.attacker.x.example.com`, and now requires
+/// the literal label `*`; and `/a/.b(c.example.com` was REJECTED because the
+/// assembly did not compile, and is now accepted, matching exactly the
+/// literal host the operator typed and nothing else.
+///
+/// The `*` change is scoped to what this function feeds, which is `Pre` and
+/// `Post` matching only. A trie-routed frontend never reaches here for
+/// matching: `TrieNode` splits the hostname on `.` and keeps a `*` label in
+/// its own `wildcard` slot, so the same configured hostname now answers
+/// differently by position. `doc/configure.md` § "Regex hostname segments"
+/// carries the table and
+/// `a_star_label_is_a_wildcard_on_the_trie_and_a_literal_on_pre_and_post`
+/// asserts it.
+///
+/// Each regex segment is compiled ON ITS OWN before it is wrapped. The
+/// wrapper supplies one `(` and one `)`, so an unbalanced segment can be
+/// balanced BY the wrapping: `a)(b` is rejected by `Regex::new`, yet
+/// `\A(?:a)(b)\.example\.com\z` compiles and matches `ab.example.com`.
+/// Without that first compile, grouping would silently promote a hostname the
+/// router rejects today into a live rule. This closes
+/// invalid-becomes-valid only; the converse is not closed, exactly as on the
+/// path side — see [`PathRule::anchored_regex`], which carries the same shape
+/// and the same measurements for a whole path value.
 fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
-    // Anchor at both ends so `Regex::is_match` only succeeds on a full-host
-    // match. Without `\A` the pattern `/example\.com/` matches any hostname
-    // containing `example.com` as a substring (e.g. `attacker.example.com.evil.org`),
-    // letting an attacker-controlled domain reach a frontend that should only
-    // serve `example.com`.
     let mut result = String::from("\\A");
 
     let s = hostname.as_bytes();
@@ -855,7 +910,14 @@ fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
             for i in index + 1..s.len() {
                 if s[i] == b'/' {
                     match std::str::from_utf8(&s[index + 1..i]) {
-                        Ok(r) => result.push_str(r),
+                        Ok(r) => {
+                            // Reject a segment that is not a regex on its own,
+                            // then group it. See this function's doc comment.
+                            Regex::new(r).ok()?;
+                            result.push_str("(?:");
+                            result.push_str(r);
+                            result.push(')');
+                        }
                         Err(_) => return None,
                     }
                     index = i + 1;
@@ -873,7 +935,9 @@ fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
                 index = i;
                 if i < s.len() && s[i] == b'.' {
                     match std::str::from_utf8(&s[start..i]) {
-                        Ok(r) => result.push_str(r),
+                        // A LITERAL label is not a pattern: escape it so it
+                        // matches itself. See this function's doc comment.
+                        Ok(r) => result.push_str(&regex::escape(r)),
                         Err(_) => return None,
                     }
                     break;
@@ -881,7 +945,7 @@ fn convert_regex_domain_rule(hostname: &str) -> Option<String> {
             }
             if index == s.len() {
                 match std::str::from_utf8(&s[start..]) {
-                    Ok(r) => result.push_str(r),
+                    Ok(r) => result.push_str(&regex::escape(r)),
                     Err(_) => return None,
                 }
             }
@@ -1048,17 +1112,18 @@ impl PathRule {
     /// search, so the previous bare `Regex::new(&rule.value)` let `bc` match
     /// `/abcd`.
     ///
-    /// `\A` … `\z` is the form the hostname side already uses, in
-    /// [`convert_regex_domain_rule`] and in `pattern_trie.rs`'s
-    /// `format!("\\A{s}\\z")` at segment-insert time.
+    /// `\A(?:` … `)\z` is the form the hostname side uses too, in
+    /// [`convert_regex_domain_rule`] around each slash-delimited segment and
+    /// in `pattern_trie.rs`'s `anchored_segment` at segment-insert time
+    /// (sozu#1356 closed the hostname half; this path half landed first, as
+    /// sozu#1357).
     ///
-    /// The non-capturing group is NOT decoration, and is the one place this
-    /// deliberately goes further than the hostname sites: `|` binds looser
-    /// than concatenation, so the ungrouped `\Aa|b\z` parses as
-    /// `(\Aa)|(b\z)` and each branch keeps only one anchor — measured, it
-    /// still matches `axx`. `\A(?:a|b)\z` does not. `(?:` … `)` is
-    /// non-capturing, so `captures_len` and therefore every `$PATH[n]`
-    /// rewrite index are unchanged.
+    /// The non-capturing group is NOT decoration: `|` binds looser than
+    /// concatenation, so the ungrouped `\Aa|b\z` parses as `(\Aa)|(b\z)`
+    /// and each branch keeps only one anchor — measured, it still matches
+    /// `axx`. `\A(?:a|b)\z` does not. `(?:` … `)` is non-capturing, so
+    /// `captures_len` and therefore every `$PATH[n]` rewrite index are
+    /// unchanged.
     ///
     /// The configured value is compiled ON ITS OWN first and only a value
     /// that compiles is wrapped. The wrapper supplies one `(` and one `)`, so
@@ -3019,28 +3084,40 @@ mod tests {
     #[test]
     fn convert_regex() {
         // Compiled regexes are anchored with `\A` … `\z` so `Regex::is_match`
-        // (unanchored by default) only succeeds on a full-host match.
+        // (unanchored by default) only succeeds on a full-host match, and each
+        // slash-delimited regex segment is wrapped in a non-capturing group so
+        // an alternation inside it cannot split those anchors between its
+        // branches (sozu#1356). A literal segment is not a pattern and is not
+        // grouped.
         assert_eq!(
             convert_regex_domain_rule("www.example.com")
                 .unwrap()
                 .as_str(),
             "\\Awww\\.example\\.com\\z"
         );
+        // A `*` label reaches this function only when the hostname ALSO
+        // carries a `/` segment, because `DomainRule::from_str` tests
+        // `contains('/')` first — these two rows exercise the function
+        // directly. `*` is a LITERAL label here, not a wildcard, and is
+        // escaped as one. Unescaped it was a regex quantifier over the
+        // preceding atom: `\A*` repeats a zero-width assertion, so it
+        // matched empty at any offset and left the whole pattern unanchored
+        // at its start.
         assert_eq!(
             convert_regex_domain_rule("*.example.com").unwrap().as_str(),
-            "\\A*\\.example\\.com\\z"
+            "\\A\\*\\.example\\.com\\z"
         );
         assert_eq!(
             convert_regex_domain_rule("test.*.example.com")
                 .unwrap()
                 .as_str(),
-            "\\Atest\\.*\\.example\\.com\\z"
+            "\\Atest\\.\\*\\.example\\.com\\z"
         );
         assert_eq!(
             convert_regex_domain_rule("css./cdn[a-z0-9]+/.example.com")
                 .unwrap()
                 .as_str(),
-            "\\Acss\\.cdn[a-z0-9]+\\.example\\.com\\z"
+            "\\Acss\\.(?:cdn[a-z0-9]+)\\.example\\.com\\z"
         );
 
         assert_eq!(
@@ -3076,7 +3153,7 @@ mod tests {
     fn regex_domain_rule_multi_segment_segments_are_isolated() {
         let pattern = convert_regex_domain_rule("/seg1/.foo./seg2/.com")
             .expect("multi-segment regex hostname must compile");
-        assert_eq!(pattern.as_str(), "\\Aseg1\\.foo\\.seg2\\.com\\z");
+        assert_eq!(pattern.as_str(), "\\A(?:seg1)\\.foo\\.(?:seg2)\\.com\\z");
     }
 
     #[test]
@@ -3093,7 +3170,7 @@ mod tests {
         assert_eq!("test.*.example.com".parse::<DomainRule>(), Err(()));
         assert_eq!(
             "/cdn[0-9]+/.example.com".parse::<DomainRule>().unwrap(),
-            DomainRule::Regex(Regex::new("\\Acdn[0-9]+\\.example\\.com\\z").unwrap())
+            DomainRule::Regex(Regex::new("\\A(?:cdn[0-9]+)\\.example\\.com\\z").unwrap())
         );
     }
 
@@ -4495,14 +4572,13 @@ mod tests {
     /// a MIDDLE branch keeps neither anchor and matches as a bare substring
     /// anywhere in the path — worse than the half-anchored ends.
     ///
-    /// This is the one point where the path side deliberately goes further
-    /// than the hostname sites (`convert_regex_domain_rule`, and
-    /// `pattern_trie.rs`'s `format!("\\A{s}\\z")` feeding
-    /// `regexp.is_match(segment)` at `pattern_trie.rs:575`), which wrap
-    /// ungrouped and carry the same gap. Measured on this tree: the hostname
-    /// `/a|b/.example.com` matches `axx.example.com` AND `xxb.example.com`.
-    /// That is the hostname path's own defect, with its own operator impact,
-    /// and is deliberately NOT changed here.
+    /// The hostname sites carried the same gap when this landed and were
+    /// closed separately by sozu#1356: `convert_regex_domain_rule` now
+    /// groups each slash-delimited segment, and `pattern_trie.rs`'s
+    /// `anchored_segment` builds `\A(?:{segment})\z` for the regex fed to
+    /// `regexp.is_match(segment)`. See
+    /// `every_branch_of_an_alternating_regex_hostname_rule_is_anchored` and
+    /// `an_alternating_regex_hostname_segment_is_anchored_on_every_branch`.
     ///
     /// To SEE THIS RED: drop the group in `PathRule::anchored_regex` — wrap as
     /// `format!("\\A{value}\\z")`, the ungrouped hostname form. The `/axx`
@@ -5247,76 +5323,722 @@ mod tests {
         );
     }
 
-    /// The hostname side wraps each regex SEGMENT ungrouped —
-    /// `pattern_trie.rs`'s `format!("\\A{s}\\z")` at insert time, and
-    /// `convert_regex_domain_rule`'s single leading `\A` — so it still carries
-    /// the alternation gap that `PathRule::anchored_regex`'s `(?:` … `)`
-    /// closes on the path side. `anchored_regex`'s own comment calls that out
-    /// as measured on this tree and deliberately left alone; nothing asserted
-    /// the measurement, so it could rot into a false comment silently.
+    /// Every branch of an alternation in a regex hostname SEGMENT is
+    /// anchored, not just the first and the last.
     ///
-    /// This pins the DEFECT, not a desirable behaviour: the segment `/a|b/`
-    /// parses as `(\Aa)|(b\z)`, so it matches any host label starting with
-    /// `a` and any label ending with `b`. A three-branch hostname segment
-    /// would be worse still, its middle branch keeping neither anchor — see
-    /// `every_branch_of_an_alternating_path_regex_is_anchored`, which
-    /// measures that on the path side.
+    /// This test is the INVERSION of
+    /// `an_alternating_regex_hostname_segment_is_still_anchored_at_one_end_only`,
+    /// which pinned the defect so that closing it would be "a deliberate
+    /// change, not a silent one" and asked, in its own comment, to be
+    /// inverted rather than deleted when the fix landed. This is that
+    /// deliberate change (sozu#1356), and the old name is kept here so the
+    /// behaviour change leaves a trace.
     ///
-    /// Filed as sozu#1356. Fixing the hostname side is a separate change with
-    /// its own operator impact, so when it lands **INVERT this test, do not
-    /// delete it**: rename it to
-    /// `an_alternating_regex_hostname_segment_is_anchored_on_every_branch`,
-    /// flip the two leak assertions to `None`, and cite this name in the new
-    /// test's comment — exactly as
-    /// `a_path_regex_is_anchored_at_both_ends_and_must_match_the_whole_request_path`
-    /// cites the `a_path_regex_is_unanchored_and_matches_anywhere_in_the_request_path`
-    /// it replaced. A deleted test leaves no trace that the behaviour ever
-    /// changed; an inverted one is the record.
+    /// `pattern_trie.rs`'s `anchored_segment` now builds
+    /// `\A(?:{s})\z`. Ungrouped, `|` binds looser than concatenation, so
+    /// `\Aa|b\z` parsed as `(\Aa)|(b\z)`: a label merely STARTING with `a`
+    /// or merely ENDING with `b` reached the frontend.
     ///
-    /// To SEE THIS RED: group the hostname segment wrapper too — make
-    /// `pattern_trie.rs`'s four `format!("\\A{s}\\z")` sites build
-    /// `format!("\\A(?:{s})\\z")`. `a.example.com` still resolves, and the
-    /// `axx.example.com` assertion fails with
-    /// `left: None, right: Some("ALTERNATION")` — the leak closing is what
-    /// makes it red.
+    /// Two branches cannot show what this test claims, because with two
+    /// branches "first and last" is every branch there is. The three-branch
+    /// case below has a MIDDLE branch, which ungrouped keeps NEITHER anchor
+    /// and matches as a bare substring anywhere in the label — strictly
+    /// worse than the half-anchored ends.
+    ///
+    /// To SEE THIS RED: drop the group in `pattern_trie.rs`'s
+    /// `anchored_segment` — build `format!("\\A{segment}\\z")`, the form
+    /// this tree carried up to 2.2.1, and relax the `debug_assert!` beside it,
+    /// which in a debug build fires first. `a.example.com` still resolves,
+    /// and the `axx.example.com` assertion fails with
+    /// `left: Some("ALTERNATION"), right: None`.
     #[test]
-    fn an_alternating_regex_hostname_segment_is_still_anchored_at_one_end_only() {
-        let mut router = Router::new();
-        assert!(router.add_tree_rule(
-            b"/a|b/.example.com",
-            &PathRule::Prefix("/".to_owned()),
-            &MethodRule::new(Some("GET".to_owned())),
-            &Route::ClusterId("ALTERNATION".to_owned()),
-        ));
-
-        let resolve = |hostname: &str| {
+    fn an_alternating_regex_hostname_segment_is_anchored_on_every_branch() {
+        let resolve_with = |pattern: &[u8], hostname: &str| {
+            let mut router = Router::new();
+            assert!(router.add_tree_rule(
+                pattern,
+                &PathRule::Prefix("/".to_owned()),
+                &MethodRule::new(Some("GET".to_owned())),
+                &Route::ClusterId("ALTERNATION".to_owned()),
+            ));
             router
                 .lookup(hostname, "/", &Method::Get)
                 .ok()
                 .and_then(|result| result.cluster_id)
         };
 
+        // Two branches: each one keeps BOTH anchors now.
         assert_eq!(
-            resolve("a.example.com").as_deref(),
+            resolve_with(b"/a|b/.example.com", "a.example.com").as_deref(),
             Some("ALTERNATION"),
             "the segment must still match what it was written for",
         );
         assert_eq!(
-            resolve("axx.example.com").as_deref(),
+            resolve_with(b"/a|b/.example.com", "b.example.com").as_deref(),
             Some("ALTERNATION"),
-            "the first branch keeps only `\\A`, so a label merely STARTING \
-             with `a` matches — the gap the path side closes",
+            "and the other branch too",
         );
         assert_eq!(
-            resolve("xxb.example.com").as_deref(),
-            Some("ALTERNATION"),
-            "the last branch keeps only `\\z`, so a label merely ENDING with \
-             `b` matches too",
+            resolve_with(b"/a|b/.example.com", "axx.example.com"),
+            None,
+            "the first branch must be anchored at its END too",
         );
         assert_eq!(
-            resolve("xx.example.com"),
+            resolve_with(b"/a|b/.example.com", "xxb.example.com"),
+            None,
+            "the last branch must be anchored at its START too",
+        );
+        assert_eq!(
+            resolve_with(b"/a|b/.example.com", "xx.example.com"),
             None,
             "a label matching neither branch must still miss",
+        );
+
+        // Three branches. `zzbzz` is the case two branches cannot express:
+        // ungrouped, the MIDDLE branch carries no anchor at either end, so
+        // the bare label `b` matches in the middle of any label at all.
+        for whole in ["a.example.com", "b.example.com", "c.example.com"] {
+            assert_eq!(
+                resolve_with(b"/a|b|c/.example.com", whole).as_deref(),
+                Some("ALTERNATION"),
+                "{whole} is a whole-label match for one branch and must route",
+            );
+        }
+        for leak in [
+            "axx.example.com",
+            "xxc.example.com",
+            "zzbzz.example.com",
+            "bzz.example.com",
+            "zzb.example.com",
+        ] {
+            assert_eq!(
+                resolve_with(b"/a|b|c/.example.com", leak),
+                None,
+                "{leak} matches no branch WHOLE and must not route",
+            );
+        }
+
+        // The control for all of the above, built by hand against the
+        // `regex` crate rather than through the trie: the UNGROUPED wrapper
+        // — the form this tree carried up to 2.2.1 — leaves the middle
+        // branch anchored at neither end. No mutation of `anchored_segment`
+        // can move this assertion, which is the point: it measures why the
+        // group is there.
+        let two = Regex::new("\\Aa|b\\z").expect("the ungrouped wrapper compiles");
+        for anywhere in ["axx", "xxb"] {
+            assert!(
+                two.is_match(anywhere.as_bytes()),
+                "{} leaks on {anywhere}",
+                two.as_str(),
+            );
+        }
+        let ungrouped = Regex::new("\\Aa|b|c\\z").expect("the ungrouped wrapper compiles");
+        for anywhere in ["axx", "zzbzz", "bzz", "zzb", "xxc"] {
+            assert!(
+                ungrouped.is_match(anywhere.as_bytes()),
+                "{} leaks on {anywhere}",
+                ungrouped.as_str(),
+            );
+        }
+        let grouped = Regex::new("\\A(?:a|b|c)\\z").expect("the grouped wrapper compiles");
+        for anywhere in ["axx", "zzbzz", "bzz", "zzb", "xxc"] {
+            assert!(
+                !grouped.is_match(anywhere.as_bytes()),
+                "{} must refuse {anywhere}",
+                grouped.as_str(),
+            );
+        }
+    }
+
+    /// Declare one regex hostname frontend the way a configured frontend
+    /// declares it — through `Router::add_http_front`, so the hostname goes
+    /// through `DomainRule::from_str` and `convert_regex_domain_rule` — and
+    /// resolve `hostname`.
+    ///
+    /// `position` picks the code path, and the two are genuinely different
+    /// code: `Pre`/`Post` match the WHOLE host against the single regex
+    /// `convert_regex_domain_rule` assembles, while `Tree` matches label by
+    /// label against `pattern_trie`'s per-segment regexes.
+    fn regex_host_routes(position: RulePosition, pattern: &str, hostname: &str) -> Option<String> {
+        let mut front = test_http_frontend();
+        front.hostname = pattern.to_owned();
+        front.position = position;
+        front.cluster_id = Some("REGEX-HOST".to_owned());
+        let mut router = Router::new();
+        router
+            .add_http_front(&front)
+            .unwrap_or_else(|error| panic!("the regex hostname {pattern:?} must build: {error}"));
+        router
+            .lookup(hostname, "/", &Method::Get)
+            .ok()
+            .and_then(|result| result.cluster_id)
+    }
+
+    /// The companion of
+    /// `an_alternating_regex_hostname_segment_is_anchored_on_every_branch`
+    /// for the OTHER hostname code path: a pre/post rule never touches the
+    /// trie, it matches the whole host against the single regex
+    /// `convert_regex_domain_rule` assembles, and that assembly carried the
+    /// same ungrouped `\A` … `\z` (sozu#1356).
+    ///
+    /// The exact assembled pattern is asserted, so "grouped" is pinned and
+    /// not merely implied by the routing verdicts.
+    ///
+    /// Two branches cannot show what this test claims — with two branches
+    /// "first and last" is every branch. The three-branch case has a MIDDLE
+    /// branch, which ungrouped keeps NEITHER anchor: it is a bare `b`,
+    /// matching any hostname on earth that contains a `b`, including one on
+    /// a different registrable domain entirely.
+    ///
+    /// To SEE THIS RED: drop the group in `convert_regex_domain_rule` —
+    /// replace the `push_str`/`push` calls in the `/` arm with the single
+    /// `result.push_str(r)` this tree carried up to 2.2.1. The
+    /// `axx.example.com` row then fails with
+    /// `left: Some("REGEX-HOST"), right: None`, and the exact-pattern
+    /// assertion below it with
+    /// `left: "\\Aa|b|c\\.example\\.com\\z", right: "\\A(?:a|b|c)\\.example\\.com\\z"`.
+    #[test]
+    fn every_branch_of_an_alternating_regex_hostname_rule_is_anchored() {
+        for position in [RulePosition::Pre, RulePosition::Post] {
+            for whole in ["a.example.com", "b.example.com", "c.example.com"] {
+                assert_eq!(
+                    regex_host_routes(position, "/a|b|c/.example.com", whole).as_deref(),
+                    Some("REGEX-HOST"),
+                    "{position:?}: {whole} is a whole-host match for one branch and must route",
+                );
+            }
+            for leak in [
+                "axx.example.com",
+                "xxc.example.com",
+                "zzbzz.example.com",
+                "b.example.com.evil.org",
+                "zzbzz.evil.org",
+            ] {
+                assert_eq!(
+                    regex_host_routes(position, "/a|b|c/.example.com", leak),
+                    None,
+                    "{position:?}: {leak} matches no branch WHOLE and must not route",
+                );
+            }
+        }
+
+        // The exact assembled pattern, so "grouped" is asserted and not
+        // merely implied by the routing verdicts above.
+        assert_eq!(
+            convert_regex_domain_rule("/a|b|c/.example.com")
+                .expect("an alternating hostname segment must convert"),
+            "\\A(?:a|b|c)\\.example\\.com\\z",
+            "each regex segment must be wrapped in a NON-capturing group",
+        );
+
+        // The control, built by hand against the `regex` crate rather than
+        // through `convert_regex_domain_rule`: the UNGROUPED assembly — the
+        // form this tree carried up to 2.2.1 — parses as
+        // `(\Aa)|(b)|(c\.example\.com\z)`. The middle branch is a bare `b`,
+        // so it matches a host on an unrelated registrable domain. No
+        // mutation of `convert_regex_domain_rule` can move these
+        // assertions, which is the point: they measure why the group is
+        // there.
+        for (assembly, leaks) in [
+            (
+                "\\Aa|b|c\\.example\\.com\\z",
+                &[
+                    "axx.example.com",
+                    "zzbzz.example.com",
+                    "b.example.com.evil.org",
+                    "zzbzz.evil.org",
+                ][..],
+            ),
+            (
+                "\\Aapi|admin\\.example\\.com\\z",
+                &["apifoo.example.com", "xadmin.example.com"][..],
+            ),
+        ] {
+            let ungrouped = Regex::new(assembly).expect("the ungrouped assembly compiles");
+            for anywhere in leaks {
+                assert!(
+                    ungrouped.is_match(anywhere.as_bytes()),
+                    "{} leaks on {anywhere}",
+                    ungrouped.as_str(),
+                );
+            }
+        }
+
+        // `doc/configure.md`'s own worked example, asserted here because it
+        // is written there as a measurement: the frontend
+        // `/api|admin/.example.com` used to also serve `apifoo.example.com`
+        // and `xadmin.example.com`, and the remediation the same paragraph
+        // gives has to keep working.
+        for (pattern, hostname, must_route) in [
+            ("/api|admin/.example.com", "api.example.com", true),
+            ("/api|admin/.example.com", "admin.example.com", true),
+            ("/api|admin/.example.com", "apifoo.example.com", false),
+            ("/api|admin/.example.com", "xadmin.example.com", false),
+            ("/api.*|.*admin/.example.com", "api.example.com", true),
+            ("/api.*|.*admin/.example.com", "admin.example.com", true),
+            ("/api.*|.*admin/.example.com", "apifoo.example.com", true),
+            ("/api.*|.*admin/.example.com", "xadmin.example.com", true),
+        ] {
+            assert_eq!(
+                regex_host_routes(RulePosition::Pre, pattern, hostname).is_some(),
+                must_route,
+                "hostname regex {pattern:?} against {hostname:?}",
+            );
+        }
+
+        // `captures_len` must be untouched by the wrapping — see
+        // `a_host_capture_rewrite_resolves_to_the_operators_own_group` for
+        // the consequence when it is not.
+        let compiled = |pattern: &str| {
+            Regex::new(&convert_regex_domain_rule(pattern).expect("the hostname must convert"))
+                .expect("the assembled hostname regex must compile")
+        };
+        assert_eq!(
+            compiled("/a|b|c/.example.com").captures_len(),
+            1,
+            "a pattern with no operator group must stay at the implicit group 0 alone",
+        );
+        assert_eq!(
+            compiled("/cdn([0-9]+)/.example.com").captures_len(),
+            2,
+            "the operator's own group must stay at index 1",
+        );
+    }
+
+    /// A `*` label in a hostname that ALSO carries a regex segment means two
+    /// different things depending on the rule position, and
+    /// `doc/configure.md` § "Regex hostname segments" now carries the table
+    /// this test asserts.
+    ///
+    /// On the trie a `*` label is the ordinary single-label wildcard: the
+    /// trie splits on `.` and `TrieNode` stores it in its `wildcard` slot,
+    /// untouched by anything here. On `Pre`/`Post` the whole host is matched
+    /// by the single pattern `convert_regex_domain_rule` assembles, where the
+    /// `*` is now a LITERAL — the sozu#1356 escaping. Up to and including
+    /// 2.2.1 it was neither: an unescaped `*` was a regex quantifier over the
+    /// preceding atom, which for a leftmost label is the opening `\A`, so the
+    /// pattern was not anchored at its start and took any host ending in
+    /// `.x.example.com` at any depth.
+    ///
+    /// The remediation the section gives for `Pre`/`Post` is asserted too,
+    /// because a documented remediation that does not work is worse than
+    /// none.
+    ///
+    /// To SEE THIS RED: drop the escaping in the literal arm of
+    /// `convert_regex_domain_rule` — push `r` instead of `&regex::escape(r)`
+    /// at both exits. The `Pre` row for `zz.x.example.com` then routes and
+    /// fails with `left: true, right: false`. (That mutation also reddens
+    /// `a_literal_hostname_label_is_escaped_and_cannot_become_a_pattern` and
+    /// `convert_regex`.)
+    #[test]
+    fn a_star_label_is_a_wildcard_on_the_trie_and_a_literal_on_pre_and_post() {
+        // The table in `doc/configure.md`, both rows, all three positions.
+        for (position, host, must_route) in [
+            (RulePosition::Tree, "zz.x.example.com", true),
+            (RulePosition::Tree, "*.x.example.com", true),
+            (RulePosition::Pre, "zz.x.example.com", false),
+            (RulePosition::Pre, "*.x.example.com", true),
+            (RulePosition::Post, "zz.x.example.com", false),
+            (RulePosition::Post, "*.x.example.com", true),
+        ] {
+            assert_eq!(
+                regex_host_routes(position, "*./x/.example.com", host).is_some(),
+                must_route,
+                "{position:?}: `*./x/.example.com` against {host:?}",
+            );
+        }
+
+        // Common to every position, and the reason the trie row is a
+        // wildcard and not a free-for-all: `*` is ONE label.
+        for position in [RulePosition::Tree, RulePosition::Pre, RulePosition::Post] {
+            for miss in ["x.example.com", "a.b.x.example.com"] {
+                assert_eq!(
+                    regex_host_routes(position, "*./x/.example.com", miss),
+                    None,
+                    "{position:?}: a `*` label is exactly one label, so {miss:?} misses",
+                );
+            }
+        }
+
+        // What 2.2.1 did on `Pre`/`Post`, built by hand against the crate:
+        // `\A*` repeats a zero-width assertion, so the pattern was not
+        // anchored at its start. No mutation of the escaping can move this.
+        let quantified =
+            Regex::new("\\A*\\.(?:x)\\.example\\.com\\z").expect("the raw assembly compiles");
+        for anywhere in [
+            "evil.attacker.x.example.com",
+            "anything.at.all.x.example.com",
+            "zzz.x.example.com",
+        ] {
+            assert!(
+                quantified.is_match(anywhere.as_bytes()),
+                "{} took {anywhere} at any depth",
+                quantified.as_str(),
+            );
+        }
+        assert!(
+            !quantified.is_match(b"x.example.com"),
+            "{} still required a leading label",
+            quantified.as_str(),
+        );
+
+        // The remediation `doc/configure.md` gives for `Pre`/`Post`: a regex
+        // segment spelling the single label out.
+        for position in [RulePosition::Pre, RulePosition::Post] {
+            for (host, must_route) in [
+                ("zz.x.example.com", true),
+                ("*.x.example.com", true),
+                ("a.b.x.example.com", false),
+                ("x.example.com", false),
+            ] {
+                assert_eq!(
+                    regex_host_routes(position, "/[^.]*/./x/.example.com", host).is_some(),
+                    must_route,
+                    "{position:?}: the documented `Pre`/`Post` remediation against {host:?}",
+                );
+            }
+        }
+    }
+
+    /// A `.*` inside a regex segment does not stop at the label boundary, and
+    /// where it stops depends on the rule POSITION — the two hostname paths
+    /// genuinely differ here. A trie rule matches each segment against one
+    /// label, so `.*` cannot leave it. A `Pre`/`Post` rule is matched by the
+    /// single whole-host pattern `convert_regex_domain_rule` assembles, in
+    /// which `.` matches the `.` separator like any other character.
+    ///
+    /// Pre-existing and NOT introduced by the anchoring, but
+    /// `doc/configure.md` walks operators into it: the remediation it gives
+    /// for the narrowing is exactly a `.*`. The section now names the
+    /// divergence and recommends `[^.]*` on `Pre`/`Post`, so all three
+    /// measurements it makes are pinned here.
+    ///
+    /// To SEE THIS RED: escape the REGEX-segment arm of
+    /// `convert_regex_domain_rule` as well as the literal arm — push
+    /// `&regex::escape(r)` in the `/` arm too. Every `Pre` row then goes
+    /// false, starting with `api.example.com`, because the segment stops
+    /// being a pattern at all.
+    #[test]
+    fn a_wildcard_in_a_hostname_segment_crosses_labels_on_pre_and_post_only() {
+        // Trie: one segment, one label. `.*` cannot escape the label.
+        for (hostname, must_route) in [
+            ("api.example.com", true),
+            ("admin.example.com", true),
+            ("apifoo.example.com", true),
+            ("api.foo.example.com", false),
+            ("zz.admin.example.com", false),
+        ] {
+            assert_eq!(
+                regex_host_routes(RulePosition::Tree, "/api.*|.*admin/.example.com", hostname)
+                    .is_some(),
+                must_route,
+                "trie rule `/api.*|.*admin/` against {hostname:?}",
+            );
+        }
+
+        // Pre/Post: one whole-host pattern, in which `.` matches the
+        // separator. The same rule reaches subdomains the operator did not
+        // write. This is the clause `doc/configure.md` now carries.
+        for position in [RulePosition::Pre, RulePosition::Post] {
+            for hostname in [
+                "api.example.com",
+                "admin.example.com",
+                "apifoo.example.com",
+                "api.foo.example.com",
+                "zz.admin.example.com",
+            ] {
+                assert!(
+                    regex_host_routes(position, "/api.*|.*admin/.example.com", hostname).is_some(),
+                    "{position:?}: `.*` spans the label separator, so {hostname:?} routes",
+                );
+            }
+        }
+
+        // ... and the remediation that section recommends for `Pre`/`Post`.
+        for position in [RulePosition::Pre, RulePosition::Post] {
+            for (hostname, must_route) in [
+                ("api.example.com", true),
+                ("admin.example.com", true),
+                ("apifoo.example.com", true),
+                ("xadmin.example.com", true),
+                ("api.foo.example.com", false),
+                ("zz.admin.example.com", false),
+            ] {
+                assert_eq!(
+                    regex_host_routes(position, "/api[^.]*|[^.]*admin/.example.com", hostname,)
+                        .is_some(),
+                    must_route,
+                    "{position:?}: `[^.]*` spells the boundary out, {hostname:?}",
+                );
+            }
+        }
+    }
+
+    /// The LITERAL-label arm of `convert_regex_domain_rule` split the anchors
+    /// exactly as the regex-segment arm did, one `else` away from it: a label
+    /// the operator never wrapped in slashes was pushed verbatim into the
+    /// assembly, so a `|` in it was a live alternation. Measured on the tree
+    /// as it stood, `/a/.x|y.com` assembled to `\A(?:a)\.x|y\.com\z` —
+    /// `(\A(?:a)\.x)|(y\.com\z)` — and matched `a.xZZZ` and `ZZZy.com`.
+    ///
+    /// The fix is `regex::escape`, not a group. A literal label is a literal,
+    /// so grouping would confine the alternation while leaving `+`, `?`, `*`,
+    /// `^` and `$` live inside the same arm — `b+c` matching `bbbc` is the
+    /// same defect with a different operator. Escaping is a no-op in matching
+    /// behaviour for every label a real hostname can carry: an LDH label is
+    /// `[A-Za-z0-9-]`, `escape` touches only the `-`, and `\-` is `-` outside
+    /// a character class. That parity is asserted below rather than asserted
+    /// of the hostname grammar in the abstract.
+    ///
+    /// To SEE THIS RED: drop the escaping in the literal arm of
+    /// `convert_regex_domain_rule` — push `r` instead of `&regex::escape(r)`
+    /// at both of its exits. The `a.xZZZ` row then fails with
+    /// `left: true, right: false`. That mutation reddens THREE tests, not
+    /// just this one: `convert_regex`'s two `*` rows go back to the
+    /// unescaped spelling, and
+    /// `a_star_label_is_a_wildcard_on_the_trie_and_a_literal_on_pre_and_post`
+    /// loses the `Pre`/`Post` half of its table.
+    #[test]
+    fn a_literal_hostname_label_is_escaped_and_cannot_become_a_pattern() {
+        // The three routing verdicts the defect turned on, through the
+        // frontend surface that carries it.
+        for (hostname, must_route) in [("a.x|y.com", true), ("a.xZZZ", false), ("ZZZy.com", false)]
+        {
+            assert_eq!(
+                regex_host_routes(RulePosition::Pre, "/a/.x|y.com", hostname).is_some(),
+                must_route,
+                "literal label `x|y` against {hostname:?}",
+            );
+        }
+        assert_eq!(
+            convert_regex_domain_rule("/a/.x|y.com").expect("the hostname must convert"),
+            "\\A(?:a)\\.x\\|y\\.com\\z",
+            "a literal label must be escaped, not grouped and not pushed raw",
+        );
+
+        // The control, built by hand: the UNESCAPED assembly is what leaked.
+        // No mutation of `convert_regex_domain_rule` can move this.
+        let unescaped = Regex::new("\\A(?:a)\\.x|y\\.com\\z").expect("the raw assembly compiles");
+        for anywhere in ["a.xZZZ", "ZZZy.com"] {
+            assert!(
+                unescaped.is_match(anywhere.as_bytes()),
+                "{} leaks on {anywhere}",
+                unescaped.as_str(),
+            );
+        }
+
+        // Escaping must be inert for every label a hostname can actually
+        // carry. `-` is the only LDH byte `regex::escape` touches, and `\-`
+        // is `-` outside a character class.
+        assert_eq!(
+            convert_regex_domain_rule("/a/.my-host01.example.com")
+                .expect("an LDH hostname must convert"),
+            "\\A(?:a)\\.my\\-host01\\.example\\.com\\z",
+            "escape only adds a backslash before the `-`",
+        );
+        for (hostname, must_route) in [
+            ("a.my-host01.example.com", true),
+            ("a.myXhost01.example.com", false),
+            ("a.my-host01.example.comZZZ", false),
+        ] {
+            assert_eq!(
+                regex_host_routes(RulePosition::Pre, "/a/.my-host01.example.com", hostname)
+                    .is_some(),
+                must_route,
+                "escaped LDH label against {hostname:?}",
+            );
+        }
+
+        // Grouping instead of escaping would have closed the `|` only. This
+        // is why the arms are treated differently, measured rather than
+        // argued: the same three quantifiers stay live under a group.
+        let grouped_not_escaped =
+            Regex::new("\\A(?:a)\\.(?:b+c)\\.com\\z").expect("the grouped assembly compiles");
+        assert!(
+            grouped_not_escaped.is_match(b"a.bbbc.com"),
+            "{} still repeats the literal `b`",
+            grouped_not_escaped.as_str(),
+        );
+        for (hostname, must_route) in [("a.b+c.com", true), ("a.bbbc.com", false)] {
+            assert_eq!(
+                regex_host_routes(RulePosition::Pre, "/a/.b+c.com", hostname).is_some(),
+                must_route,
+                "escaped literal label `b+c` against {hostname:?}",
+            );
+        }
+
+        // Two deliberate behaviour changes, both narrowing, both stated in
+        // `convert_regex_domain_rule`'s doc comment.
+        //
+        // (1) A literal `*` label was a quantifier over the preceding atom.
+        // `\A*` repeats a zero-width assertion, which matches empty at any
+        // offset, so the pattern was not anchored at its start at all.
+        let star_unescaped =
+            Regex::new("\\A*\\.(?:x)\\.example\\.com\\z").expect("the raw assembly compiles");
+        assert!(
+            star_unescaped.is_match(b"evil.attacker.x.example.com"),
+            "{} is not anchored at its start",
+            star_unescaped.as_str(),
+        );
+        assert_eq!(
+            regex_host_routes(
+                RulePosition::Pre,
+                "*./x/.example.com",
+                "evil.attacker.x.example.com",
+            ),
+            None,
+            "a literal `*` label must no longer leave the pattern unanchored",
+        );
+        assert_eq!(
+            regex_host_routes(RulePosition::Pre, "*./x/.example.com", "*.x.example.com").as_deref(),
+            Some("REGEX-HOST"),
+            "it matches the literal label the operator wrote, and only that",
+        );
+
+        // (2) A literal label carrying an unbalanced `(` or `[` made the
+        // assembly fail to compile and the frontend was REJECTED. It is now
+        // accepted and matches exactly the host that was typed. Assembled at
+        // run time because the unbalanced literal is the point.
+        for bracket in ["(", "["] {
+            let hostname = format!("/a/.b{bracket}c.com");
+            assert!(
+                convert_regex_domain_rule(&hostname).is_some(),
+                "{hostname} must convert",
+            );
+            assert_eq!(
+                regex_host_routes(RulePosition::Pre, &hostname, &format!("a.b{bracket}c.com"))
+                    .as_deref(),
+                Some("REGEX-HOST"),
+                "{hostname} must match the literal host it spells",
+            );
+            assert_eq!(
+                regex_host_routes(RulePosition::Pre, &hostname, "a.bc.com"),
+                None,
+                "{hostname} must match nothing else",
+            );
+        }
+    }
+
+    /// `$HOST[n]` rewrite indices are read from `caps.iter().skip(1)` with
+    /// the buffer sized by `captures_len()`, so the anchoring wrapper has to
+    /// be NON-capturing: a capturing `(` … `)` shifts every index by one and
+    /// silently rewrites traffic to the wrong target — a wrong `Host` header
+    /// and a wrong backend, with nothing in the configuration to show for it.
+    ///
+    /// Both hostname code paths are asserted, because they read the capture
+    /// from two DIFFERENT regexes that have to agree: a pre/post rule reads
+    /// the whole-host regex `convert_regex_domain_rule` assembles
+    /// (`RouteResult::new_no_trie`), a tree rule reads `pattern_trie`'s
+    /// per-segment regex (`RouteResult::new_with_trie`) — while
+    /// `capture_cap_host`, which bounds the template, is taken from the
+    /// whole-host one in BOTH cases.
+    ///
+    /// To SEE THIS RED: make either wrapper capturing — `result.push_str("(")`
+    /// instead of `"(?:"` in `convert_regex_domain_rule`, or
+    /// `format!("\\A({segment})\\z")` in `pattern_trie.rs`'s
+    /// `anchored_segment`. `$HOST[1]` then resolves to the whole segment
+    /// `cdn42` instead of the operator's own group `42`, failing with
+    /// `left: Some("cdn42.internal"), right: Some("42.internal")`.
+    #[test]
+    fn a_host_capture_rewrite_resolves_to_the_operators_own_group() {
+        let rewritten_host = |position: RulePosition, template: &str, hostname: &str| {
+            let mut front = test_http_frontend();
+            front.hostname = "/cdn([0-9]+)/.example.com".to_owned();
+            front.position = position;
+            front.rewrite_host = Some(template.to_owned());
+            let mut router = Router::new();
+            router
+                .add_http_front(&front)
+                .unwrap_or_else(|error| panic!("{position:?} frontend must build: {error}"));
+            router
+                .lookup(hostname, "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.rewritten_host)
+        };
+
+        for position in [RulePosition::Pre, RulePosition::Post, RulePosition::Tree] {
+            assert_eq!(
+                rewritten_host(position, "$HOST[1].internal", "cdn42.example.com").as_deref(),
+                Some("42.internal"),
+                "{position:?}: $HOST[1] must be the operator's own group, not the wrapper's",
+            );
+            assert_eq!(
+                rewritten_host(position, "$HOST[0]", "cdn42.example.com").as_deref(),
+                Some("cdn42.example.com"),
+                "{position:?}: $HOST[0] is the whole hostname",
+            );
+        }
+
+        // The cap itself. `captures_len()` is 2, so index 2 does not exist
+        // and the frontend must be refused loudly at registration rather
+        // than rewriting to an empty string. A capturing wrapper would make
+        // this index legal — which is exactly how a shifted index reaches
+        // production unnoticed.
+        let mut front = test_http_frontend();
+        front.hostname = "/cdn([0-9]+)/.example.com".to_owned();
+        front.rewrite_host = Some("$HOST[2]".to_owned());
+        assert!(
+            matches!(
+                Router::new().add_http_front(&front),
+                Err(RouterError::InvalidHostRewrite(_)),
+            ),
+            "a $HOST index past captures_len must be refused at registration",
+        );
+    }
+
+    /// Grouping must not rescue a hostname the router rejects today. The
+    /// wrapper supplies one `(` and one `)`, so an unbalanced segment can be
+    /// balanced BY the wrapping — `a)(b` is not a regex, yet
+    /// `\A(?:a)(b)\.example\.com\z` is, and it matches `ab.example.com`.
+    /// Both hostname sites therefore compile the segment on its own before
+    /// wrapping it, exactly as `PathRule::anchored_regex` does for a path.
+    ///
+    /// This covers that one direction. The converse is NOT guarded and is
+    /// not asserted here: a segment that compiles bare can be rejected once
+    /// wrapped. Such a hostname lands in `RouterError::InvalidDomain` at
+    /// frontend registration, so it costs a loud rejection and not a
+    /// mis-route.
+    ///
+    /// To SEE THIS RED: delete the `Regex::new(r).ok()?;` line in
+    /// `convert_regex_domain_rule` — the first assertion then fails, the
+    /// hostname builds, and `ab.example.com` routes. Delete the
+    /// `Regex::new(segment).ok()?;` line in `pattern_trie.rs`'s
+    /// `anchored_segment` instead and the `add_tree_rule` assertion fails.
+    #[test]
+    fn grouping_never_turns_a_rejected_hostname_regex_into_an_accepted_one() {
+        // Assembled at run time rather than written as a literal because the
+        // invalidity is the whole point and a literal invites a lint at the
+        // `Regex::new` call site.
+        let unbalanced = format!("/a{}b/.example.com", ")(");
+
+        assert_eq!(
+            convert_regex_domain_rule(&unbalanced),
+            None,
+            "{unbalanced} carries a segment that is not a regex on its own",
+        );
+        assert_eq!(
+            unbalanced.parse::<DomainRule>(),
+            Err(()),
+            "{unbalanced} must not become a usable DomainRule",
+        );
+        assert!(
+            !Router::new().add_tree_rule(
+                unbalanced.as_bytes(),
+                &PathRule::Prefix("/".to_owned()),
+                &MethodRule::new(Some("GET".to_owned())),
+                &Route::ClusterId("RESCUED".to_owned()),
+            ),
+            "{unbalanced} must not be storable in the trie either",
+        );
+
+        // The hazard is real, not hypothetical: the wrapping alone turns it
+        // into a live pattern matching a host the operator never wrote.
+        let rescued = Regex::new(&format!("\\A(?:a{}b)\\.example\\.com\\z", ")("))
+            .expect("the wrapping balances the segment");
+        assert!(
+            rescued.is_match(b"ab.example.com"),
+            "{} is what the missing pre-validation would have built",
+            rescued.as_str(),
         );
     }
 

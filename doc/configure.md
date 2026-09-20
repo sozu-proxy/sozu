@@ -1409,8 +1409,9 @@ value is wrapped as `\A(?:…)\z` when the frontend is registered, so it must
 match the **whole** request path: the pattern `bc` does **not** match `/abcd`,
 and `/ab` does not match `/abcd` either. That is the same both-ends anchoring
 regex *hostname* segments have carried since v2.0.0 — see "Regex hostname
-segments" below. Every branch of an alternation is anchored, not just the first
-and last: `/a|/b` matches `/a` and `/b` and neither `/axx` nor `/xx/b`.
+segments" below, which also carries the alternation rule that follows. Every
+branch of an alternation is anchored, not just the first and last: `/a|/b`
+matches `/a` and `/b` and neither `/axx` nor `/xx/b`.
 
 **This is a behaviour change, and it narrows existing rules** (sozu#1350). Up to
 and including 2.2.1 the value was compiled verbatim and matched with `is_match`,
@@ -1611,7 +1612,7 @@ patterns mutually exclusive. (See also sozu#1351.)
 ### Regex hostname segments
 
 A `hostname` may carry a regex in any one of its dot-separated segments by
-wrapping that segment in slashes. The pattern is anchored with `\A...\z` at
+wrapping that segment in slashes. The pattern is wrapped as `\A(?:...)\z` at
 insert time (see the 2.0.0 upgrade note), so it matches that whole segment and
 nothing else:
 
@@ -1689,10 +1690,67 @@ that separates them — that a deeper sibling sharing the regex segment was adde
 to that worker first — is not recoverable from `sozu query frontends`. A quiet
 but healthy route looks identical.
 
+Every branch of an alternation inside a segment is anchored, not just the first
+and the last. `/a|b|c/.example.com` matches `a.example.com`, `b.example.com` and
+`c.example.com`, and none of `axx.example.com`, `xxc.example.com` or
+`zzbzz.example.com`.
+
+**This narrows existing rules, and up to and including 2.2.1 it did not hold**
+(sozu#1356). The segment was wrapped without a group, and `|` binds looser than
+concatenation, so `\Aa|b\z` parsed as `(\Aa)|(b\z)`: the first branch kept
+only its opening anchor, the last only its closing one, and a middle branch kept
+neither, matching as a bare substring anywhere in the label. A frontend written
+`/api|admin/.example.com` also served `apifoo.example.com` and
+`xadmin.example.com`, neither of which the operator declared. If you were
+relying on that, write the wildcards out: `/api.*|.*admin/`.
+
+**A `.*` inside a segment does not stop at the label boundary, and where it
+stops depends on the rule position.** A trie-routed frontend — the default —
+matches each segment against one label, so `/api.*|.*admin/.example.com` there
+matches `apifoo.example.com` and neither `api.foo.example.com` nor
+`zz.admin.example.com`. A `Pre` or `Post` frontend is matched by a single
+whole-host pattern instead, in which `.` matches the separator like any other
+character, so the same rule also takes `api.foo.example.com` and
+`zz.admin.example.com` — subdomains the operator did not write. This is not new
+and is not introduced by the anchoring, but the remediation above is what walks
+you into it: on `Pre`/`Post`, spell the boundary out with `[^.]*` rather than
+`.*`.
+
+**A `*` label in a hostname that also carries a regex segment is a wildcard on
+the trie and a literal on `Pre`/`Post`**, and that divergence is a behaviour
+change on the `Pre`/`Post` side. Same configured hostname
+`*./x/.example.com`:
+
+| rule position | `zz.x.example.com` | `*.x.example.com` |
+|---------------|--------------------|-------------------|
+| trie (default) | routes             | routes            |
+| `Pre` / `Post` | does **not** route | routes            |
+
+A trie-routed frontend splits the hostname into labels and a `*` label is the
+ordinary single-label wildcard documented above, so it matches one label and not
+two — `a.b.x.example.com` misses on both positions. A `Pre`/`Post` frontend is
+matched by one whole-host pattern, and there the `*` is now escaped and matches
+the literal character `*`. Up to and including 2.2.1 it was neither: it was a
+regex quantifier over whatever preceded it, and since what preceded it was the
+opening `\A` anchor, `*./x/.example.com` compiled to a pattern that was not
+anchored at its start at all and took **any** host ending in `.x.example.com` at
+any depth, `evil.attacker.x.example.com` included. If you want a wildcard on a
+`Pre`/`Post` rule, write it as a regex segment — `/[^.]*/./x/.example.com` — or
+declare the frontend on the trie, where `*` means what the wildcard section says
+it means.
+
+The group is **non-capturing**, so it changes no `$HOST[n]` index: in
+`/cdn([0-9]+)/.example.com`, `$HOST[1]` is still the operator's own group
+(`42` for `cdn42.example.com`), and `$HOST[0]` is still the whole hostname.
+
 A segment regex must occupy a complete segment. `abc/[0-9]+/.example.com` is
 rejected, because the regex does not start at a `.` boundary, as is a hostname
 with an empty label such as `.example.com` or `./test[0-9]/.example.com`. A
-rejected frontend is reported as an error and leaves the route table unchanged.
+segment that is not a valid regex **on its own** is rejected too, even when the
+wrapping would balance it: `/a)(b/.example.com` is refused rather than compiled
+into `\A(?:a)(b)\.example\.com\z`, which would match `ab.example.com` — a host
+the operator never wrote. A rejected frontend is reported as an error and leaves
+the route table unchanged.
 
 Captured segments are addressable from `rewrite_host` / `rewrite_path` as
 `$HOST[n]` — see the redirect and rewrite section below.

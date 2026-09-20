@@ -28,6 +28,48 @@ fn find_last_slash(input: &[u8]) -> Option<usize> {
     (0..input.len()).rev().find(|&i| input[i] == b'/')
 }
 
+/// The stored pattern for one regex hostname segment: the configured
+/// `segment` anchored at both ends so `Regex::is_match` — a substring
+/// search — only succeeds on a whole-label match. `cdn[0-9]+` must match
+/// `cdn1` and not `cdn1xxx`.
+///
+/// The group is NOT decoration. `|` binds looser than concatenation, so the
+/// ungrouped `\Aa|b\z` parses as `(\Aa)|(b\z)` and each branch keeps only
+/// one anchor — measured, it still matches `axx`, and with three branches the
+/// middle one keeps NEITHER anchor and matches `zzbzz` as a bare substring.
+/// `(?:` … `)` is non-capturing, so `captures_len` and therefore every
+/// `$HOST[n]` rewrite index (`lookup_with_path` hands the segment regex to
+/// `router/mod.rs`'s `RouteResult::new_with_trie`, which reads
+/// `caps.iter().skip(1)`) are unchanged.
+///
+/// The segment is compiled ON ITS OWN first and only a segment that compiles
+/// is wrapped. The wrapper supplies one `(` and one `)`, so an unbalanced
+/// segment can be balanced BY the wrapping: `a)(b` is rejected by
+/// `Regex::new`, yet `\A(?:a)(b)\z` compiles and matches `ab`. Without the
+/// first compile, anchoring would silently promote a segment the trie rejects
+/// today into a live route matching something the operator never wrote.
+///
+/// The same string is the identity of a `regexps` entry — the dedup scan in
+/// `insert_recursive`, `remove_recursive` and `lookup_mut` all compare
+/// `Regex::as_str()` against it — so every site must build it here.
+///
+/// `None` means "this segment is not a usable regex": insert fails, and
+/// remove/lookup find nothing, which is correct because insert never stored
+/// it. `PathRule::anchored_regex` in `router/mod.rs` is the same shape for
+/// the path side; it is not shared because it returns a compiled `Regex` and
+/// three of the four call sites here need only the string, on a control-plane
+/// path that would otherwise recompile a regex per call.
+fn anchored_segment(segment: &str) -> Option<String> {
+    Regex::new(segment).ok()?;
+    let anchored = format!("\\A(?:{segment})\\z");
+    debug_assert!(
+        anchored.starts_with("\\A(?:") && anchored.ends_with(")\\z"),
+        "segment regex must be fully anchored AND grouped so every alternation \
+         branch matches the whole segment only",
+    );
+    Some(anchored)
+}
+
 /// Implementation of a trie tree structure.
 /// In Sozu this is used to store and lookup domains recursively.
 /// Each node represents a "level domain".
@@ -229,11 +271,12 @@ impl<V: Debug + Clone> TrieNode<V> {
                 }
 
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
-                    let anchored_s = format!("\\A{s}\\z");
-                    debug_assert!(
-                        anchored_s.starts_with("\\A") && anchored_s.ends_with("\\z"),
-                        "segment regex must be fully anchored so it matches the whole segment only",
-                    );
+                    // `None` is a segment that is not a regex on its own;
+                    // see `anchored_segment` for why that is refused here
+                    // rather than rescued by the wrapping.
+                    let Some(anchored_s) = anchored_segment(s) else {
+                        return InsertResult::Failed;
+                    };
                     for t in self.regexps.iter_mut() {
                         if t.0.as_str() == anchored_s {
                             // `pos > 0`: there is a `.`-separated prefix
@@ -278,12 +321,11 @@ impl<V: Debug + Clone> TrieNode<V> {
                         }
                     }
 
-                    // Anchor segment regexes so they only match the entire
-                    // segment, not partial overlaps. Without `\A...\z`, a
-                    // pattern like `cdn[0-9]+` would match `cdn123xxx`,
-                    // which silently widens the routing surface.
-                    let anchored = format!("\\A{s}\\z");
-                    if let Ok(r) = Regex::new(&anchored) {
+                    // `anchored_s` above is the very string the dedup scan
+                    // just failed to find, so the entry this opens is
+                    // addressable by `remove_recursive` and `lookup_mut`,
+                    // which rebuild it the same way.
+                    if let Ok(r) = Regex::new(&anchored_s) {
                         if pos > 0 {
                             let mut node = TrieNode::root();
                             let pos = pos - 1;
@@ -425,7 +467,11 @@ impl<V: Debug + Clone> TrieNode<V> {
                 }
 
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
-                    let anchored_s = format!("\\A{s}\\z");
+                    // A segment `insert_recursive` refused stored nothing,
+                    // so there is nothing here to remove either.
+                    let Some(anchored_s) = anchored_segment(s) else {
+                        return RemoveResult::NotFound;
+                    };
                     // Mirror of `insert_recursive`. `pos > 0`: a
                     // `.`-separated prefix precedes the regex segment, so
                     // the value sits deeper in that segment's subtree —
@@ -662,7 +708,9 @@ impl<V: Debug + Clone> TrieNode<V> {
                 }
 
                 if let Ok(s) = str::from_utf8(&partial_key[pos + 1..partial_key.len() - 1]) {
-                    let anchored_s = format!("\\A{s}\\z");
+                    // A segment `insert_recursive` refused was never stored,
+                    // so it is addressable by nothing here.
+                    let anchored_s = anchored_segment(s)?;
                     for t in self.regexps.iter_mut() {
                         if t.0.as_str() == anchored_s {
                             // `pos == 0` means the regex is the leftmost
@@ -1139,6 +1187,107 @@ mod tests {
             root.domain_lookup(b"cdnabc.example.com".as_ref(), false),
             None
         );
+    }
+
+    /// `anchored_segment` is the single source of a `regexps` entry's
+    /// identity, so its exact output is pinned here rather than inferred
+    /// from routing verdicts: `insert_recursive`'s dedup scan,
+    /// `remove_recursive` and `lookup_mut` all address an entry by comparing
+    /// `Regex::as_str()` against this string, and a second spelling would
+    /// make a stored segment un-removable and un-addressable.
+    ///
+    /// The group is non-capturing, so `captures_len` — and therefore every
+    /// `$HOST[n]` rewrite index `lookup_with_path` feeds
+    /// `router/mod.rs`'s `RouteResult::new_with_trie` — is unchanged.
+    ///
+    /// To SEE THIS RED: build `format!("\\A{segment}\\z")` in
+    /// `anchored_segment`, the form this tree carried up to 2.2.1, and relax
+    /// the `debug_assert!` beside it to `starts_with("\\A")` /
+    /// `ends_with("\\z")` — in a debug build that assertion fires first, in
+    /// `anchored_segment` itself rather than in a test. The first assertion
+    /// here then fails with
+    /// `left: Some("\\Acdn[0-9]+\\z"), right: Some("\\A(?:cdn[0-9]+)\\z")`.
+    /// Make the wrapper CAPTURING instead — `format!("\\A({segment})\\z")` —
+    /// and the `captures_len` assertions catch it.
+    #[test]
+    fn anchored_segment_wraps_in_a_non_capturing_group() {
+        assert_eq!(
+            anchored_segment("cdn[0-9]+").as_deref(),
+            Some("\\A(?:cdn[0-9]+)\\z"),
+            "the wrapper must anchor AND group",
+        );
+        assert_eq!(
+            Regex::new(&anchored_segment("a|b|c").expect("an alternation must wrap"))
+                .expect("the wrapped alternation must compile")
+                .captures_len(),
+            1,
+            "the group must be non-capturing, so `$HOST[n]` indices are untouched",
+        );
+        assert_eq!(
+            Regex::new(&anchored_segment("cdn([0-9]+)").expect("a group must wrap"))
+                .expect("the wrapped group must compile")
+                .captures_len(),
+            2,
+            "the operator's own group must stay at index 1",
+        );
+
+        // A segment that is not a regex on its own is refused, and is NOT
+        // rescued by the `(` and `)` the wrapper supplies: `a)(b` is
+        // unbalanced, yet `\A(?:a)(b)\z` compiles and matches `ab`.
+        // Assembled at run time because the invalidity is the point.
+        let unbalanced = format!("a{}b", ")(");
+        assert_eq!(
+            anchored_segment(&unbalanced),
+            None,
+            "{unbalanced} must not be rescued into a valid pattern",
+        );
+        let rescued = Regex::new(&format!("\\A(?:a{}b)\\z", ")("))
+            .expect("the wrapping balances the segment");
+        assert!(
+            rescued.is_match(b"ab"),
+            "{} is what the missing pre-validation would have built",
+            rescued.as_str(),
+        );
+    }
+
+    /// Three branches, because two cannot express the claim: with exactly
+    /// two, "first and last" is every branch there is. Ungrouped, the MIDDLE
+    /// branch keeps NEITHER anchor and matches as a bare substring anywhere
+    /// in the label.
+    ///
+    /// To SEE THIS RED: build `format!("\\A{segment}\\z")` in
+    /// `anchored_segment` and relax the `debug_assert!` beside it, which in
+    /// a debug build fires first. `axx.example.com` then resolves and the
+    /// assertion fails with
+    /// `left: Some(([47, 97, 124, 98, 124, 99, 47, 46, …], 9)), right: None`.
+    #[test]
+    fn every_branch_of_an_alternating_segment_regex_matches_the_whole_label_only() {
+        let mut root: TrieNode<u8> = TrieNode::root();
+        assert_eq!(
+            root.insert(Vec::from(&b"/a|b|c/.example.com"[..]), 9),
+            InsertResult::Ok
+        );
+
+        for whole in ["a.example.com", "b.example.com", "c.example.com"] {
+            assert_eq!(
+                root.domain_lookup(whole.as_bytes(), false),
+                Some(&(b"/a|b|c/.example.com".to_vec(), 9)),
+                "{whole} is a whole-label match for one branch and must resolve",
+            );
+        }
+        for leak in [
+            "axx.example.com",
+            "xxc.example.com",
+            "zzbzz.example.com",
+            "bzz.example.com",
+            "zzb.example.com",
+        ] {
+            assert_eq!(
+                root.domain_lookup(leak.as_bytes(), false),
+                None,
+                "{leak} matches no branch WHOLE and must not resolve",
+            );
+        }
     }
 
     #[test]
