@@ -3254,8 +3254,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // Refresh the per-stream idle timer on outbound bytes. Without
             // this, a long-running response trickled at low bandwidth would
             // be killed by `cancel_timed_out_streams` mid-delivery — the
-            // inbound-only refresh at h2.rs:3887-3895 / 4026-4031 never
-            // fires while the peer is idle.
+            // inbound-only refreshes in `handle_data_frame` (non-empty DATA)
+            // and `handle_headers_frame` never fire while the peer is idle.
             if stream_bytes > 0
                 && let Some(t) = self.stream_last_activity_at.get_mut(&stream_id)
             {

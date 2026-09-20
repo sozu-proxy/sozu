@@ -16,20 +16,25 @@ For deep per-protocol detail, follow the `LIFECYCLE.md` siblings:
 - Master/worker supervisor: [`bin/src/command/LIFECYCLE.md`](../bin/src/command/LIFECYCLE.md)
 
 This file stays narrative. Cited paths are repo-relative; SHA-pinned
-permalinks have been removed because they rot.
+permalinks have been removed because they rot. Where the prose names an
+item — a function, a method, a struct, an enum, a field — the anchor is that
+item plus its file, with no line number, because a line number does not
+survive an edit above it. A `file.rs:LINE` or `file.rs:LINE-LINE` anchor is
+kept only where the claim is about a specific statement or branch inside an
+item; those were refreshed against `main` at `ba7fa5f9` on 2026-09-20.
 
 ## 2. Conceptual primitives
 
 ### 2.1 The mio event loop
 
 A Sōzu worker is a single OS thread that owns one `mio::Poll`
-(`lib/src/server.rs:323, 342`). On Linux this is a thin wrapper around
-`epoll(7)`; on the BSDs and macOS it is `kqueue(2)`. The worker
+(`Server::poll` in `lib/src/server.rs`). On Linux this is a thin wrapper
+around `epoll(7)`; on the BSDs and macOS it is `kqueue(2)`. The worker
 registers every socket — listen sockets, frontend, backend, metrics,
 unix command-channel pair — with that single poller, then loops
 reading events out of `Events` and dispatching them to the correct
 session. Loop time is observable via the `epoll_time` time! metric
-(`lib/src/server.rs:593-595`).
+(`lib/src/server.rs:1047-1051`).
 
 ### 2.2 Edge-triggered readiness and the writable invariant
 
@@ -39,8 +44,9 @@ not drain the kernel buffer fully on that wake-up, it gets no other
 event until the *next* edge.
 
 To survive that contract, every protocol module routes its readiness
-through a `Readiness` tracker (`lib/src/protocol/mux/connection.rs:200,
-203`) and uses two helpers:
+through a `Readiness` tracker (`Readiness` in `lib/src/lib.rs`, reached in
+the mux through `Connection::readiness_mut` in
+`lib/src/protocol/mux/connection.rs`) and uses two helpers:
 
 - `signal_pending_write` — set by code that has produced bytes that
   must eventually go out, even though the writable epoll edge may have
@@ -54,18 +60,20 @@ call `arm_writable` (mux) or `signal_pending_write` (pipe),
 the session "stalls" — bytes sit in the buffer and the next epoll
 event never arrives. Past truncation bugs on this branch all
 originated here. The `mux::answers` module documents this as the
-"invariant-15 pair" (`lib/src/protocol/mux/answers.rs:280, 298`); the
+"invariant-15 pair" (`lib/src/protocol/mux/answers.rs:408-413`); the
 home for the invariant is `mux::connection`
-(`lib/src/protocol/mux/connection.rs:14`).
+(`lib/src/protocol/mux/connection.rs:13-16`).
 
 ### 2.3 Tokens, the SessionManager, and the slab
 
 Every mio registration carries a `Token` (a `usize`). The
-`SessionManager` (`lib/src/server.rs:166`) owns a
-`Slab<Rc<RefCell<dyn ProxySession>>>` (`lib/src/server.rs:170`) that
+`SessionManager` (`lib/src/server.rs`) owns a
+`Slab<Rc<RefCell<dyn ProxySession>>>` (`SessionManager::slab`,
+`lib/src/server.rs`) that
 maps each token back to the session that owns the registration. This
 slab is also the unit of bookkeeping that enforces `max_connections`
-(`lib/src/server.rs:188, 194`) and gauges
+(`SessionManager::check_limits` / `SessionManager::at_capacity`,
+`lib/src/server.rs`) and gauges
 `client.connections`, `client.connections_max`,
 `client.connections_percent`, `slab.{entries,capacity,usage_percent,
 accept_threshold_percent}` and `buffer.{in_use,capacity,usage_percent}`,
@@ -108,15 +116,15 @@ single biggest mental-model adjustment for new contributors: the same
 session is reachable through two different keys.
 
 Listen sockets themselves are stored as `ListenSession` entries in the
-same slab (`lib/src/server.rs:1920`), which is what allows the same
-event loop to multiplex accept events alongside data events.
+same slab (`ListenSession`, `lib/src/server.rs`), which is what allows
+the same event loop to multiplex accept events alongside data events.
 
 ### 2.4 The three proxies
 
 A worker hosts three proxy types, one per supported listener protocol:
 
-- `HttpProxy` (`lib/src/http.rs:762`)
-- `HttpsProxy` (`lib/src/https.rs:1319`)
+- `HttpProxy` (`lib/src/http.rs`)
+- `HttpsProxy` (`lib/src/https.rs`)
 - `TcpProxy` (`lib/src/tcp.rs`)
 
 Each proxy owns its listeners, its known frontends and clusters, the
@@ -129,35 +137,36 @@ to the next.
 ### 3.1 Listeners and SO_REUSEPORT
 
 Listen sockets are created via `lib/src/socket.rs` with
-`SO_REUSEPORT` enabled (`lib/src/socket.rs:1023`); multiple workers
-in the same Sōzu process share each listener address and the kernel
+`SO_REUSEPORT` enabled (`server_bind`, `lib/src/socket.rs`); multiple
+workers in the same Sōzu process share each listener address and the kernel
 distributes accept events across them. Each listener is registered
 with mio and tracked through a `ListenSession` slab entry. Hot
 reconfig adds and removes listeners at runtime via the master-to-
-worker channel (`lib/src/server.rs:1255, 1286, 1313, 1477, 1524,
-1565`).
+worker channel (`Server::notify_proxys`, `lib/src/server.rs`).
 
 ### 3.2 The accept queue
 
 When a listener becomes readable, the proxy accepts every pending
 connection in a single batch and parks each `TcpStream` on an internal
-`accept_queue: VecDeque<…>` (`lib/src/server.rs:294`). Sessions are
+`accept_queue: VecDeque<…>` (`Server::accept_queue`,
+`lib/src/server.rs`). Sessions are
 *not* created synchronously inside the accept loop. The queue is
 drained later, newest-first, so connections that have been waiting
 too long are dropped before they are turned into a session. The
-cut-off is `accept_queue_timeout` (`lib/src/server.rs:287`).
+cut-off is `accept_queue_timeout` (`Server::accept_queue_timeout`,
+`lib/src/server.rs`).
 
 ### 3.3 Backpressure and `max_connections`
 
 If the slab is at capacity (`SessionManager::can_accept` is `false`,
-`lib/src/server.rs:188`) the proxy stops draining the accept queue and
+`lib/src/server.rs`) the proxy stops draining the accept queue and
 the kernel's listen backlog absorbs the surplus. The
 `accept_queue.backpressure` gauge flips to 1 in that state
-(`lib/src/server.rs:196, 207`); a 1 Hz ticker also bumps
+(`lib/src/server.rs:518, 534`); a 1 Hz ticker also bumps
 `accept_queue.saturated_seconds` so dashboards can plot how long the
-worker spent backpressured (`lib/src/server.rs:104-107, 682-699`). The
+worker spent backpressured (`lib/src/server.rs:110-114, 1199-1205`). The
 system unwinds at 90% of `max_connections` to avoid flapping
-(`lib/src/server.rs:244-249`).
+(`lib/src/server.rs:588-596`).
 
 ### 3.4 Zombie detection
 
@@ -170,15 +179,16 @@ This is a safety net, not a primary lifecycle mechanism.
 For `HttpsProxy` sessions, the first protocol layer above raw TCP is
 TLS. Sōzu uses [rustls](https://docs.rs/rustls) and instantiates one
 `rustls::ServerConnection` per session
-(`lib/src/protocol/rustls.rs:12, 76, 94`). The handshake itself is
-driven from `lib/src/protocol/rustls.rs`; the listener-level config
+(`TlsHandshake::session`, `lib/src/protocol/rustls.rs`). The handshake
+itself is driven from `lib/src/protocol/rustls.rs`; the listener-level config
 (certificate stores, ALPN list, SNI binding policy) lives in
 `lib/src/https.rs` and `lib/src/tls.rs`.
 
 ### 4.1 SNI / `:authority` binding
 
 If `strict_sni_binding` is enabled on a listener
-(`command/src/config.rs:388`), Sōzu rejects any HTTP request whose
+(`ListenerBuilder::strict_sni_binding`, `command/src/config.rs`), Sōzu
+rejects any HTTP request whose
 `:authority` (H2) or `Host` (H1) is not covered by a SAN of the
 certificate served on this TLS session, with RFC 6125 §6.4.3 wildcard
 handling. This matches Firefox / Chrome connection-coalescing
@@ -200,45 +210,47 @@ with browser-driven coalescing on legitimate wildcard certs.
 ### 4.2 ALPN and `disable_http11`
 
 After the handshake completes, Sōzu inspects the negotiated ALPN
-protocol (`lib/src/https.rs:321-322, 339`) and decides which mux
+protocol (`lib/src/https.rs:446-505`) and decides which mux
 flavour to instantiate:
 
 - ALPN `h2` → HTTP/2 mux.
 - ALPN `http/1.1` → HTTP/1.1 path.
 - No ALPN selected → HTTP/1.1 by default.
 
-Listener-level `disable_http11` (`command/src/config.rs:393`) lets an
+Listener-level `disable_http11` (`ListenerBuilder::disable_http11`,
+`command/src/config.rs`) lets an
 operator force H2-only on a per-listener basis. ALPN rejections are
 counted with two distinct keys so dashboards can split refusals by
 cause:
 
 - `https.alpn.rejected.unsupported` — peer offered an ALPN that Sōzu
-  does not implement (e.g. `h3`) (`lib/src/https.rs:359`).
+  does not implement (e.g. `h3`) (`lib/src/https.rs:483`).
 - `https.alpn.rejected.http11_disabled` — peer wanted `http/1.1` but
   the listener has `disable_http11 = true`
-  (`lib/src/https.rs:342, 372`).
+  (`lib/src/https.rs:466, 496`).
 
-The startup-time validator at `command/src/config.rs:253-262` catches
-the obvious operator mistake of pairing `disable_http11 = true` with
+The startup-time validator at `command/src/config.rs:1113-1117, 1135-1141`
+catches the obvious operator mistake of pairing `disable_http11 = true` with
 `alpn_protocols` that still contains `"http/1.1"`.
 
 ### 4.3 Handshake telemetry
 
 Successful handshakes report `tls.handshake_ms` as a histogram
-(`lib/src/protocol/rustls.rs:78, 119, 193, 254, 261`). Failures are
+(`TlsHandshake::record_handshake_duration_ms`,
+`lib/src/protocol/rustls.rs`). Failures are
 tagged with a constant key per rustls error variant
 (`tls.handshake.failed.alert_received`,
 `tls.handshake.failed.no_alpn`, …) so statsd cardinality stays bounded
 even when a misbehaving client is hammering the handshake
-(`lib/src/protocol/rustls.rs:328-345, 503`).
+(`handshake_failure_reason`, `lib/src/protocol/rustls.rs`).
 
 ## 5. PROXY-protocol pre-flight
 
 When a frontend is configured to expect a HAProxy PROXY-protocol
 header (typically because Sōzu sits behind a Layer-4 load balancer)
 the session starts in a small `ExpectProxyProtocol` state
-(`lib/src/http.rs:142`,
-`lib/src/protocol/proxy_protocol/expect.rs:118`). That state reads the
+(`HttpSession::new` in `lib/src/http.rs`, `ExpectProxyProtocol::readable`
+in `lib/src/protocol/proxy_protocol/expect.rs`). That state reads the
 v1 / v2 header off the front socket, extracts the real client address,
 and then transitions the session into the downstream protocol
 (HTTP/1.1, HTTP/2, or raw TCP relay). A v2 header carrying the `LOCAL`
@@ -249,17 +261,20 @@ extracted at all.
 
 What happens next depends on the listener, because the two families
 resolve the resulting `ProxyAddr::AfUnspec` differently. A **TCP**
-listener keeps the front socket's own `peer_addr`: `into_pipe`
-(`lib/src/protocol/proxy_protocol/expect.rs:302`,
-`lib/src/protocol/proxy_protocol/relay.rs:408`), the SNI preread
-(`lib/src/tcp.rs:908`) and `TcpSession::effective_session_address`
-(`lib/src/tcp.rs:373`, which feeds the raw-TCP `max_connections_per_ip`
+listener keeps the front socket's own `peer_addr`:
+`ExpectProxyProtocol::into_pipe`
+(`lib/src/protocol/proxy_protocol/expect.rs`) /
+`RelayProxyProtocol::into_pipe`
+(`lib/src/protocol/proxy_protocol/relay.rs`), the SNI preread
+(`TcpSession::build_pipe_from_preread`, `lib/src/tcp.rs`) and
+`TcpSession::effective_session_address`
+(`lib/src/tcp.rs`, which feeds the raw-TCP `max_connections_per_ip`
 gate) all fall back to it. An **HTTP or HTTPS**
-listener instead refuses the upgrade: `upgrade_expect`
-(`lib/src/http.rs:316`, `lib/src/https.rs:334`) needs both a source and
-a destination to build the session, `AfUnspec` supplies neither, so it
-returns `None` and `upgrade` reports `SessionIsToBeClosed`
-(`lib/src/http.rs:254`) — the session is closed at the expect stage,
+listener instead refuses the upgrade: `HttpSession::upgrade_expect`
+(`lib/src/http.rs`) / `HttpsSession::upgrade_expect` (`lib/src/https.rs`)
+needs both a source and a destination to build the session, `AfUnspec` supplies neither, so it
+returns `None` and `HttpSession::upgrade` reports `SessionIsToBeClosed`
+(`lib/src/http.rs`) — the session is closed at the expect stage,
 before any request is read.
 
 That close is not a regression for legitimate traffic. HAProxy pairs
@@ -329,7 +344,7 @@ The H2 multiplexer is the largest single piece of Sōzu and lives under
   response buffers. Streams are referenced across the two through a
   `GlobalStreamId = usize`.
 - Each `Stream` carries a `StreamState`
-  (`lib/src/protocol/mux/stream.rs:35`) that walks through the
+  (`lib/src/protocol/mux/stream.rs`) that walks through the
   lifecycle `Idle` → `Link` → `Linked(Token)` → `Unlinked` →
   `Recycle`. Only `Idle` and `Recycle` are "free" slots; the
   intermediate states pin the stream to a backend connection.
@@ -344,14 +359,16 @@ The H2 mux owns a few invariants that are easy to break by accident:
   the connection.
 - **RFC 9218 priorities.** Priorities are extracted from the
   `priority` request header and from `PRIORITY_UPDATE` frames
-  (`lib/src/protocol/mux/pkawa.rs:498-520`) and feed the writable
-  scheduler so a slow priority-7 download cannot starve a priority-0
+  (`parse_rfc9218_priority`, `lib/src/protocol/mux/pkawa.rs`) and feed the
+  writable scheduler so a slow priority-7 download cannot starve a priority-0
   interactive request.
 - **GOAWAY and graceful drain.** After GOAWAY(NO_ERROR) the connection
-  enters draining mode (`lib/src/protocol/mux/h2.rs:1223-1226`); new
+  enters draining mode (`H2DrainState::draining`,
+  `lib/src/protocol/mux/h2.rs`); new
   peer streams must be refused (RFC 9113 §6.8) and existing streams
   must complete. The graceful-shutdown deadline is driven from the
-  listener config (`lib/src/https.rs:448-449, 458, 977-978`).
+  listener config (`HttpsListener::get_h2_graceful_shutdown_deadline`,
+  `lib/src/https.rs`).
 - **Flood mitigation.** The `H2FloodDetector` sits inline in the read
   path and backs the published mitigations for CVE-2023-44487 (Rapid
   Reset), CVE-2024-27316 (CONTINUATION flood), and CVE-2025-8671
@@ -362,10 +379,13 @@ The H2 mux owns a few invariants that are easy to break by accident:
   `ping_{window,lifetime}`, `settings_{window,lifetime}`,
   `empty_data_window`, `continuation_per_block`,
   `window_update_stream0_window`, `header_size_per_block`,
-  `glitch_window`; see `lib/src/protocol/mux/h2.rs:779-930, 3656`).
+  `glitch_window`; see `lib/src/protocol/mux/h2.rs:1107-1312` and
+  `ConnectionH2::handle_flood_violation`).
   GOAWAY and RST_STREAM sends/receives are attributed by error code
   via `h2.{goaway,rst_stream}.{sent,received}.<code>`
-  (`lib/src/protocol/mux/h2.rs:3706`).
+  (`metric_for_goaway_sent` / `metric_for_goaway_received` /
+  `metric_for_rst_stream_sent` / `metric_for_rst_stream_received` in
+  `lib/src/protocol/mux/h2.rs`).
 - **Edge-triggered writes.** The mux is the most common offender for
   the "queued bytes, no writable wake-up" stall described in §2.2;
   `arm_writable` calls are scattered across `mux::answers`, `mux::h1`,
@@ -380,10 +400,10 @@ catalogue are in
 Once an HTTP/1.1 session has successfully negotiated a WebSocket
 upgrade (or once a `TcpProxy` accepts a connection that is pure
 byte-stream pass-through), the session promotes to a `Pipe` state
-(`lib/src/protocol/pipe.rs:82, 118`). The pipe holds no protocol
+(`Pipe`, `lib/src/protocol/pipe.rs`). The pipe holds no protocol
 parser; it shuttles bytes between the front and back sockets and
 relies on the standard readiness-pumping discipline. WebSocket
-metadata (`WebSocketContext`, `lib/src/protocol/pipe.rs:71`) is
+metadata (`WebSocketContext`, `lib/src/protocol/pipe.rs`) is
 inherited from the H1 mux at upgrade time so logging and metrics
 keep their context.
 
@@ -395,10 +415,10 @@ Routing happens after the request headers are parsed. The router asks
 
 The available algorithms live in `lib/src/load_balancing.rs`:
 
-- `RoundRobin` (`lib/src/load_balancing.rs:20-24`)
+- `RoundRobin` (`lib/src/load_balancing.rs`)
 - `Random`
-- `LeastLoaded` (`lib/src/load_balancing.rs:86`)
-- `PowerOfTwo` (`lib/src/load_balancing.rs:127`)
+- `LeastLoaded` (`lib/src/load_balancing.rs`)
+- `PowerOfTwo` (`lib/src/load_balancing.rs`)
 
 Sticky sessions are implemented as an opt-in cookie-based override:
 when a request carries a sticky cookie that names a still-healthy
@@ -439,7 +459,7 @@ The two pitfalls that bite repeatedly:
 
 Per-cluster traffic is observed via `requests`, `bytes_in`,
 `bytes_out`, and `backend_response_time`
-(`lib/src/metrics/mod.rs:446-453`).
+(`names::backend`, `lib/src/metrics/names.rs`).
 
 ## 9. Closing the session
 
@@ -453,8 +473,8 @@ A session ends when:
 
 For TLS frontends specifically, the close path uses **write-only
 shutdown** on the front socket
-(`lib/src/https.rs:661-668`, mirrored in
-`lib/src/http.rs:448-452`):
+(`lib/src/https.rs:1008-1015`, mirrored in
+`lib/src/http.rs:602-607`):
 
 ```rust
 front_socket.shutdown(Shutdown::Write)
@@ -477,8 +497,8 @@ from the slab under both front and back tokens, mio deregisters the
 sockets, and the slab entries return to the free list. Half-closed
 H2 streams unwind the same way — per-stream cleanup in `mux::mod` and
 `mux::router` decrements `backend.pool.size`
-(`lib/src/protocol/mux/mod.rs:1641-1650`,
-`lib/src/protocol/mux/router.rs:388-394, 428`).
+(`Mux::close` in `lib/src/protocol/mux/mod.rs`, `Router::connect` in
+`lib/src/protocol/mux/router.rs`).
 
 ## 10. Hot reconfig and upgrades
 
@@ -494,7 +514,7 @@ the master with the listener file descriptors handed off across
 listening sockets without dropping accepted connections.
 
 Detailed master/worker lifecycle, the SoftStop / HardStop verbs
-(`lib/src/server.rs:788, 799`), and the audit-log envelope live in
+(`lib/src/server.rs:1299-1314`), and the audit-log envelope live in
 [`bin/src/command/LIFECYCLE.md`](../bin/src/command/LIFECYCLE.md).
 
 **Scope clarification.** Data-plane sessions never emit audit-log
@@ -532,9 +552,10 @@ set to read a session's life from a dashboard:
 
 - `tls.handshake_ms`, `tls.handshake.failed.<reason>` — handshake
   latency + per-rustls-variant failure attribution
-  (`lib/src/protocol/rustls.rs:193, 254, 261, 328-345`).
+  (`TlsHandshake::record_handshake_duration_ms` /
+  `handshake_failure_reason`, `lib/src/protocol/rustls.rs`).
 - `https.alpn.rejected.{unsupported,http11_disabled}` — ALPN refusal
-  causes (`lib/src/https.rs:342, 359, 372`).
+  causes (`lib/src/https.rs:466, 483, 496`).
 - `client.connections`, `client.connections_max`,
   `client.connections_percent` — slab-backed lifecycle gauges
   (`client.connections` is sampled per increment/decrement in
@@ -542,20 +563,23 @@ set to read a session's life from a dashboard:
   run loop alongside `slab.*` and `buffer.*`).
 - `accept_queue.backpressure`, `accept_queue.saturated_seconds` —
   binary backpressure + time-integrated saturation
-  (`lib/src/server.rs:196, 207, 682-699`).
+  (`lib/src/server.rs:518, 534, 594, 1199-1205`).
 - `backend.pool.size` — long-lived gauge mirroring open backend
-  connections (`lib/src/protocol/mux/mod.rs:1650`,
-  `lib/src/protocol/mux/router.rs:394, 428`,
-  `lib/src/protocol/mux/connection.rs:379`).
+  connections (`Router::connect` in `lib/src/protocol/mux/router.rs`,
+  `Mux::close` in `lib/src/protocol/mux/mod.rs`,
+  `Connection::pre_close_client_bookkeeping` in
+  `lib/src/protocol/mux/connection.rs`).
 - `requests`, `bytes_in`, `bytes_out`, `backend_response_time` —
   per-cluster + per-backend counters and timing
-  (`lib/src/metrics/mod.rs:446-453`).
+  (`names::backend`, `lib/src/metrics/names.rs`).
 - `h2.flood.violation.<kind>` — H2 flood-detector trips
-  (`lib/src/protocol/mux/h2.rs:779-930`).
+  (`ConnectionH2::handle_flood_violation`,
+  `lib/src/protocol/mux/h2.rs`).
 - `h2.{goaway,rst_stream}.{sent,received}.<code>` — H2 error
-  attribution (`lib/src/protocol/mux/h2.rs:3706`).
+  attribution (the `metric_for_goaway_sent` family in
+  `lib/src/protocol/mux/h2.rs`).
 - `epoll_time` — `Poll::poll` wall-clock, useful for worker saturation
-  (`lib/src/server.rs:594`).
+  (`lib/src/server.rs:1047-1051`).
 
 ## 12. Removed and migrated APIs
 

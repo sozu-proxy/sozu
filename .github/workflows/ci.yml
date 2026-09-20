@@ -339,6 +339,59 @@ jobs:
             exit 1
           fi
           echo "OK: every #[ignore] carries a reason string."
+  # ┌──────────────────────────────────────────────────────────────┐
+  # │ Group C″ — documentation citation resolver                    │
+  # │   Every `file.rs:NNN(-MMM)` in `doc/**` and `**/LIFECYCLE.md` │
+  # │   must name a file that exists and a line that is in range    │
+  # │   and not blank (sozu-proxy/sozu#1335). It runs on the merge  │
+  # │   result, which is the point: the pull request that breaks a  │
+  # │   citation is almost never the one that contains it, so no    │
+  # │   reviewer is ever shown both halves.                         │
+  # │   It is a FLOOR, not a proof — it cannot see a citation that  │
+  # │   drifted onto a different non-blank line, which is the       │
+  # │   dominant failure mode. Cite symbols where the prose names   │
+  # │   an item; see doc/README.md#citing-code-from-these-documents │
+  # └──────────────────────────────────────────────────────────────┘
+  doc-citations:
+    name: Doc citations
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          # Quoted: unquoted YAML reads this as a float, which would turn a
+          # future "3.10" into 3.1.
+          python-version: "3.12"
+
+      - name: Self-test the resolver against its broken fixture
+        run: python3 .github/scripts/check_doc_citations.py --self-test
+
+      # Reporting a failure and acting on it are two different lines of code.
+      # A build of the resolver that printed every failure and still exited 0
+      # would pass the self-test above and the real run below, so assert the
+      # exit code itself against a tree that is known to be broken.
+      - name: The resolver must exit 1, reporting failures, on the broken fixture tree
+        run: |
+          set +e
+          out=$(python3 .github/scripts/check_doc_citations.py --root .github/scripts/testdata/citations 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          # Exit 1 alone is not enough: an uncaught exception exits 1 too and
+          # would read as a healthy refusal. Require the failure report with it.
+          if [ "$code" -ne 1 ] || ! printf '%s' "$out" | grep -q 'do not resolve'; then
+            echo "::error::expected exit 1 and a failure report from the deliberately broken fixture tree, got exit $code"
+            exit 1
+          fi
+          echo "OK: the resolver exits 1 and reports failures on the broken fixture tree."
+
+      - name: Resolve every file.rs:NNN citation in doc/ and **/LIFECYCLE.md
+        run: python3 .github/scripts/check_doc_citations.py
+
 
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Group C‴ — moonpool-sim deterministic simulations (UDP core + │

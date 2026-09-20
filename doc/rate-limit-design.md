@@ -143,29 +143,30 @@ that differently, which is why the table needs two `LOCAL` rows. The four TCP
 consumers all fall back to `peer_addr`, so the connection is still counted, just
 against the socket peer:
 
-- `TcpSession::effective_session_address` (`lib/src/tcp.rs:373`) — **this is the
+- `TcpSession::effective_session_address` (`lib/src/tcp.rs`) — **this is the
   function that resolves step 1 above for raw TCP**. It reads
   `ExpectProxyProtocol::addresses` / `RelayProxyProtocol::addresses` and the
   preread outcome directly, folds the raw socket peer over them with
   `.or(self.frontend_address)` (`lib/src/tcp.rs:385`; `frontend_address =
   socket.peer_addr().ok()`, `lib/src/tcp.rs:183` and `:305`), and is called from
-  the per-(cluster, source-IP) gate at `lib/src/tcp.rs:1638`.
+  the per-(cluster, source-IP) gate at `lib/src/tcp.rs:1671`.
 - `ExpectProxyProtocol::into_pipe`
-  (`lib/src/protocol/proxy_protocol/expect.rs:302`) and
+  (`lib/src/protocol/proxy_protocol/expect.rs`) and
   `RelayProxyProtocol::into_pipe`
-  (`lib/src/protocol/proxy_protocol/relay.rs:408`) — they set
+  (`lib/src/protocol/proxy_protocol/relay.rs`) — they set
   `Pipe::session_address`, which `effective_session_address` then returns for
   the post-upgrade `Pipe` state.
 - the SNI preread's `proxy_source` (`lib/src/protocol/tcp_preread/mod.rs:284`,
   resolved against the socket at `lib/src/tcp.rs:908`).
 
 The two HTTP consumers do not:
-`upgrade_expect` (`lib/src/http.rs:316`, `lib/src/https.rs:334`) needs both a
-source and a destination, `ProxyAddr::AfUnspec` yields neither
-(`lib/src/protocol/proxy_protocol/header.rs:303, 311`), so it returns `None` and
-`upgrade` reports `SessionIsToBeClosed` (`lib/src/http.rs:254`). An HTTP or
-HTTPS session that presents a `LOCAL` header is therefore closed at the expect
-stage and never reaches §3.2's counter at all.
+`HttpSession::upgrade_expect` (`lib/src/http.rs`) and
+`HttpsSession::upgrade_expect` (`lib/src/https.rs`) need both a source and a
+destination, `ProxyAddr::AfUnspec` yields neither (`ProxyAddr::source` /
+`ProxyAddr::destination` in `lib/src/protocol/proxy_protocol/header.rs`), so
+each returns `None` and `HttpSession::upgrade` reports `SessionIsToBeClosed`
+(`lib/src/http.rs`). An HTTP or HTTPS session that presents a `LOCAL` header is
+therefore closed at the expect stage and never reaches §3.2's counter at all.
 
 That close is not a regression for legitimate traffic: HAProxy pairs `LOCAL`
 with `AF_UNSPEC`, which already parsed to `ProxyAddr::AfUnspec`, so an HTTP or

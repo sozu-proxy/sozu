@@ -1341,6 +1341,84 @@
   `lib/src/protocol/proxy_protocol/LIFECYCLE.md` and `CLAUDE.md` are updated in the same changeset.
   Net: `lib/src` goes from 87 973 to 85 415 lines of Rust — 2 712 removed, 154 added, −2 558.
 
+### 🤖 CI
+
+- **`ci(doc)`: every `file.rs:NNN` citation in `doc/` and the module `LIFECYCLE.md` files is now
+  resolved on each pull request, and the ones in `doc/` were re-read against the code first.**
+  A line number carries no anchor, so a citation rots the moment anyone edits the file it points
+  into — and the pull request that breaks it is almost never the pull request that contains it, so
+  no reviewer is ever shown both halves (#1335).
+  `.github/scripts/check_doc_citations.py` runs as the non-experimental `Doc citations` cell and
+  fails when a cited file does not exist, a cited basename is ambiguous repo-wide, a line is past
+  end of file, a line is blank, a range is inverted, or the same line repeats inside one citation
+  group. That last check exists because the `/` continuation form is real here
+  (`answers.rs:209/224`, `mod.rs:1218/1233/1311/1321` in `lib/src/protocol/mux/LIFECYCLE.md`) and
+  renumbering one on its first half alone yields `224/224`, which resolves perfectly and is
+  otherwise invisible. A cited path resolves against the
+  document's own directory first, so a module `LIFECYCLE.md` keeps citing its siblings by bare name.
+  The extraction pattern is `[A-Za-z0-9_/.-]+\.rs:[0-9]+(-[0-9]+)?`: the obvious
+  `[A-Za-z_/.-]+` has no digit in its character class and silently skips every citation naming a
+  file whose name contains one, which in this tree is most of them — on
+  `lib/src/protocol/mux/LIFECYCLE.md` it sees 78 of the 201 occurrences that are actually there.
+  `--self-test` runs the checker against a deliberately broken fixture and asserts the exact failures
+  it must report. Classifying a failure and acting on it are two different lines, though, so the
+  self-test also runs the real command line in a subprocess and requires exit `1` on the broken
+  fixture tree and exit `0` on a clean one, and the cell asserts that exit code in a step of its own.
+  Without those, changing the one `if failures:` in `main()` to `if False:` leaves every step green
+  on `main` at `ba7fa5f9`, which has 32. The fixtures pin the extraction surface as well as the
+  verdicts:
+  a digit-bearing `h2.rs`, and a `mod/LIFECYCLE.md` whose citations resolve only through the
+  sibling-directory rule, with the self-test asserting the exact citation total rather than a floor.
+  Each of the three one-line shrinks that would otherwise report a clean run over a quietly smaller
+  surface — dropping the digit from the pattern, dropping `**/LIFECYCLE.md` from the scan, dropping
+  sibling-directory resolution — now fails it.
+  On `main` at `ba7fa5f9` the checker flagged 32 of 613 citation groups.
+  In `doc/` itself all 106 citation groups across 9 files were read against the code they point at,
+  following the convention `doc/README.md` now documents: where the prose names an item the anchor
+  is that item plus its file and carries no line number, and a line or a range survives only where
+  the claim is about a specific statement or branch inside an item. 74 became symbol anchors; of the
+  32 that survive as line anchors, 24 had to be renumbered and 8 were already right.
+  Five citations landed on a blank line, which is all a mechanical scan can see. The rest resolved
+  to a perfectly valid line in the wrong place, which is the failure that matters and the one the
+  checker cannot catch: `command/src/config.rs:998` was the doc comment of `to_http` rather than the
+  `FileClusterConfig::http2` field it claimed; `bin/src/ctl/request_builder.rs:214-238` missed
+  `CommandManager::cluster_h2_command` by some 170 lines; `lib/src/server.rs:1178` named a comment
+  about `buffer.number` rather than `Server::notify_activate_listener`; `command/src/state.rs:534`
+  was a bare `cluster` token rather than `ConfigState::generate_requests`; and the five
+  `lib/src/protocol/kawa_h1/mod.rs` anchors for the backend-connection sequence had all drifted by
+  between 170 and 214 lines. `doc/README.md` says in as many words that a green `Doc citations` run means
+  "no citation is obviously dead" and nothing stronger.
+  Three stale citations outside the guarded surface are corrected in the same changeset, since
+  nothing will catch them later. `CLAUDE.md`'s logging bullet cited eleven `macro_rules!`
+  definition sites and every one had moved — `protocol/mux/mod.rs:49/87/118` against a real
+  `51`/`78`/`111`, `protocol/rustls.rs:23` against `32`, `tcp.rs:68` against `76` — so it now names
+  the macros and the files that define them. That includes `socket.rs:86/133`, whose two halves
+  pointed at a trait method declaration and at a line inside a macro body while the two real sites
+  are `macro_rules! log_socket_context` and `fn log_socket_module_prefix`; a bare `socket.rs`
+  matches every sibling in the list and needs no renumbering when that file changes.
+  `command/src/channel.rs`'s module doc and `bin/README.md` both cited `command/src/state.rs:1613,
+  1630` for the state-file save format, which is `ConfigState::write_requests_to_file`, and
+  `channel.rs:71` for the `max_buffer_size` ceiling, which is a `ChannelError` variant. The comment
+  in `lib/src/protocol/mux/h2.rs` that points at the inbound `stream_last_activity_at` refreshes
+  named SETTINGS-ACK tracking and a recycle deferral instead of `handle_data_frame` and
+  `handle_headers_frame`.
+  One anchor in `lib/src/protocol/kawa_h1/LIFECYCLE.md` is corrected too, because the new cell is
+  otherwise red on `main` the day it lands: the CL.TE framing guard is cited as `editor.rs:561-621`
+  and line 621 is blank — the guard's last statement is the `}` on 620. It is the end-of-range half
+  of the check that caught it, and the first thing that ever has.
+
+  No prose claim was rewritten to match the code. Four have gone stale and are recorded here rather
+  than silently corrected, because a citation repair that also edits claims cannot be reviewed as
+  either one. `doc/lifetime_of_a_session.md` §2.2 names `mux::connection` as the home of the
+  `signal_pending_write` / `arm_writable` invariant, where that module's own doc comment delegates
+  to `mux::h2`; the same section attributes the "invariant-15 pair" to module documentation in
+  `mux::answers`, where the phrase appears only on a test. Its §9 lists `mux::router` among the
+  per-stream `backend.pool.size` decrements: `Router::connect` does carry a `-1`, but only as a
+  rollback when mio registration fails, and the comment beside its `+1` names the two real partners,
+  in `mux::connection` and `mux::mod`. `doc/configure_admin_ops.md` §5.5 points at a
+  `doc/configure.md` section about cleartext H2 to backends rather than at the ALPN metric it is
+  documenting.
+
 ## 2.2.1 - 2026-08-28
 
 Patch release: the main process validates listeners and HTTP/HTTPS

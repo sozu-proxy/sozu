@@ -208,13 +208,13 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
   render a live `getpeername(2)` and are unchanged. For `SOCKET` the
   answer depends on the handler, not on the layer: a `SessionTcpStream`
   — every plaintext frontend and every backend socket — renders through
-  `log_socket_module_prefix` (`socket.rs:177`), which has always preferred
+  `log_socket_module_prefix` (`lib/src/socket.rs`), which has always preferred
   `configured_peer`, while a TLS frontend renders through
-  `log_socket_context!` (`socket.rs:133`), which still does a live lookup.
+  `log_socket_context!` (`lib/src/socket.rs`), which still does a live lookup.
   So on a PROXY-protocol TLS frontend the `MUX-H2` line names the client
   while the `SOCKET` line names the load balancer. That is an artefact of
   `FrontRustls` having carried no cached address until now, not a
-  deliberate split between layers. Aligning `socket.rs:133` is a
+  deliberate split between layers. Aligning `log_socket_context!` is a
   follow-up needing its own test: nothing currently asserts the `peer=`
   slot of a `SOCKET` line, so changing it would be an unguarded
   behaviour change on a second log prefix.
@@ -223,8 +223,9 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
   invariant breaks. (See `feedback_log_context_before_theorising` for the
   reasoning.)
 - When an `HttpContext` is in scope, prefer `$http_ctx.log_context()`
-  (`kawa_h1/editor.rs:587`) over hand-rolling a `LogContext { ... }`
-  struct literal — the helper is the canonical formatter.
+  (`HttpContext::log_context`, `lib/src/protocol/kawa_h1/editor.rs`) over
+  hand-rolling a `LogContext { ... }` struct literal — the helper is the
+  canonical formatter.
 
 ### Sensitive-value logging boundary
 
