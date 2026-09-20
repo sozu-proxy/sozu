@@ -1570,10 +1570,12 @@ the exact case the client sends. So:
   request the tie goes to the **last** declared; if one of them does not match
   it is skipped, so `/ab` for `GET` then `/ab` for `POST` sends `GET /abc` to
   the **first**.)
-- **regex hostname segments** — one level up in the routing trie, and not
-  method-sensitive at all: the trie returns on the first segment that matches
-  the host, so the **first declared wins** (see "Regex hostname segments"
-  below).
+- **regex hostname segments** — one level up in the routing trie. Two
+  overlapping segments are settled by declaration order, so the **first
+  declared wins** — but only among the segments that actually serve the
+  request: a segment whose rules all reject this path or method hands the
+  request to the next candidate instead of ending the lookup (see "Hostname
+  precedence" below).
 
 The method dependence is easiest to see side by side. On `www.example.com`, for
 `GET /abc`, with a regex `/a.*` and the whole-path prefix `/abc`:
@@ -1601,12 +1603,36 @@ deliberately ordered. "Most specific first" is the right instinct only for rules
 that carry a matching `method`; without one, a later rule wins, so the order to
 write is most specific *last*. Only `PREFIX`-against-`PREFIX` sorts itself out.
 
-None of that carries over to hostnames. Declaration order settles an overlap
-between two regex *segments* (below) and nothing else: any other overlapping
-pair — a `*` wildcard against a regex segment, an exact name against either — is
-resolved by the shape of the routing trie, and reordering the frontends does not
-change which one answers. So the advice above does not work here. Keep hostname
-patterns mutually exclusive. (See also sozu#1351.)
+None of that carries over to hostnames, which have a precedence order of their
+own — see the next section.
+
+### Hostname precedence
+
+Hostnames are resolved **most specific first**, whatever order the frontends
+were declared in:
+
+1. the **exact** name (`test4.example.com`),
+2. a **regex segment** that matches it (`/test[0-9]/.example.com`), the first
+   declared among those that overlap,
+3. the **`*` wildcard** (`*.example.com`), which stands for exactly one
+   leftmost label.
+
+That order is a search, not a filter. A candidate whose path and method rules
+serve nothing for this request hands it to the next candidate, so splitting one
+host's paths across an exact frontend and a regex family routes every path:
+`test4.example.com/only-for-test4` reaches the exact frontend, and
+`test4.example.com/anything-else` reaches the regex family that also claims the
+host. The same fall-through applies between two overlapping regex segments, so
+a first-declared segment carrying only `method = "POST"` no longer 404s a `GET`
+that a later segment would serve.
+
+Declaration order therefore changes nothing outside step 2, and reordering two
+overlapping regex segments is the only reordering that changes an answer.
+Keeping hostname patterns mutually exclusive is still the clearest
+configuration, but overlap is now resolved by a stated rule rather than by the
+shape of the trie. (Before the fix, an exact name added *after* a regex segment
+that matched it attached its rule to that segment instead of getting its own
+node, and the whole regex family served it — sozu#1351.)
 
 ### Regex hostname segments
 
@@ -1631,9 +1657,9 @@ resolve.
 
 Two regex segments that **overlap** are decided by declaration order, under the
 same first-declared-wins rule as `REGEX` path rules above: a node holds its
-regex segments in an ordered list, a lookup returns on the first that matches,
-and a new segment is appended. With both of these declared, `test4.example.com`
-routes to whichever came first:
+regex segments in an ordered list, a lookup takes the first that matches *and
+serves the request*, and a new segment is appended. With both of these
+declared, `test4.example.com` routes to whichever came first:
 
 ```toml
 [[clusters.numbered.frontends]]
@@ -1646,7 +1672,9 @@ hostname = "/[a-z]+[0-9]/.example.com"   # also matches `test4`
 ```
 
 Declaring `numbered` first sends `test4.example.com` to `numbered`; declaring
-`any-suffixed` first sends it to `any-suffixed`.
+`any-suffixed` first sends it to `any-suffixed`. If `numbered` carries no rule
+for the request's path or method, `any-suffixed` answers it even when
+`numbered` was declared first.
 
 Before the fix shipped in the current release, declaring the deeper
 `foo./test[0-9]/.example.com` first made the leftmost

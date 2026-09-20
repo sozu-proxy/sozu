@@ -4538,6 +4538,80 @@ mod tests {
         assert_eq!(state.count_backends(), 2);
     }
 
+    /// The order a worker replays frontends in is the `http_fronts`
+    /// `BTreeMap` key order, and that key begins with the address and the
+    /// hostname (`RequestHttpFrontend`'s `Display`, `command/src/request.rs`).
+    /// `/test[0-9]/.example.com` therefore sorts BEFORE `test4.example.com`
+    /// — `/` is 0x2F, `t` is 0x74 — whatever order the operator added the
+    /// two frontends in. `produce_initial_state` and the protobuf
+    /// `InitialState.requests` it fills both preserve that order, and the
+    /// worker side walks it in sequence, so the regex segment reaches
+    /// `add_tree_rule` first on every launch of every worker.
+    ///
+    /// This is what sozu#1351's no-migration claim rests on. Two
+    /// consequences, and the test pins the fact both follow from:
+    ///
+    /// - On a build before the fix the divergence was PERMANENT, not
+    ///   transient: the leaking order is the only order a forked worker
+    ///   ever sees, so a restart reproduced it instead of healing it. A
+    ///   correct table built live by an exact-first sequence of API calls
+    ///   is therefore re-corrupted at the next worker fork or upgrade — the
+    ///   live order is never the durable one.
+    /// - On the fixed build the same replay yields the corrected routing
+    ///   with no state rewrite, because both orders now build the same
+    ///   table (`lib/src/router/mod.rs`'s
+    ///   `hostname_routing_does_not_depend_on_declaration_order`).
+    ///
+    /// To SEE THIS RED: in `ConfigState::generate_requests`, collect the
+    /// `http_fronts` values into a `Vec`, reverse it, and push from that —
+    /// or declare `http_fronts` as a `HashMap`. The asserted order stops
+    /// holding. Adding the two frontends in the other order below does NOT
+    /// redden it, which is the point.
+    #[test]
+    fn a_regex_hostname_is_always_replayed_before_the_exact_name_it_matches() {
+        let mut state: ConfigState = Default::default();
+
+        // Added exact-first: the order that routed correctly in-process on
+        // an affected build, and the one the replay does not preserve.
+        for hostname in ["test4.example.com", "/test[0-9]/.example.com"] {
+            state
+                .dispatch(
+                    &RequestType::AddHttpFrontend(RequestHttpFrontend {
+                        cluster_id: Some(String::from("cluster_1")),
+                        hostname: String::from(hostname),
+                        path: PathRule::prefix(String::from("/")),
+                        address: SocketAddress::new_v4(0, 0, 0, 0, 8080),
+                        position: RulePosition::Tree.into(),
+                        ..Default::default()
+                    })
+                    .into(),
+                )
+                .expect("Could not execute request");
+        }
+
+        // Asserted through `produce_initial_state`, not `generate_requests`
+        // alone, so the envelope the worker actually reads is covered too.
+        let replayed: Vec<String> = state
+            .produce_initial_state()
+            .requests
+            .into_iter()
+            .filter_map(|worker_request| match worker_request.content.request_type {
+                Some(RequestType::AddHttpFrontend(front)) => Some(front.hostname),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            replayed,
+            vec![
+                String::from("/test[0-9]/.example.com"),
+                String::from("test4.example.com"),
+            ],
+            "a worker replays the regex segment before the exact name it \
+             matches, whatever order the operator added them in",
+        );
+    }
+
     #[test]
     fn count_frontends_across_types() {
         let mut state: ConfigState = Default::default();

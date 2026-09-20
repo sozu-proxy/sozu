@@ -133,73 +133,42 @@ impl Router {
             }
         }
 
+        // The hostname candidates the trie holds are tried
+        // most-specific-first — exact name, then regex segments in
+        // declaration order, then the `*` wildcard — and `select_tree_rule`
+        // is what decides whether a candidate serves THIS request. Handing
+        // it to the trie as the acceptance predicate is what makes the
+        // order a search rather than a filter: a hostname whose rules all
+        // reject this (path, method) hands the request to the next
+        // candidate instead of ending the lookup (sozu#1351).
         let trie_path: TrieMatches<'_, '_> = Vec::with_capacity(16);
         if let Some(((_, path_rules), trie_matches)) =
-            self.tree.lookup_with_path(hostname_b, true, trie_path)
+            self.tree
+                .lookup_with_path(hostname_b, true, trie_path, &mut |(_, path_rules)| {
+                    select_tree_rule(path_rules, path_b, method).is_some()
+                })
+            && let Some((path_rule, route)) = select_tree_rule(path_rules, path_b, method)
         {
-            let mut prefix_length = 0;
-            let mut matched: Option<(&PathRule, &Route)> = None;
-
-            for (rule, method_rule, route) in path_rules {
-                match rule.matches(path_b) {
-                    PathRuleResult::Regex | PathRuleResult::Equals => {
-                        match method_rule.matches(method) {
-                            MethodRuleResult::Equals => {
-                                return Ok(RouteResult::new_with_trie(
-                                    hostname_b,
-                                    trie_matches,
-                                    path_b,
-                                    rule,
-                                    route,
-                                ));
-                            }
-                            MethodRuleResult::All => {
-                                prefix_length = path_b.len();
-                                matched = Some((rule, route));
-                            }
-                            MethodRuleResult::None => {}
-                        }
-                    }
-                    PathRuleResult::Prefix(size) => {
-                        if size >= prefix_length {
-                            match method_rule.matches(method) {
-                                // FIXME: the rule order will be important here
-                                MethodRuleResult::Equals => {
-                                    // Longest-prefix wins: the selected
-                                    // length is monotonically non-decreasing
-                                    // across the candidate scan.
-                                    debug_assert!(
-                                        size >= prefix_length,
-                                        "longest-prefix selection must never shrink the match length",
-                                    );
-                                    prefix_length = size;
-                                    matched = Some((rule, route));
-                                }
-                                MethodRuleResult::All => {
-                                    debug_assert!(
-                                        size >= prefix_length,
-                                        "longest-prefix selection must never shrink the match length",
-                                    );
-                                    prefix_length = size;
-                                    matched = Some((rule, route));
-                                }
-                                MethodRuleResult::None => {}
-                            }
-                        }
-                    }
-                    PathRuleResult::None => {}
-                }
-            }
-
-            if let Some((path_rule, route)) = matched {
-                return Ok(RouteResult::new_with_trie(
-                    hostname_b,
-                    trie_matches,
-                    path_b,
-                    path_rule,
-                    route,
-                ));
-            }
+            // The second call cannot disagree with the predicate: same
+            // pure function, same leaf, same request. Re-running it is how
+            // the winning rule is carried out of a closure that may only
+            // answer yes or no.
+            //
+            // It costs a second scan of the winning leaf's rule list, so
+            // the common single-candidate hit now scans twice where it
+            // scanned once. The list is the rules of ONE hostname and the
+            // scan is a `PathRule::matches` per entry; carrying the
+            // selection out of the closure instead would need `accept` to
+            // borrow for the trie's own `'b`, which ties the predicate to
+            // the tree borrow for a saving of one pass over a short Vec.
+            // Revisit if a leaf ever holds enough rules to matter.
+            return Ok(RouteResult::new_with_trie(
+                hostname_b,
+                trie_matches,
+                path_b,
+                path_rule,
+                route,
+            ));
         }
 
         for (domain_rule, path_rule, method_rule, route) in self.post.iter() {
@@ -816,6 +785,65 @@ impl Router {
 
         false
     }
+}
+
+/// Pick the rule a trie leaf serves `path` and `method` with, or `None`
+/// when the leaf carries nothing for this request.
+///
+/// An `EQUALS`/`REGEX` rule whose `method` matches exactly wins
+/// immediately; otherwise the longest matching `PREFIX` wins, with a
+/// method-less rule competing on equal footing. Rules whose `method` is
+/// set and does not match are skipped entirely — which is why a longer
+/// prefix can lose to a shorter one (`doc/configure.md`, "Path matching
+/// precedence within a frontend").
+///
+/// Lifted out of [`Router::lookup`] so the trie walk can use the very
+/// same selection as its acceptance predicate: a hostname candidate that
+/// selects nothing must not end the lookup (sozu#1351). Two copies of
+/// this would drift, and the drift would be a route that the trie
+/// accepted and the router then refused to serve.
+fn select_tree_rule<'a>(
+    path_rules: &'a [(PathRule, MethodRule, Route)],
+    path: &[u8],
+    method: &Method,
+) -> Option<(&'a PathRule, &'a Route)> {
+    let mut prefix_length = 0;
+    let mut matched: Option<(&PathRule, &Route)> = None;
+
+    for (rule, method_rule, route) in path_rules {
+        match rule.matches(path) {
+            PathRuleResult::Regex | PathRuleResult::Equals => match method_rule.matches(method) {
+                MethodRuleResult::Equals => return Some((rule, route)),
+                MethodRuleResult::All => {
+                    prefix_length = path.len();
+                    matched = Some((rule, route));
+                }
+                MethodRuleResult::None => {}
+            },
+            PathRuleResult::Prefix(size) => {
+                if size >= prefix_length {
+                    match method_rule.matches(method) {
+                        // FIXME: the rule order will be important here
+                        MethodRuleResult::Equals | MethodRuleResult::All => {
+                            // Longest-prefix wins: the selected length is
+                            // monotonically non-decreasing across the
+                            // candidate scan.
+                            debug_assert!(
+                                size >= prefix_length,
+                                "longest-prefix selection must never shrink the match length",
+                            );
+                            prefix_length = size;
+                            matched = Some((rule, route));
+                        }
+                        MethodRuleResult::None => {}
+                    }
+                }
+            }
+            PathRuleResult::None => {}
+        }
+    }
+
+    matched
 }
 
 #[derive(Clone, Debug)]
@@ -5322,10 +5350,14 @@ mod tests {
 
     /// One level up from the path rules, two overlapping regex HOSTNAME
     /// segments follow the same first-declared-wins rule: a trie node holds
-    /// its regex segments in an ordered list, `lookup` returns on the first
-    /// that matches, and a new segment is appended.
+    /// its regex segments in an ordered list, the lookup takes the first
+    /// that matches AND serves the request, and a new segment is appended.
+    /// Both segments below serve this request, so the first declared
+    /// answers;
+    /// `a_hostname_segment_whose_rules_reject_the_method_falls_through_to_the_next`
+    /// covers the case where it does not.
     ///
-    /// To SEE THIS RED: in `TrieNode::lookup_with_path`
+    /// To SEE THIS RED: in `TrieNode::lookup_recursive`
     /// (`router/pattern_trie.rs`), iterate the regex segments in reverse —
     /// `for (regexp, child) in self.regexps.iter().rev()`. The last declared
     /// segment then answers and both assertions below flip.
@@ -5393,6 +5425,310 @@ mod tests {
                 "{miss} must not match the single-digit anchored segment",
             );
         }
+    }
+
+    /// sozu#1351, shape one — the routing leak. An exact hostname added
+    /// AFTER a regex segment that matches it used to attach its rule to
+    /// the REGEX segment's leaf: `add_tree_rule` addresses the leaf
+    /// through `domain_lookup_mut`, and that resolver walked a literal
+    /// segment through the first regex segment matching it. The rule the
+    /// operator wrote for `test4.example.com` was then served for every
+    /// host `/test[0-9]/` matches, while `sozu query frontends` showed
+    /// exactly what was typed.
+    ///
+    /// `TrieNode::lookup_mut` is key-addressed now: with
+    /// `accept_wildcard: false` a literal key may not resolve into a
+    /// non-literal entry (the guard `insert_sni_route` already documented
+    /// for the wildcard slot, extended to the regex segments), so the add
+    /// creates `test4.example.com`'s own node.
+    ///
+    /// To SEE THIS RED: in `TrieNode::lookup_mut`
+    /// (`router/pattern_trie.rs`), drop the `accept_wildcard &&` guard in
+    /// front of the `self.regexps` scan, so a literal segment resolves
+    /// through a matching regex segment again. `test7` and `test9` then
+    /// answer with EXACT-SPECIFIC.
+    #[test]
+    fn an_exact_host_added_after_a_matching_regex_segment_does_not_leak_to_the_family() {
+        let mut router = Router::new();
+        assert!(router.add_tree_rule(
+            b"/test[0-9]/.example.com",
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(None),
+            &Route::ClusterId("REGEX-FAMILY".to_owned()),
+        ));
+        assert!(router.add_tree_rule(
+            b"test4.example.com",
+            &PathRule::Prefix("/only-for-test4".to_owned()),
+            &MethodRule::new(None),
+            &Route::ClusterId("EXACT-SPECIFIC".to_owned()),
+        ));
+
+        let resolve = |hostname: &str, path: &str| {
+            router
+                .lookup(hostname, path, &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+        };
+
+        assert_eq!(
+            resolve("test4.example.com", "/only-for-test4").as_deref(),
+            Some("EXACT-SPECIFIC"),
+            "the host the rule was written for must get it",
+        );
+        for leaked in ["test7.example.com", "test9.example.com"] {
+            assert_eq!(
+                resolve(leaked, "/only-for-test4").as_deref(),
+                Some("REGEX-FAMILY"),
+                "{leaked} must keep the family route and never reach the \
+                 rule scoped to test4",
+            );
+        }
+        assert_eq!(
+            resolve("test4.example.com", "/").as_deref(),
+            Some("REGEX-FAMILY"),
+            "the exact node carries only /only-for-test4, so every other \
+             path on that host falls through to the regex segment that \
+             also claims it",
+        );
+    }
+
+    /// sozu#1351 — the clearest statement of the same bug, and of its fix:
+    /// declaring the exact host and the regex segment that matches it in
+    /// either order must produce the SAME routing table. Before the fix
+    /// the regex-first order attached the exact rule to the regex leaf
+    /// (so `test7` answered with it and `test4/` answered at all), while
+    /// the exact-first order built two separate nodes.
+    ///
+    /// To SEE THIS RED: same mutation as
+    /// `an_exact_host_added_after_a_matching_regex_segment_does_not_leak_to_the_family`
+    /// — drop the `accept_wildcard &&` guard in front of the
+    /// `self.regexps` scan of `TrieNode::lookup_mut`. The two arrays then
+    /// differ on `test4.example.com/` and on `test7.example.com`.
+    #[test]
+    fn hostname_routing_does_not_depend_on_declaration_order() {
+        let exact: (&[u8], &str, &str) =
+            (b"test4.example.com", "/only-for-test4", "EXACT-SPECIFIC");
+        let regex: (&[u8], &str, &str) = (b"/test[0-9]/.example.com", "/", "REGEX-FAMILY");
+
+        let routes = |declared: [(&[u8], &str, &str); 2]| {
+            let mut router = Router::new();
+            for (hostname, path, cluster) in declared {
+                assert!(router.add_tree_rule(
+                    hostname,
+                    &PathRule::Prefix(path.to_owned()),
+                    &MethodRule::new(None),
+                    &Route::ClusterId(cluster.to_owned()),
+                ));
+            }
+            [
+                ("test4.example.com", "/only-for-test4"),
+                ("test4.example.com", "/"),
+                ("test7.example.com", "/only-for-test4"),
+                ("test9.example.com", "/"),
+            ]
+            .map(|(hostname, path)| {
+                router
+                    .lookup(hostname, path, &Method::Get)
+                    .ok()
+                    .and_then(|result| result.cluster_id)
+            })
+        };
+
+        let regex_first = routes([regex, exact]);
+        let exact_first = routes([exact, regex]);
+        assert_eq!(
+            regex_first, exact_first,
+            "hostname resolution must not depend on the order the \
+             frontends were added in",
+        );
+        assert_eq!(
+            regex_first[0].as_deref(),
+            Some("EXACT-SPECIFIC"),
+            "and the order-independent answer is the exact host's own rule",
+        );
+        assert_eq!(
+            regex_first[2].as_deref(),
+            Some("REGEX-FAMILY"),
+            "while a sibling of the regex family never sees it",
+        );
+    }
+
+    /// Hostname precedence is most-specific-first: an exact name beats a
+    /// regex segment, a regex segment beats the `*` wildcard. One
+    /// assertion per transition, since `doc/configure.md` states the order
+    /// in prose.
+    ///
+    /// Regex-over-wildcard is the half that changed: `lookup_with_path`
+    /// used to consult the wildcard slot BEFORE the regex list whenever
+    /// the leftmost label was reached, so `*` outranked the narrower
+    /// pattern.
+    ///
+    /// To SEE THIS RED: in `TrieNode::lookup_recursive`
+    /// (`router/pattern_trie.rs`), move the wildcard block above the
+    /// `self.regexps` loop. The REGEX-over-WILDCARD assertions then answer
+    /// WILDCARD.
+    #[test]
+    fn hostname_precedence_is_exact_then_regex_then_wildcard() {
+        let exact: &[u8] = b"test4.example.com";
+        let regex: &[u8] = b"/test[0-9]/.example.com";
+        let wildcard: &[u8] = b"*.example.com";
+
+        let declare = |hostnames: &[(&[u8], &str)]| {
+            let mut router = Router::new();
+            for (hostname, cluster) in hostnames {
+                assert!(router.add_tree_rule(
+                    hostname,
+                    &PathRule::Prefix("/".to_owned()),
+                    &MethodRule::new(None),
+                    &Route::ClusterId((*cluster).to_owned()),
+                ));
+            }
+            router
+                .lookup("test4.example.com", "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+        };
+
+        assert_eq!(
+            declare(&[(regex, "REGEX"), (exact, "EXACT")]).as_deref(),
+            Some("EXACT"),
+            "an exact hostname outranks a regex segment that matches it",
+        );
+        assert_eq!(
+            declare(&[(wildcard, "WILDCARD"), (exact, "EXACT")]).as_deref(),
+            Some("EXACT"),
+            "an exact hostname outranks the wildcard",
+        );
+        assert_eq!(
+            declare(&[(wildcard, "WILDCARD"), (regex, "REGEX")]).as_deref(),
+            Some("REGEX"),
+            "a regex segment outranks the wildcard",
+        );
+        assert_eq!(
+            declare(&[(regex, "REGEX"), (wildcard, "WILDCARD")]).as_deref(),
+            Some("REGEX"),
+            "and it outranks it in the other declaration order too",
+        );
+        assert_eq!(
+            declare(&[(wildcard, "WILDCARD"), (regex, "REGEX"), (exact, "EXACT")]).as_deref(),
+            Some("EXACT"),
+            "with all three declared the most specific one answers",
+        );
+        assert_eq!(
+            declare(&[(wildcard, "WILDCARD")]).as_deref(),
+            Some("WILDCARD"),
+            "the wildcard still answers when nothing narrower claims the host",
+        );
+    }
+
+    /// The precedence order above is a search order, not a filter: a more
+    /// specific hostname candidate that serves no rule for THIS request
+    /// hands the request to the next one instead of ending the lookup.
+    /// Without this, splitting a host's paths across an exact frontend and
+    /// a regex family would make every path the exact frontend does not
+    /// carry unroutable.
+    ///
+    /// To SEE THIS RED: in `TrieNode::lookup_recursive`
+    /// (`router/pattern_trie.rs`), return
+    /// `child.lookup_recursive(prefix, accept_wildcard, trace, accept)`
+    /// directly from the `self.children.get(suffix)` arm instead of
+    /// falling through on `None` — the pre-fix shape. `/regex-only` and
+    /// `/served-by-neither` on `test4.example.com` then answer `None`.
+    #[test]
+    fn a_hostname_candidate_that_serves_no_rule_falls_through_to_the_next() {
+        let mut router = Router::new();
+        for (hostname, path, cluster) in [
+            (&b"test4.example.com"[..], "/exact-only", "EXACT"),
+            (&b"/test[0-9]/.example.com"[..], "/regex-only", "REGEX"),
+            (&b"*.example.com"[..], "/", "WILDCARD"),
+        ] {
+            assert!(router.add_tree_rule(
+                hostname,
+                &PathRule::Prefix(path.to_owned()),
+                &MethodRule::new(None),
+                &Route::ClusterId(cluster.to_owned()),
+            ));
+        }
+
+        let resolve = |hostname: &str, path: &str| {
+            router
+                .lookup(hostname, path, &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+        };
+
+        assert_eq!(
+            resolve("test4.example.com", "/exact-only").as_deref(),
+            Some("EXACT"),
+        );
+        assert_eq!(
+            resolve("test4.example.com", "/regex-only").as_deref(),
+            Some("REGEX"),
+            "the exact node carries no rule for this path, so the regex \
+             segment that also claims the host answers",
+        );
+        assert_eq!(
+            resolve("test4.example.com", "/served-by-neither").as_deref(),
+            Some("WILDCARD"),
+            "and when neither serves it the wildcard does",
+        );
+        assert_eq!(
+            resolve("testA.example.com", "/regex-only").as_deref(),
+            Some("WILDCARD"),
+            "a host the regex segment does not match never reaches it",
+        );
+    }
+
+    /// sozu#1351, shape two — the 404. Hostname candidates are chosen
+    /// without looking at the request method, so the first segment to
+    /// claim a host used to end the lookup even when its only rule was
+    /// declared for another method. The second segment, which would have
+    /// answered, was never consulted.
+    ///
+    /// The fallback above covers it: `Router::lookup` hands the trie the
+    /// same (path, method) selection it will run on the winner, so a
+    /// candidate that selects nothing is skipped.
+    ///
+    /// To SEE THIS RED: in `Router::lookup`, pass `&mut |_| true` as the
+    /// `accept` predicate of `lookup_with_path` instead of
+    /// `select_tree_rule(...).is_some()`. The GET below then answers
+    /// `None` because the POST-only segment was declared first.
+    #[test]
+    fn a_hostname_segment_whose_rules_reject_the_method_falls_through_to_the_next() {
+        let mut router = Router::new();
+        // Both segments match `test4`; the POST-only one is declared first.
+        assert!(router.add_tree_rule(
+            b"/test[0-9]/.example.com",
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(Some("POST".to_owned())),
+            &Route::ClusterId("POST-ONLY".to_owned()),
+        ));
+        assert!(router.add_tree_rule(
+            b"/[a-z]+[0-9]/.example.com",
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(Some("GET".to_owned())),
+            &Route::ClusterId("GET-ONLY".to_owned()),
+        ));
+
+        let resolve = |method: &Method| {
+            router
+                .lookup("test4.example.com", "/", method)
+                .ok()
+                .and_then(|result| result.cluster_id)
+        };
+
+        assert_eq!(
+            resolve(&Method::Get).as_deref(),
+            Some("GET-ONLY"),
+            "the first-declared segment carries no GET rule, so the second \
+             one answers instead of the request 404ing",
+        );
+        assert_eq!(
+            resolve(&Method::Post).as_deref(),
+            Some("POST-ONLY"),
+            "and the first-declared segment still wins whenever it serves \
+             the request",
+        );
     }
 
     /// `PathRule`'s `PartialEq` carried no `(Equals, Equals)` arm, so two

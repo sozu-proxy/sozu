@@ -152,6 +152,96 @@
 
 ### 🐛 Fixed
 
+- **`fix(router)`: an exact hostname added after a matching regex segment attached its rule to the
+  regex segment's leaf, and the whole regex family served it.**
+  **This changes hostname resolution for every configuration.** Read the behaviour-change note at
+  the end of this entry before upgrading; it narrows some routing and broadens other routing, and
+  both are configurations an operator can act on.
+  `add_tree_rule` (`lib/src/router/mod.rs:331`) reaches the node a hostname owns through
+  `TrieNode::domain_lookup_mut` and inserts only when that answers `None`. The resolver walked a
+  literal segment through the first regex segment matching it, so adding `test4.example.com` after
+  `/test[0-9]/.example.com` never created a node for `test4.example.com`: the rule was appended to
+  the regex segment's rule list, and every host `/test[0-9]/` matches served it. A rule scoped to
+  one host answered for a family of hosts, while `sozu query frontends` showed exactly what the
+  operator had typed. Declaration order decided whether it happened **in one process**: a live
+  sequence of API calls that added the exact name first produced two separate nodes and routed
+  correctly, which is how the report reproduced it. That order is not the one a worker runs — see
+  the state-replay note below — so on a running proxy the leak was not order-dependent at all.
+  `lookup_mut` is key-addressed now (`lib/src/router/pattern_trie.rs:818`): with
+  `accept_wildcard: false` a literal key may not resolve into a non-literal entry. That is the
+  guard `insert_sni_route` (`lib/src/tcp.rs`) already documented for the `*` slot — "an exact key
+  must never fall back to a sibling wildcard's entry, or this push would corrupt the WILDCARD's
+  route `Vec` instead of creating this key's own node" — extended to the regex list, which had
+  nothing equivalent. Its `*` case and its trailing-`/` case already matched by identity; this arm
+  did not. The TCP SNI route table is fixed by the same change, though it cannot hold a regex
+  segment today: `validate_sni_pattern` (`command/src/config.rs:1994`) rejects `/` outright.
+  **Hostname precedence is now stated and asserted, most specific first: exact name, then regex
+  segments in declaration order, then the `*` wildcard.** Two halves of one walk
+  (`TrieNode::lookup_recursive`, `lib/src/router/pattern_trie.rs:594`) and they ship together.
+  Before, the wildcard slot was tried *before* the regex list, so `*` outranked the narrower
+  pattern, and neither the exact-child arm nor the regex loop fell back: each returned whatever
+  its first candidate's subtree answered. The two fallbacks restored are not interchangeable, and
+  the mutation tests separate them. The **regex-loop** fallback is the one the reorder requires:
+  a segment that matches a label but holds no value for this host (`/cdn[0-9]+/` as opened by
+  `images./cdn[0-9]+/.hello.com`) previously reached the wildcard only because the wildcard went
+  first, so moving the wildcard after the regex list without it turns that case into a miss. The
+  **exact-child** fallback is required by the add-path fix instead: now that an exact hostname
+  gets its own node, that node carries only the paths written for it, and without the fallback
+  every other path on that host would stop resolving.
+  The order is a search, not a filter. `Router::lookup` hands the trie the very same
+  `select_tree_rule` (`lib/src/router/mod.rs:796`) it will run on the winner, so a hostname
+  candidate whose rules all reject this request's path or method is skipped rather than ending the
+  lookup. That also closes the second shape reported on the same issue: two overlapping regex
+  segments, the first declared carrying only `method = "POST"`, answered a `GET` with a 404
+  instead of falling through to the second segment that would have served it. Segment selection is
+  still method-blind — it is the fall-through that makes it not matter.
+  **Behaviour change, both directions.** *Narrower:* a rule written for one exact hostname is now
+  served for that hostname only. If a frontend was added after a regex segment matching its
+  hostname, hosts in that regex family lose a route they were being served — the route the
+  operator never wrote. Find the affected pairs with `sozu query frontends`: an exact hostname
+  and a regex hostname on the same address where the regex matches the exact name. *Broader:* a
+  host claimed by several patterns now falls through instead of 404ing, so a request that reached
+  no route can now reach the next-less-specific frontend — a wildcard or regex family frontend can
+  start serving paths and methods a narrower frontend does not carry. And *reordered:* where a
+  regex segment and a `*` wildcard both match a host, the regex segment now answers. Overlapping
+  hostname patterns are the configurations to check; mutually exclusive ones are unaffected.
+  A backtracking walk also changes the worst case from "labels × regex segments per level" to "the
+  number of trie nodes that match the key", which is bounded by the route table and not by the
+  request: the trie is a tree, so no node is visited twice, and a longer hostname adds labels
+  rather than candidates. There is no request-side amplification to rate-limit.
+  **Upgrade and state reload need no migration, and the leak was never transient.** The main
+  process replays its `ConfigState` into every worker at launch, walking a `BTreeMap` whose key is
+  `address;hostname;P<path>` (`command/src/request.rs:259`). `/test[0-9]/.example.com` sorts before
+  `test4.example.com`, so every worker took the adds in the leaking order, at every restart, on
+  every build before this one — the divergence survived restarts rather than being healed by them.
+  Nothing in the saved state records which order a worker took, and nothing has to: an exact name
+  and a regex segment that matches it now build the same routing table in either order, so the
+  same replay produces the corrected routing on the new binary. No re-add, no reordering, no state
+  rewrite. The one visible difference is the narrowing above — the family hosts stop being served
+  the exact host's rule from the first worker started on the fixed build. The corollary matters on
+  an affected build: since the replay order is the only order a forked worker ever sees, a correct
+  table built live by an exact-first sequence of API calls is re-corrupted at the next fork or
+  upgrade. `a_regex_hostname_is_always_replayed_before_the_exact_name_it_matches`
+  (`command/src/state.rs`) pins the emitted order.
+  **SNI certificate selection follows the same order**, since `lib/src/tls.rs` and
+  `lib/src/protocol/tcp_preread/` resolve through the same `TrieNode::lookup`
+  (`lib/src/router/pattern_trie.rs:706`) — one walk, stated once, so routing and certificate
+  selection cannot disagree. The reordering and the fall-through only differ for a trie that holds
+  a regex segment, and the TCP SNI route table provably cannot: `validate_sni_pattern`
+  (`command/src/config.rs:1994`) rejects `/` on every path into `sni_routes`. **The certificate
+  trie is not closed that way.** `add_certificate`'s pre-insert dry run (`lib/src/tls.rs:326`)
+  rejects only a name longer than `MAX_HOSTNAME_LENGTH` and one the trie answers
+  `InsertResult::Failed` for; it does not reject `/`. Its names are `cert_to_add.names`, which is
+  the operator's `names` override whenever that field is non-empty (`lib/src/tls.rs:136`) and only
+  otherwise the parsed CN/SAN set — so an operator-supplied label such as `/x/` inserts as a regex
+  segment and the new order reaches certificate selection. Parsed certificate names cannot produce
+  one. Nothing asserts the order on the certificate trie today. A hostname the trie has no entry
+  for still gets the default certificate.
+  `lib/src/router/pattern_trie.rs` and `lib/src/router/mod.rs` carry the regression tests, one per
+  transition of the stated order plus the two shapes from the report, both declaration orders, and
+  the method fall-through; `command/src/state.rs` pins the replay order the upgrade note rests on. `doc/configure.md` states the order under "Hostname precedence".
+  Reported in [#1351](https://github.com/sozu-proxy/sozu/issues/1351).
+
 - **`fix(h2)`: the `MUX-H2` log lines rendered `peer=None` once the peer had reset, and named the
   load balancer instead of the client behind PROXY protocol.**
   **This changes rendered log content.** If you alert, dashboard or grep on the `peer=` slot of a
