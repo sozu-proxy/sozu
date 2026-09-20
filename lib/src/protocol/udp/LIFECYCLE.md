@@ -466,7 +466,7 @@ model.
    rounding issue (repo `CLAUDE.md`).
 7. **`EMFILE`/`ENFILE` → shed, never panic.** `udp_connect` errors bubble up
    (`socket.rs`); the shell aborts the just-admitted flow
-   (`on_open_upstream` failure path, `udp.rs:1314-1334`) rather than panicking,
+   (`on_open_upstream` failure path, `udp.rs`) rather than panicking,
    freeing the slab slot it would otherwise pin for the idle timeout.
 8. **Debug invariants everywhere.** `UdpManager::check_invariants` (`manager.rs`) runs
    as a post-condition after every public mutating method

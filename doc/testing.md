@@ -573,8 +573,12 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   error path on purpose. And do NOT reuse the UDP drain from
   `capture_test_logs_at_level` (`lib/src/lib.rs`): it reads only after the run and
   silently drops datagrams at H2 volume, which is a load-sensitive flake, whereas
-  a file has no loss mode. Worked example:
+  a file has no loss mode. Worked example for raising the level:
   `tests::h2_log_context_tests::test_h2_proxy_protocol_peer_is_the_advertised_client`.
+  Worked example for provoking instead, which is the only option when EVERY
+  expansion of a macro is an `error!` — `log_socket_context!` in
+  `lib/src/socket.rs` is:
+  `tests::socket_log_context_tests::test_tls_socket_log_peer_is_the_advertised_client`.
   Full cost and residue in
   `e2e/COVERAGE.md > Out of e2e reach by construction`.
 - **A clock refactor is not wire-falsifiable; the behaviour it drives is.**

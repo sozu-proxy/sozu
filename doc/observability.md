@@ -184,7 +184,7 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
 | `RUSTLS` | `protocol/rustls.rs` | SNI/ALPN byte lengths, version, source, frontend |
 | `PIPE` | `protocol/pipe.rs` | addresses, frontend/backend status & readiness |
 | `TCP` | `tcp.rs` | frontend, backend, peer (cached on `SessionTcpStream`) |
-| `SOCKET` | `socket.rs` | session, peer, local, RTT, state |
+| `SOCKET` | `socket.rs` | session, peer, local, RTT, state. `peer` is a snapshot (see below), not a live lookup |
 
 **Conventions:**
 
@@ -205,19 +205,42 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
   from the ALPN branch of `https.rs`, and h2c is unimplemented on the
   cleartext listener.)
   `MUX` (`protocol/mux/mod.rs`) and `MUX-H1` (`protocol/mux/h1.rs`) still
-  render a live `getpeername(2)` and are unchanged. For `SOCKET` the
-  answer depends on the handler, not on the layer: a `SessionTcpStream`
-  — every plaintext frontend and every backend socket — renders through
-  `log_socket_module_prefix` (`lib/src/socket.rs`), which has always preferred
-  `configured_peer`, while a TLS frontend renders through
-  `log_socket_context!` (`lib/src/socket.rs`), which still does a live lookup.
-  So on a PROXY-protocol TLS frontend the `MUX-H2` line names the client
-  while the `SOCKET` line names the load balancer. That is an artefact of
-  `FrontRustls` having carried no cached address until now, not a
-  deliberate split between layers. Aligning `log_socket_context!` is a
-  follow-up needing its own test: nothing currently asserts the `peer=`
-  slot of a `SOCKET` line, so changing it would be an unguarded
-  behaviour change on a second log prefix.
+  render a live `getpeername(2)` and are unchanged.
+- The `peer` slot of a `SOCKET` line is the same snapshot, through the
+  same accessor, for every handler. Both of the layer's two renderers now
+  read `configured_peer` first and fall back to `getpeername(2)` only
+  when there is none: `log_socket_module_prefix` (`lib/src/socket.rs`), which
+  every plaintext frontend and every backend socket reaches through
+  `SessionTcpStream`, always did; `log_socket_context!` (`lib/src/socket.rs`),
+  whose only caller is `impl SocketHandler for FrontRustls` and therefore
+  every TLS frontend, now does too. So the two consequences described
+  above for `MUX-H2` hold for `SOCKET` as well, and on a PROXY-protocol
+  TLS frontend the `SOCKET` and `MUX-H2` lines of one connection name the
+  same host. They did not before: `SOCKET` named the load balancer while
+  `MUX-H2` named the client, which was an artefact of `FrontRustls`
+  having carried no cached address rather than a deliberate split between
+  layers.
+  Measured on a PROXY-v2 TLS frontend whose advertised client and whose
+  TCP source genuinely differ, by
+  `e2e::tests::socket_log_context_tests::test_tls_socket_log_peer_is_the_advertised_client`:
+  before, the one captured `SOCKET` line named the TCP source and none
+  named the advertised client; after, the reverse. That test also asserts
+  the line was written while the connection was still
+  `state=Some("ESTABLISHED")` — this half of the defect is not the
+  `ENOTCONN` one, and a healthy live lookup was simply naming a different
+  host.
+  The other half, the slot surviving a live lookup that FAILS, is pinned
+  by `socket::tests::log_socket_context_renders_the_cached_peer_when_the_live_lookup_fails`,
+  which stages the failure with a never-connected socket: only that
+  refuses `getpeername(2)` deterministically, whereas a socket waiting on
+  an RST is a race. So what is measured is the rendering once the socket
+  refuses, not a reset end to end — and deliberately so, because the
+  reset-related error kinds are exactly the arms of
+  `FrontRustls::socket_read`/`socket_write` that emit no log line at all.
+  `socket::tests::log_socket_context_renders_the_cached_peer_not_a_live_lookup`
+  pins the succeeding half at the macro directly.
+  Only `peer` changed. `local` is still `getsockname(2)`, and `rtt`,
+  `state` and `protocol` are untouched.
 - Tier severity by intent: `debug!`/`trace!` for expected idle closes,
   timeouts, noisy state. `warn!`/`error!` for real protocol errors or
   invariant breaks. (See `feedback_log_context_before_theorising` for the
