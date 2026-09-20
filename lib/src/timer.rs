@@ -168,9 +168,9 @@ impl TimeoutContainer {
     ///
     /// This is what a holder uses to put an entry BACK after the wheel handed
     /// it over early: re-arming with [`Self::set`] would push the deadline out
-    /// by a fresh full duration, so an entry delivered 50 ms before a 60 s
-    /// timeout would fire at ~120 s — silently doubling the operator's
-    /// configured timeout on every early delivery.
+    /// by a fresh full duration, so an entry delivered a few tens of
+    /// milliseconds before a 60 s timeout would fire at ~120 s — silently
+    /// doubling the operator's configured timeout on every early delivery.
     ///
     /// A deadline that has already passed arms the shortest entry the wheel
     /// can express (`set_timeout_at` forces at least one tick ahead), so the
@@ -208,6 +208,30 @@ impl TimeoutContainer {
 
     pub fn duration(&self) -> Duration {
         self.duration
+    }
+
+    /// Adopt a new configured duration **without touching the armed entry**.
+    ///
+    /// [`Self::set_duration`] cancels and re-arms; an owner that drives arming
+    /// itself through [`Self::set_at`] must not pay that, and must not have its
+    /// entry moved behind its back. The duration still has to be kept current,
+    /// because a container handed on to another protocol state — the WebSocket
+    /// upgrade path hands the mux's containers to `Pipe`, which calls
+    /// [`Self::reset`] — re-arms from it.
+    pub fn retune(&mut self, duration: Duration) {
+        self.duration = duration;
+    }
+
+    /// Whether a wheel entry is currently held.
+    ///
+    /// Distinct from `deadline().is_some()` only while the two are out of step,
+    /// which is exactly the state an owner that memoizes on the deadline must
+    /// be able to see: after [`Self::triggered`] both are cleared together, but
+    /// an owner keeping its own deadline mirror can believe an entry is armed
+    /// when the wheel has already handed it over. That belief is the lost
+    /// wakeup, so the check is available rather than inferred.
+    pub fn is_armed(&self) -> bool {
+        self.timeout.is_some()
     }
 
     /// The absolute instant the armed entry is meant to fire at, or `None`
@@ -643,8 +667,11 @@ mod test {
     /// ([`duration_to_tick`]) — it does not round up, despite what that
     /// function's own comment says. With the default 100 ms tick a delay in
     /// `[100N - 50, 100N + 50)` lands in tick `N`, so an entry can be delivered
-    /// up to 50 ms BEFORE the caller's deadline, and the delivery CONSUMES the
-    /// slab entry either way.
+    /// up to 50 ms BEFORE the caller's deadline when the poll lands ON the grid
+    /// — which is what this test does and what [`Timer::next_poll_date`]
+    /// schedules. A poll inside `[100N - 50, 100N)` already sees tick `N`, so
+    /// the bound a CONSUMER must tolerate is up to 99 ms; see
+    /// [`duration_to_tick`]. Either way the delivery CONSUMES the slab entry.
     ///
     /// Every consumer of this wheel must therefore read a wakeup as "my entry
     /// is gone", never as "my deadline has arrived", and re-arm on its own if
@@ -752,11 +779,16 @@ mod test {
         );
     }
 
-    /// The attained maximum earliness is a full half-tick — 50 ms at the 100 ms
-    /// default — not 49 ms. The rounding interval `[100N-50, 100N+50)` is closed
-    /// on the EARLY side and open on the late side, so a 50 ms delay lands in
-    /// tick 1 and is delivered at 100 ms, while 150 ms is pushed out to tick 2.
-    /// Lateness is what is capped at 49 ms.
+    /// The attained maximum earliness ON THE GRID is a full half-tick — 50 ms
+    /// at the 100 ms default — not 49 ms. The rounding interval
+    /// `[100N-50, 100N+50)` is closed on the EARLY side and open on the late
+    /// side, so a 50 ms delay lands in tick 1 and is delivered at 100 ms, while
+    /// 150 ms is pushed out to tick 2. Lateness is what is capped at 49 ms.
+    ///
+    /// "On the grid" is the scope of this test: it polls at grid points, as
+    /// [`Timer::next_poll_date`] schedules. A poll inside `[100N-50, 100N)`
+    /// already sees tick `N`, so the earliness a consumer must tolerate reaches
+    /// 99 ms — see [`duration_to_tick`].
     ///
     /// To SEE THIS RED: change the rounding in [`duration_to_tick`] from
     /// `saturating_add(tick_ms / 2)` to `saturating_add(tick_ms / 2 - 1)`. The

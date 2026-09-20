@@ -40,7 +40,6 @@ use crate::{
         update_readiness_after_read, update_readiness_after_write,
     },
     socket::{SocketHandler, SocketResult, stats::socket_rtt},
-    timer::TimeoutContainer,
 };
 
 /// Protocol label + session descriptor used as a prefix on every
@@ -1729,7 +1728,16 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub socket: Front,
     pub state: H2State,
     pub streams: HashMap<StreamId, GlobalStreamId>,
-    pub timeout_container: TimeoutContainer,
+    /// Configured idle timeout for this connection. The core never arms a
+    /// wheel entry itself: it publishes the next instant it wants to be called
+    /// back at through [`ConnectionH2::poll_timeout`], and the embedder — the
+    /// `Mux` adapter — owns the `TimeoutContainer` that reflects it onto the
+    /// real timer. See `LIFECYCLE.md` §7.7.
+    pub timeout_duration: Duration,
+    /// Next instant this connection wants `timeout()` called at, or `None`
+    /// when it wants no timer at all. Always derived from
+    /// [`ConnectionH2::now`], never from a fresh clock read (invariant 20).
+    pub(super) timeout_deadline: Option<Instant>,
     /// Connection-level flow control state (send window, receive tracking, pending updates).
     pub flow_control: H2FlowControl,
     /// Highest stream ID accepted from the peer (used for GoAway last_stream_id).
@@ -1944,6 +1952,37 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             && self.zero.storage.is_empty()
     }
 
+    /// The next instant this connection wants its embedder to call `timeout()`
+    /// at, or `None` for "no timer". The adapter reflects this onto the real
+    /// wheel; nothing in this module touches `crate::timer`.
+    pub(super) fn poll_timeout(&self) -> Option<Instant> {
+        self.timeout_deadline
+    }
+
+    /// Push the deadline one full [`Self::timeout_duration`] out from the
+    /// connection's clock snapshot. Replaces the old
+    /// `TimeoutContainer::reset()` at the same three call sites, and reads
+    /// `self.now` rather than the real clock (invariant 20).
+    pub(super) fn arm_timeout(&mut self) {
+        self.timeout_deadline = self.now.checked_add(self.timeout_duration);
+    }
+
+    /// Ask for no timer at all. Replaces `TimeoutContainer::cancel()`.
+    pub(super) fn clear_timeout(&mut self) {
+        self.timeout_deadline = None;
+    }
+
+    /// Adopt a new configured duration and re-arm from `now`.
+    ///
+    /// Mirrors `TimeoutContainer::set_duration`, which likewise cancelled and
+    /// re-armed rather than keeping the old deadline. `now` is the adapter's
+    /// snapshot: this is called from `Mux::ready`, outside the entry points
+    /// that mirror it into `self.now`.
+    pub(super) fn set_timeout_duration(&mut self, duration: Duration, now: Instant) {
+        self.timeout_duration = duration;
+        self.timeout_deadline = now.checked_add(duration);
+    }
+
     /// Shared constructor for both server and client H2 connections.
     ///
     /// Differences between server and client are captured by the caller-provided
@@ -1958,7 +1997,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         connection_config: H2ConnectionConfig,
         stream_idle_timeout: std::time::Duration,
         graceful_shutdown_deadline: Option<std::time::Duration>,
-        timeout_container: crate::timer::TimeoutContainer,
+        timeout_duration: std::time::Duration,
         expect_read: Option<(H2StreamId, usize)>,
         readiness_interest: sozu_command::ready::Ready,
     ) -> Option<Self> {
@@ -1997,7 +2036,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             socket,
             state: H2State::ClientPreface,
             streams: std::collections::HashMap::with_capacity(8),
-            timeout_container,
+            timeout_duration,
+            // Armed from construction, exactly as the old `TimeoutContainer`
+            // was: the frontend arrived already armed from the handshake state,
+            // and `Router::connect` armed a fresh backend with the connect
+            // timeout right after registering its socket. The adapter reflects
+            // this onto the wheel on its next reschedule.
+            timeout_deadline: now.checked_add(timeout_duration),
             flow_control: H2FlowControl {
                 window: DEFAULT_INITIAL_WINDOW_SIZE as i32,
                 received_bytes_since_update: 0,
@@ -2518,7 +2563,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 } => {
                     // Reading DATA frame payload for an application stream.
                     // This is real application activity — reset the timeout.
-                    self.timeout_container.reset();
+                    self.arm_timeout();
                     (
                         context.streams[global_stream_id]
                             .split(&self.position)
@@ -2818,7 +2863,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        self.timeout_container.reset();
+        self.arm_timeout();
         // Pre-compute byte totals for proportional overhead distribution.
         let byte_totals = self.compute_stream_byte_totals(context);
         let mut io_slices: Vec<IoSlice<'static>> = Vec::new();
@@ -5413,7 +5458,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // HEADERS frames represent real application activity (new request
         // or response). Reset the timeout since the peer is actively
         // communicating, unlike control frames (PING, WINDOW_UPDATE).
-        self.timeout_container.reset();
+        self.arm_timeout();
         if !headers.end_headers {
             // CVE-2024-27316: only initialize tracking on the very first HEADERS
             // fragment, not on re-entries from ContinuationFrame (which call
@@ -8863,7 +8908,7 @@ mod tests {
             H2ConnectionConfig::default(),
             Duration::from_secs(30),
             None,
-            TimeoutContainer::new_empty(Duration::from_secs(30)),
+            Duration::from_secs(30),
             Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
             Ready::READABLE | Ready::HUP | Ready::ERROR,
         )
@@ -8920,7 +8965,7 @@ mod tests {
             H2ConnectionConfig::default(),
             Duration::from_secs(30),
             graceful_shutdown_deadline,
-            TimeoutContainer::new_empty(Duration::from_secs(30)),
+            Duration::from_secs(30),
             Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
             Ready::READABLE | Ready::HUP | Ready::ERROR,
         )
@@ -9360,7 +9405,7 @@ mod tests {
             H2ConnectionConfig::default(),
             Duration::from_secs(30),
             None,
-            TimeoutContainer::new_empty(Duration::from_secs(30)),
+            Duration::from_secs(30),
             Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
             Ready::READABLE | Ready::HUP | Ready::ERROR,
         )

@@ -380,10 +380,14 @@
   early, so a test that measured a close at 59.901 s will now measure it at 60 s or just after.
   `Mux::shutting_down` is unaffected: `shut_down_sessions()` drives it directly and it compares
   `context.now` against `drain.started_at` rather than consuming a wheel delivery.
-  Pinned by `an_early_wheel_delivery_is_put_back_at_the_same_deadline`,
+  Pinned by `an_early_wheel_delivery_does_not_run_the_timeout_body`,
+  `an_early_wheel_delivery_leaves_a_live_entry_at_the_same_deadline`,
   `a_delivery_past_the_deadline_runs_the_timeout_body`,
-  `a_firing_with_no_recorded_deadline_is_treated_as_due` and
-  `timeout_container_mirrors_the_deadline_of_its_armed_entry`.
+  `a_firing_with_no_deadline_is_treated_as_due` and
+  `timeout_container_mirrors_the_deadline_of_its_armed_entry`. The early-delivery
+  half is covered on the frontend token only; the backend tests park an already-elapsed
+  deadline. The gate is shared (it runs before the branch split), so the behaviour is
+  common, but no test drives an early backend delivery.
   Documented in `lib/src/protocol/mux/LIFECYCLE.md` §7.6 and invariant 21.
 
 - **`docs(mux)`: settle the unverified backend re-arm question on the mux timeout path.**
@@ -401,10 +405,12 @@
   only inside `end_stream`, after the unlink). `Context::unlink_stream` is the eviction point this
   path relies on, not the only one in the module — `remove_backend_stream` has direct callers in
   `h1.rs` and `h2.rs` too, and extra eviction only strengthens the conclusion. Work attached to the backend afterwards re-arms the container itself, because
-  `TimeoutContainer::triggered` deliberately keeps its token and the `reset()` calls at the top of
-  `ConnectionH1::{readable,writable}` / `ConnectionH2::{write_streams,handle_headers_frame}` then
-  re-arm — which matters because the pool-reuse branch of `Router::connect`, unlike the fresh-dial
-  branch, never calls `timeout_container().set(token)`.
+`TimeoutContainer::triggered` deliberately keeps its token, so the re-arm at the top of
+  `ConnectionH1::{readable,writable}` / `ConnectionH2::{write_streams,handle_headers_frame}` covers
+  it — which matters because the pool-reuse branch of `Router::connect`, unlike the fresh-dial
+  branch, never arms a timeout. (Once the adapter of the next entry lands, that is covered more
+  simply still: a pooled backend stays in `router.backends`, so `Mux::reschedule` keeps its handle
+  armed every pass and nothing hangs on the first I/O.)
   No behaviour change: the reasoning is recorded at the site and backed by a `debug_assert!` that
   fires if the impossible becomes possible, plus
   `a_backend_timeout_leaves_no_linked_stream_behind_on_the_close_path` and
@@ -1059,6 +1065,56 @@
   test and a non-UTF-8 trie-key test (both seen red).
 
 ### 🔄 Changed
+
+- **`refactor(mux)`: the H1/H2 cores publish a next-timeout deadline instead of owning a timer
+  handle; the `Mux` adapter owns every `TimeoutContainer`.**
+  No behaviour change. `ConnectionH1` and `ConnectionH2` no longer hold a `TimeoutContainer` and no
+  longer reference `crate::timer` at all: each carries `timeout_duration` plus
+  `timeout_deadline: Option<Instant>` and publishes the latter through `poll_timeout()`.
+  `Connection::{arm_timeout, clear_timeout, set_timeout_duration}` replace the old
+  `timeout_container().{reset, cancel, set, set_duration}` surface one for one, and the six
+  `TimeoutContainer` sites in `lib/src/protocol/mux/h2.rs` — the field, the constructor parameter,
+  the constructor init and the three `reset()` calls — are gone.
+  `Mux` gained `timeouts: HashMap<Token, TimeoutContainer>`, one handle for the frontend token plus
+  one per backend, and `Mux::reschedule` reconciles them against the cores: it arms, re-arms or
+  cancels only when what a handle holds differs from what its core wants, then drops handles whose
+  token has left `router.backends` (`TimeoutContainer::drop` cancels). This is the shape
+  `UdpManager::{poll_timeout, reschedule}` already uses, and it is the prerequisite the deterministic
+  H2 simulator needs from the timer side — the H2 core can now be driven with no timer wheel at all.
+  Three things make the memoization safe. Two of them have a test that fails when they are
+  dropped; the third — that the reschedule is structural — has none, and rests on the wrappers
+  having no other exit.
+  (1) The reschedule is structural: `SessionState::{ready, timeout, shutting_down}` are thin
+  wrappers around `*_inner` bodies whose only job is to run it on the way out, so none of the dozen
+  early `return`s inside them can skip it. (2) `Mux::consume_timer_entry` calls
+  `TimeoutContainer::triggered` on entry to a firing, which clears the handle's deadline, so an
+  early delivery is re-armed rather than memoized away — consume-then-reschedule, the same rule
+  `UdpManager::handle_timeout` follows by clearing `armed_deadline` on entry. Without it the memo
+  reads "nothing changed" while the wheel entry is already gone, and the session is left with no
+  timer: a lost wakeup. (3) A real expiry clears the core's elapsed deadline, so `reschedule`
+  cannot re-arm an instant in the past and spin the session; every branch that keeps the session
+  alive re-arms explicitly.
+  Two `debug_assert`s come across from the UDP manager: the strict-advance guard from
+  `handle_timeout` (the entry re-armed for a fired token must be strictly in the future) and
+  `Mux::debug_assert_timer_coherence`, the analogue of `check_invariants` (6), which verifies after
+  every reschedule that each handle is armed iff its core wants a timer, holds exactly the core's
+  instant, and that no handle outlived its connection. Both run in every debug, test and e2e build.
+  One knock-on: the WebSocket upgrade (`http.rs` / `https.rs` `upgrade_mux`) used to destructure the
+  handles out of `ConnectionH1`; it now takes them out of `Mux.timeouts`, and `sync_timeout` keeps
+  each handle's `duration()` current via the new `TimeoutContainer::retune` because `Pipe` re-arms
+  from it.
+  One deliberate semantic shift comes with it, so "no behaviour change" is not literally true:
+  the old `TimeoutContainer::reset()` computed its deadline from a fresh `Instant::now()` at the
+  call site, whereas `arm_timeout(now)` computes it from the pass snapshot. A deadline therefore
+  lands earlier by however long the pass had been running when the re-arm ran — bounded by one
+  pass, in the same direction as every other snapshot-governed deadline, required by invariant 20,
+  and dominated by the wheel's own up-to-99 ms rounding.
+  Operator-visible: nothing. Verified end to end by `test_issue_810_timeout`,
+  `test_h2_backend_silent_triggers_504_within_back_timeout`, `test_idle_timeout_no_underflow`,
+  `test_h2_basic_request_response`, `test_keep_alive`, `test_websocket_upgrade` and
+  `test_proxy_protocol_websocket_upgrade`, and by the `mod.rs` unit tests (two before this
+  changeset, ten after). Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` §7.7 and invariant 23.
 
 - **`refactor(h2)`: the H2 core now reads one clock snapshot per pass instead of calling
   `Instant::now()` at twenty-one separate sites.**

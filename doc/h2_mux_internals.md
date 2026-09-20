@@ -65,7 +65,9 @@ ConnectionH2<Front>
  |-- rst_sent: HashSet<StreamId>            // Dedup: RST_STREAM already sent
  |-- settings_sent_at: Option<Instant>      // SETTINGS ACK timeout tracking
  |-- zero: GenericHttpStream                // Connection-level (stream 0) buffer
- |-- timeout_container: TimeoutContainer    // Session timeout management
+ |-- timeout_duration: Duration             // Configured idle timeout
+ |-- timeout_deadline: Option<Instant>      // Next callback instant; the Mux
+ |                                         // adapter owns the TimeoutContainer
 ```
 
 Access patterns use the sub-structure names directly:

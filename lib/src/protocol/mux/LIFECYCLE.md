@@ -460,8 +460,9 @@ re-validates every delivery and puts an early one back — §7.6.
 
 ### 7.1 Connection-level (frontend) idle timeout
 
-- Tracker: `ConnectionH{1,2}.timeout_container` (shared across the session under
-  the frontend token).
+- Tracker: `ConnectionH{1,2}.timeout_deadline`, the instant the core wants its
+  embedder to call back at. The wheel handle lives in `Mux.timeouts` under the
+  frontend token — see §7.7.
 - Fired when: no traffic observed for `configured_frontend_timeout`
   (`mod.rs:519`) while any stream is live, or the shorter `request_timeout`
   until the first `Link` transition (`mod.rs:1042-1044`).
@@ -546,7 +547,8 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
 
 ### 7.3 Backend timeout
 
-- Tracker: per-backend `Connection.timeout_container` in `self.router.backends`.
+- Tracker: the backend connection's own `timeout_deadline`, reflected onto the
+  wheel by `Mux.timeouts[&back_token]` (§7.7).
 - Set to `configured_backend_timeout` after successful connect (`mod.rs:773`).
 - Fired by: timer wheel → `Mux::timeout` with the backend token (`mod.rs:1279`).
 - Action: for each stream linked to that backend, either send 504, or forcefully
@@ -645,9 +647,10 @@ error in either direction as every other deadline.
 
 Two clocks are deliberately left alone. `SessionMetrics` stays on the real
 clock — metrics want true elapsed time, not a quantised one. `TimeoutContainer`
-and the thread-local timer wheel stay on the real clock too: the container is
-the embedder's timer, and the H2 core never reads it (it only calls
-`triggered()` / re-arms it).
+and the thread-local timer wheel stay on the real clock too: they are the
+embedder's timer, they live in the `Mux` adapter (§7.7), and no core touches
+them. A core's `timeout_deadline` is stamped from the pass snapshot like every
+other deadline here.
 
 ### 7.6 Early wheel delivery, re-validation, and why the two are one operation
 
@@ -697,8 +700,9 @@ Step 3 is the counter-intuitive one, and it is why re-validation is never
 shipped on its own:
 
 - re-arming with `set` instead of `set_at` would push the deadline out by a
-  fresh full duration, so an entry delivered 50 ms before a 60 s timeout would
-  next fire at ~120 s — silently doubling the operator's configured timeout;
+  fresh full duration, so an entry delivered a few tens of milliseconds before
+  a 60 s timeout would next fire at ~120 s — silently doubling the operator's
+  configured timeout;
 - **not re-arming at all is a lost wakeup.** The wheel entry is already gone.
   Rejecting the firing without putting it back leaves the session with no timer,
   and nothing else arms one. That is exactly the bug fixed for the UDP shell in
@@ -706,20 +710,84 @@ shipped on its own:
   `reschedule` emitted `ArmTimer` only when the minimum deadline had MOVED, and
   the fix was clearing `armed_deadline` on entry — consume-then-reschedule.
 
-Today's mux path cannot have the UDP bug on its own, because `TimeoutContainer`
-has no memoization: `set` / `reset` unconditionally cancel and re-arm, and every
-`StateResult::Continue` exit from `Mux::timeout` re-arms. The hazard belongs to
-any design that ADDS memoization on top — a `poll_timeout()`-style core that
-returns a next deadline and an adapter that re-arms only when it changed. Such
-an adapter must clear what it believes the wheel holds on entry to the firing
-handler, and must arrive after this section's re-validation, not before it.
-`consume_timer_entry` is where both halves already live together; whoever moves
-that logic must move all three steps.
+When the re-validation above first landed, the mux could not have the UDP bug
+at all: `TimeoutContainer` had no memoization — `set` / `reset` unconditionally
+cancelled and re-armed, and every `StateResult::Continue` exit from
+`Mux::timeout` re-armed. The hazard belonged to any design that ADDED
+memoization on top, which is why the re-validation had to land first.
 
-A container with no recorded deadline fails **open** and is reported due. That
-is the behaviour of every release before the re-validation existed, and it keeps
-a container armed through a path that records no deadline from becoming
-immortal.
+**That design is now here** (§7.7): `Mux::sync_timeout` touches the wheel only
+when what a handle holds differs from what its core wants. What keeps that safe
+is the rule this section exists for — the firing handler clears what it believes
+the wheel holds before anything reschedules. `Mux::consume_timer_entry` does it
+by calling `TimeoutContainer::triggered`, which clears the handle's deadline;
+`UdpManager::handle_timeout` does it by setting `armed_deadline = None`. Whoever
+moves either must move all three steps together.
+
+A firing for a core that wants no timer fails **open** and is reported due.
+That is the behaviour of every release before the re-validation existed, and it
+keeps a session whose deadline was dropped somewhere from becoming immortal.
+
+### 7.7 Who owns the timer: cores publish, the adapter arms
+
+No H1/H2 core owns a `TimeoutContainer` any more, and neither `h1.rs` nor
+`h2.rs` references `crate::timer` at all. Each core carries two plain fields —
+`timeout_duration` (configured) and `timeout_deadline: Option<Instant>` (the
+instant it wants `timeout()` called at) — and publishes the second through
+`poll_timeout()`. `Connection::{arm_timeout, clear_timeout,
+set_timeout_duration}` are the whole write surface, and they replace the old
+`timeout_container().{reset, cancel, set, set_duration}` one for one.
+
+The `Mux` adapter owns every wheel handle, in `Mux.timeouts: HashMap<Token,
+TimeoutContainer>` — one entry for the frontend token plus one per backend in
+`router.backends`. This is the only place in the mux that talks to the timer
+wheel. `Mux::reschedule` walks the cores and calls `Mux::sync_timeout`, which
+arms, re-arms or cancels an entry only when what the handle holds differs from
+what the core wants, then drops handles for departed tokens (`retain`;
+`TimeoutContainer::drop` cancels). This is the same shape as
+`UdpManager::{poll_timeout, reschedule}` (`lib/src/protocol/udp/manager.rs`),
+which is the worked example the split is modelled on.
+
+Three rules keep it honest, and each has a test that fails when it is dropped:
+
+- **The reschedule is structural, not hand-placed.** `SessionState::{ready,
+  timeout, shutting_down}` are thin wrappers around `*_inner` bodies whose only
+  job is to run `reschedule` on the way out, so none of the dozen early
+  `return`s inside them can skip it. `cancel_timeouts` calls it directly and
+  `close` drops the whole map.
+- **Consume before you reschedule.** `Mux::consume_timer_entry` calls
+  `TimeoutContainer::triggered` on entry, which clears the handle's deadline, so
+  the memo reads "the wheel holds nothing" and re-arms even when the core's
+  deadline has not moved. Without that clearing, an early delivery is memoized
+  away and the session is left with no entry at all — the lost wakeup of §7.6,
+  and the reason the stored deadline had to land before the memoized reschedule.
+  Pinned by `an_early_wheel_delivery_leaves_a_live_entry_at_the_same_deadline`.
+- **A real expiry clears the core's deadline.** The core asked to be called at
+  `D` and has been; leaving `D` in place has `reschedule` re-arm an elapsed
+  instant, which the wheel re-delivers on the next tick — a busy loop. Every
+  branch that keeps the session alive re-arms explicitly with `arm_timeout`.
+  Pinned by `a_real_expiry_clears_the_elapsed_deadline_instead_of_re_arming_it`
+  and by the strict-advance `debug_assert!` in `SessionState::timeout`, carried
+  over from `UdpManager::handle_timeout`.
+
+Two `debug_assert`s come across from the UDP manager: that strict-advance guard,
+and `Mux::debug_assert_timer_coherence` (the analogue of
+`UdpManager::check_invariants` (6)) which checks, after every reschedule, that
+each handle is armed iff its core wants a timer, holds exactly the core's
+instant, and that no handle outlived its connection.
+
+The WebSocket upgrade (`http.rs` / `https.rs` `upgrade_mux`) takes the frontend
+and backend handles out of `Mux.timeouts` and hands them to `Pipe`, which is why
+`sync_timeout` keeps each handle's `duration()` current through
+`TimeoutContainer::retune` — `Pipe` re-arms from it.
+
+One deliberate semantic shift comes with the split, and it is not literally "no
+change": the old `TimeoutContainer::reset()` computed its deadline from a fresh
+`Instant::now()` at the call site, whereas `arm_timeout(now)` computes it from
+the pass snapshot (§7.5). A deadline therefore lands earlier by however long the
+pass had been running when the re-arm ran — bounded by one pass, in the same
+direction as every other deadline the snapshot governs, and required by
+invariant 20. The wheel's own rounding (up to 99 ms, §7.6) dominates it.
 
 ---
 
@@ -890,9 +958,13 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
    short-circuit when `self.drain.draining` (`h2.rs:3160-3167`,
    `h2.rs:4518-4525`).
 9. **Connection-level timer resets only on application activity.** H2 control
-   frames (PING / WINDOW_UPDATE / SETTINGS) do **not** reset `timeout_container`
-   — enforced in `readable()` by setting it only on DATA payload (`h2.rs:1646`)
-   and HEADERS (inside `handle_frame`).
+   frames (PING / WINDOW_UPDATE / SETTINGS) do **not** push
+   `ConnectionH2.timeout_deadline` out. `arm_timeout()` has exactly three call
+   sites: DATA payload (the `H2StreamId::Other` arm of `readable`), HEADERS
+   (inside `handle_headers_frame`), and the top of `write_streams` — outbound
+   application data is activity too, and that third site is why the READ path
+   alone does not describe the invariant. A control frame reaches none of the
+   three.
 10. **Single `graceful_goaway` per session outside the final GOAWAY.**
     `Mux::shutting_down` (`mod.rs:1595`) only calls it if
     `!self.frontend.is_draining()`; a second unconditional call would
@@ -1039,10 +1111,11 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     millisecond (99 ms at the default tick) before its configured timeout;
     re-arming with `set` silently doubles that timeout; not re-arming is a LOST
     WAKEUP, because the wheel entry is already gone (§7.6). Pinned by
-    `an_early_wheel_delivery_is_put_back_at_the_same_deadline`,
+    `an_early_wheel_delivery_does_not_run_the_timeout_body`,
+    `an_early_wheel_delivery_leaves_a_live_entry_at_the_same_deadline`,
     `a_delivery_past_the_deadline_runs_the_timeout_body` and
-    `a_firing_with_no_recorded_deadline_is_treated_as_due` in `mod.rs`, and at
-    the container level by
+    `a_firing_with_no_deadline_is_treated_as_due` in `mod.rs`, and at the
+    container level by
     `timeout_container_mirrors_the_deadline_of_its_armed_entry` in `timer.rs`.
     Coverage note: the early-delivery half is exercised on the FRONTEND token
     only; the backend tests park an already-elapsed deadline. The gate is
@@ -1069,20 +1142,39 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     the other direction. `Context::unlink_stream` is the eviction point
     THIS path relies on, not the only one in the module: `remove_backend_stream`
     also has direct callers in `h1.rs` and `h2.rs`, and extra eviction only
-    strengthens the conclusion. Work attached to the backend
-    afterwards re-arms the container itself: `TimeoutContainer::triggered`
-    keeps its token, so the `reset()` at the top of
+    strengthens the conclusion. Work attached to the backend afterwards does
+    not depend on this site either: a pooled backend stays in
+    `router.backends`, so `Mux::reschedule` keeps its handle armed at whatever
+    deadline the core holds, on every pass. (`arm_timeout()` at the top of
     `ConnectionH1::{readable,writable}` and in
-    `ConnectionH2::{write_streams,handle_headers_frame}` re-arms a reused pool
-    connection on its first pass — which matters because the pool-reuse branch
-    of `Router::connect`, unlike the fresh-dial branch, never calls
-    `timeout_container().set(token)`. Asserted under `debug_assertions` at the
+    `ConnectionH2::{write_streams,handle_headers_frame}` pushes that deadline
+    out on the first pass, but nothing hangs on it.) That is what covers the
+    pool-reuse branch of `Router::connect` never arming a timeout, unlike the
+    fresh-dial branch. Asserted under `debug_assertions` at the
     re-arm site and pinned by
     `a_backend_timeout_leaves_no_linked_stream_behind_on_the_close_path` and
     `a_completed_backend_response_timeout_unlinks_through_end_stream_alone`.
     Both tests set `h1.stream = Some(0)` by hand, so they exercise
     `ConnectionH1::end_stream`'s matched path only; the mismatch arm is covered
     by the one-active-stream invariant above, not by a test.
+
+23. **Only the `Mux` adapter touches the timer wheel.** No code under
+    `ConnectionH1` or `ConnectionH2` references `crate::timer`; the cores carry
+    `timeout_duration` + `timeout_deadline` and publish the latter through
+    `poll_timeout()`. Every `TimeoutContainer` lives in `Mux.timeouts`, is
+    reconciled by `Mux::reschedule` (memoized on handle-vs-core), and is
+    released by that function's `retain` when its token leaves
+    `router.backends`. The reviewer check is
+    `grep -n 'timer::\|TimeoutContainer' lib/src/protocol/mux/h1.rs lib/src/protocol/mux/h2.rs lib/src/protocol/mux/router.rs lib/src/protocol/mux/connection.rs`.
+    Every hit must be inside a comment — `///` on the replacement accessors and
+    a plain `//` on the constructor note in `h2.rs` — and none may be code. The
+    reconciliation is placed
+    in wrappers around `ready_inner` / `timeout_inner` / `shutting_down_inner`
+    precisely so it cannot be forgotten on an early return (§7.7). Pinned by
+    `a_departed_backend_releases_its_wheel_handle`,
+    `a_real_expiry_clears_the_elapsed_deadline_instead_of_re_arming_it` and
+    `Mux::debug_assert_timer_coherence`, which runs after every reschedule in
+    debug builds — including every e2e and simulation run.
 
 ---
 

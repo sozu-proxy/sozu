@@ -24,7 +24,6 @@ use crate::{
     router::{HeaderEdit, RouteResult},
     server::CONN_RETRIES,
     socket::SessionTcpStream,
-    timer::TimeoutContainer,
 };
 
 use crate::metrics::names;
@@ -449,10 +448,6 @@ impl Router {
             let backend_peer = Some(backend.borrow().address);
             let socket = SessionTcpStream::new(socket, context.session_ulid, backend_peer);
 
-            // Build an un-armed timeout: we can't call `TimeoutContainer::new`
-            // yet because that requires the slab token, and we only allocate
-            // the token on the happy path. `.set(token)` below arms it.
-            let timeout_container = TimeoutContainer::new_empty(self.configured_connect_timeout);
             let flood_config = context.listener.borrow().get_h2_flood_config();
             let connection_config = context.listener.borrow().get_h2_connection_config();
             let stream_idle_timeout = context.listener.borrow().get_h2_stream_idle_timeout();
@@ -468,7 +463,7 @@ impl Router {
                     cluster_id.to_owned(),
                     backend,
                     context.pool.clone(),
-                    timeout_container,
+                    self.configured_connect_timeout,
                     flood_config,
                     connection_config,
                     stream_idle_timeout,
@@ -485,7 +480,7 @@ impl Router {
                     socket,
                     cluster_id.to_owned(),
                     backend,
-                    timeout_container,
+                    self.configured_connect_timeout,
                 )
             };
 
@@ -499,7 +494,8 @@ impl Router {
                     "{} Backend rejected stream start (max concurrent streams reached)",
                     log_module_context!(context.http_context(stream_id))
                 );
-                // `connection` (socket + timeout_container) drops here.
+                // `connection` (socket + pending timeout deadline) drops here; no
+                // wheel entry was ever armed for it.
                 return Err(BackendConnectionError::MaxSessionsMemory);
             }
 
@@ -565,9 +561,12 @@ impl Router {
                 }
             }
 
-            // Arm the connect timeout now that we own a real token.
-            connection.timeout_container().set(token);
-
+            // No `set(token)` here any more: the connection arms its own
+            // connect-timeout DEADLINE at construction and the `Mux` adapter
+            // reflects it onto the wheel when `ready()` reschedules, which is
+            // the same pass this runs in. Until that reschedule no wheel entry
+            // exists — which is what the rollback paths above want, since they
+            // drop `connection` without ever reaching here.
             self.backends.insert(token, connection);
             token
         };
