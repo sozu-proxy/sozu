@@ -120,7 +120,8 @@ accept()
             │                                              (StateMarker::SniPreread arm)
             │
             └─ Output::Routed{cluster, content_offset, ...} ───────┐
-                 arm backend-writable (shell.rs's handle_output)    │
+                 arm backend-writable, drop frontend-readable       │
+                 INTEREST (shell.rs's handle_output, §10.7)         │
                  sync TcpSession::cluster_id (readable()'s tail)    │
                  connect_to_backend (gated, §7)                    │
                  backend connects → back_writable → upgrade()      │
@@ -438,6 +439,37 @@ fully drained. The regression guard is
    `sim/tests/tcp_preread_sim.rs` (`generate_scenario`) that constructs one
    per required variant BY CONSTRUCTION rather than hoping randomness finds
    it.
+
+7. **A routed preread must stop advertising frontend-readable INTEREST while
+   the backend connects -- and must NOT clear the latched event.** Once
+   `handle_output` latches `Output::Routed`, `readable` (`shell.rs`) is
+   deliberately a no-op: bytes past the routed window stay in the kernel
+   socket buffer for the post-upgrade state to replay byte-for-byte (see
+   note 1). `tcp_socket_read` (`socket.rs`) returns `SocketResult::Continue`,
+   NOT `WouldBlock`, when it fills the capped slice it was handed -- exactly
+   what a client coalescing its ClientHello with payload produces -- so the
+   frontend `READABLE` event bit is still latched at the moment of the
+   decision and nothing will ever clear it. While `READABLE` also stayed in
+   `frontend_readiness.interest`, `front_interest = interest & event` in
+   `TcpSession::ready_inner` (`tcp.rs`) selected a dispatch that could never
+   make progress on every pass, so the session burned `MAX_LOOP_ITERATIONS`
+   (10 000) and closed with `bin` stuck at the cap and `bout == 0` -- the
+   `tcp.infinite_loop.error` signature of sozu-proxy/sozu#1373.
+   Deterministic under `--release`, where the payload write outruns the
+   backend connect every time; usually won under debug, which is why it
+   surfaced as an unreadable intermittent CI failure rather than a bug.
+   The fix masks the INTEREST, never the event: `upgrade_sni_preread` hands
+   `frontend_readiness.event` to the post-upgrade `Pipe`
+   (`restore_readiness_events`) or `SendProxyProtocol` (`into_pipe`), each of
+   which re-inserts `READABLE` interest, and under edge-triggered epoll that
+   carried-over bit is the ONLY wake-up the coalesced tail will ever get --
+   clearing the event instead would trade the spin for a hang. `HUP` and
+   `ERROR` stay armed, so a frontend that goes away mid-connect is still
+   noticed. Regression guards:
+   `routed_preread_stops_re_arming_frontend_readable_while_connecting`
+   (`shell.rs`) and
+   `test_tcp_sni_large_payload_coalesced_with_hello_delivered_intact`
+   (`e2e/src/tests/tcp_sni_tests.rs`, which only fails under `--release`).
 
 ---
 
