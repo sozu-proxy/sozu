@@ -317,6 +317,106 @@ budget; a test that merely waits on a quiet socket would time out and
 read as a missing deadline. Check where a deadline is evaluated before
 concluding it did not fire.
 
+## Status assertions: what a HEADERS block can falsify
+
+An H2 response status is a decode, not a search. The seven `:status` rows
+of the RFC 7541 static table (indices 8..=14 → 200, 204, 206, 304, 400,
+404, 500) are emitted as a single indexed byte; every other status is a
+literal over one of those same name indices, three unhuffmanned ASCII
+digits long. RFC 9113 §8.3.2 puts the field first in the block, so
+`decode_status` (`e2e/src/tests/h2_utils.rs`) reads byte 0 and stops.
+Nothing later in the block can be mistaken for the status.
+
+**What the old byte scan could not falsify.** Until 2026-09-20 three
+copies of `payload.windows(3).any(|w| w == b"421")` stood in this suite.
+That question has no negative space: a plain 200 answers yes whenever the
+digits happen to sit side by side anywhere in the field block, and one
+header guarantees they eventually will. Every Sōzu response carries
+`Sozu-Id`, the session's 26-character Crockford base-32 ULID
+(`lib/src/protocol/kawa_h1/editor.rs:1131`), whose alphabet is
+`0-9A-Z`-minus-`ILOU` and which the encoder writes as plain ASCII — a
+captured example is `01M2Z5AGKTYKJM9MFQY89EJMJ9`. Any given 3-digit
+needle hits about once in 1400 ULIDs. The first ten characters are the
+generation timestamp in milliseconds, so a hit there is not independent
+between runs: it holds for 1 ms, 32 ms, ~1 s, ~33 s or ~17.5 min
+depending on which triple it occupies — and ~9.3 h, ~12.4 d or ~1.1 y for
+the three slowest. All 24 windows are a priori equally likely — the slow
+ones are not rarer per draw, their characters are simply fixed for a
+whole era, so a hit there is a property of the epoch rather than of a
+run. Every response generated inside the window carries it.
+
+That is the whole of issue #1353. `strict-off FAIL: infra_ok=true
+got_ok=true got_421=true metric_stable=true foo_reqs=0 bar_reqs=1` is not
+a race between a 421 and a proxied response — it is one proxied 200 whose
+correlation id contained `421`. It is **not** a flake and does not belong
+on a flake list: the wire was right, the reading was wrong, and the
+reading is fixed. Contrast the genuinely load-sensitive entries in this
+suite, which assert on a wall-clock budget rather than on content.
+
+**The dangerous copy was not the one in the reported test.**
+`try_strict_sni_binding_toggle` (`e2e/src/tests/listener_update_tests.rs`)
+ran the same scan and fed its result into
+`got_rejection_or_421 = got_421 || contains_goaway(..)`, which gates
+`phase1_ok` — the assertion that a `strict_sni_binding=true` listener
+*rejects* a mismatched `:authority`. A ULID false positive there turns a
+security assertion silently green rather than red. Direction matters when
+pricing one of these: #1353 cost a re-run, this one would have cost the
+guard. Both are decoded now, along with `h2_tests.rs`, whose status check used
+to be ORed with a match on the answer body (`""status_code": 404"`).
+That disjunct widened the needle rather than guarding it and has been
+removed: `test_h2_default_answer_terminates_stream` passes on the
+decoded `:status` alone.
+
+**Keep the negative half — and check that you have one.**
+`h2_status_checks_decode_the_status_field_not_any_matching_bytes` asserts
+in both directions, but only after a correction worth recording. Its
+first fixture, a captured 200 whose `Sozu-Id` contains `421`, falsifies
+the digit scan. Its second, a captured 421, was *not* enough to falsify
+the companion `payload.contains(&0x88)` scan in `headers_ok_response`,
+because that captured block is pure ASCII and so holds no `0x88` byte.
+Reverting that one function left the test green — an assertion that
+looked like a guard and was not. The third fixture,
+`stray_indexed_200`, is a captured 421 block with a trailing `0x88`.
+When a `To SEE THIS RED:` names two mutations, run both.
+
+**`0x88` in a block does not mean `:status 200`.** An earlier draft of
+this section justified that third fixture by claiming the byte was
+unreachable off the wire. It is not, and the correction matters more
+than the fixture. RFC 7541 §5.1 encodes a string length ≥ 127 as a
+7-bit prefix plus continuation octets of `(len % 128) + 128`, i.e.
+`0x80..=0xFF` by construction: a 263-byte header value writes
+`7f 88 01`, and 1542 distinct lengths below 100 000 put a `0x88` octet
+in the block. A raw value byte ≥ `0x80` is a second route —
+`lib/src/protocol/mux/converter.rs:388-391` rejects only
+`0x00..=0x08 | 0x0A..=0x1F | 0x7F` and passes everything else through
+verbatim. `headers_ok_response` runs on *proxied* responses in the
+strict-off and coalescing tests, where backend headers are arbitrary, so
+a 263-byte `Location`, `Set-Cookie` or CSP header was enough to make the
+old scan report a 2xx on a 421. The narrow claim — `0x88` cannot occur
+inside an unhuffmanned ASCII *value* — is the only true one.
+
+**Still scanning, and no longer rated low risk.** Measured on
+2026-09-20, 19 indexed-status byte probes remain: 2 × `contains(&0x88)`
+and 17 × `contains(&0x8D)`, in `e2e/src/tests/h2_security_header_injection.rs`
+(3) and `e2e/src/tests/h2_security_tests.rs` (16). They are the same
+class as #1353 and carry the same exposure — a 268-byte value writes
+`7f 8d 01` — and several of them sit on the permissive side of an `||`
+(`rejected = got_rst || got_goaway || got_400`,
+`h2_security_tests.rs:589`), which is the inverted direction again.
+Converting them to `decode_status` is a follow-up, not chased here.
+
+Two things to settle before that conversion. First, `0x8D` is static
+index **13 = `:status 404`**, not 400: `:status 400` is index 12 =
+`0x8C`. Every one of those 17 sites, and the comments above them
+(`h2_security_tests.rs:577`, `:658`,
+`h2_security_header_injection.rs:73`, `:542`), names it 400, and the
+variable is `got_400` at all 15 sites in `h2_security_tests.rs`. So
+either the assertion or its label is wrong at every one of them, and a
+mechanical `headers_status_matches(.., b"400")` rewrite would change
+behaviour rather than preserve it. Second, `decode_status` returns
+`None` on a size-update-prefixed block, which is fail-closed for a
+`got_X` used positively and fail-**open** for one used as `|| !got_X`.
+
 ## Backend-TLS expansion (preview)
 
 When backend TLS lands ([#1218](https://github.com/sozu-proxy/sozu/issues/1218)),
