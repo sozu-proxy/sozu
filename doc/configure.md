@@ -1696,6 +1696,27 @@ table, because rustls hands the resolver an SNI it has already lowercased. A
 certificate carrying `MiXeD.Example.COM` therefore serves `mixed.example.com`
 instead of silently falling through to the default certificate.
 
+**A certificate name may not carry a regex segment.** Frontend hostnames get
+the slash-delimited grammar described in the next section; certificate names do
+not. `sozu certificate add` refuses any `names` entry containing `/` — the
+worker answers `could not add certificate: the SNI route table cannot host a
+certificate name` and loads nothing — because the SNI lookup table is the same
+trie as the router's, and a name such as
+`/te.*/.example.com` would otherwise compile to a regex segment and bind one
+certificate to every host the pattern happens to cover (`test.example.com` and
+`tenant.example.com` alike). `/` cannot occur in a DNS name, so no legitimate
+SAN is refused; a wildcard SAN such as `*.example.com` is not a regex segment
+and still loads and still serves its subtree. This is the rule TCP SNI routes
+have always had.
+
+The refusal is per certificate, not per name: one bad entry rejects the whole
+`AddCertificate`, before any part of it is registered, so a partially-loaded
+certificate is not a state the worker can reach. When the `names` override is
+left empty the worker derives the names from the certificate's own SAN / CN, so
+the refusal can also fire on a certificate carrying no dNSName SAN and a Common
+Name that contains a slash — reissue it with a proper dNSName SAN, or state the
+intended hostnames explicitly in `names`.
+
 ### Regex hostname segments
 
 A `hostname` may carry a regex in any one of its dot-separated segments by
