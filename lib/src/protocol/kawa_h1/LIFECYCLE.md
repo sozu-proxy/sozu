@@ -67,8 +67,8 @@ of synthesised replies. It has no `SessionState` implementation.
 |-----------------------|-----------------------------------------------|--------------------------------------------------------------------|
 | `DefaultAnswer`       | `lib/src/protocol/kawa_h1/mod.rs:40`          | Catalogue of synthesised replies (301/302/308/400/401/404/408/413/421/429/502/503/504/507) |
 | `GenericHttpStream`   | `lib/src/protocol/kawa_h1/mod.rs:28`          | `kawa::Kawa<Checkout>` — the pooled-buffer parser stream            |
-| `HttpContext`         | `lib/src/protocol/kawa_h1/editor.rs:230`      | Per-request mutable state used by Kawa parser callbacks             |
-| `HeaderEditMode` / `HeaderEditSnapshot` | `lib/src/protocol/kawa_h1/editor.rs:446` / `:471` | Per-frontend header-edit programme and its pre-edit snapshot |
+| `HttpContext`         | `lib/src/protocol/kawa_h1/editor.rs`          | Per-request mutable state used by Kawa parser callbacks             |
+| `HeaderEditMode` / `HeaderEditSnapshot` | `lib/src/protocol/kawa_h1/editor.rs`        | Per-frontend header-edit programme and its pre-edit snapshot |
 | `Method`              | `lib/src/protocol/kawa_h1/parser.rs:38`       | Owned-string-free method enum                                       |
 | `HttpAnswers`         | `lib/src/protocol/kawa_h1/answers.rs:503`     | Listener + cluster template registry                                |
 | `DefaultAnswerStream` | `lib/src/protocol/kawa_h1/answers.rs:44`      | `Kawa<SharedBuffer>` carrying a rendered default answer             |
@@ -83,32 +83,32 @@ storage behind a rendered default answer.)
 
 ## 2. Editor — `HttpContext` and the parser callbacks
 
-`HttpContext` (`lib/src/protocol/kawa_h1/editor.rs:230`) is the per-request
+`HttpContext` (`lib/src/protocol/kawa_h1/editor.rs`) is the per-request
 mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
-(`editor.rs:477`) fires:
+(`editor.rs`) fires:
 
-- `on_headers` (`editor.rs:478`) — split between request and response by
+- `on_headers` (`editor.rs`) — split between request and response by
   `stream.kind`;
-- `on_request_headers` (`editor.rs:561`) — captures the `:method`, authority,
+- `on_request_headers` (`editor.rs`) — captures the `:method`, authority,
   path; copies `X-Forwarded-For` into `xff_chain` for the access log; appends
   the configured `Forwarded`/`X-Forwarded-*` hop; injects the `Sozu-Id`
   correlation header named by `sozu_id_header`;
-- `on_response_headers` (`editor.rs:1049`) — captures `:status`, `:reason`,
+- `on_response_headers` (`editor.rs`) — captures `:status`, `:reason`,
   optionally rewrites `Set-Cookie` for sticky sessions.
 
-`HttpContext::extract_route` (`editor.rs:1217`) hands the mux router the
+`HttpContext::extract_route` (`editor.rs`) hands the mux router the
 authority, path and method it needs, and `HttpContext::log_context`
-(`editor.rs:1260`) is the canonical helper for producing the
+(`editor.rs`) is the canonical helper for producing the
 `LogContext { session_id, request_id, cluster_id, backend_id }` record consumed
 by every `log_context!` macro that has an `HttpContext` in scope — prefer it
 over hand-rolling a struct literal (per repo `CLAUDE.md`).
 
 Notable security-relevant fields on `HttpContext`:
 
-- `tls_server_name` (`editor.rs:302`) — SNI captured at handshake (lowercased,
+- `tls_server_name` (`editor.rs`) — SNI captured at handshake (lowercased,
   trailing dot stripped). Used for logging and as a fallback exact-match check
   when `tls_cert_names` is unavailable.
-- `tls_cert_names` (`editor.rs:313`) — `Option<Arc<Vec<String>>>` snapshot of
+- `tls_cert_names` (`editor.rs`) — `Option<Arc<Vec<String>>>` snapshot of
   the SAN dNSName entries of the certificate Sōzu actually served on this TLS
   session (RFC 6125 §6.4.4: when the SAN extension contains at least one
   dNSName entry, those entries are authoritative and the Common Name is
@@ -121,13 +121,13 @@ Notable security-relevant fields on `HttpContext`:
   CWE-346 / CWE-444 trust boundary (operator-defined SAN scope). `None` when
   the resolver fell back to the default cert — routing then fall-backs to
   legacy SNI exact-match.
-- `strict_sni_binding` (`editor.rs:320`) — mirrors
+- `strict_sni_binding` (`editor.rs`) — mirrors
   `HttpsListenerConfig::strict_sni_binding`; gates the `tls_cert_names` check
   on/off. Defends against cross-tenant authority spoofing (CWE-346 / CWE-444).
-- `xff_chain` (`editor.rs:261`) — verbatim upstream `X-Forwarded-For` snapshot
+- `xff_chain` (`editor.rs`) — verbatim upstream `X-Forwarded-For` snapshot
   taken before Sōzu appends its own hop, so the access log records the
   attested chain even when Sōzu mutates the live header.
-- `x_request_id` (`editor.rs:255`) — universal correlation token; populated
+- `x_request_id` (`editor.rs`) — universal correlation token; populated
   unconditionally in `on_request_headers` so the access log always has a
   cross-component join key.
 
@@ -148,10 +148,10 @@ not itself end in `chunked` is left in place (kawa only `warn!`s), so gating the
 scan on `body_size != Chunked` alone would let that second line ride through.
 
 The guard therefore folds over every non-elided `Transfer-Encoding` header in
-`request.blocks` (`editor.rs:586-606`), producing `te_count` and
+`request.blocks` (`editor.rs:607-627`), producing `te_count` and
 `te_all_suffix_chunked` — the latter true only when EVERY such value's literal
 trailing bytes are `chunked` (`compare_no_case` over the last seven bytes). The
-rejection predicate is exactly (`editor.rs:607-610`):
+rejection predicate is exactly (`editor.rs:628-631`):
 
 ```rust
 te_count > 1
@@ -197,9 +197,10 @@ The resulting `ParsingPhase::Error` is observed by the mux H1 connection
 (`lib/src/protocol/mux/h1.rs:314`), which checks `kawa.is_error()` immediately
 after `kawa::h1::parse` and, on the server side, calls
 `set_default_answer(..., 400, ...)` and returns — before routing or the
-per-frontend Basic-auth check (`mux/router.rs:865`,
-`mux/auth.rs::check_basic`) run, so an ambiguously-framed request is rejected
-before it reaches routing. Note that `crate::protocol::http` is a
+per-frontend Basic-auth check (the `check_basic` guard in
+`Router::route_from_request`, `mux/router.rs`, calling
+`mux/auth.rs::check_basic`) run, so an ambiguously-framed request is
+rejected before it reaches routing. Note that `crate::protocol::http` is a
 `pub use ... kawa_h1 as http` re-export, not a separate type, so a grep for
 consumers must search both spellings.
 
@@ -275,10 +276,10 @@ a wedged session, or a security regression.
    strictness.
 
 4. **`HttpContext` outlives a single request when keep-alive is in play.**
-   `HttpContext::reset` (`editor.rs:1150`) clears the per-request fields but
-   preserves the per-connection ULID (`session_id`, `editor.rs:273`), the
+   `HttpContext::reset` (`editor.rs`) clears the per-request fields but
+   preserves the per-connection ULID (`session_id`, `editor.rs`), the
    SNI-derived TLS state, and the rendered `sozu_id_header` label
-   (`editor.rs:360`). The `request_id` (`HttpContext::id`, `editor.rs:275`) IS
+   (`editor.rs`). The `request_id` (`HttpContext::id`, `editor.rs`) IS
    rotated per request to keep the access log correlatable.
 
 5. **`impl kawa::AsBuffer for Checkout` is unique to this module.** It lives at

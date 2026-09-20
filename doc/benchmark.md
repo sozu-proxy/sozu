@@ -291,7 +291,8 @@ connect(12, {sa_family=AF_INET, sin_port=htons(1052), sin_addr=inet_addr("127.0.
 > state machine became unreachable once `HttpStateMachine` gained its `Mux`
 > variant, and it was removed on 2026-09-20 (sozu#1346). On a current build the
 > same `connect` syscall is reached through
-> `sozu_lib::protocol::mux::router::Router::connect` (`mux/router.rs:129`), which
-> calls `Router::backend_from_request` (`mux/router.rs:899`) at `mux/router.rs:427`
-> and connects the socket it returns, all under the mux `ready` pass. The
+> `sozu_lib::protocol::mux::router::Router::connect`
+> (`lib/src/protocol/mux/router.rs`), which calls `Router::backend_from_request`
+> (`lib/src/protocol/mux/router.rs`) — its only call site — and connects the
+> socket it returns, all under the mux `ready` pass. The
 > technique this section teaches is unchanged.

@@ -462,7 +462,8 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **Assert a status by decoding it, never by scanning a field block for its
   digits.** An HPACK block is not text. `payload.windows(3).any(|w| w == b"421")`
   matches any three adjacent bytes, and every Sōzu response carries a `Sozu-Id`
-  correlation header (`lib/src/protocol/kawa_h1/editor.rs:1131`) whose value is
+  correlation header (`HttpContext::on_response_headers`,
+  `lib/src/protocol/kawa_h1/editor.rs`) whose value is
   the session's 26-character Crockford base-32 ULID — an alphabet holding every
   decimal digit, emitted with the Huffman bit clear, so it lands in the block as
   plain ASCII. A 3-digit needle therefore matches an ordinary 200 about once in

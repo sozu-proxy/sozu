@@ -394,12 +394,26 @@ impl Stream {
         };
 
         let listener = listener.borrow();
-        let tags = context.authority.as_deref().and_then(|host| {
-            let hostname = match host.split_once(':') {
-                None => host,
-                Some((hostname, _)) => hostname,
-            };
-            listener.get_tags(hostname)
+        // Tags resolved by the router from the frontend rule that actually
+        // matched this request win: they are the only ones that can be
+        // right for a wildcard, regex, ported or differently-cased
+        // frontend. The listener's authority-keyed map is written under
+        // the frontend RULE's hostname and read here under the REQUEST's
+        // authority, so it only ever answers for an exact literal
+        // frontend (sozu#1379).
+        //
+        // It stays as the fallback for a request that never reached
+        // routing at all — a malformed request, an unknown host, a TLS
+        // SNI/authority mismatch — where there is no matched frontend to
+        // ask and the pre-existing best-effort answer is better than none.
+        let tags = context.tags.as_deref().or_else(|| {
+            context.authority.as_deref().and_then(|host| {
+                let hostname = match host.split_once(':') {
+                    None => host,
+                    Some((hostname, _)) => hostname,
+                };
+                listener.get_tags(hostname)
+            })
         });
 
         log_access! {

@@ -9,12 +9,13 @@
 use std::{
     io::Write as _,
     net::{IpAddr, SocketAddr},
+    rc::Rc,
     str::from_utf8,
     sync::Arc,
 };
 
 use rusty_ulid::Ulid;
-use sozu_command_lib::logging::LogContext;
+use sozu_command_lib::logging::{CachedTags, LogContext};
 
 use crate::metrics::names;
 use crate::{
@@ -412,6 +413,25 @@ pub struct HttpContext {
     /// `None` falls back to 301 for the legacy
     /// `cluster.https_redirect = true` path. Closes #1009.
     pub redirect_status: Option<u16>,
+    /// Access-log tags of the frontend rule that matched this request,
+    /// stashed by the routing layer from `RouteResult::tags` (see
+    /// `mux/router.rs::route_from_request`) and read back by
+    /// `mux/stream.rs::generate_access_log`.
+    ///
+    /// The matched frontend is the only correct owner of these tags: the
+    /// operator configures them per frontend RULE (`*.example.com`,
+    /// `/foo.*/.example.com`, a Pre/Post string), while the request only
+    /// ever carries a concrete authority. Resolving them here — rather
+    /// than by looking the authority up in the listener's
+    /// `BTreeMap<String, CachedTags>` — is what makes a wildcard, regex,
+    /// ported or differently-cased frontend log its tags at all
+    /// (sozu#1379). `Rc` because the same `CachedTags` is shared by every
+    /// stream routed to that frontend, and because it must outlive a
+    /// frontend removed mid-request.
+    ///
+    /// `None` until the request is routed, and for a request that matched
+    /// no frontend at all.
+    pub tags: Option<Rc<CachedTags>>,
     /// Stable, structured discriminator surfaced as the access-log
     /// `message` field when the session terminates on a timeout. Set by
     /// the `MuxState::timeout` handler
@@ -542,6 +562,7 @@ impl HttpContext {
             retry_after_seconds: None,
             frontend_redirect_template: None,
             redirect_status: None,
+            tags: None,
             access_log_message: None,
         }
     }
