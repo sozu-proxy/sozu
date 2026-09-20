@@ -1063,6 +1063,50 @@
   `string`, so a lossy name carries U+FFFD and will not match a later `RemoveCertificate` — that
   now emits an `error!` carrying byte counts only, never the key. Locked by a poisoned-resolver
   test and a non-UTF-8 trie-key test (both seen red).
+- **`docs(lifecycle)`: the `file.rs:NNN` anchors in the module `LIFECYCLE.md` files had drifted,
+  and most of them never needed a line number.**
+  517 anchors across `bin/src/command/`, `lib/src/protocol/kawa_h1/`, `lib/src/protocol/mux/`,
+  `lib/src/protocol/proxy_protocol/` and `lib/src/protocol/udp/` were read against the code they
+  point at. 312 of them did not need a line number at all and are now symbol anchors; of the 205
+  that legitimately name a statement or a branch, 170 had to be renumbered and 35 were already
+  right. A line number has no anchor, so it rots the moment anyone edits above it — silently,
+  because nothing resolves it: a mechanical scan for a missing target, a line past EOF or a blank
+  line flagged only 27 of the 517. Two patterns account for nearly all of it, both named in #1335:
+  single-line anchors off by `+1`, from the `//!` module-doc line added at the top of each source
+  file after the documents were written, and ranges off by tens to thousands of lines, from the
+  TigerStyle `debug_assert!` campaign and the growth of `lib/src/protocol/mux/h2.rs` (drifts of
+  +1400 to +2165 there). A range that drifts that far does not mislead slightly: it lands the
+  reader in a different function.
+  The repair follows `lib/src/protocol/tcp_preread/LIFECYCLE.md`, which was already written this
+  way and is the reason it needed no repair. Where the prose names an item — a function, a method,
+  a struct, an enum — the anchor is now that item plus its file and carries no line number, so it
+  cannot drift; a method is qualified `Type::method` so it is greppable. A `file.rs:LINE` or
+  `file.rs:LINE-LINE` anchor survives only where the claim is about a specific statement or branch
+  inside an item, and every survivor was re-read against the code it points at. Bare basenames
+  that were ambiguous repo-wide (`server.rs`, `backends.rs`, `upgrade.rs`) are now
+  repo-root-relative, as are partial paths that resolved only from an intermediate directory
+  (`mux/auth.rs`, `udp/health.rs`, `tcp_preread/mod.rs`). Where such a statement can be named,
+  the name is used even though a line would be allowed: the `bind` / `connect` pair in
+  `udp_connect` and that function's doc comment are anchored by name, because a 13-line shift of
+  `udp_connect` moves both line anchors onto unrelated non-blank lines that a resolver accepts.
+  Three anchors were wrong the day they were written rather than drifted since:
+  `command/src/channel.rs:611` was blank when the document cited it and has since drifted onto
+  an unrelated `debug_assert_eq!` — the `usize`-prefixed framing it claims is
+  `Channel::write_delimited_message` — and `mod.rs:42` / `:44` in the UDP state-machine diagram
+  named `FlowPhase` variants while pointing at `FlowId` and `BackendId`, `FlowPhase` having only
+  ever lived in `flow.rs`. The two anchors that are blank in the tree today were
+  `lib/src/protocol/udp/mod.rs:39` and `:43`.
+  No prose claim was rewritten to match code. Two claims named a symbol that has never existed and
+  are re-anchored to the one that does: the supervisor event loop is `CommandHub::run`, not
+  `Server::run`, and `upgrade_main` lives in `bin/src/command/upgrade.rs`, not
+  `bin/src/upgrade.rs`. Six further claims have gone stale and are left for a separate pass,
+  anchored but untouched: the mux "inline removal" list, whose six sites now all call
+  `ConnectionH2::remove_dead_stream` and whose one remaining `self.streams.remove` is inside that
+  helper; `Context::unlink_stream` described as clearing `Stream::state`, which its callers do and
+  it does not; `ListenerAnswers` / `ClusterAnswers`, flattened into fields of `HttpAnswers`; the
+  H1 `Transfer-Encoding` guard, which gained a third reject condition; the `DefaultAnswer`
+  catalogue, documented as eight variants and now fourteen; and the `FlowPhase` diagram above.
+  `doc/` is untouched here, and its own anchors and the CI resolver of #1335 are separate work.
 
 ### 🔄 Changed
 
