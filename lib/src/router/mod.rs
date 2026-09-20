@@ -117,9 +117,12 @@ impl Router {
         path: &str,
         method: &Method,
     ) -> Result<RouteResult, RouterError> {
-        // The route table stores every hostname ASCII-lowercased
-        // (`add_tree_rule` and `DomainRule::from_str`, both via
-        // `idna::domain_to_ascii`), so the lookup key is normalised the
+        // The route table stores every hostname LABEL ASCII-lowercased
+        // (`add_tree_rule` via `tree_hostname_to_ascii`, and
+        // `DomainRule::from_str` via `idna::domain_to_ascii`; a regex
+        // segment keeps the operator's bytes on both paths and is
+        // compiled case-insensitively instead — see
+        // `tree_hostname_to_ascii`), so the lookup key is normalised the
         // same way — otherwise the byte-exact trie walk and the
         // byte-exact `Exact`/`Wildcard` comparisons below can never match
         // an uppercase `Host:` header. See [`normalize_hostname`] for why
@@ -367,8 +370,8 @@ impl Router {
             Ok(h) => h,
         };
 
-        match ::idna::domain_to_ascii(hostname) {
-            Ok(hostname) => {
+        match tree_hostname_to_ascii(hostname) {
+            Some(hostname) => {
                 //FIXME: necessary ti build on stable rust (1.35), can be removed once 1.36 is there
                 let mut empty = true;
                 if let Some((_, paths)) = self.tree.domain_lookup_mut(hostname.as_bytes(), false) {
@@ -448,7 +451,7 @@ impl Router {
 
                 false
             }
-            Err(_) => false,
+            None => false,
         }
     }
 
@@ -464,8 +467,8 @@ impl Router {
             Ok(h) => h,
         };
 
-        match ::idna::domain_to_ascii(hostname) {
-            Ok(hostname) => {
+        match tree_hostname_to_ascii(hostname) {
+            Some(hostname) => {
                 let should_delete = {
                     let paths_opt = self.tree.domain_lookup_mut(hostname.as_bytes(), false);
 
@@ -503,7 +506,7 @@ impl Router {
 
                 true
             }
-            Err(_) => false,
+            None => false,
         }
     }
 
@@ -792,7 +795,7 @@ impl Router {
         }
 
         // Check tree rules (exact match only, no wildcard resolution)
-        if let Ok(ascii_hostname) = ::idna::domain_to_ascii(hostname)
+        if let Some(ascii_hostname) = tree_hostname_to_ascii(hostname)
             && self
                 .tree
                 .domain_lookup(ascii_hostname.as_bytes(), false)
@@ -874,9 +877,12 @@ fn select_tree_rule<'a>(
 /// ASCII-lowercase a hostname for routing, borrowing it when it already is.
 ///
 /// RFC 9110 §4.2.3 makes the host case-insensitive, and every configured
-/// hostname is lowercased on the way into the route table:
-/// [`Router::add_tree_rule`] and [`DomainRule::from_str`] both run it
-/// through `idna::domain_to_ascii`. The lookup key has to be normalised
+/// hostname LABEL is lowercased on the way into the route table:
+/// [`Router::add_tree_rule`] runs it through [`tree_hostname_to_ascii`]
+/// and [`DomainRule::from_str`] through `idna::domain_to_ascii`. (A
+/// `/`-delimited regex segment is exempt on both paths and is folded at
+/// compile time instead; see [`tree_hostname_to_ascii`].) The lookup key
+/// has to be normalised
 /// the same way, or [`Router::lookup`]'s byte-exact trie walk and the
 /// byte-exact `DomainRule::Exact` / `DomainRule::Wildcard` comparisons
 /// can never match an uppercase `Host:` header — and no configuration
@@ -901,6 +907,101 @@ fn normalize_hostname(hostname: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(hostname)
     }
+}
+
+/// Normalise a `RulePosition::Tree` hostname for the route table,
+/// applying IDNA to its literal labels ONLY.
+///
+/// `idna::domain_to_ascii` ASCII-lowercases everything it is handed, and
+/// a tree hostname is not all domain labels: a `/`-delimited segment is
+/// regex SOURCE, where case is meaning. Folding it inverts every
+/// uppercase escape — measured, `"/\D+/.example.com"` normalises to
+/// `"/\d+/.example.com"` and `"/[^\D]/.example.com"` to
+/// `"/[^\d]/.example.com"`, turning "not a digit" into "a digit", so the
+/// installed rule matched the exact COMPLEMENT of what the operator
+/// wrote while `sozu query frontends` still echoed the original spelling
+/// (sozu#1377). `\W`/`\w` and `\S`/`\s` invert the same way.
+///
+/// The split is the one [`convert_regex_domain_rule`] already makes for
+/// `Pre`/`Post` and the one `pattern_trie`'s `insert_recursive`
+/// addresses a `regexps` entry by: a label the operator wrapped in
+/// slashes is a regex segment and is copied BYTE FOR BYTE, delimiters
+/// included; every other label is a domain label and goes through
+/// `idna::domain_to_ascii` exactly as before. Per-label and whole-domain
+/// IDNA agree on a label — measured, `"MÜNCHEN"` maps to
+/// `"xn--mnchen-3ya"` either way — so a genuine unicode label is still
+/// punycoded in the very same hostname whose regex segment is left
+/// alone.
+///
+/// Leaving the source unfolded means an uppercase LITERAL inside a
+/// segment (`/API[0-9]/`) no longer meets an ASCII-lowercased lookup key
+/// by accident. `pattern_trie`'s `compiled_segment` compiles the stored
+/// segment case-insensitively instead, which is what
+/// [`DomainRule::from_str`] already does for `Pre`/`Post`: the two
+/// positions now treat a hostname regex identically rather than by
+/// opposite mechanisms.
+///
+/// Two inputs deliberately keep the historical whole-string call, both
+/// byte-for-byte:
+///
+/// - a hostname with no `/` at all, which is every ordinary hostname —
+///   so the retained trailing dot pinned by
+///   `an_absolute_form_host_does_not_reach_a_relative_frontend_yet` and
+///   every other whole-string behaviour is untouched;
+/// - a hostname carrying a `/` that does NOT parse as this grammar, such
+///   as `abc/[0-9]+/.example.com` (a segment that is not `.`-anchored) or
+///   `example.com/`. Neither the split nor the trie sees a regex segment
+///   there — it is one literal label to both — so there is nothing to
+///   protect, and the trie accepts or rejects it exactly as it did
+///   before.
+fn tree_hostname_to_ascii(hostname: &str) -> Option<String> {
+    /// The `/…/`-aware walk. `None` means "not this grammar", never
+    /// "invalid": validating the segment is `anchored_segment`'s job at
+    /// insert time, and this function must not start rejecting hostnames
+    /// the trie has always answered for itself.
+    fn split_labels(hostname: &str) -> Option<String> {
+        let mut result = String::with_capacity(hostname.len());
+        let s = hostname.as_bytes();
+        let mut index = 0;
+
+        loop {
+            // A bare trailing `.` leaves `index` one past the end; the
+            // grammar requires a label after every `.`, so this is not
+            // the shape — fall back rather than index out of bounds.
+            if index >= s.len() {
+                return None;
+            }
+
+            if s[index] == b'/' {
+                let close = (index + 1..s.len()).find(|&i| s[i] == b'/')?;
+                // Regex source, copied verbatim. Both delimiters are
+                // ASCII `/`, so the slice is on char boundaries.
+                result.push_str(std::str::from_utf8(&s[index..=close]).ok()?);
+                index = close + 1;
+            } else {
+                let end = (index..s.len()).find(|&i| s[i] == b'.').unwrap_or(s.len());
+                let label = std::str::from_utf8(&s[index..end]).ok()?;
+                result.push_str(&::idna::domain_to_ascii(label).ok()?);
+                index = end;
+            }
+
+            if index == s.len() {
+                return Some(result);
+            }
+            if s[index] != b'.' {
+                return None;
+            }
+            result.push('.');
+            index += 1;
+        }
+    }
+
+    if hostname.contains('/')
+        && let Some(normalized) = split_labels(hostname)
+    {
+        return Some(normalized);
+    }
+    ::idna::domain_to_ascii(hostname).ok()
 }
 
 #[derive(Clone, Debug)]
@@ -1126,12 +1227,17 @@ impl std::str::FromStr for DomainRule {
                 // case-sensitively and match nothing at all — it used to
                 // match `API7.…` only, never the canonical `api7.…`.
                 //
-                // This is also the only reading that agrees with the
-                // trie: `RulePosition::Tree` runs the WHOLE hostname,
-                // regex source included, through `idna::domain_to_ascii`,
-                // so the same pattern has always been stored lowercase
-                // there. Set on the builder rather than by lowercasing
-                // the source, which would rewrite `\D` into `\d`.
+                // Set on the builder rather than by lowercasing the
+                // source, which would rewrite `\D` into `\d`. The trie
+                // does exactly the same since sozu#1377:
+                // `tree_hostname_to_ascii` leaves a segment's bytes alone
+                // and `pattern_trie::compiled_segment` folds at compile
+                // time, so the two rule positions now treat a hostname
+                // regex by the same mechanism. Up to and including 2.2.1
+                // `RulePosition::Tree` instead ran the WHOLE hostname,
+                // regex source included, through `idna::domain_to_ascii`
+                // — which is precisely the escape-inverting fold this
+                // comment refuses.
                 //
                 // The folding is the crate default, i.e. Unicode simple
                 // case folding, NOT ASCII-only: `.unicode(false)` is
@@ -6615,11 +6721,15 @@ mod tests {
 
     // ── RFC 9110 §4.2.3: the Host is case-insensitive ──────────────────
     //
-    // `add_tree_rule` and `DomainRule::from_str` both normalise a
-    // configured hostname through `idna::domain_to_ascii`, which ASCII-
-    // lowercases (measured: `"WWW.EXAMPLE.COM"` -> `"www.example.com"`,
-    // `"*.EXAMPLE.COM"` -> `"*.example.com"`, `"/API[0-9]/.example.com"`
-    // -> `"/api[0-9]/.example.com"`). `Router::lookup` used to walk the
+    // `add_tree_rule` (via `tree_hostname_to_ascii`) and
+    // `DomainRule::from_str` both normalise a configured hostname
+    // through `idna::domain_to_ascii`, which ASCII-lowercases (measured:
+    // `"WWW.EXAMPLE.COM"` -> `"www.example.com"`, `"*.EXAMPLE.COM"` ->
+    // `"*.example.com"`). A `/`-delimited regex segment is the one part
+    // that is NOT normalised — see `tree_hostname_to_ascii` and
+    // sozu#1377 — and is compiled case-insensitively instead, so an
+    // uppercase literal inside it still meets the normalised key.
+    // `Router::lookup` used to walk the
     // trie and the pre/post lists with the client's raw bytes, so the two
     // sides disagreed and no configuration could make an uppercase
     // `Host:` route. The tests below pin the restored invariant: add and
@@ -6693,13 +6803,17 @@ mod tests {
     }
 
     /// Wildcard and regex trie segments walk the same normalised key.
-    /// The regex segment is the interesting one: `add_tree_rule` runs the
-    /// WHOLE hostname — regex source included — through
-    /// `idna::domain_to_ascii`, so a stored segment is always lowercase
-    /// and can only ever meet a lowercased lookup key.
+    /// The regex segment is the interesting one: its source is stored
+    /// VERBATIM (`tree_hostname_to_ascii` normalises the literal labels
+    /// only, because folding the source inverted `\D` into `\d` —
+    /// sozu#1377), so an uppercase literal inside it meets the
+    /// lowercased lookup key only because
+    /// `pattern_trie::compiled_segment` compiles it case-insensitively.
     ///
     /// To SEE THIS RED: same mutation as
-    /// `an_uppercase_host_reaches_a_lowercase_tree_frontend`.
+    /// `an_uppercase_host_reaches_a_lowercase_tree_frontend`. Dropping
+    /// `.case_insensitive(true)` from `compiled_segment` reddens the
+    /// `API7` assertion alone, which is the half this test also guards.
     #[test]
     fn an_uppercase_host_reaches_wildcard_and_regex_tree_segments() {
         let mut router = Router::new();
@@ -6728,8 +6842,8 @@ mod tests {
         assert_eq!(
             resolve("API7.RX.EXAMPLE.COM").as_deref(),
             Some("REGEX"),
-            "the operator wrote `/API[0-9]/` but `domain_to_ascii` stored \
-             `/api[0-9]/`, so only a normalised key can match it",
+            "the operator's `/API[0-9]/` is stored verbatim and compiled \
+             case-insensitively, so the normalised key matches it",
         );
         assert_eq!(resolve("api7.rx.example.com").as_deref(), Some("REGEX"));
     }
@@ -6779,13 +6893,15 @@ mod tests {
     /// The interaction that makes normalising the lookup key dangerous on
     /// its own: a pre/post hostname REGEX keeps the operator's bytes —
     /// `convert_regex_domain_rule` copies the segment source verbatim,
-    /// unlike the trie, whose `domain_to_ascii` lowercases it. Matching a
+    /// as the trie now does too (`tree_hostname_to_ascii`, sozu#1377;
+    /// up to and including 2.2.1 `domain_to_ascii` lowercased it there).
+    /// Matching a
     /// normalised key against a case-sensitive `/API[0-9]/` would have
     /// turned a rule that used to match `API7.…` into one that matches
     /// nothing. `DomainRule::from_str` therefore compiles hostname
     /// regexes case-insensitively, which is also the only reading
-    /// that agrees with the trie: the same pattern in `RulePosition::Tree`
-    /// has always been lowercased at insert.
+    /// that agrees with the trie: `pattern_trie::compiled_segment`
+    /// folds the same way, on the same stored bytes.
     ///
     /// To SEE THIS RED: in `DomainRule::from_str`, drop the
     /// `.case_insensitive(true)` from the `RegexBuilder` and build with
@@ -7055,6 +7171,165 @@ mod tests {
                 .lookup("WWW.EXAMPLE.COM.", "/", &Method::Get)
                 .is_err(),
             "normalising the case must not accidentally close it either",
+        );
+    }
+
+    // ── sozu#1377: IDNA folding must not reach a regex segment ─────────
+    //
+    // `add_tree_rule`, `remove_tree_rule` and `has_hostname` used to run
+    // the WHOLE configured hostname through `idna::domain_to_ascii`,
+    // which ASCII-lowercases (measured: `"/\\D+/.example.com"` ->
+    // `"/\\d+/.example.com"`, `"/[^\\D]/.example.com"` ->
+    // `"/[^\\d]/.example.com"`, `"/API[0-9]/.rx.example.com"` ->
+    // `"/api[0-9]/.rx.example.com"`). Folding an uppercase regex escape
+    // INVERTS the character class it names -- `\D` is "not a digit",
+    // `\d` is "a digit"; `\W`/`\w` and `\S`/`\s` invert the same way --
+    // so the stored rule matched the exact COMPLEMENT of what the
+    // operator wrote while `sozu query frontends` still echoed the
+    // original spelling.
+    //
+    // `Pre`/`Post` never carried it: `convert_regex_domain_rule` copies a
+    // segment's source verbatim and `DomainRule::from_str` takes its case
+    // insensitivity from the `RegexBuilder` instead. The tree now agrees:
+    // `tree_hostname_to_ascii` normalises only the literal labels and
+    // `pattern_trie::compiled_segment` folds case at compile time.
+
+    /// To SEE THIS RED: in `tree_hostname_to_ascii`, replace the whole
+    /// body with `::idna::domain_to_ascii(hostname).ok()`, the form the
+    /// three call sites carried up to 2.2.1. Both assertions then fail
+    /// INVERTED -- `abc.rx.example.com` resolves to `None` and
+    /// `777.rx.example.com` to `Some("NOT-A-DIGIT")` -- which is the
+    /// defect itself: the rule matches the complement of its source --
+    /// `\D` matching a digit.
+    #[test]
+    fn a_tree_hostname_regex_escape_is_not_case_folded() {
+        let mut router = Router::new();
+        assert!(router.add_tree_rule(
+            "/\\D+/.rx.example.com".as_bytes(),
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(None),
+            &Route::ClusterId("NOT-A-DIGIT".to_owned()),
+        ));
+
+        let resolve = |hostname: &str| {
+            router
+                .lookup(hostname, "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+        };
+
+        assert_eq!(
+            resolve("777.rx.example.com"),
+            None,
+            "`\\D+` must NOT match a run of digits; folded to `\\d+` it matched \
+             exactly this and nothing else",
+        );
+        assert_eq!(
+            resolve("abc.rx.example.com").as_deref(),
+            Some("NOT-A-DIGIT"),
+            "`\\D+` is \"one or more non-digits\" and `abc` is three of them",
+        );
+    }
+
+    /// The negated-class spelling from the report, and the two other
+    /// uppercase escapes that invert: `\W` (not a word character) and
+    /// `\S` (not whitespace). `[^\D]` is "not a non-digit", i.e. a digit;
+    /// folded to `[^\d]` it becomes its own complement.
+    ///
+    /// To SEE THIS RED: same mutation as
+    /// `a_tree_hostname_regex_escape_is_not_case_folded`. Every
+    /// `matches` assertion below fails, each with its complement.
+    #[test]
+    fn every_inverting_uppercase_regex_escape_survives_a_tree_insert() {
+        // (segment source, a host label it must match, one it must not)
+        for (segment, hit, miss) in [
+            ("[^\\D]+", "777", "abc"),
+            ("\\W+", "---", "abc"),
+            ("\\S+", "abc", "   "),
+        ] {
+            let mut router = Router::new();
+            let hostname = format!("/{segment}/.rx.example.com");
+            assert!(
+                router.add_tree_rule(
+                    hostname.as_bytes(),
+                    &PathRule::Prefix("/".to_owned()),
+                    &MethodRule::new(None),
+                    &Route::ClusterId("ESCAPE".to_owned()),
+                ),
+                "{hostname} must install",
+            );
+
+            let resolve = |hostname: &str| {
+                router
+                    .lookup(hostname, "/", &Method::Get)
+                    .ok()
+                    .and_then(|result| result.cluster_id)
+            };
+
+            assert_eq!(
+                resolve(&format!("{hit}.rx.example.com")).as_deref(),
+                Some("ESCAPE"),
+                "{segment} must match {hit}",
+            );
+            assert_eq!(
+                resolve(&format!("{miss}.rx.example.com")),
+                None,
+                "{segment} must not match {miss}",
+            );
+        }
+    }
+
+    /// The other half of the split: a LITERAL label is still a domain
+    /// label and still goes through IDNA, in the very same hostname whose
+    /// regex segment is copied verbatim. Only a `/`-delimited segment is
+    /// exempt -- the same split `convert_regex_domain_rule` and the trie's
+    /// `insert_recursive` already make.
+    ///
+    /// `remove_tree_rule` normalises through the same helper, so the rule
+    /// stays addressable: a second spelling of the stored key would make
+    /// the frontend permanently un-removable.
+    ///
+    /// To SEE THIS RED: same mutation as
+    /// `a_tree_hostname_regex_escape_is_not_case_folded`. The first
+    /// assertion fails with `left: None, right: Some("IDN")` -- the
+    /// punycode is right, the folded `\d+` segment is what misses.
+    #[test]
+    fn a_unicode_label_is_punycoded_while_its_sibling_regex_segment_is_not() {
+        let hostname = "/\\D+/.MÜNCHEN.example.com";
+        let mut router = Router::new();
+        assert!(router.add_tree_rule(
+            hostname.as_bytes(),
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(None),
+            &Route::ClusterId("IDN".to_owned()),
+        ));
+
+        // `idna::domain_to_ascii("MÜNCHEN")` -> `"xn--mnchen-3ya"`
+        // (measured, and identical label-by-label and whole-domain).
+        assert_eq!(
+            router
+                .lookup("abc.xn--mnchen-3ya.example.com", "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+                .as_deref(),
+            Some("IDN"),
+            "the literal label must still be punycoded and lowercased",
+        );
+
+        assert!(
+            router.remove_tree_rule(
+                hostname.as_bytes(),
+                &PathRule::Prefix("/".to_owned()),
+                &MethodRule::new(None),
+            ),
+            "the frontend must still be addressable by the spelling that \
+             installed it",
+        );
+        assert!(
+            router
+                .lookup("abc.xn--mnchen-3ya.example.com", "/", &Method::Get)
+                .is_err(),
+            "and removing it must actually unroute it",
         );
     }
 }

@@ -1853,6 +1853,35 @@ The group is **non-capturing**, so it changes no `$HOST[n]` index: in
 `/cdn([0-9]+)/.example.com`, `$HOST[1]` is still the operator's own group
 (`42` for `cdn42.example.com`), and `$HOST[0]` is still the whole hostname.
 
+**Case inside a regex segment is preserved, and the segment is matched
+case-insensitively.** Only the literal labels of a hostname are IDN-normalised;
+the source between the slashes is stored byte for byte. So
+`/API[0-9]/.example.com` still routes `api7.example.com` (a host is
+case-insensitive, RFC 9110 §4.2.3, and the lookup key is lowercased), while
+`\D`, `\W` and `\S` keep meaning what the regex grammar says they mean —
+case-insensitivity does not reach a character-class escape. This is how `Pre`
+and `Post` rules have always treated a hostname regex; the trie now agrees.
+
+**Up to and including 2.2.1 it did not, and this changes existing rules**
+(sozu#1377). A trie-routed hostname — the default position — went through IDN
+normalisation *whole*, regex source included, and that ASCII-lowercases:
+`/\D+/.example.com` was stored as `/\d+/.example.com` and
+`/[^\D]/.example.com` as `/[^\d]/.example.com`. Lowercasing an uppercase escape
+**inverts the character class it names** — `\D` is "not a digit", `\d` is "a
+digit" — so the installed rule matched the exact **complement** of what was
+written. It was invisible from configuration: the frontend loads, `sozu query
+frontends` echoes the original spelling, and only the traffic disagrees. A
+frontend written `/\D+/.example.com` served `777.example.com` and not
+`abc.example.com`; after this change it serves `abc.example.com` and not
+`777.example.com`. `\W`/`\w` and `\S`/`\s` inverted the same way.
+
+Audit trie-routed hostnames carrying `\D`, `\W`, `\S` or `\B` before upgrading.
+A rule whose behaviour was tuned against the folded form — `/\D+/` chosen
+because it was observed to match digits — must be respelled with the lowercase
+escape it actually meant. A segment with no uppercase escape is unaffected, and
+an uppercase **literal** such as `/API[0-9]/` keeps matching exactly the hosts
+it matched before. `Pre` and `Post` frontends never carried the defect.
+
 A segment regex must occupy a complete segment. `abc/[0-9]+/.example.com` is
 rejected, because the regex does not start at a `.` boundary, as is a hostname
 with an empty label such as `.example.com` or `./test[0-9]/.example.com`. A

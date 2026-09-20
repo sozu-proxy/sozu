@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Debug, iter, str};
 
-use regex::bytes::Regex;
+use regex::bytes::{Regex, RegexBuilder};
 
 pub type Key = Vec<u8>;
 pub type KeyValue<K, V> = (K, V);
@@ -51,7 +51,9 @@ fn find_last_slash(input: &[u8]) -> Option<usize> {
 ///
 /// The same string is the identity of a `regexps` entry — the dedup scan in
 /// `insert_recursive`, `remove_recursive` and `lookup_mut` all compare
-/// `Regex::as_str()` against it — so every site must build it here.
+/// `Regex::as_str()` against it — so every site must build it here. The one
+/// site that also needs a compiled `Regex` goes through
+/// [`compiled_segment`], which wraps this function and does not respell it.
 ///
 /// `None` means "this segment is not a usable regex": insert fails, and
 /// remove/lookup find nothing, which is correct because insert never stored
@@ -68,6 +70,51 @@ fn anchored_segment(segment: &str) -> Option<String> {
          branch matches the whole segment only",
     );
     Some(anchored)
+}
+
+/// Compile the stored pattern for one regex hostname segment.
+///
+/// The pattern string comes from [`anchored_segment`] and from nowhere
+/// else: it is the identity a `regexps` entry is addressed by --
+/// `insert_recursive`, `remove_recursive` and `lookup_mut` all compare
+/// `Regex::as_str()` against it -- and `RegexBuilder` leaves `as_str()`
+/// as the pattern it was handed, so a stored segment stays addressable
+/// and removable.
+///
+/// Compiled CASE-INSENSITIVELY, for the same reason `DomainRule::from_str`
+/// is (`router/mod.rs`): a hostname is case-insensitive (RFC 9110 §4.2.3)
+/// and the keys reaching `domain_lookup` are ASCII-lowercased, while the
+/// segment source is no longer folded on the way in. `Router::add_tree_rule`
+/// used to hand the whole hostname to `idna::domain_to_ascii`, which folded
+/// `/API[0-9]/` to `/api[0-9]/` and made an uppercase literal match by
+/// accident -- and folded `\D` to `\d` in the same pass, inverting the
+/// class the operator wrote (sozu#1377). It now stops at the literal
+/// labels, and the fold happens here instead, where it reaches literals
+/// only: case insensitivity does not touch `\d`/`\D`, `\w`/`\W` or
+/// `\s`/`\S`.
+///
+/// The folding is the crate default, i.e. Unicode simple case folding and
+/// NOT ASCII-only -- `.unicode(false)` is deliberately left unset, exactly
+/// as in `DomainRule::from_str`, whose comment carries the measurement:
+/// it would reject `\p{L}` patterns that compile and route today.
+///
+/// The group `anchored_segment` supplies is non-capturing and the builder
+/// adds none, so `captures_len` -- and therefore every `$HOST[n]` rewrite
+/// index, read from `caps.iter().skip(1)` in `router/mod.rs`'s
+/// `RouteResult::new_with_trie` -- is unchanged.
+fn compiled_segment(segment: &str) -> Option<Regex> {
+    let anchored = anchored_segment(segment)?;
+    let compiled = RegexBuilder::new(&anchored)
+        .case_insensitive(true)
+        .build()
+        .ok()?;
+    debug_assert_eq!(
+        compiled.as_str(),
+        anchored,
+        "a `regexps` entry is addressed by `as_str()`, so the builder must \
+         not respell the pattern `anchored_segment` produced",
+    );
+    Some(compiled)
 }
 
 /// Implementation of a trie tree structure.
@@ -378,7 +425,7 @@ impl<V: Debug + Clone> TrieNode<V> {
                     // just failed to find, so the entry this opens is
                     // addressable by `remove_recursive` and `lookup_mut`,
                     // which rebuild it the same way.
-                    if let Ok(r) = Regex::new(&anchored_s) {
+                    if let Some(r) = compiled_segment(s) {
                         if pos > 0 {
                             let mut node = TrieNode::root();
                             let pos = pos - 1;
@@ -1376,6 +1423,87 @@ mod tests {
             rescued.is_match(b"ab"),
             "{} is what the missing pre-validation would have built",
             rescued.as_str(),
+        );
+    }
+
+    /// sozu#1377 moved the case folding of a tree hostname regex OFF the
+    /// source and ONTO the compile: `Router::add_tree_rule` no longer
+    /// hands the segment to `idna::domain_to_ascii` (which folded `\D`
+    /// into `\d` and inverted the class), and `compiled_segment` folds
+    /// here instead, where it reaches literals only.
+    ///
+    /// Three claims, and all three are load-bearing:
+    ///
+    /// - the builder must not RESPELL the pattern, because `as_str()` is
+    ///   the identity `insert_recursive`, `remove_recursive` and
+    ///   `lookup_mut` address a `regexps` entry by — a second spelling
+    ///   makes a stored segment un-removable;
+    /// - `captures_len` must be untouched, because `$HOST[n]` rewrite
+    ///   indices come from `caps.iter().skip(1)` with the buffer sized by
+    ///   `captures_len()` in `router/mod.rs`'s `RouteResult::new_with_trie`;
+    /// - the fold must reach literals and NOT escapes.
+    ///
+    /// To SEE THIS RED: drop `.case_insensitive(true)` from
+    /// `compiled_segment` — the `API[0-9]` assertion fails. Prepend
+    /// `(?i)` to the pattern handed to `RegexBuilder` instead of setting
+    /// the flag — the `as_str()` assertion fails with
+    /// `left: "(?i)\\A(?:cdn[0-9]+)\\z", right: "\\A(?:cdn[0-9]+)\\z"`.
+    /// Make `anchored_segment`'s wrapper capturing — the `captures_len`
+    /// assertions fail.
+    #[test]
+    fn compiled_segment_folds_case_without_respelling_its_identity() {
+        let anchored = anchored_segment("cdn[0-9]+").expect("the segment must wrap");
+        assert_eq!(
+            compiled_segment("cdn[0-9]+")
+                .expect("the segment must compile")
+                .as_str(),
+            anchored,
+            "the compiled entry must carry `anchored_segment`'s exact string",
+        );
+
+        assert_eq!(
+            compiled_segment("a|b|c")
+                .expect("an alternation must compile")
+                .captures_len(),
+            1,
+            "folding must not add a capture group",
+        );
+        assert_eq!(
+            compiled_segment("cdn([0-9]+)")
+                .expect("a group must compile")
+                .captures_len(),
+            2,
+            "the operator's own group must stay at index 1",
+        );
+
+        let uppercase = compiled_segment("API[0-9]").expect("the segment must compile");
+        assert!(
+            uppercase.is_match(b"api7"),
+            "an uppercase literal must meet the ASCII-lowercased lookup key",
+        );
+        assert!(uppercase.is_match(b"API7"), "and its own spelling too",);
+        assert!(
+            !uppercase.is_match(b"apix"),
+            "folding must not widen the class the operator wrote",
+        );
+
+        // Case insensitivity does not reach `\d`/`\D`, `\w`/`\W` or
+        // `\s`/`\S`: that inversion only ever came from folding the
+        // SOURCE, which is what sozu#1377 removed.
+        let not_a_digit = compiled_segment("\\D+").expect("the segment must compile");
+        assert!(not_a_digit.is_match(b"abc"), "`\\D+` matches non-digits");
+        assert!(
+            !not_a_digit.is_match(b"777"),
+            "`\\D+` must never match digits — folded to `\\d+` it matched \
+             exactly and only those",
+        );
+
+        // A segment that is not a regex on its own compiles to nothing,
+        // exactly as `anchored_segment` refuses it.
+        let unbalanced = format!("a{}b", ")(");
+        assert!(
+            compiled_segment(&unbalanced).is_none(),
+            "{unbalanced} must not be rescued into a live entry",
         );
     }
 
