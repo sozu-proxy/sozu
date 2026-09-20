@@ -4,6 +4,108 @@
 
 ### 🔐 Security
 
+- **`fix(router)`: anchor every branch of an alternation in a regex HOSTNAME segment.**
+  A regex hostname segment was anchored by concatenating `\A` and `\z` around the operator's
+  pattern without grouping it. `|` is the lowest-precedence regex operator, so `\Aa|b\z` parses as
+  `(\Aa)|(b\z)`: each branch kept **one** anchor only, which re-opens the substring match the
+  anchoring exists to prevent. With three or more branches the middle ones keep **neither** anchor
+  and match as a bare substring anywhere at all. Measured on the tree as it stood: the frontend
+  `/a|b/.example.com` served `axx.example.com` and `xxb.example.com`, and `/a|b|c/.example.com`
+  served `zzbzz.example.com` — a frontend written `/api|admin/.example.com` also served
+  `apifoo.example.com` and `xadmin.example.com`, neither of which the operator declared.
+  An operator had no way to notice: the frontend loads, `sozu query frontends` shows exactly what
+  was typed, and the extra hosts only appear if someone sends them.
+  **The literal-label arm of the same function carried the same defect and is closed with it.**
+  A label the operator did NOT wrap in slashes was pushed into the assembly verbatim, so
+  `/a/.x|y.com` assembled to `\A(?:a)\.x|y\.com\z` and matched `a.xZZZ` and `ZZZy.com`. A literal
+  label is a literal, so the treatment is `regex::escape`, not a group: grouping would confine the
+  alternation while leaving `+`, `?`, `*`, `^` and `$` live in the same arm, and `b+c` matching
+  `bbbc` is the same defect with a different operator. Escaping is a no-op in matching behaviour for
+  every label a real hostname can carry — an LDH label is `[A-Za-z0-9-]`, of which `regex::escape`
+  touches only `-`, and `\-` is `-` outside a character class; the parity is asserted rather than
+  argued. Two deliberate behaviour changes fall out for labels that are not valid hostname labels,
+  both narrowing and both measured. A literal `*` label was a quantifier over the preceding atom, so
+  `*./x/.example.com` assembled to `\A*\.(?:x)\.example\.com\z` whose `\A*` repeats a zero-width
+  assertion and matches empty at any offset: it accepted `evil.attacker.x.example.com`, and now
+  requires the literal label `*` — on `Pre`/`Post` only. The same `*` label on a trie-routed
+  frontend is untouched by any of this and remains the ordinary single-label wildcard, so one
+  configured hostname now behaves differently by position: `*./x/.example.com` takes
+  `zz.x.example.com` on the trie and does not on `Pre`/`Post`, while `*.x.example.com` routes on
+  both. `doc/configure.md` carries that table and
+  `a_star_label_is_a_wildcard_on_the_trie_and_a_literal_on_pre_and_post` asserts it, including the
+  `Pre`/`Post` remediation the section gives, `/[^.]*/./x/.example.com`.
+  And a literal label carrying an unbalanced `(` or `[` made the
+  assembly fail to compile so the frontend was REJECTED; it is now accepted and matches exactly the
+  host that was typed. Pinned by
+  `a_literal_hostname_label_is_escaped_and_cannot_become_a_pattern`.
+  Both hostname code paths carried it. `convert_regex_domain_rule` (`lib/src/router/mod.rs`)
+  assembles the whole-host regex a `Pre`/`Post` rule matches against, and pushed each
+  slash-delimited segment verbatim between one leading `\A` and one trailing `\z`; it now emits
+  `(?:` … `)` around each regex segment and passes each literal label through `regex::escape`.
+  `pattern_trie.rs` built `format!("\\A{s}\\z")` at every segment-insert site — the insert dedup
+  scan, the insert create path, `remove_recursive` and `lookup_mut` — which are now one
+  `anchored_segment` helper building `\A(?:{segment})\z`. That string is also the identity of a
+  `regexps` entry, compared via `Regex::as_str()`, so a second spelling would make a stored segment
+  un-removable; the helper is the single source of it. This is the hostname half of the wrapper
+  [#1357](https://github.com/sozu-proxy/sozu/pull/1357) landed for `path_type = "REGEX"`, whose
+  shape and measurements it mirrors.
+  **This narrows existing rules** (sozu#1356). An operator relying on the leaked hosts must write
+  the wildcards out — `/api|admin/` becomes `/api.*|.*admin/`, measured to match all four hosts
+  again. Audit alternating hostname segments before upgrading; a segment with no `|` is unaffected.
+  Two properties of the wrapping were measured rather than reasoned about, and both are pinned by
+  tests. The group is **non-capturing**, so `captures_len` and therefore every `$HOST[n]` rewrite
+  index are unchanged — in `/cdn([0-9]+)/.example.com`, `$HOST[1]` is still the operator's own
+  group (`42` for `cdn42.example.com`) and `$HOST[2]` is still refused at registration as
+  `RouterError::InvalidHostRewrite`. A capturing wrapper would shift every index by one and
+  silently rewrite traffic to the wrong target: measured, `$HOST[1]` then resolves to `cdn42`
+  instead of `42`, on both hostname paths. And each segment is compiled ON ITS OWN before being
+  wrapped, because the wrapper supplies one `(` and one `)` and can therefore balance an unbalanced
+  segment: `a)(b` is rejected by `Regex::new`, yet `\A(?:a)(b)\.example\.com\z` compiles and
+  matches `ab.example.com`. `/a)(b/.example.com` is therefore refused by
+  `convert_regex_domain_rule`, by `DomainRule::from_str` and by `add_tree_rule` alike. That guard
+  closes invalid-becomes-valid only; the opposite direction is real and is not claimed to be
+  closed, exactly as on the path side — such a hostname is refused as `RouterError::InvalidDomain`
+  at frontend registration, a loud rejection rather than a mis-route.
+  **One existing test had its meaning inverted by this change, deliberately and in the open.**
+  `an_alternating_regex_hostname_segment_is_still_anchored_at_one_end_only` pinned the defect and
+  asked, in its own comment, to be inverted rather than deleted when the fix landed. It is now
+  `an_alternating_regex_hostname_segment_is_anchored_on_every_branch`, extended to the three-branch
+  case: with exactly two branches "first and last" is every branch there is, so a two-branch
+  alternation cannot express the claim, while three branches have a middle one that ungrouped keeps
+  no anchor at all. The old name is cited in the new test's comment so the behaviour change leaves
+  a trace. `every_branch_of_an_alternating_regex_hostname_rule_is_anchored` covers the pre/post
+  path, `every_branch_of_an_alternating_segment_regex_matches_the_whole_label_only` and
+  `anchored_segment_wraps_in_a_non_capturing_group` the trie,
+  `a_host_capture_rewrite_resolves_to_the_operators_own_group` the capture indices on all three
+  positions, and `grouping_never_turns_a_rejected_hostname_regex_into_an_accepted_one` the
+  pre-validation. `doc/configure.md`'s "Regex hostname segments" section, which promised the
+  segment "matches that whole segment and nothing else", is corrected in the same changeset, and
+  now also names a pre-existing trap the remediation itself walks operators into: a `.*` inside a
+  segment does not stop at the label boundary, and where it stops depends on the rule position. A
+  trie rule matches each segment against one label, so `/api.*|.*admin/.example.com` there takes
+  `apifoo.example.com` and neither `api.foo.example.com` nor `zz.admin.example.com`; a `Pre`/`Post`
+  rule is matched by one whole-host pattern in which `.` matches the separator, so the same rule
+  also takes both of those subdomains. The section now recommends `[^.]*` on `Pre`/`Post`, and
+  `a_wildcard_in_a_hostname_segment_crosses_labels_on_pre_and_post_only` pins all three
+  measurements.
+  **The SNI route-selection path carried the same defect and is fixed with it.**
+  `lib/src/protocol/tcp_preread` resolves the ClientHello SNI against this very trie
+  (`domain_lookup`), and its `cfg.routes` are operator-configured, so an SNI route can carry a regex
+  segment: before this change a route `/a|b|c/.example.com` accepted the SNI `zzbzz.example.com`.
+  Pinned by `an_alternating_regex_route_segment_matches_the_whole_sni_label_only`.
+  `lib/src/tls.rs`'s certificate resolver uses the same `TrieNode` type, but its keys are
+  certificate SAN names (`tls.rs:330` and `:374` insert `name.to_owned().into_bytes()`) and a DNS
+  SAN cannot contain a `/`, so its `regexps` arm is unreachable in practice — same code, no
+  operator-reachable exposure, and no test is claimed for it.
+  One pre-existing defect had to be fixed to add that SNI test, and it is its own finding.
+  `tcp_preread`'s `decide` carried a `debug_assert!` requiring `matched_sni_pattern` to be either
+  the SNI itself or a `*.` wildcard the SNI falls under. `TrieNode::domain_lookup` returns a THIRD
+  shape — a key carrying `/regex/` segments — which the assertion did not admit, so a debug build
+  panicked the moment any regex-segment SNI route first matched, though routing itself was correct.
+  The assertion now admits that shape by checking the literal tail after the rightmost `/`; the
+  segments themselves are not re-derived, because the trie has already matched them and re-running
+  the grammar inside a debug assertion on the pre-read path would cost more than it proves.
+
 - **`fix(proxy-protocol)`: forward the PROXY-v2 header a `RelayHeader` cluster was never sending.**
   `RelayProxyProtocol::readable` consumed every byte it had just read — the header included —
   before `back_writable` had forwarded any of it
@@ -845,7 +947,8 @@
   operators expect, so a minor break now is cheaper than a permanently false documented guarantee.
   The configured value is now wrapped as `\A(?:…)\z`, the same both-ends anchoring regex HOSTNAME
   segments have carried since v2.0.0 (`convert_regex_domain_rule`, and `pattern_trie.rs`'s
-  `format!("\\A{s}\\z")` at segment-insert time).
+  segment-insert wrapper). The hostname sites wrapped ungrouped when this landed and were closed
+  separately in this same release — see the `fix(router)` alternation entry under 🔐 Security.
   **An operator relying on substring matching must add `.*` to their patterns**, on the side the
   pattern is open on: `bc` becomes `.*bc.*`, a prefix-shaped `/api` becomes `/api.*` — or
   `path_type = "PREFIX"`, which is what that second case is for.

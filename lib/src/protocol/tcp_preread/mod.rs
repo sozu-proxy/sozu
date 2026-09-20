@@ -465,8 +465,14 @@ impl SniPrereadCore {
         // Pair (positive + negative space): a latched SNI is always already
         // normalized -- lowercase, no trailing dot -- because `route` never
         // stores the raw wire-form SNI. The matched pattern is the trie KEY
-        // (lowercased at insert): either the concrete SNI itself (exact
-        // route) or a `*.`-prefixed wildcard whose suffix the SNI ends with.
+        // (lowercased at insert), and `TrieNode::domain_lookup` can return
+        // THREE shapes, not two: the concrete SNI itself (exact route), a
+        // `*.`-prefixed wildcard whose suffix the SNI ends with, and a key
+        // carrying one or more `/regex/` segments. The third was missing
+        // here, so any operator-configured SNI route with a regex segment
+        // -- `/a|b|c/.example.com` -- panicked this assertion on a debug
+        // build the first time it matched, even though routing itself was
+        // correct.
         if let Some(Output::Routed {
             sni,
             matched_sni_pattern,
@@ -491,8 +497,21 @@ impl SniPrereadCore {
                 matched_sni_pattern == sni
                     || matched_sni_pattern
                         .strip_prefix("*.")
-                        .is_some_and(|suffix| sni.ends_with(suffix)),
-                "matched_sni_pattern must be the SNI itself (exact route) or a wildcard the SNI falls under"
+                        .is_some_and(|suffix| sni.ends_with(suffix))
+                    // A `/regex/` segment route. What is checked is the
+                    // LITERAL tail after the last `/`: the trie matches
+                    // right to left, so everything past the closing
+                    // delimiter of the rightmost segment is literal and the
+                    // SNI must end with it. The segments themselves are NOT
+                    // re-derived -- the trie has already matched them, and
+                    // re-running the grammar (and compiling a regex) inside
+                    // a debug assertion on the pre-read path would cost more
+                    // than it proves.
+                    || matched_sni_pattern
+                        .rfind('/')
+                        .is_some_and(|close| sni.ends_with(&matched_sni_pattern[close + 1..])),
+                "matched_sni_pattern must be the SNI itself (exact route), a wildcard the SNI \
+                 falls under, or a `/regex/` segment route whose literal tail the SNI ends with"
             );
         }
     }
@@ -872,6 +891,60 @@ mod tests {
             feed(&mut core, &cfg, &wire),
             Output::Reject(RejectReason::SniUnmatched)
         );
+    }
+
+    /// SNI routing resolves against the same `TrieNode` the HTTP/HTTPS
+    /// router uses, so a regex hostname segment reaches TLS pre-read route
+    /// selection too — and the ungrouped `\A{s}\z` wrapper this trie carried
+    /// up to 2.2.1 left every alternation branch anchored at one end only
+    /// (sozu#1356). This is the SNI surface of that defect: `cfg.routes` is
+    /// operator-configured, so a route CAN carry a regex segment, unlike
+    /// `lib/src/tls.rs`'s certificate trie, whose keys are SAN names and
+    /// cannot contain a `/`.
+    ///
+    /// Three branches, because two cannot express the claim: with exactly
+    /// two, "first and last" is every branch there is. Ungrouped, the middle
+    /// branch keeps NEITHER anchor and matches as a bare substring anywhere
+    /// in the label.
+    ///
+    /// To SEE THIS RED: build `format!("\\A{segment}\\z")` in
+    /// `router::pattern_trie`'s `anchored_segment` and relax the
+    /// `debug_assert!` beside it. The first leak row is then `Routed` and the
+    /// assertion fails with `expected SniUnmatched for axx.example.com, got
+    /// Routed { cluster: "cluster-alt", …, matched_sni_pattern:
+    /// "/a|b|c/.example.com", … }`.
+    #[test]
+    fn an_alternating_regex_route_segment_matches_the_whole_sni_label_only() {
+        let mut routes = TrieNode::root();
+        routes.domain_insert(
+            b"/a|b|c/.example.com".to_vec(),
+            vec![(AlpnMatcher::Any, "cluster-alt".to_owned())],
+        );
+        let cfg = cfg(&routes);
+
+        for whole in ["a.example.com", "b.example.com", "c.example.com"] {
+            let mut core = SniPrereadCore::new();
+            match feed(&mut core, &cfg, &hello_no_alpn(whole)) {
+                Output::Routed { cluster, .. } => assert_eq!(cluster, "cluster-alt"),
+                other => panic!("expected Routed for {whole}, got {other:?}"),
+            }
+        }
+
+        for leak in [
+            "axx.example.com",
+            "xxc.example.com",
+            "zzbzz.example.com",
+            "bzz.example.com",
+            "zzb.example.com",
+        ] {
+            let mut core = SniPrereadCore::new();
+            let out = feed(&mut core, &cfg, &hello_no_alpn(leak));
+            assert_eq!(
+                out,
+                Output::Reject(RejectReason::SniUnmatched),
+                "expected SniUnmatched for {leak}, got {out:?}",
+            );
+        }
     }
 
     #[test]
