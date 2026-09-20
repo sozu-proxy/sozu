@@ -1,6 +1,7 @@
 pub mod pattern_trie;
 
 use std::{
+    borrow::Cow,
     fmt::{self, Debug, Write},
     rc::Rc,
     str::from_utf8,
@@ -116,7 +117,24 @@ impl Router {
         path: &str,
         method: &Method,
     ) -> Result<RouteResult, RouterError> {
-        let hostname_b = hostname.as_bytes();
+        // The route table stores every hostname ASCII-lowercased
+        // (`add_tree_rule` and `DomainRule::from_str`, both via
+        // `idna::domain_to_ascii`), so the lookup key is normalised the
+        // same way — otherwise the byte-exact trie walk and the
+        // byte-exact `Exact`/`Wildcard` comparisons below can never match
+        // an uppercase `Host:` header. See [`normalize_hostname`] for why
+        // this is a scan and not an allocation on the common path.
+        //
+        // The captures handed to `RouteResult` are taken from this
+        // normalised key, so `$HOST[n]` rewrite templates see the
+        // normalised host; the raw bytes the client sent stay on
+        // `HttpContext.authority`, which feeds the access log,
+        // `X-Forwarded-Host` and the redirect `Location:` and is not
+        // touched here. `RouteNotFound` below deliberately reports the
+        // ORIGINAL spelling, because that is the diagnostic an operator
+        // needs.
+        let normalized_hostname = normalize_hostname(hostname);
+        let hostname_b = normalized_hostname.as_bytes();
         let path_b = path.as_bytes();
         for (domain_rule, path_rule, method_rule, route) in &self.pre {
             if domain_rule.matches(hostname_b)
@@ -757,6 +775,13 @@ impl Router {
     /// This is used after removing a frontend to decide whether the hostname's
     /// tags should be cleaned up. Tags must only be removed when no routes remain.
     pub fn has_hostname(&self, hostname: &str) -> bool {
+        // Same normalisation as `lookup`, for the same reason: the
+        // pre/post arms compare byte-exact against `DomainRule`s the add
+        // path already lowercased. Answering `false` for a hostname whose
+        // route is still installed would drop the frontend's cached tags
+        // from under a live route.
+        let normalized_hostname = normalize_hostname(hostname);
+        let hostname = normalized_hostname.as_ref();
         let hostname_b = hostname.as_bytes();
 
         // Check pre rules
@@ -846,16 +871,58 @@ fn select_tree_rule<'a>(
     matched
 }
 
+/// ASCII-lowercase a hostname for routing, borrowing it when it already is.
+///
+/// RFC 9110 §4.2.3 makes the host case-insensitive, and every configured
+/// hostname is lowercased on the way into the route table:
+/// [`Router::add_tree_rule`] and [`DomainRule::from_str`] both run it
+/// through `idna::domain_to_ascii`. The lookup key has to be normalised
+/// the same way, or [`Router::lookup`]'s byte-exact trie walk and the
+/// byte-exact `DomainRule::Exact` / `DomainRule::Wildcard` comparisons
+/// can never match an uppercase `Host:` header — and no configuration
+/// fixes it, because declaring the frontend in uppercase gets lowercased
+/// too.
+///
+/// The scan is the whole cost on the common path: a host that is already
+/// lowercase — every host a conforming client sends — is borrowed, so
+/// the datapath allocates only for the requests that actually carry
+/// uppercase. This runs once per request, so the distinction is not
+/// academic.
+///
+/// Deliberately ASCII-only and deliberately NOT a full
+/// `idna::domain_to_ascii` round trip: `hostname_and_port`
+/// (`lib/src/protocol/kawa_h1/parser.rs`) only admits bytes matching
+/// `is_hostname_char`, all of which are ASCII, so there is no non-ASCII
+/// host to punycode here, and a per-request IDNA pass would be a real
+/// datapath cost for a case that cannot occur.
+fn normalize_hostname(hostname: &str) -> Cow<'_, str> {
+    if hostname.as_bytes().iter().any(u8::is_ascii_uppercase) {
+        Cow::Owned(hostname.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(hostname)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum DomainRule {
     Any,
     Exact(String),
     /// Matches when `hostname` ends with `s[1..]` (the wildcard pattern with
     /// the leading `*` stripped) and the remaining leftmost prefix is
-    /// non-empty and contains no `.`. Comparison is byte-exact and
-    /// case-sensitive; no IDN/punycode normalisation is performed here.
-    /// Stored with the leading `*`.
+    /// non-empty and contains no `.`. Comparison is byte-exact and no
+    /// IDN/punycode normalisation is performed here: the pattern was
+    /// already lowercased by [`DomainRule::from_str`]'s
+    /// `idna::domain_to_ascii`, and the hostname it is handed has been
+    /// through [`normalize_hostname`] in [`Router::lookup`], so both
+    /// sides are ASCII-lowercase by the time they meet. Stored with the
+    /// leading `*`.
     Wildcard(String),
+    /// Anchored full-host regex built by [`convert_regex_domain_rule`].
+    /// Unlike the other variants its source is NOT lowercased — it is
+    /// compiled case-insensitively instead, so an uppercase literal
+    /// still matches the normalised key. See [`DomainRule::from_str`]
+    /// for why that folding is Unicode-aware while the hostnames it is
+    /// ever handed are ASCII.
     Regex(Regex),
 }
 
@@ -1052,7 +1119,45 @@ impl std::str::FromStr for DomainRule {
             DomainRule::Any
         } else if s.contains('/') {
             match convert_regex_domain_rule(s) {
-                Some(s) => match regex::bytes::Regex::new(&s) {
+                // Case-insensitive, because `Router::lookup`
+                // normalises the host it matches against and a hostname
+                // is case-insensitive anyway (RFC 9110 §4.2.3). Without
+                // it an operator's `/API[0-9]/` would compile
+                // case-sensitively and match nothing at all — it used to
+                // match `API7.…` only, never the canonical `api7.…`.
+                //
+                // This is also the only reading that agrees with the
+                // trie: `RulePosition::Tree` runs the WHOLE hostname,
+                // regex source included, through `idna::domain_to_ascii`,
+                // so the same pattern has always been stored lowercase
+                // there. Set on the builder rather than by lowercasing
+                // the source, which would rewrite `\D` into `\d`.
+                //
+                // The folding is the crate default, i.e. Unicode simple
+                // case folding, NOT ASCII-only: `.unicode(false)` is
+                // deliberately left unset. It would make the fold
+                // ASCII-only, but it also rejects patterns that compile
+                // and work today — measured, `\p{L}` and `\pL` fail to
+                // build with it, so `/\p{L}+/.example.com`, which
+                // matches ASCII letters perfectly well right now, would
+                // start being refused at add time — pinned by
+                // `a_unicode_class_hostname_regex_still_compiles_and_routes`.
+                // The distinction is
+                // unobservable on the haystack side regardless: the only
+                // hostnames that reach `matches` come through
+                // `hostname_and_port`
+                // (`lib/src/protocol/kawa_h1/parser.rs`), whose
+                // `is_hostname_char` admits nothing outside ASCII, and
+                // whose own `if !i.is_empty()` guard then refuses the
+                // whole authority rather than truncating it — see
+                // `is_hostname_char_admits_only_ascii`. It IS observable
+                // on the PATTERN side: a pattern spelling `\u{212A}`
+                // folds onto `k`. Hence "case-insensitive" here, not
+                // "ASCII-case-insensitive".
+                Some(s) => match regex::bytes::RegexBuilder::new(&s)
+                    .case_insensitive(true)
+                    .build()
+                {
                     Ok(r) => DomainRule::Regex(r),
                     Err(_) => return Err(()),
                 },
@@ -6505,6 +6610,451 @@ mod tests {
                 .lookup("example.com", "/exact", &Method::Get)
                 .is_err(),
             "the Equals frontend must no longer resolve once removed",
+        );
+    }
+
+    // ── RFC 9110 §4.2.3: the Host is case-insensitive ──────────────────
+    //
+    // `add_tree_rule` and `DomainRule::from_str` both normalise a
+    // configured hostname through `idna::domain_to_ascii`, which ASCII-
+    // lowercases (measured: `"WWW.EXAMPLE.COM"` -> `"www.example.com"`,
+    // `"*.EXAMPLE.COM"` -> `"*.example.com"`, `"/API[0-9]/.example.com"`
+    // -> `"/api[0-9]/.example.com"`). `Router::lookup` used to walk the
+    // trie and the pre/post lists with the client's raw bytes, so the two
+    // sides disagreed and no configuration could make an uppercase
+    // `Host:` route. The tests below pin the restored invariant: add and
+    // lookup normalise identically.
+
+    /// To SEE THIS RED: in `Router::lookup`, replace
+    /// `let normalized_hostname = normalize_hostname(hostname);` with
+    /// `let normalized_hostname = Cow::Borrowed(hostname);`. Every
+    /// uppercase and mixed-case assertion below then fails with
+    /// `left: None, right: Some("CASE")` — the byte-exact trie walk the
+    /// fix removed.
+    #[test]
+    fn an_uppercase_host_reaches_a_lowercase_tree_frontend() {
+        let mut router = Router::new();
+        assert!(router.add_tree_rule(
+            b"www.example.com",
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(Some("GET".to_owned())),
+            &Route::ClusterId("CASE".to_owned()),
+        ));
+
+        let resolve = |hostname: &str| {
+            router
+                .lookup(hostname, "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+        };
+
+        for host in [
+            "www.example.com",
+            "WWW.EXAMPLE.COM",
+            "WwW.ExAmPlE.cOm",
+            "www.EXAMPLE.com",
+        ] {
+            assert_eq!(
+                resolve(host).as_deref(),
+                Some("CASE"),
+                "Host {host:?} names the same frontend as its lowercase form",
+            );
+        }
+    }
+
+    /// The other half of the issue: declaring the frontend in uppercase
+    /// never was a workaround, because the add path lowercases it on the
+    /// way in. Both spellings of the frontend must route both spellings
+    /// of the Host.
+    ///
+    /// To SEE THIS RED: same mutation as
+    /// `an_uppercase_host_reaches_a_lowercase_tree_frontend`.
+    #[test]
+    fn an_uppercase_tree_frontend_is_stored_and_looked_up_lowercase() {
+        let mut router = Router::new();
+        assert!(router.add_tree_rule(
+            b"WWW.EXAMPLE.COM",
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(Some("GET".to_owned())),
+            &Route::ClusterId("CASE".to_owned()),
+        ));
+
+        for host in ["www.example.com", "WWW.EXAMPLE.COM"] {
+            assert_eq!(
+                router
+                    .lookup(host, "/", &Method::Get)
+                    .ok()
+                    .and_then(|result| result.cluster_id)
+                    .as_deref(),
+                Some("CASE"),
+                "an uppercase frontend is stored lowercase, so {host:?} must resolve",
+            );
+        }
+    }
+
+    /// Wildcard and regex trie segments walk the same normalised key.
+    /// The regex segment is the interesting one: `add_tree_rule` runs the
+    /// WHOLE hostname — regex source included — through
+    /// `idna::domain_to_ascii`, so a stored segment is always lowercase
+    /// and can only ever meet a lowercased lookup key.
+    ///
+    /// To SEE THIS RED: same mutation as
+    /// `an_uppercase_host_reaches_a_lowercase_tree_frontend`.
+    #[test]
+    fn an_uppercase_host_reaches_wildcard_and_regex_tree_segments() {
+        let mut router = Router::new();
+        assert!(router.add_tree_rule(
+            b"*.wild.example.com",
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(Some("GET".to_owned())),
+            &Route::ClusterId("WILDCARD".to_owned()),
+        ));
+        assert!(router.add_tree_rule(
+            b"/API[0-9]/.rx.example.com",
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(Some("GET".to_owned())),
+            &Route::ClusterId("REGEX".to_owned()),
+        ));
+
+        let resolve = |hostname: &str| {
+            router
+                .lookup(hostname, "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+        };
+
+        assert_eq!(resolve("FOO.WILD.EXAMPLE.COM").as_deref(), Some("WILDCARD"));
+        assert_eq!(resolve("FoO.wild.EXAMPLE.com").as_deref(), Some("WILDCARD"));
+        assert_eq!(
+            resolve("API7.RX.EXAMPLE.COM").as_deref(),
+            Some("REGEX"),
+            "the operator wrote `/API[0-9]/` but `domain_to_ascii` stored \
+             `/api[0-9]/`, so only a normalised key can match it",
+        );
+        assert_eq!(resolve("api7.rx.example.com").as_deref(), Some("REGEX"));
+    }
+
+    /// Pre and post rules carry a `DomainRule` rather than a trie node.
+    /// `Exact` and `Wildcard` are lowercased by `DomainRule::from_str`
+    /// (again `idna::domain_to_ascii`) and compared byte-exact, so they
+    /// had exactly the tree's asymmetry.
+    ///
+    /// To SEE THIS RED: same mutation as
+    /// `an_uppercase_host_reaches_a_lowercase_tree_frontend`.
+    #[test]
+    fn an_uppercase_host_reaches_exact_and_wildcard_pre_post_rules() {
+        let mut router = Router::new();
+        let exact = "pre.example.com"
+            .parse::<DomainRule>()
+            .expect("an exact domain rule must parse");
+        let wildcard = "*.post.example.com"
+            .parse::<DomainRule>()
+            .expect("a wildcard domain rule must parse");
+        assert!(router.add_pre_rule(
+            &exact,
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(None),
+            &Route::ClusterId("PRE".to_owned()),
+        ));
+        assert!(router.add_post_rule(
+            &wildcard,
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(None),
+            &Route::ClusterId("POST".to_owned()),
+        ));
+
+        let resolve = |hostname: &str| {
+            router
+                .lookup(hostname, "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+        };
+
+        assert_eq!(resolve("PRE.EXAMPLE.COM").as_deref(), Some("PRE"));
+        assert_eq!(resolve("PrE.ExAmPlE.cOm").as_deref(), Some("PRE"));
+        assert_eq!(resolve("FOO.POST.EXAMPLE.COM").as_deref(), Some("POST"));
+        assert_eq!(resolve("foo.post.example.com").as_deref(), Some("POST"));
+    }
+
+    /// The interaction that makes normalising the lookup key dangerous on
+    /// its own: a pre/post hostname REGEX keeps the operator's bytes —
+    /// `convert_regex_domain_rule` copies the segment source verbatim,
+    /// unlike the trie, whose `domain_to_ascii` lowercases it. Matching a
+    /// normalised key against a case-sensitive `/API[0-9]/` would have
+    /// turned a rule that used to match `API7.…` into one that matches
+    /// nothing. `DomainRule::from_str` therefore compiles hostname
+    /// regexes case-insensitively, which is also the only reading
+    /// that agrees with the trie: the same pattern in `RulePosition::Tree`
+    /// has always been lowercased at insert.
+    ///
+    /// To SEE THIS RED: in `DomainRule::from_str`, drop the
+    /// `.case_insensitive(true)` from the `RegexBuilder` and build with
+    /// `regex::bytes::Regex::new(&s)` again. Both assertions below fail
+    /// with `left: None, right: Some("RX")`.
+    #[test]
+    fn an_uppercase_pre_rule_hostname_regex_still_matches_its_own_host() {
+        let mut router = Router::new();
+        let uppercase_regex = "/API[0-9]/.example.com"
+            .parse::<DomainRule>()
+            .expect("an uppercase hostname regex must parse");
+        assert!(router.add_pre_rule(
+            &uppercase_regex,
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(None),
+            &Route::ClusterId("RX".to_owned()),
+        ));
+
+        let resolve = |hostname: &str| {
+            router
+                .lookup(hostname, "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+        };
+
+        assert_eq!(
+            resolve("API7.example.com").as_deref(),
+            Some("RX"),
+            "the spelling the operator wrote must keep routing",
+        );
+        assert_eq!(
+            resolve("api7.example.com").as_deref(),
+            Some("RX"),
+            "and its canonical lowercase form, which never routed before",
+        );
+    }
+
+    /// The regression guard for the `.unicode(false)` that
+    /// [`DomainRule::from_str`] deliberately does NOT set. Setting it
+    /// would make the case folding ASCII-only — which is what the
+    /// hostnames ever reaching `matches` are anyway — but it also
+    /// refuses Unicode-class syntax at compile time, and `\p{L}` matches
+    /// ASCII letters perfectly well, so a frontend that installs and
+    /// routes today would start being rejected at add time.
+    ///
+    /// To SEE THIS RED: add `.unicode(false)` to the `RegexBuilder` in
+    /// `DomainRule::from_str`. The parse fails and the `expect` fires.
+    #[test]
+    fn a_unicode_class_hostname_regex_still_compiles_and_routes() {
+        let mut router = Router::new();
+        let unicode_class = "/\\p{L}+[0-9]/.example.com"
+            .parse::<DomainRule>()
+            .expect("a hostname regex using a Unicode class must still compile");
+        assert!(router.add_pre_rule(
+            &unicode_class,
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(None),
+            &Route::ClusterId("UNICODE".to_owned()),
+        ));
+
+        let resolve = |hostname: &str| {
+            router
+                .lookup(hostname, "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+        };
+
+        assert_eq!(
+            resolve("api7.example.com").as_deref(),
+            Some("UNICODE"),
+            "a Unicode letter class covers ASCII letters, so this rule is live, not decorative",
+        );
+        assert_eq!(
+            resolve("API7.example.com").as_deref(),
+            Some("UNICODE"),
+            "and it stays live for the uppercase spelling of the same host",
+        );
+    }
+
+    /// Normalisation and the hostname precedence order of sozu#1351
+    /// compose in one direction only: the key is normalised first, then
+    /// the most-specific-first search runs on it, so case never decides
+    /// WHICH candidate wins. Stated in `doc/configure.md` under
+    /// "Hostname case", so it needs an assertion.
+    ///
+    /// The shape is the one the precedence section uses: an exact name
+    /// and a regex segment that also claims it. The exact frontend must
+    /// win for both spellings — a normalisation applied anywhere after
+    /// the candidate search would let the uppercase spelling miss the
+    /// exact node and fall through to the regex family.
+    ///
+    /// To SEE THIS RED: in `Router::lookup`, replace
+    /// `let normalized_hostname = normalize_hostname(hostname);` with
+    /// `let normalized_hostname = Cow::Borrowed(hostname);`. The
+    /// uppercase spelling stops resolving at all.
+    #[test]
+    fn case_normalisation_runs_before_the_hostname_precedence_search() {
+        let mut router = Router::new();
+        assert!(router.add_tree_rule(
+            b"test4.example.com",
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(Some("GET".to_owned())),
+            &Route::ClusterId("EXACT".to_owned()),
+        ));
+        assert!(router.add_tree_rule(
+            b"/test[0-9]/.example.com",
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(Some("GET".to_owned())),
+            &Route::ClusterId("REGEX-FAMILY".to_owned()),
+        ));
+
+        let resolve = |hostname: &str| {
+            router
+                .lookup(hostname, "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id)
+        };
+
+        assert_eq!(
+            resolve("test4.example.com").as_deref(),
+            Some("EXACT"),
+            "the exact name outranks a regex segment that also claims it",
+        );
+        for spelling in ["TEST4.EXAMPLE.COM", "TeSt4.ExAmPlE.cOm"] {
+            assert_eq!(
+                resolve(spelling).as_deref(),
+                Some("EXACT"),
+                "{spelling:?} must pick the same tier as its lowercase form, \
+                 not fall through to the regex family",
+            );
+        }
+
+        // A host only the regex family claims still reaches it in either
+        // spelling: normalising did not collapse the tiers, it fed them.
+        assert_eq!(
+            resolve("test7.example.com").as_deref(),
+            Some("REGEX-FAMILY")
+        );
+        assert_eq!(
+            resolve("TEST7.EXAMPLE.COM").as_deref(),
+            Some("REGEX-FAMILY")
+        );
+    }
+
+    /// `has_hostname` decides whether a removed frontend's cached tags may
+    /// be dropped. It is fed the CONFIGURED hostname, which the pre/post
+    /// arms then compared byte-exact against a `DomainRule` the add path
+    /// had already lowercased — so an uppercase frontend answered `false`
+    /// while its route was still installed, and the tags went away under a
+    /// live route.
+    ///
+    /// To SEE THIS RED: in `has_hostname`, replace
+    /// `let normalized_hostname = normalize_hostname(hostname);` with
+    /// `let normalized_hostname = Cow::Borrowed(hostname);`. The two
+    /// uppercase assertions fail.
+    #[test]
+    fn has_hostname_answers_for_an_uppercase_spelling() {
+        let mut router = Router::new();
+        assert!(router.add_tree_rule(
+            b"tree.example.com",
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(Some("GET".to_owned())),
+            &Route::ClusterId("TREE".to_owned()),
+        ));
+        assert!(
+            router.add_pre_rule(
+                &"pre.example.com"
+                    .parse::<DomainRule>()
+                    .expect("an exact domain rule must parse"),
+                &PathRule::Prefix("/".to_owned()),
+                &MethodRule::new(None),
+                &Route::ClusterId("PRE".to_owned()),
+            )
+        );
+
+        assert!(router.has_hostname("TREE.EXAMPLE.COM"));
+        assert!(router.has_hostname("PRE.EXAMPLE.COM"));
+        assert!(!router.has_hostname("ABSENT.EXAMPLE.COM"));
+    }
+
+    /// `$HOST[n]` captures are taken from the key the router matched on,
+    /// so a rewrite template now emits the normalised host rather than
+    /// the client's raw bytes. That is the intended reading — the
+    /// configured frontend is itself stored lowercase — and it is stated
+    /// in `doc/configure.md`, so it needs an assertion.
+    ///
+    /// To SEE THIS RED: same mutation as
+    /// `an_uppercase_host_reaches_a_lowercase_tree_frontend`; the rewrite
+    /// stops resolving at all (`RouteNotFound`) and the `expect` fires.
+    #[test]
+    fn a_host_rewrite_capture_sees_the_normalized_host() {
+        let mut router = Router::new();
+        router
+            .add_http_front(&HttpFrontend {
+                hostname: "rewrite.example.com".to_owned(),
+                rewrite_host: Some("$HOST[0].internal".to_owned()),
+                ..test_http_frontend()
+            })
+            .expect("the rewrite frontend must install");
+
+        let route = router
+            .lookup("REWRITE.EXAMPLE.COM", "/", &Method::Get)
+            .expect("an uppercase Host must resolve");
+        assert_eq!(
+            route.rewritten_host.as_deref(),
+            Some("rewrite.example.com.internal"),
+            "`$HOST[0]` carries the normalised host, not the client's bytes",
+        );
+    }
+
+    /// The normalisation must cost a scan and not an allocation on the
+    /// overwhelmingly common path — every conforming client already sends
+    /// a lowercase Host, and this runs once per request.
+    ///
+    /// To SEE THIS RED: make `normalize_hostname` return
+    /// `Cow::Owned(hostname.to_ascii_lowercase())` unconditionally. The
+    /// first assertion fails.
+    #[test]
+    fn normalize_hostname_borrows_an_already_lowercase_host() {
+        assert!(
+            matches!(normalize_hostname("www.example.com"), Cow::Borrowed(_)),
+            "a lowercase host must not allocate",
+        );
+        assert!(
+            matches!(normalize_hostname("123.example-host.com"), Cow::Borrowed(_)),
+            "digits and hyphens are not uppercase and must not allocate",
+        );
+        assert_eq!(
+            normalize_hostname("WwW.ExAmPlE.cOm"),
+            Cow::Owned::<str>("www.example.com".to_owned()),
+        );
+    }
+
+    /// Known gap, deliberately NOT closed here: RFC 1034 §3.1 makes
+    /// `www.example.com.` the absolute form of `www.example.com`, but
+    /// `idna::domain_to_ascii` keeps the trailing dot on the add path
+    /// (measured: `"www.example.com."` -> `"www.example.com."`) and the
+    /// trie then splits it into a trailing empty label that no
+    /// dot-free frontend carries. The TLS side already strips one
+    /// trailing dot (`lib/src/https.rs`'s `sni_owned`,
+    /// `lib/src/protocol/tcp_preread/mod.rs`'s `normalize_sni`); HTTP
+    /// routing does not. This test records the current answer so the day
+    /// someone fixes it, it fails here and gets inverted rather than
+    /// silently changing behaviour.
+    ///
+    /// To SEE THIS RED: strip a single trailing `.` inside
+    /// `normalize_hostname`.
+    #[test]
+    fn an_absolute_form_host_does_not_reach_a_relative_frontend_yet() {
+        let mut router = Router::new();
+        assert!(router.add_tree_rule(
+            b"www.example.com",
+            &PathRule::Prefix("/".to_owned()),
+            &MethodRule::new(Some("GET".to_owned())),
+            &Route::ClusterId("CASE".to_owned()),
+        ));
+
+        assert!(
+            router
+                .lookup("www.example.com.", "/", &Method::Get)
+                .is_err(),
+            "absolute-form Host routing is a separate defect, tracked \
+             apart from the case asymmetry",
+        );
+        assert!(
+            router
+                .lookup("WWW.EXAMPLE.COM.", "/", &Method::Get)
+                .is_err(),
+            "normalising the case must not accidentally close it either",
         );
     }
 }

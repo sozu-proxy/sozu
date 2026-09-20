@@ -279,3 +279,50 @@ fn hostname_and_port_returns_no_port_when_absent() {
     assert_eq!(host, b"example.com");
     assert_eq!(port, None);
 }
+
+/// The ASCII constraint `router::DomainRule::from_str` cites when it
+/// explains why leaving its hostname regexes on the regex crate's
+/// default Unicode case folding is unobservable: no byte outside ASCII
+/// ever reaches `Router::lookup` as part of a hostname.
+///
+/// `is_hostname_char` gates the `take_while`, so a non-ASCII byte ends
+/// the host early and the leftover trips this function's own
+/// `if !i.is_empty()` guard — the whole authority is refused with
+/// `ErrorKind::Eof`, which `frontend_from_request` (`lib/src/http.rs`,
+/// `lib/src/https.rs`) surfaces as `FrontendFromRequestError::HostParse`
+/// and the mux answers 400. Note that it is this guard, not the
+/// `InvalidCharsAfterHost` branch in the callers, that does the refusing:
+/// a successful return always carries an empty remainder.
+///
+/// The byte sweep is exhaustive rather than exemplary: one `é` would only
+/// show that ONE non-ASCII byte is refused.
+///
+/// To SEE THIS RED: make `is_hostname_char` admit non-ASCII — add
+/// `|| i >= 0x80` to it. The sweep reports the first accepted byte above
+/// 0x7F, and `café.example.com` starts parsing instead of erroring.
+#[test]
+fn is_hostname_char_admits_only_ascii() {
+    for byte in u8::MIN..=u8::MAX {
+        assert!(
+            !is_hostname_char(byte) || byte.is_ascii(),
+            "is_hostname_char accepted the non-ASCII byte {byte:#04x}; \
+             DomainRule::from_str's Unicode case folding stops being \
+             unobservable the moment one of these can reach a hostname",
+        );
+    }
+
+    // `café.example.com`: `é` is U+00E9, two UTF-8 bytes, neither ASCII.
+    // The host stops at `caf` and the rest is refused outright.
+    assert!(
+        hostname_and_port("café.example.com".as_bytes()).is_err(),
+        "a non-ASCII byte must fail the whole authority, not truncate it to `caf`",
+    );
+
+    // Control: the same name spelled in ASCII parses whole, so the
+    // rejection above is the non-ASCII byte and not the shape.
+    let (remaining, (host, port)) =
+        hostname_and_port(b"cafe.example.com").expect("the ASCII spelling must parse");
+    assert!(remaining.is_empty());
+    assert_eq!(host, b"cafe.example.com");
+    assert_eq!(port, None);
+}

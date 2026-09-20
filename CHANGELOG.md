@@ -481,6 +481,90 @@
   unexpected kinds, which is why the e2e test provokes a decrypt failure rather than a reset. Both are the changes the `MUX-H2` entry below already described,
   now reaching the second prefix. Nothing changes for a plaintext frontend or a backend socket:
   those render through `log_socket_module_prefix`, which already preferred the cache.
+- **`fix(router)`: an uppercase `Host` header did not match a lowercase frontend
+  ([#1349](https://github.com/sozu-proxy/sozu/issues/1349)).**
+  **This changes routing outcomes.** Requests that used to be answered 404 now reach a frontend.
+  That is the point of the fix, but if you relied on a case-varying `Host` being rejected, read on.
+  Host is case-insensitive (RFC 9110 §7.2 / §4.2.3), but Sozu normalised only one side of the
+  comparison. The **add** path lowercases: `Router::add_tree_rule` and `DomainRule::from_str`
+  (`lib/src/router/mod.rs`) both run the configured hostname through `idna::domain_to_ascii`, which
+  ASCII-lowercases — measured, `"WWW.EXAMPLE.COM"` becomes `"www.example.com"`, `"*.EXAMPLE.COM"`
+  becomes `"*.example.com"`, and even a regex segment's source is folded, `"/API[0-9]/.example.com"`
+  becoming `"/api[0-9]/.example.com"`. The **lookup** path did not: `Router::lookup` walked the
+  routing trie with the client's raw bytes and compared `DomainRule::Exact` / `Wildcard`
+  byte-exactly. Nothing between the wire and that walk touches the case either — kawa slices the
+  authority verbatim, `HttpContext::on_request_headers` copies it verbatim
+  (`lib/src/protocol/kawa_h1/editor.rs`), and `hostname_and_port`
+  (`lib/src/protocol/kawa_h1/parser.rs`) strips the port and nothing else, since `is_hostname_char`
+  accepts `is_alphanum()`.
+  So `Host: WWW.EXAMPLE.COM` missed a frontend declared `www.example.com`, and **no configuration
+  fixed it**: declaring the frontend as `WWW.EXAMPLE.COM` stored it lowercase too. `sozu query
+  frontends` showed the frontend present and correct the whole time.
+  `Router::lookup` and `Router::has_hostname` now normalise their key the same way the add path
+  does, through a new `normalize_hostname` helper that returns `Cow::Borrowed` for a host that is
+  already lowercase — the overwhelmingly common case — so the datapath pays a scan per request and
+  allocates only for the requests that actually carry uppercase. Both HTTP/1.1 and HTTP/2 reach the
+  same `frontend_from_request` → `Router::lookup` call, so one change covers both; e2e coverage
+  exercises each over a real socket, which the issue noted had never been done.
+  Two adjacent behaviours move with it. (1) A **pre/post hostname regex** keeps the operator's bytes
+  — `convert_regex_domain_rule` copies the segment source verbatim, unlike the trie — so matching a
+  normalised key against a case-sensitive `/API[0-9]/` would have turned a rule that matched
+  `API7.example.com` into one that matched nothing at all. `DomainRule::from_str` now compiles
+  hostname regexes case-insensitively, which is both the RFC reading and the only one that
+  agrees with the trie, where the same pattern has always been lowercased at insert. It is set on
+  the `RegexBuilder` rather than by folding the pattern source, which would rewrite `\D` into
+  `\d`. The fold is the crate default — Unicode simple case folding — and `.unicode(false)` is
+  deliberately not set: it would make the fold ASCII-only, but it also refuses Unicode-class syntax
+  at compile time, and `\p{L}` matches ASCII letters, so a frontend that installs and routes today
+  would start being rejected at add time. A regression test pins that. On the haystack side the
+  distinction cannot be observed either way: `hostname_and_port` admits no byte outside ASCII and
+  refuses the whole authority when it meets one, which a second test pins by sweeping all 256 byte
+  values. (2) `$HOST[n]` rewrite captures are taken from the matched key, so a `rewrite_host`
+  template now emits the normalised host. The parsed authority every other consumer reads is
+  untouched: the access log, the `X-Forwarded-Host` a `rewrite_host` frontend injects, the redirect
+  `Location:` and the builtin 404's `route` field all still carry the client's own bytes.
+  It composes with the hostname precedence order landed for
+  [#1351](https://github.com/sozu-proxy/sozu/issues/1351) in one direction: the key is normalised
+  first, then the most-specific-first search runs on it, so case never decides which candidate wins
+  — `CASE.EXAMPLE.COM` picks the same exact / regex-segment / wildcard tier as `case.example.com`.
+  A regression test pins that against both tiers.
+  Two known gaps are deliberately left open rather than silently closed. A **trailing dot** —
+  `Host: www.example.com.`, the legal absolute form per RFC 1034 §3.1 — still does not reach a
+  frontend declared without it; `idna::domain_to_ascii` keeps the dot on the add path (measured)
+  and the trie then sees a trailing empty label. A regression test records that answer so the day
+  it is fixed, it fails and gets inverted. And the per-frontend **access-log tag map**
+  (`ListenerHandler::set_tags` / `get_tags`) is keyed on the configured hostname verbatim on both
+  sides, so its tags attach only when the client's spelling matches the operator's; this fix does
+  not change that either way.
+
+- **`fix(router)`: a certificate whose SAN carried uppercase was unreachable by any SNI.**
+  The same add/lookup case asymmetry on the TLS side, with the two sides swapped. rustls lowercases
+  the SNI inside `process_client_hello` (`DnsName::to_lowercase_owned`) before
+  `ResolvesServerCert::resolve` is ever called, so the lookup key is always lowercase. The add side
+  was verbatim: `CertifiedKeyWrapper::try_from` (`lib/src/tls.rs`) took the SAN / CN set from the
+  X.509 (`command/src/certificate.rs`'s `get_cn_and_san_attributes`) or the operator's `names`
+  override exactly as written, and `add_certificate` inserted those bytes into the SNI trie and the
+  name index. A certificate carrying `MiXeD.Example.COM` was therefore reachable by no SNI at all:
+  every handshake for that name fell back to `DEFAULT_CERTIFICATE`, with no diagnostic on either
+  side and the certificate still recorded and queryable. RFC 4343 makes DNS names compare
+  case-insensitively, so normalising loses nothing.
+  The names are now ASCII-lowercased at the single point where the set is built, so the trie key,
+  the name index, the removal walk and the SAN snapshot that feeds the HTTP/2 `:authority` binding
+  all agree by construction. The `AddCertificate` request itself is not modified, so the control
+  plane's own record of the certificate is unchanged.
+  Two operator-visible consequences on the worker's own
+  `QueryCertificatesFromWorkers` answer. Its `--domain` lookup is normalised the same way, so
+  `sozu query certificates --domain MiXeD.Example.COM` now finds the certificate instead of
+  reporting it missing while the proxy serves it; and the `domain` field of each summary is the
+  normalised trie key, so it renders lowercase. The main process's own
+  `ConfigState::get_certificates` filter (`command/src/state.rs`) still compares the requested
+  domain against the stored names with an exact `contains`, and is deliberately left alone here —
+  it filters the control plane's record, not the worker's SNI table.
+  Audited in the same pass and found already correct, so left alone: the TCP SNI preread routes
+  (`lib/src/tcp.rs`'s `route_key_and_matcher` lowercases on add, `normalize_sni` in
+  `lib/src/protocol/tcp_preread/mod.rs` lowercases and strips a trailing dot on lookup), and the
+  `:authority`-versus-SNI 421 check (`authority_matches_sni` /
+  `authority_matched_cert_name` in `lib/src/protocol/mux/router.rs`, ASCII-folding both sides).
 
 - **`fix(h2)`: the `MUX-H2` log lines rendered `peer=None` once the peer had reset, and named the
   load balancer instead of the client behind PROXY protocol.**
