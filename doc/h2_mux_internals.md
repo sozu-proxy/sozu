@@ -395,9 +395,12 @@ Flushes control data before application frames, in order:
    sends GOAWAY(SETTINGS_TIMEOUT)
 2. **Zero buffer resume**: If a previous control frame write was partial
    (WouldBlock), resume flushing via `flush_zero_to_socket()`
-3. **WINDOW_UPDATE frames**: Serializes queued `pending_window_updates` into
+3. **Deferred initial GOAWAY**: If `H2DrainState::initial_goaway_pending` is
+   set (`graceful_goaway` deferred it — see below), serializes it via the new
+   `ConnectionH2::send_initial_goaway` and clears the flag
+4. **WINDOW_UPDATE frames**: Serializes queued `pending_window_updates` into
    the zero buffer, coalescing entries by stream ID, then flushes
-4. **Pending RST_STREAM frames**: Drains `pending_rst_streams` into the zero
+5. **Pending RST_STREAM frames**: Drains `pending_rst_streams` into the zero
    buffer, with flood detection (`MAX_PENDING_RST_STREAMS` cap). Proxy-
    emitted RSTs (DATA-on-closed, `refuse_stream_and_discard`, `reset_stream`)
    are queued via the canonical `ConnectionH2::enqueue_rst` helper, which
@@ -411,13 +414,19 @@ Flushes control data before application frames, in order:
    `expect_write.is_none()`) re-runs on the next tick rather than
    stranding the queued RST.
 
-Stages 3 and 4 both defer — leaving the queue untouched — while
-`header_block_reassembly_in_progress()` is true (`self.state` is
-`ContinuationHeader`/`ContinuationFrame`): the zero buffer is where an
-in-progress, non-refused HEADERS+CONTINUATION field block is accumulating,
-and clearing it to serialize an unrelated control frame would corrupt that
-reassembly. Nothing is lost — queuing either kind of frame already arms
-`WRITABLE` — the flush just waits for the block to complete.
+Stages 3, 4, and 5 all defer — leaving their respective queue/flag
+untouched — while `header_block_reassembly_in_progress()` is true
+(`self.state` is `ContinuationHeader`/`ContinuationFrame`): the zero buffer
+is where an in-progress, non-refused HEADERS+CONTINUATION field block is
+accumulating, and clearing it to serialize an unrelated control frame (or
+the advisory GOAWAY) would corrupt that reassembly. Nothing is lost —
+queuing a WINDOW_UPDATE or RST_STREAM already arms `WRITABLE`, and
+`graceful_goaway` arms it explicitly when it defers — the flush just waits
+for the block to complete. Stage 3 is the one exception among the three
+where "nothing is lost" isn't free: unlike the WINDOW_UPDATE/RST_STREAM
+queues, there is no separate pending-GOAWAY queue to fall back on, so the
+`initial_goaway_pending` flag itself is what guarantees the advisory GOAWAY
+is still sent once reassembly completes rather than silently dropped.
 
 Returns `Some(MuxResult)` if the caller should return early, `None` to proceed.
 

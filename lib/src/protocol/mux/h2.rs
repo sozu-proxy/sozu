@@ -1707,6 +1707,16 @@ pub struct H2DrainState {
     /// `GOAWAY(NO_ERROR)`. `None` means "wait indefinitely" (knob value `0`).
     /// Default when unset upstream: 5 s (see `L7ListenerHandler`).
     pub graceful_shutdown_deadline: Option<std::time::Duration>,
+    /// True when [`ConnectionH2::graceful_goaway`] decided to drain but had
+    /// to defer serializing the advisory GOAWAY because
+    /// `header_block_reassembly_in_progress()` was true at the time —
+    /// `self.zero.storage` is also the in-flight HEADERS/CONTINUATION
+    /// accumulation buffer and clearing it would corrupt the reassembly.
+    /// [`ConnectionH2::flush_pending_control_frames`] sends it, via
+    /// [`ConnectionH2::send_initial_goaway`], as soon as reassembly
+    /// completes. Cleared without sending if a final GOAWAY
+    /// ([`ConnectionH2::goaway`]) supersedes it first.
+    pub initial_goaway_pending: bool,
 }
 
 pub struct ConnectionH2<Front: SocketHandler> {
@@ -2169,6 +2179,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 peer_last_stream_id: None,
                 started_at: None,
                 graceful_shutdown_deadline,
+                initial_goaway_pending: false,
             },
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
             bytes: H2ByteAccounting {
@@ -3932,6 +3943,23 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.expect_write = None;
         }
 
+        // Stage — send a deferred initial GOAWAY.
+        // `graceful_goaway` could not serialize into `self.zero.storage`
+        // while `header_block_reassembly_in_progress()` was true — see its
+        // comment and `send_initial_goaway`. Send it now that reassembly has
+        // completed; if it is still in progress this call, leave the flag
+        // set and retry on a later pass (nothing is lost: `graceful_goaway`
+        // already armed WRITABLE, and completing the reassembly re-enters
+        // this function via the next writable() call in the same
+        // readable()/writable() sweep).
+        if self.drain.initial_goaway_pending
+            && self.expect_write.is_none()
+            && !self.header_block_reassembly_in_progress()
+        {
+            self.drain.initial_goaway_pending = false;
+            return Some(self.send_initial_goaway());
+        }
+
         // Stage — drain pending WINDOW_UPDATE frames.
         // Serialize and flush them inline to avoid extra event loop
         // iterations that could cause response data to be sent before
@@ -4947,6 +4975,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
         self.state = H2State::Error;
         self.drain.draining = true;
+        // A final/error GOAWAY supersedes any advisory initial GOAWAY that
+        // `graceful_goaway` deferred: this frame carries a real
+        // `last_stream_id` and `expect_read` is dropped below, so no further
+        // readable() will ever complete the reassembly that deferred it.
+        // Sending the stale advisory afterward would only be a redundant,
+        // less informative GOAWAY.
+        self.drain.initial_goaway_pending = false;
         self.expect_read = None;
         // Disarm the SETTINGS ACK timer: once we've committed to GOAWAY, the
         // timeout check at `readable()` / `flush_pending_control_frames()` must
@@ -5018,11 +5053,52 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // but does not yet know the cutoff. This gives in-flight requests a chance
         // to arrive before we commit to a final last_stream_id.
         self.drain.draining = true;
-        // Arm the forced-close timer from the moment the proxy decides to drain.
-        // `Mux::shutting_down` samples it against `graceful_shutdown_deadline`
-        // and returns `true` once the budget is exhausted so the session loop
-        // tears the connection down instead of waiting forever.
+        // Arm the forced-close timer from the moment the proxy decides to drain,
+        // unconditionally — including when the GOAWAY itself must be deferred
+        // below. `Mux::shutting_down` samples it against
+        // `graceful_shutdown_deadline` and returns `true` once the budget is
+        // exhausted so the session loop tears the connection down instead of
+        // waiting forever; a late start here would let a stalled reassembly
+        // silently extend that budget.
         self.drain.started_at = Some(now);
+
+        // `self.zero.storage` is also the read-side accumulation buffer for
+        // an in-flight HEADERS/CONTINUATION field block
+        // (`header_block_reassembly_in_progress`, a few lines above the
+        // WINDOW_UPDATE stage of `flush_pending_control_frames`): clearing it
+        // here to serialize the GOAWAY would destroy that reassembly out from
+        // under it, directly contradicting the "existing streams should
+        // continue reading" promise below. Defer, the same way
+        // `flush_pending_control_frames` already defers its WINDOW_UPDATE and
+        // RST_STREAM drains: `flush_pending_control_frames` sends the
+        // deferred GOAWAY via `send_initial_goaway` as soon as reassembly
+        // completes.
+        if self.header_block_reassembly_in_progress() {
+            self.drain.initial_goaway_pending = true;
+            debug!(
+                "{} GOAWAY (graceful, initial) deferred: header block reassembly in progress",
+                log_context!(self)
+            );
+            // Ensure a writable() pass happens even if nothing else would
+            // arm it, so the deferred GOAWAY is not left waiting on an
+            // unrelated event.
+            self.readiness.arm_writable();
+            return MuxResult::Continue;
+        }
+
+        self.send_initial_goaway()
+    }
+
+    /// Serializes and queues the first, advisory GOAWAY
+    /// (`NO_ERROR`, `last_stream_id = STREAM_ID_MAX`) of a graceful drain
+    /// into `self.zero.storage`.
+    ///
+    /// Split out of [`Self::graceful_goaway`] so
+    /// [`Self::flush_pending_control_frames`] can call it once an in-flight
+    /// header block finishes reassembling, for the case where
+    /// `graceful_goaway` had to defer it. Callers must already have checked
+    /// `!self.header_block_reassembly_in_progress()`.
+    fn send_initial_goaway(&mut self) -> MuxResult {
         // Keep expect_read as-is: existing streams should continue reading
         // data during the drain window opened by the initial GOAWAY. Only
         // the final GOAWAY (via `goaway()`) removes READABLE.
@@ -5159,7 +5235,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// Directly flush the zero buffer to the socket without going through
     /// the full writable() path. Used during shutdown when the event loop
     /// won't deliver new epoll events for this session (edge-triggered).
+    ///
+    /// No-op while `header_block_reassembly_in_progress()`: `self.zero` is
+    /// also the read-side accumulation buffer for an in-flight
+    /// HEADERS/CONTINUATION field block, and `Mux::shutting_down` calls this
+    /// unconditionally right after `graceful_goaway` — including when
+    /// `graceful_goaway` deferred its GOAWAY for that exact reason and left
+    /// nothing queued. `expect_write == Some(H2StreamId::Zero)` (the only
+    /// case with legitimate bytes to flush here) already cannot coexist with
+    /// reassembly in progress — READABLE is disabled for the whole time a
+    /// zero-buffer write is stalled — so skipping is always safe and never
+    /// drops a real write.
     pub fn flush_zero_buffer(&mut self) {
+        if self.header_block_reassembly_in_progress() {
+            return;
+        }
         if self.flush_zero_to_socket() {
             return;
         }
@@ -10091,6 +10181,227 @@ mod tests {
             vec![(b"x-sozu-marker".to_vec(), b"legitimate-value".to_vec())],
             "stream 1's field block must have been decoded byte-for-byte, not \
              clobbered by the unrelated WINDOW_UPDATE flush"
+        );
+    }
+
+    /// Same shape as
+    /// `a_legitimate_continuation_survives_an_unrelated_window_update_flush`,
+    /// but the clobbering trigger is `graceful_goaway` itself instead of an
+    /// unrelated WINDOW_UPDATE flush — the third instance of the same bug
+    /// class (issue #1398).
+    ///
+    /// To SEE THIS RED: this is the pre-existing behaviour on `main`, no
+    /// mutation needed. `graceful_goaway` clears `self.zero.storage`
+    /// unconditionally to serialize the advisory GOAWAY, with no check on
+    /// `header_block_reassembly_in_progress()`. Deferring that clear (and
+    /// the serialization) until reassembly completes — mirroring the
+    /// WINDOW_UPDATE/RST_STREAM drains `flush_pending_control_frames`
+    /// already gates — is exactly the fix this test proves.
+    #[test]
+    fn a_legitimate_continuation_survives_a_graceful_goaway() {
+        use std::io::{Read, Write};
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        // Past the preface/SETTINGS handshake, waiting on a frame header.
+        // `drain.draining` stays false until `graceful_goaway` is called
+        // below: stream 1 must be genuinely accepted, not refused — this is
+        // the ordinary, non-refusal path.
+        connection.state = H2State::Header;
+        connection.expect_read = Some((H2StreamId::Zero, 9));
+
+        // The peer's encoder. The marker header's name is in neither table,
+        // so encoding it appends `x-sozu-marker: legitimate-value` to the
+        // peer's dynamic table at a known index — the same technique
+        // `a_legitimate_continuation_survives_an_unrelated_window_update_flush`
+        // uses to prove decoder sync.
+        let mut peer_encoder = loona_hpack::Encoder::new();
+        let field_block = peer_encoder.encode([
+            (&b":method"[..], &b"GET"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/legit-multiframe"[..]),
+            (&b"x-sozu-marker"[..], &b"legitimate-value"[..]),
+        ]);
+        // Same header set and split proportions as
+        // `a_legitimate_continuation_survives_an_unrelated_window_update_flush`:
+        // `header_block_fragment`'s window is a `(start, len)` pair recorded
+        // once, independent of `self.zero.storage`'s own bookkeeping, so
+        // *any* clear-then-refill of that buffer — 13 bytes of WINDOW_UPDATE
+        // or 17 bytes of GOAWAY, it makes no difference — leaves the window
+        // pointing at the same wrong offset once `end`/`head` reset to 0 and
+        // the CONTINUATION's own bytes land there instead. Matching the split
+        // reproduces the same decodable-but-wrong HPACK byte sequence rather
+        // than a split that happens to land on an invalid opcode.
+        assert!(
+            field_block.len() > 34,
+            "the probe block must be large enough to split meaningfully"
+        );
+        let split = field_block.len() / 2;
+        let (first_half, second_half) = field_block.split_at(split);
+
+        // HEADERS, END_STREAM but NOT END_HEADERS, stream 1: a legitimate
+        // multi-frame header block, exactly as a large request produces.
+        let mut headers_frame = Vec::with_capacity(9 + first_half.len());
+        headers_frame.extend_from_slice(&(first_half.len() as u32).to_be_bytes()[1..]);
+        headers_frame.push(1); // HEADERS
+        headers_frame.push(parser::FLAG_END_STREAM);
+        headers_frame.extend_from_slice(&1u32.to_be_bytes());
+        headers_frame.extend_from_slice(first_half);
+        peer.write_all(&headers_frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        // Drive reads until the connection is genuinely waiting on the
+        // CONTINUATION frame for stream 1 — accepted, not refused.
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.state, H2State::ContinuationHeader(_)) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(connection.state, H2State::ContinuationHeader(_)),
+            "stream 1's HEADERS frame must be accepted and await CONTINUATION: {:?}",
+            connection.state
+        );
+        assert!(
+            !connection.streams.is_empty(),
+            "a non-refused HEADERS frame must create stream 1"
+        );
+
+        // The proxy decides to drain — a graceful shutdown or hot reload
+        // landing mid-reassembly, exactly as issue #1398 describes. Nothing
+        // about it targets stream 1 or its in-progress header block.
+        let drain_at = connection.now;
+        let result = connection.graceful_goaway(drain_at);
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "graceful_goaway must not tear the connection down while deferring: {result:?}"
+        );
+
+        // The forced-close budget must arm from the moment the proxy decided
+        // to drain, not from whenever the deferred GOAWAY eventually goes
+        // out — `Mux::shutting_down` samples exactly this field against
+        // `graceful_shutdown_deadline`.
+        assert!(
+            connection.drain.draining,
+            "graceful_goaway must mark the connection as draining immediately, \
+             even when the GOAWAY itself is deferred"
+        );
+        assert_eq!(
+            connection.drain.started_at,
+            Some(drain_at),
+            "the forced-close budget must arm from `graceful_goaway`'s `now` \
+             parameter immediately, not once the deferred GOAWAY is sent"
+        );
+        assert!(
+            connection.drain.initial_goaway_pending,
+            "the advisory GOAWAY must be deferred while a header block is \
+             reassembling, not sent (and clobber the reassembly) or dropped"
+        );
+
+        // Mirror `Mux::shutting_down_inner` exactly: it calls
+        // `flush_zero_buffer()` immediately after `graceful_goaway()`
+        // returns `Continue`, because edge-triggered epoll won't deliver a
+        // fresh WRITABLE event for an already-writable socket. Must be a
+        // no-op while reassembly is still in progress.
+        connection.flush_zero_buffer();
+
+        // Now the CONTINUATION frame completing the block arrives.
+        let mut continuation_frame = Vec::with_capacity(9 + second_half.len());
+        continuation_frame.extend_from_slice(&(second_half.len() as u32).to_be_bytes()[1..]);
+        continuation_frame.push(9); // CONTINUATION
+        continuation_frame.push(parser::FLAG_END_HEADERS);
+        continuation_frame.extend_from_slice(&1u32.to_be_bytes());
+        continuation_frame.extend_from_slice(second_half);
+        peer.write_all(&continuation_frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if !matches!(
+                connection.state,
+                H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
+            ) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        assert!(
+            !matches!(connection.state, H2State::Error | H2State::GoAway),
+            "a graceful_goaway landing mid-reassembly must not corrupt a \
+             legitimate in-progress header block into a connection error: {:?}",
+            connection.state
+        );
+
+        // The peer's next block references the dynamic entry its encoder
+        // added while encoding stream 1's request.
+        let next_block = peer_encoder.encode([(&b"x-sozu-marker"[..], &b"legitimate-value"[..])]);
+        assert_eq!(
+            next_block.len(),
+            1,
+            "the peer must now reference its dynamic entry, not re-send a literal"
+        );
+
+        let mut decoded = Vec::new();
+        let status = connection.decoder.decode_with_cb(&next_block, |k, v| {
+            decoded.push((k.into_owned(), v.into_owned()));
+        });
+
+        assert!(
+            status.is_ok(),
+            "the connection decoder must still resolve the peer's dynamic table \
+             after a graceful_goaway during header-block reassembly, got {status:?}"
+        );
+        assert_eq!(
+            decoded,
+            vec![(b"x-sozu-marker".to_vec(), b"legitimate-value".to_vec())],
+            "stream 1's field block must have been decoded byte-for-byte, not \
+             clobbered by graceful_goaway"
+        );
+
+        // The deferred advisory GOAWAY must not be lost: drive writable()
+        // until it is queued and flushed, then verify the peer actually
+        // received it, byte-for-byte identical to an immediate (non-deferred)
+        // serialization.
+        for _ in 0..8 {
+            connection.writable(&mut context, EndpointClient(&mut router));
+            if !connection.drain.initial_goaway_pending && connection.expect_write.is_none() {
+                break;
+            }
+        }
+        assert!(
+            !connection.drain.initial_goaway_pending,
+            "the deferred advisory GOAWAY must be sent once reassembly completes, \
+             not left pending forever"
+        );
+        assert!(
+            connection.expect_write.is_none(),
+            "the advisory GOAWAY must have been fully flushed to the socket"
+        );
+
+        let mut expected = [0u8; 17];
+        let (_, expected_size) =
+            serializer::gen_goaway(&mut expected, STREAM_ID_MAX, H2Error::NoError)
+                .expect("serializing the expected GOAWAY must succeed");
+        assert_eq!(expected_size, 17);
+
+        let mut received = [0u8; 17];
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("setting a read timeout must succeed");
+        peer.read_exact(&mut received)
+            .expect("the peer must receive the deferred advisory GOAWAY");
+        assert_eq!(
+            received, expected,
+            "the deferred advisory GOAWAY must reach the peer byte-for-byte \
+             once header-block reassembly completes"
         );
     }
 }
