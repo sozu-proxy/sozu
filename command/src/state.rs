@@ -366,13 +366,33 @@ impl ConfigState {
             );
         }
 
-        // Certificates: nested map keyed by (address, fingerprint). The inner
-        // map's fingerprint key is the addressing identity used by diff; we do
-        // not recompute it here (expensive), but the outer/inner structure must
-        // not hold an empty inner map silently produced outside the API — an
-        // empty bucket is a benign no-op for diff/replay, so we only assert the
-        // address-key relationship is preserved by construction (trivially true
-        // for a BTree/HashMap), leaving the costly fingerprint recompute out.
+        // Certificates: nested map keyed by (address, fingerprint). We do not
+        // recompute each inner fingerprint here (expensive -- it requires
+        // re-parsing the stored PEM), but the outer bucket itself must never
+        // be empty. `add_certificate` and `replace_certificate` only ever
+        // materialise a bucket together with a certificate, and
+        // `remove_certificate` evicts the address key once its last
+        // certificate is gone -- so an address key mapped to zero
+        // certificates is unreachable through the public API. It is exactly
+        // the corrupt state sozu-proxy/sozu#1404 produced, and the same
+        // shape two OTHER paths were independently found to reach while
+        // adding this coverage: `remove_certificate` leaving a dangling
+        // empty bucket after evicting an address's last certificate
+        // (`remove_certificate_evicts_the_address_when_its_last_certificate_is_removed`),
+        // and a rejected `add_certificate` leaving one behind for a
+        // previously-absent address
+        // (`add_certificate_with_valid_pem_armor_but_invalid_x509_leaves_no_bucket`).
+        // Both are fixed alongside this check. Left uncaught, this state is
+        // invisible to `hash_state` (which does not fold `self.certificates`
+        // at all) and silently dropped by `generate_requests` (which emits no
+        // `AddCertificate` for an empty bucket) -- `check_invariants` is the
+        // one place in this postcondition sweep that can catch it.
+        for (address, certs) in &self.certificates {
+            debug_assert!(
+                !certs.is_empty(),
+                "certificate bucket for address {address} must never be empty (sozu-proxy/sozu#1404)"
+            );
+        }
 
         // Public accounting helpers must agree with the raw maps. These are the
         // numbers the CLI and metrics surface; a drift here is a real bug.
@@ -1184,12 +1204,22 @@ impl ConfigState {
             .fingerprint()
             .map_err(StateError::AddCertificate)?;
 
-        let entry = self.certificates.entry(add.address.into()).or_default();
-
+        // Both fallible steps (`fingerprint()` above, `apply_overriding_names`
+        // below -- the latter re-parses as X.509 when `names` is empty, so
+        // well-formed PEM armor around invalid DER content still fails here)
+        // run BEFORE `self.certificates` is touched. `entry(..).or_default()`
+        // unconditionally materialises a bucket for the address, including a
+        // brand-new one; ordering it after either fallible step used to leave
+        // a dangling empty bucket for a previously-absent address on a
+        // rejected add -- the same "mutate before the fallible step" defect
+        // class as sozu-proxy/sozu#1404's `replace_certificate`, found while
+        // adding certificate coverage to `check_invariants` for that issue.
         let mut add = add.clone();
         add.certificate
             .apply_overriding_names()
             .map_err(StateError::AddCertificate)?;
+
+        let entry = self.certificates.entry(add.address.into()).or_default();
 
         if entry.contains_key(&fingerprint) {
             let names_bytes = add
@@ -1226,22 +1256,54 @@ impl ConfigState {
             hex::decode(&remove.fingerprint)
                 .map_err(|decode_error| StateError::RemoveCertificate(decode_error.to_string()))?,
         );
+        let address = remove.address.into();
 
-        if let Some(index) = self.certificates.get_mut(&remove.address.into()) {
+        let became_empty = if let Some(index) = self.certificates.get_mut(&address) {
             index.remove(&fingerprint);
             debug_assert!(
                 !index.contains_key(&fingerprint),
                 "remove_certificate must evict the fingerprint when the address is known"
             );
+            index.is_empty()
+        } else {
+            false
+        };
+
+        // Mirror `CertificateResolver::remove_certificate`'s
+        // `name_fingerprint_idx` cleanup (`lib/src/tls.rs`, #1202): an
+        // address bucket emptied by removing its last certificate must not
+        // linger as a dangling `self.certificates[address] == {}` entry.
+        // That leftover was reachable through ordinary
+        // `AddCertificate`+`RemoveCertificate` and broke
+        // `generate_requests`'s own round-trip postcondition (an empty
+        // bucket contributes zero `AddCertificate` requests, so replaying
+        // them into a fresh `ConfigState` never recreates the entry).
+        // Found while adding certificate coverage to `check_invariants` for
+        // sozu-proxy/sozu#1404.
+        if became_empty {
+            self.certificates.remove(&address);
         }
 
         Ok(())
     }
 
-    /// - Remove old certificate from certificates, using the old fingerprint
-    /// - calculate the new fingerprint
+    /// - check that the address is known
+    /// - calculate the new fingerprint (fallible: parses the PEM)
     /// - insert the new certificate with the new fingerprint as key
     /// - check that the new entry is present in the certificates hashmap
+    /// - only then remove the old certificate, using the old fingerprint
+    ///
+    /// Add-before-remove ordering, mirroring the fix applied to
+    /// `CertificateResolver::replace_certificate` in `lib/src/tls.rs` for
+    /// the same defect (sozu-proxy/sozu#1202, closing #774): computing the
+    /// new fingerprint is fallible, so nothing is removed until the
+    /// replacement is safely stored. A malformed PEM therefore leaves the
+    /// address's certificate map untouched instead of emptied
+    /// (sozu-proxy/sozu#1404). This also makes the idempotent case (old
+    /// fingerprint == new fingerprint, e.g. an operator or ACME retry loop
+    /// resubmitting the same PEM) naturally safe: the entry is
+    /// (re-)inserted and then deliberately NOT removed, instead of being
+    /// removed right after being re-inserted under the same key.
     fn replace_certificate(&mut self, replace: &ReplaceCertificate) -> Result<(), StateError> {
         let replace_address = replace.address.into();
         let old_fingerprint = Fingerprint(
@@ -1249,13 +1311,12 @@ impl ConfigState {
                 .map_err(|decode_error| StateError::RemoveCertificate(decode_error.to_string()))?,
         );
 
-        self.certificates
-            .get_mut(&replace_address)
-            .ok_or(StateError::NotFound {
+        if !self.certificates.contains_key(&replace_address) {
+            return Err(StateError::NotFound {
                 kind: ObjectKind::Certificate,
                 id: replace.address.to_string(),
-            })?
-            .remove(&old_fingerprint);
+            });
+        }
 
         let new_fingerprint = Fingerprint(
             calculate_fingerprint(replace.new_certificate.certificate.as_bytes()).map_err(
@@ -1265,7 +1326,11 @@ impl ConfigState {
 
         self.certificates
             .get_mut(&replace_address)
-            .map(|certs| certs.insert(new_fingerprint.clone(), replace.new_certificate.clone()));
+            .ok_or(StateError::ReplaceCertificate(
+                "Unlikely error. This entry in the certificate hashmap should be present"
+                    .to_string(),
+            ))?
+            .insert(new_fingerprint.clone(), replace.new_certificate.clone());
 
         if !self
             .certificates
@@ -1281,6 +1346,17 @@ impl ConfigState {
                 replace.address
             )));
         }
+
+        // Idempotent-replace short-circuit: when old == new, the entry
+        // just (re-)inserted above IS the certificate the caller meant to
+        // keep. Removing `old_fingerprint` now would delete it again
+        // immediately.
+        if new_fingerprint != old_fingerprint {
+            self.certificates
+                .get_mut(&replace_address)
+                .map(|certs| certs.remove(&old_fingerprint));
+        }
+
         // Postcondition: the new fingerprint is keyed under the address, and
         // (unless old and new collide, e.g. a self-replace) the old one is gone.
         debug_assert!(
@@ -3413,6 +3489,241 @@ mod tests {
             output.len() <= 512,
             "duplicate certificate log is not bounded: {} bytes",
             output.len()
+        );
+    }
+
+    /// Regression for sozu-proxy/sozu#1404 (#774 surviving in a second
+    /// implementation of the same verb): `replace_certificate` used to
+    /// remove the old fingerprint from the address's certificate map
+    /// BEFORE computing the new fingerprint, and computing it is fallible
+    /// (`calculate_fingerprint` parses the PEM). A malformed
+    /// `new_certificate.certificate` therefore made the `?` propagate
+    /// after the old certificate was already gone, leaving the address
+    /// with zero certificates. The fix must compute/insert the new
+    /// certificate before removing the old one, so a failed replace is a
+    /// true no-op on `self`.
+    #[test]
+    fn replace_certificate_with_malformed_pem_keeps_old_certificate() {
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../assets/certificate.pem").to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: Vec::new(),
+        };
+        let old_fingerprint = certificate
+            .fingerprint()
+            .expect("test certificate fingerprint must be computable");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+
+        let mut state = ConfigState::default();
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate,
+                expired_at: None,
+            })
+            .expect("initial certificate insertion must succeed");
+
+        let malformed = CertificateAndKey {
+            certificate: "not a valid pem certificate".to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: Vec::new(),
+        };
+        let error = state
+            .replace_certificate(&ReplaceCertificate {
+                address,
+                new_certificate: malformed,
+                old_fingerprint: old_fingerprint.to_string(),
+                new_expired_at: None,
+            })
+            .expect_err("replacing with a malformed PEM must fail");
+        assert!(
+            matches!(error, StateError::ReplaceCertificate(_)),
+            "expected StateError::ReplaceCertificate, got {error:?}"
+        );
+
+        let certificates_for_address = state
+            .certificates
+            .get(&SocketAddr::from(address))
+            .expect("the address must still be present in the certificate map");
+        assert!(
+            certificates_for_address.contains_key(&old_fingerprint),
+            "a failed replace must leave the original certificate in place, found {:?}",
+            certificates_for_address.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            certificates_for_address.len(),
+            1,
+            "a failed replace must not leave the address with zero (or extra) certificates"
+        );
+    }
+
+    /// When `ReplaceCertificate` resubmits the SAME PEM (an operator or
+    /// ACME retry loop), the old and new fingerprints are equal.
+    /// Mirrors `lib/src/tls.rs`'s
+    /// `replace_certificate_with_same_fingerprint_is_noop`: an
+    /// unconditional "insert new, then remove old" must not delete the
+    /// entry the caller meant to retain merely because old == new.
+    #[test]
+    fn replace_certificate_with_same_fingerprint_keeps_certificate() {
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../assets/certificate.pem").to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: Vec::new(),
+        };
+        let fingerprint = certificate
+            .fingerprint()
+            .expect("test certificate fingerprint must be computable");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+
+        let mut state = ConfigState::default();
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate: certificate.clone(),
+                expired_at: None,
+            })
+            .expect("initial certificate insertion must succeed");
+
+        state
+            .replace_certificate(&ReplaceCertificate {
+                address,
+                new_certificate: certificate,
+                old_fingerprint: fingerprint.to_string(),
+                new_expired_at: None,
+            })
+            .expect("idempotent replace with the identical certificate must succeed");
+
+        let certificates_for_address = state
+            .certificates
+            .get(&SocketAddr::from(address))
+            .expect("the address must still be present in the certificate map");
+        assert!(
+            certificates_for_address.contains_key(&fingerprint),
+            "an idempotent replace (old fingerprint == new fingerprint) must not delete \
+             the entry the caller meant to retain, found {:?}",
+            certificates_for_address.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            certificates_for_address.len(),
+            1,
+            "an idempotent replace must not change the number of stored certificates"
+        );
+    }
+
+    /// Found while adding certificate coverage to `check_invariants` for
+    /// sozu-proxy/sozu#1404: `remove_certificate` removed the fingerprint
+    /// from the address's inner map but never evicted the address key
+    /// itself, so removing an address's LAST certificate through the
+    /// ordinary, successful `AddCertificate` + `RemoveCertificate` sequence
+    /// left a dangling `self.certificates[address] == {}` entry. That
+    /// leftover is not merely untidy: `generate_requests` (`produce_initial_state`
+    /// / `SaveState` / worker bootstrap / hot upgrade) skips an empty bucket
+    /// when emitting `AddCertificate` requests, so replaying those requests
+    /// into a fresh `ConfigState` never recreates the entry -- it already
+    /// broke `generate_requests`'s own round-trip debug_assert before this
+    /// fix. Mirrors the `name_fingerprint_idx` empty-entry leak
+    /// `CertificateResolver::remove_certificate` (`lib/src/tls.rs`) was
+    /// fixed for in #1202.
+    #[test]
+    fn remove_certificate_evicts_the_address_when_its_last_certificate_is_removed() {
+        let certificate = CertificateAndKey {
+            certificate: include_str!("../assets/certificate.pem").to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: Vec::new(),
+        };
+        let fingerprint = certificate
+            .fingerprint()
+            .expect("test certificate fingerprint must be computable");
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+
+        let mut state = ConfigState::default();
+        state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate,
+                expired_at: None,
+            })
+            .expect("initial certificate insertion must succeed");
+
+        state
+            .remove_certificate(&RemoveCertificate {
+                address,
+                fingerprint: fingerprint.to_string(),
+            })
+            .expect("removing the only certificate must succeed");
+
+        assert!(
+            !state.certificates.contains_key(&SocketAddr::from(address)),
+            "removing an address's last certificate must evict the address key too, \
+             found {:?}",
+            state.certificates.get(&SocketAddr::from(address))
+        );
+
+        // Regression proof for the round-trip this leak broke: this is the
+        // live path SaveState / worker bootstrap / hot upgrade use, and it
+        // carries its own debug_assert that a fresh replay reproduces `self`.
+        let _ = state.produce_initial_state();
+    }
+
+    /// Found alongside the `remove_certificate` leak above, same
+    /// investigation (sozu-proxy/sozu#1404): `add_certificate` computed
+    /// `add.certificate.fingerprint()` (parses PEM only) and THEN called
+    /// `self.certificates.entry(address).or_default()` -- unconditionally
+    /// materialising a bucket for the address, including a brand-new one --
+    /// BEFORE the second fallible step, `apply_overriding_names`, which
+    /// additionally parses full X.509 when `names` is empty. Valid PEM
+    /// armor wrapping invalid X.509 DER content therefore left a dangling
+    /// empty bucket for a previously-absent address on a REJECTED add,
+    /// violating the same "a rejected dispatch must be a true no-op"
+    /// contract `replace_certificate`'s ordering bug violated.
+    #[test]
+    fn add_certificate_with_valid_pem_armor_but_invalid_x509_leaves_no_bucket() {
+        // Valid PEM framing (base64 of arbitrary bytes), but the decoded
+        // bytes are not a valid X.509 DER structure.
+        let junk_pem = "-----BEGIN CERTIFICATE-----\n\
+             dGhpcyBpcyBub3QgYSB2YWxpZCB4NTA5IGRlciBzdHJ1Y3R1cmUgYXQgYWxsLCBq\n\
+             dXN0IGZpbGxlciBieXRlcyBwYWRkZWQgb3V0\n\
+             -----END CERTIFICATE-----\n";
+        let certificate = CertificateAndKey {
+            certificate: junk_pem.to_owned(),
+            key: include_str!("../assets/key.pem").to_owned(),
+            certificate_chain: Vec::new(),
+            versions: Vec::new(),
+            names: Vec::new(),
+        };
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8443);
+
+        let mut state = ConfigState::default();
+        assert!(
+            !state.certificates.contains_key(&SocketAddr::from(address)),
+            "the address must be absent before the add attempt"
+        );
+
+        let error = state
+            .add_certificate(&AddCertificate {
+                address,
+                certificate,
+                expired_at: None,
+            })
+            .expect_err("valid PEM armor around invalid X.509 content must be rejected");
+        assert!(
+            matches!(error, StateError::AddCertificate(_)),
+            "expected StateError::AddCertificate, got {error:?}"
+        );
+
+        assert!(
+            !state.certificates.contains_key(&SocketAddr::from(address)),
+            "a rejected add_certificate must leave no bucket for a previously-absent address, \
+             found {:?}",
+            state.certificates.get(&SocketAddr::from(address))
         );
     }
 
