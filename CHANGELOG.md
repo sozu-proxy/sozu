@@ -353,6 +353,51 @@
   `a_certificate_name_carrying_a_regex_segment_is_refused` (`lib/src/tls.rs`) pins the refusal, the
   absence of any mutation, and the wildcard name that must keep working.
   Reported in [#1378](https://github.com/sozu-proxy/sozu/issues/1378).
+- **`fix(http)`: every HTTP/HTTPS frontend whose hostname is not an exact literal logged its
+  requests without its `--tags`.**
+  **This changes observable access-log output.** Lines that were emitted with an empty tag field
+  now carry the frontend's tags; nothing that already had tags loses them.
+  The per-frontend tag cache was WRITTEN under the frontend RULE's hostname —
+  `listener.set_tags(front.hostname.to_owned(), front.tags.to_owned())` in `lib/src/https.rs`, with
+  the twin in `lib/src/http.rs` — and READ back under the REQUEST's authority,
+  `listener.get_tags(hostname)` in `lib/src/protocol/mux/stream.rs`, where `hostname` is the
+  `:authority` with any `:port` stripped. The store is a `BTreeMap<String, CachedTags>` and the read
+  is `self.tags.get(key)`: exact key, no pattern resolution. So for `*.example.com`,
+  `/foo.*/.example.com` or any `Pre`/`Post` rule string, the key written could never be produced by
+  the key read, `get_tags` returned `None`, and the tags were silently absent from every access-log
+  line of that frontend. Three distinct ways to miss, all from the same asymmetry: wildcard/regex,
+  port (the read strips `:port`, the write does not) and case (the write stores the operator's
+  spelling, the read the client's). Exact literal frontends were unaffected, which is why ordinary
+  testing never showed it.
+  The fix resolves L7 tags **through the router** instead of through a parallel exact map, which is
+  what the TCP proxy already does with the structured `sni_tags_key` built by the same function on
+  both sides (`lib/src/tcp.rs`). The router already knows which frontend rule matched the request
+  and is the only correct owner of its tags — a request carries a concrete authority while tags are
+  configured per rule, so no string key can be spelled the same on both sides. Three linked changes:
+  `Router::add_http_front_with_hsts_origin` counts `tags` as a policy field, so a tagged frontend is
+  stored as `Route::Frontend(Rc<Frontend>)` carrying `Rc<CachedTags>` instead of a tagless
+  `Route::ClusterId`; `Router::route_from_request` stashes `RouteResult.tags` on `HttpContext.tags`
+  before every early return, so a redirect, a 401 and a backend-connect failure log them too; and
+  `Stream::generate_access_log` reads them from there. Keying by port or case would have patched two
+  of the three symptoms and left wildcard and regex frontends — the main case — still silent.
+  Only a **tagged** frontend takes the `Rc<Frontend>` shape; an untagged one keeps the lightweight
+  `Route::ClusterId` it had. A clusterless tagged frontend now goes through `Frontend::new`'s
+  `FORWARD` → `UNAUTHORIZED` coercion and logs that coercion's existing warning on add; the 401 it
+  serves is unchanged.
+  Two paths deliberately keep the older key lookup. A request that never reached routing at all —
+  malformed request, unknown host, TLS SNI / `:authority` mismatch — still falls back to the
+  exact-authority lookup, because there is no matched frontend to ask and an exact literal frontend
+  still answers there. And the WS/WSS post-upgrade pipe (`lib/src/protocol/pipe.rs::log_request`)
+  keeps its `Pipe::set_tags_key` string, which only the TCP SNI-preread path ever sets: on an
+  HTTP/HTTPS listener it falls back to the listener address, which is never a hostname key, so a
+  WebSocket access-log line carries no frontend tags on **any** frontend shape. That is a separate
+  pre-existing miss with a different cause, left open rather than silently folded in here.
+  `a_wildcard_frontends_tags_reach_the_access_log_of_a_concrete_authority` pins the fix end to end:
+  it registers `*.example.com` with tags through `HttpProxy::add_http_frontend`, routes
+  `foo.example.com` through `Router::route_from_request`, emits through
+  `Stream::generate_access_log`, and asserts on the rendered access-log line rather than on any
+  intermediate field. `doc/observability.md` carries the resolution order.
+  ([#1379](https://github.com/sozu-proxy/sozu/issues/1379))
 
 - **`fix(router)`: an exact hostname added after a matching regex segment attached its rule to the
   regex segment's leaf, and the whole regex family served it.**
@@ -637,7 +682,8 @@
   it is fixed, it fails and gets inverted. And the per-frontend **access-log tag map**
   (`ListenerHandler::set_tags` / `get_tags`) is keyed on the configured hostname verbatim on both
   sides, so its tags attach only when the client's spelling matches the operator's; this fix does
-  not change that either way.
+  not change that either way. The routed-request half of that gap is closed in the same release by
+  the access-log tag entry below, which stops resolving L7 tags through that map at all.
 
 - **`fix(router)`: a certificate whose SAN carried uppercase was unreachable by any SNI.**
   The same add/lookup case asymmetry on the TLS side, with the two sides swapped. rustls lowercases

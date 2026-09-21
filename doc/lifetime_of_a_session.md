@@ -60,7 +60,8 @@ call `arm_writable` (mux) or `signal_pending_write` (pipe),
 the session "stalls" — bytes sit in the buffer and the next epoll
 event never arrives. Past truncation bugs on this branch all
 originated here. The `mux::answers` module documents this as the
-"invariant-15 pair" (`lib/src/protocol/mux/answers.rs:408-413`); the
+"invariant-15 pair" (`set_default_answer_arms_writable_and_signals`,
+`lib/src/protocol/mux/answers.rs`); the
 home for the invariant is `mux::connection`
 (`lib/src/protocol/mux/connection.rs:13-16`).
 

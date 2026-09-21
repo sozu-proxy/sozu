@@ -253,6 +253,14 @@ impl Router {
         // and the rich `Route::Frontend(Rc<Frontend>)` shape: any non-
         // default policy field flips us onto the rich path so the mux
         // can honour redirect/rewrite/headers/auth at request time.
+        //
+        // `tags` counts as such a field. The legacy shapes carry no tags
+        // (`RouteResult::forward` / `::deny` both set `tags: None`), so a
+        // tagged frontend stored as `Route::ClusterId` would hand the mux
+        // a tagless routing decision and its access logs would have to
+        // fall back to the authority-keyed listener map — the exact
+        // spelling mismatch of sozu#1379. Only tagged frontends pay the
+        // `Rc<Frontend>`; an untagged one keeps the lightweight shape.
         let has_policy = front.redirect.is_some()
             || front.redirect_scheme.is_some()
             || front.redirect_template.is_some()
@@ -261,7 +269,8 @@ impl Router {
             || front.rewrite_port.is_some()
             || front.required_auth.unwrap_or(false)
             || !front.headers.is_empty()
-            || front.hsts.is_some();
+            || front.hsts.is_some()
+            || front.tags.is_some();
 
         let domain =
             front

@@ -367,6 +367,41 @@ are sourced from the rustls handshake context in `lib/src/https.rs` and
 plumbed via `mux::Context` into `HttpContext`. The pipe path picks them up
 via `Pipe::set_tls_metadata` called from `https.rs::upgrade_mux`.
 
+### Where a frontend's `--tags` come from
+
+On HTTP and HTTPS listeners the access-log `tags` field is resolved **through
+the router**, not by a hostname lookup. `Router::add_http_front_with_hsts_origin`
+(`lib/src/router/mod.rs`) treats a frontend's `tags` as a policy field, so a
+tagged frontend is stored as `Route::Frontend(Rc<Frontend>)` carrying
+`Rc<CachedTags>`; `Router::lookup` returns them on `RouteResult.tags`;
+`Router::route_from_request` (`lib/src/protocol/mux/router.rs`) stashes them on
+`HttpContext.tags` before any of its early returns, so a redirect, a 401 and a
+backend-connect failure log them too; and
+`Stream::generate_access_log` (`lib/src/protocol/mux/stream.rs`) reads them from
+there.
+
+This is what makes a frontend whose hostname is not an exact literal log its
+tags at all. The matched frontend rule is the only correct owner: the operator
+configures tags per rule (`*.example.com`, `/foo.*/.example.com`, a `Pre`/`Post`
+string) while a request only ever carries a concrete authority, so no string key
+can be spelled the same on both sides.
+
+Two paths still use the older `ListenerHandler::get_tags` key lookup against the
+listener's `BTreeMap<String, CachedTags>`:
+
+- a request that **never reached routing** (malformed request, unknown host, TLS
+  SNI / `:authority` mismatch) falls back to an exact-authority lookup — there is
+  no matched frontend to ask, and an exact-literal frontend still answers;
+- the **WS / WSS post-upgrade pipe** (`lib/src/protocol/pipe.rs::log_request`)
+  looks up `Pipe::set_tags_key`, which only the TCP SNI-preread path sets. On an
+  HTTP/HTTPS listener it falls back to the listener address, which is never a
+  hostname key, so a WebSocket access-log line carries no frontend tags on any
+  frontend shape. Tracked separately from the routed-request resolution.
+
+The TCP proxy resolves its own tags with a structured key built by the same
+function on both sides (`sni_tags_key` in `lib/src/tcp.rs`); UDP keys by the
+frontend address on both sides. Neither has the L7 spelling asymmetry.
+
 ## Tracing — current state
 
 **This is W3C `traceparent` passthrough only.** No span lifecycle, no OTLP

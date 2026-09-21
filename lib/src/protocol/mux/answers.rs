@@ -398,6 +398,7 @@ mod tests {
             retry_after_seconds: None,
             frontend_redirect_template: None,
             redirect_status: None,
+            tags: None,
             access_log_message: None,
         };
         let stream =
