@@ -493,6 +493,60 @@
   breaking changes; making it authoritative — rejecting an activation that claims `from_scm: true`
   when no descriptor arrived — would be a behaviour change worth its own decision. Neither is done
   here. Comments only.
+- **`fix(command)`: `sozu certificate list --domain <host>` could not see a wildcard certificate.**
+  `sozu certificate list --domain foo.example.com` reported nothing when the certificate actually
+  serving that host was registered as `*.example.com`, while TLS handshakes for it kept succeeding.
+  The inventory contradicted the running proxy exactly when an operator was debugging a certificate
+  problem and trusting the query, and the wildcard case is the common one. It fails closed rather
+  than open — no certificate was ever wrongly disclosed — so this is a diagnostic defect, not a
+  security one (sozu#1383).
+  The main process answered `--domain` from `ConfigState::get_certificates`
+  (`command/src/state.rs`), which filters the SAN list with `Vec::contains`, i.e. exact string
+  equality. The certificate that actually serves a handshake is chosen by
+  `CertificateResolver::domain_lookup` (`lib/src/tls.rs`) — a `TrieNode` lookup that resolves `*.`
+  wildcard labels and, since sozu#1378, regex labels. The two disagree for every certificate not
+  bound by an exact name.
+  The `--domain` query is now resolved through that same trie, rebuilt from the control plane's own
+  record, in `certificates_serving_domain` (`bin/src/command/requests.rs`). It is fixed at the
+  caller rather than inside `ConfigState` because `TrieNode` lives in `sozu-lib`, which already
+  depends on `sozu-command-lib`: the reverse edge is a cargo cycle, moving the trie into `command/`
+  would grow a `regex` production dependency that crate does not have, and reimplementing hostname
+  matching there would duplicate it and drift from the resolver — which is this bug. `bin/`
+  already depends on both crates and holds the only `--domain` consumer of `get_certificates`.
+  Three properties of the rebuilt index were measured rather than assumed, and each is pinned by a
+  test in `bin/src/command/requests.rs`. **One trie per listener address, unioned**, because
+  `ConfigState::certificates` is keyed by listener and each worker listener owns its own resolver:
+  `TrieNode::insert` answers `InsertResult::Existing` and keeps the incumbent, so a single global
+  trie would silently drop a second listener's certificate for the same name
+  (`every_listener_answers_with_its_own_certificate`). **Both sides are ASCII-lowercased**, which is
+  the sole derivation difference between the two name sets — `ConfigState::add_certificate`
+  resolves the SAN/CN set exactly as `CertifiedKeyWrapper::try_from` does, but only the resolver
+  folds case (`the_query_and_the_stored_names_are_ascii_folded`). And a name longer than
+  `MAX_HOSTNAME_LENGTH`, which the resolver refuses outright, is skipped rather than indexed, so a
+  saved state file cannot make the query answer for a name no handshake can reach
+  (`a_name_the_resolver_would_refuse_is_skipped_rather_than_indexed`).
+  **This is an operator-visible change to the shape of the answer.** A trie lookup resolves to one
+  entry, so `--domain` now returns **at most one certificate per HTTPS listener** where the
+  exact-equality filter could return several; a host carried by two certificates on the *same*
+  listener reports one of them. The main process does not retain `AddCertificate::expired_at`, so it
+  cannot reproduce the resolver's longest-lived tie-break and reports a reproducible choice instead
+  — `--workers` reports what each worker's resolver actually selected
+  (`one_listener_answers_with_exactly_one_certificate`). Scripts parsing
+  `sozu certificate list --domain <host> --json` and expecting the full set of certificates carrying
+  that exact SAN must list everything and filter on `names` themselves; there is no exact-SAN flag.
+  `--domain` is also not a prefix or substring search: `*.example.com` answers for
+  `foo.example.com` and not for the apex `example.com` nor for `deep.foo.example.com`
+  (`a_wildcard_certificate_stays_fail_closed_outside_the_hosts_it_serves`). Note that
+  `sozu frontend list --domain` is a *third*, unrelated reading of the same flag name — a plain
+  substring test on the frontend hostname (`ConfigState::list_frontends`) — and is untouched here.
+  `doc/configure_cli.md` gains the section stating which question `--domain` answers, which the
+  documentation did not say at all before, and the `--domain` CLI help text now states it too.
+  **One divergence is deliberately left in place and documented.** `lib/src/server.rs` intercepts a
+  `QueryCertificatesFromWorkers` request whose filter carries a fingerprint, and hands it to
+  `get_certificates`, whose domain arm is tested first — so
+  `sozu certificate list --fingerprint <hex> --domain <host> --workers` still takes the exact-SAN
+  arm. Passing both filters was never a conjunction on any path; `doc/configure_cli.md` says so and
+  says to query one filter at a time.
 
 - **`fix(router)`: an exact hostname added after a matching regex segment attached its rule to the
   regex segment's leaf, and the whole regex family served it.**
@@ -802,7 +856,9 @@
   normalised trie key, so it renders lowercase. The main process's own
   `ConfigState::get_certificates` filter (`command/src/state.rs`) still compares the requested
   domain against the stored names with an exact `contains`, and is deliberately left alone here —
-  it filters the control plane's record, not the worker's SNI table.
+  it filters the control plane's record, not the worker's SNI table. Its `--domain` caller is not:
+  see the sozu#1383 entry above, which resolves that query through the trie one layer up in `bin/`
+  and folds case on both sides there.
   Audited in the same pass and found already correct, so left alone: the TCP SNI preread routes
   (`lib/src/tcp.rs`'s `route_key_and_matcher` lowercases on add, `normalize_sni` in
   `lib/src/protocol/tcp_preread/mod.rs` lowercases and strips a trailing dot on lookup), and the
@@ -1373,9 +1429,11 @@
   **The next worker restart makes such a route live, and it requires no operator action.** Because
   the release-build worker reported success, the main process kept the frontend in its authoritative
   `ConfigState` — the pre-dispatch validation probes a fresh, empty `Router`
-  (`bin/src/command/requests.rs:2169-2181`), which cannot see an ordering conflict, and the
+  (`validate_frontend_request`, `bin/src/command/requests.rs`), which cannot see an ordering
+  conflict, and the
   unacknowledged-add rollback only fires when no worker answers `Ok`
-  (`bin/src/command/requests.rs:2286`). That state is replayed into every worker at launch
+  (`should_rollback_fanout`, `bin/src/command/requests.rs`). That state is replayed into every
+  worker at launch
   (`ConfigState::generate_requests`, `command/src/state.rs:1702-1704`), walking a `BTreeMap` keyed
   `{address};{hostname};P{path}` (`command/src/state.rs:120`, `command/src/request.rs:259-278`) — so
   `/test[0-9]/.example.com` replays BEFORE `foo./test[0-9]/.example.com`, the insertion order that

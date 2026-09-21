@@ -22,22 +22,27 @@ use rusty_ulid::Ulid;
 use sha2::{Digest, Sha256};
 use sozu_command_lib::{
     buffer::fixed::Buffer,
+    certificate::Fingerprint,
     config::Config,
     logging,
     parser::parse_several_requests,
     proto::command::{
-        AggregatedMetrics, AvailableMetrics, CertificatesWithFingerprints, ClusterHashes,
-        ClusterInformations, Event, EventKind, FrontendFilters, HardStop, ListenerType,
-        MetricDetail, MetricDetailStatus, MetricsConfiguration, QueryCertificatesFilters,
-        QueryHealthChecks, QueryMetricsOptions, RemoveListener, Request, ResponseContent,
-        ResponseStatus, RunState, SetMetricDetail, SoftStop, Status, UpdateHttpListenerConfig,
-        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig, WorkerInfo,
-        WorkerInfos, WorkerRequest, WorkerResponse, WorkerResponses, request::RequestType,
-        response_content::ContentType,
+        AggregatedMetrics, AvailableMetrics, CertificateAndKey, CertificatesWithFingerprints,
+        ClusterHashes, ClusterInformations, Event, EventKind, FrontendFilters, HardStop,
+        ListenerType, MetricDetail, MetricDetailStatus, MetricsConfiguration,
+        QueryCertificatesFilters, QueryHealthChecks, QueryMetricsOptions, RemoveListener, Request,
+        ResponseContent, ResponseStatus, RunState, SetMetricDetail, SoftStop, Status,
+        UpdateHttpListenerConfig, UpdateHttpsListenerConfig, UpdateTcpListenerConfig,
+        UpdateUdpListenerConfig, WorkerInfo, WorkerInfos, WorkerRequest, WorkerResponse,
+        WorkerResponses, request::RequestType, response_content::ContentType,
     },
     sd_notify,
+    state::ConfigState,
 };
-use sozu_lib::metrics::METRICS;
+use sozu_lib::{
+    metrics::METRICS,
+    router::{MAX_HOSTNAME_LENGTH, pattern_trie::TrieNode},
+};
 
 use crate::command::{
     server::{
@@ -504,19 +509,112 @@ impl Server {
 pub fn query_certificates_from_main(
     server: &mut Server,
     client: &mut ClientSession,
-    filters: QueryCertificatesFilters,
+    mut filters: QueryCertificatesFilters,
 ) {
     debug!(
         "querying certificates in the state with filters {:?}",
         filters
     );
 
-    let certs = server.state.get_certificates(filters);
+    // sozu#1383: `--domain` asks "which certificate would Sōzu present for
+    // this host?", so it is resolved through the same SNI trie the resolver
+    // uses rather than by exact SAN equality. `take` leaves `filters.domain`
+    // at `None` so the fall-through below cannot reach the exact-equality arm
+    // of `ConfigState::get_certificates` with a domain still set.
+    let certs = match filters.domain.take() {
+        Some(domain) => certificates_serving_domain(&server.state, &domain),
+        None => server.state.get_certificates(filters),
+    };
 
     client.finish_ok_with_content(
         ContentType::CertificatesWithFingerprints(CertificatesWithFingerprints { certs }).into(),
         "Successfully queried certificates from the state of main process",
     );
+}
+
+/// Which certificate would Sōzu present for `domain`, on each HTTPS listener
+/// that has one — the question `sozu certificate list --domain <host>` reads
+/// as, answered against the main process's own `ConfigState`.
+///
+/// `ConfigState::get_certificates` filters `--domain` with `Vec::contains`,
+/// i.e. exact SAN equality, while the certificate that actually serves a
+/// handshake is chosen by `CertificateResolver::domain_lookup`
+/// (`lib/src/tls.rs`) — a [`TrieNode`] lookup resolving `*.` wildcard and
+/// regex labels. The two disagreed for every certificate not bound by an
+/// exact name, so `--domain foo.example.com` reported nothing while TLS for
+/// that host succeeded on a `*.example.com` certificate (sozu#1383).
+///
+/// The fix lives here rather than in `ConfigState` because `TrieNode` is in
+/// `sozu-lib`, which already depends on `sozu-command-lib`: the reverse edge
+/// is a cargo cycle, moving the trie into `command/` would grow a `regex`
+/// production dependency it does not have, and reimplementing the match there
+/// would duplicate hostname matching and drift from the resolver — which is
+/// this bug. `bin/` already depends on both crates, and this is the only
+/// `--domain` consumer of `get_certificates`.
+///
+/// Three properties are deliberate:
+///
+/// - **One trie per listener address, unioned.** `ConfigState::certificates`
+///   is keyed by listener and each worker listener owns its own resolver, so
+///   a single global trie would silently drop a second listener's certificate
+///   for the same name: `TrieNode::insert` answers
+///   `InsertResult::Existing` and keeps the incumbent.
+/// - **Both sides are ASCII-lowercased.** Name derivation does not otherwise
+///   drift — `ConfigState::add_certificate` resolves the SAN/CN set exactly as
+///   `CertifiedKeyWrapper::try_from` does — but the resolver lowercases that
+///   set and `ConfigState` does not, so the query and the stored names are
+///   folded here instead. `lib/src/https.rs`'s `query_certificate_for_domain`
+///   folds the query the same way.
+/// - **At most one certificate per listener**, because a trie lookup resolves
+///   to one entry. The exact-equality filter could answer with several, so a
+///   `--domain` query returns fewer certificates than it used to whenever more
+///   than one carried the requested name verbatim; see `doc/configure_cli.md`.
+fn certificates_serving_domain(
+    state: &ConfigState,
+    domain: &str,
+) -> BTreeMap<String, CertificateAndKey> {
+    let queried = domain.to_ascii_lowercase();
+    let mut serving = BTreeMap::new();
+
+    for certificates in state.certificates.values() {
+        let mut domains: TrieNode<Fingerprint> = TrieNode::root();
+
+        // Iterate in fingerprint order, not `HashMap` order. `domain_insert`
+        // keeps the incumbent on a collision, so two certificates carrying the
+        // same name on one listener would otherwise make the answer vary from
+        // run to run. `ConfigState` does not retain `AddCertificate::expired_at`
+        // and so cannot reproduce the resolver's longest-lived tie-break;
+        // ordering by fingerprint at least makes this answer reproducible, and
+        // `sozu certificate list --domain <host> --workers` reports the choice
+        // the worker's resolver actually made.
+        for (fingerprint, certificate) in certificates.iter().collect::<BTreeMap<_, _>>() {
+            for name in &certificate.names {
+                // `CertificateResolver::add_certificate` bounds every name the
+                // same way, because the trie recurses once per label, and
+                // refuses a certificate carrying a name the trie cannot host.
+                // `ConfigState` enforces neither, so a name a saved state file
+                // carried past it is skipped here rather than indexed: no
+                // handshake can reach it either. A name the trie refuses
+                // outright makes `domain_insert` a no-op, which is the same
+                // outcome.
+                if name.len() > MAX_HOSTNAME_LENGTH {
+                    continue;
+                }
+                domains.domain_insert(
+                    name.to_ascii_lowercase().into_bytes(),
+                    fingerprint.to_owned(),
+                );
+            }
+        }
+
+        if let Some((_, fingerprint)) = domains.domain_lookup(queried.as_bytes(), true)
+            && let Some(certificate) = certificates.get(fingerprint)
+        {
+            serving.insert(fingerprint.to_string(), certificate.to_owned());
+        }
+    }
+
+    serving
 }
 
 fn list_health_checks(server: &mut Server, client: &mut ClientSession, query: QueryHealthChecks) {
@@ -5921,6 +6019,218 @@ mod load_state_rollback_tests {
         assert!(
             matches!(bulk_replay_timeout(0, 0), Timeout::Custom(d) if d >= std::time::Duration::from_secs(1)),
             "a zero worker_timeout must not produce a zero deadline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod certificate_domain_filter_tests {
+    //! sozu#1383: `sozu certificate list --domain <host>` reads as "which
+    //! certificate would Sōzu present for this host?", but
+    //! `ConfigState::get_certificates` answered it with `Vec::contains` — exact
+    //! SAN equality — while the serving path resolves it through
+    //! `CertificateResolver::domain_lookup`, a `TrieNode` lookup. The two
+    //! disagree for every certificate not bound by an exact name, so a
+    //! `*.example.com` certificate was invisible to a query for
+    //! `foo.example.com` that TLS handshakes were succeeding on.
+    //!
+    //! To SEE THESE RED, restore the pre-fix behaviour by replacing the body of
+    //! [`super::certificates_serving_domain`] with the delegation it displaced:
+    //!
+    //! ```ignore
+    //! state.get_certificates(QueryCertificatesFilters {
+    //!     domain: Some(domain.to_owned()),
+    //!     fingerprint: None,
+    //! })
+    //! ```
+    //!
+    //! Five of the seven tests below then fail —
+    //! `a_wildcard_certificate_answers_a_query_for_a_covered_host`,
+    //! `every_listener_answers_with_its_own_certificate`,
+    //! `the_query_and_the_stored_names_are_ascii_folded`,
+    //! `one_listener_answers_with_exactly_one_certificate` each report an empty
+    //! answer, which is sozu#1383 as filed, and
+    //! `a_name_the_resolver_would_refuse_is_skipped_rather_than_indexed`
+    //! answers for a name no handshake can reach, because exact equality does
+    //! not care what the trie can host. The two remaining tests stay green under
+    //! that mutation — they guard the fix from over-reaching, not the bug.
+    //!
+    //! The worker-side half of the same question is already correct and is
+    //! pinned in `lib/src/https.rs`
+    //! (`query_certificate_for_domain_answers_any_spelling_of_the_name`).
+
+    use std::{collections::HashMap, net::SocketAddr};
+
+    use sozu_command_lib::{
+        certificate::Fingerprint, proto::command::CertificateAndKey, state::ConfigState,
+    };
+
+    use super::{MAX_HOSTNAME_LENGTH, certificates_serving_domain};
+
+    /// One certificate in a fixture: its one-byte fingerprint and its names.
+    type TestCertificate<'a> = (u8, &'a [&'a str]);
+    /// One HTTPS listener in a fixture: its address and the certificates on it.
+    type TestListener<'a> = (&'a str, &'a [TestCertificate<'a>]);
+
+    fn certificate(names: &[&str]) -> CertificateAndKey {
+        CertificateAndKey {
+            names: names.iter().map(|name| (*name).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// `ConfigState::add_certificate` stores the `CertificateAndKey` verbatim
+    /// once `apply_overriding_names` has resolved its `names`, and — unlike
+    /// `CertifiedKeyWrapper::try_from` — does not ASCII-lowercase them.
+    /// Populating the public `certificates` map directly keeps these tests on
+    /// the filter under test rather than on PEM parsing, and preserves that
+    /// unfolded spelling.
+    ///
+    /// Each entry is `(listener address, [(fingerprint byte, names)])`; a
+    /// one-byte fingerprint renders as its own hex, so `0xaa` keys the answer
+    /// under `"aa"`.
+    fn state_with(listeners: &[TestListener<'_>]) -> ConfigState {
+        let mut state = ConfigState::new();
+        for (address, entries) in listeners {
+            let address: SocketAddr = address.parse().expect("test listener address must parse");
+            let certificates: HashMap<Fingerprint, CertificateAndKey> = entries
+                .iter()
+                .map(|(tag, names)| (Fingerprint(vec![*tag]), certificate(names)))
+                .collect();
+            state.certificates.insert(address, certificates);
+        }
+        state
+    }
+
+    fn fingerprints_for(state: &ConfigState, domain: &str) -> Vec<String> {
+        certificates_serving_domain(state, domain)
+            .into_keys()
+            .collect()
+    }
+
+    #[test]
+    fn a_wildcard_certificate_answers_a_query_for_a_covered_host() {
+        let state = state_with(&[("127.0.0.1:8443", &[(0xaa, &["*.example.com"])])]);
+
+        assert_eq!(
+            fingerprints_for(&state, "foo.example.com"),
+            vec!["aa".to_owned()],
+            "the *.example.com certificate serves foo.example.com, so the query must report it"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_certificate_stays_fail_closed_outside_the_hosts_it_serves() {
+        let state = state_with(&[("127.0.0.1:8443", &[(0xaa, &["*.example.com"])])]);
+
+        // `*` is a single-label wildcard and does not cover the apex — the same
+        // boundaries `keep_resolving_with_wildcard` (`lib/src/tls.rs`) asserts
+        // against the resolver's own trie.
+        for host in [
+            "deep.foo.example.com",
+            "example.com",
+            "example.org",
+            "fooexample.com",
+        ] {
+            assert!(
+                fingerprints_for(&state, host).is_empty(),
+                "*.example.com must not answer for {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exact_name_still_answers_and_an_unrelated_host_still_does_not() {
+        let state = state_with(&[(
+            "127.0.0.1:8443",
+            &[(0xaa, &["lolcatho.st", "www.lolcatho.st"])],
+        )]);
+
+        for host in ["lolcatho.st", "www.lolcatho.st"] {
+            assert_eq!(
+                fingerprints_for(&state, host),
+                vec!["aa".to_owned()],
+                "an exactly-named certificate must keep answering for {host}"
+            );
+        }
+        assert!(
+            fingerprints_for(&state, "other.st").is_empty(),
+            "resolving through the trie must not make an unrelated host match"
+        );
+    }
+
+    #[test]
+    fn every_listener_answers_with_its_own_certificate() {
+        let state = state_with(&[
+            ("127.0.0.1:8443", &[(0xaa, &["*.example.com"])]),
+            ("127.0.0.1:9443", &[(0xbb, &["*.example.com"])]),
+        ]);
+
+        assert_eq!(
+            fingerprints_for(&state, "foo.example.com"),
+            vec!["aa".to_owned(), "bb".to_owned()],
+            "each listener owns its own resolver: a single shared trie keeps the incumbent on a \
+             name collision and would drop one of these two certificates"
+        );
+    }
+
+    #[test]
+    fn the_query_and_the_stored_names_are_ascii_folded() {
+        let state = state_with(&[("127.0.0.1:8443", &[(0xaa, &["*.Example.COM"])])]);
+
+        for query in ["FOO.example.com", "foo.example.com", "Foo.Example.Com"] {
+            assert_eq!(
+                fingerprints_for(&state, query),
+                vec!["aa".to_owned()],
+                "the resolver lowercases certificate names and ConfigState does not, so both \
+                 sides are folded here: {query} must find *.Example.COM"
+            );
+        }
+    }
+
+    #[test]
+    fn one_listener_answers_with_exactly_one_certificate() {
+        // A trie lookup resolves to one entry, so a listener carrying the same
+        // name on two certificates answers with one of them — where the
+        // exact-equality filter answered with both. `ConfigState` does not
+        // retain `AddCertificate::expired_at`, so it cannot reproduce the
+        // resolver's longest-lived tie-break; the contract is only that the
+        // answer is reproducible rather than `HashMap`-order dependent.
+        for _ in 0..16 {
+            let state = state_with(&[(
+                "127.0.0.1:8443",
+                &[(0x01, &["*.example.com"]), (0x02, &["*.example.com"])],
+            )]);
+
+            assert_eq!(
+                fingerprints_for(&state, "foo.example.com"),
+                vec!["01".to_owned()],
+                "a name carried twice on one listener must resolve to one reproducible answer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_the_resolver_would_refuse_is_skipped_rather_than_indexed() {
+        // `CertificateResolver::add_certificate` refuses a name longer than
+        // `MAX_HOSTNAME_LENGTH` because the trie recurses once per label.
+        // `ConfigState` enforces no such bound, so a saved state file can carry
+        // one; it must not be indexed here either, while the certificate's
+        // other names keep answering.
+        let too_long = format!("{}.example.com", "x".repeat(MAX_HOSTNAME_LENGTH));
+        let state = state_with(&[(
+            "127.0.0.1:8443",
+            &[(0xaa, &[too_long.as_str(), "ok.example.com"])],
+        )]);
+
+        assert!(
+            fingerprints_for(&state, &too_long).is_empty(),
+            "a name past MAX_HOSTNAME_LENGTH reaches no handshake and must reach no query either"
+        );
+        assert_eq!(
+            fingerprints_for(&state, "ok.example.com"),
+            vec!["aa".to_owned()],
+            "skipping one unhostable name must not hide the certificate's other names"
         );
     }
 }

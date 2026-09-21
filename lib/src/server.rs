@@ -1982,6 +1982,16 @@ impl Server {
                 ));
                 return;
             }
+            // A filter carrying a fingerprint is answered from this worker's
+            // own `ConfigState` rather than from its resolver. Note that
+            // `get_certificates` tests its domain arm FIRST, so a request
+            // carrying BOTH filters is answered by exact SAN equality on the
+            // domain and the fingerprint is ignored — the one path where
+            // `--domain` is not the trie lookup `query_certificate_for_domain`
+            // and `bin`'s `certificates_serving_domain` both perform
+            // (sozu#1383). `QueryCertificatesFilters` documents that the two
+            // filters do not compound; `doc/configure_cli.md` says to pass one
+            // at a time.
             Some(RequestType::QueryCertificatesFromWorkers(filters))
                 if filters.fingerprint.is_some() =>
             {

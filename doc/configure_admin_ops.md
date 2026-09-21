@@ -19,8 +19,10 @@ for the supervisor side see
 Every `sozu listener {http,https,tcp} update` invocation produces an
 `Update*Listener` request type
 (`UpdateHttpListenerConfig` / `UpdateHttpsListenerConfig` /
-`UpdateTcpListenerConfig` — see
-`bin/src/command/requests.rs:33-34` for the imports). The semantic is
+`UpdateTcpListenerConfig` — the payloads of
+`RequestType::UpdateHttpListener`, `RequestType::UpdateHttpsListener` and
+`RequestType::UpdateTcpListener`, dispatched in
+`bin/src/command/requests.rs`). The semantic is
 **preserve on omit**: every CLI flag you do not pass keeps its current
 value on the worker side, so an update is a true patch rather than a full
 replacement.

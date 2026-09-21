@@ -145,15 +145,18 @@ dropped at scope end, which sends RST/EOF to the peer.
 `Server::handle_client_request` (`bin/src/command/requests.rs`) is invoked when
 a client sends a complete `Request` over the channel. Steps:
 
-1. Reject empty `request_type` with an `error!` log (`requests.rs:280-283`).
-2. Apply `command_allowed_uids` admission (`requests.rs:290-310`).
+1. Reject empty `request_type` with an `error!` log — the `None` arm of the
+   opening `match request.request_type` in `Server::handle_client_request`.
+2. Apply `command_allowed_uids` admission (`Config::command_allowed_uids`,
+   `command/src/config.rs`; enforced in `Server::handle_client_request`).
    When `Config::command_allowed_uids` is `None` (the default), every
    same-UID local process is permitted; when set,
    `actor_uid` must be in the allowlist or the request is rejected with
    `client.finish_failure("unauthorized: ...")` and recorded in the audit
    trail. The historical "any same-UID" behaviour is preserved for sites
    that do not set the field.
-3. Match on `RequestType` (`requests.rs:373-453`) and dispatch:
+3. Match on `RequestType` (the `match request_type` block in
+   `Server::handle_client_request`) and dispatch:
    - master-only verbs (`SaveState`, `LoadState`, `ListWorkers`,
      `Status`, `Logging`, `SubscribeEvents`, `ReloadConfiguration`,
      `UpgradeMain`, `CountRequests`, …) handle inline;
@@ -277,7 +280,7 @@ read in isolation; the commit subject is the canonical search key.
 Optional `Config::command_allowed_uids: Option<Vec<u32>>`
 (`FileConfig::command_allowed_uids`, `command/src/config.rs`; propagated into
 the runtime `Config` by `ConfigBuilder::new`). Enforced in
-`Server::handle_client_request` (`bin/src/command/requests.rs:290-310`).
+`Server::handle_client_request` (`bin/src/command/requests.rs`).
 `None` preserves the historical "any same-UID local process" behaviour;
 `Some(allowlist)` rejects every actor UID outside the list. Rejected
 verbs still emit an audit line (`client.finish_failure(...)` is captured
@@ -299,8 +302,9 @@ machinery:
 - `audit_emit` (`requests.rs`) — text sink (the `info!`-driven log
   drain).
 - `audit_record_to_json` (`requests.rs`) — JSON sink. Every free-form
-  field is passed through `sanitize_for_audit` at render time (see
-  `requests.rs:1925-1929`) so `\n`/`\t`/ANSI sequences cannot forge a
+  field is passed through `sanitize_for_audit` at render time (the
+  `*_sanitized` bindings in `audit_record_to_json`) so `\n`/`\t`/ANSI
+  sequences cannot forge a
   second JSON record. The fix at `ad487958` extended the sanitization
   to the JSON sink free-form fields after the initial pass shipped with
   text-only sanitization.
