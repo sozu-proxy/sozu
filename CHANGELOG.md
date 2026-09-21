@@ -478,6 +478,22 @@
   way it is, and says outright not to reintroduce a trailing-OWS rejection to compensate.
   No behaviour change: `lib/src/protocol/kawa_h1/editor.rs` is touched in comments only.
 
+- **`docs(command)`: two comments described `ActivateListener.from_scm` as meaningful. It is inert.**
+  `from_scm` is a `required` protobuf field with no reader. `Server::notify_activate_listener` never
+  consults it; whether a listener adopts a descriptor is decided entirely by whether
+  `Server::scm_listeners` holds one for the address, in all four listener arms. Setting it `true`
+  changes nothing, and setting it `false` while a descriptor is present still adopts the descriptor.
+  Twenty-one construction sites across `bin/`, `command/` and `e2e/` supply it, all writing `false`,
+  and two comments — in `e2e/src/tests/listener_reactivation_tests.rs` and
+  `e2e/src/tests/udp_tests.rs` — told a reader the value controlled behaviour it does not control
+  (#1382). Both now say so: the reactivation helper's comment keeps `to_scm: false` as the half that
+  IS read (`Server::notify_deactivate_listener` reads it) and marks `from_scm` inert, and the UDP
+  setup comment credits the empty `Listeners` rather than the field.
+  The field is part of the wire format, so removing it is a protocol break and belongs with other
+  breaking changes; making it authoritative — rejecting an activation that claims `from_scm: true`
+  when no descriptor arrived — would be a behaviour change worth its own decision. Neither is done
+  here. Comments only.
+
 - **`fix(router)`: an exact hostname added after a matching regex segment attached its rule to the
   regex segment's leaf, and the whole regex family served it.**
   **This changes hostname resolution for every configuration.** Read the behaviour-change note at

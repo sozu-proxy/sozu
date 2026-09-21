@@ -71,10 +71,17 @@ const ROUND_TRIP: Duration = Duration::from_millis(1500);
 /// Send `deactivate-listener` then `activate-listener` for `address` and read
 /// both worker responses. Returns `true` when both answered `Ok`.
 ///
-/// `to_scm` / `from_scm` are both false: the deactivated socket is dropped
-/// rather than handed to a supervisor, and the reactivation binds a fresh one
-/// (`server_bind` sets `SO_REUSEADDR` + `SO_REUSEPORT`). The retained listen
-/// token is what must survive, not the file descriptor.
+/// `to_scm: false` is the one of the two that means anything:
+/// `Server::notify_deactivate_listener` reads it, and false drops the socket
+/// rather than handing it to a supervisor.
+///
+/// `from_scm: false` is inert. `Server::notify_activate_listener` never reads
+/// the field (sozu#1382); whether a listener adopts a descriptor is decided
+/// solely by whether `Server::scm_listeners` holds one for the address. This
+/// worker was started with no SCM listeners, so the reactivation binds a fresh
+/// socket (`server_bind` sets `SO_REUSEADDR` + `SO_REUSEPORT`) — and would do
+/// so with `from_scm: true` just the same. The retained listen token is what
+/// must survive, not the file descriptor.
 fn cycle_listener(worker: &mut Worker, address: &SocketAddress, proxy: ListenerType) -> bool {
     worker.send_proxy_request_type(RequestType::DeactivateListener(DeactivateListener {
         address: address.clone(),

@@ -83,8 +83,11 @@ fn setup_udp_test(
     nb_backends: usize,
 ) -> (Worker, Vec<SocketAddr>, SocketAddr) {
     let front_address = create_local_address();
-    // An empty config + empty listeners: the UDP listener binds its own socket
-    // on activation (from_scm = false), so we don't pre-attach an SCM fd.
+    // An empty config + empty listeners: no SCM descriptor is pre-attached, so
+    // the UDP listener binds its own socket on activation. The `from_scm` field
+    // set below does not say that — it is inert, never read by
+    // `Server::notify_activate_listener` (sozu#1382); the empty `Listeners` is
+    // the whole of it.
     let (config, listeners, state) = Worker::empty_config();
     let mut worker = Worker::start_new_worker_owned(name, config, listeners, state);
 
