@@ -30,8 +30,8 @@ use sozu_command_lib::{
 };
 
 use super::h2_utils::{
-    H2_FRAME_HEADERS, H2Frame, collect_response_frames, h2_handshake, log_frames,
-    raw_h2_connection_with_sni, teardown,
+    H2_FRAME_HEADERS, H2Frame, collect_response_frames, decode_status, h2_handshake,
+    headers_status_matches, log_frames, raw_h2_connection_with_sni, teardown,
 };
 use crate::{
     http_utils::{http_ok_response, http_request},
@@ -69,22 +69,11 @@ fn build_request_headers(authority: &[u8]) -> Vec<u8> {
     block
 }
 
-/// Scan a HEADERS payload for the literal ASCII bytes of a 3-digit status
-/// code. Sozu's `:status 421` is emitted as a literal (not in the HPACK
-/// static table), so the bytes `b"421"` appear verbatim in the payload.
-fn headers_status_matches(frames: &[(u8, u8, u32, Vec<u8>)], code: &[u8]) -> bool {
-    frames.iter().any(|(ft, _fl, _sid, payload)| {
-        *ft == H2_FRAME_HEADERS && payload.windows(code.len()).any(|w| w == code)
-    })
-}
-
-/// Detect a successful 2xx response encoded via the HPACK static table.
-/// Indices: 8=`:status 200`, 9=`:status 204`, 10=`:status 206`. The indexed
-/// representation flips the MSB so 8→0x88, 9→0x89, 10→0x8a.
+/// Whether any response on the connection carried a 2xx status, decoded
+/// from its `:status` field (see [`decode_status`]).
 fn headers_ok_response(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
     frames.iter().any(|(ft, _fl, _sid, payload)| {
-        *ft == H2_FRAME_HEADERS
-            && (payload.contains(&0x88) || payload.contains(&0x89) || payload.contains(&0x8a))
+        *ft == H2_FRAME_HEADERS && decode_status(payload).is_some_and(|s| (200..300).contains(&s))
     })
 }
 
@@ -815,5 +804,141 @@ fn e2e_h2_cn_not_coalesced_with_san() {
             try_h2_cn_not_coalesced_with_san
         ),
         State::Success
+    );
+}
+
+// ============================================================================
+// Regression: the status checks decode `:status`, they do not scan bytes
+// ============================================================================
+
+/// Rebuild the `:status 200` response HEADERS block Sōzu emits for a proxied
+/// request, parameterised by the `Sozu-Id` value.
+///
+/// The byte sequence is a verbatim capture taken on 2026-09-20 from
+/// `try_h2_sni_authority_mismatch_allowed_when_strict_binding_disabled`:
+/// `88` (indexed static 8 = `:status 200`), `0f 0d 01 '8'`
+/// (`content-length: 8`), then `40 07 "sozu-id" 1a <26-byte ULID>`. Kawa's
+/// HPACK encoder never sets the Huffman bit, so every literal value — the
+/// ULID included — appears as plain ASCII in the block.
+fn captured_200_headers(sozu_id: &str) -> Vec<u8> {
+    let mut payload = vec![0x88, 0x0f, 0x0d, 0x01, b'8', 0x40, 0x07];
+    payload.extend_from_slice(b"sozu-id");
+    payload.push(sozu_id.len() as u8);
+    payload.extend_from_slice(sozu_id.as_bytes());
+    payload
+}
+
+/// Rebuild the `:status 421` response HEADERS block, likewise captured on
+/// 2026-09-20 from `try_h2_sni_authority_mismatch_blocked`: `0e 03 "421"`
+/// (literal without indexing, static name index 14 = `:status`, 3-byte
+/// unhuffmanned value), `0f 09 08 "no-cache"`, then the same `sozu-id`
+/// literal.
+fn captured_421_headers(sozu_id: &str) -> Vec<u8> {
+    let mut payload = vec![0x0e, 0x03, b'4', b'2', b'1', 0x0f, 0x09, 0x08];
+    payload.extend_from_slice(b"no-cache");
+    payload.push(0x40);
+    payload.push(0x07);
+    payload.extend_from_slice(b"sozu-id");
+    payload.push(sozu_id.len() as u8);
+    payload.extend_from_slice(sozu_id.as_bytes());
+    payload
+}
+
+/// Closes #1353. `got_421` must come from the stream's decoded `:status`,
+/// never from the digits `4`, `2`, `1` happening to sit next to each other
+/// somewhere in the field block.
+///
+/// Sōzu stamps every response with the `Sozu-Id` correlation header
+/// (`HttpContext::on_response_headers`, `lib/src/protocol/kawa_h1/editor.rs`)
+/// whose value is the session's
+/// 26-character Crockford base-32 ULID — an alphabet that contains `4`, `2`
+/// and `1`. A ULID therefore carries the substring `421` roughly once in
+/// 1400, and its leading ten characters are a monotonic millisecond
+/// timestamp, so when the hit lands in that prefix every response in a
+/// window carries it: 1 ms, 32 ms, ~1 s, ~33 s or ~17.5 min depending on
+/// which character triple it occupies, and ~9.3 h, ~12.4 d or ~1.1 y for the
+/// three slowest. All 24 windows are a priori equally likely; the slow ones
+/// are not rarer per draw, they are fixed for a whole era, so a hit there is
+/// a property of the epoch rather than of a run. That is
+/// the observed CI signature of #1353: `got_ok=true got_421=true
+/// metric_stable=true bar_reqs=1` on both iterations, then green on a re-run
+/// of the same commit. No 421 was ever emitted — the only production site
+/// that can emit one on this path is `lib/src/protocol/mux/mod.rs:1306`,
+/// reachable solely through `RetrieveClusterError::SniAuthorityMismatch`,
+/// constructed at the single site `lib/src/protocol/mux/router.rs:672`
+/// immediately after `incr!(names::http::SNI_AUTHORITY_MISMATCH)`, and that
+/// counter did not move.
+///
+/// To SEE THIS RED, either:
+/// - restore the historical body of `headers_status_matches`,
+///   `payload.windows(code.len()).any(|w| w == code)` — the `proxied_200`
+///   assertion fails; or
+/// - restore the historical body of `headers_ok_response`,
+///   `payload.contains(&0x88) || payload.contains(&0x89) ||
+///   payload.contains(&0x8a)` — the `stray_indexed_200` assertion fails.
+///
+/// Both mutations have been run and seen red. Note which fixture reddens
+/// which: `misdirected_421` alone does **not** falsify the `0x88` scan,
+/// because a captured block holds nothing but ASCII and therefore no `0x88`
+/// byte. That is why `stray_indexed_200` exists and why it is the one
+/// deliberately synthetic fixture here.
+#[test]
+fn h2_status_checks_decode_the_status_field_not_any_matching_bytes() {
+    // A real 200 whose ULID carries `421` in its random half.
+    let proxied_200 = vec![(
+        H2_FRAME_HEADERS,
+        0x04,
+        1u32,
+        captured_200_headers("01M2Z5AGKT421M9MFQY89EJMJ9"),
+    )];
+    assert!(
+        headers_ok_response(&proxied_200),
+        "a `:status 200` block must read as a 2xx response"
+    );
+    assert!(
+        !headers_status_matches(&proxied_200, b"421"),
+        "a `Sozu-Id` carrying the digits 421 is not a 421 response"
+    );
+
+    // A real 421 must still be detected — the tightened check has to keep
+    // failing the strict-binding tests it exists to guard.
+    let misdirected_421 = vec![(
+        H2_FRAME_HEADERS,
+        0x04,
+        1u32,
+        captured_421_headers("01M2Z5FD3TWATYZGVA29XQ085D"),
+    )];
+    assert!(
+        headers_status_matches(&misdirected_421, b"421"),
+        "a `:status 421` block must read as a 421 response"
+    );
+
+    // Constructed rather than captured, and the property it pins is
+    // wire-reachable. `0x88` in a field block does not imply `:status 200`:
+    // RFC 7541 §5.1 encodes a value length ≥ 127 as a 7-bit prefix plus
+    // continuation octets, each `(len % 128) + 128`, so a 263-byte header
+    // value — an ordinary `Location`, `Set-Cookie` or CSP header — writes
+    // `7f 88 01` with no status anywhere near it (1542 distinct lengths
+    // below 100 000 produce a `0x88` octet). A raw value byte ≥ `0x80` gets
+    // there too: `lib/src/protocol/mux/converter.rs:388-391` rejects only
+    // `0x00..=0x08 | 0x0A..=0x1F | 0x7F` and passes the rest verbatim. Since
+    // `headers_ok_response` runs on *proxied* responses in the strict-off
+    // and coalescing tests, where backend headers are arbitrary, the
+    // historical `contains(&0x88)` scan was falsifiable on the wire. A
+    // trailing indexed `0x88` is the cheapest block carrying that byte
+    // without a 200, and it pins what `decode_status` promises: the first
+    // field decides the status, and a later field — even one that looks
+    // exactly like a status — cannot change the answer.
+    let mut stray = captured_421_headers("01M2Z5FD3TWATYZGVA29XQ085D");
+    stray.push(0x88);
+    let stray_indexed_200 = vec![(H2_FRAME_HEADERS, 0x04, 1u32, stray)];
+    assert!(
+        !headers_ok_response(&stray_indexed_200),
+        "only the first field decides the status: a trailing indexed `:status 200` \
+         does not make a 421 block a 2xx response"
+    );
+    assert!(
+        headers_status_matches(&stray_indexed_200, b"421"),
+        "a trailing field must not displace the real `:status 421`"
     );
 }

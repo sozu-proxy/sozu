@@ -40,7 +40,6 @@ use crate::{
         update_readiness_after_read, update_readiness_after_write,
     },
     socket::{SocketHandler, SocketResult, stats::socket_rtt},
-    timer::TimeoutContainer,
 };
 
 /// Protocol label + session descriptor used as a prefix on every
@@ -1729,7 +1728,16 @@ pub struct ConnectionH2<Front: SocketHandler> {
     pub socket: Front,
     pub state: H2State,
     pub streams: HashMap<StreamId, GlobalStreamId>,
-    pub timeout_container: TimeoutContainer,
+    /// Configured idle timeout for this connection. The core never arms a
+    /// wheel entry itself: it publishes the next instant it wants to be called
+    /// back at through [`ConnectionH2::poll_timeout`], and the embedder — the
+    /// `Mux` adapter — owns the `TimeoutContainer` that reflects it onto the
+    /// real timer. See `LIFECYCLE.md` §7.7.
+    pub timeout_duration: Duration,
+    /// Next instant this connection wants `timeout()` called at, or `None`
+    /// when it wants no timer at all. Always derived from
+    /// [`ConnectionH2::now`], never from a fresh clock read (invariant 20).
+    pub(super) timeout_deadline: Option<Instant>,
     /// Connection-level flow control state (send window, receive tracking, pending updates).
     pub flow_control: H2FlowControl,
     /// Highest stream ID accepted from the peer (used for GoAway last_stream_id).
@@ -1775,6 +1783,13 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// Used to detect sustained misbehavior even when writable() drains the
     /// pending queue between readable() calls.
     pub total_rst_streams_queued: usize,
+    /// Set by [`Self::refuse_stream_and_discard`], consumed once by the
+    /// `H2State::Discard` arm of [`Self::readable`]. Carries enough of the
+    /// refused frame's shape to still hand the connection-level HPACK
+    /// decoder a complete field block before its bytes are dropped — RFC
+    /// 9113 §4.3: field-compression state is scoped to the connection, not
+    /// the stream. See `LIFECYCLE.md`'s Discard section.
+    discarded_field_block: Option<DiscardedFieldBlock>,
     /// Reusable buffer for priority-sorted stream IDs in write_streams().
     /// Cleared and reused each call to avoid per-frame allocation.
     priorities_buf: Vec<StreamId>,
@@ -1925,6 +1940,110 @@ pub enum H2StreamId {
     Other { id: StreamId, gid: GlobalStreamId },
 }
 
+/// What [`ConnectionH2::refuse_stream_and_discard`] hands the `H2State::Discard`
+/// arm of [`ConnectionH2::readable`] to locate a refused stream's HPACK field
+/// block, so the connection decoder can still be advanced before the bytes are
+/// dropped (RFC 9113 §4.3).
+///
+/// RFC 9113 §6.10: only a HEADERS frame carries PADDED/PRIORITY — a
+/// CONTINUATION never does. `New` therefore keeps the whole flag byte so the
+/// fragment can be located inside the raw payload the same way
+/// [`parser::headers_frame`] would. `Continuation` already knows everything
+/// accumulated from every *prior* frame in the block (copied out eagerly,
+/// see the call site in `handle_continuation_header_state` for why it cannot
+/// be a byte offset into `zero.storage` instead) and only needs this frame's
+/// own END_HEADERS bit.
+#[derive(Debug)]
+enum DiscardedFieldBlock {
+    /// A brand-new stream's initiating HEADERS frame was refused whole
+    /// (drain, MAX_CONCURRENT_STREAMS, or buffer-pool exhaustion).
+    New { flags: u8 },
+    /// A later CONTINUATION frame in an in-progress header block was refused
+    /// (CVE-2024-27316 flood mitigation). `prior_fragment` is every field-block
+    /// byte accumulated before this (about to be refused) frame's own payload,
+    /// which is still unread at capture time and gets appended once it lands
+    /// in `zero.storage` at Discard time.
+    Continuation {
+        prior_fragment: Vec<u8>,
+        end_headers: bool,
+    },
+}
+
+/// Decode a refused stream's HPACK field block into `decoder` so the
+/// connection-level dynamic table stays in sync with the peer's encoder (RFC
+/// 9113 §4.3) — no header pair is kept, the stream itself was already
+/// refused and its headers are never used. `payload` is the just-read bytes
+/// sitting in `zero.storage` at the moment `H2State::Discard` is reached
+/// (this frame's own payload only — see [`DiscardedFieldBlock::Continuation`]
+/// for how any earlier frames' bytes are threaded in).
+///
+/// A free function rather than a `ConnectionH2` method: the caller in the
+/// `H2State::Discard` arm of [`ConnectionH2::readable`] already holds
+/// `zero.storage` borrowed as `kawa`, and a method needing the whole
+/// `&mut self` would conflict with that borrow. Taking `decoder` and
+/// `payload` as disjoint parameters keeps the borrow legal.
+fn decode_discarded_field_block(
+    decoder: &mut loona_hpack::Decoder<'static>,
+    payload: &[u8],
+    discarded: DiscardedFieldBlock,
+) -> Result<(), H2Error> {
+    match discarded {
+        DiscardedFieldBlock::New { flags } => {
+            // Reparse using the same grammar as an accepted HEADERS frame
+            // (RFC 9113 §6.2): [Pad Length][Stream Dependency+Weight][field
+            // block fragment][padding]. `payload` is exactly this frame's
+            // whole wire payload — `refuse_stream_and_discard` was handed
+            // `header.payload_len` before any padding/priority stripping —
+            // so the field block has to be located the same way
+            // `parser::headers_frame` locates it for an accepted stream.
+            let header = FrameHeader {
+                payload_len: payload.len() as u32,
+                frame_type: FrameType::Headers,
+                flags,
+                stream_id: 0,
+            };
+            let (_, frame) =
+                parser::headers_frame(payload, &header).map_err(|_| H2Error::ProtocolError)?;
+            let Frame::Headers(headers) = frame else {
+                unreachable!("parser::headers_frame always yields Frame::Headers")
+            };
+            // Correction: when END_HEADERS is not set, the block continues
+            // on a CONTINUATION frame that (per `handle_header_state`) can
+            // now only arrive as a standalone frame and is therefore
+            // rejected as a connection error of type PROTOCOL_ERROR before
+            // any further bytes of this block are read. There is nothing
+            // to decode yet, and decoding a fragment that ends mid-integer
+            // or mid-Huffman-string would misreport COMPRESSION_ERROR in
+            // place of that PROTOCOL_ERROR.
+            if !headers.end_headers {
+                return Ok(());
+            }
+            let fragment = headers
+                .header_block_fragment
+                .data_opt(payload)
+                .ok_or(H2Error::InternalError)?;
+            decoder
+                .decode_with_cb(fragment, |_, _| {})
+                .map_err(|_| H2Error::CompressionError)
+        }
+        DiscardedFieldBlock::Continuation {
+            mut prior_fragment,
+            end_headers,
+        } => {
+            // Same END_HEADERS gate as above, evaluated on this trailing
+            // CONTINUATION frame's own flags rather than the (still false)
+            // flag the originating HEADERS frame carried.
+            if !end_headers {
+                return Ok(());
+            }
+            prior_fragment.extend_from_slice(payload);
+            decoder
+                .decode_with_cb(&prior_fragment, |_, _| {})
+                .map_err(|_| H2Error::CompressionError)
+        }
+    }
+}
+
 impl<Front: SocketHandler> ConnectionH2<Front> {
     fn frontend_hung_up_while_draining(&self) -> bool {
         matches!(self.position, Position::Server)
@@ -1944,6 +2063,37 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             && self.zero.storage.is_empty()
     }
 
+    /// The next instant this connection wants its embedder to call `timeout()`
+    /// at, or `None` for "no timer". The adapter reflects this onto the real
+    /// wheel; nothing in this module touches `crate::timer`.
+    pub(super) fn poll_timeout(&self) -> Option<Instant> {
+        self.timeout_deadline
+    }
+
+    /// Push the deadline one full [`Self::timeout_duration`] out from the
+    /// connection's clock snapshot. Replaces the old
+    /// `TimeoutContainer::reset()` at the same three call sites, and reads
+    /// `self.now` rather than the real clock (invariant 20).
+    pub(super) fn arm_timeout(&mut self) {
+        self.timeout_deadline = self.now.checked_add(self.timeout_duration);
+    }
+
+    /// Ask for no timer at all. Replaces `TimeoutContainer::cancel()`.
+    pub(super) fn clear_timeout(&mut self) {
+        self.timeout_deadline = None;
+    }
+
+    /// Adopt a new configured duration and re-arm from `now`.
+    ///
+    /// Mirrors `TimeoutContainer::set_duration`, which likewise cancelled and
+    /// re-armed rather than keeping the old deadline. `now` is the adapter's
+    /// snapshot: this is called from `Mux::ready`, outside the entry points
+    /// that mirror it into `self.now`.
+    pub(super) fn set_timeout_duration(&mut self, duration: Duration, now: Instant) {
+        self.timeout_duration = duration;
+        self.timeout_deadline = now.checked_add(duration);
+    }
+
     /// Shared constructor for both server and client H2 connections.
     ///
     /// Differences between server and client are captured by the caller-provided
@@ -1958,7 +2108,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         connection_config: H2ConnectionConfig,
         stream_idle_timeout: std::time::Duration,
         graceful_shutdown_deadline: Option<std::time::Duration>,
-        timeout_container: crate::timer::TimeoutContainer,
+        timeout_duration: std::time::Duration,
         expect_read: Option<(H2StreamId, usize)>,
         readiness_interest: sozu_command::ready::Ready,
     ) -> Option<Self> {
@@ -1997,7 +2147,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             socket,
             state: H2State::ClientPreface,
             streams: std::collections::HashMap::with_capacity(8),
-            timeout_container,
+            timeout_duration,
+            // Armed from construction, exactly as the old `TimeoutContainer`
+            // was: the frontend arrived already armed from the handshake state,
+            // and `Router::connect` armed a fresh backend with the connect
+            // timeout right after registering its socket. The adapter reflects
+            // this onto the wheel on its next reschedule.
+            timeout_deadline: now.checked_add(timeout_duration),
             flow_control: H2FlowControl {
                 window: DEFAULT_INITIAL_WINDOW_SIZE as i32,
                 received_bytes_since_update: 0,
@@ -2025,6 +2181,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             pending_rst_streams: Vec::new(),
             rst_sent: std::collections::HashSet::new(),
             total_rst_streams_queued: 0,
+            discarded_field_block: None,
             priorities_buf: Vec::new(),
             close_notify_sent: false,
             max_pending_window_updates: 1 + connection_config.max_concurrent_streams as usize * 4,
@@ -2212,6 +2369,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 stream_id,
                                 H2Error::RefusedStream,
                                 header.payload_len,
+                                DiscardedFieldBlock::New {
+                                    flags: header.flags,
+                                },
                             );
                         }
                         if self.streams.len()
@@ -2233,6 +2393,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                 stream_id,
                                 H2Error::RefusedStream,
                                 header.payload_len,
+                                DiscardedFieldBlock::New {
+                                    flags: header.flags,
+                                },
                             );
                         }
                         match self.create_stream(stream_id, context) {
@@ -2256,6 +2419,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                                     stream_id,
                                     H2Error::RefusedStream,
                                     header.payload_len,
+                                    DiscardedFieldBlock::New {
+                                        flags: header.flags,
+                                    },
                                 );
                             }
                         }
@@ -2436,10 +2602,37 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     if let Some(global_stream_id) = self.streams.get(&stream_id).copied() {
                         self.remove_dead_stream(stream_id, global_stream_id);
                     }
+                    // Capture the field-block bytes accumulated by every
+                    // *prior* frame in this block now, synchronously, while
+                    // they are still intact in `zero.storage`. They cannot
+                    // survive as a byte offset instead: `enqueue_rst` (inside
+                    // `refuse_stream_and_discard`, below) arms WRITABLE, and
+                    // this connection's `writable()` preamble
+                    // (`flush_pending_control_frames`) reuses `self.zero` as
+                    // scratch space to serialize the very RST_STREAM this
+                    // call queues — the same event-loop pass dispatches that
+                    // write before the next `readable()` pass reads this
+                    // frame's own payload (`mod.rs`'s inner loop calls
+                    // frontend `readable()` then `writable()` in one sweep).
+                    let Some(prior_fragment) = headers
+                        .header_block_fragment
+                        .data_opt(self.zero.storage.buffer())
+                    else {
+                        error!(
+                            "{} accumulated header_block_fragment out of bounds of zero.storage",
+                            log_context!(self)
+                        );
+                        return self.goaway(H2Error::InternalError);
+                    };
+                    let prior_fragment = prior_fragment.to_vec();
                     return self.refuse_stream_and_discard(
                         stream_id,
                         H2Error::RefusedStream,
                         payload_len,
+                        DiscardedFieldBlock::Continuation {
+                            prior_fragment,
+                            end_headers: flags & parser::FLAG_END_HEADERS != 0,
+                        },
                     );
                 }
                 if (payload_len as usize) > self.zero.storage.available_space() {
@@ -2518,7 +2711,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 } => {
                     // Reading DATA frame payload for an application stream.
                     // This is real application activity — reset the timeout.
-                    self.timeout_container.reset();
+                    self.arm_timeout();
                     (
                         context.streams[global_stream_id]
                             .split(&self.position)
@@ -2594,8 +2787,25 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 return self.force_disconnect();
             }
             (H2State::Discard, _) => {
-                let _i = kawa.storage.data();
-                trace!("{} DISCARDING: {:?}", log_context!(self), _i);
+                let i = kawa.storage.data();
+                trace!("{} DISCARDING: {:?}", log_context!(self), i);
+                // RFC 9113 §4.3: HPACK field-compression state is scoped to
+                // the connection, not the stream. `i` is this refused
+                // frame's own just-read payload; decode it (folding in any
+                // earlier frames' bytes for a CONTINUATION refusal — see
+                // `DiscardedFieldBlock`) before it is dropped, so our
+                // decoder does not fall behind the peer's encoder.
+                if let Some(discarded) = self.discarded_field_block.take()
+                    && let Err(error) =
+                        decode_discarded_field_block(&mut self.decoder, i, discarded)
+                {
+                    error!(
+                        "{} discarded stream's HPACK field block failed to decode: {:?}",
+                        log_context!(self),
+                        error
+                    );
+                    return self.goaway(error);
+                }
                 kawa.storage.clear();
                 self.attribute_bytes_to_overhead();
                 self.expect_header();
@@ -2818,7 +3028,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        self.timeout_container.reset();
+        self.arm_timeout();
         // Pre-compute byte totals for proportional overhead distribution.
         let byte_totals = self.compute_stream_byte_totals(context);
         let mut io_slices: Vec<IoSlice<'static>> = Vec::new();
@@ -3209,8 +3419,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // Refresh the per-stream idle timer on outbound bytes. Without
             // this, a long-running response trickled at low bandwidth would
             // be killed by `cancel_timed_out_streams` mid-delivery — the
-            // inbound-only refresh at h2.rs:3887-3895 / 4026-4031 never
-            // fires while the peer is idle.
+            // inbound-only refreshes in `handle_data_frame` (non-empty DATA)
+            // and `handle_headers_frame` never fire while the peer is idle.
             if stream_bytes > 0
                 && let Some(t) = self.stream_last_activity_at.get_mut(&stream_id)
             {
@@ -3659,6 +3869,28 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
+    /// `self.zero` is doing double duty: it is the read-side accumulation
+    /// buffer for a HEADERS/CONTINUATION field block in progress (spanning
+    /// one or more `readable()` passes, by protocol design — a legitimate
+    /// large header block routinely splits across frames) AND the write
+    /// scratch space [`Self::flush_pending_control_frames`] reuses for ANY
+    /// queued WINDOW_UPDATE or RST_STREAM, for any stream. `mod.rs`'s inner
+    /// event loop dispatches frontend `readable()` then `writable()` in the
+    /// same sweep, so without this guard an unrelated control-frame flush
+    /// can clobber a header block that has nothing to do with it.
+    ///
+    /// The write side already protects the mirror case — while a zero-buffer
+    /// write is stalled (`expect_write == Some(Zero)`), READABLE interest is
+    /// explicitly disabled (see the comment a few lines below) so a fresh
+    /// frame read cannot clobber the pending write. This is the missing
+    /// other half of that same invariant.
+    fn header_block_reassembly_in_progress(&self) -> bool {
+        matches!(
+            self.state,
+            H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
+        )
+    }
+
     /// Flush pending control frames (zero-buffer resume, WINDOW_UPDATEs, RST_STREAMs)
     /// before entering the main writable state machine.
     ///
@@ -3704,7 +3936,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Serialize and flush them inline to avoid extra event loop
         // iterations that could cause response data to be sent before
         // subsequent frames are validated.
-        if !self.flow_control.pending_window_updates.is_empty() && self.expect_write.is_none() {
+        //
+        // Deferred while a header block is being reassembled: this stage
+        // clears and reuses `self.zero.storage`, which right now holds the
+        // bytes accumulated from an earlier HEADERS/CONTINUATION frame on
+        // some (possibly different) stream, awaiting its own CONTINUATION.
+        // The queued WINDOW_UPDATEs stay queued — WRITABLE was already
+        // armed when they were enqueued (`Self::queue_window_update`), so
+        // the next `writable()` call after the block completes drains them
+        // normally; nothing is lost, only delayed.
+        if !self.flow_control.pending_window_updates.is_empty()
+            && self.expect_write.is_none()
+            && !self.header_block_reassembly_in_progress()
+        {
             let kawa = &mut self.zero;
             kawa.storage.clear();
             let buf = kawa.storage.space();
@@ -3767,7 +4011,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Accounting happens at queue-time inside `Self::enqueue_rst`, so
         // this drain only serialises and flushes — no metric/flood calls
         // here would double-count.
-        if !self.pending_rst_streams.is_empty() && self.expect_write.is_none() {
+        //
+        // Deferred while a header block is being reassembled, for the same
+        // `self.zero.storage` reuse reason as the WINDOW_UPDATE stage above
+        // — `Self::enqueue_rst` already arms WRITABLE, so this is a delay,
+        // not a drop.
+        if !self.pending_rst_streams.is_empty()
+            && self.expect_write.is_none()
+            && !self.header_block_reassembly_in_progress()
+        {
             let kawa = &mut self.zero;
             kawa.storage.clear();
             let buf = kawa.storage.space();
@@ -4502,17 +4754,24 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// [`BACKPRESSURE_WINDOW_DURATION`], the advertised
     /// `SETTINGS_MAX_CONCURRENT_STREAMS` is halved via
     /// [`Self::apply_mcs_backpressure`].
+    ///
+    /// `discarded` is stashed in [`Self::discarded_field_block`] for the
+    /// `H2State::Discard` arm of [`Self::readable`] to consume — see
+    /// [`DiscardedFieldBlock`] for why the HPACK field block cannot simply be
+    /// dropped with the rest of the payload.
     fn refuse_stream_and_discard(
         &mut self,
         stream_id: StreamId,
         error: H2Error,
         payload_len: u32,
+        discarded: DiscardedFieldBlock,
     ) -> MuxResult {
         if let Some(result) = self.enqueue_rst(stream_id, error) {
             return result;
         }
         self.state = H2State::Discard;
         self.expect_read = Some((H2StreamId::Zero, payload_len as usize));
+        self.discarded_field_block = Some(discarded);
         self.record_refusal_for_backpressure();
         MuxResult::Continue
     }
@@ -5413,7 +5672,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // HEADERS frames represent real application activity (new request
         // or response). Reset the timeout since the peer is actively
         // communicating, unlike control frames (PING, WINDOW_UPDATE).
-        self.timeout_container.reset();
+        self.arm_timeout();
         if !headers.end_headers {
             // CVE-2024-27316: only initialize tracking on the very first HEADERS
             // fragment, not on re-entries from ContinuationFrame (which call
@@ -8669,6 +8928,7 @@ mod tests {
             retry_after_seconds: None,
             frontend_redirect_template: None,
             redirect_status: None,
+            tags: None,
             access_log_message: None,
         };
         Stream::new(Rc::downgrade(pool), http_ctx, 65_535)
@@ -8863,7 +9123,7 @@ mod tests {
             H2ConnectionConfig::default(),
             Duration::from_secs(30),
             None,
-            TimeoutContainer::new_empty(Duration::from_secs(30)),
+            Duration::from_secs(30),
             Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
             Ready::READABLE | Ready::HUP | Ready::ERROR,
         )
@@ -8920,7 +9180,7 @@ mod tests {
             H2ConnectionConfig::default(),
             Duration::from_secs(30),
             graceful_shutdown_deadline,
-            TimeoutContainer::new_empty(Duration::from_secs(30)),
+            Duration::from_secs(30),
             Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
             Ready::READABLE | Ready::HUP | Ready::ERROR,
         )
@@ -9360,7 +9620,7 @@ mod tests {
             H2ConnectionConfig::default(),
             Duration::from_secs(30),
             None,
-            TimeoutContainer::new_empty(Duration::from_secs(30)),
+            Duration::from_secs(30),
             Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
             Ready::READABLE | Ready::HUP | Ready::ERROR,
         )
@@ -9429,6 +9689,408 @@ mod tests {
             !rendered.contains(&live_peer.to_string()),
             "per-stream MUX-H2 context must not fall back to the live \
              getpeername(2) answer: {rendered}"
+        );
+    }
+
+    // ── RFC 9113 §4.3: a refused stream must not desynchronise HPACK ──────
+    //
+    // Field compression state is scoped to the whole connection, not to a
+    // stream. When `handle_header_state` refuses a stream — during a
+    // graceful drain, over MAX_CONCURRENT_STREAMS, or on buffer-pool
+    // exhaustion — the HEADERS payload it drops is an HPACK field block the
+    // peer's encoder has *already* applied to its own dynamic table. Dropping
+    // it without decoding leaves our decoder permanently behind the peer's
+    // encoder, and every later header block on the surviving connection then
+    // resolves the wrong dynamic entry or fails outright.
+
+    /// To SEE THIS RED: in the `(H2State::Discard, _)` arm of
+    /// [`ConnectionH2::readable`], remove the `if let Some(discarded) =
+    /// self.discarded_field_block.take() && ...` block that calls
+    /// [`decode_discarded_field_block`], restoring the unconditional
+    /// `kawa.storage.clear()`. The peer's second block is then a one-byte
+    /// reference to dynamic index 62 that our decoder has never been told
+    /// about, and the decode fails with `HeaderIndexOutOfBounds`. Verified
+    /// 2026-09-21 (see this commit's message for the exact failure output).
+    #[test]
+    fn a_refused_stream_keeps_the_hpack_decoder_in_sync() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        // Past the preface/SETTINGS handshake, waiting on a frame header, and
+        // draining — so the next client-initiated stream is refused rather
+        // than created. Drain is only the cheapest of the three refusal
+        // triggers; MAX_CONCURRENT_STREAMS and pool exhaustion reach the same
+        // `refuse_stream_and_discard` call.
+        connection.state = H2State::Header;
+        connection.expect_read = Some((H2StreamId::Zero, 9));
+        connection.drain.draining = true;
+
+        // The peer's encoder. `loona_hpack` indexes a header whose *name* is in
+        // neither table, so this block appends `x-sozu-probe: alpha` to the
+        // peer's dynamic table at index 62.
+        let mut peer_encoder = loona_hpack::Encoder::new();
+        let refused_block = peer_encoder.encode([
+            (&b":method"[..], &b"GET"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/refused"[..]),
+            (&b"x-sozu-probe"[..], &b"alpha"[..]),
+        ]);
+        assert!(
+            refused_block.len() < 16_384,
+            "the probe block must fit one HEADERS frame under the default max frame size"
+        );
+
+        // HEADERS, END_STREAM | END_HEADERS, stream 1.
+        let mut frame = Vec::with_capacity(9 + refused_block.len());
+        frame.extend_from_slice(&(refused_block.len() as u32).to_be_bytes()[1..]);
+        frame.push(1);
+        frame.push(parser::FLAG_END_STREAM | parser::FLAG_END_HEADERS);
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&refused_block);
+        peer.write_all(&frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        // Two passes consume the 9-byte header and then the payload; the rest
+        // are `WouldBlock` no-ops. Bounded so a delivery hiccup fails loudly
+        // instead of hanging.
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.state, H2State::Header)
+                && matches!(connection.expect_read, Some((H2StreamId::Zero, 9)))
+                && !connection.pending_rst_streams.is_empty()
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        // Premise of the test: we really went through the refusal path, the
+        // stream was refused rather than created, and the connection survived.
+        assert_eq!(
+            connection.pending_rst_streams,
+            vec![(1, H2Error::RefusedStream)],
+            "the drain gate must refuse stream 1 with RST_STREAM(REFUSED_STREAM)"
+        );
+        assert!(
+            connection.streams.is_empty(),
+            "a refused stream must not be created"
+        );
+        assert!(
+            !matches!(connection.state, H2State::Error | H2State::GoAway),
+            "refusing one stream must leave the connection usable: {:?}",
+            connection.state
+        );
+
+        // The peer's next block references the dynamic entry its encoder added
+        // while encoding the refused request — a single indexed field.
+        let next_block = peer_encoder.encode([(&b"x-sozu-probe"[..], &b"alpha"[..])]);
+        assert_eq!(
+            next_block.len(),
+            1,
+            "the peer must now reference its dynamic entry, not re-send a literal"
+        );
+
+        let mut decoded = Vec::new();
+        let status = connection.decoder.decode_with_cb(&next_block, |k, v| {
+            decoded.push((k.into_owned(), v.into_owned()));
+        });
+
+        assert!(
+            status.is_ok(),
+            "the connection decoder must still resolve the peer's dynamic table \
+             after a refused stream, got {status:?}"
+        );
+        assert_eq!(
+            decoded,
+            vec![(b"x-sozu-probe".to_vec(), b"alpha".to_vec())],
+            "the refused stream's field block must have been decoded into the \
+             connection's HPACK context"
+        );
+    }
+
+    /// The RED-confirmed test above sends a HEADERS payload that is nothing
+    /// but a field block: no `Pad Length`, no `Stream Dependency`/`Weight`.
+    /// That shape cannot catch correction #1 — RFC 9113 §6.2 lays a HEADERS
+    /// payload out as `[Pad Length?][Priority?][field block][padding?]`, and
+    /// `refuse_stream_and_discard`'s new-stream callers pass the *whole*
+    /// payload. A decode that forgets to strip the PADDED/PRIORITY prefix
+    /// feeds the HPACK decoder six bytes of pad-length/dependency/weight
+    /// garbage before the real field block starts.
+    ///
+    /// To SEE THIS RED: in [`decode_discarded_field_block`]'s
+    /// `DiscardedFieldBlock::New` arm, replace the `let fragment = headers
+    /// .header_block_fragment.data_opt(payload)...` lines with `let fragment
+    /// = payload;` — i.e. hand the connection decoder the raw payload
+    /// unstripped, the way a fix that only handled the un-padded case would.
+    /// The peer's first block is still legitimate HPACK once you skip past
+    /// the 6-byte prefix, but decoding from byte 0 instead makes the pad
+    /// length byte and the first three dependency/weight octets look like
+    /// HPACK opcodes. Verified 2026-09-21: the decode fails with
+    /// `H2Error::CompressionError`, observed via the connection reaching
+    /// `H2State::GoAway` (the panic is on the "connection usable" assertion,
+    /// not the later decode assertion — the malformed prefix corrupts the
+    /// connection before the probe even gets to send its second block).
+    #[test]
+    fn a_refused_padded_prioritized_stream_keeps_the_hpack_decoder_in_sync() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        connection.state = H2State::Header;
+        connection.expect_read = Some((H2StreamId::Zero, 9));
+        connection.drain.draining = true;
+
+        // Same probe technique as the sibling test: this appends
+        // `x-sozu-probe: alpha` to the peer's dynamic table at index 62.
+        let mut peer_encoder = loona_hpack::Encoder::new();
+        let field_block = peer_encoder.encode([
+            (&b":method"[..], &b"GET"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/refused"[..]),
+            (&b"x-sozu-probe"[..], &b"alpha"[..]),
+        ]);
+
+        // RFC 9113 §6.2 HEADERS payload: Pad Length (1) + Stream Dependency
+        // (4, exclusive bit clear, depends on stream 0) + Weight (1) + the
+        // field block + 3 zero padding bytes.
+        const PAD_LEN: u8 = 3;
+        let mut payload = Vec::with_capacity(1 + 5 + field_block.len() + PAD_LEN as usize);
+        payload.push(PAD_LEN);
+        payload.extend_from_slice(&0u32.to_be_bytes()); // Stream Dependency
+        payload.push(15); // Weight
+        payload.extend_from_slice(&field_block);
+        payload.extend(std::iter::repeat_n(0u8, PAD_LEN as usize));
+
+        // HEADERS, END_STREAM | END_HEADERS | PADDED | PRIORITY, stream 1.
+        let mut frame = Vec::with_capacity(9 + payload.len());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+        frame.push(1);
+        frame.push(
+            parser::FLAG_END_STREAM
+                | parser::FLAG_END_HEADERS
+                | parser::FLAG_PADDED
+                | parser::FLAG_PRIORITY,
+        );
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        peer.write_all(&frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.state, H2State::Header)
+                && matches!(connection.expect_read, Some((H2StreamId::Zero, 9)))
+                && !connection.pending_rst_streams.is_empty()
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        assert_eq!(
+            connection.pending_rst_streams,
+            vec![(1, H2Error::RefusedStream)],
+            "the drain gate must refuse stream 1 with RST_STREAM(REFUSED_STREAM)"
+        );
+        assert!(
+            connection.streams.is_empty(),
+            "a refused stream must not be created"
+        );
+        assert!(
+            !matches!(connection.state, H2State::Error | H2State::GoAway),
+            "refusing a PADDED|PRIORITY HEADERS frame must leave the connection \
+             usable: {:?}",
+            connection.state
+        );
+
+        let next_block = peer_encoder.encode([(&b"x-sozu-probe"[..], &b"alpha"[..])]);
+        assert_eq!(
+            next_block.len(),
+            1,
+            "the peer must now reference its dynamic entry, not re-send a literal"
+        );
+
+        let mut decoded = Vec::new();
+        let status = connection.decoder.decode_with_cb(&next_block, |k, v| {
+            decoded.push((k.into_owned(), v.into_owned()));
+        });
+
+        assert!(
+            status.is_ok(),
+            "the connection decoder must still resolve the peer's dynamic table \
+             after a refused PADDED|PRIORITY stream, got {status:?}"
+        );
+        assert_eq!(
+            decoded,
+            vec![(b"x-sozu-probe".to_vec(), b"alpha".to_vec())],
+            "the refused stream's field block — located past the Pad Length and \
+             Priority prefix — must have been decoded into the connection's \
+             HPACK context"
+        );
+    }
+
+    // ── `self.zero` is read-accumulation AND write scratch — that is the bug ──
+    //
+    // `ConnectionH2::zero` serves two roles: the read-side accumulation
+    // buffer for a HEADERS/CONTINUATION field block in progress, and the
+    // write scratch space `flush_pending_control_frames` reuses to
+    // serialise ANY queued WINDOW_UPDATE or RST_STREAM — for any stream,
+    // not just the one being reassembled. `mod.rs`'s inner event loop
+    // dispatches frontend `readable()` then `writable()` in the same sweep,
+    // so a legitimate, non-refused multi-frame header block can be
+    // clobbered by completely unrelated connection-level flow-control
+    // housekeeping before its CONTINUATION frame ever arrives — no
+    // adversarial peer required.
+
+    /// To SEE THIS RED: this is the pre-existing behaviour on `main`, no
+    /// mutation needed. `flush_pending_control_frames`'s WINDOW_UPDATE-drain
+    /// stage (`let kawa = &mut self.zero; kawa.storage.clear();`) runs
+    /// unconditionally whenever a WINDOW_UPDATE is queued, with no check on
+    /// `self.state`. Guarding that stage (and the RST_STREAM-drain stage
+    /// beneath it) on `matches!(self.state, H2State::ContinuationHeader(_) |
+    /// H2State::ContinuationFrame(_))` is exactly the fix this test proves.
+    #[test]
+    fn a_legitimate_continuation_survives_an_unrelated_window_update_flush() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        // Past the preface/SETTINGS handshake, waiting on a frame header.
+        // `drain.draining` stays false: stream 1 must be genuinely accepted,
+        // not refused — this is the ordinary, non-refusal path.
+        connection.state = H2State::Header;
+        connection.expect_read = Some((H2StreamId::Zero, 9));
+
+        // The peer's encoder. The marker header's name is in neither table,
+        // so encoding it appends `x-sozu-marker: legitimate-value` to the
+        // peer's dynamic table at a known index — the same technique
+        // `a_refused_stream_keeps_the_hpack_decoder_in_sync` uses to prove
+        // decoder sync, here applied to a stream that is never refused.
+        let mut peer_encoder = loona_hpack::Encoder::new();
+        let field_block = peer_encoder.encode([
+            (&b":method"[..], &b"GET"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/legit-multiframe"[..]),
+            (&b"x-sozu-marker"[..], &b"legitimate-value"[..]),
+        ]);
+        // Split well past the 13 bytes a single WINDOW_UPDATE frame occupies,
+        // so the clobber this test provokes lands inside real field-block
+        // bytes rather than in a margin this test invented.
+        assert!(
+            field_block.len() > 26,
+            "the probe block must be large enough to split meaningfully"
+        );
+        let split = field_block.len() / 2;
+        let (first_half, second_half) = field_block.split_at(split);
+
+        // HEADERS, END_STREAM but NOT END_HEADERS, stream 1: a legitimate
+        // multi-frame header block, exactly as a large request produces.
+        let mut headers_frame = Vec::with_capacity(9 + first_half.len());
+        headers_frame.extend_from_slice(&(first_half.len() as u32).to_be_bytes()[1..]);
+        headers_frame.push(1); // HEADERS
+        headers_frame.push(parser::FLAG_END_STREAM);
+        headers_frame.extend_from_slice(&1u32.to_be_bytes());
+        headers_frame.extend_from_slice(first_half);
+        peer.write_all(&headers_frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        // Drive reads until the connection is genuinely waiting on the
+        // CONTINUATION frame for stream 1 — accepted, not refused.
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.state, H2State::ContinuationHeader(_)) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(connection.state, H2State::ContinuationHeader(_)),
+            "stream 1's HEADERS frame must be accepted and await CONTINUATION: {:?}",
+            connection.state
+        );
+        assert!(
+            !connection.streams.is_empty(),
+            "a non-refused HEADERS frame must create stream 1"
+        );
+
+        // Completely unrelated connection-level housekeeping: replenishing
+        // the connection flow-control window after DATA consumed on some
+        // other stream. Nothing about it targets stream 1 or its
+        // in-progress header block — this is the ordinary path, not an
+        // attack.
+        connection.queue_window_update(0, 65_535);
+        connection.writable(&mut context, EndpointClient(&mut router));
+
+        // Now the CONTINUATION frame completing the block arrives.
+        let mut continuation_frame = Vec::with_capacity(9 + second_half.len());
+        continuation_frame.extend_from_slice(&(second_half.len() as u32).to_be_bytes()[1..]);
+        continuation_frame.push(9); // CONTINUATION
+        continuation_frame.push(parser::FLAG_END_HEADERS);
+        continuation_frame.extend_from_slice(&1u32.to_be_bytes());
+        continuation_frame.extend_from_slice(second_half);
+        peer.write_all(&continuation_frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if !matches!(
+                connection.state,
+                H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
+            ) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        assert!(
+            !matches!(connection.state, H2State::Error | H2State::GoAway),
+            "an unrelated WINDOW_UPDATE flush must not corrupt a legitimate \
+             in-progress header block into a connection error: {:?}",
+            connection.state
+        );
+
+        // The peer's next block references the dynamic entry its encoder
+        // added while encoding stream 1's request.
+        let next_block = peer_encoder.encode([(&b"x-sozu-marker"[..], &b"legitimate-value"[..])]);
+        assert_eq!(
+            next_block.len(),
+            1,
+            "the peer must now reference its dynamic entry, not re-send a literal"
+        );
+
+        let mut decoded = Vec::new();
+        let status = connection.decoder.decode_with_cb(&next_block, |k, v| {
+            decoded.push((k.into_owned(), v.into_owned()));
+        });
+
+        assert!(
+            status.is_ok(),
+            "the connection decoder must still resolve the peer's dynamic table \
+             after an unrelated WINDOW_UPDATE flush during header-block \
+             reassembly, got {status:?}"
+        );
+        assert_eq!(
+            decoded,
+            vec![(b"x-sozu-marker".to_vec(), b"legitimate-value".to_vec())],
+            "stream 1's field block must have been decoded byte-for-byte, not \
+             clobbered by the unrelated WINDOW_UPDATE flush"
         );
     }
 }

@@ -440,6 +440,47 @@ pub fn try_h1_idle_connection_zombie_metric_increments() -> State {
     }
 }
 
+/// Wall-clock budget for a soft-stop with one idle keep-alive session.
+///
+/// The shutdown path is quantised by two independent 100 ms grids, so this
+/// is an integer number of those ticks rather than a round number raised
+/// until it passed.
+///
+/// * `Server::reset_loop_time_and_get_timeout` (`lib/src/server.rs`) clamps
+///   the poll timeout to a 100 ms `shutdown_tick` for as long as
+///   `shutting_down.is_some()`, and the run loop calls `shut_down_sessions`
+///   once per iteration. Every iteration the loop needs after the first
+///   therefore costs up to one full 100 ms `poll()` block.
+/// * The timer wheel's default `tick_ms` is 100 ms (`Builder::default`,
+///   `lib/src/timer.rs`) and `duration_to_tick` rounds to the NEAREST tick,
+///   so any timer-driven step is displaced from the caller's deadline by
+///   `(delay_ms + tick_ms / 2) mod tick_ms`, spanning `[0, 99]` ms.
+///
+/// One tick is the indivisible unit of this measurement, and the historical
+/// `Duration::from_millis(100)` bound was exactly one tick: it allowed the
+/// loop zero re-polls and zero grid displacement, which is why it reddened
+/// on contended GitHub runners while every failing iteration still reported
+/// a correct proxy exchange (issue #1376). One tick per mechanism that can
+/// consume one:
+///
+/// * 100 ms — the `poll()` block the loop re-enters when the first
+///   `shut_down_sessions()` pass cannot yet close the session;
+/// * 100 ms — timer-wheel grid displacement, up to `tick_ms - 1` = 99 ms;
+/// * 100 ms — scheduler slack: a 100 ms `poll()` on a contended 4-vCPU
+///   runner returns late by up to its own quantum.
+///
+/// 3 x 100 ms = 300 ms. That is 1/33 of `DEFAULT_REQUEST_TIMEOUT` (10 s)
+/// and 1/200 of `DEFAULT_FRONT_TIMEOUT` (60 s), so the bound still
+/// discriminates what issue 810 is about: a shutdown that waits for a
+/// session timeout misses it by two orders of magnitude, not by a tick.
+///
+/// To SEE THIS RED: insert `thread::sleep(Duration::from_millis(500))`
+/// immediately after `let start = Instant::now()` in
+/// [`try_issue_810_timeout`]. Measured 2026-09-20:
+/// `issue 810: shutdown took 500.17227ms, budget 300ms`, failing on the
+/// first of the 100 iterations.
+const ISSUE_810_SHUTDOWN_BUDGET: Duration = Duration::from_millis(300);
+
 pub fn try_issue_810_timeout() -> State {
     let front_address = create_local_address();
 
@@ -483,7 +524,24 @@ pub fn try_issue_810_timeout() -> State {
         backend.name, backend.responses_sent, backend.requests_received
     );
 
-    if !success || duration > Duration::from_millis(100) {
+    // The exchange has to have happened, or the budget below is timing an
+    // idle worker. These four counters were printed and never asserted, so a
+    // run whose client never sent or never got its response was
+    // indistinguishable from one that proxied correctly — the same
+    // `rejection || !got_200` shape as issue #1381, one file over.
+    //
+    // To SEE THIS RED: delete the `client.receive();` above. Measured
+    // 2026-09-20: `client sent: 1, received: 0` with
+    // `shutdown took 3.877983ms` — comfortably inside the budget, so the
+    // historical `!success || duration > 100ms` bound passed it.
+    let proxied = client.requests_sent == 1
+        && client.responses_received == 1
+        && backend.requests_received == 1
+        && backend.responses_sent == 1;
+
+    println!("issue 810: shutdown took {duration:?}, budget {ISSUE_810_SHUTDOWN_BUDGET:?}");
+
+    if !success || !proxied || duration > ISSUE_810_SHUTDOWN_BUDGET {
         State::Fail
     } else {
         State::Success

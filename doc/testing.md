@@ -234,8 +234,8 @@ introduce and expensive to debug from a symptom.
 
 `lib/src/protocol/udp/{manager,flow}.rs` is the reference. `flow.rs` carries 12
 `debug_assert`s and `manager.rs` carries 45, including the full
-`check_invariants()` sweep. The invariants `check_invariants()` enforces
-(`manager.rs:683`):
+`check_invariants()` sweep. The invariants `UdpManager::check_invariants`
+enforces (`lib/src/protocol/udp/manager.rs`):
 
 1. **Table → slab consistency** — every `FlowId` in the routing table points at a
    live slab slot (no dangling keys).
@@ -448,17 +448,89 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 
 - **Never hardcode ports.** Allocate through the port registry
   (`e2e/src/port_registry.rs`). Use `tests::create_local_address()`
-  (`e2e/src/tests/tests.rs:85`), which draws a free localhost port from the
+  (`e2e/src/tests/tests.rs`), which draws a free localhost port from the
   registry. Hardcoded ports collide under parallel test execution.
 - **Always drain with a `loop_read_*` helper when asserting on TCP responses.** A
   single `read()` sees one TCP segment under load — your assertion races the
   network. Use the looping readers (`Client::receive_until_eof`,
-  `e2e/src/mock/client.rs:136`, and the UDP analogue in `e2e/src/mock/udp_client.rs`)
+  `e2e/src/mock/client.rs`, and the UDP analogue in `e2e/src/mock/udp_client.rs`)
   that drain until EOF or a deadline. Commits exist *only* to paper over this
   rule being skipped — do not add to them.
 - **Prefer deadlines / repeat-until-error over `sleep`.** Use
-  `repeat_until_error_or` (`e2e/src/tests/mod.rs:232`) or an explicit deadline for
+  `repeat_until_error_or` (`e2e/src/tests/mod.rs`) or an explicit deadline for
   timing-sensitive assertions. A fixed `sleep` is both slow and flaky.
+- **Assert a status by decoding it, never by scanning a field block for its
+  digits.** An HPACK block is not text. `payload.windows(3).any(|w| w == b"421")`
+  matches any three adjacent bytes, and every Sōzu response carries a `Sozu-Id`
+  correlation header (`HttpContext::on_response_headers`,
+  `lib/src/protocol/kawa_h1/editor.rs`) whose value is
+  the session's 26-character Crockford base-32 ULID — an alphabet holding every
+  decimal digit, emitted with the Huffman bit clear, so it lands in the block as
+  plain ASCII. A 3-digit needle therefore matches an ordinary 200 about once in
+  1400 responses. Worse, the ULID's leading ten characters are a monotonic
+  millisecond timestamp, so a hit landing there is not independent between runs:
+  it holds for every response generated in a window whose length depends on
+  which character triple it occupies — 1 ms for the last, 32 ms, ~1 s, ~33 s and
+  ~17.5 min for the middle, and ~9.3 h, ~12.4 d or ~1.1 y for the slow head.
+  Two consecutive CI retries red and a re-run green is that signature. That is
+  issue #1353 — a test that never read the status at all, presenting as a
+  load-dependent flake. Decode the `:status` field RFC 9113 §8.3.2 puts first in
+  the block: `decode_status` and `headers_status_matches`
+  (`e2e/src/tests/h2_utils.rs`), guarded by
+  `h2_status_checks_decode_the_status_field_not_any_matching_bytes`
+  (`e2e/src/tests/h2_security_sni.rs`). All three former copies of the scan now
+  route through it — `h2_security_sni.rs`, `h2_tests.rs`, and
+  `listener_update_tests.rs`. Do not read an OR with an answer-body match as
+  mitigation — it *widens* the false-positive surface rather than narrowing it.
+  `h2_tests.rs` carried one such disjunct (`""status_code": 404"`); it was
+  removed rather than documented, and
+  `test_h2_default_answer_terminates_stream` passes on the decoded `:status`
+  alone. The H1 form of the rule is a
+  status-line prefix check rather than `response.contains("302")`
+  (`e2e/src/tests/redirect_rewrite_auth_tests.rs:264`). Nineteen indexed-status
+  byte probes survive in `h2_security_tests.rs` and
+  `h2_security_header_injection.rs`, inventoried in
+  `e2e/COVERAGE.md > Status assertions`, together with the `0x8D` / `:status 404`
+  mislabel that has to be settled before converting them.
+- **A false positive in a rejection assertion is worse than one in a liveness
+  assertion.** #1353 turned a test red. The same scan in
+  `try_strict_sni_binding_toggle` (`e2e/src/tests/listener_update_tests.rs`) fed
+  `got_rejection_or_421`, which gates the `strict_sni_binding=true` *rejection*
+  check, so a ULID false positive there would have turned a security test
+  silently **green** — a listener that had stopped rejecting would still pass.
+  When auditing a byte-scan assertion, ask which direction its false positive
+  points before pricing the fix. Both sites are decoded now.
+- **`decode_status` returns `None` on a size-update-prefixed block, and whether
+  that is fail-closed depends on the call site.** `H2BlockConverter::emit_pending_size_update_if_new_block`
+  (`lib/src/protocol/mux/converter.rs:112`, armed at
+  `lib/src/protocol/mux/h2.rs:6052`) prepends a `001xxxxx` HPACK dynamic table
+  size update when a peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e
+  call sites send one: `h2_security_tests.rs:2440` (value 0) and
+  `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
+  `h2_correctness_tests.rs:3559` and `:3663`. No test that decodes a `:status`
+  sends one, and the three that send one decode no status, so nothing meets the
+  update today — `h2_handshake` sends empty SETTINGS. When that changes, `None`
+  reads as "no status": fail-closed for a `got_X` asserted positively,
+  fail-**open** for one used as `|| !got_X`, which is exactly the shape of
+  `got_200` in `try_strict_sni_binding_toggle`. Teach the helper to skip a
+  leading update before pointing a new assertion at a size-updating client.
+- **Check the direction of a false negative too, not just a false positive.**
+  Replacing `payload.contains(&0x88)` with a decode is not automatically a
+  strict improvement: the scan had no false negative for a Sōzu 200, the decode
+  has one. Whether that is safe depends on whether the flag is asserted or
+  negated at its call site, which is recorded in the comment above `got_200`
+  (`e2e/src/tests/listener_update_tests.rs`).
+- **A test that only reddens under CI load is not automatically a flake — find
+  the production site first.** Before retrying or quarantining, ask whether the
+  symptom is reachable at all. #1353's 421 has exactly one emission site
+  (`lib/src/protocol/mux/mod.rs:1306`), reachable only through
+  `RetrieveClusterError::SniAuthorityMismatch`, which is constructed at exactly
+  one site (`lib/src/protocol/mux/router.rs:672`) immediately after
+  `incr!(names::http::SNI_AUTHORITY_MISMATCH)` — and the failing run reported
+  that counter unmoved, alongside a correct backend request count. The proxy was
+  innocent by construction, and sixteen serial local reproductions were never
+  going to show otherwise. Reading the emission path cost less than the first
+  reproduction attempt.
 - **Worker-upgrade workflow.** Hot worker upgrades (SCM_RIGHTS fd handoff +
   graceful drain) are covered by `test_upgrade*` in `e2e/src/tests/tests.rs`.
   Read `doc/upgrade_e2e_tests.md` before touching upgrade code and run:
@@ -479,12 +551,15 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   the wrong reason and guards nothing. Before adding a test for a defect on a
   quiet path, confirm a session actually gets there — planting a temporary
   unconditional `panic!` in the target function and running the suite settles
-  it in one run. The standing case is `protocol::kawa_h1::Http`: neither
-  `HttpStateMachine` (`Expect | Mux | WebSocket`, `lib/src/http.rs:63`) nor
+  it in one run. The worked example is `protocol::kawa_h1::Http`: neither
+  `HttpStateMachine` (`Expect | Mux | WebSocket`, `lib/src/http.rs`) nor
   `HttpsStateMachine` (`Expect | Handshake | Mux | WebSocket`,
-  `lib/src/https.rs:81`) has a variant holding it and `Http::new` has no code
-  caller, so H1 runs through `protocol/mux` and `kawa_h1::save_http_status_metric`
-  is dead in every binary. New findings of this kind belong in
+  `lib/src/https.rs`) had a variant holding it and `Http::new` had no code
+  caller under either module spelling, so H1 runs through `protocol/mux` and
+  the whole session — including `kawa_h1::save_http_status_metric` — was dead
+  in every binary. It was deleted on 2026-09-20 (sozu#1346); the unit test
+  that guarded it was ported onto the live `mux::stream` path instead of being
+  deleted with it. New findings of this kind belong in
   `e2e/COVERAGE.md > Out of e2e reach by construction`, with the mechanism, not
   just the conclusion.
 - **A worker's own log output IS readable — name the level.** It was not until
@@ -499,8 +574,12 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   error path on purpose. And do NOT reuse the UDP drain from
   `capture_test_logs_at_level` (`lib/src/lib.rs`): it reads only after the run and
   silently drops datagrams at H2 volume, which is a load-sensitive flake, whereas
-  a file has no loss mode. Worked example:
+  a file has no loss mode. Worked example for raising the level:
   `tests::h2_log_context_tests::test_h2_proxy_protocol_peer_is_the_advertised_client`.
+  Worked example for provoking instead, which is the only option when EVERY
+  expansion of a macro is an `error!` — `log_socket_context!` in
+  `lib/src/socket.rs` is:
+  `tests::socket_log_context_tests::test_tls_socket_log_peer_is_the_advertised_client`.
   Full cost and residue in
   `e2e/COVERAGE.md > Out of e2e reach by construction`.
 - **A clock refactor is not wire-falsifiable; the behaviour it drives is.**

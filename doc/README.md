@@ -70,6 +70,153 @@ Sōzu is a reverse proxy for load balancing, written in Rust. Its main job is to
 
 * [Nightly CI notes][nci]
 
+## Citing code from these documents
+
+These documents anchor their claims to code. There are two forms, and the choice between them is not
+stylistic:
+
+* **The prose names an item** — a function, method, struct, enum, field, constant or macro — so cite
+  the *symbol*, qualified as `Type::method` so it stays greppable, with the file path and no line
+  number: `TcpSession::effective_session_address` (`lib/src/tcp.rs`). A symbol survives every
+  edit above it.
+* **The prose means a specific statement or branch inside an item** — one `match` arm, one guard, one
+  log line — so cite a line or a range: `lib/src/tcp.rs:NNN-MMM, NNN-MMM`. Keep the path
+  repo-root-relative; a bare `manager.rs` is ambiguous in this tree.
+
+A line number carries no anchor. It rots the moment anyone edits the file it points into, and the
+pull request that breaks it is almost never the pull request that contains it — so no reviewer is
+ever shown both halves. In [sozu-proxy/sozu#1335][cit] an audit of one module document found 29 of
+its 35 citations wrong: single lines uniformly off by +1 after a `//!` module-doc block was inserted
+above them, and ranges off by +38 to +57 after a `debug_assert!` campaign grew the functions. A range
+that drifts 46 lines does not mislead slightly — it lands the reader in a different branch.
+
+### Running the resolver locally
+
+The surviving line citations are guarded by the `Doc citations` CI job, which runs on the merge
+result. The same check runs locally:
+
+```bash
+python3 .github/scripts/check_doc_citations.py                 # check the tree
+python3 .github/scripts/check_doc_citations.py --base main     # + report every citation that drifted
+python3 .github/scripts/check_doc_citations.py --show          # print every resolved citation
+python3 .github/scripts/check_doc_citations.py --self-test     # prove it still fails on a broken fixture
+```
+
+It scans `doc/**` and every `**/LIFECYCLE.md`, and fails when a cited file does not exist, a cited
+basename is ambiguous, a line number is below 1 or past end-of-file, either end of a range is blank,
+a range is inverted, or the same line repeats inside one citation group — `file.rs:NNN/NNN`, which is
+what a `/` or `,` continuation renumbered on one half only looks like, and which would otherwise
+resolve perfectly.
+
+### Reporting a citation that drifted
+
+Everything above is a floor: a citation that slides onto a *different non-blank line* resolves, hits
+code, and passes. That is the dominant failure mode, not the exotic one. In
+[sozu-proxy/sozu#1389][drift] a changeset that grew `kawa_h1/editor.rs` by 21 lines and
+`mux/router.rs` by 14 moved **24** citations, and the blank-line rule reported **2** — the other 22
+all landed on code. Worse, the green job read as "the citations are right" when it only ever meant
+"no citation landed on a blank line".
+
+`--base <revision>` closes that, and needs no data the merge already has. Every citation is resolved
+the same way — the document's own directory first, so a module `LIFECYCLE.md` keeps citing its
+siblings by bare name — and the *text* of the cited line is read at the merge base of `<revision>`
+and HEAD as well as at HEAD. Different text is reported, blank or not, at both ends of a range. A
+citation this changeset **re-anchored** is not reported: only one that carries the same path and the
+same line numbers it carried at the base while the text underneath it changed. Comparison is on the
+stripped line, so a re-indent is not drift.
+
+The `Doc citations` CI job passes the pull request's base sha, and checks out with `fetch-depth: 0`
+because the default shallow checkout has no base commit to read. An unreachable `--base` is an
+**error and exit 1**, never a skip — a guard that answered a missing base with a clean run would be
+green forever while comparing nothing. With no `--base` at all, the run says on its own line that
+the rule did not run.
+
+It remains a floor in one direction: a citation into code that this changeset never touched is not
+compared. Cite a symbol wherever the prose names an item.
+
+`--self-test` is what keeps the checker honest. It asserts the exact failures a deliberately broken
+fixture must produce, *and* runs the real command line in a subprocess to require exit `1` on that
+fixture and exit `0` on a clean one — because reporting a failure and acting on it are two different
+lines of code, and a checker that did the first and not the second would be green forever. The drift
+half is asserted the same way and in both directions: `testdata/citations/` carries a document whose
+every citation resolves to a non-blank line at **both** revisions, so the same tree must exit `0`
+without `--base` and `1` with it, and an unreachable base must be refused rather than skipped.
+
+### Citing a test by name
+
+The same command carries a second, independent rule, for the citation form that has no path at all:
+prose naming a **test** as its evidence — "`<name>` pinned the defect", "see `<name>` for the exact
+semantics". That form rots the same way a line number does, and more quietly: in
+[sozu-proxy/sozu#1380][test-cit] three test names were cited as evidence in six places — in
+`CHANGELOG.md`, in `lib/src/router/mod.rs`, in `lib/src/tcp.rs` and in an e2e module preamble — and
+none of the three had a definition anywhere in the repository.
+
+The rule is: a backticked identifier that looks like a test name, in prose that is talking about
+tests, must name a `fn` somewhere in the tree. "Looks like a test name" is two measured filters —
+at least five underscore-separated segments, so a sentence rather than a noun phrase, and the
+enclosing comment block or markdown paragraph containing the word "test". Without both, the raw
+candidate set is 358 identifiers over 864 sites, nearly all configuration keys and struct fields;
+with both it is twelve. The scanned surface is every `*.rs` comment plus `CHANGELOG.md`, `doc/**`
+and every `**/LIFECYCLE.md`.
+
+When it fires, repoint the citation at the test that exists, write the test the prose claims, or
+drop the claim. Two dispositions are available in the script and both are deliberate, reviewed
+decisions rather than escapes:
+
+* `RENAMED_TESTS` — a test cited on purpose by a name it no longer carries, because the prose is
+  recording the rename ("it is now `X`"). The entry gives the name it carries now, and **that name
+  must itself resolve to a `fn`**, so the forwarding pointer cannot rot in turn.
+* `NOT_A_TEST` — a sentence-shaped identifier that is not a test name at all: a configuration key, a
+  std method, the identifier of a note kept outside the repository. Each entry carries its reason;
+  one without a reason is an unreviewed silencing of the rule.
+
+[test-cit]: https://github.com/sozu-proxy/sozu/issues/1380
+
+### What the resolver does not catch
+
+This matters more than what it does. The resolver cannot tell whether a citation lands on *the
+construct the surrounding prose is talking about*. A citation that drifted from line 118 to line 164
+still resolves, still hits code, and still passes the blank-line rule — and that is the dominant
+failure mode, not the exotic one. Measured on the module `LIFECYCLE.md` files: the resolver flagged
+27 of the 507 anchors those documents carry, while the hand audit that followed cut them to 238 and
+had to renumber 159 of the survivors.
+
+The drift rule above closes that for every line the changeset under test actually moved, which is
+where a citation rots. It closes nothing for a line nobody touched: a citation that was already
+pointing at the wrong place before this pull request opened is carried forward unreported. [#1389][drift]
+tracked one such anchor into `kawa_h1/editor.rs` across three trees: correct in the first, already
+wrong in the second, wrong again in the third, and non-blank at every step.
+
+Two narrower gaps are deliberate. Only the two **ends** of a range are required to be non-blank:
+interior blank lines are normal in a span that covers a whole branch — 26 of them across the
+guarded surface once the module `LIFECYCLE.md` repair has landed, 57 before it — so requiring every
+line would reject correct citations. And a cited path binds
+to the citing document's own directory before the repository root, which is what lets a module
+`LIFECYCLE.md` write `h2.rs:NNN` for its own sibling; without it the guarded surface reports 251
+false ambiguities. The cost is that a sibling could shadow a repo-root file of the same relative
+path and hide a real failure. No such pair exists in the tree today, but it is the reason to write
+the repo-root-relative path whenever a citation leaves its own module.
+
+The test-name rule is a floor in the same way. A test name of four segments or fewer is not
+examined, prose that never says "test" is not examined, and a citation naming a real `fn` that is
+not the test the prose means still passes. The alternative is 864 sites of noise, which nobody reads
+and therefore nobody maintains.
+
+A green `Doc citations` run means "no citation is obviously dead, and none that this changeset moved
+was left behind". It does not mean the citations are right, and it is not a licence to skip reading
+the code when you touch one. Where the prose names an item, cite the symbol and the question does
+not arise.
+
+One surface gap is known and left open on purpose. The line-citation rules read `doc/**` and every
+`**/LIFECYCLE.md`; the test-name rule additionally reads every `*.rs` comment and `CHANGELOG.md`.
+Aligning them was measured on `265d895d`: it adds 195 citations across 190 files and **50**
+pre-existing failures, 27 of them in `CHANGELOG.md`, which is an append-only record of the tree as
+it stood at each release and must not be renumbered to satisfy a guard. That repair is its own
+changeset, and it would not reach `e2e/COVERAGE.md` either — no rule reads that file today.
+
+[cit]: https://github.com/sozu-proxy/sozu/issues/1335
+[drift]: https://github.com/sozu-proxy/sozu/issues/1389
+
 ## Release Notes
 
 * [Changelog](../CHANGELOG.md)

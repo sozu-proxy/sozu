@@ -1301,6 +1301,22 @@ pub(crate) fn log_frames(test_name: &str, frames: &[(u8, u8, u32, Vec<u8>)]) {
         } else if *ft == H2_FRAME_RST_STREAM && payload.len() >= 4 {
             let error_code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
             println!("  frame {i}: RST_STREAM stream={sid} error_code=0x{error_code:x}");
+        } else if *ft == H2_FRAME_HEADERS {
+            // Print the decoded `:status` rather than leaving the reader to
+            // eyeball an HPACK block. Every assertion in the H2 security
+            // suites turns on this value, and `None` (a block that does not
+            // open with `:status`) is exactly the case a byte scan used to
+            // hide. See [`decode_status`].
+            match decode_status(payload) {
+                Some(status) => println!(
+                    "  frame {i}: HEADERS flags=0x{fl:02x} stream={sid} len={} status={status}",
+                    payload.len()
+                ),
+                None => println!(
+                    "  frame {i}: HEADERS flags=0x{fl:02x} stream={sid} len={} status=<undecodable>",
+                    payload.len()
+                ),
+            }
         } else {
             println!(
                 "  frame {i}: type=0x{ft:02x} flags=0x{fl:02x} stream={sid} len={}",
@@ -1420,6 +1436,125 @@ pub(crate) fn rejected_with_goaway_or_rst(frames: &[(u8, u8, u32, Vec<u8>)]) -> 
 /// Check if frames contain a HEADERS response (type 0x1) on any stream.
 pub(crate) fn contains_headers_response(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
     frames.iter().any(|(t, _, _, _)| *t == H2_FRAME_HEADERS)
+}
+
+/// Decode the `:status` pseudo-header of a response HEADERS block.
+///
+/// RFC 9113 §8.3.2 makes `:status` the first field of a response field
+/// block, and Kawa's encoder emits it in exactly two shapes: an indexed
+/// static entry (`1xxxxxxx` over indices 8..=14, the seven `:status` rows
+/// of the RFC 7541 static table) when that table carries the status, or a
+/// literal over one of those same name indices for every other status.
+/// Only the first field is read, so no later field — header name, header
+/// value, or a second pseudo-header — can be mistaken for the status.
+///
+/// Returns `None` for a block that does not start with a `:status` field,
+/// which includes a trailers block and a block opening with a dynamic
+/// table size update. That last case is real, not hypothetical:
+/// `H2BlockConverter::emit_pending_size_update_if_new_block`
+/// (`lib/src/protocol/mux/converter.rs:112`, armed at
+/// `lib/src/protocol/mux/h2.rs:5838`) prepends a `001xxxxx` update when a
+/// peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e call sites do
+/// send one — `h2_security_tests.rs:2440` with value 0, and
+/// `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
+/// `h2_correctness_tests.rs:3559` and `:3663`. None of the three decodes a
+/// status, and `h2_handshake` sends empty SETTINGS, so no assertion meets
+/// the update today. The first one that does gets `None`, which reads as
+/// "no status" — fail-closed wherever a decoded status is asserted
+/// positively, and merely non-blocking where one is asserted negatively,
+/// as `&& !got_200` in `listener_update_tests.rs`. Teach this helper to
+/// skip a leading update before pointing a new assertion at a
+/// size-updating client.
+pub(crate) fn decode_status(payload: &[u8]) -> Option<u16> {
+    /// RFC 7541 Appendix A, static indices 8..=14.
+    const INDEXED_STATUS: [u16; 7] = [200, 204, 206, 304, 400, 404, 500];
+
+    let first = *payload.first()?;
+    if first & 0x80 != 0 {
+        // Indexed Header Field (RFC 7541 §6.1): name *and* value come from
+        // the table, so the index alone carries the status.
+        return INDEXED_STATUS
+            .get(usize::from(first & 0x7f).checked_sub(8)?)
+            .copied();
+    }
+    // Literal Header Field (RFC 7541 §6.2): `01xxxxxx` with incremental
+    // indexing carries a 6-bit name index, `0000xxxx` without indexing and
+    // `0001xxxx` never-indexed carry a 4-bit one. `001xxxxx` is a dynamic
+    // table size update, not a field at all.
+    if first & 0xe0 == 0x20 {
+        return None;
+    }
+    let name_index = if first & 0xc0 == 0x40 {
+        first & 0x3f
+    } else {
+        first & 0x0f
+    };
+    if !(8..=14).contains(&name_index) {
+        return None;
+    }
+    let length_byte = *payload.get(1)?;
+    // Kawa never sets the Huffman bit; a coded value would need the full
+    // Huffman table to read and cannot be compared byte-wise.
+    if length_byte & 0x80 != 0 {
+        return None;
+    }
+    let value = payload.get(2..2 + usize::from(length_byte & 0x7f))?;
+    str::from_utf8(value).ok()?.parse().ok()
+}
+
+/// Whether any response in `frames` carried this 3-digit status, decoded
+/// from its `:status` field (see [`decode_status`]).
+///
+/// A byte scan cannot do this job, and three copies of one used to try.
+/// Every Sōzu response carries a `Sozu-Id` correlation header
+/// (`HttpContext::on_response_headers`, `lib/src/protocol/kawa_h1/editor.rs`)
+/// holding the session's
+/// 26-character Crockford base-32 ULID, written with the Huffman bit
+/// clear, so it reaches the field block as plain ASCII over an alphabet
+/// that contains every decimal digit. A 3-digit needle therefore matches
+/// an ordinary 200 about once in 1400 responses (issue #1353).
+pub(crate) fn headers_status_matches(frames: &[(u8, u8, u32, Vec<u8>)], code: &[u8]) -> bool {
+    let wanted: u16 = str::from_utf8(code)
+        .ok()
+        .and_then(|code| code.parse().ok())
+        .expect("status needle must be a decimal status code");
+    frames.iter().any(|(ft, _fl, _sid, payload)| {
+        *ft == H2_FRAME_HEADERS && decode_status(payload) == Some(wanted)
+    })
+}
+
+/// Whether any HEADERS frame **on `stream_id`** carried this decoded
+/// `:status` — the stream-scoped twin of [`headers_status_matches`].
+///
+/// The H2 security suites all assert on a single stream and used to write
+/// that check inline as `payload.contains(&0x8D)`, calling the result
+/// `got_400`. `0x8D` is an indexed HPACK field whose static index is 13,
+/// which RFC 7541 Appendix A lists as `:status 404`, not 400 — 400 is index
+/// 12, `0x8C` (issue #1374). Both halves of that scan are wrong:
+///
+/// * It keys on the wrong status. Sōzu really does answer an indexed
+///   `0x8d` 404 when the router finds no cluster for the request
+///   (`try_h2_default_answer_terminates_stream` in `h2_tests.rs` asserts
+///   exactly that shape), so a request that sōzu
+///   *accepted and routed to the default answer* satisfied a term named
+///   `got_400` and reported itself as a rejection.
+/// * It is a byte scan, so it also fires on a length octet or a raw value
+///   byte anywhere in the block. RFC 7541 §5.1 writes a 268-byte header
+///   value as `7f 8d 01`, and
+///   `lib/src/protocol/mux/converter.rs:388-391` forwards raw value bytes
+///   ≥ `0x80` verbatim. That is issue #1353's mechanism pointed at a
+///   security assertion.
+///
+/// [`decode_status`] reads the first field of the block instead, so
+/// neither a later field nor a length octet can answer for the status.
+pub(crate) fn stream_status_matches(
+    frames: &[(u8, u8, u32, Vec<u8>)],
+    stream_id: u32,
+    status: u16,
+) -> bool {
+    frames.iter().any(|(ft, _fl, sid, payload)| {
+        *ft == H2_FRAME_HEADERS && *sid == stream_id && decode_status(payload) == Some(status)
+    })
 }
 
 /// Check if frames contain a DATA frame on any stream.

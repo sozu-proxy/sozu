@@ -2045,6 +2045,20 @@ pub struct TcpListener {
     cluster_id: Option<String>,
     config: TcpListenerConfig,
     listener: Option<MioTcpListener>,
+    /// A socket this listener holds but has NOT registered.
+    ///
+    /// `activate()` parks an inherited socket here when `Registry::register`
+    /// fails, instead of letting the `?` drop and close a descriptor
+    /// `Listeners::get_*` has already removed from the SCM table (sozu#1342).
+    /// The next activation reuses it rather than binding a second one.
+    ///
+    /// Deliberately NOT `listener`: every other consumer reads that field's `Some` as
+    /// "registered and live" — `soft_stop` and `hard_stop` deregister it and
+    /// report the failure, `give_back_listener` hands it back as an activated
+    /// socket, `accept` accepts on it. A parked socket is none of those things,
+    /// and putting it there made a failed registration answer `ENOENT` from
+    /// `deregister` and fail the whole soft stop.
+    parked_listener: Option<MioTcpListener>,
     /// SNI -> `(AlpnMatcher, ClusterId)` route table (sozu-proxy/sozu#1279).
     /// Populated by `add_tcp_front`/`remove_tcp_front` from
     /// `RequestTcpFrontend.sni`/`.alpn`; empty for a listener whose fronts
@@ -2089,6 +2103,7 @@ impl TcpListener {
         Ok(TcpListener {
             cluster_id: None,
             listener: None,
+            parked_listener: None,
             token,
             address: config.address.into(),
             config,
@@ -2382,18 +2397,56 @@ impl TcpListener {
         if self.active {
             return Ok(self.token);
         }
+        let address: SocketAddr = self.config.address.into();
 
-        let mut listener = match tcp_listener {
-            Some(listener) => listener,
-            None => {
-                let address = self.config.address.into();
+        // Reuse a socket a previous attempt parked here after a failed
+        // registration, rather than binding a second one. Taking it
+        // unconditionally is what keeps the two from coexisting: if the caller
+        // ALSO handed one over, the parked socket is disposed of deliberately
+        // below instead of being silently overwritten.
+        let parked = self.parked_listener.take();
+        let mut listener = match (tcp_listener, parked) {
+            (Some(inherited), Some(parked)) => {
+                // Not reachable while `Listeners::get_*` removes the entry it
+                // hands over and `scm_listeners` is written once: a parked
+                // socket means this address's entry was already consumed, so
+                // the caller cannot have another. Neither of those is enforced
+                // here, so dispose of the loser explicitly and loudly rather
+                // than letting an assignment close it — that silent close is
+                // sozu#1342 itself.
+                warn!(
+                    "{} closing the socket parked on the TCP listener for {}: an \
+                     inherited socket arrived for the same address and is the one being \
+                     activated",
+                    log_module_context!(),
+                    address
+                );
+                drop(parked);
+                inherited
+            }
+            (Some(inherited), None) => inherited,
+            (None, Some(parked)) => parked,
+            (None, None) => {
                 server_bind(address).map_err(|e| ProxyError::BindToSocket(address, e))?
             }
         };
 
-        registry
+        let registration = registry
             .register(&mut listener, self.token, Interest::READABLE)
-            .map_err(ProxyError::RegisterListener)?;
+            .map_err(ProxyError::RegisterListener);
+        if let Err(error) = registration {
+            // Park the socket instead of letting the `?` drop it. `register`
+            // is fallible (EEXIST for a descriptor still registered because
+            // `notify_deactivate_listener` only logs a failed deregister,
+            // EBADF, ENOMEM), and a socket still held in a local is dropped —
+            // and closed — on the way out. For an SCM-inherited socket that is
+            // the sozu#1342 close in a second place: `Listeners::get_*` has
+            // already removed the entry, so nothing else owns the descriptor.
+            // It goes to `parked_listener`, never to `listener`, because every other
+            // consumer of that field reads `Some` as "registered and live".
+            self.parked_listener = Some(listener);
+            return Err(error);
+        }
 
         self.listener = Some(listener);
         self.active = true;
@@ -2670,6 +2723,26 @@ impl TcpProxy {
 
         self.listeners.retain(|_, l| l.borrow().address != address);
         self.listeners.len() < len
+    }
+
+    /// What this proxy would do with a socket handed to
+    /// [`activate_listener`](Self::activate_listener) for `addr`. See
+    /// [`InheritedSocketFate`].
+    ///
+    /// The event loop is single-threaded, so nothing can change the listener's
+    /// `active` flag between this answer and the `activate_listener` call that
+    /// acts on it.
+    pub fn inherited_socket_fate(&self, addr: &SocketAddr) -> crate::InheritedSocketFate {
+        use crate::InheritedSocketFate;
+        match self
+            .listeners
+            .values()
+            .find(|listener| listener.borrow().address == *addr)
+        {
+            None => InheritedSocketFate::Unclaimed,
+            Some(listener) if listener.borrow().active => InheritedSocketFate::Refused,
+            Some(_) => InheritedSocketFate::Adopted,
+        }
     }
 
     pub fn activate_listener(
@@ -4570,8 +4643,8 @@ mod sni_routing_tests {
         // net-zero-per-session contract spans the full lifecycle (accept ->
         // live backend connect -> upgrade/teardown) and is the behavioural job
         // of the e2e gauge assertion
-        // (`test_tcp_sni_reject_then_valid_connection_not_limited` in
-        // `e2e/src/tests/tcp_sni_tests.rs`), not reproducible at this unit
+        // (`test_tcp_sni_per_ip_limiter_rejects_second_then_admits_after_release`
+        // in `e2e/src/tests/tcp_sni_tests.rs`), not reproducible at this unit
         // level.
         let ServerParts {
             registry,

@@ -19,8 +19,10 @@ for the supervisor side see
 Every `sozu listener {http,https,tcp} update` invocation produces an
 `Update*Listener` request type
 (`UpdateHttpListenerConfig` / `UpdateHttpsListenerConfig` /
-`UpdateTcpListenerConfig` — see
-`bin/src/command/requests.rs:33` for the imports). The semantic is
+`UpdateTcpListenerConfig` — the payloads of
+`RequestType::UpdateHttpListener`, `RequestType::UpdateHttpsListener` and
+`RequestType::UpdateTcpListener`, dispatched in
+`bin/src/command/requests.rs`). The semantic is
 **preserve on omit**: every CLI flag you do not pass keeps its current
 value on the worker side, so an update is a true patch rather than a full
 replacement.
@@ -121,16 +123,17 @@ sozu cluster h2 disable --id my-cluster
 ```
 
 Behaviourally this is a **query-then-resubmit** dance, not a partial
-patch. See `bin/src/ctl/request_builder.rs:214-238`:
+patch. See `CommandManager::cluster_h2_command`
+(`bin/src/ctl/request_builder.rs`):
 
 1. The CLI emits a `QueryClusterById(my-cluster)` request and waits
-   synchronously for the master's response (`request_builder.rs:220-221`).
+   synchronously for the master's response (`request_builder.rs:388-389`).
 2. It locates the matching `ClusterInformation` in the response and
    extracts the current `ClusterConfiguration`
-   (`request_builder.rs:222-240`).
+   (`request_builder.rs:391-397`).
 3. It rewrites the `http2` field on the extracted configuration and
    re-submits as a full `AddCluster(updated)`
-   (`request_builder.rs:242-247`). The supervisor treats `AddCluster`
+   (`request_builder.rs:399-404`). The supervisor treats `AddCluster`
    as upsert, so this acts as a targeted edit even though no dedicated
    "patch cluster" verb exists.
 
@@ -223,7 +226,8 @@ ratebar matches the sum of the labelled buckets.
 
 ### 5.5 `https.alpn.rejected.unsupported` counter
 
-Source: `lib/src/https.rs:359`. Documented in `doc/configure.md:933`.
+Source: `HttpsSession::upgrade_handshake` (`lib/src/https.rs:483`).
+Documented in `doc/configure.md:933`.
 
 Fires on the rustls accept path when the negotiated ALPN protocol is
 not one of the explicitly handled values (`h2`, `http/1.1`, or absent).

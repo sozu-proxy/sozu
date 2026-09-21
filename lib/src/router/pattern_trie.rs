@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Debug, iter, str};
 
-use regex::bytes::Regex;
+use regex::bytes::{Regex, RegexBuilder};
 
 pub type Key = Vec<u8>;
 pub type KeyValue<K, V> = (K, V);
@@ -51,7 +51,9 @@ fn find_last_slash(input: &[u8]) -> Option<usize> {
 ///
 /// The same string is the identity of a `regexps` entry — the dedup scan in
 /// `insert_recursive`, `remove_recursive` and `lookup_mut` all compare
-/// `Regex::as_str()` against it — so every site must build it here.
+/// `Regex::as_str()` against it — so every site must build it here. The one
+/// site that also needs a compiled `Regex` goes through
+/// [`compiled_segment`], which wraps this function and does not respell it.
 ///
 /// `None` means "this segment is not a usable regex": insert fails, and
 /// remove/lookup find nothing, which is correct because insert never stored
@@ -68,6 +70,51 @@ fn anchored_segment(segment: &str) -> Option<String> {
          branch matches the whole segment only",
     );
     Some(anchored)
+}
+
+/// Compile the stored pattern for one regex hostname segment.
+///
+/// The pattern string comes from [`anchored_segment`] and from nowhere
+/// else: it is the identity a `regexps` entry is addressed by --
+/// `insert_recursive`, `remove_recursive` and `lookup_mut` all compare
+/// `Regex::as_str()` against it -- and `RegexBuilder` leaves `as_str()`
+/// as the pattern it was handed, so a stored segment stays addressable
+/// and removable.
+///
+/// Compiled CASE-INSENSITIVELY, for the same reason `DomainRule::from_str`
+/// is (`router/mod.rs`): a hostname is case-insensitive (RFC 9110 §4.2.3)
+/// and the keys reaching `domain_lookup` are ASCII-lowercased, while the
+/// segment source is no longer folded on the way in. `Router::add_tree_rule`
+/// used to hand the whole hostname to `idna::domain_to_ascii`, which folded
+/// `/API[0-9]/` to `/api[0-9]/` and made an uppercase literal match by
+/// accident -- and folded `\D` to `\d` in the same pass, inverting the
+/// class the operator wrote (sozu#1377). It now stops at the literal
+/// labels, and the fold happens here instead, where it reaches literals
+/// only: case insensitivity does not touch `\d`/`\D`, `\w`/`\W` or
+/// `\s`/`\S`.
+///
+/// The folding is the crate default, i.e. Unicode simple case folding and
+/// NOT ASCII-only -- `.unicode(false)` is deliberately left unset, exactly
+/// as in `DomainRule::from_str`, whose comment carries the measurement:
+/// it would reject `\p{L}` patterns that compile and route today.
+///
+/// The group `anchored_segment` supplies is non-capturing and the builder
+/// adds none, so `captures_len` -- and therefore every `$HOST[n]` rewrite
+/// index, read from `caps.iter().skip(1)` in `router/mod.rs`'s
+/// `RouteResult::new_with_trie` -- is unchanged.
+fn compiled_segment(segment: &str) -> Option<Regex> {
+    let anchored = anchored_segment(segment)?;
+    let compiled = RegexBuilder::new(&anchored)
+        .case_insensitive(true)
+        .build()
+        .ok()?;
+    debug_assert_eq!(
+        compiled.as_str(),
+        anchored,
+        "a `regexps` entry is addressed by `as_str()`, so the builder must \
+         not respell the pattern `anchored_segment` produced",
+    );
+    Some(compiled)
 }
 
 /// Implementation of a trie tree structure.
@@ -101,6 +148,59 @@ pub enum TrieSubMatch<'a, 'b> {
 /// templates (`$HOST[n]`) so frontend rewrites can reach into the matched
 /// segments. Empty when only literal segments matched.
 pub type TrieMatches<'a, 'b> = Vec<TrieSubMatch<'a, 'b>>;
+
+/// Sink for the non-literal trie segments a lookup consumed.
+///
+/// [`TrieNode::lookup`] and [`TrieNode::lookup_with_path`] run the SAME
+/// walk, so the precedence order is stated once. They differ only in
+/// whether they record the segments it matched, and a caller with no
+/// rewrite template to fill must not pay for a record it will drop:
+/// [`NoTrace`] monomorphises every sink call away, so SNI resolution
+/// (`lib/src/tls.rs`, `lib/src/protocol/tcp_preread/`) still allocates
+/// nothing per lookup.
+///
+/// That is a claim about the SINK alone. The `accept` predicate beside it
+/// is a `&mut dyn FnMut`, not a generic parameter, so it is one indirect
+/// call per candidate leaf the walk reaches — including on the SNI path,
+/// where it is the constant `true`. Making it generic too would
+/// monomorphise `lookup_recursive` once per predicate type; it has not
+/// been worth the code size.
+///
+/// The walk BACKTRACKS, so a sink must be rewindable: a candidate that
+/// ends up not answering must leave none of its segments behind.
+trait SubMatchSink<'a, 'b> {
+    /// Position to rewind to when the branch about to be tried fails.
+    fn mark(&self) -> usize;
+    fn rewind(&mut self, mark: usize);
+    fn push(&mut self, sub_match: TrieSubMatch<'a, 'b>);
+}
+
+/// Sink that records nothing.
+struct NoTrace;
+
+impl<'a, 'b> SubMatchSink<'a, 'b> for NoTrace {
+    fn mark(&self) -> usize {
+        0
+    }
+
+    fn rewind(&mut self, _mark: usize) {}
+
+    fn push(&mut self, _sub_match: TrieSubMatch<'a, 'b>) {}
+}
+
+impl<'a, 'b> SubMatchSink<'a, 'b> for TrieMatches<'a, 'b> {
+    fn mark(&self) -> usize {
+        self.len()
+    }
+
+    fn rewind(&mut self, mark: usize) {
+        Vec::truncate(self, mark);
+    }
+
+    fn push(&mut self, sub_match: TrieSubMatch<'a, 'b>) {
+        Vec::push(self, sub_match);
+    }
+}
 
 impl<V: PartialEq> std::cmp::PartialEq for TrieNode<V> {
     fn eq(&self, other: &Self) -> bool {
@@ -325,7 +425,7 @@ impl<V: Debug + Clone> TrieNode<V> {
                     // just failed to find, so the entry this opens is
                     // addressable by `remove_recursive` and `lookup_mut`,
                     // which rebuild it the same way.
-                    if let Ok(r) = Regex::new(&anchored_s) {
+                    if let Some(r) = compiled_segment(s) {
                         if pos > 0 {
                             let mut node = TrieNode::root();
                             let pos = pos - 1;
@@ -564,22 +664,60 @@ impl<V: Debug + Clone> TrieNode<V> {
         }
     }
 
-    /// Look up `partial_key` and additionally collect the non-literal segments
-    /// that matched along the way (`TrieMatches`).
+    /// Resolve `partial_key` against this subtree, MOST SPECIFIC FIRST.
     ///
-    /// Equivalent to `lookup` for callers that don't need the captures, but
-    /// frontends with `$HOST[n]` rewrite templates need the matched segments
-    /// to fill the placeholders. The accumulator is passed in by value so
-    /// callers can pre-size it (`Vec::with_capacity`) and we own the path
-    /// returned alongside the value.
-    pub fn lookup_with_path<'a, 'b>(
+    /// At every level the candidates are tried in one stated order:
+    ///
+    /// 1. the exact literal child,
+    /// 2. the regex segments, in declaration order,
+    /// 3. the `*` wildcard, which only ever stands for the leftmost label.
+    ///
+    /// A candidate that yields nothing hands the key to the next one: the
+    /// walk BACKTRACKS instead of ending the lookup. `accept` is what
+    /// "yields something" means to the caller — `Router::lookup` accepts a
+    /// leaf only when one of its rules serves this request's path AND
+    /// method, so a hostname candidate whose rules all reject the request
+    /// is skipped rather than answered with a 404 (sozu#1351).
+    ///
+    /// The two fallbacks are NOT interchangeable, and which one a change
+    /// may drop is not guessable — the mutation tests measure it.
+    ///
+    /// - The **regex-loop** fallback is what the reorder requires. The
+    ///   wildcard used to be consulted BEFORE the regex list, so a segment
+    ///   that matches a label but holds no value for this host
+    ///   (`/cdn[0-9]+/`, as opened by `images./cdn[0-9]+/.hello.com`)
+    ///   reached the wildcard only because the wildcard went first. Move
+    ///   the wildcard after the regex list without this fallback and that
+    ///   case becomes a miss:
+    ///   `a_regex_segment_holding_no_value_falls_back_to_the_wildcard`.
+    /// - The **exact-child** fallback answers to the add-path fix instead.
+    ///   An exact hostname now owns its own node, carrying only the paths
+    ///   written for it, so without this fallback every other path on that
+    ///   host stops resolving. Dropping it does NOT redden the regex case
+    ///   above; it reddens
+    ///   `a_hostname_candidate_that_serves_no_rule_falls_through_to_the_next`
+    ///   and the leak test.
+    ///
+    /// Both still ship together — the add fix and the reorder each need
+    /// one — but a future reader deciding whether they can be split should
+    /// read that pairing, not assume it.
+    ///
+    /// The walk visits each node at most once: the trie is a tree, so two
+    /// candidates never share a node. The cost is therefore bounded by the
+    /// number of nodes matching the key, not by the product of the
+    /// per-level candidate counts.
+    fn lookup_recursive<'a, 'b, S: SubMatchSink<'a, 'b>>(
         &'b self,
         partial_key: &'a [u8],
         accept_wildcard: bool,
-        mut trace: TrieMatches<'a, 'b>,
-    ) -> Option<(&'b KeyValue<Key, V>, TrieMatches<'a, 'b>)> {
+        trace: &mut S,
+        accept: &mut dyn FnMut(&KeyValue<Key, V>) -> bool,
+    ) -> Option<&'b KeyValue<Key, V>> {
         if partial_key.is_empty() {
-            return self.key_value.as_ref().map(|kv| (kv, trace));
+            return match self.key_value.as_ref() {
+                Some(key_value) if accept(key_value) => Some(key_value),
+                _ => None,
+            };
         }
 
         let pos = find_last_dot(partial_key);
@@ -596,92 +734,97 @@ impl<V: Debug + Clone> TrieNode<V> {
             "dot-split must partition the key without losing or duplicating bytes",
         );
         debug_assert!(
+            !suffix.is_empty(),
+            "the suffix the trie matches children against must be non-empty",
+        );
+        debug_assert!(
             pos.is_none() || suffix.first() == Some(&b'.'),
             "a dotted split must place the separator at the head of the suffix",
         );
 
-        match self.children.get(suffix) {
-            Some(child) => child.lookup_with_path(prefix, accept_wildcard, trace),
-            None => {
-                if prefix.is_empty() && self.wildcard.is_some() && accept_wildcard {
-                    let segment = if !suffix.is_empty() && suffix[0] == b'.' {
-                        &suffix[1..]
-                    } else {
-                        suffix
-                    };
-                    trace.push(TrieSubMatch::Wildcard(segment));
-                    self.wildcard.as_ref().map(|kv| (kv, trace))
-                } else {
-                    for (regexp, child) in self.regexps.iter() {
-                        let segment = if !suffix.is_empty() && suffix[0] == b'.' {
-                            &suffix[1..]
-                        } else {
-                            suffix
-                        };
-                        if regexp.is_match(segment) {
-                            let mut next = trace;
-                            next.push(TrieSubMatch::Regexp(segment, regexp));
-                            return child.lookup_with_path(prefix, accept_wildcard, next);
-                        }
-                    }
-                    None
-                }
+        // 1. the exact literal child.
+        if let Some(child) = self.children.get(suffix) {
+            let mark = trace.mark();
+            if let Some(found) = child.lookup_recursive(prefix, accept_wildcard, trace, accept) {
+                return Some(found);
             }
+            trace.rewind(mark);
         }
+
+        // The bytes a non-literal segment stands for: `suffix` without the
+        // separator the dot-split kept at its head.
+        let segment = if suffix[0] == b'.' {
+            &suffix[1..]
+        } else {
+            suffix
+        };
+
+        // 2. the regex segments, in declaration order.
+        for (regexp, child) in self.regexps.iter() {
+            if !regexp.is_match(segment) {
+                continue;
+            }
+            let mark = trace.mark();
+            trace.push(TrieSubMatch::Regexp(segment, regexp));
+            if let Some(found) = child.lookup_recursive(prefix, accept_wildcard, trace, accept) {
+                return Some(found);
+            }
+            trace.rewind(mark);
+        }
+
+        // 3. the wildcard, which stands for one leftmost label, and only
+        //    when the caller accepts one.
+        if prefix.is_empty()
+            && accept_wildcard
+            && let Some(key_value) = self.wildcard.as_ref()
+            && accept(key_value)
+        {
+            trace.push(TrieSubMatch::Wildcard(segment));
+            return Some(key_value);
+        }
+
+        None
     }
 
+    /// Look up `partial_key` and additionally collect the non-literal segments
+    /// that matched along the way (`TrieMatches`).
+    ///
+    /// Equivalent to `lookup` for callers that don't need the captures, but
+    /// frontends with `$HOST[n]` rewrite templates need the matched segments
+    /// to fill the placeholders. The accumulator is passed in by value so
+    /// callers can pre-size it (`Vec::with_capacity`) and we own the path
+    /// returned alongside the value. It carries the segments of the
+    /// candidate that ANSWERED: the walk rewinds the ones it tried and
+    /// abandoned.
+    ///
+    /// `accept` filters candidates — see [`TrieNode::lookup_recursive`]
+    /// for the precedence order it is applied in. Pass
+    /// `&mut |_: &KeyValue<Key, V>| true` to take the first leaf found.
+    pub fn lookup_with_path<'a, 'b>(
+        &'b self,
+        partial_key: &'a [u8],
+        accept_wildcard: bool,
+        mut trace: TrieMatches<'a, 'b>,
+        accept: &mut dyn FnMut(&KeyValue<Key, V>) -> bool,
+    ) -> Option<(&'b KeyValue<Key, V>, TrieMatches<'a, 'b>)> {
+        self.lookup_recursive(partial_key, accept_wildcard, &mut trace, accept)
+            .map(|key_value| (key_value, trace))
+    }
+
+    /// Request-addressed lookup: which entry serves `partial_key`.
+    ///
+    /// Same walk and same precedence as [`TrieNode::lookup_with_path`] —
+    /// stated once, in [`TrieNode::lookup_recursive`] — without recording
+    /// the segments it matched. This is the resolver SNI goes through
+    /// (`lib/src/tls.rs`, `lib/src/protocol/tcp_preread/`), so certificate
+    /// selection follows the same order as HTTP routing.
     pub fn lookup(&self, partial_key: &[u8], accept_wildcard: bool) -> Option<&KeyValue<Key, V>> {
-        //println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
-
-        if partial_key.is_empty() {
-            return self.key_value.as_ref();
-        }
-
-        let pos = find_last_dot(partial_key);
-        let (prefix, suffix) = match pos {
-            None => (&b""[..], partial_key),
-            Some(pos) => (&partial_key[..pos], &partial_key[pos..]),
-        };
-        //println!("lookup: prefix|suffix: {} | {}", std::str::from_utf8(prefix).unwrap(), std::str::from_utf8(suffix).unwrap());
-        debug_assert_eq!(
-            prefix.len() + suffix.len(),
-            partial_key.len(),
-            "dot-split must partition the key without losing or duplicating bytes",
-        );
-        debug_assert!(
-            !suffix.is_empty(),
-            "the suffix the trie matches children against must be non-empty",
-        );
-
-        match self.children.get(suffix) {
-            Some(child) => child.lookup(prefix, accept_wildcard),
-            None => {
-                //println!("no child found, testing wildcard and regexps");
-
-                if prefix.is_empty() && self.wildcard.is_some() && accept_wildcard {
-                    //println!("no dot, wildcard applies");
-                    self.wildcard.as_ref()
-                } else {
-                    //println!("there's still a subdomain, wildcard does not apply");
-
-                    for (regexp, child) in self.regexps.iter() {
-                        let suffix = if suffix[0] == b'.' {
-                            &suffix[1..]
-                        } else {
-                            suffix
-                        };
-                        //println!("testing regexp: {} on suffix {}", r.as_str(), str::from_utf8(s).unwrap());
-
-                        if regexp.is_match(suffix) {
-                            //println!("matched");
-                            return child.lookup(prefix, accept_wildcard);
-                        }
-                    }
-
-                    None
-                }
-            }
-        }
+        self.lookup_recursive(
+            partial_key,
+            accept_wildcard,
+            &mut NoTrace,
+            &mut |_: &KeyValue<Key, V>| true,
+        )
     }
 
     pub fn lookup_mut(
@@ -768,6 +911,30 @@ impl<V: Debug + Clone> TrieNode<V> {
                     self.wildcard.as_mut()
                 } else {
                     //println!("there's still a subdomain, wildcard does not apply");
+
+                    // A literal segment resolves through a matching regex
+                    // segment only when the caller accepts a non-literal
+                    // entry for its key -- the guard `insert_sni_route`
+                    // (`lib/src/tcp.rs`) already documents for the wildcard
+                    // slot right above, extended to the regex list.
+                    //
+                    // `lookup_mut` addresses a KEY, not a request: it is
+                    // how `add_tree_rule`/`remove_tree_rule` and
+                    // `insert_sni_route`/`remove_sni_route` reach the node
+                    // a configured hostname owns, and both its `*` case and
+                    // its trailing-`/` case above match by IDENTITY. This
+                    // arm did not, so adding `test4.example.com` after
+                    // `/test[0-9]/.example.com` pushed the exact host's
+                    // rule onto the REGEX segment's leaf and the whole
+                    // family served it -- a routing leak the operator
+                    // could not see, since `sozu query frontends` showed
+                    // exactly what they had typed (sozu#1351). The
+                    // request-addressed resolvers (`lookup`,
+                    // `lookup_with_path`) are where a literal host is meant
+                    // to match a regex segment.
+                    if !accept_wildcard {
+                        return None;
+                    }
 
                     for &mut (ref regexp, ref mut child) in self.regexps.iter_mut() {
                         let suffix = if suffix[0] == b'.' {
@@ -926,6 +1093,15 @@ impl<V: Debug + Clone> TrieNode<V> {
         self.lookup(key, accept_wildcard)
     }
 
+    /// Key-addressed mutable accessor: the node the configured hostname
+    /// `key` OWNS, never the node that would serve a request for it.
+    ///
+    /// With `accept_wildcard: false` a literal key may not resolve into a
+    /// non-literal entry — neither the `*` slot nor a matching regex
+    /// segment — which is what keeps `add_tree_rule` and `insert_sni_route`
+    /// from pushing a rule onto an entry that serves a whole family of
+    /// hosts (sozu#1351). Use [`TrieNode::domain_lookup`] to ask which
+    /// entry serves a host.
     pub fn domain_lookup_mut(
         &mut self,
         key: &[u8],
@@ -1247,6 +1423,87 @@ mod tests {
             rescued.is_match(b"ab"),
             "{} is what the missing pre-validation would have built",
             rescued.as_str(),
+        );
+    }
+
+    /// sozu#1377 moved the case folding of a tree hostname regex OFF the
+    /// source and ONTO the compile: `Router::add_tree_rule` no longer
+    /// hands the segment to `idna::domain_to_ascii` (which folded `\D`
+    /// into `\d` and inverted the class), and `compiled_segment` folds
+    /// here instead, where it reaches literals only.
+    ///
+    /// Three claims, and all three are load-bearing:
+    ///
+    /// - the builder must not RESPELL the pattern, because `as_str()` is
+    ///   the identity `insert_recursive`, `remove_recursive` and
+    ///   `lookup_mut` address a `regexps` entry by — a second spelling
+    ///   makes a stored segment un-removable;
+    /// - `captures_len` must be untouched, because `$HOST[n]` rewrite
+    ///   indices come from `caps.iter().skip(1)` with the buffer sized by
+    ///   `captures_len()` in `router/mod.rs`'s `RouteResult::new_with_trie`;
+    /// - the fold must reach literals and NOT escapes.
+    ///
+    /// To SEE THIS RED: drop `.case_insensitive(true)` from
+    /// `compiled_segment` — the `API[0-9]` assertion fails. Prepend
+    /// `(?i)` to the pattern handed to `RegexBuilder` instead of setting
+    /// the flag — the `as_str()` assertion fails with
+    /// `left: "(?i)\\A(?:cdn[0-9]+)\\z", right: "\\A(?:cdn[0-9]+)\\z"`.
+    /// Make `anchored_segment`'s wrapper capturing — the `captures_len`
+    /// assertions fail.
+    #[test]
+    fn compiled_segment_folds_case_without_respelling_its_identity() {
+        let anchored = anchored_segment("cdn[0-9]+").expect("the segment must wrap");
+        assert_eq!(
+            compiled_segment("cdn[0-9]+")
+                .expect("the segment must compile")
+                .as_str(),
+            anchored,
+            "the compiled entry must carry `anchored_segment`'s exact string",
+        );
+
+        assert_eq!(
+            compiled_segment("a|b|c")
+                .expect("an alternation must compile")
+                .captures_len(),
+            1,
+            "folding must not add a capture group",
+        );
+        assert_eq!(
+            compiled_segment("cdn([0-9]+)")
+                .expect("a group must compile")
+                .captures_len(),
+            2,
+            "the operator's own group must stay at index 1",
+        );
+
+        let uppercase = compiled_segment("API[0-9]").expect("the segment must compile");
+        assert!(
+            uppercase.is_match(b"api7"),
+            "an uppercase literal must meet the ASCII-lowercased lookup key",
+        );
+        assert!(uppercase.is_match(b"API7"), "and its own spelling too",);
+        assert!(
+            !uppercase.is_match(b"apix"),
+            "folding must not widen the class the operator wrote",
+        );
+
+        // Case insensitivity does not reach `\d`/`\D`, `\w`/`\W` or
+        // `\s`/`\S`: that inversion only ever came from folding the
+        // SOURCE, which is what sozu#1377 removed.
+        let not_a_digit = compiled_segment("\\D+").expect("the segment must compile");
+        assert!(not_a_digit.is_match(b"abc"), "`\\D+` matches non-digits");
+        assert!(
+            !not_a_digit.is_match(b"777"),
+            "`\\D+` must never match digits — folded to `\\d+` it matched \
+             exactly and only those",
+        );
+
+        // A segment that is not a regex on its own compiles to nothing,
+        // exactly as `anchored_segment` refuses it.
+        let unbalanced = format!("a{}b", ")(");
+        assert!(
+            compiled_segment(&unbalanced).is_none(),
+            "{unbalanced} must not be rescued into a live entry",
         );
     }
 
@@ -1602,7 +1859,14 @@ mod tests {
         // panicked at `partial_key[..pos - 1]`; must now resolve the leaf
         // (value unchanged from the first insert — Existing did not
         // overwrite).
-        let resolved = root.domain_lookup_mut(b"test4.example.com", false);
+        //
+        // The probe is the HOST KEY, not a host the segment matches: the
+        // underflow lives in the trailing-`/` arm, which only a key ending
+        // in a regex segment reaches. Probing `test4.example.com` instead
+        // (as this test did before sozu#1351 made `lookup_mut`
+        // key-addressed) never ran the arm under test at all — it left
+        // through the `regexps` scan one level down.
+        let resolved = root.domain_lookup_mut(b"/test[0-9]/.example.com", false);
         assert_eq!(
             resolved.map(|(_, v)| *v),
             Some(7),
@@ -1935,6 +2199,151 @@ mod tests {
         assert!(
             root.is_empty(),
             "dropping the last host under a regex segment must leave an empty trie",
+        );
+    }
+    /// sozu#1351: `lookup_mut` addresses a KEY, `lookup` addresses a
+    /// REQUEST. The two had drifted: `lookup_mut` resolved a literal
+    /// segment through the first regex segment matching it, so
+    /// `add_tree_rule` — which reaches a leaf through `domain_lookup_mut`
+    /// before deciding whether to insert — attached an exact host's rule
+    /// to the regex segment's leaf, and the whole regex family served it.
+    ///
+    /// `accept_wildcard: false` now means "this literal key may not
+    /// resolve into a non-literal entry", covering the regex segments the
+    /// way it already covered the wildcard slot (`tcp.rs`'s
+    /// `insert_sni_route` documents the same reasoning for `*`).
+    ///
+    /// To SEE THIS RED: in `TrieNode::lookup_mut`, drop the
+    /// `accept_wildcard &&` guard in front of the `self.regexps` scan.
+    /// The first assertion then resolves to `Some(7)` — the regex leaf.
+    #[test]
+    fn lookup_mut_does_not_resolve_a_literal_host_through_a_regex_segment() {
+        let mut root: TrieNode<u8> = TrieNode::root();
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"/test[0-9]/.example.com"[..]), 7),
+            InsertResult::Ok
+        );
+
+        assert_eq!(
+            root.domain_lookup_mut(b"test4.example.com", false)
+                .map(|(_, v)| *v),
+            None,
+            "a literal host is not a key of this trie just because a regex \
+             segment matches it",
+        );
+        assert_eq!(
+            root.domain_lookup_mut(b"/test[0-9]/.example.com", false)
+                .map(|(_, v)| *v),
+            Some(7),
+            "the regex segment's own key still resolves, by regex identity",
+        );
+        assert_eq!(
+            root.domain_lookup(b"test4.example.com", false),
+            Some(&(b"/test[0-9]/.example.com"[..].to_vec(), 7)),
+            "while the request-addressed lookup still matches the family",
+        );
+
+        // Which is the point: the exact host can now get its OWN node.
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"test4.example.com"[..]), 4),
+            InsertResult::Ok
+        );
+        assert_eq!(
+            root.domain_lookup(b"test4.example.com", false),
+            Some(&(b"test4.example.com"[..].to_vec(), 4)),
+            "and it outranks the regex segment that also matches it",
+        );
+    }
+
+    /// The request-addressed `lookup` walks its candidates
+    /// most-specific-first — exact child, then regex segments in
+    /// declaration order, then the wildcard — and a candidate that holds
+    /// no value for the host hands it to the next one.
+    ///
+    /// This is the walk `lib/src/tls.rs` and
+    /// `lib/src/protocol/tcp_preread/` resolve SNI with, so certificate
+    /// selection follows the same order as HTTP routing.
+    ///
+    /// To SEE THIS RED: in `TrieNode::lookup_recursive`, move the wildcard
+    /// block above the `self.regexps` loop — `test7.example.com` then
+    /// answers with the wildcard entry.
+    #[test]
+    fn lookup_prefers_exact_then_regex_then_wildcard() {
+        let mut root: TrieNode<u8> = TrieNode::root();
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"*.example.com"[..]), 1),
+            InsertResult::Ok
+        );
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"/test[0-9]/.example.com"[..]), 2),
+            InsertResult::Ok
+        );
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"test4.example.com"[..]), 3),
+            InsertResult::Ok
+        );
+
+        assert_eq!(
+            root.domain_lookup(b"test4.example.com", true)
+                .map(|(_, v)| *v),
+            Some(3),
+            "the exact child wins over both",
+        );
+        assert_eq!(
+            root.domain_lookup(b"test7.example.com", true)
+                .map(|(_, v)| *v),
+            Some(2),
+            "a regex segment wins over the wildcard",
+        );
+        assert_eq!(
+            root.domain_lookup(b"other.example.com", true)
+                .map(|(_, v)| *v),
+            Some(1),
+            "the wildcard answers what neither claims",
+        );
+        assert_eq!(
+            root.domain_lookup(b"test7.example.com", false)
+                .map(|(_, v)| *v),
+            Some(2),
+            "and the regex segment still answers when the wildcard is \
+             refused, which is what makes the order above observable",
+        );
+    }
+
+    /// A regex segment that matches the label but whose subtree holds
+    /// nothing for this host must not swallow the lookup: the walk
+    /// rewinds and tries the wildcard.
+    ///
+    /// `images./cdn[0-9]+/.hello.com` opens the `cdn[0-9]+` entry with a
+    /// VALUELESS subtree (`TrieNode::root`) holding only `images`, so
+    /// `cdn10.hello.com` matches the segment and finds no value behind it.
+    ///
+    /// To SEE THIS RED: in `TrieNode::lookup_recursive`, `return` the
+    /// result of the recursive call inside the `self.regexps` loop instead
+    /// of continuing on `None`. `cdn10.hello.com` then answers `None`.
+    #[test]
+    fn a_regex_segment_holding_no_value_falls_back_to_the_wildcard() {
+        let mut root: TrieNode<u8> = TrieNode::root();
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"images./cdn[0-9]+/.hello.com"[..]), 8),
+            InsertResult::Ok
+        );
+        assert_eq!(
+            root.domain_insert(Vec::from(&b"*.hello.com"[..]), 7),
+            InsertResult::Ok
+        );
+
+        assert_eq!(
+            root.domain_lookup(b"images.cdn10.hello.com", true)
+                .map(|(_, v)| *v),
+            Some(8),
+            "the regex segment serves the host it was opened for",
+        );
+        assert_eq!(
+            root.domain_lookup(b"cdn10.hello.com", true)
+                .map(|(_, v)| *v),
+            Some(7),
+            "and the wildcard serves the one it was not",
         );
     }
 }

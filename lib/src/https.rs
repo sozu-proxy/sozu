@@ -689,7 +689,7 @@ impl HttpsSession {
                 mux::Connection::new_h1_server(
                     session_ulid,
                     front_stream,
-                    handshake.container_frontend_timeout,
+                    handshake.container_frontend_timeout.duration(),
                 )
             }
             AlpnProtocol::H2 => {
@@ -703,7 +703,7 @@ impl HttpsSession {
                     session_ulid,
                     front_stream,
                     self.pool.clone(),
-                    handshake.container_frontend_timeout,
+                    handshake.container_frontend_timeout.duration(),
                     flood_config,
                     connection_config,
                     stream_idle_timeout,
@@ -748,6 +748,10 @@ impl HttpsSession {
             context,
             router,
             session_ulid,
+            // Carry the already-armed handshake entry into the adapter rather
+            // than dropping it and arming a fresh one: the session's request
+            // timeout started when the socket was accepted.
+            timeouts: HashMap::from([(self.frontend_token, handshake.container_frontend_timeout)]),
         }))
     }
 
@@ -763,22 +767,26 @@ impl HttpsSession {
         // http.active_requests was already decremented by generate_access_log()
         // in h1.rs before MuxResult::Upgrade was returned to us.
 
-        let (frontend_readiness, frontend_socket, mut container_frontend_timeout) =
-            match mux.frontend {
-                mux::Connection::H1(mux::ConnectionH1 {
-                    readiness,
-                    socket,
-                    timeout_container,
-                    ..
-                }) => (readiness, socket, timeout_container),
-                mux::Connection::H2(_) => {
-                    error!(
-                        "{} only h1<->h1 connections can upgrade to websocket",
-                        log_context!(self)
-                    );
-                    return None;
-                }
-            };
+        // The cores no longer own a wheel handle; the `Mux` adapter does. Take
+        // the frontend's out of the adapter map before dismantling the
+        // connection, so the WebSocket `Pipe` inherits the same live entry it
+        // used to inherit from `ConnectionH1`.
+        let mut container_frontend_timeout = mux
+            .timeouts
+            .remove(&mux.frontend_token)
+            .unwrap_or_else(|| TimeoutContainer::new_empty(mux.configured_frontend_timeout));
+        let (frontend_readiness, frontend_socket) = match mux.frontend {
+            mux::Connection::H1(mux::ConnectionH1 {
+                readiness, socket, ..
+            }) => (readiness, socket),
+            mux::Connection::H2(_) => {
+                error!(
+                    "{} only h1<->h1 connections can upgrade to websocket",
+                    log_context!(self)
+                );
+                return None;
+            }
+        };
 
         let mux::StreamState::Linked(back_token) = stream.state else {
             error!(
@@ -795,31 +803,32 @@ impl HttpsSession {
             );
             return None;
         };
-        let (cluster_id, backend, backend_readiness, backend_socket, mut container_backend_timeout) =
-            match backend {
-                mux::Connection::H1(mux::ConnectionH1 {
-                    position:
-                        mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
-                    readiness,
-                    socket,
-                    timeout_container,
-                    ..
-                }) => (cluster_id, backend, readiness, socket, timeout_container),
-                mux::Connection::H1(_) => {
-                    error!(
-                        "{} the backend disconnected just after upgrade, abort",
-                        log_context!(self)
-                    );
-                    return None;
-                }
-                mux::Connection::H2(_) => {
-                    error!(
-                        "{} only h1<->h1 connections can upgrade to websocket",
-                        log_context!(self)
-                    );
-                    return None;
-                }
-            };
+        let mut container_backend_timeout = mux
+            .timeouts
+            .remove(&back_token)
+            .unwrap_or_else(|| TimeoutContainer::new_empty(mux.router.configured_backend_timeout));
+        let (cluster_id, backend, backend_readiness, backend_socket) = match backend {
+            mux::Connection::H1(mux::ConnectionH1 {
+                position: mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
+                readiness,
+                socket,
+                ..
+            }) => (cluster_id, backend, readiness, socket),
+            mux::Connection::H1(_) => {
+                error!(
+                    "{} the backend disconnected just after upgrade, abort",
+                    log_context!(self)
+                );
+                return None;
+            }
+            mux::Connection::H2(_) => {
+                error!(
+                    "{} only h1<->h1 connections can upgrade to websocket",
+                    log_context!(self)
+                );
+                return None;
+            }
+        };
 
         let ws_context = stream.context.websocket_context();
 
@@ -1137,6 +1146,20 @@ pub struct HttpsListener {
     config: HttpsListenerConfig,
     fronts: Router,
     listener: Option<MioTcpListener>,
+    /// A socket this listener holds but has NOT registered.
+    ///
+    /// `activate()` parks an inherited socket here when `Registry::register`
+    /// fails, instead of letting the `?` drop and close a descriptor
+    /// `Listeners::get_*` has already removed from the SCM table (sozu#1342).
+    /// The next activation reuses it rather than binding a second one.
+    ///
+    /// Deliberately NOT `listener`: every other consumer reads that field's `Some` as
+    /// "registered and live" — `soft_stop` and `hard_stop` deregister it and
+    /// report the failure, `give_back_listener` hands it back as an activated
+    /// socket, `accept` accepts on it. A parked socket is none of those things,
+    /// and putting it there made a failed registration answer `ENOENT` from
+    /// `deregister` and fail the whole soft stop.
+    parked_listener: Option<MioTcpListener>,
     resolver: Arc<MutexCertificateResolver>,
     rustls_details: Arc<RustlsServerConfig>,
     tags: BTreeMap<String, CachedTags>,
@@ -1391,6 +1414,7 @@ impl HttpsListener {
 
         Ok(HttpsListener {
             listener: None,
+            parked_listener: None,
             address: config.address.into(),
             resolver,
             rustls_details: server_config,
@@ -1448,9 +1472,34 @@ impl HttpsListener {
         }
         let address: StdSocketAddr = self.config.address.into();
 
-        let mut listener = match tcp_listener {
-            Some(tcp_listener) => tcp_listener,
-            None => {
+        // Reuse a socket a previous attempt parked here after a failed
+        // registration, rather than binding a second one. Taking it
+        // unconditionally is what keeps the two from coexisting: if the caller
+        // ALSO handed one over, the parked socket is disposed of deliberately
+        // below instead of being silently overwritten.
+        let parked = self.parked_listener.take();
+        let mut listener = match (tcp_listener, parked) {
+            (Some(inherited), Some(parked)) => {
+                // Not reachable while `Listeners::get_*` removes the entry it
+                // hands over and `scm_listeners` is written once: a parked
+                // socket means this address's entry was already consumed, so
+                // the caller cannot have another. Neither of those is enforced
+                // here, so dispose of the loser explicitly and loudly rather
+                // than letting an assignment close it — that silent close is
+                // sozu#1342 itself.
+                warn!(
+                    "{} closing the socket parked on the HTTPS listener for {}: an \
+                     inherited socket arrived for the same address and is the one being \
+                     activated",
+                    log_module_context!(),
+                    address
+                );
+                drop(parked);
+                inherited
+            }
+            (Some(inherited), None) => inherited,
+            (None, Some(parked)) => parked,
+            (None, None) => {
                 server_bind(address).map_err(|server_bind_error| ListenerError::Activation {
                     address,
                     error: server_bind_error.to_string(),
@@ -1458,9 +1507,22 @@ impl HttpsListener {
             }
         };
 
-        registry
+        let registration = registry
             .register(&mut listener, self.token, Interest::READABLE)
-            .map_err(ListenerError::SocketRegistration)?;
+            .map_err(ListenerError::SocketRegistration);
+        if let Err(error) = registration {
+            // Park the socket instead of letting the `?` drop it. `register`
+            // is fallible (EEXIST for a descriptor still registered because
+            // `notify_deactivate_listener` only logs a failed deregister,
+            // EBADF, ENOMEM), and a socket still held in a local is dropped —
+            // and closed — on the way out. For an SCM-inherited socket that is
+            // the sozu#1342 close in a second place: `Listeners::get_*` has
+            // already removed the entry, so nothing else owns the descriptor.
+            // It goes to `parked_listener`, never to `listener`, because every other
+            // consumer of that field reads `Some` as "registered and live".
+            self.parked_listener = Some(listener);
+            return Err(error);
+        }
 
         self.listener = Some(listener);
         self.active = true;
@@ -2001,6 +2063,13 @@ impl HttpsProxy {
         &mut self,
         domain: String,
     ) -> Result<Option<ResponseContent>, ProxyError> {
+        // The resolver keys its SNI trie on ASCII-lowercased certificate
+        // names (`CertifiedKeyWrapper::try_from`), because that is the
+        // only form rustls ever asks it for. An operator query has to
+        // ask the same question a handshake does, or
+        // `sozu query certificates --domain Example.COM` reports the
+        // certificate missing while the proxy happily serves it.
+        let domain_key = domain.to_ascii_lowercase();
         let certificates = self
             .listeners
             .values()
@@ -2015,7 +2084,8 @@ impl HttpsProxy {
                     .map_err(|e| ProxyError::Lock(e.to_string()))?;
                 let mut certificate_summaries = vec![];
 
-                if let Some((k, fingerprint)) = resolver.domain_lookup(domain.as_bytes(), true) {
+                if let Some((k, fingerprint)) = resolver.domain_lookup(domain_key.as_bytes(), true)
+                {
                     certificate_summaries.push(CertificateSummary {
                         domain: certificate_summary_domain(k),
                         fingerprint: fingerprint.to_string(),
@@ -2045,6 +2115,26 @@ impl HttpsProxy {
         Ok(Some(
             ContentType::CertificatesByAddress(ListOfCertificatesByAddress { certificates }).into(),
         ))
+    }
+
+    /// What this proxy would do with a socket handed to
+    /// [`activate_listener`](Self::activate_listener) for `addr`. See
+    /// [`InheritedSocketFate`].
+    ///
+    /// The event loop is single-threaded, so nothing can change the listener's
+    /// `active` flag between this answer and the `activate_listener` call that
+    /// acts on it.
+    pub fn inherited_socket_fate(&self, addr: &StdSocketAddr) -> crate::InheritedSocketFate {
+        use crate::InheritedSocketFate;
+        match self
+            .listeners
+            .values()
+            .find(|listener| listener.borrow().address == *addr)
+        {
+            None => InheritedSocketFate::Unclaimed,
+            Some(listener) if listener.borrow().active => InheritedSocketFate::Refused,
+            Some(_) => InheritedSocketFate::Adopted,
+        }
     }
 
     pub fn activate_listener(
@@ -3086,23 +3176,6 @@ mod tests {
         );
     }
 
-    /*
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn size_test() {
-      assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
-      assert_size!(TlsHandshake, 240);
-      assert_size!(Http<SslStream<mio::net::TcpStream>>, 1232);
-      assert_size!(Pipe<SslStream<mio::net::TcpStream>>, 272);
-      assert_size!(State, 1240);
-      // fails depending on the platform?
-      assert_size!(Session, 1672);
-
-      assert_size!(SslStream<mio::net::TcpStream>, 16);
-      assert_size!(Ssl, 8);
-    }
-    */
-
     #[test]
     fn frontend_from_request_test() {
         let cluster_id1 = "cluster_1".to_owned();
@@ -3158,6 +3231,7 @@ mod tests {
         println!("it doesn't even matter");
 
         let listener = HttpsListener {
+            parked_listener: None,
             listener: None,
             address: address.into(),
             fronts,
@@ -3550,6 +3624,60 @@ mod tests {
             snapshot,
             Some(live_peer),
             "with nothing cached, FrontRustls::peer_addr must degrade to getpeername(2)"
+        );
+    }
+
+    /// `sozu query certificates --domain <d>` must ask the resolver the
+    /// same question a TLS handshake asks it.
+    ///
+    /// The resolver keys its SNI trie on ASCII-lowercased certificate
+    /// names (`CertifiedKeyWrapper::try_from`, `lib/src/tls.rs`), because
+    /// rustls hands `ResolvesServerCert::resolve` an SNI it has already
+    /// lowercased and no other key can ever be looked up at handshake
+    /// time. The operator query has to be normalised the same way, or
+    /// `sozu query certificates --domain MiXeD.Example.COM` reports the
+    /// certificate missing while the proxy is serving it on every
+    /// handshake for that name.
+    ///
+    /// To SEE THIS RED: in `query_certificate_for_domain`, look the
+    /// domain up with `domain.as_bytes()` instead of
+    /// `domain_key.as_bytes()`. The two case-varying queries return zero
+    /// summaries.
+    #[test]
+    fn query_certificate_for_domain_answers_any_spelling_of_the_name() {
+        let mut proxy = proxy_with_certificate_domain("MiXeD.Example.COM".to_owned());
+
+        let mut summaries_for = |query: &str| {
+            let response = proxy
+                .query_certificate_for_domain(query.to_owned())
+                .expect("the domain certificate query must succeed")
+                .expect("the domain certificate query must return content");
+            match response.content_type {
+                Some(ContentType::CertificatesByAddress(list)) => list
+                    .certificates
+                    .iter()
+                    .map(|entry| entry.certificate_summaries.len())
+                    .sum::<usize>(),
+                _ => panic!("the domain query must answer with CertificatesByAddress"),
+            }
+        };
+
+        for query in [
+            "MiXeD.Example.COM",
+            "mixed.example.com",
+            "MIXED.EXAMPLE.COM",
+        ] {
+            assert_eq!(
+                summaries_for(query),
+                1,
+                "querying {query:?} must find the certificate stored as MiXeD.Example.COM",
+            );
+        }
+
+        assert_eq!(
+            summaries_for("other.example.com"),
+            0,
+            "normalising the query must not make an unrelated domain match",
         );
     }
 }

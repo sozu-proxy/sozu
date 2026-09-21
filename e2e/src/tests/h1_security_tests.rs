@@ -2029,14 +2029,37 @@ fn test_h1_smuggling_auth_bypass() {
 // `DefaultAnswer` variant, so an unrouted request must still get the builtin
 // 404, never the operator's `000`.
 //
-// Scope note: the sibling half of that fix, the same range assertion on a
-// status parsed from the BACKEND's response line
-// (`kawa_h1::save_http_status_metric`), is NOT reachable from this suite — an
-// unconditional `panic!` planted at the top of that function does not fire for
-// any e2e HTTP session, because H1 proxying runs through `protocol/mux`, not
-// `protocol/kawa_h1`. It stays covered by
-// `kawa_h1::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`.
+// Scope note: the sibling half of that fix is the same range assertion on a
+// status parsed from the BACKEND's response line. It used to live in
+// `kawa_h1::save_http_status_metric`, which an unconditional planted `panic!`
+// proved unreachable from this suite — H1 proxying runs through
+// `protocol/mux`, not through the `kawa_h1` session, which was removed on
+// 2026-09-20 (sozu#1346). The assertion now guards the live bucketer and is
+// covered by
+// `mux::stream::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`.
 // =========================================================================
+
+/// Did the unrouted request draw the builtin 404, and not the operator's
+/// out-of-range `000` answer?
+///
+/// Both conjuncts read the STATUS LINE alone. Scanning the whole response for
+/// the substring `"000"` is falsifiable on the wire: the builtin 404 carries a
+/// Crockford base32 ULID in its `Sozu-Id` response header and again in the
+/// `request_id` field of its HTML body, and roughly one ULID in twenty
+/// contains `000` — so the guard reddened on a perfectly correct answer in CI
+/// job 105898321274 (check `fips`, head `5cb5395e`, 2026-09-19), on
+/// `HTTP/1.1 404 Not Found … Sozu-Id: 01M2WV005MHC6FDKVS19000JFY`. The
+/// request immediately before it drew `01M2WV005JRA3CXKWPPESY3TCR` and passed.
+/// That is cause C of sozu#1393, a defect in this assertion and not in sozu.
+///
+/// The negative conjunct is kept rather than folded into the positive one: it
+/// states the property this test exists to guard — the compiled `000` answer
+/// stays unselectable — and keeps holding if the positive conjunct is ever
+/// loosened.
+fn builtin_404_answer_selected(answer: &str) -> bool {
+    let status_line = answer.split_once("\r\n").map_or(answer, |(line, _)| line);
+    status_line.starts_with("HTTP/1.1 404") && !status_line.starts_with("HTTP/1.1 000")
+}
 
 /// To SEE THIS RED: in `lib/src/protocol/kawa_h1/answers.rs`, restore the
 /// deleted post-condition at the end of `Template::new`:
@@ -2113,8 +2136,7 @@ fn try_h1_custom_answer_with_out_of_range_status_does_not_kill_the_worker() -> S
         .write_all(b"GET /api HTTP/1.1\r\nHost: unrouted.example.com\r\nConnection: close\r\n\r\n")
         .expect("write the unrouted request");
     let stray_answer = raw_read_all(&mut stray);
-    let builtin_answer_selected =
-        stray_answer.starts_with("HTTP/1.1 404") && !stray_answer.contains("000");
+    let builtin_answer_selected = builtin_404_answer_selected(&stray_answer);
     println!("H1-BAD-ANSWER: unrouted request got {stray_answer:?}");
 
     worker.soft_stop();
@@ -2139,5 +2161,81 @@ fn test_h1_custom_answer_with_out_of_range_status_does_not_kill_the_worker() {
             try_h1_custom_answer_with_out_of_range_status_does_not_kill_the_worker,
         ),
         State::Success,
+    );
+}
+
+/// Pins `builtin_404_answer_selected` against the exact answer that reddened
+/// CI job 105898321274 (check `fips`, head `5cb5395e`, 2026-09-19): a correct
+/// builtin 404 whose ULID happens to carry the digits `000`. The fixture is
+/// the response the e2e test printed verbatim before returning `State::Fail`,
+/// so the property is captured, not constructed — a regression test that
+/// waited for an unlucky ULID would detect nothing, since only about one draw
+/// in twenty carries the substring.
+///
+/// To SEE THIS RED: restore the historical body of
+/// `builtin_404_answer_selected`,
+/// `answer.starts_with("HTTP/1.1 404") && !answer.contains("000")` — the
+/// `ulid_carrying_000` assertion fails, because the substring scan reaches the
+/// `Sozu-Id` header and the `request_id` in the body. The `operator_000`
+/// assertion is what keeps that mutation from being repaired by deleting the
+/// negative conjunct: the guard must still reject the operator's answer.
+#[test]
+fn the_unselectable_000_guard_reads_the_status_line_not_the_whole_answer() {
+    // Captured from the failing run: `Sozu-Id` and the HTML `request_id` both
+    // repeat the ULID `01M2WV005MHC6FDKVS19000JFY`.
+    let ulid_carrying_000 = concat!(
+        "HTTP/1.1 404 Not Found\r\n",
+        "Cache-Control: no-cache\r\n",
+        "Connection: close\r\n",
+        "Sozu-Id: 01M2WV005MHC6FDKVS19000JFY\r\n",
+        "\r\n",
+        "<html><head><meta charset='utf-8'><head><body>\r\n",
+        "<style>pre{background:#EEE;padding:10px;border:1px solid #AAA;",
+        "border-radius: 5px;}</style>\r\n",
+        "<h1>404 Not Found</h1>\r\n",
+        "<pre>\r\n",
+        "{\r\n",
+        "    \"status_code\": 404,\r\n",
+        "    \"route\": \"GET unrouted.example.com/api\",\r\n",
+        "    \"request_id\": \"01M2WV005MHC6FDKVS19000JFY\"\r\n",
+        "}\r\n",
+        "</pre>\r\n",
+        "<footer>This is an automatic answer by S\u{14d}zu.</footer></body></html>",
+    );
+    assert!(
+        builtin_404_answer_selected(ulid_carrying_000),
+        "a builtin 404 whose ULID carries the digits 000 is still a builtin 404"
+    );
+
+    // The draw the same run made one request earlier, which passed.
+    let ulid_without_000 = concat!(
+        "HTTP/1.1 404 Not Found\r\n",
+        "Cache-Control: no-cache\r\n",
+        "Connection: close\r\n",
+        "Sozu-Id: 01M2WV005JRA3CXKWPPESY3TCR\r\n",
+        "\r\n",
+    );
+    assert!(
+        builtin_404_answer_selected(ulid_without_000),
+        "an ordinary builtin 404 must keep passing the guard"
+    );
+
+    // The check is not vacuous: the operator's compiled answer must still be
+    // rejected, whatever its ULID.
+    let operator_000 = concat!(
+        "HTTP/1.1 000 x\r\n",
+        "Content-Length: 0\r\n",
+        "Sozu-Id: 01M2WV005JRA3CXKWPPESY3TCR\r\n",
+        "\r\n",
+    );
+    assert!(
+        !builtin_404_answer_selected(operator_000),
+        "the operator's out-of-range 000 answer must never read as the builtin 404"
+    );
+
+    // A truncated answer carrying no CRLF is not a builtin 404 either.
+    assert!(
+        !builtin_404_answer_selected("HTTP/1.1 000 x"),
+        "a header-less 000 status line must still be rejected"
     );
 }

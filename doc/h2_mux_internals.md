@@ -65,7 +65,9 @@ ConnectionH2<Front>
  |-- rst_sent: HashSet<StreamId>            // Dedup: RST_STREAM already sent
  |-- settings_sent_at: Option<Instant>      // SETTINGS ACK timeout tracking
  |-- zero: GenericHttpStream                // Connection-level (stream 0) buffer
- |-- timeout_container: TimeoutContainer    // Session timeout management
+ |-- timeout_duration: Duration             // Configured idle timeout
+ |-- timeout_deadline: Option<Instant>      // Next callback instant; the Mux
+ |                                         // adapter owns the TimeoutContainer
 ```
 
 Access patterns use the sub-structure names directly:
@@ -409,6 +411,14 @@ Flushes control data before application frames, in order:
    `expect_write.is_none()`) re-runs on the next tick rather than
    stranding the queued RST.
 
+Stages 3 and 4 both defer — leaving the queue untouched — while
+`header_block_reassembly_in_progress()` is true (`self.state` is
+`ContinuationHeader`/`ContinuationFrame`): the zero buffer is where an
+in-progress, non-refused HEADERS+CONTINUATION field block is accumulating,
+and clearing it to serialize an unrelated control frame would corrupt that
+reassembly. Nothing is lost — queuing either kind of frame already arms
+`WRITABLE` — the flush just waits for the block to complete.
+
 Returns `Some(MuxResult)` if the caller should return early, `None` to proceed.
 
 ### write_streams()
@@ -661,7 +671,8 @@ this branch. The large-asset suite in `e2e/src/tests/h2_correctness_tests.rs`
 locks those fixes in:
 
 - `test_h2_php_apache_chunked_flush_drains_fully` — 312 KiB chunked body with
-  per-chunk flush cadence exercising `mux/h1.rs:341-346, 351-357` (C1).
+  per-chunk flush cadence exercising the peer-readiness re-arm in
+  `ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs:440-446`) (C1).
 - `test_h2_slow_backend_idle_timeout_cancels` — 64 KiB chunked body streamed
   over 4 s, exercising the outbound refresh of `stream_last_activity_at` (C2).
 - `test_h2_chunked_backend_crash_mid_stream_rsts` — verifies the chunked-EOF
@@ -684,10 +695,10 @@ locks those fixes in:
 
 `H2FloodDetector` caps stream-0 `WINDOW_UPDATE` frames at
 `DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW = 100` per sliding window
-(`lib/src/protocol/mux/h2.rs:259`, enforcement at `:856`). The drain helper
-refreshes per-stream windows only; the one-shot conn-level bump during
-`h2_handshake_chromium_146` is the single stream-0 `WINDOW_UPDATE` emitted
-during the test.
+(`lib/src/protocol/mux/h2.rs`, enforced by `H2FloodDetector::check_flood`). The
+drain helper refreshes per-stream windows only; the one-shot conn-level bump
+during `h2_handshake_chromium_146` is the single stream-0 `WINDOW_UPDATE`
+emitted during the test.
 
 ### Safety properties
 

@@ -720,7 +720,8 @@ pub enum BackendConnectionError {
     TooManyConnectionsPerIp { cluster_id: String },
 }
 
-/// used in kawa_h1 module for the Http session state
+/// Route-extraction failures raised by `kawa_h1::editor::HttpContext` and
+/// consumed by the mux router.
 #[derive(thiserror::Error)]
 pub enum RetrieveClusterError {
     #[error("No method given")]
@@ -757,6 +758,50 @@ pub enum AcceptError {
     RegisterError,
     WrongSocketAddress,
     BufferCapacityReached,
+}
+
+/// What a proxy would do with a listening socket handed to its
+/// `activate_listener(address)`.
+///
+/// `Server::notify_activate_listener` asks BEFORE it pulls a descriptor out of
+/// the SCM table, because `Listeners::get_*` removes the entry as it hands it
+/// over while `activate()` returns on its `if self.active` guard without
+/// consuming anything. Taking a descriptor that nothing will consume drops the
+/// owning wrapper on the floor and closes the inherited socket unused — the
+/// accept backlog or receive buffer with it (sozu#1342).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InheritedSocketFate {
+    /// A listener exists at the address and is not active: it adopts the
+    /// socket. Take the descriptor.
+    Adopted,
+    /// A listener exists at the address and is already active on a socket of
+    /// its own. `activate()` short-circuits, so nothing consumes this
+    /// descriptor **now**. Close it deliberately.
+    ///
+    /// Not because it could never be adopted: `give_back_listener` clears
+    /// `active` and keeps the listener object, so `DeactivateListener` followed
+    /// by `ActivateListener` — an operator-reachable feature, covered by
+    /// `e2e/src/tests/listener_reactivation_tests.rs` — brings this address back
+    /// to [`Adopted`](Self::Adopted). Closing here is therefore irreversible:
+    /// `scm_listeners` is filled once in `Server::new` and never refilled, so a
+    /// reactivation after this point binds a fresh socket.
+    ///
+    /// It is a deliberate trade, not a claim about the lifetime. The only thing
+    /// this descriptor carries is the connections queued on it at hand-off, and
+    /// their value decays — the peers behind them time out or reset while the
+    /// address is served by the listener's own socket. The cost of keeping it is
+    /// continuous instead: the descriptor is the retiring worker's listening
+    /// socket, still bound with `SO_REUSEPORT` and registered with no event
+    /// loop, so the kernel is expected to keep giving it a share of incoming
+    /// connections that nobody accepts. (That last step follows from
+    /// `SO_REUSEPORT` load-balancing semantics; nothing here measures it.) A
+    /// decaying backlog is not worth an indefinite share of new connections.
+    Refused,
+    /// No listener at the address yet. Keep the descriptor in the table: an
+    /// `AddListener` + `ActivateListener` pair can still arrive and adopt it,
+    /// which is exactly what an upgrade does when the initial state carries the
+    /// listeners inactive and activates them afterwards.
+    Unclaimed,
 }
 
 /// returned by the HTTP, HTTPS and TCP listeners

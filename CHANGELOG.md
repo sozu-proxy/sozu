@@ -4,6 +4,113 @@
 
 ### 🔐 Security
 
+- **`fix(mux-h2)`: decode a refused stream's HPACK field block instead of dropping it, so the
+  connection-level decoder cannot desynchronise from the peer's encoder.** RFC 9113 §4.3 scopes
+  field-compression state to the whole connection, not to a stream: when `H2State::Discard` is
+  entered — draining, `MAX_CONCURRENT_STREAMS`, buffer-pool exhaustion, or a CONTINUATION flood
+  refusal (CVE-2024-27316 mitigation) — the bytes it drops are a field block the peer's encoder has
+  already applied to its own dynamic table. Dropping them undecoded left the decoder permanently
+  behind, so every later header block on the surviving connection resolved the wrong dynamic entry
+  or failed outright with `HeaderIndexOutOfBounds`. `ConnectionH2::readable`'s Discard arm now
+  decodes the field block into `ConnectionH2::decoder` (the header pairs themselves are discarded —
+  the stream was already refused) before clearing `zero.storage`, via the new
+  `decode_discarded_field_block` free function and the `DiscardedFieldBlock` value
+  `refuse_stream_and_discard` stashes for it.
+  A HEADERS payload is not itself a field block (RFC 9113 §6.2): `[Pad Length?][Stream
+  Dependency+Weight?][field block fragment][padding?]`. A new-stream refusal now re-parses the whole
+  payload with `parser::headers_frame` to strip any PADDED/PRIORITY prefix before decoding — a naive
+  decode of the raw payload turns a legitimate padded or prioritized refusal into a spurious
+  `GOAWAY(COMPRESSION_ERROR)`. When the refused frame did not carry END_HEADERS, decoding is skipped
+  rather than attempted: a refused multi-frame block cannot legally continue (a standalone
+  CONTINUATION is already a `PROTOCOL_ERROR` per `handle_header_state`), so decoding a fragment that
+  ends mid-integer would only misreport `COMPRESSION_ERROR` in place of that `PROTOCOL_ERROR`. A
+  CONTINUATION frame refused mid-block copies out every prior frame's accumulated field-block bytes
+  at refusal time, because queuing the RST_STREAM arms `WRITABLE` and the same event-loop pass's
+  `writable()` preamble reuses `zero.storage` as RST_STREAM scratch before the next `readable()` pass
+  would otherwise read this frame's own payload. A genuine HPACK decode failure of a complete block
+  is reported as `GOAWAY(COMPRESSION_ERROR)` per RFC 9113 §4.3, distinct from the `PROTOCOL_ERROR`
+  a malformed Pad Length now correctly produces.
+
+- **`fix(mux-h2)`: stop an unrelated WINDOW_UPDATE/RST_STREAM flush from corrupting an in-progress,
+  non-refused HEADERS+CONTINUATION reassembly.** `ConnectionH2::zero` does double duty: it is the
+  read-side accumulation buffer for a header block in progress — `headers.header_block_fragment`
+  stays a `(start, len)` window into it across every `readable()` pass until `END_HEADERS`, by
+  protocol design, not just on short TCP reads — and it is also the write scratch space
+  `flush_pending_control_frames`'s WINDOW_UPDATE and RST_STREAM drain stages reuse to serialise ANY
+  queued frame, for ANY stream. Because the event loop dispatches frontend `readable()` then
+  `writable()` in the same sweep, ordinary connection-level flow-control housekeeping — replenishing
+  the window after DATA received on a completely different stream, no adversarial peer required —
+  could run between a HEADERS frame and its CONTINUATION and clear `zero.storage` out from under the
+  accumulating fragment. The clobbered bytes still HPACK-decoded (any byte sequence usually does),
+  so the observed failure was not a crash but silently wrong header names/values reaching the
+  request, or a connection-wide `GOAWAY` on a legitimate multiplexed request that happened to share
+  a connection with routine flow-control traffic. Both drain stages now defer instead of flushing
+  while `ConnectionH2::header_block_reassembly_in_progress` (`self.state` is `ContinuationHeader` or
+  `ContinuationFrame`) — nothing is lost, since queuing a WINDOW_UPDATE or RST_STREAM already arms
+  `WRITABLE`, so the next `writable()` call after the block completes drains it normally. This
+  mirrors the write side's own pre-existing protection of the same buffer: while a zero-buffer write
+  is stalled, READABLE interest is disabled so a fresh frame read cannot clobber it either — the
+  read side had no analogous guard until now.
+
+- **`fix(router)`: stop IDN-normalising the regex source of a `Tree` hostname, which inverted every
+  uppercase escape.** `Router::add_tree_rule`, `Router::remove_tree_rule` and `Router::has_hostname`
+  ran the WHOLE configured hostname through `idna::domain_to_ascii`, regex segments included. That
+  function ASCII-lowercases, and lowercasing an uppercase regex escape **inverts the character class
+  it names**: measured, `"/\D+/.example.com"` normalised to `"/\d+/.example.com"` and
+  `"/[^\D]/.example.com"` to `"/[^\d]/.example.com"`. `\D` is "not a digit" and `\d` is "a digit",
+  so the installed rule matched the exact **complement** of what the operator wrote. Measured on the
+  tree as it stood, the frontend `/\D+/.rx.example.com` served `777.rx.example.com` and did **not**
+  serve `abc.rx.example.com`. `\W`/`\w` and `\S`/`\s` invert the same way. An operator had no way to
+  notice: the frontend loads, `sozu query frontends` shows exactly what was typed, and only the
+  traffic disagrees — a `Tree` frontend cannot carry case-significant regex syntax at all, which is
+  also why sozu#1349's host-case work deliberately left this untouched
+  ([#1377](https://github.com/sozu-proxy/sozu/issues/1377)).
+  `Pre` and `Post` never carried it: `convert_regex_domain_rule` copies a segment's source verbatim
+  and `DomainRule::from_str` takes its case insensitivity from the `RegexBuilder` instead. The two
+  positions now use the same mechanism rather than opposite ones.
+  **The split between "regex" and "domain label" is the one that already existed.** A label the
+  operator wrapped in slashes is regex source and is copied byte for byte; every other label is a
+  domain label and still goes through `idna::domain_to_ascii` — the same split
+  `convert_regex_domain_rule` makes and the one `pattern_trie.rs`'s `insert_recursive` addresses a
+  `regexps` entry by. Per-label and whole-domain IDNA agree on a label (measured: `"MÜNCHEN"` maps
+  to `"xn--mnchen-3ya"` either way), so a genuine unicode label in a hostname that also carries a
+  regex segment is still punycoded — `a_unicode_label_is_punycoded_while_its_sibling_regex_segment_is_not`
+  pins both halves in one hostname. A hostname with no `/` at all, which is every ordinary hostname,
+  and a hostname whose `/` does not parse as that grammar (`abc/[0-9]+/.example.com`,
+  `example.com/`) both keep the historical whole-string call byte for byte, so the retained trailing
+  dot and every other whole-string behaviour are untouched.
+  **Not folding the source moved the fold onto the compile, and that half is load-bearing.** An
+  uppercase LITERAL inside a segment — `/API[0-9]/` — used to meet the ASCII-lowercased lookup key
+  only because the source had been lowercased too. `pattern_trie.rs` now compiles a stored segment
+  through `compiled_segment`, which wraps `anchored_segment` and sets `case_insensitive(true)`,
+  exactly as `DomainRule::from_str` does for `Pre`/`Post`; case insensitivity does not reach
+  `\d`/`\D`, `\w`/`\W` or `\s`/`\S`, so literals fold and escapes do not. `RegexBuilder` leaves
+  `as_str()` as the pattern it was handed, so `anchored_segment` remains the single source of a
+  `regexps` entry's identity and a stored segment stays removable — `compiled_segment` asserts that,
+  and `a_unicode_label_is_punycoded_while_its_sibling_regex_segment_is_not` round-trips an add and a
+  remove through the same spelling. `captures_len` is unchanged by either the anchoring or the
+  folding, so every `$HOST[n]` rewrite index still resolves to the operator's own group;
+  `compiled_segment_folds_case_without_respelling_its_identity` pins all three properties, and
+  dropping `.case_insensitive(true)` reddens both it and the existing
+  `an_uppercase_host_reaches_wildcard_and_regex_tree_segments`.
+  **This changes existing rules.** A trie-routed frontend spelling `\D`, `\W` or `\S` has been
+  matching the complement of its source and now matches what it says. Audit those hostnames before
+  upgrading; a rule tuned against the folded behaviour must be respelled with the lowercase escape
+  it actually meant. A segment with no uppercase escape is unaffected, and `/API[0-9]/` keeps
+  matching exactly the hosts it matched before. `doc/configure.md` § "Regex hostname segments"
+  carries the migration note.
+  **One other consumer of the same trie exists and is named rather than claimed unaffected.** The
+  SNI *route* table (`lib/src/tcp.rs`) cannot reach this: `validate_sni_pattern` rejects `/`
+  outright, so an SNI route never carries a regex segment. The certificate-name trie
+  (`lib/src/tls.rs`) has no such validator, so a certificate SAN spelling `/…/` would now match
+  case-insensitively where it previously matched case-sensitively — a widening confined to a SAN
+  shape no conforming X.509 dNSName carries.
+  Regression tests: `a_tree_hostname_regex_escape_is_not_case_folded` (the inversion itself, red on
+  the unfixed tree with `\D+` resolving `777.rx.example.com`),
+  `every_inverting_uppercase_regex_escape_survives_a_tree_insert` (`[^\D]`, `\W` and `\S`),
+  `a_unicode_label_is_punycoded_while_its_sibling_regex_segment_is_not`, and
+  `compiled_segment_folds_case_without_respelling_its_identity`.
+
 - **`fix(router)`: anchor every branch of an alternation in a regex HOSTNAME segment.**
   A regex hostname segment was anchored by concatenating `\A` and `\z` around the operator's
   pattern without grouping it. `|` is the lowest-precedence regex operator, so `\Aa|b\z` parses as
@@ -254,6 +361,642 @@
 
 ### 🐛 Fixed
 
+- **`fix(tls)`: a certificate name containing `/` was stored as a REGEX segment and bound one
+  certificate to an open-ended class of SNI values; it is now refused.**
+  `AddCertificate.certificate.names` is a free `Vec<String>` that `CertificateResolver::add_certificate`
+  (`lib/src/tls.rs`) inserted into the SNI `TrieNode<Fingerprint>` verbatim, and that trie is the
+  same `lib/src/router/pattern_trie.rs` the HTTP router uses: a dot-separated label wrapped in
+  `/.../` is compiled as a regex segment. A certificate declared for `/te.*/.example.com` was
+  therefore served for `test.example.com` and for `tenant.example.com` alike — measured on
+  `c7ac070e` — while the certificate inventory an operator reads showed a SAN-shaped string. A name
+  like `/.*/.example.com` is one character away from a plausible typo.
+  The validation that existed could not catch it. It dry-runs every name into a scratch trie and
+  asks only whether the name INSERTS, and a regex segment inserts perfectly well; the check has to
+  be on the name's BYTES. `add_certificate` now also refuses a name containing `/`, in the SAME
+  pre-mutation block as the `MAX_HOSTNAME_LENGTH` bound, returning
+  `CertificateResolverError::InvalidName` — surfaced to the control plane as
+  `could not add certificate: the SNI route table cannot host a certificate name`. Nothing is
+  half-registered: the refusal precedes every mutation of the certificate store, the name index and
+  the trie. `/` cannot occur in a DNS name, so no legitimate SAN is lost, and an ordinary
+  `*.example.com` wildcard name is not a regex segment and still loads and still serves its subtree.
+  This is the rule `config::validate_sni_pattern` (`command/src/config.rs`) has always applied to
+  every path into the TCP SNI route table; the certificate trie was the one SNI table left open.
+  Removal is unaffected. `remove_certificate` re-inserts the names a certificate already carries and
+  never re-validates them — its `InsertResult::Failed` canary asserts an internal bug, not an input
+  error — so a certificate a previous build accepted stays removable and the new refusal cannot
+  strand one.
+  **How to find an affected configuration.** The bundled `sozu certificate add` never sets the
+  `names` override (it sends an empty vector and the worker derives the names from the
+  certificate's own SAN / CN), so a configuration can only be affected through a control plane that
+  fills `AddCertificate.certificate.names` itself, or through a saved state replaying one. Check
+  the live workers with `sozu certificate list --json` and look for a `names` entry containing a
+  slash; check any `saved_state` file the same way before upgrading. A hit stops loading at the
+  next restart, loudly, instead of silently widening. One further case: when `names` is empty and
+  the certificate carries no dNSName SAN, the worker falls back to the Common Name, so a CN
+  containing a slash is now refused as well — reissue with a proper dNSName SAN, or state the
+  hostnames explicitly in `names`.
+  This is operator-supplied input, not attacker-supplied, so it was not a remote vulnerability; it
+  was an undocumented semantic with no coverage. `doc/configure.md` now states the rule under
+  "Hostname case", beside the certificate-name normalisation it sits with, and
+  `a_certificate_name_carrying_a_regex_segment_is_refused` (`lib/src/tls.rs`) pins the refusal, the
+  absence of any mutation, and the wildcard name that must keep working.
+  Reported in [#1378](https://github.com/sozu-proxy/sozu/issues/1378).
+- **`fix(http)`: every HTTP/HTTPS frontend whose hostname is not an exact literal logged its
+  requests without its `--tags`.**
+  **This changes observable access-log output.** Lines that were emitted with an empty tag field
+  now carry the frontend's tags; nothing that already had tags loses them.
+  The per-frontend tag cache was WRITTEN under the frontend RULE's hostname —
+  `listener.set_tags(front.hostname.to_owned(), front.tags.to_owned())` in `lib/src/https.rs`, with
+  the twin in `lib/src/http.rs` — and READ back under the REQUEST's authority,
+  `listener.get_tags(hostname)` in `lib/src/protocol/mux/stream.rs`, where `hostname` is the
+  `:authority` with any `:port` stripped. The store is a `BTreeMap<String, CachedTags>` and the read
+  is `self.tags.get(key)`: exact key, no pattern resolution. So for `*.example.com`,
+  `/foo.*/.example.com` or any `Pre`/`Post` rule string, the key written could never be produced by
+  the key read, `get_tags` returned `None`, and the tags were silently absent from every access-log
+  line of that frontend. Three distinct ways to miss, all from the same asymmetry: wildcard/regex,
+  port (the read strips `:port`, the write does not) and case (the write stores the operator's
+  spelling, the read the client's). Exact literal frontends were unaffected, which is why ordinary
+  testing never showed it.
+  The fix resolves L7 tags **through the router** instead of through a parallel exact map, which is
+  what the TCP proxy already does with the structured `sni_tags_key` built by the same function on
+  both sides (`lib/src/tcp.rs`). The router already knows which frontend rule matched the request
+  and is the only correct owner of its tags — a request carries a concrete authority while tags are
+  configured per rule, so no string key can be spelled the same on both sides. Three linked changes:
+  `Router::add_http_front_with_hsts_origin` counts `tags` as a policy field, so a tagged frontend is
+  stored as `Route::Frontend(Rc<Frontend>)` carrying `Rc<CachedTags>` instead of a tagless
+  `Route::ClusterId`; `Router::route_from_request` stashes `RouteResult.tags` on `HttpContext.tags`
+  before every early return, so a redirect, a 401 and a backend-connect failure log them too; and
+  `Stream::generate_access_log` reads them from there. Keying by port or case would have patched two
+  of the three symptoms and left wildcard and regex frontends — the main case — still silent.
+  Only a **tagged** frontend takes the `Rc<Frontend>` shape; an untagged one keeps the lightweight
+  `Route::ClusterId` it had. A clusterless tagged frontend now goes through `Frontend::new`'s
+  `FORWARD` → `UNAUTHORIZED` coercion and logs that coercion's existing warning on add; the 401 it
+  serves is unchanged.
+  Two paths deliberately keep the older key lookup. A request that never reached routing at all —
+  malformed request, unknown host, TLS SNI / `:authority` mismatch — still falls back to the
+  exact-authority lookup, because there is no matched frontend to ask and an exact literal frontend
+  still answers there. And the WS/WSS post-upgrade pipe (`lib/src/protocol/pipe.rs::log_request`)
+  keeps its `Pipe::set_tags_key` string, which only the TCP SNI-preread path ever sets: on an
+  HTTP/HTTPS listener it falls back to the listener address, which is never a hostname key, so a
+  WebSocket access-log line carries no frontend tags on **any** frontend shape. That is a separate
+  pre-existing miss with a different cause, left open rather than silently folded in here.
+  `a_wildcard_frontends_tags_reach_the_access_log_of_a_concrete_authority` pins the fix end to end:
+  it registers `*.example.com` with tags through `HttpProxy::add_http_frontend`, routes
+  `foo.example.com` through `Router::route_from_request`, emits through
+  `Stream::generate_access_log`, and asserts on the rendered access-log line rather than on any
+  intermediate field. `doc/observability.md` carries the resolution order.
+  ([#1379](https://github.com/sozu-proxy/sozu/issues/1379))
+- **`fix(tcp)`: a routed SNI preread kept re-arming frontend-readable interest while its backend
+  was still connecting, spinning the session to `MAX_LOOP_ITERATIONS`.**
+  A `protocol = "tcp"` listener with SNI routes accumulates the ClientHello in `SniPreread`
+  (`lib/src/protocol/tcp_preread/shell.rs`) and stays parked there through the backend connect.
+  Once routed, `readable` deliberately reads nothing more: bytes past the routed window must stay
+  in the kernel socket buffer so the post-upgrade `Pipe` can replay the stream byte-for-byte.
+  `tcp_socket_read` (`lib/src/socket.rs`) returns `SocketResult::Continue`, not `WouldBlock`, when
+  it fills the capped slice it was handed, so a client that coalesces its ClientHello with the
+  first payload bytes — a TLS client writing a large request in one go — left the frontend
+  `READABLE` event latched with nothing able to clear it. `READABLE` also stayed in
+  `frontend_readiness.interest`, so `front_interest = interest & event` in
+  `TcpSession::ready_inner` (`lib/src/tcp.rs`) selected a dispatch that could never make progress
+  on every pass of the event loop: the worker logged `Handling session went through 10000
+  iterations, there's a probable infinite loop bug`, incremented `tcp.infinite_loop.error`, and
+  closed a healthy connection that had delivered `bin: 16384, bout: 0` — zero of the client's
+  bytes. Routing itself had succeeded; this is the datapath after it. The window is the backend
+  connect, so the faster the client and the slower the backend, the more reliably it fires:
+  deterministic on a release build, usually won on a debug build, which is why it surfaced as an
+  unreadable intermittent CI failure across unrelated branches rather than as a bug.
+  The routed transition now drops `READABLE` from the frontend INTEREST and deliberately preserves
+  the latched EVENT: `upgrade_sni_preread` hands that event bit to the post-upgrade `Pipe`
+  (`restore_readiness_events`) or `SendProxyProtocol` (`into_pipe`), each of which re-inserts
+  `READABLE` interest, and under edge-triggered epoll it is the only wake-up the coalesced tail
+  will ever get — clearing it instead would trade the spin for a hang. `HUP` and `ERROR` stay
+  armed, so a frontend that goes away mid-connect is still noticed, and no metric, configuration
+  key or CLI flag changes. Pinned by
+  `routed_preread_stops_re_arming_frontend_readable_while_connecting`
+  (`lib/src/protocol/tcp_preread/shell.rs`), which drives `ready_inner`'s exact re-entry predicate
+  against a real socket, and by the release-profile
+  `test_tcp_sni_large_payload_coalesced_with_hello_delivered_intact`
+  (`e2e/src/tests/tcp_sni_tests.rs`). See
+  [#1373](https://github.com/sozu-proxy/sozu/issues/1373) and hardening note 7 in
+  `lib/src/protocol/tcp_preread/LIFECYCLE.md`.
+- **`docs(kawa_h1)`: the CL.TE guard's rationale described kawa 0.7.0 and asserted the opposite of
+  what the guard does.**
+  The comment above the Transfer-Encoding check in `HttpContext::on_request_headers` claimed that
+  "the literal-suffix check is what keeps OWS-obfuscated codings (`chunked\t`, `chunked `)
+  … fail-closed" and that kawa "still forwards the TE field line *verbatim*". Neither holds
+  against the kawa this workspace pins (`^0.7.1`, locked at 0.7.1). kawa >= 0.7.1 excludes
+  leading and trailing OWS from every field value (RFC 9112 §5), so the value the guard reads
+  for `Transfer-Encoding: chunked\t` is already `chunked`: the suffix check passes, `body_size` is
+  Chunked, the request is accepted, and it reaches the backend spelled canonically with no
+  Content-Length beside it. Measured, not reasoned about —
+  `test_h1_te_ows_forwarded_canonically` sends exactly that request and pins the forwarded bytes,
+  and it passes on this tree. The `trailing-tab` / `trailing-space` rows of `TE_SMUGGLING_CASES`
+  still answer 400 for their invalid chunked BODY rather than through this predicate, which that
+  table's own doc comment already said.
+  The rewrite also settles which clause of the guard fires at all, since getting that wrong is the
+  same defect one layer down. kawa 0.7.1 resolves the combined Transfer-Encoding in its own
+  `process_headers` before the callback and, for a REQUEST whose combined final coding is not
+  chunked, errors the parse and returns without calling `on_headers` — so `chunked, gzip` never
+  reaches this code, and neither the suffix clause nor the `body_size` clause can fire on a request
+  kawa accepted. They stay as defense in depth against a kawa regression. The clause that does fire
+  is the COUNT: kawa judges the LAST TE line, so `Transfer-Encoding: identity` followed by
+  `Transfer-Encoding: chunked` combines to a chunked-final coding and parses clean, and forwarding
+  both lines is what sōzu refuses. That paragraph is marked in the comment as read from kawa's
+  source rather than measured here, so a future reader knows which kind of claim it is.
+  `lib/src/protocol/kawa_h1/LIFECYCLE.md` — the document #1375 says the wrong claim was nearly
+  written into — carried the same 0.7.0 latch paragraph and attributed the `not-final-coding` and
+  `multi-line-chunked-then-identity` 400s to this predicate. Both are corrected in the same
+  changeset.
+  Expanding the comment moves every line below it, so the citations that point there are repaired
+  in the same changeset too. The two deliberate RANGES in that document — the `te_count` fold and
+  the rejection predicate — are recomputed to `editor.rs:638-658` and `editor.rs:659-662`, each of
+  the four endpoints verified against the text it now lands on rather than by arithmetic. Three
+  citations of `editor.rs:1131` for the `Sozu-Id` stamping site, in `e2e/COVERAGE.md`,
+  `e2e/src/tests/h2_security_sni.rs` and `e2e/src/tests/h2_utils.rs`, become
+  `HttpContext::on_response_headers` — a symbol, which is what the convention asks for and what
+  cannot drift again. That line number was already wrong before this changeset touched it, and the
+  `Doc citations` resolver could not have said so: it fails only on a BLANK landing, and all three
+  were pointing at a perfectly non-blank `debug_assert!(`.
+  This is not cosmetic. The comment misled a reviewer into a confident wrong finding about a
+  request-smuggling guard, which was relayed as an instruction and nearly written into
+  `lib/src/protocol/mux/LIFECYCLE.md`; the chain broke only because the implementer ran the test
+  (#1375). Nothing mechanical catches a wrong comment, and a comment asserting a security property
+  is the kind nobody re-derives. The rewritten rationale states the 0.7.1 behaviour, names the test
+  as the executable statement of it, keeps the 0.7.0 history as the reason the check is shaped the
+  way it is, and says outright not to reintroduce a trailing-OWS rejection to compensate.
+  No behaviour change: `lib/src/protocol/kawa_h1/editor.rs` is touched in comments only.
+
+- **`docs(command)`: two comments described `ActivateListener.from_scm` as meaningful. It is inert.**
+  `from_scm` is a `required` protobuf field with no reader. `Server::notify_activate_listener` never
+  consults it; whether a listener adopts a descriptor is decided entirely by whether
+  `Server::scm_listeners` holds one for the address, in all four listener arms. Setting it `true`
+  changes nothing, and setting it `false` while a descriptor is present still adopts the descriptor.
+  Twenty-one construction sites across `bin/`, `command/` and `e2e/` supply it, all writing `false`,
+  and two comments — in `e2e/src/tests/listener_reactivation_tests.rs` and
+  `e2e/src/tests/udp_tests.rs` — told a reader the value controlled behaviour it does not control
+  (#1382). Both now say so: the reactivation helper's comment keeps `to_scm: false` as the half that
+  IS read (`Server::notify_deactivate_listener` reads it) and marks `from_scm` inert, and the UDP
+  setup comment credits the empty `Listeners` rather than the field.
+  The field is part of the wire format, so removing it is a protocol break and belongs with other
+  breaking changes; making it authoritative — rejecting an activation that claims `from_scm: true`
+  when no descriptor arrived — would be a behaviour change worth its own decision. Neither is done
+  here. Comments only.
+- **`fix(command)`: `sozu certificate list --domain <host>` could not see a wildcard certificate.**
+  `sozu certificate list --domain foo.example.com` reported nothing when the certificate actually
+  serving that host was registered as `*.example.com`, while TLS handshakes for it kept succeeding.
+  The inventory contradicted the running proxy exactly when an operator was debugging a certificate
+  problem and trusting the query, and the wildcard case is the common one. It fails closed rather
+  than open — no certificate was ever wrongly disclosed — so this is a diagnostic defect, not a
+  security one (sozu#1383).
+  The main process answered `--domain` from `ConfigState::get_certificates`
+  (`command/src/state.rs`), which filters the SAN list with `Vec::contains`, i.e. exact string
+  equality. The certificate that actually serves a handshake is chosen by
+  `CertificateResolver::domain_lookup` (`lib/src/tls.rs`) — a `TrieNode` lookup that resolves `*.`
+  wildcard labels and, since sozu#1378, regex labels. The two disagree for every certificate not
+  bound by an exact name.
+  The `--domain` query is now resolved through that same trie, rebuilt from the control plane's own
+  record, in `certificates_serving_domain` (`bin/src/command/requests.rs`). It is fixed at the
+  caller rather than inside `ConfigState` because `TrieNode` lives in `sozu-lib`, which already
+  depends on `sozu-command-lib`: the reverse edge is a cargo cycle, moving the trie into `command/`
+  would grow a `regex` production dependency that crate does not have, and reimplementing hostname
+  matching there would duplicate it and drift from the resolver — which is this bug. `bin/`
+  already depends on both crates and holds the only `--domain` consumer of `get_certificates`.
+  Three properties of the rebuilt index were measured rather than assumed, and each is pinned by a
+  test in `bin/src/command/requests.rs`. **One trie per listener address, unioned**, because
+  `ConfigState::certificates` is keyed by listener and each worker listener owns its own resolver:
+  `TrieNode::insert` answers `InsertResult::Existing` and keeps the incumbent, so a single global
+  trie would silently drop a second listener's certificate for the same name
+  (`every_listener_answers_with_its_own_certificate`). **Both sides are ASCII-lowercased**, which is
+  the sole derivation difference between the two name sets — `ConfigState::add_certificate`
+  resolves the SAN/CN set exactly as `CertifiedKeyWrapper::try_from` does, but only the resolver
+  folds case (`the_query_and_the_stored_names_are_ascii_folded`). And a name longer than
+  `MAX_HOSTNAME_LENGTH`, which the resolver refuses outright, is skipped rather than indexed, so a
+  saved state file cannot make the query answer for a name no handshake can reach
+  (`a_name_the_resolver_would_refuse_is_skipped_rather_than_indexed`).
+  **This is an operator-visible change to the shape of the answer.** A trie lookup resolves to one
+  entry, so `--domain` now returns **at most one certificate per HTTPS listener** where the
+  exact-equality filter could return several; a host carried by two certificates on the *same*
+  listener reports one of them. The main process does not retain `AddCertificate::expired_at`, so it
+  cannot reproduce the resolver's longest-lived tie-break and reports a reproducible choice instead
+  — `--workers` reports what each worker's resolver actually selected
+  (`one_listener_answers_with_exactly_one_certificate`). Scripts parsing
+  `sozu certificate list --domain <host> --json` and expecting the full set of certificates carrying
+  that exact SAN must list everything and filter on `names` themselves; there is no exact-SAN flag.
+  `--domain` is also not a prefix or substring search: `*.example.com` answers for
+  `foo.example.com` and not for the apex `example.com` nor for `deep.foo.example.com`
+  (`a_wildcard_certificate_stays_fail_closed_outside_the_hosts_it_serves`). Note that
+  `sozu frontend list --domain` is a *third*, unrelated reading of the same flag name — a plain
+  substring test on the frontend hostname (`ConfigState::list_frontends`) — and is untouched here.
+  `doc/configure_cli.md` gains the section stating which question `--domain` answers, which the
+  documentation did not say at all before, and the `--domain` CLI help text now states it too.
+  **One divergence is deliberately left in place and documented.** `lib/src/server.rs` intercepts a
+  `QueryCertificatesFromWorkers` request whose filter carries a fingerprint, and hands it to
+  `get_certificates`, whose domain arm is tested first — so
+  `sozu certificate list --fingerprint <hex> --domain <host> --workers` still takes the exact-SAN
+  arm. Passing both filters was never a conjunction on any path; `doc/configure_cli.md` says so and
+  says to query one filter at a time.
+
+- **`fix(router)`: an exact hostname added after a matching regex segment attached its rule to the
+  regex segment's leaf, and the whole regex family served it.**
+  **This changes hostname resolution for every configuration.** Read the behaviour-change note at
+  the end of this entry before upgrading; it narrows some routing and broadens other routing, and
+  both are configurations an operator can act on.
+  `add_tree_rule` (`lib/src/router/mod.rs:331`) reaches the node a hostname owns through
+  `TrieNode::domain_lookup_mut` and inserts only when that answers `None`. The resolver walked a
+  literal segment through the first regex segment matching it, so adding `test4.example.com` after
+  `/test[0-9]/.example.com` never created a node for `test4.example.com`: the rule was appended to
+  the regex segment's rule list, and every host `/test[0-9]/` matches served it. A rule scoped to
+  one host answered for a family of hosts, while `sozu query frontends` showed exactly what the
+  operator had typed. Declaration order decided whether it happened **in one process**: a live
+  sequence of API calls that added the exact name first produced two separate nodes and routed
+  correctly, which is how the report reproduced it. That order is not the one a worker runs — see
+  the state-replay note below — so on a running proxy the leak was not order-dependent at all.
+  `lookup_mut` is key-addressed now (`lib/src/router/pattern_trie.rs:818`): with
+  `accept_wildcard: false` a literal key may not resolve into a non-literal entry. That is the
+  guard `insert_sni_route` (`lib/src/tcp.rs`) already documented for the `*` slot — "an exact key
+  must never fall back to a sibling wildcard's entry, or this push would corrupt the WILDCARD's
+  route `Vec` instead of creating this key's own node" — extended to the regex list, which had
+  nothing equivalent. Its `*` case and its trailing-`/` case already matched by identity; this arm
+  did not. The TCP SNI route table is fixed by the same change, though it cannot hold a regex
+  segment today: `validate_sni_pattern` (`command/src/config.rs:1994`) rejects `/` outright.
+  **Hostname precedence is now stated and asserted, most specific first: exact name, then regex
+  segments in declaration order, then the `*` wildcard.** Two halves of one walk
+  (`TrieNode::lookup_recursive`, `lib/src/router/pattern_trie.rs:594`) and they ship together.
+  Before, the wildcard slot was tried *before* the regex list, so `*` outranked the narrower
+  pattern, and neither the exact-child arm nor the regex loop fell back: each returned whatever
+  its first candidate's subtree answered. The two fallbacks restored are not interchangeable, and
+  the mutation tests separate them. The **regex-loop** fallback is the one the reorder requires:
+  a segment that matches a label but holds no value for this host (`/cdn[0-9]+/` as opened by
+  `images./cdn[0-9]+/.hello.com`) previously reached the wildcard only because the wildcard went
+  first, so moving the wildcard after the regex list without it turns that case into a miss. The
+  **exact-child** fallback is required by the add-path fix instead: now that an exact hostname
+  gets its own node, that node carries only the paths written for it, and without the fallback
+  every other path on that host would stop resolving.
+  The order is a search, not a filter. `Router::lookup` hands the trie the very same
+  `select_tree_rule` (`lib/src/router/mod.rs:796`) it will run on the winner, so a hostname
+  candidate whose rules all reject this request's path or method is skipped rather than ending the
+  lookup. That also closes the second shape reported on the same issue: two overlapping regex
+  segments, the first declared carrying only `method = "POST"`, answered a `GET` with a 404
+  instead of falling through to the second segment that would have served it. Segment selection is
+  still method-blind — it is the fall-through that makes it not matter.
+  **Behaviour change, both directions.** *Narrower:* a rule written for one exact hostname is now
+  served for that hostname only. If a frontend was added after a regex segment matching its
+  hostname, hosts in that regex family lose a route they were being served — the route the
+  operator never wrote. Find the affected pairs with `sozu query frontends`: an exact hostname
+  and a regex hostname on the same address where the regex matches the exact name. *Broader:* a
+  host claimed by several patterns now falls through instead of 404ing, so a request that reached
+  no route can now reach the next-less-specific frontend — a wildcard or regex family frontend can
+  start serving paths and methods a narrower frontend does not carry. And *reordered:* where a
+  regex segment and a `*` wildcard both match a host, the regex segment now answers. Overlapping
+  hostname patterns are the configurations to check; mutually exclusive ones are unaffected.
+  A backtracking walk also changes the worst case from "labels × regex segments per level" to "the
+  number of trie nodes that match the key", which is bounded by the route table and not by the
+  request: the trie is a tree, so no node is visited twice, and a longer hostname adds labels
+  rather than candidates. There is no request-side amplification to rate-limit.
+  **Upgrade and state reload need no migration, and the leak was never transient.** The main
+  process replays its `ConfigState` into every worker at launch, walking a `BTreeMap` whose key is
+  `address;hostname;P<path>` (`command/src/request.rs:259`). `/test[0-9]/.example.com` sorts before
+  `test4.example.com`, so every worker took the adds in the leaking order, at every restart, on
+  every build before this one — the divergence survived restarts rather than being healed by them.
+  Nothing in the saved state records which order a worker took, and nothing has to: an exact name
+  and a regex segment that matches it now build the same routing table in either order, so the
+  same replay produces the corrected routing on the new binary. No re-add, no reordering, no state
+  rewrite. The one visible difference is the narrowing above — the family hosts stop being served
+  the exact host's rule from the first worker started on the fixed build. The corollary matters on
+  an affected build: since the replay order is the only order a forked worker ever sees, a correct
+  table built live by an exact-first sequence of API calls is re-corrupted at the next fork or
+  upgrade. `a_regex_hostname_is_always_replayed_before_the_exact_name_it_matches`
+  (`command/src/state.rs`) pins the emitted order.
+  **SNI certificate selection follows the same order**, since `lib/src/tls.rs` and
+  `lib/src/protocol/tcp_preread/` resolve through the same `TrieNode::lookup`
+  (`lib/src/router/pattern_trie.rs:706`) — one walk, stated once, so routing and certificate
+  selection cannot disagree. The reordering and the fall-through only differ for a trie that holds
+  a regex segment, and the TCP SNI route table provably cannot: `validate_sni_pattern`
+  (`command/src/config.rs:1994`) rejects `/` on every path into `sni_routes`. **The certificate
+  trie is closed the same way in this same release** — `add_certificate`'s pre-insert dry run
+  (`lib/src/tls.rs`) rejected only a name longer than `MAX_HOSTNAME_LENGTH` and one the trie
+  answers `InsertResult::Failed` for, and now refuses a name containing `/` as well; see the
+  `fix(tls)` entry above (sozu#1378). The names it guards are `cert_to_add.names`, which is the
+  operator's `names` override whenever that field is non-empty and only otherwise the parsed
+  CN/SAN set — so an operator-supplied label such as `/x/`, which used to insert as a regex
+  segment and carry the new order into certificate selection, is now rejected before any
+  mutation. Parsed certificate names cannot produce one either. No SNI table this release ships
+  can therefore hold a regex segment, and the reordering is unobservable on certificate selection.
+  A hostname the trie has no entry for still gets the default certificate.
+  `lib/src/router/pattern_trie.rs` and `lib/src/router/mod.rs` carry the regression tests, one per
+  transition of the stated order plus the two shapes from the report, both declaration orders, and
+  the method fall-through; `command/src/state.rs` pins the replay order the upgrade note rests on. `doc/configure.md` states the order under "Hostname precedence".
+  Reported in [#1351](https://github.com/sozu-proxy/sozu/issues/1351).
+
+- **`fix(mux)`: a mux session could be torn down up to a full timer tick before its configured
+  timeout.**
+  `crate::timer`'s wheel is duration-based and rounds a requested delay to the NEAREST tick
+  (`duration_to_tick`: `(elapsed_ms + tick_ms / 2) / tick_ms`), then `Timer::poll` recomputes
+  `current_tick` from the real clock and fires everything whose tick has come. An entry armed for
+  deadline `D` is therefore delivered from `tick * round(D / tick) - tick/2` onwards: the earliness
+  is `(D_ms + 50) mod 100` with the worker's default 100 ms tick, spanning **[0, 99] ms** — a full
+  tick minus a millisecond, not half a tick. The `<= 50 ms` half is unconditional (`next_poll_date`
+  returns the tick grid point); the further `<= 49 ms` needs the loop to poll inside
+  `[100T - 50, 100T)`, which it reaches through another session's earlier wheel entry plus loop
+  latency, or through the `Token(1)` arm.
+  `Mux::timeout` took every delivery at face value: it called `TimeoutContainer::triggered()` and
+  ran the timeout body, so a 60 s `front_timeout` could write a 408 and close a live session at
+  **59.901 s**, and a `backend_timeout` could 504 a backend that still had time left. Small in wall
+  clock, but it is a session closed before the operator's configured deadline, and it is the same
+  class of bug as the UDP shell's early-expiry handling.
+  `TimeoutContainer` now records the absolute instant each armed entry is meant to fire at —
+  the mirror of the wheel entry the wheel itself does not keep, stamped at exactly the sites that
+  touch the wheel — and exposes it as `deadline()`. `Mux::timeout` re-validates every delivery
+  against that instant through the new `consume_timer_entry` helper, on both the frontend and the
+  backend branch.
+  An early delivery is put back **at the same absolute deadline** (`TimeoutContainer::set_at`), not
+  re-armed for a fresh full duration: re-arming with `set` would push a 60 s timeout out to ~120 s
+  on every early delivery, and *not* re-arming at all would be strictly worse — the wheel entry is
+  already consumed, so rejecting the firing without putting it back is a **lost wakeup**, the exact
+  bug fixed for the UDP shell in `UdpManager::handle_timeout`. Those three steps (consume,
+  re-validate, put back) are one operation and must move together; `consume_timer_entry` carries
+  that requirement in its documentation.
+  A container with no recorded deadline fails **open** and is reported due, which is the behaviour
+  of every release before this one — an immortal session would be a worse outcome than the
+  early close being fixed here.
+  Operator-visible: nothing changes on a healthy session. A timing out session now reaches its
+  `front_timeout` / `backend_timeout` / `connect_timeout` exactly rather than up to one timer tick
+  early, so a test that measured a close at 59.901 s will now measure it at 60 s or just after.
+  `Mux::shutting_down` is unaffected: `shut_down_sessions()` drives it directly and it compares
+  `context.now` against `drain.started_at` rather than consuming a wheel delivery.
+  Pinned by `an_early_wheel_delivery_does_not_run_the_timeout_body`,
+  `an_early_wheel_delivery_leaves_a_live_entry_at_the_same_deadline`,
+  `a_delivery_past_the_deadline_runs_the_timeout_body`,
+  `a_firing_with_no_deadline_is_treated_as_due` and
+  `timeout_container_mirrors_the_deadline_of_its_armed_entry`. The early-delivery
+  half is covered on the frontend token only; the backend tests park an already-elapsed
+  deadline. The gate is shared (it runs before the branch split), so the behaviour is
+  common, but no test drives an early backend delivery.
+  Documented in `lib/src/protocol/mux/LIFECYCLE.md` §7.6 and invariant 21.
+
+- **`docs(mux)`: settle the unverified backend re-arm question on the mux timeout path.**
+  In the backend-token branch of `Mux::timeout` the backend's timer is consumed unconditionally but
+  re-armed only when `!should_close`, while the shared tail can still return `Continue` — through
+  the `should_write` writable loop, or through `delay_close_for_frontend_flush("timeout")` — having
+  re-armed only the *frontend* container. Whether a backend could reach that tail still carrying
+  live work had never been traced. It cannot, though the chain is one link longer than it looks.
+  The branch calls `Connection::end_stream` for every id in `context.backend_streams[&token]`,
+  unconditionally at the bottom of the loop. `ConnectionH2::end_stream` then begins with
+  `Context::unlink_stream` — but `ConnectionH1::end_stream` does NOT: it guards
+  `self.stream != Some(stream)` and returns early first. That guard cannot reject a stream this loop
+  passes it, because an H1 connection carries at most one linked stream and it equals `self.stream`
+  (`self.stream = Some(..)` only in `start_stream`, paired with `link_stream`; `self.stream = None`
+  only inside `end_stream`, after the unlink). `Context::unlink_stream` is the eviction point this
+  path relies on, not the only one in the module — `remove_backend_stream` has direct callers in
+  `h1.rs` and `h2.rs` too, and extra eviction only strengthens the conclusion. Work attached to the backend afterwards re-arms the container itself, because
+`TimeoutContainer::triggered` deliberately keeps its token, so the re-arm at the top of
+  `ConnectionH1::{readable,writable}` / `ConnectionH2::{write_streams,handle_headers_frame}` covers
+  it — which matters because the pool-reuse branch of `Router::connect`, unlike the fresh-dial
+  branch, never arms a timeout. (Once the adapter of the next entry lands, that is covered more
+  simply still: a pooled backend stays in `router.backends`, so `Mux::reschedule` keeps its handle
+  armed every pass and nothing hangs on the first I/O.)
+  No behaviour change: the reasoning is recorded at the site and backed by a `debug_assert!` that
+  fires if the impossible becomes possible, plus
+  `a_backend_timeout_leaves_no_linked_stream_behind_on_the_close_path` and
+  `a_completed_backend_response_timeout_unlinks_through_end_stream_alone`. Both tests set
+  `h1.stream = Some(0)` by hand, so they exercise `ConnectionH1::end_stream`'s matched path only;
+  the mismatch arm is guarded by `debug_assert_h1_owns_stream`, a new `debug_assert!` that runs
+  immediately before every `end_stream` call in `Mux::timeout` and fires if `backend_streams` and
+  `ConnectionH1::stream` ever drift. It is at the call site rather than inside
+  `ConnectionH1::end_stream` on purpose: that function's mismatch arm is an `error!`, not an
+  `unreachable!`, and is reachable from `EndpointServer`/`EndpointClient` paths this proof never
+  traced, so asserting there would promote a logged anomaly into a debug abort outside the claim.
+- **`fix(socket)`: a `SOCKET` log line on a TLS frontend named the load balancer, not the client
+  behind PROXY protocol.**
+  **This changes rendered log content.** If you alert, dashboard or grep on the `peer=` slot of a
+  `SOCKET` line, read the operator note at the end of this entry before upgrading.
+  `log_socket_context!` (`lib/src/socket.rs:128`) built its `peer=` slot from
+  `$self.socket_ref().peer_addr().ok()` — a live `getpeername(2)` — while its module-level twin
+  `log_socket_module_prefix` (`:190`) already preferred the address the handler had cached. The two
+  renderers of one log prefix therefore disagreed, and the split fell exactly along the handler:
+  `log_socket_context!` has one production caller, `impl SocketHandler for FrontRustls`, whose
+  thirteen expansions are every `SOCKET` line a TLS frontend emits, while every plaintext frontend
+  and every backend socket reaches the free function through `SessionTcpStream`.
+  So on a PROXY-protocol HTTPS frontend the `MUX-H2` line named the client and the `SOCKET` line
+  named the load balancer, for one and the same connection. That was an artefact of `FrontRustls`
+  having carried no cached address before `SocketHandler::peer_addr` and
+  `FrontRustls::configured_peer` landed, not a deliberate split between layers; it was documented
+  as a follow-up in `doc/observability.md` rather than fixed, because nothing asserted the `peer=`
+  slot of a `SOCKET` line and changing it would have been an unguarded behaviour change.
+  The slot is now `SocketHandler::peer_addr`, the same accessor with the same
+  cached-then-live preference the rest of the stack uses. It is written fully qualified to
+  foreclose a latent hazard, not to fix a present one: the unqualified `$self.peer_addr()`
+  compiles clean today and passes every test, because no current expansion sits on a raw
+  `mio::TcpStream` and `FrontRustls` has no inherent `peer_addr` for method resolution to prefer.
+  Add an expansion on a bare `TcpStream`, though, and the unqualified form silently picks mio's
+  inherent method — measured on a throwaway probe, that slot renders `peer=Ok(127.0.0.1:33587)`
+  beside `local=Some(..)`, an `io::Result` where every other expansion renders an `Option`. The
+  qualification makes that impossible rather than merely unlikely.
+  `local`, `rtt`, `state` and `protocol` are untouched, and no wire byte, metric, control-flow
+  decision or log *layout* changes.
+  The missing assertions are the substance of this change, and there are three.
+  `e2e::tests::socket_log_context_tests::test_tls_socket_log_peer_is_the_advertised_client` drives a
+  real PROXY-v2 header through the real accept path and asserts on the `SOCKET` lines the worker
+  actually wrote. It has to provoke an error path rather than raise a level — the opposite of its
+  `MUX-H2` sibling — because every `log_socket_context!` expansion is an `error!` and a healthy TLS
+  session emits no `SOCKET` line at any level; it corrupts one TLS record after the mux is
+  established, which reaches the macro while the TCP connection is still `ESTABLISHED` — a
+  condition the test asserts rather than assumes, because it is what makes the negative half
+  discriminate: only while `getpeername(2)` still succeeds can a slot name the raw TCP peer at all.
+  Under the pre-fix macro it measures one `SOCKET` line, zero naming the advertised client and one
+  naming the connection's raw TCP source. Two unit tests pin the macro's slot directly, one per half of the
+  defect: `socket::tests::log_socket_context_renders_the_cached_peer_not_a_live_lookup` covers a
+  live lookup that SUCCEEDS and disagrees with the cache, and also asserts `local=` is still
+  `getsockname(2)`; `socket::tests::log_socket_context_renders_the_cached_peer_when_the_live_lookup_fails`
+  covers a live lookup that FAILS, staged with a never-connected socket because only that refuses
+  `getpeername(2)` deterministically — a socket waiting on an RST is a race the suite already
+  refuses to assert on. Against the pre-fix macro the second renders `peer=None`.
+  **Operator note.** On a PROXY-protocol HTTPS frontend, the `peer=` slot of a `SOCKET` line now
+  shows the PROXY-advertised client instead of the load balancer, so it agrees with the `MUX-H2`
+  and `HTTPS` lines for the same connection; a dashboard grouping by that slot will switch from a
+  handful of balancer addresses to the real client population, which may be a large cardinality
+  increase. And wherever `getpeername(2)` would refuse — after a peer reset it answers `ENOTCONN` —
+  the slot now carries the cached address instead of collapsing to `peer=None`, so a rule matching
+  `peer=None` on a `SOCKET` line to detect a reset will stop firing. What is measured there is the
+  rendering once the socket refuses, not the reset itself: no e2e test provokes a `SOCKET` line
+  after an RST, because the reset-related error kinds (`ConnectionReset`, `ConnectionAborted`,
+  `BrokenPipe`) are precisely the arms of `FrontRustls::socket_read`/`socket_write` that set
+  `peer_reset` and emit no log line at all. The arms that DO log are the `_ =>` catch-alls for
+  unexpected kinds, which is why the e2e test provokes a decrypt failure rather than a reset. Both are the changes the `MUX-H2` entry below already described,
+  now reaching the second prefix. Nothing changes for a plaintext frontend or a backend socket:
+  those render through `log_socket_module_prefix`, which already preferred the cache.
+- **`fix(router)`: an uppercase `Host` header did not match a lowercase frontend
+  ([#1349](https://github.com/sozu-proxy/sozu/issues/1349)).**
+  **This changes routing outcomes.** Requests that used to be answered 404 now reach a frontend.
+  That is the point of the fix, but if you relied on a case-varying `Host` being rejected, read on.
+  Host is case-insensitive (RFC 9110 §7.2 / §4.2.3), but Sozu normalised only one side of the
+  comparison. The **add** path lowercases: `Router::add_tree_rule` and `DomainRule::from_str`
+  (`lib/src/router/mod.rs`) both run the configured hostname through `idna::domain_to_ascii`, which
+  ASCII-lowercases — measured, `"WWW.EXAMPLE.COM"` becomes `"www.example.com"`, `"*.EXAMPLE.COM"`
+  becomes `"*.example.com"`, and even a regex segment's source is folded, `"/API[0-9]/.example.com"`
+  becoming `"/api[0-9]/.example.com"`. The **lookup** path did not: `Router::lookup` walked the
+  routing trie with the client's raw bytes and compared `DomainRule::Exact` / `Wildcard`
+  byte-exactly. Nothing between the wire and that walk touches the case either — kawa slices the
+  authority verbatim, `HttpContext::on_request_headers` copies it verbatim
+  (`lib/src/protocol/kawa_h1/editor.rs`), and `hostname_and_port`
+  (`lib/src/protocol/kawa_h1/parser.rs`) strips the port and nothing else, since `is_hostname_char`
+  accepts `is_alphanum()`.
+  So `Host: WWW.EXAMPLE.COM` missed a frontend declared `www.example.com`, and **no configuration
+  fixed it**: declaring the frontend as `WWW.EXAMPLE.COM` stored it lowercase too. `sozu query
+  frontends` showed the frontend present and correct the whole time.
+  `Router::lookup` and `Router::has_hostname` now normalise their key the same way the add path
+  does, through a new `normalize_hostname` helper that returns `Cow::Borrowed` for a host that is
+  already lowercase — the overwhelmingly common case — so the datapath pays a scan per request and
+  allocates only for the requests that actually carry uppercase. Both HTTP/1.1 and HTTP/2 reach the
+  same `frontend_from_request` → `Router::lookup` call, so one change covers both; e2e coverage
+  exercises each over a real socket, which the issue noted had never been done.
+  Two adjacent behaviours move with it. (1) A **pre/post hostname regex** keeps the operator's bytes
+  — `convert_regex_domain_rule` copies the segment source verbatim, unlike the trie — so matching a
+  normalised key against a case-sensitive `/API[0-9]/` would have turned a rule that matched
+  `API7.example.com` into one that matched nothing at all. `DomainRule::from_str` now compiles
+  hostname regexes case-insensitively, which is both the RFC reading and the only one that
+  agrees with the trie, where the same pattern has always been lowercased at insert. It is set on
+  the `RegexBuilder` rather than by folding the pattern source, which would rewrite `\D` into
+  `\d`. The fold is the crate default — Unicode simple case folding — and `.unicode(false)` is
+  deliberately not set: it would make the fold ASCII-only, but it also refuses Unicode-class syntax
+  at compile time, and `\p{L}` matches ASCII letters, so a frontend that installs and routes today
+  would start being rejected at add time. A regression test pins that. On the haystack side the
+  distinction cannot be observed either way: `hostname_and_port` admits no byte outside ASCII and
+  refuses the whole authority when it meets one, which a second test pins by sweeping all 256 byte
+  values. (2) `$HOST[n]` rewrite captures are taken from the matched key, so a `rewrite_host`
+  template now emits the normalised host. The parsed authority every other consumer reads is
+  untouched: the access log, the `X-Forwarded-Host` a `rewrite_host` frontend injects, the redirect
+  `Location:` and the builtin 404's `route` field all still carry the client's own bytes.
+  It composes with the hostname precedence order landed for
+  [#1351](https://github.com/sozu-proxy/sozu/issues/1351) in one direction: the key is normalised
+  first, then the most-specific-first search runs on it, so case never decides which candidate wins
+  — `CASE.EXAMPLE.COM` picks the same exact / regex-segment / wildcard tier as `case.example.com`.
+  A regression test pins that against both tiers.
+  Two known gaps are deliberately left open rather than silently closed. A **trailing dot** —
+  `Host: www.example.com.`, the legal absolute form per RFC 1034 §3.1 — still does not reach a
+  frontend declared without it; `idna::domain_to_ascii` keeps the dot on the add path (measured)
+  and the trie then sees a trailing empty label. A regression test records that answer so the day
+  it is fixed, it fails and gets inverted. And the per-frontend **access-log tag map**
+  (`ListenerHandler::set_tags` / `get_tags`) is keyed on the configured hostname verbatim on both
+  sides, so its tags attach only when the client's spelling matches the operator's; this fix does
+  not change that either way. The routed-request half of that gap is closed in the same release by
+  the access-log tag entry below, which stops resolving L7 tags through that map at all.
+
+- **`fix(router)`: a certificate whose SAN carried uppercase was unreachable by any SNI.**
+  The same add/lookup case asymmetry on the TLS side, with the two sides swapped. rustls lowercases
+  the SNI inside `process_client_hello` (`DnsName::to_lowercase_owned`) before
+  `ResolvesServerCert::resolve` is ever called, so the lookup key is always lowercase. The add side
+  was verbatim: `CertifiedKeyWrapper::try_from` (`lib/src/tls.rs`) took the SAN / CN set from the
+  X.509 (`command/src/certificate.rs`'s `get_cn_and_san_attributes`) or the operator's `names`
+  override exactly as written, and `add_certificate` inserted those bytes into the SNI trie and the
+  name index. A certificate carrying `MiXeD.Example.COM` was therefore reachable by no SNI at all:
+  every handshake for that name fell back to `DEFAULT_CERTIFICATE`, with no diagnostic on either
+  side and the certificate still recorded and queryable. RFC 4343 makes DNS names compare
+  case-insensitively, so normalising loses nothing.
+  The names are now ASCII-lowercased at the single point where the set is built, so the trie key,
+  the name index, the removal walk and the SAN snapshot that feeds the HTTP/2 `:authority` binding
+  all agree by construction. The `AddCertificate` request itself is not modified, so the control
+  plane's own record of the certificate is unchanged.
+  Two operator-visible consequences on the worker's own
+  `QueryCertificatesFromWorkers` answer. Its `--domain` lookup is normalised the same way, so
+  `sozu query certificates --domain MiXeD.Example.COM` now finds the certificate instead of
+  reporting it missing while the proxy serves it; and the `domain` field of each summary is the
+  normalised trie key, so it renders lowercase. The main process's own
+  `ConfigState::get_certificates` filter (`command/src/state.rs`) still compares the requested
+  domain against the stored names with an exact `contains`, and is deliberately left alone here —
+  it filters the control plane's record, not the worker's SNI table. Its `--domain` caller is not:
+  see the sozu#1383 entry above, which resolves that query through the trie one layer up in `bin/`
+  and folds case on both sides there.
+  Audited in the same pass and found already correct, so left alone: the TCP SNI preread routes
+  (`lib/src/tcp.rs`'s `route_key_and_matcher` lowercases on add, `normalize_sni` in
+  `lib/src/protocol/tcp_preread/mod.rs` lowercases and strips a trailing dot on lookup), and the
+  `:authority`-versus-SNI 421 check (`authority_matches_sni` /
+  `authority_matched_cert_name` in `lib/src/protocol/mux/router.rs`, ASCII-folding both sides).
+- **`fix(upgrade)`: a worker upgrade closed every inherited listener socket unused.**
+  On a worker upgrade the retiring worker hands its listening sockets to its replacement over
+  `SCM_RIGHTS`. The replacement was throwing all of them away, on all four protocols.
+  `Server::new` applied the initial state — which `ConfigState::generate_requests`
+  (`ConfigState::generate_requests`, `command/src/state.rs`) builds as one `AddXxxListener` immediately followed by one
+  `ActivateListener` per **active** listener — before it called `receive_listeners()`.
+  `scm_listeners` was therefore still `None` for the whole initial state, so every
+  `ActivateListener` took the `server_bind` / `udp_bind` branch of `XxxListener::activate`
+  (`lib/src/http.rs`, `lib/src/https.rs`, `lib/src/tcp.rs`, `lib/src/udp.rs`)
+  and the listener came up `active` on a socket it had bound itself. That bind succeeds only
+  because `server_bind` / `udp_bind` set `SO_REUSEPORT` (`lib/src/socket.rs`), which
+  is also why this never showed up as an outage: the address kept being served throughout.
+  What was lost is the point of the hand-off. The inherited descriptors arrived immediately
+  afterwards, and `UpgradeWorkerTask` then scattered `generate_activate_requests()` to the new
+  worker (`UpgradeWorkerTask::receive_listen_sockets`, `bin/src/command/upgrade.rs`). Each repeat pulled its descriptor out of the SCM
+  table — `Listeners::get_http` and friends **remove** the entry as they hand it over
+  (`Listeners::get_*`, `command/src/scm_socket.rs`) — wrapped it in an owning `MioTcpListener` /
+  `MioUdpSocket` (`lib/src/server.rs`, `notify_activate_listener`), and handed it to an `activate()`
+  that returns on `XxxListener::activate`'s `if self.active` guard (`lib/src/http.rs`,
+  `lib/src/https.rs`, `lib/src/tcp.rs`, `lib/src/udp.rs`) before it can consume it. The wrapper dropped, the
+  descriptor closed, once per listener per upgrade: the accept backlog for TCP/HTTP/HTTPS, so a
+  connection that had completed its handshake against the old socket got an RST instead of being
+  served, and the receive buffer for UDP.
+  `Server::new` now receives the SCM listeners **before** it applies the initial state, so the very
+  first `ActivateListener` adopts the inherited descriptor and the later repeats find nothing left
+  to discard. No socket is replaced under a live listener: at that point the listener was created
+  by the `AddXxxListener` on the line above and holds no socket at all. The relocated call is the
+  same blocking read as before, only earlier — the sole production caller of
+  `fork_main_into_worker`, `CommandServer::launch_new_worker` (`bin/src/command/server.rs`),
+  always passes `Some(listeners)` and always sends a manifest, so a fresh start receives an empty
+  one immediately and every listener binds its own socket exactly as it always did.
+  Ownership of the descriptor is now settled before it leaves the table rather than after. Each arm
+  of `notify_activate_listener` asks the proxy `inherited_socket_fate(&address)`, which answers one
+  of three things. `Adopted` — a listener exists at the address and is not active — takes the
+  descriptor, which is the upgrade path. `Refused` — a listener is there and already active on a
+  socket of its own — takes it and closes it **deliberately**, with a `warn!` naming the address.
+  Not because it could never be adopted: `give_back_listener` clears `active` and keeps the
+  listener object, so `DeactivateListener` followed by `ActivateListener` — an operator-reachable
+  feature covered by `e2e/src/tests/listener_reactivation_tests.rs` — brings that address back to
+  `Adopted`, and since `scm_listeners` is filled once in `Server::new` and never refilled, the
+  close is irreversible. It is a deliberate trade: the only thing the descriptor carries is the
+  connections queued on it at hand-off, and their value decays as those peers time out or reset
+  while the address is served by the listener's own socket, whereas the cost of keeping it is
+  continuous — it is the retiring worker's listening socket, still bound with `SO_REUSEPORT` and
+  registered with no event loop, so it is expected to keep taking a share of new connections that
+  nothing accepts. (That expectation follows from `SO_REUSEPORT` load-balancing semantics; nothing
+  in this changeset measures it, and the code comments and log lines say so too.) A decaying
+  backlog is not worth an indefinite share of new connections.
+  `Unclaimed` — no listener at the address at all — leaves it in the table, because an
+  `AddListener` + `ActivateListener` pair can still arrive and adopt it; that is exactly the shape
+  of an upgrade whose initial state carries the listeners inactive and activates them afterwards,
+  so closing leftovers at the end of startup would destroy the case this entry fixes. There is no
+  point during startup at which a leftover is provably unclaimable, so retention stays open-ended
+  and `Server::new` instead reports what it kept: `info` for an address whose listener exists and
+  has yet to be activated, `warn` for an address with no listener at all, which is the one an
+  operator needs to see.
+  A second copy of the same close lived on the registration-error path. `activate()` moved the
+  socket into a local to register it and propagated a `Registry::register` failure straight from
+  there, so the `?` dropped the local and closed a descriptor `Listeners::get_*` had already removed
+  from the table. `register` answers `EEXIST` for a descriptor already registered on the same epoll
+  instance, which is what `notify_deactivate_listener` leaves behind when its `deregister` only
+  logs. All four `activate()` implementations now park that socket and reuse it on the next attempt
+  instead of binding a second one. It is parked in a **new** `parked_listener` / `parked_socket`
+  field, not in the listener's live socket field: every other consumer reads that field's `Some` as
+  "registered and live" — `give_back_listener` hands it back as an activated socket and answers
+  `Ok`, `soft_stop` / `hard_stop` deregister it and fold a failure into `ProxyError::SoftStop` /
+  `HardStop`, `accept` accepts on it — so parking there would have made a listener that never came
+  up look activated, and a registration failure that leaves the socket unregistered would have made
+  `deregister` answer `ENOENT` and report a failed shutdown. If an inherited socket and a parked one
+  ever coexist, the loser is closed explicitly and logged rather than dropped by an assignment.
+  Covered by four tests in `scm_listener_handoff_tests` (`lib/src/server.rs`), each red on its own
+  mutation and on no other, for each of the four protocols independently:
+  `inherited_listener_sockets_are_adopted_by_the_initial_activation` hands a worker one queued
+  connection per TCP-family protocol and one queued datagram for UDP and asserts all four survive
+  the hand-off; `a_repeated_activation_closes_the_descriptor_it_cannot_adopt_now` asserts a
+  descriptor this activation cannot adopt is taken out of the table and closed;
+  `an_inherited_descriptor_with_no_listener_yet_is_adopted_by_a_later_activation` asserts the
+  opposite case survives an early activation and is then adopted, backlog and all, by the
+  `AddListener` + `ActivateListener` that follows; and
+  `a_failed_registration_does_not_close_the_socket_it_was_handed` pre-registers a descriptor so
+  `register` answers `EEXIST` and asserts the socket outlives the failure; and
+  `a_socket_parked_by_a_failed_registration_is_not_mistaken_for_a_live_one` asserts that after that
+  failure `give_back_listener` still answers `ProxyError::UnactivatedListener` and a stop still
+  succeeds. Reported as sozu#1342.
+
 - **`fix(h2)`: the `MUX-H2` log lines rendered `peer=None` once the peer had reset, and named the
   load balancer instead of the client behind PROXY protocol.**
   **This changes rendered log content.** If you alert, dashboard or grep on the `peer=` slot of a
@@ -279,7 +1022,7 @@
   no such cache at all until this change.
   `SocketHandler` gains a `peer_addr` method returning the address the handler snapshotted at
   construction, falling back to the live lookup only when it holds none — the preference
-  `log_socket_module_prefix` already applied to every `SessionTcpStream` (`lib/src/socket.rs:177`),
+  `log_socket_module_prefix` already applied to every `SessionTcpStream` (`lib/src/socket.rs:190`),
   now reachable from the mux. `FrontRustls` gains the matching `configured_peer` field, seeded from
   `HttpsSession::peer_address` and deliberately **not** from `stream.peer_addr()`: the latter
   compiles, passes all 878 other unit tests, and silently preserves the PROXY-protocol split. That
@@ -310,7 +1053,7 @@
   running `build_session` + `*slot = session` on every `Ok(token)`, under a comment asserting the
   slot "holds nothing but this listener's own placeholder — the overwrite can never land on a live
   session". True the first time and false every time after: `UdpListener::activate`
-  (`lib/src/udp.rs:287`) short-circuits on its own `active` flag and answers `Ok(self.token)`
+  (`lib/src/udp.rs:302`) short-circuits on its own `active` flag and answers `Ok(self.token)`
   without doing any work, so a second `activate-listener` for a listener that is already up reached
   that assignment with a live `UdpListenerSession` in the slot — the overwrite the change claimed to
   have removed "by construction rather than by check". Reserving the slot settles which key the slab
@@ -323,11 +1066,11 @@
   its own.
   The replacement session shares the proxy's `UdpManager` — and therefore its flow table — but
   starts with empty `upstream_sockets`, `upstream_to_flow` and `flow_to_upstream`. `close()` is a
-  `ProxySession` method and not `Drop` (`lib/src/udp.rs:1824`), so the displaced session ran no
+  `ProxySession` method and not `Drop` (`UdpListenerSession::close`, `lib/src/udp.rs`), so the displaced session ran no
   teardown on the way out. Every in-flight flow stopped forwarding on the spot: the manager still
   resolved the client to its flow and emitted `SendToBackend`, and the new session had no upstream
   socket to send it on. The flow's upstream slab slot was stranded for the worker's lifetime —
-  `on_close_flow` (`lib/src/udp.rs:1659`) reaches that slot only through `flow_to_upstream`, so the
+  `on_close_flow` (`lib/src/udp.rs:1749`) reaches that slot only through `flow_to_upstream`, so the
   eventual teardown could no longer free it. The request answered `ok` throughout.
   The `udp.active_flows` gauge did *not* drift: the retained manager is its sole author, so
   `FlowEvicted` still fired once per flow at the eventual teardown. What the gauge lost was its
@@ -406,12 +1149,16 @@
   Other commit citations elsewhere in the tree are also off-`main` or dangling; they are out of
   scope here and deliberately untouched.
 - **`fix(udp)`: an idle UDP flow was never evicted after an early timer-wheel fire.**
-  `Timer::duration_to_tick` (`lib/src/timer.rs:496`) rounds a requested delay to the **nearest**
+  `Timer::duration_to_tick` (`lib/src/timer.rs`) rounds a requested delay to the **nearest**
   tick, not up — despite its own comment saying otherwise — so with the 100 ms default tick an
-  entry whose deadline falls in `[100N-50, 100N+50)` is delivered at tick `N`, up to **50 ms
-  early**, and `Timer::poll` removes it from the wheel as it does so. The UDP listener owns exactly
+  entry whose deadline falls in `[100N-50, 100N+50)` is delivered at tick `N`, and `Timer::poll`
+  removes it from the wheel as it does so. That is up to **50 ms early** when the poll lands on the
+  tick grid, which is what `Timer::next_poll_date` schedules; `Timer::poll` recomputes
+  `current_tick` from the real clock, so a poll anywhere in `[100N-50, 100N)` already sees tick `N`
+  and the bound a consumer must tolerate is `(delay_ms + 50) mod 100`, i.e. up to **99 ms** — a
+  full tick minus a millisecond. Either figure is fatal here: the hazard is any earliness at all. The UDP listener owns exactly
   one wheel entry for all its flows. On such an early fire `UdpListenerSession::timeout`
-  (`lib/src/udp.rs:1798`) called `UdpManager::handle_timeout`, which found no flow past its
+  (`lib/src/udp.rs`) called `UdpManager::handle_timeout`, which found no flow past its
   deadline, closed nothing, and called `reschedule` — and `reschedule`
   (`lib/src/protocol/udp/manager.rs:600`) emits `ArmTimer` only when the minimum deadline *changes*.
   Nothing had changed, so nothing was emitted, the consumed entry was never replaced, and the wheel
@@ -425,7 +1172,7 @@
   `close_flow` triggers — which makes an unchanged deadline re-emit `ArmTimer` instead of being
   memoized away. `handle_timeout` is only ever called from a wheel expiry, so this is the truthful
   state on entry rather than a special case. The shell drops its now-dangling `timer_handle` in the
-  same place (`lib/src/udp.rs:1810`); that half is **hygiene, not a second fix**. A delivered handle
+  same place (`lib/src/udp.rs:1900`); that half is **hygiene, not a second fix**. A delivered handle
   is already inert: `set_timeout_at` clamps every new entry past `self.tick`, a delivered one sat at
   or below it, and `self.tick` never decreases, so `cancel_timeout`'s tick guard can never match the
   successor that reuses its slab slot — the slot really is reused, and the cancel really is refused
@@ -446,7 +1193,9 @@
   `test_timeout_fires_up_to_half_a_tick_early` and `test_maximum_earliness_is_a_full_half_tick`
   (`lib/src/timer.rs`) so the intuitive but wrong "a timer never fires early" assumption cannot be
   re-derived; the rounding interval is closed on the early side, so the attained maximum earliness
-  is a full 50 ms and it is *lateness* that is capped at 49 ms. Seen red at all three levels: the
+  **on the tick grid** is a full 50 ms and it is *lateness* that is capped at 49 ms. Those two
+  tests poll at grid points and measure the grid mapping; off-grid delivery reaches 99 ms, as their
+  doc comments and `duration_to_tick` now spell out. Seen red at all three levels: the
   manager's re-arm (`early_expiry_that_finds_nothing_due_still_rearms`,
   `repeated_early_expiries_each_rearm`) and the eviction itself against a real wheel, a real
   `UdpListenerSession` and a real `UdpManager` (`an_early_wheel_fire_still_evicts_the_idle_flow`,
@@ -728,9 +1477,11 @@
   **The next worker restart makes such a route live, and it requires no operator action.** Because
   the release-build worker reported success, the main process kept the frontend in its authoritative
   `ConfigState` — the pre-dispatch validation probes a fresh, empty `Router`
-  (`bin/src/command/requests.rs:2169-2181`), which cannot see an ordering conflict, and the
+  (`validate_frontend_request`, `bin/src/command/requests.rs`), which cannot see an ordering
+  conflict, and the
   unacknowledged-add rollback only fires when no worker answers `Ok`
-  (`bin/src/command/requests.rs:2286`). That state is replayed into every worker at launch
+  (`should_rollback_fanout`, `bin/src/command/requests.rs`). That state is replayed into every
+  worker at launch
   (`ConfigState::generate_requests`, `command/src/state.rs:1702-1704`), walking a `BTreeMap` keyed
   `{address};{hostname};P{path}` (`command/src/state.rs:120`, `command/src/request.rs:259-278`) — so
   `/test[0-9]/.example.com` replays BEFORE `foo./test[0-9]/.example.com`, the insertion order that
@@ -888,8 +1639,102 @@
   `string`, so a lossy name carries U+FFFD and will not match a later `RemoveCertificate` — that
   now emits an `error!` carrying byte counts only, never the key. Locked by a poisoned-resolver
   test and a non-UTF-8 trie-key test (both seen red).
+- **`docs(lifecycle)`: the `file.rs:NNN` anchors in the module `LIFECYCLE.md` files had drifted,
+  and most of them never needed a line number.**
+  517 anchors across `bin/src/command/`, `lib/src/protocol/kawa_h1/`, `lib/src/protocol/mux/`,
+  `lib/src/protocol/proxy_protocol/` and `lib/src/protocol/udp/` were read against the code they
+  point at. 312 of them did not need a line number at all and are now symbol anchors; of the 205
+  that legitimately name a statement or a branch, 170 had to be renumbered and 35 were already
+  right. A line number has no anchor, so it rots the moment anyone edits above it — silently,
+  because nothing resolves it: a mechanical scan for a missing target, a line past EOF or a blank
+  line flagged only 27 of the 517. Two patterns account for nearly all of it, both named in #1335:
+  single-line anchors off by `+1`, from the `//!` module-doc line added at the top of each source
+  file after the documents were written, and ranges off by tens to thousands of lines, from the
+  TigerStyle `debug_assert!` campaign and the growth of `lib/src/protocol/mux/h2.rs` (drifts of
+  +1400 to +2165 there). A range that drifts that far does not mislead slightly: it lands the
+  reader in a different function.
+  The repair follows `lib/src/protocol/tcp_preread/LIFECYCLE.md`, which was already written this
+  way and is the reason it needed no repair. Where the prose names an item — a function, a method,
+  a struct, an enum — the anchor is now that item plus its file and carries no line number, so it
+  cannot drift; a method is qualified `Type::method` so it is greppable. A `file.rs:LINE` or
+  `file.rs:LINE-LINE` anchor survives only where the claim is about a specific statement or branch
+  inside an item, and every survivor was re-read against the code it points at. Bare basenames
+  that were ambiguous repo-wide (`server.rs`, `backends.rs`, `upgrade.rs`) are now
+  repo-root-relative, as are partial paths that resolved only from an intermediate directory
+  (`mux/auth.rs`, `udp/health.rs`, `tcp_preread/mod.rs`). Where such a statement can be named,
+  the name is used even though a line would be allowed: the `bind` / `connect` pair in
+  `udp_connect` and that function's doc comment are anchored by name, because a 13-line shift of
+  `udp_connect` moves both line anchors onto unrelated non-blank lines that a resolver accepts.
+  Three anchors were wrong the day they were written rather than drifted since:
+  `command/src/channel.rs:611` was blank when the document cited it and has since drifted onto
+  an unrelated `debug_assert_eq!` — the `usize`-prefixed framing it claims is
+  `Channel::write_delimited_message` — and `mod.rs:42` / `:44` in the UDP state-machine diagram
+  named `FlowPhase` variants while pointing at `FlowId` and `BackendId`, `FlowPhase` having only
+  ever lived in `flow.rs`. The two anchors that are blank in the tree today were
+  `lib/src/protocol/udp/mod.rs:39` and `:43`.
+  No prose claim was rewritten to match code. Two claims named a symbol that has never existed and
+  are re-anchored to the one that does: the supervisor event loop is `CommandHub::run`, not
+  `Server::run`, and `upgrade_main` lives in `bin/src/command/upgrade.rs`, not
+  `bin/src/upgrade.rs`. Six further claims have gone stale and are left for a separate pass,
+  anchored but untouched: the mux "inline removal" list, whose six sites now all call
+  `ConnectionH2::remove_dead_stream` and whose one remaining `self.streams.remove` is inside that
+  helper; `Context::unlink_stream` described as clearing `Stream::state`, which its callers do and
+  it does not; `ListenerAnswers` / `ClusterAnswers`, flattened into fields of `HttpAnswers`; the
+  H1 `Transfer-Encoding` guard, which gained a third reject condition; the `DefaultAnswer`
+  catalogue, documented as eight variants and now fourteen; and the `FlowPhase` diagram above.
+  `doc/` is untouched here, and its own anchors and the CI resolver of #1335 are separate work.
 
 ### 🔄 Changed
+
+- **`refactor(mux)`: the H1/H2 cores publish a next-timeout deadline instead of owning a timer
+  handle; the `Mux` adapter owns every `TimeoutContainer`.**
+  No behaviour change. `ConnectionH1` and `ConnectionH2` no longer hold a `TimeoutContainer` and no
+  longer reference `crate::timer` at all: each carries `timeout_duration` plus
+  `timeout_deadline: Option<Instant>` and publishes the latter through `poll_timeout()`.
+  `Connection::{arm_timeout, clear_timeout, set_timeout_duration}` replace the old
+  `timeout_container().{reset, cancel, set, set_duration}` surface one for one, and the six
+  `TimeoutContainer` sites in `lib/src/protocol/mux/h2.rs` — the field, the constructor parameter,
+  the constructor init and the three `reset()` calls — are gone.
+  `Mux` gained `timeouts: HashMap<Token, TimeoutContainer>`, one handle for the frontend token plus
+  one per backend, and `Mux::reschedule` reconciles them against the cores: it arms, re-arms or
+  cancels only when what a handle holds differs from what its core wants, then drops handles whose
+  token has left `router.backends` (`TimeoutContainer::drop` cancels). This is the shape
+  `UdpManager::{poll_timeout, reschedule}` already uses, and it is the prerequisite the deterministic
+  H2 simulator needs from the timer side — the H2 core can now be driven with no timer wheel at all.
+  Three things make the memoization safe. Two of them have a test that fails when they are
+  dropped; the third — that the reschedule is structural — has none, and rests on the wrappers
+  having no other exit.
+  (1) The reschedule is structural: `SessionState::{ready, timeout, shutting_down}` are thin
+  wrappers around `*_inner` bodies whose only job is to run it on the way out, so none of the dozen
+  early `return`s inside them can skip it. (2) `Mux::consume_timer_entry` calls
+  `TimeoutContainer::triggered` on entry to a firing, which clears the handle's deadline, so an
+  early delivery is re-armed rather than memoized away — consume-then-reschedule, the same rule
+  `UdpManager::handle_timeout` follows by clearing `armed_deadline` on entry. Without it the memo
+  reads "nothing changed" while the wheel entry is already gone, and the session is left with no
+  timer: a lost wakeup. (3) A real expiry clears the core's elapsed deadline, so `reschedule`
+  cannot re-arm an instant in the past and spin the session; every branch that keeps the session
+  alive re-arms explicitly.
+  Two `debug_assert`s come across from the UDP manager: the strict-advance guard from
+  `handle_timeout` (the entry re-armed for a fired token must be strictly in the future) and
+  `Mux::debug_assert_timer_coherence`, the analogue of `check_invariants` (6), which verifies after
+  every reschedule that each handle is armed iff its core wants a timer, holds exactly the core's
+  instant, and that no handle outlived its connection. Both run in every debug, test and e2e build.
+  One knock-on: the WebSocket upgrade (`http.rs` / `https.rs` `upgrade_mux`) used to destructure the
+  handles out of `ConnectionH1`; it now takes them out of `Mux.timeouts`, and `sync_timeout` keeps
+  each handle's `duration()` current via the new `TimeoutContainer::retune` because `Pipe` re-arms
+  from it.
+  One deliberate semantic shift comes with it, so "no behaviour change" is not literally true:
+  the old `TimeoutContainer::reset()` computed its deadline from a fresh `Instant::now()` at the
+  call site, whereas `arm_timeout(now)` computes it from the pass snapshot. A deadline therefore
+  lands earlier by however long the pass had been running when the re-arm ran — bounded by one
+  pass, in the same direction as every other snapshot-governed deadline, required by invariant 20,
+  and dominated by the wheel's own up-to-99 ms rounding.
+  Operator-visible: nothing. Verified end to end by `test_issue_810_timeout`,
+  `test_h2_backend_silent_triggers_504_within_back_timeout`, `test_idle_timeout_no_underflow`,
+  `test_h2_basic_request_response`, `test_keep_alive`, `test_websocket_upgrade` and
+  `test_proxy_protocol_websocket_upgrade`, and by the `mod.rs` unit tests (two before this
+  changeset, ten after). Documented in
+  `lib/src/protocol/mux/LIFECYCLE.md` §7.7 and invariant 23.
 
 - **`refactor(h2)`: the H2 core now reads one clock snapshot per pass instead of calling
   `Instant::now()` at twenty-one separate sites.**
@@ -1015,6 +1860,287 @@
   `doc/configure.md`'s "Path matching precedence within a frontend" section, rewritten by #1352 to
   say path regexes are NOT anchored, is corrected in the same changeset; the "write your own
   anchors" advice is gone.
+
+### ➖ Removed
+
+- **BREAKING (library API) — `refactor(kawa_h1)`: delete the unreachable `Http` session state
+  machine, closing [#1346](https://github.com/sozu-proxy/sozu/issues/1346) and
+  [#1347](https://github.com/sozu-proxy/sozu/issues/1347).**
+  `sozu_lib::protocol::kawa_h1::Http<Front, L>` — re-exported as
+  `sozu_lib::protocol::http::Http` and, until now, as `sozu_lib::protocol::Http` — is gone, with
+  its `SessionState` impl, `TimeoutStatus`, `ResponseStream`, `save_http_status_metric`, the
+  module-local `handle_connection_result` (`tcp.rs` keeps its own separate copy), this module's
+  `log_context!` macro, and the whole `kawa_h1::diagnostics` module
+  (`diagnostic_400_502`, `diagnostic_413_507`). No binary could reach any of it: `HttpStateMachine`
+  (`lib/src/http.rs`) is `Expect | Mux | WebSocket` and `HttpsStateMachine` (`lib/src/https.rs`) is
+  `Expect | Handshake | Mux | WebSocket`, neither holds one, and `Http::new` had zero code callers
+  under **either** module spelling — a grep on one spelling undercounts, because
+  `lib/src/protocol/mod.rs` re-exports `kawa_h1 as http`. Measured rather than inferred: an
+  unconditional `panic!("PROBEALWAYS …")` planted at the top of `Http::new` and
+  `save_http_status_metric` fired 0 times across four real proxied HTTP/HTTPS e2e sessions, while
+  the same planted binary panicked immediately under the function's own unit test (the positive
+  control). H1 has run through `protocol/mux` in H1 mode since the mux migration.
+  This is **breaking for downstream `sozu-lib` consumers**, not for operators: nothing on the wire,
+  no metric, no log line, no configuration key and no CLI flag changes, but a crate that named
+  `sozu_lib::protocol::Http`, `::protocol::http::Http`, `::protocol::kawa_h1::Http`,
+  `::protocol::kawa_h1::{TimeoutStatus, ResponseStream}` or `::protocol::kawa_h1::diagnostics::*`
+  no longer compiles. There is no migration target: the type implemented a session state machine no
+  Sōzu binary instantiated. The `Http` name is no longer re-exported at
+  `sozu_lib::protocol::Http`.
+  #1347 — a frontend timeout consumed by `container_frontend_timeout.triggered()` and never
+  re-armed, leaving the session alive until the 30-minute `zombie_check` — lived inside that
+  `impl`. It is **closed by the removal, not fixed**: after this change there is no code left to
+  redden, so it gets no regression test. The equivalent live defect class is already handled in the
+  mux, which re-arms explicitly under `if !should_close` / `if result == StateResult::Continue`
+  (`lib/src/protocol/mux/mod.rs`).
+  Nothing was weakened to reach green. Exactly one test was orphaned,
+  `kawa_h1::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`, which asserted that a
+  backend status line outside `100..=999` is bucketed as `http.status.other` rather than asserted
+  away. `mux::stream::generate_access_log` is the live implementation of the same concern and had
+  no such assertion, so the test was **ported, not deleted**, as
+  `mux::stream::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`; it was seen red
+  against the live path by planting the forbidden `debug_assert!((100..=999).contains(&status))` in
+  the bucket arm, which reproduces `generate_access_log got a non-3-digit status: 0`.
+  Also removed: the two commented-out `size_test` blocks in `lib/src/http.rs` and
+  `lib/src/https.rs`, which `assert_size!`d `Http<..>` — and, in the HTTPS one, OpenSSL types that
+  left the tree several releases ago. #1346 cited them as live references to the type; they were
+  inside `/* … */`.
+  `kawa_h1` itself stays: `answers::{HttpAnswers, DefaultAnswerStream, merge_legacy_into_map}`,
+  `editor::{HttpContext, HeaderEditMode, HeaderEditSnapshot}`, `parser::{Method, hostname_and_port,
+  compare_no_case}`, the `DefaultAnswer` enum and the crate's only
+  `impl kawa::AsBuffer for Checkout` are all live and consumed by `mux`. `answers.rs` was assessed
+  item by item and **nothing** in it became dead. `lib/src/protocol/kawa_h1/LIFECYCLE.md` has been
+  rewritten from "H1 session lifecycle" to "the H1 vocabulary the mux builds on", with its
+  citations refreshed; `doc/lifetime_of_a_session.md` §6.1, `doc/testing.md`, `doc/observability.md`
+  (the `KAWA-H1` log tag no longer exists), `doc/configure.md`, `doc/benchmark.md` (a pre-mux
+  profiler capture, kept verbatim with a note), `e2e/COVERAGE.md`, `lib/README.md`,
+  `lib/src/protocol/proxy_protocol/LIFECYCLE.md` and `CLAUDE.md` are updated in the same changeset.
+  Net: `lib/src` goes from 87 973 to 85 415 lines of Rust — 2 712 removed, 154 added, −2 558.
+
+### 🤖 CI
+
+- **`ci(doc)`: a `file.rs:NNN` citation whose line MOVED is now reported, not just one that landed
+  on a blank line.**
+  The resolver below failed a citation only when the cited line was blank, and said so in its own
+  output — "This is a floor, not a proof". The gap turned out to be far larger than the floor
+  language suggested, and #1389 measured it three times. On #1379's changeset, which added +21 lines
+  to `lib/src/protocol/kawa_h1/editor.rs` and +14 to `lib/src/protocol/mux/router.rs`, **24
+  citations moved and the guard reported 2**; the other 22 all landed on non-blank code, and
+  `lib/src/protocol/kawa_h1/LIFECYCLE.md` alone cites `editor.rs` 21 times. The guard's presence was
+  itself the hazard: a green `Doc citations` job reads as "the citations are right" when it only
+  ever meant "no citation landed on a blank line".
+  `.github/scripts/check_doc_citations.py --base <revision>` closes that with the base revision and
+  no new data. Every citation is resolved by the resolver's own `resolve_path`/`CITATION` — a naive
+  basename match reports false positives, because a bare `mod.rs` in `mux/LIFECYCLE.md` binds to its
+  sibling — and the TEXT of the cited line is read at the merge base and at HEAD. Different text is
+  reported whether or not the new line is blank, at both ends of a range, which makes the rule a
+  strict superset of the blank-line rule for every line the changeset touched. Comparison is on the
+  stripped line, so a re-indent is not drift.
+  **Re-anchoring is not drift.** A citation is compared only when the same path and the same line
+  numbers are also present in the base revision of its own document, so repointing `editor.rs:1131`
+  at `editor.rs:1152` is accepted silently and only a citation left pointing at text that changed
+  underneath it is reported. Identity is the citation and not its position, so moving a paragraph
+  does not excuse a stale number.
+  **It fails closed.** The base commit has to be in the object store and the default
+  `actions/checkout` is shallow, so the `Doc citations` job now checks out with `fetch-depth: 0` —
+  pull requests here stack on one another, so the base is often not `main` and no narrower fetch
+  covers every case — and passes the pull request's base sha through the environment. An
+  unreachable `--base` is an error and exit `1`, never a skip: a guard that answered a missing base
+  with a clean run would be green forever while comparing nothing, which is the defect being closed.
+  A `main` or tag push carries no changeset, and the run then states on its own line that the rule
+  did not run rather than implying it passed.
+  The self-test grew the matching half, asserted in BOTH directions. `testdata/citations/` gained a
+  document whose five citations all resolve to a non-blank line at both revisions — so the older
+  rules are green on it either way — plus a `drift.rs`, and a `<name>.base` second revision of each
+  that no walk in the script can see. The self-test commits those base revisions into a throwaway
+  repository, restores the head ones, and requires the SAME tree to exit `0` without `--base` and
+  `1` with it, the two drifts to be the exact two expected, 17 cited line ends to have been compared
+  (an exact total, not a floor, so a comparison that quietly stopped running fails), and an
+  unreachable base to be refused rather than skipped.
+  On this tree the rule compares 340 cited line ends and reports none. Inserting two lines at the
+  top of `editor.rs` reddens it with two citations from `kawa_h1/LIFECYCLE.md` while the blank-line
+  rule stays green on all 229 — which is the defect, reproduced on the production surface.
+  **The scanned surface is unchanged and that is deliberate.** #1389's follow-on asked for the
+  line-citation surface to be aligned with the test-name rule's `*.rs` + `CHANGELOG.md`. Measured on
+  `265d895d` that adds 195 citations across 190 files and 50 pre-existing failures, 27 of them in
+  `CHANGELOG.md` — an append-only record of the tree as it stood at each release, which must not be
+  renumbered to satisfy a guard. It is its own changeset, and it would still not reach
+  `e2e/COVERAGE.md`, which no rule reads.
+- **`ci(doc)`: a cited TEST NAME must now name a `fn` in the tree, and the citations that named
+  nothing are repaired.**
+  The citation resolver below only sees a citation that carries a path. The other form carries none:
+  prose naming a test as its evidence — "`<name>` pinned the defect", "see `<name>` for the exact
+  semantics". It rots the same way a line number does and more quietly, because nothing in a build
+  or a test run reads it. On `c7ac070e` three such names were cited in six places and none of the
+  three had a definition anywhere in the repository (#1380); a fourth and a fifth turned up once the
+  rule ran.
+  `.github/scripts/check_doc_citations.py` gained a second, independent rule in the same run: a
+  backticked identifier that looks like a test name, in prose that is talking about tests, must name
+  a `fn` somewhere in the tree. Both halves of "looks like a test name" were measured rather than
+  guessed. `^[a-z][a-z0-9_]{12,}$` alone — the shape #1380 proposed — yields 358 distinct
+  identifiers over 864 sites, nearly all configuration keys, struct fields and std methods.
+  Requiring five underscore-separated segments, a sentence rather than a noun phrase, cuts it to 21;
+  additionally requiring the enclosing comment block or markdown paragraph to contain the word
+  "test" cuts it to 12, which is small enough to disposition by hand. The scanned surface is every
+  `*.rs` comment plus `CHANGELOG.md`, `doc/**` and every `**/LIFECYCLE.md` — all four carried one of
+  the six. On this tree the rule examines 3444 candidate identifiers, checks 262 and, before the
+  repairs below, reported 5.
+  Two dispositions exist and neither is an escape hatch. `RENAMED_TESTS` records a test cited on
+  purpose by a name it no longer carries, because the prose is recording the rename, and the name it
+  forwards to **must itself resolve to a `fn`** — removing an entry or pointing it at an absent name
+  both fail the run, which is how the table was proven non-vacuous. `NOT_A_TEST` records a
+  sentence-shaped identifier that is no test at all — a configuration key, a std method, the
+  identifier of a note kept outside the repository — each with its reason.
+  The repairs: `lib/src/tcp.rs` and `e2e/src/tests/tcp_sni_tests.rs` both cited the SNI per-IP
+  limiter test by the name it carried before `c7f244c8` renamed it, and now cite
+  `test_tcp_sni_per_ip_limiter_rejects_second_then_admits_after_release`.
+  `e2e/src/tests/eviction_tests.rs`'s preamble announced a `..._skipped_during_soft_stop` test that
+  was never written — `git log -S` over the whole history finds no definition — so the bullet now
+  describes `test_evict_on_queue_full_disabled_drops_overflow`, which exists, and states plainly
+  that the soft-stop short-circuit in `Server::create_sessions` has no coverage in that module. The
+  same preamble's two drifted `server.rs:NNN` anchors became symbols. The four deliberate former
+  names, in `lib/src/router/mod.rs` and in this file, are unchanged except that the two `mod.rs`
+  doc comments now say "formerly named" at the point of citation, so a reader is not sent hunting.
+  The self-test grew the matching half: a clean fixture, a broken one, an examined/checked pair
+  asserted as exact totals rather than floors — raising the segment floor or narrowing the
+  "about tests" test fails it — and a second pass with fixture-local tables that proves an
+  allowlisted name passes, a rename with a live target passes, and a rename whose target is itself
+  gone is still reported.
+- **`test(e2e)`: decode `:status` in every H2 status assertion, assert the positive outcome where
+  `rejection || !got_200` accepted a silent worker, and derive the issue-810 shutdown budget from
+  the timer's own tick.** Three defects of one shape: a test that passes while proving less than
+  its name says.
+  Seventeen assertions across `e2e/src/tests/h2_security_tests.rs` and
+  `e2e/src/tests/h2_security_header_injection.rs` scanned a HEADERS payload for the byte `0x8D`
+  under the name `got_400` and a comment calling index 13 `:status 400`
+  ([#1374](https://github.com/sozu-proxy/sozu/issues/1374)). RFC 7541's static table puts
+  `:status 400` at index 12 (`0x8C`) and `:status 404` at 13, and sōzu really does answer an
+  indexed `0x8d` 404 when the router finds no cluster — so a request sōzu **accepted and routed**
+  satisfied a term named `got_400` and reported itself as a rejection. A byte scan also fires on a
+  length octet: RFC 7541 §5.1 writes a 268-byte header value as `7f 8d 01`, which is
+  [#1353](https://github.com/sozu-proxy/sozu/issues/1353)'s mechanism aimed at a security
+  assertion. All nineteen probes — the two `contains(&0x88)` 200-detectors included — are now one
+  helper, `stream_status_matches`, built on the existing `decode_status`, which reads the first
+  field of the block so neither a later field nor a length octet can answer for the status.
+  The label was right and the byte was wrong at every site: each of those tests sends a malformed
+  request and documents RFC 9113's "stream error or 400" contract, so every one decodes **400**
+  and the comments are corrected rather than the assertions retargeted at 404. Measured before
+  converting: every iteration of all fifteen `h2_security_tests.rs` sites reports `400: false` and
+  produces no HEADERS frame at all — RST_STREAM only — so the term was dead under either reading.
+  **One site was not dead.** The `asterisk-with-OPTIONS` case of `test_h2_path_syntax_enforced` —
+  its deliberately *accepted* case — answers `HEADERS stream=7 status=404`, and its inner
+  `protocol_error` probe read that as a 400. It stayed green only because the outer `rejected`
+  probe was hardcoded to stream 1 while the case runs on stream 7; both are stream-scoped and
+  decoded now. `h2_400_terms_decode_the_status_field_not_the_0x8d_byte` is the negative half, with
+  a routed-404 fixture and a 200 carrying a `7f 8d 01` length octet. Restoring the byte scan reddens
+  exactly its two negative assertions, one per fixture, and leaves the positive ones green, because
+  a scan that ignores its status argument answers yes to every status.
+  Separately, two assertions written `rejection || !got_200` passed when the worker returned
+  **nothing** ([#1381](https://github.com/sozu-proxy/sozu/issues/1381)): `got_200` is derived from
+  frames that may never arrive, so a silent reset, a timeout collecting zero frames or a worker
+  that died between phases all read as success, and a regression turning a clean rejection into a
+  crash read as a pass. `try_strict_sni_binding_toggle`
+  (`e2e/src/tests/listener_update_tests.rs`) asserts the positive outcome its own comment always
+  claimed, `got_rejection_or_421 && !got_200`, and narrows that term from `contains_goaway` to
+  `rejected_with_goaway_or_rst`: phase 1 ends with `GOAWAY error_code=0x0`, the graceful close
+  riding behind the 421, so the wide form accepted a 502 followed by that same close — precisely
+  the distinction the issue says these assertions cannot make. `try_h2_invalid_status_rejected`
+  (`e2e/src/tests/h2_security_header_injection.rs`) asserts
+  `got_frames && (protocol_rejection || got_502) && !got_200`, requiring frames to have arrived at
+  all. Sōzu answers 502 on that path — measured on all four malformed upstream `:status` values.
+  Finally, `test_issue_810_timeout` (`e2e/src/tests/tests.rs`) asserted a zero-slack 100 ms
+  shutdown budget 100 times over and reddened on contended runners while every failing iteration
+  still proxied correctly ([#1376](https://github.com/sozu-proxy/sozu/issues/1376)). 100 ms is not
+  a margin there, it is exactly one tick of the two grids the shutdown path runs on:
+  `Server::reset_loop_time_and_get_timeout` clamps the poll timeout to a 100 ms `shutdown_tick`
+  while `shutting_down.is_some()` and `shut_down_sessions` runs once per loop iteration, so any
+  iteration after the first costs a full `poll()` block; and the timer wheel's default `tick_ms`
+  is 100 ms with `duration_to_tick` rounding to the NEAREST tick, displacing a timer-driven step by
+  `(delay_ms + tick_ms / 2) mod tick_ms` ∈ `[0, 99]` ms. `ISSUE_810_SHUTDOWN_BUDGET` is three of
+  those ticks — one re-poll, one grid displacement, one scheduler quantum — still 1/33 of
+  `DEFAULT_REQUEST_TIMEOUT` and 1/200 of `DEFAULT_FRONT_TIMEOUT`, so a shutdown that waits for a
+  session timeout misses it by two orders of magnitude. The same test now asserts the four exchange
+  counters it used to print and never check, so an iteration whose client never received its
+  response can no longer be timed as though it had.
+  `e2e/COVERAGE.md` carries the byte-scan inventory, the 404-vs-400 decision and the tick
+  derivation; `frames.is_empty()` as an accepted outcome is deliberately untouched and stays open
+  on #1374.
+
+- **`ci(doc)`: every `file.rs:NNN` citation in `doc/` and the module `LIFECYCLE.md` files is now
+  resolved on each pull request, and the ones in `doc/` were re-read against the code first.**
+  A line number carries no anchor, so a citation rots the moment anyone edits the file it points
+  into — and the pull request that breaks it is almost never the pull request that contains it, so
+  no reviewer is ever shown both halves (#1335).
+  `.github/scripts/check_doc_citations.py` runs as the non-experimental `Doc citations` cell and
+  fails when a cited file does not exist, a cited basename is ambiguous repo-wide, a line is past
+  end of file, a line is blank, a range is inverted, or the same line repeats inside one citation
+  group. That last check exists because the `/` continuation form is real here
+  (`answers.rs:209/224`, `mod.rs:1218/1233/1311/1321` in `lib/src/protocol/mux/LIFECYCLE.md`) and
+  renumbering one on its first half alone yields `224/224`, which resolves perfectly and is
+  otherwise invisible. A cited path resolves against the
+  document's own directory first, so a module `LIFECYCLE.md` keeps citing its siblings by bare name.
+  The extraction pattern is `[A-Za-z0-9_/.-]+\.rs:[0-9]+(-[0-9]+)?`: the obvious
+  `[A-Za-z_/.-]+` has no digit in its character class and silently skips every citation naming a
+  file whose name contains one, which in this tree is most of them — on
+  `lib/src/protocol/mux/LIFECYCLE.md` it sees 78 of the 201 occurrences that are actually there.
+  `--self-test` runs the checker against a deliberately broken fixture and asserts the exact failures
+  it must report. Classifying a failure and acting on it are two different lines, though, so the
+  self-test also runs the real command line in a subprocess and requires exit `1` on the broken
+  fixture tree and exit `0` on a clean one, and the cell asserts that exit code in a step of its own.
+  Without those, changing the one `if failures:` in `main()` to `if False:` leaves every step green
+  on `main` at `ba7fa5f9`, which has 32. The fixtures pin the extraction surface as well as the
+  verdicts:
+  a digit-bearing `h2.rs`, and a `mod/LIFECYCLE.md` whose citations resolve only through the
+  sibling-directory rule, with the self-test asserting the exact citation total rather than a floor.
+  Each of the three one-line shrinks that would otherwise report a clean run over a quietly smaller
+  surface — dropping the digit from the pattern, dropping `**/LIFECYCLE.md` from the scan, dropping
+  sibling-directory resolution — now fails it.
+  On `main` at `ba7fa5f9` the checker flagged 32 of 613 citation groups.
+  In `doc/` itself all 106 citation groups across 9 files were read against the code they point at,
+  following the convention `doc/README.md` now documents: where the prose names an item the anchor
+  is that item plus its file and carries no line number, and a line or a range survives only where
+  the claim is about a specific statement or branch inside an item. 74 became symbol anchors; of the
+  32 that survive as line anchors, 24 had to be renumbered and 8 were already right.
+  Five citations landed on a blank line, which is all a mechanical scan can see. The rest resolved
+  to a perfectly valid line in the wrong place, which is the failure that matters and the one the
+  checker cannot catch: `command/src/config.rs:998` was the doc comment of `to_http` rather than the
+  `FileClusterConfig::http2` field it claimed; `bin/src/ctl/request_builder.rs:214-238` missed
+  `CommandManager::cluster_h2_command` by some 170 lines; `lib/src/server.rs:1178` named a comment
+  about `buffer.number` rather than `Server::notify_activate_listener`; `command/src/state.rs:534`
+  was a bare `cluster` token rather than `ConfigState::generate_requests`; and the five
+  `lib/src/protocol/kawa_h1/mod.rs` anchors for the backend-connection sequence had all drifted by
+  between 170 and 214 lines. `doc/README.md` says in as many words that a green `Doc citations` run means
+  "no citation is obviously dead" and nothing stronger.
+  Three stale citations outside the guarded surface are corrected in the same changeset, since
+  nothing will catch them later. `CLAUDE.md`'s logging bullet cited eleven `macro_rules!`
+  definition sites and every one had moved — `protocol/mux/mod.rs:49/87/118` against a real
+  `51`/`78`/`111`, `protocol/rustls.rs:23` against `32`, `tcp.rs:68` against `76` — so it now names
+  the macros and the files that define them. That includes `socket.rs:86/133`, whose two halves
+  pointed at a trait method declaration and at a line inside a macro body while the two real sites
+  are `macro_rules! log_socket_context` and `fn log_socket_module_prefix`; a bare `socket.rs`
+  matches every sibling in the list and needs no renumbering when that file changes.
+  `command/src/channel.rs`'s module doc and `bin/README.md` both cited `command/src/state.rs:1613,
+  1630` for the state-file save format, which is `ConfigState::write_requests_to_file`, and
+  `channel.rs:71` for the `max_buffer_size` ceiling, which is a `ChannelError` variant. The comment
+  in `lib/src/protocol/mux/h2.rs` that points at the inbound `stream_last_activity_at` refreshes
+  named SETTINGS-ACK tracking and a recycle deferral instead of `handle_data_frame` and
+  `handle_headers_frame`.
+  One anchor in `lib/src/protocol/kawa_h1/LIFECYCLE.md` is corrected too, because the new cell is
+  otherwise red on `main` the day it lands: the CL.TE framing guard is cited as `editor.rs:561-621`
+  and line 621 is blank — the guard's last statement is the `}` on 620. It is the end-of-range half
+  of the check that caught it, and the first thing that ever has.
+
+  No prose claim was rewritten to match the code. Four have gone stale and are recorded here rather
+  than silently corrected, because a citation repair that also edits claims cannot be reviewed as
+  either one. `doc/lifetime_of_a_session.md` §2.2 names `mux::connection` as the home of the
+  `signal_pending_write` / `arm_writable` invariant, where that module's own doc comment delegates
+  to `mux::h2`; the same section attributes the "invariant-15 pair" to module documentation in
+  `mux::answers`, where the phrase appears only on a test. Its §9 lists `mux::router` among the
+  per-stream `backend.pool.size` decrements: `Router::connect` does carry a `-1`, but only as a
+  rollback when mio registration fails, and the comment beside its `+1` names the two real partners,
+  in `mux::connection` and `mux::mod`. `doc/configure_admin_ops.md` §5.5 points at a
+  `doc/configure.md` section about cleartext H2 to backends rather than at the ALPN metric it is
+  documenting.
 
 ## 2.2.1 - 2026-08-28
 

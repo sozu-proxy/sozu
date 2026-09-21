@@ -5,7 +5,10 @@
 //! same routing / shutdown / readiness machinery applies across H1 and H2
 //! connections. Long-form lifecycle: `lib/src/protocol/mux/LIFECYCLE.md`.
 
-use std::io::IoSlice;
+use std::{
+    io::IoSlice,
+    time::{Duration, Instant},
+};
 
 use rusty_ulid::Ulid;
 use sozu_command::{logging::ansi_palette, ready::Ready};
@@ -22,7 +25,6 @@ use crate::{
         update_readiness_after_read, update_readiness_after_write,
     },
     socket::{SocketHandler, SocketResult, stats::socket_rtt},
-    timer::TimeoutContainer,
 };
 
 /// Prefix applied to every [`ConnectionH1`] log line. Matches the RUSTLS
@@ -114,7 +116,15 @@ pub struct ConnectionH1<Front: SocketHandler> {
     /// Active stream index, or `None` when the connection has no assigned stream
     /// (initial client state before `start_stream`, or after `end_stream` detaches).
     pub stream: Option<GlobalStreamId>,
-    pub timeout_container: TimeoutContainer,
+    /// Configured idle timeout for this connection. The core never arms a
+    /// wheel entry itself: it publishes the next instant it wants to be called
+    /// back at through [`ConnectionH1::poll_timeout`], and the embedder — the
+    /// `Mux` adapter — owns the `TimeoutContainer` that reflects it onto the
+    /// real timer. See `LIFECYCLE.md` §7.7.
+    pub timeout_duration: Duration,
+    /// Next instant this connection wants `timeout()` called at, or `None`
+    /// when it wants no timer at all.
+    pub(super) timeout_deadline: Option<Instant>,
     /// Set when `readable` exits early because the kawa buffer was full.
     /// Edge-triggered epoll will not re-fire READABLE for data already in the
     /// kernel socket buffer, so the cross-readiness mechanism must re-arm it
@@ -140,6 +150,35 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
 }
 
 impl<Front: SocketHandler> ConnectionH1<Front> {
+    /// The next instant this connection wants its embedder to call `timeout()`
+    /// at, or `None` for "no timer". The adapter reflects this onto the real
+    /// wheel; nothing here touches `crate::timer`.
+    pub(super) fn poll_timeout(&self) -> Option<Instant> {
+        self.timeout_deadline
+    }
+
+    /// Push the deadline one full [`Self::timeout_duration`] out from `now`.
+    /// Replaces the old `TimeoutContainer::reset()` at the same call sites.
+    pub(super) fn arm_timeout(&mut self, now: Instant) {
+        self.timeout_deadline = now.checked_add(self.timeout_duration);
+    }
+
+    /// Ask for no timer at all. Replaces `TimeoutContainer::cancel()`.
+    pub(super) fn clear_timeout(&mut self) {
+        self.timeout_deadline = None;
+    }
+
+    /// Adopt a new configured duration and re-arm from `now`.
+    ///
+    /// Mirrors `TimeoutContainer::set_duration`, which likewise cancelled and
+    /// re-armed rather than keeping the old deadline. It re-arms
+    /// unconditionally: the old method re-armed whenever the container had ever
+    /// held a token, which every live connection has.
+    pub(super) fn set_timeout_duration(&mut self, duration: Duration, now: Instant) {
+        self.timeout_duration = duration;
+        self.arm_timeout(now);
+    }
+
     fn defer_close_for_tls_flush(&mut self, reason: &'static str) -> MuxResult {
         if self.initiate_close_notify() {
             trace!(
@@ -229,7 +268,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             );
             return MuxResult::Continue;
         };
-        self.timeout_container.reset();
+        self.arm_timeout(context.now);
         let answers_rc = context.listener.borrow().get_answers().clone();
         let stream = &mut context.streams[stream_id];
         if stream.metrics.start.is_none() {
@@ -296,7 +335,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 && !parts.context.keep_alive_backend
             {
                 Self::terminate_close_delimited(kawa, stream_id);
-                self.timeout_container.cancel();
+                self.timeout_deadline = None;
                 self.readiness.interest.remove(Ready::READABLE);
                 if let StreamState::Linked(token) = stream.state {
                     // Signal pending write alongside the WRITABLE interest flip:
@@ -369,7 +408,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             false
         };
         if kawa.is_terminated() && !is_1xx_backend {
-            self.timeout_container.cancel();
+            self.timeout_deadline = None;
             self.readiness.interest.remove(Ready::READABLE);
         }
         if kawa.is_main_phase() {
@@ -465,7 +504,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         {
             let kawa = &mut context.streams[stream_id].back;
             Self::terminate_close_delimited(kawa, stream_id);
-            self.timeout_container.cancel();
+            self.timeout_deadline = None;
             self.readiness.interest.remove(Ready::READABLE);
         }
 
@@ -492,7 +531,11 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
             return MuxResult::Continue;
         };
-        self.timeout_container.reset();
+        // One clock read for the whole pass: the two later re-arms below
+        // (100-Continue, keep-alive recycle) run while `context` is mutably
+        // reborrowed for the stream, so they cannot reach `context.now`.
+        let now = context.now;
+        self.arm_timeout(now);
         let stream = &mut context.streams[stream_id];
         let parts = stream.split(&self.position);
         let kawa = parts.wbuffer;
@@ -592,7 +635,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             // with its request body. Do NOT call generate_access_log
                             // here — the final response will emit the access log.
                             // Calling it here would double-decrement http.active_requests.
-                            self.timeout_container.reset();
+                            self.timeout_deadline = now.checked_add(self.timeout_duration);
                             self.readiness.interest.insert(Ready::READABLE);
                             kawa.clear();
                             stream.metrics.backend_stop();
@@ -657,7 +700,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         remove_backend_stream(&mut context.backend_streams, token, stream_id);
                     }
                     if stream.context.keep_alive_frontend {
-                        self.timeout_container.reset();
+                        self.timeout_deadline = now.checked_add(self.timeout_duration);
                         if let StreamState::Linked(token) = old_state {
                             endpoint.end_stream(token, stream_id, context);
                         }
@@ -885,8 +928,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         );
         context.unlink_stream(stream);
         // Post: whatever backend token this stream was Linked to no longer
-        // lists it in the reverse index — `unlink_stream` is the single
-        // eviction point, so a subsequent end/close cannot double-remove it.
+        // lists it in the reverse index. `unlink_stream` is idempotent — it
+        // evicts only while the stream is still `Linked` — so a subsequent
+        // end/close cannot double-remove it. It is NOT the module's only
+        // eviction point: `remove_backend_stream` has direct callers here and
+        // in `h2.rs`. Extra eviction is harmless; what this post-condition
+        // claims is that THIS path evicted.
         // (The `state` field is still `Linked` here; the arms below retire it.)
         #[cfg(debug_assertions)]
         if let StreamState::Linked(token) = context.streams[stream].state {

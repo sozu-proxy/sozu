@@ -51,7 +51,7 @@
 //!   `SniPreread` state construction), matched by the two `-1` exits (the
 //!   routed upgrade in `upgrade_sni_preread`, and `close()`'s
 //!   `StateMarker::SniPreread` arm).
-//!   `test_tcp_sni_reject_then_valid_connection_not_limited`
+//!   `test_tcp_sni_per_ip_limiter_rejects_second_then_admits_after_release`
 //!   now asserts the gauge increments while a session is mid-preread AND
 //!   returns to a clean 0 after a reject-storm + a routed connection + a
 //!   limit-rejected connection -- against the pre-fix gauge (clamped to a
@@ -1834,6 +1834,48 @@ fn try_tcp_sni_large_payload_coalesced_with_hello_delivered_intact() -> State {
     if stopped && write_completed && byte_identical && routed_ok {
         State::Success
     } else {
+        // Strictly additive, and deliberately narrower than the equivalent
+        // block in `tls_tests::try_tls_connection_close_large_response`.
+        // The unconditional line above already names `write_completed`,
+        // `backend_contacted`, `byte_identical`, `routed_ok`,
+        // `tcp.sni_preread.routed`, `tcp.sni_preread.rejected.too_large`
+        // and the received/expected byte counts — and that line is exactly
+        // how sozu#1393 was diagnosed. Re-announcing any of them would add
+        // no datum. Two facts are missing from it, and only those are
+        // added here:
+        //
+        // 1. `stopped` is computed AFTER that line, so a stop failure is
+        //    the one conjunct with no output at all.
+        // 2. When the two byte counts match, `byte_identical=false` says
+        //    the payload diverged but not WHERE. For a guard whose subject
+        //    is the sozu#1279 close-before-flush truncation, truncation
+        //    against equal-length corruption is the load-bearing
+        //    distinction. The truncation case needs nothing here: the two
+        //    counts on the line above already state it.
+        //
+        // The verdict itself is unchanged.
+        //
+        // To SEE THIS RED: after `let received = backend_handle.join()...`,
+        // insert `let mut received = received; received[600_000] ^= 0xFF;`.
+        // Measured 2026-09-21: `TCP-SNI-LARGE-COALESCED: FAIL - payload
+        // CORRUPTED at matching length (1048630 bytes): first differing
+        // offset Some(600000)`, where the unconditional line above reported
+        // two identical counts and `byte_identical=false`.
+        if !stopped {
+            println!(
+                "TCP-SNI-LARGE-COALESCED: FAIL - worker did not stop cleanly (wait_for_server_stop returned false)"
+            );
+        }
+        if !byte_identical && received.len() == expected.len() {
+            let first_diff = received
+                .iter()
+                .zip(expected.iter())
+                .position(|(got, want)| got != want);
+            println!(
+                "TCP-SNI-LARGE-COALESCED: FAIL - payload CORRUPTED at matching length ({} bytes): first differing offset {first_diff:?}",
+                received.len()
+            );
+        }
         State::Fail
     }
 }

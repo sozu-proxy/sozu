@@ -105,13 +105,26 @@ pub trait SocketHandler {
 /// comes from [`sozu_command::logging::ansi_palette`] — single source of
 /// truth for every `log_*_context!` macro in the proxy.
 ///
-/// `peer` is a live `getpeername(2)` lookup: the SOCKET layer reports the
-/// kernel's view of the transport. The cached alternative is
-/// [`SocketHandler::peer_addr`], which [`log_socket_module_prefix`] and the
-/// `MUX-H2` context use instead. On a PROXY-protocol frontend the two
-/// deliberately differ — this slot shows the connection's peer, `peer_addr`
-/// shows the advertised client. `local`, `rtt`,
-/// `state` render per [`log_socket_module_prefix`]'s description.
+/// `peer` is [`SocketHandler::peer_addr`] — the address the handler cached,
+/// falling back to a live `getpeername(2)` only where it has none. Same
+/// preference order, and now the same single source, as
+/// [`log_socket_module_prefix`] and the `MUX-*` contexts, so every rendering
+/// of one connection names one host.
+///
+/// Spelled as a fully-qualified trait call to foreclose a latent hazard, not
+/// to fix a present one: `$self.peer_addr()` compiles clean today and passes
+/// every test, because no current expansion sits on a raw [`TcpStream`] — all
+/// of them are in `impl SocketHandler for FrontRustls`, which has no inherent
+/// `peer_addr` for method resolution to prefer. Add one on a bare `mio`
+/// [`TcpStream`] and the unqualified form silently picks mio's inherent
+/// method instead of this trait's: measured, that slot renders
+/// `peer=Ok(127.0.0.1:33587)` beside `local=Some(..)` — an `io::Result` where
+/// every other expansion renders an `Option`. The qualification makes that
+/// impossible rather than merely unlikely.
+///
+/// `local`, `rtt`, `state` render per [`log_socket_module_prefix`]'s
+/// description; `local` stays a live `getsockname(2)`, which survives what
+/// `getpeername(2)` does not.
 macro_rules! log_socket_context {
     ($self:expr) => {{
         let (open, reset, grey, gray, white) = ansi_palette();
@@ -130,7 +143,7 @@ macro_rules! log_socket_context {
             gray = gray,
             white = white,
             ulid = ulid,
-            peer = $self.socket_ref().peer_addr().ok(),
+            peer = crate::socket::SocketHandler::peer_addr($self),
             local = $self.socket_ref().local_addr().ok(),
             rtt = rtt,
             state = state,
@@ -1749,6 +1762,149 @@ mod tests {
             SocketHandler::peer_addr(&stream),
             Some(live_peer),
             "the contextless handler must report the kernel's answer"
+        );
+    }
+
+    /// The `peer=` slot of a `SOCKET` line is the handler's cached address,
+    /// the same one `MUX-H2` and `log_socket_module_prefix` render — not a
+    /// live `getpeername(2)`.
+    ///
+    /// Renders through [`log_socket_context!`] itself rather than through
+    /// [`SocketHandler::peer_addr`], because the accessor was already correct
+    /// for every impl while the macro consulted the kernel behind its back.
+    /// The three `peer_addr` tests above therefore all passed while a `SOCKET`
+    /// line still named the load balancer on a PROXY-protocol TLS frontend.
+    ///
+    /// Expanded against [`SessionTcpStream`] and not [`FrontRustls`], which is
+    /// the macro's only production caller, because a `FrontRustls` needs a
+    /// completed rustls handshake and this module builds no TLS. The macro is
+    /// generic over [`SocketHandler`], so what this pins is the slot's
+    /// resolution for every impl; that the TLS frontend really renders the
+    /// PROXY-advertised client on the wire is pinned end to end by
+    /// `e2e::tests::socket_log_context_tests::    /// test_tls_socket_log_peer_is_the_advertised_client`.
+    ///
+    /// The palette is empty here — `LOGGER_COLORED` defaults to `false` and
+    /// this test installs no logger — so the slot is matched as plain text. A
+    /// coloured palette would split `peer=` with an escape sequence and redden
+    /// the test rather than silently passing it.
+    ///
+    /// To SEE THIS RED: in [`log_socket_context!`], replace
+    /// `peer = crate::socket::SocketHandler::peer_addr($self),` with the
+    /// pre-fix `peer = $self.socket_ref().peer_addr().ok(),`.
+    #[test]
+    fn log_socket_context_renders_the_cached_peer_not_a_live_lookup() {
+        let (_listener, stream, live_peer) = connected_loopback_stream();
+        let cached: SocketAddr = CACHED_PEER
+            .parse()
+            .expect("the cached peer literal must parse");
+        let handler = SessionTcpStream::new(stream, Ulid::generate(), Some(cached));
+
+        // Premise: the live lookup is healthy and disagrees with the cache, so
+        // neither assertion below can pass for the wrong reason.
+        assert_eq!(
+            handler.socket_ref().peer_addr().ok(),
+            Some(live_peer),
+            "the test socket must be genuinely connected, so a live lookup succeeds"
+        );
+        assert_ne!(
+            cached, live_peer,
+            "the cached and live addresses must differ for this test to discriminate"
+        );
+
+        // `&handler`, not `handler`: the macro's `peer` slot is a
+        // fully-qualified `SocketHandler::peer_addr` call, so the expansion
+        // binds a shared reference. Production call sites pass `self` from a
+        // `&mut self` method and reach the same place by reborrow.
+        let rendered = log_socket_context!(&handler);
+
+        assert!(
+            rendered.contains(&format!("peer=Some({cached})")),
+            "the SOCKET peer= slot must render the cached address; rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("peer=Some({live_peer})")),
+            "the SOCKET peer= slot must not render a live getpeername(2); rendered: {rendered}"
+        );
+        // Scope guard: this change touches `peer` and nothing else. `local` is
+        // still `getsockname(2)` on the same socket, which is the stream's own
+        // address and never the cached peer.
+        assert!(
+            rendered.contains(&format!(
+                "local=Some({})",
+                handler
+                    .socket_ref()
+                    .local_addr()
+                    .expect("a connected socket has a local address")
+            )),
+            "the SOCKET local= slot must stay getsockname(2); rendered: {rendered}"
+        );
+    }
+
+    /// A socket that was never connected, and therefore one whose
+    /// `getpeername(2)` fails with `ENOTCONN` *deterministically*.
+    ///
+    /// This is the one reliable way to stage a failing live lookup in a test.
+    /// The obvious alternative — connect to a closed port and wait for the RST
+    /// — is the race `connected_loopback_stream`'s note already rules out:
+    /// whether the kernel has collected the RST yet, and so whether
+    /// `getpeername(2)` has started refusing, is not something a test may
+    /// assert on. An unconnected socket is in the refusing state from birth.
+    fn unconnected_stream() -> TcpStream {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+            .expect("a test socket must be creatable");
+        socket
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        TcpStream::from_std(std::net::TcpStream::from(socket))
+    }
+
+    /// The `peer=` slot survives a live lookup that FAILS, which is the arm an
+    /// operator meets during an incident: `getpeername(2)` answers `ENOTCONN`
+    /// once the peer has reset, so the pre-fix macro rendered `peer=None` on
+    /// exactly the error lines being read at the time.
+    ///
+    /// Staged with a never-connected socket rather than a reset one, because
+    /// only the former refuses deterministically — see
+    /// [`unconnected_stream`]. A peer reset is one way to reach that state;
+    /// what this pins is the rendering once the socket is in it, which is the
+    /// part the macro owns.
+    ///
+    /// The companion
+    /// [`log_socket_context_renders_the_cached_peer_not_a_live_lookup`] covers
+    /// the other half, where the live lookup SUCCEEDS and disagrees. The two
+    /// are separate tests because a single one cannot be red for both reasons,
+    /// and the PROXY-protocol defect lives in the succeeding half.
+    ///
+    /// To SEE THIS RED: in [`log_socket_context!`], replace
+    /// `peer = crate::socket::SocketHandler::peer_addr($self),` with the
+    /// pre-fix `peer = $self.socket_ref().peer_addr().ok(),`. The slot
+    /// collapses to `peer=None`.
+    #[test]
+    fn log_socket_context_renders_the_cached_peer_when_the_live_lookup_fails() {
+        let stream = unconnected_stream();
+        let cached: SocketAddr = CACHED_PEER
+            .parse()
+            .expect("the cached peer literal must parse");
+
+        // Premise: the live lookup really is refusing, so the assertion below
+        // cannot pass for the wrong reason.
+        assert_eq!(
+            stream.peer_addr().ok(),
+            None,
+            "an unconnected socket must refuse getpeername(2)"
+        );
+
+        let handler = SessionTcpStream::new(stream, Ulid::generate(), Some(cached));
+        let rendered = log_socket_context!(&handler);
+
+        assert!(
+            rendered.contains(&format!("peer=Some({cached})")),
+            "the SOCKET peer= slot must survive a failed live lookup; rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("peer=None"),
+            "the SOCKET peer= slot must not collapse to None while a cache exists; \
+             rendered: {rendered}"
         );
     }
 }

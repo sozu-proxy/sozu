@@ -318,5 +318,5 @@ cargo test -p sozu-e2e
 | `e2e/src/mock/sync_backend.rs` | Manually-stepped backend for precise ordering |
 | `e2e/src/mock/async_backend.rs` | Auto-responding backend for throughput tests |
 | `e2e/src/mock/chunked_flush_h1_backend.rs` | Keep-alive H1 backend with TCP_NODELAY + per-chunk `flush()` + sleep for the H2 large-asset repro suite (C1/C2/C3) |
-| `lib/src/server.rs:1178` | `notify_activate_listener` — SCM FD activation |
-| `command/src/state.rs:534` | `generate_requests` — state replay including listeners |
+| `lib/src/server.rs` | `Server::notify_activate_listener` — SCM FD activation |
+| `command/src/state.rs` | `ConfigState::generate_requests` — state replay including listeners |

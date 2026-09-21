@@ -282,8 +282,8 @@ impl Stream {
     /// on the parent `Mux`/connection and the backend socket lives on
     /// `Router.backends.get(token)`. Each caller snapshots the two
     /// `getsockopt(TCP_INFO)` values from the sockets it can reach, mirroring
-    /// the inline pattern used by the `kawa_h1`, `pipe`, and TCP-frontend
-    /// access-log sites.
+    /// the inline pattern used by the `pipe` and TCP-frontend access-log
+    /// sites.
     pub fn generate_access_log<L>(
         &mut self,
         error: bool,
@@ -324,9 +324,14 @@ impl Stream {
             "request_counted must only clear here, never spontaneously set"
         );
         if error {
-            // Labelled with `(cluster_id, backend_id)`; see the matching
-            // emission in `kawa_h1::log_request_error` for the cardinality
-            // contract (`metrics::filter_labels_for_detail`).
+            // Labelled with `(cluster_id, backend_id)`. Since the unreachable
+            // `kawa_h1::Http` session was removed (sozu#1346) this is the SOLE
+            // `names::http::ERRORS` emission site in the crate, so the labels
+            // written here are the whole cardinality contract for `http.errors`;
+            // the backend label is dropped centrally, by detail level, in
+            // `metrics::filter_labels_for_detail` (`lib/src/metrics/mod.rs:44`).
+            // `pipe::log_request_error` is a different metric
+            // (`names::pipe::ERRORS`) and is not a second source of this one.
             incr!(
                 names::http::ERRORS,
                 context.cluster_id.as_deref(),
@@ -349,7 +354,9 @@ impl Stream {
         // Save the HTTP status code of the backend response. Emits the bucket
         // counter unconditionally, plus the per-code counter from
         // `crate::metrics::http_status_code_metric_name` when the status is on
-        // the short-list shared with the H1 path (`save_http_status_metric`).
+        // the short-list that file maintains. This is the ONLY HTTP status
+        // bucketer left since `kawa_h1::save_http_status_metric` was removed
+        // with the unreachable H1 session (sozu#1346, 2026-09-20).
         let bucket_key = if let Some(status) = context.status {
             match status {
                 100..=199 => names::http::STATUS_1XX,
@@ -387,12 +394,26 @@ impl Stream {
         };
 
         let listener = listener.borrow();
-        let tags = context.authority.as_deref().and_then(|host| {
-            let hostname = match host.split_once(':') {
-                None => host,
-                Some((hostname, _)) => hostname,
-            };
-            listener.get_tags(hostname)
+        // Tags resolved by the router from the frontend rule that actually
+        // matched this request win: they are the only ones that can be
+        // right for a wildcard, regex, ported or differently-cased
+        // frontend. The listener's authority-keyed map is written under
+        // the frontend RULE's hostname and read here under the REQUEST's
+        // authority, so it only ever answers for an exact literal
+        // frontend (sozu#1379).
+        //
+        // It stays as the fallback for a request that never reached
+        // routing at all — a malformed request, an unknown host, a TLS
+        // SNI/authority mismatch — where there is no matched frontend to
+        // ask and the pre-existing best-effort answer is better than none.
+        let tags = context.tags.as_deref().or_else(|| {
+            context.authority.as_deref().and_then(|host| {
+                let hostname = match host.split_once(':') {
+                    None => host,
+                    Some((hostname, _)) => hostname,
+                };
+                listener.get_tags(hostname)
+            })
         });
 
         log_access! {
@@ -426,5 +447,89 @@ impl Stream {
             otel: None,
         };
         self.metrics.register_end_of_session(&context.log_context());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    use rusty_ulid::Ulid;
+
+    use super::*;
+    use crate::protocol::mux::test_support::TestListener;
+
+    /// A backend response status line is wire data, not a Sōzu-side invariant.
+    ///
+    /// kawa 0.7.1 reads the status with `take(3)` followed by
+    /// `str::parse::<u16>()` and applies no range check
+    /// (`kawa/src/protocol/h1/parser/primitives.rs:194-203`); the
+    /// `Kind::Response` arm stores the resulting `code` verbatim
+    /// (`.../h1/parser/mod.rs:249-258`). `"000".parse::<u16>()` is `Ok(0)`, so
+    /// a backend that answers `HTTP/1.1 000 …` drives `code == 0` through
+    /// [`HttpContext::on_response_headers`] into `context.status` and then into
+    /// the status bucketer at the top of [`Stream::generate_access_log`], which
+    /// buckets it as `http.status.other` — exactly what the catch-all arm is
+    /// for.
+    ///
+    /// Ported on 2026-09-20 from
+    /// `kawa_h1::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`,
+    /// which asserted the same property against `kawa_h1::save_http_status_metric`.
+    /// That function and the `kawa_h1::Http` session it belonged to were removed
+    /// with the unreachable H1 state machine (sozu#1346), so the assertion now
+    /// guards the LIVE mux bucketer instead of a path no binary could enter.
+    ///
+    /// To SEE THIS RED: in [`Stream::generate_access_log`], insert
+    /// `debug_assert!((100..=999).contains(&status), "generate_access_log got a
+    /// non-3-digit status: {status}");` as the first statement of the
+    /// `if let Some(status) = context.status` bucket arm — this test then panics
+    /// with `generate_access_log got a non-3-digit status: 0`, i.e. a panic on
+    /// network input in every debug, test, e2e and fuzz build (sozu#1279).
+    #[test]
+    fn a_backend_status_line_below_100_is_bucketed_not_asserted() {
+        setup_test_logger!();
+        const RESPONSE: &[u8] = b"HTTP/1.1 000 Nope\r\nContent-Length: 0\r\n\r\n";
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2, 4096)));
+        let context = HttpContext::new(
+            Ulid::generate(),
+            Ulid::generate(),
+            Protocol::HTTP,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                54321,
+            )),
+            "SERVERID".to_owned(),
+            "Sozu-Id".to_owned(),
+            false,
+            false,
+        );
+        let mut stream =
+            Stream::new(Rc::downgrade(&pool), context, 65535).expect("test stream checkout");
+
+        let space = stream.back.storage.space();
+        space[..RESPONSE.len()].copy_from_slice(RESPONSE);
+        stream.back.storage.fill(RESPONSE.len());
+        kawa::h1::parse(&mut stream.back, &mut stream.context);
+
+        // Reachability: the value handed to the metric bucketer came off the
+        // wire through the real parser and the real response-header callback,
+        // not from a hand-written `Some(0)`.
+        assert_eq!(
+            stream.context.status,
+            Some(0),
+            "kawa must surface the backend's out-of-range status verbatim"
+        );
+
+        // The call itself is the assertion: with a range precondition in place
+        // this panics instead of incrementing `http.status.other`.
+        stream.generate_access_log(
+            false,
+            None,
+            Rc::new(RefCell::new(TestListener::new())),
+            None,
+            None,
+        );
     }
 }

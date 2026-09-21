@@ -99,6 +99,52 @@ It will show global statistics about sozu, workers and clusters metrics.
 sozu --config /etc/sozu/config.toml query metrics
 ```
 
+## Query certificates
+
+```bash
+# every certificate the main process knows about
+sozu --config /etc/sozu/config.toml certificate list
+
+# the certificate with this fingerprint
+sozu --config /etc/sozu/config.toml certificate list --fingerprint <hex>
+
+# the certificate Sōzu would present for this host
+sozu --config /etc/sozu/config.toml certificate list --domain foo.example.com
+
+# ask the workers instead of the main process (slower)
+sozu --config /etc/sozu/config.toml certificate list --domain foo.example.com --workers
+```
+
+`--domain` answers **"which certificate would Sōzu present for this host?"**,
+not "which certificates carry this exact SAN?". The host is resolved through
+the same SNI trie the TLS resolver uses, so a `*.example.com` certificate
+answers a query for `foo.example.com`. Consequences of that reading:
+
+- The lookup is **wildcard-aware but not a prefix or substring search.**
+  `*.example.com` answers for `foo.example.com`, and not for the apex
+  `example.com`, nor for `deep.foo.example.com` — `*` covers exactly one
+  label. Regex hostname labels resolve the same way they do at handshake.
+- The host and the stored certificate names are compared **ASCII
+  case-insensitively** (RFC 4343), so `--domain FOO.Example.COM` and
+  `--domain foo.example.com` answer identically.
+- **At most one certificate per HTTPS listener** comes back, because a trie
+  lookup resolves to a single entry — the answer is the union over listeners,
+  one entry each. A host served by two certificates on the *same* listener
+  therefore reports one of them. The main process does not retain certificate
+  expiry, so it cannot reproduce the worker resolver's longest-lived tie-break
+  and reports a reproducible choice instead; add `--workers` to see the
+  certificate each worker's resolver actually selected.
+- Passing `--fingerprint` and `--domain` together is not a conjunction:
+  `--domain` wins and `--fingerprint` is ignored. The one exception is
+  `--fingerprint <hex> --domain <host> --workers`, where the worker answers
+  the fingerprint query by **exact SAN equality** on the domain instead
+  (`lib/src/server.rs` intercepts any filter carrying a fingerprint). Query
+  one filter at a time.
+
+To ask the other question — "which certificates carry this exact SAN?" —
+there is no flag today; list everything and filter on `names` with
+`--json`.
+
 ## Dump and restore state
 
 If sozu configurations (clusters, frontends & backends) are not written in the config file, you can save sozu state to restore it later.

@@ -283,3 +283,16 @@ connect(12, {sa_family=AF_INET, sin_port=htons(1052), sin_addr=inet_addr("127.0.
  > /usr/lib/libc.so.6(__libc_start_main+0x8a) [0x27d8a]
  > /path/to/sozu/target/debug/sozu(_start+0x25) [0x17bca5]
 ```
+
+> **This capture predates the mux migration.** It is kept verbatim because it
+> is recorded output, not prose. The frames it names — `kawa_h1::Http<Front,L>`
+> and its `ready_inner` / `connect_to_backend` / `backend_from_request` /
+> `get_backend_for_sticky_session` methods — no longer exist: that session
+> state machine became unreachable once `HttpStateMachine` gained its `Mux`
+> variant, and it was removed on 2026-09-20 (sozu#1346). On a current build the
+> same `connect` syscall is reached through
+> `sozu_lib::protocol::mux::router::Router::connect`
+> (`lib/src/protocol/mux/router.rs`), which calls `Router::backend_from_request`
+> (`lib/src/protocol/mux/router.rs`) — its only call site — and connects the
+> socket it returns, all under the mux `ready` pass. The
+> technique this section teaches is unchanged.

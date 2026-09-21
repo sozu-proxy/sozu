@@ -9,19 +9,23 @@
 use std::{
     io::Write as _,
     net::{IpAddr, SocketAddr},
+    rc::Rc,
     str::from_utf8,
     sync::Arc,
 };
 
 use rusty_ulid::Ulid;
-use sozu_command_lib::logging::LogContext;
+use sozu_command_lib::logging::{CachedTags, LogContext};
 
 use crate::metrics::names;
 use crate::{
     Protocol, RetrieveClusterError,
     pool::Checkout,
     protocol::{
-        http::{GenericHttpStream, Method, parser::compare_no_case},
+        http::{
+            GenericHttpStream,
+            parser::{Method, compare_no_case},
+        },
         pipe::WebSocketContext,
     },
 };
@@ -409,9 +413,28 @@ pub struct HttpContext {
     /// `None` falls back to 301 for the legacy
     /// `cluster.https_redirect = true` path. Closes #1009.
     pub redirect_status: Option<u16>,
+    /// Access-log tags of the frontend rule that matched this request,
+    /// stashed by the routing layer from `RouteResult::tags` (see
+    /// `mux/router.rs::route_from_request`) and read back by
+    /// `mux/stream.rs::generate_access_log`.
+    ///
+    /// The matched frontend is the only correct owner of these tags: the
+    /// operator configures them per frontend RULE (`*.example.com`,
+    /// `/foo.*/.example.com`, a Pre/Post string), while the request only
+    /// ever carries a concrete authority. Resolving them here — rather
+    /// than by looking the authority up in the listener's
+    /// `BTreeMap<String, CachedTags>` — is what makes a wildcard, regex,
+    /// ported or differently-cased frontend log its tags at all
+    /// (sozu#1379). `Rc` because the same `CachedTags` is shared by every
+    /// stream routed to that frontend, and because it must outlive a
+    /// frontend removed mid-request.
+    ///
+    /// `None` until the request is routed, and for a request that matched
+    /// no frontend at all.
+    pub tags: Option<Rc<CachedTags>>,
     /// Stable, structured discriminator surfaced as the access-log
     /// `message` field when the session terminates on a timeout. Set by
-    /// the timeout handlers in `kawa_h1::timeout` and `MuxState::timeout`
+    /// the `MuxState::timeout` handler
     /// **before** the default-answer or `forcefully_terminate_answer`
     /// path consumes it. The vocabulary is operator-visible API once
     /// shipped — see the access-log section of `doc/configure.md` for
@@ -539,6 +562,7 @@ impl HttpContext {
             retry_after_seconds: None,
             frontend_redirect_template: None,
             redirect_status: None,
+            tags: None,
             access_log_message: None,
         }
     }
@@ -562,24 +586,55 @@ impl HttpContext {
         let blocks_at_entry = request.blocks.len();
 
         // Defense-in-depth against CL.TE request smuggling (CWE-444, RFC 9110 §7.6 /
-        // RFC 9112 §6.1; reopen of #726). kawa never elides the Transfer-Encoding header
-        // and evaluates each TE field line independently, so we must reason about ALL
-        // surviving TE headers, not kawa's aggregate `body_size` (which a leading
-        // `chunked` line can latch while a later non-chunked line rides along). Reject:
+        // RFC 9112 §6.1; reopen of #726). kawa leaves every Transfer-Encoding field line
+        // in place, so we reason about ALL surviving TE headers rather than its aggregate
+        // `body_size`. Reject:
         //   * more than one non-elided TE header  (RFC 9112 §6.1: chunked must be applied
-        //     once and be the final coding; multiple field lines can't be safely
-        //     reconciled here and a Chunked latch would leave a second line forwarded), or
-        //   * a TE header whose raw value does not literally end in `chunked`, or
+        //     once and be the final coding; several field lines cannot be safely
+        //     reconciled here, and forwarding them all hands the backend the combining
+        //     problem we just declined to solve), or
+        //   * a TE header whose field value does not end in `chunked`, or
         //   * a TE header present while kawa did not adopt chunked framing.
         //
-        // The literal-suffix check is what keeps OWS-obfuscated codings (`chunked\t`,
-        // `chunked `) and non-final codings (`chunked, gzip`) fail-closed. kawa >=0.7.0
-        // OWS-trims the final coding, so it frames `chunked\t` AS chunked and elides the
-        // Content-Length — but it still forwards the TE field line *verbatim*. A backend
-        // that does not itself trim OWS would then see neither a coding it recognizes nor
-        // a Content-Length, and would read our chunked body bytes as a pipelined request:
-        // a TE.TE desync. Framing the message correctly is kawa's job; refusing to forward
-        // an obfuscated coding we had to normalize to understand is ours.
+        // WHICH CLAUSE ACTUALLY FIRES, against the kawa this workspace pins (`^0.7.1`,
+        // locked at 0.7.1). Read from kawa 0.7.1's `process_headers`
+        // (its `src/protocol/h1/parser/mod.rs`), not measured here: kawa resolves the
+        // combined Transfer-Encoding BEFORE this callback and, for a REQUEST whose
+        // combined final coding is not chunked, errors the parse and returns without
+        // calling `callbacks.on_headers` at all (RFC 9112 §6.3). It judges the LAST TE
+        // line, per RFC 9110 §5.3 combining, so an earlier `chunked` line can no longer
+        // latch chunked framing on its own — that latch was a kawa 0.7.0 shape.
+        //   * the COUNT clause is the one that fires on traffic kawa accepted:
+        //     `Transfer-Encoding: identity` followed by `Transfer-Encoding: chunked`
+        //     combines to a chunked-final coding, so kawa parses it clean, and forwarding
+        //     both lines is what we refuse.
+        //   * the other two cannot fire on a request kawa accepted: a surviving TE line is
+        //     chunked-final (or kawa already refused the request), and `body_size` is then
+        //     Chunked. `chunked, gzip` never reaches this code — kawa refused it. They are
+        //     defense in depth against a kawa regression. Keep them; do not describe them
+        //     as closing a live hole.
+        //
+        // OWS IS NOT AMBIGUITY, and this guard must not treat it as one. kawa >=0.7.1
+        // trims OWS from every field value at parse time (`trim_ows` in its
+        // `parser/primitives.rs`, RFC 9112 §5), so `header.val` here already reads
+        // `chunked` for `Transfer-Encoding: chunked\t`: the suffix check passes,
+        // `body_size` is Chunked, the request is ACCEPTED — and it reaches the backend
+        // spelled `chunked`, with the Content-Length elided. Measured:
+        // `test_h1_te_ows_forwarded_canonically` (`e2e/src/tests/h1_security_tests.rs`)
+        // sends exactly that request and pins the forwarded bytes. An obfuscated coding
+        // over a valid chunked body is legal traffic; refusing it would refuse legal
+        // traffic.
+        //
+        // kawa 0.7.0 is what the suffix check was written against: it framed on the
+        // trimmed reading but forwarded the field line verbatim, so a backend that did not
+        // itself trim saw neither a coding it recognized nor a Content-Length, and read
+        // our chunked body as a pipelined request — a TE.TE desync. 0.7.1 closed that at
+        // the source. Do not reintroduce a trailing-OWS rejection here to compensate.
+        //
+        // The `trailing-tab` / `trailing-space` rows of that module's `TE_SMUGGLING_CASES`
+        // still answer 400, for their invalid chunked BODY (`Hello` is not a chunk) and
+        // not through this predicate — as that table's own doc comment says. Their 400 is
+        // not evidence that this guard rejects an obfuscated coding.
         let (te_count, te_all_suffix_chunked) = {
             const CHUNKED: &[u8] = b"chunked";
             let buf0 = request.storage.buffer();

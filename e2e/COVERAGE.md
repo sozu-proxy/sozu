@@ -144,36 +144,42 @@ at all, and the reason is structural rather than a missing helper — a
 test written against it would pass for the wrong reason. The mechanism
 is recorded here so the next person does not re-derive it.
 
-- **`protocol::kawa_h1::Http`, and everything only it reaches**,
-  including `kawa_h1::save_http_status_metric`. No session state machine
-  has a variant that holds it: `HttpStateMachine` is
-  `Expect | Mux | WebSocket` (`lib/src/http.rs:63`) and
-  `HttpsStateMachine` is `Expect | Handshake | Mux | WebSocket`
-  (`lib/src/https.rs:81`). H1 proxying runs through `protocol/mux`
-  (`MuxClear` / `MuxTls`), not through `kawa_h1`. `Http::new` has zero
-  code callers in the workspace; the only compiled reference to the type
-  is the `pub use` re-export at `lib/src/protocol/mod.rs:23`, and the
-  only other mentions are prose
-  (`lib/src/protocol/kawa_h1/LIFECYCLE.md:62`) and two `assert_size!`
-  lines sitting inside block comments (`lib/src/http.rs:1892`,
-  `lib/src/https.rs:3084`). It is therefore unreachable in **any**
-  binary, not merely under e2e — measured by planting an unconditional
-  `panic!` at the top of `save_http_status_metric` and running the HTTP
-  e2e tests, which still passed.
+- **`protocol::kawa_h1::Http` — resolved by deletion on 2026-09-20, kept
+  here as the worked example.** The `Http` session state machine, its
+  `SessionState` impl, `TimeoutStatus`, `ResponseStream`,
+  `save_http_status_metric`, `handle_connection_result` and the whole
+  `kawa_h1::diagnostics` module were unreachable in **any** binary: no
+  session state machine had a variant holding one — `HttpStateMachine` is
+  `Expect | Mux | WebSocket` (`lib/src/http.rs`) and `HttpsStateMachine`
+  is `Expect | Handshake | Mux | WebSocket` (`lib/src/https.rs`) — and
+  `Http::new` had zero code callers under either module spelling
+  (`crate::protocol::kawa_h1::` and the `crate::protocol::http::`
+  re-export). That was measured, not inferred: an unconditional
+  `panic!("PROBEALWAYS …")` planted at the top of both
+  `save_http_status_metric` and `Http::new` fired 0 times across four real
+  proxied HTTP/HTTPS e2e sessions, while the same planted binary panicked
+  immediately under the function's own unit test (the positive control).
+  sozu#1346 removed all of it; sozu#1347, a frontend timeout consumed
+  without re-arming, was closed by that removal rather than patched.
 
   The rest of the module is *not* dead and *is* e2e-reachable:
-  `kawa_h1::editor::HttpContext`, `kawa_h1::answers` and
-  `kawa_h1::parser` are what `mux` builds on. Only the `Http` session
-  state and the helpers nothing else calls are stranded.
+  `kawa_h1::editor::HttpContext`, `kawa_h1::answers` (`HttpAnswers`,
+  `DefaultAnswerStream`, `merge_legacy_into_map`), `kawa_h1::parser`
+  (`Method`, `hostname_and_port`) and the `DefaultAnswer` enum are what
+  `mux` builds on.
 
-  Consequence for coverage: a status-handling defect on that path can
-  only be guarded by a unit test —
-  `kawa_h1::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`.
-  Its control-plane-reachable sibling, an operator answer template
-  carrying an out-of-range status, *is* e2e-covered by
+  Consequence for coverage, and the reusable lesson: the unit test that
+  guarded the dead bucketer,
+  `kawa_h1::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`,
+  was ported onto the live path as
+  `mux::stream::tests::a_backend_status_line_below_100_is_bucketed_not_asserted`
+  rather than deleted with the code — a unit test on an unreachable
+  function reads as protocol coverage and is not. Its
+  control-plane-reachable sibling, an operator answer template carrying an
+  out-of-range status, *is* e2e-covered by
   `tests::h1_security_tests::test_h1_custom_answer_with_out_of_range_status_does_not_kill_the_worker`.
-  Do not write an e2e test that drives a backend status line and claim
-  it guards `save_http_status_metric`: it passes either way.
+  Before writing a test for a defect on a quiet path, plant the `panic!`
+  and run the suite: it settles reachability in one run.
 
 - **Rendered log content, including the `peer=` slot of a `MUX-H2` line
   — no longer out of reach.** This entry used to say the harness could
@@ -215,6 +221,35 @@ is recorded here so the next person does not re-derive it.
   and none names the connection's raw TCP peer. Under the pre-fix macro
   it measures 27 `peer=` slots, 0 advertised, 26 raw and one `peer=None`
   — the `ENOTCONN` rendering the fix also removes.
+
+  Second worked example, taking the other branch of cost 1 below:
+  `tests::socket_log_context_tests::test_tls_socket_log_peer_is_the_advertised_client`
+  pins the `peer=` slot of a `SOCKET` line on the same kind of frontend.
+  Every `log_socket_context!` expansion in `lib/src/socket.rs` is an
+  `error!`, and each needs an abnormal condition, so a healthy TLS
+  session emits no `SOCKET` line at ANY level and raising one cannot
+  help. That test therefore stays at plain `"error"` and provokes
+  instead: it establishes the session, then writes one undecryptable TLS
+  record straight onto the TCP socket, which reaches
+  `FrontRustls::socket_read`'s `process_new_packets` arm while the
+  connection underneath is still `ESTABLISHED`. Keeping the connection
+  healthy is the point — it makes `getpeername(2)` succeed and answer the
+  wrong address, which is the half of the defect that is not `ENOTCONN`.
+  Under the pre-fix macro it measures 1 `SOCKET` line, 0 advertised, 1
+  raw. Keeping the connection alive is load-bearing for WHICH half is
+  proven rather than for redness: a dead-socket provocation would still
+  redden the test, since `peer=None` also fails the "every slot names the
+  advertised client" check; what only a live connection buys is the
+  negative assertion that no slot names the raw TCP peer. The `ENOTCONN`
+  half is pinned by the unit test
+  `socket::tests::log_socket_context_renders_the_cached_peer_when_the_live_lookup_fails`
+  instead, staged with a never-connected socket because only that refuses
+  `getpeername(2)` deterministically.
+  One claim here is reasoned, not measured, and is flagged as such in the
+  test's own module note: that a corrupt record sent before the server
+  has read the client's `Finished` would fail inside `protocol/rustls.rs`
+  and log `RUSTLS` rather than `SOCKET`. That is read off the state
+  machine; no test drives it.
 
   **What it costs.** Four things, all measured:
 
@@ -303,6 +338,31 @@ every window but exceeds it cumulatively — is what catches a window that
 stopped advancing, which is the false-positive half of the CVE control
 and the failure mode a frozen clock produces.
 
+**A wall-clock budget is quantised — spend the quantum, do not round it.**
+`test_issue_810_timeout` asserted that a soft-stop with one idle
+keep-alive session completes inside 100 ms, repeated 100 times, one
+breach failing the run. It reddened on GitHub runners while every failing
+iteration still reported a correct proxy exchange (#1376). 100 ms is not
+a margin here, it is exactly one tick of the two grids the shutdown path
+runs on: `Server::reset_loop_time_and_get_timeout` clamps the poll
+timeout to a 100 ms `shutdown_tick` while `shutting_down.is_some()` and
+`shut_down_sessions` runs once per loop iteration, so any iteration after
+the first costs up to a full 100 ms `poll()` block; and the timer wheel's
+default `tick_ms` is 100 ms with `duration_to_tick` rounding to the
+NEAREST tick, displacing a timer-driven step by
+`(delay_ms + tick_ms / 2) mod tick_ms` ∈ `[0, 99]` ms. The budget is now
+`ISSUE_810_SHUTDOWN_BUDGET`, three ticks — one for the re-poll, one for
+grid displacement, one for scheduler slack on a contended 4-vCPU host —
+and it is still 1/33 of `DEFAULT_REQUEST_TIMEOUT` and 1/200 of
+`DEFAULT_FRONT_TIMEOUT`, so it keeps discriminating what issue 810 is
+about: a shutdown that waits for a session timeout misses it by two
+orders of magnitude, not by a tick. Derive such a bound from the
+mechanism's own quantum; a number raised until CI goes green tells you
+nothing about what it still catches. The same commit asserts the four
+exchange counters that iteration printed and never checked, so an
+iteration where the client never got its response can no longer be timed
+as if it had.
+
 **A deadline needs an event to be observed.** The SETTINGS-ACK watchdog
 is evaluated inside `readable()` and `flush_pending_control_frames()`
 only, so a silent connection is never re-examined and the GOAWAY does not
@@ -310,6 +370,166 @@ arrive on its own. The test pokes with a PING every 500 ms past the
 budget; a test that merely waits on a quiet socket would time out and
 read as a missing deadline. Check where a deadline is evaluated before
 concluding it did not fire.
+
+## Status assertions: what a HEADERS block can falsify
+
+An H2 response status is a decode, not a search. The seven `:status` rows
+of the RFC 7541 static table (indices 8..=14 → 200, 204, 206, 304, 400,
+404, 500) are emitted as a single indexed byte; every other status is a
+literal over one of those same name indices, three unhuffmanned ASCII
+digits long. RFC 9113 §8.3.2 puts the field first in the block, so
+`decode_status` (`e2e/src/tests/h2_utils.rs`) reads byte 0 and stops.
+Nothing later in the block can be mistaken for the status.
+
+**What the old byte scan could not falsify.** Until 2026-09-20 three
+copies of `payload.windows(3).any(|w| w == b"421")` stood in this suite.
+That question has no negative space: a plain 200 answers yes whenever the
+digits happen to sit side by side anywhere in the field block, and one
+header guarantees they eventually will. Every Sōzu response carries
+`Sozu-Id`, the session's 26-character Crockford base-32 ULID
+(`HttpContext::on_response_headers`, `lib/src/protocol/kawa_h1/editor.rs`),
+whose alphabet is `0-9A-Z`-minus-`ILOU` and which the encoder writes as plain ASCII — a
+captured example is `01M2Z5AGKTYKJM9MFQY89EJMJ9`. Any given 3-digit
+needle hits about once in 1400 ULIDs. The first ten characters are the
+generation timestamp in milliseconds, so a hit there is not independent
+between runs: it holds for 1 ms, 32 ms, ~1 s, ~33 s or ~17.5 min
+depending on which triple it occupies — and ~9.3 h, ~12.4 d or ~1.1 y for
+the three slowest. All 24 windows are a priori equally likely — the slow
+ones are not rarer per draw, their characters are simply fixed for a
+whole era, so a hit there is a property of the epoch rather than of a
+run. Every response generated inside the window carries it.
+
+That is the whole of issue #1353. `strict-off FAIL: infra_ok=true
+got_ok=true got_421=true metric_stable=true foo_reqs=0 bar_reqs=1` is not
+a race between a 421 and a proxied response — it is one proxied 200 whose
+correlation id contained `421`. It is **not** a flake and does not belong
+on a flake list: the wire was right, the reading was wrong, and the
+reading is fixed. Contrast the genuinely load-sensitive entries in this
+suite, which assert on a wall-clock budget rather than on content.
+
+**The dangerous copy was not the one in the reported test.**
+`try_strict_sni_binding_toggle` (`e2e/src/tests/listener_update_tests.rs`)
+ran the same scan and fed its result into `got_rejection_or_421`, which
+gates `phase1_ok` — the assertion that a `strict_sni_binding=true`
+listener
+*rejects* a mismatched `:authority`. (That term then read
+`got_421 || contains_goaway(..)`; see the `#1381` section below for why
+the `contains_goaway` arm had to be narrowed too.) A ULID false positive
+there turns a
+security assertion silently green rather than red. Direction matters when
+pricing one of these: #1353 cost a re-run, this one would have cost the
+guard. Both are decoded now, along with `h2_tests.rs`, whose status check used
+to be ORed with a match on the answer body (`""status_code": 404"`).
+That disjunct widened the needle rather than guarding it and has been
+removed: `test_h2_default_answer_terminates_stream` passes on the
+decoded `:status` alone.
+
+**Keep the negative half — and check that you have one.**
+`h2_status_checks_decode_the_status_field_not_any_matching_bytes` asserts
+in both directions, but only after a correction worth recording. Its
+first fixture, a captured 200 whose `Sozu-Id` contains `421`, falsifies
+the digit scan. Its second, a captured 421, was *not* enough to falsify
+the companion `payload.contains(&0x88)` scan in `headers_ok_response`,
+because that captured block is pure ASCII and so holds no `0x88` byte.
+Reverting that one function left the test green — an assertion that
+looked like a guard and was not. The third fixture,
+`stray_indexed_200`, is a captured 421 block with a trailing `0x88`.
+When a `To SEE THIS RED:` names two mutations, run both.
+
+**`0x88` in a block does not mean `:status 200`.** An earlier draft of
+this section justified that third fixture by claiming the byte was
+unreachable off the wire. It is not, and the correction matters more
+than the fixture. RFC 7541 §5.1 encodes a string length ≥ 127 as a
+7-bit prefix plus continuation octets of `(len % 128) + 128`, i.e.
+`0x80..=0xFF` by construction: a 263-byte header value writes
+`7f 88 01`, and 1542 distinct lengths below 100 000 put a `0x88` octet
+in the block. A raw value byte ≥ `0x80` is a second route —
+`lib/src/protocol/mux/converter.rs:388-391` rejects only
+`0x00..=0x08 | 0x0A..=0x1F | 0x7F` and passes everything else through
+verbatim. `headers_ok_response` runs on *proxied* responses in the
+strict-off and coalescing tests, where backend headers are arbitrary, so
+a 263-byte `Location`, `Set-Cookie` or CSP header was enough to make the
+old scan report a 2xx on a 421. The narrow claim — `0x88` cannot occur
+inside an unhuffmanned ASCII *value* — is the only true one.
+
+**Converted on 2026-09-20 — and one of them was live.** The 19
+indexed-status byte probes that stood here (2 × `contains(&0x88)`, 17 ×
+`contains(&0x8D)`, in `e2e/src/tests/h2_security_header_injection.rs`
+(3) and `e2e/src/tests/h2_security_tests.rs` (16)) all read
+`stream_status_matches(frames, stream_id, status)` now, which decodes
+`:status` through `decode_status` (issues #1374 and #1381). No live byte
+probe is left under `e2e/src/tests/`; the literal survives only in
+comments recording what was there.
+
+**The label was right and the byte was wrong, at every site.** `0x8D` is
+static index **13 = `:status 404`**; `:status 400` is index 12 = `0x8C`.
+All 17 sites and the comments above them named it 400, and the variable
+was `got_400` at all 15 sites in `h2_security_tests.rs`. Each of those
+tests sends a *malformed request* and documents RFC 9113's "stream error
+or 400" contract, so the conversion is to a decoded **400** everywhere
+and the comments are corrected rather than the assertions retargeted at
+404. What settled the direction empirically: on 2026-09-20 every
+iteration of every one of the fifteen `h2_security_tests.rs` sites
+reported `400: false` and produced no HEADERS frame at all — RST_STREAM
+only, once or twice per case (`CL/TE conflict` answers two, error codes
+`0x1` then `0x5`) — so the term was dead under either reading and no test
+was quietly depending on a 404.
+
+**The one site that was not dead is the one that proves the class.** The
+`asterisk-with-OPTIONS` case of `test_h2_path_syntax_enforced` — its
+deliberately *accepted* case — answers `HEADERS flags=0x04 stream=7
+len=48 status=404`, whose indexed HPACK byte is exactly the `0x8D` the
+scan keyed on. Its inner `protocol_error` probe therefore read a request
+sōzu had accepted and routed as "sōzu emitted a 400". It stayed green
+only because the outer `rejected` probe was hardcoded to stream 1 while
+the case runs on stream 7: two wrongs in opposite directions. Both are
+`stream_status_matches(.., stream_id, 400)` now — the scope is right
+*and* a 404 no longer answers for a 400.
+
+**Keep the negative half — and know which half it is.**
+`h2_400_terms_decode_the_status_field_not_the_0x8d_byte`
+(`h2_security_tests.rs`) is it, with two wire-reachable fixtures: a
+routed 404 default answer, and an ordinary 200 whose 268-byte header
+value writes its length as `7f 8d 01` — prefix `0x7f`, then
+`(141 % 128) + 128 = 0x8D`, then `141 / 128 = 0x01`. Restoring the byte
+scan as the helper body reddens exactly its two *negative* assertions,
+one per fixture, measured 2026-09-20; the positive ones stay green under
+that mutation because a scan that ignores the status argument answers
+"yes" to every status. That is the same lesson as the `0x88` fixture
+above: run every mutation a `To SEE THIS RED:` names, and check which
+assertion it actually moves.
+
+`decode_status` still returns `None` on a size-update-prefixed block,
+which is fail-closed for a `got_X` used positively and fail-**open** for
+one used as `|| !got_X`. Both sites that carried that exposure are gone
+(#1381): `try_strict_sni_binding_toggle` asserts
+`got_rejection_or_421 && !got_200` and `try_h2_invalid_status_rejected`
+asserts `got_frames && (protocol_rejection || got_502) && !got_200`.
+Each used to be written `rejection || !got_200` and passed on a worker
+that returned nothing at all — a regression turning a clean 421 or 502
+into a crash read as success. Both were run against a shadowed empty
+frame list on 2026-09-20: the strengthened forms fail on the first
+iteration, the historical forms pass the identical fault.
+
+**Half of that `||` was still too wide, and it is the half the issue
+names.** `got_rejection_or_421` read `got_421 || contains_goaway(..)`,
+and `contains_goaway` matches ANY GOAWAY — including the
+`error_code=0x0` graceful close that rides along behind the 421 in this
+very test (`SNI-TOGGLE strict=true - received 8 frames … frame 7: GOAWAY
+error_code=0x0`). A 502 or a 503 followed by that same close would have
+answered "a 421 or GOAWAY was observed", which is exactly the
+"cannot distinguish a correct 421 from any other non-200" the issue
+quotes. It reads `got_421 || rejected_with_goaway_or_rst(..)` now, whose
+GOAWAY arm requires an error code other than `NO_ERROR`. Tighten the
+term the positive assertion rests on, not only the shape of the
+expression around it.
+
+**`frames.is_empty()` as an accepted outcome is untouched** and stays
+open (#1374). It still sits in `try_h2_desync_authority_host_conflict`'s
+`got_rejection || got_400 || got_200 || frames.is_empty()` and in the
+non-dangerous arm of `try_h2_content_length_format_fuzzing`, where it is
+deliberate, documented policy. Tightening either is a behavioural change
+needing its own evidence, not a by-product of decoding a status.
 
 ## Backend-TLS expansion (preview)
 

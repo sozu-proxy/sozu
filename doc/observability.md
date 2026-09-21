@@ -181,11 +181,10 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
 | `MUX-H1` | `protocol/mux/h1.rs` | …plus stream id, parked, close_notify |
 | `MUX-ROUTER` | `protocol/mux/router.rs` | renders `[session req cluster backend]` via `HttpContext::log_context()` |
 | `MUX-CONN` / `MUX-CONV` / `MUX-PARSER` / `MUX-PKAWA` / `MUX-STREAM` | corresponding files | module-level only (no per-session context) |
-| `KAWA-H1` | `protocol/kawa_h1/mod.rs` | session, frontend, request/response parsing phase |
 | `RUSTLS` | `protocol/rustls.rs` | SNI/ALPN byte lengths, version, source, frontend |
 | `PIPE` | `protocol/pipe.rs` | addresses, frontend/backend status & readiness |
 | `TCP` | `tcp.rs` | frontend, backend, peer (cached on `SessionTcpStream`) |
-| `SOCKET` | `socket.rs` | session, peer, local, RTT, state |
+| `SOCKET` | `socket.rs` | session, peer, local, RTT, state. `peer` is a snapshot (see below), not a live lookup |
 
 **Conventions:**
 
@@ -206,26 +205,50 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
   from the ALPN branch of `https.rs`, and h2c is unimplemented on the
   cleartext listener.)
   `MUX` (`protocol/mux/mod.rs`) and `MUX-H1` (`protocol/mux/h1.rs`) still
-  render a live `getpeername(2)` and are unchanged. For `SOCKET` the
-  answer depends on the handler, not on the layer: a `SessionTcpStream`
-  — every plaintext frontend and every backend socket — renders through
-  `log_socket_module_prefix` (`socket.rs:177`), which has always preferred
-  `configured_peer`, while a TLS frontend renders through
-  `log_socket_context!` (`socket.rs:133`), which still does a live lookup.
-  So on a PROXY-protocol TLS frontend the `MUX-H2` line names the client
-  while the `SOCKET` line names the load balancer. That is an artefact of
-  `FrontRustls` having carried no cached address until now, not a
-  deliberate split between layers. Aligning `socket.rs:133` is a
-  follow-up needing its own test: nothing currently asserts the `peer=`
-  slot of a `SOCKET` line, so changing it would be an unguarded
-  behaviour change on a second log prefix.
+  render a live `getpeername(2)` and are unchanged.
+- The `peer` slot of a `SOCKET` line is the same snapshot, through the
+  same accessor, for every handler. Both of the layer's two renderers now
+  read `configured_peer` first and fall back to `getpeername(2)` only
+  when there is none: `log_socket_module_prefix` (`lib/src/socket.rs`), which
+  every plaintext frontend and every backend socket reaches through
+  `SessionTcpStream`, always did; `log_socket_context!` (`lib/src/socket.rs`),
+  whose only caller is `impl SocketHandler for FrontRustls` and therefore
+  every TLS frontend, now does too. So the two consequences described
+  above for `MUX-H2` hold for `SOCKET` as well, and on a PROXY-protocol
+  TLS frontend the `SOCKET` and `MUX-H2` lines of one connection name the
+  same host. They did not before: `SOCKET` named the load balancer while
+  `MUX-H2` named the client, which was an artefact of `FrontRustls`
+  having carried no cached address rather than a deliberate split between
+  layers.
+  Measured on a PROXY-v2 TLS frontend whose advertised client and whose
+  TCP source genuinely differ, by
+  `e2e::tests::socket_log_context_tests::test_tls_socket_log_peer_is_the_advertised_client`:
+  before, the one captured `SOCKET` line named the TCP source and none
+  named the advertised client; after, the reverse. That test also asserts
+  the line was written while the connection was still
+  `state=Some("ESTABLISHED")` — this half of the defect is not the
+  `ENOTCONN` one, and a healthy live lookup was simply naming a different
+  host.
+  The other half, the slot surviving a live lookup that FAILS, is pinned
+  by `socket::tests::log_socket_context_renders_the_cached_peer_when_the_live_lookup_fails`,
+  which stages the failure with a never-connected socket: only that
+  refuses `getpeername(2)` deterministically, whereas a socket waiting on
+  an RST is a race. So what is measured is the rendering once the socket
+  refuses, not a reset end to end — and deliberately so, because the
+  reset-related error kinds are exactly the arms of
+  `FrontRustls::socket_read`/`socket_write` that emit no log line at all.
+  `socket::tests::log_socket_context_renders_the_cached_peer_not_a_live_lookup`
+  pins the succeeding half at the macro directly.
+  Only `peer` changed. `local` is still `getsockname(2)`, and `rtt`,
+  `state` and `protocol` are untouched.
 - Tier severity by intent: `debug!`/`trace!` for expected idle closes,
   timeouts, noisy state. `warn!`/`error!` for real protocol errors or
   invariant breaks. (See `feedback_log_context_before_theorising` for the
   reasoning.)
 - When an `HttpContext` is in scope, prefer `$http_ctx.log_context()`
-  (`kawa_h1/editor.rs:587`) over hand-rolling a `LogContext { ... }`
-  struct literal — the helper is the canonical formatter.
+  (`HttpContext::log_context`, `lib/src/protocol/kawa_h1/editor.rs`) over
+  hand-rolling a `LogContext { ... }` struct literal — the helper is the
+  canonical formatter.
 
 ### Sensitive-value logging boundary
 
@@ -331,8 +354,7 @@ a field requires:
 2. Field on `ProtobufAccessLog` (proto, append a new optional tag — never
    reuse or reorder existing tags).
 3. Populate at every emit site:
-   - H1: `lib/src/protocol/kawa_h1/mod.rs::log_request`
-   - H2 mux: `lib/src/protocol/mux/stream.rs::generate_access_log`
+   - H1 and H2 mux: `lib/src/protocol/mux/stream.rs::generate_access_log`
    - TCP: `lib/src/tcp.rs::log_request`
    - WS / WSS post-upgrade pipe: `lib/src/protocol/pipe.rs::log_request`
 4. Update `RequestRecord::duplicate()` in `access_logs.rs` so the protobuf
@@ -344,6 +366,41 @@ The TLS metadata fields (`tls_version`, `tls_cipher`, `tls_sni`, `tls_alpn`)
 are sourced from the rustls handshake context in `lib/src/https.rs` and
 plumbed via `mux::Context` into `HttpContext`. The pipe path picks them up
 via `Pipe::set_tls_metadata` called from `https.rs::upgrade_mux`.
+
+### Where a frontend's `--tags` come from
+
+On HTTP and HTTPS listeners the access-log `tags` field is resolved **through
+the router**, not by a hostname lookup. `Router::add_http_front_with_hsts_origin`
+(`lib/src/router/mod.rs`) treats a frontend's `tags` as a policy field, so a
+tagged frontend is stored as `Route::Frontend(Rc<Frontend>)` carrying
+`Rc<CachedTags>`; `Router::lookup` returns them on `RouteResult.tags`;
+`Router::route_from_request` (`lib/src/protocol/mux/router.rs`) stashes them on
+`HttpContext.tags` before any of its early returns, so a redirect, a 401 and a
+backend-connect failure log them too; and
+`Stream::generate_access_log` (`lib/src/protocol/mux/stream.rs`) reads them from
+there.
+
+This is what makes a frontend whose hostname is not an exact literal log its
+tags at all. The matched frontend rule is the only correct owner: the operator
+configures tags per rule (`*.example.com`, `/foo.*/.example.com`, a `Pre`/`Post`
+string) while a request only ever carries a concrete authority, so no string key
+can be spelled the same on both sides.
+
+Two paths still use the older `ListenerHandler::get_tags` key lookup against the
+listener's `BTreeMap<String, CachedTags>`:
+
+- a request that **never reached routing** (malformed request, unknown host, TLS
+  SNI / `:authority` mismatch) falls back to an exact-authority lookup — there is
+  no matched frontend to ask, and an exact-literal frontend still answers;
+- the **WS / WSS post-upgrade pipe** (`lib/src/protocol/pipe.rs::log_request`)
+  looks up `Pipe::set_tags_key`, which only the TCP SNI-preread path sets. On an
+  HTTP/HTTPS listener it falls back to the listener address, which is never a
+  hostname key, so a WebSocket access-log line carries no frontend tags on any
+  frontend shape. Tracked separately from the routed-request resolution.
+
+The TCP proxy resolves its own tags with a structured key built by the same
+function on both sides (`sni_tags_key` in `lib/src/tcp.rs`); UDP keys by the
+frontend address on both sides. Neither has the L7 spelling asymmetry.
 
 ## Tracing — current state
 

@@ -151,8 +151,11 @@ impl HttpSession {
             let session_ulid = rusty_ulid::Ulid::generate();
             let sock = crate::socket::SessionTcpStream::new(sock, session_ulid, session_address);
 
-            let frontend =
-                mux::Connection::new_h1_server(session_ulid, sock, container_frontend_timeout);
+            let frontend = mux::Connection::new_h1_server(
+                session_ulid,
+                sock,
+                container_frontend_timeout.duration(),
+            );
             let router = mux::Router::new(configured_backend_timeout, configured_connect_timeout);
             let mut context = mux::Context::new(
                 session_ulid,
@@ -171,6 +174,10 @@ impl HttpSession {
                 router,
                 context,
                 session_ulid,
+                // Carry the already-armed handshake entry into the adapter
+                // rather than dropping it and arming a fresh one: the session's
+                // request timeout started when the socket was accepted.
+                timeouts: HashMap::from([(token, container_frontend_timeout)]),
             })
         };
 
@@ -332,7 +339,7 @@ impl HttpSession {
                         session_ulid,
                         Some(session_address),
                     ),
-                    expect.container_frontend_timeout,
+                    expect.container_frontend_timeout.duration(),
                 );
                 let router = mux::Router::new(
                     self.configured_backend_timeout,
@@ -359,6 +366,10 @@ impl HttpSession {
                     router,
                     context,
                     session_ulid,
+                    timeouts: HashMap::from([(
+                        self.frontend_token,
+                        expect.container_frontend_timeout,
+                    )]),
                 };
                 mux.frontend.readiness_mut().event = expect.frontend_readiness.event;
 
@@ -407,22 +418,26 @@ impl HttpSession {
         // http.active_requests was already decremented by generate_access_log()
         // in h1.rs before MuxResult::Upgrade was returned to us.
 
-        let (frontend_readiness, frontend_socket, mut container_frontend_timeout) =
-            match mux.frontend {
-                mux::Connection::H1(mux::ConnectionH1 {
-                    readiness,
-                    socket,
-                    timeout_container,
-                    ..
-                }) => (readiness, socket, timeout_container),
-                mux::Connection::H2(_) => {
-                    error!(
-                        "{} only h1<->h1 connections can upgrade to websocket",
-                        log_context!(self)
-                    );
-                    return None;
-                }
-            };
+        // The cores no longer own a wheel handle; the `Mux` adapter does. Take
+        // the frontend's out of the adapter map before dismantling the
+        // connection, so the WebSocket `Pipe` inherits the same live entry it
+        // used to inherit from `ConnectionH1`.
+        let mut container_frontend_timeout = mux
+            .timeouts
+            .remove(&mux.frontend_token)
+            .unwrap_or_else(|| TimeoutContainer::new_empty(mux.configured_frontend_timeout));
+        let (frontend_readiness, frontend_socket) = match mux.frontend {
+            mux::Connection::H1(mux::ConnectionH1 {
+                readiness, socket, ..
+            }) => (readiness, socket),
+            mux::Connection::H2(_) => {
+                error!(
+                    "{} only h1<->h1 connections can upgrade to websocket",
+                    log_context!(self)
+                );
+                return None;
+            }
+        };
 
         let mux::StreamState::Linked(back_token) = stream.state else {
             error!(
@@ -449,31 +464,32 @@ impl HttpSession {
             );
             return None;
         };
-        let (cluster_id, backend, backend_readiness, backend_socket, mut container_backend_timeout) =
-            match backend {
-                mux::Connection::H1(mux::ConnectionH1 {
-                    position:
-                        mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
-                    readiness,
-                    socket,
-                    timeout_container,
-                    ..
-                }) => (cluster_id, backend, readiness, socket, timeout_container),
-                mux::Connection::H1(_) => {
-                    error!(
-                        "{} the backend disconnected just after upgrade, abort",
-                        log_context!(self)
-                    );
-                    return None;
-                }
-                mux::Connection::H2(_) => {
-                    error!(
-                        "{} only h1<->h1 connections can upgrade to websocket",
-                        log_context!(self)
-                    );
-                    return None;
-                }
-            };
+        let mut container_backend_timeout = mux
+            .timeouts
+            .remove(&back_token)
+            .unwrap_or_else(|| TimeoutContainer::new_empty(mux.router.configured_backend_timeout));
+        let (cluster_id, backend, backend_readiness, backend_socket) = match backend {
+            mux::Connection::H1(mux::ConnectionH1 {
+                position: mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
+                readiness,
+                socket,
+                ..
+            }) => (cluster_id, backend, readiness, socket),
+            mux::Connection::H1(_) => {
+                error!(
+                    "{} the backend disconnected just after upgrade, abort",
+                    log_context!(self)
+                );
+                return None;
+            }
+            mux::Connection::H2(_) => {
+                error!(
+                    "{} only h1<->h1 connections can upgrade to websocket",
+                    log_context!(self)
+                );
+                return None;
+            }
+        };
 
         // Post-removal book-keeping: the backend is gone from the map and the
         // count dropped by exactly one (the `remove` matched a present key).
@@ -733,6 +749,20 @@ pub struct HttpListener {
     config: HttpListenerConfig,
     fronts: Router,
     listener: Option<MioTcpListener>,
+    /// A socket this listener holds but has NOT registered.
+    ///
+    /// `activate()` parks an inherited socket here when `Registry::register`
+    /// fails, instead of letting the `?` drop and close a descriptor
+    /// `Listeners::get_*` has already removed from the SCM table (sozu#1342).
+    /// The next activation reuses it rather than binding a second one.
+    ///
+    /// Deliberately NOT `listener`: every other consumer reads that field's
+    /// `Some` as "registered and live" — `soft_stop` and `hard_stop`
+    /// deregister it and report the failure, `give_back_listener` hands it
+    /// back as an activated socket, `accept` accepts on it. A parked socket is
+    /// none of those things, and putting it there made a failed registration
+    /// answer `ENOENT` from `deregister` and fail the whole soft stop.
+    parked_listener: Option<MioTcpListener>,
     tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
@@ -1004,6 +1034,26 @@ impl HttpProxy {
         Ok(())
     }
 
+    /// What this proxy would do with a socket handed to
+    /// [`activate_listener`](Self::activate_listener) for `addr`. See
+    /// [`InheritedSocketFate`].
+    ///
+    /// The event loop is single-threaded, so nothing can change the listener's
+    /// `active` flag between this answer and the `activate_listener` call that
+    /// acts on it.
+    pub fn inherited_socket_fate(&self, addr: &SocketAddr) -> crate::InheritedSocketFate {
+        use crate::InheritedSocketFate;
+        match self
+            .listeners
+            .values()
+            .find(|listener| listener.borrow().address == *addr)
+        {
+            None => InheritedSocketFate::Unclaimed,
+            Some(listener) if listener.borrow().active => InheritedSocketFate::Refused,
+            Some(_) => InheritedSocketFate::Adopted,
+        }
+    }
+
     pub fn activate_listener(
         &self,
         addr: &SocketAddr,
@@ -1261,6 +1311,7 @@ impl HttpListener {
             config,
             fronts: Router::new(),
             listener: None,
+            parked_listener: None,
             tags: BTreeMap::new(),
             token,
         })
@@ -1302,9 +1353,34 @@ impl HttpListener {
         }
         let address: SocketAddr = self.config.address.into();
 
-        let mut listener = match tcp_listener {
-            Some(tcp_listener) => tcp_listener,
-            None => {
+        // Reuse a socket a previous attempt parked here after a failed
+        // registration, rather than binding a second one. Taking it
+        // unconditionally is what keeps the two from coexisting: if the caller
+        // ALSO handed one over, the parked socket is disposed of deliberately
+        // below instead of being silently overwritten.
+        let parked = self.parked_listener.take();
+        let mut listener = match (tcp_listener, parked) {
+            (Some(inherited), Some(parked)) => {
+                // Not reachable while `Listeners::get_*` removes the entry it
+                // hands over and `scm_listeners` is written once: a parked
+                // socket means this address's entry was already consumed, so
+                // the caller cannot have another. Neither of those is enforced
+                // here, so dispose of the loser explicitly and loudly rather
+                // than letting an assignment close it — that silent close is
+                // sozu#1342 itself.
+                warn!(
+                    "{} closing the socket parked on the HTTP listener for {}: an \
+                     inherited socket arrived for the same address and is the one being \
+                     activated",
+                    log_module_context!(),
+                    address
+                );
+                drop(parked);
+                inherited
+            }
+            (Some(inherited), None) => inherited,
+            (None, Some(parked)) => parked,
+            (None, None) => {
                 server_bind(address).map_err(|server_bind_error| ListenerError::Activation {
                     address,
                     error: server_bind_error.to_string(),
@@ -1312,9 +1388,22 @@ impl HttpListener {
             }
         };
 
-        registry
+        let registration = registry
             .register(&mut listener, self.token, Interest::READABLE)
-            .map_err(ListenerError::SocketRegistration)?;
+            .map_err(ListenerError::SocketRegistration);
+        if let Err(error) = registration {
+            // Park the socket instead of letting the `?` drop it. `register`
+            // is fallible (EEXIST for a descriptor still registered because
+            // `notify_deactivate_listener` only logs a failed deregister,
+            // EBADF, ENOMEM), and a socket still held in a local is dropped —
+            // and closed — on the way out. For an SCM-inherited socket that is
+            // the sozu#1342 close in a second place: `Listeners::get_*` has
+            // already removed the entry, so nothing else owns the descriptor.
+            // It goes to `parked_listener`, never to `listener`, because every other
+            // consumer of that field reads `Some` as "registered and live".
+            self.parked_listener = Some(listener);
+            return Err(error);
+        }
 
         self.listener = Some(listener);
         self.active = true;
@@ -1884,19 +1973,6 @@ mod tests {
         response::{Backend, HttpFrontend},
     };
 
-    /*
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn size_test() {
-      assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
-      assert_size!(Http<mio::net::TcpStream>, 1232);
-      assert_size!(Pipe<mio::net::TcpStream>, 272);
-      assert_size!(State, 1240);
-      // fails depending on the platform?
-      assert_size!(Session, 1592);
-    }
-    */
-
     #[test]
     fn round_trip() {
         setup_test_logger!();
@@ -2292,6 +2368,7 @@ mod tests {
             .expect("Could not create default HTTP listener config");
 
         let listener = HttpListener {
+            parked_listener: None,
             listener: None,
             address: address.into(),
             fronts,

@@ -24,9 +24,9 @@
 //! and does not make a literal key impossible. Known gaps, all pre-existing:
 //!
 //! - **Other crates.** `bin/` and `command/` are outside `CARGO_MANIFEST_DIR`
-//!   and are not scanned. `bin/src/command/requests.rs:3695` and `:3704` emit
-//!   `count!("config.load_skipped_invalid", 1)` — a literal key with no
-//!   `names.rs` entry — and this test says nothing about them.
+//!   and are not scanned. `load_state` (`bin/src/command/requests.rs`) emits
+//!   `count!("config.load_skipped_invalid", 1)` at two sites — a literal key
+//!   with no `names.rs` entry — and this test says nothing about them.
 //! - **Keys assembled by a helper.** `reject_metric_key!` and
 //!   `h2_error_metric_key!` `concat!` a literal prefix with a variant suffix,
 //!   and `metric_for_rst_stream_received` ends in a bare

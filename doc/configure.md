@@ -55,7 +55,7 @@ by the main process and workers (like the log level):
 | `zombie_check_interval`       | duration between checks for zombie sessions                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |                                           |
 | `evict_on_queue_full`         | evict the least-recently-active sessions when `max_connections` is reached, making room for new accepts. Defaults to `false`: during a DDoS the existing connections are more likely to be legitimate clients than the queued ones, so refusing new accepts is the safer mitigation. Enable when overload is dominated by normal traffic spikes. Triggers a config-load `warn!` when `max_connections < 100` because the 1% eviction batch clamps to 1 (so the per-round share grows).                                                                                                                                                                                                                                                     | `true`, `false` (default: `false`)        |
 | `activate_listeners`          | automatically start listeners                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |                                           |
-| `max_connections_per_ip`      | global default per-(cluster, source-IP) connection limit. `0` disables the feature (default). The source IP is taken from the parsed PROXY-protocol header when present, else `peer_addr`. A PROXY-v2 header carrying the `LOCAL` command (ver/cmd `0x20`) describes a connection the upstream proxy originated itself, so its address block is discarded per the HAProxy PROXY protocol specification §2.2 — a `LOCAL` header may legally carry a populated address block, and honouring it would let any peer choose the counter it is charged against. A TCP listener then charges the connection to `peer_addr`; an HTTP or HTTPS listener with `expect_proxy = true` closes the session at the expect upgrade instead (`lib/src/http.rs:316`, `lib/src/https.rs:334`), so it never reaches a counter at all — which was already the outcome for the `AF_UNSPEC` block HAProxy actually emits, so only a forged populated block changes behaviour. HTTP/HTTPS clients hitting the limit receive `429 Too Many Requests`; TCP clients see a graceful FIN. Each cluster may override via its own `max_connections_per_ip` field (`None` inherits, `Some(0)` is explicit unlimited, `Some(n > 0)` overrides). Counters are kept per `(cluster_id, source_ip)`, so two clusters never share a counter.                                                                                                                                                                                                 | integer (0 = unlimited)                   |
+| `max_connections_per_ip`      | global default per-(cluster, source-IP) connection limit. `0` disables the feature (default). The source IP is taken from the parsed PROXY-protocol header when present, else `peer_addr`. A PROXY-v2 header carrying the `LOCAL` command (ver/cmd `0x20`) describes a connection the upstream proxy originated itself, so its address block is discarded per the HAProxy PROXY protocol specification §2.2 — a `LOCAL` header may legally carry a populated address block, and honouring it would let any peer choose the counter it is charged against. A TCP listener then charges the connection to `peer_addr`; an HTTP or HTTPS listener with `expect_proxy = true` closes the session at the expect upgrade instead (`HttpSession::upgrade_expect` in `lib/src/http.rs`, `HttpsSession::upgrade_expect` in `lib/src/https.rs`), so it never reaches a counter at all — which was already the outcome for the `AF_UNSPEC` block HAProxy actually emits, so only a forged populated block changes behaviour. HTTP/HTTPS clients hitting the limit receive `429 Too Many Requests`; TCP clients see a graceful FIN. Each cluster may override via its own `max_connections_per_ip` field (`None` inherits, `Some(0)` is explicit unlimited, `Some(n > 0)` overrides). Counters are kept per `(cluster_id, source_ip)`, so two clusters never share a counter.                                                                                                                                                                                                 | integer (0 = unlimited)                   |
 | `retry_after`                 | global default `Retry-After` header value (seconds) for HTTP 429 responses. `0` omits the header — `Retry-After: 0` invites an immediate retry that defeats the limit. Each cluster may override. TCP listeners ignore this value (no HTTP envelope).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | integer (0 = omit)                        |
 
 _Example:_
@@ -939,7 +939,8 @@ servers).
 > (the `alpn_protocols` listener option) and is independent of per-cluster
 > configuration. A cluster with `http2 = false` (or omitted) can still receive
 > H2 requests from clients; Sōzu will translate them to H1 before forwarding to
-> the backend. See `command/src/config.rs:998` for the field definition.
+> the backend. See `FileClusterConfig::http2` (`command/src/config.rs`) for
+> the field definition.
 
 You can also toggle HTTP/2 at runtime on an existing cluster via the CLI:
 
@@ -1253,10 +1254,11 @@ more) PROXY-v2 hops in front of Sōzu. A frame carrying the `LOCAL` command
 originated itself, its address block is discarded per the HAProxy PROXY protocol
 specification §2.2, and no address pair survives for the session to adopt. An
 HTTP or HTTPS listener does **not** fall back to the connection peer: the
-expect upgrade needs both endpoints (`lib/src/http.rs:316`,
-`lib/src/https.rs:334`), gets neither, and the session is closed
-(`lib/src/http.rs:254`). No `X-Real-IP` is injected because no request is ever
-read. Only raw TCP listeners fall back to `peer_addr`, and they inject no HTTP
+expect upgrade needs both endpoints (`HttpSession::upgrade_expect` in
+`lib/src/http.rs`, `HttpsSession::upgrade_expect` in `lib/src/https.rs`), gets
+neither, and the session is closed (`HttpSession::upgrade`,
+`lib/src/http.rs`). No `X-Real-IP` is injected because no request is ever read.
+Only raw TCP listeners fall back to `peer_addr`, and they inject no HTTP
 header. HAProxy pairs `LOCAL` with `AF_UNSPEC`, which already closed such a
 session, so the only behaviour that changes is a forged `LOCAL` carrying a
 populated address block: it used to be injected verbatim as `X-Real-IP`, and now
@@ -1571,10 +1573,12 @@ the exact case the client sends. So:
   request the tie goes to the **last** declared; if one of them does not match
   it is skipped, so `/ab` for `GET` then `/ab` for `POST` sends `GET /abc` to
   the **first**.)
-- **regex hostname segments** — one level up in the routing trie, and not
-  method-sensitive at all: the trie returns on the first segment that matches
-  the host, so the **first declared wins** (see "Regex hostname segments"
-  below).
+- **regex hostname segments** — one level up in the routing trie. Two
+  overlapping segments are settled by declaration order, so the **first
+  declared wins** — but only among the segments that actually serve the
+  request: a segment whose rules all reject this path or method hands the
+  request to the next candidate instead of ending the lookup (see "Hostname
+  precedence" below).
 
 The method dependence is easiest to see side by side. On `www.example.com`, for
 `GET /abc`, with a regex `/a.*` and the whole-path prefix `/abc`:
@@ -1602,12 +1606,116 @@ deliberately ordered. "Most specific first" is the right instinct only for rules
 that carry a matching `method`; without one, a later rule wins, so the order to
 write is most specific *last*. Only `PREFIX`-against-`PREFIX` sorts itself out.
 
-None of that carries over to hostnames. Declaration order settles an overlap
-between two regex *segments* (below) and nothing else: any other overlapping
-pair — a `*` wildcard against a regex segment, an exact name against either — is
-resolved by the shape of the routing trie, and reordering the frontends does not
-change which one answers. So the advice above does not work here. Keep hostname
-patterns mutually exclusive. (See also sozu#1351.)
+None of that carries over to hostnames, which have a precedence order of their
+own — see the next section.
+
+### Hostname precedence
+
+Hostnames are resolved **most specific first**, whatever order the frontends
+were declared in:
+
+1. the **exact** name (`test4.example.com`),
+2. a **regex segment** that matches it (`/test[0-9]/.example.com`), the first
+   declared among those that overlap,
+3. the **`*` wildcard** (`*.example.com`), which stands for exactly one
+   leftmost label.
+
+That order is a search, not a filter. A candidate whose path and method rules
+serve nothing for this request hands it to the next candidate, so splitting one
+host's paths across an exact frontend and a regex family routes every path:
+`test4.example.com/only-for-test4` reaches the exact frontend, and
+`test4.example.com/anything-else` reaches the regex family that also claims the
+host. The same fall-through applies between two overlapping regex segments, so
+a first-declared segment carrying only `method = "POST"` no longer 404s a `GET`
+that a later segment would serve.
+
+Declaration order therefore changes nothing outside step 2, and reordering two
+overlapping regex segments is the only reordering that changes an answer.
+Keeping hostname patterns mutually exclusive is still the clearest
+configuration, but overlap is now resolved by a stated rule rather than by the
+shape of the trie. (Before the fix, an exact name added *after* a regex segment
+that matched it attached its rule to that segment instead of getting its own
+node, and the whole regex family served it — sozu#1351.)
+
+### Hostname case
+
+A `hostname` is matched **case-insensitively**, per RFC 9110 §4.2.3. The route
+table stores every configured hostname ASCII-lowercased, and the incoming
+`Host:` header / HTTP/2 `:authority` is normalised the same way before the
+lookup, so all of these reach the same frontend:
+
+```
+hostname = "case.example.com"
+
+Host: case.example.com        -> routed
+Host: CASE.EXAMPLE.COM        -> routed
+Host: CaSe.ExAmPlE.cOm        -> routed
+Host: CASE.EXAMPLE.COM:80     -> routed (the port is stripped first)
+Host: other.example.com       -> 404, as before
+```
+
+Writing the frontend itself in uppercase changes nothing — `hostname =
+"CASE.EXAMPLE.COM"` is stored as `case.example.com` and answers the same four
+requests. There is no configuration that makes hostname matching
+case-*sensitive*.
+
+Normalisation happens to the key *before* the precedence search above runs, so
+the two compose in one direction only: case never decides which candidate wins.
+`CASE.EXAMPLE.COM` picks the same exact / regex-segment / wildcard tier that
+`case.example.com` picks, and reordering frontends still changes nothing
+outside overlapping regex segments.
+
+Consequences worth knowing:
+
+- **A regex hostname segment is matched against the normalised host.** An
+  uppercase literal inside one — `/API[0-9]/.example.com` — therefore matches
+  `api7.example.com` as well as `API7.example.com`. Do not use a character
+  class to distinguish case in a hostname segment; it cannot work, and a
+  `Tree`-position frontend has always had its whole pattern lowercased at
+  insert time anyway.
+- **`$HOST[n]` captures carry the normalised host**, so a `rewrite_host`
+  template emits lowercase regardless of what the client typed.
+- **The value the client sent is not lost.** The normalisation happens inside
+  the route lookup and nowhere else: the parsed authority every other consumer
+  reads — the access log, the `X-Forwarded-Host` header a `rewrite_host`
+  frontend injects, the redirect `Location:` — is untouched. The observable
+  case is the builtin 404 answer, whose `route` field echoes the client's
+  spelling (`GET OTHER.EXAMPLE.COM/`, not the lowercased key), because that is
+  the diagnostic you need when a route misses.
+- **A trailing dot is not yet handled.** `Host: case.example.com.` is the legal
+  absolute form of the same name (RFC 1034 §3.1), but it does **not** reach a
+  frontend declared as `case.example.com` — the trailing dot survives
+  normalisation and the trie sees an extra empty label. The TLS side already
+  strips one trailing dot (`lib/src/https.rs`'s post-handshake SNI and
+  `lib/src/protocol/tcp_preread/mod.rs`'s `normalize_sni`); HTTP routing does
+  not. Declare the absolute form as a second frontend if you need it.
+
+Certificate names follow the same rule on the TLS side: the worker
+ASCII-lowercases every SAN / `names` entry before it enters the SNI lookup
+table, because rustls hands the resolver an SNI it has already lowercased. A
+certificate carrying `MiXeD.Example.COM` therefore serves `mixed.example.com`
+instead of silently falling through to the default certificate.
+
+**A certificate name may not carry a regex segment.** Frontend hostnames get
+the slash-delimited grammar described in the next section; certificate names do
+not. `sozu certificate add` refuses any `names` entry containing `/` — the
+worker answers `could not add certificate: the SNI route table cannot host a
+certificate name` and loads nothing — because the SNI lookup table is the same
+trie as the router's, and a name such as
+`/te.*/.example.com` would otherwise compile to a regex segment and bind one
+certificate to every host the pattern happens to cover (`test.example.com` and
+`tenant.example.com` alike). `/` cannot occur in a DNS name, so no legitimate
+SAN is refused; a wildcard SAN such as `*.example.com` is not a regex segment
+and still loads and still serves its subtree. This is the rule TCP SNI routes
+have always had.
+
+The refusal is per certificate, not per name: one bad entry rejects the whole
+`AddCertificate`, before any part of it is registered, so a partially-loaded
+certificate is not a state the worker can reach. When the `names` override is
+left empty the worker derives the names from the certificate's own SAN / CN, so
+the refusal can also fire on a certificate carrying no dNSName SAN and a Common
+Name that contains a slash — reissue it with a proper dNSName SAN, or state the
+intended hostnames explicitly in `names`.
 
 ### Regex hostname segments
 
@@ -1632,9 +1740,9 @@ resolve.
 
 Two regex segments that **overlap** are decided by declaration order, under the
 same first-declared-wins rule as `REGEX` path rules above: a node holds its
-regex segments in an ordered list, a lookup returns on the first that matches,
-and a new segment is appended. With both of these declared, `test4.example.com`
-routes to whichever came first:
+regex segments in an ordered list, a lookup takes the first that matches *and
+serves the request*, and a new segment is appended. With both of these
+declared, `test4.example.com` routes to whichever came first:
 
 ```toml
 [[clusters.numbered.frontends]]
@@ -1647,7 +1755,9 @@ hostname = "/[a-z]+[0-9]/.example.com"   # also matches `test4`
 ```
 
 Declaring `numbered` first sends `test4.example.com` to `numbered`; declaring
-`any-suffixed` first sends it to `any-suffixed`.
+`any-suffixed` first sends it to `any-suffixed`. If `numbered` carries no rule
+for the request's path or method, `any-suffixed` answers it even when
+`numbered` was declared first.
 
 Before the fix shipped in the current release, declaring the deeper
 `foo./test[0-9]/.example.com` first made the leftmost
@@ -1742,6 +1852,35 @@ it means.
 The group is **non-capturing**, so it changes no `$HOST[n]` index: in
 `/cdn([0-9]+)/.example.com`, `$HOST[1]` is still the operator's own group
 (`42` for `cdn42.example.com`), and `$HOST[0]` is still the whole hostname.
+
+**Case inside a regex segment is preserved, and the segment is matched
+case-insensitively.** Only the literal labels of a hostname are IDN-normalised;
+the source between the slashes is stored byte for byte. So
+`/API[0-9]/.example.com` still routes `api7.example.com` (a host is
+case-insensitive, RFC 9110 §4.2.3, and the lookup key is lowercased), while
+`\D`, `\W` and `\S` keep meaning what the regex grammar says they mean —
+case-insensitivity does not reach a character-class escape. This is how `Pre`
+and `Post` rules have always treated a hostname regex; the trie now agrees.
+
+**Up to and including 2.2.1 it did not, and this changes existing rules**
+(sozu#1377). A trie-routed hostname — the default position — went through IDN
+normalisation *whole*, regex source included, and that ASCII-lowercases:
+`/\D+/.example.com` was stored as `/\d+/.example.com` and
+`/[^\D]/.example.com` as `/[^\d]/.example.com`. Lowercasing an uppercase escape
+**inverts the character class it names** — `\D` is "not a digit", `\d` is "a
+digit" — so the installed rule matched the exact **complement** of what was
+written. It was invisible from configuration: the frontend loads, `sozu query
+frontends` echoes the original spelling, and only the traffic disagrees. A
+frontend written `/\D+/.example.com` served `777.example.com` and not
+`abc.example.com`; after this change it serves `abc.example.com` and not
+`777.example.com`. `\W`/`\w` and `\S`/`\s` inverted the same way.
+
+Audit trie-routed hostnames carrying `\D`, `\W`, `\S` or `\B` before upgrading.
+A rule whose behaviour was tuned against the folded form — `/\D+/` chosen
+because it was observed to match digits — must be respelled with the lowercase
+escape it actually meant. A segment with no uppercase escape is unaffected, and
+an uppercase **literal** such as `/API[0-9]/` keeps matching exactly the hosts
+it matched before. `Pre` and `Post` frontends never carried the defect.
 
 A segment regex must occupy a complete segment. `abc/[0-9]+/.example.com` is
 rejected, because the regex does not start at a `.` boundary, as is a hostname
@@ -2187,9 +2326,9 @@ closed (operator-visible API once shipped):
 
 | Token                            | Trigger                                                                                                                                                                                                                                                                                                                                       | Status seen by client                      |
 | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `client_timeout`                 | Frontend timer fired while waiting for the request to arrive (`TimeoutStatus::Request` in the H1 path; `StreamState::Idle` in the mux path)                                                                                                                                                                                                   | `408 Request Timeout`                      |
+| `client_timeout`                 | Frontend timer fired while waiting for the request to arrive (`StreamState::Idle` in the mux path, which serves both H1 and H2)                                                                                                                                                                                                   | `408 Request Timeout`                      |
 | `client_timeout_during_response` | Frontend timer fired while the backend was still composing the response — ambiguous case where timeout responsibility should already have switched. Mapped to gateway-timeout for client clarity                                                                                                                                              | `504 Gateway Timeout`                      |
-| `backend_timeout`                | Backend timer fired before any response byte arrived — connection-level slowness or backend stuck pre-headers. The H1 invariant-break arm (`TimeoutStatus::Request` on the backend) collapses into the same token because the operator-visible cause is identical; the internal `error!` log keeps the diagnostic signal for sozu maintainers | `504 Gateway Timeout`                      |
+| `backend_timeout`                | Backend timer fired before any response byte arrived — connection-level slowness or backend stuck pre-headers. The invariant-break arm (an idle stream on the backend side) collapses into the same token because the operator-visible cause is identical; the internal `error!` log keeps the diagnostic signal for sozu maintainers | `504 Gateway Timeout`                      |
 | `backend_response_timeout`       | Backend timer fired while the response body was streaming — partial response in flight. Mux replies with `RST_STREAM` (`H2Error::InternalError`); H1 forcibly closes the session because no default-answer can replace an in-flight response body                                                                                             | `RST_STREAM` (mux) / connection close (H1) |
 
 Non-timeout default-answer paths (e.g. 503 from `Router::route_from_request`,
@@ -2457,7 +2596,7 @@ registered.
 | `cluster.total_backends`        | gauge   | cluster | Backends configured for the cluster, regardless of state. Pairs with `cluster.available_backends` so dashboards can compute health ratios per cluster                                                                                                                                         |
 | `cluster.no_available_backends` | counter | cluster | Incremented exactly once per `Available → AllDown` transition. Pairs with the existing `EventKind::NoAvailableBackends` event and the `error!` log line `cluster X: all N backends are down`                                                                                                  |
 | `cluster.available_recovered`   | counter | cluster | Incremented exactly once per `AllDown → Available` transition. Pairs with `EventKind::ClusterRecovered` (proto tag 29) and the `info!` log line `cluster X: backends recovered (i/N available)`                                                                                               |
-| `backend.available`             | gauge   | backend | `1` when the backend passes `is_available()` (health + retry policy + status), `0` after a transition to unavailable. Emitted at the up/down transition sites in `health_check.rs`, `kawa_h1`, `mux`, and `tcp` — not per-request, so the cardinality cost is bounded by transition frequency |
+| `backend.available`             | gauge   | backend | `1` when the backend passes `is_available()` (health + retry policy + status), `0` after a transition to unavailable. Emitted at the up/down transition sites in `health_check.rs`, `mux`, and `tcp` — not per-request, so the cardinality cost is bounded by transition frequency |
 
 The `health_check.healthy_backends` gauge is now labelled with `cluster_id`;
 prior emissions overwrote each other across clusters because the unlabelled key
@@ -2472,7 +2611,6 @@ health-check tick. Clusters that have **not** configured a
 retry policy as TCP connect attempts succeed or fail.
 
 - Every TCP connect failure on the data path (`lib/src/tcp.rs`,
-  `lib/src/protocol/kawa_h1/mod.rs::fail_backend_connection`,
   `lib/src/protocol/mux/mod.rs`) calls `Backend::retry_policy.fail()`, arming an
   exponential-backoff window. After `max_tries` consecutive failures (default
   `6`) the policy reports `is_down() == true`. When every backend in the cluster
@@ -2925,7 +3063,7 @@ milliseconds and the helper multiplies by 1000 before exposing the same
 
 | Access-log field | Wire tag                                               | Populated on                                                                             |
 | ---------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
-| `client_rtt`     | `ProtobufAccessLog.client_rtt` #9 (`optional uint64`)  | every protocol path: H1 (`kawa_h1`), H2 (`mux`), Pipe (TCP/WS), TCP frontend             |
+| `client_rtt`     | `ProtobufAccessLog.client_rtt` #9 (`optional uint64`)  | every protocol path: H1 and H2 (`mux`), Pipe (TCP/WS), TCP frontend                      |
 | `server_rtt`     | `ProtobufAccessLog.server_rtt` #10 (`optional uint64`) | every protocol path that has a backend socket; `None` for the TCP frontend (no upstream) |
 
 Capture is at access-log emission time and is cheap (one `getsockopt(TCP_INFO)`
@@ -3010,6 +3148,21 @@ teardown). A bare TCP health check (connect then close, zero bytes sent) is
 See `lib/src/protocol/tcp_preread/LIFECYCLE.md` for the full state lifecycle,
 the four `proxy_protocol` handoff paths out of preread, and the reasoning
 behind each reject reason.
+
+> **`tcp.infinite_loop.error` on an SNI-routed listener.** Before
+> [#1373](https://github.com/sozu-proxy/sozu/issues/1373), a session whose
+> client coalesced its ClientHello with the first payload bytes — a TLS client
+> writing a large request in one go — kept the frontend selected as readable
+> while its backend was still connecting, even though a routed preread
+> deliberately reads nothing more. The event loop re-entered that dispatch
+> until the 10 000-iteration safety breaker tripped: the worker logged
+> `Handling session went through 10000 iterations, there's a probable infinite
+> loop bug`, incremented `tcp.infinite_loop.error`, and closed a healthy
+> connection that had delivered none of the client's bytes. The symptom is a
+> `tcp.infinite_loop.error` rising in step with `tcp.sni_preread.routed` while
+> `tcp.read.error` and `tcp.write.error` stay flat. Nothing to configure: the fix is in the datapath,
+> and the wider the gap between a fast client and a slow backend connect, the
+> more often the old behaviour fired.
 
 #### Socket and I/O errors
 

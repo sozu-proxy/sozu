@@ -24,7 +24,6 @@ use crate::{
     router::{HeaderEdit, RouteResult},
     server::CONN_RETRIES,
     socket::SessionTcpStream,
-    timer::TimeoutContainer,
 };
 
 use crate::metrics::names;
@@ -449,10 +448,6 @@ impl Router {
             let backend_peer = Some(backend.borrow().address);
             let socket = SessionTcpStream::new(socket, context.session_ulid, backend_peer);
 
-            // Build an un-armed timeout: we can't call `TimeoutContainer::new`
-            // yet because that requires the slab token, and we only allocate
-            // the token on the happy path. `.set(token)` below arms it.
-            let timeout_container = TimeoutContainer::new_empty(self.configured_connect_timeout);
             let flood_config = context.listener.borrow().get_h2_flood_config();
             let connection_config = context.listener.borrow().get_h2_connection_config();
             let stream_idle_timeout = context.listener.borrow().get_h2_stream_idle_timeout();
@@ -468,7 +463,7 @@ impl Router {
                     cluster_id.to_owned(),
                     backend,
                     context.pool.clone(),
-                    timeout_container,
+                    self.configured_connect_timeout,
                     flood_config,
                     connection_config,
                     stream_idle_timeout,
@@ -485,7 +480,7 @@ impl Router {
                     socket,
                     cluster_id.to_owned(),
                     backend,
-                    timeout_container,
+                    self.configured_connect_timeout,
                 )
             };
 
@@ -499,7 +494,8 @@ impl Router {
                     "{} Backend rejected stream start (max concurrent streams reached)",
                     log_module_context!(context.http_context(stream_id))
                 );
-                // `connection` (socket + timeout_container) drops here.
+                // `connection` (socket + pending timeout deadline) drops here; no
+                // wheel entry was ever armed for it.
                 return Err(BackendConnectionError::MaxSessionsMemory);
             }
 
@@ -565,9 +561,12 @@ impl Router {
                 }
             }
 
-            // Arm the connect timeout now that we own a real token.
-            connection.timeout_container().set(token);
-
+            // No `set(token)` here any more: the connection arms its own
+            // connect-timeout DEADLINE at construction and the `Mux` adapter
+            // reflects it onto the wheel when `ready()` reschedules, which is
+            // the same pass this runs in. Until that reschedule no wheel entry
+            // exists — which is what the rollback paths above want, since they
+            // drop `connection` without ever reaching here.
             self.backends.insert(token, connection);
             token
         };
@@ -711,8 +710,22 @@ impl Router {
             headers_request,
             headers_response,
             required_auth: frontend_required_auth,
-            ..
+            tags,
         } = route;
+
+        // The matched frontend rule is the only correct owner of the
+        // access-log tags, so stash them here — before every early return
+        // below, so a redirect, a 401 and a backend-connect failure log
+        // them too. The listener's `BTreeMap<String, CachedTags>` cannot
+        // do this job: it is written under the frontend rule's hostname
+        // and read under the request's authority, two spellings that only
+        // coincide for an exact literal frontend (sozu#1379).
+        //
+        // No `..` in the destructure above, deliberately: that wildcard is
+        // exactly how `tags` was dropped on the floor for as long as the
+        // bug lived. A future `RouteResult` field now has to be routed
+        // here explicitly or the build breaks.
+        context.tags = tags;
 
         // ── HSTS (RFC 6797) snapshot hoist for HTTPS ──────────────────────
         // The response snapshot is built in two passes so HSTS reaches
@@ -1332,8 +1345,133 @@ pub(crate) fn authority_matched_cert_name<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{authority_matches_sni, log_coalescing_accepted, log_sni_authority_mismatch};
-    use crate::protocol::http::editor::HttpContext;
+    use std::{cell::RefCell, collections::BTreeMap, rc::Rc, time::Duration};
+
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{PathRule, RequestHttpFrontend, RulePosition, SocketAddress},
+    };
+
+    use super::{
+        Router, authority_matches_sni, log_coalescing_accepted, log_sni_authority_mismatch,
+    };
+    use crate::{
+        L7Proxy,
+        http::HttpProxy,
+        protocol::{
+            http::{editor::HttpContext, parser::Method},
+            mux::stream::Stream,
+        },
+    };
+
+    /// A frontend declared as `*.example.com` and carrying `--tags` must put
+    /// those tags on the access-log line of a request whose authority is
+    /// `foo.example.com` (sozu#1379).
+    ///
+    /// The bug this pins: the tag cache was WRITTEN under the frontend
+    /// RULE's hostname (`listener.set_tags(front.hostname, …)` in
+    /// `lib/src/http.rs` / `lib/src/https.rs`) and READ back under the
+    /// REQUEST's authority (`listener.get_tags(hostname)` in
+    /// `lib/src/protocol/mux/stream.rs`), against a `BTreeMap<String,
+    /// CachedTags>` that does exact-key lookup only. `*.example.com` is a
+    /// key `foo.example.com` can never produce, so every access-log line of
+    /// every wildcard, regex, ported or differently-cased frontend lost its
+    /// tags silently. The fix resolves the tags through the router, which
+    /// already knows which frontend rule matched.
+    ///
+    /// The test drives the production add path (`HttpProxy::add_http_frontend`),
+    /// the production routing path (`Router::route_from_request`) and the
+    /// production emit path (`Stream::generate_access_log`), and asserts on
+    /// the rendered access-log line rather than on any intermediate field,
+    /// so it stays valid whatever the resolution mechanism becomes.
+    ///
+    /// To SEE THIS RED: in `Router::route_from_request`
+    /// (`lib/src/protocol/mux/router.rs`), replace the
+    /// `context.tags = tags;` stash that follows the `RouteResult`
+    /// destructure with `let _ = tags;`. The access log then falls back to
+    /// the authority-keyed listener map, which holds only the
+    /// `*.example.com` key, and the line is emitted with an empty `[]` tag
+    /// field. Dropping `|| front.tags.is_some()` from `has_policy` in
+    /// `Router::add_http_front_with_hsts_origin`
+    /// (`lib/src/router/mod.rs`) reddens it the same way, one step
+    /// earlier: the frontend is then stored as a tagless
+    /// `Route::ClusterId` and there is nothing left for the stash to
+    /// carry.
+    #[test]
+    fn a_wildcard_frontends_tags_reach_the_access_log_of_a_concrete_authority() {
+        const TAG: &str = "owner=team-wildcard-1379";
+
+        let output = crate::capture_test_logs(|| {
+            let port = crate::testing::provide_port();
+            let address = SocketAddress::new_v4(127, 0, 0, 1, port);
+            let config = ListenerBuilder::new_http(address)
+                .to_http(None)
+                .expect("test http listener config must build");
+            let parts = crate::testing::prebuild_server(10, 16_384, false)
+                .expect("test server parts must build");
+            let pool = parts.pool.clone();
+            let mut proxy =
+                HttpProxy::new(parts.registry, parts.sessions, parts.pool, parts.backends);
+            let token = mio::Token(0);
+            proxy
+                .add_listener(config, token)
+                .expect("test listener must register");
+            proxy
+                .add_http_frontend(RequestHttpFrontend {
+                    cluster_id: Some("cluster-1379".to_owned()),
+                    address,
+                    hostname: "*.example.com".to_owned(),
+                    path: PathRule::prefix("/".to_owned()),
+                    position: RulePosition::Tree.into(),
+                    tags: BTreeMap::from([("owner".to_owned(), "team-wildcard-1379".to_owned())]),
+                    ..Default::default()
+                })
+                .expect("the wildcard frontend must register");
+            let listener = proxy
+                .get_listener(&token)
+                .expect("the registered listener must be reachable");
+            let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(proxy));
+
+            let mut context = HttpContext::new(
+                rusty_ulid::Ulid::generate(),
+                rusty_ulid::Ulid::generate(),
+                crate::Protocol::HTTP,
+                "127.0.0.1:80"
+                    .parse()
+                    .expect("test public address must parse"),
+                Some(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .expect("test session address must parse"),
+                ),
+                "SOZUBALANCEID".to_owned(),
+                "Sozu-Id".to_owned(),
+                false,
+                false,
+            );
+            context.authority = Some("foo.example.com".to_owned());
+            context.path = Some("/".to_owned());
+            context.method = Some(Method::Get);
+
+            let mut stream = Stream::new(Rc::downgrade(&pool), context, 65_535)
+                .expect("test stream must check out its buffers");
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            let (front, stream_context) = {
+                let split = &mut stream;
+                (&mut split.front, &mut split.context)
+            };
+            router
+                .route_from_request(stream_context, front, &listener, &proxy)
+                .expect("the wildcard frontend must route foo.example.com");
+
+            stream.generate_access_log(false, None, listener, None, None);
+        });
+
+        assert!(
+            output.contains(TAG),
+            "the access log of a request routed by `*.example.com` must carry that frontend's tags, got: {output}"
+        );
+    }
 
     #[test]
     fn routing_runtime_logs_bound_method_authority_sni_and_certificate_names() {

@@ -133,11 +133,31 @@ impl TryFrom<&AddCertificate> for CertifiedKeyWrapper {
 
         let x509 = parse_x509(&pem.contents).map_err(CertificateResolverError::ParseX509)?;
 
+        // ASCII-lowercase every name at the single point where the set
+        // is built, so the SNI trie key, the name index, the removal
+        // walk and the SAN snapshot all agree by construction.
+        //
+        // The lookup side is already lowercase and there is nothing we
+        // can do about it: rustls lowercases the SNI inside
+        // `process_client_hello` (`DnsName::to_lowercase_owned`) before
+        // `ResolvesServerCert::resolve` ever sees it, so a name stored
+        // with uppercase — an X.509 SAN carrying it (RFC 5280 does not
+        // forbid it) or an operator `names` override — was reachable by
+        // no SNI at all and every handshake for it fell back to
+        // `DEFAULT_CERTIFICATE`. DNS names compare case-insensitively
+        // (RFC 4343), so normalising loses nothing.
         let overriding_names = if add.certificate.names.is_empty() {
             get_cn_and_san_attributes(&x509)
         } else {
             add.certificate.names.clone()
         };
+        let overriding_names: Vec<String> = overriding_names
+            .into_iter()
+            .map(|mut name| {
+                name.make_ascii_lowercase();
+                name
+            })
+            .collect();
 
         let expiration = add
             .expired_at
@@ -323,10 +343,27 @@ impl CertificateResolver {
         // `self.domains` never learns the name -- a dead SNI route
         // failing every handshake with no diagnostic. The length bound
         // mirrors the router's: the trie recurses once per label.
+        //
+        // A name carrying `/` is refused on its BYTES, not on whether it
+        // inserts. `self.domains` is the router's
+        // `pattern_trie::TrieNode`, which compiles a label wrapped in
+        // `/.../` into a REGEX segment, so such a name INSERTS happily
+        // and then binds one certificate to an open-ended class of SNI
+        // values: `/te.*/.example.com` was served for both
+        // `test.example.com` and `tenant.example.com` (#1378). The
+        // dry-run alone can never see it. `/` cannot occur in a DNS
+        // name, so nothing legitimate is lost, and this is the rule
+        // `config::validate_sni_pattern` already applies to every path
+        // into the TCP SNI route table -- the certificate trie was the
+        // one SNI table still open. Removal is unaffected: it re-inserts
+        // the names a certificate already carries and never re-validates
+        // them, so no certificate accepted by an earlier build becomes
+        // un-removable.
         {
             let mut scratch: TrieNode<()> = TrieNode::root();
             for name in &cert_to_add.names {
                 if name.len() > MAX_HOSTNAME_LENGTH
+                    || name.contains('/')
                     || scratch.domain_insert(name.to_owned().into_bytes(), ())
                         == InsertResult::Failed
                 {
@@ -800,7 +837,10 @@ mod tests {
         AddCertificate, CertificateAndKey, ReplaceCertificate, SocketAddress,
     };
 
-    use super::{CertificateResolver, CertifiedKeyWrapper, MutexCertificateResolver};
+    use super::{
+        CertificateResolver, CertificateResolverError, CertifiedKeyWrapper,
+        MutexCertificateResolver,
+    };
 
     fn drive_client_hello(resolver: Arc<MutexCertificateResolver>, server_name: String) {
         let provider = Arc::new(crate::crypto::default_provider());
@@ -1629,5 +1669,171 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// The SNI half of the same add/lookup case asymmetry, with the two
+    /// sides swapped.
+    ///
+    /// RFC 4343 makes DNS names compare case-insensitively, and rustls
+    /// hands `ResolvesServerCert::resolve` an SNI it has ALREADY
+    /// lowercased: `rustls::server::hs::process_client_hello` stores
+    /// `dns_name.to_lowercase_owned()` (rustls 0.23,
+    /// `rustls-pki-types`' `DnsName::to_lowercase_owned` is an
+    /// `to_ascii_lowercase`), and `ClientHello::server_name()` surfaces
+    /// that field. The ADD side had no such normalisation: a SAN read off
+    /// the X.509 (`command/src/certificate.rs`'s
+    /// `get_cn_and_san_attributes`) or an operator-supplied `names`
+    /// override went into the SNI trie and the name index verbatim.
+    ///
+    /// So a certificate carrying `MiXeD.Example.COM` was reachable by no
+    /// SNI at all — every handshake for that name fell through to the
+    /// `DEFAULT_CERTIFICATE` arm of `MutexCertificateResolver::resolve`,
+    /// which also increments `names::tls::DEFAULT_CERT_USED`, while the
+    /// certificate stayed recorded and queryable.
+    ///
+    /// To SEE THIS RED: in `CertifiedKeyWrapper::try_from`, delete the
+    /// `let overriding_names: Vec<String> = overriding_names …` rebind
+    /// that maps `|mut name| { name.make_ascii_lowercase(); name }`, so
+    /// the names reach the trie as written. The FIRST assertion below
+    /// fails — `domain_lookup(b"mixed.example.com", true)` is `None`, so
+    /// the test panics there and the later ones are never reached.
+    #[test]
+    fn a_mixed_case_certificate_name_resolves_for_the_lowercased_sni() {
+        const MIXED: &str = "MiXeD.Example.COM";
+        const LOWER: &str = "mixed.example.com";
+
+        let mut resolver = CertificateResolver::default();
+        let fingerprint = resolver
+            .add_certificate(&AddCertificate {
+                address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate: CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    names: vec![MIXED.to_owned()],
+                    ..Default::default()
+                },
+                expired_at: None,
+            })
+            .expect("the mixed-case certificate must load");
+
+        assert!(
+            resolver.domain_lookup(LOWER.as_bytes(), true).is_some(),
+            "rustls only ever asks for the lowercased SNI, so that is the \
+             only key the trie can usefully hold",
+        );
+        assert_eq!(
+            resolver.names_for_sni(LOWER.as_bytes()),
+            Some(vec![LOWER.to_owned()]),
+            "the SAN snapshot feeding the H2 `:authority` binding must \
+             carry the normalised name",
+        );
+
+        // Removal walks the certificate's stored names, so it stays
+        // symmetric with the add path by construction: normalise once at
+        // the single point where `names` is built and both verbs agree.
+        resolver
+            .remove_certificate(&fingerprint)
+            .expect("the mixed-case certificate must be removable");
+        assert!(
+            resolver.domain_lookup(LOWER.as_bytes(), true).is_none(),
+            "removing the certificate must retire its normalised trie key",
+        );
+    }
+
+    /// A certificate name enters the SNI `TrieNode` verbatim, and that
+    /// trie is the same `lib/src/router/pattern_trie.rs` the HTTP router
+    /// uses: a dot-separated label wrapped in `/.../` is compiled as a
+    /// REGEX segment (`insert_recursive` -> `anchored_segment` ->
+    /// `Regex::new`). So an operator `names` entry such as
+    /// `/te.*/.example.com` bound ONE certificate to an open-ended class
+    /// of SNI values -- measured on `c7ac070e`, that name was served for
+    /// both `test.example.com` and `tenant.example.com`
+    /// (sozu-proxy/sozu#1378). A name like `/.*/.example.com` is one
+    /// character away from a plausible typo, and the certificate
+    /// inventory an operator reads shows a SAN-shaped string while the
+    /// trie holds a pattern.
+    ///
+    /// The validation that already existed could not catch it: it
+    /// dry-runs every name into a scratch trie and asks only whether the
+    /// name INSERTS, and a regex segment inserts perfectly well. The
+    /// check therefore has to be on the name's BYTES, and it has to run
+    /// in the same pre-mutation block as the `MAX_HOSTNAME_LENGTH` bound
+    /// so nothing is half-registered. `/` cannot occur in a DNS name, so
+    /// nothing legitimate is refused -- and the ordinary `*.` wildcard
+    /// name, which the trie handles as a wildcard and not as a regex,
+    /// still loads; the second half of this test pins that the guard was
+    /// not widened into "refuse anything that is not a literal".
+    ///
+    /// This mirrors `validate_sni_pattern` (`command/src/config.rs`),
+    /// which already rejects `/` on every path into the TCP SNI route
+    /// table; the certificate trie was the one SNI table left open.
+    ///
+    /// To SEE THIS RED: in `add_certificate`'s pre-mutation dry-run
+    /// block, delete the `|| name.contains('/')` disjunct from the
+    /// rejection condition. The certificate then loads and `expect_err`
+    /// panics on the returned `Ok(fingerprint)`, so the test fails at its
+    /// very first statement.
+    #[test]
+    fn a_certificate_name_carrying_a_regex_segment_is_refused() {
+        const REGEX_NAME: &str = "/te.*/.example.com";
+
+        let mut resolver = CertificateResolver::default();
+        let error = resolver
+            .add_certificate(&AddCertificate {
+                address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate: CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    names: vec![REGEX_NAME.to_owned()],
+                    ..Default::default()
+                },
+                expired_at: None,
+            })
+            .expect_err("a certificate name carrying a regex segment must be refused");
+
+        assert!(
+            matches!(&error, CertificateResolverError::InvalidName(name) if name == REGEX_NAME),
+            "the refusal must be InvalidName, got {error:?}",
+        );
+
+        // Refused BEFORE any mutation, exactly like the
+        // `MAX_HOSTNAME_LENGTH` bound it sits beside: no certificate
+        // stored, no name indexed, and -- the point of the report -- no
+        // open-ended class of SNI values bound in the trie.
+        assert!(
+            resolver.certificates.is_empty(),
+            "a refused certificate must not be stored",
+        );
+        assert!(
+            resolver.name_fingerprint_idx.is_empty(),
+            "a refused certificate must not index any name",
+        );
+        for sni in ["test.example.com", "tenant.example.com", REGEX_NAME] {
+            assert!(
+                resolver.domain_lookup(sni.as_bytes(), true).is_none(),
+                "a refused certificate name must bind no SNI, yet {sni} resolved",
+            );
+        }
+
+        // The guard is on `/` alone. An ordinary wildcard SAN is not a
+        // regex segment, still loads, and still serves its subtree.
+        resolver
+            .add_certificate(&AddCertificate {
+                address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate: CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    names: vec!["*.example.com".to_owned()],
+                    ..Default::default()
+                },
+                expired_at: None,
+            })
+            .expect("a wildcard certificate name must still load");
+        assert!(
+            resolver
+                .domain_lookup(b"tenant.example.com", true)
+                .is_some(),
+            "the wildcard certificate must still serve a subdomain",
+        );
     }
 }
