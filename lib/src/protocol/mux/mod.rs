@@ -140,6 +140,7 @@ pub mod debug;
 mod h1;
 mod h2;
 mod h2_flow_control;
+mod h2_stream_table;
 mod hpack_state;
 pub mod parser;
 mod pkawa;
@@ -2650,7 +2651,7 @@ mod tests {
         let Connection::H2(h2) = &mut frontend else {
             unreachable!("frontend was built as H2")
         };
-        h2.streams.insert(1, stream_id);
+        h2.__test_insert_wire_mapping_only(1, stream_id);
 
         let mut mux = Mux {
             configured_frontend_timeout: Duration::from_secs(30),

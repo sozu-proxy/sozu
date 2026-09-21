@@ -1832,6 +1832,52 @@
   guarantees it). Complexity is unmeasured beyond the default `max_concurrent_streams`: see the
   module's doc comment.
 
+- **`refactor(mux-h2)`: H2 wire-level stream-slot bookkeeping moves into its own
+  `lib/src/protocol/mux/h2_stream_table.rs`, behind the same closed-API shape `hpack_state.rs`
+  and `h2_flow_control.rs` established in the two prior extraction steps.** `H2StreamTable` now
+  owns the wire `StreamId -> GlobalStreamId` map, `highest_peer_stream_id`, the `expect_read` /
+  `expect_write` index-caching fields (`LIFECYCLE.md` §5), `rst_sent`, and the per-stream
+  liveness/flow-control-stall caches (`stream_last_activity_at`, `stream_fc_stalled_since`,
+  `stream_fc_stalled_progress`). `ConnectionH2::create_stream`, `start_stream`,
+  `remove_dead_stream` and `refuse_stream_and_discard` stay on `ConnectionH2` — they orchestrate
+  `Context`, logging, metrics, the RFC 9218 `prioriser` and readiness, none of which the new module
+  has — but their bookkeeping now delegates to `H2StreamTable`'s narrow API instead of touching
+  seven raw fields directly. `H2StreamTable::remove` is the sole removal chokepoint, including the
+  `expect_read`/`expect_write` gid invalidation `LIFECYCLE.md` §5.4 documents; `streams` is now a
+  private field of `h2_stream_table.rs`, so `self.streams.remove(...)` cannot even be *written* from
+  `h2.rs` any more — a compile error, verified by a deliberately reintroduced inline removal that
+  failed with `E0609: no field 'streams'` (reverted). This makes §5.4's "no call site removes
+  inline anymore" claim compiler-enforced rather than prose that can silently go stale, which is
+  exactly what happened to it once already (sozu-proxy/sozu#1399 had to correct a false version of
+  that same claim). On this branch the claim was independently verified true before the move too —
+  `self.streams.remove` occurred at exactly one call site, inside the old `remove_dead_stream` —
+  so no parallel removal site needed eliminating here; the extraction's contribution is closing off
+  the possibility of one ever reappearing.
+  One determinism fix rides along, found by enumerating every iteration over the moved state (not
+  just grepping for `.iter()/.keys()/.values()/.drain()`, which misses a `for (&k, &v) in &map`
+  site): `H2StreamTable::collect_timed_out` (the reap-candidate union
+  `ConnectionH2::cancel_timed_out_streams` drives) used to read `stream_last_activity_at` and
+  `stream_fc_stalled_since` as plain `HashMap`s with `for (&k, &v) in map` loops, so **which of
+  several simultaneously-timed-out streams got `RST_STREAM`'d first was non-deterministic across
+  process restarts** — the same class of wire-order leak sozu-proxy/sozu#1338 decided to close, and
+  the same fix step 2 already applied to `pending_window_updates`. That order flows directly onto
+  the wire: `collect_timed_out`'s returned order is the order `cancel_timed_out_streams` calls
+  `enqueue_rst` in, which pushes onto `pending_rst_streams`, drained in push order. Both maps are
+  now `BTreeMap`s (`stream_fc_stalled_progress` converts alongside `stream_fc_stalled_since` since
+  the two are documented as kept in lockstep at every arm/clear/evict site), so `collect_timed_out`
+  walks each guard group — idle-timeout, then window-stall — in ascending `StreamId` order. Every
+  other iteration over the wire map itself (`streams`) was enumerated and found NOT to leak: the
+  RFC 9218 priority scheduler's `HashMap`-order `keys()` feed is immediately sorted by
+  `(urgency, *id)`, a total order because `*id` is a unique tiebreaker; the GOAWAY retry loop and
+  `close()`'s backend-teardown loop only affect reconnect/notify *scheduling* order, not the bytes
+  of a fixed frame set, which `write_streams`'s deterministic priority sort still governs; and
+  GOAWAY's own `last_stream_id` is the incrementally-updated `highest_peer_stream_id` scalar, never
+  derived by iterating the map. See the new module's doc comment for the full enumeration.
+  `H2StreamTable` carries `debug_assert!` pre/post-conditions on every mutating method plus a
+  `#[cfg(debug_assertions)] check_invariants()` sweep — including that `stream_fc_stalled_since` and
+  `stream_fc_stalled_progress` track exactly the same stream ids — run as a post-condition of each,
+  exactly as `h2_flow_control::H2FlowControl` and `protocol::udp::manager::UdpManager` do.
+
 - **`refactor(mux)`: the H1/H2 cores publish a next-timeout deadline instead of owning a timer
   handle; the `Mux` adapter owns every `TimeoutContainer`.**
   No behaviour change. `ConnectionH1` and `ConnectionH2` no longer hold a `TimeoutContainer` and no
