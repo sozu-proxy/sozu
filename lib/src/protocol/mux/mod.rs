@@ -139,6 +139,7 @@ mod converter;
 pub mod debug;
 mod h1;
 mod h2;
+mod hpack_state;
 pub mod parser;
 mod pkawa;
 pub mod router;

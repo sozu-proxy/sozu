@@ -33,7 +33,7 @@ use crate::{
     protocol::mux::{
         BackendStatus, Context, DebugEvent, DebugHistory, Endpoint, GenericHttpStream,
         GlobalStreamId, MuxResult, Position, Stream, StreamId, StreamState, converter,
-        forcefully_terminate_answer,
+        forcefully_terminate_answer, hpack_state,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
         pkawa, remove_backend_stream, serializer, set_default_answer,
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
@@ -1725,8 +1725,11 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// prefix emitted by this module's `log_context!` / `log_context_stream!`
     /// macros.
     pub session_ulid: Ulid,
-    pub decoder: loona_hpack::Decoder<'static>,
-    pub encoder: loona_hpack::Encoder<'static>,
+    /// HPACK decoder/encoder pair and their reusable scratch buffers
+    /// (`converter_buf`, `lowercase_buf`, `cookie_buf`, `priorities_buf`),
+    /// encapsulated so nothing outside `hpack_state.rs` can reach the raw
+    /// fields — see [`hpack_state::HpackState`].
+    hpack: hpack_state::HpackState,
     pub expect_read: Option<(H2StreamId, usize)>,
     pub expect_write: Option<H2StreamId>,
     pub last_stream_id: StreamId,
@@ -1764,12 +1767,6 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// requirement, not a nicety — see the RFC 9113 encoder-decoder
     /// synchronisation contract (§6.5.2).
     pub pending_table_size_update: Option<u32>,
-    /// Reusable buffer for HPACK-encoded headers in the H2 block converter.
-    pub converter_buf: Vec<u8>,
-    /// Reusable buffer for lowercasing header keys in the H2 block converter.
-    pub lowercase_buf: Vec<u8>,
-    /// Reusable buffer for assembling cookie values in the H2 block converter.
-    pub cookie_buf: Vec<u8>,
     /// Connection draining state for graceful shutdown.
     pub drain: H2DrainState,
     pub zero: GenericHttpStream,
@@ -1800,9 +1797,6 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// 9113 §4.3: field-compression state is scoped to the connection, not
     /// the stream. See `LIFECYCLE.md`'s Discard section.
     discarded_field_block: Option<DiscardedFieldBlock>,
-    /// Reusable buffer for priority-sorted stream IDs in write_streams().
-    /// Cleared and reused each call to avoid per-frame allocation.
-    priorities_buf: Vec<StreamId>,
     /// True once we've asked rustls to emit TLS close_notify for this frontend.
     close_notify_sent: bool,
     /// Per-listener H2 connection tuning (window size, max streams, shrink ratio).
@@ -2135,14 +2129,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             settings_max_concurrent_streams: connection_config.max_concurrent_streams,
             ..H2Settings::default()
         };
-        let mut decoder = loona_hpack::Decoder::new();
         // RFC 7541 §4.2: enforce SETTINGS_HEADER_TABLE_SIZE as the upper bound
         // for dynamic table size updates from the peer
-        decoder.set_max_allowed_table_size(local_settings.settings_header_table_size as usize);
+        let hpack =
+            hpack_state::HpackState::new(local_settings.settings_header_table_size as usize);
         Some(ConnectionH2 {
             session_ulid,
-            decoder,
-            encoder: loona_hpack::Encoder::new(),
+            hpack,
             expect_read,
             expect_write: None,
             last_stream_id: 0,
@@ -2171,9 +2164,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             },
             highest_peer_stream_id: 0,
             pending_table_size_update: None,
-            converter_buf: Vec::new(),
-            lowercase_buf: Vec::new(),
-            cookie_buf: Vec::new(),
             drain: H2DrainState {
                 draining: false,
                 peer_last_stream_id: None,
@@ -2193,7 +2183,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             rst_sent: std::collections::HashSet::new(),
             total_rst_streams_queued: 0,
             discarded_field_block: None,
-            priorities_buf: Vec::new(),
             close_notify_sent: false,
             max_pending_window_updates: 1 + connection_config.max_concurrent_streams as usize * 4,
             connection_config,
@@ -2808,7 +2797,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // decoder does not fall behind the peer's encoder.
                 if let Some(discarded) = self.discarded_field_block.take()
                     && let Err(error) =
-                        decode_discarded_field_block(&mut self.decoder, i, discarded)
+                        decode_discarded_field_block(self.hpack.decoder_mut(), i, discarded)
                 {
                     error!(
                         "{} discarded stream's HPACK field block failed to decode: {:?}",
@@ -3032,8 +3021,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// the socket, and recycles completed streams.
     ///
     /// NOTE: The priority iteration loop and converter setup remain inline here
-    /// because the converter borrows `self.encoder`, preventing further
-    /// decomposition into `&mut self` methods within the loop body.
+    /// because the converter borrows `self.hpack` (for its encoder), preventing
+    /// further decomposition into `&mut self` methods within the loop body.
     fn write_streams<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
     where
         E: Endpoint,
@@ -3151,17 +3140,28 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             b"http"
         };
         let mut completed_streams = Vec::new();
-        let mut converter_buf = std::mem::take(&mut self.converter_buf);
+        let mut converter_buf = self.hpack.take_converter_buf();
         converter_buf.clear();
+        let lowercase_buf = self.hpack.take_lowercase_buf();
+        let cookie_buf = self.hpack.take_cookie_buf();
+        // Taken out (by value) before `encoder_mut()` below for the same
+        // reason: once the converter holds the encoder borrow, no other
+        // `self.hpack` accessor can run until it is dropped. Restored
+        // alongside the other scratch buffers at the end of this pass.
+        let mut priorities_buf = self.hpack.take_priorities_buf();
         let mut converter = converter::H2BlockConverter {
             max_frame_size: self.peer_settings.settings_max_frame_size as usize,
             window: 0,
             stream_id: 0,
-            encoder: &mut self.encoder,
+            // Must be the last `self.hpack` accessor called before
+            // `converter` is fully built: it borrows `self.hpack` for as
+            // long as `converter` is alive, so every other `self.hpack.*`
+            // buffer needed by this struct literal is taken out above.
+            encoder: self.hpack.encoder_mut(),
             out: converter_buf,
             scheme,
-            lowercase_buf: std::mem::take(&mut self.lowercase_buf),
-            cookie_buf: std::mem::take(&mut self.cookie_buf),
+            lowercase_buf,
+            cookie_buf,
             // When this connection is a backend client we are writing
             // toward the upstream backend — flow-control stalls in that
             // direction are scoped to `backend.flow_control.paused` (in
@@ -3192,13 +3192,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // RST_STREAM(InternalError).
             pending_oversized_abort: false,
         };
-        self.priorities_buf.clear();
-        self.priorities_buf.extend(self.streams.keys().copied());
+        priorities_buf.clear();
+        priorities_buf.extend(self.streams.keys().copied());
         // RFC 9218 §4 primary sort: ascending urgency, then stream ID for
         // stability. The incremental flag is handled by
         // `apply_incremental_rotation` below so it does not perturb the
         // non-incremental fast path.
-        self.priorities_buf.sort_by_cached_key(|id| {
+        priorities_buf.sort_by_cached_key(|id| {
             let (urgency, _) = self.prioriser.get(id);
             (urgency, *id)
         });
@@ -3208,7 +3208,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // same-urgency incremental peers.
         let incremental_count = self
             .prioriser
-            .apply_incremental_rotation(&mut self.priorities_buf);
+            .apply_incremental_rotation(&mut priorities_buf);
 
         // RFC 9218 §4 refinement (Tier 3a): the connection-global
         // `incremental_count` is too coarse for `converter.incremental_peer_count`.
@@ -3219,7 +3219,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // are actually ready to emit this pass (eligibility mirrors the check
         // in the write loop below).
         let mut ready_incremental_by_urgency: HashMap<u8, usize> = HashMap::new();
-        for &sid in self.priorities_buf.iter() {
+        for &sid in priorities_buf.iter() {
             let (urgency, is_incremental) = self.prioriser.get(&sid);
             if !is_incremental {
                 continue;
@@ -3242,7 +3242,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         trace!(
             "{} PRIORITIES: {:?} (incremental_count={}, per_bucket={:?})",
             log_context!(self),
-            self.priorities_buf,
+            priorities_buf,
             incremental_count,
             ready_incremental_by_urgency
         );
@@ -3259,11 +3259,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Collect every fresh RST_STREAM emitted via the converter
         // (`initialize` chokepoint or the HPACK over-budget abort path)
         // so we can run `account_emitted_rst` for each one AFTER the
-        // converter is dropped — the converter holds `&mut self.encoder`
-        // for the loop body so we cannot take `&mut self` until then.
+        // converter is dropped — the converter holds the encoder borrowed
+        // out of `self.hpack` for the loop body so we cannot take `&mut
+        // self` until then.
         let mut freshly_emitted_rsts: Vec<H2Error> = Vec::new();
-        'outer: for idx in 0..self.priorities_buf.len() {
-            let stream_id = self.priorities_buf[idx];
+        'outer: for &stream_id in &priorities_buf {
             let Some(&global_stream_id) = self.streams.get(&stream_id) else {
                 error!(
                     "{} stream_id {} from sorted keys missing in streams map",
@@ -3325,7 +3325,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     // trailers, malformed bodies, etc.) would land an
                     // unaccounted RST on the wire. We defer the actual
                     // accounting call until after `drop(converter)` — the
-                    // converter holds `&mut self.encoder` here.
+                    // converter holds the encoder borrowed out of
+                    // `self.hpack` here.
                     if freshly_rst {
                         freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
                     }
@@ -3523,15 +3524,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         // Sample the pass's final bucket totals. Publication is deferred to
         // the `gauge_connection_state` call below: `converter` still borrows
-        // `self.encoder` here, and the value must reach the gauge in the SAME
-        // pass that computed it — the entry call at the top of `write_streams`
-        // runs before `ready_incremental_by_urgency` exists.
+        // the encoder out of `self.hpack` here, and the value must reach the
+        // gauge in the SAME pass that computed it — the entry call at the
+        // top of `write_streams` runs before `ready_incremental_by_urgency`
+        // exists.
         self.ready_incremental_streams = ready_incremental_by_urgency
             .values()
             .copied()
             .sum::<usize>();
-        // Reclaim the converter's reusable buffers before any &mut self calls,
-        // since the converter borrows self.encoder.
+        // Reclaim the converter's reusable buffers before any &mut self.hpack
+        // calls, since the converter borrows the encoder out of self.hpack.
         let converter_out = std::mem::take(&mut converter.out);
         let lowercase_buf = std::mem::take(&mut converter.lowercase_buf);
         let cookie_buf = std::mem::take(&mut converter.cookie_buf);
@@ -3559,10 +3561,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 return result;
             }
         }
-        self.converter_buf = converter_out;
-        self.lowercase_buf = lowercase_buf;
-        self.cookie_buf = cookie_buf;
-        self.shrink_converter_buffers();
+        self.hpack.put_converter_buf(converter_out);
+        self.hpack.put_lowercase_buf(lowercase_buf);
+        self.hpack.put_cookie_buf(cookie_buf);
+        self.hpack.put_priorities_buf(priorities_buf);
+        self.hpack.shrink_converter_buffers();
         // RFC 9218 §4: commit the round-robin cursor so the next writable
         // cycle begins with the stream immediately after the one we fired
         // first this pass.
@@ -3570,10 +3573,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             .advance_incremental_cursor(first_incremental_fired);
         let mut close_frontend_after_completed_stream = false;
         for (dead_id, global_stream_id, token, close_frontend) in completed_streams {
-            // The main write loop borrows self.encoder, so we can't mutate the
-            // H2 maps inline. Retire the recycled stream immediately after the
-            // converter borrow ends, before endpoint.end_stream() can trigger
-            // teardown and observe a stale `Recycle` entry in self.streams.
+            // The main write loop borrows the encoder out of self.hpack, so
+            // we can't mutate the H2 maps inline. Retire the recycled stream
+            // immediately after the converter borrow ends, before
+            // endpoint.end_stream() can trigger teardown and observe a
+            // stale `Recycle` entry in self.streams.
             self.remove_dead_stream(dead_id, global_stream_id);
             close_frontend_after_completed_stream |= close_frontend;
             if let Some(token) = token {
@@ -3777,20 +3781,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 stream.state = StreamState::Recycle;
             }
             self.remove_dead_stream(stream_id, global_stream_id);
-        }
-    }
-
-    /// Shrink reusable converter buffers when they grow beyond 16 KB to avoid
-    /// holding memory after a burst of large headers.
-    fn shrink_converter_buffers(&mut self) {
-        if self.converter_buf.capacity() > 16_384 {
-            self.converter_buf.shrink_to(4096);
-        }
-        if self.lowercase_buf.capacity() > 16_384 {
-            self.lowercase_buf.shrink_to(4096);
-        }
-        if self.cookie_buf.capacity() > 16_384 {
-            self.cookie_buf.shrink_to(4096);
         }
     }
 
@@ -4239,8 +4229,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///
     /// Takes individual field references (not `&self`) for the same reason
     /// `try_recycle_server_stream` does — to avoid borrow conflicts with the
-    /// `H2BlockConverter` that holds `&mut self.encoder` during the per-stream
-    /// write loop.
+    /// `H2BlockConverter` that holds the encoder borrowed out of `self.hpack`
+    /// during the per-stream write loop.
     fn snapshot_rtts<E: Endpoint>(
         position: &Position,
         socket: &Front,
@@ -4266,7 +4256,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// if a token was returned. Returns `None` if recycling was deferred or not applicable.
     ///
     /// Takes individual field references instead of `&mut self` to avoid borrow
-    /// conflicts when the H2 block converter holds `&mut self.encoder`.
+    /// conflicts when the H2 block converter holds the encoder borrowed out
+    /// of `self.hpack`.
     /// `client_rtt`/`server_rtt` are snapshotted by the caller (which still
     /// owns `&self.socket` and `&endpoint`) and forwarded into the access log.
     #[allow(clippy::too_many_arguments)]
@@ -4556,18 +4547,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // on a session that has been idle long enough to risk timing
         // out a stream).
         const SCRATCH_BUF_RETAIN: usize = 16 * 1024;
-        if self.converter_buf.capacity() > SCRATCH_BUF_RETAIN * 4 {
-            self.converter_buf.shrink_to(SCRATCH_BUF_RETAIN);
-        }
-        if self.lowercase_buf.capacity() > SCRATCH_BUF_RETAIN * 4 {
-            self.lowercase_buf.shrink_to(SCRATCH_BUF_RETAIN);
-        }
-        if self.cookie_buf.capacity() > SCRATCH_BUF_RETAIN * 4 {
-            self.cookie_buf.shrink_to(SCRATCH_BUF_RETAIN);
-        }
-        if self.priorities_buf.capacity() > SCRATCH_BUF_RETAIN * 4 {
-            self.priorities_buf.shrink_to(SCRATCH_BUF_RETAIN);
-        }
+        self.hpack.reclaim_idle_buffers(SCRATCH_BUF_RETAIN);
 
         if self.streams.is_empty()
             || (self.stream_last_activity_at.is_empty() && self.stream_fc_stalled_since.is_empty())
@@ -4754,8 +4734,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///     RST_STREAM frames straight into `kawa.out` from inside
     ///     `kawa.prepare`. We collect those `H2Error` codes during the
     ///     `write_streams` loop and call this helper for each one
-    ///     after `drop(converter)` (because the converter holds
-    ///     `&mut self.encoder`).
+    ///     after `drop(converter)` (because the converter holds the
+    ///     encoder borrowed out of `self.hpack`).
     ///
     /// Returning `Some(MuxResult)` means the caller MUST short-circuit
     /// with that result — the flood detector tripped its lifetime cap
@@ -5824,7 +5804,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let was_initial = parts.rbuffer.is_initial();
         let elide_x_real_ip = parts.context.elide_x_real_ip;
         let status = pkawa::handle_header(
-            &mut self.decoder,
+            self.hpack.decoder_mut(),
             &mut self.prioriser,
             stream_id,
             parts.rbuffer,
@@ -6148,7 +6128,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // RFC 7541 §4.2: sync the decoder's max allowed table size with
             // what we advertised. Currently a no-op (settings don't change at
             // runtime), but guards against future runtime SETTINGS updates.
-            self.decoder.set_max_allowed_table_size(
+            self.hpack.set_decoder_max_allowed_table_size(
                 self.local_settings.settings_header_table_size as usize,
             );
             self.attribute_bytes_to_overhead();
@@ -6184,7 +6164,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     let cap = self.flood_detector.config.max_header_table_size;
                     let capped = v.min(cap);
                     self.peer_settings.settings_header_table_size = capped;
-                    self.encoder.set_max_table_size(capped as usize);
+                    self.hpack.set_encoder_max_table_size(capped as usize);
                     // RFC 7541 §4.2 / §6.3: queue a dynamic-table-size-update
                     // HPACK directive for the next header block we emit.
                     // Without it, the peer's decoder keeps its previous (possibly
@@ -9887,9 +9867,12 @@ mod tests {
         );
 
         let mut decoded = Vec::new();
-        let status = connection.decoder.decode_with_cb(&next_block, |k, v| {
-            decoded.push((k.into_owned(), v.into_owned()));
-        });
+        let status = connection
+            .hpack
+            .decoder_mut()
+            .decode_with_cb(&next_block, |k, v| {
+                decoded.push((k.into_owned(), v.into_owned()));
+            });
 
         assert!(
             status.is_ok(),
@@ -10012,9 +9995,12 @@ mod tests {
         );
 
         let mut decoded = Vec::new();
-        let status = connection.decoder.decode_with_cb(&next_block, |k, v| {
-            decoded.push((k.into_owned(), v.into_owned()));
-        });
+        let status = connection
+            .hpack
+            .decoder_mut()
+            .decode_with_cb(&next_block, |k, v| {
+                decoded.push((k.into_owned(), v.into_owned()));
+            });
 
         assert!(
             status.is_ok(),
@@ -10166,9 +10152,12 @@ mod tests {
         );
 
         let mut decoded = Vec::new();
-        let status = connection.decoder.decode_with_cb(&next_block, |k, v| {
-            decoded.push((k.into_owned(), v.into_owned()));
-        });
+        let status = connection
+            .hpack
+            .decoder_mut()
+            .decode_with_cb(&next_block, |k, v| {
+                decoded.push((k.into_owned(), v.into_owned()));
+            });
 
         assert!(
             status.is_ok(),
@@ -10351,9 +10340,12 @@ mod tests {
         );
 
         let mut decoded = Vec::new();
-        let status = connection.decoder.decode_with_cb(&next_block, |k, v| {
-            decoded.push((k.into_owned(), v.into_owned()));
-        });
+        let status = connection
+            .hpack
+            .decoder_mut()
+            .decode_with_cb(&next_block, |k, v| {
+                decoded.push((k.into_owned(), v.into_owned()));
+            });
 
         assert!(
             status.is_ok(),
