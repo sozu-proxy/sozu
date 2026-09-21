@@ -115,6 +115,43 @@ pub fn build_h2_or_h1_client() -> HttpsClient {
     Client::builder(TokioExecutor::new()).build(https)
 }
 
+/// Render `error` and every link of its [`std::error::Error::source`]
+/// chain on a single line.
+///
+/// Hyper's top-level `Display` is deliberately opaque: a request whose
+/// connection died before a response arrived prints `client error
+/// (SendRequest)` and nothing else, while the transport failure that
+/// actually ended it — a TLS alert, a `ConnectionReset`, an H2 GOAWAY and
+/// its error code — lives one or more `source()` links below and was
+/// discarded at every call site in this module. Two CI failures on
+/// 2026-09-21 (sozu#1393) reported exactly that eight-word string and
+/// stayed undiagnosable:
+/// `hsts_tests::test_hsts_on_https_unreachable_503` and
+/// `protocol_pair_matrix::basic_auth::test_h2_h1`. Neither was a timeout —
+/// both helpers print a distinct timeout message and neither appeared.
+///
+/// Rendered as `<outer> | caused by [1]: <source> | caused by [2]: ...`;
+/// an error with no source renders exactly as `Display` did before, so no
+/// existing log line loses information.
+///
+/// To SEE THIS RED: point any test's URI at a port nothing listens on.
+/// Measured 2026-09-21 against `test_hsts_on_https_unreachable_503`:
+/// `Could not get response: client error (Connect) | caused by [1]: tcp
+/// connect error: Connection refused (os error 111) | caused by [2]:
+/// Connection refused (os error 111)` — where the unchained print was the
+/// bare `client error (Connect)`.
+pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    let mut depth = 0usize;
+    while let Some(cause) = source {
+        depth += 1;
+        rendered.push_str(&format!(" | caused by [{depth}]: {cause}"));
+        source = cause.source();
+    }
+    rendered
+}
+
 /// Sends a GET request to the given URI using the provided client,
 /// awaits the response, returns the status code and body in case of success
 pub fn resolve_request(client: &HttpsClient, uri: hyper::Uri) -> Option<(StatusCode, String)> {
@@ -137,7 +174,7 @@ pub fn resolve_request_with_headers(
             let response = match client.get(uri).await {
                 Ok(response) => response,
                 Err(error) => {
-                    println!("Could not get response: {error}");
+                    println!("Could not get response: {}", format_error_chain(&error));
                     return None;
                 }
             };
@@ -146,7 +183,7 @@ pub fn resolve_request_with_headers(
             let body_bytes = match response.into_body().collect().await {
                 Ok(collected) => collected.to_bytes(),
                 Err(error) => {
-                    println!("Could not get body: {error}");
+                    println!("Could not get body: {}", format_error_chain(&error));
                     return Some((status, headers, String::new()));
                 }
             };
@@ -174,7 +211,7 @@ pub fn resolve_request_timeout(
             let response = match client.get(uri).await {
                 Ok(response) => response,
                 Err(error) => {
-                    println!("Could not get response: {error}");
+                    println!("Could not get response: {}", format_error_chain(&error));
                     return None;
                 }
             };
@@ -183,7 +220,7 @@ pub fn resolve_request_timeout(
             let body_bytes = match response.into_body().collect().await {
                 Ok(collected) => collected.to_bytes(),
                 Err(error) => {
-                    println!("Could not get body: {error}");
+                    println!("Could not get body: {}", format_error_chain(&error));
                     return Some((status, String::new()));
                 }
             };
@@ -218,7 +255,7 @@ pub fn resolve_post_request(
             let response = match client.request(request).await {
                 Ok(response) => response,
                 Err(error) => {
-                    println!("Could not get response: {error}");
+                    println!("Could not get response: {}", format_error_chain(&error));
                     return None;
                 }
             };
@@ -227,7 +264,7 @@ pub fn resolve_post_request(
             let body_bytes = match response.into_body().collect().await {
                 Ok(collected) => collected.to_bytes(),
                 Err(error) => {
-                    println!("Could not get body: {error}");
+                    println!("Could not get body: {}", format_error_chain(&error));
                     return Some((status, String::new()));
                 }
             };
@@ -260,7 +297,7 @@ pub fn resolve_concurrent_requests(
                         let response = match client.get(uri).await {
                             Ok(response) => response,
                             Err(error) => {
-                                println!("Could not get response: {error}");
+                                println!("Could not get response: {}", format_error_chain(&error));
                                 return None;
                             }
                         };
@@ -268,7 +305,7 @@ pub fn resolve_concurrent_requests(
                         let body_bytes = match response.into_body().collect().await {
                             Ok(collected) => collected.to_bytes(),
                             Err(error) => {
-                                println!("Could not get body: {error}");
+                                println!("Could not get body: {}", format_error_chain(&error));
                                 return Some((status, String::new()));
                             }
                         };
