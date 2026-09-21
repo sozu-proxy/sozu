@@ -398,6 +398,39 @@
   `Stream::generate_access_log`, and asserts on the rendered access-log line rather than on any
   intermediate field. `doc/observability.md` carries the resolution order.
   ([#1379](https://github.com/sozu-proxy/sozu/issues/1379))
+- **`fix(tcp)`: a routed SNI preread kept re-arming frontend-readable interest while its backend
+  was still connecting, spinning the session to `MAX_LOOP_ITERATIONS`.**
+  A `protocol = "tcp"` listener with SNI routes accumulates the ClientHello in `SniPreread`
+  (`lib/src/protocol/tcp_preread/shell.rs`) and stays parked there through the backend connect.
+  Once routed, `readable` deliberately reads nothing more: bytes past the routed window must stay
+  in the kernel socket buffer so the post-upgrade `Pipe` can replay the stream byte-for-byte.
+  `tcp_socket_read` (`lib/src/socket.rs`) returns `SocketResult::Continue`, not `WouldBlock`, when
+  it fills the capped slice it was handed, so a client that coalesces its ClientHello with the
+  first payload bytes — a TLS client writing a large request in one go — left the frontend
+  `READABLE` event latched with nothing able to clear it. `READABLE` also stayed in
+  `frontend_readiness.interest`, so `front_interest = interest & event` in
+  `TcpSession::ready_inner` (`lib/src/tcp.rs`) selected a dispatch that could never make progress
+  on every pass of the event loop: the worker logged `Handling session went through 10000
+  iterations, there's a probable infinite loop bug`, incremented `tcp.infinite_loop.error`, and
+  closed a healthy connection that had delivered `bin: 16384, bout: 0` — zero of the client's
+  bytes. Routing itself had succeeded; this is the datapath after it. The window is the backend
+  connect, so the faster the client and the slower the backend, the more reliably it fires:
+  deterministic on a release build, usually won on a debug build, which is why it surfaced as an
+  unreadable intermittent CI failure across unrelated branches rather than as a bug.
+  The routed transition now drops `READABLE` from the frontend INTEREST and deliberately preserves
+  the latched EVENT: `upgrade_sni_preread` hands that event bit to the post-upgrade `Pipe`
+  (`restore_readiness_events`) or `SendProxyProtocol` (`into_pipe`), each of which re-inserts
+  `READABLE` interest, and under edge-triggered epoll it is the only wake-up the coalesced tail
+  will ever get — clearing it instead would trade the spin for a hang. `HUP` and `ERROR` stay
+  armed, so a frontend that goes away mid-connect is still noticed, and no metric, configuration
+  key or CLI flag changes. Pinned by
+  `routed_preread_stops_re_arming_frontend_readable_while_connecting`
+  (`lib/src/protocol/tcp_preread/shell.rs`), which drives `ready_inner`'s exact re-entry predicate
+  against a real socket, and by the release-profile
+  `test_tcp_sni_large_payload_coalesced_with_hello_delivered_intact`
+  (`e2e/src/tests/tcp_sni_tests.rs`). See
+  [#1373](https://github.com/sozu-proxy/sozu/issues/1373) and hardening note 7 in
+  `lib/src/protocol/tcp_preread/LIFECYCLE.md`.
 
 - **`fix(router)`: an exact hostname added after a matching regex segment attached its rule to the
   regex segment's leaf, and the whole regex family served it.**

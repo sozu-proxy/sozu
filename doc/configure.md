@@ -3149,6 +3149,21 @@ See `lib/src/protocol/tcp_preread/LIFECYCLE.md` for the full state lifecycle,
 the four `proxy_protocol` handoff paths out of preread, and the reasoning
 behind each reject reason.
 
+> **`tcp.infinite_loop.error` on an SNI-routed listener.** Before
+> [#1373](https://github.com/sozu-proxy/sozu/issues/1373), a session whose
+> client coalesced its ClientHello with the first payload bytes — a TLS client
+> writing a large request in one go — kept the frontend selected as readable
+> while its backend was still connecting, even though a routed preread
+> deliberately reads nothing more. The event loop re-entered that dispatch
+> until the 10 000-iteration safety breaker tripped: the worker logged
+> `Handling session went through 10000 iterations, there's a probable infinite
+> loop bug`, incremented `tcp.infinite_loop.error`, and closed a healthy
+> connection that had delivered none of the client's bytes. The symptom is a
+> `tcp.infinite_loop.error` rising in step with `tcp.sni_preread.routed` while
+> `tcp.read.error` and `tcp.write.error` stay flat. Nothing to configure: the fix is in the datapath,
+> and the wider the gap between a fast client and a slow backend connect, the
+> more often the old behaviour fired.
+
 #### Socket and I/O errors
 
 | Metric                             | Type    | Scope | Description                                     |

@@ -192,10 +192,14 @@ impl<Front: SocketHandler> SniPreread<Front> {
         if self.outcome.is_some() {
             // Already decided -- and deliberately not reading: bytes the
             // client sends past the routed window must stay in the kernel
-            // socket buffer for the post-upgrade state to consume. Frontend
-            // READABLE interest stays armed until the upgrade swaps states
-            // (nothing quiesces it mid-connect), so a re-dispatch here is
-            // normal, not an error.
+            // socket buffer for the post-upgrade state to consume. Defensive
+            // only since sozu-proxy/sozu#1373: the `Output::Routed` arm of
+            // `handle_output` drops frontend-readable INTEREST at the same
+            // moment it latches the outcome, so `TcpSession::ready_inner`
+            // stops selecting this dispatch entirely. Returning `Continue`
+            // without consuming the (still latched, deliberately preserved)
+            // READABLE event is what spun the session to
+            // `MAX_LOOP_ITERATIONS` while the backend was still connecting.
             return SessionResult::Continue;
         }
 
@@ -346,6 +350,34 @@ impl<Front: SocketHandler> SniPreread<Front> {
                 // mirrors `RelayProxyProtocol::readable`'s identical arm
                 // once its own header has been parsed.
                 self.backend_readiness.interest.insert(Ready::WRITABLE);
+                // ...and drop frontend-readable interest in the same breath,
+                // completing the mirror: `relay.rs` drops READABLE on the line
+                // ABOVE the arm above, and copying only half of that pair is
+                // what left this state spinning. From here on
+                // `readable` deliberately reads nothing (the
+                // coalesced tail must stay in the kernel buffer for the
+                // post-upgrade state to replay byte-for-byte), so a frontend
+                // READABLE bit that stays SELECTED is a dispatch that can
+                // never make progress. `tcp_socket_read` returns
+                // `SocketResult::Continue` -- not `WouldBlock` -- when it
+                // fills the capped slice it was handed, which is exactly what
+                // a client coalescing its ClientHello with payload produces,
+                // so the event below is latched and nothing will ever clear
+                // it. Left selected, `front_interest = interest & event` in
+                // `TcpSession::ready_inner` stays readable on every pass and
+                // the session spins to `MAX_LOOP_ITERATIONS` with `bin` stuck
+                // at the cap and `bout == 0` (sozu-proxy/sozu#1373).
+                //
+                // Mask the INTEREST, never the event: `upgrade_sni_preread`
+                // hands `frontend_readiness.event` to the post-upgrade `Pipe`
+                // (`restore_readiness_events`) or `SendProxyProtocol`
+                // (`into_pipe`), both of which re-insert READABLE interest,
+                // and under edge-triggered epoll that carried-over bit is the
+                // only wake-up the coalesced tail will ever get. Clearing the
+                // event here would trade the spin for a hang. HUP and ERROR
+                // stay armed, so a frontend that goes away mid-connect is
+                // still noticed.
+                self.frontend_readiness.interest.remove(Ready::READABLE);
                 self.outcome = Some(RoutedOutcome {
                     cluster,
                     content_offset,
@@ -591,6 +623,136 @@ mod tests {
             result,
             SessionResult::Close,
             "an over-cap preread window must reject-and-close"
+        );
+
+        drop(client);
+    }
+
+    /// Regression guard for sozu-proxy/sozu#1373: a routed SNI preread must
+    /// stop advertising frontend-readable interest while it waits for the
+    /// backend connect, or `TcpSession::ready_inner` spins to
+    /// `MAX_LOOP_ITERATIONS` and kills a perfectly healthy session.
+    ///
+    /// A client that coalesces its ClientHello with the first payload bytes
+    /// -- what a `--release` e2e client does every time -- fills the whole
+    /// `effective_max_bytes` window in one read. `tcp_socket_read` returns
+    /// `SocketResult::Continue` (not `WouldBlock`) when it fills the slice it
+    /// was handed, so the frontend READABLE *event* stays latched. The route
+    /// decision lands on that same read, and from then on `readable` is
+    /// deliberately a no-op: the coalesced tail must stay in the kernel
+    /// buffer for the post-upgrade state to replay byte-for-byte. Nothing
+    /// clears the latch, so if READABLE also stays in
+    /// `frontend_readiness.interest`, `front_interest = interest & event`
+    /// (`lib/src/tcp.rs`, the loop's re-entry predicate, mirrored below)
+    /// stays readable on every pass until the 10 000-iteration guard closes
+    /// the connection with `bin` stuck at the cap and `bout == 0`.
+    ///
+    /// The latched *event* must SURVIVE. `upgrade_sni_preread` hands
+    /// `frontend_readiness.event` to the post-upgrade `Pipe`
+    /// (`restore_readiness_events`) or `SendProxyProtocol` (`into_pipe`),
+    /// each of which re-inserts READABLE interest; under edge-triggered
+    /// epoll that carried-over bit is the ONLY wake-up the coalesced tail
+    /// will ever get. Clearing the event instead of masking the interest
+    /// would trade this spin for a hang.
+    ///
+    /// To SEE THIS RED: delete
+    /// `self.frontend_readiness.interest.remove(Ready::READABLE);` from the
+    /// `Output::Routed` arm of `handle_output`.
+    #[test]
+    fn routed_preread_stops_re_arming_frontend_readable_while_connecting() {
+        use std::io::Write as _;
+        use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+
+        use mio::net::TcpStream as MioTcpStream;
+
+        use crate::pool::Pool;
+        use crate::protocol::tcp_preread::parser;
+
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener local addr");
+        let mut client = StdTcpStream::connect(addr).expect("connect test client");
+        let (server, _) = listener.accept().expect("accept test server");
+        server.set_nonblocking(true).expect("server nonblocking");
+
+        // The coalescing shape of sozu-proxy/sozu#1373: one write carrying a
+        // complete ClientHello immediately followed by payload, far more than
+        // the preread cap, so the capped read fills its slice exactly and
+        // `socket_read` reports `Continue` rather than `WouldBlock`.
+        let hello = parser::build_client_hello_wire(&[parser::encode_sni_extension("example.com")]);
+        let effective_max_bytes = 16 * 1024usize;
+        let mut coalesced = hello.clone();
+        coalesced.resize(hello.len() + 2 * effective_max_bytes, 0x17);
+        client.write_all(&coalesced).expect("write coalesced hello");
+        client.flush().ok();
+
+        let mut routes = TrieNode::root();
+        routes.domain_insert(
+            b"example.com".to_vec(),
+            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+        );
+        let cfg = PrereadConfig {
+            routes: &routes,
+            inbound_proxy: false,
+            max_bytes: effective_max_bytes,
+            timeout: Duration::from_secs(3),
+            accept_wildcard: true,
+        };
+
+        let mut pool = Pool::with_capacity(1, 1, effective_max_bytes);
+        let frontend_buffer = pool.checkout().expect("frontend buffer");
+        let mut preread = SniPreread::new(
+            MioTcpStream::from_std(server),
+            Token(0),
+            Ulid::generate(),
+            frontend_buffer,
+            effective_max_bytes,
+        );
+        let mut metrics = SessionMetrics::new(Some(Duration::ZERO));
+
+        // epoll delivered one frontend-readable event; the backend is still
+        // `Connecting`, so no backend readiness ever fires during this pass.
+        preread.frontend_readiness.event.insert(Ready::READABLE);
+
+        // `TcpSession::ready_inner`'s re-entry predicate, bounded far below
+        // `MAX_LOOP_ITERATIONS` so the spin is a failed assertion in
+        // milliseconds rather than a 10 000-iteration burn.
+        const DISPATCH_BUDGET: usize = 4;
+        let mut dispatches = 0usize;
+        while (preread.frontend_readiness.interest & preread.frontend_readiness.event).is_readable()
+        {
+            assert!(
+                dispatches < DISPATCH_BUDGET,
+                "routed SNI preread re-armed frontend-readable {DISPATCH_BUDGET} times \
+                 without consuming the event: this is the spin to MAX_LOOP_ITERATIONS \
+                 (interest {:?}, event {:?}, bin {})",
+                preread.frontend_readiness.interest,
+                preread.frontend_readiness.event,
+                metrics.bin
+            );
+            dispatches += 1;
+            assert_eq!(
+                preread.readable(&mut metrics, &cfg),
+                SessionResult::Continue
+            );
+        }
+
+        assert!(
+            preread.is_routed(),
+            "the coalesced hello must route, otherwise this test witnesses nothing"
+        );
+        assert_eq!(
+            metrics.bin, effective_max_bytes,
+            "the routing read must fill the whole cap, the coalescing shape of the bug"
+        );
+        assert!(
+            preread.frontend_readiness.event.is_readable(),
+            "the latched frontend-readable event must survive for the post-upgrade \
+             Pipe/SendProxyProtocol to drain the coalesced tail: under edge-triggered \
+             epoll it is the only wake-up that tail will ever get"
+        );
+        assert!(
+            preread.backend_readiness.interest.is_writable(),
+            "routing must still arm backend-writable so the connect completion upgrades"
         );
 
         drop(client);
