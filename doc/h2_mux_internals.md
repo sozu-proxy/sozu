@@ -62,12 +62,13 @@ ConnectionH2<Front>
  |-- encoder: loona_hpack::Encoder          // HPACK encoder (outbound)
  |-- local_settings: H2Settings             // Settings we advertise
  |-- peer_settings: H2Settings              // Settings the peer advertised
- |-- streams: HashMap<StreamId, GlobalStreamId>  // H2 stream ID -> shared pool index
- |-- highest_peer_stream_id: StreamId       // For GOAWAY last_stream_id
+ |-- stream_table: H2StreamTable             // Closed API (h2_stream_table.rs, private fields):
+ |                                         // streams: HashMap<StreamId, GlobalStreamId>,
+ |                                         // highest_peer_stream_id, expect_read, expect_write,
+ |                                         // rst_sent, and the per-stream activity/fc-stall maps
  |-- converter_buf: Vec<u8>                 // Reusable HPACK encode buffer
  |-- lowercase_buf: Vec<u8>                 // Reusable header key lowercase buffer
  |-- pending_rst_streams: Vec<(StreamId, H2Error)>  // Queued RST_STREAM frames
- |-- rst_sent: HashSet<StreamId>            // Dedup: RST_STREAM already sent
  |-- settings_sent_at: Option<Instant>      // SETTINGS ACK timeout tracking
  |-- zero: GenericHttpStream                // Connection-level (stream 0) buffer
  |-- timeout_duration: Duration             // Configured idle timeout
@@ -75,9 +76,10 @@ ConnectionH2<Front>
  |                                         // adapter owns the TimeoutContainer
 ```
 
-Access patterns use the sub-structure names directly, except `flow_control`,
-which is a closed API (`h2_flow_control.rs`, private fields) reached only
-through its accessor/mutator methods:
+Access patterns use the sub-structure names directly, except `flow_control`
+and `stream_table`, which are closed APIs (`h2_flow_control.rs` and
+`h2_stream_table.rs` respectively, both private fields) reached only through
+their accessor/mutator methods:
 
 ```rust
 self.flow_control.consume_send_window(consumed);
@@ -131,7 +133,7 @@ tokens `u=N` and `i`/`i=?1`/`i=?0`. Malformed tokens are silently ignored.
 In `write_streams()`, all active stream IDs are collected and sorted:
 
 ```rust
-let mut priorities = self.streams.keys().collect::<Vec<_>>();
+let mut priorities = self.stream_table.streams().keys().collect::<Vec<_>>();
 priorities.sort_by(|a, b| {
     let (ua, _) = self.prioriser.get(a);
     let (ub, _) = self.prioriser.get(b);
@@ -415,15 +417,16 @@ Flushes control data before application frames, in order:
    buffer, with flood detection (`MAX_PENDING_RST_STREAMS` cap). Proxy-
    emitted RSTs (DATA-on-closed, `refuse_stream_and_discard`, `reset_stream`)
    are queued via the canonical `ConnectionH2::enqueue_rst` helper, which
-   dedupes through `self.rst_sent`, bumps `total_rst_streams_queued`, and
-   arms WRITABLE. This path is independent of the owning `Stream` still
-   being present in `self.streams`, so it survives `remove_dead_stream`
-   eviction (which the per-stream error callers invoke synchronously after
+   dedupes through the wire-map's `rst_sent` set (`H2StreamTable`,
+   `h2_stream_table.rs`), bumps `total_rst_streams_queued`, and arms
+   WRITABLE. This path is independent of the owning `Stream` still being
+   present in the wire map, so it survives `remove_dead_stream` eviction
+   (which the per-stream error callers invoke synchronously after
    `reset_stream` returns). `finalize_write` retains `Ready::WRITABLE`
    whenever the queue is non-empty so a partial write that deferred the
    flush (the RST_STREAM drain stage is gated on
-   `expect_write.is_none()`) re-runs on the next tick rather than
-   stranding the queued RST.
+   `stream_table.expect_write().is_none()`) re-runs on the next tick rather
+   than stranding the queued RST.
 
 Stages 3, 4, and 5 all defer — leaving their respective queue/flag
 untouched — while `header_block_reassembly_in_progress()` is true
@@ -445,13 +448,15 @@ Returns `Some(MuxResult)` if the caller should return early, `None` to proceed.
 
 The main data-plane write path:
 
-1. Resumes any partially-written stream (`expect_write`)
+1. Resumes any partially-written stream (`stream_table.expect_write()`)
 2. Pre-computes `byte_totals` for overhead distribution
 3. Sets up `H2BlockConverter` borrowing `self.encoder`
 4. Sorts streams by priority (urgency, then stream_id)
 5. For each stream: converts kawa blocks to H2 frames, writes to socket
 6. Recycles completed streams, distributes overhead, emits access logs
-7. Cleans up `dead_streams` (removes from streams map, rst_sent, prioriser)
+7. Cleans up `dead_streams` via `remove_dead_stream` (evicts the
+   `H2StreamTable` wire mapping, `rst_sent`, and the activity/fc-stall
+   caches together, plus `prioriser`)
 8. Shrinks converter buffers if they grew beyond 16KB
 
 **Why write_streams() can't be further decomposed**: The `H2BlockConverter`
