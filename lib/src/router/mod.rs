@@ -4631,8 +4631,9 @@ mod tests {
     /// `path_type = "REGEX"` is anchored at both ends: the configured pattern
     /// must match the WHOLE request path, not a substring of it.
     ///
-    /// This test is the INVERSION of
-    /// `a_path_regex_is_unanchored_and_matches_anywhere_in_the_request_path`,
+    /// This test is the INVERSION of the test formerly named
+    /// `a_path_regex_is_unanchored_and_matches_anywhere_in_the_request_path`
+    /// — a name no longer in the tree, this one having replaced it —
     /// added by #1352 to pin the opposite. That test was correct about the
     /// code and is now deliberately obsolete: sozu#1350 asked whether
     /// `doc/configure.md` (which has promised `\A...\z` since v2.0.0) or
@@ -5574,8 +5575,9 @@ mod tests {
     /// Every branch of an alternation in a regex hostname SEGMENT is
     /// anchored, not just the first and the last.
     ///
-    /// This test is the INVERSION of
-    /// `an_alternating_regex_hostname_segment_is_still_anchored_at_one_end_only`,
+    /// This test is the INVERSION of the test formerly named
+    /// `an_alternating_regex_hostname_segment_is_still_anchored_at_one_end_only`
+    /// — a name no longer in the tree, this one having replaced it —
     /// which pinned the defect so that closing it would be "a deliberate
     /// change, not a silent one" and asked, in its own comment, to be
     /// inverted rather than deleted when the fix landed. This is that

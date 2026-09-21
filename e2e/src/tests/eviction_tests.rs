@@ -3,7 +3,7 @@
 //! When the accept queue saturates and `check_limits` refuses, sōzu can
 //! either drop the queued sockets (default, `evict_on_queue_full = false`)
 //! or evict the least-recently-active sessions to make room
-//! (`evict_on_queue_full = true`, see `lib::server::Server::accept_*`
+//! (`evict_on_queue_full = true`, see `lib::server::Server::create_sessions`
 //! and `evict_least_active_sessions`).
 //!
 //! Coverage:
@@ -11,13 +11,19 @@
 //!   enabled and the slab saturated by long-lived idle clients, a fresh
 //!   connection MUST be admitted (eviction made room) and the
 //!   `sessions.evicted` counter MUST advance. The eviction predicate is
-//!   `last_event()`-based (server.rs:2231) so the OLDEST connection is
-//!   the one chosen.
-//! - `test_evict_on_queue_full_skipped_during_soft_stop` — a soft-stop
-//!   in flight short-circuits the eviction loop (server.rs:2067) so
-//!   shutdown semantics dominate over admission. The skip is observable
-//!   by the absence of `sessions.evicted` increments while
-//!   `shutting_down.is_some()`.
+//!   `last_event()`-based (`Server::evict_least_active_sessions`) so the
+//!   OLDEST connection is the one chosen.
+//! - `test_evict_on_queue_full_disabled_drops_overflow` — with the knob
+//!   at its default `false`, the same saturated slab MUST refuse the
+//!   fresh connection instead of evicting an idle one.
+//!
+//! NOT covered here: the soft-stop short-circuit. `Server::create_sessions`
+//! breaks out of the eviction branch while `shutting_down.is_some()`, so
+//! shutdown semantics dominate over admission, and no test in this module
+//! exercises it. An earlier draft of this preamble announced a
+//! `..._skipped_during_soft_stop` test as if it existed; it never did.
+//! Adding it means asserting the absence of `sessions.evicted` increments
+//! during a soft stop.
 //!
 //! These tests are timing-sensitive because saturating the accept queue
 //! deterministically requires more concurrent connections than the

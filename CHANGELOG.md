@@ -1813,6 +1813,46 @@
 
 ### 🤖 CI
 
+- **`ci(doc)`: a cited TEST NAME must now name a `fn` in the tree, and the citations that named
+  nothing are repaired.**
+  The citation resolver below only sees a citation that carries a path. The other form carries none:
+  prose naming a test as its evidence — "`<name>` pinned the defect", "see `<name>` for the exact
+  semantics". It rots the same way a line number does and more quietly, because nothing in a build
+  or a test run reads it. On `c7ac070e` three such names were cited in six places and none of the
+  three had a definition anywhere in the repository (#1380); a fourth and a fifth turned up once the
+  rule ran.
+  `.github/scripts/check_doc_citations.py` gained a second, independent rule in the same run: a
+  backticked identifier that looks like a test name, in prose that is talking about tests, must name
+  a `fn` somewhere in the tree. Both halves of "looks like a test name" were measured rather than
+  guessed. `^[a-z][a-z0-9_]{12,}$` alone — the shape #1380 proposed — yields 358 distinct
+  identifiers over 864 sites, nearly all configuration keys, struct fields and std methods.
+  Requiring five underscore-separated segments, a sentence rather than a noun phrase, cuts it to 21;
+  additionally requiring the enclosing comment block or markdown paragraph to contain the word
+  "test" cuts it to 12, which is small enough to disposition by hand. The scanned surface is every
+  `*.rs` comment plus `CHANGELOG.md`, `doc/**` and every `**/LIFECYCLE.md` — all four carried one of
+  the six. On this tree the rule examines 3444 candidate identifiers, checks 262 and, before the
+  repairs below, reported 5.
+  Two dispositions exist and neither is an escape hatch. `RENAMED_TESTS` records a test cited on
+  purpose by a name it no longer carries, because the prose is recording the rename, and the name it
+  forwards to **must itself resolve to a `fn`** — removing an entry or pointing it at an absent name
+  both fail the run, which is how the table was proven non-vacuous. `NOT_A_TEST` records a
+  sentence-shaped identifier that is no test at all — a configuration key, a std method, the
+  identifier of a note kept outside the repository — each with its reason.
+  The repairs: `lib/src/tcp.rs` and `e2e/src/tests/tcp_sni_tests.rs` both cited the SNI per-IP
+  limiter test by the name it carried before `c7f244c8` renamed it, and now cite
+  `test_tcp_sni_per_ip_limiter_rejects_second_then_admits_after_release`.
+  `e2e/src/tests/eviction_tests.rs`'s preamble announced a `..._skipped_during_soft_stop` test that
+  was never written — `git log -S` over the whole history finds no definition — so the bullet now
+  describes `test_evict_on_queue_full_disabled_drops_overflow`, which exists, and states plainly
+  that the soft-stop short-circuit in `Server::create_sessions` has no coverage in that module. The
+  same preamble's two drifted `server.rs:NNN` anchors became symbols. The four deliberate former
+  names, in `lib/src/router/mod.rs` and in this file, are unchanged except that the two `mod.rs`
+  doc comments now say "formerly named" at the point of citation, so a reader is not sent hunting.
+  The self-test grew the matching half: a clean fixture, a broken one, an examined/checked pair
+  asserted as exact totals rather than floors — raising the segment floor or narrowing the
+  "about tests" test fails it — and a second pass with fixture-local tables that proves an
+  allowlisted name passes, a rename with a live target passes, and a rename whose target is itself
+  gone is still reported.
 - **`ci(doc)`: every `file.rs:NNN` citation in `doc/` and the module `LIFECYCLE.md` files is now
   resolved on each pull request, and the ones in `doc/` were re-read against the code first.**
   A line number carries no anchor, so a citation rots the moment anyone edits the file it points

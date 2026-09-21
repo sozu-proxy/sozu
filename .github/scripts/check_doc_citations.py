@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
-# Resolve every `file.rs:NNN(-MMM)?` citation in `doc/**` and `**/LIFECYCLE.md`
-# against the tree it ships with, and fail when one of them cannot be resolved.
+# Resolve every citation in this repository's prose against the tree it ships
+# with, and fail when one of them cannot be resolved. Two citation forms are
+# checked, by two independent rules:
+#
+#   1. `file.rs:NNN(-MMM)?` in `doc/**` and `**/LIFECYCLE.md` — a path and a
+#      line number. See "WHAT THIS CATCHES" below.
+#   2. a backticked TEST NAME, in a Rust comment or a CHANGELOG/doc paragraph,
+#      that names no `fn` anywhere in the tree. See "DEAD TEST-NAME CITATIONS"
+#      further down.
 #
 # Why this exists: a line number carries no anchor, so a citation rots the
 # moment anyone edits the file it points into — and the edit usually lands in a
@@ -54,9 +61,43 @@
 # citation naming a file with a digit in its name — `h1.rs:NNN`, `h2.rs:NNN`,
 # which in this tree is the majority of them.
 #
+# DEAD TEST-NAME CITATIONS
+#   The resolver above only sees a citation that carries a path. A second form
+#   carries none: prose that names a TEST as its evidence — "`<name>` pinned
+#   the defect", "see `<name>` for the exact semantics". When that test is
+#   renamed, folded into another, or never lands, the claim survives and points
+#   at nothing. No compiler, no test run and no reviewer notices, because the
+#   prose and the test live in different pull requests. Three such names, cited
+#   in six places, survived every check in this tree until sozu-proxy/sozu#1380.
+#
+#   The rule: a backticked identifier that LOOKS like a test name, in prose
+#   that is talking about tests, must name a `fn` somewhere in the tree.
+#
+#   Both halves of "looks like a test name" are load-bearing, and both were
+#   measured on this tree rather than guessed:
+#     * `^[a-z][a-z0-9_]{12,}$` alone yields 358 distinct identifiers over 864
+#       sites, nearly all configuration keys (`max_connections_per_ip`), struct
+#       fields (`frontend_buffer`) and std methods (`saturating_sub`);
+#     * requiring FIVE underscore-separated segments — a sentence, not a noun
+#       phrase — cuts that to 21 distinct names, and additionally requiring the
+#       enclosing comment block or markdown paragraph to contain the word
+#       "test" cuts it to 12.
+#   Twelve is small enough to disposition by hand, which is what the two tables
+#   below are: NOT_A_TEST for an identifier that is not a test name at all, and
+#   RENAMED_TESTS for a test deliberately cited by a name it no longer carries.
+#   A RENAMED_TESTS entry must forward to a name that DOES resolve to a `fn`,
+#   so the forwarding pointer cannot rot in turn.
+#
+#   This rule is a floor in the same way the resolver is. A test name of four
+#   segments or fewer is not examined; prose that never says "test" is not
+#   examined; and a citation that names a `fn` which is not the test the prose
+#   means still passes. The alternative is 864 sites of noise, which nobody
+#   reads and therefore nobody maintains.
+#
 # Usage:
 #   python3 .github/scripts/check_doc_citations.py            # check the tree
-#   python3 .github/scripts/check_doc_citations.py --show     # + print targets
+#   python3 .github/scripts/check_doc_citations.py --show     # + print every
+#                                                             #   resolved citation
 #   python3 .github/scripts/check_doc_citations.py --self-test # prove it fails
 #
 # Standard library only, on purpose: this is tooling, and sozu's production
@@ -255,6 +296,179 @@ def check(root, show=False, out=sys.stdout):
     return total, failures
 
 
+# ── Rule 2: dead test-name citations ──────────────────────────────────────
+#
+# See "DEAD TEST-NAME CITATIONS" in the header for why this exists and how the
+# two filters below were calibrated.
+
+# A backticked identifier that could be a Rust item name. The `{12,}` floor is
+# sozu-proxy/sozu#1380's own proposal: below it, `body_size` and `req_id` flood
+# the candidate set.
+TEST_NAME = re.compile(r"`([a-z][a-z0-9_]{12,})`")
+# A sentence, not a noun phrase: five underscore-separated segments. A
+# configuration key or a struct field stops at four.
+MIN_NAME_SEGMENTS = 5
+# The enclosing prose must be talking about tests for a name in it to be read
+# as a test citation.
+TEST_WORD = re.compile(r"\btests?\b", re.IGNORECASE)
+# `fn name`, with line comments stripped first so that prose *describing* a
+# function cannot vouch for a citation. Stripping can only SHRINK the set of
+# known names, which is the safe direction: it produces a report to
+# disposition, never a silent pass.
+FN_DECL = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)")
+LINE_COMMENT = re.compile(r"//.*$", re.MULTILINE)
+
+# A test deliberately cited by a name it no longer carries, mapped to the name
+# it carries now. Each of these is prose that says so in the same breath — "it
+# is now `X`", "this test is the INVERSION of `Y`" — kept so the behaviour
+# change leaves a trace. The checker holds the forwarding pointer live: the
+# value must itself name a `fn`, or the citation is reported.
+RENAMED_TESTS = {
+    # sozu#1356 inverted the test that pinned the hostname-segment anchoring
+    # defect instead of deleting it, as that test's own comment asked.
+    "an_alternating_regex_hostname_segment_is_still_anchored_at_one_end_only":
+        "an_alternating_regex_hostname_segment_is_anchored_on_every_branch",
+    # sozu#1350, same shape: #1352's test pinned the unanchored path-regex
+    # behaviour so that anchoring it later would be deliberate. It was.
+    "a_path_regex_is_unanchored_and_matches_anywhere_in_the_request_path":
+        "a_path_regex_is_anchored_at_both_ends_and_must_match_the_whole_request_path",
+    # Renamed because the old name claimed a guarantee its body did not make.
+    "reactivating_a_udp_listener_cannot_overwrite_a_live_session":
+        "a_deactivated_udp_listeners_key_is_not_handed_to_another_session",
+    # Re-based on one UDP frontend per address, which made the old premise
+    # impossible rather than merely untested.
+    "remove_udp_frontend_spares_same_address_siblings":
+        "remove_udp_frontend_drops_exactly_the_frontend_its_tags_name",
+}
+
+# Sentence-shaped identifiers that survive both filters and are not test names.
+# Every entry carries the reason it is here; an entry without one is an
+# unreviewed silencing of this rule.
+NOT_A_TEST = {
+    "h2_graceful_shutdown_deadline_seconds": "listener configuration key",
+    "h2_max_rst_stream_per_window": "listener configuration key",
+    "select_nth_unstable_by_key": "std library method",
+    "project_sozu_h2_flood_family_flakes": "agent memory note, not a test",
+    "feedback_h2_repro_multi_data_frames": "agent memory note, not a test",
+    "feedback_log_context_before_theorising": "agent memory note, not a test",
+}
+
+
+def fn_names(root):
+    """Every `fn <name>` declared in the tree, line comments stripped first."""
+    names = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            if not name.endswith(".rs"):
+                continue
+            with open(os.path.join(dirpath, name), encoding="utf-8", errors="replace") as handle:
+                body = LINE_COMMENT.sub("", handle.read())
+            names.update(match.group(1) for match in FN_DECL.finditer(body))
+    return names
+
+
+def prose_files(root):
+    """The surface rule 2 reads: every `*.rs`, plus CHANGELOG.md and the docs.
+
+    A test citation lives wherever a claim does — a module `//!` preamble, a
+    `///` doc comment, a `//` note inside a test body, a CHANGELOG entry. All
+    four carried one of sozu-proxy/sozu#1380's six.
+    """
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, name), root).replace(os.sep, "/")
+            if name.endswith(".rs"):
+                found.append((rel, True))
+            elif rel == "CHANGELOG.md" or name == "LIFECYCLE.md" or (
+                rel.startswith("doc/") and name.endswith(".md")
+            ):
+                found.append((rel, False))
+    return sorted(found)
+
+
+def prose_blocks(text, is_rust):
+    """Split a file into prose blocks, each `(text, first line number)`.
+
+    A block is the unit the "is this prose about tests?" question is asked of:
+    a contiguous run of comment lines in Rust, a blank-line-delimited paragraph
+    in markdown. Anything wider would let one distant mention of the word vouch
+    for a whole file.
+    """
+    blocks = []
+    current = []
+    start = None
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.lstrip()
+        keep = stripped.startswith("//") if is_rust else bool(line.strip())
+        if keep:
+            if start is None:
+                start = number
+            current.append(stripped)
+        elif current:
+            blocks.append(("\n".join(current), start))
+            current = []
+            start = None
+    if current:
+        blocks.append(("\n".join(current), start))
+    return blocks
+
+
+def check_test_citations(root, renamed=None, not_a_test=None, show=False, out=sys.stdout):
+    """Every test name cited in prose must name a `fn` in the tree.
+
+    Returns `(examined, checked, failures)`: how many backticked identifiers
+    were long enough to be candidates at all, how many survived both filters
+    and were actually resolved, and the failures among those.
+    """
+    renamed = RENAMED_TESTS if renamed is None else renamed
+    not_a_test = NOT_A_TEST if not_a_test is None else not_a_test
+    known = fn_names(root)
+    examined = 0
+    checked = 0
+    failures = []
+
+    for rel, is_rust in prose_files(root):
+        with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as handle:
+            body = handle.read()
+        for block, start in prose_blocks(body, is_rust):
+            about_tests = bool(TEST_WORD.search(block))
+            for match in TEST_NAME.finditer(block):
+                examined += 1
+                name = match.group(1)
+                if name.count("_") + 1 < MIN_NAME_SEGMENTS or not about_tests:
+                    continue
+                checked += 1
+                where = "%s:%d" % (rel, start)
+                if name in not_a_test:
+                    if show:
+                        out.write("%s  `%s`  |not a test: %s\n" % (where, name, not_a_test[name]))
+                    continue
+                if name in known:
+                    if show:
+                        out.write("%s  `%s`  |names a fn in the tree\n" % (where, name))
+                    continue
+                if name in renamed:
+                    target = renamed[name]
+                    if target in known:
+                        if show:
+                            out.write("%s  `%s`  |renamed to `%s`\n" % (where, name, target))
+                        continue
+                    failures.append(
+                        "%s: `%s` — recorded as renamed to `%s`, which names no `fn` in the "
+                        "tree either; the forwarding pointer is dead too"
+                        % (where, name, target)
+                    )
+                    continue
+                failures.append(
+                    "%s: `%s` — cited as a test, but names no `fn` in the tree" % (where, name)
+                )
+
+    return examined, checked, failures
+
+
 FIXTURE_EXPECTED = [
     "doc/bad.md:3: `sample.rs:99` — past end of sample.rs (10 lines)",
     "doc/bad.md:5: `sample.rs:4` — sample.rs:4 is blank",
@@ -275,6 +489,44 @@ FIXTURE_EXPECTED = [
 # Neither is an accidental shape, and neither announces itself: on the real
 # tree they report a clean run over a quietly smaller surface.
 FIXTURE_TOTAL = 14
+
+# Rule 2's half of the fixtures. `tests_bad.rs` and the fixture `CHANGELOG.md`
+# are the broken documents; `tests_good.rs` is the clean one and also carries
+# the two witnesses that must NOT be examined — a four-segment noun phrase in a
+# block that does say "test", and a sentence-shaped name in a block that does
+# not.
+FIXTURE_TEST_EXPECTED = [
+    "CHANGELOG.md:3: `a_fixture_changelog_test_name_that_names_no_function` — cited as a test",
+    "tests_bad.rs:4: `a_fixture_test_that_was_renamed_or_never_landed` — cited as a test",
+    "tests_bad.rs:9: `a_fixture_test_renamed_to_a_name_that_is_also_gone` — cited as a test",
+]
+
+# Asserting both totals — not floors — is what makes a quietly SHRINKING
+# surface or a quietly TIGHTENED filter fail instead of reporting a clean run:
+#   * dropping `*.rs` from prose_files() loses five of the six examined names;
+#   * dropping CHANGELOG.md loses the sixth;
+#   * raising MIN_NAME_SEGMENTS or narrowing TEST_WORD drops `checked` below 4
+#     while every remaining citation still resolves.
+FIXTURE_TEST_EXAMINED = 6
+FIXTURE_TEST_CHECKED = 4
+
+# Fixture-local tables, used to exercise the two dispositions on a tree where
+# the real RENAMED_TESTS / NOT_A_TEST entries name nothing. `..._never_landed`
+# is forwarded to a name `tests_good.rs` really declares, so it must pass;
+# `..._also_gone` is forwarded to a name nothing declares, so it must be
+# reported with the rename-specific message rather than silently accepted.
+FIXTURE_RENAMED = {
+    "a_fixture_test_that_was_renamed_or_never_landed":
+        "a_fixture_test_cited_by_the_name_it_still_carries",
+    "a_fixture_test_renamed_to_a_name_that_is_also_gone":
+        "a_fixture_test_nothing_in_this_tree_declares",
+}
+FIXTURE_NOT_A_TEST = {
+    "a_fixture_changelog_test_name_that_names_no_function": "fixture allowlist witness",
+}
+
+# Every fixture document that is MEANT to fail, removed for the clean-tree run.
+BROKEN_FIXTURES = ("doc/bad.md", "tests_bad.rs", "CHANGELOG.md")
 
 
 def _run_cli(args):
@@ -327,6 +579,50 @@ def self_test():
             "the scanned surface or the extraction pattern has shrunk" % (total, FIXTURE_TOTAL)
         )
 
+    # ── Rule 2 ────────────────────────────────────────────────────────────
+    # Default tables first: nothing in them names anything in the fixture
+    # tree, so all three broken citations must report as plainly dead.
+    examined, checked, dead = check_test_citations(fixtures)
+    dead = sorted(dead)
+    if len(dead) != len(FIXTURE_TEST_EXPECTED):
+        ok = False
+        print(
+            "FAIL self-test: expected %d dead test-name citations from the fixtures, got %d:"
+            % (len(FIXTURE_TEST_EXPECTED), len(dead))
+        )
+        for line in dead:
+            print("  " + line)
+    else:
+        for expected, actual in zip(FIXTURE_TEST_EXPECTED, dead):
+            if not actual.startswith(expected):
+                ok = False
+                print("FAIL self-test: expected a failure starting %r, got %r" % (expected, actual))
+
+    if (examined, checked) != (FIXTURE_TEST_EXAMINED, FIXTURE_TEST_CHECKED):
+        ok = False
+        print(
+            "FAIL self-test: examined %d / checked %d candidate test names, expected %d / %d — "
+            "the scanned surface or one of the two filters has moved"
+            % (examined, checked, FIXTURE_TEST_EXAMINED, FIXTURE_TEST_CHECKED)
+        )
+
+    # Now the two dispositions. With the fixture tables, the allowlisted name
+    # and the rename with a LIVE target must both disappear, and the rename
+    # whose target is itself absent must still be reported — an allowlist that
+    # accepted every entry unconditionally would pass the run above and turn
+    # this rule off one line at a time.
+    _, _, disposed = check_test_citations(
+        fixtures, renamed=FIXTURE_RENAMED, not_a_test=FIXTURE_NOT_A_TEST
+    )
+    if len(disposed) != 1 or "which names no `fn` in the tree either" not in disposed[0]:
+        ok = False
+        print(
+            "FAIL self-test: with the fixture tables, expected exactly one failure — the rename "
+            "whose target is also gone — got %d:" % len(disposed)
+        )
+        for line in disposed:
+            print("  " + line)
+
     # `check()` classifying correctly is NOT the same as the command acting on
     # it. A build of this script that reports every failure and still exits 0
     # is green in CI and guards nothing, and nothing above this point executes
@@ -342,11 +638,12 @@ def self_test():
         print("".join("    " + line + "\n" for line in out.splitlines()))
 
     with tempfile.TemporaryDirectory() as tmp:
-        # The whole fixture tree minus the one document that is meant to fail:
+        # The whole fixture tree minus the documents that are meant to fail:
         # copying it wholesale keeps this half honest as fixtures are added.
         clean = os.path.join(tmp, "clean")
         shutil.copytree(fixtures, clean)
-        os.remove(os.path.join(clean, "doc", "bad.md"))
+        for broken in BROKEN_FIXTURES:
+            os.remove(os.path.join(clean, *broken.split("/")))
         code, out = _run_cli(["--root", clean])
     if code != 0:
         ok = False
@@ -355,8 +652,9 @@ def self_test():
 
     if ok:
         print(
-            "OK self-test: %d fixture citations, %d expected failures reported, "
-            "exit 1 on the broken tree and 0 on the clean one." % (total, len(bad))
+            "OK self-test: %d fixture line citations and %d examined test names (%d checked), "
+            "%d + %d expected failures reported, exit 1 on the broken tree and 0 on the clean one."
+            % (total, examined, checked, len(bad), len(dead))
         )
     return 0 if ok else 1
 
@@ -364,15 +662,19 @@ def self_test():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".", help="repository root (default: .)")
-    parser.add_argument("--show", action="store_true", help="print every resolved target line")
+    parser.add_argument("--show", action="store_true", help="print every resolved citation")
     parser.add_argument("--self-test", action="store_true", help="run the fixture self-test and exit")
     args = parser.parse_args()
 
     if args.self_test:
         return self_test()
 
-    total, failures = check(os.path.abspath(args.root), show=args.show)
+    root = os.path.abspath(args.root)
+    status = 0
+
+    total, failures = check(root, show=args.show)
     if failures:
+        status = 1
         print("::error::%d of %d `file.rs:NNN` citations in doc/ and **/LIFECYCLE.md do not resolve:" % (len(failures), total))
         for line in failures:
             print("  " + line)
@@ -380,11 +682,32 @@ def main():
         print("Cite a symbol (`Type::method`) where the prose names an item — a symbol cannot drift.")
         print("Keep a line or a range only where the prose means a specific branch inside an item.")
         print("Convention and local usage: doc/README.md#citing-code-from-these-documents")
-        return 1
+    else:
+        print("OK: all %d `file.rs:NNN` citations in doc/ and **/LIFECYCLE.md resolve to a non-blank line." % total)
+        print("This is a floor, not a proof: a citation that drifted onto a different non-blank line still passes.")
 
-    print("OK: all %d `file.rs:NNN` citations in doc/ and **/LIFECYCLE.md resolve to a non-blank line." % total)
-    print("This is a floor, not a proof: a citation that drifted onto a different non-blank line still passes.")
-    return 0
+    examined, checked, dead = check_test_citations(root, show=args.show)
+    if dead:
+        status = 1
+        print("")
+        print(
+            "::error::%d of %d cited test names (from %d candidate identifiers) name no `fn` in the tree:"
+            % (len(dead), checked, examined)
+        )
+        for line in dead:
+            print("  " + line)
+        print("")
+        print("Repoint the citation at the test that exists, write the test the prose claims, or drop the claim.")
+        print("A name deliberately kept as a former one belongs in RENAMED_TESTS, with the name it carries now;")
+        print("an identifier that is not a test name at all belongs in NOT_A_TEST, with the reason.")
+    else:
+        print(
+            "OK: all %d cited test names (from %d candidate identifiers) name a `fn` in the tree."
+            % (checked, examined)
+        )
+        print("This too is a floor: a citation naming a real but unrelated `fn` still passes.")
+
+    return status
 
 
 if __name__ == "__main__":
