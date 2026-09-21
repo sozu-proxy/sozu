@@ -684,7 +684,9 @@ locks those fixes in:
   (SETTINGS with `INITIAL_WINDOW_SIZE=6_291_456`, one-shot
   `WINDOW_UPDATE(0, 15_663_105)`, per-stream `WINDOW_UPDATE(sid, 32 KiB)`
   cadence, `priority: u=3, i`). Asserts sha256 byte-identity of the gzipped
-  wire body within 8 s. The streaming drain helper
+  wire body within `LARGE_BODY_DRAIN_BUDGET` (30 s; raised from an unvalidated
+  8 s after a 2026-09-21 CI contention failure, sozu#1393 cause D). The
+  streaming drain helper
   `drain_h2_stream_streaming` keeps memory linear in one frame (not one
   stream) by hashing DATA payloads as they arrive and only retaining an
   at-most-one-frame `carry` tail between reads.

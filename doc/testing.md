@@ -507,7 +507,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   size update when a peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e
   call sites send one: `h2_security_tests.rs:2440` (value 0) and
   `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
-  `h2_correctness_tests.rs:3559` and `:3663`. No test that decodes a `:status`
+  `h2_correctness_tests.rs:3604` and `:3708`. No test that decodes a `:status`
   sends one, and the three that send one decode no status, so nothing meets the
   update today — `h2_handshake` sends empty SETTINGS. When that changes, `None`
   reads as "no status": fail-closed for a `got_X` asserted positively,

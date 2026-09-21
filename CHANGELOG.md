@@ -2141,6 +2141,28 @@
   in `mux::connection` and `mux::mod`. `doc/configure_admin_ops.md` §5.5 points at a
   `doc/configure.md` section about cleartext H2 to backends rather than at the ALPN metric it is
   documenting.
+- **`test(e2e)`: raise the two large-body H2 drain tests' timeout from an unvalidated 8 s to a
+  measured 30 s.** `try_h2_large_gzipped_chunked_drains_fully` and
+  `try_h2_large_chunked_7mb_drains_fully` (`e2e/src/tests/h2_correctness_tests.rs`) both bounded
+  their `drain_h2_stream_streaming` call and elapsed-time assertion with `Duration::from_secs(8)`.
+  That bound was never validated against CI contention: the commit that introduced these tests
+  (`23f5f4f7`, 2026-04-24) recorded only "typical local run: ~285 ms per iteration", so 8 s was 28x
+  an idle-only figure with no margin anyone had measured against a loaded runner.
+  It failed on 2026-09-21, on a tree that already contained the #1373 spin fix (`5b83908a`), so that
+  fix does not cover it: `body_bytes=3440640/7763292 elapsed=8.036659064s` (44.32% transferred). A
+  stall was excluded rather than assumed — in the same CI job and the same contention window, the
+  sibling `test_h2_large_gzipped_chunked_drains_fully` (same payload, same drain helper, same 8 s
+  bound) passed all three of its iterations, with handshake-to-handshake cycles of 6.606 s and
+  6.073 s against its own ~285 ms idle baseline; a lost wake-up does not recover on its own three
+  times, severe scheduling delay does.
+  The new bound is not a round number: `LARGE_BODY_DRAIN_BUDGET` is ~1.7x the CI failure's linear
+  extrapolation (~18.1 s) and ~4.5x the sibling's realized cycle, while staying well inside
+  `DEFAULT_FRONT_TIMEOUT` (60 s) so the test still fails outright rather than tripping the proxy's
+  own timeout first. The full measurement record — idle and loaded local baselines, the CI failure
+  and the corroborating sibling — is recorded at the constant, not here, so it cannot drift out of
+  sync with the code it bounds. `doc/h2_mux_internals.md`'s large-asset coverage section is updated
+  in the same changeset, since it restated the old 8 s figure. Closes cause D of
+  [#1393](https://github.com/sozu-proxy/sozu/issues/1393).
 
 ## 2.2.1 - 2026-08-28
 
