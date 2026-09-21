@@ -52,6 +52,34 @@
   is stalled, READABLE interest is disabled so a fresh frame read cannot clobber it either — the
   read side had no analogous guard until now.
 
+- **`fix(mux-h2)`: stop `graceful_goaway` from corrupting an in-progress, non-refused
+  HEADERS+CONTINUATION reassembly — the third instance of the same `zero.storage` double-duty bug
+  class, and the only one that fired unconditionally, on every graceful shutdown or hot reload that
+  landed mid-reassembly.** `graceful_goaway`'s first GOAWAY unconditionally cleared and reused
+  `self.zero.storage` to serialize the advisory `GOAWAY(NO_ERROR, last_stream_id=MAX)`, directly
+  contradicting its own comment's promise that "existing streams should continue reading" during the
+  drain window: the field block being reassembled for one of those very streams was destroyed the
+  moment the drain began. Unlike the WINDOW_UPDATE/RST_STREAM case, no adversarial timing or
+  coincident traffic was required — every drain during an in-flight reassembly hit it. `graceful_goaway`
+  now checks the same `header_block_reassembly_in_progress()` guard and defers the advisory GOAWAY's
+  serialization via the new `ConnectionH2::send_initial_goaway` (split out of `graceful_goaway`) and
+  a new `H2DrainState::initial_goaway_pending` flag, drained by `flush_pending_control_frames` as
+  soon as reassembly completes — mirroring the WINDOW_UPDATE/RST_STREAM drains' existing defer
+  pattern, with one asymmetry: those stages already had a pending queue to fall back on, so skipping
+  a drain was free, while a deferred `graceful_goaway` has nothing else to fall back on, so the flag
+  guarantees the advisory GOAWAY is still emitted once reassembly finishes rather than silently
+  lost. `self.drain.draining` and `self.drain.started_at` are still set unconditionally and
+  immediately, before the deferral check, so `Mux::shutting_down`'s forced-close budget starts on
+  time regardless of whether the wire GOAWAY itself had to wait. A final/error GOAWAY
+  (`ConnectionH2::goaway`) now also clears `initial_goaway_pending`: it drops `expect_read` and
+  moves to a terminal state, so no further `readable()` will ever complete the reassembly the
+  advisory GOAWAY was waiting on, and sending it afterward would only be a redundant, less
+  informative GOAWAY. `ConnectionH2::flush_zero_buffer` — called directly by `Mux::shutting_down`
+  right after `graceful_goaway`, bypassing the normal `writable()` dispatch because edge-triggered
+  epoll will not deliver a fresh WRITABLE event for an already-writable socket — is now also a no-op
+  while reassembly is in progress, since it would otherwise flush (and clear) `zero.storage` in
+  exactly the scenario `graceful_goaway`'s own deferral exists to prevent.
+
 - **`fix(router)`: stop IDN-normalising the regex source of a `Tree` hostname, which inverted every
   uppercase escape.** `Router::add_tree_rule`, `Router::remove_tree_rule` and `Router::has_hostname`
   ran the WHOLE configured hostname through `idna::domain_to_ascii`, regex segments included. That
