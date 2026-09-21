@@ -467,6 +467,59 @@
   `remove_certificate_evicts_the_address_when_its_last_certificate_is_removed`, and
   `add_certificate_with_valid_pem_armor_but_invalid_x509_leaves_no_bucket`.
   Closes [#1404](https://github.com/sozu-proxy/sozu/issues/1404).
+- **`test(router)`: a `quickcheck` property harness for hostname resolution, plus a stability fix
+  for the dead `qc_insert` test it sits beside.**
+  Four hostname routing defects shipped and were fixed in the days before this changeset — an
+  uppercase `Host` header not matching a lowercase frontend
+  ([#1349](https://github.com/sozu-proxy/sozu/issues/1349)), an exact hostname added after a
+  matching regex segment leaking to the whole regex family
+  ([#1351](https://github.com/sozu-proxy/sozu/issues/1351)), a hostname regex alternation anchored
+  at only one end of each branch ([#1356](https://github.com/sozu-proxy/sozu/issues/1356)), and
+  `idna::domain_to_ascii` folding — and inverting — an uppercase regex escape in a `Tree` hostname
+  ([#1377](https://github.com/sozu-proxy/sozu/issues/1377)). Each was pinned by one example-based
+  regression test, but nothing generated cases: a survey of `lib/src/router/` found the only
+  property test in the file, `pattern_trie.rs`'s `qc_insert`, commented out with `FIXME: randomly
+  fails`, checking only exact-string insert/lookup against a `HashMap` oracle — no regex, wildcard,
+  case folding or declaration-order precedence, so it could not have caught any of the four.
+  `qc_router_hostname_resolution_matches_the_documented_semantics` (`lib/src/router/mod.rs`) is a
+  new `quickcheck` property that would have. Its oracle is independent of `pattern_trie` — written
+  fresh from `doc/configure.md`'s "Hostname precedence" and "Regex hostname segments" sections, not
+  by calling `anchored_segment`, `compiled_segment`, `TrieNode::lookup*`, `tree_hostname_to_ascii` or
+  `convert_regex_domain_rule` — and the generator is biased toward the four bugs' own shapes: mixed
+  exact/wildcard/regex rules sharing one hostname, case variation on both the declared rule and the
+  query, uppercase regex escapes (`\D`, `\W`, `\S`), alternations, a Fisher-Yates-shuffled
+  declaration order, and a small distinct-path pool (`PATH_POOL`) crossed against every declared
+  hostname. Path had to vary, not stay fixed: sozu#1351's actual production symptom is an exact
+  rule at one path answering a request for a hostname nobody declared, at a DIFFERENT declared
+  path (measured live against the reverted fix: `test4.example.com` at `/other` leaks onto
+  `/test[0-9]/.example.com`'s family, so `test7.example.com` at `/other` wrongly answers with the
+  `test4` rule) — with every rule pinned to one shared path, that leak still happens at insert
+  time but is invisible at lookup time, because the colliding node already carries that identical
+  `(path, method)` and `add_tree_rule`'s append-skip condition refuses the second insert outright.
+  Reverting each of the four fixes in turn (the exact mutation each fix's own commit message names
+  as its "To SEE THIS RED" step) reproduces a shrunk failing case for every one, each a genuine
+  `MISMATCH host=... path=... expected=... actual=...` line, not a panic:
+  `Scenario { rules: [Literal("xadmin", path "/")], queries: [("XADMIN.example.com", "/")] }` for
+  #1349 (`expected=Some("C1") actual=None`);
+  `Scenario { rules: [Regex("\S+", path "/other", cluster C1), Literal("abc", path "/", cluster C0)], queries: [("UNMATCHED-HOST.example.com", "/")] }`
+  for #1351 (`expected=None actual=Some("C0")` — the unrelated `\S+`-matching host leaked onto the
+  literal `abc` rule's shared node, since almost every ASCII label matches `\S+`, an even more open
+  version of the family-wide leak sozu#1351 reported);
+  `Scenario { rules: [Regex("a|b", path "/other")], queries: [("aBC.example.com", "/other")] }` for
+  #1356 (`expected=None actual=Some("C2")` — the half-anchored first branch matching a superstring);
+  and `Scenario { rules: [Regex("\D+", path "/")], queries: [("unmatched-host.example.com", "/")] }`
+  for #1377 (`expected=Some("C1") actual=None` — the letters-only host stopped matching once the
+  folded source became `\d+`).
+  `qc_insert`'s own "randomly fails" was investigated rather than assumed and turned out to be a gap
+  in the test's own exclusion list, not a router defect: `TrieNode::insert_recursive`'s dotless arm
+  stores a value in the WILDCARD slot whenever a key's LEFTMOST label is exactly `"*"` — not only
+  when the whole key is `"*"` — and `qc_insert`'s `hm_insert` skipped only the latter, so a
+  `HashMap` key like `"*."` inserted fine into the wildcard slot and then reported "did not find
+  key" against `TrieNode::lookup(key, accept_wildcard: false)`, which structurally can never
+  consult that slot. Shrunk counterexample: `{"*.": 0}`. `hm_insert`'s skip list now excludes any
+  key whose leftmost label is `"*"`; 100,000+ quickcheck iterations across repeated runs are clean.
+  `doc/testing.md` §2 notes both properties.
+
 - **`fix(tls)`: a certificate name containing `/` was stored as a REGEX segment and bound one
   certificate to an open-ended class of SNI values; it is now refused.**
   `AddCertificate.certificate.names` is a free `Vec<String>` that `CertificateResolver::add_certificate`
