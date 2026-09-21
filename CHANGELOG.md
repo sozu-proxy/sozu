@@ -31,6 +31,27 @@
   is reported as `GOAWAY(COMPRESSION_ERROR)` per RFC 9113 §4.3, distinct from the `PROTOCOL_ERROR`
   a malformed Pad Length now correctly produces.
 
+- **`fix(mux-h2)`: stop an unrelated WINDOW_UPDATE/RST_STREAM flush from corrupting an in-progress,
+  non-refused HEADERS+CONTINUATION reassembly.** `ConnectionH2::zero` does double duty: it is the
+  read-side accumulation buffer for a header block in progress — `headers.header_block_fragment`
+  stays a `(start, len)` window into it across every `readable()` pass until `END_HEADERS`, by
+  protocol design, not just on short TCP reads — and it is also the write scratch space
+  `flush_pending_control_frames`'s WINDOW_UPDATE and RST_STREAM drain stages reuse to serialise ANY
+  queued frame, for ANY stream. Because the event loop dispatches frontend `readable()` then
+  `writable()` in the same sweep, ordinary connection-level flow-control housekeeping — replenishing
+  the window after DATA received on a completely different stream, no adversarial peer required —
+  could run between a HEADERS frame and its CONTINUATION and clear `zero.storage` out from under the
+  accumulating fragment. The clobbered bytes still HPACK-decoded (any byte sequence usually does),
+  so the observed failure was not a crash but silently wrong header names/values reaching the
+  request, or a connection-wide `GOAWAY` on a legitimate multiplexed request that happened to share
+  a connection with routine flow-control traffic. Both drain stages now defer instead of flushing
+  while `ConnectionH2::header_block_reassembly_in_progress` (`self.state` is `ContinuationHeader` or
+  `ContinuationFrame`) — nothing is lost, since queuing a WINDOW_UPDATE or RST_STREAM already arms
+  `WRITABLE`, so the next `writable()` call after the block completes drains it normally. This
+  mirrors the write side's own pre-existing protection of the same buffer: while a zero-buffer write
+  is stalled, READABLE interest is disabled so a fresh frame read cannot clobber it either — the
+  read side had no analogous guard until now.
+
 - **`fix(router)`: stop IDN-normalising the regex source of a `Tree` hostname, which inverted every
   uppercase escape.** `Router::add_tree_rule`, `Router::remove_tree_rule` and `Router::has_hostname`
   ran the WHOLE configured hostname through `idna::domain_to_ascii`, regex segments included. That

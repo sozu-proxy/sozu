@@ -411,6 +411,14 @@ Flushes control data before application frames, in order:
    `expect_write.is_none()`) re-runs on the next tick rather than
    stranding the queued RST.
 
+Stages 3 and 4 both defer — leaving the queue untouched — while
+`header_block_reassembly_in_progress()` is true (`self.state` is
+`ContinuationHeader`/`ContinuationFrame`): the zero buffer is where an
+in-progress, non-refused HEADERS+CONTINUATION field block is accumulating,
+and clearing it to serialize an unrelated control frame would corrupt that
+reassembly. Nothing is lost — queuing either kind of frame already arms
+`WRITABLE` — the flush just waits for the block to complete.
+
 Returns `Some(MuxResult)` if the caller should return early, `None` to proceed.
 
 ### write_streams()
