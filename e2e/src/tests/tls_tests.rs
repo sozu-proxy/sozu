@@ -1160,8 +1160,9 @@ fn try_tls_connection_close_large_response() -> State {
         }
     };
 
-    let response_ok =
-        headers.contains("HTTP/1.1 200") && body.len() == payload.len() && body == payload;
+    let status_ok = headers.contains("HTTP/1.1 200");
+    let length_ok = body.len() == payload.len();
+    let body_ok = body == payload;
 
     worker.soft_stop();
     let success = worker.wait_for_server_stop();
@@ -1169,9 +1170,69 @@ fn try_tls_connection_close_large_response() -> State {
     let responses_sent = backend.responses_sent();
     backend.stop();
 
-    if success && response_ok && requests_received == 1 && responses_sent == 1 {
+    // Name every failing conjunct with its values.
+    //
+    // This replaces `success && response_ok && requests_received == 1 &&
+    // responses_sent == 1`, where `response_ok` itself hid three more
+    // conditions: SIX distinguishable causes collapsed into one bit that
+    // returned a bare `State::Fail` with no output at all. The five
+    // `println!`s earlier in this function only fire on early returns, so a
+    // verdict failure printed nothing and the cause had to be reproduced to
+    // be learned — on a test that fails intermittently in CI.
+    //
+    // The distinction that matters most for a large-response delivery guard
+    // is truncation (`length_ok`, a short body — the sozu#1279 shape) versus
+    // corruption at equal length (`body_ok`), which the collapsed boolean
+    // could not tell apart. They are reported separately, the latter with the
+    // first differing offset.
+    //
+    // The verdict is unchanged: `failures.is_empty()` holds exactly when the
+    // original conjunction did (a `body_ok` true with `length_ok` false is
+    // unreachable — equal strings have equal length).
+    let mut failures = Vec::new();
+    if !success {
+        failures
+            .push("worker did not stop cleanly (wait_for_server_stop returned false)".to_owned());
+    }
+    if !status_ok {
+        failures.push(format!(
+            "response status line is not 200; headers = {headers:?}"
+        ));
+    }
+    if !length_ok {
+        failures.push(format!(
+            "body TRUNCATED or padded: got {} bytes, expected {}",
+            body.len(),
+            payload.len()
+        ));
+    } else if !body_ok {
+        let first_diff = body
+            .as_bytes()
+            .iter()
+            .zip(payload.as_bytes())
+            .position(|(got, want)| got != want);
+        failures.push(format!(
+            "body CORRUPTED at matching length ({} bytes): first differing offset {first_diff:?}",
+            body.len()
+        ));
+    }
+    if requests_received != 1 {
+        failures.push(format!(
+            "backend received {requests_received} requests, expected 1"
+        ));
+    }
+    if responses_sent != 1 {
+        failures.push(format!(
+            "backend sent {responses_sent} responses, expected 1"
+        ));
+    }
+
+    if failures.is_empty() {
         State::Success
     } else {
+        for failure in &failures {
+            println!("TLS-CONN-CLOSE-LARGE: FAIL - {failure}");
+        }
         State::Fail
     }
 }

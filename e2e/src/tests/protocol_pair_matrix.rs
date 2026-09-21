@@ -53,7 +53,7 @@ use crate::{
         aggregator::SimpleAggregator,
         async_backend::BackendHandle as AsyncBackend,
         h2_backend::H2Backend,
-        https_client::{HttpsClient, build_h2_client, build_https_client},
+        https_client::{HttpsClient, build_h2_client, build_https_client, format_error_chain},
     },
     sozu::worker::Worker,
     tests::{
@@ -362,7 +362,7 @@ fn send_request(client: &HttpsClient, req: HyperRequest<String>) -> Option<u16> 
         {
             Ok(Ok(resp)) => Some(resp.status().as_u16()),
             Ok(Err(error)) => {
-                eprintln!("matrix request failed: {error}");
+                eprintln!("matrix request failed: {}", format_error_chain(&error));
                 None
             }
             Err(_) => {
@@ -387,7 +387,7 @@ fn send_request_full(
             let resp = match client.request(req).await {
                 Ok(r) => r,
                 Err(error) => {
-                    eprintln!("matrix request failed: {error}");
+                    eprintln!("matrix request failed: {}", format_error_chain(&error));
                     return None;
                 }
             };
@@ -400,7 +400,7 @@ fn send_request_full(
             let body_bytes = match resp.into_body().collect().await {
                 Ok(c) => c.to_bytes(),
                 Err(error) => {
-                    eprintln!("matrix body collect failed: {error}");
+                    eprintln!("matrix body collect failed: {}", format_error_chain(&error));
                     return Some((status, headers, String::new()));
                 }
             };
