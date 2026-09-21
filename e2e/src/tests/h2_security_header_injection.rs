@@ -32,7 +32,7 @@ use sozu_command_lib::proto::command::request::RequestType;
 use super::h2_utils::{
     H2_FRAME_HEADERS, H2Frame, collect_response_frames, h2_handshake, log_frames,
     raw_h2_connection, rejected_with_goaway_or_rst, setup_h2_listener_only, setup_h2_test,
-    teardown, verify_sozu_alive,
+    stream_status_matches, teardown, verify_sozu_alive,
 };
 use crate::{
     mock::{raw_h2_response_backend::RawH2ResponseBackend, sync_backend::Backend as SyncBackend},
@@ -69,14 +69,6 @@ fn request_prefix_localhost() -> Vec<u8> {
     ]
 }
 
-/// Check whether a HEADERS response on stream 1 carries `:status 400` using
-/// the HPACK static-table encoding (`0x8D` = static index 13 = `:status 400`).
-fn contains_400_response(frames: &[(u8, u8, u32, Vec<u8>)]) -> bool {
-    frames.iter().any(|(ft, _fl, sid, payload)| {
-        *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x8D)
-    })
-}
-
 // ============================================================================
 // FIX-1 — CRLF / CTL rejection in H2 regular header values
 // ============================================================================
@@ -110,7 +102,7 @@ fn try_h2_header_value_crlf_rejected() -> State {
     log_frames("CRLF-in-value", &frames);
 
     // Stream-scope header-injection violation: sozu must emit RST/GOAWAY or 400.
-    let rejected = rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
+    let rejected = rejected_with_goaway_or_rst(&frames) || stream_status_matches(&frames, 1, 400);
     drop(tls);
     thread::sleep(Duration::from_millis(100));
     let still_alive = verify_sozu_alive(front_port);
@@ -157,7 +149,7 @@ fn try_h2_cookie_value_nul_rejected() -> State {
     log_frames("NUL-in-cookie", &frames);
 
     // Stream-scope header-injection violation: sozu must emit RST/GOAWAY or 400.
-    let rejected = rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
+    let rejected = rejected_with_goaway_or_rst(&frames) || stream_status_matches(&frames, 1, 400);
     let infra_ok = teardown(tls, front_port, worker, backends);
     if rejected && infra_ok {
         State::Success
@@ -233,7 +225,7 @@ fn try_h2_host_authority_mismatch_rejected() -> State {
     log_frames("host-vs-authority mismatch", &frames);
 
     // Stream-scope desync violation (FIX-6): sozu must emit RST/GOAWAY or 400.
-    let rejected = rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
+    let rejected = rejected_with_goaway_or_rst(&frames) || stream_status_matches(&frames, 1, 400);
 
     // Prove sozu did NOT open a connection towards the sync backend.
     let accepted = backend.accept(0);
@@ -436,7 +428,8 @@ fn try_h2_invalid_scheme_rejected() -> State {
             &frames,
         );
         // Stream-scope invalid-scheme violation: sozu must emit RST/GOAWAY or 400.
-        let rejected = rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
+        let rejected =
+            rejected_with_goaway_or_rst(&frames) || stream_status_matches(&frames, 1, 400);
         if !rejected {
             println!("scheme {:?} — NOT rejected", bad);
             all_rejected = false;
@@ -528,8 +521,16 @@ fn try_h2_path_syntax_enforced() -> State {
         // after the eager-RST fix. `!wrote` still accepted: the HPACK decoder
         // can reject a control-char `:path` early and collapse the TLS write
         // before the stream layer sees it.
-        let rejected =
-            !wrote || rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
+        //
+        // Scoped to `stream_id`, not the hardcoded stream 1 the shared helper
+        // used: every case after the first runs on 3, 5, 7, so the 400 arm was
+        // dead for three of the four. Safe to make live only now that it
+        // decodes `:status` — the `asterisk-with-OPTIONS` case answers 404
+        // (observed 2026-09-20: `HEADERS stream=7 status=404`), whose indexed
+        // HPACK byte is the `0x8D` the old scan keyed on (issue #1374).
+        let rejected = !wrote
+            || rejected_with_goaway_or_rst(&frames)
+            || stream_status_matches(&frames, stream_id, 400);
 
         if *should_reject && !rejected {
             println!("case '{label}' — expected rejection, got acceptance");
@@ -537,12 +538,13 @@ fn try_h2_path_syntax_enforced() -> State {
         } else if !*should_reject && rejected {
             // Accept either "no rejection" OR "backend unreachable" (502) —
             // we only fail if sozu emits GOAWAY / PROTOCOL_ERROR / 400.
+            // A decoded 400 is a reject; any other `:status` is fine — sozu
+            // routed and the answer came from routing or the backend. The
+            // byte scan this replaces read `0x8D` as 400; that is static
+            // index 13, `:status 404`, so the 404 this very case produces
+            // answered "protocol error" (issue #1374).
             let protocol_error = rejected_with_goaway_or_rst(&frames)
-                || frames.iter().any(|(ft, _fl, sid, payload)| {
-                    // 400 (0x8D) is a reject; any other :status (e.g. 502
-                    // = 0x92) is fine — sozu routed but backend refused.
-                    *ft == H2_FRAME_HEADERS && *sid == stream_id && payload.contains(&0x8D)
-                });
+                || stream_status_matches(&frames, stream_id, 400);
             if protocol_error {
                 println!("case '{label}' — unexpected PROTOCOL_ERROR/400");
                 everything_ok = false;
@@ -627,7 +629,8 @@ fn try_h2_content_length_strict_syntax() -> State {
         let frames = collect_response_frames(&mut tls, 400, 3, 400);
         log_frames(&format!("cl={:?}", String::from_utf8_lossy(cl)), &frames);
         // Stream-scope content-length syntax violation: sozu must emit RST/GOAWAY or 400.
-        let rejected = rejected_with_goaway_or_rst(&frames) || contains_400_response(&frames);
+        let rejected =
+            rejected_with_goaway_or_rst(&frames) || stream_status_matches(&frames, 1, 400);
         if !rejected {
             println!("cl {:?} — NOT rejected", String::from_utf8_lossy(cl));
             all_rejected = false;
@@ -715,20 +718,40 @@ fn try_h2_invalid_status_rejected() -> State {
             &frames,
         );
 
-        // Valid outcomes: RST_STREAM on stream 1, GOAWAY, 502 status,
-        // or connection reset (no frames read back).
+        // Valid outcomes: a decoded 502 on stream 1, or a protocol-level
+        // rejection (RST_STREAM on stream 1 / GOAWAY).
+        //
+        // This assertion used to read `protocol_rejection || !got_200`, which
+        // a worker that answered *nothing* satisfied: `got_200` is derived
+        // from frames that may never arrive, so a silent reset, a timeout
+        // collecting zero frames, or a worker that died between iterations
+        // all read as success, and a regression turning a clean 502 into a
+        // crash read as a pass (issue #1381). Assert the positive outcome
+        // instead, require frames to have arrived at all, and keep `!got_200`
+        // as a conjunct rather than an escape hatch.
+        //
+        // Sōzu answers 502 here — observed 2026-09-20 on all four bad
+        // statuses, `HEADERS flags=0x04 stream=1 len=52 status=502`. Both
+        // status probes decode `:status` rather than scanning for `0x88`,
+        // which is a length octet or a raw value byte as often as it is an
+        // indexed `:status 200` (issue #1374, same defect class).
         let protocol_rejection = rejected_with_goaway_or_rst(&frames);
-        // 502 is HPACK static index 29 (`:status 500`) off by nothing useful;
-        // we assert "NOT 200" i.e. no 0x88 (200) on stream 1.
-        let got_200 = frames.iter().any(|(ft, _fl, sid, payload)| {
-            *ft == H2_FRAME_HEADERS && *sid == 1 && payload.contains(&0x88)
-        });
-        let ok = protocol_rejection || !got_200;
+        let got_200 = stream_status_matches(&frames, 1, 200);
+        let got_502 = stream_status_matches(&frames, 1, 502);
+        // To SEE THIS RED: shadow `frames` with an empty `Vec` right after
+        // the `collect_response_frames` call above. Measured 2026-09-20:
+        // `FAIL — bad :status "abc": frames=0, protocol_rejection=false,
+        // got_502=false, got_200=false`, while the historical
+        // `protocol_rejection || !got_200` passed both iterations.
+        let got_frames = !frames.is_empty();
+        let ok = got_frames && (protocol_rejection || got_502) && !got_200;
 
         if !ok {
             println!(
-                "FAIL — bad :status {:?} produced 200 OK response to client",
-                String::from_utf8_lossy(bad_status)
+                "FAIL — bad :status {:?}: frames={}, protocol_rejection={protocol_rejection}, \
+                 got_502={got_502}, got_200={got_200}",
+                String::from_utf8_lossy(bad_status),
+                frames.len()
             );
             drop(backend);
             drop(tls);

@@ -42,7 +42,7 @@ use super::h2_utils::{
     H2_ERROR_ENHANCE_YOUR_CALM, H2Frame, collect_response_frames, contains_goaway,
     contains_goaway_with_error, contains_headers_response, h2_handshake, headers_status_matches,
     log_frames, raw_h2_connection, raw_h2_connection_with_sni, read_all_available,
-    verify_sozu_alive,
+    rejected_with_goaway_or_rst, verify_sozu_alive,
 };
 use crate::{
     mock::{
@@ -519,15 +519,25 @@ fn try_strict_sni_binding_toggle() -> State {
     // The `payload.contains(&0x88)` probe it replaces had no false negative
     // for a Sōzu 200; `decode_status` returns `None` — hence `got_200 =
     // false` — for a block prefixed with an HPACK dynamic table size update
-    // (`lib/src/protocol/mux/converter.rs:112`). Because `got_200` enters
-    // `phase1_ok` below as `|| !got_200`, that false negative is
-    // fail-**open** at this call site, not fail-closed. Unreachable today:
-    // this test drives `h2_handshake`, which sends empty SETTINGS, so Sōzu
-    // never arms an update. Pointing a size-updating client at this test
-    // means teaching `decode_status` to skip a leading update first.
+    // (`lib/src/protocol/mux/converter.rs:112`). `got_200` now enters
+    // `phase1_ok` below as the conjunct `&& !got_200`, so that false
+    // negative can no longer carry the assertion on its own — it only fails
+    // to *block* a phase that already produced a 421 or a real rejection.
+    // Unreachable today either way: this test drives `h2_handshake`, which
+    // sends empty SETTINGS, so Sōzu never arms an update. Pointing a
+    // size-updating client at this test means teaching `decode_status` to
+    // skip a leading update first.
     let got_421 = headers_status_matches(&frames_strict, b"421");
     let got_200 = headers_status_matches(&frames_strict, b"200");
-    let got_rejection_or_421 = got_421 || contains_goaway(&frames_strict);
+    // `contains_goaway` is too wide to carry this on its own: it matches ANY
+    // GOAWAY, and phase 1 ends with `GOAWAY error_code=0x0`, the graceful
+    // close that rides along behind the 421 (observed 2026-09-20). A 502 or
+    // a 503 followed by the same graceful close would therefore have
+    // satisfied "a 421 or GOAWAY was observed" — the very distinction issue
+    // #1381 says these assertions cannot make. `rejected_with_goaway_or_rst`
+    // requires a GOAWAY whose error code is NOT `NO_ERROR`, or an
+    // RST_STREAM.
+    let got_rejection_or_421 = got_421 || rejected_with_goaway_or_rst(&frames_strict);
     println!("SNI-TOGGLE strict=true: got_421={got_421}, got_200={got_200}");
     drop(tls_strict);
 
@@ -568,8 +578,35 @@ fn try_strict_sni_binding_toggle() -> State {
     let success = worker.wait_for_server_stop();
     backend.stop_and_get_aggregator();
 
-    // Success: phase1 produced 421 or GOAWAY; patch succeeded; phase2 got a response.
-    let phase1_ok = got_rejection_or_421 || !got_200;
+    // Success: phase1 produced 421 or GOAWAY; patch succeeded; phase2 got a
+    // response.
+    //
+    // The comment above has always stated this contract; the code used to
+    // read `got_rejection_or_421 || !got_200` and accept a third outcome it
+    // never mentioned. `got_200` is derived from frames that may never
+    // arrive, so phase 1 producing *nothing at all* — a silent connection
+    // reset, a timeout collecting zero frames, a worker that died between
+    // setup and phase 1 — satisfied `!got_200` and passed. A regression that
+    // turned a clean 421 into a crash read as success (issue #1381).
+    //
+    // Assert the positive outcome instead. `got_rejection_or_421` is only
+    // true when a `:status 421` HEADERS block, an RST_STREAM or a non-
+    // `NO_ERROR` GOAWAY was read off the wire, so it already subsumes
+    // "frames were received at all"; `!got_200` stays as a conjunct so a
+    // phase that somehow carried both reads as a failure rather than a
+    // pass.
+    //
+    // To SEE THIS RED, either:
+    // - shadow `frames_strict` with an empty `Vec` right after the
+    //   `collect_response_frames` call above. Measured 2026-09-20: the
+    //   strengthened form fails on iteration 1, the historical
+    //   `got_rejection_or_421 || !got_200` passes all five; or
+    // - shadow it with a `:status 502` HEADERS block plus a
+    //   `GOAWAY(NO_ERROR)`. The strengthened form fails; restoring
+    //   `contains_goaway` in place of `rejected_with_goaway_or_rst` above
+    //   makes the same fixture pass.
+    // Both mutations have been run and seen red.
+    let phase1_ok = got_rejection_or_421 && !got_200;
     if success && still_alive && patch_ok && phase1_ok && got_response_after_patch {
         State::Success
     } else {

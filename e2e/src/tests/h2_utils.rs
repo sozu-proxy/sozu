@@ -1301,6 +1301,22 @@ pub(crate) fn log_frames(test_name: &str, frames: &[(u8, u8, u32, Vec<u8>)]) {
         } else if *ft == H2_FRAME_RST_STREAM && payload.len() >= 4 {
             let error_code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
             println!("  frame {i}: RST_STREAM stream={sid} error_code=0x{error_code:x}");
+        } else if *ft == H2_FRAME_HEADERS {
+            // Print the decoded `:status` rather than leaving the reader to
+            // eyeball an HPACK block. Every assertion in the H2 security
+            // suites turns on this value, and `None` (a block that does not
+            // open with `:status`) is exactly the case a byte scan used to
+            // hide. See [`decode_status`].
+            match decode_status(payload) {
+                Some(status) => println!(
+                    "  frame {i}: HEADERS flags=0x{fl:02x} stream={sid} len={} status={status}",
+                    payload.len()
+                ),
+                None => println!(
+                    "  frame {i}: HEADERS flags=0x{fl:02x} stream={sid} len={} status=<undecodable>",
+                    payload.len()
+                ),
+            }
         } else {
             println!(
                 "  frame {i}: type=0x{ft:02x} flags=0x{fl:02x} stream={sid} len={}",
@@ -1444,10 +1460,11 @@ pub(crate) fn contains_headers_response(frames: &[(u8, u8, u32, Vec<u8>)]) -> bo
 /// `h2_correctness_tests.rs:3559` and `:3663`. None of the three decodes a
 /// status, and `h2_handshake` sends empty SETTINGS, so no assertion meets
 /// the update today. The first one that does gets `None`, which reads as
-/// "no status" — fail-closed for `headers_status_matches`, but see the
-/// `got_200` caveat in `listener_update_tests.rs`, where a `None` lands on
-/// the permissive side of a `||`. Teach this helper to skip a leading
-/// update before pointing a new assertion at a size-updating client.
+/// "no status" — fail-closed wherever a decoded status is asserted
+/// positively, and merely non-blocking where one is asserted negatively,
+/// as `&& !got_200` in `listener_update_tests.rs`. Teach this helper to
+/// skip a leading update before pointing a new assertion at a
+/// size-updating client.
 pub(crate) fn decode_status(payload: &[u8]) -> Option<u16> {
     /// RFC 7541 Appendix A, static indices 8..=14.
     const INDEXED_STATUS: [u16; 7] = [200, 204, 206, 304, 400, 404, 500];
@@ -1503,6 +1520,40 @@ pub(crate) fn headers_status_matches(frames: &[(u8, u8, u32, Vec<u8>)], code: &[
         .expect("status needle must be a decimal status code");
     frames.iter().any(|(ft, _fl, _sid, payload)| {
         *ft == H2_FRAME_HEADERS && decode_status(payload) == Some(wanted)
+    })
+}
+
+/// Whether any HEADERS frame **on `stream_id`** carried this decoded
+/// `:status` — the stream-scoped twin of [`headers_status_matches`].
+///
+/// The H2 security suites all assert on a single stream and used to write
+/// that check inline as `payload.contains(&0x8D)`, calling the result
+/// `got_400`. `0x8D` is an indexed HPACK field whose static index is 13,
+/// which RFC 7541 Appendix A lists as `:status 404`, not 400 — 400 is index
+/// 12, `0x8C` (issue #1374). Both halves of that scan are wrong:
+///
+/// * It keys on the wrong status. Sōzu really does answer an indexed
+///   `0x8d` 404 when the router finds no cluster for the request
+///   (`try_h2_default_answer_terminates_stream` in `h2_tests.rs` asserts
+///   exactly that shape), so a request that sōzu
+///   *accepted and routed to the default answer* satisfied a term named
+///   `got_400` and reported itself as a rejection.
+/// * It is a byte scan, so it also fires on a length octet or a raw value
+///   byte anywhere in the block. RFC 7541 §5.1 writes a 268-byte header
+///   value as `7f 8d 01`, and
+///   `lib/src/protocol/mux/converter.rs:388-391` forwards raw value bytes
+///   ≥ `0x80` verbatim. That is issue #1353's mechanism pointed at a
+///   security assertion.
+///
+/// [`decode_status`] reads the first field of the block instead, so
+/// neither a later field nor a length octet can answer for the status.
+pub(crate) fn stream_status_matches(
+    frames: &[(u8, u8, u32, Vec<u8>)],
+    stream_id: u32,
+    status: u16,
+) -> bool {
+    frames.iter().any(|(ft, _fl, sid, payload)| {
+        *ft == H2_FRAME_HEADERS && *sid == stream_id && decode_status(payload) == Some(status)
     })
 }
 
