@@ -3503,6 +3503,51 @@ fn fill_deterministic_prng(buf: &mut [u8], seed: [u8; 32]) {
 /// Test A — customer-shape gzipped 7.7 MB over TLS H2 with a Chromium-146
 /// request profile. Serves the synthetic payload gzipped + chunked from an
 /// H1 backend and asserts sha256 byte-identity of the gzipped wire body.
+/// Wall-clock budget for the two large-body H2 drain tests, derived from
+/// measurement on 2026-09-21 (sozu-proxy/sozu#1393, cause D).
+///
+/// The previous bound was `Duration::from_secs(8)`. It was never validated
+/// against CI contention: the commit that introduced these tests (`23f5f4f7`,
+/// 2026-04-24) recorded only "typical local run: ~285 ms per iteration", so 8 s
+/// was 28x an idle-only figure with no margin anybody had measured.
+///
+/// It failed on 2026-09-21, on a tree that already contained the #1373 spin fix
+/// `5b83908a`, so the spin fix does not cover it:
+///
+///   body_bytes=3440640/7763292 elapsed=8.036659064s   (44.32% transferred)
+///
+/// That is not a stall. Three things rule one out. Every write-queueing site on
+/// this path in `lib/src/protocol/mux/h1.rs` pairs `arm_writable()` /
+/// `signal_pending_write()` with an explicit edge-triggered-epoll comment, and
+/// `writable()` asserts the invariant. `h2.rs` has a window-stall reaper with
+/// its own passing e2e test. And decisively: in the SAME CI job and the same
+/// ~30 s window, the sibling `test_h2_large_gzipped_chunked_drains_fully` —
+/// same payload, same `drain_h2_stream_streaming` helper, same 8 s bound —
+/// passed all three iterations, with handshake-to-handshake cycles of 6.606 s
+/// and 6.073 s against its own ~285 ms idle baseline. A lost wake-up does not
+/// recover on its own three times; severe scheduling delay does.
+///
+/// Measurements behind the 30 s figure:
+///
+///   idle, 20 cores, crypto-ring and fips      272-287 ms  (11 samples)
+///   full local suite in parallel, 20 cores    697 ms - 1.121 s
+///   h2_ subset, `taskset -c 0-3`              749-793 ms
+///     (4 cores matches `ubuntu-latest`'s actual vCPU count)
+///   CI sibling test, realized cycle           6.073 s, 6.606 s
+///   CI failure, linear extrapolation          ~18.1 s  (8.037 / 0.4432)
+///
+/// 30 s is ~1.7x that extrapolation and ~4.5x the sibling's realized cycle,
+/// while staying well inside `DEFAULT_FRONT_TIMEOUT` (60 s) so the test still
+/// fails rather than tripping the proxy's own timeout first.
+///
+/// The local ceiling reproducible on this hardware is ~1.1 s, an order of
+/// magnitude short of what CI needed that day, so this bound is extrapolated
+/// from one CI snapshot plus a same-run corroborating sibling — not measured
+/// end to end the way `ISSUE_810_SHUTDOWN_BUDGET` was. If this fails again,
+/// the printed `elapsed=` is the datum to tighten it with; do not raise it
+/// further without one.
+const LARGE_BODY_DRAIN_BUDGET: Duration = Duration::from_secs(30);
+
 fn try_h2_large_gzipped_chunked_drains_fully() -> State {
     use std::io::Write as _;
 
@@ -3572,11 +3617,11 @@ fn try_h2_large_gzipped_chunked_drains_fully() -> State {
     // GOAWAY(ENHANCE_YOUR_CALM) that truncates the tail of the response.
     // The 6 MiB initial stream window (CHROME146_INITIAL_WINDOW_SIZE) plus
     // a single 1 MiB refresh is plenty of credit for a 7.77 MiB body.
-    let outcome = drain_h2_stream_streaming(&mut tls, sid, Duration::from_secs(8), 1024 * 1024);
+    let outcome = drain_h2_stream_streaming(&mut tls, sid, LARGE_BODY_DRAIN_BUDGET, 1024 * 1024);
 
     println!(
         "h2 customer gzipped chunked: body_bytes={}/{gzipped_len} \
-         end_stream={} rst={} elapsed={:?} \
+         end_stream={} rst={} elapsed={:?} budget={LARGE_BODY_DRAIN_BUDGET:?} \
          sha256={} expected={expected_hex} \
          backend_responses={}",
         outcome.body_bytes,
@@ -3600,13 +3645,13 @@ fn try_h2_large_gzipped_chunked_drains_fully() -> State {
         && outcome.end_stream_seen
         && outcome.body_bytes == gzipped_len
         && outcome.sha256_hex == expected_hex
-        && outcome.elapsed < Duration::from_secs(8)
+        && outcome.elapsed < LARGE_BODY_DRAIN_BUDGET
     {
         State::Success
     } else {
         println!(
             "FAIL: body_bytes={} (want {gzipped_len}), end_stream={}, rst={}, \
-             sha256={} (want {expected_hex}), elapsed={:?}, infra_ok={infra_ok}",
+             sha256={} (want {expected_hex}), elapsed={:?} (budget {LARGE_BODY_DRAIN_BUDGET:?}), infra_ok={infra_ok}",
             outcome.body_bytes,
             outcome.end_stream_seen,
             outcome.got_rst,
@@ -3675,11 +3720,11 @@ fn try_h2_large_chunked_7mb_drains_fully() -> State {
     // GOAWAY(ENHANCE_YOUR_CALM) that truncates the tail of the response.
     // The 6 MiB initial stream window (CHROME146_INITIAL_WINDOW_SIZE) plus
     // a single 1 MiB refresh is plenty of credit for a 7.77 MiB body.
-    let outcome = drain_h2_stream_streaming(&mut tls, sid, Duration::from_secs(8), 1024 * 1024);
+    let outcome = drain_h2_stream_streaming(&mut tls, sid, LARGE_BODY_DRAIN_BUDGET, 1024 * 1024);
 
     println!(
         "h2 7MB smoke: body_bytes={}/{BODY_SIZE} \
-         end_stream={} rst={} elapsed={:?} \
+         end_stream={} rst={} elapsed={:?} budget={LARGE_BODY_DRAIN_BUDGET:?} \
          backend_responses={}",
         outcome.body_bytes,
         outcome.end_stream_seen,
@@ -3700,13 +3745,13 @@ fn try_h2_large_chunked_7mb_drains_fully() -> State {
         && !outcome.got_rst
         && outcome.end_stream_seen
         && outcome.body_bytes == BODY_SIZE
-        && outcome.elapsed < Duration::from_secs(8)
+        && outcome.elapsed < LARGE_BODY_DRAIN_BUDGET
     {
         State::Success
     } else {
         println!(
             "FAIL: body_bytes={} (want {BODY_SIZE}), end_stream={}, rst={}, \
-             elapsed={:?}, infra_ok={infra_ok}",
+             elapsed={:?} (budget {LARGE_BODY_DRAIN_BUDGET:?}), infra_ok={infra_ok}",
             outcome.body_bytes, outcome.end_stream_seen, outcome.got_rst, outcome.elapsed,
         );
         State::Fail
