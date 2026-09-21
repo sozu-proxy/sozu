@@ -1665,7 +1665,7 @@ fn test_hot_upgrade_replay() {
 
 /// `LoadState` after `UpdateHttpsListener` must not wipe the live patched value.
 ///
-/// Per codex analysis: `LoadState` at `bin/src/command/requests.rs:1071` is
+/// Per codex analysis: `LoadState` (`load_state`, `bin/src/command/requests.rs`) is
 /// merge-only — when a listener at the same address already exists, the saved
 /// `Add*Listener` is skipped rather than overwriting the live config.
 ///
@@ -1685,7 +1685,7 @@ fn test_load_state_merge_semantics() {
     // worker-level. The e2e harness only owns a worker, so we verify the
     // merge-only invariant at the `ConfigState::dispatch` layer directly —
     // which is the code path the main process actually uses when replaying a
-    // saved state via LoadState at `bin/src/command/requests.rs:1071`.
+    // saved state via `LoadState` (`load_state`, `bin/src/command/requests.rs`).
     let (mut worker, backends, _front_port, front_address) =
         setup_https_test_with_address("LOAD-STATE-MERGE", 1);
 
@@ -1734,7 +1734,7 @@ fn test_load_state_merge_semantics() {
     // an Add verb hitting an already-registered address, `ConfigState::add_
     // https_listener` (`command/src/state.rs`) returns `StateError::Exists`,
     // i.e. the save-side state is *skipped*, not overwritten. This is the
-    // merge-only property codex confirmed at `requests.rs:1071`.
+    // merge-only property codex confirmed in `load_state` (`requests.rs`).
     let replay = worker
         .state
         .dispatch(&RequestType::AddHttpsListener(pre_patch.clone()).into());

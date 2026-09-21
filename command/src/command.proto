@@ -1012,7 +1012,11 @@ message CertificateAndKey {
 // These filter do not compound, use either one but not both.
 // If none of them is specified, all certificates will be returned.
 message QueryCertificatesFilters {
-    // a domain name to filter certificate results
+    // a host name. Answers with the certificate Sōzu would present for that
+    // host, resolved through the same SNI trie a handshake uses, so a wildcard
+    // certificate answers for the hosts it serves. This is NOT an exact-SAN
+    // filter, and it resolves to at most one certificate per HTTPS listener.
+    // See sozu#1383 and doc/configure_cli.md.
     optional string domain = 1;
     // a hex-encoded fingerprint of the TLS certificate to find
     optional string fingerprint = 2;

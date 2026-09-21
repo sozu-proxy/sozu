@@ -2738,6 +2738,23 @@ impl ConfigState {
         cluster_ids
     }
 
+    /// Filter the control plane's certificate record.
+    ///
+    /// `filters.domain` is matched by **exact SAN equality** and is tested
+    /// before `filters.fingerprint`, so a request carrying both answers the
+    /// domain only. That is deliberately NOT the question
+    /// `sozu certificate list --domain <host>` asks: the certificate that
+    /// serves a handshake is chosen by `CertificateResolver::domain_lookup`,
+    /// a `TrieNode` lookup resolving `*.` wildcard and regex labels, so a
+    /// `*.example.com` certificate is invisible to an exact-equality query
+    /// for `foo.example.com` (sozu#1383).
+    ///
+    /// The trie lives in `sozu-lib`, which depends on this crate — the
+    /// reverse edge is a cargo cycle — so the operator-facing `--domain`
+    /// query is resolved one layer up, in `bin`'s
+    /// `certificates_serving_domain` (`bin/src/command/requests.rs`). Do not
+    /// reimplement hostname matching here: a second implementation is what
+    /// drifts from the resolver and reopens sozu#1383.
     pub fn get_certificates(
         &self,
         filters: QueryCertificatesFilters,

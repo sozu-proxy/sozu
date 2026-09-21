@@ -1698,7 +1698,10 @@ Use the --json option to get a much more verbose result, with certificate conten
         #[clap(
             short = 'd',
             long = "domain",
-            help = "list certificates for a domain name"
+            help = "show the certificate Sōzu would present for this host. Resolved through the \
+                    SNI trie, so a wildcard certificate answers for the hosts it serves; this is \
+                    NOT an exact-SAN filter. At most one certificate per HTTPS listener. Ignores \
+                    --fingerprint. See doc/configure_cli.md"
         )]
         domain: Option<String>,
         #[clap(
