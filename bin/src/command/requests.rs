@@ -2305,6 +2305,44 @@ fn validate_request(request: &RequestType) -> Result<(), String> {
 /// replace a prior value in place) and certificates would need the prior value
 /// captured to revert correctly, so they are deliberately NOT covered and keep
 /// today's best-effort behavior; every other request returns `None`.
+///
+/// `ReplaceCertificate` (sozu-proxy/sozu#1404) is one of those certificate
+/// verbs, named explicitly here because it is easy to mistake for an `Add`:
+/// its only identity for the certificate it displaces is `old_fingerprint`, a
+/// one-way SHA-256 hash, never the displaced certificate's PEM/key bytes. An
+/// inverse would have to reconstruct "put the old certificate back", which is
+/// not computable from the hash — unlike `RemoveListener`/`Remove*Frontend`,
+/// whose covered `Add` requests already carry everything the inverse needs.
+/// Recovering that content would mean capturing it out-of-band, before
+/// `worker_request` calls `state.dispatch`, and changing this function's
+/// request-only signature to accept that snapshot — a materially bigger
+/// change than this function's other entries, and out of scope here.
+///
+/// `ConfigState::replace_certificate` (`command/src/state.rs`) was fixed
+/// alongside this comment to add the new certificate before removing the
+/// old one, so a rejected dispatch (e.g. malformed PEM) is now a true no-op
+/// on `ConfigState`. That no-op property is NOT the one [`worker_request`]'s
+/// `state_hash_before` check already asserted: `ConfigState::hash_state`
+/// folds only `self.clusters`, `self.backends`, `self.tcp_fronts`,
+/// `self.http_fronts` and `self.https_fronts` — never `self.certificates` —
+/// so that check could not see a certificate-map corruption before this fix
+/// and still cannot see one after it. Nothing in either debug or release
+/// builds covered `self.certificates` before this changeset; that is
+/// precisely why #1404 could ship and sit there undetected.
+/// `ConfigState::check_invariants` (the OTHER debug-only postcondition,
+/// run inside `dispatch` itself) gained the missing coverage in the same
+/// changeset instead: every `self.certificates[address]` bucket must be
+/// non-empty, which in turn required fixing two further dangling-empty-
+/// bucket paths this coverage surfaced — `remove_certificate` (did not
+/// evict the address key when its last certificate was removed) and
+/// `add_certificate` (could leave a bucket behind for a previously-absent
+/// address on a rejected add). See `command/src/state.rs`'s
+/// `check_invariants` and its certificate regression tests.
+/// This closes the internal partial-failure hazard #1404 was filed for. It
+/// does NOT touch the separate hazard this function guards against — a
+/// successful dispatch that zero workers ever acknowledge — which
+/// `ReplaceCertificate` still carries, same as `AddCertificate`/
+/// `RemoveCertificate` above.
 fn compute_rollback(request: &RequestType) -> Option<Request> {
     let inverse = match request {
         RequestType::AddHttpListener(config) => RequestType::RemoveListener(RemoveListener {
@@ -4852,8 +4890,8 @@ mod listener_validation_tests {
     use sozu_command_lib::{
         config::ListenerBuilder,
         proto::command::{
-            HttpsListenerConfig, RequestTcpFrontend, RequestUdpFrontend, SocketAddress,
-            request::RequestType,
+            CertificateAndKey, HttpsListenerConfig, ReplaceCertificate, RequestTcpFrontend,
+            RequestUdpFrontend, SocketAddress, request::RequestType,
         },
         state::{ConfigState, StateError},
     };
@@ -5020,6 +5058,34 @@ mod listener_validation_tests {
         assert!(
             super::compute_rollback(&RequestType::Logging("info".to_owned())).is_none(),
             "a non-add verb must have no rollback inverse"
+        );
+
+        // sozu-proxy/sozu#1404: `ReplaceCertificate` is deliberately uncovered
+        // too, and for the same content-recovery reason as `AddCertificate` /
+        // `RemoveCertificate` — its only identity for the certificate it
+        // displaces is `old_fingerprint`, a one-way hash, never the displaced
+        // certificate's PEM/key bytes, so no `Request` can express "put the
+        // old certificate back" from the request's own fields alone. Now that
+        // `ConfigState::replace_certificate` is fixed to add-before-remove, a
+        // rejected dispatch is a true no-op (see `state.rs`'s regression
+        // tests); this pins that the still-open "zero worker acknowledged"
+        // divergence intentionally has no compensating request.
+        let replace = RequestType::ReplaceCertificate(ReplaceCertificate {
+            address: SocketAddress::new_v4(127, 0, 0, 1, 8443),
+            new_certificate: CertificateAndKey {
+                certificate: include_str!("../../../command/assets/certificate.pem").to_owned(),
+                key: include_str!("../../../command/assets/key.pem").to_owned(),
+                certificate_chain: Vec::new(),
+                versions: Vec::new(),
+                names: Vec::new(),
+            },
+            old_fingerprint: "aa".repeat(32),
+            new_expired_at: None,
+        });
+        assert!(
+            super::compute_rollback(&replace).is_none(),
+            "ReplaceCertificate must have no rollback inverse: the request never carries the \
+             displaced certificate's content, only its fingerprint hash"
         );
     }
 

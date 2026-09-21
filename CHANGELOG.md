@@ -389,6 +389,51 @@
 
 ### 🐛 Fixed
 
+- **`fix(command)`: `ConfigState::replace_certificate` no longer empties an address's certificate
+  map on a malformed replacement PEM, and `check_invariants` gains the certificate coverage that
+  let this class of bug ship undetected.**
+  `command/src/state.rs`'s `replace_certificate` removed the old fingerprint from
+  `self.certificates[address]` BEFORE computing the new one, and computing it
+  (`calculate_fingerprint`, `command/src/certificate.rs`) parses the PEM and is fallible. A
+  malformed `ReplaceCertificate.new_certificate.certificate` made the `?` propagate after the old
+  entry was already gone, leaving the address with zero certificates. Nothing existing caught it:
+  the two postcondition `debug_assert!`s at the end of the function are debug-only and only run on
+  the `Ok` path the early return skipped; `worker_request`'s (`bin/src/command/requests.rs`)
+  `state_hash_before` no-op check folds only `self.clusters`, `self.backends`, `self.tcp_fronts`,
+  `self.http_fronts` and `self.https_fronts` and has never covered `self.certificates` at all; and
+  `ConfigState::check_invariants` — the debug-only postcondition run inside `dispatch` itself — had
+  no certificate coverage either. No invariant in debug or release builds covered `self.certificates`
+  before this changeset, which is exactly why this could ship silently and sit there.
+  This is sozu-proxy/sozu#774 surviving in a second, independent implementation of the same verb:
+  `CertificateResolver::replace_certificate` (`lib/src/tls.rs`) was fixed for exactly this ordering
+  in [#1202](https://github.com/sozu-proxy/sozu/pull/1202) ("now adds the new certificate before
+  removing the old one"), and that fix was never mirrored into `ConfigState`'s own copy.
+  `replace_certificate` now computes and inserts the new certificate first, and only removes the old
+  fingerprint once the insert is confirmed — and, mirroring #1202's own idempotent-replace guard,
+  skips that removal entirely when the old and new fingerprints are equal, so an operator or ACME
+  retry loop resubmitting the same PEM does not delete the entry it meant to keep.
+  `check_invariants` now asserts every `self.certificates[address]` bucket is non-empty. Making that
+  true required fixing two further dangling-empty-bucket paths the new coverage surfaced in the same
+  file: `remove_certificate` did not evict the address key when its last certificate was removed
+  (reachable through an ordinary, successful `AddCertificate` + `RemoveCertificate` sequence, and
+  already silently breaking `generate_requests`'s own round-trip replay postcondition before this
+  fix — mirroring the `name_fingerprint_idx` empty-entry leak #1202 fixed in `lib/src/tls.rs`'s
+  sibling `remove_certificate`); and `add_certificate` could leave a bucket behind for a
+  previously-absent address when its second fallible step (`apply_overriding_names`, which
+  re-parses full X.509 when `names` is empty) rejected valid-PEM-armor-but-invalid-X.509 content
+  after `self.certificates.entry(address).or_default()` had already materialised the bucket — the
+  same "mutate before the fallible step" defect class as `replace_certificate`'s own bug.
+  `compute_rollback` (`bin/src/command/requests.rs`) gains no new arm for `ReplaceCertificate`: its
+  only identity for the certificate it displaces is `old_fingerprint`, a one-way hash, never the
+  displaced certificate's content, so no `Request` value can express "put the old certificate back"
+  from the request's own fields alone — the same reason `AddCertificate`/`RemoveCertificate` are
+  absent from that function today.
+  Regression tests in `command/src/state.rs::tests`:
+  `replace_certificate_with_malformed_pem_keeps_old_certificate`,
+  `replace_certificate_with_same_fingerprint_keeps_certificate`,
+  `remove_certificate_evicts_the_address_when_its_last_certificate_is_removed`, and
+  `add_certificate_with_valid_pem_armor_but_invalid_x509_leaves_no_bucket`.
+  Closes [#1404](https://github.com/sozu-proxy/sozu/issues/1404).
 - **`fix(tls)`: a certificate name containing `/` was stored as a REGEX segment and bound one
   certificate to an open-ended class of SNI values; it is now refused.**
   `AddCertificate.certificate.names` is a free `Vec<String>` that `CertificateResolver::add_certificate`
