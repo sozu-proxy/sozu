@@ -568,12 +568,21 @@ impl Aggregator {
     /// rejection instead of silently capped semantics. Same shape for
     /// over-long `client_id` and a full lease table — see
     /// [`LeaseApplyOutcome`] for the failure arms.
+    ///
+    /// `now` is parameterised exactly like [`Self::lease_tick`] so the whole
+    /// lease lifecycle (apply, tick) is driven off one caller-supplied clock
+    /// reading instead of `Instant::now()` on the datapath — the same
+    /// sans-io shape as `UdpManager::handle_input` — letting a deterministic
+    /// simulation drive `lease_apply` under a virtual clock. `SessionMetrics`
+    /// and the timer wheel elsewhere in this module intentionally keep the
+    /// real clock and are out of scope for this parameterisation.
     pub fn lease_apply(
         &mut self,
         client_id: String,
         level: MetricDetailLevel,
         ttl: Duration,
         binding: PeerBinding,
+        now: Instant,
     ) -> LeaseApplyOutcome {
         if client_id.len() > LEASE_CLIENT_ID_MAX_BYTES {
             return LeaseApplyOutcome::ClientIdTooLong;
@@ -607,7 +616,7 @@ impl Aggregator {
         {
             return LeaseApplyOutcome::Unauthorized;
         }
-        let expires_at = Instant::now() + ttl;
+        let expires_at = now + ttl;
         let before_len = self.leases.len();
         self.leases.insert(
             client_id,
@@ -1189,6 +1198,7 @@ mod tests {
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
             PeerBinding::default(),
+            Instant::now(),
         ));
         assert_eq!(prev, MetricDetailLevel::Cluster);
         assert_eq!(new, MetricDetailLevel::Backend);
@@ -1207,6 +1217,7 @@ mod tests {
             MetricDetailLevel::Cluster,
             Duration::from_secs(60),
             PeerBinding::default(),
+            Instant::now(),
         ));
         assert_eq!(prev, MetricDetailLevel::Backend);
         assert_eq!(new, MetricDetailLevel::Backend);
@@ -1224,6 +1235,7 @@ mod tests {
                 MetricDetailLevel::Backend,
                 Duration::from_secs(60),
                 PeerBinding::default(),
+                Instant::now(),
             ),
             LeaseApplyOutcome::ClientIdTooLong
         );
@@ -1236,6 +1248,7 @@ mod tests {
         // insert is refused. A RENEWAL of an existing entry must still
         // succeed (replaces in place, count unchanged).
         let mut agg = Aggregator::new("sozu".to_owned());
+        let now = Instant::now();
         for i in 0..LEASE_TABLE_CAP {
             assert!(matches!(
                 agg.lease_apply(
@@ -1243,6 +1256,7 @@ mod tests {
                     MetricDetailLevel::Backend,
                     Duration::from_secs(60),
                     PeerBinding::default(),
+                    now,
                 ),
                 LeaseApplyOutcome::Applied { .. }
             ));
@@ -1255,6 +1269,7 @@ mod tests {
                 MetricDetailLevel::Backend,
                 Duration::from_secs(60),
                 PeerBinding::default(),
+                now,
             ),
             LeaseApplyOutcome::TableFull,
         );
@@ -1266,6 +1281,7 @@ mod tests {
                 MetricDetailLevel::Backend,
                 Duration::from_secs(120),
                 PeerBinding::default(),
+                now,
             ),
             LeaseApplyOutcome::Applied { .. }
         ));
@@ -1282,6 +1298,7 @@ mod tests {
                 MetricDetailLevel::Backend,
                 LEASE_TTL_MAX + Duration::from_secs(1),
                 PeerBinding::default(),
+                Instant::now(),
             ),
             LeaseApplyOutcome::TtlOutOfRange,
         );
@@ -1294,17 +1311,20 @@ mod tests {
         // is REPLACED (not duplicated). Lease count stays at 1.
         // Unknown bindings on both sides skip the renewal-binding gate.
         let mut agg = Aggregator::new("sozu".to_owned());
+        let now = Instant::now();
         let _ = agg.lease_apply(
             "renewer".to_owned(),
             MetricDetailLevel::Backend,
             Duration::from_secs(30),
             PeerBinding::default(),
+            now,
         );
         let _ = agg.lease_apply(
             "renewer".to_owned(),
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
             PeerBinding::default(),
+            now,
         );
         assert_eq!(agg.lease_count(), 1);
     }
@@ -1318,6 +1338,7 @@ mod tests {
         // remains the sole authoritative owner — both for subsequent
         // renewals AND for the victim's own Drop-time `clear`.
         let mut agg = Aggregator::new("sozu".to_owned());
+        let now = Instant::now();
         let victim = PeerBinding {
             pid: Some(4242),
             session_ulid: Some(0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210),
@@ -1327,6 +1348,7 @@ mod tests {
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
             victim,
+            now,
         );
         assert!(
             matches!(outcome, LeaseApplyOutcome::Applied { .. }),
@@ -1341,6 +1363,7 @@ mod tests {
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
             attacker,
+            now,
         );
         assert_eq!(
             outcome,
@@ -1363,6 +1386,7 @@ mod tests {
         // (pid, session_ulid). The renewal must succeed so the TUI's
         // own renewer thread keeps the lease alive across its TTL.
         let mut agg = Aggregator::new("sozu".to_owned());
+        let now = Instant::now();
         let owner = PeerBinding {
             pid: Some(1234),
             session_ulid: Some(0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000_1111),
@@ -1372,12 +1396,14 @@ mod tests {
             MetricDetailLevel::Backend,
             Duration::from_secs(30),
             owner,
+            now,
         );
         let outcome = agg.lease_apply(
             "topcli".to_owned(),
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
             owner,
+            now,
         );
         assert!(
             matches!(outcome, LeaseApplyOutcome::Applied { .. }),
@@ -1394,17 +1420,20 @@ mod tests {
         // Cluster floor would mask the Frontend lease).
         let mut agg = Aggregator::new("sozu".to_owned());
         agg.set_up_detail(MetricDetailLevel::Process);
+        let now = Instant::now();
         let _ = agg.lease_apply(
             "scraper".to_owned(),
             MetricDetailLevel::Frontend,
             Duration::from_secs(60),
             PeerBinding::default(),
+            now,
         );
         let _ = agg.lease_apply(
             "topcli".to_owned(),
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
             PeerBinding::default(),
+            now,
         );
         assert_eq!(agg.detail_effective(), MetricDetailLevel::Backend);
         assert_eq!(agg.lease_count(), 2);
@@ -1429,6 +1458,7 @@ mod tests {
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
             PeerBinding::default(),
+            Instant::now(),
         );
         assert_eq!(
             agg.lease_clear("ghost", PeerBinding::default()),
@@ -1447,6 +1477,7 @@ mod tests {
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
             owner_binding(),
+            Instant::now(),
         );
         let outcome = agg.lease_clear("owner-lease", owner_binding());
         assert!(matches!(outcome, LeaseClearOutcome::Cleared { .. }));
@@ -1463,6 +1494,7 @@ mod tests {
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
             owner_binding(),
+            Instant::now(),
         );
         let outcome = agg.lease_clear("owner-lease", other_binding());
         assert_eq!(outcome, LeaseClearOutcome::Unauthorized);
@@ -1478,6 +1510,7 @@ mod tests {
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
             PeerBinding::default(),
+            Instant::now(),
         );
         let outcome = agg.lease_clear("legacy", owner_binding());
         assert!(matches!(outcome, LeaseClearOutcome::Cleared { .. }));
@@ -1493,6 +1526,7 @@ mod tests {
             MetricDetailLevel::Backend,
             Duration::from_secs(60),
             owner_binding(),
+            Instant::now(),
         );
         let outcome = agg.lease_clear("owner-lease", PeerBinding::default());
         assert_eq!(outcome, LeaseClearOutcome::Unauthorized);
@@ -1543,7 +1577,10 @@ mod tests {
     #[test]
     fn lease_apply_at_max_ttl_succeeds() {
         // Boundary: exactly LEASE_TTL_MAX is allowed; LEASE_TTL_MAX + 1ns is
-        // rejected (covered by lease_apply_rejects_ttl_over_max above).
+        // rejected (covered by lease_apply_rejects_ttl_over_max above). With
+        // `now` injected (rather than read from the host clock) the expiry
+        // is checked for EXACT equality to `now + LEASE_TTL_MAX`, not a
+        // fuzzy upper bound — the whole point of parameterising the clock.
         let mut agg = Aggregator::new("sozu".to_owned());
         let now = Instant::now();
         let outcome = agg.lease_apply(
@@ -1551,9 +1588,10 @@ mod tests {
             MetricDetailLevel::Backend,
             LEASE_TTL_MAX,
             PeerBinding::default(),
+            now,
         );
         assert!(matches!(outcome, LeaseApplyOutcome::Applied { .. }));
         let entry = agg.leases.get("max").unwrap();
-        assert!(entry.expires_at <= now + LEASE_TTL_MAX + Duration::from_millis(50));
+        assert_eq!(entry.expires_at, now + LEASE_TTL_MAX);
     }
 }

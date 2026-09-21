@@ -87,6 +87,7 @@ catching.
 | **Fuzz** | `fuzz/fuzz_targets/*` (out-of-workspace `sozu-fuzz` crate) | nightly toolchain + `cargo-fuzz` | `fuzz` CI job (nightly toolchain, 300 s/target on every push/PR); `#[ignore]`-style runtime skip when prereqs absent | yes (300 s/target); daily 900 s sweep in `simulation-sweep.yml` |
 | **Deterministic simulation** | `sim/tests/udp_simulation.rs` (`sozu-sim`, moonpool-sim) | `RUSTFLAGS="--cfg tokio_unstable"` (scoped to the sim — cfg-gated, off by default) | per-PR `udp-simulation` job (modest sweep) + nightly deep swarm; widened via env knobs | yes |
 | **Deterministic simulation** | `sim/tests/tcp_preread_sim.rs` (`sozu-sim`, moonpool-sim) — TCP SNI-preread core, [#1279](https://github.com/sozu-proxy/sozu/issues/1279) | same `--cfg tokio_unstable` gating as above | per-PR `udp-simulation` job (same job, added step, modest sweep) + nightly `tcp-preread-simulation-sweep` job in `simulation-sweep.yml` (deep swarm); widened via `SOZU_TCP_PREREAD_SIM_*` env knobs | yes |
+| **Deterministic simulation** | `sim/tests/metrics_lease_sim.rs` (`sozu-sim`, moonpool-sim) — metrics cardinality-lease core (`Aggregator::lease_apply`/`lease_clear`/`lease_tick` plus the `remove_cluster`/`add_cluster`/`remove_backend` tombstone) | same `--cfg tokio_unstable` gating as above | no CI job yet — run manually with the command below; widened via `SOZU_METRICS_LEASE_SIM_*` env knobs | no (not yet wired into CI — see this section's closing note) |
 | **Regression guards** | `lib/tests/log_layout.rs` | nothing | runs in `cargo test -p sozu-lib`; build-time `cargo:warning=` echo from `lib/build.rs` | yes |
 
 Notes:
@@ -101,6 +102,12 @@ Notes:
   a `decided`/`deadline` latch, a `check_invariants()` sweep run at both ends of
   `handle_input`, and one unit test per reachable `RejectReason` variant. See
   `lib/src/protocol/tcp_preread/LIFECYCLE.md` for the full lifecycle.
+- `sim/tests/metrics_lease_sim.rs` has no CI job. A `metrics-lease-simulation`
+  job analogous to `udp-simulation` (a modest per-PR sweep) plus a
+  `metrics-lease-simulation-sweep` job in `simulation-sweep.yml` (deep nightly
+  swarm) is proposed but intentionally not added by the change that introduced
+  this simulator — wiring CI is a separate decision. Run it manually with the
+  command in "Targeted runs" until that decision is made.
 - `e2e/src/tests/fuzz_tests.rs` is a thin integration wrapper that shells out to
   the four fuzz targets for 10 s each. It *skips gracefully* (prints a notice,
   returns clean) when the nightly toolchain or `cargo-fuzz` is missing, so the
@@ -131,9 +138,9 @@ cargo test --workspace --locked            # unit + simulation + regression guar
 ### Targeted runs
 
 ```bash
-# Unit + lib-level tests (includes the log-layout guard; the UDP and
-# TCP-preread deterministic simulations moved to the sozu-sim crate — see
-# the targeted `-p sozu-sim` invocations below):
+# Unit + lib-level tests (includes the log-layout guard; the UDP,
+# TCP-preread, and metrics-lease deterministic simulations moved to the
+# sozu-sim crate — see the targeted `-p sozu-sim` invocations below):
 cargo test -p sozu-lib --locked
 
 # A single test module / filter:
@@ -147,6 +154,9 @@ RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test udp_simulation
 
 # Deterministic TCP SNI-preread simulation (same crate, same cfg gating):
 RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test tcp_preread_sim
+
+# Deterministic metrics cardinality-lease simulation (same crate, same cfg gating):
+RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test metrics_lease_sim
 ```
 
 ### Simulation sweep + single-seed replay
@@ -179,6 +189,17 @@ connections per seed):
 ```bash
 RUSTFLAGS="--cfg tokio_unstable" SOZU_TCP_PREREAD_SIM_SEED=0xdeadbeef \
   cargo test -p sozu-sim --test tcp_preread_sim
+```
+
+The metrics cardinality-lease simulator (`sim/tests/metrics_lease_sim.rs`,
+`sozu_lib::metrics::Aggregator`'s `lease_apply`/`lease_clear`/`lease_tick`
+plus the `remove_cluster`/`add_cluster`/`remove_backend` tombstone) mirrors
+the same contract under `SOZU_METRICS_LEASE_SIM_SEED` / `_SEEDS` / `_STEPS`
+(default 256 seeds × 1200 steps):
+
+```bash
+RUSTFLAGS="--cfg tokio_unstable" SOZU_METRICS_LEASE_SIM_SEED=0xdeadbeef \
+  cargo test -p sozu-sim --test metrics_lease_sim
 ```
 
 ### Fuzzing
@@ -346,6 +367,7 @@ bug):
 |---|---|---|---|
 | UDP | `ClientDatagram` — the sole flow creator; without it every shadow-model invariant is vacuously green | `Drain`, `CloseAll`, `AbortFlow`, `SetMaxFlows` — each evicts flows, resets the manager, or sheds future admissions, repairing the very full-table state a capacity bug needs | `BackendResolved`, `BackendDatagram`, `AdvanceClock`, `ReconfigCluster`, `SetMaxRx` |
 | TCP preread | none — `SniPrereadCore` is fresh per connection, and the harness machinery (replay checks, coverage tally) is observation, not a feature | none — no state survives a connection, so nothing can suppress across connections; the swarm benefit here is pure passive competition | all 25 generators, plus the fragmentation axis |
+| Metrics lease | `LeaseApply` — the sole lease creator; `RemoveCluster` — the sole tombstone armer; `EmitClusterMetric` — the sole resurrection prober; omitting any of the three makes an entire assertion class vacuously green | `LeaseClear`, `LeaseTick`, `AddCluster` — each shrinks the lease table or clears a tombstone, repairing the very full-table / still-tombstoned state a capacity or resurrection bug needs | `EmitBackendMetric`, `RemoveBackend`, `SetDetail`, `TableCapacityStress`, `BoundaryExpiry`, `RenewalAuthGate` |
 
 **Per-seed draw and campaign composition.** Campaigns run the explicit seed
 range `0..n`, and seeds divisible by four keep the inclusive all-features
@@ -363,12 +385,13 @@ run.
 `swarm-config sim=... seed=... mode=... features=[...] total_weight=...` line
 before the workload runs, byte-identical across replays of the same seed (the
 `*_swarm_config_is_stable_across_draws` tests assert the stability). A failing
-seed replayed with `SOZU_UDP_SIM_SEED` / `SOZU_TCP_PREREAD_SIM_SEED` therefore
-always shows its configuration. `SOZU_SIM_SWARM=0` (shared by both simulators)
-disables the draw entirely — zero extra RNG consumption, byte-identical to the
-pre-swarm grammar — so a swarm campaign and an all-features campaign of
-identical seed count can be compared directly. The pinned
-`*_replays_known_seed` smoke tests run with swarm off for the same reason.
+seed replayed with `SOZU_UDP_SIM_SEED` / `SOZU_TCP_PREREAD_SIM_SEED` /
+`SOZU_METRICS_LEASE_SIM_SEED` therefore always shows its configuration.
+`SOZU_SIM_SWARM=0` (shared by all three simulators) disables the draw
+entirely — zero extra RNG consumption, byte-identical to the pre-swarm
+grammar — so a swarm campaign and an all-features campaign of identical seed
+count can be compared directly. The pinned `*_replays_known_seed` smoke tests
+run with swarm off for the same reason.
 
 **Coverage gate placement.** The TCP per-class gate
 (`CoverageTally::assert_full_coverage`) is asserted on the MERGED campaign
@@ -376,7 +399,10 @@ tally, never per seed: a single swarm seed legitimately cannot reach every
 `RejectReason` class, but the sweep still must, and still fails loudly when it
 does not. If a swarm subset trips an invariant, that is the point of the
 exercise: report the failing seed and its printed configuration — never weaken
-the assertion or the gate.
+the assertion or the gate. The metrics-lease simulator's `CoverageTally` (its
+thirteen `LeaseApplyOutcome`/`LeaseClearOutcome`/tick/tombstone classes,
+including `TableFull`, `TtlOutOfRange`, and the exact-boundary expiry) follows
+the same merged-tally placement.
 
 ### Recipe: adding a simulator over another sans-io core
 
@@ -397,6 +423,18 @@ The pattern generalizes to any pure state machine. To add one:
    `#![cfg(tokio_unstable)]`, and put the moonpool dev-deps under
    `[target.'cfg(tokio_unstable)'.dev-dependencies]` so the flag stays scoped to
    the sim crate.
+
+`sim/tests/metrics_lease_sim.rs` (the metrics cardinality-lease core,
+`Aggregator::lease_apply`/`lease_clear`/`lease_tick` plus the cluster/backend
+removal tombstone) is a worked example of this recipe end to end: step 1
+required parameterising `lease_apply`'s clock (it previously read
+`Instant::now()` directly, unlike its sibling `lease_tick`) before the
+simulator could exist at all. Its module doc comment names four traps this
+project has already paid for and expects not to repeat — a leaked host-clock
+read reading as vacuously deterministic under virtual time, a pinned seed
+that silently keeps drawing fresh ones, a shadow model that never inspects
+the core's actual output, and chaos that is on by default but rarely fires —
+read it before adding a fifth simulator.
 
 The H2 mux (`lib/src/protocol/mux/`) is the obvious next candidate — its stream
 slot lifecycle, flow-control accounting, and GOAWAY/RST_STREAM semantics are a

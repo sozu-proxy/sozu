@@ -21,12 +21,12 @@ publish = false
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
-# The harness is an integration test (tests/udp_simulation.rs) gated on
-# `--cfg tokio_unstable` (which moonpool-sim needs for tokio `RngSeed` scheduler
-# determinism). Gating the dev-deps on the SAME cfg means cargo only resolves and
-# COMPILES the async moonpool/tokio closure when the flag is set — so a plain
-# `cargo test --workspace` (no flag) builds an empty 0-test binary here and never
-# pulls tokio_unstable into the rest of the workspace. Run the real sweep with:
+# The harness is an integration test (tests/udp_simulation.rs, tests/tcp_preread_sim.rs,
+# tests/metrics_lease_sim.rs) gated on `--cfg tokio_unstable` (which moonpool-sim needs
+# for tokio `RngSeed` scheduler determinism). Gating the dev-deps on the SAME cfg means
+# cargo only resolves and COMPILES the async moonpool/tokio closures when the flag is
+# set — so a plain `cargo test --workspace` (no flag) builds empty 0-test binaries here
+# and never pulls tokio_unstable into the rest of the workspace. Run a real sweep with:
 #   RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test udp_simulation
 [target.'cfg(tokio_unstable)'.dev-dependencies]
 async-trait = { workspace = true }
@@ -35,3 +35,7 @@ moonpool-sim = { workspace = true }
 # crypto-ring so sozu-lib resolves a rustls provider and compiles; the UDP core
 # under simulation never touches TLS.
 sozu-lib = { workspace = true, features = ["crypto-ring"] }
+# proto types (QueryMetricsOptions, ResponseContent, ClusterMetrics, ...) and
+# MetricDetailLevel for tests/metrics_lease_sim.rs, which drives sozu-lib's
+# metrics::Aggregator directly and inspects its query() output.
+sozu-command-lib = { workspace = true }
