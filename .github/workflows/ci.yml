@@ -347,15 +347,23 @@ jobs:
   # │   result, which is the point: the pull request that breaks a  │
   # │   citation is almost never the one that contains it, so no    │
   # │   reviewer is ever shown both halves.                         │
-  # │   A second rule covers the citation form that carries no      │
+  # │   A second rule reads those same citations at TWO revisions:  │
+  # │   one this changeset did not touch must still name the same   │
+  # │   line TEXT it named at the merge base (sozu-proxy/sozu#1389  │
+  # │   — on #1379's changeset 24 citations moved and the           │
+  # │   blank-line rule alone reported 2). It needs the base in the │
+  # │   object store, which is why this job alone checks out with   │
+  # │   fetch-depth: 0, and an unreachable base is an ERROR here,   │
+  # │   never a skip.                                               │
+  # │   A third rule covers the citation form that carries no       │
   # │   path: a backticked TEST NAME, in a Rust comment or a        │
   # │   CHANGELOG/doc paragraph about tests, must name a `fn`       │
   # │   somewhere in the tree (sozu-proxy/sozu#1380 — three names   │
   # │   cited in six places named nothing at all).                  │
-  # │   It is a FLOOR, not a proof — it cannot see a citation that  │
-  # │   drifted onto a different non-blank line, which is the       │
-  # │   dominant failure mode. Cite symbols where the prose names   │
-  # │   an item; see doc/README.md#citing-code-from-these-documents │
+  # │   It is still a FLOOR, not a proof: a citation into code this │
+  # │   changeset never touched is not compared at all. Cite        │
+  # │   symbols where the prose names an item; see                  │
+  # │   doc/README.md#citing-code-from-these-documents              │
   # └──────────────────────────────────────────────────────────────┘
   doc-citations:
     name: Doc citations
@@ -364,6 +372,14 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The drifted-citation rule reads each cited line at the merge base
+          # as well as at HEAD, so the base commit has to be in the object
+          # store. The default shallow checkout leaves it out entirely, and the
+          # rule refuses to run rather than reporting a clean comparison of
+          # nothing. Pull requests here stack on each other, so the base is
+          # often not `main` and no narrower fetch covers every case.
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -394,8 +410,24 @@ jobs:
           fi
           echo "OK: the resolver exits 1 and reports failures on the broken fixture tree."
 
-      - name: Resolve every file.rs:NNN citation and every cited test name
-        run: python3 .github/scripts/check_doc_citations.py
+      - name: Resolve every citation, report every one that drifted, and every cited test name
+        # The base revision arrives through the environment, never interpolated
+        # into the shell, and it is a commit sha rather than free text. On a
+        # `pull_request` the event always carries one; a `main` or tag push has
+        # no changeset to compare against, so the script says on its own line
+        # that the drift rule did not run instead of implying it passed.
+        env:
+          CITATION_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] && [ -z "$CITATION_BASE" ]; then
+            echo "::error::this pull request carries no base sha, so the drifted-citation rule would not run"
+            exit 1
+          fi
+          if [ -n "$CITATION_BASE" ]; then
+            python3 .github/scripts/check_doc_citations.py --base "$CITATION_BASE"
+          else
+            python3 .github/scripts/check_doc_citations.py
+          fi
 
 
   # ┌──────────────────────────────────────────────────────────────┐

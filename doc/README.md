@@ -96,9 +96,10 @@ The surviving line citations are guarded by the `Doc citations` CI job, which ru
 result. The same check runs locally:
 
 ```bash
-python3 .github/scripts/check_doc_citations.py             # check the tree
-python3 .github/scripts/check_doc_citations.py --show      # print every resolved citation
-python3 .github/scripts/check_doc_citations.py --self-test # prove it still fails on a broken fixture
+python3 .github/scripts/check_doc_citations.py                 # check the tree
+python3 .github/scripts/check_doc_citations.py --base main     # + report every citation that drifted
+python3 .github/scripts/check_doc_citations.py --show          # print every resolved citation
+python3 .github/scripts/check_doc_citations.py --self-test     # prove it still fails on a broken fixture
 ```
 
 It scans `doc/**` and every `**/LIFECYCLE.md`, and fails when a cited file does not exist, a cited
@@ -107,10 +108,39 @@ a range is inverted, or the same line repeats inside one citation group — `fil
 what a `/` or `,` continuation renumbered on one half only looks like, and which would otherwise
 resolve perfectly.
 
+### Reporting a citation that drifted
+
+Everything above is a floor: a citation that slides onto a *different non-blank line* resolves, hits
+code, and passes. That is the dominant failure mode, not the exotic one. In
+[sozu-proxy/sozu#1389][drift] a changeset that grew `kawa_h1/editor.rs` by 21 lines and
+`mux/router.rs` by 14 moved **24** citations, and the blank-line rule reported **2** — the other 22
+all landed on code. Worse, the green job read as "the citations are right" when it only ever meant
+"no citation landed on a blank line".
+
+`--base <revision>` closes that, and needs no data the merge already has. Every citation is resolved
+the same way — the document's own directory first, so a module `LIFECYCLE.md` keeps citing its
+siblings by bare name — and the *text* of the cited line is read at the merge base of `<revision>`
+and HEAD as well as at HEAD. Different text is reported, blank or not, at both ends of a range. A
+citation this changeset **re-anchored** is not reported: only one that carries the same path and the
+same line numbers it carried at the base while the text underneath it changed. Comparison is on the
+stripped line, so a re-indent is not drift.
+
+The `Doc citations` CI job passes the pull request's base sha, and checks out with `fetch-depth: 0`
+because the default shallow checkout has no base commit to read. An unreachable `--base` is an
+**error and exit 1**, never a skip — a guard that answered a missing base with a clean run would be
+green forever while comparing nothing. With no `--base` at all, the run says on its own line that
+the rule did not run.
+
+It remains a floor in one direction: a citation into code that this changeset never touched is not
+compared. Cite a symbol wherever the prose names an item.
+
 `--self-test` is what keeps the checker honest. It asserts the exact failures a deliberately broken
 fixture must produce, *and* runs the real command line in a subprocess to require exit `1` on that
 fixture and exit `0` on a clean one — because reporting a failure and acting on it are two different
-lines of code, and a checker that did the first and not the second would be green forever.
+lines of code, and a checker that did the first and not the second would be green forever. The drift
+half is asserted the same way and in both directions: `testdata/citations/` carries a document whose
+every citation resolves to a non-blank line at **both** revisions, so the same tree must exit `0`
+without `--base` and `1` with it, and an unreachable base must be refused rather than skipped.
 
 ### Citing a test by name
 
@@ -146,10 +176,16 @@ decisions rather than escapes:
 
 This matters more than what it does. The resolver cannot tell whether a citation lands on *the
 construct the surrounding prose is talking about*. A citation that drifted from line 118 to line 164
-still resolves, still hits code, and still passes — and that is the dominant failure mode, not the
-exotic one. Measured on the module `LIFECYCLE.md` files: the resolver flagged 27 of the 507 anchors
-those documents carry, while the hand audit that followed cut them to 238 and had to renumber 159 of
-the survivors.
+still resolves, still hits code, and still passes the blank-line rule — and that is the dominant
+failure mode, not the exotic one. Measured on the module `LIFECYCLE.md` files: the resolver flagged
+27 of the 507 anchors those documents carry, while the hand audit that followed cut them to 238 and
+had to renumber 159 of the survivors.
+
+The drift rule above closes that for every line the changeset under test actually moved, which is
+where a citation rots. It closes nothing for a line nobody touched: a citation that was already
+pointing at the wrong place before this pull request opened is carried forward unreported. [#1389][drift]
+tracked one such anchor into `kawa_h1/editor.rs` across three trees: correct in the first, already
+wrong in the second, wrong again in the third, and non-blank at every step.
 
 Two narrower gaps are deliberate. Only the two **ends** of a range are required to be non-blank:
 interior blank lines are normal in a span that covers a whole branch — 26 of them across the
@@ -166,11 +202,20 @@ examined, prose that never says "test" is not examined, and a citation naming a 
 not the test the prose means still passes. The alternative is 864 sites of noise, which nobody reads
 and therefore nobody maintains.
 
-A green `Doc citations` run means "no citation is obviously dead". It does not mean the citations are
-right, and it is not a licence to skip reading the code when you touch one. Where the prose names an
-item, cite the symbol and the question does not arise.
+A green `Doc citations` run means "no citation is obviously dead, and none that this changeset moved
+was left behind". It does not mean the citations are right, and it is not a licence to skip reading
+the code when you touch one. Where the prose names an item, cite the symbol and the question does
+not arise.
+
+One surface gap is known and left open on purpose. The line-citation rules read `doc/**` and every
+`**/LIFECYCLE.md`; the test-name rule additionally reads every `*.rs` comment and `CHANGELOG.md`.
+Aligning them was measured on `265d895d`: it adds 195 citations across 190 files and **50**
+pre-existing failures, 27 of them in `CHANGELOG.md`, which is an append-only record of the tree as
+it stood at each release and must not be renumbered to satisfy a guard. That repair is its own
+changeset, and it would not reach `e2e/COVERAGE.md` either — no rule reads that file today.
 
 [cit]: https://github.com/sozu-proxy/sozu/issues/1335
+[drift]: https://github.com/sozu-proxy/sozu/issues/1389
 
 ## Release Notes
 
