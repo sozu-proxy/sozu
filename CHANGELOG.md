@@ -254,6 +254,47 @@
 
 ### 🐛 Fixed
 
+- **`fix(tls)`: a certificate name containing `/` was stored as a REGEX segment and bound one
+  certificate to an open-ended class of SNI values; it is now refused.**
+  `AddCertificate.certificate.names` is a free `Vec<String>` that `CertificateResolver::add_certificate`
+  (`lib/src/tls.rs`) inserted into the SNI `TrieNode<Fingerprint>` verbatim, and that trie is the
+  same `lib/src/router/pattern_trie.rs` the HTTP router uses: a dot-separated label wrapped in
+  `/.../` is compiled as a regex segment. A certificate declared for `/te.*/.example.com` was
+  therefore served for `test.example.com` and for `tenant.example.com` alike — measured on
+  `c7ac070e` — while the certificate inventory an operator reads showed a SAN-shaped string. A name
+  like `/.*/.example.com` is one character away from a plausible typo.
+  The validation that existed could not catch it. It dry-runs every name into a scratch trie and
+  asks only whether the name INSERTS, and a regex segment inserts perfectly well; the check has to
+  be on the name's BYTES. `add_certificate` now also refuses a name containing `/`, in the SAME
+  pre-mutation block as the `MAX_HOSTNAME_LENGTH` bound, returning
+  `CertificateResolverError::InvalidName` — surfaced to the control plane as
+  `could not add certificate: the SNI route table cannot host a certificate name`. Nothing is
+  half-registered: the refusal precedes every mutation of the certificate store, the name index and
+  the trie. `/` cannot occur in a DNS name, so no legitimate SAN is lost, and an ordinary
+  `*.example.com` wildcard name is not a regex segment and still loads and still serves its subtree.
+  This is the rule `config::validate_sni_pattern` (`command/src/config.rs`) has always applied to
+  every path into the TCP SNI route table; the certificate trie was the one SNI table left open.
+  Removal is unaffected. `remove_certificate` re-inserts the names a certificate already carries and
+  never re-validates them — its `InsertResult::Failed` canary asserts an internal bug, not an input
+  error — so a certificate a previous build accepted stays removable and the new refusal cannot
+  strand one.
+  **How to find an affected configuration.** The bundled `sozu certificate add` never sets the
+  `names` override (it sends an empty vector and the worker derives the names from the
+  certificate's own SAN / CN), so a configuration can only be affected through a control plane that
+  fills `AddCertificate.certificate.names` itself, or through a saved state replaying one. Check
+  the live workers with `sozu certificate list --json` and look for a `names` entry containing a
+  slash; check any `saved_state` file the same way before upgrading. A hit stops loading at the
+  next restart, loudly, instead of silently widening. One further case: when `names` is empty and
+  the certificate carries no dNSName SAN, the worker falls back to the Common Name, so a CN
+  containing a slash is now refused as well — reissue with a proper dNSName SAN, or state the
+  hostnames explicitly in `names`.
+  This is operator-supplied input, not attacker-supplied, so it was not a remote vulnerability; it
+  was an undocumented semantic with no coverage. `doc/configure.md` now states the rule under
+  "Hostname case", beside the certificate-name normalisation it sits with, and
+  `a_certificate_name_carrying_a_regex_segment_is_refused` (`lib/src/tls.rs`) pins the refusal, the
+  absence of any mutation, and the wildcard name that must keep working.
+  Reported in [#1378](https://github.com/sozu-proxy/sozu/issues/1378).
+
 - **`fix(router)`: an exact hostname added after a matching regex segment attached its rule to the
   regex segment's leaf, and the whole regex family served it.**
   **This changes hostname resolution for every configuration.** Read the behaviour-change note at
@@ -331,14 +372,16 @@
   selection cannot disagree. The reordering and the fall-through only differ for a trie that holds
   a regex segment, and the TCP SNI route table provably cannot: `validate_sni_pattern`
   (`command/src/config.rs:1994`) rejects `/` on every path into `sni_routes`. **The certificate
-  trie is not closed that way.** `add_certificate`'s pre-insert dry run (`lib/src/tls.rs:326`)
-  rejects only a name longer than `MAX_HOSTNAME_LENGTH` and one the trie answers
-  `InsertResult::Failed` for; it does not reject `/`. Its names are `cert_to_add.names`, which is
-  the operator's `names` override whenever that field is non-empty (`lib/src/tls.rs:136`) and only
-  otherwise the parsed CN/SAN set — so an operator-supplied label such as `/x/` inserts as a regex
-  segment and the new order reaches certificate selection. Parsed certificate names cannot produce
-  one. Nothing asserts the order on the certificate trie today. A hostname the trie has no entry
-  for still gets the default certificate.
+  trie is closed the same way in this same release** — `add_certificate`'s pre-insert dry run
+  (`lib/src/tls.rs`) rejected only a name longer than `MAX_HOSTNAME_LENGTH` and one the trie
+  answers `InsertResult::Failed` for, and now refuses a name containing `/` as well; see the
+  `fix(tls)` entry above (sozu#1378). The names it guards are `cert_to_add.names`, which is the
+  operator's `names` override whenever that field is non-empty and only otherwise the parsed
+  CN/SAN set — so an operator-supplied label such as `/x/`, which used to insert as a regex
+  segment and carry the new order into certificate selection, is now rejected before any
+  mutation. Parsed certificate names cannot produce one either. No SNI table this release ships
+  can therefore hold a regex segment, and the reordering is unobservable on certificate selection.
+  A hostname the trie has no entry for still gets the default certificate.
   `lib/src/router/pattern_trie.rs` and `lib/src/router/mod.rs` carry the regression tests, one per
   transition of the stated order plus the two shapes from the report, both declaration orders, and
   the method fall-through; `command/src/state.rs` pins the replay order the upgrade note rests on. `doc/configure.md` states the order under "Hostname precedence".
