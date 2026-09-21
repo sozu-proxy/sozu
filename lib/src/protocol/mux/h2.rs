@@ -33,7 +33,7 @@ use crate::{
     protocol::mux::{
         BackendStatus, Context, DebugEvent, DebugHistory, Endpoint, GenericHttpStream,
         GlobalStreamId, MuxResult, Position, Stream, StreamId, StreamState, converter,
-        forcefully_terminate_answer, hpack_state,
+        forcefully_terminate_answer, h2_flow_control, hpack_state,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
         pkawa, remove_backend_stream, serializer, set_default_answer,
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
@@ -85,7 +85,7 @@ macro_rules! log_context {
             state = $self.state,
             streams = $self.streams.len(),
             last_peer_id = $self.highest_peer_stream_id,
-            window = $self.flow_control.window,
+            window = $self.flow_control.window(),
             draining = $self.drain.draining,
             total_rst_streams_emitted_lifetime = $self.flood_detector.total_rst_streams_emitted_lifetime,
             total_rst_received_lifetime = $self.flood_detector.total_rst_received_lifetime,
@@ -119,7 +119,7 @@ macro_rules! log_context_stream {
             state = $self.state,
             streams = $self.streams.len(),
             last_peer_id = $self.highest_peer_stream_id,
-            window = $self.flow_control.window,
+            window = $self.flow_control.window(),
             draining = $self.drain.draining,
             total_rst_streams_emitted_lifetime = $self.flood_detector.total_rst_streams_emitted_lifetime,
             total_rst_received_lifetime = $self.flood_detector.total_rst_received_lifetime,
@@ -1670,16 +1670,6 @@ impl Prioriser {
     }
 }
 
-/// Connection-level flow control state (RFC 9113 §6.9).
-pub struct H2FlowControl {
-    /// Connection-level send window (can go negative per RFC 9113 §6.9.2).
-    pub window: i32,
-    /// Bytes received since last connection-level WINDOW_UPDATE.
-    pub received_bytes_since_update: u32,
-    /// Queued stream_id -> accumulated increment for WINDOW_UPDATE frames (O(1) coalescing).
-    pub pending_window_updates: HashMap<u32, u32>,
-}
-
 /// Byte accounting for connection overhead attribution.
 pub struct H2ByteAccounting {
     /// Bytes read on the zero stream not yet attributed to a stream.
@@ -1751,8 +1741,10 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// when it wants no timer at all. Always derived from
     /// [`ConnectionH2::now`], never from a fresh clock read (invariant 20).
     pub(super) timeout_deadline: Option<Instant>,
-    /// Connection-level flow control state (send window, receive tracking, pending updates).
-    pub flow_control: H2FlowControl,
+    /// Connection-level flow control state (send window, receive tracking,
+    /// pending updates), encapsulated so nothing outside `h2_flow_control.rs`
+    /// can reach the raw fields — see [`h2_flow_control::H2FlowControl`].
+    flow_control: h2_flow_control::H2FlowControl,
     /// Highest stream ID accepted from the peer (used for GoAway last_stream_id).
     pub highest_peer_stream_id: StreamId,
     /// RFC 7541 §4.2 / §6.3 pending dynamic-table-size-update signal.
@@ -1909,7 +1901,7 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
             .field("socket", &self.socket.socket_ref())
             .field("streams", &self.streams)
             .field("zero", &self.zero.storage.meter(20))
-            .field("window", &self.flow_control.window)
+            .field("window", &self.flow_control.window())
             .field("total_rst_streams_queued", &self.total_rst_streams_queued)
             .finish()
     }
@@ -2157,11 +2149,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // timeout right after registering its socket. The adapter reflects
             // this onto the wheel on its next reschedule.
             timeout_deadline: now.checked_add(timeout_duration),
-            flow_control: H2FlowControl {
-                window: DEFAULT_INITIAL_WINDOW_SIZE as i32,
-                received_bytes_since_update: 0,
-                pending_window_updates: HashMap::new(),
-            },
+            flow_control: h2_flow_control::H2FlowControl::new(DEFAULT_INITIAL_WINDOW_SIZE as i32),
             highest_peer_stream_id: 0,
             pending_table_size_update: None,
             drain: H2DrainState {
@@ -2959,9 +2947,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// `Mux::close`, panic-unwind, …).
     fn gauge_connection_state(&mut self) {
         let snapshot = (
-            self.flow_control.window.max(0) as usize,
+            self.flow_control.window().max(0) as usize,
             self.streams.len(),
-            self.flow_control.pending_window_updates.len(),
+            self.flow_control.pending_window_updates_len(),
             self.ready_incremental_streams,
         );
         if self.last_gauge_snapshot == Some(snapshot) {
@@ -3081,7 +3069,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // drip the M2 cumulative-stall budget closes. While still blocked,
                 // leave the deadline (and its progress accumulator) for the main
                 // write loop's budget to govern — keeping the two maps in lockstep.
-                if min(*parts.window, self.flow_control.window) > 0 {
+                if min(*parts.window, self.flow_control.window()) > 0 {
                     self.stream_fc_stalled_since.remove(&stream_id);
                     self.stream_fc_stalled_progress.remove(&stream_id);
                 }
@@ -3284,7 +3272,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 || (kawa.is_terminated() && !kawa.is_completed())
                 || (kawa.is_error() && !self.rst_sent.contains(&stream_id))
             {
-                let window = min(*parts.window, self.flow_control.window);
+                let window = min(*parts.window, self.flow_control.window());
                 converter.window = window;
                 converter.stream_id = stream_id;
                 // RFC 9218 §4: incremental streams yield the converter after
@@ -3401,7 +3389,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 }
                 consumed = window - converter.window;
                 *parts.window = parts.window.saturating_sub(consumed);
-                self.flow_control.window = self.flow_control.window.saturating_sub(consumed);
+                self.flow_control.consume_send_window(consumed);
                 if is_incremental && consumed > 0 && first_incremental_fired.is_none() {
                     first_incremental_fired = Some(stream_id);
                 }
@@ -3457,7 +3445,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // deadline ages out and `cancel_timed_out_streams` RST(CANCEL)s the
             // slot-pinning stream after `stream_idle_timeout`.
             let outbound_window_blocked = has_sendable_response(kawa)
-                && min(*parts.window, self.flow_control.window) <= 0
+                && min(*parts.window, self.flow_control.window()) <= 0
                 && (!kawa.blocks.is_empty() || !kawa.out.is_empty());
             match fc_stall_budget_decision(
                 outbound_window_blocked,
@@ -3841,7 +3829,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         .to_owned(),
                 ));
             } else if !self.pending_rst_streams.is_empty()
-                || !self.flow_control.pending_window_updates.is_empty()
+                || !self.flow_control.pending_window_updates_is_empty()
             {
                 // Control-frame liveness: `flush_pending_control_frames` is
                 // gated on `expect_write.is_none()`, so when a prior partial
@@ -3901,7 +3889,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if self.frontend_hung_up_while_draining() {
             self.expect_write = None;
             self.zero.storage.clear();
-            self.flow_control.pending_window_updates.clear();
+            self.flow_control.clear_pending_window_updates();
             self.pending_rst_streams.clear();
         }
 
@@ -3963,37 +3951,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // armed when they were enqueued (`Self::queue_window_update`), so
         // the next `writable()` call after the block completes drains them
         // normally; nothing is lost, only delayed.
-        if !self.flow_control.pending_window_updates.is_empty()
+        if !self.flow_control.pending_window_updates_is_empty()
             && self.expect_write.is_none()
             && !self.header_block_reassembly_in_progress()
         {
             let kawa = &mut self.zero;
             kawa.storage.clear();
             let buf = kawa.storage.space();
-            let mut offset = 0;
-            // Track which entries we successfully serialized so we can remove them.
-            // Each WINDOW_UPDATE frame is 13 bytes (9-byte header + 4-byte payload).
-            let mut written_ids = Vec::new();
-            for (&stream_id, &increment) in &self.flow_control.pending_window_updates {
-                if increment == 0 {
-                    written_ids.push(stream_id);
-                    continue;
-                }
-                match serializer::gen_window_update(&mut buf[offset..], stream_id, increment) {
-                    Ok((_, size)) => {
-                        offset += size;
-                        written_ids.push(stream_id);
-                        incr!(names::h2::FRAMES_TX_WINDOW_UPDATE);
-                    }
-                    Err(_) => {
-                        // Buffer full — stop here, remaining entries stay in the map
-                        break;
-                    }
-                }
-            }
-            // Remove only the entries we successfully wrote (or skipped)
-            for id in written_ids {
-                self.flow_control.pending_window_updates.remove(&id);
+            // Emission order is the deterministic ascending stream_id order
+            // `H2FlowControl` guarantees — see its module doc — not
+            // insertion/arrival order.
+            let (offset, frames_written) = self.flow_control.drain_window_updates_into(buf);
+            if frames_written > 0 {
+                count!(names::h2::FRAMES_TX_WINDOW_UPDATE, frames_written as i64);
             }
             if offset > 0 {
                 kawa.storage.fill(offset);
@@ -4412,55 +4382,49 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     }
 
     /// Queue a WINDOW_UPDATE, coalescing with any existing entry for the same stream_id.
-    /// RFC 9113 §6.9.1: window size increment MUST be 1..2^31-1 (0x7FFFFFFF).
+    /// RFC 9113 §6.9.1: window size increment MUST be 1..2^31-1 (0x7FFFFFFF);
+    /// `increment == 0` is a legal no-op to *send* and queues nothing (see
+    /// `h2_flow_control::H2FlowControl::queue_window_update`).
     ///
     /// Always signals pending write so callers don't have to remember the
     /// edge-triggered epoll invariant (see memory feedback_epollet_signal_pending_write):
     /// under ET epoll a queued WINDOW_UPDATE without a live WRITABLE event bit
     /// is invisible to filter_interest() and will never get flushed.
     fn queue_window_update(&mut self, stream_id: u32, increment: u32) {
-        let max_increment = i32::MAX as u32;
-        if let Some(existing) = self.flow_control.pending_window_updates.get_mut(&stream_id) {
-            let old = *existing;
-            *existing = existing.saturating_add(increment).min(max_increment);
-            // Coalescing invariant: the accumulated increment never decreases
-            // and never exceeds i32::MAX (RFC 9113 §6.9 caps a WINDOW_UPDATE
-            // increment at 2^31-1; emitting a larger value would be a protocol
-            // error on the wire).
-            debug_assert!(
-                *existing >= old,
-                "coalesced WINDOW_UPDATE increment must be monotonic non-decreasing"
-            );
-            debug_assert!(
-                *existing <= max_increment,
-                "coalesced WINDOW_UPDATE increment must stay within i32::MAX"
-            );
-            trace!(
-                "{} WINDOW_UPDATE coalesced: stream={} old={} new={}",
-                log_context!(self),
-                stream_id,
-                old,
-                *existing
-            );
-        } else if self.flow_control.pending_window_updates.len() < self.max_pending_window_updates {
-            self.flow_control
-                .pending_window_updates
-                .insert(stream_id, increment.min(max_increment));
-            trace!(
-                "{} WINDOW_UPDATE queued: stream={} increment={}",
-                log_context!(self),
-                stream_id,
-                increment.min(max_increment)
-            );
-        } else {
-            error!(
-                "{} WINDOW_UPDATE dropped: queue full ({} entries), stream={} increment={}",
-                log_context!(self),
-                self.max_pending_window_updates,
-                stream_id,
-                increment
-            );
-            incr!(names::h2::WINDOW_UPDATE_DROPPED);
+        match self.flow_control.queue_window_update(
+            stream_id,
+            increment,
+            self.max_pending_window_updates,
+        ) {
+            h2_flow_control::QueueWindowUpdateOutcome::Coalesced { old, new } => {
+                trace!(
+                    "{} WINDOW_UPDATE coalesced: stream={} old={} new={}",
+                    log_context!(self),
+                    stream_id,
+                    old,
+                    new
+                );
+            }
+            h2_flow_control::QueueWindowUpdateOutcome::Inserted { increment } => {
+                trace!(
+                    "{} WINDOW_UPDATE queued: stream={} increment={}",
+                    log_context!(self),
+                    stream_id,
+                    increment
+                );
+            }
+            h2_flow_control::QueueWindowUpdateOutcome::Dropped => {
+                error!(
+                    "{} WINDOW_UPDATE dropped: queue full ({} entries), stream={} increment={}",
+                    log_context!(self),
+                    self.max_pending_window_updates,
+                    stream_id,
+                    increment
+                );
+                incr!(names::h2::WINDOW_UPDATE_DROPPED);
+            }
+            // Zero increment: nothing was queued, nothing to log.
+            h2_flow_control::QueueWindowUpdateOutcome::Noop => {}
         }
         self.readiness.arm_writable();
     }
@@ -5404,7 +5368,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
         // (4) Pending WINDOW_UPDATE coalescing map bound.
         debug_assert!(
-            self.flow_control.pending_window_updates.len() <= self.max_pending_window_updates,
+            self.flow_control.pending_window_updates_len() <= self.max_pending_window_updates,
             "pending WINDOW_UPDATE map must stay within its per-connection cap"
         );
 
@@ -5531,12 +5495,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // connection-level flow control using the full wire length
             // (including pad-length byte and padding), otherwise the window
             // shrinks permanently and eventually stalls the connection.
-            self.flow_control.received_bytes_since_update += wire_payload_len;
             let conn_threshold = self.connection_config.initial_connection_window / 2;
-            if self.flow_control.received_bytes_since_update >= conn_threshold {
-                let increment = self.flow_control.received_bytes_since_update;
+            if let Some(increment) = self
+                .flow_control
+                .account_received_bytes(wire_payload_len, conn_threshold)
+            {
                 self.queue_window_update(0, increment);
-                self.flow_control.received_bytes_since_update = 0;
                 self.readiness.arm_writable();
             }
             self.attribute_bytes_to_overhead();
@@ -5572,11 +5536,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // RST the violating stream, its per-stream window is moot per
         // RFC 9113 §6.9 (the receiver discards further frames for the stream).
         let conn_threshold = self.connection_config.initial_connection_window / 2;
-        self.flow_control.received_bytes_since_update += wire_payload_len;
-        if self.flow_control.received_bytes_since_update >= conn_threshold {
-            let increment = self.flow_control.received_bytes_since_update;
+        if let Some(increment) = self
+            .flow_control
+            .account_received_bytes(wire_payload_len, conn_threshold)
+        {
             self.queue_window_update(0, increment);
-            self.flow_control.received_bytes_since_update = 0;
         }
 
         // RFC 9113 §8.1.1: if Content-Length is present, total DATA payload
@@ -5595,7 +5559,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // Pair WRITABLE arming with the queued connection-level
             // WINDOW_UPDATE before returning; otherwise the credit sits
             // until the next inbound frame on this connection.
-            if !self.flow_control.pending_window_updates.is_empty() {
+            if !self.flow_control.pending_window_updates_is_empty() {
                 self.readiness.arm_writable();
             }
             let result = self.reset_stream(
@@ -5629,7 +5593,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // under edge-triggered epoll the WRITABLE event bit may have been consumed
         // by a previous write cycle. Without the event bit set, filter_interest()
         // returns 0 and the WINDOW_UPDATEs never get flushed, stalling the client.
-        if !self.flow_control.pending_window_updates.is_empty() {
+        if !self.flow_control.pending_window_updates_is_empty() {
             self.readiness.arm_writable();
         }
 
@@ -6194,7 +6158,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // the ServerSettings writable path, but the client needs to do
         // it here after receiving the server's initial SETTINGS.
         if self.position.is_client()
-            && self.flow_control.window <= DEFAULT_INITIAL_WINDOW_SIZE as i32
+            && self.flow_control.window() <= DEFAULT_INITIAL_WINDOW_SIZE as i32
         {
             let increment = self
                 .connection_config
@@ -6466,36 +6430,31 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             );
             check_flood_or_return!(self);
             self.attribute_bytes_to_overhead();
-            let window_before = self.flow_control.window;
-            if let Some(window) = self.flow_control.window.checked_add(increment) {
-                if self.flow_control.window <= 0 && window > 0 {
-                    self.readiness.arm_writable();
+            // Window arithmetic + its replenish-invariant asserts live on
+            // `H2FlowControl` now (see its module doc); this arm keeps the
+            // frame-dispatch orchestration — flood accounting, logging,
+            // GOAWAY — which needs `self` (flood_detector, readiness,
+            // log_context!) that the flow-control module deliberately does
+            // not have.
+            match self.flow_control.apply_window_update(increment) {
+                h2_flow_control::ApplyWindowUpdateOutcome::Applied {
+                    new_window,
+                    should_arm_writable,
+                } => {
+                    if should_arm_writable {
+                        self.readiness.arm_writable();
+                    }
+                    debug!(
+                        "{} WINDOW_UPDATE received: stream=0 increment={} new_connection_window={}",
+                        log_context!(self),
+                        increment,
+                        new_window
+                    );
                 }
-                self.flow_control.window = window;
-                // Flow-control replenish invariant (RFC 9113 §6.9): the
-                // connection send window grows by exactly `increment` and stays
-                // within i32 (the `checked_add` already rejected overflow, which
-                // is a FLOW_CONTROL_ERROR on the wire). The window may legally
-                // be negative (a SETTINGS change can shrink it below zero) but
-                // a WINDOW_UPDATE only ever increases it.
-                debug_assert_eq!(
-                    self.flow_control.window,
-                    window_before + increment,
-                    "connection window must increase by exactly the increment"
-                );
-                debug_assert!(
-                    self.flow_control.window > window_before,
-                    "a positive WINDOW_UPDATE must strictly grow the connection window"
-                );
-                debug!(
-                    "{} WINDOW_UPDATE received: stream=0 increment={} new_connection_window={}",
-                    log_context!(self),
-                    increment,
-                    self.flow_control.window
-                );
-            } else {
-                error!("{} INVALID WINDOW INCREMENT", log_context!(self));
-                return self.goaway(H2Error::FlowControlError);
+                h2_flow_control::ApplyWindowUpdateOutcome::Overflow => {
+                    error!("{} INVALID WINDOW INCREMENT", log_context!(self));
+                    return self.goaway(H2Error::FlowControlError);
+                }
             }
         } else if let Some(global_stream_id) = self.streams.get(&stream_id).copied() {
             let stream = &mut context.streams[global_stream_id];
@@ -8133,65 +8092,11 @@ mod tests {
     }
 
     // ── H2FlowControl ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_flow_control_initial_state() {
-        let fc = H2FlowControl {
-            window: DEFAULT_INITIAL_WINDOW_SIZE as i32,
-            received_bytes_since_update: 0,
-            pending_window_updates: HashMap::new(),
-        };
-        assert_eq!(fc.window, 65535);
-        assert_eq!(fc.received_bytes_since_update, 0);
-        assert!(fc.pending_window_updates.is_empty());
-    }
-
-    #[test]
-    fn test_flow_control_window_update_coalescing() {
-        let mut updates: HashMap<u32, u32> = HashMap::new();
-
-        // First update for stream 1
-        updates.insert(1, 1000);
-        assert_eq!(*updates.get(&1).unwrap(), 1000);
-
-        // Coalesce second update for same stream
-        if let Some(existing) = updates.get_mut(&1) {
-            *existing = existing.saturating_add(500).min(i32::MAX as u32);
-        }
-        assert_eq!(*updates.get(&1).unwrap(), 1500);
-
-        // Different stream gets its own entry
-        updates.insert(3, 2000);
-        assert_eq!(updates.len(), 2);
-        assert_eq!(*updates.get(&3).unwrap(), 2000);
-    }
-
-    #[test]
-    fn test_flow_control_window_update_saturation() {
-        let mut updates: HashMap<u32, u32> = HashMap::new();
-
-        // Insert near max and coalesce — should saturate to i32::MAX
-        let max_increment = i32::MAX as u32;
-        updates.insert(1, max_increment - 100);
-        if let Some(existing) = updates.get_mut(&1) {
-            *existing = existing.saturating_add(200).min(max_increment);
-        }
-        assert_eq!(*updates.get(&1).unwrap(), max_increment);
-    }
-
-    #[test]
-    fn test_flow_control_connection_window_can_go_negative() {
-        // RFC 9113 §6.9.2: connection-level window can go negative
-        let mut fc = H2FlowControl {
-            window: 100,
-            received_bytes_since_update: 0,
-            pending_window_updates: HashMap::new(),
-        };
-
-        // Simulate consuming more than available
-        fc.window -= 200;
-        assert_eq!(fc.window, -100);
-    }
+    //
+    // H2FlowControl's own unit tests (initial state, coalescing, saturation,
+    // negative window, the ordering-determinism regression test) moved to
+    // `h2_flow_control.rs`'s `#[cfg(test)] mod tests` alongside the type —
+    // its fields are private to that module now, matching `HpackState`.
 
     // ── H2FloodConfig ───────────────────────────────────────────────────
 
@@ -8440,29 +8345,17 @@ mod tests {
         assert_eq!(config.stream_shrink_ratio, 4);
     }
 
-    #[test]
-    fn test_flow_control_window_settings_change_negative() {
-        // RFC 9113 §6.9.2: A change to SETTINGS_INITIAL_WINDOW_SIZE can cause
-        // the flow-control window to become negative.
-        let mut fc = H2FlowControl {
-            window: 100,
-            received_bytes_since_update: 0,
-            pending_window_updates: HashMap::new(),
-        };
-
-        // Simulate SETTINGS_INITIAL_WINDOW_SIZE reduction:
-        // old_initial = 65535, new_initial = 10 => delta = 10 - 65535 = -65525
-        let old_initial: i32 = DEFAULT_INITIAL_WINDOW_SIZE as i32;
-        let new_initial: i32 = 10;
-        let delta = new_initial - old_initial; // -65525
-        fc.window += delta;
-
-        assert!(
-            fc.window < 0,
-            "Window must be able to go negative after settings change"
-        );
-        assert_eq!(fc.window, 100 + (10 - 65535));
-    }
+    // The old settings-change-negative-window test was removed here, not
+    // moved: its docstring premise was wrong. `update_initial_window_size`
+    // (below) only ever adjusts *per-stream* windows on a
+    // SETTINGS_INITIAL_WINDOW_SIZE change, never the connection-level
+    // `flow_control.window` that test constructed and mutated directly — so
+    // it never exercised a real code path. `h2_flow_control.rs`'s test
+    // `consume_send_window_saturates_at_i32_min_without_wrapping` covers a
+    // genuinely different, previously-untested boundary of the same
+    // `consume_send_window` API (the `saturating_sub` floor at `i32::MIN`);
+    // it does not restore the deleted test's coverage, because the deleted
+    // test covered nothing real.
 
     #[test]
     fn test_flow_control_coalesce_saturates_at_max_increment() {

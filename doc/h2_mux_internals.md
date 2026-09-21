@@ -8,7 +8,8 @@ Source files covered by this document:
 
 | File | Role |
 |------|------|
-| `lib/src/protocol/mux/h2.rs` | `ConnectionH2` struct, state machine, flow control, flood detection |
+| `lib/src/protocol/mux/h2.rs` | `ConnectionH2` struct, state machine, flow-control orchestration, flood detection |
+| `lib/src/protocol/mux/h2_flow_control.rs` | `H2FlowControl` — connection-level send/receive window + pending WINDOW_UPDATE queue (RFC 9113 §6.9), closed API |
 | `lib/src/protocol/mux/pkawa.rs` | HPACK decoding, pseudo-header validation, RFC 9218 priority parsing |
 | `lib/src/protocol/mux/mod.rs` | Mux session, Stream, Router, ready() loop, stream lifecycle |
 | `lib/src/protocol/mux/converter.rs` | Kawa-to-H2 frame encoding (`H2BlockConverter`) |
@@ -30,10 +31,14 @@ ConnectionH2<Front>
  |-- position: Position                     // Server or Client(cluster, scheme)
  |-- readiness: Readiness                   // Edge-triggered interest tracking
  |
- |-- flow_control: H2FlowControl            // Connection-level flow control
+ |-- flow_control: h2_flow_control::H2FlowControl  // Connection-level flow control
+ |   |                                       // (defined in h2_flow_control.rs; private
+ |   |                                       // fields, reached only through its
+ |   |                                       // accessor/mutator methods — see below)
  |   |-- window: i32                        // Send window (can go negative per RFC 9113 s6.9.2)
  |   |-- received_bytes_since_update: u32   // Inbound bytes since last WINDOW_UPDATE
- |   |-- pending_window_updates: Vec<(u32, u32)>  // Queued (stream_id, increment) pairs
+ |   |-- pending_window_updates: BTreeMap<u32, u32>  // Queued stream_id -> increment,
+ |   |                                       // ascending order for deterministic drain
  |
  |-- bytes: H2ByteAccounting                // Overhead attribution bookkeeping
  |   |-- zero_bytes_read: usize             // Bytes read on stream 0 not yet attributed
@@ -70,10 +75,12 @@ ConnectionH2<Front>
  |                                         // adapter owns the TimeoutContainer
 ```
 
-Access patterns use the sub-structure names directly:
+Access patterns use the sub-structure names directly, except `flow_control`,
+which is a closed API (`h2_flow_control.rs`, private fields) reached only
+through its accessor/mutator methods:
 
 ```rust
-self.flow_control.window -= consumed;
+self.flow_control.consume_send_window(consumed);
 self.bytes.overhead_bin += size;
 self.drain.draining = true;
 self.flood_detector.check_flood();
@@ -398,8 +405,12 @@ Flushes control data before application frames, in order:
 3. **Deferred initial GOAWAY**: If `H2DrainState::initial_goaway_pending` is
    set (`graceful_goaway` deferred it — see below), serializes it via the new
    `ConnectionH2::send_initial_goaway` and clears the flag
-4. **WINDOW_UPDATE frames**: Serializes queued `pending_window_updates` into
-   the zero buffer, coalescing entries by stream ID, then flushes
+4. **WINDOW_UPDATE frames**: `H2FlowControl::drain_window_updates_into`
+   (`h2_flow_control.rs`) serializes every queued entry into the zero buffer
+   and removes what it wrote — coalescing already happened at queue time
+   (`queue_window_update`, keyed by stream ID; `0` is the connection-level
+   entry). Drain order is the map's ascending stream-id order, deterministic
+   across processes — see that module's doc comment
 5. **Pending RST_STREAM frames**: Drains `pending_rst_streams` into the zero
    buffer, with flood detection (`MAX_PENDING_RST_STREAMS` cap). Proxy-
    emitted RSTs (DATA-on-closed, `refuse_stream_and_discard`, `reset_stream`)
