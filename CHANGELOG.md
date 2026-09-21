@@ -1813,6 +1813,53 @@
 
 ### 🤖 CI
 
+- **`ci(doc)`: a `file.rs:NNN` citation whose line MOVED is now reported, not just one that landed
+  on a blank line.**
+  The resolver below failed a citation only when the cited line was blank, and said so in its own
+  output — "This is a floor, not a proof". The gap turned out to be far larger than the floor
+  language suggested, and #1389 measured it three times. On #1379's changeset, which added +21 lines
+  to `lib/src/protocol/kawa_h1/editor.rs` and +14 to `lib/src/protocol/mux/router.rs`, **24
+  citations moved and the guard reported 2**; the other 22 all landed on non-blank code, and
+  `lib/src/protocol/kawa_h1/LIFECYCLE.md` alone cites `editor.rs` 21 times. The guard's presence was
+  itself the hazard: a green `Doc citations` job reads as "the citations are right" when it only
+  ever meant "no citation landed on a blank line".
+  `.github/scripts/check_doc_citations.py --base <revision>` closes that with the base revision and
+  no new data. Every citation is resolved by the resolver's own `resolve_path`/`CITATION` — a naive
+  basename match reports false positives, because a bare `mod.rs` in `mux/LIFECYCLE.md` binds to its
+  sibling — and the TEXT of the cited line is read at the merge base and at HEAD. Different text is
+  reported whether or not the new line is blank, at both ends of a range, which makes the rule a
+  strict superset of the blank-line rule for every line the changeset touched. Comparison is on the
+  stripped line, so a re-indent is not drift.
+  **Re-anchoring is not drift.** A citation is compared only when the same path and the same line
+  numbers are also present in the base revision of its own document, so repointing `editor.rs:1131`
+  at `editor.rs:1152` is accepted silently and only a citation left pointing at text that changed
+  underneath it is reported. Identity is the citation and not its position, so moving a paragraph
+  does not excuse a stale number.
+  **It fails closed.** The base commit has to be in the object store and the default
+  `actions/checkout` is shallow, so the `Doc citations` job now checks out with `fetch-depth: 0` —
+  pull requests here stack on one another, so the base is often not `main` and no narrower fetch
+  covers every case — and passes the pull request's base sha through the environment. An
+  unreachable `--base` is an error and exit `1`, never a skip: a guard that answered a missing base
+  with a clean run would be green forever while comparing nothing, which is the defect being closed.
+  A `main` or tag push carries no changeset, and the run then states on its own line that the rule
+  did not run rather than implying it passed.
+  The self-test grew the matching half, asserted in BOTH directions. `testdata/citations/` gained a
+  document whose five citations all resolve to a non-blank line at both revisions — so the older
+  rules are green on it either way — plus a `drift.rs`, and a `<name>.base` second revision of each
+  that no walk in the script can see. The self-test commits those base revisions into a throwaway
+  repository, restores the head ones, and requires the SAME tree to exit `0` without `--base` and
+  `1` with it, the two drifts to be the exact two expected, 17 cited line ends to have been compared
+  (an exact total, not a floor, so a comparison that quietly stopped running fails), and an
+  unreachable base to be refused rather than skipped.
+  On this tree the rule compares 340 cited line ends and reports none. Inserting two lines at the
+  top of `editor.rs` reddens it with two citations from `kawa_h1/LIFECYCLE.md` while the blank-line
+  rule stays green on all 229 — which is the defect, reproduced on the production surface.
+  **The scanned surface is unchanged and that is deliberate.** #1389's follow-on asked for the
+  line-citation surface to be aligned with the test-name rule's `*.rs` + `CHANGELOG.md`. Measured on
+  `265d895d` that adds 195 citations across 190 files and 50 pre-existing failures, 27 of them in
+  `CHANGELOG.md` — an append-only record of the tree as it stood at each release, which must not be
+  renumbered to satisfy a guard. It is its own changeset, and it would still not reach
+  `e2e/COVERAGE.md`, which no rule reads.
 - **`ci(doc)`: a cited TEST NAME must now name a `fn` in the tree, and the citations that named
   nothing are repaired.**
   The citation resolver below only sees a citation that carries a path. The other form carries none:

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # Resolve every citation in this repository's prose against the tree it ships
 # with, and fail when one of them cannot be resolved. Two citation forms are
-# checked, by two independent rules:
+# checked, by three independent rules:
 #
 #   1. `file.rs:NNN(-MMM)?` in `doc/**` and `**/LIFECYCLE.md` — a path and a
 #      line number. See "WHAT THIS CATCHES" below.
-#   2. a backticked TEST NAME, in a Rust comment or a CHANGELOG/doc paragraph,
+#   2. the same citations, read at TWO revisions: a citation this changeset did
+#      not touch must still name the same line TEXT it named at the base. See
+#      "DRIFTED CITATIONS" further down. Needs `--base <revision>`.
+#   3. a backticked TEST NAME, in a Rust comment or a CHANGELOG/doc paragraph,
 #      that names no `fn` anywhere in the tree. See "DEAD TEST-NAME CITATIONS"
 #      further down.
 #
@@ -29,15 +32,17 @@
 #     and a rewrite that touches only its first half produces a duplicate that
 #     resolves perfectly and is therefore invisible to every other check here
 #
-# WHAT THIS DOES NOT CATCH — READ THIS BEFORE TRUSTING A GREEN RUN
-#   This is a floor, not a proof. It cannot tell whether a citation lands on
+# WHAT RULE 1 ALONE DOES NOT CATCH — READ THIS BEFORE TRUSTING A GREEN RUN
+#   Rule 1 is a floor, not a proof. It cannot tell whether a citation lands on
 #   *the construct the surrounding prose is talking about*. A citation that
 #   drifted from line 118 to line 164 still resolves, still hits code, and
-#   still passes here while pointing the reader at a different branch. That is
-#   the dominant failure mode, not the exotic one. Measured on the module
+#   still passes rule 1 while pointing the reader at a different branch. That
+#   is the dominant failure mode, not the exotic one. Measured on the module
 #   LIFECYCLE.md files at main `ba7fa5f9`: this resolver flagged 27 of the 507
 #   anchors those documents carry, while the hand audit that followed cut them
-#   to 238 and had to renumber 159 of the survivors.
+#   to 238 and had to renumber 159 of the survivors. Rule 2 closes that gap for
+#   any line the changeset under test actually moved, which is where a citation
+#   rots; nothing mechanical closes it for a line nobody touched.
 #
 #   Two narrower gaps, both deliberate. Only the two ENDS of a range are
 #   required to be non-blank: interior blank lines are normal in a span that
@@ -49,12 +54,44 @@
 #   in the tree today, so it pays for itself — but write the repo-root-relative
 #   path when a citation leaves its own module.
 #
-#   Nothing mechanical closes that gap. The remedy is to cite a *symbol*
+#   The remedy for the rest is to cite a *symbol*
 #   (`ExpectProxyProtocol::readable`) wherever the prose names an item, and to
 #   keep a line or a range only where the prose means a specific branch or
 #   statement inside an item. A symbol cannot drift; a line always can. Treat a
-#   green run as "no citation is obviously dead", never as "the citations are
-#   right".
+#   green run as "no citation is obviously dead, and none that this changeset
+#   moved was left behind", never as "the citations are right".
+#
+# DRIFTED CITATIONS
+#   Rule 1 fires only when a citation lands on a BLANK line, which is a small
+#   corner of the way citations rot. sozu-proxy/sozu#1389 measured the rest:
+#   on sozu-proxy/sozu#1379's changeset, which added +21 lines to
+#   `kawa_h1/editor.rs` and +14 to `mux/router.rs`, 24 citations moved and rule
+#   1 reported 2. The 22 it could not see all landed on non-blank code —
+#   `kawa_h1/LIFECYCLE.md` alone cites `editor.rs` 21 times. Worse, the guard's
+#   presence was itself the hazard: a green `Doc citations` job reads as "the
+#   citations are right" while it only ever meant "no citation landed on a
+#   blank line".
+#
+#   Rule 2 closes that with the base revision and nothing else. Every citation
+#   is resolved with rule 1's own `resolve_path`/`CITATION` — a naive basename
+#   match gives false positives, because a bare `mod.rs` in `mux/LIFECYCLE.md`
+#   binds to its sibling — and the TEXT of the cited line is read at the merge
+#   base and at HEAD. Different text is reported, blank or not, which makes
+#   this a strict superset of rule 1 for every line the changeset touched.
+#
+#   An author who RE-ANCHORS a citation is not drifting it, so a citation is
+#   compared only when the identical `path` and line numbers are also present
+#   in the BASE revision of its own document. Identity is the citation, not its
+#   position in the file: moving a paragraph does not excuse a stale number,
+#   and repointing `editor.rs:1131` at `editor.rs:1152` is silently accepted.
+#   Comparison is on the STRIPPED line, so a pure re-indent is not drift.
+#
+#   It FAILS CLOSED. The base revision has to be in the object store, and the
+#   default `actions/checkout` is shallow, so `git merge-base` exits non-zero
+#   there. Treating that as "nothing to compare" would report a clean run while
+#   checking nothing — the exact shape this rule exists to close — so an
+#   unreachable `--base` is an error and exit 1, never a skip. Without `--base`
+#   at all the rule announces that it did not run, on its own line.
 #
 # The regex is deliberately `[A-Za-z0-9_/.-]+\.rs:[0-9]+`. The obvious
 # character class `[A-Za-z_/.-]+` has no digit in it and silently skips every
@@ -184,6 +221,29 @@ def resolve_path(cited, by_suffix, root, doc_dir):
     )
 
 
+def doc_line_finder(body):
+    """Map a citation's match offset in `body` to the 1-based line it sits on.
+
+    Shared by the resolver and the drift rule so the two never disagree about
+    where in a document they are reporting from.
+    """
+    starts = [0]
+    for line in body.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+
+    def doc_line(offset):
+        lo, hi = 0, len(starts) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if starts[mid] <= offset:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo + 1
+
+    return doc_line
+
+
 def parse_spans(text):
     """`1563-1567, 1830-1835` -> [(1563, 1567), (1830, 1835)]."""
     out = []
@@ -210,19 +270,7 @@ def check(root, show=False, out=sys.stdout):
         with open(os.path.join(root, doc), encoding="utf-8") as handle:
             body = handle.read()
         # Line number of the citation itself, for the error message.
-        starts = [0]
-        for line in body.splitlines(keepends=True):
-            starts.append(starts[-1] + len(line))
-
-        def doc_line(offset):
-            lo, hi = 0, len(starts) - 1
-            while lo < hi:
-                mid = (lo + hi + 1) // 2
-                if starts[mid] <= offset:
-                    lo = mid
-                else:
-                    hi = mid - 1
-            return lo + 1
+        doc_line = doc_line_finder(body)
 
         for match in CITATION.finditer(body):
             total += 1
@@ -296,7 +344,166 @@ def check(root, show=False, out=sys.stdout):
     return total, failures
 
 
-# ── Rule 2: dead test-name citations ──────────────────────────────────────
+# ── Rule 2: drifted citations ─────────────────────────────────────────────
+#
+# See "DRIFTED CITATIONS" in the header for the measurements this rule closes.
+
+# A drifted line is quoted in the report, and a quoted line of Rust can be very
+# long. Enough to recognise the construct, not enough to wrap the log.
+QUOTE_WIDTH = 72
+
+
+def git(root, *args):
+    """Run one git command in `root`; return `(returncode, stdout)`.
+
+    stderr is deliberately dropped: every caller here treats a non-zero exit as
+    the answer ("that object is not in this checkout"), and git's own wording
+    for a missing object would only obscure the report this script writes.
+
+    The encoding is named rather than inherited, exactly as every `open()` here
+    names it: a document under `doc/` is full of em dashes, and decoding git's
+    output through the ambient locale would make this rule's verdict depend on
+    the runner's `LANG`.
+    """
+    proc = subprocess.run(
+        ["git", "-C", root] + list(args),
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    return proc.returncode, proc.stdout
+
+
+def shallow_note(root):
+    """The clause that names a shallow checkout as the cause, when it is one."""
+    code, out = git(root, "rev-parse", "--is-shallow-repository")
+    if code == 0 and out.strip() == "true":
+        return (
+            "; this checkout is SHALLOW, so the base revision is simply not in it — "
+            "fetch it (actions/checkout `fetch-depth: 0`)"
+        )
+    return ""
+
+
+def resolve_base(root, base):
+    """Turn `--base REV` into the commit the drift rule reads, or explain.
+
+    Returns `(sha, None)` or `(None, reason)`. The caller must treat a reason
+    as a FAILURE, never as "nothing to compare": the default `actions/checkout`
+    is shallow and leaves the base out of the object store entirely, so a guard
+    that skipped on an unreachable base would report a clean run over an empty
+    comparison — which is the shape of defect this whole file exists to close.
+    """
+    code, out = git(root, "rev-parse", "--verify", "--quiet", "%s^{commit}" % base)
+    if code != 0:
+        return None, "`%s` names no commit in this checkout%s" % (base, shallow_note(root))
+    resolved = out.strip()
+    code, out = git(root, "merge-base", "HEAD", resolved)
+    if code != 0:
+        return None, "HEAD and `%s` have no common ancestor here%s" % (
+            base,
+            shallow_note(root),
+        )
+    return out.strip(), None
+
+
+def blob(root, rev, path, cache):
+    """`path` as it stood at `rev`, or None when that tree did not carry it."""
+    key = (rev, path)
+    if key not in cache:
+        code, text = git(root, "show", "%s:%s" % (rev, path))
+        cache[key] = text if code == 0 else None
+    return cache[key]
+
+
+def quote(line):
+    """One source line, stripped and clipped, for a report the log can hold."""
+    line = line.strip()
+    return line if len(line) <= QUOTE_WIDTH else line[: QUOTE_WIDTH - 1] + "…"
+
+
+def check_drift(root, base, show=False, out=sys.stdout):
+    """A citation this changeset left alone must still name the same line TEXT.
+
+    Returns `(compared, failures)`: how many cited line ENDS were resolvable at
+    both revisions and therefore actually compared, and the drifts among them.
+
+    Resolution is rule 1's own `resolve_path` on the HEAD tree, so a bare
+    `mod.rs` in `mux/LIFECYCLE.md` binds to that directory's sibling exactly as
+    it does above; the resolved path is then read at `base` and at HEAD and the
+    two lines compared. Comparison is on the STRIPPED line, so a re-indent is
+    not drift. Both ENDS of a range are compared, and interior lines are not,
+    matching the blank-line rule so this stays a strict superset of it.
+
+    Three things are deliberately not compared, each because rule 1 already
+    owns it or because there is nothing to compare against: a citation absent
+    from the base revision of its own document (the author re-anchored it), a
+    document or a cited file that the base tree did not carry (both are new
+    here), and a line number out of range at either revision.
+    """
+    by_suffix = rust_files(root)
+    blobs = {}
+    head = {}
+    failures = []
+    compared = 0
+
+    for doc in doc_files(root):
+        base_body = blob(root, base, doc, blobs)
+        if base_body is None:
+            continue  # the document itself is new in this changeset
+        # Identity is the citation, not where it sits: a paragraph that moved
+        # still carries the same claim, so moving it does not excuse a stale
+        # number. Keying on the PARSED spans rather than their text also makes
+        # `3/6` and `3, 6` the same citation, which they are.
+        untouched = {
+            (m.group("path"), tuple(parse_spans(m.group("spans"))))
+            for m in CITATION.finditer(base_body)
+        }
+
+        doc_dir = os.path.dirname(doc)
+        with open(os.path.join(root, doc), encoding="utf-8") as handle:
+            body = handle.read()
+        doc_line = doc_line_finder(body)
+
+        for match in CITATION.finditer(body):
+            cited = match.group("path")
+            spans = parse_spans(match.group("spans"))
+            if (cited, tuple(spans)) not in untouched:
+                continue  # re-anchored by this changeset, which is not drift
+
+            target, _ = resolve_path(cited, by_suffix, root, doc_dir)
+            if target is None:
+                continue  # rule 1 reports an unresolvable path
+            base_lines = blob(root, base, target, blobs)
+            if base_lines is None:
+                continue  # the cited file is new in this changeset
+            base_lines = base_lines.splitlines()
+            if target not in head:
+                with open(os.path.join(root, target), encoding="utf-8") as handle:
+                    head[target] = handle.read().splitlines()
+            head_lines = head[target]
+
+            where = "%s:%d" % (doc, doc_line(match.start()))
+            for start, end in spans:
+                span = str(start) if start == end else "%d-%d" % (start, end)
+                edges = [(start, "")] if start == end else [(start, ""), (end, " (end of range)")]
+                for number, edge in edges:
+                    if not 1 <= number <= min(len(base_lines), len(head_lines)):
+                        continue  # rule 1 owns out-of-range at HEAD
+                    compared += 1
+                    was = base_lines[number - 1].strip()
+                    now = head_lines[number - 1].strip()
+                    if was == now:
+                        if show:
+                            out.write("%s  %s:%d  |unmoved\n" % (where, target, number))
+                        continue
+                    failures.append(
+                        "%s: `%s:%s` — %s:%d moved%s: was `%s`, now `%s`"
+                        % (where, cited, span, target, number, edge, quote(was), quote(now))
+                    )
+
+    return compared, failures
+
+
+# ── Rule 3: dead test-name citations ──────────────────────────────────────
 #
 # See "DEAD TEST-NAME CITATIONS" in the header for why this exists and how the
 # two filters below were calibrated.
@@ -369,7 +576,7 @@ def fn_names(root):
 
 
 def prose_files(root):
-    """The surface rule 2 reads: every `*.rs`, plus CHANGELOG.md and the docs.
+    """The surface rule 3 reads: every `*.rs`, plus CHANGELOG.md and the docs.
 
     A test citation lives wherever a claim does — a module `//!` preamble, a
     `///` doc comment, a `//` note inside a test body, a CHANGELOG entry. All
@@ -488,9 +695,40 @@ FIXTURE_EXPECTED = [
 #   * dropping `**/LIFECYCLE.md` from doc_files() loses mod/LIFECYCLE.md's two.
 # Neither is an accidental shape, and neither announces itself: on the real
 # tree they report a clean run over a quietly smaller surface.
-FIXTURE_TOTAL = 14
+# `doc/drift.md` contributes five of these: rule 2's fixture is an ordinary
+# document that rule 1 must also see, and see as clean.
+FIXTURE_TOTAL = 19
 
-# Rule 2's half of the fixtures. `tests_bad.rs` and the fixture `CHANGELOG.md`
+# Rule 2's half of the fixtures is a PAIR of revisions, so every file that
+# drifts carries its base revision beside it as `<name>.base`. That suffix is
+# what keeps those files invisible to all three surfaces — `drift.rs.base` is
+# not `*.rs` and `doc/drift.md.base` is not `*.md`, so no walk in this script
+# sees either — and they exist only for the self-test, which copies each over
+# its live counterpart, commits that as the base, and restores the tree.
+DRIFT_BASE_SUFFIX = ".base"
+
+# `doc/drift.md` cites `drift.rs` five times and EVERY ONE of them resolves to
+# a non-blank line at both revisions, so rule 1 is green on it in both
+# directions and only the comparison separates the cases:
+#   * `drift.rs:8` and `drift.rs:8-10` did not move   — must stay silent
+#   * `drift.rs:12` moved onto another method's signature       — reported
+#   * `drift.rs:8-13` kept its start and moved its end          — reported
+#   * `drift.rs:16` is the re-anchored form of the first drift  — must stay
+#     silent, because it is absent from the base revision of the document
+FIXTURE_DRIFT_EXPECTED = [
+    "doc/drift.md:11: `drift.rs:12` — drift.rs:12 moved: "
+    "was `pub fn moved(&self) -> u8 {`, now `pub fn inserted(&self) -> u8 {`",
+    "doc/drift.md:15: `drift.rs:8-13` — drift.rs:13 moved (end of range): "
+    "was `1`, now `0`",
+]
+
+# The exact number of cited line ENDS compared across the clean fixture tree,
+# asserted for the same reason FIXTURE_TOTAL is: a rule that quietly stopped
+# comparing would otherwise report a clean run. Losing the document-directory
+# binding, the range-end comparison or a whole fixture document each move it.
+FIXTURE_DRIFT_COMPARED = 17
+
+# Rule 3's half of the fixtures. `tests_bad.rs` and the fixture `CHANGELOG.md`
 # are the broken documents; `tests_good.rs` is the clean one and also carries
 # the two witnesses that must NOT be examined — a four-segment noun phrase in a
 # block that does say "test", and a sentence-shaped name in a block that does
@@ -539,6 +777,68 @@ def _run_cli(args):
     return proc.returncode, proc.stdout + proc.stderr
 
 
+def _base_variants(tree):
+    """Every `<name>.base` in `tree`, paired with the file it is a revision of."""
+    pairs = []
+    for dirpath, dirnames, filenames in os.walk(tree):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            if name.endswith(DRIFT_BASE_SUFFIX):
+                path = os.path.join(dirpath, name)
+                pairs.append((path, path[: -len(DRIFT_BASE_SUFFIX)]))
+    return sorted(pairs)
+
+
+def _commit_all(repo, message):
+    """Commit a throwaway repository wholesale and return the commit sha.
+
+    The operator's own git configuration is cut out: a global `commit.gpgsign`
+    would make this hang on a hardware key, and a global `core.hooksPath` or
+    commit template would make the self-test depend on the machine it runs on.
+    """
+    env = dict(os.environ)
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    settings = [
+        "-c", "user.name=citation self-test",
+        "-c", "user.email=self-test@invalid",
+        "-c", "commit.gpgsign=false",
+        "-c", "init.defaultBranch=main",
+    ]
+    for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", message]):
+        subprocess.run(
+            ["git", "-C", repo] + settings + args,
+            check=True, capture_output=True, text=True, encoding="utf-8", env=env,
+        )
+    done = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True, encoding="utf-8", env=env,
+    )
+    return done.stdout.strip()
+
+
+def _drift_repository(tmp, fixtures):
+    """A one-commit git repository holding the fixtures at BOTH revisions.
+
+    The working tree ends up at the head revision and the single commit holds
+    the base one, which is exactly the shape a pull request presents: edited
+    files on disk, the revision they departed from in the object store. The
+    documents that rule 1 and rule 3 are MEANT to fail are removed, so any
+    non-zero exit from this tree belongs to the drift rule alone.
+    """
+    repo = os.path.join(tmp, "drift")
+    shutil.copytree(fixtures, repo)
+    for broken in BROKEN_FIXTURES:
+        os.remove(os.path.join(repo, *broken.split("/")))
+    for base, live in _base_variants(repo):
+        shutil.copyfile(base, live)
+    sha = _commit_all(repo, "base revision of the citation drift fixture")
+    for base, live in _base_variants(repo):
+        shutil.copyfile(os.path.join(fixtures, os.path.relpath(live, repo)), live)
+    return repo, sha
+
+
 def self_test():
     """Prove the resolver fails on breakage instead of exiting 0 vacuously.
 
@@ -550,10 +850,14 @@ def self_test():
     total, failures = check(fixtures)
     ok = True
 
-    good = [f for f in failures if f.startswith("doc/good.md")]
+    # Everything that is not the deliberately broken document must be clean —
+    # named by exclusion rather than by listing `doc/good.md`, so a fixture
+    # added later is covered the day it lands instead of the day someone
+    # remembers to extend this line.
+    good = [f for f in failures if not f.startswith("doc/bad.md")]
     if good:
         ok = False
-        print("FAIL self-test: the clean fixture produced failures:")
+        print("FAIL self-test: a clean fixture produced failures:")
         for line in good:
             print("  " + line)
 
@@ -580,6 +884,79 @@ def self_test():
         )
 
     # ── Rule 2 ────────────────────────────────────────────────────────────
+    # A pair of revisions in a throwaway repository. Everything rule 1 and
+    # rule 3 are meant to fail has been removed from it, so the SAME tree that
+    # exits 0 without `--base` must exit 1 with it: that contrast is the whole
+    # rule, and asserting both directions is what proves the drift is not
+    # something the older rules were catching all along.
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, base_sha = _drift_repository(tmp, fixtures)
+
+        resolved, why = resolve_base(repo, base_sha)
+        if resolved != base_sha:
+            ok = False
+            print("FAIL self-test: the base revision did not resolve: %s" % why)
+
+        compared, drifted = check_drift(repo, base_sha)
+        drifted = sorted(drifted)
+        if len(drifted) != len(FIXTURE_DRIFT_EXPECTED):
+            ok = False
+            print(
+                "FAIL self-test: expected %d drifted citations from the fixtures, got %d:"
+                % (len(FIXTURE_DRIFT_EXPECTED), len(drifted))
+            )
+            for line in drifted:
+                print("  " + line)
+        else:
+            for expected, actual in zip(FIXTURE_DRIFT_EXPECTED, drifted):
+                if actual != expected:
+                    ok = False
+                    print("FAIL self-test: expected the drift %r, got %r" % (expected, actual))
+
+        if compared != FIXTURE_DRIFT_COMPARED:
+            ok = False
+            print(
+                "FAIL self-test: compared %d cited lines against the base revision, expected "
+                "exactly %d — the scanned surface or the comparison has shrunk"
+                % (compared, FIXTURE_DRIFT_COMPARED)
+            )
+
+        # The same tree, without a base: every drift above is invisible to the
+        # blank-line rule because every drifted line is non-blank at both
+        # revisions. This is the red half of the rule, asserted rather than
+        # described.
+        code, out = _run_cli(["--root", repo])
+        if code != 0:
+            ok = False
+            print(
+                "FAIL self-test: the drift fixture exited %d WITHOUT `--base`, expected 0 — "
+                "its drifts must be invisible to the other two rules, or this fixture is "
+                "not testing the drift rule" % code
+            )
+            print("".join("    " + line + "\n" for line in out.splitlines()))
+
+        code, out = _run_cli(["--root", repo, "--base", base_sha])
+        if code != 1 or "citations drifted" not in out:
+            ok = False
+            print(
+                "FAIL self-test: the drift fixture exited %d WITH `--base`, expected 1 and a "
+                "drift report — the rule classifies without acting on it" % code
+            )
+            print("".join("    " + line + "\n" for line in out.splitlines()))
+
+        # Fail closed. An unreachable base is the normal state of a shallow
+        # `actions/checkout`, and a guard that answered it with a clean run
+        # would be green forever while comparing nothing.
+        code, out = _run_cli(["--root", repo, "--base", "0" * 40])
+        if code != 1 or "names no commit in this checkout" not in out:
+            ok = False
+            print(
+                "FAIL self-test: an unreachable `--base` exited %d, expected 1 and a refusal — "
+                "the drift rule must never treat a missing base as nothing to compare" % code
+            )
+            print("".join("    " + line + "\n" for line in out.splitlines()))
+
+    # ── Rule 3 ────────────────────────────────────────────────────────────
     # Default tables first: nothing in them names anything in the fixture
     # tree, so all three broken citations must report as plainly dead.
     examined, checked, dead = check_test_citations(fixtures)
@@ -652,9 +1029,11 @@ def self_test():
 
     if ok:
         print(
-            "OK self-test: %d fixture line citations and %d examined test names (%d checked), "
-            "%d + %d expected failures reported, exit 1 on the broken tree and 0 on the clean one."
-            % (total, examined, checked, len(bad), len(dead))
+            "OK self-test: %d fixture line citations, %d of them compared against a base "
+            "revision, and %d examined test names (%d checked); %d + %d + %d expected failures "
+            "reported, exit 1 on the broken tree and 0 on the clean one, and an unreachable "
+            "base refused instead of skipped."
+            % (total, compared, examined, checked, len(bad), len(drifted), len(dead))
         )
     return 0 if ok else 1
 
@@ -662,6 +1041,12 @@ def self_test():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".", help="repository root (default: .)")
+    parser.add_argument(
+        "--base",
+        help="revision this changeset departed from; enables the drifted-citation rule. "
+        "Its merge base with HEAD is what is compared against, and a revision that is not "
+        "in this checkout is an error, never a skip.",
+    )
     parser.add_argument("--show", action="store_true", help="print every resolved citation")
     parser.add_argument("--self-test", action="store_true", help="run the fixture self-test and exit")
     args = parser.parse_args()
@@ -684,12 +1069,48 @@ def main():
         print("Convention and local usage: doc/README.md#citing-code-from-these-documents")
     else:
         print("OK: all %d `file.rs:NNN` citations in doc/ and **/LIFECYCLE.md resolve to a non-blank line." % total)
-        print("This is a floor, not a proof: a citation that drifted onto a different non-blank line still passes.")
 
+    print("")
+    if not args.base:
+        print("SKIPPED: the drifted-citation rule needs `--base <revision>` and did not run.")
+        print("Without it the rule above is a floor, not a proof: a citation that drifted onto a")
+        print("different non-blank line resolves, hits code, and passes. On sozu-proxy/sozu#1379's")
+        print("changeset 24 citations moved and this run would have reported 2 (sozu#1389).")
+    else:
+        base, why = resolve_base(root, args.base)
+        if base is None:
+            print("::error::the drifted-citation rule cannot run: %s" % why)
+            print("")
+            print("This is an error and not a skip on purpose. A guard that answered a missing base")
+            print("with a clean run would be green forever while comparing nothing, which is the")
+            print("shape of defect this file exists to close.")
+            return 1
+        compared, drifted = check_drift(root, base, show=args.show)
+        if drifted:
+            status = 1
+            print(
+                "::error::%d of %d compared citations drifted since %s:"
+                % (len(drifted), compared, base[:12])
+            )
+            for line in drifted:
+                print("  " + line)
+            print("")
+            print("The cited line moved and the citation did not follow it. Renumber it, or better,")
+            print("replace it with the symbol the prose already names — a symbol cannot drift.")
+            print("A citation this changeset re-anchored on purpose is not reported: only one left")
+            print("pointing at text that changed underneath it.")
+        else:
+            print(
+                "OK: none of the %d cited lines compared against %s changed their text."
+                % (compared, base[:12])
+            )
+            print("Still a floor for a line this changeset did not touch: only drift SINCE the base")
+            print("is visible, so cite a symbol wherever the prose names an item.")
+
+    print("")
     examined, checked, dead = check_test_citations(root, show=args.show)
     if dead:
         status = 1
-        print("")
         print(
             "::error::%d of %d cited test names (from %d candidate identifiers) name no `fn` in the tree:"
             % (len(dead), checked, examined)

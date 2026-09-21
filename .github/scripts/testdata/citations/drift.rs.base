@@ -1,0 +1,15 @@
+// Fixture source for the drifted-citation rule. Not compiled: it lives under
+// testdata/, which the checker skips when it walks the real tree. A second
+// revision of it sits beside it as `drift.rs.base`; the self-test commits that
+// one, restores this one, and compares the cited lines across the two.
+pub struct Drift;
+
+impl Drift {
+    pub fn stable(&self) -> bool {
+        true
+    }
+
+    pub fn moved(&self) -> u8 {
+        1
+    }
+}
