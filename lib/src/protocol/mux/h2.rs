@@ -3869,6 +3869,28 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
+    /// `self.zero` is doing double duty: it is the read-side accumulation
+    /// buffer for a HEADERS/CONTINUATION field block in progress (spanning
+    /// one or more `readable()` passes, by protocol design — a legitimate
+    /// large header block routinely splits across frames) AND the write
+    /// scratch space [`Self::flush_pending_control_frames`] reuses for ANY
+    /// queued WINDOW_UPDATE or RST_STREAM, for any stream. `mod.rs`'s inner
+    /// event loop dispatches frontend `readable()` then `writable()` in the
+    /// same sweep, so without this guard an unrelated control-frame flush
+    /// can clobber a header block that has nothing to do with it.
+    ///
+    /// The write side already protects the mirror case — while a zero-buffer
+    /// write is stalled (`expect_write == Some(Zero)`), READABLE interest is
+    /// explicitly disabled (see the comment a few lines below) so a fresh
+    /// frame read cannot clobber the pending write. This is the missing
+    /// other half of that same invariant.
+    fn header_block_reassembly_in_progress(&self) -> bool {
+        matches!(
+            self.state,
+            H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
+        )
+    }
+
     /// Flush pending control frames (zero-buffer resume, WINDOW_UPDATEs, RST_STREAMs)
     /// before entering the main writable state machine.
     ///
@@ -3914,7 +3936,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Serialize and flush them inline to avoid extra event loop
         // iterations that could cause response data to be sent before
         // subsequent frames are validated.
-        if !self.flow_control.pending_window_updates.is_empty() && self.expect_write.is_none() {
+        //
+        // Deferred while a header block is being reassembled: this stage
+        // clears and reuses `self.zero.storage`, which right now holds the
+        // bytes accumulated from an earlier HEADERS/CONTINUATION frame on
+        // some (possibly different) stream, awaiting its own CONTINUATION.
+        // The queued WINDOW_UPDATEs stay queued — WRITABLE was already
+        // armed when they were enqueued (`Self::queue_window_update`), so
+        // the next `writable()` call after the block completes drains them
+        // normally; nothing is lost, only delayed.
+        if !self.flow_control.pending_window_updates.is_empty()
+            && self.expect_write.is_none()
+            && !self.header_block_reassembly_in_progress()
+        {
             let kawa = &mut self.zero;
             kawa.storage.clear();
             let buf = kawa.storage.space();
@@ -3977,7 +4011,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Accounting happens at queue-time inside `Self::enqueue_rst`, so
         // this drain only serialises and flushes — no metric/flood calls
         // here would double-count.
-        if !self.pending_rst_streams.is_empty() && self.expect_write.is_none() {
+        //
+        // Deferred while a header block is being reassembled, for the same
+        // `self.zero.storage` reuse reason as the WINDOW_UPDATE stage above
+        // — `Self::enqueue_rst` already arms WRITABLE, so this is a delay,
+        // not a drop.
+        if !self.pending_rst_streams.is_empty()
+            && self.expect_write.is_none()
+            && !self.header_block_reassembly_in_progress()
+        {
             let kawa = &mut self.zero;
             kawa.storage.clear();
             let buf = kawa.storage.space();
@@ -9895,6 +9937,160 @@ mod tests {
             "the refused stream's field block — located past the Pad Length and \
              Priority prefix — must have been decoded into the connection's \
              HPACK context"
+        );
+    }
+
+    // ── `self.zero` is read-accumulation AND write scratch — that is the bug ──
+    //
+    // `ConnectionH2::zero` serves two roles: the read-side accumulation
+    // buffer for a HEADERS/CONTINUATION field block in progress, and the
+    // write scratch space `flush_pending_control_frames` reuses to
+    // serialise ANY queued WINDOW_UPDATE or RST_STREAM — for any stream,
+    // not just the one being reassembled. `mod.rs`'s inner event loop
+    // dispatches frontend `readable()` then `writable()` in the same sweep,
+    // so a legitimate, non-refused multi-frame header block can be
+    // clobbered by completely unrelated connection-level flow-control
+    // housekeeping before its CONTINUATION frame ever arrives — no
+    // adversarial peer required.
+
+    /// To SEE THIS RED: this is the pre-existing behaviour on `main`, no
+    /// mutation needed. `flush_pending_control_frames`'s WINDOW_UPDATE-drain
+    /// stage (`let kawa = &mut self.zero; kawa.storage.clear();`) runs
+    /// unconditionally whenever a WINDOW_UPDATE is queued, with no check on
+    /// `self.state`. Guarding that stage (and the RST_STREAM-drain stage
+    /// beneath it) on `matches!(self.state, H2State::ContinuationHeader(_) |
+    /// H2State::ContinuationFrame(_))` is exactly the fix this test proves.
+    #[test]
+    fn a_legitimate_continuation_survives_an_unrelated_window_update_flush() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        // Past the preface/SETTINGS handshake, waiting on a frame header.
+        // `drain.draining` stays false: stream 1 must be genuinely accepted,
+        // not refused — this is the ordinary, non-refusal path.
+        connection.state = H2State::Header;
+        connection.expect_read = Some((H2StreamId::Zero, 9));
+
+        // The peer's encoder. The marker header's name is in neither table,
+        // so encoding it appends `x-sozu-marker: legitimate-value` to the
+        // peer's dynamic table at a known index — the same technique
+        // `a_refused_stream_keeps_the_hpack_decoder_in_sync` uses to prove
+        // decoder sync, here applied to a stream that is never refused.
+        let mut peer_encoder = loona_hpack::Encoder::new();
+        let field_block = peer_encoder.encode([
+            (&b":method"[..], &b"GET"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/legit-multiframe"[..]),
+            (&b"x-sozu-marker"[..], &b"legitimate-value"[..]),
+        ]);
+        // Split well past the 13 bytes a single WINDOW_UPDATE frame occupies,
+        // so the clobber this test provokes lands inside real field-block
+        // bytes rather than in a margin this test invented.
+        assert!(
+            field_block.len() > 26,
+            "the probe block must be large enough to split meaningfully"
+        );
+        let split = field_block.len() / 2;
+        let (first_half, second_half) = field_block.split_at(split);
+
+        // HEADERS, END_STREAM but NOT END_HEADERS, stream 1: a legitimate
+        // multi-frame header block, exactly as a large request produces.
+        let mut headers_frame = Vec::with_capacity(9 + first_half.len());
+        headers_frame.extend_from_slice(&(first_half.len() as u32).to_be_bytes()[1..]);
+        headers_frame.push(1); // HEADERS
+        headers_frame.push(parser::FLAG_END_STREAM);
+        headers_frame.extend_from_slice(&1u32.to_be_bytes());
+        headers_frame.extend_from_slice(first_half);
+        peer.write_all(&headers_frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        // Drive reads until the connection is genuinely waiting on the
+        // CONTINUATION frame for stream 1 — accepted, not refused.
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.state, H2State::ContinuationHeader(_)) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(connection.state, H2State::ContinuationHeader(_)),
+            "stream 1's HEADERS frame must be accepted and await CONTINUATION: {:?}",
+            connection.state
+        );
+        assert!(
+            !connection.streams.is_empty(),
+            "a non-refused HEADERS frame must create stream 1"
+        );
+
+        // Completely unrelated connection-level housekeeping: replenishing
+        // the connection flow-control window after DATA consumed on some
+        // other stream. Nothing about it targets stream 1 or its
+        // in-progress header block — this is the ordinary path, not an
+        // attack.
+        connection.queue_window_update(0, 65_535);
+        connection.writable(&mut context, EndpointClient(&mut router));
+
+        // Now the CONTINUATION frame completing the block arrives.
+        let mut continuation_frame = Vec::with_capacity(9 + second_half.len());
+        continuation_frame.extend_from_slice(&(second_half.len() as u32).to_be_bytes()[1..]);
+        continuation_frame.push(9); // CONTINUATION
+        continuation_frame.push(parser::FLAG_END_HEADERS);
+        continuation_frame.extend_from_slice(&1u32.to_be_bytes());
+        continuation_frame.extend_from_slice(second_half);
+        peer.write_all(&continuation_frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if !matches!(
+                connection.state,
+                H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
+            ) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        assert!(
+            !matches!(connection.state, H2State::Error | H2State::GoAway),
+            "an unrelated WINDOW_UPDATE flush must not corrupt a legitimate \
+             in-progress header block into a connection error: {:?}",
+            connection.state
+        );
+
+        // The peer's next block references the dynamic entry its encoder
+        // added while encoding stream 1's request.
+        let next_block = peer_encoder.encode([(&b"x-sozu-marker"[..], &b"legitimate-value"[..])]);
+        assert_eq!(
+            next_block.len(),
+            1,
+            "the peer must now reference its dynamic entry, not re-send a literal"
+        );
+
+        let mut decoded = Vec::new();
+        let status = connection.decoder.decode_with_cb(&next_block, |k, v| {
+            decoded.push((k.into_owned(), v.into_owned()));
+        });
+
+        assert!(
+            status.is_ok(),
+            "the connection decoder must still resolve the peer's dynamic table \
+             after an unrelated WINDOW_UPDATE flush during header-block \
+             reassembly, got {status:?}"
+        );
+        assert_eq!(
+            decoded,
+            vec![(b"x-sozu-marker".to_vec(), b"legitimate-value".to_vec())],
+            "stream 1's field block must have been decoded byte-for-byte, not \
+             clobbered by the unrelated WINDOW_UPDATE flush"
         );
     }
 }
