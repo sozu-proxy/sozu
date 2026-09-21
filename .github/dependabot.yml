@@ -12,10 +12,17 @@ updates:
       # `dtolnay/rust-toolchain@<ref>` names the Rust toolchain to install, not
       # an action release. Dependabot reads that ref as a version and bumps it:
       # on 2026-09-20 it proposed `@1.120.0`, a Rust release that does not
-      # exist, and four jobs died on `could not download nonexistent rust
-      # version 1.120.0-x86_64-unknown-linux-gnu`. Had the version existed, the
-      # bump would instead have silently raised the MSRV that `rust-toolchain`
-      # pins to 1.93.1, with no test able to notice. Raise the MSRV by editing
+      # exist, and `cargo audit`, `UDP simulation (moonpool)`, `Build
+      # lagging_server` and `Build bench_logger` all died on `could not
+      # download nonexistent rust version 1.120.0-x86_64-unknown-linux-gnu`.
+      # A version that DID exist would have failed far more quietly. The action
+      # runs `rustup default <ref>` and exports no `RUSTUP_TOOLCHAIN`, so the
+      # `rust-toolchain` file still pins cargo to 1.93.1 for work inside this
+      # checkout; but the steps that build outside it — `Build lagging_server`,
+      # `Build bench_logger`, `cargo install cargo-audit` — would have silently
+      # moved to the new toolchain, and the release build, whose own comment
+      # promises it "must match the MSRV pinned in `rust-toolchain`", would no
+      # longer have said what it means. Raise the MSRV by editing
       # `rust-toolchain` and every workflow pin together.
       - dependency-name: dtolnay/rust-toolchain
     open-pull-requests-limit: 5
