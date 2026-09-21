@@ -268,7 +268,7 @@ millisecond. Either figure is enough for what follows; the hazard is any
 earliness at all. `Timer::poll` then *removes* that entry from its slab. So on every expiry, whether or not a flow
 was due:
 
-- the manager clears `armed_deadline` (`manager.rs:534`) **before** any
+- the manager clears `armed_deadline` (`manager.rs:535`) **before** any
   `reschedule`, so a recomputed deadline equal to the old one is still emitted
   as a fresh `ArmTimer` instead of being memoized away — this is the
   load-bearing half;
