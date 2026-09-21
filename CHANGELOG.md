@@ -4,6 +4,65 @@
 
 ### 🔐 Security
 
+- **`fix(router)`: stop IDN-normalising the regex source of a `Tree` hostname, which inverted every
+  uppercase escape.** `Router::add_tree_rule`, `Router::remove_tree_rule` and `Router::has_hostname`
+  ran the WHOLE configured hostname through `idna::domain_to_ascii`, regex segments included. That
+  function ASCII-lowercases, and lowercasing an uppercase regex escape **inverts the character class
+  it names**: measured, `"/\D+/.example.com"` normalised to `"/\d+/.example.com"` and
+  `"/[^\D]/.example.com"` to `"/[^\d]/.example.com"`. `\D` is "not a digit" and `\d` is "a digit",
+  so the installed rule matched the exact **complement** of what the operator wrote. Measured on the
+  tree as it stood, the frontend `/\D+/.rx.example.com` served `777.rx.example.com` and did **not**
+  serve `abc.rx.example.com`. `\W`/`\w` and `\S`/`\s` invert the same way. An operator had no way to
+  notice: the frontend loads, `sozu query frontends` shows exactly what was typed, and only the
+  traffic disagrees — a `Tree` frontend cannot carry case-significant regex syntax at all, which is
+  also why sozu#1349's host-case work deliberately left this untouched
+  ([#1377](https://github.com/sozu-proxy/sozu/issues/1377)).
+  `Pre` and `Post` never carried it: `convert_regex_domain_rule` copies a segment's source verbatim
+  and `DomainRule::from_str` takes its case insensitivity from the `RegexBuilder` instead. The two
+  positions now use the same mechanism rather than opposite ones.
+  **The split between "regex" and "domain label" is the one that already existed.** A label the
+  operator wrapped in slashes is regex source and is copied byte for byte; every other label is a
+  domain label and still goes through `idna::domain_to_ascii` — the same split
+  `convert_regex_domain_rule` makes and the one `pattern_trie.rs`'s `insert_recursive` addresses a
+  `regexps` entry by. Per-label and whole-domain IDNA agree on a label (measured: `"MÜNCHEN"` maps
+  to `"xn--mnchen-3ya"` either way), so a genuine unicode label in a hostname that also carries a
+  regex segment is still punycoded — `a_unicode_label_is_punycoded_while_its_sibling_regex_segment_is_not`
+  pins both halves in one hostname. A hostname with no `/` at all, which is every ordinary hostname,
+  and a hostname whose `/` does not parse as that grammar (`abc/[0-9]+/.example.com`,
+  `example.com/`) both keep the historical whole-string call byte for byte, so the retained trailing
+  dot and every other whole-string behaviour are untouched.
+  **Not folding the source moved the fold onto the compile, and that half is load-bearing.** An
+  uppercase LITERAL inside a segment — `/API[0-9]/` — used to meet the ASCII-lowercased lookup key
+  only because the source had been lowercased too. `pattern_trie.rs` now compiles a stored segment
+  through `compiled_segment`, which wraps `anchored_segment` and sets `case_insensitive(true)`,
+  exactly as `DomainRule::from_str` does for `Pre`/`Post`; case insensitivity does not reach
+  `\d`/`\D`, `\w`/`\W` or `\s`/`\S`, so literals fold and escapes do not. `RegexBuilder` leaves
+  `as_str()` as the pattern it was handed, so `anchored_segment` remains the single source of a
+  `regexps` entry's identity and a stored segment stays removable — `compiled_segment` asserts that,
+  and `a_unicode_label_is_punycoded_while_its_sibling_regex_segment_is_not` round-trips an add and a
+  remove through the same spelling. `captures_len` is unchanged by either the anchoring or the
+  folding, so every `$HOST[n]` rewrite index still resolves to the operator's own group;
+  `compiled_segment_folds_case_without_respelling_its_identity` pins all three properties, and
+  dropping `.case_insensitive(true)` reddens both it and the existing
+  `an_uppercase_host_reaches_wildcard_and_regex_tree_segments`.
+  **This changes existing rules.** A trie-routed frontend spelling `\D`, `\W` or `\S` has been
+  matching the complement of its source and now matches what it says. Audit those hostnames before
+  upgrading; a rule tuned against the folded behaviour must be respelled with the lowercase escape
+  it actually meant. A segment with no uppercase escape is unaffected, and `/API[0-9]/` keeps
+  matching exactly the hosts it matched before. `doc/configure.md` § "Regex hostname segments"
+  carries the migration note.
+  **One other consumer of the same trie exists and is named rather than claimed unaffected.** The
+  SNI *route* table (`lib/src/tcp.rs`) cannot reach this: `validate_sni_pattern` rejects `/`
+  outright, so an SNI route never carries a regex segment. The certificate-name trie
+  (`lib/src/tls.rs`) has no such validator, so a certificate SAN spelling `/…/` would now match
+  case-insensitively where it previously matched case-sensitively — a widening confined to a SAN
+  shape no conforming X.509 dNSName carries.
+  Regression tests: `a_tree_hostname_regex_escape_is_not_case_folded` (the inversion itself, red on
+  the unfixed tree with `\D+` resolving `777.rx.example.com`),
+  `every_inverting_uppercase_regex_escape_survives_a_tree_insert` (`[^\D]`, `\W` and `\S`),
+  `a_unicode_label_is_punycoded_while_its_sibling_regex_segment_is_not`, and
+  `compiled_segment_folds_case_without_respelling_its_identity`.
+
 - **`fix(router)`: anchor every branch of an alternation in a regex HOSTNAME segment.**
   A regex hostname segment was anchored by concatenating `\A` and `\z` around the operator's
   pattern without grouping it. `|` is the lowest-precedence regex operator, so `\Aa|b\z` parses as
