@@ -347,6 +347,11 @@ jobs:
   # │   result, which is the point: the pull request that breaks a  │
   # │   citation is almost never the one that contains it, so no    │
   # │   reviewer is ever shown both halves.                         │
+  # │   A second rule covers the citation form that carries no      │
+  # │   path: a backticked TEST NAME, in a Rust comment or a        │
+  # │   CHANGELOG/doc paragraph about tests, must name a `fn`       │
+  # │   somewhere in the tree (sozu-proxy/sozu#1380 — three names   │
+  # │   cited in six places named nothing at all).                  │
   # │   It is a FLOOR, not a proof — it cannot see a citation that  │
   # │   drifted onto a different non-blank line, which is the       │
   # │   dominant failure mode. Cite symbols where the prose names   │
@@ -389,7 +394,7 @@ jobs:
           fi
           echo "OK: the resolver exits 1 and reports failures on the broken fixture tree."
 
-      - name: Resolve every file.rs:NNN citation in doc/ and **/LIFECYCLE.md
+      - name: Resolve every file.rs:NNN citation and every cited test name
         run: python3 .github/scripts/check_doc_citations.py
 
 

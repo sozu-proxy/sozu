@@ -4643,8 +4643,8 @@ mod sni_routing_tests {
         // net-zero-per-session contract spans the full lifecycle (accept ->
         // live backend connect -> upgrade/teardown) and is the behavioural job
         // of the e2e gauge assertion
-        // (`test_tcp_sni_reject_then_valid_connection_not_limited` in
-        // `e2e/src/tests/tcp_sni_tests.rs`), not reproducible at this unit
+        // (`test_tcp_sni_per_ip_limiter_rejects_second_then_admits_after_release`
+        // in `e2e/src/tests/tcp_sni_tests.rs`), not reproducible at this unit
         // level.
         let ServerParts {
             registry,

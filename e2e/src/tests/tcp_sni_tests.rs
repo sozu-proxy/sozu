@@ -51,7 +51,7 @@
 //!   `SniPreread` state construction), matched by the two `-1` exits (the
 //!   routed upgrade in `upgrade_sni_preread`, and `close()`'s
 //!   `StateMarker::SniPreread` arm).
-//!   `test_tcp_sni_reject_then_valid_connection_not_limited`
+//!   `test_tcp_sni_per_ip_limiter_rejects_second_then_admits_after_release`
 //!   now asserts the gauge increments while a session is mid-preread AND
 //!   returns to a clean 0 after a reject-storm + a routed connection + a
 //!   limit-rejected connection -- against the pre-fix gauge (clamped to a

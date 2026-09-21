@@ -97,7 +97,7 @@ result. The same check runs locally:
 
 ```bash
 python3 .github/scripts/check_doc_citations.py             # check the tree
-python3 .github/scripts/check_doc_citations.py --show      # print every resolved target line
+python3 .github/scripts/check_doc_citations.py --show      # print every resolved citation
 python3 .github/scripts/check_doc_citations.py --self-test # prove it still fails on a broken fixture
 ```
 
@@ -111,6 +111,36 @@ resolve perfectly.
 fixture must produce, *and* runs the real command line in a subprocess to require exit `1` on that
 fixture and exit `0` on a clean one — because reporting a failure and acting on it are two different
 lines of code, and a checker that did the first and not the second would be green forever.
+
+### Citing a test by name
+
+The same command carries a second, independent rule, for the citation form that has no path at all:
+prose naming a **test** as its evidence — "`<name>` pinned the defect", "see `<name>` for the exact
+semantics". That form rots the same way a line number does, and more quietly: in
+[sozu-proxy/sozu#1380][test-cit] three test names were cited as evidence in six places — in
+`CHANGELOG.md`, in `lib/src/router/mod.rs`, in `lib/src/tcp.rs` and in an e2e module preamble — and
+none of the three had a definition anywhere in the repository.
+
+The rule is: a backticked identifier that looks like a test name, in prose that is talking about
+tests, must name a `fn` somewhere in the tree. "Looks like a test name" is two measured filters —
+at least five underscore-separated segments, so a sentence rather than a noun phrase, and the
+enclosing comment block or markdown paragraph containing the word "test". Without both, the raw
+candidate set is 358 identifiers over 864 sites, nearly all configuration keys and struct fields;
+with both it is twelve. The scanned surface is every `*.rs` comment plus `CHANGELOG.md`, `doc/**`
+and every `**/LIFECYCLE.md`.
+
+When it fires, repoint the citation at the test that exists, write the test the prose claims, or
+drop the claim. Two dispositions are available in the script and both are deliberate, reviewed
+decisions rather than escapes:
+
+* `RENAMED_TESTS` — a test cited on purpose by a name it no longer carries, because the prose is
+  recording the rename ("it is now `X`"). The entry gives the name it carries now, and **that name
+  must itself resolve to a `fn`**, so the forwarding pointer cannot rot in turn.
+* `NOT_A_TEST` — a sentence-shaped identifier that is not a test name at all: a configuration key, a
+  std method, the identifier of a note kept outside the repository. Each entry carries its reason;
+  one without a reason is an unreviewed silencing of the rule.
+
+[test-cit]: https://github.com/sozu-proxy/sozu/issues/1380
 
 ### What the resolver does not catch
 
@@ -130,6 +160,11 @@ to the citing document's own directory before the repository root, which is what
 false ambiguities. The cost is that a sibling could shadow a repo-root file of the same relative
 path and hide a real failure. No such pair exists in the tree today, but it is the reason to write
 the repo-root-relative path whenever a citation leaves its own module.
+
+The test-name rule is a floor in the same way. A test name of four segments or fewer is not
+examined, prose that never says "test" is not examined, and a citation naming a real `fn` that is
+not the test the prose means still passes. The alternative is 864 sites of noise, which nobody reads
+and therefore nobody maintains.
 
 A green `Doc citations` run means "no citation is obviously dead". It does not mean the citations are
 right, and it is not a licence to skip reading the code when you touch one. Where the prose names an
