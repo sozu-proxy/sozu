@@ -4,6 +4,33 @@
 
 ### 🔐 Security
 
+- **`fix(mux-h2)`: decode a refused stream's HPACK field block instead of dropping it, so the
+  connection-level decoder cannot desynchronise from the peer's encoder.** RFC 9113 §4.3 scopes
+  field-compression state to the whole connection, not to a stream: when `H2State::Discard` is
+  entered — draining, `MAX_CONCURRENT_STREAMS`, buffer-pool exhaustion, or a CONTINUATION flood
+  refusal (CVE-2024-27316 mitigation) — the bytes it drops are a field block the peer's encoder has
+  already applied to its own dynamic table. Dropping them undecoded left the decoder permanently
+  behind, so every later header block on the surviving connection resolved the wrong dynamic entry
+  or failed outright with `HeaderIndexOutOfBounds`. `ConnectionH2::readable`'s Discard arm now
+  decodes the field block into `ConnectionH2::decoder` (the header pairs themselves are discarded —
+  the stream was already refused) before clearing `zero.storage`, via the new
+  `decode_discarded_field_block` free function and the `DiscardedFieldBlock` value
+  `refuse_stream_and_discard` stashes for it.
+  A HEADERS payload is not itself a field block (RFC 9113 §6.2): `[Pad Length?][Stream
+  Dependency+Weight?][field block fragment][padding?]`. A new-stream refusal now re-parses the whole
+  payload with `parser::headers_frame` to strip any PADDED/PRIORITY prefix before decoding — a naive
+  decode of the raw payload turns a legitimate padded or prioritized refusal into a spurious
+  `GOAWAY(COMPRESSION_ERROR)`. When the refused frame did not carry END_HEADERS, decoding is skipped
+  rather than attempted: a refused multi-frame block cannot legally continue (a standalone
+  CONTINUATION is already a `PROTOCOL_ERROR` per `handle_header_state`), so decoding a fragment that
+  ends mid-integer would only misreport `COMPRESSION_ERROR` in place of that `PROTOCOL_ERROR`. A
+  CONTINUATION frame refused mid-block copies out every prior frame's accumulated field-block bytes
+  at refusal time, because queuing the RST_STREAM arms `WRITABLE` and the same event-loop pass's
+  `writable()` preamble reuses `zero.storage` as RST_STREAM scratch before the next `readable()` pass
+  would otherwise read this frame's own payload. A genuine HPACK decode failure of a complete block
+  is reported as `GOAWAY(COMPRESSION_ERROR)` per RFC 9113 §4.3, distinct from the `PROTOCOL_ERROR`
+  a malformed Pad Length now correctly produces.
+
 - **`fix(router)`: stop IDN-normalising the regex source of a `Tree` hostname, which inverted every
   uppercase escape.** `Router::add_tree_rule`, `Router::remove_tree_rule` and `Router::has_hostname`
   ran the WHOLE configured hostname through `idna::domain_to_ascii`, regex segments included. That
