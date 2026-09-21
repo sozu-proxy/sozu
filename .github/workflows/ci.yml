@@ -290,7 +290,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install rust 1.93.1
-        uses: dtolnay/rust-toolchain@1.120.0
+        uses: dtolnay/rust-toolchain@1.93.1
 
       - name: Cache cargo target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
@@ -376,7 +376,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install rust 1.93.1
-        uses: dtolnay/rust-toolchain@1.120.0
+        uses: dtolnay/rust-toolchain@1.93.1
 
       - name: Cache cargo target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
@@ -423,7 +423,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install rust 1.93.1
-        uses: dtolnay/rust-toolchain@1.120.0
+        uses: dtolnay/rust-toolchain@1.93.1
 
       - name: Clone lagging_server
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -453,7 +453,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install rust 1.93.1
-        uses: dtolnay/rust-toolchain@1.120.0
+        uses: dtolnay/rust-toolchain@1.93.1
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -490,7 +490,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
 
       - name: Install rust 1.93.1
-        uses: dtolnay/rust-toolchain@1.120.0
+        uses: dtolnay/rust-toolchain@1.93.1
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -581,7 +581,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install rust 1.93.1
-        uses: dtolnay/rust-toolchain@1.120.0
+        uses: dtolnay/rust-toolchain@1.93.1
 
       # Reuse the crypto-ring pipeline cache for the release sozu
       # build that the logger bench drives.
