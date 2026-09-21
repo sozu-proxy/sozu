@@ -1490,7 +1490,8 @@ pub(crate) fn decode_status(payload: &[u8]) -> Option<u16> {
 ///
 /// A byte scan cannot do this job, and three copies of one used to try.
 /// Every Sōzu response carries a `Sozu-Id` correlation header
-/// (`lib/src/protocol/kawa_h1/editor.rs:1131`) holding the session's
+/// (`HttpContext::on_response_headers`, `lib/src/protocol/kawa_h1/editor.rs`)
+/// holding the session's
 /// 26-character Crockford base-32 ULID, written with the Huffman bit
 /// clear, so it reaches the field block as plain ASCII over an alphabet
 /// that contains every decimal digit. A 3-digit needle therefore matches

@@ -362,8 +362,8 @@ That question has no negative space: a plain 200 answers yes whenever the
 digits happen to sit side by side anywhere in the field block, and one
 header guarantees they eventually will. Every Sōzu response carries
 `Sozu-Id`, the session's 26-character Crockford base-32 ULID
-(`lib/src/protocol/kawa_h1/editor.rs:1131`), whose alphabet is
-`0-9A-Z`-minus-`ILOU` and which the encoder writes as plain ASCII — a
+(`HttpContext::on_response_headers`, `lib/src/protocol/kawa_h1/editor.rs`),
+whose alphabet is `0-9A-Z`-minus-`ILOU` and which the encoder writes as plain ASCII — a
 captured example is `01M2Z5AGKTYKJM9MFQY89EJMJ9`. Any given 3-digit
 needle hits about once in 1400 ULIDs. The first ten characters are the
 generation timestamp in milliseconds, so a hit there is not independent

@@ -431,6 +431,52 @@
   (`e2e/src/tests/tcp_sni_tests.rs`). See
   [#1373](https://github.com/sozu-proxy/sozu/issues/1373) and hardening note 7 in
   `lib/src/protocol/tcp_preread/LIFECYCLE.md`.
+- **`docs(kawa_h1)`: the CL.TE guard's rationale described kawa 0.7.0 and asserted the opposite of
+  what the guard does.**
+  The comment above the Transfer-Encoding check in `HttpContext::on_request_headers` claimed that
+  "the literal-suffix check is what keeps OWS-obfuscated codings (`chunked\t`, `chunked `)
+  … fail-closed" and that kawa "still forwards the TE field line *verbatim*". Neither holds
+  against the kawa this workspace pins (`^0.7.1`, locked at 0.7.1). kawa >= 0.7.1 excludes
+  leading and trailing OWS from every field value (RFC 9112 §5), so the value the guard reads
+  for `Transfer-Encoding: chunked\t` is already `chunked`: the suffix check passes, `body_size` is
+  Chunked, the request is accepted, and it reaches the backend spelled canonically with no
+  Content-Length beside it. Measured, not reasoned about —
+  `test_h1_te_ows_forwarded_canonically` sends exactly that request and pins the forwarded bytes,
+  and it passes on this tree. The `trailing-tab` / `trailing-space` rows of `TE_SMUGGLING_CASES`
+  still answer 400 for their invalid chunked BODY rather than through this predicate, which that
+  table's own doc comment already said.
+  The rewrite also settles which clause of the guard fires at all, since getting that wrong is the
+  same defect one layer down. kawa 0.7.1 resolves the combined Transfer-Encoding in its own
+  `process_headers` before the callback and, for a REQUEST whose combined final coding is not
+  chunked, errors the parse and returns without calling `on_headers` — so `chunked, gzip` never
+  reaches this code, and neither the suffix clause nor the `body_size` clause can fire on a request
+  kawa accepted. They stay as defense in depth against a kawa regression. The clause that does fire
+  is the COUNT: kawa judges the LAST TE line, so `Transfer-Encoding: identity` followed by
+  `Transfer-Encoding: chunked` combines to a chunked-final coding and parses clean, and forwarding
+  both lines is what sōzu refuses. That paragraph is marked in the comment as read from kawa's
+  source rather than measured here, so a future reader knows which kind of claim it is.
+  `lib/src/protocol/kawa_h1/LIFECYCLE.md` — the document #1375 says the wrong claim was nearly
+  written into — carried the same 0.7.0 latch paragraph and attributed the `not-final-coding` and
+  `multi-line-chunked-then-identity` 400s to this predicate. Both are corrected in the same
+  changeset.
+  Expanding the comment moves every line below it, so the citations that point there are repaired
+  in the same changeset too. The two deliberate RANGES in that document — the `te_count` fold and
+  the rejection predicate — are recomputed to `editor.rs:638-658` and `editor.rs:659-662`, each of
+  the four endpoints verified against the text it now lands on rather than by arithmetic. Three
+  citations of `editor.rs:1131` for the `Sozu-Id` stamping site, in `e2e/COVERAGE.md`,
+  `e2e/src/tests/h2_security_sni.rs` and `e2e/src/tests/h2_utils.rs`, become
+  `HttpContext::on_response_headers` — a symbol, which is what the convention asks for and what
+  cannot drift again. That line number was already wrong before this changeset touched it, and the
+  `Doc citations` resolver could not have said so: it fails only on a BLANK landing, and all three
+  were pointing at a perfectly non-blank `debug_assert!(`.
+  This is not cosmetic. The comment misled a reviewer into a confident wrong finding about a
+  request-smuggling guard, which was relayed as an instruction and nearly written into
+  `lib/src/protocol/mux/LIFECYCLE.md`; the chain broke only because the implementer ran the test
+  (#1375). Nothing mechanical catches a wrong comment, and a comment asserting a security property
+  is the kind nobody re-derives. The rewritten rationale states the 0.7.1 behaviour, names the test
+  as the executable statement of it, keeps the 0.7.0 history as the reason the check is shaped the
+  way it is, and says outright not to reintroduce a trailing-OWS rejection to compensate.
+  No behaviour change: `lib/src/protocol/kawa_h1/editor.rs` is touched in comments only.
 
 - **`fix(router)`: an exact hostname added after a matching regex segment attached its rule to the
   regex segment's leaf, and the whole regex family served it.**

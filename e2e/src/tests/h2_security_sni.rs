@@ -849,7 +849,8 @@ fn captured_421_headers(sozu_id: &str) -> Vec<u8> {
 /// somewhere in the field block.
 ///
 /// Sōzu stamps every response with the `Sozu-Id` correlation header
-/// (`lib/src/protocol/kawa_h1/editor.rs:1131`) whose value is the session's
+/// (`HttpContext::on_response_headers`, `lib/src/protocol/kawa_h1/editor.rs`)
+/// whose value is the session's
 /// 26-character Crockford base-32 ULID — an alphabet that contains `4`, `2`
 /// and `1`. A ULID therefore carries the substring `421` roughly once in
 /// 1400, and its leading ten characters are a monotonic millisecond

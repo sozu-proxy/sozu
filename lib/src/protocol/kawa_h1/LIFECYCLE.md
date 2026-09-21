@@ -141,17 +141,30 @@ forward a message whose framing is ambiguous.
 
 The guard runs once per request, after kawa's own header pass (`process_headers`)
 has finalised `body_size` but before `HttpContext` captures anything from the
-request. kawa never elides the `Transfer-Encoding` header and evaluates each TE
-field line independently — a leading `Transfer-Encoding: chunked` line latches
-`body_size = Chunked`, but a second, later TE line (e.g. `identity`) that does
-not itself end in `chunked` is left in place (kawa only `warn!`s), so gating the
-scan on `body_size != Chunked` alone would let that second line ride through.
+request. kawa never elides the `Transfer-Encoding` header, so every TE field line
+is still there to be forwarded, and `body_size` alone cannot tell you how many
+there were — which is why the guard folds over the blocks rather than reading the
+aggregate.
+
+kawa **>= 0.7.1** resolves the combined Transfer-Encoding from the LAST TE field
+line, per RFC 9110 §5.3 combining, and errors the parse for a REQUEST whose
+combined final coding is not `chunked` (RFC 9112 §6.3), returning before
+`callbacks.on_headers` is called at all. Two consequences, read from kawa 0.7.1's
+`src/protocol/h1/parser/mod.rs` rather than measured here:
+
+- a leading `Transfer-Encoding: chunked` line can no longer latch chunked framing
+  while a later `identity` line rides along. That latch was a kawa **0.7.0**
+  shape, and it is the shape the second and third clauses below were written
+  against;
+- the residual gap is the mirror of it: a chunked-final LAST line with a
+  differently-framed EARLIER one — `identity` then `chunked` — parses clean under
+  0.7.1, and forwarding both lines is what the count clause refuses.
 
 The guard therefore folds over every non-elided `Transfer-Encoding` header in
-`request.blocks` (`editor.rs:607-627`), producing `te_count` and
+`request.blocks` (`editor.rs:638-658`), producing `te_count` and
 `te_all_suffix_chunked` — the latter true only when EVERY such value's literal
 trailing bytes are `chunked` (`compare_no_case` over the last seven bytes). The
-rejection predicate is exactly (`editor.rs:628-631`):
+rejection predicate is exactly (`editor.rs:659-662`):
 
 ```rust
 te_count > 1
@@ -163,15 +176,22 @@ which rejects three distinct shapes:
 
 - `te_count > 1` — more than one non-elided TE header. RFC 9112 §6.1 requires
   `chunked` be applied once and be the final coding; multiple TE field lines
-  cannot be safely reconciled here, and it is exactly the shape that lets a
-  `Chunked` latch from an earlier line mask a later, differently-framed line
-  (the multi-line CL.TE bypass this guard was hardened against). Covered by the
-  `multi-line-chunked-then-identity` case in `e2e`'s `TE_SMUGGLING_CASES`;
+  cannot be safely reconciled here, and forwarding them all hands the backend the
+  combining problem sōzu just declined to solve. **This is the only clause that
+  can fire on a request kawa 0.7.1 accepted**, in the `identity`-then-`chunked`
+  shape above;
 - one surviving TE header whose final coding is not `chunked`
-  (`!te_all_suffix_chunked`), e.g. `Transfer-Encoding: chunked, gzip` — the
-  `not-final-coding` case;
+  (`!te_all_suffix_chunked`), e.g. `Transfer-Encoding: chunked, gzip`;
 - one surviving TE header while kawa did not adopt chunked framing
   (`body_size != BodySize::Chunked`).
+
+The last two cannot fire under kawa 0.7.1: a TE line that survives to this point
+is chunked-final, or kawa already refused the request, and `body_size` is then
+`Chunked`. They stay as defense in depth against a kawa regression — do not read
+either as closing a live hole, and do not delete them on that basis. The
+`not-final-coding` and `multi-line-chunked-then-identity` rows of `e2e`'s
+`TE_SMUGGLING_CASES` do still answer 400, but through kawa's own refusal rather
+than through this predicate.
 
 **An OWS-obfuscated coding is NOT rejected by this guard.** kawa >= 0.7.1
 excludes leading/trailing OWS from every field value (RFC 9112 §5), so
