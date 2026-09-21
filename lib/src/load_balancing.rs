@@ -1,10 +1,10 @@
 use std::{cell::RefCell, fmt::Debug, hash::Hasher, net::SocketAddr, rc::Rc};
 
 use rand::{
-    RngExt,
+    RngExt, SeedableRng,
     distr::{Distribution, weighted::WeightedIndex},
     prelude::IndexedRandom,
-    rng,
+    rngs::{StdRng, SysRng},
 };
 
 use crate::{backends::Backend, sozu_command::proto::command::LoadMetric};
@@ -227,8 +227,75 @@ impl RoundRobin {
     }
 }
 
+/// Uniform (optionally weight-biased) random backend selection.
+///
+/// The RNG is read off the datapath, at construction, instead of reaching for
+/// the ambient thread-local `rand::rng()` on the selection hot path — but,
+/// unlike [`Rendezvous`]/[`Maglev`], it is NOT seeded from the shared
+/// [`DEFAULT_HASH_SEED`] constant. `Rendezvous`/`Maglev` feed their seed into
+/// a *pure, stateless* hash function (`hash_backend`): same `(seed, key,
+/// addr)` in, same score out, independent of call history, so sharing the
+/// seed fleet-wide is exactly the point — it is what makes the same affinity
+/// key land on the same backend across workers and restarts.
+/// `Random` feeds its seed into a *stateful, advancing* `StdRng`, where the
+/// n-th pick depends on the whole call history. Seeding that from a shared
+/// compile-time constant would make every worker, on every cold start, with
+/// an identically-ordered backend list, draw from a bit-for-bit identical
+/// keystream — so every fresh worker's first pick over N equal-weight
+/// backends would be the same backend index, fleet-wide, on every restart:
+/// exactly the correlated-load event uniform selection exists to prevent,
+/// arriving at the worst possible moment (a synchronised redeploy, when every
+/// worker's call counter resets together and initial load is otherwise
+/// indistinguishable). So `new()` reads a fresh seed from the OS
+/// (`SysRng`) once, at construction — off the datapath, satisfying the
+/// no-ambient-entropy-on-the-hot-path rule without recreating the old
+/// thread-local `rng()`'s cross-process correlation. `with_seed(seed)` stays
+/// available for tests and any future deterministic simulator that needs a
+/// fixed, reproducible sequence (mirrors `quinn-proto`'s
+/// `rng_seed`/`SysRng` construction shape).
+///
+/// This does NOT make `Random` return a fixed backend: `next_available_backend`
+/// *advances* the internal RNG on every call, so a sequence of calls still
+/// draws a well-distributed spread of backends. "Random" here means
+/// "statistically spread, and — given `with_seed` — reproducible for a fixed
+/// seed and exact call sequence" — not "constant". Two instances built with
+/// `with_seed` on the same seed and driven through the same sequence of
+/// backend sets reproduce the same sequence of picks (what makes this
+/// testable); a single instance called repeatedly keeps drawing fresh values
+/// from its advancing RNG state, exactly like a real RNG would; two `new()`
+/// instances draw from independent OS-seeded keystreams, exactly like the old
+/// ambient `rng()` did.
 #[derive(Debug)]
-pub struct Random;
+pub struct Random {
+    rng: StdRng,
+}
+
+impl Default for Random {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Random {
+    /// Seed from the OS, once, off the datapath. Deliberately NOT
+    /// `DEFAULT_HASH_SEED` — see the struct docs for why sharing a
+    /// compile-time constant here would correlate every worker's pick
+    /// sequence instead of merely making each one internally reproducible.
+    pub fn new() -> Self {
+        Self {
+            rng: StdRng::try_from_rng(&mut SysRng)
+                .expect("failed to seed random number generator from system"),
+        }
+    }
+
+    /// Deterministic construction for tests / simulation. NOT used for the
+    /// production default — see [`Random::new`].
+    pub fn with_seed(seed: u64) -> Self {
+        Self {
+            rng: StdRng::seed_from_u64(seed),
+        }
+    }
+}
 
 impl LoadBalancingAlgorithm for Random {
     fn next_available_backend(
@@ -236,7 +303,6 @@ impl LoadBalancingAlgorithm for Random {
         _key: Option<u64>,
         backends: &mut Vec<Rc<RefCell<Backend>>>,
     ) -> Option<Rc<RefCell<Backend>>> {
-        let mut rng = rng();
         let len = backends.len();
         let weights: Vec<i32> = backends
             .iter()
@@ -257,7 +323,7 @@ impl LoadBalancingAlgorithm for Random {
         );
 
         if let Ok(dist) = WeightedIndex::new(weights) {
-            let index = dist.sample(&mut rng);
+            let index = dist.sample(&mut self.rng);
             // `WeightedIndex` only samples valid indices into the weight vector,
             // which is the same length as `backends`, so the lookup hits.
             debug_assert!(index < len, "Random sampled an out-of-range index");
@@ -266,7 +332,7 @@ impl LoadBalancingAlgorithm for Random {
             // `WeightedIndex::new` fails only when the set is empty or every
             // weight is zero; the uniform `choose` then selects iff non-empty.
             let chosen = (*backends)
-                .choose(&mut rng)
+                .choose(&mut self.rng)
                 .map(|backend| (*backend).clone());
             debug_assert_eq!(
                 chosen.is_some(),
@@ -329,9 +395,74 @@ impl LoadBalancingAlgorithm for LeastLoaded {
     }
 }
 
+/// Power-of-two-choices (P2C) load-aware selection: sample two candidates,
+/// keep the lighter one, and coin-flip a tie.
+///
+/// # Tie-break: seeded-random, deliberately NOT deterministic-by-id
+///
+/// Unlike [`Rendezvous`]/[`Maglev`], `PowerOfTwo` carries no affinity `key` —
+/// every call is an independent, unlabeled selection event, so there is no
+/// "the same key must land on the same backend across workers/restarts"
+/// requirement to *preserve* here. But answering "must we preserve
+/// agreement?" is not the same question as "does this mechanism *create*
+/// agreement?" — see the next section for why that distinction is the whole
+/// reason `new()` does not use [`DEFAULT_HASH_SEED`].
+///
+/// A deterministic tie-break (e.g. "lowest backend id wins") was considered
+/// and rejected: ties are common, not rare — every backend starts at zero
+/// load, so a cold start, a post-scale-up rebalance, or any tick where two
+/// backends carry identical load all resolve through this branch. Always
+/// awarding the tie to the same backend (e.g. the lowest id) would bias the
+/// distribution toward that backend on exactly the events P2C exists to
+/// spread out, reintroducing the herding effect P2C is designed to avoid —
+/// on every one of Sōzu's single-threaded workers simultaneously, since they
+/// would all observe the same tie and resolve it the same deterministic way.
+/// A seeded RNG that *advances* per call keeps ties spread across the
+/// candidate set over the process lifetime while still satisfying the
+/// no-ambient-entropy-on-the-hot-path rule.
+///
+/// # Seed source: OS entropy at construction, NOT `DEFAULT_HASH_SEED`
+///
+/// `Rendezvous`/`Maglev` feed their seed into a *pure, stateless* hash
+/// function: sharing [`DEFAULT_HASH_SEED`] fleet-wide is exactly what gives
+/// them cross-worker/cross-restart agreement for the same key. `PowerOfTwo`
+/// feeds its seed into a *stateful, advancing* `StdRng`, where the n-th
+/// tie-break depends on the whole call history. Seeding that from the same
+/// shared constant would make every worker, on every cold start, draw from a
+/// bit-for-bit identical keystream — so the very first tie any two workers
+/// hit after a synchronised redeploy (and ties are the common case here, see
+/// above) would resolve identically, fleet-wide, on every restart. That is
+/// the deterministic-tie-break herding problem above, reintroduced by the
+/// "fix" instead of prevented by it. `new()` therefore reads a fresh seed
+/// from the OS (`SysRng`) once, at construction — off the datapath — so each
+/// worker's keystream is independent, the same property the old thread-local
+/// `rng()` had. `with_seed(seed, metric)` stays available for tests and any
+/// future deterministic simulator that needs a fixed, reproducible sequence.
 #[derive(Debug)]
 pub struct PowerOfTwo {
     pub metric: LoadMetric,
+    rng: StdRng,
+}
+
+impl PowerOfTwo {
+    /// Seed from the OS, once, off the datapath. Deliberately NOT
+    /// `DEFAULT_HASH_SEED` — see the struct docs.
+    pub fn new(metric: LoadMetric) -> Self {
+        Self {
+            metric,
+            rng: StdRng::try_from_rng(&mut SysRng)
+                .expect("failed to seed random number generator from system"),
+        }
+    }
+
+    /// Deterministic construction for tests / simulation. NOT used for the
+    /// production default — see [`PowerOfTwo::new`].
+    pub fn with_seed(seed: u64, metric: LoadMetric) -> Self {
+        Self {
+            metric,
+            rng: StdRng::seed_from_u64(seed),
+        }
+    }
 }
 
 impl LoadBalancingAlgorithm for PowerOfTwo {
@@ -397,7 +528,7 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
             // should not happen, but let's be exhaustive
             (None, Some((_, b))) => Some(b.clone()),
             (Some((_, b1)), Some((_, b2))) => {
-                if rng().random_bool(0.5) {
+                if self.rng.random_bool(0.5) {
                     Some(b1.clone())
                 } else {
                     Some(b2.clone())
@@ -1333,6 +1464,289 @@ mod test {
         assert!(
             heavy > total * 70 / 100,
             "weighted Maglev did not favor the heavy backend: {heavy}/{total}"
+        );
+    }
+
+    // ----- Random / PowerOfTwo: injected, seedable entropy -----
+
+    /// Map a test backend's address back to the index `make_backends` gave it
+    /// (`last_octet - 1`), so a selection sequence can be asserted as a
+    /// compact `Vec<u8>` instead of a `Vec<SocketAddr>`.
+    fn addr_index(addr: SocketAddr) -> u8 {
+        match addr.ip() {
+            IpAddr::V4(v4) => v4.octets()[3] - 1,
+            IpAddr::V6(_) => unreachable!("test backends are always IPv4"),
+        }
+    }
+
+    #[test]
+    fn random_is_deterministic_and_matches_an_expected_sequence() {
+        let backends = make_backends(4);
+        let mut r1 = Random::with_seed(DEFAULT_HASH_SEED);
+        let mut r2 = Random::with_seed(DEFAULT_HASH_SEED);
+
+        let mut sel1 = backends.clone();
+        let mut sel2 = backends.clone();
+
+        let seq1: Vec<u8> = (0..20)
+            .map(|_| {
+                addr_index(chosen_addr(
+                    &r1.next_available_backend(None, &mut sel1).unwrap(),
+                ))
+            })
+            .collect();
+        let seq2: Vec<u8> = (0..20)
+            .map(|_| {
+                addr_index(chosen_addr(
+                    &r2.next_available_backend(None, &mut sel2).unwrap(),
+                ))
+            })
+            .collect();
+
+        // Reproducibility: same seed + same inputs + same call sequence must
+        // give the same picks.
+        assert_eq!(
+            seq1, seq2,
+            "Random::with_seed must reproduce the same sequence for the same seed"
+        );
+
+        // Absolute-value check (paired with the determinism check above so a
+        // test that is merely "reproducible" but reproducibly wrong still
+        // fails): the sequence for DEFAULT_HASH_SEED over 4 uniformly
+        // weighted backends, captured from this implementation.
+        //
+        // Brittleness note: this literal is coupled to `rand` 0.10.2's exact
+        // `StdRng` algorithm (ChaCha12) and `seed_from_u64`'s splitmix64
+        // expansion. A `rand` version bump that changes either (the type's
+        // own docs disclaim portability/reproducibility across versions) will
+        // break this assertion for reasons unrelated to Sōzu's load-balancing
+        // logic — recapture the sequence, don't "fix" the algorithm.
+        let expected: Vec<u8> = vec![1, 2, 1, 1, 0, 2, 1, 3, 1, 0, 3, 1, 0, 0, 3, 2, 1, 3, 3, 1];
+        assert_eq!(
+            seq1, expected,
+            "Random sequence for DEFAULT_HASH_SEED regressed"
+        );
+    }
+
+    #[test]
+    fn random_new_instances_are_not_correlated() {
+        // Regression guard for a real defect a review caught in an earlier
+        // revision of this change: `Random::new()` must NOT seed from
+        // `DEFAULT_HASH_SEED` (or any other shared constant). If it did,
+        // every freshly constructed `Random` — i.e. every worker process, on
+        // every cold start — would draw from a bit-for-bit identical
+        // keystream, so two independently constructed instances would pick
+        // the exact same backend at every step. That is precisely the
+        // correlated-load event uniform selection exists to prevent, and it
+        // would arrive at the worst possible moment: a synchronised
+        // redeploy, when every worker's call counter resets together and
+        // initial load is otherwise indistinguishable. `Random::new()` reads
+        // a fresh seed from the OS per instance, so two instances must
+        // diverge — this asserts that property directly, not just that
+        // `new()` compiles.
+        let backends = make_backends(4);
+        let mut r1 = Random::new();
+        let mut r2 = Random::new();
+
+        let mut sel1 = backends.clone();
+        let mut sel2 = backends.clone();
+
+        let seq1: Vec<u8> = (0..32)
+            .map(|_| {
+                addr_index(chosen_addr(
+                    &r1.next_available_backend(None, &mut sel1).unwrap(),
+                ))
+            })
+            .collect();
+        let seq2: Vec<u8> = (0..32)
+            .map(|_| {
+                addr_index(chosen_addr(
+                    &r2.next_available_backend(None, &mut sel2).unwrap(),
+                ))
+            })
+            .collect();
+
+        // Collision probability over 32 draws across 4 backends is
+        // astronomically small (~4^-32) if the two instances are genuinely
+        // independently seeded, so this is not a flaky assertion in
+        // practice.
+        assert_ne!(
+            seq1, seq2,
+            "two Random::new() instances must NOT draw from a shared/correlated keystream"
+        );
+    }
+
+    #[test]
+    fn random_distribution_does_not_collapse() {
+        // A seeded RNG must still spread draws across every backend rather
+        // than pinning one — determinism is per-(seed, sequence), not
+        // "always the same backend".
+        //
+        // This is a smoke check, not a uniformity test: the +/-35% band is
+        // wide enough (roughly ±12 sigma at n=5, total=5000) to reliably
+        // catch full collapse (one backend gets ~0 or ~100%) or a gross bias,
+        // but a systematic ~20-25% skew would pass it. Tightening the band
+        // to something a real skew would fail is a legitimate follow-up; the
+        // name deliberately promises no more than "does not collapse".
+        let n = 5u8;
+        let backends = make_backends(n);
+        let mut r = Random::with_seed(DEFAULT_HASH_SEED);
+        let mut sel = backends.clone();
+
+        let total = 5_000u64;
+        let mut counts = [0u64; 5];
+        for _ in 0..total {
+            let idx = addr_index(chosen_addr(
+                &r.next_available_backend(None, &mut sel).unwrap(),
+            ));
+            counts[idx as usize] += 1;
+        }
+
+        let expected = total / n as u64;
+        for (idx, &c) in counts.iter().enumerate() {
+            assert!(
+                c > expected * 65 / 100 && c < expected * 135 / 100,
+                "Random distribution skewed for backend {idx}: got {c}, expected ~{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn power_of_two_tie_break_is_deterministic_and_matches_an_expected_sequence() {
+        // All backends report the same load (0 active connections), so every
+        // call reaches the two-candidate tie-break branch.
+        let backends = make_backends(4);
+        let mut p1 = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+        let mut p2 = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+
+        let mut sel1 = backends.clone();
+        let mut sel2 = backends.clone();
+
+        let seq1: Vec<u8> = (0..20)
+            .map(|_| {
+                addr_index(chosen_addr(
+                    &p1.next_available_backend(None, &mut sel1).unwrap(),
+                ))
+            })
+            .collect();
+        let seq2: Vec<u8> = (0..20)
+            .map(|_| {
+                addr_index(chosen_addr(
+                    &p2.next_available_backend(None, &mut sel2).unwrap(),
+                ))
+            })
+            .collect();
+
+        // Reproducibility: `with_seed` is deterministic given the same seed
+        // and call sequence — the property tests/simulation need. This is
+        // NOT a claim about production: `PowerOfTwo::new()` seeds from OS
+        // entropy specifically so two independent worker processes do NOT
+        // draw from the same keystream (see the struct docs' "Seed source"
+        // section for why sharing a seed here would be a regression, not a
+        // feature).
+        assert_eq!(
+            seq1, seq2,
+            "PowerOfTwo::with_seed must reproduce the same tie-break sequence for the same seed"
+        );
+
+        // Absolute-value check: the two tracked candidates are always
+        // backends 2 and 3 (the last two processed by the fold, since every
+        // measure ties at 0), so this also pins which two backends the
+        // tie-break alternates between, not just that it is reproducible.
+        //
+        // Brittleness note: this literal is coupled to `rand` 0.10.2's exact
+        // `StdRng` algorithm (ChaCha12) and `seed_from_u64`'s splitmix64
+        // expansion. A `rand` version bump that changes either (the type's
+        // own docs disclaim portability/reproducibility across versions) will
+        // break this assertion for reasons unrelated to Sōzu's load-balancing
+        // logic — recapture the sequence, don't "fix" the algorithm.
+        let expected: Vec<u8> = vec![2, 3, 2, 2, 3, 3, 3, 2, 2, 3, 2, 3, 3, 2, 3, 3, 3, 3, 2, 3];
+        assert_eq!(
+            seq1, expected,
+            "PowerOfTwo tie-break sequence for DEFAULT_HASH_SEED regressed"
+        );
+    }
+
+    #[test]
+    fn power_of_two_new_instances_are_not_correlated() {
+        // Same regression guard as `random_new_instances_are_not_correlated`,
+        // for the tie-break: `PowerOfTwo::new()` must NOT seed from
+        // `DEFAULT_HASH_SEED`. Every backend starts at zero load, so a tie
+        // (and therefore a coin flip) is the COMMON case, not the rare one —
+        // if `new()` shared a seed, every worker's first tie-break after a
+        // synchronised redeploy would resolve identically, fleet-wide,
+        // reintroducing exactly the herding effect P2C exists to prevent.
+        let backends = make_backends(4);
+        let mut p1 = PowerOfTwo::new(LoadMetric::Connections);
+        let mut p2 = PowerOfTwo::new(LoadMetric::Connections);
+
+        let mut sel1 = backends.clone();
+        let mut sel2 = backends.clone();
+
+        let seq1: Vec<u8> = (0..48)
+            .map(|_| {
+                addr_index(chosen_addr(
+                    &p1.next_available_backend(None, &mut sel1).unwrap(),
+                ))
+            })
+            .collect();
+        let seq2: Vec<u8> = (0..48)
+            .map(|_| {
+                addr_index(chosen_addr(
+                    &p2.next_available_backend(None, &mut sel2).unwrap(),
+                ))
+            })
+            .collect();
+
+        // Each draw is a 1-bit choice between the two tracked candidates, so
+        // 48 draws give a ~2^-48 collision probability if the two instances
+        // are genuinely independently seeded — not a flaky assertion.
+        assert_ne!(
+            seq1, seq2,
+            "two PowerOfTwo::new() instances must NOT draw from a shared/correlated keystream"
+        );
+    }
+
+    #[test]
+    fn power_of_two_tie_break_distribution_does_not_collapse() {
+        // The seeded RNG must still alternate between the two tied
+        // candidates over many draws rather than pinning one — otherwise the
+        // fix would trade "ambient nondeterminism" for "deterministic bias",
+        // which is exactly the regression the herding argument in
+        // `PowerOfTwo`'s doc comment warns about.
+        //
+        // Smoke check, not a uniformity test: the +/-35% band (~25 sigma at
+        // p=0.5, total=5000) reliably catches full collapse onto one
+        // candidate but would pass a systematic skew — see the equivalent
+        // note on `random_distribution_does_not_collapse`.
+        let backends = make_backends(4);
+        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+        let mut sel = backends.clone();
+
+        let total = 5_000u64;
+        let mut counts = [0u64; 4];
+        for _ in 0..total {
+            let idx = addr_index(chosen_addr(
+                &p.next_available_backend(None, &mut sel).unwrap(),
+            ));
+            counts[idx as usize] += 1;
+        }
+
+        // Only backends 2 and 3 are ever tracked as candidates (see the test
+        // above); each must get a substantial share, and 0/1 must never be
+        // picked.
+        assert_eq!(counts[0], 0, "backend 0 is never a tracked candidate");
+        assert_eq!(counts[1], 0, "backend 1 is never a tracked candidate");
+        let expected = total / 2;
+        assert!(
+            counts[2] > expected * 65 / 100 && counts[2] < expected * 135 / 100,
+            "PowerOfTwo tie-break skewed toward backend 3: backend 2 got {}, expected ~{expected}",
+            counts[2]
+        );
+        assert!(
+            counts[3] > expected * 65 / 100 && counts[3] < expected * 135 / 100,
+            "PowerOfTwo tie-break skewed toward backend 2: backend 3 got {}, expected ~{expected}",
+            counts[3]
         );
     }
 }

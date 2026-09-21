@@ -874,7 +874,7 @@ impl BackendList {
         BackendList {
             backends: Vec::new(),
             next_id: 0,
-            load_balancing: Box::new(Random),
+            load_balancing: Box::new(Random::new()),
             fail_open_warned: false,
             availability: Cell::new(ClusterAvailability::Available),
         }
@@ -1171,16 +1171,15 @@ impl BackendList {
             LoadBalancingAlgorithms::RoundRobin => {
                 self.load_balancing = Box::new(RoundRobin::new())
             }
-            LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(Random {}),
+            LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(Random::new()),
             LoadBalancingAlgorithms::LeastLoaded => {
                 self.load_balancing = Box::new(LeastLoaded {
                     metric: metric.unwrap_or(LoadMetric::Connections),
                 })
             }
             LoadBalancingAlgorithms::PowerOfTwo => {
-                self.load_balancing = Box::new(PowerOfTwo {
-                    metric: metric.unwrap_or(LoadMetric::Connections),
-                })
+                self.load_balancing =
+                    Box::new(PowerOfTwo::new(metric.unwrap_or(LoadMetric::Connections)))
             }
             // Affinity policies (used by the UDP datapath). They consult the
             // optional hash key; with `None` they fall back to round-robin.
