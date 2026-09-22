@@ -493,6 +493,110 @@
   all. The quoted `debug_assert!` is the one that need not stay unreachable, and the pin puts it
   under the fenced-block rule from the next changeset onward.
 
+- **`fix(mux)`: re-issue an idempotent request on a fresh backend when the pooled keep-alive
+  upstream it was written to turns out to be closed, instead of answering `502 Bad Gateway`.**
+  An H1 keep-alive backend connection parked in `Router::backends`
+  (`lib/src/protocol/mux/router.rs`) can be closed by its peer while idle, with no event Sōzu has
+  processed yet. The next request routed to that cluster is written onto the dead socket, the
+  backend read returns EOF, and `end_stream_decision` (`lib/src/protocol/mux/shared.rs`) classified
+  it as `SendDefault(502)` on the sole ground that `front.consumed` was set — i.e. that the request
+  had left the front buffer. `Router::connect` already bounded HTTP retries through its
+  `stream.attempts >= CONN_RETRIES` gate (`lib/src/protocol/mux/router.rs`); what was missing was a
+  path that *decided* to retry this shape, not a bound on how often it may be retried. Measured
+  2026-09-22 on this tree with the replay decision reverted and everything else identical: 25 red
+  runs out of 25, 25 failures over 576 pooled `test_issue_806` trials (4.3% per trial), the failing
+  iteration ranging from 1 to 81, every one answering `502 Bad Gateway` from the stopped backend
+  with `"backend_id": "cluster_0-0"` and `"parsing_phase": "Error"` while the surviving backend
+  served nothing. The 502 arrives in well
+  under a millisecond, so it is a *fast wrong answer* that no latency budget detects; the hardened
+  `test_issue_806` catches it because it asserts the response status, which the earlier
+  `!= State::Fail` shape did not.
+  `end_stream_decision` now returns a new `EndStreamAction::ReplayOnFreshBackend` for that shape,
+  and both `ConnectionH1::end_stream` and `ConnectionH2::end_stream` re-link the stream through
+  `Router::connect`, which picks a fresh backend from the load balancer. The boundary is **no
+  response byte has been received** — nothing was observed by the client, so re-issuing is
+  unobservable — narrowed by three conditions, each with its precedent. *Pooled connections only*
+  (`ConnectionH1::reused_from_pool`, set on the `KeepAlive -> Connected` transition in
+  `start_stream` and nowhere else): this is pingora's `RetryType::ReusedOnly`. It is a policy, not
+  a diagnosis — Sōzu cannot tell a stale pool socket from an origin that half-closed after
+  processing the request, or from one that crashed mid-request, because `ConnectionH1::readable`
+  treats every `size == 0` alike and an empty back buffer proves only that no response byte
+  arrived. Restricting the replay to pooled connections narrows it to the case where an unobserved
+  idle close is plausible; what makes re-issuing permissible at all is the idempotence condition
+  that follows, which is exactly what RFC 9110 §9.2.2 licenses.
+  *Idempotent methods only* (`Method::is_idempotent`,
+  `lib/src/protocol/kawa_h1/parser.rs`, RFC 9110 §9.2.2), with `Method::Custom` — which is how Sōzu
+  parses `PATCH` — counted as non-idempotent: nginx keeps `non_idempotent` out of the
+  `proxy_next_upstream` default, and pingora's default `error_while_proxy` vetoes on
+  `!method.is_idempotent()`. *One front buffer*: `ConnectionH1::writable` copies the bytes it hands
+  the socket into `Stream::retry_buffer` before `kawa::Kawa::consume` drops them and shifts the
+  storage, and truncates the capture to `None` past `front.storage.capacity()` — HAProxy states the
+  same trade, that retrying past `conn-failure` "requires to allocate a buffer and copy the whole
+  request into it", and that "Requests not fitting in a single buffer will never be retried". That
+  copy is charged only to requests written onto a reused connection, so a freshly dialled upstream
+  and every frontend write cost nothing, and it is appended straight onto the capture rather than
+  staged through a temporary `Vec` first.
+  The captured bytes are *prepended* to `front.out`. `out` need not be empty at that point: a
+  partial `socket_write_vectored` leaves the bytes the kernel refused still queued, because
+  `kawa::Kawa::consume` pushes the partially consumed store back to the *front* of `out`. Appending
+  the capture behind that remainder would hand the healthy backend `[tail][head]` — a request
+  mangled mid-token.
+  The replay is bounded by `CONN_RETRIES` alone. The capture is *taken*, not cloned, so it does not
+  survive its own replay — but that does not make one request one replay: `start_stream` re-arms a
+  fresh capture on every `KeepAlive -> Connected` transition and `reused_from_pool` is never
+  cleared, so a replay that lands on another pooled connection may itself be replayed, and
+  `backend.retry.stale_upstream` can increment more than once for one client request. The re-link
+  goes back through `Router::connect`, whose existing `stream.attempts >= CONN_RETRIES` gate (3,
+  `lib/src/server.rs`) answers `503` and increments `backend.connect.retries_exhausted` once the
+  budget is spent — the same bound `lib/src/tcp.rs` already used, and the only bound here.
+  `Router::connect` skips `route_from_request` on a replay (`front.consumed` is the discriminator)
+  because routing already ran on the first attempt and its rewrites are baked into the captured
+  bytes; re-running it against a drained front kawa cannot reproduce them, and whatever the next
+  `prepare` did emit would land *behind* the replayed bytes as a second, partial copy of the
+  request. A replay whose routing decision did not survive, or whose cluster switched to HTTP/2
+  between attempts, is therefore refused outright through the new
+  `BackendConnectionError::ReplayRefused` and answered `502` — what the stream would have received
+  before the replay existed — instead of being re-routed against that drained kawa or having its H1
+  wire bytes framed as an HTTP/2 DATA payload.
+  Replaying the serialized form rather than re-running the block converter
+  also makes the re-issued request byte-identical to the first attempt — same `Sozu-Id`, same
+  `X-Forwarded-*` — so one client request still produces one access-log line and one
+  `http.requests` increment.
+  New counter `backend.retry.stale_upstream` (`lib/src/metrics/names.rs`, scoped
+  `cluster, backend`, documented in `doc/configure.md`) counts each replay, labelled with the
+  **stale** backend, and documented as counting "an upstream went away before answering" rather
+  than "the pool held a closed socket": a backend that half-closes after processing a request, or
+  that crashes mid-request, lands there too, so raising the upstream keep-alive idle timeout is the
+  right remedy for only one of those readings. Pinned by `test_issue_806`
+  (`e2e/src/tests/tests.rs`, green over 25 consecutive runs of 100 iterations where the same tree
+  without the replay decision was red on 25 of 25 — at the measured 4.3% per-trial rate a 100-trial
+  run still ends without exercising the race on about 1.2% of runs, so that is a strong signal and
+  not determinism) and by eight unit tests in `lib/src/protocol/mux/mod.rs` — which are eight
+  tests, not eight pieces of evidence that the replay works. THREE of them discriminate:
+  `a_stale_pooled_upstream_that_never_answered_is_replayed_not_502`,
+  `a_replay_is_queued_ahead_of_the_unwritten_tail`, and the first four assertions of
+  `queueing_a_replay_moves_the_captured_bytes_into_the_front_buffer`. The other FIVE pin the veto.
+  Each asserts `SendDefault(502)`, which is what `end_stream_decision` returned unconditionally for
+  every `front.consumed` case before this change, so none of them separates the old behaviour from
+  the new one: `a_non_idempotent_request_is_never_replayed_on_a_stale_upstream`,
+  `an_unknown_method_is_never_replayed_on_a_stale_upstream`,
+  `a_request_written_to_a_freshly_dialled_upstream_is_not_replayed`,
+  `a_buffered_response_byte_forecloses_the_replay` and
+  `a_forwarded_response_byte_forecloses_the_replay`. They are kept because the veto is the part a
+  later change is most likely to widen by accident, but they are a guard rail rather than evidence.
+  Three code paths this changeset documents carry no unit coverage at all and are named here rather
+  than claimed: the capture loop in `ConnectionH1::writable` including its budget check and its
+  overflow-to-`None`, both `BackendConnectionError::ReplayRefused` refusals in `Router::connect`,
+  and the `None` fallbacks in `ConnectionH1::end_stream` and `ConnectionH2::end_stream`.
+  No configuration key, CLI
+  flag or route changes; the conditions above are not tunable. Two attribution notes for anyone
+  reading the metrics: a replay makes a second pool lookup, so it increments
+  `backend.pool.hit`/`backend.pool.miss` twice for one client request; and `SessionMetrics.
+  backend_bout` accumulates across attempts, so the bytes written to the stale backend are charged
+  to the surviving one in `back_bytes_out`. `backend.requests`, `backend_connection_time` and
+  `backend_response_time` are emitted once, against the backend that actually served. Long-form map
+  in `lib/src/protocol/mux/LIFECYCLE.md` §8.5. Fixes #1442.
+
 - **`fix(command)`: re-arm `Ready::READABLE` on the read failures a channel can parse past, and
   count retired bytes as drain progress.** `Channel::read_message_nonblocking`
   (`command/src/channel.rs`) re-armed `Ready::READABLE` only on its `NothingRead` path; every error

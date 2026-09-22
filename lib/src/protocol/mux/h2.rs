@@ -6041,6 +6041,40 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         let answers = answers_rc.borrow();
                         set_default_answer(stream, &mut self.readiness, status, &answers);
                     }
+                    EndStreamAction::ReplayOnFreshBackend => {
+                        // Reachable only through an H1 BACKEND behind this H2
+                        // frontend: `reused_from_pool` — and so the captured
+                        // request — is set by `ConnectionH1::start_stream`
+                        // alone, and an H2 backend never fills it. The action
+                        // is handled here rather than merged into
+                        // `SendDefault` so the H2 frontend re-routes the same
+                        // stale-upstream race the H1 frontend does, with the
+                        // same bytes on the wire.
+                        match stream.queue_upstream_replay() {
+                            Some(len) => {
+                                debug!(
+                                    "{} H2 REPLAY {} request bytes on a fresh backend",
+                                    log_context!(self),
+                                    len
+                                );
+                                incr!(
+                                    names::backend::RETRY_STALE_UPSTREAM,
+                                    stream.context.cluster_id.as_deref(),
+                                    stream.context.backend_id.as_deref()
+                                );
+                                stream.state = StreamState::Link;
+                                context.pending_links.push_back(stream_gid);
+                            }
+                            None => {
+                                error!(
+                                    "{} replay selected with no captured request",
+                                    log_context!(self)
+                                );
+                                let answers = answers_rc.borrow();
+                                set_default_answer(stream, &mut self.readiness, 502, &answers);
+                            }
+                        }
+                    }
                     EndStreamAction::Reconnect => {
                         debug!("{} H2 RECONNECT", log_context!(self));
                         #[cfg(debug_assertions)]

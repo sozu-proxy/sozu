@@ -213,9 +213,10 @@ If the predicate holds, the guard increments
 short-circuit anything else in kawa — the very next line back in
 `kawa::h1::parse`'s loop re-checks `parsing_phase`, sees `Error`, and returns.
 
-The resulting `ParsingPhase::Error` is observed by the mux H1 connection
-(`lib/src/protocol/mux/h1.rs:314`), which checks `kawa.is_error()` immediately
-after `kawa::h1::parse` and, on the server side, calls
+The resulting `ParsingPhase::Error` is observed by the mux H1 connection in
+`ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs:383`), which checks
+`kawa.is_error()` immediately after `kawa::h1::parse` and, on the server side,
+calls
 `set_default_answer(..., 400, ...)` and returns — before routing or the
 per-frontend Basic-auth check (the `check_basic` guard in
 `Router::route_from_request`, `mux/router.rs`, calling
@@ -260,7 +261,7 @@ template-rendered Kawa streams. The relevant pieces:
 
 Status mapping `DefaultAnswer → u16` lives at `mod.rs:110`, and the status
 bucket / per-code metrics are emitted once, from
-`mux::stream::generate_access_log` (`lib/src/protocol/mux/stream.rs:356-380`).
+`mux::stream::generate_access_log` (`lib/src/protocol/mux/stream.rs:500-524`).
 
 ---
 
@@ -291,7 +292,7 @@ a wedged session, or a security regression.
    the tolerant variant is enabled only via the `tolerant-http1-parser`
    feature on `sozu-lib` and `sozu-bin` (`lib/Cargo.toml:121`,
    `bin/Cargo.toml:100`). Tolerant mode relaxes the hostname charset rules
-   (`parser.rs:120-143`). It must not be enabled in security-sensitive
+   (`parser.rs:158-181`). It must not be enabled in security-sensitive
    deployments without measuring the risk against the upstream backends'
    strictness.
 

@@ -669,6 +669,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             stream.back.storage.clear();
             stream.front.clear();
             stream.front.storage.clear();
+            stream.forget_upstream_replay();
             stream.metrics.reset();
             stream.metrics.mark_request_start();
             // After recycling a slot, check if the Vec has excessive trailing
@@ -1908,6 +1909,22 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                     retry_after,
                                 );
                             }
+                            // A stale-upstream replay whose preconditions no
+                            // longer hold (sozu-proxy/sozu#1442). 502 is the
+                            // answer this stream received before the replay
+                            // existed, so refusing costs the client nothing it
+                            // would not already have paid — and costs it far
+                            // less than H1 wire bytes framed as an HTTP/2 DATA
+                            // payload, or a second partial copy of the request
+                            // trailing the first.
+                            BE::ReplayRefused(reason) => {
+                                warn!(
+                                    "{} stale-upstream replay refused: {}",
+                                    log_module_context!(stream.context),
+                                    reason
+                                );
+                                set_default_answer(stream, front_readiness, 502, &answers);
+                            }
                         }
                         context.debug.push(DebugEvent::CCF(stream_id, error));
                     }
@@ -2579,6 +2596,7 @@ mod tests {
     use super::*;
     use crate::{
         pool::Pool,
+        protocol::http::parser::Method,
         protocol::mux::{
             h2::{ConnectionH2, H2ConnectionConfig, H2State},
             h2_flood_detector::H2FloodConfig,
@@ -2729,6 +2747,325 @@ mod tests {
             timeouts: HashMap::new(),
         };
         (mux, peer)
+    }
+
+    /// Stage the exact shape of sozu-proxy/sozu#1442: a request fully written
+    /// onto a REUSED keep-alive upstream that then closed without answering.
+    ///
+    /// `front.consumed` is what `end_stream_decision` reads to mean "the
+    /// request left the front buffer"; the armed `retry_buffer` is what
+    /// `ConnectionH1::writable` fills, and only ever on a connection whose
+    /// `reused_from_pool` is set.
+    fn stale_pooled_upstream_stream(
+        pool: &Rc<RefCell<Pool>>,
+        method: Method,
+    ) -> (
+        Mux<mio::net::TcpStream, test_support::TestListener>,
+        std::net::TcpStream,
+    ) {
+        let (mut mux, peer) = h1_mux_with_idle_stream(pool, Duration::from_secs(60));
+        let stream = &mut mux.context.streams[0];
+        stream.context.method = Some(method);
+        stream.arm_upstream_replay();
+        stream
+            .retry_buffer
+            .as_mut()
+            .expect("arm_upstream_replay must install a buffer")
+            .extend_from_slice(b"GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        stream.front.consumed = true;
+        // The upstream produced nothing: not in body phase, nothing forwarded,
+        // nothing buffered.
+        assert!(
+            !stream.back.is_main_phase() && !stream.back.consumed && stream.back.storage.is_empty(),
+            "precondition: the upstream must have produced no response at all"
+        );
+        (mux, peer)
+    }
+
+    /// Concatenate every byte `ConnectionH1::writable` would hand the socket,
+    /// in queue order. Mirrors its own `kawa.out` walk.
+    fn queued_request_bytes(front: &GenericHttpStream) -> Vec<u8> {
+        let buffer = front.storage.buffer();
+        front
+            .out
+            .iter()
+            .map(|block| match block {
+                kawa::OutBlock::Store(store) => store.data(buffer).to_vec(),
+                kawa::OutBlock::Delimiter => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    /// Stage the partial-write shape of sozu-proxy/sozu#1442 on the front
+    /// kawa: a real request, parsed and serialized exactly as
+    /// `ConnectionH1::writable` serializes it, of which the socket accepted
+    /// everything but the last `unwritten_tail` bytes.
+    ///
+    /// `kawa::Kawa::consume` pushes the partially consumed store back to the
+    /// FRONT of `out` (kawa-0.7.1 `storage/repr.rs`), so the refused tail
+    /// stays queued ahead of anything appended afterwards. That is what makes
+    /// the queue position of the replay load-bearing.
+    ///
+    /// Returns the complete serialization, which a correct replay reproduces
+    /// byte-for-byte.
+    fn stage_partially_written_pooled_request(
+        stream: &mut Stream,
+        unwritten_tail: usize,
+    ) -> Vec<u8> {
+        let request: &[u8] = b"GET /api HTTP/1.1\r\nHost: localhost\r\nX-Tail: unwritten\r\n\r\n";
+        stream.front.storage.space()[..request.len()].copy_from_slice(request);
+        stream.front.storage.fill(request.len());
+        kawa::h1::parse(&mut stream.front, &mut stream.context);
+        assert!(
+            stream.front.is_main_phase(),
+            "the staged request must parse"
+        );
+        stream.front.prepare(&mut kawa::h1::BlockConverter);
+        assert!(
+            stream.front.blocks.is_empty(),
+            "prepare must drain blocks, as it has by the time writable writes"
+        );
+
+        let serialized = queued_request_bytes(&stream.front);
+        let accepted = serialized
+            .len()
+            .checked_sub(unwritten_tail)
+            .expect("the unwritten tail must fit inside the serialized request");
+        stream.context.method = Some(Method::Get);
+        stream.retry_buffer = Some(serialized[..accepted].to_vec());
+        stream.front.consume(accepted);
+        stream.front.consumed = true;
+        serialized
+    }
+
+    /// The replay must be queued AHEAD of the bytes the kernel refused.
+    ///
+    /// `ConnectionH1::writable` handles a partial `socket_write_vectored` by
+    /// calling `signal_pending_write()` and returning `MuxResult::Continue`,
+    /// which leaves the unwritten remainder queued: `kawa::Kawa::consume`
+    /// pushes the partially consumed store back to the FRONT of `out`
+    /// (kawa-0.7.1 `storage/repr.rs`). `Kawa::push_out` APPENDS, so queueing
+    /// the capture with it would hand the healthy backend `[tail][head]` — a
+    /// request mangled mid-token, on the wire, to a backend that never saw
+    /// the first attempt.
+    ///
+    /// Reachable on an idempotent request large enough that the kernel
+    /// accepts only part of one write to a pooled upstream, followed by that
+    /// stale peer EOFing without answering.
+    ///
+    /// The remainder spans zero, one, three and thirteen `out` entries across
+    /// the cases below: `consume` pushes back at most ONE partially consumed
+    /// store and drops every entry before it, so how many survive depends on
+    /// where the split falls. Prepending is correct for all of them because
+    /// `VecDeque::push_front` preserves the relative order of what is already
+    /// queued, and the capture is exactly the complementary prefix.
+    ///
+    /// To SEE THIS RED: in `Stream::queue_upstream_replay`, swap the
+    /// `front.out.push_front(...)` back for `self.front.push_out(...)`.
+    #[test]
+    fn a_replay_is_queued_ahead_of_the_unwritten_tail() {
+        for (unwritten_tail, queued_entries) in [(0, 0), (2, 1), (21, 3), (100, 13)] {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+            let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+            let stream = &mut mux.context.streams[0];
+            let serialized = stage_partially_written_pooled_request(stream, unwritten_tail);
+            assert_eq!(
+                stream.front.out.len(),
+                queued_entries,
+                "staging a {unwritten_tail}-byte tail must leave {queued_entries} queued entries"
+            );
+            assert_eq!(
+                shared::end_stream_decision(stream),
+                shared::EndStreamAction::ReplayOnFreshBackend,
+                "a partially written request on a stale pooled upstream is still replayable"
+            );
+
+            stream
+                .queue_upstream_replay()
+                .expect("the staged stream carries a capture");
+
+            assert_eq!(
+                queued_request_bytes(&stream.front),
+                serialized,
+                "with a {unwritten_tail}-byte unwritten tail the fresh backend must \
+                 receive the request in its original order, not the tail first"
+            );
+        }
+    }
+
+    /// The defect of sozu-proxy/sozu#1442. A request written onto a pooled
+    /// keep-alive upstream that the peer had already closed must be replayed
+    /// on a fresh backend, not answered `502 Bad Gateway`: nothing was
+    /// observed by the client, so re-issuing it is unobservable. Measured
+    /// 2026-09-22 with only the replay decision reverted: 25 failures over
+    /// 576 pooled `test_issue_806` trials (4.3% per trial), 25 red runs of
+    /// 25; green on 25 of 25 with the replay in place.
+    ///
+    /// To SEE THIS RED: in `super::shared::end_stream_decision`, replace the
+    /// `can_replay_on_fresh_upstream()` branch with a bare
+    /// `EndStreamAction::SendDefault(502)` — the pre-fix shape.
+    #[test]
+    fn a_stale_pooled_upstream_that_never_answered_is_replayed_not_502() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mux, _peer) = stale_pooled_upstream_stream(&pool, Method::Get);
+        assert_eq!(
+            shared::end_stream_decision(&mux.context.streams[0]),
+            shared::EndStreamAction::ReplayOnFreshBackend,
+        );
+    }
+
+    /// The method veto. nginx keeps `non_idempotent` out of the
+    /// `proxy_next_upstream` default so `POST, LOCK, PATCH` are "not passed
+    /// to the next server if a request has been sent to an upstream server";
+    /// pingora's default `error_while_proxy` calls `set_retry(false)` on
+    /// `!method.is_idempotent()`. Replaying a POST can duplicate a write the
+    /// origin may already have committed.
+    ///
+    /// To SEE THIS RED: drop the `Method::is_idempotent` conjunct from
+    /// `Stream::can_replay_on_fresh_upstream`.
+    #[test]
+    fn a_non_idempotent_request_is_never_replayed_on_a_stale_upstream() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mux, _peer) = stale_pooled_upstream_stream(&pool, Method::Post);
+        assert_eq!(
+            shared::end_stream_decision(&mux.context.streams[0]),
+            shared::EndStreamAction::SendDefault(502),
+        );
+    }
+
+    /// An extension method sozu does not know the semantics of is treated
+    /// like POST. nginx's list is a closed `POST, LOCK, PATCH`; sozu parses
+    /// `PATCH` as `Method::Custom`, so refusing every `Custom` is what makes
+    /// PATCH non-replayable here without maintaining a second list.
+    #[test]
+    fn an_unknown_method_is_never_replayed_on_a_stale_upstream() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mux, _peer) = stale_pooled_upstream_stream(&pool, Method::new(b"PATCH"));
+        assert!(matches!(
+            mux.context.streams[0].context.method,
+            Some(Method::Custom(_))
+        ));
+        assert_eq!(
+            shared::end_stream_decision(&mux.context.streams[0]),
+            shared::EndStreamAction::SendDefault(502),
+        );
+    }
+
+    /// pingora's `RetryType::ReusedOnly`. The same EOF means "the pool handed
+    /// out a socket the peer had already closed" on a reused connection and
+    /// "the origin accepted the request and then died" on a fresh dial; only
+    /// the first is replayable. A fresh dial never arms the capture, so the
+    /// absent buffer IS the provenance check.
+    ///
+    /// To SEE THIS RED: drop the `retry_buffer.is_some()` conjunct from
+    /// `Stream::can_replay_on_fresh_upstream` — the provenance check itself.
+    /// NOT `ConnectionH1::writable`'s `reused_from_pool` guard: this test
+    /// never calls `writable`. It stages the capture through
+    /// `stale_pooled_upstream_stream` and clears it with
+    /// `Stream::forget_upstream_replay`, so a recipe naming the write path
+    /// cannot redden it however plausible it reads.
+    #[test]
+    fn a_request_written_to_a_freshly_dialled_upstream_is_not_replayed() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _peer) = stale_pooled_upstream_stream(&pool, Method::Get);
+        mux.context.streams[0].forget_upstream_replay();
+        assert_eq!(
+            shared::end_stream_decision(&mux.context.streams[0]),
+            shared::EndStreamAction::SendDefault(502),
+        );
+    }
+
+    /// The boundary itself: once a response byte exists the request is no
+    /// longer replayable. nginx — "passing a request to the next server is
+    /// only possible if nothing has been sent to a client yet". A byte merely
+    /// BUFFERED is already refused here, which is stricter: a partial status
+    /// line is HAProxy's `junk-response`, absent from every default.
+    ///
+    /// To SEE THIS RED: drop the `back.storage.is_empty()` conjunct from
+    /// `Stream::can_replay_on_fresh_upstream`.
+    #[test]
+    fn a_buffered_response_byte_forecloses_the_replay() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _peer) = stale_pooled_upstream_stream(&pool, Method::Get);
+        let back = &mut mux.context.streams[0].back;
+        back.storage.space()[..4].copy_from_slice(b"HTTP");
+        back.storage.fill(4);
+        assert!(!back.is_main_phase(), "a bare `HTTP` is not yet a response");
+        assert_eq!(
+            shared::end_stream_decision(&mux.context.streams[0]),
+            shared::EndStreamAction::SendDefault(502),
+        );
+    }
+
+    /// A response byte already FORWARDED to the client is the same refusal,
+    /// reached through the other conjunct.
+    ///
+    /// To SEE THIS RED: drop the `!back.consumed` conjunct from
+    /// `Stream::can_replay_on_fresh_upstream`.
+    #[test]
+    fn a_forwarded_response_byte_forecloses_the_replay() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _peer) = stale_pooled_upstream_stream(&pool, Method::Get);
+        mux.context.streams[0].back.consumed = true;
+        assert_eq!(
+            shared::end_stream_decision(&mux.context.streams[0]),
+            shared::EndStreamAction::SendDefault(502),
+        );
+    }
+
+    /// The replay re-serializes the captured bytes and nothing else: they go
+    /// back into `front.out` as an owned store, `front.blocks` stays empty so
+    /// `kawa::Kawa::prepare` contributes nothing, and the buffer is taken so
+    /// one capture cannot be replayed twice. That is not a per-REQUEST bound:
+    /// `ConnectionH1::start_stream` arms a fresh capture on the next pooled
+    /// attempt, and `CONN_RETRIES` is what bounds the request as a whole.
+    ///
+    /// To SEE THIS RED: make `Stream::queue_upstream_replay` clone the buffer
+    /// instead of taking it.
+    #[test]
+    fn queueing_a_replay_moves_the_captured_bytes_into_the_front_buffer() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _peer) = stale_pooled_upstream_stream(&pool, Method::Get);
+        let stream = &mut mux.context.streams[0];
+        let captured = stream
+            .retry_buffer
+            .as_ref()
+            .expect("the staged stream carries a capture")
+            .clone();
+
+        assert_eq!(stream.queue_upstream_replay(), Some(captured.len()));
+
+        assert!(
+            stream.retry_buffer.is_none(),
+            "the capture must be taken, not cloned: it cannot outlive its replay"
+        );
+        assert!(
+            stream.front.blocks.is_empty(),
+            "prepare must have nothing to convert, or it would prepend a \
+             second copy of the request line"
+        );
+        let buffer = stream.front.storage.buffer();
+        let queued: Vec<u8> = stream
+            .front
+            .out
+            .iter()
+            .map(|block| match block {
+                kawa::OutBlock::Store(store) => store.data(buffer).to_vec(),
+                kawa::OutBlock::Delimiter => Vec::new(),
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(
+            queued, captured,
+            "the replayed request must be byte-identical to the first attempt"
+        );
+        assert_eq!(
+            shared::end_stream_decision(stream),
+            shared::EndStreamAction::SendDefault(502),
+            "with the capture spent and nothing re-arming it, a second stale \
+             upstream falls back to 502"
+        );
     }
 
     /// Park the frontend core's next deadline at an exact instant, then push it

@@ -85,6 +85,44 @@ impl Method {
             Method::Custom(String::from_utf8_lossy(s).into_owned())
         }
     }
+
+    /// RFC 9110 §9.2.2: is re-issuing this request equivalent to issuing it
+    /// once?
+    ///
+    /// Used by the mux to decide whether a request already written to a
+    /// pooled upstream connection may be replayed on a fresh one after the
+    /// peer turned out to have closed it (`Stream::can_replay_on_fresh_
+    /// upstream`). `Method::Custom` is deliberately NOT idempotent: an
+    /// extension method sozu does not know the semantics of is treated like
+    /// POST, matching nginx's closed `POST, LOCK, PATCH` list being an
+    /// opt-in carve-out rather than an inferred property, and pingora's
+    /// `http::Method::is_idempotent` returning false for anything it does
+    /// not recognise as safe.
+    ///
+    /// `CONNECT` is excluded: RFC 9110 §9.3.6 makes it neither safe nor
+    /// idempotent, and sozu upgrades it out of the request/response path
+    /// anyway.
+    ///
+    /// Caveat, pre-existing and not introduced here: [`Method::new`] matches
+    /// case-INSENSITIVELY (`compare_no_case`), while RFC 9110 §9.1 makes the
+    /// method token case-sensitive. So `get` parses to [`Method::Get`] and is
+    /// judged idempotent here, while the origin receives the original `get`
+    /// bytes and may treat them as an unrecognised method with semantics of
+    /// its own. The stale-upstream replay (sozu-proxy/sozu#1442) is the first
+    /// caller for which that gap is load-bearing. Narrowing `Method::new`
+    /// would change routing, metrics and access-log behaviour well beyond
+    /// this gate, so it is tracked separately rather than folded in here.
+    pub fn is_idempotent(&self) -> bool {
+        match self {
+            Method::Get
+            | Method::Head
+            | Method::Put
+            | Method::Delete
+            | Method::Options
+            | Method::Trace => true,
+            Method::Post | Method::Connect | Method::Custom(_) => false,
+        }
+    }
 }
 
 impl AsRef<str> for Method {

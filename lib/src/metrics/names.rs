@@ -59,6 +59,25 @@ pub mod backend {
     pub const DOWN: &str = "backend.down";
     pub const CONNECTIONS_ERROR: &str = "backend.connections.error";
     pub const CONNECT_RETRIES_EXHAUSTED: &str = "backend.connect.retries_exhausted";
+
+    /// An idempotent request written onto a pooled keep-alive upstream that
+    /// then closed without answering was replayed on a fresh backend instead
+    /// of being answered `502 Bad Gateway` (sozu-proxy/sozu#1442). Labelled
+    /// with the cluster and the STALE backend — the one that did not answer.
+    ///
+    /// One request can increment this more than once: the replay goes back
+    /// through `Router::connect`, so `CONN_RETRIES` bounds the total, not
+    /// this counter.
+    ///
+    /// Read it as "an upstream went away before answering", NOT as "the pool
+    /// held a closed socket". sozu cannot tell those apart: a backend that
+    /// half-closes after processing a request, and one that crashes
+    /// mid-request, both land here. Raising the upstream keep-alive idle
+    /// timeout above sozu's is the right fix only for the first reading, so
+    /// check the backends' own error rate and restart/OOM history before
+    /// reaching for it — if they are dying mid-request, this counter is
+    /// reporting that, and the idle timeout will not move it.
+    pub const RETRY_STALE_UPSTREAM: &str = "backend.retry.stale_upstream";
 }
 
 /// Buffer-pool gauges and counters.

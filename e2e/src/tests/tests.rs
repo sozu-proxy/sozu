@@ -450,6 +450,67 @@ pub fn try_sync(nb_clients: usize, nb_requests: usize) -> State {
     }
 }
 
+/// How long the reconnect to a surviving backend may take, once the backend
+/// a session was using is stopped from under it.
+///
+/// Issue 806 is a reconnect that waits for a timeout instead. On loopback,
+/// against a mock backend, a healthy reconnect costs well under a
+/// millisecond, so this is ~100x headroom and a breach means sozu waited on
+/// something rather than that the machine was busy.
+///
+/// Measured 2026-09-22, pooled over 25 runs = 401 trials, counting only the
+/// 376 that actually re-routed: min 0.242 ms, median 0.636 ms, p99 1.043 ms,
+/// max 1.462 ms — 68x under the bound at its worst. The 25 trials that did
+/// NOT re-route are excluded on purpose: they answer 502 off the stale
+/// connection and are the *fastest* samples in the set (min 0.209 ms, median
+/// 0.308 ms), so folding them in lowers every statistic and makes a failure
+/// look like headroom. For the same reason this bound must not be tightened
+/// on the strength of those numbers: it would bite healthy reconnects while
+/// leaving the 502s, which are quicker than all of them, untouched.
+///
+/// To SEE THIS RED: insert `std::thread::sleep(Duration::from_millis(150))`
+/// immediately before the `mio::net::TcpStream::connect` in
+/// `Backend::try_connect` (`lib/src/backends.rs`). Measured 2026-09-22:
+/// `reconnecting to another backend took 165.363581ms, over the 100ms
+/// budget`, failing on the first of the 100 iterations with the re-route
+/// itself intact (`backend2` served `(1, 1)`, status 200), so the budget
+/// branch is reached and red on its own and not through the status check
+/// above it. The same break leaves the pre-#1427 shape of this test GREEN,
+/// which is what it was reported for.
+const RECONNECT_BUDGET_MS: u64 = 100;
+const RECONNECT_BUDGET: Duration = Duration::from_millis(RECONNECT_BUDGET_MS);
+
+/// How long the mock client waits on the reconnect before giving up.
+///
+/// Derived from [`RECONNECT_BUDGET`] rather than written out, because the
+/// ordering is the point: `Client::connect` applies a 100 ms read timeout
+/// (`e2e/src/mock/client.rs:44`), exactly the budget, so a reconnect slow
+/// enough to breach the budget makes `receive` time out *first* and the
+/// comparison is never reached. The socket has to outlast the budget for the
+/// budget to be the thing that decides.
+///
+/// It does not outlast every slow reconnect, and is not meant to: 10x the
+/// budget is 1 s, while `DEFAULT_REQUEST_TIMEOUT` is 10 s, so a reconnect
+/// that really waits for sozu's own timeout still trips the client first and
+/// is reported by the `client could not complete its requests` branch. That
+/// is the same `State::Fail` verdict, reached through a different message —
+/// the branches differ in what they tell the reader, not in what they
+/// return. Widening this past 10 s would move such a trial into the budget
+/// branch at the cost of a 10 s stall per trial, which is not worth a
+/// wording.
+const CLIENT_PATIENCE: Duration = Duration::from_millis(RECONNECT_BUDGET_MS * 10);
+
+/// The status line the request after the backend stop must come back with.
+///
+/// `Client::receive` returns `Some` for *any* bytes, so a sozu-generated
+/// error page satisfies "the client completed its requests" just as well as
+/// a proxied response. Measured 2026-09-22, 2-9% of trials per run answered
+/// `502 Bad Gateway` from `backend_id: cluster_0-0` — the stopped backend —
+/// with `parsing_phase: Error`, meaning sozu wrote the request to the
+/// keep-alive connection it had not yet noticed was closed and did not
+/// re-route. Those trials are exactly what this test exists to catch.
+const RECONNECT_STATUS_LINE: &str = "HTTP/1.1 200 OK";
+
 pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
     let front_address = create_local_address();
 
@@ -471,7 +532,7 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
     let mut backend2 = backends.pop().expect("backend2");
     let mut backend1 = backends.pop().expect("backend1");
 
-    let mut aggregator = Some(SimpleAggregator {
+    let mut backend1_aggregator = Some(SimpleAggregator {
         requests_received: 0,
         responses_sent: 0,
     });
@@ -482,41 +543,155 @@ pub fn try_backend_stop(nb_requests: usize, zombie: Option<u32>) -> State {
         http_request("GET", "/api", "ping", "localhost"),
     );
     client.connect();
+    let stream = client.stream.as_ref().expect("the client is connected");
+    stream
+        .set_read_timeout(Some(CLIENT_PATIENCE))
+        .expect("could not set read timeout");
+    stream
+        .set_write_timeout(Some(CLIENT_PATIENCE))
+        .expect("could not set write timeout");
 
-    let start = Instant::now();
+    // The budget below is written for the reconnect alone, so only the
+    // reconnect may be timed. The round trips issued while `backend1` is
+    // still up are warm-up, and `stop_and_get_aggregator` shuts a harness
+    // thread down; timing either against a proxy budget measures the test
+    // rig. The reconnect is the first round trip issued once `backend1` is
+    // gone: its back connection is dead, so sozu has to notice and route
+    // the request to `backend2` instead.
+    let mut backend1_stopped = false;
+    let mut reconnect = None;
+    let mut client_completed_requests = true;
     for i in 0..nb_requests {
+        let times_the_reconnect = backend1_stopped && reconnect.is_none();
+        let round_trip_start = Instant::now();
         if client.send().is_none() {
+            client_completed_requests = false;
             break;
         }
-        match client.receive() {
-            Some(response) => println!("{response}"),
-            None => break,
+        // The clock stops on the bytes arriving, before they are printed:
+        // under `--nocapture` that `println!` is a write to the terminal and
+        // has no business inside a budget written for sozu.
+        let received = client.receive();
+        let round_trip = round_trip_start.elapsed();
+        let Some(response) = received else {
+            client_completed_requests = false;
+            break;
+        };
+        println!("{response}");
+        if times_the_reconnect {
+            // Duration and response travel together so the two can never
+            // disagree about which round trip was the reconnect.
+            reconnect = Some((round_trip, response));
         }
         if i == 0 {
-            aggregator = backend1.stop_and_get_aggregator();
+            backend1_aggregator = backend1.stop_and_get_aggregator();
+            backend1_stopped = true;
         }
     }
-    let duration = Instant::now().duration_since(start);
 
     worker.soft_stop();
     let success = worker.wait_for_server_stop();
+    let backend2_aggregator = backend2.stop_and_get_aggregator();
 
     println!(
         "sent: {}, received: {}",
         client.requests_sent, client.responses_received
     );
-    println!("backend1 aggregator: {aggregator:?}");
-    aggregator = backend2.stop_and_get_aggregator();
-    println!("backend2 aggregator: {aggregator:?}");
+    println!("backend1 aggregator: {backend1_aggregator:?}");
+    println!("backend2 aggregator: {backend2_aggregator:?}");
+
+    let served = |aggregator: &Option<SimpleAggregator>| {
+        aggregator
+            .as_ref()
+            .map(|a| (a.requests_received, a.responses_sent))
+    };
+    let backend1_served = served(&backend1_aggregator);
+    let backend2_served = served(&backend2_aggregator);
 
     if !success {
-        State::Fail
-    } else if duration > Duration::from_millis(100) {
-        // Reconnecting to unother backend should have lasted less that 100 miliseconds
-        State::Undecided
-    } else {
-        State::Success
+        // `wait_for_server_stop` is false only when joining the worker
+        // thread returns `Err`, i.e. the worker panicked.
+        println!("the worker thread did not join cleanly");
+        return State::Fail;
     }
+    if !client_completed_requests {
+        // `send`/`receive` returned `None`: sozu dropped the front
+        // connection or let it time out. `backend2` is up for the whole
+        // trial, so nothing legitimately keeps the client from being
+        // served, and issue 806's own symptom is the request that follows
+        // the backend stop never completing. Before, both paths only broke
+        // out of the loop, which *shortened* the measured span and so made
+        // a pass more likely.
+        println!("client could not complete its {nb_requests} requests");
+        return State::Fail;
+    }
+
+    // Not a trial outcome: with `nb_requests >= 2` the loop above either
+    // recorded the round trip that followed the backend stop or left through
+    // the `client_completed_requests` branch. A caller passing less than 2
+    // asks for a reconnect test without a reconnect.
+    let (reconnect_duration, reconnect_response) =
+        reconnect.expect("nb_requests must be at least 2 for a request to follow the backend stop");
+    println!("reconnect: {reconnect_duration:?}");
+
+    if backend1_served != Some((1, 1)) {
+        // The warm-up request has to have been served by the backend that is
+        // then stopped, or there is no stale back connection for sozu to
+        // re-route off and the trial has nothing to say about issue 806.
+        // Which backend takes it is the load balancer's call, so this is a
+        // trial that could not set up its measurement, not an observation of
+        // the defect — the same classification as
+        // `try_h2_dual_backend_failure_no_gauge_underflow`
+        // (`e2e/src/tests/h2_tests.rs`), whose own test also asserts
+        // `State::Success`.
+        //
+        // `Undecided` is NOT tolerated at the assertion, and that is not a
+        // contradiction. `run_stability_check` (`e2e/src/tests/mod.rs`) stops
+        // at the first trial that is not `Success`, so an interrupted 100-run
+        // check performed fewer than 100 trials and has therefore not measured
+        // the property `test_issue_806` claims — `State::Success` is the only
+        // assertion that means what the test says. What the separate state
+        // buys is the diagnosis: the run reports "stability check INTERRUPTED:
+        // iteration i of 100 was undecided" and the line below names the setup
+        // that did not hold, instead of reading as "issue 806 reproduced".
+        // Observed on 300 of 300 trials measured 2026-09-22 the warm-up landed
+        // on the stopped backend, so an `Undecided` here is itself a change
+        // worth surfacing rather than an outcome to accept.
+        println!("the stopped backend served {backend1_served:?}, expected Some((1, 1))");
+        return State::Undecided;
+    }
+
+    // The re-route itself, asserted before anything is timed: a budget only
+    // means something once the thing it bounds actually happened.
+    //
+    // `client.receive` returns `Some` for any bytes at all, so without these
+    // two a sozu-generated `502 Bad Gateway` reads exactly like a proxied
+    // response, and the counters below were printed and never asserted --
+    // the `#1381` shape `try_issue_810_timeout` names further down.
+    if !reconnect_response.starts_with(RECONNECT_STATUS_LINE) {
+        println!(
+            "the request after the backend stop was answered {:?}, not {RECONNECT_STATUS_LINE:?}",
+            reconnect_response.lines().next().unwrap_or_default()
+        );
+        return State::Fail;
+    }
+    if backend2_served != Some((1, 1)) {
+        println!("the surviving backend served {backend2_served:?}, expected Some((1, 1))");
+        return State::Fail;
+    }
+
+    if reconnect_duration > RECONNECT_BUDGET {
+        // The property issue 806 is about. `Fail`, not `Undecided`: the
+        // reconnect was measured and it was too slow. Elsewhere in this
+        // suite `Undecided` means a trial could not set up its
+        // measurement, never that the measured property was violated.
+        println!(
+            "reconnecting to another backend took {reconnect_duration:?}, \
+             over the {RECONNECT_BUDGET:?} budget"
+        );
+        return State::Fail;
+    }
+    State::Success
 }
 
 pub fn try_h1_idle_connection_zombie_metric_increments() -> State {
@@ -3007,16 +3182,53 @@ fn test_soft_stop() {
 }
 
 // https://github.com/sozu-proxy/sozu/issues/806
-// This should actually be a success
+//
+// This test was RED when its assertions were hardened. sozu wrote the request
+// onto a keep-alive back connection whose peer it had not yet noticed closed,
+// then answered `502 Bad Gateway` off that connection (`backend_id:
+// cluster_0-0`, `parsing_phase: Error`) rather than re-routing to the
+// surviving backend.
+//
+// Measured 2026-09-22, on this tree with only the replay decision in
+// `end_stream_decision` reverted to a bare `SendDefault(502)` and everything
+// else identical: 25 red runs out of 25, 25 failures over 576 pooled trials
+// (4.3% per trial), the failing iteration ranging from 1 to 81.
+//
+// `repeat_until_error_or` stops at the first failure, so a run performs
+// between 1 and `n` trials, not `n` — which is why 25 runs pool to 576 trials
+// rather than 2500, and why the per-trial rate is the figure to reason about.
+//
+// sozu-proxy/sozu#1442 fixed that: `end_stream_decision`
+// (`lib/src/protocol/mux/shared.rs`) now returns
+// `EndStreamAction::ReplayOnFreshBackend` for a request written onto a POOLED
+// keep-alive upstream that produced no response byte, and the captured bytes
+// are re-issued on a fresh backend. Measured the same day after the fix: 25
+// runs of 25 green, i.e. 2500 consecutive clean trials. A `panic!` staged in
+// the replay branch fires on this test (`PROBE replay branch reached with 300
+// bytes`, iteration 14), so the green comes from the replay actually running
+// and not from the race going quiet.
+//
+// The assertion must not be loosened. `!= State::Fail` and the unasserted
+// response status are what kept this test green across that 4.3%; restoring
+// either would certify the defect rather than report it, and so would
+// dropping `n` far enough for a 4.3% per-trial rate to stop showing.
+//
+// Nor is 100 iterations a determinism proof. At the measured 4.3% per-trial
+// rate a 100-trial run reaches the end without ever exercising the race on
+// (1 - 0.043)^100 ≈ 1.2% of runs, so "25 runs of 25 green" is a strong
+// signal, not a certainty. The deterministic gate is the unit set in
+// `lib/src/protocol/mux/mod.rs`; this test is the end-to-end corroboration.
 
 #[test]
 fn test_issue_806() {
-    assert!(
+    assert_eq!(
         repeat_until_error_or(
             100,
-            "issue 806: timeout with invalid back token\n(not fixed)",
+            "issue 806: a session whose backend is stopped must be re-routed to\n\
+             a surviving backend within the reconnect budget, not after a timeout",
             || try_backend_stop(2, None)
-        ) != State::Fail
+        ),
+        State::Success
     );
 }
 
