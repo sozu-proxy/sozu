@@ -139,6 +139,7 @@ mod converter;
 pub mod debug;
 mod h1;
 mod h2;
+mod h2_flow_control;
 mod hpack_state;
 pub mod parser;
 mod pkawa;
@@ -177,7 +178,6 @@ pub use crate::protocol::mux::{
     h2::H2ConnectionConfig,
     h2::H2DrainState,
     h2::H2FloodConfig,
-    h2::H2FlowControl,
     parser::H2Error,
     router::Router,
     stream::{Stream, StreamParts, StreamState},

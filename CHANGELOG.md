@@ -1759,6 +1759,46 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: connection-level HTTP/2 flow control (RFC 9113 §6.9) moves into its own
+  `lib/src/protocol/mux/h2_flow_control.rs`, behind the same closed-API shape
+  `hpack_state.rs` established for the HPACK coders.** `H2FlowControl` (send window,
+  receive-side byte accounting, the pending WINDOW_UPDATE queue), `queue_window_update`, the
+  connection-level (`stream_id == 0`) arm of `handle_window_update_frame`'s window arithmetic, and
+  the WINDOW_UPDATE drain stage of `flush_pending_control_frames` all move; `ConnectionH2` keeps only
+  the frame-dispatch orchestration (flood counters, logging, GOAWAY) that needs `self`. The
+  per-stream arm of `handle_window_update_frame` and `Stream.window` are unaffected — they stay on
+  `ConnectionH2`/`Stream` pending a later step. The new type's transmit surface,
+  `drain_window_updates_into(&mut self, buf: &mut [u8]) -> (usize, usize)`, follows the house
+  `serializer::gen_*(buf, ...)` caller-supplied-buffer contract: it writes into the caller's existing
+  `zero.storage` ring buffer and never allocates or returns owned bytes.
+  One deliberate behaviour change comes with it, so "pure relocation" is not literally true:
+  `pending_window_updates` was a `HashMap<u32, u32>`, and the drain loop serialized it in the map's
+  iteration order — seeded per-process (`RandomState`), so which stream's WINDOW_UPDATE reached the
+  wire first was **non-deterministic across process restarts**, one of the order leaks
+  sozu-proxy/sozu#1338 decided to close. It is now a `BTreeMap`, so drain order is the deterministic
+  ascending stream-id total order; the connection-level entry (key `0`) always sorts first, which is
+  also the protocol-friendlier choice (it unblocks every stream at once). A second, narrower
+  correctness fix rides along: `queue_window_update` used to insert a zero-increment entry into the
+  pending map for an empty non-END_STREAM DATA frame (`wire_payload_len == 0`) and let the drain
+  stage silently skip it; it now treats `increment == 0` as a no-op and queues nothing. This does
+  **not** change the `h2.connection.pending_window_updates` gauge — that gauge is sampled only from
+  `gauge_connection_state`, reached only through `write_streams` on the `writable()` path, and
+  `flush_pending_control_frames` (which already stripped any zero-increment entry) runs at the top
+  of that same `writable()` call, before the gauge is ever read, so the gauge never observed a dead
+  entry either way. What the fix changes is the pending map's state *at rest*, in the window between
+  the `readable()` pass that used to insert a zero entry and the next `writable()` pass that would
+  have flushed it: fewer inserts and removes, and a `check_invariants` invariant ("a queued increment
+  is never zero") that holds unconditionally rather than only by the time anything looks.
+  `H2FlowControl` carries `debug_assert!` pre/post-conditions on every mutating method plus a
+  `#[cfg(debug_assertions)] check_invariants()` sweep (a queued increment is never zero) run as a
+  post-condition of each, exactly as `protocol::udp::manager::UdpManager` does. The RFC 9113 §6.9.1
+  `2^31 - 1` ceiling is asserted where it is actually checkable — `apply_window_update`'s overflow
+  arm widens to `i64` and confirms `checked_add` rejected the increment because the true sum exceeds
+  `i32::MAX`, rather than comparing the already-`i32` window against `i32::MAX` on the struct itself,
+  which clippy's `absurd_extreme_comparisons` correctly rejects as a tautology (the type already
+  guarantees it). Complexity is unmeasured beyond the default `max_concurrent_streams`: see the
+  module's doc comment.
+
 - **`refactor(mux)`: the H1/H2 cores publish a next-timeout deadline instead of owning a timer
   handle; the `Mux` adapter owns every `TimeoutContainer`.**
   No behaviour change. `ConnectionH1` and `ConnectionH2` no longer hold a `TimeoutContainer` and no
