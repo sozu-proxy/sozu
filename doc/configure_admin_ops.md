@@ -178,17 +178,55 @@ concurrency, and re-sample after one second.
 Commit: `18c251f1`. Reference: `command/src/channel.rs`.
 
 The supervisor↔worker `Channel` framing carries a `usize`-prefixed
-message length. The new upper bound rejects any peer-sent length that
-exceeds the configured `command_buffer_size`, so a malformed worker
-cannot trick the supervisor into allocating a multi-gigabyte read
-buffer. The default `command_buffer_size = 16384` is generous for the
-verbs Sōzu speaks today; raise it (in tandem on both ends) if you
-introduce a verb whose payload genuinely exceeds the cap.
+message length. The upper bound rejects any peer-sent length that
+exceeds the configured `max_command_buffer_size` — **not**
+`command_buffer_size` — so a malformed worker cannot trick the
+supervisor into allocating a multi-gigabyte read buffer.
+`Channel::try_read_delimited_message` compares the declared
+`message_len` against the channel's private `max_buffer_size` field,
+and `Channel::write_delimited_message` (reached from `write_message`)
+bounds an outgoing frame against that same field. Every *production*
+construction site populates it from `max_command_buffer_size`:
+`bin/src/command/server.rs`, `bin/src/worker.rs`, `bin/src/ctl/mod.rs`
+and `bin/src/upgrade.rs`. No other construction site says anything
+about the shipped bound: the unit tests in `command/src/channel.rs`,
+`lib/src/http.rs`, `lib/src/server.rs` and `lib/src/tcp.rs`, and all
+three example programs under `lib/examples/` — `http.rs`, `https.rs`
+and `tcp.rs` — pass literal sizes, while the end-to-end harness
+(`Worker::create_server` and `Worker::spawn_worker` in
+`e2e/src/sozu/worker.rs`) does build its channels from
+`command_buffer_size` and `max_command_buffer_size`, but from a
+configuration the test run assembles rather than a deployed one.
 
-When the cap is exceeded the supervisor logs and drops the offending
-peer's session; the worker observes the drop as an EOF on its channel
-and is restarted by the supervisor's standard worker-respawn path
-(when `worker_automatic_restart` is enabled).
+The two keys are distinct, default independently, and are not
+interchangeable:
+
+| key | role | default |
+| --- | --- | --- |
+| `command_buffer_size` | initial capacity a channel buffer is allocated at, and the capacity it shrinks back to once drained — on the supervisor↔worker channels (`bin/src/worker.rs`, `bin/src/upgrade.rs`, `CommandHub::from_upgrade_data`) and on the CLI's own channel (`bin/src/ctl/mod.rs`). It does **not** size the command-socket client channel: `CommandHub::register_client` allocates that one at a hardcoded `4096` and only its ceiling comes from configuration | `DEFAULT_COMMAND_BUFFER_SIZE`, `1_000_000` bytes |
+| `max_command_buffer_size` | ceiling the buffers may grow to by doubling, **and** the bound a peer-declared `message_len` is rejected against | `DEFAULT_MAX_COMMAND_BUFFER_SIZE`, `2_000_000` bytes |
+
+`command_buffer_size` must never exceed `max_command_buffer_size`: the
+first is the capacity a channel buffer is configured to start at and to
+shrink back to once drained, the second is the ceiling that buffer may
+never grow past, so a pair in the other order asks for a starting
+buffer larger than the bound that must contain it. Check the two values
+against each other whenever you change either.
+
+So raise `max_command_buffer_size` (in tandem on both ends) if you
+introduce a verb whose payload genuinely exceeds the cap. Lowering
+`command_buffer_size` tightens nothing — it only makes the channel
+start smaller and grow more often. Note also that all four
+configuration files shipped in this repository — `bin/config.toml`,
+`os-build/config.toml`, `command/assets/config.toml` and
+`.github/workflows/bench.toml` — set both keys explicitly and below
+these defaults, so read the values actually in force rather than
+assuming the built-in ones.
+
+What the supervisor does with a frame the cap rejects is deliberately
+not stated here: the handling of `MessageTooLarge` on the command
+channel is the subject of the open issue sozu-proxy/sozu#1428, and this
+section will name the behaviour once that is settled.
 
 ### 5.3 Drop-on-register-fail for the unix command socket
 

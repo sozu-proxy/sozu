@@ -222,6 +222,50 @@
   `lib/src/metrics/mod.rs::tests`.
   Closes [#1408](https://github.com/sozu-proxy/sozu/issues/1408).
 
+- **`docs(command)`: `doc/configure_admin_ops.md` §5.2 named the wrong key for the command channel's
+  wire-length bound, and the wrong default for it.** The section told an operator the framing rejects
+  a peer-declared `message_len` that exceeds `command_buffer_size`, "default `16384`". Both halves
+  were wrong. `Channel::try_read_delimited_message` (`command/src/channel.rs`) compares `message_len`
+  against the channel's `max_buffer_size` field, and `Channel::write_delimited_message` bounds an
+  outgoing frame against the same field; every *production* construction site
+  (`bin/src/command/server.rs`, `bin/src/worker.rs`, `bin/src/ctl/mod.rs`, `bin/src/upgrade.rs`)
+  fills that field from `max_command_buffer_size`, never from `command_buffer_size`. And `16384` is
+  not a default at all — it is the value three of the four configuration files shipped here override
+  to; the built-in defaults are `DEFAULT_COMMAND_BUFFER_SIZE` = `1_000_000` and
+  `DEFAULT_MAX_COMMAND_BUFFER_SIZE` = `2_000_000` (`command/src/config.rs`). Under
+  the defaults the document understated the accepted bound by a factor of two, and an operator
+  tightening the bound against a hostile peer was pointed at the knob that does not set it. §5.2 now
+  names `max_command_buffer_size`, tabulates what each of the two keys actually controls
+  (`command_buffer_size` is the initial and shrink-back capacity of the supervisor↔worker and
+  CLI channels — not of the command-socket client channel, which `CommandHub::register_client`
+  allocates at a hardcoded `4096`; `max_command_buffer_size` is the growth ceiling **and** the
+  wire-length bound, everywhere) with each key's real default, and says that lowering
+  `command_buffer_size` tightens nothing. Closes #1421.
+- **`docs(config)`: the shipped example configurations claimed `max_command_buffer_size` "defaults to
+  `command_buffer_size * 2`". It does not.** `bin/config.toml` and `os-build/config.toml` annotate a
+  TOML key, and the TOML path (`ConfigBuilder::new`, `command/src/config.rs`) resolves an
+  omitted `max_command_buffer_size` to the flat `DEFAULT_MAX_COMMAND_BUFFER_SIZE` = `2_000_000`,
+  independently of `command_buffer_size`. The doubling lives only in
+  `resolve_max_command_buffer_size` (`bin/src/main.rs`), which serves the internal `worker` / `main`
+  re-exec subcommands its own doc comment describes as "never operator-facing". An operator who set
+  `command_buffer_size = 163_840` and omitted the max was told to expect `327_680` and got
+  `2_000_000`. Both comments now state the real default.
+- **`docs(protocol)`: `doc/protocol.md` gave the command-channel ceiling as "2 MiB" twice.**
+  `DEFAULT_MAX_COMMAND_BUFFER_SIZE` is `2_000_000` bytes — 2 MB, not 2 MiB — which is how
+  `command/src/config.rs` and `bin/src/command/server.rs` already describe it. Corrected to `2 MB` so
+  the four sites agree.
+- **`docs(command)`: four files — two documents and the two shipped example configurations — claimed
+  the command channel closes the connection when a frame declares a length above the cap. It does
+  not.** `doc/configure_admin_ops.md` §5.2 said the supervisor "logs and drops the offending peer's
+  session"; `doc/protocol.md` said "the channel is closed"; `bin/config.toml` and
+  `os-build/config.toml` said "sozu will close the connection".
+  `try_read_delimited_message` (`command/src/channel.rs`) returns `ChannelError::MessageTooLarge`,
+  `extract_messages` (`bin/src/command/sessions.rs`) discards every read error without logging it,
+  `ClientSession::ready` then returns `ClientResult::NothingToDo`, and `WorkerSession::ready` returns
+  `CloseSession` only for `is_error()`/`is_hup()` readiness, which a parse error never sets. The four
+  sites no longer assert a behaviour the code does not have; naming what does happen is left to
+  #1428, which tracks the defect.
+
 ### 🔐 Security
 
 - **`fix(mux-h2)`: decode a refused stream's HPACK field block instead of dropping it, so the
