@@ -168,7 +168,7 @@ into logical sub-structs for maintainability:
 
 - `H2FlowControl` — connection-level window, peer window, initial window size
 - `H2ByteAccounting` — overhead bytes, zero-window count
-- `H2DrainState` — GoAway sent flag, last stream ID, pending RST streams
+- `H2DrainState` — RFC 9113 §6.8 GOAWAY/graceful-drain state machine; fields private to `h2_drain.rs`
 - `H2FloodConfig` — 6 configurable flood detection thresholds (per-listener)
 - `Prioriser` — RFC 9218 urgency + incremental tracking per stream
 
