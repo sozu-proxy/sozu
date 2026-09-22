@@ -374,6 +374,38 @@
   raw struct literal, `Channel::new` is the *only* place a `Channel` is built (its buffer-size fields
   are private), so this clamp cannot be routed around. Closes #1416.
 
+- **`fix(cli)`: `--load-balancing-policy` help now names the values the parser actually accepts.**
+  The flag's help (`bin/src/cli.rs:455`) advertised `'roundrobin'`, `'random'` and
+  `'leastconnections'`, while the value is consumed by `FromStr for LoadBalancingAlgorithms`
+  (`command/src/request.rs:301`), which matches only `round_robin`, `random`, `power_of_two`,
+  `least_loaded`, `hrw` and `maglev`, case-insensitively via `s.to_lowercase()`. Two of the three
+  advertised spellings matched no arm and four accepted values went undocumented. Because the field
+  is typed `LoadBalancingAlgorithms`, clap resolves a `FromStr`-backed value parser and rejects a bad
+  value during argument parsing, before any I/O: `sozu cluster add --id demo
+  --load-balancing-policy roundrobin` exits 2 with `invalid value 'roundrobin'`. Since
+  `--load-balancing-policy` is a *required* argument, a user following the help could not create a
+  cluster at all — this was an unusable flag, not merely a stale comment. A `FromStr`-backed parser
+  also carries no value enumeration, so clap renders no `[possible values: …]` line: the help string
+  was the only list a user ever saw. `roundrobin` was orphaned by `7555d383` (2022-12-18 UTC), which
+  renamed the accepted spelling to `round_robin` in the parser without sweeping the CLI or the docs;
+  `leastconnections` matched no arm even before that. `doc/configure_cli.md`'s getting-started
+  recipe repeated the rejected value in two copy-pasteable commands and is corrected in the same
+  changeset. Two new guards in `bin/src/cli.rs`'s test module derive the expected list from the
+  protobuf enum itself — `LoadBalancingAlgorithms::try_from` scanned across every discriminant
+  below a documented bound, then `as_str_name().to_lowercase()`, which is exactly the spelling
+  `FromStr` accepts — rather than restating it, so the help must name every declared variant and
+  may name nothing the parser rejects. The scan deliberately does not stop at the first gap:
+  `reserved 6;` beside `WEIGHTED = 7;` is the canonical way to retire a protobuf enum value, and a
+  scan that broke there would skip the new variant and pass green while the help omitted it.
+  Adding an algorithm to `command/src/command.proto` therefore fails the suite until the help names
+  it, for any discriminant below that bound; a discriminant at or beyond it is the single residual
+  case the guards do not cover *for a proto-declared variant*. What they compare is the proto enum
+  against the help, so a hand-written `FromStr` arm with no proto counterpart — an alias such as
+  `"rr" => RoundRobin` — is outside what they can see: the CLI would accept it while the help never
+  named it. Adding an alias means naming it in the help by hand.
+  `doc/architecture.md`'s prose list, which named four of the six algorithms, is completed in the
+  same changeset.
+
 - **`fix(metrics)`: a client renewing its own cardinality lease at a LOWER level no longer trips
   `lease_apply`'s own debug assertion.** `Aggregator::lease_apply` (`lib/src/metrics/mod.rs`)
   decided whether a call was a renewal purely by `client_id` presence and never compared the

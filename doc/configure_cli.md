@@ -11,16 +11,17 @@ command_socket = "path/to/your/command_folder/sock"
 
 ## Add a cluster with an http and https frontends
 
-First you need to create a new cluster with an id and a load balancing policy (roundrobin or random):
+First you need to create a new cluster with an id and a load balancing policy (`round_robin`, `random`,
+`power_of_two`, `least_loaded`, `hrw` or `maglev`):
 
 ```bash
-sozu --config /etc/sozu/config.toml cluster add --id <my_cluster_id> --load-balancing-policy roundrobin
+sozu --config /etc/sozu/config.toml cluster add --id <my_cluster_id> --load-balancing-policy round_robin
 ```
 
 To create a cluster with HTTP/2 backend connections enabled:
 
 ```bash
-sozu --config /etc/sozu/config.toml cluster add --id <my_cluster_id> --load-balancing-policy roundrobin --http2
+sozu --config /etc/sozu/config.toml cluster add --id <my_cluster_id> --load-balancing-policy round_robin --http2
 ```
 
 It won't show anything but you can verify that the cluster has been added successfully by querying sozu:
