@@ -25,11 +25,11 @@ use std::{
 
 use super::h2_utils::{
     H2_ERROR_ENHANCE_YOUR_CALM, H2_ERROR_FLOW_CONTROL_ERROR, H2_ERROR_FRAME_SIZE_ERROR,
-    H2_ERROR_REFUSED_STREAM, H2_FLAG_END_STREAM, H2_FRAME_GOAWAY, H2Frame, collect_response_frames,
-    contains_goaway, contains_goaway_with_error, contains_rst_stream, extract_rst_streams,
-    goaway_error_code, h2_handshake, headers_status_matches, log_frames, parse_h2_frames,
-    raw_h2_connection, raw_h2_connection_with_sni, read_all_available, setup_h2_listener_only,
-    setup_h2_test, verify_sozu_alive,
+    H2_ERROR_NO_ERROR, H2_ERROR_REFUSED_STREAM, H2_FLAG_END_STREAM, H2_FRAME_GOAWAY, H2Frame,
+    collect_response_frames, contains_goaway, contains_goaway_with_error, contains_rst_stream,
+    extract_rst_streams, goaway_error_code, h2_handshake, headers_status_matches, log_frames,
+    parse_h2_frames, raw_h2_connection, raw_h2_connection_with_sni, read_all_available,
+    setup_h2_listener_only, setup_h2_test, verify_sozu_alive,
 };
 use crate::{
     mock::{
@@ -712,6 +712,214 @@ fn try_h2_goaway_graceful_drain() -> State {
 }
 
 // ============================================================================
+// Test 3b: legitimate CONTINUATION reassembly survives a graceful drain
+// ============================================================================
+
+/// End-to-end coverage of the LIFECYCLE.md invariant-24 / #1423 shape: a
+/// HEADERS+CONTINUATION block still being reassembled on one stream, when
+/// the worker receives `soft_stop()`, must complete and be served normally
+/// afterward, not corrupted by the graceful GOAWAY landing in the middle of
+/// it. `h2.rs`'s unit tests (`a_legitimate_continuation_survives_a_graceful_goaway`,
+/// `a_legitimate_continuation_survives_a_hup_while_draining`) pin the same
+/// property at the `ConnectionH2` level with hand-manipulated state; this is
+/// the wire-level shape, driven through a real worker's event loop and a
+/// real graceful shutdown racing a real split HEADERS/CONTINUATION send.
+///
+/// A raw connection opens two streams: stream 1 is a complete, ordinary
+/// request that reaches a deliberately slow backend and stays unresolved for
+/// `ANCHOR_DELAY` — the in-flight work that makes the worker actually drain
+/// instead of exiting immediately with nothing to wait for. Stream 3's
+/// HEADERS frame (no END_HEADERS) is sent once stream 1 is confirmed to have
+/// reached the backend; `soft_stop()` then fires while stream 3's block is
+/// still incomplete, and stream 3's CONTINUATION is sent only after that.
+///
+/// `drain_witnessed` (a GOAWAY frame observed in the response) is a required
+/// part of success, not just `anchor_ok`/`stream3_ok`: without it, a run
+/// proves nothing about the race this test exists to exercise — the two
+/// fixed `150ms` sleeps could simply have missed the drain window entirely,
+/// and the corruption check would then pass vacuously on a run that never
+/// actually raced anything.
+fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let back_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker = Worker::start_new_worker_owned("H2-CONT-DRAIN-E2E", config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address.into(),
+        None,
+    )));
+    worker.read_to_last();
+
+    const ANCHOR_DELAY: Duration = Duration::from_millis(600);
+    let mut delayed_backend =
+        DelayedH2Backend::start(back_address, ANCHOR_DELAY, "anchor-response-body");
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    // Stream 1: a complete, ordinary request. Sent first so it is the one
+    // holding the connection open when the drain lands.
+    let anchor_block =
+        super::h2_utils::build_chrome146_get_headers("localhost", "/api/anchor", None);
+    let anchor_frame = H2Frame::headers(1, anchor_block, true, true);
+    if tls.write_all(&anchor_frame.encode()).is_err() || tls.flush().is_err() {
+        println!("H2 CONTINUATION+drain - anchor HEADERS write failed");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        delayed_backend.stop();
+        return State::Fail;
+    }
+
+    let wait_start = Instant::now();
+    while delayed_backend.get_requests_received() == 0 {
+        if wait_start.elapsed() > Duration::from_secs(5) {
+            println!("H2 CONTINUATION+drain - anchor request never reached the backend");
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            delayed_backend.stop();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Stream 3: a real, complete request header block — the same builder the
+    // Chromium-146 e2e tests use — split roughly in half so the first half
+    // alone is not a legal standalone block and a CONTINUATION is required.
+    let block = super::h2_utils::build_chrome146_get_headers("localhost", "/api/cont-drain", None);
+    assert!(
+        block.len() > 20,
+        "the Chromium-146 header block must be large enough to split meaningfully"
+    );
+    let split = block.len() / 2;
+    let (first_half, second_half) = block.split_at(split);
+
+    // HEADERS, END_STREAM but NOT END_HEADERS: the block is legitimately
+    // incomplete, exactly as a large request produces.
+    let headers_frame = H2Frame::headers(3, first_half.to_vec(), false, true);
+    if tls.write_all(&headers_frame.encode()).is_err() || tls.flush().is_err() {
+        println!("H2 CONTINUATION+drain - stream 3 HEADERS write failed");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        delayed_backend.stop();
+        return State::Fail;
+    }
+
+    // Give sozu's event loop a moment to read the HEADERS frame and enter
+    // the CONTINUATION-reassembly state before the drain lands.
+    thread::sleep(Duration::from_millis(150));
+
+    // Trigger a graceful shutdown WHILE stream 3's block is still incomplete
+    // — exactly the window #1401/#1423 describe — while stream 1 is still
+    // unresolved on the deliberately slow backend, so the worker actually
+    // drains instead of exiting with nothing to wait for. `soft_stop()` only
+    // signals the worker; the drain itself runs asynchronously on the
+    // worker's own event loop, leaving a real race window before the
+    // CONTINUATION below is sent.
+    worker.soft_stop();
+    thread::sleep(Duration::from_millis(150));
+
+    // Now complete stream 3's block.
+    let continuation_frame = H2Frame::continuation(3, second_half.to_vec(), true);
+    let sent = tls.write_all(&continuation_frame.encode()).is_ok() && tls.flush().is_ok();
+
+    // Poll past the anchor's delay so both streams have a chance to resolve.
+    let frames = collect_response_frames(
+        &mut tls,
+        50,
+        30,
+        (ANCHOR_DELAY.as_millis() as u64 / 30).max(50),
+    );
+    log_frames("H2 CONTINUATION+drain", &frames);
+
+    // Both streams hit the same `DelayedH2Backend`, which always answers
+    // "anchor-response-body" — the body text does not distinguish the two
+    // streams, only the frame's `stream_id` does.
+    let stream_served = |stream_id: u32| {
+        let stream_frames: Vec<_> = frames
+            .iter()
+            .filter(|(_, _, sid, _)| *sid == stream_id)
+            .cloned()
+            .collect();
+        headers_status_matches(&stream_frames, b"200")
+            && stream_frames.iter().any(|(ft, _, _, payload)| {
+                *ft == super::h2_utils::H2_FRAME_DATA
+                    && payload.windows(9).any(|w| w == b"anchor-re")
+            })
+    };
+
+    let anchor_ok = sent && stream_served(1);
+    // A GOAWAY(NO_ERROR) is the graceful drain's own expected advisory +
+    // final GOAWAY, not corruption — only an error-carrying GOAWAY (e.g. a
+    // desynced HPACK decoder reporting COMPRESSION_ERROR) would indicate
+    // that stream 3's reassembly was clobbered.
+    let stream3_ok = sent
+        && goaway_error_code(&frames).is_none_or(|code| code == H2_ERROR_NO_ERROR)
+        && !contains_rst_stream(&frames)
+        && stream_served(3);
+    // Witness: without at least one GOAWAY in the response, `stream3_ok`'s
+    // `is_none_or` check above is vacuously true and this run proves
+    // NOTHING about the race this test exists to exercise — soft_stop()'s
+    // drain may simply not have reached the point of emitting a GOAWAY
+    // before the two fixed `thread::sleep(150ms)` windows elapsed. Treat a
+    // missing witness as a failed (inconclusive) run rather than a silent
+    // pass, so `repeat_until_error_or`'s retries have a chance to land one
+    // that actually raced the drain.
+    let drain_witnessed = contains_goaway(&frames);
+
+    if !anchor_ok || !stream3_ok || !drain_witnessed {
+        println!(
+            "H2 CONTINUATION+drain - anchor_ok={anchor_ok} stream3_ok={stream3_ok} \
+             drain_witnessed={drain_witnessed} sent={sent}"
+        );
+    }
+
+    drop(tls);
+    let success = worker.wait_for_server_stop();
+    delayed_backend.stop();
+
+    if success && anchor_ok && stream3_ok && drain_witnessed {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+// ============================================================================
 // Test 4: RST_STREAM on backend disconnect
 // ============================================================================
 
@@ -1114,6 +1322,19 @@ fn test_h2_goaway_graceful_drain() {
             5,
             "H2 edge: GoAway graceful drain of in-flight requests",
             try_h2_goaway_graceful_drain
+        ),
+        State::Success
+    );
+}
+
+#[test]
+fn test_h2_continuation_survives_a_graceful_drain_mid_reassembly() {
+    assert_eq!(
+        repeat_until_error_or(
+            5,
+            "H2 edge: a HEADERS+CONTINUATION block still in progress when a \
+             graceful drain lands must complete and be served, not corrupted",
+            try_h2_continuation_survives_a_graceful_drain_mid_reassembly
         ),
         State::Success
     );

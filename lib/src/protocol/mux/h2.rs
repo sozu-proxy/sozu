@@ -37,7 +37,7 @@ use crate::{
         forcefully_terminate_answer,
         h2_drain::{self, GracefulDrainDecision},
         h2_flood_detector::{self, H2FloodConfig, H2FloodViolation},
-        h2_flow_control, h2_stream_table, hpack_state,
+        h2_flow_control, h2_header_reassembly, h2_stream_table, hpack_state,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
         pkawa, remove_backend_stream, serializer, set_default_answer,
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
@@ -1078,7 +1078,21 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// nothing outside `h2_drain.rs` can reach the raw fields — see
     /// [`h2_drain::H2DrainState`].
     pub(super) drain: h2_drain::H2DrainState,
+    /// Control-frame write scratch (WINDOW_UPDATE, RST_STREAM, GOAWAY,
+    /// SETTINGS) and the read landing zone for every stream-0 frame's own
+    /// header/payload bytes for the duration of ONE frame's read. It no
+    /// longer doubles as a HEADERS+CONTINUATION reassembly buffer — that
+    /// role moved to [`Self::header_reassembly`]; see that field's doc and
+    /// `h2_header_reassembly.rs` for why, and LIFECYCLE.md invariant 24 for
+    /// the bugs the split closes.
     pub zero: GenericHttpStream,
+    /// Owned accumulator for an in-progress HEADERS+CONTINUATION field
+    /// block (`H2State::ContinuationHeader`/`ContinuationFrame`). Separated
+    /// from [`Self::zero`] so a control-frame flush that clears and reuses
+    /// `zero.storage` has no way to name — and therefore cannot corrupt —
+    /// the bytes reassembled so far. See `h2_header_reassembly.rs` and
+    /// LIFECYCLE.md invariant 24.
+    header_reassembly: h2_header_reassembly::HeaderBlockAccumulator,
     /// Byte accounting for connection overhead attribution.
     pub bytes: H2ByteAccounting,
     /// CVE-mitigation flood/abuse counters (Rapid Reset, MadeYouReset,
@@ -1194,6 +1208,11 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
             .field("socket", &self.socket.socket_ref())
             .field("streams", self.stream_table.streams())
             .field("zero", &self.zero.storage.meter(20))
+            .field(
+                "header_reassembly_in_progress",
+                &self.header_reassembly.is_in_progress(),
+            )
+            .field("header_reassembly_len", &self.header_reassembly.len())
             .field("window", &self.flow_control.window())
             .field("total_rst_streams_queued", &self.total_rst_streams_queued)
             .finish()
@@ -1444,6 +1463,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             pending_table_size_update: None,
             drain: h2_drain::H2DrainState::new(graceful_shutdown_deadline),
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
+            header_reassembly: h2_header_reassembly::HeaderBlockAccumulator::new(),
             bytes: H2ByteAccounting {
                 zero_bytes_read: 0,
                 overhead_bin: 0,
@@ -1799,15 +1819,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     stream_id,
                 },
             )) => {
-                if self.zero.storage.end < 9 {
-                    error!(
-                        "{} CONTINUATION header: storage.end ({}) too small to remove frame header",
-                        log_context!(self),
-                        self.zero.storage.end
-                    );
-                    return self.goaway(H2Error::InternalError);
-                }
-                self.zero.storage.end -= 9;
+                // The 9-byte CONTINUATION frame header has now been fully
+                // parsed from `zero.storage`; nothing about it needs to
+                // survive the transition below. Earlier revisions kept the
+                // buffer's trailing bytes alive with a manual
+                // `storage.end -= 9` so the next payload read would land
+                // contiguously after the accumulated fragment inside
+                // `zero.storage` itself — that trick existed only to serve
+                // the old design where the fragment lived here. It now
+                // lives in `self.header_reassembly` (h2_header_reassembly.rs),
+                // so there is nothing left to stay contiguous with.
+                self.zero.storage.clear();
                 if stream_id != headers.stream_id {
                     error!(
                         "{} CONTINUATION stream_id {} does not match HEADERS stream_id {}",
@@ -1846,29 +1868,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     if let Some(global_stream_id) = self.stream_table.get(stream_id) {
                         self.remove_dead_stream(stream_id, global_stream_id);
                     }
-                    // Capture the field-block bytes accumulated by every
-                    // *prior* frame in this block now, synchronously, while
-                    // they are still intact in `zero.storage`. They cannot
-                    // survive as a byte offset instead: `enqueue_rst` (inside
-                    // `refuse_stream_and_discard`, below) arms WRITABLE, and
-                    // this connection's `writable()` preamble
-                    // (`flush_pending_control_frames`) reuses `self.zero` as
-                    // scratch space to serialize the very RST_STREAM this
-                    // call queues — the same event-loop pass dispatches that
-                    // write before the next `readable()` pass reads this
-                    // frame's own payload (`mod.rs`'s inner loop calls
-                    // frontend `readable()` then `writable()` in one sweep).
-                    let Some(prior_fragment) = headers
-                        .header_block_fragment
-                        .data_opt(self.zero.storage.buffer())
-                    else {
-                        error!(
-                            "{} accumulated header_block_fragment out of bounds of zero.storage",
-                            log_context!(self)
-                        );
-                        return self.goaway(H2Error::InternalError);
-                    };
-                    let prior_fragment = prior_fragment.to_vec();
+                    // The field-block bytes accumulated by every *prior*
+                    // frame in this block already live in
+                    // `self.header_reassembly`, decoupled from
+                    // `zero.storage`'s own bookkeeping — no eager copy is
+                    // needed here the way the old single-buffer design
+                    // required (the buffer this comment used to warn about
+                    // reuse of is `zero.storage`; that reuse now targets an
+                    // empty, unrelated scratch region, not this fragment).
+                    let prior_fragment = self.header_reassembly.finish();
                     return self.refuse_stream_and_discard(
                         stream_id,
                         H2Error::RefusedStream,
@@ -1892,10 +1900,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     .set_expect_read(Some((H2StreamId::Zero, payload_len as usize)));
                 let mut headers = headers.clone();
                 headers.end_headers = flags & parser::FLAG_END_HEADERS != 0;
-                headers.header_block_fragment.len = headers
-                    .header_block_fragment
-                    .len
-                    .saturating_add(payload_len);
+                // `header_block_fragment`'s window is no longer extended
+                // here: it described an offset into `zero.storage`, which
+                // this CONTINUATION frame's payload has not been read into
+                // yet. `(H2State::ContinuationFrame(headers), _)` folds this
+                // frame's payload into `self.header_reassembly` once it has
+                // actually been read, and `handle_headers_frame` reads the
+                // accumulator directly rather than through this field.
                 self.state = H2State::ContinuationFrame(headers);
             }
             Err(error) => {
@@ -2160,19 +2171,31 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                 };
                 if let H2StreamId::Zero = stream_id {
-                    if header.frame_type == FrameType::Headers {
-                        kawa.storage.head = kawa.storage.end;
-                    } else {
-                        kawa.storage.end = kawa.storage.head;
-                    }
+                    // Free `zero.storage` for the next frame header read. A
+                    // HEADERS frame used to be special-cased here
+                    // (`head = end`, preserving its payload bytes in place
+                    // so a following CONTINUATION could extend them
+                    // in-buffer) — the reassembly accumulator that needed
+                    // now lives in `self.header_reassembly` instead (see
+                    // `handle_headers_frame`), copied out before this read
+                    // cycle ends, so every zero-stream frame gets the same
+                    // treatment.
+                    kawa.storage.end = kawa.storage.head;
                 }
                 self.expect_header();
                 return self.handle_frame(frame, wire_payload_len, context, endpoint);
             }
             (H2State::ContinuationFrame(headers), _) => {
-                kawa.storage.head = kawa.storage.end;
-                let i = kawa.storage.data();
-                trace!("{}   data: {:?}", log_context!(self), i);
+                // This CONTINUATION frame's payload has just finished being
+                // read into `zero.storage` (the generic stream-0 read
+                // dispatch above, shared by every zero-stream frame type).
+                // Move it into the owned reassembly accumulator and free
+                // `zero.storage` immediately — from this point until the
+                // next CONTINUATION's bytes start arriving, `zero.storage`
+                // holds nothing belonging to this header block. See
+                // `h2_header_reassembly.rs` and LIFECYCLE.md invariant 24.
+                self.header_reassembly.append(kawa.storage.data());
+                kawa.storage.clear();
                 let headers = headers.clone();
                 self.expect_header();
                 return self.handle_frame(Frame::Headers(headers), 0, context, endpoint);
@@ -3085,15 +3108,36 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
-    /// `self.zero` is doing double duty: it is the read-side accumulation
-    /// buffer for a HEADERS/CONTINUATION field block in progress (spanning
-    /// one or more `readable()` passes, by protocol design — a legitimate
-    /// large header block routinely splits across frames) AND the write
-    /// scratch space [`Self::flush_pending_control_frames`] reuses for ANY
-    /// queued WINDOW_UPDATE or RST_STREAM, for any stream. `mod.rs`'s inner
-    /// event loop dispatches frontend `readable()` then `writable()` in the
-    /// same sweep, so without this guard an unrelated control-frame flush
-    /// can clobber a header block that has nothing to do with it.
+    /// True while a HEADERS/CONTINUATION field block is being reassembled
+    /// (spanning one or more `readable()` passes, by protocol design — a
+    /// legitimate large header block routinely splits across frames).
+    ///
+    /// `self.zero` no longer doubles as the reassembly buffer — that role
+    /// moved to `self.header_reassembly` (`h2_header_reassembly.rs`), which
+    /// no write-side code can reach. That closes the #1396/#1397/#1401
+    /// class outright: the ACCUMULATED, multi-frame history of a block is
+    /// no longer representable as bytes a control-frame flush can touch, by
+    /// construction, not by convention.
+    ///
+    /// What THIS flag still guards is narrower but still real: a single
+    /// CONTINUATION frame's payload can be *mid-flight* in `zero.storage` —
+    /// a `socket_read()` that has only partially filled this one frame —
+    /// when a write pass runs in the same event-loop sweep (`mod.rs`'s
+    /// inner loop dispatches frontend `readable()` then `writable()`
+    /// together). Losing those bytes would still corrupt an otherwise-
+    /// completable block. Checked at every site that clears or reuses
+    /// `zero.storage`'s write-scratch role: the frontend-hung-up-while-
+    /// draining, WINDOW_UPDATE-drain and RST_STREAM-drain stages and the
+    /// deferred-initial-GOAWAY-readiness check, all four in
+    /// [`Self::flush_pending_control_frames`]; plus [`Self::graceful_goaway`]'s
+    /// own defer-or-send decision and [`Self::flush_zero_buffer`]'s no-op
+    /// guard — six call sites in total. All six were already present
+    /// except the frontend-hung-up-while-draining one, added in the review
+    /// that found #1423's premise wrong: that stage used to assume
+    /// `Ready::HUP` means no further bytes can ever arrive, which mio's own
+    /// `is_read_closed()` documentation contradicts (a TCP half-close can
+    /// still have unread data queued) — see that stage's own comment and
+    /// `h2_header_reassembly.rs`'s module doc for the full account.
     ///
     /// The write side already protects the mirror case — while a zero-buffer
     /// write is stalled (`expect_write == Some(Zero)`), READABLE interest is
@@ -3113,9 +3157,31 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// Returns `Some(result)` if the caller should return early (e.g. socket would
     /// block, GOAWAY triggered), or `None` if writable() should proceed normally.
     fn flush_pending_control_frames(&mut self) -> Option<MuxResult> {
+        // CORRECTION (review of e1c3c2fb, B2): this stage used to clear
+        // `zero.storage` unconditionally here, on the theory that
+        // `frontend_hung_up_while_draining()` firing meant "no further
+        // bytes can ever arrive". That is false: `Ready::HUP` is
+        // `is_read_closed() || is_write_closed()`
+        // (`command/src/ready.rs`), and mio documents `is_read_closed()` as
+        // true not only on a full close but also when "the peer stream has
+        // shutdown the write half of its socket" (TCP half-close) — a
+        // FIN with data the peer already sent still sitting in the kernel
+        // receive queue, unread. `drive_frontend_shutdown_io` (`mod.rs`)
+        // force-calls `readable()` for H2 on every `shutting_down()` poll,
+        // so a CONTINUATION frame split across TCP segments can have its
+        // partial payload wiped here — mid-flight, not stale — one
+        // `readable()` pass before the rest of it would have been read.
+        // `self.header_reassembly` still protects the ACCUMULATED history
+        // of a block from every other write-side site (see
+        // `h2_header_reassembly.rs`); what this stage could still corrupt
+        // is the same narrower "one frame still mid-`socket_read()`" window
+        // the three sibling stages below already guard — so it now shares
+        // their guard instead of being the one stage that does not.
         if self.frontend_hung_up_while_draining() {
             self.stream_table.set_expect_write(None);
-            self.zero.storage.clear();
+            if !self.header_block_reassembly_in_progress() {
+                self.zero.storage.clear();
+            }
             self.flow_control.clear_pending_window_updates();
             self.pending_rst_streams.clear();
         }
@@ -4928,11 +4994,42 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // handle_frame(Frame::Headers) with the accumulated header block).
             self.flood_detector
                 .begin_header_block_if_new(headers.header_block_fragment.len);
+            if !self.header_reassembly.is_in_progress() {
+                // First HEADERS frame of this block: copy its fragment out of
+                // `zero.storage` now, before the caller's `expect_header()`
+                // starts overwriting it with the next frame's bytes. A
+                // re-entry from `(H2State::ContinuationFrame(headers), _)`
+                // already appended THIS frame's own payload to the
+                // accumulator before calling back in here (see that match
+                // arm in `readable()`), so there is nothing left to copy.
+                //
+                // `data_opt` (bounds-checked), not `data` (panics on OOB):
+                // `header_block_fragment` is network-facing-derived — the
+                // parser computes it correctly by construction, so this
+                // should never actually be out of bounds, but "no panic on
+                // network-facing input" (CLAUDE.md) applies regardless, and
+                // the CVE-2024-27316 abort path below this one used to make
+                // exactly this check before this step replaced its own
+                // buffer access with `HeaderBlockAccumulator::finish()`
+                // (owned bytes, no slicing left to bound-check there).
+                let Some(fragment) = headers
+                    .header_block_fragment
+                    .data_opt(self.zero.storage.buffer())
+                else {
+                    error!(
+                        "{} header_block_fragment out of bounds of zero.storage",
+                        log_context!(self)
+                    );
+                    return self.goaway(H2Error::InternalError);
+                };
+                self.header_reassembly.begin(fragment);
+                self.zero.storage.clear();
+            }
             debug!(
-                "{} FRAGMENT: stream_id={}, len={}",
+                "{} FRAGMENT: stream_id={}, accumulated_len={}",
                 log_context!(self),
                 headers.stream_id,
-                self.zero.storage.data().len()
+                self.header_reassembly.len()
             );
             self.state = H2State::ContinuationHeader(headers);
             return MuxResult::Continue;
@@ -4960,6 +5057,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         if let Some(priority) = &headers.priority
             && self.prioriser.push_priority(stream_id, priority.clone())
         {
+            // This HEADERS frame's own block just completed (single-frame,
+            // or the final CONTINUATION of a multi-frame sequence) — but
+            // we're aborting before ever reaching the `finish()` call below.
+            // If a CONTINUATION sequence fed it, `header_reassembly` is
+            // still `is_in_progress() == true`; retire it here or it leaks
+            // that flag into the NEXT HEADERS frame processed on this
+            // connection, which may belong to a completely different
+            // stream — that frame's own "read from zero.storage" fast path
+            // would then be skipped in favour of these stale, already-
+            // discarded bytes (sozu-proxy/sozu review of e1c3c2fb, B1).
+            // Regression:
+            // `a_priority_self_dependency_reset_does_not_leak_the_reassembly_accumulator`.
+            if self.header_reassembly.is_in_progress() {
+                self.header_reassembly.finish();
+            }
             self.reset_stream(
                 stream_id,
                 global_stream_id,
@@ -4973,8 +5085,27 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
         let stream = &mut context.streams[global_stream_id];
         self.attribute_bytes_to_stream(&mut stream.metrics);
-        let kawa = &mut self.zero;
-        let buffer = headers.header_block_fragment.data(kawa.storage.buffer());
+        // The field-block bytes live in one of two places depending on how
+        // we got here: the owned reassembly accumulator when a CONTINUATION
+        // sequence fed this HEADERS (`header_reassembly.is_in_progress()`),
+        // or straight out of `zero.storage` for the single-frame fast path
+        // — the common case, which never touches the accumulator at all.
+        // See `h2_header_reassembly.rs`.
+        let buffer: &[u8] = if self.header_reassembly.is_in_progress() {
+            self.header_reassembly.data()
+        } else {
+            // Invariant: only reachable when nothing is accumulating for
+            // THIS stream's own block. Every early-return path above this
+            // point that could have left a CONTINUATION-fed reassembly
+            // `is_in_progress()` now retires it first (see the priority
+            // self-dependency branch above — B1 in the review of e1c3c2fb
+            // was exactly a return that skipped this and leaked the flag
+            // into the next HEADERS frame's decode).
+            debug_assert!(!self.header_reassembly.is_in_progress());
+            headers
+                .header_block_fragment
+                .data(self.zero.storage.buffer())
+        };
         let stream = &mut context.streams[global_stream_id];
         let parts = &mut stream.split(&self.position);
         let was_initial = parts.rbuffer.is_initial();
@@ -4991,7 +5122,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.flood_detector.config().max_header_fields(),
             elide_x_real_ip,
         );
-        kawa.storage.clear();
+        if self.header_reassembly.is_in_progress() {
+            self.header_reassembly.finish();
+        }
+        self.zero.storage.clear();
         if let Err((error, global)) = status {
             match self.position {
                 Position::Client(..) => incr!(names::http::BACKEND_PARSE_ERRORS),
@@ -8798,5 +8932,879 @@ mod tests {
             "the deferred advisory GOAWAY must reach the peer byte-for-byte \
              once header-block reassembly completes"
         );
+    }
+
+    /// Regression test for #1423: `flush_pending_control_frames`'s
+    /// `frontend_hung_up_while_draining()` stage cleared `zero.storage`
+    /// unconditionally, with no `header_block_reassembly_in_progress()`
+    /// guard — unlike its three sibling stages, which #1397 and #1401
+    /// already gated. LIFECYCLE.md invariant 24 tracked this as a "known
+    /// live gap, reported and NOT fixed" until this changeset.
+    ///
+    /// Same shape as `a_legitimate_continuation_survives_a_graceful_goaway`,
+    /// but the clobbering trigger is a HUP/ERROR readiness event landing
+    /// while draining — exactly `frontend_hung_up_while_draining()`'s own
+    /// condition — instead of `graceful_goaway` itself. This test drives
+    /// the gap BETWEEN two frames (a HUP arriving while
+    /// `expect_read = Some((Zero, 9))`, waiting for the next CONTINUATION's
+    /// header, with nothing of this block's history left in `zero.storage`
+    /// to lose). Moving the accumulator out of `zero.storage` into
+    /// `self.header_reassembly` (`h2_header_reassembly.rs`) makes THIS
+    /// scenario safe regardless of whether this stage is guarded: there is
+    /// no accumulated history left in `zero.storage` for it to clobber.
+    ///
+    /// That is NOT the whole of #1423, though — see
+    /// `a_continuation_frame_split_by_tcp_segmentation_survives_a_hup_while_draining`
+    /// below for the narrower "HUP lands mid-frame, not between frames"
+    /// case this test does not cover, which review of this changeset's
+    /// first version (`e1c3c2fb`) proved the accumulator move alone does
+    /// NOT make safe, and which is why `frontend_hung_up_while_draining()`'s
+    /// stage carries the same `header_block_reassembly_in_progress()` guard
+    /// as its three siblings after all.
+    ///
+    /// To SEE THIS RED on this step's base commit (`f76c8eb3`, before the
+    /// accumulator moved out of `zero.storage`): run this test unmodified
+    /// against that commit. `flush_pending_control_frames`'s first stage
+    /// clears `zero.storage` — which, on that commit, still holds stream 1's
+    /// entire accumulated first-half fragment — before the CONTINUATION
+    /// frame completing the block arrives; the CONTINUATION's own bytes
+    /// then land at the wrong (reset-to-zero) offset, and the connection's
+    /// HPACK decoder desyncs from the peer's encoder. The failure is
+    /// silent corruption, not a crash (HPACK carries no self-check): the
+    /// `decode_with_cb` assertion below fails with a decode error, or
+    /// succeeds but yields something other than
+    /// `[(b"x-sozu-marker", b"legitimate-value")]`.
+    #[test]
+    fn a_legitimate_continuation_survives_a_hup_while_draining() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        // Past the preface/SETTINGS handshake, waiting on a frame header.
+        // `drain.draining` stays false until manually forced below: stream 1
+        // must be genuinely accepted, not refused — this is the ordinary,
+        // non-refusal path.
+        connection.state = H2State::Header;
+        connection
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+
+        // The peer's encoder. The marker header's name is in neither table,
+        // so encoding it appends `x-sozu-marker: legitimate-value` to the
+        // peer's dynamic table at a known index — the same technique the
+        // sibling WINDOW_UPDATE/graceful_goaway tests use to prove decoder
+        // sync.
+        let mut peer_encoder = loona_hpack::Encoder::new();
+        let field_block = peer_encoder.encode([
+            (&b":method"[..], &b"GET"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/legit-multiframe"[..]),
+            (&b"x-sozu-marker"[..], &b"legitimate-value"[..]),
+        ]);
+        assert!(
+            field_block.len() > 34,
+            "the probe block must be large enough to split meaningfully"
+        );
+        let split = field_block.len() / 2;
+        let (first_half, second_half) = field_block.split_at(split);
+
+        // HEADERS, END_STREAM but NOT END_HEADERS, stream 1: a legitimate
+        // multi-frame header block, exactly as a large request produces.
+        let mut headers_frame = Vec::with_capacity(9 + first_half.len());
+        headers_frame.extend_from_slice(&(first_half.len() as u32).to_be_bytes()[1..]);
+        headers_frame.push(1); // HEADERS
+        headers_frame.push(parser::FLAG_END_STREAM);
+        headers_frame.extend_from_slice(&1u32.to_be_bytes());
+        headers_frame.extend_from_slice(first_half);
+        peer.write_all(&headers_frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        // Drive reads until the connection is genuinely waiting on the
+        // CONTINUATION frame for stream 1 — accepted, not refused.
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.state, H2State::ContinuationHeader(_)) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(connection.state, H2State::ContinuationHeader(_)),
+            "stream 1's HEADERS frame must be accepted and await CONTINUATION: {:?}",
+            connection.state
+        );
+        assert!(
+            !connection.stream_table.is_empty(),
+            "a non-refused HEADERS frame must create stream 1"
+        );
+
+        // Exactly #1423's trigger: the connection is draining AND the
+        // frontend readiness reports HUP, landing squarely mid-reassembly.
+        // A peer can legitimately produce this by sending TCP FIN together
+        // with (or shortly after) the last CONTINUATION frame it manages to
+        // get out, observed by edge-triggered epoll as one combined event.
+        connection.drain.__test_set_draining();
+        connection.readiness.event.insert(Ready::HUP);
+
+        // `flush_pending_control_frames`'s first, HUP-gated stage fires
+        // here.
+        connection.writable(&mut context, EndpointClient(&mut router));
+
+        // Real epoll delivers HUP once; un-signal it so the reads below
+        // reflect the peer's normal traffic rather than a second synthetic
+        // HUP this test injected by hand.
+        connection.readiness.event.remove(Ready::HUP);
+
+        // Now the CONTINUATION frame completing the block arrives — still
+        // fully deliverable, exactly as it would be if the peer's FIN and
+        // its last frame arrived close together but the block itself was
+        // sent in full.
+        let mut continuation_frame = Vec::with_capacity(9 + second_half.len());
+        continuation_frame.extend_from_slice(&(second_half.len() as u32).to_be_bytes()[1..]);
+        continuation_frame.push(9); // CONTINUATION
+        continuation_frame.push(parser::FLAG_END_HEADERS);
+        continuation_frame.extend_from_slice(&1u32.to_be_bytes());
+        continuation_frame.extend_from_slice(second_half);
+        peer.write_all(&continuation_frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if !matches!(
+                connection.state,
+                H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
+            ) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        assert!(
+            !matches!(connection.state, H2State::Error | H2State::GoAway),
+            "a HUP-while-draining event landing mid-reassembly must not corrupt \
+             a legitimate in-progress header block into a connection error: {:?}",
+            connection.state
+        );
+
+        // The peer's next block references the dynamic entry its encoder
+        // added while encoding stream 1's request.
+        let next_block = peer_encoder.encode([(&b"x-sozu-marker"[..], &b"legitimate-value"[..])]);
+        assert_eq!(
+            next_block.len(),
+            1,
+            "the peer must now reference its dynamic entry, not re-send a literal"
+        );
+
+        let mut decoded = Vec::new();
+        let status = connection
+            .hpack
+            .decoder_mut()
+            .decode_with_cb(&next_block, |k, v| {
+                decoded.push((k.into_owned(), v.into_owned()));
+            });
+
+        assert!(
+            status.is_ok(),
+            "the connection decoder must still resolve the peer's dynamic table \
+             after a HUP-while-draining event during header-block reassembly, \
+             got {status:?}"
+        );
+        assert_eq!(
+            decoded,
+            vec![(b"x-sozu-marker".to_vec(), b"legitimate-value".to_vec())],
+            "stream 1's field block must have been decoded byte-for-byte, not \
+             clobbered by the HUP-while-draining stage of \
+             flush_pending_control_frames"
+        );
+    }
+
+    /// Regression test for B1 (review of `e1c3c2fb`): `handle_headers_frame`'s
+    /// RFC 9113 §5.3.1 self-dependency early return — `reset_stream` +
+    /// `remove_dead_stream` when a stream's own PRIORITY depends on itself —
+    /// used to skip retiring `self.header_reassembly` before returning. When
+    /// the aborted stream's block had gone through CONTINUATION reassembly
+    /// (`header_reassembly.is_in_progress() == true` at abort time), the
+    /// flag leaked into the very NEXT HEADERS frame processed on this
+    /// connection: that frame's own "read from `zero.storage`" fast path
+    /// was silently skipped in favour of the aborted stream's stale,
+    /// already-discarded bytes — corrupting an entirely unrelated stream's
+    /// decoded request. This reproduces in BOTH debug and release builds:
+    /// nothing on this path was ever a `debug_assert!`.
+    ///
+    /// To SEE THIS RED on `e1c3c2fb` (before this fix): stream 1's block
+    /// completes reassembly, its RFC 7540 PRIORITY self-dependency
+    /// (`stream_dependency.stream_id == 1`) aborts it via `reset_stream`
+    /// without retiring the accumulator, and
+    /// `header_reassembly.is_in_progress()` stays `true`. Stream 3's own,
+    /// unrelated, single-frame request is then decoded from stream 1's
+    /// stale fragment instead of its own bytes: the `:path` pseudo-header
+    /// this test asserts on is corrupted rather than
+    /// `"/stream-3-legitimate"`.
+    #[test]
+    fn a_priority_self_dependency_reset_does_not_leak_the_reassembly_accumulator() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        connection.state = H2State::Header;
+        connection
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+
+        // Stream 1: a legitimate multi-frame header block — split across
+        // HEADERS + CONTINUATION, exactly like the sibling reassembly tests
+        // — but the FIRST frame also carries an RFC 7540 PRIORITY field
+        // whose stream dependency is stream 1 itself (RFC 9113 §5.3.1: a
+        // stream cannot depend on itself).
+        let mut peer_encoder = loona_hpack::Encoder::new();
+        let field_block = peer_encoder.encode([
+            (&b":method"[..], &b"GET"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/stream-1-aborted"[..]),
+        ]);
+        assert!(
+            field_block.len() > 10,
+            "the probe block must be large enough to split meaningfully"
+        );
+        let split = field_block.len() / 2;
+        let (first_half, second_half) = field_block.split_at(split);
+
+        // HEADERS, PRIORITY (self-dependency), NOT END_HEADERS.
+        let mut priority_prefix = Vec::with_capacity(5);
+        priority_prefix.extend_from_slice(&1u32.to_be_bytes()); // stream_dependency = 1 (self)
+        priority_prefix.push(15); // weight
+        let mut headers_frame = Vec::with_capacity(9 + priority_prefix.len() + first_half.len());
+        headers_frame.extend_from_slice(
+            &((priority_prefix.len() + first_half.len()) as u32).to_be_bytes()[1..],
+        );
+        headers_frame.push(1); // HEADERS
+        headers_frame.push(parser::FLAG_PRIORITY);
+        headers_frame.extend_from_slice(&1u32.to_be_bytes());
+        headers_frame.extend_from_slice(&priority_prefix);
+        headers_frame.extend_from_slice(first_half);
+        peer.write_all(&headers_frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.state, H2State::ContinuationHeader(_)) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(connection.state, H2State::ContinuationHeader(_)),
+            "stream 1's HEADERS frame must be accepted and await CONTINUATION: {:?}",
+            connection.state
+        );
+
+        // Complete the block — this re-enters `handle_headers_frame`, which
+        // detects the self-dependency and aborts stream 1.
+        let mut continuation_frame = Vec::with_capacity(9 + second_half.len());
+        continuation_frame.extend_from_slice(&(second_half.len() as u32).to_be_bytes()[1..]);
+        continuation_frame.push(9); // CONTINUATION
+        continuation_frame.push(parser::FLAG_END_HEADERS);
+        continuation_frame.extend_from_slice(&1u32.to_be_bytes());
+        continuation_frame.extend_from_slice(second_half);
+        peer.write_all(&continuation_frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if connection.stream_table.get(1).is_none() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        // Premise: stream 1 really was torn down for self-dependency.
+        assert!(
+            connection.stream_table.get(1).is_none(),
+            "the self-dependent stream must have been torn down"
+        );
+
+        // The direct proof of the fix: the accumulator must be idle again
+        // before any other stream's HEADERS frame is processed. `h2.rs`'s
+        // own test module can reach the private field directly — no
+        // test-only accessor needed.
+        assert!(
+            !connection.header_reassembly.is_in_progress(),
+            "aborting a self-dependent stream mid-reassembly must retire the \
+             accumulator, not leave it `is_in_progress() == true` for the \
+             next HEADERS frame on this connection"
+        );
+
+        // Stream 3: an entirely unrelated, single-frame, complete request.
+        let stream3_block = peer_encoder.encode([
+            (&b":method"[..], &b"GET"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/stream-3-legitimate"[..]),
+        ]);
+        let mut stream3_frame = Vec::with_capacity(9 + stream3_block.len());
+        stream3_frame.extend_from_slice(&(stream3_block.len() as u32).to_be_bytes()[1..]);
+        stream3_frame.push(1); // HEADERS
+        stream3_frame.push(parser::FLAG_END_STREAM | parser::FLAG_END_HEADERS);
+        stream3_frame.extend_from_slice(&3u32.to_be_bytes());
+        stream3_frame.extend_from_slice(&stream3_block);
+        peer.write_all(&stream3_frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        // Wait until the connection is back at `Header`, waiting on the
+        // NEXT frame's 9-byte header — not merely until the stream slot
+        // exists, which `create_stream` populates as soon as the frame
+        // HEADER is parsed, well before its payload is read and decoded.
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.state, H2State::Header)
+                && matches!(
+                    connection.stream_table.expect_read(),
+                    Some((H2StreamId::Zero, 9))
+                )
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        let stream3_gid = connection
+            .stream_table
+            .get(3)
+            .expect("stream 3's HEADERS frame must create a stream");
+        assert_eq!(
+            context.streams[stream3_gid].context.path.as_deref(),
+            Some("/stream-3-legitimate"),
+            "stream 3 must decode its OWN bytes, not stream 1's stale, \
+             aborted reassembly fragment"
+        );
+    }
+
+    /// Regression test for B2 (review of `e1c3c2fb`): `flush_pending_control_frames`'s
+    /// `frontend_hung_up_while_draining()` stage used to clear `zero.storage`
+    /// unconditionally, on the premise that `Ready::HUP` means "no further
+    /// bytes can ever arrive". That premise is false: `Ready::HUP` is
+    /// `is_read_closed() || is_write_closed()` (`command/src/ready.rs`), and
+    /// mio documents `is_read_closed()` as also true on a TCP half-close —
+    /// a FIN with data the peer already sent still sitting, unread, in the
+    /// kernel receive queue. A CONTINUATION frame's payload split across two
+    /// TCP segments can have its FIRST segment already read into
+    /// `zero.storage` (a genuine partial `socket_read()`, not stale bytes
+    /// from a completed pass) when the readiness event batches HUP together
+    /// with that first segment; `drive_frontend_shutdown_io` (`mod.rs`)
+    /// force-calls `readable()` for H2 on every `shutting_down()` poll, so
+    /// this is the ordinary soft-stop path, not a contrived corner case.
+    ///
+    /// To SEE THIS RED on `e1c3c2fb` (before this fix): the partial first
+    /// segment is wiped by the unconditional clear; the second segment then
+    /// lands at the wrong (reset-to-zero) offset once appended, and the
+    /// connection's HPACK decoder desyncs from the peer's encoder — the
+    /// same silent-wrong-values failure mode as #1397/#1401/#1423.
+    #[test]
+    fn a_continuation_frame_split_by_tcp_segmentation_survives_a_hup_while_draining() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        connection.state = H2State::Header;
+        connection
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+
+        let mut peer_encoder = loona_hpack::Encoder::new();
+        let field_block = peer_encoder.encode([
+            (&b":method"[..], &b"GET"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/tcp-segmented"[..]),
+            (&b"x-sozu-marker"[..], &b"legitimate-value"[..]),
+        ]);
+        assert!(
+            field_block.len() > 40,
+            "the probe block must be large enough to split meaningfully"
+        );
+        let split = field_block.len() / 2;
+        let (first_half, continuation_payload) = field_block.split_at(split);
+        assert!(
+            continuation_payload.len() > 10,
+            "the CONTINUATION frame's own payload must be large enough to \
+             split into two TCP segments"
+        );
+        let payload_split = continuation_payload.len() / 2;
+        let (payload_segment_1, payload_segment_2) = continuation_payload.split_at(payload_split);
+
+        // HEADERS, END_STREAM but NOT END_HEADERS, stream 1.
+        let mut headers_frame = Vec::with_capacity(9 + first_half.len());
+        headers_frame.extend_from_slice(&(first_half.len() as u32).to_be_bytes()[1..]);
+        headers_frame.push(1); // HEADERS
+        headers_frame.push(parser::FLAG_END_STREAM);
+        headers_frame.extend_from_slice(&1u32.to_be_bytes());
+        headers_frame.extend_from_slice(first_half);
+        peer.write_all(&headers_frame)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.state, H2State::ContinuationHeader(_)) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(connection.state, H2State::ContinuationHeader(_)),
+            "stream 1's HEADERS frame must be accepted and await CONTINUATION: {:?}",
+            connection.state
+        );
+
+        // The CONTINUATION frame header, announcing the FULL payload
+        // length, followed by only its FIRST TCP segment.
+        let mut continuation_header_and_segment_1 = Vec::with_capacity(9 + payload_segment_1.len());
+        continuation_header_and_segment_1
+            .extend_from_slice(&(continuation_payload.len() as u32).to_be_bytes()[1..]);
+        continuation_header_and_segment_1.push(9); // CONTINUATION
+        continuation_header_and_segment_1.push(parser::FLAG_END_HEADERS);
+        continuation_header_and_segment_1.extend_from_slice(&1u32.to_be_bytes());
+        continuation_header_and_segment_1.extend_from_slice(payload_segment_1);
+        peer.write_all(&continuation_header_and_segment_1)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        // Drive reads until the connection has consumed exactly the first
+        // segment and is waiting on the rest of THIS SAME CONTINUATION
+        // frame's payload — a genuine partial `socket_read()`, proven by
+        // `expect_read` still wanting the remainder.
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.state, H2State::ContinuationFrame(_))
+                && matches!(
+                    connection.stream_table.expect_read(),
+                    Some((H2StreamId::Zero, remaining)) if remaining == payload_segment_2.len()
+                )
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(connection.state, H2State::ContinuationFrame(_)),
+            "the CONTINUATION frame must be mid-payload, waiting on its \
+             second TCP segment: {:?}",
+            connection.state
+        );
+        assert_eq!(
+            connection.stream_table.expect_read(),
+            Some((H2StreamId::Zero, payload_segment_2.len())),
+            "expect_read must want exactly the remaining bytes of this \
+             frame's own payload — proof this is a genuine partial read, \
+             not an inter-frame gap"
+        );
+
+        // Exactly B2's trigger: the connection is draining AND the frontend
+        // readiness reports HUP, landing squarely mid-payload-read — the
+        // shape a TCP half-close produces (mio's `is_read_closed()` can be
+        // true with data the peer already sent still unread).
+        connection.drain.__test_set_draining();
+        connection.readiness.event.insert(Ready::HUP);
+        connection.writable(&mut context, EndpointClient(&mut router));
+        connection.readiness.event.remove(Ready::HUP);
+
+        // Now the second TCP segment, completing the CONTINUATION frame's
+        // payload, arrives.
+        peer.write_all(payload_segment_2)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        for _ in 0..64 {
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if !matches!(
+                connection.state,
+                H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
+            ) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        assert!(
+            !matches!(connection.state, H2State::Error | H2State::GoAway),
+            "a HUP-while-draining event landing mid-TCP-segment must not \
+             corrupt a legitimate in-progress header block into a \
+             connection error: {:?}",
+            connection.state
+        );
+
+        let next_block = peer_encoder.encode([(&b"x-sozu-marker"[..], &b"legitimate-value"[..])]);
+        assert_eq!(
+            next_block.len(),
+            1,
+            "the peer must now reference its dynamic entry, not re-send a literal"
+        );
+
+        let mut decoded = Vec::new();
+        let status = connection
+            .hpack
+            .decoder_mut()
+            .decode_with_cb(&next_block, |k, v| {
+                decoded.push((k.into_owned(), v.into_owned()));
+            });
+
+        assert!(
+            status.is_ok(),
+            "the connection decoder must still resolve the peer's dynamic \
+             table after a HUP-while-draining event landing mid-TCP-segment, \
+             got {status:?}"
+        );
+        assert_eq!(
+            decoded,
+            vec![(b"x-sozu-marker".to_vec(), b"legitimate-value".to_vec())],
+            "stream 1's field block must have been decoded byte-for-byte, \
+             not clobbered by a HUP-while-draining event landing between \
+             two TCP segments of the same CONTINUATION frame"
+        );
+    }
+
+    // ── Property coverage: interleaved reassembly + control-frame flushes ──
+    //
+    // The four deterministic pinning tests above each fix ONE interleaving
+    // (an unrelated WINDOW_UPDATE flush, a graceful_goaway, a HUP-while-
+    // draining event between frames, a HUP-while-draining event mid-TCP-
+    // segment) at ONE point. This property generalises them: a
+    // `quickcheck`-driven `ReassemblyPlan` splits a real HPACK field block
+    // into 2..=5 CONTINUATION fragments and independently chooses, before
+    // each one, whether to interleave nothing, an unrelated WINDOW_UPDATE
+    // flush, a `graceful_goaway`, or a HUP-while-draining event — the same
+    // four triggers, now composed in every order and count `quickcheck`
+    // cares to generate — and, independently again, whether that interleave
+    // lands BETWEEN two frames or in the MIDDLE of one frame's own TCP-level
+    // write (review of `e1c3c2fb`, B2/B3: the two shapes are not
+    // interchangeable — `zero.storage` is empty in the former and holds a
+    // genuine partial `socket_read()` in the latter, and only the latter
+    // reaches the narrower guard the four deterministic tests individually
+    // pin). `quickcheck` is already a workspace dependency (see
+    // `lib/src/router/mod.rs`'s `qc_router_hostname_resolution_matches_
+    // the_documented_semantics`, whose `Arbitrary`/`quickcheck!` shape this
+    // mirrors).
+    //
+    // Any out-of-bounds read or other panic inside `drive()` fails the
+    // `quickcheck` run directly — there is no separate assertion for it.
+    // CONTINUATION-flood abort and the CVE-2024-27316 refusal path are
+    // deliberately NOT folded into this property: they end the block in a
+    // *different* terminal state (refused, not decoded), which would split
+    // this property's single pass/fail oracle in two. That path already has
+    // dedicated deterministic coverage —
+    // `a_refused_stream_keeps_the_hpack_decoder_in_sync` and
+    // `a_refused_padded_prioritized_stream_keeps_the_hpack_decoder_in_sync`
+    // above.
+    mod reassembly_property {
+        use quickcheck::{Arbitrary, Gen, TestResult, quickcheck};
+
+        use super::*;
+
+        /// One interleaved event the property driver may inject before a
+        /// CONTINUATION fragment. Mirrors the four deterministic pinning
+        /// tests' triggers.
+        #[derive(Debug, Clone, Copy)]
+        enum Interleave {
+            None,
+            UnrelatedWindowUpdateFlush,
+            HupWhileDraining,
+            GracefulGoawayDefer,
+        }
+
+        impl Arbitrary for Interleave {
+            fn arbitrary(g: &mut Gen) -> Self {
+                *g.choose(&[
+                    Interleave::None,
+                    Interleave::UnrelatedWindowUpdateFlush,
+                    Interleave::HupWhileDraining,
+                    Interleave::GracefulGoawayDefer,
+                ])
+                .expect("the choice slice above is non-empty")
+            }
+        }
+
+        /// One interleave point, paired with whether it lands between two
+        /// frames (`mid_frame == false`, the original shape) or in the
+        /// middle of the following fragment's own TCP-level write
+        /// (`mid_frame == true` — a genuine partial `socket_read()`, the
+        /// shape B2 proved is NOT interchangeable with the former).
+        #[derive(Debug, Clone, Copy)]
+        struct InterleavePoint {
+            interleave: Interleave,
+            mid_frame: bool,
+        }
+
+        impl Arbitrary for InterleavePoint {
+            fn arbitrary(g: &mut Gen) -> Self {
+                InterleavePoint {
+                    interleave: Interleave::arbitrary(g),
+                    mid_frame: bool::arbitrary(g),
+                }
+            }
+        }
+
+        /// How many CONTINUATION frames to split the field block into
+        /// (2..=5) and which [`InterleavePoint`] to inject before each one
+        /// after the first — exactly `splits - 1` points, one per fragment
+        /// boundary, never `splits` (there is no point "before the first
+        /// fragment": the HEADERS frame that carries it is what starts the
+        /// reassembly).
+        #[derive(Debug, Clone)]
+        struct ReassemblyPlan {
+            splits: u8,
+            points: Vec<InterleavePoint>,
+        }
+
+        impl Arbitrary for ReassemblyPlan {
+            fn arbitrary(g: &mut Gen) -> Self {
+                let splits = 2 + (u8::arbitrary(g) % 4); // 2..=5
+                let points = (0..splits - 1)
+                    .map(|_| InterleavePoint::arbitrary(g))
+                    .collect();
+                ReassemblyPlan { splits, points }
+            }
+        }
+
+        /// Apply one interleave. `GracefulGoawayDefer` checks
+        /// `connection.drain.draining()` — the AUTHORITATIVE state, not a
+        /// separately tracked bool — before calling `graceful_goaway`:
+        /// once the connection is already draining (whether a prior point
+        /// in this same plan called `graceful_goaway` itself, OR a prior
+        /// `HupWhileDraining` point set it via the test-only
+        /// `__test_set_draining()` backdoor), a SECOND `graceful_goaway`
+        /// call would be the RFC 9113 §6.8 FINAL GOAWAY
+        /// (`GracefulDrainDecision::AlreadyDraining`), which drops
+        /// `expect_read` and makes the block permanently uncompletable — a
+        /// different scenario than this property drives, so a
+        /// `GracefulGoawayDefer` point reached while already draining is
+        /// treated as `None` instead. A local `bool` tracking only
+        /// "did GracefulGoawayDefer itself fire" would miss the
+        /// `HupWhileDraining` case and was exactly the bug `quickcheck`
+        /// found while writing this property (review of `e1c3c2fb`, B3).
+        fn apply_interleave<L>(
+            connection: &mut ConnectionH2<mio::net::TcpStream>,
+            context: &mut Context<L>,
+            router: &mut Router,
+            interleave: Interleave,
+        ) where
+            L: ListenerHandler + L7ListenerHandler,
+        {
+            match interleave {
+                Interleave::None => {}
+                Interleave::UnrelatedWindowUpdateFlush => {
+                    connection.queue_window_update(0, 65_535);
+                    connection.writable(context, EndpointClient(router));
+                }
+                Interleave::HupWhileDraining => {
+                    connection.drain.__test_set_draining();
+                    connection.readiness.event.insert(Ready::HUP);
+                    connection.writable(context, EndpointClient(router));
+                    connection.readiness.event.remove(Ready::HUP);
+                }
+                Interleave::GracefulGoawayDefer => {
+                    if !connection.drain.draining() {
+                        let now = connection.now;
+                        connection.graceful_goaway(now);
+                    }
+                }
+            }
+        }
+
+        /// Build the connection, split a real field block into
+        /// `plan.splits` fragments, and send them as HEADERS + N-1
+        /// CONTINUATION frames, injecting `plan.points[i - 1]` before
+        /// fragment `i` (`i >= 1`) — either between the two frames, or
+        /// split across two TCP-level writes of that fragment's OWN
+        /// payload with the interleave firing in between. Asserts the
+        /// connection stays usable and the block decodes byte-for-byte
+        /// regardless of which interleaves fired or where.
+        fn drive(plan: ReassemblyPlan) -> TestResult {
+            use std::io::Write;
+
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+            let (mut connection, mut peer) = test_h2_connection(&pool, None);
+            let mut context = test_context(&pool);
+            let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+            connection.state = H2State::Header;
+            connection
+                .stream_table
+                .set_expect_read(Some((H2StreamId::Zero, 9)));
+
+            let mut peer_encoder = loona_hpack::Encoder::new();
+            let field_block = peer_encoder.encode([
+                (&b":method"[..], &b"GET"[..]),
+                (&b":scheme"[..], &b"https"[..]),
+                (&b":authority"[..], &b"example.com"[..]),
+                (&b":path"[..], &b"/qc-multiframe"[..]),
+                (&b"x-sozu-qc-marker"[..], &b"qc-value"[..]),
+            ]);
+            let splits = plan.splits as usize;
+            if field_block.len() < splits * 2 {
+                // Too few bytes to split `splits` ways meaningfully.
+                return TestResult::discard();
+            }
+
+            let chunk = (field_block.len() / splits).max(1);
+            let mut fragments: Vec<&[u8]> = Vec::with_capacity(splits);
+            let mut rest = &field_block[..];
+            for i in 0..splits {
+                if i + 1 == splits {
+                    fragments.push(rest);
+                } else {
+                    let (a, b) = rest.split_at(chunk);
+                    fragments.push(a);
+                    rest = b;
+                }
+            }
+            if fragments.iter().any(|f| f.is_empty()) {
+                return TestResult::discard();
+            }
+
+            let first = fragments[0];
+            let mut frame = Vec::with_capacity(9 + first.len());
+            frame.extend_from_slice(&(first.len() as u32).to_be_bytes()[1..]);
+            frame.push(1); // HEADERS
+            frame.push(parser::FLAG_END_STREAM);
+            frame.extend_from_slice(&1u32.to_be_bytes());
+            frame.extend_from_slice(first);
+            if peer.write_all(&frame).is_err() || peer.flush().is_err() {
+                return TestResult::discard();
+            }
+
+            for _ in 0..64 {
+                connection.readable(&mut context, EndpointClient(&mut router));
+                if matches!(connection.state, H2State::ContinuationHeader(_)) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            if !matches!(connection.state, H2State::ContinuationHeader(_)) {
+                return TestResult::discard();
+            }
+
+            for (idx, fragment) in fragments.iter().enumerate().skip(1) {
+                let point = plan.points[idx - 1];
+                let is_last = idx + 1 == fragments.len();
+                let end_headers_flag = if is_last { parser::FLAG_END_HEADERS } else { 0 };
+
+                if point.mid_frame && fragment.len() >= 2 {
+                    // Split THIS fragment's own payload into two TCP-level
+                    // writes, firing the interleave in between — a genuine
+                    // partial `socket_read()`, not a gap between frames.
+                    let mid = fragment.len() / 2;
+                    let (segment_1, segment_2) = fragment.split_at(mid);
+
+                    let mut header_and_segment_1 = Vec::with_capacity(9 + segment_1.len());
+                    header_and_segment_1
+                        .extend_from_slice(&(fragment.len() as u32).to_be_bytes()[1..]);
+                    header_and_segment_1.push(9); // CONTINUATION
+                    header_and_segment_1.push(end_headers_flag);
+                    header_and_segment_1.extend_from_slice(&1u32.to_be_bytes());
+                    header_and_segment_1.extend_from_slice(segment_1);
+                    if peer.write_all(&header_and_segment_1).is_err() || peer.flush().is_err() {
+                        return TestResult::discard();
+                    }
+
+                    for _ in 0..64 {
+                        connection.readable(&mut context, EndpointClient(&mut router));
+                        if matches!(connection.state, H2State::ContinuationFrame(_))
+                            && matches!(
+                                connection.stream_table.expect_read(),
+                                Some((H2StreamId::Zero, remaining)) if remaining == segment_2.len()
+                            )
+                        {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                    if !matches!(connection.state, H2State::ContinuationFrame(_)) {
+                        // The segment split did not land as a genuine
+                        // partial read (e.g. too small to observe) — treat
+                        // as a discard rather than a false failure.
+                        return TestResult::discard();
+                    }
+
+                    apply_interleave(&mut connection, &mut context, &mut router, point.interleave);
+
+                    if peer.write_all(segment_2).is_err() || peer.flush().is_err() {
+                        return TestResult::discard();
+                    }
+                } else {
+                    apply_interleave(&mut connection, &mut context, &mut router, point.interleave);
+
+                    let mut cframe = Vec::with_capacity(9 + fragment.len());
+                    cframe.extend_from_slice(&(fragment.len() as u32).to_be_bytes()[1..]);
+                    cframe.push(9); // CONTINUATION
+                    cframe.push(end_headers_flag);
+                    cframe.extend_from_slice(&1u32.to_be_bytes());
+                    cframe.extend_from_slice(fragment);
+                    if peer.write_all(&cframe).is_err() || peer.flush().is_err() {
+                        return TestResult::discard();
+                    }
+                }
+
+                for _ in 0..64 {
+                    connection.readable(&mut context, EndpointClient(&mut router));
+                    if !matches!(
+                        connection.state,
+                        H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
+                    ) {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+
+            if matches!(connection.state, H2State::Error | H2State::GoAway) {
+                return TestResult::error(format!(
+                    "connection reached {:?} while reassembling under plan {plan:?}",
+                    connection.state
+                ));
+            }
+
+            let next_block = peer_encoder.encode([(&b"x-sozu-qc-marker"[..], &b"qc-value"[..])]);
+            let mut decoded = Vec::new();
+            let status = connection
+                .hpack
+                .decoder_mut()
+                .decode_with_cb(&next_block, |k, v| {
+                    decoded.push((k.into_owned(), v.into_owned()));
+                });
+            if status.is_err() {
+                return TestResult::error(format!(
+                    "decoder desynced after plan {plan:?}: {status:?}"
+                ));
+            }
+            if decoded != vec![(b"x-sozu-qc-marker".to_vec(), b"qc-value".to_vec())] {
+                return TestResult::error(format!(
+                    "decoded {decoded:?} after plan {plan:?}, expected the qc marker header"
+                ));
+            }
+
+            TestResult::passed()
+        }
+
+        quickcheck! {
+            fn qc_h2_header_reassembly_survives_interleaved_control_frame_flushes(plan: ReassemblyPlan) -> TestResult {
+                drive(plan)
+            }
+        }
     }
 }
