@@ -354,6 +354,29 @@
 
 ### 🐛 Fixed
 
+- **`docs(testing)`: re-anchor the `pending_table_size_update` arming citation, and record a full
+  read of every line citation in `doc/testing.md`.** The `decode_status` note cited
+  `lib/src/protocol/mux/h2.rs:5349` as the site where
+  `H2BlockConverter::emit_pending_size_update_if_new_block` is armed. That line is
+  `if !settings.settings.is_empty() {`, the RFC 9113 §6.5 SETTINGS-ACK empty-payload check — a real
+  line inside the same `handle_settings_frame`, but a different statement in a different part of it,
+  with nothing to do with the HPACK table-size update. The arming site is
+  `self.pending_table_size_update = Some(capped);` at `lib/src/protocol/mux/h2.rs:5384`, in that
+  function's `parser::SETTINGS_HEADER_TABLE_SIZE` arm; the citation now points there. It was
+  re-derived from the construct the prose names
+  (`grep -n 'pending_table_size_update = Some' lib/src/protocol/mux/h2.rs`) and read back, never
+  computed by offsetting the stale number. All nine line citations in `doc/testing.md` were read
+  against their targets for this changeset — the eight `path.rs:NNN` groups
+  `.github/scripts/check_doc_citations.py` resolves, plus the bare `:3708` continuation its regex
+  cannot see because that form carries no path — and this was the only one landing on an unrelated
+  construct. The other eight are correct, including the two that anchor on the explanatory comment
+  above the code rather than the code line (`redirect_rewrite_auth_tests.rs:264`,
+  `h2_security_tests.rs:2440`), which were left as they are. `check_doc_citations.py` exits 0 both
+  before and after this change and is not evidence for it: rule 1 proves only that a cited line is
+  non-blank, and the drift rule exempts a `(path, spans)` pair that was already wrong at base, so a
+  citation pointing at a real but unrelated line passes silently in both directions. This changeset
+  corrects one such citation; it does not narrow that gap, and adds no check that detects the class.
+
 - **`fix(command)`: reject `command_buffer_size > max_command_buffer_size` at config load, and make
   `Channel::new`/`generate_nonblocking` clamp to it structurally.** `Channel::new`
   (`command/src/channel.rs`) took `buffer_size` and `max_buffer_size` without ever comparing them, so
