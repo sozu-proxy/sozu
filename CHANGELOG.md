@@ -712,6 +712,79 @@
   at most half the capacity out of a buffer filled to `max_buffer_size`, then one larger than what
   remains), not an observation against a running master. Closes #1436.
 
+- **`docs(command)`: `command_buffer_size` is not global, and three shipped files said it was.**
+  `doc/configure.md`'s row read "size, in bytes, of the buffer used by the main process to handle
+  commands", and `bin/config.toml` / `os-build/config.toml` both introduced the key as "size in
+  bytes of the buffer used by the command socket protocol" — precisely the channel it does not
+  size. All three are false for one of the three channel kinds the binary builds. `CommandHub::register_client`
+  (`bin/src/command/server.rs`) sizes every command-socket client channel at a literal `4096` and
+  takes only its ceiling from `max_command_buffer_size`, while the supervisor↔worker channels
+  (`bin/src/worker.rs`, `bin/src/upgrade.rs`, `CommandHub::from_upgrade_data`) and the CLI's own end
+  of that very connection (`create_channel`, `bin/src/ctl/mod.rs`) all take `command_buffer_size`.
+  An operator lowering or raising the key therefore changed nothing on the main process's end of the
+  command socket, and nothing in the configuration said so.
+
+  Resolved by keeping the value and recording the reason rather than by wiring the key through. The
+  literal is now the named `CLIENT_CHANNEL_INITIAL_BUFFER_SIZE`, carrying the argument in full: this
+  is the many-per-process channel kind — `CommandHub::run`'s accept loop registers one client per
+  `accept()` with no connection cap — and it is an address-space floor per client, plus a resident
+  one for every page a client touches, because `Channel::new` allocates both buffers eagerly
+  (`Buffer::with_capacity` is `vec![0; capacity]`) and `try_shrink_front_buf` / `try_shrink_back_buf`
+  (`command/src/channel.rs`) shrink a grown buffer back to it and never below.
+
+  Measured at 2000 clients holding two buffers each, under the jemalloc the `sozu` binary links by
+  default (`bin/Cargo.toml`, `bin/src/main.rs`): feeding `command_buffer_size` in at its 1 MB
+  built-in default costs 4737 MiB of address space and 9 MiB RSS untouched, rising to 3837 MiB RSS
+  once every page is written — roughly 2.4 MiB of address space per client and up to 1.9 MiB
+  resident. Today's value costs 18 MiB of address space and 17 MiB RSS across the same 2000 clients
+  whether faulted or not, about 9 KiB per client. So the cheapest attack — connect and send nothing —
+  buys address space rather than RSS, which still matters under `RLIMIT_AS` or strict overcommit.
+  The resident cost does not arrive with the first byte either: it arrives page by page, as a client
+  fills its buffers. A 200-byte `status` request faults one page, and the same 2000 clients with
+  1 KiB touched in each buffer cost 28 MiB RSS at the 1 MB size, not 3837 MiB. Both multiply against
+  the uncapped accept loop, and a client that never writes never reaches `command_allowed_uids`, which
+  rejects at the request layer, after registration. Capping connections is the fix for that and is a
+  separate change. What wiring the key through would buy in exchange is eight buffer doublings, and
+  only on the read side: `Channel::grow_size` has exactly two call sites, `Channel::readable` and
+  `try_read_delimited_message`, and both grow `front_buf`, so a *request* that fills the 2 MB default
+  ceiling takes nine doublings from 4096 and one from 1 MB, amortised against the socket reads of
+  that same request. A response saves none — `write_delimited_message` doubles in a local variable
+  and calls `back_buf.grow` once, one reallocation from either floor. Sizing this channel kind is a
+  memory-per-client decision, not a throughput one.
+
+  No rationale for the literal was ever recorded, and that is checked rather than assumed:
+  `f0ecc544` introduced it as the only commit of [#1060](https://github.com/sozu-proxy/sozu/pull/1060),
+  which carries zero inline review comments, zero issue comments, and a body that mentions neither
+  `4096` nor a buffer nor a capacity. In that same commit
+  `from_upgrade_data` fifty lines below already passed `command_buffer_size`, so the author had the
+  configured values in hand and diverged here, plausibly for one page per connection. The
+  `usize::MAX` ceiling it was paired with rules out a *ceiling* defence, not a sizing intent, and
+  the CWE-770 comment that later appeared at the call site argues that ceiling only — it is now
+  marked as covering that half alone. The argument above is therefore new, and the constant is where
+  it is written out.
+
+  The four documents that name the exception now defer to the constant instead of each carrying the
+  argument: `doc/configure.md`'s row states which channels the key sizes, which one it does not, and
+  what happens when `max_command_buffer_size` is set below 4096 — `Channel::new`'s clamp (#1416)
+  starts that channel *at* the ceiling with a `warn!`, never above it — while keeping the row's
+  existing sentence that `command_buffer_size` above `max_command_buffer_size` is rejected at config
+  load with `ConfigError::CommandBufferSizeExceedsMax`; `doc/configure_admin_ops.md` §5.2's table
+  names the constant, replacing "a hardcoded `4096`", and the paragraph under it states that
+  `ConfigBuilder::into_config` rejects an inverted pair at config load instead of advising operators
+  to check the two values against each other themselves, which #1416 made weaker than the code; and
+  both shipped configuration files say the key does not reach the main process's end of the command
+  socket. The sibling `max_command_buffer_size` row
+  in `doc/configure.md`, which carried the same false phrasing and no default, is corrected in the
+  same pass. `fuzz/README.md`'s construction-time note is corrected in the same pass too: it still
+  asserted that `Channel::new` "never validates `buffer_size <= max_buffer_size`" and that
+  `config.rs` "does not validate `command_buffer_size <= max_command_buffer_size` either", both of
+  which #1416 closed without touching that file, and its `command/src/channel.rs:528` line citation
+  had rotted onto an unrelated timeout loop — it now cites the symbol. No behaviour change: the constant holds the same `4096` the literal did.
+  `client_channel_initial_capacity_is_independent_of_command_buffer_size` pins it — it fails with
+  `left: 1000000 right: 4096` the moment the key is wired through, so a future change that decides
+  otherwise has to delete the test and argue the memory.
+  Closes [#1430](https://github.com/sozu-proxy/sozu/issues/1430).
+
 ### 🔐 Security
 
 - **`fix(mux-h2)`: decode a refused stream's HPACK field block instead of dropping it, so the

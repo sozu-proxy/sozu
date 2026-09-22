@@ -278,23 +278,28 @@ that exercises `readable()` incidentally. Whether the fuzz target should
 grow a second, socket-facing harness to reach `readable()` (and thereby
 this defect class) is a real open question this document does not answer.
 
-**Note — a live construction-time defect found while developing this
-target.** `Channel::new` (and therefore `generate_nonblocking`) never
-validates `buffer_size <= max_buffer_size`; every production caller
-happens to respect it, but nothing enforces it, and `config.rs` does not
-validate `command_buffer_size <= max_command_buffer_size` either. Passing
-`buffer_size > max_buffer_size` makes `front_buf` start out already larger
-than `max_buffer_size`, which trips `try_read_delimited_message`'s own
-`debug_assert!` (`command/src/channel.rs:528`, "front buffer capacity must
-never exceed max_buffer_size") on the very first parse attempt — this
-target found it within seconds via `ReaderChannel::generate_nonblocking(45,
-32)`. This is a construction-precondition gap, not a wire-framing defect,
-so it is outside this target's adversarial-input scope; the generator was
-adjusted to clamp `buffer_size <= max_buffer_size` (see the target's own
-comment at the construction-parameter derivation) rather than continuing to
-explore it. It was not fixed here (`command/src/channel.rs` is out of
-scope for this test-only changeset) — see the introducing changeset's
-report for the minimized input and full detail.
+**Note — a construction-time defect found while developing this target,
+FIXED SINCE (sozu-proxy/sozu#1416).** `Channel::new` (and therefore
+`generate_nonblocking`) used to accept `buffer_size > max_buffer_size`
+without ever comparing them; every production caller happened to respect
+the ordering, but nothing enforced it, and `config.rs` did not validate
+`command_buffer_size <= max_command_buffer_size` either. Passing
+`buffer_size > max_buffer_size` made `front_buf` start out already larger
+than `max_buffer_size`, which tripped `try_read_delimited_message`'s own
+`debug_assert!` ("front buffer capacity must never exceed
+max_buffer_size") on the very first parse attempt — this target found it
+within seconds via `ReaderChannel::generate_nonblocking(45, 32)`. This was
+a construction-precondition gap, not a wire-framing defect, so it was
+outside this target's adversarial-input scope; the generator was adjusted
+to clamp `buffer_size <= max_buffer_size` (see the target's own comment at
+the construction-parameter derivation) rather than continuing to explore
+it, and it was not fixed in that test-only changeset — see the introducing
+changeset's report for the minimized input and full detail. Both halves
+are now closed: `ConfigBuilder::into_config` rejects the pair with
+`ConfigError::CommandBufferSizeExceedsMax`, and `Channel::new` clamps
+`buffer_size` down to `max_buffer_size` with a `warn!`, pinned by
+`channel_new_clamps_buffer_size_above_max`. The generator's clamp is
+therefore redundant rather than a workaround.
 
 Seed corpus (`fuzz/corpus/fuzz_command_channel/`): regression-only, unlike
 `fuzz_frame_parser` / `fuzz_hpack_decoder` / `fuzz_tcp_clienthello`'s named

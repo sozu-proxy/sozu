@@ -62,6 +62,83 @@ pub type TaskId = usize;
 pub type WorkerId = u32;
 pub type RequestId = String;
 
+/// Per-client capacity both buffers of every command-socket client channel are
+/// allocated at, deliberately NOT the global `command_buffer_size`. The one
+/// exception is structural, not configurable: `Channel::new` clamps any
+/// initial capacity above `max_buffer_size` down to it (sozu-proxy/sozu#1416),
+/// so an operator who sets `max_command_buffer_size` below 4096 gets a client
+/// channel starting AT that ceiling, with a warning, never above it.
+///
+/// `command_buffer_size` sizes the one-or-few channel kinds: the
+/// supervisor↔worker channels (`crate::worker`, `crate::upgrade`,
+/// `CommandHub::from_upgrade_data`) and the CLI's own end of this very
+/// connection (`crate::ctl::create_channel`). This is the many-per-process
+/// kind: `CommandHub::run`'s accept loop registers one client per `accept()`
+/// with no connection cap, so whatever goes here is multiplied by the number
+/// of simultaneously connected same-UID processes.
+///
+/// It is an ADDRESS-SPACE floor, and a RESIDENT one for every page a client
+/// has touched. `Channel::new` allocates both buffers eagerly and
+/// `Buffer::with_capacity` is `vec![0; capacity]`, which the allocator serves
+/// from fresh zero pages that do not fault until written; but
+/// `Channel::try_shrink_front_buf` / `try_shrink_back_buf` shrink a grown
+/// buffer back to this value and NEVER below. Growth ABOVE the floor is
+/// released — `Buffer::shrink` truncates and `shrink_to_fit`s, so a client
+/// that grew to 1 MB and drained gets that megabyte back; the floor itself is
+/// what is never released while a client stays connected. Keep the two costs
+/// apart — the difference between them is large, and mixing them up is how
+/// this value gets sized wrong.
+///
+/// Measured at 2000 clients holding two buffers each, under the jemalloc this
+/// binary actually links (`bin/src/main.rs`'s `#[global_allocator]`): feeding
+/// `command_buffer_size` in at its 1 MB built-in default costs 4737 MiB of
+/// address space and 9 MiB RSS while untouched, rising to 3837 MiB RSS once
+/// every page is written — about 2.4 MiB of address space per client, and up
+/// to 1.9 MiB resident per client. Today's value costs 18 MiB of address space
+/// and 17 MiB RSS across the same 2000 clients, faulted or not: about 9 KiB
+/// per client either way.
+///
+/// So the cheapest attack — connect and send nothing — buys address space, not
+/// RSS: a client that never writes faults neither buffer. That is still worth
+/// refusing under `RLIMIT_AS` or strict overcommit. The resident cost does not
+/// arrive with the first byte either: it arrives page by page, as a client
+/// FILLS its buffers. A 200-byte `status` request faults one page, and the
+/// same 2000 clients with 1 KiB touched in each buffer cost 28 MiB RSS at the
+/// 1 MB size, not the 3837 MiB above. Both multiply against
+/// `CommandHub::run`'s uncapped accept loop, and a client that never writes
+/// never reaches `command_allowed_uids` (`crate::command::requests`), which
+/// rejects at the REQUEST layer, after registration. Capping connections is
+/// the fix for that and is a separate change; raising this floor before the
+/// cap exists is the wrong order.
+///
+/// No rationale was ever recorded for the value, and that is checked rather
+/// than assumed: `f0ecc544` introduced it as the only commit of PR #1060,
+/// which carries zero inline review comments, zero issue comments, and a body
+/// that mentions neither `4096` nor a buffer nor a capacity. In that same
+/// commit `from_upgrade_data` fifty lines below already passed
+/// `command_buffer_size` — so the author had the configured values in hand and
+/// diverged here, plausibly for one page per connection. The `usize::MAX`
+/// ceiling it was paired with rules out a CEILING defence, not a sizing
+/// intent, and the CWE-770 comment that later appeared at the call site argues
+/// that ceiling only. The argument above is why the value is kept now, written
+/// down so the next reader does not have to guess.
+///
+/// What keeping it small costs is reallocation, and only on the READ side.
+/// `Channel::grow_size` has exactly two call sites, `Channel::readable` and
+/// `try_read_delimited_message`, and both grow `front_buf`: a REQUEST that
+/// fills the 2 MB default ceiling takes nine doublings from here and one from
+/// 1 MB — eight saved, amortised against the socket reads of that same
+/// request. A response saves none: `write_delimited_message` doubles in a
+/// local variable and calls `back_buf.grow` once, one reallocation from either
+/// floor. That is noise. Sizing this channel kind is a memory-per-client
+/// decision, not a throughput one, which is why it does not follow the
+/// global. Raise `max_command_buffer_size` to carry a larger payload; there is
+/// no knob for this floor, and `doc/configure.md` says so.
+///
+/// Pinned by
+/// `client_channel_initial_capacity_is_independent_of_command_buffer_size`.
+const CLIENT_CHANNEL_INITIAL_BUFFER_SIZE: u64 = 4096;
+
 /// The `(worker_id, task_id, request_index)` triple [`Server::scatter_on`]
 /// embeds in every per-worker request id, `"{worker_id}-{task_id}-{request_index}"`.
 ///
@@ -366,8 +443,14 @@ impl CommandHub {
         // 2 MB, configurable) — same ceiling worker channels at the
         // fork_main_into_worker site already use. Operators who legitimately
         // need a larger ceiling can raise `max_command_buffer_size` in the
-        // global config.
-        let channel = Channel::new(stream, 4096, self.config.max_command_buffer_size);
+        // global config. That paragraph is about the CEILING only; the
+        // initial capacity next to it is `CLIENT_CHANNEL_INITIAL_BUFFER_SIZE`
+        // and its own rationale is recorded there.
+        let channel = Channel::new(
+            stream,
+            CLIENT_CHANNEL_INITIAL_BUFFER_SIZE,
+            self.config.max_command_buffer_size,
+        );
         let id = self.next_client_id();
         let session = ClientSession::new(
             channel,
@@ -1711,7 +1794,7 @@ impl Debug for Server {
 mod tests {
     use super::*;
     use sozu_command_lib::{
-        config::Config,
+        config::{Config, DEFAULT_COMMAND_BUFFER_SIZE, DEFAULT_MAX_COMMAND_BUFFER_SIZE},
         proto::command::{
             AddBackend, CertificateSummary, CertificatesByAddress, Cluster,
             ListOfCertificatesByAddress, RequestHttpFrontend, RequestTcpFrontend, SocketAddress,
@@ -1748,6 +1831,79 @@ mod tests {
         let unix_listener = UnixListener::bind(&socket_path).expect("Could not bind socket");
         CommandHub::new(unix_listener, Config::default(), "sozu".to_owned())
             .expect("Could not create command hub")
+    }
+
+    /// Regression (sozu#1430): the command-socket client channel is sized at
+    /// `CLIENT_CHANNEL_INITIAL_BUFFER_SIZE`, never at the global
+    /// `command_buffer_size`, and the two are deliberately independent.
+    ///
+    /// `command_buffer_size` sizes the one-or-few channel kinds — the
+    /// supervisor↔worker channels and the CLI's own end of this very
+    /// connection. This kind is many-per-process: `CommandHub::run`'s accept
+    /// loop registers one client per `accept()` and caps nothing. The value is
+    /// an address-space floor per client, and a resident one for every page a
+    /// client touches, because `try_shrink_front_buf` / `try_shrink_back_buf`
+    /// never shrink below it. `CLIENT_CHANNEL_INITIAL_BUFFER_SIZE` carries the
+    /// measurements and the argument; this test only pins the wiring.
+    ///
+    /// A future change may still decide to follow the global; it then has to
+    /// delete this test and argue the memory it costs, rather than move the
+    /// per-client floor by two orders of magnitude in passing.
+    #[test]
+    fn client_channel_initial_capacity_is_independent_of_command_buffer_size() {
+        let dir = tempfile::tempdir().expect("Could not create temp dir");
+        let socket_path = dir.path().join("test.sock");
+        let unix_listener = UnixListener::bind(&socket_path).expect("Could not bind socket");
+
+        // Both keys are set EXPLICITLY, from the constants themselves. The
+        // built-in defaults are applied by `ConfigBuilder::into_config`
+        // (`command/src/config.rs`), which this test never runs, and `Config`
+        // derives `Default` — so `..Default::default()` alone would leave both
+        // at `0` and the fixture would prove nothing. Naming the constants
+        // instead of copying their values keeps the fixture the case the
+        // decision is about (a deployment that omits both keys) even if either
+        // default is changed.
+        let config = Config {
+            command_buffer_size: DEFAULT_COMMAND_BUFFER_SIZE,
+            max_command_buffer_size: DEFAULT_MAX_COMMAND_BUFFER_SIZE,
+            ..Default::default()
+        };
+        assert_ne!(
+            config.command_buffer_size, CLIENT_CHANNEL_INITIAL_BUFFER_SIZE,
+            "the fixture must separate the two values or this test proves nothing"
+        );
+
+        let mut hub = CommandHub::new(unix_listener, config, "sozu".to_owned())
+            .expect("Could not create command hub");
+
+        let (_client_side, accepted) =
+            std::os::unix::net::UnixStream::pair().expect("could not create a socket pair");
+        accepted
+            .set_nonblocking(true)
+            .expect("could not set the accepted stream nonblocking");
+        hub.register_client(UnixStream::from_std(accepted));
+
+        assert_eq!(
+            hub.clients.len(),
+            1,
+            "register_client must have inserted exactly one client session"
+        );
+        let session = hub
+            .clients
+            .values()
+            .next()
+            .expect("the registered client session");
+
+        assert_eq!(
+            session.channel.front_buf.capacity() as u64,
+            CLIENT_CHANNEL_INITIAL_BUFFER_SIZE,
+            "client channel front buffer must start at the per-client floor"
+        );
+        assert_eq!(
+            session.channel.back_buf.capacity() as u64,
+            CLIENT_CHANNEL_INITIAL_BUFFER_SIZE,
+            "client channel back buffer must start at the per-client floor"
+        );
     }
 
     /// Regression (sozu#1301, sozu#1314): `handle_finishing_task` must forward

@@ -74,11 +74,14 @@ log_target = "stdout"
 # default value points to "sozu.sock" file in the current directory
 command_socket = "./sozu.sock"
 
-# size in bytes of the buffer used by the command socket protocol. If the message
-# sent to sozu is too large, or the data that sozu must return is too large, the
-# buffer will grow up to max_command_buffer_size. A frame declaring a length above
-# that ceiling is rejected; what happens to the connection afterwards is the
-# subject of sozu-proxy/sozu#1428
+# initial size in bytes of a command channel's buffers: the supervisor<->worker
+# channels and sozu ctl's own end of the command socket. It does NOT size the main
+# process's end of the command socket, which no key configures -- see
+# doc/configure_admin_ops.md section 5.2. If the message sent to sozu is too large,
+# or the data that sozu must return is too large, the buffer will grow up to
+# max_command_buffer_size. A frame declaring a length above that ceiling is
+# rejected; what happens to the connection afterwards is the subject of
+# sozu-proxy/sozu#1428
 # defaults to 1000000
 command_buffer_size = 16384
 # defaults to 2000000
