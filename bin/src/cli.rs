@@ -452,7 +452,7 @@ pub enum ClusterCmd {
         expect_proxy: bool,
         #[clap(
             long = "load-balancing-policy",
-            help = "Configures the load balancing policy. Possible values are 'roundrobin', 'random' or 'leastconnections'"
+            help = "Configures the load balancing policy. Possible values: 'round_robin', 'random', 'power_of_two', 'least_loaded', 'hrw', 'maglev' (case-insensitive). 'hrw' and 'maglev' are flow-affine policies designed for UDP clusters."
         )]
         load_balancing_policy: LoadBalancingAlgorithms,
         #[clap(
@@ -1995,5 +1995,125 @@ mod tests {
         ])
         .expect_err("clap should reject --hsts-disabled with --hsts-force-replace-backend");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    // ── `--load-balancing-policy` help text vs. the parser ──
+    // The flag's help is hand-written, while the values are consumed by
+    // `FromStr for LoadBalancingAlgorithms` (`command/src/request.rs`). The two
+    // drifted at `7555d383`, which renamed the accepted `roundrobin` to
+    // `round_robin` without sweeping this file, so the help went on naming two
+    // spellings clap rejects outright and omitted four it accepts (issue #1429).
+    // These guards derive the expected list from the proto enum itself rather
+    // than restating it, so adding a variant to `command.proto` below
+    // `LOAD_BALANCING_DISCRIMINANT_SCAN` fails here until the help names it. A
+    // discriminant at or beyond that bound is the one case that escapes them
+    // for a proto-declared variant. They see nothing else: what they compare is
+    // the proto enum against the help, so a `FromStr` arm with no proto
+    // counterpart — an alias such as `"rr" => RoundRobin` in
+    // `command/src/request.rs` — is invisible to both. It would be accepted on
+    // the command line while the help never named it, which is this very bug
+    // again. Do not add one without naming it in the help.
+
+    /// Upper bound of the discriminant scan below. `LoadBalancingAlgorithms`
+    /// declares 0..=5 today; the headroom covers future values, including ones
+    /// added past a `reserved` gap.
+    const LOAD_BALANCING_DISCRIMINANT_SCAN: i32 = 1024;
+
+    /// Every `LoadBalancingAlgorithms` variant the protobuf schema declares with
+    /// a discriminant below `LOAD_BALANCING_DISCRIMINANT_SCAN`.
+    ///
+    /// The scan deliberately does NOT stop at the first gap. `reserved 6;` next
+    /// to `WEIGHTED = 7;` is the canonical protobuf idiom for retiring an enum
+    /// value, and a scan that broke at the gap would never see `WEIGHTED`, so
+    /// these guards would pass green while the help omitted an accepted value,
+    /// precisely the drift they exist to catch.
+    fn declared_load_balancing_algorithms() -> Vec<super::LoadBalancingAlgorithms> {
+        let declared: Vec<super::LoadBalancingAlgorithms> = (0..LOAD_BALANCING_DISCRIMINANT_SCAN)
+            .filter_map(|discriminant| super::LoadBalancingAlgorithms::try_from(discriminant).ok())
+            .collect();
+        assert!(
+            !declared.is_empty(),
+            "LoadBalancingAlgorithms declares no variant"
+        );
+        declared
+    }
+
+    /// The rendered help of `sozu cluster add --load-balancing-policy`.
+    fn load_balancing_policy_help() -> String {
+        use clap::CommandFactory;
+
+        let command = super::Args::command();
+        let cluster = command
+            .find_subcommand("cluster")
+            .expect("`cluster` subcommand");
+        let add = cluster.find_subcommand("add").expect("`cluster add`");
+        let arg = add
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("load-balancing-policy"))
+            .expect("`--load-balancing-policy` argument");
+
+        arg.get_help()
+            .expect("`--load-balancing-policy` carries a help string")
+            .to_string()
+    }
+
+    /// Every single-quoted token in `help`, in order.
+    ///
+    /// Pairs quotes positionally, so the help string must not contain a prose
+    /// apostrophe (`the cluster's policy`) — that would shift every later
+    /// token. An odd quote count is caught here; a balanced prose pair instead
+    /// surfaces as a token the parser rejects, which fails the guard below
+    /// rather than passing silently.
+    fn quoted_tokens(help: &str) -> Vec<String> {
+        assert_eq!(
+            help.matches('\'').count() % 2,
+            0,
+            "`--load-balancing-policy` help has an unbalanced quote: {help}"
+        );
+        help.split('\'')
+            .skip(1)
+            .step_by(2)
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn load_balancing_policy_help_names_every_accepted_value() {
+        use super::*;
+        use std::str::FromStr;
+
+        let help = load_balancing_policy_help();
+        let quoted = quoted_tokens(&help);
+
+        for algorithm in declared_load_balancing_algorithms() {
+            // `FromStr` lowercases its input, so the protobuf name lowercased is
+            // the canonical command-line spelling.
+            let spelling = algorithm.as_str_name().to_lowercase();
+
+            assert_eq!(
+                LoadBalancingAlgorithms::from_str(&spelling).ok(),
+                Some(algorithm),
+                "`{spelling}` must round-trip through FromStr back to {algorithm:?}"
+            );
+            assert!(
+                quoted.iter().any(|token| token == &spelling),
+                "`--load-balancing-policy` help omits the accepted value `{spelling}`. help:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_balancing_policy_help_names_no_rejected_value() {
+        use super::*;
+        use std::str::FromStr;
+
+        let help = load_balancing_policy_help();
+
+        for token in quoted_tokens(&help) {
+            assert!(
+                LoadBalancingAlgorithms::from_str(&token).is_ok(),
+                "`--load-balancing-policy` help names `{token}`, which the parser rejects. help:\n{help}"
+            );
+        }
     }
 }
