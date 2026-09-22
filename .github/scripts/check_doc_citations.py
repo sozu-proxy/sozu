@@ -558,6 +558,7 @@ NOT_A_TEST = {
     "project_sozu_h2_flood_family_flakes": "agent memory note, not a test",
     "feedback_h2_repro_multi_data_frames": "agent memory note, not a test",
     "feedback_log_context_before_theorising": "agent memory note, not a test",
+    "total_abusive_rst_received_lifetime": "H2FloodDetector field name, not a test",
 }
 
 

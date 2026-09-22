@@ -8,8 +8,9 @@ Source files covered by this document:
 
 | File | Role |
 |------|------|
-| `lib/src/protocol/mux/h2.rs` | `ConnectionH2` struct, state machine, flow-control orchestration, flood detection |
+| `lib/src/protocol/mux/h2.rs` | `ConnectionH2` struct, state machine, flow-control orchestration |
 | `lib/src/protocol/mux/h2_flow_control.rs` | `H2FlowControl` — connection-level send/receive window + pending WINDOW_UPDATE queue (RFC 9113 §6.9), closed API |
+| `lib/src/protocol/mux/h2_flood_detector.rs` | `H2FloodConfig`, `H2FloodViolation`, `H2FloodDetector` — CVE-2023-44487 / CVE-2024-27316 / CVE-2025-8671 flood/abuse detection, closed API |
 | `lib/src/protocol/mux/pkawa.rs` | HPACK decoding, pseudo-header validation, RFC 9218 priority parsing |
 | `lib/src/protocol/mux/mod.rs` | Mux session, Stream, Router, ready() loop, stream lifecycle |
 | `lib/src/protocol/mux/converter.rs` | Kawa-to-H2 frame encoding (`H2BlockConverter`) |
@@ -49,11 +50,11 @@ ConnectionH2<Front>
  |   |-- draining: bool                     // True after first GOAWAY sent
  |   |-- peer_last_stream_id: Option<StreamId>  // From peer's GOAWAY (for retry)
  |
- |-- flood_detector: H2FloodDetector        // CVE-mitigation rate limiters
- |   |-- config: H2FloodConfig              // 6 configurable thresholds
- |   |-- rst_stream_count, ping_count, ...  // Per-window counters
- |   |-- glitch_count: u32                  // Cumulative anomaly counter
- |   |-- window_start: Instant              // Sliding window epoch
+ |-- flood_detector: H2FloodDetector        // Closed API (h2_flood_detector.rs, private fields):
+ |                                         // config: H2FloodConfig (13 configurable thresholds),
+ |                                         // per-window rate counters + never-decaying lifetime
+ |                                         // ceilings (Rapid Reset / MadeYouReset / CONTINUATION /
+ |                                         // Ping / Settings floods), glitch_count, window_start
  |
  |-- prioriser: Prioriser                   // RFC 9218 stream priorities
  |   |-- priorities: HashMap<StreamId, (u8, bool)>  // urgency + incremental
@@ -76,16 +77,17 @@ ConnectionH2<Front>
  |                                         // adapter owns the TimeoutContainer
 ```
 
-Access patterns use the sub-structure names directly, except `flow_control`
-and `stream_table`, which are closed APIs (`h2_flow_control.rs` and
-`h2_stream_table.rs` respectively, both private fields) reached only through
-their accessor/mutator methods:
+Access patterns use the sub-structure names directly, except `flow_control`,
+`stream_table` and `flood_detector`, which are closed APIs
+(`h2_flow_control.rs`, `h2_stream_table.rs` and `h2_flood_detector.rs`
+respectively, all with private fields) reached only through their
+accessor/mutator methods:
 
 ```rust
 self.flow_control.consume_send_window(consumed);
 self.bytes.overhead_bin += size;
 self.drain.draining = true;
-self.flood_detector.check_flood();
+self.flood_detector.check_flood(self.now);
 self.prioriser.get(&stream_id);
 ```
 
@@ -159,45 +161,74 @@ Priority entries are removed at 4 lifecycle sites to prevent HashMap growth:
 
 ## Flood Detection
 
+`H2FloodConfig`, `H2FloodViolation` and `H2FloodDetector` live in
+`lib/src/protocol/mux/h2_flood_detector.rs`, behind the same closed-API shape
+`hpack_state.rs`, `h2_flow_control.rs` and `h2_stream_table.rs` use:
+`H2FloodDetector`'s fields are private to that module, reached only through
+its `record_*`/`check_flood`/`config`/accessor methods — `ConnectionH2` (in
+`h2.rs`) orchestrates the frame-dispatch logging and GOAWAY around it.
+
 ### H2FloodConfig
 
 Configurable thresholds with safe compile-time defaults:
 
 | Field | Default | CVE | Attack |
 |-------|---------|-----|--------|
-| `max_rst_stream_per_window` | 100 | CVE-2023-44487, CVE-2019-9514 | Rapid Reset / Reset Flood |
+| `max_rst_stream_per_window` | 100 | CVE-2023-44487, CVE-2019-9514 | Rapid Reset / Reset Flood (per-window) |
+| `max_rst_stream_lifetime` | 10 000 | CVE-2023-44487 | Rapid Reset, never-decaying lifetime ceiling |
+| `max_rst_stream_abusive_lifetime` | 50 | CVE-2023-44487 | Rapid Reset signature (pre-response-start RST) |
+| `max_rst_stream_emitted_lifetime` | 500 | CVE-2025-8671 | MadeYouReset (server-emitted RST_STREAM) |
 | `max_ping_per_window` | 100 | CVE-2019-9512 | Ping Flood |
 | `max_settings_per_window` | 50 | CVE-2019-9515 | Settings Flood |
 | `max_empty_data_per_window` | 100 | CVE-2019-9518 | Empty Frames Attack |
-| `max_continuation_frames` | 20 | CVE-2024-27316 | CONTINUATION Flood |
+| `max_window_update_stream0_per_window` | 100 | (rate cap) | Stream-0 WINDOW_UPDATE CPU-burn |
+| `max_continuation_frames` | 20 | CVE-2024-27316 | CONTINUATION Flood (per-block frame count) |
+| `max_header_list_size` | 65536 (64 KiB) | CVE-2024-27316 | CONTINUATION Flood (per-block accumulated size) |
+| `max_header_table_size` | 65536 (64 KiB) | (HPACK memory) | Peer-advertised dynamic table size cap |
+| `max_header_fields` | 128 | (HPACK memory) | Indexed-reference "header bomb" |
 | `max_glitch_count` | 100 | (cumulative) | General protocol abuse |
 
-The sliding window duration is 1 second (`FLOOD_WINDOW_DURATION`).
+The sliding window duration is 1 second (`FLOOD_WINDOW_DURATION`). Every
+threshold is clamped to at least 1 by `H2FloodConfig::new` (a zero threshold
+would trip on the very first frame).
 
 ### H2FloodDetector
 
-Created via `H2FloodDetector::new(config)`. Tracks per-window counters for each
-frame type plus a cumulative `glitch_count` for miscellaneous protocol violations.
+Created via `H2FloodDetector::new(config, now)` — `now` is the caller's clock
+snapshot (`ConnectionH2::new`'s single accept-time sample); the detector never
+reads the clock itself. Tracks per-window counters for each frame type, the
+never-decaying lifetime ceilings above, plus a cumulative `glitch_count` for
+miscellaneous protocol violations.
 
 **Sliding window decay** (`maybe_reset_window`): When the window expires,
-counters are halved (not zeroed). This half-decay catches burst-then-wait attack
-patterns where an attacker sends a burst, waits for the window to reset, then
-bursts again.
+rate-based counters (not the lifetime ceilings) are halved (not zeroed). This
+half-decay catches burst-then-wait attack patterns where an attacker sends a
+burst, waits for the window to reset, then bursts again.
 
-**Check flow** (`check_flood`):
+**Check flow** (`check_flood`, evaluated in this fixed order — not an
+iteration over anything, so the order cannot vary between runs):
 
 ```
-check_flood()
-  |-- maybe_reset_window()   // half-decay if window expired
-  |-- check rst_stream_count > threshold?  --> Some(EnhanceYourCalm)
-  |-- check ping_count > threshold?        --> Some(EnhanceYourCalm)
-  |-- check settings_count > threshold?    --> Some(EnhanceYourCalm)
-  |-- check empty_data_count > threshold?  --> Some(EnhanceYourCalm)
-  |-- check continuation_count > threshold? --> Some(EnhanceYourCalm)
-  |-- check accumulated_header_size > 64KB? --> Some(EnhanceYourCalm)
-  |-- check glitch_count > threshold?      --> Some(EnhanceYourCalm)
+check_flood(now)
+  |-- maybe_reset_window(now)               // half-decay if window expired
+  |-- check rst_stream_count > threshold?          --> Some(EnhanceYourCalm)
+  |-- check ping_count > threshold?                --> Some(EnhanceYourCalm)
+  |-- check total_ping_received_lifetime > 10 000?  --> Some(EnhanceYourCalm)
+  |-- check settings_count > threshold?            --> Some(EnhanceYourCalm)
+  |-- check total_settings_received_lifetime > 10 000? --> Some(EnhanceYourCalm)
+  |-- check empty_data_count > threshold?          --> Some(EnhanceYourCalm)
+  |-- check continuation_count > threshold?        --> Some(EnhanceYourCalm)
+  |-- check window_update_stream0_count > threshold? --> Some(EnhanceYourCalm)
+  |-- check accumulated_header_size > threshold?   --> Some(EnhanceYourCalm)
+  |-- check glitch_count > threshold?              --> Some(EnhanceYourCalm)
   '-- None (all OK)
 ```
+
+The RST_STREAM lifetime ceilings (`max_rst_stream_lifetime`,
+`max_rst_stream_abusive_lifetime`) and the MadeYouReset ceiling
+(`max_rst_stream_emitted_lifetime`) are checked separately, by
+`record_rst_lifetime` and `record_rst_emitted` respectively, at their own
+call sites — not inside `check_flood`'s chain.
 
 **CONTINUATION-specific counters** are reset when a header block completes
 (`reset_continuation()`), since they track per-block counts, not per-window.
@@ -722,7 +753,8 @@ locks those fixes in:
 
 `H2FloodDetector` caps stream-0 `WINDOW_UPDATE` frames at
 `DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW = 100` per sliding window
-(`lib/src/protocol/mux/h2.rs`, enforced by `H2FloodDetector::check_flood`). The
+(`lib/src/protocol/mux/h2_flood_detector.rs`, enforced by
+`H2FloodDetector::check_flood`). The
 drain helper refreshes per-stream windows only; the one-shot conn-level bump
 during `h2_handshake_chromium_146` is the single stream-0 `WINDOW_UPDATE`
 emitted during the test.
