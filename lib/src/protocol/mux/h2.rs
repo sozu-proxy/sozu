@@ -35,6 +35,7 @@ use crate::{
         BackendStatus, Context, DebugEvent, DebugHistory, Endpoint, GenericHttpStream,
         GlobalStreamId, MuxResult, Position, Stream, StreamId, StreamState, converter,
         forcefully_terminate_answer,
+        h2_drain::{self, GracefulDrainDecision},
         h2_flood_detector::{self, H2FloodConfig, H2FloodViolation},
         h2_flow_control, h2_stream_table, hpack_state,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
@@ -89,7 +90,7 @@ macro_rules! log_context {
             streams = $self.stream_table.len(),
             last_peer_id = $self.stream_table.highest_peer_stream_id(),
             window = $self.flow_control.window(),
-            draining = $self.drain.draining,
+            draining = $self.drain.draining(),
             total_rst_streams_emitted_lifetime = $self.flood_detector.total_rst_streams_emitted_lifetime(),
             total_rst_received_lifetime = $self.flood_detector.total_rst_received_lifetime(),
             readiness = $self.readiness,
@@ -123,7 +124,7 @@ macro_rules! log_context_stream {
             streams = $self.stream_table.len(),
             last_peer_id = $self.stream_table.highest_peer_stream_id(),
             window = $self.flow_control.window(),
-            draining = $self.drain.draining,
+            draining = $self.drain.draining(),
             total_rst_streams_emitted_lifetime = $self.flood_detector.total_rst_streams_emitted_lifetime(),
             total_rst_received_lifetime = $self.flood_detector.total_rst_received_lifetime(),
             readiness = $self.readiness,
@@ -1022,35 +1023,6 @@ pub struct H2ByteAccounting {
     pub overhead_bout: usize,
 }
 
-/// Connection draining state for graceful shutdown.
-pub struct H2DrainState {
-    /// True when we've sent GOAWAY and are draining.
-    pub draining: bool,
-    /// Last stream ID from peer's GOAWAY (for retry decisions).
-    pub peer_last_stream_id: Option<StreamId>,
-    /// Wall-clock timestamp captured the first time this connection entered
-    /// `draining` during soft-stop. Used together with
-    /// [`Self::graceful_shutdown_deadline`] to decide when to force-close.
-    /// Remains `None` until the proxy-initiated drain begins (peer-initiated
-    /// drains via `handle_goaway_frame` don't arm the forced-close timer —
-    /// the caller in `Mux::shutting_down` is the only writer).
-    pub started_at: Option<Instant>,
-    /// Wall-clock budget granted to in-flight streams after the initial
-    /// `GOAWAY(NO_ERROR)`. `None` means "wait indefinitely" (knob value `0`).
-    /// Default when unset upstream: 5 s (see `L7ListenerHandler`).
-    pub graceful_shutdown_deadline: Option<std::time::Duration>,
-    /// True when [`ConnectionH2::graceful_goaway`] decided to drain but had
-    /// to defer serializing the advisory GOAWAY because
-    /// `header_block_reassembly_in_progress()` was true at the time —
-    /// `self.zero.storage` is also the in-flight HEADERS/CONTINUATION
-    /// accumulation buffer and clearing it would corrupt the reassembly.
-    /// [`ConnectionH2::flush_pending_control_frames`] sends it, via
-    /// [`ConnectionH2::send_initial_goaway`], as soon as reassembly
-    /// completes. Cleared without sending if a final GOAWAY
-    /// ([`ConnectionH2::goaway`]) supersedes it first.
-    pub initial_goaway_pending: bool,
-}
-
 pub struct ConnectionH2<Front: SocketHandler> {
     /// Connection/session ULID propagated from the parent [`Mux`]. Used to
     /// stamp the session slot of the `[session req cluster backend]` log
@@ -1102,8 +1074,10 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// requirement, not a nicety — see the RFC 9113 encoder-decoder
     /// synchronisation contract (§6.5.2).
     pub pending_table_size_update: Option<u32>,
-    /// Connection draining state for graceful shutdown.
-    pub drain: H2DrainState,
+    /// RFC 9113 §6.8 double-GOAWAY drain bookkeeping, encapsulated so
+    /// nothing outside `h2_drain.rs` can reach the raw fields — see
+    /// [`h2_drain::H2DrainState`].
+    pub(super) drain: h2_drain::H2DrainState,
     pub zero: GenericHttpStream,
     /// Byte accounting for connection overhead attribution.
     pub bytes: H2ByteAccounting,
@@ -1362,7 +1336,7 @@ fn decode_discarded_field_block(
 impl<Front: SocketHandler> ConnectionH2<Front> {
     fn frontend_hung_up_while_draining(&self) -> bool {
         matches!(self.position, Position::Server)
-            && self.drain.draining
+            && self.drain.draining()
             && (self.readiness.event.is_hup() || self.readiness.event.is_error())
     }
 
@@ -1468,13 +1442,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             timeout_deadline: now.checked_add(timeout_duration),
             flow_control: h2_flow_control::H2FlowControl::new(DEFAULT_INITIAL_WINDOW_SIZE as i32),
             pending_table_size_update: None,
-            drain: H2DrainState {
-                draining: false,
-                peer_last_stream_id: None,
-                started_at: None,
-                graceful_shutdown_deadline,
-                initial_goaway_pending: false,
-            },
+            drain: h2_drain::H2DrainState::new(graceful_shutdown_deadline),
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
             bytes: H2ByteAccounting {
                 zero_bytes_read: 0,
@@ -1662,7 +1630,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         // Without this check, a peer racing the drain
                         // window could open arbitrary new streams between
                         // the initial and final GOAWAY emission.
-                        if self.drain.draining {
+                        if self.drain.draining() {
                             self.stream_table.observe_peer_stream_id(stream_id);
                             return self.refuse_stream_and_discard(
                                 stream_id,
@@ -2016,7 +1984,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.bytes.zero_bytes_read += size;
                 if update_readiness_after_read(size, status, &mut self.readiness) {
                     if matches!(self.position, Position::Server)
-                        && self.drain.draining
+                        && self.drain.draining()
                         && matches!(status, SocketResult::Closed | SocketResult::Error)
                     {
                         // During graceful drain, a frontend EOF/HUP means no
@@ -2858,7 +2826,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 endpoint.end_stream(token, global_stream_id, context);
             }
         }
-        if close_frontend_after_completed_stream && !self.drain.draining {
+        if close_frontend_after_completed_stream && !self.drain.draining() {
             return if self.stream_table.streams().is_empty() {
                 self.goaway(H2Error::NoError)
             } else {
@@ -3003,7 +2971,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        if !self.drain.draining || !matches!(self.state, H2State::GoAway | H2State::Error) {
+        if !self.drain.draining() || !matches!(self.state, H2State::GoAway | H2State::Error) {
             return;
         }
 
@@ -3061,7 +3029,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         // RFC 9113 §6.8: if draining and all streams have completed,
         // send the final GOAWAY with the actual last_stream_id
-        if self.drain.draining && self.stream_table.streams().is_empty() {
+        if self.drain.draining() && self.stream_table.streams().is_empty() {
             return self.graceful_goaway(self.now);
         }
 
@@ -3188,12 +3156,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // set and retry on a later pass (nothing is lost: `graceful_goaway`
         // already armed WRITABLE, and completing the reassembly re-enters
         // this function via the next writable() call in the same
-        // readable()/writable() sweep).
-        if self.drain.initial_goaway_pending
-            && self.stream_table.expect_write().is_none()
-            && !self.header_block_reassembly_in_progress()
+        // readable()/writable() sweep). The readiness/reassembly check stays
+        // here, computed by this caller: `H2DrainState` has neither
+        // `self.stream_table` nor `self.state` to compute it itself — see
+        // `h2_drain`'s module doc.
+        let ready_to_flush_initial_goaway = self.stream_table.expect_write().is_none()
+            && !self.header_block_reassembly_in_progress();
+        if self
+            .drain
+            .take_deferred_initial_goaway(ready_to_flush_initial_goaway)
         {
-            self.drain.initial_goaway_pending = false;
             return Some(self.send_initial_goaway());
         }
 
@@ -4172,14 +4144,13 @@ fn h2_frame_rx_metric_key(frame: &Frame) -> &'static str {
 impl<Front: SocketHandler> ConnectionH2<Front> {
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
         self.state = H2State::Error;
-        self.drain.draining = true;
         // A final/error GOAWAY supersedes any advisory initial GOAWAY that
         // `graceful_goaway` deferred: this frame carries a real
         // `last_stream_id` and `expect_read` is dropped below, so no further
         // readable() will ever complete the reassembly that deferred it.
         // Sending the stale advisory afterward would only be a redundant,
         // less informative GOAWAY.
-        self.drain.initial_goaway_pending = false;
+        self.drain.enter_final_goaway();
         self.stream_table.set_expect_read(None);
         // Disarm the SETTINGS ACK timer: once we've committed to GOAWAY, the
         // timeout check at `readable()` / `flush_pending_control_frames()` must
@@ -4246,49 +4217,41 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// `ready()` and therefore outside the pass that last refreshed the
     /// mirror. In-module callers pass `self.now`.
     pub fn graceful_goaway(&mut self, now: Instant) -> MuxResult {
-        if self.drain.draining {
-            // Second GOAWAY: send with the real last_stream_id
-            return self.goaway(H2Error::NoError);
-        }
-
-        // First GOAWAY: advertise MAX stream ID so the peer knows we are draining
-        // but does not yet know the cutoff. This gives in-flight requests a chance
-        // to arrive before we commit to a final last_stream_id.
-        self.drain.draining = true;
-        // Arm the forced-close timer from the moment the proxy decides to drain,
-        // unconditionally — including when the GOAWAY itself must be deferred
-        // below. `Mux::shutting_down` samples it against
-        // `graceful_shutdown_deadline` and returns `true` once the budget is
-        // exhausted so the session loop tears the connection down instead of
-        // waiting forever; a late start here would let a stalled reassembly
-        // silently extend that budget.
-        self.drain.started_at = Some(now);
-
         // `self.zero.storage` is also the read-side accumulation buffer for
         // an in-flight HEADERS/CONTINUATION field block
         // (`header_block_reassembly_in_progress`, a few lines above the
         // WINDOW_UPDATE stage of `flush_pending_control_frames`): clearing it
         // here to serialize the GOAWAY would destroy that reassembly out from
         // under it, directly contradicting the "existing streams should
-        // continue reading" promise below. Defer, the same way
-        // `flush_pending_control_frames` already defers its WINDOW_UPDATE and
-        // RST_STREAM drains: `flush_pending_control_frames` sends the
-        // deferred GOAWAY via `send_initial_goaway` as soon as reassembly
-        // completes.
-        if self.header_block_reassembly_in_progress() {
-            self.drain.initial_goaway_pending = true;
-            debug!(
-                "{} GOAWAY (graceful, initial) deferred: header block reassembly in progress",
-                log_context!(self)
-            );
-            // Ensure a writable() pass happens even if nothing else would
-            // arm it, so the deferred GOAWAY is not left waiting on an
-            // unrelated event.
-            self.readiness.arm_writable();
-            return MuxResult::Continue;
+        // continue reading" promise below. `H2DrainState::begin_graceful_drain`
+        // decides whether to defer for exactly that reason, given this
+        // caller-computed check — the module has no `H2State` of its own to
+        // read it with.
+        let reassembly_in_progress = self.header_block_reassembly_in_progress();
+        match self.drain.begin_graceful_drain(now, reassembly_in_progress) {
+            // Second GOAWAY: send with the real last_stream_id.
+            GracefulDrainDecision::AlreadyDraining => self.goaway(H2Error::NoError),
+            // Defer, the same way `flush_pending_control_frames` already
+            // defers its WINDOW_UPDATE and RST_STREAM drains:
+            // `flush_pending_control_frames` sends the deferred GOAWAY via
+            // `send_initial_goaway` as soon as reassembly completes.
+            GracefulDrainDecision::DeferInitial => {
+                debug!(
+                    "{} GOAWAY (graceful, initial) deferred: header block reassembly in progress",
+                    log_context!(self)
+                );
+                // Ensure a writable() pass happens even if nothing else would
+                // arm it, so the deferred GOAWAY is not left waiting on an
+                // unrelated event.
+                self.readiness.arm_writable();
+                MuxResult::Continue
+            }
+            // First GOAWAY, no reassembly in progress: advertise MAX stream
+            // ID so the peer knows we are draining but does not yet know the
+            // cutoff. This gives in-flight requests a chance to arrive
+            // before we commit to a final last_stream_id.
+            GracefulDrainDecision::SendInitial => self.send_initial_goaway(),
         }
-
-        self.send_initial_goaway()
     }
 
     /// Serializes and queues the first, advisory GOAWAY
@@ -4353,12 +4316,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// - the knob is `0` / `None` (indefinite wait explicitly opted in),
     /// - or the elapsed time is still within the configured budget.
     pub fn graceful_shutdown_deadline_elapsed(&self) -> bool {
-        match (self.drain.started_at, self.drain.graceful_shutdown_deadline) {
-            (Some(started_at), Some(deadline)) => {
-                self.now.saturating_duration_since(started_at) >= deadline
-            }
-            _ => false,
-        }
+        self.drain.deadline_elapsed(self.now)
     }
 
     /// Returns `true` if there is data queued waiting to be flushed:
@@ -4480,7 +4438,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         L: ListenerHandler + L7ListenerHandler,
     {
         // RFC 9113 §6.8: reject new streams on a draining connection
-        if self.drain.draining {
+        if self.drain.draining() {
             error!(
                 "{} Rejecting new stream {} on draining connection",
                 log_context!(self),
@@ -4639,7 +4597,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
         // (5) Drain/state coupling: terminal states imply draining.
         debug_assert!(
-            !matches!(self.state, H2State::GoAway | H2State::Error) || self.drain.draining,
+            !matches!(self.state, H2State::GoAway | H2State::Error) || self.drain.draining(),
             "GoAway/Error state must imply the connection is draining"
         );
     }
@@ -5519,8 +5477,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         count!(metric_for_goaway_received(goaway.error_code), 1);
         // RFC 9113 §6.8: begin graceful drain.
-        self.drain.draining = true;
-        self.drain.peer_last_stream_id = Some(goaway.last_stream_id);
+        self.drain.observe_peer_goaway(goaway.last_stream_id);
+        let peer_last_stream_id = self
+            .drain
+            .peer_last_stream_id()
+            .expect("observe_peer_goaway just recorded this");
 
         // Streams with ID > last_stream_id were NOT processed by the peer.
         // Mark them for retry (StreamState::Link) so they can be retried
@@ -5530,7 +5491,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // RST_STREAM to the client, killing the request instead of retrying it.
         let mut retry_streams = Vec::new();
         for (&stream_id, &global_stream_id) in self.stream_table.streams() {
-            if stream_id > goaway.last_stream_id {
+            if stream_id > peer_last_stream_id {
                 retry_streams.push((stream_id, global_stream_id));
             }
         }
@@ -6193,7 +6154,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // stream's liveness deadline below.
         self.now = context.now;
         // RFC 9113 §6.8: reject new streams on a draining connection
-        if self.drain.draining {
+        if self.drain.draining() {
             error!(
                 "{} Cannot open new stream on draining connection (stream {})",
                 log_context!(self),
@@ -7694,17 +7655,19 @@ mod tests {
     /// `armed_at`, and the "not yet elapsed" assertion would trip.
     ///
     /// To SEE THIS RED: restore either half of the old behaviour.
-    /// (a) `self.drain.started_at = Some(Instant::now());` in
-    ///     `graceful_goaway` — the `assert_eq!` on `drain.started_at` fails:
-    ///     ``assertion `left == right` failed: graceful_goaway must arm the
-    ///     budget from its `now` parameter / left: Some(Instant { tv_sec:
-    ///     107343, .. }) / right: Some(Instant { tv_sec: 107443, .. })`` —
-    ///     the two differing by exactly the 100 s offset above.
+    /// (a) `self.started_at = Some(Instant::now());` in
+    ///     `h2_drain::H2DrainState::begin_graceful_drain` — the `assert_eq!`
+    ///     on `drain.__test_started_at()` fails: ``assertion `left == right`
+    ///     failed: graceful_goaway must arm the budget from its `now`
+    ///     parameter / left: Some(Instant { tv_sec: 107343, .. }) / right:
+    ///     Some(Instant { tv_sec: 107443, .. })`` — the two differing by
+    ///     exactly the 100 s offset above.
     /// (b) `started_at.elapsed() >= deadline` in
-    ///     `graceful_shutdown_deadline_elapsed` — the LAST assertion fails with
-    ///     `advancing only the connection snapshot past the budget must force
-    ///     close`, because no real time passes in this test, so the forced-close
-    ///     budget never expires however far the connection's clock is moved.
+    ///     `h2_drain::H2DrainState::deadline_elapsed` — the LAST assertion
+    ///     fails with `advancing only the connection snapshot past the
+    ///     budget must force close`, because no real time passes in this
+    ///     test, so the forced-close budget never expires however far the
+    ///     connection's clock is moved.
     #[test]
     fn graceful_shutdown_deadline_is_evaluated_against_the_connection_snapshot() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
@@ -7720,7 +7683,7 @@ mod tests {
         let armed_at = connection.now + Duration::from_secs(100);
         connection.graceful_goaway(armed_at);
         assert_eq!(
-            connection.drain.started_at,
+            connection.drain.__test_started_at(),
             Some(armed_at),
             "graceful_goaway must arm the budget from its `now` parameter"
         );
@@ -8223,7 +8186,7 @@ mod tests {
         connection
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
-        connection.drain.draining = true;
+        connection.drain.__test_set_draining();
 
         // The peer's encoder. `loona_hpack` indexes a header whose *name* is in
         // neither table, so this block appends `x-sozu-probe: alpha` to the
@@ -8351,7 +8314,7 @@ mod tests {
         connection
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
-        connection.drain.draining = true;
+        connection.drain.__test_set_draining();
 
         // Same probe technique as the sibling test: this appends
         // `x-sozu-probe: alpha` to the peer's dynamic table at index 62.
@@ -8716,18 +8679,18 @@ mod tests {
         // out — `Mux::shutting_down` samples exactly this field against
         // `graceful_shutdown_deadline`.
         assert!(
-            connection.drain.draining,
+            connection.drain.draining(),
             "graceful_goaway must mark the connection as draining immediately, \
              even when the GOAWAY itself is deferred"
         );
         assert_eq!(
-            connection.drain.started_at,
+            connection.drain.__test_started_at(),
             Some(drain_at),
             "the forced-close budget must arm from `graceful_goaway`'s `now` \
              parameter immediately, not once the deferred GOAWAY is sent"
         );
         assert!(
-            connection.drain.initial_goaway_pending,
+            connection.drain.__test_initial_goaway_pending(),
             "the advisory GOAWAY must be deferred while a header block is \
              reassembling, not sent (and clobber the reassembly) or dropped"
         );
@@ -8803,14 +8766,14 @@ mod tests {
         // serialization.
         for _ in 0..8 {
             connection.writable(&mut context, EndpointClient(&mut router));
-            if !connection.drain.initial_goaway_pending
+            if !connection.drain.__test_initial_goaway_pending()
                 && connection.stream_table.expect_write().is_none()
             {
                 break;
             }
         }
         assert!(
-            !connection.drain.initial_goaway_pending,
+            !connection.drain.__test_initial_goaway_pending(),
             "the deferred advisory GOAWAY must be sent once reassembly completes, \
              not left pending forever"
         );
