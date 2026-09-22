@@ -39,6 +39,25 @@
   `fuzz/README.md` §2.5/§6). Run with `cargo +nightly fuzz run fuzz_command_channel` from `fuzz/`
   (`doc/testing.md` §6).
 
+- **`ci(docs)`: `check_doc_citations.py` gained a fourth rule — a fenced code block may name the
+  lines it quotes, and is then compared to them literally.** The first three rules all check a
+  *pointer* (a path, a line number, a test name); none looked at the code a document **quotes**, so
+  `doc/h2_mux_internals.md` could carry blocks writing `self.encoder`, `self.decoder`,
+  `self.converter_buf` and `self.lowercase_buf` on `ConnectionH2` months after #1403 moved all four
+  behind `hpack_state.rs` where they are private — `E0609` as written, and green under every check
+  (sozu-proxy/sozu#1424). The annotation goes in the fence's info string after the language,
+  ` ```rust lib/src/protocol/mux/hpack_state.rs:121-131 `, and the cited lines are compared to the
+  block line by line, stripped, so losing an `impl` block's indentation is not a mismatch and every
+  other character is. It is an ordinary citation, so a pinned block is range-checked by rule 1 and
+  drift-checked by rule 2 as well. The rule is **opt-in by design**: of the 27 `rust` blocks on the
+  guarded surface only 7 are verbatim quotes — the rest are deliberately abbreviated, composite or
+  simplified — so a rule comparing all of them would fire on 20 of 27 and be silenced. `rustdoc`
+  doctests cannot substitute: a doctest compiles as a separate crate against the public API, and
+  every snippet at issue reads a private field of a private type inside `impl ConnectionH2`.
+  Convention and the measurements behind it: `doc/README.md#pinning-a-quoted-code-block`.
+  Note the one wrinkle: the drift rule compares a pin only from the *next* commit onward, because
+  it exempts a citation the base revision of the document did not carry.
+
 - **`test(sim)`: deterministic simulation of the metrics cardinality-lease core.**
   `sim/tests/metrics_lease_sim.rs` drives `sozu_lib::metrics::Aggregator`'s `lease_apply` /
   `lease_clear` / `lease_tick` machinery, plus the `remove_cluster` / `add_cluster` /
@@ -215,6 +234,42 @@
   `ROUND_ROBIN`, `LEAST_LOADED` and `POWER_OF_TWO` do not, and `HRW`/`MAGLEV` only on the
   flow-keyed path, falling back to `ROUND_ROBIN` without a key. `POWER_OF_TWO` and `LEAST_LOADED`
   can now be told apart before one is chosen over the other.
+
+- **`docs(mux-h2)`: swept `doc/h2_mux_internals.md` for code that no longer compiles, and pinned
+  every block that can be quoted verbatim.** The H2 sans-io extraction series moved fields behind
+  module boundaries without touching this document, so its snippets drifted while their citations
+  kept resolving (sozu-proxy/sozu#1424). Repaired: the `ConnectionH2` field tree (`decoder`,
+  `encoder`, `converter_buf`, `lowercase_buf` are now `hpack: HpackState`, and `drain` carries three
+  more fields); the HPACK table-size sync and converter-buffer shrink blocks, now quoting
+  `hpack_state.rs` and the capped `SETTINGS_HEADER_TABLE_SIZE` arm; `distribute_overhead`'s seventh
+  parameter `is_last_stream`; `compute_stream_byte_totals`'s generic signature; the priority sort,
+  which is `sort_by_cached_key` over `priorities_buf` followed by
+  `Prioriser::apply_incremental_rotation` — so the claim that the `incremental` flag was "stored but
+  not yet used" was wrong; the access-log path, where overhead is distributed inside
+  `try_recycle_server_stream` and `snapshot_rtts` is an associated function, not a method; the
+  fallible `write_all` pattern, which now returns a typed `RejectReason`; `check_flood`, which takes
+  a clock snapshot and returns `Option<H2FloodViolation>` over ten counters including the
+  never-decaying lifetime ones; `readable`/`writable`'s real signatures; and
+  `Stream::generate_access_log`, which lives in `stream.rs`, not `mod.rs`. The protobuf excerpt no
+  longer claims its field numbers hold for `HttpsListenerConfig`, which numbers the same names
+  differently. 17 of the file's 19 `rust` blocks now carry a source pin; the two that do not are a
+  synthetic list of call shapes and a bare `#[cfg]` attribute, neither of which is a quote of one
+  span.
+  The same sweep corrects what the GOAWAY/drain extraction left behind: `drain: H2DrainState` was
+  still listed with its five fields inline — `draining`, `peer_last_stream_id`, `started_at`,
+  `graceful_shutdown_deadline`, `initial_goaway_pending` — as though they were the struct's shape,
+  while the document never named `h2_drain.rs` at all. All five are private to that module and
+  `h2.rs` reads none of them directly outside test code, reaching the state through `draining()` at
+  eleven call sites plus `begin_graceful_drain`, `deadline_elapsed`, `observe_peer_goaway` and
+  `enter_final_goaway`. The entry now carries the same `Closed API (h2_drain.rs, private fields)`
+  annotation the other four extracted modules already had, the access-pattern list names five
+  closed APIs rather than four, and two worked examples that showed a `drain.draining = true`
+  field write — one in the access-pattern block, one in the flood-violation sequence — now call
+  `enter_final_goaway()`, which is what the code does. The deferred-advisory step names
+  `H2DrainState::take_deferred_initial_goaway` instead of describing a readable
+  `initial_goaway_pending` flag. None of this is reachable by the resolver: the drift rule compares
+  a cited line at two revisions, and this document does not modify `h2.rs`, so every one of these
+  sentences passed a green gate while being false.
 
 - **`refactor(metrics)`: `Aggregator::lease_apply` now takes an injected `now: Instant` instead of
   reading `Instant::now()` directly.** Every other clock-dependent entry point on the lease table —

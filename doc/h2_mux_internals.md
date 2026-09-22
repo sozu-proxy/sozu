@@ -46,9 +46,9 @@ ConnectionH2<Front>
  |   |-- overhead_bin: usize                // Overhead bytes received (connection frames)
  |   |-- overhead_bout: usize               // Overhead bytes sent (connection frames)
  |
- |-- drain: H2DrainState                    // Graceful shutdown state
- |   |-- draining: bool                     // True after first GOAWAY sent
- |   |-- peer_last_stream_id: Option<StreamId>  // From peer's GOAWAY (for retry)
+ |-- drain: H2DrainState                    // Closed API (h2_drain.rs, private fields):
+ |                                         // draining, peer_last_stream_id, started_at,
+ |                                         // graceful_shutdown_deadline, initial_goaway_pending
  |
  |-- flood_detector: H2FloodDetector        // Closed API (h2_flood_detector.rs, private fields):
  |                                         // config: H2FloodConfig (13 configurable thresholds),
@@ -58,38 +58,63 @@ ConnectionH2<Front>
  |
  |-- prioriser: Prioriser                   // RFC 9218 stream priorities
  |   |-- priorities: HashMap<StreamId, (u8, bool)>  // urgency + incremental
+ |   |-- incremental_cursor: StreamId       // RFC 9218 s4 round-robin cursor
  |
- |-- decoder: loona_hpack::Decoder          // HPACK decoder (inbound)
- |-- encoder: loona_hpack::Encoder          // HPACK encoder (outbound)
+ |-- hpack: HpackState                      // Closed API (hpack_state.rs, private fields):
+ |                                         // decoder, encoder, and the reusable
+ |                                         // converter_buf / lowercase_buf / cookie_buf /
+ |                                         // priorities_buf scratch buffers
  |-- local_settings: H2Settings             // Settings we advertise
  |-- peer_settings: H2Settings              // Settings the peer advertised
  |-- stream_table: H2StreamTable             // Closed API (h2_stream_table.rs, private fields):
  |                                         // streams: HashMap<StreamId, GlobalStreamId>,
  |                                         // highest_peer_stream_id, expect_read, expect_write,
  |                                         // rst_sent, and the per-stream activity/fc-stall maps
- |-- converter_buf: Vec<u8>                 // Reusable HPACK encode buffer
- |-- lowercase_buf: Vec<u8>                 // Reusable header key lowercase buffer
+ |-- pending_table_size_update: Option<u32> // RFC 7541 s6.3 directive owed to the peer
  |-- pending_rst_streams: Vec<(StreamId, H2Error)>  // Queued RST_STREAM frames
  |-- settings_sent_at: Option<Instant>      // SETTINGS ACK timeout tracking
  |-- zero: GenericHttpStream                // Connection-level (stream 0) buffer
  |-- timeout_duration: Duration             // Configured idle timeout
  |-- timeout_deadline: Option<Instant>      // Next callback instant; the Mux
  |                                         // adapter owns the TimeoutContainer
+ |-- connection_config: H2ConnectionConfig  // Per-listener window / max-streams / shrink
+ |-- stream_idle_timeout: Duration          // Per-stream idle cap
+ |-- now: Instant                           // Clock snapshot for the executing pass
 ```
 
+The listing is the shape, not the census: `ConnectionH2` also carries the
+back-pressure, gauge-rebalancing and discard-state fields that no section below
+discusses. Read the struct for the full list.
+
 Access patterns use the sub-structure names directly, except `flow_control`,
-`stream_table` and `flood_detector`, which are closed APIs
-(`h2_flow_control.rs`, `h2_stream_table.rs` and `h2_flood_detector.rs`
-respectively, all with private fields) reached only through their
-accessor/mutator methods:
+`stream_table`, `hpack`, `flood_detector` and `drain`, which are closed APIs
+(`h2_flow_control.rs`, `h2_stream_table.rs`, `hpack_state.rs`,
+`h2_flood_detector.rs` and `h2_drain.rs` respectively, all five with private
+fields) reached only through their accessor/mutator methods:
 
 ```rust
 self.flow_control.consume_send_window(consumed);
-self.bytes.overhead_bin += size;
-self.drain.draining = true;
+self.bytes.overhead_bin += self.bytes.zero_bytes_read;
+self.drain.enter_final_goaway();
 self.flood_detector.check_flood(self.now);
 self.prioriser.get(&stream_id);
+self.hpack.encoder_mut();
 ```
+
+`drain` is the newest of the five, extracted into `h2_drain.rs` with the
+GOAWAY/drain state machine. `h2.rs` reaches it through `draining()` at eleven
+call sites plus `begin_graceful_drain`, `deadline_elapsed`,
+`observe_peer_goaway` and `enter_final_goaway`, and reads none of its five
+fields directly. The `__test_*` backdoors are the sole exception and are
+reached only from test code.
+
+The three closed modules are the reason a snippet in this document can stop
+compiling without any citation going stale: `self.encoder` and
+`self.converter_buf` were plain `ConnectionH2` fields until they moved into
+`hpack_state.rs`, and prose quoting them kept resolving long after it stopped
+being valid Rust. Fenced blocks here now name the lines they quote, in the
+fence's info string, so `check_doc_citations.py` compares the two — see
+[README.md](./README.md#pinning-a-quoted-code-block).
 
 ---
 
@@ -112,8 +137,8 @@ self.prioriser.get(&stream_id);
 
 Located in `pkawa.rs`, this function parses the `priority` HTTP header value:
 
-```rust
-fn parse_rfc9218_priority(value: &[u8]) -> (u8, bool)
+```rust lib/src/protocol/mux/pkawa.rs:623
+pub(super) fn parse_rfc9218_priority(value: &[u8]) -> (u8, bool) {
 ```
 
 The header uses RFC 8941 Structured Fields dictionary format. Examples:
@@ -134,19 +159,43 @@ tokens `u=N` and `i`/`i=?1`/`i=?0`. Malformed tokens are silently ignored.
 
 In `write_streams()`, all active stream IDs are collected and sorted:
 
-```rust
-let mut priorities = self.stream_table.streams().keys().collect::<Vec<_>>();
-priorities.sort_by(|a, b| {
-    let (ua, _) = self.prioriser.get(a);
-    let (ub, _) = self.prioriser.get(b);
-    ua.cmp(&ub).then_with(|| a.cmp(b))
+```rust lib/src/protocol/mux/h2.rs:2440-2449
+priorities_buf.clear();
+priorities_buf.extend(self.stream_table.streams().keys().copied());
+// RFC 9218 §4 primary sort: ascending urgency, then stream ID for
+// stability. The incremental flag is handled by
+// `apply_incremental_rotation` below so it does not perturb the
+// non-incremental fast path.
+priorities_buf.sort_by_cached_key(|id| {
+    let (urgency, _) = self.prioriser.get(id);
+    (urgency, *id)
 });
 ```
 
 Lower urgency values are served first (urgency 0 = highest priority).
 Among streams with equal urgency, lower stream IDs go first for stability.
-The `incremental` flag is stored but not yet used for round-robin scheduling
-within an urgency level.
+`priorities_buf` is a scratch `Vec<StreamId>` owned by `HpackState` and taken
+out by value for the pass, because the converter holds the encoder borrow for
+the whole loop and no other `self.hpack` accessor can run until it is dropped.
+
+The `incremental` flag is applied in a second pass, immediately after the
+primary sort:
+
+```rust lib/src/protocol/mux/h2.rs:2450-2456
+// RFC 9218 §4: inside each urgency bucket, move incremental streams
+// to the tail and rotate them by the per-connection round-robin
+// cursor so no single slow-draining stream can starve its
+// same-urgency incremental peers.
+let incremental_count = self
+    .prioriser
+    .apply_incremental_rotation(&mut priorities_buf);
+```
+
+`Prioriser::apply_incremental_rotation` partitions each urgency bucket so that
+non-incremental streams keep the front, then rotates the incremental tail by
+`Prioriser::incremental_cursor` — the stream that headed the tail last pass.
+`Prioriser::advance_incremental_cursor`, called at the end of `write_streams`,
+commits the cursor for the next pass.
 
 ### Priority cleanup
 
@@ -190,7 +239,9 @@ Configurable thresholds with safe compile-time defaults:
 
 The sliding window duration is 1 second (`FLOOD_WINDOW_DURATION`). Every
 threshold is clamped to at least 1 by `H2FloodConfig::new` (a zero threshold
-would trip on the very first frame).
+would trip on the very first frame). The three `*_lifetime` counters
+deliberately never decay: a half-decaying window counter cannot see a patient
+attacker who stays under the per-second ceiling forever.
 
 ### H2FloodDetector
 
@@ -205,24 +256,41 @@ rate-based counters (not the lifetime ceilings) are halved (not zeroed). This
 half-decay catches burst-then-wait attack patterns where an attacker sends a
 burst, waits for the window to reset, then bursts again.
 
-**Check flow** (`check_flood`, evaluated in this fixed order — not an
-iteration over anything, so the order cannot vary between runs):
+**Check flow** (`H2FloodDetector::check_flood`, which takes the pass's clock
+snapshot and returns `Option<H2FloodViolation>` rather than a bare error code —
+the violation carries the counter name, its metric key, the observed count and
+the threshold it crossed, so the log line and the statsd counter cannot drift
+apart; the checks are evaluated in this fixed order — not an iteration over
+anything, so the order cannot vary between runs):
 
 ```
 check_flood(now)
-  |-- maybe_reset_window(now)               // half-decay if window expired
-  |-- check rst_stream_count > threshold?          --> Some(EnhanceYourCalm)
-  |-- check ping_count > threshold?                --> Some(EnhanceYourCalm)
-  |-- check total_ping_received_lifetime > 10 000?  --> Some(EnhanceYourCalm)
-  |-- check settings_count > threshold?            --> Some(EnhanceYourCalm)
-  |-- check total_settings_received_lifetime > 10 000? --> Some(EnhanceYourCalm)
-  |-- check empty_data_count > threshold?          --> Some(EnhanceYourCalm)
-  |-- check continuation_count > threshold?        --> Some(EnhanceYourCalm)
-  |-- check window_update_stream0_count > threshold? --> Some(EnhanceYourCalm)
-  |-- check accumulated_header_size > threshold?   --> Some(EnhanceYourCalm)
-  |-- check glitch_count > threshold?              --> Some(EnhanceYourCalm)
+  |-- maybe_reset_window(now)  // half-decay if window expired
+  |-- rst_stream_count      > max_rst_stream_per_window?       --> Some(..)
+  |-- ping_count            > max_ping_per_window?             --> Some(..)
+  |-- total_ping_received_lifetime     > DEFAULT_MAX_PING_LIFETIME?     --> Some(..)
+  |-- settings_count        > max_settings_per_window?         --> Some(..)
+  |-- total_settings_received_lifetime > DEFAULT_MAX_SETTINGS_LIFETIME? --> Some(..)
+  |-- empty_data_count      > max_empty_data_per_window?       --> Some(..)
+  |-- continuation_count    > max_continuation_frames?         --> Some(..)
+  |-- window_update_stream0_count > max_window_update_stream0_per_window? --> Some(..)
+  |-- accumulated_header_size     > max_header_list_size?      --> Some(..)
+  |-- glitch_count          > max_glitch_count?                --> Some(..)
   '-- None (all OK)
 ```
+
+Every variant carries `H2Error::EnhanceYourCalm`; the checks are strict `>`, and
+a `debug_assert!` at the end of the chain holds both properties. `H2FloodDetector`
+carries five `*_lifetime` counters — `total_rst_received_lifetime`,
+`total_abusive_rst_received_lifetime`, `total_rst_streams_emitted_lifetime`,
+`total_ping_received_lifetime` and `total_settings_received_lifetime` — and
+none of them decays: `maybe_reset_window` halves exactly the six per-window
+counters and leaves the lifetime ones alone. That is what closes the
+patient-attacker pattern the half-decaying window counters cannot see. Two of
+the five are checked inside `check_flood` above; the three RST ones are
+enforced at their own frame-handling sites. `ConnectionH2` reaches this through
+the `check_flood_or_return!` macro, which passes `self.now` and routes any
+violation to `ConnectionH2::handle_flood_violation`.
 
 The RST_STREAM lifetime ceilings (`max_rst_stream_lifetime`,
 `max_rst_stream_abusive_lifetime`) and the MadeYouReset ceiling
@@ -246,21 +314,26 @@ providing cumulative abuse detection.
 
 ### What happens when a threshold is exceeded
 
-When `check_flood()` returns `Some(EnhanceYourCalm)`:
+When `check_flood()` returns `Some(violation)`, `handle_flood_violation`:
 
-1. A warning is logged identifying the specific threshold exceeded
-2. `goaway(H2Error::EnhanceYourCalm)` is called
-3. The connection enters `H2State::Error`, `drain.draining = true`
+1. Counts `violation.metric_key` and logs a warning naming `violation.reason`
+   with the observed count and the threshold it crossed
+2. `goaway(violation.error)` is called — always `H2Error::EnhanceYourCalm`
+3. The connection enters `H2State::Error`, `drain.enter_final_goaway()`
 4. A GOAWAY frame with error code ENHANCE_YOUR_CALM (0xb) is serialized
 5. The connection transitions to `H2State::GoAway` for final write + disconnect
 
 ### Per-listener configurability
 
-Thresholds are configurable via protobuf listener config. Both `HttpListenerConfig`
-and `HttpsListenerConfig` expose optional fields:
+Thresholds are configurable via protobuf listener config. `HttpListenerConfig`
+and `HttpsListenerConfig` expose the same optional field *names*, and so do the
+matching `UpdateHttpListenerConfig` / `UpdateHttpsListenerConfig` messages —
+but each message numbers them independently, so read the field numbers from
+`command/src/command.proto` rather than from here:
 
 ```protobuf
-// In HttpListenerConfig and HttpsListenerConfig:
+// In HttpListenerConfig (HttpsListenerConfig carries the same names
+// at its own field numbers):
 // Flood detection thresholds:
 optional uint32 h2_max_rst_stream_per_window = 13;
 optional uint32 h2_max_ping_per_window = 14;
@@ -273,6 +346,13 @@ optional uint32 h2_initial_connection_window = 19;
 optional uint32 h2_max_concurrent_streams = 20;
 optional uint32 h2_stream_shrink_ratio = 21;
 ```
+
+That is an excerpt, not the full set: the same messages also carry the
+lifetime RST_STREAM caps, `h2_max_header_list_size`,
+`h2_max_header_table_size`, `h2_max_header_fields`,
+`h2_stream_idle_timeout_seconds`, `h2_graceful_shutdown_deadline_seconds` and
+`h2_max_window_update_stream0_per_window`. `doc/configure.md` is the
+user-facing reference for all of them.
 
 When absent (`None`), the built-in defaults apply:
 - Flood thresholds from `H2FloodConfig::default()`
@@ -303,7 +383,7 @@ must be attributed proportionally.
 
 A **free function** (not a method) to avoid borrow conflicts:
 
-```rust
+```rust lib/src/protocol/mux/h2.rs:460-468
 fn distribute_overhead(
     metrics: &mut SessionMetrics,
     overhead_bin: &mut usize,
@@ -311,30 +391,43 @@ fn distribute_overhead(
     stream_bytes: (usize, usize),
     total_bytes: (usize, usize),
     active_streams: usize,
-)
+    is_last_stream: bool,
+) {
 ```
 
-It is extracted as a free function because `write_streams()` borrows `self.encoder`
-through the converter while simultaneously needing to update per-stream metrics
-and connection overhead counters. A `&mut self` method would conflict.
+It is extracted as a free function because `write_streams()` borrows the HPACK
+encoder out of `self.hpack` (`HpackState::encoder_mut`) for the converter while
+simultaneously needing to update per-stream metrics and connection overhead
+counters. A `&mut self` method would conflict — and so would any other
+`self.hpack` accessor, which is why the scratch buffers are taken out by value
+before the converter is built.
 
-**Distribution formula:**
+**Distribution formula**, per direction, in the order the branches are taken:
 
 ```
-share_in  = overhead_bin  * (stream_bytes_in  / total_bytes_in)
-share_out = overhead_bout * (stream_bytes_out / total_bytes_out)
+is_last_stream        -> share = the whole remaining pool
+total_bytes  > 0      -> share = min(overhead * stream_bytes / total_bytes, overhead)
+total_bytes == 0      -> share = overhead / max(active_streams, 1)
 ```
 
-When `total_bytes` is zero (no stream has transferred data yet), falls back to
-even distribution: `overhead / max(active_streams, 1)`.
+The `is_last_stream` branch exists because integer division loses a remainder
+on every earlier stream; handing the last one whatever is left conserves the
+pool exactly. The `min` on the proportional branch exists for the mirror
+reason: accumulated rounding can push the shares above the pool, and the
+subtraction below is on `usize`, so an overshoot would wrap rather than go
+negative. Two `debug_assert!`s hold both properties.
 
 After attribution, the distributed amounts are subtracted from the overhead
-accumulators, so remaining overhead carries over to subsequent streams.
+accumulators, so remaining overhead carries over to subsequent streams, and the
+last stream drains them to zero.
 
 ### compute_stream_byte_totals()
 
-```rust
-fn compute_stream_byte_totals(&self, context: &Context) -> (usize, usize)
+```rust lib/src/protocol/mux/h2.rs:3569-3572
+fn compute_stream_byte_totals<L: ListenerHandler + L7ListenerHandler>(
+    &self,
+    context: &Context<L>,
+) -> (usize, usize) {
 ```
 
 Iterates all active streams summing `(bin + backend_bin, bout + backend_bout)`.
@@ -353,18 +446,69 @@ Bytes are classified as overhead in two places:
 
 ### How it feeds into SessionMetrics
 
-At stream completion (`complete_server_stream` or `reset_stream`), the overhead
-is distributed to the stream's `SessionMetrics` before the access log is emitted:
+At stream completion the overhead is distributed to the stream's
+`SessionMetrics` before the access log is emitted. On the normal completion
+path that happens inside `ConnectionH2::try_recycle_server_stream`, which calls
+the free function directly because it is itself a static helper holding
+`&mut H2ByteAccounting` rather than `&mut self`:
 
-```rust
-self.distribute_overhead(&mut stream.metrics, byte_totals);
-let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, stream.linked_token());
+```rust lib/src/protocol/mux/h2.rs:3504-3516
+let stream_bytes = (
+    stream.metrics.bin + stream.metrics.backend_bin,
+    stream.metrics.bout + stream.metrics.backend_bout,
+);
+distribute_overhead(
+    &mut stream.metrics,
+    &mut bytes.overhead_bin,
+    &mut bytes.overhead_bout,
+    stream_bytes,
+    byte_totals,
+    streams.len(),
+    streams.len() == 1,
+);
+```
+
+It then hands the stream to `ConnectionH2::complete_server_stream`, which emits
+the log:
+
+```rust lib/src/protocol/mux/h2.rs:3549-3555
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
     listener,
     client_rtt,
     server_rtt,
+);
+```
+
+The other three sites take the `&mut self` wrapper
+`ConnectionH2::distribute_overhead` instead, and each emits its own log:
+
+- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3841`) passes a
+  `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
+  the reap under a different metric for each so a DoS-mitigation reap stays
+  distinguishable from an ordinary idle one.
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5273`) uses
+  `H2::ResetFrame`.
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:5980`) uses
+  `H2::Reset`.
+
+Only the last two are reset paths; the first is the idle/stall sweep.
+
+`snapshot_rtts` is an associated function taking individual field references
+rather than a `&self` method, for the same reason `try_recycle_server_stream`
+is: inside the per-stream write loop the `H2BlockConverter` holds the encoder
+borrowed out of `self.hpack`, so a `&self` receiver would conflict. The call
+below sits inside the `let stream = &mut context.streams[global_stream_id];`
+borrow taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2521`) and passes
+`stream.linked_token()` straight out of it:
+
+```rust lib/src/protocol/mux/h2.rs:2734-2739
+let (client_rtt, server_rtt) = Self::snapshot_rtts(
+    &self.position,
+    &self.socket,
+    &endpoint,
+    stream.linked_token(),
 );
 ```
 
@@ -382,8 +526,12 @@ the complexity of the H2 state machine:
 
 ### readable() entry point
 
-```rust
-pub fn readable(&mut self, context, endpoint) -> MuxResult
+```rust lib/src/protocol/mux/h2.rs:1918-1922
+pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
+where
+    E: Endpoint,
+    L: ListenerHandler + L7ListenerHandler,
+{
 ```
 
 Dispatches based on `H2State`:
@@ -418,8 +566,12 @@ fragment length.
 
 ### writable() entry point
 
-```rust
-pub fn writable(&mut self, context, endpoint) -> MuxResult
+```rust lib/src/protocol/mux/h2.rs:3278-3282
+pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
+where
+    E: Endpoint,
+    L: ListenerHandler + L7ListenerHandler,
+{
 ```
 
 1. Calls `flush_pending_control_frames()` as preamble
@@ -435,9 +587,9 @@ Flushes control data before application frames, in order:
    sends GOAWAY(SETTINGS_TIMEOUT)
 2. **Zero buffer resume**: If a previous control frame write was partial
    (WouldBlock), resume flushing via `flush_zero_to_socket()`
-3. **Deferred initial GOAWAY**: If `H2DrainState::initial_goaway_pending` is
-   set (`graceful_goaway` deferred it — see below), serializes it via the new
-   `ConnectionH2::send_initial_goaway` and clears the flag
+3. **Deferred initial GOAWAY**: `H2DrainState::take_deferred_initial_goaway`
+   check-and-clears the deferred advisory (`graceful_goaway` deferred it — see
+   below), and it is serialized via `ConnectionH2::send_initial_goaway`
 4. **WINDOW_UPDATE frames**: `H2FlowControl::drain_window_updates_into`
    (`h2_flow_control.rs`) serializes every queued entry into the zero buffer
    and removes what it wrote — coalescing already happened at queue time
@@ -481,25 +633,27 @@ The main data-plane write path:
 
 1. Resumes any partially-written stream (`stream_table.expect_write()`)
 2. Pre-computes `byte_totals` for overhead distribution
-3. Sets up `H2BlockConverter` borrowing `self.encoder`
+3. Sets up `H2BlockConverter` borrowing the encoder out of `self.hpack`
 4. Sorts streams by priority (urgency, then stream_id)
 5. For each stream: converts kawa blocks to H2 frames, writes to socket
 6. Recycles completed streams, distributes overhead, emits access logs
 7. Cleans up `dead_streams` via `remove_dead_stream` (evicts the
    `H2StreamTable` wire mapping, `rst_sent`, and the activity/fc-stall
    caches together, plus `prioriser`)
-8. Shrinks converter buffers if they grew beyond 16KB
+8. Returns the scratch buffers to `self.hpack` and shrinks the three converter
+   buffers if they grew beyond 16KB (`HpackState::shrink_converter_buffers`)
 
 **Why write_streams() can't be further decomposed**: The `H2BlockConverter`
-borrows `self.encoder` for the duration of the priority loop. This prevents
-calling any `&mut self` method within the loop body. The free function
+borrows `self.hpack`, through `HpackState::encoder_mut`, for the duration of
+the priority loop. This prevents calling any `&mut self` method within the loop
+body — including any other `self.hpack` accessor. The free function
 `distribute_overhead()` works around this for metrics, but the converter setup
 and priority iteration must remain in a single method scope.
 
 ### flush_zero_to_socket()
 
-```rust
-fn flush_zero_to_socket(&mut self) -> bool
+```rust lib/src/protocol/mux/h2.rs:4372
+fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
 Writes the zero buffer to the socket in a loop. Returns `true` if the socket
@@ -560,7 +714,7 @@ When disabled, the `otel` field in access log records is `None`.
 OpenTelemetry context propagation is handled by `HttpContext` (defined in
 `lib/src/protocol/kawa_h1/editor.rs`), which contains:
 
-```rust
+```rust lib/src/protocol/kawa_h1/editor.rs:264-265
 #[cfg(feature = "opentelemetry")]
 pub otel: Option<sozu_command::logging::OpenTelemetry>,
 ```
@@ -576,9 +730,10 @@ and `tracestate` headers are extracted from inbound requests:
 
 ### SpanContext propagation into access logs
 
-At access log emission time (`Stream::generate_access_log` in `mod.rs`):
+At access log emission time (`Stream::generate_access_log`, in
+`lib/src/protocol/mux/stream.rs`):
 
-```rust
+```rust lib/src/protocol/mux/stream.rs:444-447
 #[cfg(feature = "opentelemetry")]
 otel: context.otel.as_ref(),
 #[cfg(not(feature = "opentelemetry"))]
@@ -602,22 +757,29 @@ by design.
 
 ### Fallible write_all() pattern
 
-All HPACK decode callbacks in `pkawa.rs` use fallible writes to kawa storage:
+All HPACK decode callbacks in `pkawa.rs` use fallible writes to kawa storage.
+The helper that stores one regular header returns a typed rejection instead of
+writing past the buffer:
 
-```rust
+```rust lib/src/protocol/mux/pkawa.rs:540-542
 if kawa.storage.write_all(value).is_err() {
-    invalid_headers = true;
-    return;
+    return Err(RejectReason::OversizedPseudoValue);
 }
 ```
 
 This prevents buffer overflows when the decoded header block exceeds available
-storage. The `invalid_headers` flag is checked after decoding completes, and
-triggers a stream reset (`H2Error::ProtocolError`) rather than a connection error.
+storage. `write_regular_header` returns `Err(RejectReason)` for each validity
+rule it enforces; the caller passes it to `metric_reject`, which increments
+`h2.headers.rejected.<reason>` via `reject_metric_key!`, and then sets the
+`invalid_headers` flag. The flag is checked after decoding completes and
+triggers a stream reset (`H2Error::ProtocolError`) rather than a connection
+error.
 
 ### invalid_headers flag
 
-Set `true` by the decode callback for any of:
+`decode_headers_with_budget` owns the flag and returns its final value, so the
+caller can decide between a stream error and a connection error. It is set
+`true` for any of:
 
 - Uppercase ASCII in header name (RFC 9113 s8.2)
 - Connection-specific headers: `connection`, `proxy-connection`,
@@ -641,38 +803,69 @@ connection-level. The caller sends RST_STREAM rather than GOAWAY.
 Per RFC 7541 s4.2, the HPACK dynamic table size must be synchronized when
 SETTINGS are acknowledged:
 
-```rust
-// On receiving SETTINGS ACK from peer:
-self.decoder.set_max_allowed_table_size(
+On receiving a SETTINGS ACK from the peer:
+
+```rust lib/src/protocol/mux/h2.rs:5316-5318
+self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
+```
 
-// On receiving peer's SETTINGS:
-self.peer_settings.settings_header_table_size = v;
-self.encoder.set_max_table_size(v as usize);
+On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
+
+```rust lib/src/protocol/mux/h2.rs:5333-5336
+let cap = self.flood_detector.config().max_header_table_size;
+let capped = v.min(cap);
+self.peer_settings.settings_header_table_size = capped;
+self.hpack.set_encoder_max_table_size(capped as usize);
 ```
 
 The decoder's allowed table size matches what we advertised; the encoder's
-table size matches what the peer advertised. This prevents desynchronization
-that would cause `CompressionError` (GOAWAY).
+table size matches what the peer advertised, capped to
+`H2FloodConfig::max_header_table_size` so a peer cannot advertise up to 4 GB
+and inflate encoder memory. This prevents desynchronization that would cause
+`CompressionError` (GOAWAY).
+
+Both coders live in `HpackState` (`hpack_state.rs`), whose fields are private
+to that module, so neither is reachable as `self.decoder` / `self.encoder`
+from `h2.rs` — every access goes through an accessor declared there.
+
+Capping alone is not enough: the change has to reach the peer's decoder. The
+arm therefore also sets `ConnectionH2::pending_table_size_update`, which
+`H2BlockConverter::emit_pending_size_update_if_new_block` consumes to prepend
+the RFC 7541 §6.3 `001xxxxx` dynamic-table-size-update directive to the next
+header block this connection emits.
 
 ### Buffer shrinking after large headers
 
-The `converter_buf` and `lowercase_buf` are reusable buffers moved into and
-out of `H2BlockConverter` each `write_streams()` cycle:
+`converter_buf`, `lowercase_buf` and `cookie_buf` are reusable buffers moved
+into and out of `H2BlockConverter` each `write_streams()` cycle. They belong to
+`HpackState`, so `h2.rs` reclaims them with `self.hpack.put_converter_buf(…)`
+and friends and then calls one method that shrinks all three:
 
-```rust
-// After reclaiming buffers from the converter:
-if self.converter_buf.capacity() > 16_384 {
-    self.converter_buf.shrink_to(4096);
-}
-if self.lowercase_buf.capacity() > 16_384 {
-    self.lowercase_buf.shrink_to(4096);
+```rust lib/src/protocol/mux/hpack_state.rs:121-131
+pub(super) fn shrink_converter_buffers(&mut self) {
+    if self.converter_buf.capacity() > 16_384 {
+        self.converter_buf.shrink_to(4096);
+    }
+    if self.lowercase_buf.capacity() > 16_384 {
+        self.lowercase_buf.shrink_to(4096);
+    }
+    if self.cookie_buf.capacity() > 16_384 {
+        self.cookie_buf.shrink_to(4096);
+    }
 }
 ```
 
 This prevents a single request with abnormally large headers from permanently
 inflating memory for the lifetime of the connection.
+
+`priorities_buf` is deliberately not in that list: it holds one `StreamId` per
+active stream, not header bytes, so it is reclaimed on the quiet-time path
+instead — `HpackState::reclaim_idle_buffers`, called from
+`ConnectionH2::cancel_timed_out_streams`, tests all four independently — one
+`capacity() > retain_size * 4` guard each — and shrinks only those that
+individually exceed it.
 
 ---
 
@@ -680,17 +873,35 @@ inflating memory for the lifetime of the connection.
 
 ### Test inventory
 
-185 e2e tests across 7 files:
+The e2e suite lives in `e2e/src/tests/`, registered in that directory's
+`mod.rs`. A per-file count is not reproduced here: it rots between releases and
+nothing checks it. Count the current one with
 
-| File | Count | Focus |
-|------|-------|-------|
-| `e2e/src/tests/tests.rs` | 40 | General HTTP proxying, keep-alive, routing, worker lifecycle |
-| `e2e/src/tests/h2_security_tests.rs` | 41 | Security edge cases: flood detection thresholds, rapid reset, CONTINUATION bombs, settings flood, empty DATA flood, glitch counting, malformed frame handling |
-| `e2e/src/tests/h2_tests.rs` | 64 | Protocol correctness: HEADERS, DATA, flow control, GOAWAY, stream lifecycle, priority, HPACK, concurrent streams, window updates, graceful shutdown, H2 backend behavior |
-| `e2e/src/tests/mux_tests.rs` | 21 | Cross-protocol scenarios: H1-to-H2 backend, H2-to-H1 backend, end-to-end H2, mixed protocol combinations |
-| `e2e/src/tests/h1_security_tests.rs` | 8 | H1-specific security (request smuggling, header injection) |
-| `e2e/src/tests/tls_tests.rs` | 6 | TLS handshake, ALPN negotiation, certificate handling, close semantics |
-| `e2e/src/tests/tcp_tests.rs` | 5 | Raw TCP proxying |
+```bash
+grep -rc '^\s*#\[test\]' e2e/src/tests/
+```
+
+The files that carry H2 coverage, and what each is for:
+
+| File | Focus |
+|------|-------|
+| `e2e/src/tests/tests.rs` | General HTTP proxying, keep-alive, routing, worker lifecycle |
+| `e2e/src/tests/mod.rs` | Module registry plus the shared harness every suite imports: `setup_sync_test`, `setup_async_test`, `provide_port` (backed by `e2e/src/port_registry.rs`) |
+| `e2e/src/tests/h2_tests.rs` | Protocol correctness: HEADERS, DATA, flow control, GOAWAY, stream lifecycle, priority, HPACK, concurrent streams, window updates, graceful shutdown, H2 backend behavior |
+| `e2e/src/tests/h2_correctness_tests.rs` | Large-asset and wake-gap regressions — see the section below |
+| `e2e/src/tests/h2_security_tests.rs` | Flood detection thresholds, rapid reset, CONTINUATION bombs, settings flood, empty DATA flood, glitch counting, malformed frame handling |
+| `e2e/src/tests/h2_security_parser.rs` | Frame-parser and HPACK adversarial input |
+| `e2e/src/tests/h2_security_header_injection.rs` | Pseudo-header ordering, CRLF/NUL injection, smuggling vectors |
+| `e2e/src/tests/h2_security_session.rs` | Session-level abuse: idle timeouts, concurrency caps, back-pressure |
+| `e2e/src/tests/h2_security_sni.rs` | SNI binding and certificate selection under H2 |
+| `e2e/src/tests/h2_priority_rearm_tests.rs` | RFC 9218 urgency, the incremental round-robin, and readiness re-arm |
+| `e2e/src/tests/h2_clock_tests.rs` | Clock-snapshot discipline (`ConnectionH2::now`) |
+| `e2e/src/tests/h2_log_context_tests.rs` | `[session req cluster backend]` prefix on the H2 paths |
+| `e2e/src/tests/mux_tests.rs` | Cross-protocol scenarios: H1-to-H2 backend, H2-to-H1 backend, end-to-end H2, mixed protocol combinations |
+| `e2e/src/tests/h2_utils.rs` | Shared H2 client helpers (no tests of its own) |
+| `e2e/src/tests/h1_security_tests.rs` | H1-specific security (request smuggling, header injection) |
+| `e2e/src/tests/tls_tests.rs` | TLS handshake, ALPN negotiation, certificate handling, close semantics |
+| `e2e/src/tests/tcp_tests.rs` | Raw TCP proxying |
 
 ### Test infrastructure
 
@@ -767,7 +978,7 @@ return errors that are converted to GOAWAY or RST_STREAM rather than panicking.
 The compile-time assertion at the top of `h2.rs` guards against silent pointer
 truncation on sub-32-bit platforms:
 
-```rust
+```rust lib/src/protocol/mux/h2.rs:23-26
 const _: () = assert!(
     std::mem::size_of::<usize>() >= 4,
     "sozu requires at least 32-bit pointers"

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Resolve every citation in this repository's prose against the tree it ships
-# with, and fail when one of them cannot be resolved. Two citation forms are
-# checked, by three independent rules:
+# with, and fail when one of them cannot be resolved. Three citation forms are
+# checked, by four independent rules:
 #
 #   1. `file.rs:NNN(-MMM)?` in `doc/**` and `**/LIFECYCLE.md` — a path and a
 #      line number. See "WHAT THIS CATCHES" below.
@@ -11,6 +11,9 @@
 #   3. a backticked TEST NAME, in a Rust comment or a CHANGELOG/doc paragraph,
 #      that names no `fn` anywhere in the tree. See "DEAD TEST-NAME CITATIONS"
 #      further down.
+#   4. a fenced code block whose INFO STRING names the lines it quotes —
+#      ```rust path/to/file.rs:NNN-MMM — must quote them literally. See "STALE
+#      CODE QUOTED IN PROSE" further down.
 #
 # Why this exists: a line number carries no anchor, so a citation rots the
 # moment anyone edits the file it points into — and the edit usually lands in a
@@ -149,6 +152,61 @@
 #   examined; and a citation that names a `fn` which is not the test the prose
 #   means still passes. The alternative is 864 sites of noise, which nobody
 #   reads and therefore nobody maintains.
+#
+# STALE CODE QUOTED IN PROSE
+#   Rules 1 to 3 all check a POINTER — a path, a line number, a name. None of
+#   them looks at the code a document QUOTES. sozu-proxy/sozu#1424 measured the
+#   consequence: `doc/h2_mux_internals.md` carried fenced Rust blocks writing
+#   `self.encoder`, `self.decoder`, `self.converter_buf` and `self.lowercase_buf`
+#   on `ConnectionH2` months after #1403 moved all four behind
+#   `hpack_state.rs`, where they are private. Each would fail to compile, and
+#   every check here was green over them — a stale quote beside a RESOLVING
+#   citation reads as authoritative, so a reader who copies it assumes the
+#   compile error is theirs.
+#
+#   Two mechanisms were measured on this tree before this rule was written, and
+#   both were rejected:
+#
+#     * COMPARE EVERY ```rust BLOCK AGAINST THE TREE. The guarded surface holds
+#       215 fenced blocks, 27 of them Rust. Searching the whole tree for each
+#       block's exact line sequence locates 7. The other 20 are not stale —
+#       they are abbreviated on purpose (`pub fn readable(&mut self, context,
+#       endpoint) -> MuxResult` drops the generics and the `where` clause that
+#       would bury the point), composite (one block narrating two distant call
+#       sites), or simplified (`pub struct FlowKey { pub src: SocketAddr }`).
+#       A rule firing on 20 of 27 blocks is a rule that gets silenced.
+#     * RUSTDOC DOCTESTS via `#[doc = include_str!("../../doc/....md")]`. This
+#       tree has no `include_str!` of a markdown file and no doctest
+#       configuration anywhere, and the reason is structural rather than
+#       historical: a doctest is compiled as a SEPARATE crate against the
+#       public API. Every snippet at issue sits inside `impl ConnectionH2` and
+#       reads a private field of a private type in a private module. No
+#       doctest can see any of it. The mechanism cannot reach the exact class
+#       that motivated the rule.
+#
+#   So the rule is OPT-IN, and the annotation is an ordinary citation in the
+#   fence's info string:
+#
+#       ```rust lib/src/protocol/mux/hpack_state.rs:121-131
+#
+#   The cited lines are read and compared to the block, stripped, line by
+#   line. That is zero false positives BY CONSTRUCTION — a block that cannot
+#   be quoted verbatim simply carries no annotation — and it gives the author
+#   the thing no rule here offered before: a way to say "this is a quote, hold
+#   me to it". Because the fence line is part of the document body, rules 1
+#   and 2 see the annotation too: rule 1 range-checks a pinned block from the
+#   moment it lands, and rule 2 drift-checks it FROM THE NEXT COMMIT ONWARD —
+#   not on the commit that introduces it. Rule 2 exempts a citation absent
+#   from the base revision of its own document, and on that commit every pin
+#   is absent. Measured when the 17 pins in `doc/h2_mux_internals.md` landed:
+#   the cited-line total went 219 -> 238 while `compared` stayed at exactly
+#   325, so every one of them was exempt that day.
+#
+#   Be honest about what opt-in costs: a quote nobody pins is a quote nobody
+#   checks, and this rule would not have caught #1424's four blocks on its own.
+#   What it does is make the repair durable. `doc/h2_mux_internals.md` now pins
+#   every block it can, so the next extraction step moves those lines and this
+#   rule reports it instead of a reviewer finding it two refactors later.
 #
 # Usage:
 #   python3 .github/scripts/check_doc_citations.py            # check the tree
@@ -696,6 +754,234 @@ def check_test_citations(root, renamed=None, not_a_test=None, show=False, out=sy
     return examined, checked, failures
 
 
+# ── Rule 4: pinned snippets ───────────────────────────────────────────────
+#
+# See "STALE CODE QUOTED IN PROSE" in the header for the measurements that
+# shaped this rule, and for the two alternatives it was chosen over.
+
+# A fenced block whose info string carries, after the language, exactly one
+# citation: ```rust lib/src/protocol/mux/hpack_state.rs:121-131
+#
+# The info string is the right place for it. CommonMark trims the text after
+# the opening fence and calls it the info string, and every renderer in use
+# takes only its FIRST word as the language — so the annotation highlights as
+# Rust and stays invisible in the rendered page, while a citation written in
+# the prose above would have to be read by a heuristic ("which paragraph
+# belongs to which block?") that has no right answer.
+#
+# It is also, deliberately, an ordinary citation: rules 1 and 2 already see it
+# because the fence line is part of the document body, so a pinned block gets
+# range-checking immediately and drift-checking from the NEXT commit onward —
+# rule 2 exempts a citation the base revision of the document did not carry —
+# and this rule only adds the literal comparison on top.
+#
+# Both patterns match the INFO STRING — the text after the opening fence's
+# backticks — never the whole line. The fence shape is `FENCE`'s business
+# alone, so there is one place that knows how a fence is spelled.
+PINNED_FENCE = re.compile(
+    rf"^[A-Za-z0-9_+#-]*[ \t]+(?P<path>{PATH}):(?P<spans>{SPAN}(?:[,/][ \t]*{SPAN})*)[ \t]*$"
+)
+# The same shape without a citation — a plain ```rust — which this rule does
+# NOT look at. Named so the count of unpinned Rust blocks can be reported
+# beside the pinned ones: the rule's honest coverage number is that ratio.
+RUST_FENCE = re.compile(r"^(?:rust|rs)[ \t]*$")
+
+# A fence LINE: optional indentation, a run of three or more backticks, then
+# the info string. The run's LENGTH is load-bearing and the `startswith("```")`
+# scan that stood here was blind to it.
+#
+# CommonMark closes a fenced block only on a fence AT LEAST AS LONG as the one
+# that opened it, carrying nothing after it but whitespace. That is the only
+# way a document can SHOW an annotated fence without pinning it, and
+# `doc/README.md` documents this very rule by doing exactly that. A scanner
+# that closed on any ``` mistakes such an inner example for its enclosing
+# block's closing fence and then runs one block OUT OF PHASE for the rest of
+# the document.
+#
+# Measured on this repository's own fixtures before the fix: a document
+# holding an unmatched inner opening fence took the pinned count from 3 to 2,
+# left a deliberately stale pin unreported, and exited 0. A count that SHRINKS
+# reads exactly like a pass, which is why `fenced_blocks` is worth getting
+# right rather than approximating.
+#
+# Two limits, both deliberate. Tilde fences are not recognised: this tree has
+# none, and PINNED_FENCE names backticks anyway. And an opening fence is
+# accepted at any indentation rather than CommonMark's three columns — a fence
+# this scanner cannot see is a fence it cannot PAIR, and an unpaired one is the
+# phase error above, so erring toward seeing too many is the safe direction.
+FENCE = re.compile(r"^[ \t]*(?P<ticks>`{3,})(?P<info>.*)$")
+
+
+def fenced_blocks(body):
+    """Every fenced block in a markdown body as `(info, lines, first_line)`.
+
+    `info` is the info string — what follows the opening fence's backticks —
+    with surrounding whitespace kept, since PINNED_FENCE anchors on it.
+
+    `first_line` is the 1-based line of the OPENING fence, which is the line
+    an annotation sits on and therefore the line a failure must name.
+
+    Closing follows CommonMark: at least as many backticks as the opener, and
+    nothing but whitespace after them. See `FENCE` for what that buys.
+    """
+    lines = body.splitlines()
+    blocks = []
+    index = 0
+    while index < len(lines):
+        opening = FENCE.match(lines[index])
+        if opening is None:
+            index += 1
+            continue
+        open_at = index
+        ticks = len(opening.group("ticks"))
+        index += 1
+        while index < len(lines):
+            closing = FENCE.match(lines[index])
+            if (
+                closing is not None
+                and len(closing.group("ticks")) >= ticks
+                and not closing.group("info").strip()
+            ):
+                break
+            index += 1
+        blocks.append((opening.group("info"), lines[open_at + 1 : index], open_at + 1))
+        index += 1
+    return blocks
+
+
+def trim_blank_edges(lines):
+    """Drop leading and trailing blank lines; keep the interior as it is.
+
+    A quoted span routinely starts or ends on a blank line the doc author has
+    no reason to reproduce, and a block routinely carries a blank line after
+    the fence. Interior blanks are kept and compared, because a dropped line
+    inside a quote changes what the quote says.
+    """
+    start, end = 0, len(lines)
+    while start < end and not lines[start].strip():
+        start += 1
+    while end > start and not lines[end - 1].strip():
+        end -= 1
+    return lines[start:end]
+
+
+def check_pinned_snippets(root, show=False, out=sys.stdout):
+    """A fenced block that names the lines it quotes must quote them exactly.
+
+    Returns `(pinned, unpinned, failures)`: how many fenced blocks carried an
+    annotation and were therefore compared, how many Rust blocks carried none
+    and were therefore not looked at, and the mismatches among the first.
+
+    Comparison is on the STRIPPED line, matching rule 2, so the indentation a
+    quote loses when it leaves an `impl` block is not a mismatch — but every
+    other character is. There is no elision syntax on purpose: a block that
+    cannot be quoted verbatim simply carries no annotation, which is what
+    keeps this rule off the abbreviated and illustrative snippets that are the
+    majority of the Rust blocks in this tree.
+    """
+    by_suffix = rust_files(root)
+    cache = {}
+    failures = []
+    pinned = 0
+    unpinned = 0
+
+    for doc in doc_files(root):
+        doc_dir = os.path.dirname(doc)
+        with open(os.path.join(root, doc), encoding="utf-8") as handle:
+            body = handle.read()
+
+        for info, block, fence_line in fenced_blocks(body):
+            match = PINNED_FENCE.match(info)
+            if match is None:
+                if RUST_FENCE.match(info):
+                    unpinned += 1
+                continue
+
+            cited = match.group("path")
+            spans_text = " ".join(match.group("spans").split())
+            spans = parse_spans(match.group("spans"))
+            where = "%s:%d" % (doc, fence_line)
+
+            target, _ = resolve_path(cited, by_suffix, root, doc_dir)
+            if target is None:
+                continue  # rule 1 reports an unresolvable path
+            if target not in cache:
+                with open(os.path.join(root, target), encoding="utf-8") as handle:
+                    cache[target] = handle.read().splitlines()
+            lines = cache[target]
+
+            # Rule 1 owns every out-of-range and inverted span, and reports it
+            # with its own wording; re-reporting it here would double every
+            # such failure in the log.
+            if any(start < 1 or start > end or end > len(lines) for start, end in spans):
+                continue
+
+            pinned += 1
+            source = []
+            numbers = []
+            for start, end in spans:
+                for number in range(start, end + 1):
+                    source.append(lines[number - 1])
+                    numbers.append(number)
+
+            # Trim the source and the block independently, then re-derive the
+            # source line numbers that survived the trim so a mismatch can name
+            # the real line it is talking about.
+            head = 0
+            while head < len(source) and not source[head].strip():
+                head += 1
+            tail = len(source)
+            while tail > head and not source[tail - 1].strip():
+                tail -= 1
+            source, numbers = source[head:tail], numbers[head:tail]
+            quoted = trim_blank_edges(block)
+
+            if len(quoted) != len(source):
+                failures.append(
+                    "%s: `%s:%s` — pinned block quotes %d line%s, %s:%s is %d"
+                    % (
+                        where,
+                        cited,
+                        spans_text,
+                        len(quoted),
+                        "" if len(quoted) == 1 else "s",
+                        target,
+                        spans_text,
+                        len(source),
+                    )
+                )
+                continue
+
+            differing = [
+                offset
+                for offset in range(len(source))
+                if quoted[offset].strip() != source[offset].strip()
+            ]
+            if not differing:
+                if show:
+                    out.write("%s  %s:%s  |%d lines quoted verbatim\n" % (where, target, spans_text, len(source)))
+                continue
+
+            first = differing[0]
+            failures.append(
+                "%s: `%s:%s` — pinned block line %d does not match %s:%d: block has `%s`, "
+                "source has `%s`%s"
+                % (
+                    where,
+                    cited,
+                    spans_text,
+                    first + 1,
+                    target,
+                    numbers[first],
+                    quote(quoted[first]),
+                    quote(source[first]),
+                    "" if len(differing) == 1 else " (%d of %d lines differ)" % (len(differing), len(source)),
+                )
+            )
+
+    return pinned, unpinned, failures
+
+
 FIXTURE_EXPECTED = [
     "doc/bad.md:3: `sample.rs:99` — past end of sample.rs (10 lines)",
     "doc/bad.md:5: `sample.rs:4` — sample.rs:4 is blank",
@@ -717,7 +1003,14 @@ FIXTURE_EXPECTED = [
 # tree they report a clean run over a quietly smaller surface.
 # `doc/drift.md` contributes five of these: rule 2's fixture is an ordinary
 # document that rule 1 must also see, and see as clean.
-FIXTURE_TOTAL = 19
+# `doc/pinned.md` and `doc/pinned_bad.md` contribute one each, for the same
+# reason and with more force: rule 4's annotation lives in the document body,
+# so rule 1 resolves it exactly as it resolves a citation written in prose —
+# which is what lets a pinned block be range-checked without a second parser.
+# `doc/pinned_nested.md` contributes two: the annotation it DISPLAYS inside a
+# four-tick example is still a citation to rule 1, which is correct — the text
+# names a real span either way — and the real pin after it is the second.
+FIXTURE_TOTAL = 23
 
 # Rule 2's half of the fixtures is a PAIR of revisions, so every file that
 # drifts carries its base revision beside it as `<name>.base`. That suffix is
@@ -746,7 +1039,11 @@ FIXTURE_DRIFT_EXPECTED = [
 # asserted for the same reason FIXTURE_TOTAL is: a rule that quietly stopped
 # comparing would otherwise report a clean run. Losing the document-directory
 # binding, the range-end comparison or a whole fixture document each move it.
-FIXTURE_DRIFT_COMPARED = 17
+# Six of these are pin annotations, whose ranges have two ends like any other:
+# `doc/pinned.md`'s one and `doc/pinned_nested.md`'s two. They are compared
+# here because the fixture base revision already carries them — on the commit
+# that first ADDS a pin, rule 2 exempts it (see "STALE CODE QUOTED IN PROSE").
+FIXTURE_DRIFT_COMPARED = 23
 
 # Rule 3's half of the fixtures. `tests_bad.rs` and the fixture `CHANGELOG.md`
 # are the broken documents; `tests_good.rs` is the clean one and also carries
@@ -783,8 +1080,33 @@ FIXTURE_NOT_A_TEST = {
     "a_fixture_changelog_test_name_that_names_no_function": "fixture allowlist witness",
 }
 
+# Rule 4's half of the fixtures. `doc/pinned_bad.md` pins the SAME span as the
+# clean `doc/pinned.md` and quotes it one rename out of date, so rule 1 resolves
+# it, rule 2 finds it unmoved, and only the literal comparison separates the
+# two — which is the whole claim this rule makes.
+FIXTURE_PINNED_EXPECTED = [
+    "doc/pinned_bad.md:8: `pinned.rs:11-15` — pinned block line 1 does not match pinned.rs:11: "
+    "block has `pub fn shrink_buffers(&mut self) {`, source has `pub fn shrink(&mut self) {` "
+    "(3 of 5 lines differ)",
+]
+
+# Asserting both totals — not floors — for the reason every other total here is
+# asserted. `pinned` going to 0 is what a broken PINNED_FENCE looks like, and it
+# would otherwise report a clean run over nothing; `unpinned` is the rule's own
+# coverage number, so a fixture that silently stopped carrying an UNannotated
+# Rust block would stop proving that such a block is left alone.
+#
+# `doc/pinned_nested.md` is the third pin, and it is here to hold the FENCE
+# pairing specifically: it shows an annotated fence inside a four-tick block
+# without pinning it, then carries a real pin after it. A scanner that closed
+# the outer block on that inner opener runs out of phase and never sees the
+# real pin — measured at 2 instead of 3, with a stale pin unreported and exit
+# 0. Only an exact total turns that into a failure, because the count SHRINKS.
+FIXTURE_PINNED = 3
+FIXTURE_UNPINNED = 1
+
 # Every fixture document that is MEANT to fail, removed for the clean-tree run.
-BROKEN_FIXTURES = ("doc/bad.md", "tests_bad.rs", "CHANGELOG.md")
+BROKEN_FIXTURES = ("doc/bad.md", "tests_bad.rs", "CHANGELOG.md", "doc/pinned_bad.md")
 
 
 def _run_cli(args):
@@ -1020,6 +1342,34 @@ def self_test():
         for line in disposed:
             print("  " + line)
 
+    # ── Rule 4 ────────────────────────────────────────────────────────────
+    # The broken document's citation resolves, so rule 1 passes it; asserting
+    # that above (`good` is empty for every document but `doc/bad.md`) is what
+    # makes this a rule and not a restatement of the resolver.
+    pinned, unpinned, mismatched = check_pinned_snippets(fixtures)
+    mismatched = sorted(mismatched)
+    if len(mismatched) != len(FIXTURE_PINNED_EXPECTED):
+        ok = False
+        print(
+            "FAIL self-test: expected %d mismatched pinned blocks from the fixtures, got %d:"
+            % (len(FIXTURE_PINNED_EXPECTED), len(mismatched))
+        )
+        for line in mismatched:
+            print("  " + line)
+    else:
+        for expected, actual in zip(FIXTURE_PINNED_EXPECTED, mismatched):
+            if actual != expected:
+                ok = False
+                print("FAIL self-test: expected the mismatch %r, got %r" % (expected, actual))
+
+    if (pinned, unpinned) != (FIXTURE_PINNED, FIXTURE_UNPINNED):
+        ok = False
+        print(
+            "FAIL self-test: compared %d pinned blocks and left %d unpinned Rust blocks alone, "
+            "expected exactly %d / %d — the annotation pattern or the scanned surface has moved"
+            % (pinned, unpinned, FIXTURE_PINNED, FIXTURE_UNPINNED)
+        )
+
     # `check()` classifying correctly is NOT the same as the command acting on
     # it. A build of this script that reports every failure and still exits 0
     # is green in CI and guards nothing, and nothing above this point executes
@@ -1050,10 +1400,14 @@ def self_test():
     if ok:
         print(
             "OK self-test: %d fixture line citations, %d of them compared against a base "
-            "revision, and %d examined test names (%d checked); %d + %d + %d expected failures "
+            "revision, %d examined test names (%d checked), and %d pinned blocks compared "
+            "(%d unpinned Rust blocks left alone); %d + %d + %d + %d expected failures "
             "reported, exit 1 on the broken tree and 0 on the clean one, and an unreachable "
             "base refused instead of skipped."
-            % (total, compared, examined, checked, len(bad), len(drifted), len(dead))
+            % (
+                total, compared, examined, checked, pinned, unpinned,
+                len(bad), len(drifted), len(dead), len(mismatched),
+            )
         )
     return 0 if ok else 1
 
@@ -1147,6 +1501,28 @@ def main():
             % (checked, examined)
         )
         print("This too is a floor: a citation naming a real but unrelated `fn` still passes.")
+
+    print("")
+    pinned, unpinned, mismatched = check_pinned_snippets(root, show=args.show)
+    if mismatched:
+        status = 1
+        print(
+            "::error::%d of %d pinned code blocks no longer quote the lines they name:"
+            % (len(mismatched), pinned)
+        )
+        for line in mismatched:
+            print("  " + line)
+        print("")
+        print("The quoted code changed and the block did not follow it. Re-quote the cited lines")
+        print("verbatim, repoint the annotation at the lines the block really shows, or drop the")
+        print("annotation — an abbreviated or illustrative snippet is not meant to carry one.")
+    else:
+        print(
+            "OK: all %d pinned code blocks quote their cited lines verbatim (%d unannotated "
+            "Rust blocks were not compared)." % (pinned, unpinned)
+        )
+        print("This is a floor too, and an opt-in one: a block that carries no `path:NNN-MMM` in its")
+        print("fence is never compared, so a quote is only guarded once its author pins it.")
 
     return status
 
