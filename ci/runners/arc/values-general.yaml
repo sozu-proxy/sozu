@@ -1,0 +1,23 @@
+# Chart: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+# Pinned version: 0.14.2
+# Helm release name "sozu-general" IS the runs-on label: runs-on: sozu-general
+#
+# Known follow-up, not handled by this initial deploy: release.yml's docker-release job
+# builds/pushes clevercloud/sozu:* via buildx. This scale-set does NOT enable containerMode: dind
+# (privileged pods) — that job stays on ubuntu-latest until dind (or an equivalent docker-socket
+# sidecar) is deliberately added here, since that's a real security-posture escalation and
+# shouldn't ride in silently with the rest of the matrix migration.
+githubConfigUrl: "https://github.com/sozu-proxy/sozu"
+githubConfigSecret: sozu-runner-github-app
+
+minRunners: 0
+maxRunners: 6
+
+template:
+  spec:
+    nodeSelector:
+      clever-cloud.com/nodegroup: default
+    containers:
+      - name: runner
+        image: clevercloud/sozu-ci-runner:latest
+        command: ["/home/runner/run.sh"]
