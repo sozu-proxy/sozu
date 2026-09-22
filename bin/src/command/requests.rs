@@ -1023,7 +1023,7 @@ pub fn load_static_config(server: &mut Server, mut client: OptionalClient, path:
         if let Some(reason) = request
             .request_type
             .as_ref()
-            .and_then(|request_type| validate_request(request_type).err())
+            .and_then(|request_type| validate_request(request_type, RequestOrigin::Authored).err())
         {
             warn!("Skipping invalid config entry: {}", reason);
             client.return_processing(format!("Skipping invalid config entry: {reason}"));
@@ -2279,11 +2279,67 @@ fn validate_frontend_request(request: &RequestType) -> Result<(), String> {
         .map_err(|router_error| router_error.to_string())
 }
 
-/// sozu#1301 + sozu#1313: the single pre-dispatch validation every master apply
-/// path — [`worker_request`], [`load_state`] and [`load_static_config`] — runs
-/// before mutating `ConfigState`.
-fn validate_request(request: &RequestType) -> Result<(), String> {
+/// Which door a request arrived at. The buildability and route-grammar gates
+/// are the same at both; the H2 knob floors are not (sozu#1418).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestOrigin {
+    /// Somebody is stating this value right now — a `sozu ctl` invocation, a
+    /// raw protobuf request on the command socket, the boot configuration.
+    /// An out-of-range knob is a typo, and an error names the key to fix.
+    Authored,
+    /// Replay of state the main process already accepted and is already
+    /// serving — `LoadState`, and the hot-upgrade handover it backs. The
+    /// operator is upgrading, not authoring.
+    Replayed,
+}
+
+/// Master-side pre-validation of the H2 listener knobs (sozu#1418).
+///
+/// Separate from [`validate_listener_request`] because it is the one gate
+/// whose verdict depends on [`RequestOrigin`]: a worker *can* build a listener
+/// whose threshold is out of range — `H2FloodConfig::from_optional` clamps it
+/// to the floor — so this is a policy about what may be stated, not a
+/// buildability check. Every other request returns `Ok`.
+fn validate_h2_knob_floors(request: &RequestType) -> Result<(), String> {
+    match request {
+        RequestType::AddHttpListener(config) => {
+            sozu_command_lib::state::validate_h2_flood_knobs_http_listener(config)
+        }
+        RequestType::AddHttpsListener(config) => {
+            sozu_command_lib::state::validate_h2_flood_knobs_https_listener(config)
+        }
+        _ => return Ok(()),
+    }
+    .map_err(|state_error| state_error.to_string())
+}
+
+/// sozu#1301 + sozu#1313 + sozu#1418: the single pre-dispatch validation every
+/// master apply path — [`worker_request`], [`load_state`] and
+/// [`load_static_config`] — runs before mutating `ConfigState`.
+///
+/// [`validate_h2_knob_floors`] runs only for [`RequestOrigin::Authored`], and
+/// that asymmetry is deliberate. The other two gates reject configurations
+/// that CANNOT function: an answer template that will not parse, a hostname
+/// the router refuses. An H2 threshold of `0` is a perfectly buildable
+/// listener that the workers clamp to the floor and then serve from. Applying
+/// the same skip to a replayed entry would turn degraded-but-serving into
+/// absent — on an HTTPS listener, a full outage for every frontend behind it,
+/// at upgrade time, to prevent a single silently-corrected threshold.
+///
+/// Be exact about what the clamp does, because it does NOT tighten anything:
+/// `check_flood`'s `flag` is `count > threshold`, so a threshold of `0` trips
+/// on the FIRST counted event and the clamped `1` trips on the second. Every
+/// clamped knob is loosened, by exactly one event. That is still the right
+/// trade, because `0` is not "no limit" and not a protection level anyone
+/// tuned — it is a typo whose only effect is to trip immediately, and the
+/// clamp moves it one event. Refusing on replay spends an outage to buy that
+/// one event back. `load_state` therefore admits the entry and warns, loudly,
+/// with the key to fix.
+fn validate_request(request: &RequestType, origin: RequestOrigin) -> Result<(), String> {
     validate_listener_request(request)?;
+    if origin == RequestOrigin::Authored {
+        validate_h2_knob_floors(request)?;
+    }
     validate_frontend_request(request)
 }
 
@@ -2769,7 +2825,9 @@ pub fn worker_request(
     let apply_result = request
         .request_type
         .as_ref()
-        .map_or(Ok(()), validate_request)
+        .map_or(Ok(()), |request_type| {
+            validate_request(request_type, RequestOrigin::Authored)
+        })
         .map_err(|reason| (AuditErrorCode::InvalidInput, reason))
         .and_then(|()| {
             server
@@ -3824,16 +3882,40 @@ pub fn load_state(server: &mut Server, mut client: OptionalClient, path: &str) {
                     // persisted by the next `SaveState`. `warn!`, not `debug!`:
                     // an entry silently dropped from the state the operator
                     // saved must be visible at the default log level.
-                    if let Some(request_type) = &request.content.request_type
-                        && let Err(reason) = validate_request(request_type)
-                    {
-                        warn!(
-                            "load_state: skipping an entry rejected by pre-dispatch validation: {}",
-                            reason
-                        );
-                        count!("config.load_skipped_invalid", 1);
-                        skipped_invalid += 1;
-                        continue;
+                    if let Some(request_type) = &request.content.request_type {
+                        if let Err(reason) = validate_request(request_type, RequestOrigin::Replayed)
+                        {
+                            warn!(
+                                "load_state: skipping an entry rejected by pre-dispatch validation: {}",
+                                reason
+                            );
+                            count!("config.load_skipped_invalid", 1);
+                            skipped_invalid += 1;
+                            continue;
+                        }
+                        // sozu#1418: an out-of-range H2 knob is NOT a reason to
+                        // drop a replayed listener. The entry was accepted
+                        // before the gate existed and is serving today; the
+                        // workers clamp the threshold to the floor. That clamp
+                        // LOOSENS the knob by exactly one event — `count >
+                        // threshold` trips on the first counted event at `0`
+                        // and on the second at `1` — but `0` is not "no limit"
+                        // and not a protection level anyone tuned. Dropping
+                        // the listener instead would unbind it and take every
+                        // frontend behind it offline — a far larger blast
+                        // radius than that one event. Keep it, and say so at
+                        // `warn!` so the operator can fix the source rather
+                        // than discovering it at the next upgrade.
+                        if let Err(reason) = validate_h2_knob_floors(request_type) {
+                            warn!(
+                                "load_state: keeping a listener whose H2 knob is out of range — \
+                                 the workers clamp it to the floor: {}. Correct it with \
+                                 `sozu ctl listener http|https update` (or in the configuration \
+                                 file) and save the state again.",
+                                reason
+                            );
+                            count!("config.load_h2_knob_clamped", 1);
+                        }
                     }
                     if let Err(error) = server.state.dispatch(&request.content) {
                         // The entry never enters ConfigState and is never
@@ -4886,7 +4968,9 @@ mod listener_validation_tests {
     //! return `Ok(())` unconditionally — the pre-fix behavior where the main
     //! process committed listener configs without validating them. The
     //! `is_err()` assertions below then fail.
-    use super::validate_listener_request;
+    use super::{
+        RequestOrigin, validate_h2_knob_floors, validate_listener_request, validate_request,
+    };
     use sozu_command_lib::{
         config::ListenerBuilder,
         proto::command::{
@@ -5002,6 +5086,132 @@ mod listener_validation_tests {
         assert!(
             validate_listener_request(&request).is_err(),
             "an unbuildable HTTP listener must be rejected before commit"
+        );
+    }
+
+    /// Regression for sozu-proxy/sozu#1418: the H2 knob floors were enforced
+    /// on `UpdateHttp(s)Listener` (`validate_h2_flood_knobs_http`/`_https`)
+    /// and, since that issue, at config load (`ListenerBuilder::to_http`/
+    /// `to_tls`) — but a raw protobuf `Add{Http,Https}Listener` straight to
+    /// the command socket reached neither. `ConfigState::add_http_listener`
+    /// clones the config in with no validation, so the value became
+    /// authoritative, `SaveState` re-serialised it, every replay re-injected
+    /// it, and each worker then rewrote the operator's `0` to `1` with
+    /// `H2FloodConfig::from_optional`'s clamp — the silent rewrite the whole
+    /// fix exists to avoid, surviving on the one path nothing gated.
+    ///
+    /// To SEE THIS RED: drop the `validate_h2_knob_floors(request)?` call from
+    /// `validate_request`. Both `is_err()` assertions then fail.
+    #[test]
+    fn raw_protobuf_listener_add_with_an_out_of_range_h2_knob_is_rejected_before_commit() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 8085);
+        let mut http = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("default HTTP listener config");
+        // `ListenerBuilder::to_http` refuses this value; a raw protobuf
+        // request never went through it.
+        http.h2_max_rst_stream_per_window = Some(0);
+
+        // The pathology: `ConfigState` has no knob validation of its own — it
+        // records the zero and makes it authoritative. Prove it at the state
+        // layer so the master-side guard below is demonstrably load-bearing.
+        {
+            let mut state = ConfigState::new();
+            state
+                .dispatch(&RequestType::AddHttpListener(http.clone()).into())
+                .expect("ConfigState records the zero — add_http_listener does not validate");
+        }
+
+        assert!(
+            validate_request(&RequestType::AddHttpListener(http), RequestOrigin::Authored).is_err(),
+            "a raw protobuf AddHttpListener carrying h2_max_rst_stream_per_window = 0 must be \
+             rejected before commit instead of being clamped by every worker"
+        );
+
+        // The HTTPS twin, on the one knob whose floor is 2 rather than 1.
+        let mut https = https_config(SocketAddress::new_v4(127, 0, 0, 1, 8086), true);
+        https.h2_stream_shrink_ratio = Some(1);
+        assert!(
+            validate_request(
+                &RequestType::AddHttpsListener(https),
+                RequestOrigin::Authored
+            )
+            .is_err(),
+            "a raw protobuf AddHttpsListener carrying h2_stream_shrink_ratio = 1 must be \
+             rejected before commit"
+        );
+    }
+
+    /// sozu#1418: the knob floors must NOT drop a replayed listener.
+    ///
+    /// `load_state` shares `validate_request` with the authoring paths, and an
+    /// entry it rejects is skipped — the listener never enters `ConfigState`,
+    /// never binds, and every frontend behind it is offline. For an entry that
+    /// cannot function (sozu#1301's unparseable answer template, sozu#1313's
+    /// unroutable hostname) that is the right trade. For an H2 threshold of
+    /// `0` it is not: the listener builds, the workers clamp the threshold to
+    /// the floor, and it serves. The clamp LOOSENS that knob by exactly one
+    /// event — `count > threshold` trips on the first counted event at `0` and
+    /// on the second at `1` — on a `0` nobody chose as a protection level.
+    /// Dropping the listener would instead convert degraded-but-serving into a
+    /// full outage for its frontends, at upgrade time, and an HTTPS listener
+    /// takes its whole TLS surface with it.
+    ///
+    /// To SEE THIS RED: make `validate_request` run `validate_h2_knob_floors`
+    /// unconditionally (drop the `origin == RequestOrigin::Authored` guard).
+    /// The `Replayed` assertion then fails — which is exactly the state file
+    /// being dropped.
+    #[test]
+    fn a_replayed_listener_with_an_out_of_range_h2_knob_is_kept_not_dropped() {
+        let mut http = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8088))
+            .to_http(None)
+            .expect("default HTTP listener config");
+        http.h2_max_rst_stream_per_window = Some(0);
+        let request = RequestType::AddHttpListener(http);
+
+        assert!(
+            validate_request(&request, RequestOrigin::Authored).is_err(),
+            "the authoring door must still refuse an out-of-range knob"
+        );
+        assert!(
+            validate_request(&request, RequestOrigin::Replayed).is_ok(),
+            "a replayed listener whose only fault is an out-of-range H2 knob must be kept — \
+             the workers clamp it; dropping it unbinds the listener and takes its frontends down"
+        );
+        assert!(
+            validate_h2_knob_floors(&request).is_err(),
+            "the replay path must still be able to see the fault, to warn with the key to fix"
+        );
+
+        // A replayed entry that genuinely cannot function is still dropped:
+        // the asymmetry is about buildable-but-degraded, not about replay.
+        let mut unbuildable = https_config(SocketAddress::new_v4(127, 0, 0, 1, 8089), false);
+        unbuildable.h2_max_rst_stream_per_window = Some(0);
+        assert!(
+            validate_request(
+                &RequestType::AddHttpsListener(unbuildable),
+                RequestOrigin::Replayed
+            )
+            .is_err(),
+            "an unbuildable replayed listener must still be skipped (sozu#1301)"
+        );
+    }
+
+    /// The floors must not reject a listener that merely leaves the knobs
+    /// unset or sets them at their minimum — `valid_listener_adds_of_every_type_pass_validation`
+    /// covers the unset case; this covers the boundary.
+    #[test]
+    fn listener_add_with_h2_knobs_at_their_minimum_passes_validation() {
+        let mut http = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8087))
+            .to_http(None)
+            .expect("default HTTP listener config");
+        http.h2_max_rst_stream_per_window = Some(1);
+        http.h2_max_rst_stream_abusive_lifetime = Some(1);
+        http.h2_max_header_fields = Some(1);
+        http.h2_stream_shrink_ratio = Some(2);
+        assert!(
+            validate_request(&RequestType::AddHttpListener(http), RequestOrigin::Authored).is_ok(),
+            "H2 knobs at their documented minimum must be accepted"
         );
     }
 
@@ -5145,7 +5355,7 @@ mod frontend_validation_tests {
     //! return `Ok(())` unconditionally — the pre-fix behavior where the main
     //! process committed frontends without checking the router grammar. The
     //! `is_err()` assertions below then fail.
-    use super::{validate_frontend_request, validate_request};
+    use super::{RequestOrigin, validate_frontend_request, validate_request};
     use sozu_command_lib::{
         config::ListenerBuilder,
         proto::command::{
@@ -5320,15 +5530,23 @@ mod frontend_validation_tests {
         cfg.answers
             .insert("404".to_owned(), "not a valid http response".to_owned());
         assert!(
-            validate_request(&RequestType::AddHttpListener(cfg)).is_err(),
+            validate_request(&RequestType::AddHttpListener(cfg), RequestOrigin::Authored).is_err(),
             "validate_request must keep rejecting an unbuildable listener (sozu#1301)"
         );
         assert!(
-            validate_request(&RequestType::AddHttpFrontend(frontend(INCIDENT_HOSTNAME))).is_err(),
+            validate_request(
+                &RequestType::AddHttpFrontend(frontend(INCIDENT_HOSTNAME)),
+                RequestOrigin::Authored
+            )
+            .is_err(),
             "validate_request must reject a malformed frontend (sozu#1313)"
         );
         assert!(
-            validate_request(&RequestType::AddHttpFrontend(frontend("example.com"))).is_ok(),
+            validate_request(
+                &RequestType::AddHttpFrontend(frontend("example.com")),
+                RequestOrigin::Authored
+            )
+            .is_ok(),
             "validate_request must accept a well-formed frontend"
         );
     }

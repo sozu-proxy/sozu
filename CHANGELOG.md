@@ -120,8 +120,9 @@
 - **`refactor(mux-h2)`: H2 flood/abuse detection moves into its own
   `lib/src/protocol/mux/h2_flood_detector.rs`, behind the same closed-API shape `hpack_state.rs`,
   `h2_flow_control.rs` and `h2_stream_table.rs` established in the three prior extraction steps.**
-  `H2FloodConfig` (the CVE-tagged thresholds — its fields stay `pub`, unchanged, because
-  `lib/src/http.rs`/`lib/src/https.rs` build it with a struct literal from listener config),
+  `H2FloodConfig` (the CVE-tagged thresholds — its fields stayed `pub` at this step because
+  `lib/src/http.rs`/`lib/src/https.rs` built it with a struct literal from listener config; the
+  Fixed entry below closes that, so the type now matches its three siblings),
   `H2FloodViolation`, `H2FloodDetector` and `check_flood` all move; `ConnectionH2` keeps a single
   private `flood_detector: h2_flood_detector::H2FloodDetector` field and calls its new
   `record_glitch` / `record_continuation_frame` / `begin_header_block_if_new` /
@@ -536,6 +537,72 @@
   control-plane TCP listener, so this is a robustness fix rather than a remotely triggerable one —
   but the same parser serves the master↔worker socketpair, where a worker compromised through the
   traffic it proxies could wedge its supervisor session. Closes #1428.
+
+- **`fix(mux-h2)`: reject an out-of-range H2 listener threshold at config load and on a raw
+  `Add{Http,Https}Listener`, and make `H2FloodConfig` constructible only through its clamping
+  constructors.** `H2FloodConfig::new` clamps every threshold to `>= 1`, and nothing in production
+  called it: `get_h2_flood_config` in `lib/src/http.rs` and `lib/src/https.rs` built the struct with
+  a raw literal, so only `Default::default()`'s compile-time constants — which never needed
+  validation — went through the clamp, and every value an operator could actually set bypassed it.
+  A `0` there does not disable a check: `check_flood` compares `count > threshold`, so it makes the
+  first event that counter sees a violation, with no error at load time and no log explaining it.
+  How far that reaches depends on the knob, and it is worth being precise about, because the two
+  ends are very different. `h2_max_header_list_size` and `h2_max_header_fields` are also the HPACK
+  decode budget `pkawa::decode_headers_with_budget` enforces, so `0` makes the first header field of
+  every block exceed it (name + value + the 32-octet RFC 9113 §6.5.2 overhead) and every request on
+  the listener is refused with `ENHANCE_YOUR_CALM` — per stream for a header block that fits one
+  HEADERS frame, and as a connection `GOAWAY` for one that spans CONTINUATION frames, where
+  `record_continuation_frame` lifts `accumulated_header_size` above the zero threshold and
+  `check_flood_or_return!` fires before the explicit size test. (`h2_max_header_table_size` is not in
+  this class: `0` there only zeroes the HPACK encoder's dynamic table.) The per-window and lifetime
+  counters are inert until a client sends the frame they count — `h2_max_rst_stream_per_window = 0`
+  costs nothing on a connection that never sends RST_STREAM, since `0 > 0` is false, and tears the
+  connection down with `GOAWAY(ENHANCE_YOUR_CALM)` on the first one that does. In a debug build
+  `H2FloodDetector::new`'s pre-condition `debug_assert!` fired instead, at connection setup — that
+  assertion documented a pre-condition that had never held on the path that mattered, and its
+  comment blamed a "raw struct literal in a future caller" that was in fact already there; it now
+  covers all thirteen thresholds rather than five, because `impl Default` is itself an in-module
+  struct literal.
+  `ListenerBuilder::to_http`/`to_tls` (`command/src/config.rs`) now refuse the value with a new
+  `ConfigError::H2ThresholdBelowMinimum` naming the listener, the key, the value and the minimum,
+  over exactly the field set and minimums `validate_h2_flood_knobs_http`/`_https` already enforced
+  on `UpdateHttp(s)Listener` — the same `0` an operator could not patch in, they could previously
+  boot with. A raw protobuf `Add{Http,Https}Listener` straight to the command socket reached neither
+  gate: `ConfigState::add_http_listener` cloned it in unvalidated, `SaveState` re-serialised it,
+  every replay re-injected it, and each worker rewrote the `0` to `1`. The main process's
+  pre-dispatch validation (`bin/src/command/requests.rs`, sozu#1301) now runs the same floors through
+  the new `validate_h2_flood_knobs_http(s)_listener`, so an out-of-range knob is refused before the
+  address is reserved. All five validators — `ListenerBuilder::validate_h2_thresholds` in
+  `command/src/config.rs` and the four `validate_h2_flood_knobs_*` in `command/src/state.rs` — now
+  expand one shared list, `for_each_h2_knob_floor!` in `command/src/lib.rs`, instead of keeping five
+  copies of the same fifteen knobs; adding a knob to one door and forgetting another is what would
+  reopen this bug one level up, and it is no longer expressible.
+  Rejected rather than silently clamped, so the operator's stated intent is not rewritten out from
+  under them. `H2FloodConfig`'s thirteen fields become private with `pub` accessors, matching
+  `hpack_state`, `h2_flow_control` and `h2_stream_table`; `H2FloodConfig::from_optional` (the same
+  shape as the adjacent `H2ConnectionConfig::from_optional` already used by
+  `get_h2_connection_config`) resolves each `None` to its default and delegates to `new`, and both
+  listeners call it. The clamp stays as the fail-safe for what predates every gate — a state file
+  saved before they existed — and a new per-field test in each listener pins the thirteen positional
+  arguments `get_h2_flood_config` hands `from_optional`, where a transposition would otherwise
+  compile silently. Closes #1418.
+
+  **Upgrade note — your listeners are NOT dropped.** A listener already recorded with an
+  out-of-range H2 knob keeps working after this release. `LoadState` replay deliberately does not
+  apply the new rejection: an entry it rejects is skipped, and a skipped listener never binds, which
+  would take every frontend behind it offline — on an HTTPS listener, its whole TLS surface — to
+  prevent one silently-corrected threshold. A replayed listener whose only fault is an out-of-range
+  knob is therefore kept and served, the workers clamp that one threshold to the floor exactly as
+  they did before, and the main process logs
+  `load_state: keeping a listener whose H2 knob is out of range …` at `warn!` with the key to fix and
+  increments `config.load_h2_knob_clamped`. Be clear about what that clamp does to your listener: it
+  **loosens** the knob, it does not tighten it. Flood detection compares `count > threshold`, so a
+  threshold of `0` trips on the very first counted event and the clamped `1` trips on the second —
+  one event of slack, on a `0` that is a typo rather than a protection level anyone tuned. What the
+  clamp cannot do is switch detection off. The rejection applies where somebody is *stating* the
+  value — the configuration file, `sozu ctl`, and a raw protobuf `Add{Http,Https}Listener` — because
+  there an error names the key while the operator is still typing. Fix the source and save the state
+  again to clear the warning.
 
 ### 🔐 Security
 

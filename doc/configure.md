@@ -1118,10 +1118,32 @@ sends an excessive number of certain frame types within a rolling window, Sozu
 terminates the connection with a `GOAWAY(ENHANCE_YOUR_CALM)` frame. This
 protects against several known HTTP/2 denial-of-service vectors.
 
-Six per-window thresholds are configurable per-listener. When omitted,
-compile-time defaults are used (see also
+Seven thresholds are configurable per-listener: the six per-window counters
+below, half-decayed once per `FLOOD_WINDOW_DURATION` (1 second), plus
+`h2_max_continuation_frames`, which counts per header block and is reset when
+the block completes. When omitted, compile-time defaults are used (see also
 [RST_STREAM lifetime caps](#h2-rst_stream-lifetime-caps) for connection-lifetime
-counters):
+counters).
+
+Every one of them must be `>= 1`. A `0` does not disable the check — flood
+detection compares `count > threshold`, so it makes the first event that
+counter sees a violation, and the connection is torn down with
+`GOAWAY(ENHANCE_YOUR_CALM)` as soon as one client sends the frame that counter
+counts. (`h2_max_header_list_size` and `h2_max_header_fields`, in the
+[listener field table](#http-and-https-listeners), are worse still: they are
+also the HPACK decode budget, so `0` refuses *every* request with
+`ENHANCE_YOUR_CALM` — per stream for a header block that fits one HEADERS
+frame, and as a connection `GOAWAY` for one that spans CONTINUATION frames.)
+
+A `0` is refused when the configuration is loaded, refused by `sozu ctl` on a
+listener update, and refused on a raw `AddHttpListener` / `AddHttpsListener`
+sent straight to the command socket, so the value is never silently rewritten.
+Replaying a state file saved before those checks existed is the one exception:
+the listener is kept and its threshold clamped to the floor, because dropping
+it would unbind it and take its frontends offline. `sozu` logs that at `warn!`
+with the key to fix, and counts `config.load_h2_knob_clamped`.
+
+The seven thresholds:
 
 | Parameter                                 | Default | Protects against                                                                                                                                                                                                                             | CVE            |
 | ----------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
@@ -2260,8 +2282,9 @@ immediately after the patch is acknowledged.
 | `h2_initial_connection_window`            | `u32`           | per-connection setup | `1048576`               | Connection receive window (bytes, RFC 9113 §6.9.2)                                                                                                           |
 | `h2_max_concurrent_streams`               | `u32` (≥ 1)     | per-connection setup | `100`                   | `SETTINGS_MAX_CONCURRENT_STREAMS`                                                                                                                            |
 | `h2_stream_shrink_ratio`                  | `u32` (≥ 2)     | per-connection setup | `2`                     | Stream-slot Vec shrink threshold                                                                                                                             |
-| `h2_max_header_list_size`                 | `u32`           | per-connection setup | `65536`                 | HPACK decoded header budget (`SETTINGS_MAX_HEADER_LIST_SIZE`)                                                                                                |
-| `h2_max_header_table_size`                | `u32`           | per-connection setup | `65536`                 | HPACK dynamic table size cap (`SETTINGS_HEADER_TABLE_SIZE`)                                                                                                  |
+| `h2_max_header_list_size`                 | `u32` (≥ 1)     | per-connection setup | `65536`                 | HPACK decoded header budget (`SETTINGS_MAX_HEADER_LIST_SIZE`). `0` refuses every request.                                                                    |
+| `h2_max_header_table_size`                | `u32` (≥ 1)     | per-connection setup | `65536`                 | HPACK dynamic table size cap (`SETTINGS_HEADER_TABLE_SIZE`)                                                                                                  |
+| `h2_max_header_fields`                    | `u32` (≥ 1)     | per-connection setup | `128`                   | Materialized header fields per HEADERS/trailers block, cookie crumbs included (RFC 9113 §8.2.3). `0` refuses every request.                                   |
 | `h2_stream_idle_timeout_seconds`          | `u32`           | per-connection setup | `max(30, back_timeout)` | Per-stream idle timeout (slow-multiplex Slowloris defence). When unset, inherits `back_timeout` floored at 30 s; set explicitly to cap below `back_timeout`. |
 | `h2_graceful_shutdown_deadline_seconds`   | `u32`           | per-connection setup | `5`                     | Forced-close deadline after `GOAWAY(NO_ERROR)` on soft-stop. `0` = wait forever.                                                                             |
 

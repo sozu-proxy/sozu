@@ -631,6 +631,8 @@ RENAMED_TESTS = {
 NOT_A_TEST = {
     "h2_graceful_shutdown_deadline_seconds": "listener configuration key",
     "h2_max_rst_stream_per_window": "listener configuration key",
+    "h2_max_header_list_size": "listener configuration key",
+    "h2_max_header_table_size": "listener configuration key",
     "select_nth_unstable_by_key": "std library method",
     "project_sozu_h2_flood_family_flakes": "agent memory note, not a test",
     "feedback_h2_repro_multi_data_frames": "agent memory note, not a test",

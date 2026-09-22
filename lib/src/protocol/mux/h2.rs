@@ -1828,13 +1828,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // connection can no longer decode header blocks safely and we
                 // escalate to GOAWAY(EnhanceYourCalm).
                 if self.flood_detector.accumulated_header_size()
-                    > self.flood_detector.config().max_header_list_size
+                    > self.flood_detector.config().max_header_list_size()
                 {
                     error!(
                         "{} CONTINUATION accumulated header size {} exceeds {}",
                         log_context!(self),
                         self.flood_detector.accumulated_header_size(),
-                        self.flood_detector.config().max_header_list_size
+                        self.flood_detector.config().max_header_list_size()
                     );
                     if (payload_len as usize) > self.zero.storage.available_space() {
                         return self.goaway(H2Error::EnhanceYourCalm);
@@ -4987,8 +4987,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             buffer,
             headers.end_stream,
             parts.context,
-            self.flood_detector.config().max_header_list_size,
-            self.flood_detector.config().max_header_fields,
+            self.flood_detector.config().max_header_list_size(),
+            self.flood_detector.config().max_header_fields(),
             elide_x_real_ip,
         );
         kawa.storage.clear();
@@ -5330,7 +5330,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 parser::SETTINGS_HEADER_TABLE_SIZE => {
                     // Cap to the configured maximum — a malicious peer can
                     // advertise up to 4 GB to inflate HPACK encoder memory.
-                    let cap = self.flood_detector.config().max_header_table_size;
+                    let cap = self.flood_detector.config().max_header_table_size();
                     let capped = v.min(cap);
                     self.peer_settings.settings_header_table_size = capped;
                     self.hpack.set_encoder_max_table_size(capped as usize);

@@ -361,6 +361,66 @@ pub enum ConfigError {
         command_buffer_size: u64,
         max_command_buffer_size: u64,
     },
+    /// An H2 listener knob was set below the minimum the runtime can honour.
+    /// Every flood-detection threshold needs `>= 1`: `check_flood`
+    /// (`lib/src/protocol/mux/h2_flood_detector.rs`) compares
+    /// `count > threshold`, so `0` does not disable the check, it makes the
+    /// first event the counter sees a violation. `h2_stream_shrink_ratio`
+    /// needs `>= 2` for the same reason its runtime `.max(2)` exists.
+    ///
+    /// What that costs depends on which counter the key guards, and the error
+    /// text says so rather than promising the worst case for all of them:
+    ///
+    /// - `h2_max_header_list_size` and `h2_max_header_fields` are *also* the
+    ///   HPACK decode budget `lib/src/protocol/mux/pkawa.rs`'s
+    ///   `decode_headers_with_budget` enforces. At `0` the first header field
+    ///   of every block already exceeds it (name + value + the 32-octet RFC
+    ///   9113 §6.5.2 overhead), so every request on the listener is refused
+    ///   with `ENHANCE_YOUR_CALM`. Immediate and universal. The frame it
+    ///   arrives in depends on the request: a header block that fits one
+    ///   HEADERS frame is refused per stream (`pkawa.rs`'s
+    ///   `Err((EnhanceYourCalm, false))` → `reset_stream`), while one that
+    ///   spans CONTINUATION frames takes the whole connection down —
+    ///   `record_continuation_frame` lifts `accumulated_header_size` above the
+    ///   zero threshold and `check_flood_or_return!`
+    ///   (`lib/src/protocol/mux/h2.rs`) escalates to
+    ///   `GOAWAY(ENHANCE_YOUR_CALM)` before the explicit size test below it.
+    ///   `h2_max_header_table_size` is NOT in this class: `0` only zeroes the
+    ///   HPACK encoder's dynamic table.
+    /// - The per-window and lifetime frame counters only move when a client
+    ///   sends the frame they count. `h2_max_rst_stream_per_window = 0` is
+    ///   harmless to a connection that never sends RST_STREAM — `0 > 0` is
+    ///   false — and fatal to the first one that does.
+    /// - `h2_max_concurrent_streams` and `h2_stream_shrink_ratio` are not
+    ///   flood counters at all: `H2ConnectionConfig::new`
+    ///   (`lib/src/protocol/mux/h2.rs`) promotes an out-of-range value to the
+    ///   floor behind a `warn!`, which is the silent rewrite this error
+    ///   exists to replace.
+    ///
+    /// Rejected at config load rather than silently clamped, so the operator
+    /// sees which key to fix instead of the mistake being rewritten out from
+    /// under them. `UpdateHttp(s)Listener` already refuses the same values via
+    /// `validate_h2_flood_knobs_http`/`_https` (`command/src/state.rs`); this
+    /// is the matching gate on the config-file / `sozu ctl add listener` path
+    /// (sozu-proxy/sozu#1418).
+    #[error(
+        "listener {address}: {key} = {value} is below the minimum of {minimum} the runtime can \
+         honour. Below the minimum the value does not relax the limit, it breaks it: the H2 flood \
+         detector compares count > threshold, so 0 is already exceeded the first time the counter \
+         it guards leaves zero. How far that reaches depends on the key — \
+         h2_max_header_list_size and h2_max_header_fields are also the HPACK decode budget, so 0 \
+         refuses every request on this listener with ENHANCE_YOUR_CALM (as a stream reset, or as \
+         a connection GOAWAY once a header block spans CONTINUATION frames), while a per-window \
+         or lifetime frame counter only trips once a client sends the frame it counts, and \
+         h2_max_concurrent_streams / h2_stream_shrink_ratio are instead promoted to their floor \
+         behind a warning. Raise {key} to >= {minimum}, or remove it to keep the default."
+    )]
+    H2ThresholdBelowMinimum {
+        address: String,
+        key: &'static str,
+        value: u64,
+        minimum: u64,
+    },
     /// `redirect = "<value>"` on a frontend used a value the parser doesn't
     /// recognise. Accepted values are `forward`, `permanent`, `unauthorized`
     /// (case-insensitive).
@@ -1011,6 +1071,46 @@ impl ListenerBuilder {
         self.request_timeout = Some(self.request_timeout.unwrap_or(config.request_timeout));
     }
 
+    /// Reject an H2 knob the runtime cannot honour, before it reaches a
+    /// listener config (sozu-proxy/sozu#1418).
+    ///
+    /// `UpdateHttp(s)Listener` has refused these values since the knobs
+    /// existed (`validate_h2_flood_knobs_http`/`_https`, `command/src/state.rs`)
+    /// — the config file and `sozu ctl add listener` did not, so the same `0`
+    /// an operator could not patch in, they could boot with. It reached
+    /// `HttpListenerConfig` untouched, and `lib/src/http.rs::get_h2_flood_config`
+    /// handed it to the flood detector, whose `check_flood` compares
+    /// `count > threshold`: the first event the counter saw was already a
+    /// violation. For `h2_max_header_list_size`/`h2_max_header_fields`, which
+    /// double as the HPACK decode budget, that is every request on the
+    /// listener; for the per-window and lifetime frame counters it is the
+    /// first client that sends the frame they count. Rejecting here rather
+    /// than clamping at use keeps the operator's mistake visible — the error
+    /// names the key, the value and the minimum.
+    ///
+    /// The field set and the minimums are deliberately the same as
+    /// `validate_h2_flood_knobs_http`'s: a value one door refuses must not get
+    /// in through the other. `h2_graceful_shutdown_deadline_seconds = 0` stays
+    /// allowed there and here — it means "wait forever".
+    fn validate_h2_thresholds(&self) -> Result<(), ConfigError> {
+        macro_rules! require_at_least {
+            ($builder:ident, $field:ident, $minimum:literal) => {
+                if let Some(value) = $builder.$field
+                    && u64::from(value) < $minimum
+                {
+                    return Err(ConfigError::H2ThresholdBelowMinimum {
+                        address: $builder.address.to_string(),
+                        key: stringify!($field),
+                        value: u64::from(value),
+                        minimum: $minimum,
+                    });
+                }
+            };
+        }
+        crate::for_each_h2_knob_floor!(require_at_least, self);
+        Ok(())
+    }
+
     /// build an HTTP listener with config timeouts, using defaults if no config is provided
     pub fn to_http(&mut self, config: Option<&Config>) -> Result<HttpListenerConfig, ConfigError> {
         if self.protocol != Some(ListenerProtocol::Http) {
@@ -1019,6 +1119,8 @@ impl ListenerBuilder {
                 found: self.protocol.to_owned(),
             });
         }
+
+        self.validate_h2_thresholds()?;
 
         // RFC 6797 §7.2: `Strict-Transport-Security` MUST NOT appear on
         // plaintext-HTTP responses. Reject an `[hsts]` block on an HTTP
@@ -1094,6 +1196,8 @@ impl ListenerBuilder {
                 found: self.protocol.to_owned(),
             });
         }
+
+        self.validate_h2_thresholds()?;
 
         let default_cipher_list = DEFAULT_CIPHER_LIST.into_iter().map(String::from).collect();
 
@@ -4578,6 +4682,103 @@ mod tests {
             ),
             other => panic!("expected HstsOnPlainHttp, got {other:?}"),
         }
+    }
+
+    /// Regression for sozu-proxy/sozu#1418: an H2 flood threshold of `0` set
+    /// in the config file reached `HttpListenerConfig` untouched. From there
+    /// `lib/src/http.rs::get_h2_flood_config` handed it to
+    /// `H2FloodDetector::new`, whose `check_flood` compares `count >
+    /// threshold` — so the first counted RST_STREAM of every H2 connection
+    /// tripped the detector and the listener answered `ENHANCE_YOUR_CALM` to
+    /// every client. `UpdateHttpListener` already refused the same value
+    /// (`validate_h2_flood_knobs_http`); the config-file path did not.
+    #[test]
+    fn h2_flood_threshold_zero_rejected_on_http_listener() {
+        let mut listener = ListenerBuilder::new(
+            SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            ListenerProtocol::Http,
+        );
+        listener.h2_max_rst_stream_per_window = Some(0);
+        match listener.to_http(None).unwrap_err() {
+            ConfigError::H2ThresholdBelowMinimum {
+                key,
+                value,
+                minimum,
+                ..
+            } => {
+                assert_eq!(key, "h2_max_rst_stream_per_window");
+                assert_eq!(value, 0);
+                assert_eq!(minimum, 1);
+            }
+            other => panic!("expected H2ThresholdBelowMinimum, got {other:?}"),
+        }
+    }
+
+    /// The HTTPS listener path (`to_tls`) carries the same knobs and needs the
+    /// same gate (sozu-proxy/sozu#1418). A lifetime cap is used here rather
+    /// than a per-window one so the `u64` knobs are covered too.
+    #[test]
+    fn h2_flood_threshold_zero_rejected_on_https_listener() {
+        let mut listener = ListenerBuilder::new_https(SocketAddress::new_v4(127, 0, 0, 1, 8443));
+        listener.h2_max_rst_stream_abusive_lifetime = Some(0);
+        match listener.to_tls(None).unwrap_err() {
+            ConfigError::H2ThresholdBelowMinimum {
+                key,
+                value,
+                minimum,
+                ..
+            } => {
+                assert_eq!(key, "h2_max_rst_stream_abusive_lifetime");
+                assert_eq!(value, 0);
+                assert_eq!(minimum, 1);
+            }
+            other => panic!("expected H2ThresholdBelowMinimum, got {other:?}"),
+        }
+    }
+
+    /// `h2_stream_shrink_ratio` has a runtime floor of 2, not 1
+    /// (`lib/src/protocol/mux/h2.rs`'s `.max(2)`), and
+    /// `validate_h2_flood_knobs_http` rejects `< 2` on the update path. The
+    /// config-file path must agree (sozu-proxy/sozu#1418).
+    #[test]
+    fn h2_stream_shrink_ratio_below_two_rejected_on_http_listener() {
+        let mut listener = ListenerBuilder::new(
+            SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            ListenerProtocol::Http,
+        );
+        listener.h2_stream_shrink_ratio = Some(1);
+        match listener.to_http(None).unwrap_err() {
+            ConfigError::H2ThresholdBelowMinimum {
+                key,
+                value,
+                minimum,
+                ..
+            } => {
+                assert_eq!(key, "h2_stream_shrink_ratio");
+                assert_eq!(value, 1);
+                assert_eq!(minimum, 2);
+            }
+            other => panic!("expected H2ThresholdBelowMinimum, got {other:?}"),
+        }
+    }
+
+    /// The boundary itself must load: every documented minimum is an accepted
+    /// value, not a rejected one.
+    #[test]
+    fn h2_thresholds_at_their_minimum_accepted() {
+        let mut listener = ListenerBuilder::new(
+            SocketAddress::new_v4(127, 0, 0, 1, 8080),
+            ListenerProtocol::Http,
+        );
+        listener.h2_max_rst_stream_per_window = Some(1);
+        listener.h2_max_rst_stream_abusive_lifetime = Some(1);
+        listener.h2_stream_shrink_ratio = Some(2);
+        let config = listener
+            .to_http(None)
+            .expect("thresholds at their minimum must be accepted");
+        assert_eq!(config.h2_max_rst_stream_per_window, Some(1));
+        assert_eq!(config.h2_max_rst_stream_abusive_lifetime, Some(1));
+        assert_eq!(config.h2_stream_shrink_ratio, Some(2));
     }
 
     #[test]
