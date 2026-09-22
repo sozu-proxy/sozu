@@ -642,12 +642,15 @@ impl Aggregator {
         );
         let previous_effective = self.effective;
         self.recompute_effective();
-        // An apply can only ELEVATE the effective level (a fresh/renewed
-        // lease adds to the max), never lower it below the prior effective.
-        debug_assert!(
-            self.effective >= previous_effective,
-            "lease_apply must not lower the effective detail level"
-        );
+        // A lease is a mechanism for a client to temporarily ELEVATE
+        // cardinality on its own behalf, not a one-way ratchet on the
+        // shared `effective` level: `effective` is, and must stay,
+        // `max(configured, max over live leases)`. A renewal at a LOWER
+        // level than the client's own previous entry is that client
+        // withdrawing part of its own request, so `effective` dropping in
+        // response is the correct outcome -- not an invariant violation.
+        // The only invariant that must hold here is the configured floor,
+        // checked below.
         debug_assert!(
             self.effective >= self.configured,
             "effective must never drop below the configured floor"
@@ -1326,6 +1329,41 @@ mod tests {
             PeerBinding::default(),
             now,
         );
+        assert_eq!(agg.lease_count(), 1);
+    }
+
+    #[test]
+    fn lease_apply_renewal_at_lower_level_lowers_effective() {
+        // Issue #1408: a client holding the current maximum renews its own
+        // lease at a LOWER level. A lease only ever elevates cardinality on
+        // the client's own behalf, so a client giving part of that back is
+        // withdrawing its own request, not violating a shared invariant.
+        // `effective` must recompute to max(configured, max over live
+        // leases) exactly like any other apply -- dropping here is the
+        // correct outcome, not a bug.
+        let mut agg = Aggregator::new("sozu".to_owned());
+        agg.set_up_detail(MetricDetailLevel::Process);
+        let now = Instant::now();
+        let (_, new) = unwrap_applied(agg.lease_apply(
+            "renewer".to_owned(),
+            MetricDetailLevel::Backend,
+            Duration::from_secs(60),
+            PeerBinding::default(),
+            now,
+        ));
+        assert_eq!(new, MetricDetailLevel::Backend);
+        assert_eq!(agg.detail_effective(), MetricDetailLevel::Backend);
+        // Same client_id renews at a strictly lower level.
+        let (prev, new) = unwrap_applied(agg.lease_apply(
+            "renewer".to_owned(),
+            MetricDetailLevel::Frontend,
+            Duration::from_secs(60),
+            PeerBinding::default(),
+            now,
+        ));
+        assert_eq!(prev, MetricDetailLevel::Backend);
+        assert_eq!(new, MetricDetailLevel::Frontend);
+        assert_eq!(agg.detail_effective(), MetricDetailLevel::Frontend);
         assert_eq!(agg.lease_count(), 1);
     }
 

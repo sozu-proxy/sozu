@@ -2469,9 +2469,13 @@ same surface.
 
 The lease is keyed by an operator-supplied `client_id` and stored on each
 worker. The effective level is `max(configured, max(active leases))`, so a
-lease never *lowers* the configured detail; it only elevates. When the last
-lease expires (TTL pop) or is explicitly cleared, the effective level falls
-back to the configured value.
+lease never *lowers* the configured detail; it only elevates. A client MAY
+renew its own lease at a lower level than its previous request — that is the
+client voluntarily giving back cardinality it no longer needs, and the
+effective level recomputes downward in response, same as any other apply;
+it still never drops below the configured floor. When the last lease expires
+(TTL pop) or is explicitly cleared, the effective level falls back to the
+configured value.
 
 The proto verb that exposes this surface is `SetMetricDetail` (request tag
 `55`); the response shape is `MetricDetailStatus` carrying the master's

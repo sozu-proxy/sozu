@@ -35,6 +35,41 @@
   takes the same injected clock. `SessionMetrics` and the timer wheel elsewhere in `lib/src/metrics/`
   deliberately keep the real clock and are unaffected.
 
+### 🐛 Fixed
+
+- **`fix(metrics)`: a client renewing its own cardinality lease at a LOWER level no longer trips
+  `lease_apply`'s own debug assertion.** `Aggregator::lease_apply` (`lib/src/metrics/mod.rs`)
+  decided whether a call was a renewal purely by `client_id` presence and never compared the
+  incoming `level` against the stored one; after replacing the entry and recomputing `effective`,
+  a `debug_assert!(self.effective >= previous_effective, ...)` claimed an apply could only ELEVATE
+  `effective`. Reachable through the ordinary `SetMetricDetail` dispatch path: a caller re-sending
+  its own `client_id` with a lower `detail` — the client holding the current maximum lowering its
+  own request — made `recompute_effective()` lower `effective` and tripped the assertion in every
+  debug/test/fuzz build; in release, where `debug_assert!` compiles out, `effective` silently
+  dropped anyway, which is the *correct* outcome, just the opposite of what the assertion and its
+  comment promised. The comment was wrong, not the code: a lease is a mechanism for a client to
+  temporarily elevate cardinality on its own behalf, and `effective` is, and must stay,
+  `max(configured, max over live leases)` — exactly what `recompute_effective()` already computed.
+  A client lowering its own lease is withdrawing part of its own request, not violating a shared
+  invariant, so `effective` dropping in response is correct; rejecting or clamping a lowering
+  renewal would instead force a client to drop its lease entirely (losing its peer binding) just to
+  give back cardinality it no longer needs. The assertion is deleted and the comment corrected to
+  state the real invariant; the sibling `debug_assert!(self.effective >= self.configured, ...)`
+  is unaffected and still holds — `recompute_effective` seeds its running max from `self.configured`
+  and only ever raises it, so `effective` can never drop below the configured floor regardless of
+  lease levels.
+  `sim/tests/metrics_lease_sim.rs`'s `level_for_client` helper (landed in #1409) used to reroll any
+  drawn level that would be strictly lower than a renewing client's existing one, specifically to
+  keep the sweep from failing on this defect; that reroll is removed, so every `LeaseApply` draw —
+  fresh insert or renewal, raising or lowering — is now an unconstrained fresh draw. The shadow
+  `Model::apply` already recomputed `expected_effective()` as a pure `max(configured, every stored
+  lease's level)` on every call, with no elevate-only assumption, so it needed no change. Both the
+  256-seed default sweep and a deeper 2048-seed sweep pass cleanly with lowering renewals exercised
+  throughout.
+  Regression test: `lease_apply_renewal_at_lower_level_lowers_effective` in
+  `lib/src/metrics/mod.rs::tests`.
+  Closes [#1408](https://github.com/sozu-proxy/sozu/issues/1408).
+
 ### 🔐 Security
 
 - **`fix(mux-h2)`: decode a refused stream's HPACK field block instead of dropping it, so the
