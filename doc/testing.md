@@ -186,6 +186,35 @@ Notes:
   omits: a peer decoder that never saw the first block must FAIL on the
   second, which a generated table size small enough to evict the dynamic table
   would make untrue.
+- **RFC 9218 §4 incremental scheduler fairness is unit-tested with `quickcheck`**
+  (`lib/src/protocol/mux/h2_scheduler.rs`,
+  `fairness_property::qc_incremental_leadership_visits_every_peer_once_per_cycle`),
+  on top of the example-based
+  `incremental_leadership_rotates_one_position_per_pass` and
+  `no_incremental_peer_is_starved_over_a_full_cycle`. A third sibling of the
+  two properties above rather than a case inside either: those drive
+  `ConnectionH2`'s HPACK decoder across a fragmented read and its encoder
+  across one write pass, while this one drives `H2Scheduler`'s round-robin
+  cursor across MANY passes, and its oracle is the cyclic successor in the
+  generated plan's own ascending stream-id list — computed from the plan, never
+  from anything the scheduler returned. One `quickcheck` verdict over three
+  unrelated state machines would say nothing about any of them. It generates
+  2..=8 same-urgency incremental peers with arbitrary ids and gaps, an
+  arbitrary urgency bucket, 1..=4 full cycles, and a distractor set
+  (non-incremental peers in the same bucket, incremental streams in a
+  lower-priority bucket) that must not perturb the rotation, then asserts both
+  the exact leader sequence and the starvation bound: every peer leads exactly
+  once per cycle. Of the deterministic pair, one fixes four peers over eight
+  passes and the other deliberately goes to five rather than stopping at two,
+  because a rotation bug that swaps a pair still looks fair on two streams and
+  starves the fifth. All of it is scoped to the urgency bucket that supplies
+  the pass leader: the round-robin cursor is one connection-global stream id,
+  so a trailing bucket can be permanently static, which
+  `the_round_robin_cursor_is_connection_global_so_only_the_leading_bucket_rotates`
+  pins as observed behaviour. See LIFECYCLE.md invariant 26. Each test carries
+  a `TO SEE THIS RED` recipe naming the statement to delete and the panic it
+  produces — except that last one, which asserts what the code already does
+  and says so.
 - `e2e/src/tests/fuzz_tests.rs` is a thin integration wrapper that shells out to
   the four fuzz targets for 10 s each. It *skips gracefully* (prints a notice,
   returns clean) when the nightly toolchain or `cargo-fuzz` is missing, so the
@@ -644,11 +673,11 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **`decode_status` returns `None` on a size-update-prefixed block, and whether
   that is fail-closed depends on the call site.** `H2BlockConverter::emit_pending_size_update_if_new_block`
   (`lib/src/protocol/mux/converter.rs:112`, armed at
-  `lib/src/protocol/mux/h2.rs:5572`) prepends a `001xxxxx` HPACK dynamic table
+  `lib/src/protocol/mux/h2.rs:5254`) prepends a `001xxxxx` HPACK dynamic table
   size update when a peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e
   call sites send one: `h2_security_tests.rs:2440` (value 0) and
   `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
-  `h2_correctness_tests.rs:3604` and `:3708`. No test that decodes a `:status`
+  `h2_correctness_tests.rs:3605` and `:3708`. No test that decodes a `:status`
   sends one, and the three that send one decode no status, so nothing meets the
   update today — `h2_handshake` sends empty SETTINGS. When that changes, `None`
   reads as "no status": fail-closed for a `got_X` asserted positively,
@@ -664,7 +693,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **A test that only reddens under CI load is not automatically a flake — find
   the production site first.** Before retrying or quarantining, ask whether the
   symptom is reachable at all. #1353's 421 has exactly one emission site
-  (`lib/src/protocol/mux/mod.rs:1855`), reachable only through
+  (`lib/src/protocol/mux/mod.rs:1856`), reachable only through
   `RetrieveClusterError::SniAuthorityMismatch`, which is constructed at exactly
   one site (`lib/src/protocol/mux/router.rs:672`) immediately after
   `incr!(names::http::SNI_AUTHORITY_MISMATCH)` — and the failing run reported

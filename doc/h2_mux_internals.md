@@ -56,14 +56,16 @@ ConnectionH2<Front>
  |                                         // ceilings (Rapid Reset / MadeYouReset / CONTINUATION /
  |                                         // Ping / Settings floods), glitch_count, window_start
  |
- |-- prioriser: Prioriser                   // RFC 9218 stream priorities
- |   |-- priorities: HashMap<StreamId, (u8, bool)>  // urgency + incremental
- |   |-- incremental_cursor: StreamId       // RFC 9218 s4 round-robin cursor
+ |-- scheduler: H2Scheduler                 // Closed API (h2_scheduler.rs, private
+ |                                         // fields): prioriser (priorities:
+ |                                         // HashMap<StreamId, (u8, bool)> urgency +
+ |                                         // incremental, incremental_cursor) and the
+ |                                         // reusable write-pass order buffer
  |
  |-- hpack: HpackState                      // Closed API (hpack_state.rs, private fields):
  |                                         // decoder, encoder, and the reusable
- |                                         // converter_buf / lowercase_buf / cookie_buf /
- |                                         // priorities_buf scratch buffers
+ |                                         // converter_buf / lowercase_buf / cookie_buf
+ |                                         // scratch buffers
  |-- local_settings: H2Settings             // Settings we advertise
  |-- peer_settings: H2Settings              // Settings the peer advertised
  |-- stream_table: H2StreamTable             // Closed API (h2_stream_table.rs, private fields):
@@ -99,17 +101,17 @@ back-pressure, gauge-rebalancing and discard-state fields that no section below
 discusses. Read the struct for the full list.
 
 Access patterns use the sub-structure names directly, except `flow_control`,
-`stream_table`, `hpack`, `flood_detector` and `drain`, which are closed APIs
-(`h2_flow_control.rs`, `h2_stream_table.rs`, `hpack_state.rs`,
-`h2_flood_detector.rs` and `h2_drain.rs` respectively, all five with private
-fields) reached only through their accessor/mutator methods:
+`stream_table`, `hpack`, `flood_detector`, `drain` and `scheduler`, which are
+closed APIs (`h2_flow_control.rs`, `h2_stream_table.rs`, `hpack_state.rs`,
+`h2_flood_detector.rs`, `h2_drain.rs` and `h2_scheduler.rs` respectively, all
+six with private fields) reached only through their accessor/mutator methods:
 
 ```rust
 self.flow_control.consume_send_window(consumed);
 self.bytes.overhead_bin += self.bytes.zero_bytes_read;
 self.drain.enter_final_goaway();
 self.flood_detector.check_flood(self.now);
-self.prioriser.get(&stream_id);
+self.scheduler.priority(&stream_id);
 self.hpack.encoder_mut();
 ```
 
@@ -132,18 +134,44 @@ fence's info string, so `check_doc_citations.py` compares the two — see
 
 ## RFC 9218 Extensible Priorities
 
-### Prioriser struct
+### H2Scheduler and Prioriser
+
+Both live in `lib/src/protocol/mux/h2_scheduler.rs`, behind the closed-API shape
+`hpack_state.rs`, `h2_flow_control.rs`, `h2_stream_table.rs` and
+`h2_flood_detector.rs` use. `ConnectionH2` holds one private `scheduler` field
+and reaches everything below through the methods listed here.
 
 `Prioriser` manages per-stream scheduling priorities per RFC 9218. It wraps a
-`HashMap<StreamId, (u8, bool)>` where the tuple is `(urgency, incremental)`.
+`HashMap<StreamId, (u8, bool)>` where the tuple is `(urgency, incremental)`,
+plus the round-robin `incremental_cursor`.
 
-**Methods:**
+**`Prioriser` methods:**
 
 | Method | Signature | Behavior |
 |--------|-----------|----------|
 | `push_priority` | `(&mut self, StreamId, PriorityPart) -> bool` | Inserts/updates priority. Returns `true` on self-dependency (protocol error). Clamps urgency to 0-7. Ignores deprecated RFC 7540 tree priorities. |
+| `push_priority_guarded` | `(&mut self, StreamId, PriorityPart, StreamId, &HashMap<StreamId, GlobalStreamId>) -> bool` | Same, behind the open-stream / idle-look-ahead filter that bounds a PRIORITY flood. |
 | `get` | `(&self, &StreamId) -> (u8, bool)` | Returns `(urgency, incremental)`. Defaults to `(3, false)` if absent. |
 | `remove` | `(&mut self, &StreamId)` | Removes entry at stream cleanup. |
+| `apply_incremental_rotation` | `(&self, &mut [StreamId]) -> usize` | Inside each urgency bucket, moves incremental streams to the tail and rotates that tail past `incremental_cursor`. Returns the incremental count. |
+| `advance_incremental_cursor` | `(&mut self, Option<StreamId>)` | Commits the pass's leader as the next pass's cursor. `None` is a no-op. |
+
+**`H2Scheduler` methods** — `priority`, `push_priority`,
+`push_priority_guarded`, `remove_stream` and `prioriser_mut` delegate to the
+`Prioriser` above; the pass API is:
+
+| Method | Signature | Behavior |
+|--------|-----------|----------|
+| `begin_pass` | `(&mut self, impl IntoIterator<Item = StreamId>, impl FnMut(StreamId) -> bool) -> (Vec<StreamId>, ReadyIncrementalCensus)` | Orders one write pass and takes its same-urgency ready-incremental census. The closure is the caller's readiness projection — the one fact the scheduler does not own — and is called for incremental streams only. |
+| `end_pass` | `(&mut self, Vec<StreamId>, ReadyIncrementalCensus)` | Takes the order buffer back and commits the round-robin cursor. |
+| `reclaim_idle_buffer` | `(&mut self, usize)` | Quiet-time shrink of the order buffer, beside `HpackState::reclaim_idle_buffers`. |
+
+`ReadyIncrementalCensus` is a fixed `[usize; 8]` (RFC 9218 §4.1 urgency is
+`[0, 7]`) plus the pass leader. `write_streams` reads
+`incremental_peer_count(urgency)` per stream, calls `note_ineligible` at the
+three mid-pass transitions of LIFECYCLE.md invariant 17, `note_fired` when a
+stream consumes window, and `ready_total` for the
+`h2.streams.ready_incremental.by_urgency` gauge.
 
 ### parse_rfc9218_priority()
 
@@ -169,57 +197,35 @@ tokens `u=N` and `i`/`i=?1`/`i=?0`. Malformed tokens are silently ignored.
 
 ### How priorities affect stream scheduling
 
-In `write_streams()`, all active stream IDs are collected and sorted:
+`write_streams()` hands the wire map's keys to the scheduler, which owns the
+whole ordering decision:
 
-```rust lib/src/protocol/mux/h2.rs:2511-2520
-priorities_buf.clear();
-priorities_buf.extend(self.stream_table.streams().keys().copied());
-// RFC 9218 §4 primary sort: ascending urgency, then stream ID for
-// stability. The incremental flag is handled by
-// `apply_incremental_rotation` below so it does not perturb the
-// non-incremental fast path.
-priorities_buf.sort_by_cached_key(|id| {
-    let (urgency, _) = self.prioriser.get(id);
-    (urgency, *id)
-});
+```rust
+let (order, mut census) = self.scheduler.begin_pass(
+    self.stream_table.streams().keys().copied(),
+    |stream_id| { /* is this stream ready to emit this pass? */ },
+);
 ```
 
-Lower urgency values are served first (urgency 0 = highest priority).
-Among streams with equal urgency, lower stream IDs go first for stability.
-`priorities_buf` is a scratch `Vec<StreamId>` owned by `HpackState` and taken
-out by value for the pass, because the converter holds the encoder borrow for
-the whole loop and no other `self.hpack` accessor can run until it is dropped.
-
-The `incremental` flag is applied in a second pass, immediately after the
-primary sort:
-
-```rust lib/src/protocol/mux/h2.rs:2521-2527
-// RFC 9218 §4: inside each urgency bucket, move incremental streams
-// to the tail and rotate them by the per-connection round-robin
-// cursor so no single slow-draining stream can starve its
-// same-urgency incremental peers.
-let incremental_count = self
-    .prioriser
-    .apply_incremental_rotation(&mut priorities_buf);
-```
-
-`Prioriser::apply_incremental_rotation` partitions each urgency bucket so that
-non-incremental streams keep the front, then rotates the incremental tail by
-`Prioriser::incremental_cursor` — the stream that headed the tail last pass.
-`Prioriser::advance_incremental_cursor`, called at the end of `write_streams`,
-commits the cursor for the next pass.
+`begin_pass` sorts by `(urgency, stream_id)`, then applies
+`Prioriser::apply_incremental_rotation`. Lower urgency values are served first
+(urgency 0 = highest priority). Among streams with equal urgency, lower stream
+IDs go first for stability, non-incremental streams drain before incremental
+ones, and the incremental tail is rotated past `incremental_cursor` so
+same-urgency incremental downloads take the lead in turn — one position per
+pass, which is LIFECYCLE.md invariant 26's starvation bound.
 
 ### Priority cleanup
 
 Priority entries are removed at 4 lifecycle sites to prevent HashMap growth:
 
-1. **dead_streams loop** (end of `write_streams`): `self.prioriser.remove(&stream_id)`
+1. **dead_streams loop** (end of `write_streams`): `self.scheduler.remove_stream(&stream_id)`
 2. **RST_STREAM received** (in `handle_frame`): cleaned via stream removal
 3. **GoAway processing** (`handle_goaway_frame`, plus
    `prune_inactive_streams_while_closing` for streams that never opened):
    cleaned via stream removal, one retired stream at a time — neither site
    clears the map wholesale
-4. **`end_stream`** (backend-initiated close): `self.prioriser.remove(&id)`
+4. **`end_stream`** (backend-initiated close): `self.scheduler.remove_stream(&id)`
 
 ---
 
@@ -514,7 +520,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:3620-3633
+```rust lib/src/protocol/mux/h2.rs:3301-3314
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -538,7 +544,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:3666-3672
+```rust lib/src/protocol/mux/h2.rs:3347-3353
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -551,13 +557,13 @@ stream.generate_access_log(
 The other three sites take the `&mut self` wrapper
 `ConnectionH2::distribute_overhead` instead, and each emits its own log:
 
-- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3957`) passes a
+- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3639`) passes a
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5503`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5185`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6209`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:5891`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -566,10 +572,10 @@ Only the last two are reset paths; the first is the idle/stall sweep.
 for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
-taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2593`) and passes
+taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2292`) and passes
 `stream.linked_token()` straight out of it:
 
-```rust lib/src/protocol/mux/h2.rs:2820
+```rust lib/src/protocol/mux/h2.rs:2507
 let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, stream.linked_token());
 ```
 
@@ -587,7 +593,7 @@ the complexity of the H2 state machine:
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:2001-2005
+```rust lib/src/protocol/mux/h2.rs:1727-1731
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -631,7 +637,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:3402-3406
+```rust lib/src/protocol/mux/h2.rs:3083-3087
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -744,14 +750,19 @@ The main data-plane write path:
 2. Pre-computes `byte_totals` for overhead distribution
 3. Opens a `H2ConverterPass` holding the reusable scratch and the pending
    RFC 7541 §6.3 size-update signal
-4. Sorts streams by priority (urgency, then stream_id)
+4. Asks `H2Scheduler::begin_pass` for the pass order (urgency, then
+   stream_id, then the rotated incremental tail) and its ready-incremental
+   census
 5. For each stream: converts kawa blocks to H2 frames, writes to socket
 6. Recycles completed streams, distributes overhead, emits access logs
 7. Cleans up `dead_streams` via `remove_dead_stream` (evicts the
    `H2StreamTable` wire mapping, `rst_sent`, and the activity/fc-stall
-   caches together, plus `prioriser`)
+   caches together, plus the scheduler's priority entry via
+   `H2Scheduler::remove_stream`)
 8. Returns the scratch buffers to `self.hpack` and shrinks the three converter
-   buffers if they grew beyond 16KB (`HpackState::shrink_converter_buffers`)
+   buffers if they grew beyond 16KB (`HpackState::shrink_converter_buffers`),
+   then ends the pass with `H2Scheduler::end_pass`, which takes the order
+   buffer back and commits the RFC 9218 §4 round-robin cursor
 
 **How the converter borrow is scoped**: `H2BlockConverter` borrows the
 connection's HPACK encoder out of `HpackState`. It is built for exactly ONE
@@ -774,7 +785,7 @@ live.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4535
+```rust lib/src/protocol/mux/h2.rs:4217
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -927,7 +938,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5546-5548
+```rust lib/src/protocol/mux/h2.rs:5228-5230
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -935,7 +946,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5560-5566
+```rust lib/src/protocol/mux/h2.rs:5242-5248
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
@@ -970,7 +981,7 @@ per-`prepare` `H2BlockConverter` — a `Vec` move, never a copy of the bytes.
 The pass gives them back at the end, and `HpackState::shrink_converter_buffers`
 then caps each one:
 
-```rust lib/src/protocol/mux/hpack_state.rs:122-132
+```rust lib/src/protocol/mux/hpack_state.rs:106-116
 pub(super) fn shrink_converter_buffers(&mut self) {
     if self.converter_buf.capacity() > 16_384 {
         self.converter_buf.shrink_to(4096);
@@ -987,12 +998,13 @@ pub(super) fn shrink_converter_buffers(&mut self) {
 This prevents a single request with abnormally large headers from permanently
 inflating memory for the lifetime of the connection.
 
-`priorities_buf` is deliberately not in that list: it holds one `StreamId` per
-active stream, not header bytes, so it is reclaimed on the quiet-time path
-instead — `HpackState::reclaim_idle_buffers`, called from
-`ConnectionH2::cancel_timed_out_streams`, tests all four independently — one
-`capacity() > retain_size * 4` guard each — and shrinks only those that
-individually exceed it.
+The scheduler's pass-order buffer is deliberately not in that list: it holds
+one `StreamId` per active stream, not header bytes, so it is reclaimed on the
+quiet-time path instead. `ConnectionH2::cancel_timed_out_streams` calls
+`HpackState::reclaim_idle_buffers`, which tests the three converter buffers
+independently, and `H2Scheduler::reclaim_idle_buffer`, which applies the same
+guard to the order buffer — one `capacity() > retain_size * 4` guard each,
+shrinking only those that individually exceed it.
 
 ---
 

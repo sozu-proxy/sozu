@@ -170,7 +170,8 @@ into logical sub-structs for maintainability:
 - `H2ByteAccounting` — overhead bytes, zero-window count
 - `H2DrainState` — RFC 9113 §6.8 GOAWAY/graceful-drain state machine; fields private to `h2_drain.rs`
 - `H2FloodConfig` — 6 configurable flood detection thresholds (per-listener)
-- `Prioriser` — RFC 9218 urgency + incremental tracking per stream
+- `H2Scheduler` (`h2_scheduler.rs`) — RFC 9218 urgency + incremental tracking
+  per stream, the write-pass stream order, and the round-robin cursor
 
 For detailed internals, see [h2_mux_internals.md](./h2_mux_internals.md).
 
@@ -344,9 +345,11 @@ with `file.rs:LINE` citations against current HEAD.
   Frontend H2 is driven by TLS ALPN negotiation on the listener (`alpn_protocols`
   containing `"h2"`); a cluster with `http2 = false` can still serve H2 clients on
   the frontend, with H2 → H1 conversion at the backend boundary.
-- **RFC 9218 priorities**: The `Prioriser` struct tracks urgency (0-7) and incremental
-  flags per stream from the `priority` header. Stream scheduling in `write_streams()`
-  sorts by urgency first (lower = higher priority), then by stream ID. Default urgency
+- **RFC 9218 priorities**: The `Prioriser` struct (`h2_scheduler.rs`) tracks urgency
+  (0-7) and incremental flags per stream from the `priority` header. Each write pass
+  is ordered by `H2Scheduler::begin_pass`: urgency first (lower = higher priority),
+  then stream ID, then incremental streams to the tail of their bucket, rotated by a
+  round-robin cursor so same-urgency incremental downloads interleave. Default urgency
   is 3 per RFC 9218.
 - **Configurable flood detection**: Six thresholds (RST_STREAM, PING, SETTINGS, empty
   DATA, CONTINUATION, glitch count) are configurable per-listener via protobuf, with
