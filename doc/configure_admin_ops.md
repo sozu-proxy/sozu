@@ -204,15 +204,18 @@ interchangeable:
 
 | key | role | default |
 | --- | --- | --- |
-| `command_buffer_size` | initial capacity a channel buffer is allocated at, and the capacity it shrinks back to once drained — on the supervisor↔worker channels (`bin/src/worker.rs`, `bin/src/upgrade.rs`, `CommandHub::from_upgrade_data`) and on the CLI's own channel (`bin/src/ctl/mod.rs`). It does **not** size the command-socket client channel: `CommandHub::register_client` allocates that one at a hardcoded `4096` and only its ceiling comes from configuration | `DEFAULT_COMMAND_BUFFER_SIZE`, `1_000_000` bytes |
+| `command_buffer_size` | initial capacity a channel buffer is allocated at, and the capacity it shrinks back to once drained — on the supervisor↔worker channels (`bin/src/worker.rs`, `bin/src/upgrade.rs`, `CommandHub::from_upgrade_data`) and on the CLI's own channel (`bin/src/ctl/mod.rs`). It does **not** size the command-socket client channel: `CommandHub::register_client` allocates that one at `CLIENT_CHANNEL_INITIAL_BUFFER_SIZE` (4096 bytes, which `Channel::new` clamps down to `max_command_buffer_size` should that be set lower — sozu-proxy/sozu#1416) and only its ceiling comes from configuration. That constant is where the argument for the exception is written out, with the address-space and resident measurements behind it | `DEFAULT_COMMAND_BUFFER_SIZE`, `1_000_000` bytes |
 | `max_command_buffer_size` | ceiling the buffers may grow to by doubling, **and** the bound a peer-declared `message_len` is rejected against | `DEFAULT_MAX_COMMAND_BUFFER_SIZE`, `2_000_000` bytes |
 
 `command_buffer_size` must never exceed `max_command_buffer_size`: the
 first is the capacity a channel buffer is configured to start at and to
 shrink back to once drained, the second is the ceiling that buffer may
 never grow past, so a pair in the other order asks for a starting
-buffer larger than the bound that must contain it. Check the two values
-against each other whenever you change either.
+buffer larger than the bound that must contain it. You do not have to
+check that yourself: `ConfigBuilder::into_config` rejects such a pair at
+config load with `ConfigError::CommandBufferSizeExceedsMax`, naming both
+keys and both values, before any channel is built
+(sozu-proxy/sozu#1416).
 
 So raise `max_command_buffer_size` (in tandem on both ends) if you
 introduce a verb whose payload genuinely exceeds the cap. Lowering

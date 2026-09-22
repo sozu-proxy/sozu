@@ -107,7 +107,7 @@ peer. Between the `SO_PEERCRED` snapshot and the `/proc` read the kernel
 could (a) recycle the PID into a different process, or (b) the original
 process could `execve()` and become a different binary. To prevent (a)
 from leaking the recycled owner's name into the audit line, the function
-opens `/proc/<pid>/stat` first (`bin/src/command/server.rs:1617`); if the stat read fails
+opens `/proc/<pid>/stat` first (`bin/src/command/server.rs:1700`); if the stat read fails
 the PID is gone and `peer_comm` returns `None`. Case (b) cannot be
 detected by `starttime` alone — `execve` does not change `starttime` —
 but `exec` is not adversarial in our deployment (the `sozu` CLI never
@@ -253,7 +253,7 @@ live in `WorkerSession` (`bin/src/command/sessions.rs`).
 1. On `UpgradeMain`, calls `upgrade_main` (`bin/src/command/upgrade.rs`)
    which serialises the master state via
    `SerializedWorkerSession::try_from(&worker_session)`
-   (`bin/src/command/server.rs:1537`) into an `UpgradeData` blob, forks a
+   (`bin/src/command/server.rs:1620`) into an `UpgradeData` blob, forks a
    replacement master via `fork_main_into_new_main`
    (`bin/src/upgrade.rs`), hands the blob over a pipe, and exits once
    the new master takes over.
