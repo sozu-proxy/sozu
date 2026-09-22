@@ -134,6 +134,36 @@ Notes:
   derived. `lib/src/router/pattern_trie.rs`'s `qc_insert` is the same
   technique applied to raw trie insert/lookup, independent of routing
   semantics.
+- **H2 HEADERS+CONTINUATION reassembly is unit-tested with `quickcheck`**
+  (`lib/src/protocol/mux/h2.rs`,
+  `reassembly_property::qc_h2_header_reassembly_survives_interleaved_control_frame_flushes`),
+  on top of three example-based pinning tests for the individual fixed bugs
+  (`a_legitimate_continuation_survives_an_unrelated_window_update_flush` #1397,
+  `a_legitimate_continuation_survives_a_graceful_goaway` #1401,
+  `a_legitimate_continuation_survives_a_hup_while_draining` #1423). This one
+  is a `ConnectionH2` state-machine property, not a pure-function one like the
+  router's: it drives a real connection (`test_h2_connection`, a loopback
+  socket, a `Pool`, a `Router`) through `readable()`/`writable()`, splitting a
+  real HPACK field block into 2..=5 CONTINUATION fragments and, before each
+  one after the first, independently choosing one of four interleaves —
+  nothing, an unrelated WINDOW_UPDATE flush, a HUP-while-draining event, or a
+  deferred `graceful_goaway` — composing all three deterministic triggers
+  above (not just two of them, an earlier version of this property claimed to
+  but did not) in every order and count `quickcheck` cares to generate. Each
+  interleave point also independently chooses to fire at a frame boundary or
+  mid-frame — splitting that CONTINUATION fragment's own bytes across two
+  separate simulated TCP segments — so the accumulator holds genuinely
+  unretired bytes when the interleave lands, not just an empty `zero.storage`
+  between whole-frame writes. Deliberately kept OUT of the `fuzz_frame_parser` target
+  (§6), which is scoped to the stateless `protocol::mux::parser` functions:
+  `ConnectionH2` is a private, stateful type needing a real socket/`Pool`/
+  `Router` that the out-of-workspace fuzz crate cannot reach without exposing
+  internals it has no other reason to expose, whereas `#[cfg(test)] mod tests`
+  inside `h2.rs` already has all of it. CONTINUATION-flood abort and the
+  CVE-2024-27316 refusal path are intentionally not folded into this
+  property — see its own doc comment for why — and stay covered by
+  `a_refused_stream_keeps_the_hpack_decoder_in_sync` and
+  `a_refused_padded_prioritized_stream_keeps_the_hpack_decoder_in_sync`.
 - `e2e/src/tests/fuzz_tests.rs` is a thin integration wrapper that shells out to
   the four fuzz targets for 10 s each. It *skips gracefully* (prints a notice,
   returns clean) when the nightly toolchain or `cargo-fuzz` is missing, so the
@@ -592,7 +622,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **`decode_status` returns `None` on a size-update-prefixed block, and whether
   that is fail-closed depends on the call site.** `H2BlockConverter::emit_pending_size_update_if_new_block`
   (`lib/src/protocol/mux/converter.rs:112`, armed at
-  `lib/src/protocol/mux/h2.rs:5342`) prepends a `001xxxxx` HPACK dynamic table
+  `lib/src/protocol/mux/h2.rs:5476`) prepends a `001xxxxx` HPACK dynamic table
   size update when a peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e
   call sites send one: `h2_security_tests.rs:2440` (value 0) and
   `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
@@ -612,7 +642,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **A test that only reddens under CI load is not automatically a flake — find
   the production site first.** Before retrying or quarantining, ask whether the
   symptom is reachable at all. #1353's 421 has exactly one emission site
-  (`lib/src/protocol/mux/mod.rs:1854`), reachable only through
+  (`lib/src/protocol/mux/mod.rs:1855`), reachable only through
   `RetrieveClusterError::SniAuthorityMismatch`, which is constructed at exactly
   one site (`lib/src/protocol/mux/router.rs:672`) immediately after
   `incr!(names::http::SNI_AUTHORITY_MISMATCH)` — and the failing run reported

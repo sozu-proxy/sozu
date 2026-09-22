@@ -260,7 +260,16 @@ def rust_files(root):
 
 
 def doc_files(root):
-    """`doc/**` markdown plus every `**/LIFECYCLE.md` — the guarded surface."""
+    """`doc/**` markdown plus every `**/LIFECYCLE.md` — the guarded surface.
+
+    CHANGELOG.md is NOT in this surface, on purpose per rule 1/2's own scope,
+    but that means its `file.rs:NNN` citations get no rule-1 blank check and
+    no rule-2 drift check either — only rule 3's narrower test-name sweep
+    reaches it. Measured on this tree with this module's own `CITATION`
+    regex: 108 matches in CHANGELOG.md (105 unique `(path, spans)` pairs),
+    none of them checked by anything. A green run here proves nothing about
+    that file's line-number citations.
+    """
     found = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]

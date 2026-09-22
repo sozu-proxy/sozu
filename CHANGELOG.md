@@ -631,6 +631,76 @@
   value — the configuration file, `sozu ctl`, and a raw protobuf `Add{Http,Https}Listener` — because
   there an error names the key while the operator is still typing. Fix the source and save the state
   again to clear the warning.
+- **`refactor(mux-h2)`: the HEADERS+CONTINUATION reassembly buffer moves out of `ConnectionH2::zero`
+  into its own owned accumulator, `lib/src/protocol/mux/h2_header_reassembly.rs`, behind the same
+  closed-API shape `hpack_state.rs`, `h2_flow_control.rs`, `h2_stream_table.rs`, `h2_flood_detector.rs`
+  and `h2_drain.rs` established in the prior extraction steps.** `ConnectionH2::zero` used to serve two
+  incompatible roles at once: the read-side accumulator a field block was reassembled into across
+  however many `readable()` passes a HEADERS+CONTINUATION sequence took
+  (`headers.header_block_fragment`, a `(start, len)` window over `zero.storage`), and the write-side
+  scratch buffer every control-frame flush (WINDOW_UPDATE, RST_STREAM, GOAWAY) clears and reuses.
+  LIFECYCLE.md invariant 24 has the full account of the four bugs that shipped from the two roles
+  sharing one buffer (#1396, #1397, #1401, #1423, the last closed by this step — see the Security
+  entries below). `HeaderBlockAccumulator` (new) owns its bytes (`Vec<u8>`, no new dependency)
+  instead of borrowing a window into `zero.storage`: the initiating HEADERS frame's fragment is
+  copied out and `zero.storage` is cleared in the same step that enters `H2State::ContinuationHeader`,
+  each CONTINUATION frame's payload is folded in and `zero.storage` cleared again in the same step
+  that leaves `H2State::ContinuationFrame`, and the block is retired — decoded, or handed unread to
+  the CVE-2024-27316 refusal path — the single exit point matching the single entry point. The old
+  `self.zero.storage.end -= 9` trick that kept a CONTINUATION frame's incoming header from disturbing
+  the accumulated fragment's physical position in `zero.storage` no longer has anything to stay
+  contiguous with, and is gone; every zero-stream frame, HEADERS included, now frees `zero.storage`
+  the same way every other frame type already did. No write-side code holds a field named
+  `header_reassembly` — in any build profile — so a control-frame flush cannot reach the ACCUMULATED,
+  multi-frame history of a reassembly in progress: the specific clobber #1396/#1397/#1401 shipped from
+  is unrepresentable to write-side code, not merely guarded. That is narrower than "unrepresentable,
+  full stop": review of this step's first version (`e1c3c2fb`) found and fixed two further hazards
+  before it could land — see the two `fix(mux-h2)` entries below (accumulator leak on an early return;
+  the frontend-hung-up-while-draining stage's own justification for staying unguarded). The FOUR
+  `header_block_reassembly_in_progress()` call sites `flush_pending_control_frames` already had
+  (including, after review, the frontend-hung-up-while-draining stage) plus the two inside
+  `graceful_goaway`/`flush_zero_buffer` are all kept: together they protect the narrower case of a
+  single CONTINUATION frame's own not-yet-fully-read payload sitting in `zero.storage`
+  mid-`socket_read()` when a write pass runs in the same event-loop sweep, which is real regardless of
+  whether the frontend has already signalled HUP. `h2_drain.rs`'s deferred-initial-GOAWAY machinery is
+  unchanged. New coverage: a `quickcheck` property
+  (`reassembly_property::qc_h2_header_reassembly_survives_interleaved_control_frame_flushes`, `h2.rs`)
+  composes its four interleave choices — no interleave, an unrelated WINDOW_UPDATE flush, a
+  deferred `graceful_goaway`, and HUP-while-draining, the latter three being the deterministic
+  triggers behind #1397/#1401/#1423 — across a 2..=5-way split header block in every order and count it generates,
+  independently choosing per interleave point whether it lands between two frames or inside one
+  frame's own TCP-level write — the two shapes are not interchangeable, and only the latter reaches
+  the guard the HUP finding above needed — see `doc/testing.md`.
+  End-to-end, `test_h2_continuation_survives_a_graceful_drain_mid_reassembly`
+  (`e2e/src/tests/h2_tests.rs`) drives the same shape through a real worker's event loop: stream 1
+  parks on a backend that holds its response open, stream 3's HEADERS arrives without END_HEADERS,
+  `soft_stop()` lands while that block is still incomplete, and the CONTINUATION completes it.
+  Every ordering the test depends on is established by waiting on observable worker state over the
+  command channel, never by sleeping — `h2.frames.rx.headers` ticking once proves sozu decoded the
+  partial HEADERS and is in `H2State::ContinuationHeader`; `server.live` dropping to 0 proves
+  `Server::run` has completed an iteration with `shutting_down` set, and therefore that
+  `shut_down_sessions()` → `Mux::shutting_down` → `ConnectionH2::graceful_goaway` has already run on
+  that connection; a second tick of the same counter proves the reassembled block was consumed
+  before the held response is released. Neither ordering is observable on the connection itself:
+  RFC 9113 §6.2/§6.10 forbid interleaving any frame into an open header block and sozu enforces that
+  with `GOAWAY(PROTOCOL_ERROR)`, so there is no legal in-band probe, and the initial GOAWAY is
+  deliberately deferred for precisely the duration of the reassembly under test, so its absence —
+  not its arrival — is what the correct interleaving produces.
+  **Copy cost**: the single-frame fast path (the common case — most requests never need
+  CONTINUATION) is unchanged: no new copy, straight from `zero.storage`. The multi-frame path gains
+  one `memcpy` per frame (`HeaderBlockAccumulator::begin`/`append`), where the previous design kept
+  the fragment in place inside `zero.storage` and paid nothing per frame; this is offset by the
+  CVE-2024-27316 refusal path's old *eager* `to_vec()` (copied unconditionally at refusal time to
+  survive the imminent RST_STREAM flush) now being amortised into the same per-frame `append` cost
+  it would have paid anyway. Net: more copies than before on the multi-frame path, not fewer — the
+  series' stated goal was eliminating a hazard class, not copies, and this step does not claim
+  otherwise. **Behaviour change**: with `zero.storage` cleared after every frame instead of held for
+  the whole block, `payload_len > available_space()` (`h2.rs`, `handle_continuation_header_state`)
+  no longer implicitly caps a multi-frame block's *total* accumulated size at the zero buffer's
+  capacity — only `max_header_list_size` (default 65536, `h2.rs`) does now. A block that used to hit
+  `GOAWAY(EnhanceYourCalm)` from the old implicit buffer-capacity ceiling, below
+  `max_header_list_size`, now runs to the explicit limit instead; operators relying on the old
+  implicit ceiling as a secondary bound should set `max_header_list_size` explicitly.
 
 - **`fix(command)`: compact the channel's front buffer instead of declaring it full, so a frame that
   fits the ceiling but not the current buffer layout completes rather than wedging the session.**
@@ -789,6 +859,79 @@
   epoll will not deliver a fresh WRITABLE event for an already-writable socket — is now also a no-op
   while reassembly is in progress, since it would otherwise flush (and clear) `zero.storage` in
   exactly the scenario `graceful_goaway`'s own deferral exists to prevent.
+
+- **`fix(mux-h2)`: an accumulated multi-frame reassembly surviving a HUP-while-draining event between
+  frames does not mean it survives one landing mid-frame — sozu-proxy/sozu#1423's actual residual,
+  found and closed in review before this step could land.** This step's own first version
+  (`e1c3c2fb`) moved the reassembly accumulator out of `ConnectionH2::zero` (see the Changed entry
+  above) and, on that basis, left `flush_pending_control_frames`'s first stage —
+  `if self.frontend_hung_up_while_draining() { ...; self.zero.storage.clear(); ... }` — genuinely
+  unguarded, reasoning that `Ready::HUP` means "no further bytes can ever arrive on this socket", so
+  the only thing that stage could still clobber (a single CONTINUATION frame's own not-yet-fully-read
+  payload) could never have completed into a decodable block regardless. **That reasoning is false.**
+  `Ready::HUP` is `is_read_closed() || is_write_closed()` (`command/src/ready.rs`), and mio's own
+  documentation states `is_read_closed()` is true not only on a full close but also on a TCP
+  half-close — a FIN with data the peer already sent still sitting, unread, in the kernel receive
+  queue. `drive_frontend_shutdown_io` (`mod.rs`) force-calls `readable()` for H2 on every
+  `shutting_down()` poll, so a CONTINUATION frame split across TCP segments landing a HUP event
+  alongside its first segment is the ordinary soft-stop path, not a contrived corner case. Fixed by
+  giving this stage the same `header_block_reassembly_in_progress()` guard its three same-function
+  siblings in `flush_pending_control_frames` already had — restoring that function's guarded-stage
+  count to four, not the three this step originally shipped with. Two more guard sites elsewhere in
+  the file (`graceful_goaway`'s drain-defer decision, `flush_zero_buffer`) bring the module-wide
+  total to six — see LIFECYCLE.md invariant 24, which this entry's "three"/"four" no longer
+  contradicts. Regression test
+  `a_continuation_frame_split_by_tcp_segmentation_survives_a_hup_while_draining` (`h2.rs`) sends a
+  CONTINUATION frame's payload as two separate TCP segments with the HUP-while-draining event landing
+  between them: red on `e1c3c2fb` with `MUX-PKAWA INVALID FRAGMENT: StringDecodingError(NotEnoughOctets)`
+  followed by a desynced connection decoder — the exact silent-wrong-values shape #1397/#1401 already
+  showed — green after. `a_legitimate_continuation_survives_a_hup_while_draining` (`h2.rs`, unchanged)
+  still pins the narrower "HUP lands between two frames, nothing left in `zero.storage` to lose"
+  case, which the accumulator move alone genuinely does make safe regardless of this stage's guard —
+  that is real, just not the whole of #1423. Closes #1423.
+  **Residual risk this guard reintroduces, verified rather than assumed: with
+  `h2_graceful_shutdown_deadline_seconds` explicitly set to `0`, a peer dying mid-CONTINUATION during
+  a drain can wedge shutdown indefinitely.** `0` maps to `graceful_shutdown_deadline = None`
+  (`lib/src/lib.rs`), and `H2DrainState::deadline_elapsed` (`h2_drain.rs`) returns `false`
+  unconditionally whenever the deadline is `None` — its own doc comment says so: "the knob is
+  `0`/`None` (indefinite wait explicitly opted in)". `Mux::shutting_down_inner` (`mod.rs`) checks that
+  deadline first and force-closes when it elapses; with it disabled, that branch never fires and the
+  function falls through to `if self.frontend.has_pending_write() { return false; }` (`mod.rs:2426`).
+  `ConnectionH2::has_pending_write` (`h2.rs:4400-4407`) includes `!self.zero.storage.is_empty()`, and
+  this guard is precisely what keeps `zero.storage` non-empty — on purpose — while a CONTINUATION
+  frame's bytes are still partially read at the moment the peer's FIN lands. Those bytes can now never
+  arrive (the peer is gone), so `zero.storage` never re-empties on its own, `has_pending_write` never
+  flips to `false`, and `shutting_down_inner` returns `false` on every subsequent poll: the session
+  waits forever. This is a real hole the fix opens, not a false alarm — traced through source, not
+  assumed. It is also narrow: it requires the operator to have explicitly opted out of the default
+  5 s forced-close budget (`Some(Duration::from_secs(5))`, `lib/src/lib.rs`) AND the specific race of
+  a peer disconnecting mid-frame during an active drain. With the default deadline (any value other
+  than `0`), the forced-close branch fires on schedule regardless of `zero.storage`'s state, and this
+  does not apply. Recorded here rather than fixed in this changeset; not covered by any existing
+  test. Operators setting the knob to `0` should be aware the "indefinite wait" it explicitly opts
+  into is now, in this one narrow shape, load-bearing on the peer actually going away cleanly.
+
+- **`fix(mux-h2)`: a stream aborted mid-reassembly for an RFC 9113 §5.3.1 PRIORITY self-dependency
+  could leak its accumulator state into the NEXT, unrelated stream's decode — found and closed in
+  review of this step's first version (`e1c3c2fb`) before it could land.**
+  `ConnectionH2::handle_headers_frame`'s self-dependency check (`stream_dependency.stream_id ==
+  stream_id`, RFC 9113 §5.3.1) resets and tears down the offending stream and returns early —
+  *before* reaching the `HeaderBlockAccumulator::finish()` call every other exit path from this
+  function goes through. When the aborted stream's block had gone through CONTINUATION reassembly,
+  `header_reassembly.is_in_progress()` stayed `true` after the return. The NEXT HEADERS frame
+  processed on the same connection — for a completely different, well-formed stream — read
+  `is_in_progress()` as "still reassembling" and decoded the PREVIOUS stream's stale, already-torn-
+  down fragment instead of its own bytes: a single-frame request silently served with a corrupted
+  (or empty) `:path` and other pseudo-headers. No `debug_assert!` fired, because the bug is a call
+  that is *skipped* (the `!self.header_reassembly.is_in_progress()`-gated `begin()` for the new
+  stream's own fragment never runs), and an assertion can only fire on a call that happens. Fixed by
+  retiring the accumulator on this early return before it executes; a `debug_assert!` was also added
+  to the fast-path branch as a general invariant check, though it could not by itself have caught
+  this specific leak (which takes the OTHER branch instead — see `h2_header_reassembly.rs`'s module
+  doc for why). Regression test
+  `a_priority_self_dependency_reset_does_not_leak_the_reassembly_accumulator` (`h2.rs`): red on
+  `e1c3c2fb` (stream 3's `:path` decoded as `None` instead of `/stream-3-legitimate`, fed from stream
+  1's 22 stale bytes), green after.
 
 - **`fix(router)`: stop IDN-normalising the regex source of a `Tree` hostname, which inverted every
   uppercase escape.** `Router::add_tree_rule`, `Router::remove_tree_rule` and `Router::has_hostname`

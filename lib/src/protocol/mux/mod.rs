@@ -142,6 +142,7 @@ mod h2;
 mod h2_drain;
 mod h2_flood_detector;
 mod h2_flow_control;
+mod h2_header_reassembly;
 mod h2_stream_table;
 mod hpack_state;
 pub mod parser;
