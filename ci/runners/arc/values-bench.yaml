@@ -15,6 +15,10 @@
 # rationale (ephemeral pods + Task 10's repo setting as the fork-PR gate; digest pin + safe
 # securityContext subset applied 2026-09-22 per automated security review; readOnlyRootFilesystem
 # and automountServiceAccountToken:false deliberately deferred, not silently skipped).
+#
+# hostAliases: same CoreDNS-reliability root cause as values-general.yaml (see there for the full
+# investigation) — the bench cells run the identical e2e suite (bench only gates the separate
+# Criterion step), so they hit the exact same three-hostname DNS dependency.
 githubConfigUrl: "https://github.com/sozu-proxy/sozu"
 githubConfigSecret: sozu-runner-github-app
 
@@ -23,6 +27,12 @@ maxRunners: 4
 
 template:
   spec:
+    hostAliases:
+      - ip: "127.0.0.1"
+        hostnames:
+          - "cluster-a.localhost"
+          - "cluster-b.localhost"
+          - "other.localhost"
     nodeSelector:
       clever-cloud.com/nodegroup: bench
     securityContext:
