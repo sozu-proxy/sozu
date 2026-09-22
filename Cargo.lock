@@ -3407,6 +3407,7 @@ version = "2.2.1"
 dependencies = [
  "async-trait",
  "moonpool-sim",
+ "sozu-command-lib",
  "sozu-lib",
 ]
 

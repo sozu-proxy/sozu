@@ -1593,7 +1593,9 @@ impl Server {
         // cardinality. The janitor runs at most every LEASE_TICK_INTERVAL,
         // gated by `lease_tick_due` so the hot path of `notify` doesn't pay
         // the HashMap walk on every iteration. Single-threaded worker, so
-        // `borrow_mut` is safe here.
+        // `borrow_mut` is safe here. The same `now` reading is also threaded
+        // into `lease_apply` below (`SetMetricDetail` arm) so the whole lease
+        // lifecycle for this `notify` call is anchored to one clock read.
         let now = std::time::Instant::now();
         // Capture (previous, effective) before releasing the borrow so we
         // can emit an Event afterwards. Holding `METRICS.borrow_mut`
@@ -1822,7 +1824,7 @@ impl Server {
                 let (outcome, configured_after, lease_count_after) = METRICS.with(|metrics| {
                     let mut m = metrics.borrow_mut();
                     let outcome =
-                        m.lease_apply(req.client_id.clone(), level, ttl, presented_binding);
+                        m.lease_apply(req.client_id.clone(), level, ttl, presented_binding, now);
                     (outcome, m.detail_configured(), m.lease_count())
                 });
                 match outcome {

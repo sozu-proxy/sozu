@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### ✨ Added
+
+- **`test(sim)`: deterministic simulation of the metrics cardinality-lease core.**
+  `sim/tests/metrics_lease_sim.rs` drives `sozu_lib::metrics::Aggregator`'s `lease_apply` /
+  `lease_clear` / `lease_tick` machinery, plus the `remove_cluster` / `add_cluster` /
+  `remove_backend` cluster tombstone, through a moonpool-sim seeded workload on the same pattern as
+  `udp_simulation.rs` and `tcp_preread_sim.rs` (`doc/testing.md`'s "Recipe: adding a simulator over
+  another sans-io core"). A parallel shadow model mirrors the lease table's exact
+  insert/renew/expire/clear discipline and the tombstone's resurrection guard, cross-checked every
+  step against `lease_apply`/`lease_clear`/`lease_tick`'s own return values AND against
+  `Aggregator::query`'s actual `WorkerMetrics` output — not just internal counters. The workload
+  interleaves lease apply/clear/tick with cluster/backend removal and late emissions from
+  long-lived sessions (the 0238c3a4 interleaving), table-capacity exhaustion (`TableFull`), TTL
+  bound rejection (`TtlOutOfRange`), and expiry at the exact boundary, with a merged per-campaign
+  coverage gate over all thirteen outcome classes. Run with
+  `RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test metrics_lease_sim`
+  (`SOZU_METRICS_LEASE_SIM_SEED` / `_SEEDS` / `_STEPS` replay knobs, same contract as the other two
+  simulators); no CI job is wired yet (see `doc/testing.md`).
+
+### 🔄 Changed
+
+- **`refactor(metrics)`: `Aggregator::lease_apply` now takes an injected `now: Instant` instead of
+  reading `Instant::now()` directly.** Every other clock-dependent entry point on the lease table —
+  `lease_tick`, and by extension the janitor `lease_tick_due` gates — already took `now` as a
+  parameter, sans-io style; `lease_apply` was the one holdout, computing `expires_at` from the host
+  clock on its own. The sole caller (`Server::notify`, `lib/src/server.rs`) already captures one
+  `now = Instant::now()` per `notify` call for the janitor; that same reading is now threaded into
+  `lease_apply` too, so a whole `notify` invocation's lease lifecycle is anchored to one clock read.
+  This is what makes `sim/tests/metrics_lease_sim.rs`'s deterministic simulation possible: a
+  virtual-clock-driven workload can only control lease expiry if every entry point that computes it
+  takes the same injected clock. `SessionMetrics` and the timer wheel elsewhere in `lib/src/metrics/`
+  deliberately keep the real clock and are unaffected.
+
 ### 🔐 Security
 
 - **`fix(mux-h2)`: decode a refused stream's HPACK field block instead of dropping it, so the
