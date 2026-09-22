@@ -84,7 +84,7 @@ macro_rules! log_context {
             gray = gray,
             white = white,
             ulid = $self.session_ulid,
-            peer = $self.socket.peer_addr(),
+            peer = $self.peer_address,
             position = $self.position,
             state = $self.state,
             streams = $self.stream_table.len(),
@@ -118,7 +118,7 @@ macro_rules! log_context_stream {
             req = $http_context.id,
             cluster = $http_context.cluster_id.as_deref().unwrap_or("-"),
             backend = $http_context.backend_id.as_deref().unwrap_or("-"),
-            peer = $self.socket.peer_addr(),
+            peer = $self.peer_address,
             position = $self.position,
             state = $self.state,
             streams = $self.stream_table.len(),
@@ -837,6 +837,43 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// [`h2_scheduler::H2Scheduler`].
     scheduler: h2_scheduler::H2Scheduler,
     pub readiness: Readiness,
+    /// Peer address of this connection, captured once at construction from
+    /// [`SocketHandler::peer_addr`](crate::socket::SocketHandler::peer_addr)
+    /// and never re-read.
+    ///
+    /// This is the `peer=` slot of every line `log_context!` /
+    /// `log_context_stream!` render, and those two macros expand at 113
+    /// production callsites in this file — so sourcing the slot from
+    /// `self.socket` made *every logging method* socket-coupled, including
+    /// the ones that touch no I/O at all.
+    ///
+    /// Both production handlers *prefer* a cached address and fall back to
+    /// a live `getpeername(2)` when they have none — `SessionTcpStream` and
+    /// `FrontRustls` each answer
+    /// `self.configured_peer.or_else(|| self.stream.peer_addr().ok())`
+    /// (`socket.rs`). **That fallback arm is reachable**, it is pinned by its
+    /// own tests, and `FrontRustls`' arm carries a comment saying so and
+    /// naming the test that fails without it. So this snapshot is not
+    /// unconditionally the same value a per-line call would have produced,
+    /// and nothing here may be read as licence to delete those arms.
+    ///
+    /// It is at least as good on every path, which is the actual argument.
+    /// The snapshot is taken after the handshake, so wherever the fallback
+    /// would have answered, it answers here too — and it then survives the
+    /// peer's reset, where a later live lookup returns `ENOTCONN` and renders
+    /// `peer=None` on exactly the error lines an operator reads during an
+    /// incident. On the direct-HTTPS frontend route, where `HttpsSession::new`
+    /// seeds `peer_address` with a best-effort `peer_addr().ok()`, a line
+    /// emitted after a reset now renders `peer=Some(addr)` where it used to
+    /// render `peer=None`. That is a rendered-line change, and it is
+    /// `df52d83d`'s intent applied one level further in.
+    ///
+    /// No production caller reaches [`SocketHandler::peer_addr`] on a bare
+    /// `mio::net::TcpStream`. The impl exists and `MioTcpStream` is
+    /// instantiated in production (`TcpStateMachine`, `tcp.rs`), but the TCP
+    /// proxy reads its peer through mio's inherent method; only tests call
+    /// the trait method on a bare stream.
+    peer_address: Option<std::net::SocketAddr>,
     pub socket: Front,
     pub state: H2State,
     /// Wire `StreamId -> GlobalStreamId` map, `expect_read`/`expect_write`,
@@ -1248,6 +1285,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 interest: readiness_interest,
                 event: Ready::EMPTY,
             },
+            // The one read of `peer_addr()` on this connection's whole
+            // lifetime. Taken before `socket` is moved into the struct.
+            peer_address: socket.peer_addr(),
             socket,
             state: H2State::ClientPreface,
             timeout_duration,
@@ -7846,9 +7886,17 @@ mod tests {
 
     /// To SEE THIS RED: in `log_context!` (h2.rs), put
     /// `peer = $self.socket.socket_ref().peer_addr().ok(),` back in place of
-    /// `peer = $self.socket.peer_addr(),`. The rendered line then carries the
+    /// `peer = $self.peer_address,`. The rendered line then carries the
     /// loopback address the socket is really connected to, so the first
     /// assertion fails on the missing cached address.
+    ///
+    /// Substituting the pre-snapshot `peer = $self.socket.peer_addr(),` does
+    /// NOT turn this red, and that is worth stating: for a handler that
+    /// already caches, reading the cache and reading a snapshot taken from
+    /// that cache agree by construction. What the snapshot changed is WHICH
+    /// object is read on a log line, not what comes back — so the call-count
+    /// property, not this one, is what distinguishes them. It is pinned by
+    /// [`log_context_reads_the_peer_address_once_per_connection`].
     #[test]
     fn log_context_renders_the_cached_peer_not_a_live_lookup() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
@@ -7878,7 +7926,7 @@ mod tests {
 
     /// To SEE THIS RED: in `log_context_stream!` (h2.rs), put
     /// `peer = $self.socket.socket_ref().peer_addr().ok(),` back in place of
-    /// `peer = $self.socket.peer_addr(),`. The per-stream envelope then
+    /// `peer = $self.peer_address,`. The per-stream envelope then
     /// diverges from the connection envelope, which is worse than either being
     /// wrong alone: the same session renders two different peers depending on
     /// whether a stream happened to be in scope at the callsite.
@@ -7906,6 +7954,123 @@ mod tests {
             !rendered.contains(&live_peer.to_string()),
             "per-stream MUX-H2 context must not fall back to the live \
              getpeername(2) answer: {rendered}"
+        );
+    }
+
+    /// A [`SocketHandler`] that counts how often it is asked for the peer
+    /// address, delegating every other method to a real loopback stream.
+    ///
+    /// The two tests above pin WHICH address the log prefix renders. Neither
+    /// can see how many times the connection reaches into the socket to get
+    /// it, because both production handlers answer from a cache and so give
+    /// the same answer however often they are asked. This handler makes the
+    /// count observable.
+    struct PeerAddrCountingSocket {
+        stream: mio::net::TcpStream,
+        peer: std::net::SocketAddr,
+        calls: Rc<std::cell::Cell<usize>>,
+    }
+
+    impl SocketHandler for PeerAddrCountingSocket {
+        fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
+            self.stream.socket_read(buf)
+        }
+
+        fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+            self.stream.socket_write(buf)
+        }
+
+        fn socket_write_vectored(&mut self, bufs: &[IoSlice]) -> (usize, SocketResult) {
+            self.stream.socket_write_vectored(bufs)
+        }
+
+        fn socket_ref(&self) -> &mio::net::TcpStream {
+            &self.stream
+        }
+
+        fn socket_mut(&mut self) -> &mut mio::net::TcpStream {
+            &mut self.stream
+        }
+
+        fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+            self.calls.set(self.calls.get() + 1);
+            Some(self.peer)
+        }
+
+        fn protocol(&self) -> crate::socket::TransportProtocol {
+            crate::socket::TransportProtocol::Tcp
+        }
+
+        fn read_error(&self) {}
+
+        fn write_error(&self) {}
+    }
+
+    /// The `peer=` slot is read from the socket exactly ONCE per connection —
+    /// at construction — however many log lines the connection renders.
+    ///
+    /// This is the property that makes `peer_address` worth having. It is not
+    /// about which address appears (the two tests above own that); it is about
+    /// `log_context!` no longer being a socket operation. The macro expands at
+    /// 113 production callsites in this file, so before the snapshot every
+    /// method that logged was `Front`-coupled whether or not it did any I/O —
+    /// which is 113 of the ~140 total `Front` touch points in `h2.rs`.
+    ///
+    /// TO SEE THIS RED: in `log_context!` (h2.rs), put
+    /// `peer = $self.socket.peer_addr(),` back in place of
+    /// `peer = $self.peer_address,`. The count then rises by one per rendered
+    /// line and the final assertion fails with
+    /// `the peer address must be read once, at construction, not once per log line:
+    /// left: 4, right: 1`.
+    #[test]
+    fn log_context_reads_the_peer_address_once_per_connection() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (_listener, stream, _live_peer) = connected_loopback_stream();
+        let calls = Rc::new(std::cell::Cell::new(0usize));
+        let session_ulid = Ulid::generate();
+        let socket = PeerAddrCountingSocket {
+            stream,
+            peer: CACHED_PEER
+                .parse()
+                .expect("the cached peer literal must parse"),
+            calls: Rc::clone(&calls),
+        };
+        let connection = ConnectionH2::new(
+            session_ulid,
+            socket,
+            Position::Server,
+            Rc::downgrade(&pool),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "construction takes exactly one peer_addr() snapshot"
+        );
+
+        // Premise: the rendered lines really do carry the address, so a zero
+        // count below would mean the slot went missing rather than that it
+        // became free.
+        for _ in 0..3 {
+            let rendered = log_context!(connection);
+            assert!(
+                rendered.contains(&format!("peer=Some({CACHED_PEER})")),
+                "each rendered line must still carry the peer: {rendered}"
+            );
+        }
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the peer address must be read once, at construction, not once per log line"
         );
     }
 

@@ -520,7 +520,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:3301-3314
+```rust lib/src/protocol/mux/h2.rs:3341-3354
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -544,7 +544,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:3347-3353
+```rust lib/src/protocol/mux/h2.rs:3387-3393
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -557,13 +557,13 @@ stream.generate_access_log(
 The other three sites take the `&mut self` wrapper
 `ConnectionH2::distribute_overhead` instead, and each emits its own log:
 
-- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3639`) passes a
+- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3679`) passes a
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5185`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5225`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:5891`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:5931`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -572,10 +572,10 @@ Only the last two are reset paths; the first is the idle/stall sweep.
 for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
-taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2292`) and passes
+taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2332`) and passes
 `stream.linked_token()` straight out of it:
 
-```rust lib/src/protocol/mux/h2.rs:2507
+```rust lib/src/protocol/mux/h2.rs:2547
 let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, stream.linked_token());
 ```
 
@@ -593,7 +593,7 @@ the complexity of the H2 state machine:
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:1727-1731
+```rust lib/src/protocol/mux/h2.rs:1767-1771
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -637,7 +637,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:3083-3087
+```rust lib/src/protocol/mux/h2.rs:3123-3127
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -785,7 +785,7 @@ live.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4217
+```rust lib/src/protocol/mux/h2.rs:4257
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -938,7 +938,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5228-5230
+```rust lib/src/protocol/mux/h2.rs:5268-5270
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -946,7 +946,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5242-5248
+```rust lib/src/protocol/mux/h2.rs:5282-5288
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

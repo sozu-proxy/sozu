@@ -130,8 +130,8 @@ fn proxy_protocol_v2_header(source_port: u16, destination_port: u16) -> Vec<u8> 
 // =========================================================================
 
 /// To SEE THIS RED: in `lib/src/protocol/mux/h2.rs`, revert the `peer` slot of
-/// BOTH `log_context!` (`:84`) and `log_context_stream!` (`:118`) from
-/// `peer = $self.socket.peer_addr(),` to the pre-fix
+/// BOTH `log_context!` and `log_context_stream!` from
+/// `peer = $self.peer_address,` to the pre-fix
 /// `peer = $self.socket.socket_ref().peer_addr().ok(),`. Measured on one
 /// iteration: 27 `peer=` slots, 0 naming the PROXY-advertised client, 26
 /// naming the connection's raw TCP source — and the 27th rendering

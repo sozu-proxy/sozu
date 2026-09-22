@@ -77,6 +77,30 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the `peer=` slot of every `MUX-H2` log line is read from a snapshot
+  `ConnectionH2` captures at construction, not from the socket handler on every line.** New private
+  `ConnectionH2::peer_address: Option<SocketAddr>`, filled once in `ConnectionH2::new` from
+  `SocketHandler::peer_addr`; `log_context!` and `log_context_stream!` interpolate the field. No
+  wire behaviour changes. There IS a rendered-line change, and it is the intended one: both
+  production handlers (`SessionTcpStream`, `FrontRustls`) *prefer* a cached address but keep a
+  reachable live-`getpeername(2)` fallback, pinned by its own tests, so on the direct-HTTPS
+  frontend route a `MUX-H2` line emitted after the peer resets now renders `peer=Some(addr)` where
+  it used to render `peer=None`. The snapshot is taken after the handshake, so it answers wherever
+  the fallback would have answered and additionally survives the reset — `df52d83d`'s intent
+  applied one level further in. Nothing here licenses deleting those fallback arms.
+
+  What changes structurally is that rendering a log line is no longer a socket operation.
+  `log_context!` has 113 production callsites in `h2.rs` and `log_context_stream!` has none, and
+  counting production lines that are not comments, the type's `Front` touch points go from **140 to
+  27** — the remaining 27 are direct `self.socket` calls that later steps address. Measured against
+  `d8b8546e`; these are facts about a diff, so they are pinned to their base. This commit
+  itself *grows* `h2.rs` by 165 lines (+169/-4); the file only shrinks once the later extractions land. First
+  step of removing the `Front` parameter from `ConnectionH2`; it moves a value and nothing else.
+  `log_context_reads_the_peer_address_once_per_connection` pins the count at exactly one per
+  connection through a counting `SocketHandler`, which is a property neither existing peer-slot test
+  could observe: both production handlers answer from a cache, so they return the same address
+  however often they are asked.
+
 - **`refactor(mux-h2)`: the RFC 9218 priority and write-pass scheduling decision moves out of
   `h2.rs` into a new `lib/src/protocol/mux/h2_scheduler.rs`, behind the same closed API the
   `hpack_state` / `h2_flow_control` / `h2_stream_table` / `h2_drain` / `h2_flood_detector` /

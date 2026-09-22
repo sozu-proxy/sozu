@@ -673,7 +673,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **`decode_status` returns `None` on a size-update-prefixed block, and whether
   that is fail-closed depends on the call site.** `H2BlockConverter::emit_pending_size_update_if_new_block`
   (`lib/src/protocol/mux/converter.rs:112`, armed at
-  `lib/src/protocol/mux/h2.rs:5254`) prepends a `001xxxxx` HPACK dynamic table
+  `lib/src/protocol/mux/h2.rs:5294`) prepends a `001xxxxx` HPACK dynamic table
   size update when a peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e
   call sites send one: `h2_security_tests.rs:2440` (value 0) and
   `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
