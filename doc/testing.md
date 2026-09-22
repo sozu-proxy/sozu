@@ -140,7 +140,10 @@ Notes:
   rest of the e2e suite still runs. CI skips it in the per-cell pipeline (`--skip
   tests::fuzz_tests::`) and runs real fuzzing in the dedicated `fuzz` job
   (nightly toolchain, 300 s per target on every push/PR), which has a step for
-  each of the four targets, including `fuzz_tcp_clienthello` (see §6).
+  each of the four targets, including `fuzz_tcp_clienthello` (see §6). A fifth
+  target, `fuzz_command_channel` (the command-channel IPC framing, see §6), is
+  not yet wired into either the wrapper or the CI job -- that wiring is
+  proposed, not added, alongside this target's introduction.
 
 ---
 
@@ -236,6 +239,7 @@ cargo +nightly fuzz run fuzz_frame_parser
 cargo +nightly fuzz run fuzz_hpack_decoder
 cargo +nightly fuzz run fuzz_udp_flow
 cargo +nightly fuzz run fuzz_tcp_clienthello
+cargo +nightly fuzz run fuzz_command_channel
 
 # Bounded run (what the e2e wrapper and CI do):
 cargo +nightly fuzz run fuzz_frame_parser -- -max_total_time=300
@@ -470,7 +474,7 @@ state machine of the same shape. This is a stated direction, not a commitment.
 
 ## 6. Fuzzing
 
-The out-of-workspace `sozu-fuzz` crate (`fuzz/`) has four cargo-fuzz targets
+The out-of-workspace `sozu-fuzz` crate (`fuzz/`) has five cargo-fuzz targets
 (`fuzz/fuzz_targets/`), each defending a network-facing parser or state machine:
 
 | Target | Surface | Defends against |
@@ -479,28 +483,36 @@ The out-of-workspace `sozu-fuzz` crate (`fuzz/`) has four cargo-fuzz targets
 | `fuzz_hpack_decoder` | HPACK decoder (RFC 7541, `loona-hpack`) under three dynamic-table profiles | header-block oversize and incomplete-update flaws; resize/eviction paths |
 | `fuzz_udp_flow` | the sans-io UDP core + flow-key extraction + PPv2 DGRAM framing | flow-count overrun, gauge underflow, fd/slab leak; reuses the same invariants the simulator asserts |
 | `fuzz_tcp_clienthello` | the sans-io TCP SNI-preread core (`protocol::tcp_preread`, [#1279](https://github.com/sozu-proxy/sozu/issues/1279)) — TLS record/ClientHello parsing, PROXY-v2 stripping, SNI/ALPN routing | the core mutating the fed byte window, a latched terminal verdict (`Routed`/`Reject`) changing on a later call, `NeedMore` reappearing after a terminal, `content_offset` exceeding the fed window, a `NeedMore` deadline regressing across calls |
+| `fuzz_command_channel` | the command channel's length-delimited IPC framing (`sozu_command_lib::channel::Channel`, `command/src/channel.rs`) — `try_read_delimited_message` (reached via the public, purely in-memory `read_message()`) and `write_delimited_message`, against truncated frames, an under-delimiter/zero/oversize/split-across-boundary declared length, and valid frames followed by garbage | a `read_message()` call increasing pending data; a successful decode not consuming exactly the declared frame length; `MessageLengthUnderDelimiter` not dropping exactly the delimiter to resync; `MessageTooLarge` consuming bytes or growing the buffer before rejecting; byte-conservation drift between fed and consumed bytes; a write/read round trip losing the encoded `id` |
 
 Run a target locally (from inside `fuzz/`, nightly + `cargo-fuzz` required):
 
 ```bash
 cargo +nightly fuzz run fuzz_udp_flow
 cargo +nightly fuzz run fuzz_tcp_clienthello
+cargo +nightly fuzz run fuzz_command_channel
 ```
 
 **CI.** The dedicated `fuzz` job (`.github/workflows/ci.yml`; nightly
 toolchain — cargo-fuzz requires it) installs `cargo-fuzz` and runs all four
-targets — `fuzz_frame_parser`, `fuzz_hpack_decoder`, `fuzz_udp_flow`, and
-`fuzz_tcp_clienthello` — for 300 s each on every push/PR, uploading any crash
-artefacts from `fuzz/artifacts/`. The per-cell pipeline skips the e2e
-`fuzz_tests` wrapper to avoid rebuilding the fuzz crate under every
-crypto-provider cache; the wrapper's 10 s smoke runs (§2),
+*originally-wired* targets — `fuzz_frame_parser`, `fuzz_hpack_decoder`,
+`fuzz_udp_flow`, and `fuzz_tcp_clienthello` — for 300 s each on every push/PR,
+uploading any crash artefacts from `fuzz/artifacts/`. The per-cell pipeline
+skips the e2e `fuzz_tests` wrapper to avoid rebuilding the fuzz crate under
+every crypto-provider cache; the wrapper's 10 s smoke runs (§2),
 `fuzz_tcp_clienthello` included, still cover local `cargo test -p sozu-e2e`
 invocations. The daily-scheduled `simulation-sweep.yml` widens all four
 targets to `fuzz_seconds` (default 900 s) via its `extended-fuzz` job matrix.
+`fuzz_command_channel` is **not yet wired** into either the `fuzz` CI job, the
+`extended-fuzz` sweep, or the `e2e/src/tests/fuzz_tests.rs` wrapper — adding a
+`fuzz_command_channel` step to all three, mirroring `fuzz_tcp_clienthello`'s,
+is proposed but intentionally left for a separate CI-wiring decision. Until
+then run it manually with the commands above when touching
+`command/src/channel.rs`.
 
-**When to run fuzzers.** Any H2 parser, HPACK, UDP-core, or TCP SNI-preread
-change must run the focused e2e tests *and* the relevant cargo-fuzz target
-before pushing (`CLAUDE.md > Testing`).
+**When to run fuzzers.** Any H2 parser, HPACK, UDP-core, TCP SNI-preread, or
+command-channel-framing change must run the focused unit/e2e tests *and* the
+relevant cargo-fuzz target before pushing (`CLAUDE.md > Testing`).
 
 ---
 

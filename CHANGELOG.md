@@ -4,6 +4,41 @@
 
 ### ✨ Added
 
+- **`test(fuzz)`: cargo-fuzz target for the command channel's length-delimited IPC framing.**
+  `fuzz/fuzz_targets/fuzz_command_channel.rs` drives `Channel::try_read_delimited_message` and
+  `Channel::write_delimited_message` (`command/src/channel.rs`) through their public, purely
+  in-memory entry points (`read_message()`/`write_delimited_message`, with bytes placed directly
+  into `front_buf` — the fuzzed path never touches the underlying `MioUnixStream`), against
+  truncated frames, an under-delimiter/zero/oversize/`usize::MAX` declared length, frames split
+  across arbitrary chunk boundaries, and valid frames followed by garbage. Asserts structural
+  properties rather than "no crash" alone: a `read_message()` call never increases pending data; a
+  successful decode consumes EXACTLY the declared frame length; `MessageLengthUnderDelimiter`
+  always drops exactly `delimiter_size()` bytes to resync; `MessageTooLarge` never consumes bytes
+  or grows the buffer before rejecting; a global byte-conservation invariant
+  (`front_buf.available_data() == total_fed - total_consumed`), independently counted by the
+  harness rather than read back from the code under test, holds at every step; and a write/read
+  round trip decodes back to the same `id`. Reintroducing `5af7daea`'s missing short-frame
+  rejection reproduces a panic in under a second with a 6-byte minimized input
+  (`command/src/channel.rs:589`'s `debug_assert!` — `cargo-fuzz` always builds with
+  `-Cdebug-assertions`); a from-scratch release build with assertions compiled out confirmed the
+  same missing check still panics, at `command/src/channel.rs:607` with the original 2026-05-20
+  report's own `slice index starts at 8 but ends at 0`, since the slice-range check is a
+  language-level invariant — a reachable-input DoS in every build profile, not a debug-only
+  artefact. The target found the input clean again after restoring the fix. `2c6832b9`'s doubling-loop fix is a pure
+  allocation-amortization change no oracle here distinguishes; `7299c285` fixed a real stuck-read
+  defect in `Channel::readable()` (issue #1050) that this target cannot reach because `readable()`
+  is the socket I/O shell outside its sans-io scope, not because the defect was benign — see
+  `fuzz/README.md` §2.5 for the distinction. While developing the target, it also surfaced a live,
+  narrow, construction-time gap: `Channel::new` (and `config.rs`'s
+  `command_buffer_size`/`max_command_buffer_size`) never validates `buffer_size <=
+  max_buffer_size`, and violating it trips `try_read_delimited_message`'s own internal
+  `debug_assert!` on the first parse — reported, not fixed, here (out of scope for this
+  test-only changeset). Fifth target alongside the existing `fuzz_frame_parser`,
+  `fuzz_hpack_decoder`, `fuzz_udp_flow`, and `fuzz_tcp_clienthello`; not yet wired into the `fuzz`
+  CI job, the `extended-fuzz` sweep, or `e2e/src/tests/fuzz_tests.rs` (proposed, not added — see
+  `fuzz/README.md` §2.5/§6). Run with `cargo +nightly fuzz run fuzz_command_channel` from `fuzz/`
+  (`doc/testing.md` §6).
+
 - **`test(sim)`: deterministic simulation of the metrics cardinality-lease core.**
   `sim/tests/metrics_lease_sim.rs` drives `sozu_lib::metrics::Aggregator`'s `lease_apply` /
   `lease_clear` / `lease_tick` machinery, plus the `remove_cluster` / `add_cluster` /

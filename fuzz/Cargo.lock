@@ -1273,6 +1273,7 @@ version = "2.2.1"
 dependencies = [
  "libfuzzer-sys",
  "loona-hpack",
+ "sozu-command-lib",
  "sozu-lib",
 ]
 

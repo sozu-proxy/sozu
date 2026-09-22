@@ -1,16 +1,21 @@
 # Sōzu — Fuzzing
 
 `fuzz/` is an out-of-workspace `cargo-fuzz` crate hosting libFuzzer harnesses
-for the H2 wire surface, the sans-io UDP load-balancing core, and the
-sans-io TCP SNI-preread core. The crate is intentionally outside the main
-Cargo workspace (see `[workspace]` block at `fuzz/Cargo.toml:16`) so that
-nightly sanitizer builds do not pull the rest of the workspace through
-libFuzzer's build flags.
+for the H2 wire surface, the sans-io UDP load-balancing core, the sans-io
+TCP SNI-preread core, and the command channel's length-delimited IPC
+framing. The crate is intentionally outside the main Cargo workspace (see
+`[workspace]` block at `fuzz/Cargo.toml:16`) so that nightly sanitizer
+builds do not pull the rest of the workspace through libFuzzer's build
+flags.
 
-This document covers the layout, the four harnesses, how to run them
+This document covers the layout, the five harnesses, how to run them
 locally, how to triage findings, how CI's dedicated nightly fuzz job
 exercises them, and what would additionally be required to wire the
 project into ClusterFuzzLite / OSS-Fuzz.
+
+`fuzz_command_channel` is new and, unlike the other four, is not yet wired
+into `.github/workflows/ci.yml`'s `fuzz` job or `e2e/src/tests/fuzz_tests.rs`
+-- that wiring is a separate, proposed-not-added decision (see §3 and §6).
 
 ---
 
@@ -24,7 +29,8 @@ fuzz/
 │   ├── fuzz_frame_parser.rs          # H2 frame-codec fuzzer (RFC 9113)
 │   ├── fuzz_hpack_decoder.rs         # HPACK-decoder fuzzer (RFC 7541)
 │   ├── fuzz_udp_flow.rs              # sans-io UDP load-balancing core fuzzer
-│   └── fuzz_tcp_clienthello.rs       # sans-io TCP SNI-preread core fuzzer
+│   ├── fuzz_tcp_clienthello.rs       # sans-io TCP SNI-preread core fuzzer
+│   └── fuzz_command_channel.rs       # command-channel IPC framing fuzzer
 ├── corpus/                           # tracked seed corpora
 │   ├── fuzz_frame_parser/
 │   │   ├── connection_preface
@@ -35,19 +41,22 @@ fuzz/
 │   │   └── ...
 │   ├── fuzz_hpack_decoder/
 │   │   └── ...
-│   └── fuzz_tcp_clienthello/
-│       ├── routed_exact_sni
-│       ├── proxy_v2_prefixed_hello
-│       ├── truncated_hello_then_timeout
-│       ├── grease_heavy_hello_oneof_alpn
-│       ├── non_tls_junk
-│       ├── malformed_record_oversize
-│       └── ...
+│   ├── fuzz_tcp_clienthello/
+│   │   ├── routed_exact_sni
+│   │   ├── proxy_v2_prefixed_hello
+│   │   ├── truncated_hello_then_timeout
+│   │   ├── grease_heavy_hello_oneof_alpn
+│   │   ├── non_tls_junk
+│   │   ├── malformed_record_oversize
+│   │   └── ...
+│   └── fuzz_command_channel/
+│       └── crash-b7157bd6-message-len-zero-under-delimiter-regression
 └── artifacts/                        # crash artifacts, not committed
     ├── fuzz_frame_parser/
     ├── fuzz_hpack_decoder/
     ├── fuzz_udp_flow/
-    └── fuzz_tcp_clienthello/
+    ├── fuzz_tcp_clienthello/
+    └── fuzz_command_channel/
 ```
 
 The seed corpora under `fuzz/corpus/` are committed to the repository on
@@ -62,7 +71,7 @@ either reviewed for promotion or pruned with `git clean -f fuzz/corpus/`.
 
 ---
 
-## 2. The Four Harnesses
+## 2. The Five Harnesses
 
 ### 2.1 `fuzz_frame_parser`
 
@@ -197,6 +206,107 @@ byte sequences that triggered this bug class before the fix; this
 document does not assert a 1:1 mapping between a given file and a specific
 named test above.
 
+### 2.5 `fuzz_command_channel`
+
+Source: `fuzz/fuzz_targets/fuzz_command_channel.rs`.
+
+Drives [`Channel::try_read_delimited_message`](../command/src/channel.rs) —
+the sans-io length-delimited IPC framing parser behind the master ↔ worker
+and master ↔ CLI command channel — and `Channel::write_delimited_message`,
+through the public, purely in-memory `read_message()` / `write_delimited_message`
+entry points. Bytes are placed directly into the public `front_buf` field
+(mirroring what `Channel::readable()` would have copied off the wire) so
+the fuzzed data path never touches the underlying `MioUnixStream`; the
+socket pair `Channel::generate_nonblocking` requires only satisfies the
+field's type. A big-endian `Reader` over the fuzz input (mirroring
+`fuzz_udp_flow.rs` / `fuzz_tcp_clienthello.rs`) derives, in order:
+
+1. a small, fuzz-chosen `(buffer_size, max_buffer_size)` pair for the
+   "reader" channel under test, clamped to `buffer_size <= max_buffer_size`
+   (see the note below) so `MessageTooLarge` / `BufferFull` stay cheaply
+   reachable without the construction-time precondition gap;
+2. a bounded (≤ 512 iterations) step loop that, each step, either encodes a
+   real `WorkerRequest` via the writer channel and feeds the wire bytes
+   into the reader whole or split across 1-3 arbitrary chunk boundaries;
+   encodes a real frame immediately followed by raw garbage; feeds a raw
+   adversarial chunk taken directly from the remaining fuzz bytes; or
+   crafts an explicit little-endian `usize` delimiter — biased toward `0`,
+   `1`, `delimiter_size() - 1`, `delimiter_size()`, `delimiter_size() + 1`,
+   `max_buffer_size`, `max_buffer_size + 1`, `usize::MAX`, and a
+   fuzz-chosen arbitrary value — followed by fuzz-chosen trailing bytes
+   that may be shorter or longer than the declared length. Every feed is
+   drained (`read_message()`, up to 8 times) until it stops making
+   progress.
+
+Invariants asserted beyond "never panic" (see `check_read` in the target):
+a single `read_message()` call never increases the front buffer's pending
+data; a successful decode consumes EXACTLY the declared frame length
+(peeked independently before the call); `MessageLengthUnderDelimiter`
+always drops exactly `delimiter_size()` bytes to resync; `MessageTooLarge`
+never consumes bytes or grows the buffer's capacity before rejecting;
+`NothingRead` never consumes pending bytes; a global byte-conservation
+property (`front_buf.available_data() == total_fed - total_consumed`) at
+every step; and a write/read round trip decodes back to the same `id`.
+
+Bug class defended: the four historical framing defects listed in this
+target's own module doc comment —
+[`5af7daea`](https://github.com/sozu-proxy/sozu/commit/5af7daeaea8a8e8cc45949a8aa69e59a0296eb30)
+(reject a declared length shorter than the delimiter) and
+[`7b8dce97`](https://github.com/sozu-proxy/sozu/commit/7b8dce978b66098192ae7ef3714dfb71a87f0c7b)
+(bound `message_len` before any growth) are both reachable and asserted
+here. The other two are NOT independently distinguishable by this target's
+oracles, for two different reasons:
+[`2c6832b9`](https://github.com/sozu-proxy/sozu/commit/2c6832b95bff8f8c12b408f4710ba51d9d26b8c3)
+is an allocation-strategy amortization change (an inner `min(..., needed)`
+cap removed, same final ceiling either way) with no effect on decode
+correctness, so no oracle here could distinguish it regardless of what it
+touches — it remains covered by `back_buffer_grows_with_doubling_on_write`.
+[`7299c285`](https://github.com/sozu-proxy/sozu/commit/7299c285f12e733de8c835283358d74c07581995)
+is different: per its own commit message it "Closes #1050 where the
+channel silently stopped reading when the buffer was full" — a genuine
+stuck-read correctness defect in `Channel::readable()`'s socket-read loop,
+which gave up instead of growing before the fix. This target cannot reach
+it not because the defect is benign, but because `readable()` is the
+socket I/O shell the sans-io boundary deliberately keeps this target out
+of (see the module doc comment) — there is a real defect class in that
+shell that nothing here fuzzes. `command/src/channel.rs`'s own
+`buffer_grows_with_doubling_strategy` unit test only calls `grow_size()`
+directly, in isolation, not `readable()`'s socket-read loop that
+`7299c285` actually fixed — so unlike `2c6832b9`, this one has no
+dedicated regression test either, only the general e2e/production traffic
+that exercises `readable()` incidentally. Whether the fuzz target should
+grow a second, socket-facing harness to reach `readable()` (and thereby
+this defect class) is a real open question this document does not answer.
+
+**Note — a live construction-time defect found while developing this
+target.** `Channel::new` (and therefore `generate_nonblocking`) never
+validates `buffer_size <= max_buffer_size`; every production caller
+happens to respect it, but nothing enforces it, and `config.rs` does not
+validate `command_buffer_size <= max_command_buffer_size` either. Passing
+`buffer_size > max_buffer_size` makes `front_buf` start out already larger
+than `max_buffer_size`, which trips `try_read_delimited_message`'s own
+`debug_assert!` (`command/src/channel.rs:528`, "front buffer capacity must
+never exceed max_buffer_size") on the very first parse attempt — this
+target found it within seconds via `ReaderChannel::generate_nonblocking(45,
+32)`. This is a construction-precondition gap, not a wire-framing defect,
+so it is outside this target's adversarial-input scope; the generator was
+adjusted to clamp `buffer_size <= max_buffer_size` (see the target's own
+comment at the construction-parameter derivation) rather than continuing to
+explore it. It was not fixed here (`command/src/channel.rs` is out of
+scope for this test-only changeset) — see the introducing changeset's
+report for the minimized input and full detail.
+
+Seed corpus (`fuzz/corpus/fuzz_command_channel/`): regression-only, unlike
+`fuzz_frame_parser` / `fuzz_hpack_decoder` / `fuzz_tcp_clienthello`'s named
+shape corpora — `fuzz_udp_flow` sets the precedent for a
+`Reader`-grammar target committing no named "shape" seeds, since a byte
+sequence's meaning depends on how the grammar consumes it rather than
+being a direct wire encoding.
+
+| Seed | Regression |
+|---|---|
+| `crash-b7157bd6-message-len-zero-under-delimiter-regression` | The `5af7daea` reintroduction test for this changeset: with the `MessageLengthUnderDelimiter` guard removed, this 6-byte input (`[0, 0, 0, 0, 5, 9]` — an 8-byte all-zero delimiter, i.e. a declared `message_len = 0`) makes `try_read_delimited_message` fall through to the decode branch and trip its own `debug_assert!("decode path requires a frame at least as large as its delimiter")` at `command/src/channel.rs:589` (found at run #295, under a second). Replayed against the restored fix it decodes cleanly to `Err(MessageLengthUnderDelimiter { message_len: 0, .. })`. In a release build with debug assertions compiled out — `cargo fuzz` never runs one, since `cargo-fuzz` unconditionally injects `-Cdebug-assertions`, but a plain `cargo build --release`/`cargo test --release` does, and this workspace's root `[profile.release]` sets no `debug-assertions` override — the same missing check instead reaches the raw slice at `command/src/channel.rs:607` (`Rx::decode(&buffer[delimiter_size()..message_len])`) and panics with the original 2026-05-20 report's own message, `slice index starts at 8 but ends at 0`: Rust's slice-range check is a language-level memory-safety invariant, not a debug-only gate, so this is a reachable-input DoS in every build profile — confirmed first-hand with a scratch `--release` test (reverted before commit), not merely inferred. See this changeset's report for the full red/green transcript. |
+
 ---
 
 ## 3. Running Locally
@@ -214,6 +324,7 @@ cargo +nightly fuzz run fuzz_frame_parser
 cargo +nightly fuzz run fuzz_hpack_decoder
 cargo +nightly fuzz run fuzz_udp_flow
 cargo +nightly fuzz run fuzz_tcp_clienthello
+cargo +nightly fuzz run fuzz_command_channel
 ```
 
 Each invocation runs forever until you stop it. To time-bound a run:
@@ -225,13 +336,15 @@ cargo +nightly fuzz run fuzz_frame_parser -- -max_total_time=60
 Corpus growth is automatic — libFuzzer will append surviving inputs to
 `fuzz/corpus/fuzz_frame_parser/` while the run progresses.
 
-The in-tree smoke check `e2e/src/tests/fuzz_tests.rs` runs each target for
-ten seconds inside the standard `cargo test` flow when the nightly
-toolchain and `cargo-fuzz` are available; when they are not, the test
-logs a skip notice and returns cleanly so the rest of the e2e suite still
-runs. The four wrappers are ordinary `#[test]` functions — not
+The in-tree smoke check `e2e/src/tests/fuzz_tests.rs` runs each of its four
+wired targets for ten seconds inside the standard `cargo test` flow when
+the nightly toolchain and `cargo-fuzz` are available; when they are not,
+the test logs a skip notice and returns cleanly so the rest of the e2e
+suite still runs. The four wrappers are ordinary `#[test]` functions — not
 `#[ignore]`d — so they already run as part of a plain
-`cargo test -p sozu-e2e`. To run only them:
+`cargo test -p sozu-e2e`. `fuzz_command_channel` is not yet one of them
+(see §2.5 / §6.1) — run it directly with the command above. To run the
+existing wrappers only:
 
 ```bash
 cargo test -p sozu-e2e fuzz
@@ -289,13 +402,23 @@ directory at the repository root and no
 `google/clusterfuzzlite/actions/run_fuzzers` job. CI does, however, run a
 dedicated `fuzz` job (`.github/workflows/ci.yml`, nightly Rust toolchain,
 `timeout-minutes: 45`) on every push and pull request: it installs
-`cargo-fuzz` and runs each of the four targets for `-max_total_time=300`
-seconds, uploading `fuzz/artifacts/` on failure. The four harnesses are
-therefore exercised in three places: that CI job, local
-`cargo +nightly fuzz run` (§3), and the `e2e/src/tests/fuzz_tests.rs`
+`cargo-fuzz` and runs each of the four *originally-wired* targets for
+`-max_total_time=300` seconds, uploading `fuzz/artifacts/` on failure.
+Those four harnesses are therefore exercised in three places: that CI job,
+local `cargo +nightly fuzz run` (§3), and the `e2e/src/tests/fuzz_tests.rs`
 ten-second smoke check documented above (skipped by test-name in the main
 pipeline's `Test sozu-e2e` step, to avoid rebuilding `fuzz/` under every
 crypto-provider cache key — see the comment above that step in `ci.yml`).
+
+`fuzz_command_channel` (§2.5) is not part of the `fuzz` CI job, the
+`extended-fuzz` matrix in `simulation-sweep.yml`, or the
+`e2e/src/tests/fuzz_tests.rs` wrapper. A `Fuzz fuzz_command_channel (300s)`
+step mirroring the `fuzz_tcp_clienthello` step (`ci.yml`), a
+`fuzz_command_channel` entry in the `extended-fuzz` matrix
+(`simulation-sweep.yml`), and a fifth `#[test]` wrapper in
+`fuzz_tests.rs` are proposed as this target's natural CI wiring — see the
+introducing changeset's report for the exact proposed diff. None of the
+three is added by this changeset; wiring CI is a separate decision.
 
 ### 6.2 Steps to integrate ClusterFuzzLite (per-PR continuous fuzzing)
 
@@ -323,13 +446,16 @@ the work is roughly:
 
 Until ClusterFuzzLite is added, the existing safety nets are:
 
-- CI's dedicated `fuzz` job (§6.1), running all four targets for 300 s
-  each on every push and pull request;
+- CI's dedicated `fuzz` job (§6.1), running the four originally-wired
+  targets for 300 s each on every push and pull request;
 - the local `cargo +nightly fuzz run` workflow documented in §3, run by
   reviewers when touching `lib/src/protocol/mux/parser.rs`,
   `lib/src/protocol/mux/pkawa.rs`, `lib/src/protocol/mux/serializer.rs`,
-  `lib/src/protocol/udp/`, or `lib/src/protocol/tcp_preread/`;
-- the in-tree `e2e/src/tests/fuzz_tests.rs` ten-second smoke check.
+  `lib/src/protocol/udp/`, `lib/src/protocol/tcp_preread/`, or
+  `command/src/channel.rs` (`fuzz_command_channel`, not yet CI-wired — run
+  it manually until it is, see §6.1);
+- the in-tree `e2e/src/tests/fuzz_tests.rs` ten-second smoke check (four of
+  the five targets).
 
 ---
 
@@ -350,5 +476,12 @@ Until ClusterFuzzLite is added, the existing safety nets are:
 - `lib/src/protocol/tcp_preread/mod.rs` — the sans-io TCP SNI-preread core
   the `fuzz_tcp_clienthello` target drives; `lib/src/protocol/tcp_preread/parser.rs`
   owns the ClientHello wire parsing it exercises.
+- `command/src/channel.rs` — the command channel's length-delimited IPC
+  framing (`try_read_delimited_message` / `write_delimited_message`) the
+  `fuzz_command_channel` target drives; see §2.5.
+- `e2e/src/tests/command_channel_security_tests.rs` — the e2e regression
+  tests reproducing the same `5af7daea` / `MessageLengthUnderDelimiter`
+  defect class at the full worker level, from before this fuzz target
+  existed.
 - `.github/workflows/ci.yml` — the dedicated `fuzz` job (nightly
-  toolchain) that runs all four targets in CI; see §6.1.
+  toolchain) that runs the four originally-wired targets in CI; see §6.1.
