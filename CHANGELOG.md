@@ -285,6 +285,70 @@
   sites no longer assert a behaviour the code does not have; naming what does happen is left to
   #1428, which tracks the defect.
 
+- **`fix(command)`: drop a peer that declares a frame length above the channel ceiling, instead of
+  wedging its session on a header that can never be completed.** `try_read_delimited_message`
+  (`command/src/channel.rs`) rejected an oversized declared length with
+  `ChannelError::MessageTooLarge` but left the eight-byte header at the head of `front_buf` and moved
+  no readiness bit — unlike the sibling `MessageLengthUnderDelimiter` branch twelve lines below, which
+  consumes the bogus delimiter precisely so the channel can re-sync. Nothing downstream compensated:
+  `read_message_nonblocking` propagated the error with `?` and no log, `extract_messages`
+  (`bin/src/command/sessions.rs`) discarded it with a bare `Err(_)`, and `ClientSession::ready` /
+  `WorkerSession::ready` close only on `readiness.is_error() || is_hup()`, which no parse error sets.
+  The session therefore stayed registered for the life of the process, re-parsing the same header on
+  every later read, pinning its file descriptor and up to `max_command_buffer_size` of buffer, with
+  nothing logged; the command socket accepts without a connection cap, so the wedged sessions
+  accumulated one per connection from an eight-byte write each. The recovery is deliberately *not*
+  the sibling's consume-and-re-sync: an oversized length can never be satisfied by a buffer bounded at
+  `max_buffer_size`, and the bytes behind the header may be payload rather than a fresh delimiter, so
+  dropping the header and re-framing on them would decode peer-chosen bytes as a control-plane
+  command. It is now fatal for that peer — logged, then `readiness.insert(Ready::ERROR)` — which is
+  the stance the write side already took for the identical condition (`is_transient_overflow`: "a
+  frame bigger than the ceiling itself, which no amount of draining will ever admit"), and reuses the
+  existing close path: `ClientSession::ready` / `WorkerSession::ready` return `CloseSession`, and for
+  a worker `handle_worker_close` → `close_worker` sends `SIGKILL`, after which `workers_to_spawn`
+  replaces the process only when `config.worker_automatic_restart` is set. The bit is *inserted*, not
+  assigned: on a worker's own channel (`lib/src/server.rs`) `interest` holds only READABLE and
+  WRITABLE, so `readiness()` masks ERROR away and nothing there reads `is_error()` — assigning would
+  only clear WRITABLE and stall `Server::send_queue` until the next edge-triggered writability event.
+  Closing is **not** a verdict on the peer. The two ends size their channels from their own
+  `max_command_buffer_size`, so a peer configured higher emits such a frame through the ordinary
+  write path while conforming perfectly: the two configurations shipped here already disagree
+  tenfold, `bin/config.toml` at `163_840` against `os-build/config.toml`'s `1_638_400`, so a
+  `sozu ctl --config` pointed at one while the supervisor was started from the other overruns it on a
+  large `LoadState`. Two binaries built with different `SOZU_CONFIG` defaults (`bin/build.rs`,
+  `bin/src/util.rs`) diverge the same way; without `--config`, `sozu ctl` uses the path baked in at
+  build time and fails outright when none was, so it never falls back to a compiled buffer default.
+  The end that receives it still cannot complete or re-sync the frame, so it still closes, but the
+  `error!` line now names `max_command_buffer_size` and `command_buffer_size` on both ends instead of
+  implying hostility. The branch's own comment claimed the rejection made "the read loop disconnect
+  cleanly"; that half was false and is corrected, as is the same claim in
+  `doc/configure_admin_ops.md` §5.2, which additionally said a dropped worker "observes the close as
+  an EOF on its channel" — it observes nothing, `SIGKILL` cannot be caught.
+  Pinned by `oversized_declared_length_marks_the_channel_for_closing` (the channel contract) and
+  `client_session_closes_on_oversized_declared_length` (the supervisor behaviour), both seen red
+  first. The same return-before-`consume` shape sat six lines below, on `Rx::decode`: a valid
+  declared length with an undecodable payload — eight good length bytes plus garbage, or protobuf
+  skew between two builds — left the whole frame buffered and wedged the session identically. That
+  one now consumes and re-syncs instead of closing. Not because the boundary is proven: `message_len`
+  is only range-checked. Because the decode-*success* path four lines down already consumes that same
+  peer-supplied length and re-frames on whatever follows, so the failure path now re-frames on
+  exactly the bytes the success path already did, and closing only on the failing half would punish
+  the case more likely to be honest protobuf skew. Pinned by
+  `malformed_payload_is_consumed_so_the_channel_resyncs`, also seen red first — a channel-level test:
+  `extract_messages` returns on the first `Err(_)` with the capacity unchanged, so a valid frame
+  already pipelined behind the malformed one reaches the session only on its next readable event, and
+  that residual is deliberately untested and unfixed here. A third instance is **known-remaining and
+  deliberately untouched**, now tracked as #1436: the `BufferFull` arm at the ceiling likewise
+  returns without consuming and without moving a readiness bit, and is reachable once a decoded frame
+  of at most half the capacity leaves `Buffer::consume` short of its shift threshold. Its recovery is
+  neither of the other two — those bytes are still buffered and a `Buffer::shift` would make room for
+  the pending frame, so closing there would drop a conforming peer over an internal
+  buffer-management detail.
+  Reachability: the command socket is a unix socket chmod'd `0o600` and there is no
+  control-plane TCP listener, so this is a robustness fix rather than a remotely triggerable one —
+  but the same parser serves the master↔worker socketpair, where a worker compromised through the
+  traffic it proxies could wedge its supervisor session. Closes #1428.
+
 ### 🔐 Security
 
 - **`fix(mux-h2)`: decode a refused stream's HPACK field block instead of dropping it, so the

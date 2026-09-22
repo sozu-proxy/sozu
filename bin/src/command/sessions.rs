@@ -616,7 +616,19 @@ pub fn wants_to_tick<Tx, Rx>(channel: &Channel<Tx, Rx>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_for_audit, sanitize_for_audit_kv};
+    use std::sync::Arc;
+
+    use mio::Token;
+    use sozu_command_lib::{
+        channel::Channel,
+        proto::command::{Request, Response},
+        ready::Ready,
+    };
+
+    use super::{
+        ClientResult, ClientSession, sanitize_for_audit, sanitize_for_audit_kv, wants_to_tick,
+    };
+    use crate::command::server::PeerCred;
 
     // -----------------------------------------------------------------
     // sanitize_for_audit_kv: strict, used for column-boundary fields
@@ -788,5 +800,75 @@ mod tests {
         let input = "héllo שלום مرحبا";
         assert_eq!(sanitize_for_audit(input), input);
         assert_eq!(sanitize_for_audit_kv(input), input);
+    }
+
+    // -----------------------------------------------------------------
+    // oversized declared frame length: the supervisor must drop the peer
+    // -----------------------------------------------------------------
+
+    /// Regression for sozu-proxy/sozu#1428, the supervisor half of
+    /// `command/src/channel.rs`'s
+    /// `oversized_declared_length_marks_the_channel_for_closing`.
+    ///
+    /// `try_read_delimited_message` cannot re-sync past a declared length
+    /// above `max_buffer_size`, so it signals the only safe recovery through
+    /// `Ready::ERROR`. This pins the two links that turn that signal into the
+    /// behaviour `doc/configure_admin_ops.md` §5.2 promises: `wants_to_tick`
+    /// must schedule the session even though nothing is buffered to write,
+    /// and `ClientSession::ready` must then answer `CloseSession`.
+    ///
+    /// Before the fix both links were absent — `extract_messages` swallowed
+    /// the error with its bare `Err(_)` arm, no readiness bit moved, and the
+    /// session stayed registered forever with the poisoned delimiter parked
+    /// at the head of its front buffer.
+    #[test]
+    fn client_session_closes_on_oversized_declared_length() {
+        let (channel, mut writer): (Channel<Response, Request>, Channel<Request, Response>) =
+            Channel::generate_nonblocking(1000, 10000)
+                .expect("could not generate nonblocking channels");
+
+        let mut client = ClientSession::new(
+            channel,
+            1,
+            Token(1),
+            PeerCred {
+                uid: None,
+                gid: None,
+                pid: None,
+            },
+            None,
+            None,
+            Arc::from("/tmp/sozu-test.sock"),
+        );
+
+        // Raw write: `write_delimited_message` refuses to emit a frame this large.
+        let oversized: usize = 10_001;
+        std::io::Write::write_all(&mut writer.sock, &oversized.to_le_bytes())
+            .expect("raw write of the oversized delimiter");
+
+        client.update_readiness(Ready::READABLE);
+
+        // The tick that parses the bad header yields no request: the channel is
+        // marked errored from inside `extract_messages`, after `ready`'s own
+        // entry check has already run.
+        assert!(
+            matches!(client.ready(), ClientResult::NothingToDo),
+            "the parsing tick yields no request"
+        );
+
+        // The event loop must be told to come back, or the mark is never read:
+        // nothing is queued to write and no mio event is owed, so `wants_to_tick`
+        // is the only thing that re-schedules this session.
+        assert!(
+            wants_to_tick(&client.channel),
+            "a channel marked for closing must be re-scheduled by the event loop"
+        );
+
+        assert!(
+            matches!(client.ready(), ClientResult::CloseSession),
+            "the supervisor must drop a peer that declared an unsatisfiable \
+             frame length, instead of leaving the session wedged on a delimiter \
+             it can neither complete nor re-sync past"
+        );
     }
 }

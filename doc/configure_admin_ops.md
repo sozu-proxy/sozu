@@ -223,10 +223,40 @@ configuration files shipped in this repository — `bin/config.toml`,
 these defaults, so read the values actually in force rather than
 assuming the built-in ones.
 
-What the supervisor does with a frame the cap rejects is deliberately
-not stated here: the handling of `MessageTooLarge` on the command
-channel is the subject of the open issue sozu-proxy/sozu#1428, and this
-section will name the behaviour once that is settled.
+A declared length above the cap is fatal for the peer that sent it, not a
+skipped frame. That length can never be satisfied — the frame would not fit
+a buffer bounded by the cap however much more is read — and the bytes
+behind the header cannot be assumed to begin a fresh frame, so re-framing
+on them would decode peer-chosen bytes as a command. The supervisor
+therefore logs the rejection and marks the channel errored;
+`ClientSession::ready` / `WorkerSession::ready` then drop the session, and
+nothing is re-synchronised on that stream.
+
+Read that log line as a configuration report, not as an attack report. The
+two ends of a channel take their ceiling from their own configuration, so a
+peer built with a larger `max_command_buffer_size` emits frames this end
+refuses while conforming perfectly, and the two `max_command_buffer_size`
+values must therefore be raised in tandem on both ends. The two
+configurations shipped in this repository already disagree tenfold —
+`bin/config.toml` sets `163_840`, `os-build/config.toml` `1_638_400` — so a
+`sozu ctl --config` pointed at one while the supervisor was started from the
+other overruns it on a large `LoadState`. Two binaries built with different
+`SOZU_CONFIG` defaults diverge the same way: without `--config`, `sozu ctl`
+uses the configuration path baked in at build time, and fails outright when
+none was. Closing is still the only correct exit for the end that can
+neither complete nor re-sync the frame, but the repair is to reconcile the
+two values, and the log line names both keys so an operator can.
+
+When the dropped peer is a worker, the supervisor does not merely close the
+channel: `handle_worker_close` calls `close_worker`, which sends the worker
+process `SIGKILL`. The worker observes nothing — `SIGKILL` cannot be caught
+— and a replacement is spawned on a later tick when
+`worker_automatic_restart` is enabled; with that setting off the worker is
+simply gone.
+
+Before sozu-proxy/sozu#1428 none of that happened: the oversized header was
+left at the head of the read buffer, the error was discarded without a log,
+and the session stayed open and wedged.
 
 ### 5.3 Drop-on-register-fail for the unix command socket
 
