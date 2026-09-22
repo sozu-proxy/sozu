@@ -594,6 +594,7 @@ where
         trace!("Channel readable: {:?}", status);
         let old_capacity = channel.front_buf.capacity();
         let old_space = channel.front_buf.available_space();
+        let old_pending = channel.front_buf.available_data();
         let message = channel.read_message();
         match message {
             Ok(message) => {
@@ -603,6 +604,7 @@ where
             Err(_) => {
                 let new_capacity = channel.front_buf.capacity();
                 let new_space = channel.front_buf.available_space();
+                let new_pending = channel.front_buf.available_data();
                 // INVARIANT: the read buffer only ever grows while we drain it
                 // (the channel doubles capacity on a partial read, never
                 // shrinks mid-loop). A shrink here would mean `read_message`
@@ -612,6 +614,36 @@ where
                     new_capacity >= old_capacity,
                     "channel read buffer must not shrink while draining messages"
                 );
+                // Added last and checked first (sozu-proxy/sozu#1445): a FAILED
+                // parse that RETIRED bytes. Neither anchor below sees one.
+                // Capacity is untouched, and `Buffer::consume`
+                // (`command/src/buffer/growable.rs`) advances `position`,
+                // shifting only past `capacity / 2`, so retiring an eight-byte
+                // prefix leaves `end` — and therefore `available_space()` —
+                // exactly where it was. The drain then returned on the very
+                // parse that re-synchronised the stream, and the bytes still in
+                // the socket were stranded on a session `wants_to_tick` below
+                // does not re-schedule.
+                //
+                // Unlike the compaction retry it needs no spin guard:
+                // `consume` is the sole writer of `position`, so
+                // `available_data()` can only fall by bytes the parser actually
+                // retired, and every `continue` here retires at least one. The
+                // iteration count is therefore bounded by the bytes the peer
+                // writes — the same bound the `Ok` arm has always had — which
+                // is also why it resets the compaction guard, exactly as
+                // delivering a message does.
+                //
+                // Which read failures retire bytes, and why refilling after one
+                // is safe, is `rearms_readable` (`command/src/channel.rs`).
+                // This anchor is the drain half of that same fix: `readable()`
+                // refuses to run while `interest` has lost READABLE, so neither
+                // half recovers the stranded bytes without the other.
+                if new_pending < old_pending {
+                    retried_after_compaction = false;
+                    continue;
+                }
+
                 // Termination anchor. It used to be "capacity stopped growing",
                 // which was the only way `read_message` could make room for a
                 // frame it could not yet complete. Since sozu-proxy/sozu#1436 it
@@ -666,7 +698,8 @@ mod tests {
     };
 
     use super::{
-        ClientResult, ClientSession, sanitize_for_audit, sanitize_for_audit_kv, wants_to_tick,
+        ClientResult, ClientSession, extract_messages, sanitize_for_audit, sanitize_for_audit_kv,
+        wants_to_tick,
     };
     use crate::command::server::PeerCred;
 
@@ -1028,6 +1061,115 @@ mod tests {
 
         // And this is why the drain loop, not `wants_to_tick`, had to be the
         // fix: nothing re-schedules a session that is merely readable.
+        assert!(
+            !wants_to_tick(&client.channel),
+            "no queued response, no hup, no error: had the drain stopped early \
+             the session would never have been ticked again"
+        );
+    }
+
+    /// Regression for sozu-proxy/sozu#1445: a malformed frame must not strand
+    /// the bytes behind it on a session nothing will schedule again. Which read
+    /// failures leave a channel able to make progress, and why, is
+    /// `rearms_readable` (`command/src/channel.rs`);
+    /// `MessageLengthUnderDelimiter` is the one a peer reaches today.
+    ///
+    /// The shape, at `capacity == max_buffer_size == 64`: a 40-byte frame, an
+    /// 8-byte prefix declaring 3 (below the delimiter, a value no writer can
+    /// emit for any payload), and a 46-byte frame, written together in ONE
+    /// 94-byte write. The first `readable()` takes 64 of those 94 bytes and
+    /// drops READABLE at the ceiling; frame one decodes; the bogus prefix is
+    /// consumed -- and the remaining 30 bytes of frame two sat in the socket
+    /// with `wants_to_tick` false, no hup and no error.
+    ///
+    /// Delivery has to happen inside this tick, because `wants_to_tick` below
+    /// does not re-schedule a session for being merely readable. So this counts
+    /// what the drain hands back rather than asserting a readiness bit -- and
+    /// counts it rather than naming one frame, because `ClientSession::ready`
+    /// returns `requests.pop()` and which of the two that is, is its own
+    /// pre-existing pipelining question rather than this one.
+    #[test]
+    fn client_session_delivers_the_frame_behind_a_malformed_length_prefix() {
+        let capacity = 64u64;
+        let (channel, mut writer): (Channel<Response, Request>, Channel<Request, Response>) =
+            Channel::generate_nonblocking(capacity, capacity)
+                .expect("could not generate nonblocking channels");
+
+        let mut client = ClientSession::new(
+            channel,
+            1,
+            Token(1),
+            PeerCred {
+                uid: None,
+                gid: None,
+                pid: None,
+            },
+            None,
+            None,
+            Arc::from("/tmp/sozu-test.sock"),
+        );
+
+        // Frame one: a well-formed request that decodes on the first parse and
+        // leaves the read cursor part-way into the buffer.
+        let first = Request {
+            request_type: Some(RequestType::LoadState("x".repeat(30))),
+        };
+        writer
+            .write_delimited_message(&first)
+            .expect("could not frame the first request");
+        let mut wire = writer.back_buf.data().to_vec();
+        writer.back_buf.consume(wire.len());
+        assert_eq!(wire.len(), 40, "the first frame must be 40 bytes");
+
+        // The malformed prefix: a declared length below `delimiter_size()`, the
+        // one value `write_delimited_message` can never emit, so the parser is
+        // entitled to skip exactly those 8 bytes and re-align.
+        let under_delimiter: usize = 3;
+        wire.extend_from_slice(&under_delimiter.to_le_bytes());
+
+        // Frame two: well-formed, and split by the 64-byte ceiling -- 16 of its
+        // bytes land in the buffer behind the bogus prefix, 30 stay in the
+        // socket and are the bytes that used to be stranded.
+        let second_request = Request {
+            request_type: Some(RequestType::LoadState("y".repeat(36))),
+        };
+        writer
+            .write_delimited_message(&second_request)
+            .expect("could not frame the second request");
+        let second = writer.back_buf.data().to_vec();
+        writer.back_buf.consume(second.len());
+        assert_eq!(second.len(), 46, "the second frame must be 46 bytes");
+        wire.extend_from_slice(&second);
+
+        // ONE write, then the peer waits for its response -- it owes no further
+        // byte, and no further byte is what the defect needed.
+        assert_eq!(wire.len(), 94);
+        std::io::Write::write_all(&mut writer.sock, &wire)
+            .expect("raw write of the whole 94-byte stream in a single write");
+
+        client.update_readiness(Ready::READABLE);
+
+        let delivered = extract_messages(&mut client.channel);
+        assert_eq!(
+            delivered.len(),
+            2,
+            "both frames must be delivered on this tick: the peer sent every \
+             byte it owes and nothing will schedule another one.\n\
+             NOTE: this is sozu-proxy/sozu#1445 -- 1 here is the frame BEFORE \
+             the bogus prefix delivered alone, the 30 bytes behind it left in \
+             the socket, because the parse that consumed that prefix returned \
+             through `?` without re-arming READABLE and `readable()` could no \
+             longer refill the buffer"
+        );
+
+        assert_eq!(
+            client.channel.front_buf.available_data(),
+            0,
+            "the whole 94-byte write must have been drained"
+        );
+
+        // And this is why the delivery, not a readiness bit, is the assertion:
+        // nothing re-schedules a session that is merely readable.
         assert!(
             !wants_to_tick(&client.channel),
             "no queued response, no hup, no error: had the drain stopped early \
