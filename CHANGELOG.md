@@ -189,6 +189,25 @@
 
 ### 🐛 Fixed
 
+- **`fix(command)`: reject `command_buffer_size > max_command_buffer_size` at config load, and make
+  `Channel::new`/`generate_nonblocking` clamp to it structurally.** `Channel::new`
+  (`command/src/channel.rs`) took `buffer_size` and `max_buffer_size` without ever comparing them, so
+  a caller-supplied `buffer_size` above `max_buffer_size` started `front_buf`/`back_buf` already
+  larger than the ceiling every growth/shrink path in the file — `grow_size`,
+  `try_read_delimited_message`, `try_shrink_front_buf`/`try_shrink_back_buf` — reasons against.
+  `try_read_delimited_message` then tripped its own "front buffer capacity must never exceed
+  max_buffer_size" `debug_assert!` on the very first parse, before any wire byte was examined; a
+  release build ran on with the invariant silently violated. It was reachable from configuration:
+  `command_buffer_size` and `max_command_buffer_size` were independent `command/src/config.rs`
+  options with no cross-validation, so an operator's TOML reached the same state on the real
+  master↔worker channel. `ConfigBuilder::into_config` now rejects the pair with a new
+  `ConfigError::CommandBufferSizeExceedsMax`, naming both keys and both values, before a `Channel` is
+  ever built. `Channel::new` additionally clamps `buffer_size` to `max_buffer_size` (logging a
+  `warn!` when it does) as a structural backstop for any direct caller that bypasses config
+  validation — unlike `H2FloodConfig::new`'s clamp (#1418), which production bypasses entirely via a
+  raw struct literal, `Channel::new` is the *only* place a `Channel` is built (its buffer-size fields
+  are private), so this clamp cannot be routed around. Closes #1416.
+
 - **`fix(metrics)`: a client renewing its own cardinality lease at a LOWER level no longer trips
   `lease_apply`'s own debug assertion.** `Aggregator::lease_apply` (`lib/src/metrics/mod.rs`)
   decided whether a call was a renewal purely by `client_id` presence and never compared the

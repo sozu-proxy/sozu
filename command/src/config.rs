@@ -345,6 +345,22 @@ pub enum ConfigError {
         minimum: u64,
         listeners: usize,
     },
+    /// `command_buffer_size` is greater than `max_command_buffer_size`. The command
+    /// channel (`command/src/channel.rs`) allocates its initial buffer at
+    /// `command_buffer_size` and must never let it exceed `max_command_buffer_size` —
+    /// every growth/shrink path on that channel reasons against that ceiling. Rejected
+    /// at load rather than silently clamped, so the operator sees which of the two
+    /// keys to fix instead of the mistake being rewritten out from under them
+    /// (sozu-proxy/sozu#1416).
+    #[error(
+        "command_buffer_size = {command_buffer_size} exceeds max_command_buffer_size = \
+         {max_command_buffer_size}: lower command_buffer_size to <= {max_command_buffer_size} \
+         or raise max_command_buffer_size to >= {command_buffer_size}"
+    )]
+    CommandBufferSizeExceedsMax {
+        command_buffer_size: u64,
+        max_command_buffer_size: u64,
+    },
     /// `redirect = "<value>"` on a frontend used a value the parser doesn't
     /// recognise. Accepted values are `forward`, `permanent`, `unauthorized`
     /// (case-insensitive).
@@ -3653,6 +3669,19 @@ impl ConfigBuilder {
             });
         }
 
+        // The command channel (`Channel::new`, `command/src/channel.rs`) allocates its
+        // initial buffer at `command_buffer_size` and must never let it exceed
+        // `max_command_buffer_size` -- every growth/shrink path on that channel reasons
+        // against that ceiling. Reject at config load, where the error can name both
+        // keys and both values, rather than let a misconfigured pair reach the real
+        // master<->worker channel (sozu-proxy/sozu#1416).
+        if self.built.command_buffer_size > self.built.max_command_buffer_size {
+            return Err(ConfigError::CommandBufferSizeExceedsMax {
+                command_buffer_size: self.built.command_buffer_size,
+                max_command_buffer_size: self.built.max_command_buffer_size,
+            });
+        }
+
         // Warn (no hard reject) when the configured Basic-auth credential
         // cap is large enough to dominate the per-frontend buffer. The
         // worker copies a decoded credential into a transient allocation
@@ -4965,6 +4994,49 @@ mod tests {
         assert!(
             result.is_ok(),
             "non-H2 HTTPS listener with sub-16393 buffer should be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn command_buffer_size_exceeds_max_rejected() {
+        // command_buffer_size > max_command_buffer_size must be rejected at load
+        // (sozu-proxy/sozu#1416): otherwise the real command Channel::new starts its
+        // front/back buffers larger than the ceiling max_buffer_size is supposed to
+        // enforce.
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            command_buffer_size = 2000000
+            max_command_buffer_size = 1000000
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        match result {
+            Err(ConfigError::CommandBufferSizeExceedsMax {
+                command_buffer_size: 2_000_000,
+                max_command_buffer_size: 1_000_000,
+            }) => {}
+            other => panic!("expected CommandBufferSizeExceedsMax, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_buffer_size_equal_to_max_accepted() {
+        // The boundary itself (command_buffer_size == max_command_buffer_size) must
+        // load: `Channel::new` allocates exactly at the ceiling, never above it.
+        let toml_content = r#"
+            command_socket = "/tmp/sozu_test.sock"
+            worker_count = 1
+            command_buffer_size = 1000000
+            max_command_buffer_size = 1000000
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+        assert!(
+            result.is_ok(),
+            "command_buffer_size == max_command_buffer_size should be accepted: {result:?}"
         );
     }
 

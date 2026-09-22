@@ -230,7 +230,7 @@ cause:
   the listener has `disable_http11 = true`
   (`lib/src/https.rs:466, 496`).
 
-The startup-time validator at `command/src/config.rs:1113-1117, 1135-1141`
+The startup-time validator at `command/src/config.rs:1129-1133, 1151-1157`
 catches the obvious operator mistake of pairing `disable_http11 = true` with
 `alpn_protocols` that still contains `"http/1.1"`.
 

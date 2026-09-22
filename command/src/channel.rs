@@ -128,14 +128,47 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
     }
 
     /// Creates a nonblocking channel, using a unix stream
+    ///
+    /// `buffer_size` is clamped to `max_buffer_size` (sozu-proxy/sozu#1416):
+    /// every growth/shrink path in this file — `grow_size`, `try_read_delimited_message`,
+    /// `try_shrink_front_buf`/`try_shrink_back_buf` — reasons about `front_buf`/`back_buf`
+    /// capacity never exceeding `max_buffer_size`; a caller-supplied `buffer_size` above
+    /// that ceiling would start the channel already violating the invariant those paths
+    /// assert, before a single byte is read.
+    ///
+    /// A clamp, not a fallible constructor, because `max_buffer_size` and
+    /// `initial_buffer_size` are private fields with no external struct-literal path
+    /// around this function: `Channel::new` is the *only* place a `Channel` is built, so
+    /// unlike `H2FloodConfig::new` (sozu-proxy/sozu#1418, whose clamp is bypassed in
+    /// production by a raw struct literal in `get_h2_flood_config`) this clamp cannot be
+    /// routed around — it runs on every construction, including the dozen-plus call sites
+    /// across `bin/`, `e2e/`, `lib/examples/` and this module's own tests. Config load
+    /// (`ConfigBuilder::into_config`) is the operator-facing gate and rejects the
+    /// misconfiguration with a named error before a `Channel` is ever built; this clamp is
+    /// the structural backstop for any other direct caller that bypasses config
+    /// validation (tests, examples, a future call site), so it logs instead of silently
+    /// doing nothing observable.
     pub fn new(sock: MioUnixStream, buffer_size: u64, max_buffer_size: u64) -> Channel<Tx, Rx> {
         let buffer_size = buffer_size as usize;
         let max_buffer_size = max_buffer_size as usize;
+        let initial_buffer_size = min(buffer_size, max_buffer_size);
+        if initial_buffer_size < buffer_size {
+            warn!(
+                "channel buffer_size ({}) exceeds max_buffer_size ({}); clamping initial \
+                 buffer capacity to {}",
+                buffer_size, max_buffer_size, initial_buffer_size
+            );
+        }
+        // Postcondition: the invariant every growth/shrink path in this file assumes.
+        debug_assert!(
+            initial_buffer_size <= max_buffer_size,
+            "initial buffer capacity must never exceed max_buffer_size"
+        );
         Channel {
             sock,
-            front_buf: Buffer::with_capacity(buffer_size),
-            back_buf: Buffer::with_capacity(buffer_size),
-            initial_buffer_size: buffer_size,
+            front_buf: Buffer::with_capacity(initial_buffer_size),
+            back_buf: Buffer::with_capacity(initial_buffer_size),
+            initial_buffer_size,
             max_buffer_size,
             readiness: Ready::EMPTY,
             interest: Ready::READABLE,
@@ -1222,5 +1255,38 @@ mod tests {
                  NOTE: a panic here means the slice-OOB hardening was reverted",
             ),
         }
+    }
+
+    /// Regression for sozu-proxy/sozu#1416: `Channel::new`/`generate_nonblocking` took
+    /// `buffer_size` and `max_buffer_size` without ever comparing them, so a caller
+    /// passing `buffer_size > max_buffer_size` built a `front_buf` already larger than
+    /// the ceiling it must respect. `45, 32` is the exact pair the fuzz target's
+    /// construction generator produced before it was clamped to work around this defect.
+    /// `try_read_delimited_message` then tripped its own
+    /// "front buffer capacity must never exceed max_buffer_size" `debug_assert!` on the
+    /// very first parse, before any wire byte was examined.
+    #[test]
+    fn channel_new_clamps_buffer_size_above_max() {
+        let (mut reader, _writer): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate_nonblocking(45, 32).expect("could not generate channels");
+
+        // Parsing an empty buffer must not trip the capacity invariant assertion
+        // (pre-fix: `try_read_delimited_message`'s own "front buffer capacity must
+        // never exceed max_buffer_size" `debug_assert!` fires right here, before any
+        // wire byte is examined).
+        assert_eq!(
+            reader
+                .try_read_delimited_message()
+                .expect("parsing an empty buffer must not error"),
+            None
+        );
+
+        assert!(
+            reader.front_buf.capacity() <= 32,
+            "front buffer capacity {} must never exceed max_buffer_size 32",
+            reader.front_buf.capacity()
+        );
     }
 }
