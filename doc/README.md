@@ -72,8 +72,8 @@ Sōzu is a reverse proxy for load balancing, written in Rust. Its main job is to
 
 ## Citing code from these documents
 
-These documents anchor their claims to code. There are two forms, and the choice between them is not
-stylistic:
+These documents anchor their claims to code. There are three forms, and the choice between them is
+not stylistic:
 
 * **The prose names an item** — a function, method, struct, enum, field, constant or macro — so cite
   the *symbol*, qualified as `Type::method` so it stays greppable, with the file path and no line
@@ -82,6 +82,9 @@ stylistic:
 * **The prose means a specific statement or branch inside an item** — one `match` arm, one guard, one
   log line — so cite a line or a range: `lib/src/tcp.rs:NNN-MMM, NNN-MMM`. Keep the path
   repo-root-relative; a bare `manager.rs` is ambiguous in this tree.
+* **The prose QUOTES code in a fenced block** — so put the citation in the fence's info string and
+  let the checker compare the quote to its source, character for character. See
+  [Pinning a quoted code block](#pinning-a-quoted-code-block).
 
 A line number carries no anchor. It rots the moment anyone edits the file it points into, and the
 pull request that breaks it is almost never the pull request that contains it — so no reviewer is
@@ -171,6 +174,63 @@ decisions rather than escapes:
   one without a reason is an unreviewed silencing of the rule.
 
 [test-cit]: https://github.com/sozu-proxy/sozu/issues/1380
+
+### Pinning a quoted code block
+
+The three rules above all check a *pointer* — a path, a line number, a name. None of them looks at
+the code a document **quotes**. [sozu-proxy/sozu#1424][quote] measured what that costs:
+`doc/h2_mux_internals.md` carried fenced Rust blocks writing `self.encoder`, `self.decoder`,
+`self.converter_buf` and `self.lowercase_buf` on `ConnectionH2` months after [#1403][hpack] moved all
+four behind `hpack_state.rs`, where they are private. Every one would fail to compile with `E0609`,
+and every check here was green over them. A stale quote sitting beside a *resolving* citation reads
+as authoritative — a reader who copies it assumes the compile error is theirs.
+
+A fenced block closes that by naming the lines it quotes, in the info string, after the language:
+
+````markdown
+```rust lib/src/protocol/mux/hpack_state.rs:121-131
+pub(super) fn shrink_converter_buffers(&mut self) {
+    if self.converter_buf.capacity() > 16_384 {
+        self.converter_buf.shrink_to(4096);
+    }
+    ...
+}
+```
+````
+
+The checker reads those lines and compares them to the block, line by line. Comparison is on the
+**stripped** line, matching the drift rule, so the indentation a quote loses when it leaves an `impl`
+block is not a mismatch — every other character is. A citation may carry several spans
+(`lib/src/protocol/mux/hpack_state.rs:121-131, 139`), and the block must then be their concatenation
+in order. There is no elision
+syntax, on purpose. And because the fence line is part of the document body, the annotation is an
+ordinary citation: a pinned block is range-checked by the resolver and compared against the base
+revision by the drift rule as well.
+
+**The rule is opt-in, and that is the design, not an oversight.** Two alternatives were measured on
+this tree first:
+
+* *Compare every `rust` block against the tree.* The guarded surface holds 215 fenced blocks, 27 of
+  them Rust. Searching the whole tree for each block's exact line sequence locates 7. The other 20
+  are not stale — they are abbreviated on purpose (`pub fn readable(&mut self, context, endpoint) ->
+  MuxResult` drops the generics and the `where` clause that would bury the point), composite (one
+  block narrating two distant call sites), or simplified (`pub struct FlowKey { pub src: SocketAddr
+  }`). A rule that fires on 20 of 27 blocks is a rule that gets silenced, and a silenced rule is
+  worse than no rule.
+* *`rustdoc` doctests, via `#![doc = include_str!("../../doc/....md")]`.* This tree has no
+  `include_str!` of a markdown file and no doctest configuration anywhere, and the reason is
+  structural rather than historical: a doctest is compiled as a **separate crate against the public
+  API**. Every snippet at issue sits inside `impl ConnectionH2` and reads a private field of a
+  private type in a private module. No doctest can see any of it. The mechanism cannot reach the
+  exact class that motivated the rule.
+
+So a block that cannot be quoted verbatim simply carries no annotation and is never compared, which
+is what keeps the rule off the illustrative majority. The cost is real and worth stating: a quote
+nobody pins is a quote nobody checks. What pinning buys is that the repair is durable — the next
+refactor to move those lines is reported, instead of being found two extraction steps later.
+
+[quote]: https://github.com/sozu-proxy/sozu/issues/1424
+[hpack]: https://github.com/sozu-proxy/sozu/pull/1403
 
 ### What the resolver does not catch
 
