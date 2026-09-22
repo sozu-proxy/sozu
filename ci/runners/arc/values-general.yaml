@@ -7,6 +7,19 @@
 # (privileged pods) — that job stays on ubuntu-latest until dind (or an equivalent docker-socket
 # sidecar) is deliberately added here, since that's a real security-posture escalation and
 # shouldn't ride in silently with the rest of the matrix migration.
+#
+# Fork-PR exposure (flagged by automated security review 2026-09-22): sozu is a public repo, so
+# this scale-set is only safe under the two-layer gate the design chose — ephemeral pods (below)
+# plus GitHub's "Require approval for first-time contributors" repo setting (Task 10, operator-run,
+# not verifiable via API — no REST field exists for it as of this writing).
+#
+# Pod hardening applied 2026-09-22 per the same review: runAsNonRoot/no-new-privileges/dropped
+# capabilities/seccomp, all safe no-behavior-change additions (container already runs as uid 1001
+# per the Dockerfile's `USER runner`). Deliberately NOT applied: readOnlyRootFilesystem (a Rust
+# build writes extensively — target/, ~/.cargo, /tmp — this would need a full audit of every
+# writable path plus emptyDir mounts before it's safe) and automountServiceAccountToken: false
+# (unconfirmed whether the runner pod itself ever needs K8s API access under ARC's default,
+# non-Kubernetes containerMode — verify against ARC's runner-pod source before disabling).
 githubConfigUrl: "https://github.com/sozu-proxy/sozu"
 githubConfigSecret: sozu-runner-github-app
 
@@ -17,7 +30,17 @@ template:
   spec:
     nodeSelector:
       clever-cloud.com/nodegroup: default
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1001
+      seccompProfile:
+        type: RuntimeDefault
     containers:
       - name: runner
-        image: clevercloud/sozu-ci-runner:latest
+        image: clevercloud/sozu-ci-runner@sha256:3425e7d5438218d2237a8304cc3b5624bc4f8d85997834da6c021c6a4d410667
+        imagePullPolicy: IfNotPresent
         command: ["/home/runner/run.sh"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]

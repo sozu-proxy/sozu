@@ -11,6 +11,10 @@
 # co-scheduled on a bench node regardless of nodeSelector correctness elsewhere — this is what
 # actually buys bench reproducibility (Heracles ISCA 2015: cgroup/QoS isolation alone is
 # insufficient against LLC/DRAM-bandwidth interference; only physical node exclusivity holds).
+# Fork-PR exposure and pod hardening notes: same as values-general.yaml — see there for the full
+# rationale (ephemeral pods + Task 10's repo setting as the fork-PR gate; digest pin + safe
+# securityContext subset applied 2026-09-22 per automated security review; readOnlyRootFilesystem
+# and automountServiceAccountToken:false deliberately deferred, not silently skipped).
 githubConfigUrl: "https://github.com/sozu-proxy/sozu"
 githubConfigSecret: sozu-runner-github-app
 
@@ -21,10 +25,20 @@ template:
   spec:
     nodeSelector:
       clever-cloud.com/nodegroup: bench
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1001
+      seccompProfile:
+        type: RuntimeDefault
     containers:
       - name: runner
-        image: clevercloud/sozu-ci-runner:latest
+        image: clevercloud/sozu-ci-runner@sha256:3425e7d5438218d2237a8304cc3b5624bc4f8d85997834da6c021c6a4d410667
+        imagePullPolicy: IfNotPresent
         command: ["/home/runner/run.sh"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
         resources:
           requests:
             cpu: "15"
