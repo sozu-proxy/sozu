@@ -1145,6 +1145,7 @@ impl<V: Debug + Clone> TrieNode<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quickcheck::quickcheck;
 
     #[test]
     fn insert() {
@@ -1731,23 +1732,34 @@ mod tests {
         );
     }
 
+    /// A key `hm_insert` must skip on both the insert and the lookup pass:
+    /// the wildcard slot, keyed by literal identity rather than by the
+    /// child map. `TrieNode::insert_recursive`'s dotless arm stores a value
+    /// in `self.wildcard` whenever the LEFTMOST label of the key is exactly
+    /// `"*"` — not only when the whole key is `"*"` — because the
+    /// recursive dot-split always keeps the original first byte at index 0
+    /// of every prefix it recurses on, so only the leftmost label can ever
+    /// reach that arm. `hm_insert`'s lookups pass `accept_wildcard: false`
+    /// (it is testing plain literal lookup, not `*` resolution), which
+    /// structurally can never see `self.wildcard` — see
+    /// `TrieNode::lookup_recursive`'s step 3. A key like `"*."` or
+    /// `"*.example.com"` therefore inserts `Ok` into the wildcard slot and
+    /// then reports "did not find key" on lookup: not a router defect, a
+    /// gap in this oracle's own exclusion list. This was `qc_insert`'s
+    /// shrunk failure (`{"*.": 0}`) before this filter closed it; see the
+    /// commit message for the investigation.
+    fn hm_insert_skips(k: &str) -> bool {
+        k.is_empty()
+            || k.as_bytes()[0] == b'.'
+            || k.contains('/')
+            || k.split('.').next() == Some("*")
+    }
+
     fn hm_insert(h: std::collections::HashMap<String, u32>) -> bool {
         let mut root: TrieNode<u32> = TrieNode::root();
 
         for (k, v) in h.iter() {
-            if k.is_empty() {
-                continue;
-            }
-
-            if k.as_bytes()[0] == b'.' {
-                continue;
-            }
-
-            if k.contains('/') {
-                continue;
-            }
-
-            if k == "*" {
+            if hm_insert_skips(k) {
                 continue;
             }
 
@@ -1763,19 +1775,7 @@ mod tests {
 
         //root.print();
         for (k, v) in h.iter() {
-            if k.is_empty() {
-                continue;
-            }
-
-            if k.as_bytes()[0] == b'.' {
-                continue;
-            }
-
-            if k.contains('/') {
-                continue;
-            }
-
-            if k == "*" {
+            if hm_insert_skips(k) {
                 continue;
             }
 
@@ -1803,13 +1803,11 @@ mod tests {
         true
     }
 
-    /* FIXME: randomly fails
     quickcheck! {
       fn qc_insert(h: std::collections::HashMap<String, u32>) -> bool {
         hm_insert(h)
       }
     }
-    */
 
     #[test]
     fn insert_disappearing_tree() {

@@ -2461,6 +2461,7 @@ impl RouteResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quickcheck::{Arbitrary, Gen, TestResult, quickcheck};
 
     fn test_http_frontend() -> HttpFrontend {
         HttpFrontend {
@@ -7342,5 +7343,631 @@ mod tests {
                 .is_err(),
             "and removing it must actually unroute it",
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Property-test harness: sozu#1349, sozu#1351, sozu#1356, sozu#1377
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // Every regression test above pins ONE fixed example. This harness
+    // generates many, against an ORACLE that is independent of the trie:
+    // it does not call `pattern_trie::anchored_segment`,
+    // `compiled_segment`, `TrieNode::lookup*`, `tree_hostname_to_ascii` or
+    // `convert_regex_domain_rule` — reusing any of those would make the
+    // oracle agree with the implementation by construction, proving
+    // nothing. It is written fresh from `doc/configure.md`'s "Hostname
+    // precedence" and "Regex hostname segments" sections and the RFC text
+    // those sections cite (RFC 9110 §4.2.3 for case, RFC 9110's own
+    // grammar for the wildcard), and it uses the `regex` crate only as a
+    // primitive — exactly as `pattern_trie` does — never the router's own
+    // wrapping of it.
+    //
+    // Scope, stated explicitly because it is a deliberate narrowing: every
+    // generated rule and every query share the fixed two-label suffix
+    // `example.com`, one variable FRONT label, and `MethodRule::new(None)`
+    // (matches every method). This is what puts every rule in a scenario
+    // on the SAME trie branch, which is where sozu#1351's leak and
+    // precedence questions live, and it removes METHOD precedence from
+    // the oracle's job — a separate concern with its own existing tests
+    // (`case_normalisation_runs_before_the_hostname_precedence_search`
+    // and neighbours). PATH does vary — see `PATH_POOL` — because sozu#1351's
+    // actual production symptom needs it: with every rule pinned to the
+    // SAME path, a literal whose insert would leak onto a regex leaf finds
+    // that leaf already carrying an identical `(path, method)`, so
+    // `add_tree_rule`'s append-skip condition is always false and the
+    // insert is refused before any lookup happens — the leak is real but
+    // observable only as `add_tree_rule` returning `false`, never as a
+    // routing mismatch. Varying path is what lets the SAME leak surface the
+    // way it did in production: an exact rule at one path answering a
+    // request for a hostname nobody declared, at a DIFFERENT declared path.
+    //
+    // The generator is biased, not uniform: `REGEX_CATALOG` is the fixed
+    // set of segment shapes that actually bit sozu, `LITERAL_POOL`
+    // deliberately overlaps those shapes' `hits` so an exact rule and a
+    // regex rule naturally collide on the same host (sozu#1351), case is
+    // varied on both the declared rule and the query independently
+    // (sozu#1349), declaration order is an explicit Fisher-Yates shuffle
+    // driven by the same `Gen` (sozu#1351 again — order must not move an
+    // exact-vs-regex verdict, and must move a regex-vs-regex one), and
+    // queries cross every generated hit/miss hostname against every path
+    // declared anywhere in the scenario, not just the declaring rule's own
+    // (sozu#1351's leak crosses fronts, so a query pairing has to as well).
+    //
+    // Two honesty notes about this harness's own limits, not the router's:
+    //
+    // - **No reproducible seed.** `quickcheck` 1.1.0's `Gen::new` seeds
+    //   from OS entropy with no seed exposed to reproduce a specific run,
+    //   unlike the FoundationDB-style simulators `doc/testing.md` §5
+    //   describes (`SOZU_UDP_SIM_SEED` and friends). A failing CI run here
+    //   is reproduced by RE-RUNNING locally with a raised `QUICKCHECK_TESTS`
+    //   (this property's generator is dense enough that a real regression
+    //   reappears quickly), not by replaying the failing seed — there is
+    //   none to replay. Not fixed in this changeset.
+    // - **The anchoring convention is shared, not external.** This oracle's
+    //   `\A(?:source)\z` case-insensitive anchoring matches
+    //   `doc/configure.md`'s "Regex hostname segments" section — but that
+    //   section's prose was itself ADDED by the sozu#1356 fix this harness
+    //   is supposed to catch a regression of. So for the GROUPING half of
+    //   that anchoring, the oracle and the implementation share a
+    //   convention rather than the oracle checking against an independent
+    //   spec; a regression that un-groups BOTH the doc and the code back to
+    //   their pre-#1356 form would not be caught by prose comparison alone
+    //   — it is caught here because the oracle's grouping is also
+    //   independently reasoned from what `|`'s precedence in a regex
+    //   grammar requires, the same reasoning #1356's own fix commit gives.
+    //   The CASE-FOLDING half (`(?i)`) is genuinely independent, derived
+    //   straight from RFC 9110 §4.2.3, not from anything #1356 or #1377
+    //   added to `doc/configure.md`.
+
+    /// One `/regex/` hostname segment source this harness declares, with
+    /// concrete labels independently reasoned to match or not match it
+    /// under `\A(?:source)\z` compiled case-insensitively — the anchoring
+    /// `doc/configure.md` documents and sozu#1356 restored, built fresh
+    /// here rather than borrowed from `anchored_segment`.
+    struct RegexCase {
+        source: &'static str,
+        /// Whole-label matches for one branch of the pattern.
+        hits: &'static [&'static str],
+        /// Labels that must NOT match under the documented semantics, but
+        /// that a pre-fix implementation matched: a half-anchored
+        /// alternation branch (sozu#1356 — `axx`, `xxb`, the bare
+        /// substring `zzbzz` for a 3-way alternation's ungrouped middle
+        /// branch) or the inverted class an ASCII-lowercase fold produces
+        /// (sozu#1377 — folding `\D` into `\d` turns "not a digit" into
+        /// "a digit").
+        misses: &'static [&'static str],
+    }
+
+    const REGEX_CATALOG: &[RegexCase] = &[
+        RegexCase {
+            source: "a|b",
+            hits: &["a", "b"],
+            misses: &["axx", "xxb", "xx"],
+        },
+        RegexCase {
+            source: "a|b|c",
+            // The 3-branch case two branches cannot express: ungrouped,
+            // the MIDDLE branch of `\Aa|b|c\z` keeps NEITHER anchor and
+            // matches as a bare substring anywhere in the label.
+            hits: &["a", "b", "c"],
+            misses: &["axx", "xxc", "zzbzz", "bzz", "zzb"],
+        },
+        RegexCase {
+            source: "api|admin",
+            // `doc/configure.md`'s own worked example for sozu#1356.
+            hits: &["api", "admin"],
+            misses: &["apifoo", "xadmin"],
+        },
+        RegexCase {
+            source: "\\D+",
+            // sozu#1377's own measured shape: folded to `\d+`, this
+            // matched digits and rejected letters — the complement.
+            hits: &["abc", "xyz"],
+            misses: &["777", "42"],
+        },
+        RegexCase {
+            source: "\\W+",
+            hits: &["---", "..."],
+            misses: &["abc", "42a"],
+        },
+        RegexCase {
+            source: "\\S+",
+            hits: &["abc", "777"],
+            // Folded to `\s`, this would match ONLY whitespace; no ASCII
+            // hostname label the wire ever admits can carry one, but
+            // `Router::lookup` takes a plain `&str` and does not itself
+            // re-validate the charset, so the harness can still probe it.
+            misses: &[" "],
+        },
+        RegexCase {
+            source: "[^\\D]+",
+            // sozu#1377's negated-class shape from the issue itself:
+            // "not a non-digit" is a digit; folded it becomes its own
+            // complement.
+            hits: &["777", "42"],
+            misses: &["abc"],
+        },
+        RegexCase {
+            source: "API[0-9]",
+            // An uppercase literal INSIDE a class: must still meet the
+            // lowercased lookup key by folding at compile time, not by
+            // folding the stored source (which would invert the escapes
+            // above in the very same pass).
+            hits: &["api7", "API7", "ApI4"],
+            misses: &["apiZ"],
+        },
+        RegexCase {
+            source: "test[0-9]",
+            // sozu#1351's own shape: `test4` is also `LITERAL_POOL`'s
+            // exact-rule text, so a literal `test4` rule and this regex
+            // rule collide on the same host with decent probability.
+            hits: &["test4", "TEST7", "Test9"],
+            misses: &["testA", "test10x"],
+        },
+        RegexCase {
+            source: "[a-z]+[0-9]",
+            hits: &["test4", "cdn1"],
+            misses: &["4test", "TEST"],
+        },
+    ];
+
+    /// Literal exact-rule candidates. Deliberately overlapping with
+    /// `REGEX_CATALOG`'s `hits` — `test4`, `api`, `admin`, `a`, `b`, `c`
+    /// all reappear there — so an exact rule and an overlapping regex
+    /// rule land in the SAME generated scenario often enough to exercise
+    /// sozu#1351 without hand-injecting a forced pair.
+    const LITERAL_POOL: &[&str] = &[
+        "a", "b", "c", "api", "admin", "test4", "test7", "test9", "TEST4", "API7", "abc", "777",
+        "42", "cdn1", "zz", "apifoo", "xadmin",
+    ];
+
+    /// Declared-path candidates. Small and deliberately NOT elaborate: the
+    /// production shape of sozu#1351 needs exactly two rules at two
+    /// different paths (reproduced live against the reverted fix: an exact
+    /// `test4.example.com` frontend at `/other` leaking onto the
+    /// `/test[0-9]/.example.com` regex family, answering `test7.example.com`
+    /// requests for `/other`). `"/"` is a prefix of every other entry here
+    /// and is weighted to appear often, so a scenario still frequently
+    /// declares two fronts at the SAME path (exercising the harness's
+    /// pre-existing hostname-only coverage) as well as at different ones
+    /// (exercising the path dimension this fixes). Every entry is used only
+    /// as a `PathRule::Prefix`; `PathRule::Equals`/`PathRule::Regex` are not
+    /// generated — see the module doc comment for why method stays fixed
+    /// too, and the same reasoning applies here: sozu#1351 needs two
+    /// declared paths to differ, not the full path-matching precedence
+    /// surface, which has its own existing tests.
+    const PATH_POOL: &[&str] = &["/", "/", "/other", "/api", "/only"];
+
+    /// The dot-separated FRONT label of a generated Tree-position
+    /// hostname rule. Every rule in a [`Scenario`] shares the fixed
+    /// trailing `example.com` — see the harness's module-level doc
+    /// comment for why.
+    #[derive(Clone, Copy, Debug)]
+    enum FrontLabel {
+        /// A literal label, in whatever case the generator chose.
+        /// `tree_hostname_to_ascii` case-folds it on insert (sozu#1377).
+        Literal(&'static str),
+        /// The leftmost-only wildcard, exactly one label.
+        Wildcard,
+        /// A `/regex/` segment, addressed into [`REGEX_CATALOG`].
+        Regex(usize),
+    }
+
+    /// Dedup identity for a [`FrontLabel`] within one scenario. Two
+    /// literals that differ only by case must be treated as the SAME
+    /// front: `add_tree_rule` case-folds them to the same trie node, and
+    /// generating both would silently drop one rule's cluster id from the
+    /// harness's own model — a harness bug, not something under test.
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    enum FrontKey {
+        Literal(String),
+        Wildcard,
+        Regex(usize),
+    }
+
+    impl From<FrontLabel> for FrontKey {
+        fn from(front: FrontLabel) -> Self {
+            match front {
+                FrontLabel::Literal(text) => FrontKey::Literal(text.to_ascii_lowercase()),
+                FrontLabel::Wildcard => FrontKey::Wildcard,
+                FrontLabel::Regex(idx) => FrontKey::Regex(idx),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct GenRule {
+        front: FrontLabel,
+        /// This rule's OWN declared path, from [`PATH_POOL`]. Every front
+        /// carries exactly one `(path, route)` pair in this harness's
+        /// model — one `add_tree_rule` call per generated front — so there
+        /// is no within-one-hostname path-precedence list to model; only
+        /// whether THIS front's path serves a given query path.
+        path: &'static str,
+        cluster: String,
+    }
+
+    /// One generated case: a set of Tree-position rules, in DECLARATION
+    /// order (already shuffled — see [`Scenario::arbitrary`]), and a set
+    /// of (hostname, path) queries to look up against them.
+    #[derive(Clone, Debug)]
+    struct Scenario {
+        rules: Vec<GenRule>,
+        queries: Vec<(String, String)>,
+    }
+
+    fn render_hostname(front: FrontLabel) -> String {
+        match front {
+            FrontLabel::Literal(text) => format!("{text}.example.com"),
+            FrontLabel::Wildcard => "*.example.com".to_owned(),
+            FrontLabel::Regex(idx) => format!("/{}/.example.com", REGEX_CATALOG[idx].source),
+        }
+    }
+
+    /// The oracle's OWN anchoring: `\A(?:source)\z`, case-insensitive.
+    /// Built fresh from `doc/configure.md`'s "Regex hostname segments"
+    /// section and the sozu#1356 fix's stated invariant, not by calling
+    /// `pattern_trie::anchored_segment` or `compiled_segment`. Using the
+    /// `regex` crate as a primitive is not reusing the implementation:
+    /// regex matching itself is not what any of the four issues broke —
+    /// Sozu's own anchoring, grouping and case handling around it is.
+    fn oracle_regex_matches(source: &str, label: &str) -> bool {
+        let pattern = format!("(?i)\\A(?:{source})\\z");
+        Regex::new(&pattern)
+            .unwrap_or_else(|error| {
+                panic!("the harness's own catalog regex {source:?} must compile: {error}")
+            })
+            .is_match(label.as_bytes())
+    }
+
+    fn front_label_matches(front: FrontLabel, query_label: &str) -> bool {
+        match front {
+            FrontLabel::Literal(text) => text.eq_ignore_ascii_case(query_label),
+            FrontLabel::Wildcard => !query_label.is_empty(),
+            FrontLabel::Regex(idx) => oracle_regex_matches(REGEX_CATALOG[idx].source, query_label),
+        }
+    }
+
+    /// Whether `front` (this harness's stand-in for one declared Tree
+    /// rule) matches the full hostname `query` — case-insensitively on
+    /// the fixed `example.com` suffix (RFC 9110 §4.2.3, sozu#1349) and
+    /// per [`front_label_matches`] on the one variable label.
+    fn oracle_hostname_matches(front: FrontLabel, query: &str) -> bool {
+        let mut labels = query.split('.');
+        let (Some(first), Some(second), Some(third), None) =
+            (labels.next(), labels.next(), labels.next(), labels.next())
+        else {
+            return false;
+        };
+        second.eq_ignore_ascii_case("example")
+            && third.eq_ignore_ascii_case("com")
+            && front_label_matches(front, first)
+    }
+
+    /// `PathRule::Prefix` semantics (`PathRule::matches`, `router/mod.rs`):
+    /// a rule matches iff the query path starts with the declared path's
+    /// bytes. Every generated front carries exactly one path, so there is
+    /// no longest-prefix tie-break to model here — see [`GenRule::path`].
+    fn oracle_path_matches(rule_path: &str, query_path: &str) -> bool {
+        query_path.starts_with(rule_path)
+    }
+
+    /// The oracle's precedence search, stated in `doc/configure.md` under
+    /// "Hostname precedence" and restored by sozu#1351: the EXACT name,
+    /// then a REGEX segment (the first declared among those that match),
+    /// then the `*` WILDCARD — each candidate accepted only when it ALSO
+    /// serves this request's path (`Router::lookup` hands the trie the
+    /// same path-serving predicate it uses on the winner, so a hostname
+    /// candidate that matches but does not serve this path is skipped
+    /// rather than ending the search — `doc/configure.md`, "Hostname
+    /// precedence": "a search, not a filter"). Exact-vs-regex hostname
+    /// precedence is checked in a pass that does not depend on `rules`'
+    /// order at all — the documented, order-independent half of the
+    /// invariant sozu#1351 restored. Regex-vs-regex precedence is "first
+    /// in `rules`' own order that matches (hostname AND path)" — the half
+    /// that DOES still depend on declaration order, by design
+    /// (`doc/configure.md`, "Regex hostname segments").
+    fn oracle_lookup<'r>(rules: &'r [GenRule], hostname: &str, path: &str) -> Option<&'r str> {
+        let serves = |rule: &&GenRule| {
+            oracle_hostname_matches(rule.front, hostname) && oracle_path_matches(rule.path, path)
+        };
+        rules
+            .iter()
+            .find(|rule| matches!(rule.front, FrontLabel::Literal(_)) && serves(rule))
+            .or_else(|| {
+                rules
+                    .iter()
+                    .find(|rule| matches!(rule.front, FrontLabel::Regex(_)) && serves(rule))
+            })
+            .or_else(|| {
+                rules
+                    .iter()
+                    .find(|rule| matches!(rule.front, FrontLabel::Wildcard) && serves(rule))
+            })
+            .map(|rule| rule.cluster.as_str())
+    }
+
+    /// Vary the case of `s`: as declared, all-uppercase, all-lowercase, or
+    /// a per-character random mix — independently of whatever case the
+    /// OTHER side (rule vs. query) picked, so RFC 9110 §4.2.3
+    /// case-insensitivity (sozu#1349) is exercised on both sides and not
+    /// just one.
+    fn case_variant(g: &mut Gen, s: &str) -> String {
+        match u8::arbitrary(g) % 4 {
+            0 => s.to_owned(),
+            1 => s.to_ascii_uppercase(),
+            2 => s.to_ascii_lowercase(),
+            _ => s
+                .chars()
+                .map(|c| {
+                    if bool::arbitrary(g) {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c.to_ascii_lowercase()
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn push_unique_front(
+        front: FrontLabel,
+        path: &'static str,
+        rules: &mut Vec<GenRule>,
+        seen: &mut Vec<FrontKey>,
+    ) {
+        let key = FrontKey::from(front);
+        if seen.contains(&key) {
+            return;
+        }
+        seen.push(key);
+        let cluster = format!("C{}", rules.len());
+        rules.push(GenRule {
+            front,
+            path,
+            cluster,
+        });
+    }
+
+    /// One hit and one miss hostname sample per declared front (see
+    /// [`RegexCase`]'s doc comment for what those pin), plus three
+    /// universal hostname probes every scenario gets regardless of what it
+    /// declared: an unrelated host that must match nothing, the bare
+    /// suffix with the front label dropped entirely (must miss even a
+    /// declared wildcard, which stands for exactly one label and not
+    /// zero), and its uppercase spelling.
+    ///
+    /// Each hit hostname is queried at EVERY distinct path declared
+    /// anywhere in the scenario, not just its own front's path — sozu#1351's
+    /// leak crosses fronts (an exact rule's cluster answering a DIFFERENT
+    /// hostname, at whatever path THAT hostname's own rule declared), so a
+    /// query pairing that only ever asked a front's own path could not
+    /// observe it. Miss hostnames and the universal probes are checked only
+    /// at their own front's path (or `/`): they exist to confirm a mismatch
+    /// does not appear where none is expected, which does not need the
+    /// cross product.
+    fn push_hit_queries(
+        g: &mut Gen,
+        label: &str,
+        declared_paths: &[&str],
+        queries: &mut Vec<(String, String)>,
+    ) {
+        for &path in declared_paths {
+            queries.push((
+                format!("{}.example.com", case_variant(g, label)),
+                path.to_owned(),
+            ));
+        }
+    }
+
+    fn generate_queries(g: &mut Gen, rules: &[GenRule]) -> Vec<(String, String)> {
+        let mut queries = Vec::new();
+        let mut declared_paths: Vec<&str> = rules.iter().map(|rule| rule.path).collect();
+        declared_paths.sort_unstable();
+        declared_paths.dedup();
+
+        for rule in rules {
+            match rule.front {
+                FrontLabel::Literal(text) => {
+                    push_hit_queries(g, text, &declared_paths, &mut queries);
+                }
+                FrontLabel::Wildcard => {
+                    let label = *g.choose(LITERAL_POOL).unwrap_or(&"zz");
+                    push_hit_queries(g, label, &declared_paths, &mut queries);
+                }
+                FrontLabel::Regex(idx) => {
+                    let case = &REGEX_CATALOG[idx];
+                    if let Some(&hit) = g.choose(case.hits) {
+                        push_hit_queries(g, hit, &declared_paths, &mut queries);
+                    }
+                    if let Some(miss) = g.choose(case.misses) {
+                        queries.push((
+                            format!("{}.example.com", case_variant(g, miss)),
+                            rule.path.to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        queries.push((
+            format!("{}.example.com", case_variant(g, "unmatched-host")),
+            "/".to_owned(),
+        ));
+        queries.push(("example.com".to_owned(), "/".to_owned()));
+        queries.push(("EXAMPLE.COM".to_owned(), "/".to_owned()));
+
+        queries
+    }
+
+    impl Arbitrary for Scenario {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let mut rules = Vec::new();
+            let mut seen_keys = Vec::new();
+
+            let pick_path = |g: &mut Gen| {
+                *g.choose(PATH_POOL)
+                    .expect("PATH_POOL is a non-empty const slice")
+            };
+
+            // With even odds, include the wildcard: it participates in
+            // every precedence chain and costs only one extra rule.
+            if bool::arbitrary(g) {
+                let path = pick_path(g);
+                push_unique_front(FrontLabel::Wildcard, path, &mut rules, &mut seen_keys);
+            }
+
+            // 1..=3 additional fronts, each independently a regex segment
+            // or a literal drawn from the overlap-biased pool, each with
+            // its own independently chosen path.
+            let extra = 1 + (u8::arbitrary(g) % 3);
+            for _ in 0..extra {
+                if bool::arbitrary(g) {
+                    let idx = usize::from(u8::arbitrary(g)) % REGEX_CATALOG.len();
+                    let path = pick_path(g);
+                    push_unique_front(FrontLabel::Regex(idx), path, &mut rules, &mut seen_keys);
+                } else {
+                    let text = *g
+                        .choose(LITERAL_POOL)
+                        .expect("LITERAL_POOL is a non-empty const slice");
+                    let path = pick_path(g);
+                    push_unique_front(FrontLabel::Literal(text), path, &mut rules, &mut seen_keys);
+                }
+            }
+
+            // Declaration order is itself under test (sozu#1351): shuffle
+            // with a Fisher-Yates driven by the same `Gen`, independent of
+            // insertion order above.
+            for i in (1..rules.len()).rev() {
+                let j = usize::from(u8::arbitrary(g)) % (i + 1);
+                rules.swap(i, j);
+            }
+
+            let queries = generate_queries(g, &rules);
+            Scenario { rules, queries }
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            let mut shrunk = Vec::new();
+
+            for i in 0..self.rules.len() {
+                let mut rules = self.rules.clone();
+                rules.remove(i);
+                shrunk.push(Scenario {
+                    rules,
+                    queries: self.queries.clone(),
+                });
+            }
+
+            for i in 0..self.queries.len() {
+                let mut queries = self.queries.clone();
+                queries.remove(i);
+                shrunk.push(Scenario {
+                    rules: self.rules.clone(),
+                    queries,
+                });
+            }
+
+            Box::new(shrunk.into_iter())
+        }
+    }
+
+    /// Every catalog entry's own `hits`/`misses` verdicts, checked against
+    /// nothing but [`oracle_regex_matches`] — a self-check that the
+    /// harness's table is internally consistent BEFORE it is trusted to
+    /// judge the router. This does not touch `Router` or `TrieNode` at
+    /// all.
+    #[test]
+    fn regex_catalog_samples_match_their_own_documented_semantics() {
+        for case in REGEX_CATALOG {
+            for hit in case.hits {
+                assert!(
+                    oracle_regex_matches(case.source, hit),
+                    "{:?} must match {hit:?} under \\A(?:...)\\z case-insensitive",
+                    case.source,
+                );
+            }
+            for miss in case.misses {
+                assert!(
+                    !oracle_regex_matches(case.source, miss),
+                    "{:?} must NOT match {miss:?} under \\A(?:...)\\z case-insensitive",
+                    case.source,
+                );
+            }
+        }
+    }
+
+    /// Build the rules `scenario` declares into a fresh [`Router`], in
+    /// its own declaration order, then check every query against both the
+    /// oracle and the router.
+    fn oracle_matches_router(scenario: Scenario) -> TestResult {
+        if scenario.rules.is_empty() {
+            return TestResult::discard();
+        }
+
+        let mut router = Router::new();
+        for rule in &scenario.rules {
+            let hostname = render_hostname(rule.front);
+            // A refused insert here is not automatically dismissed as a
+            // harness artifact: sozu#1351's own mechanism (a literal
+            // resolving through a matching regex segment because
+            // `TrieNode::lookup_mut`'s guard is gone) can make this EXACT
+            // call return `false`, when the two fronts' generated paths
+            // happen to coincide -- see the module doc comment. Every
+            // front here is still unique (`FrontKey`-deduped) and every
+            // catalog regex compiles standalone, so a refusal is real
+            // signal either way: fail loudly and report it rather than
+            // silently skipping the rule, which would just hide the
+            // question inside a `None` at lookup time instead of at
+            // insert time.
+            if !router.add_tree_rule(
+                hostname.as_bytes(),
+                &PathRule::Prefix(rule.path.to_owned()),
+                &MethodRule::new(None),
+                &Route::ClusterId(rule.cluster.clone()),
+            ) {
+                eprintln!(
+                    "INSERT REFUSED hostname={hostname:?} path={:?} cluster={:?} \
+                     declared-so-far={:?}",
+                    rule.path,
+                    rule.cluster,
+                    scenario
+                        .rules
+                        .iter()
+                        .map(|r| (render_hostname(r.front), r.path))
+                        .collect::<Vec<_>>(),
+                );
+                return TestResult::failed();
+            }
+        }
+
+        for (hostname, path) in &scenario.queries {
+            let expected = oracle_lookup(&scenario.rules, hostname, path);
+            let actual = router
+                .lookup(hostname, path, &Method::Get)
+                .ok()
+                .and_then(|result| result.cluster_id);
+
+            if expected != actual.as_deref() {
+                let declared: Vec<(String, &str)> = scenario
+                    .rules
+                    .iter()
+                    .map(|rule| (render_hostname(rule.front), rule.path))
+                    .collect();
+                eprintln!(
+                    "MISMATCH host={hostname:?} path={path:?} expected={expected:?} \
+                     actual={actual:?} declared (in order, with path)={declared:?}",
+                );
+                return TestResult::failed();
+            }
+        }
+
+        TestResult::passed()
+    }
+
+    quickcheck! {
+        fn qc_router_hostname_resolution_matches_the_documented_semantics(scenario: Scenario) -> TestResult {
+            oracle_matches_router(scenario)
+        }
     }
 }

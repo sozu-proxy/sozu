@@ -108,6 +108,32 @@ Notes:
   swarm) is proposed but intentionally not added by the change that introduced
   this simulator — wiring CI is a separate decision. Run it manually with the
   command in "Targeted runs" until that decision is made.
+- **Router hostname resolution is unit-tested with `quickcheck`**
+  (`lib/src/router/mod.rs`,
+  `qc_router_hostname_resolution_matches_the_documented_semantics`), on top of
+  the example-based regression tests pinning individual fixed bugs. The
+  property is checked against an ORACLE independent of `pattern_trie` —
+  written fresh from `doc/configure.md`'s "Hostname precedence" and "Regex
+  hostname segments" sections rather than by calling the trie's own matching
+  functions — over a generator biased toward mixed exact/wildcard/regex rules,
+  case variation, uppercase regex escapes, alternations, permuted declaration
+  order, and a small pool of distinct declared PATHS crossed against every
+  declared hostname: the shapes behind sozu#1349, #1351, #1356 and #1377. Path
+  varies deliberately — sozu#1351's real symptom (an exact rule leaking onto a
+  regex family) is only observable as a routing MISMATCH when two colliding
+  fronts declare different paths; pinned to one shared path, the same leak
+  still happens but surfaces as a refused insert instead. Two known limits,
+  noted in the harness's own doc comment rather than left implicit: it has no
+  reproducible seed (`quickcheck` 1.1.0 seeds `Gen` from OS entropy, unlike the
+  FoundationDB-style simulators in §5 below), so a CI failure is reproduced by
+  re-running with a raised `QUICKCHECK_TESTS`, not by seed replay; and its
+  regex anchoring convention (`\A(?:…)\z`, non-capturing) matches
+  `doc/configure.md`'s own prose because that prose was itself added by the
+  sozu#1356 fix, so that half is a shared convention rather than an
+  independent spec — the case-folding half is genuinely RFC 9110 §4.2.3
+  derived. `lib/src/router/pattern_trie.rs`'s `qc_insert` is the same
+  technique applied to raw trie insert/lookup, independent of routing
+  semantics.
 - `e2e/src/tests/fuzz_tests.rs` is a thin integration wrapper that shells out to
   the four fuzz targets for 10 s each. It *skips gracefully* (prints a notice,
   returns clean) when the nightly toolchain or `cargo-fuzz` is missing, so the
