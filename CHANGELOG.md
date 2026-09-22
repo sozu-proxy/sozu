@@ -2007,6 +2007,56 @@
   say path regexes are NOT anchored, is corrected in the same changeset; the "write your own
   anchors" advice is gone.
 
+- **`refactor(load-balancing)`: `Random` and `PowerOfTwo` seed their own RNG at construction
+  instead of reaching for the ambient thread-local `rand::rng()`.** Two call sites drew from
+  process entropy on the selection hot path: `Random::next_available_backend` and `PowerOfTwo`'s
+  two-candidate tie-break. Both now hold a `rand::rngs::StdRng` field seeded at construction, via
+  `Random::new()` / `PowerOfTwo::new(metric)`. `BackendList::{new, set_load_balancing_policy}`
+  (`lib/src/backends.rs`) are the only two call sites and now go through those constructors.
+  This does not make selection constant: `next_available_backend` advances the stored RNG on every
+  call, so a sequence of calls still draws a well-distributed spread of backends — the seed makes
+  the *sequence* reproducible given the same seed and the same call sequence, not the *pick*.
+  **Seed source, and a defect an earlier revision of this branch shipped:** `new()` reads a fresh
+  seed from the OS (`StdRng::try_from_rng(&mut rand::rngs::SysRng)`) once, at construction —
+  off the datapath, so it never touches process entropy on the hot path, same discipline `Rendezvous`
+  and `Maglev` already follow for their hashers. It does **not** seed from the existing
+  `DEFAULT_HASH_SEED` constant those two use, and an earlier revision that did so was wrong: review
+  caught that `Rendezvous`/`Maglev` feed their seed into a *pure, stateless* hash function (same
+  `(seed, key, addr)` in, same score out, independent of call history), so sharing `DEFAULT_HASH_SEED`
+  fleet-wide is exactly what gives them their cross-worker/cross-restart agreement for a given key.
+  `Random`/`PowerOfTwo` feed their seed into a *stateful, advancing* `StdRng`, where the n-th pick
+  depends on the whole call history — seeding that from a shared compile-time constant would have
+  made every worker, on every cold start, with an identically-ordered backend list, draw from a
+  bit-for-bit identical keystream: every fresh worker's first `Random` pick over N equal-weight
+  backends would be the same index, fleet-wide, on every restart, and every worker's first
+  `PowerOfTwo` tie-break (the common case, since every backend starts at zero load) would resolve
+  identically. That is precisely the correlated-load event uniform selection exists to prevent,
+  landing at the worst possible moment — a synchronised redeploy, when every worker's call counter
+  resets together and initial load is otherwise indistinguishable. `DEFAULT_HASH_SEED` stays
+  exactly where it is and keeps meaning exactly what it always meant for `Rendezvous`/`Maglev`; it is
+  not reused here. `Random::with_seed(seed)` / `PowerOfTwo::with_seed(seed, metric)` still exist,
+  unchanged, for tests and any future deterministic simulator that needs a fixed, reproducible
+  sequence — do not "simplify" `new()` back to `with_seed(DEFAULT_HASH_SEED, ..)`; that is the exact
+  regression this paragraph documents.
+  `PowerOfTwo`'s tie-break was separately considered for a deterministic replacement (lowest backend
+  id) and rejected: unlike `Rendezvous`/`Maglev`, `PowerOfTwo` carries no affinity key, so there is no
+  same-key-same-backend requirement to preserve, and every backend starts at zero load, so ties are
+  the common case, not the rare one — a deterministic tie-break would bias every worker toward the
+  same backend on exactly the events (cold start, post-scale-up rebalance) power-of-two-choices
+  exists to spread out. The seeded, advancing RNG keeps that spread while satisfying the
+  no-ambient-entropy-on-the-hot-path rule.
+  Verified with a red-then-green regression test in `lib/src/load_balancing.rs`: on the pre-change
+  code, two `Random` (respectively `PowerOfTwo`) instances constructed the same way and driven
+  through the same 20-call sequence over a cloned backend list diverge (seen failing); after the
+  change, `Random::with_seed`/`PowerOfTwo::with_seed` reproduce an identical, hardcoded-expected
+  sequence (a literal coupled to `rand` 0.10.2's exact `StdRng` algorithm — noted at the assertion so
+  a future `rand` bump is diagnosed correctly), and a separate 5,000-draw smoke check confirms
+  neither collapses onto a single backend (a coarse bound: it catches full collapse or gross bias,
+  not a systematic skew — documented at the assertion, not oversold in the name). Two further tests,
+  `random_new_instances_are_not_correlated` and `power_of_two_new_instances_are_not_correlated`,
+  guard the defect directly: two `new()` instances must diverge, which would fail immediately if
+  `new()` were ever changed back to a shared constant seed.
+
 ### ➖ Removed
 
 - **BREAKING (library API) — `refactor(kawa_h1)`: delete the unreachable `Http` session state
