@@ -747,21 +747,80 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
         }
 
         if self.front_buf.available_space() == 0 {
-            // KNOWN REMAINING, tracked as sozu-proxy/sozu#1436 and
-            // deliberately not folded into sozu-proxy/sozu#1428: this arm
-            // returns without consuming and without moving a readiness bit, so
-            // it wedges its session exactly as the oversize arm above used to.
-            // It is reachable -- decode a frame of at most `capacity / 2` out
-            // of a buffer filled to `capacity` and `Buffer::consume` advances
-            // `position` without reaching its shift threshold, which leaves
-            // `available_space() == 0` while the next declared length no longer
-            // fits the data that remains. Its recovery is NOT this branch's,
-            // though: those bytes are still buffered and a `Buffer::shift`
-            // would make room, so the frame can still complete and the peer is
-            // blameless. Marking the channel errored here would drop a
-            // conforming peer over an internal buffer-management detail, which
-            // is precisely the conflation this changeset corrects above.
+            // Compact before concluding anything about the space (fixes
+            // sozu-proxy/sozu#1436). `available_space()` is `capacity - end`,
+            // so it measures the free TAIL, not the free room: a buffer whose
+            // `position` sits mid-way reports zero space while holding
+            // `position` reusable bytes at its head. `Buffer::consume`
+            // (`command/src/buffer/growable.rs`) only compacts past
+            // `capacity / 2`, so decoding one frame of at most half the
+            // capacity out of a buffer filled to capacity leaves exactly that
+            // layout, and `Buffer::shift` hands the room straight back.
+            //
+            // Without it this arm returned `BufferFull` without consuming and
+            // without moving a readiness bit -- the shape
+            // sozu-proxy/sozu#1428 removed from the two branches above -- and
+            // no later call could recover: `readable()` sees
+            // `available_space() == 0`, gets `None` from `grow_size` at the
+            // ceiling and executes `interest.remove(Ready::READABLE)`, so
+            // every later `readable()` returns `Err(Connection(None))` and
+            // `fill` is out of reach; `consume` needs a decoded frame or an
+            // under-delimiter length, which this return path never reaches;
+            // and `try_shrink_front_buf` is never reached, because both
+            // `read_message` paths call it only after a frame decoded, and
+            // both of its own early returns would stop it anyway --
+            // `capacity <= initial_buffer_size` whenever the channel was
+            // configured with `command_buffer_size == max_command_buffer_size`,
+            // and `available_data() * 4 < initial_buffer_size`, which is false
+            // with that much pending. Not because it shrinks rather than
+            // shifts: `Buffer::shrink` calls `shift` unconditionally before its
+            // own size bail, so reaching it WOULD have compacted. The session
+            // then wedged permanently, holding its file descriptor and a full
+            // buffer, on a peer that had done nothing wrong.
+            //
+            // Compacting here also changes the sub-ceiling path: a front buffer
+            // still below `max_buffer_size` now compacts on its first zero-space
+            // parse and grows on the next one, rather than doubling straight
+            // away. The frame still completes -- the compacted buffer refills to
+            // `end == capacity` at `position == 0`, where the shift is a no-op
+            // and the grow below runs -- one read-parse round later, against one
+            // fewer doubling.
+            //
+            // Compaction is the whole recovery, NOT a close: the frame is
+            // under this end's ceiling and its buffered bytes are intact, so
+            // only the buffer's internal offsets stand in the way. It cannot
+            // mask an unsatisfiable frame either -- a declared length above
+            // `max_buffer_size` returns `MessageTooLarge` at the guard above,
+            // before control ever arrives here, so the ordering of the two is
+            // what keeps "too large for the ceiling" and "too large for the
+            // current layout" apart. The write side already compacts on the
+            // same reasoning before it considers growing
+            // (`write_delimited_message` below).
+            //
+            // Compacting makes the channel recoverable; it does not by itself
+            // make a session recover. Freeing space without changing capacity
+            // ended `extract_messages`' drain loop (`bin/src/command/sessions.rs`)
+            // on the very parse that made the room, one read short of completing
+            // the frame, and nothing re-schedules a merely-readable session. That
+            // loop's termination anchor was corrected in the same changeset; a
+            // change to what this arm does to the buffer without changing
+            // capacity has to be checked against it.
+            self.front_buf.shift();
+        }
+
+        if self.front_buf.available_space() == 0 {
             if self.front_buf.capacity() >= self.max_buffer_size {
+                // Past the compaction above, zero space means `position == 0`
+                // and `end == capacity`, so the whole capacity is pending data;
+                // with `capacity == max_buffer_size` any in-range declared
+                // length would have decoded already. Only a capacity too small
+                // to hold a length prefix at all reaches this -- a
+                // configuration that can never frame a message, not a buffer
+                // that has run out of room.
+                debug_assert!(
+                    self.front_buf.available_data() < delimiter_size(),
+                    "a compacted, full buffer at the ceiling can only fail to parse when its capacity cannot hold a length prefix"
+                );
                 return Err(ChannelError::BufferFull {
                     capacity: self.front_buf.capacity(),
                     max: self.max_buffer_size,
@@ -1594,6 +1653,239 @@ mod tests {
             ProtobufMessage { inner: 7 },
             "the channel must make progress past a malformed frame instead of \
              re-decoding it on every later read"
+        );
+    }
+
+    /// Builds the exact front-buffer layout of sozu-proxy/sozu#1436 and returns
+    /// the reader sitting in it, the writer still holding the pending frame's
+    /// tail, and that tail.
+    ///
+    /// `Buffer::fill` (`command/src/buffer/growable.rs`) compacts whenever a
+    /// read reaches the end of the buffer, so a front buffer filled to capacity
+    /// always lands at `position == 0`. `Buffer::consume` compacts only past
+    /// `capacity / 2`, so decoding one frame of at most half the capacity out of
+    /// that full buffer advances `position` without reaching the threshold and
+    /// leaves `available_space() == 0` with `capacity - first.len()` bytes
+    /// pending. At `capacity == max_buffer_size` nothing can grow out of it
+    /// either.
+    ///
+    /// `declared` is the length the second frame announces; the caller picks it
+    /// on whichever side of the ceiling it wants to exercise.
+    fn wedged_reader(
+        capacity: usize,
+        declared: usize,
+    ) -> (
+        Channel<ProtobufMessage, ProtobufMessage>,
+        Channel<ProtobufMessage, ProtobufMessage>,
+        Vec<u8>,
+    ) {
+        let (mut reader, mut writer): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate_nonblocking(capacity as u64, capacity as u64)
+            .expect("could not generate nonblocking channels");
+
+        // A real frame, produced by the production write path.
+        writer
+            .write_delimited_message(&ProtobufMessage { inner: 1 })
+            .expect("could not frame the first message");
+        let first = writer.back_buf.data().to_vec();
+        writer.back_buf.consume(first.len());
+        assert!(
+            first.len() <= capacity / 2,
+            "the first frame ({} bytes) must stay at or under `Buffer::consume`'s \
+             {}-byte shift threshold, or the layout under test never forms",
+            first.len(),
+            capacity / 2
+        );
+
+        // The second frame. `[0x08, 0x2a]` is field 1 set to 42, repeated: a
+        // non-repeated scalar takes its last occurrence, so the payload decodes
+        // at any EVEN length -- callers pass an even `declared`, since an odd
+        // one would truncate the last pair to a tag with no varint behind it.
+        // Written raw because both ends of this pair share one ceiling, so
+        // `write_delimited_message` cannot emit a frame this large -- a peer
+        // configured with a larger `max_command_buffer_size` puts exactly these
+        // bytes on the wire through the ordinary write path.
+        let mut second = declared.to_le_bytes().to_vec();
+        while second.len() < declared {
+            second.extend_from_slice(&[0x08, 0x2a]);
+        }
+        debug_assert_eq!(
+            declared % 2,
+            0,
+            "an odd declared length truncates the padding to a dangling tag"
+        );
+        second.truncate(declared.max(delimiter_size()));
+
+        // Fill the front buffer to the brim: the first frame, then as much of
+        // the second as fits. The rest stays in the writer.
+        let head = capacity - first.len();
+        let head = head.min(second.len());
+        let mut wire = first.clone();
+        wire.extend_from_slice(&second[..head]);
+        std::io::Write::write_all(&mut writer.sock, &wire)
+            .expect("raw write of the first frame and the second frame's head");
+
+        reader.handle_events(Ready::READABLE);
+        assert_eq!(
+            reader
+                .readable()
+                .expect("the reader must fill its front buffer"),
+            wire.len()
+        );
+        assert_eq!(
+            reader.front_buf.available_space(),
+            0,
+            "the front buffer must be filled to the brim before the decode"
+        );
+
+        assert_eq!(
+            reader.read_message().expect("the first frame must decode"),
+            ProtobufMessage { inner: 1 }
+        );
+        assert_eq!(reader.front_buf.available_data(), capacity - first.len());
+        assert_eq!(
+            reader.front_buf.available_space(),
+            0,
+            "the layout under test: data pending, zero space, capacity pinned at \
+             the ceiling -- `Buffer::consume` did not reach its shift threshold"
+        );
+
+        let tail = second[head..].to_vec();
+        (reader, writer, tail)
+    }
+
+    /// Regression for sozu-proxy/sozu#1436: a frame that fits the ceiling but
+    /// not the front buffer's current *layout* must be rescued by compaction,
+    /// not rejected.
+    ///
+    /// The `BufferFull` arm of `try_read_delimited_message` returned without
+    /// consuming and without moving a readiness bit -- the shape
+    /// sozu-proxy/sozu#1428 removed from its two siblings -- and nothing
+    /// downstream compensated: `extract_messages` (`bin/src/command/sessions.rs`)
+    /// discards the error with a bare `Err(_)`, and `ClientSession::ready` /
+    /// `WorkerSession::ready` close only on `readiness.is_error() || is_hup()`.
+    /// Worse, it was unrecoverable: the three `front_buf` mutators that can
+    /// trigger a `Buffer::shift` are all out of reach afterwards. `fill` needs a
+    /// successful read, but `readable()` finds `available_space() == 0`, gets
+    /// `None` from `grow_size` at the ceiling and executes
+    /// `interest.remove(Ready::READABLE)`, so every later `readable()` returns
+    /// `Err(Connection(None))`; `consume` needs a decoded frame or an
+    /// under-delimiter length, and the parse returns before either;
+    /// `try_shrink_front_buf` is only called after a frame decoded, and both
+    /// of its own early returns would stop it anyway -- `capacity <=
+    /// initial_buffer_size`, which holds whenever the channel was configured
+    /// with `command_buffer_size == max_command_buffer_size`, and
+    /// `available_data() * 4 < initial_buffer_size`, which is false with that
+    /// much pending. Not because it shrinks rather than shifts: `Buffer::shrink`
+    /// calls `shift` unconditionally before its own size bail.
+    ///
+    /// SCOPE: this is the channel contract. It proves the parser makes room and
+    /// the frame decodes once its tail is buffered; it proves nothing about the
+    /// session, whose drain loop had its own reason to stop one read short --
+    /// see `client_session_completes_a_compacted_frame_without_another_peer_write`
+    /// in `bin/src/command/sessions.rs`.
+    ///
+    /// The recovery is NOT the oversize branch's close. That branch drops the
+    /// peer because the declared length can never be satisfied by a buffer
+    /// bounded at `max_buffer_size`. Here the frame is under the ceiling and its
+    /// buffered bytes are intact: only the buffer's internal offsets are in the
+    /// way, and a single `Buffer::shift` hands back exactly the space the
+    /// consumed frame left behind. Closing would drop a conforming peer over an
+    /// internal buffer-management detail.
+    #[test]
+    fn a_frame_within_the_ceiling_is_rescued_by_compaction() {
+        let capacity = 64usize;
+        // Exactly at the ceiling: the largest frame this end may legitimately
+        // be asked to accept, and the boundary case of the guard above.
+        let (mut reader, mut writer, tail) = wedged_reader(capacity, capacity);
+        assert!(
+            !tail.is_empty(),
+            "the second frame must still be incomplete"
+        );
+
+        std::io::Write::write_all(&mut writer.sock, &tail)
+            .expect("raw write of the second frame's tail");
+
+        // The parse that used to wedge. It must make room and ask for more
+        // bytes, not declare the buffer unusable.
+        match reader.read_message() {
+            Err(ChannelError::NothingRead) => {}
+            other => panic!(
+                "expected the parser to compact and wait for the rest of the \
+                 frame, got {other:?}"
+            ),
+        }
+        assert!(
+            reader.front_buf.available_space() >= tail.len(),
+            "compaction must hand back the space the consumed frame left behind: \
+             {} bytes of room for a {}-byte tail",
+            reader.front_buf.available_space(),
+            tail.len()
+        );
+        assert!(
+            !reader.readiness.is_error(),
+            "a frame within the ceiling must not mark the channel for closing"
+        );
+
+        // And the session is alive: it reads again, and the frame completes.
+        reader.handle_events(Ready::READABLE);
+        assert_eq!(
+            reader
+                .readable()
+                .expect("the reader must still accept the frame's tail"),
+            tail.len()
+        );
+        assert_eq!(
+            reader
+                .read_message()
+                .expect("the second frame must decode once its tail is buffered"),
+            ProtobufMessage { inner: 42 },
+            "a conforming peer's frame must complete rather than wedge the session"
+        );
+    }
+
+    /// The other side of sozu-proxy/sozu#1436's boundary: compaction must not
+    /// rescue a frame that is genuinely unsatisfiable.
+    ///
+    /// A declared length above `max_buffer_size` does not fit a buffer bounded
+    /// at `max_buffer_size` however it is compacted, so it must keep taking the
+    /// sozu-proxy/sozu#1428 path -- `MessageTooLarge`, logged, channel marked
+    /// errored -- from this layout exactly as from an empty buffer. The ceiling
+    /// check runs before the zero-space arm precisely so that the two cases
+    /// cannot be confused.
+    #[test]
+    fn a_frame_above_the_ceiling_still_closes_from_the_same_layout() {
+        let capacity = 64usize;
+        // Past the ceiling, in the very layout the compaction path rescues at
+        // `capacity`. Even, because `wedged_reader` pads with two-byte protobuf
+        // pairs and an odd length would leave a dangling tag; `capacity + 1` is
+        // rejected by the identical guard, one byte earlier.
+        let (mut reader, _writer, _tail) = wedged_reader(capacity, capacity + 2);
+
+        let pending = reader.front_buf.available_data();
+        match reader.read_message() {
+            Err(ChannelError::MessageTooLarge {
+                message_len, max, ..
+            }) => {
+                assert_eq!(message_len, capacity + 2);
+                assert_eq!(max, capacity);
+            }
+            other => panic!(
+                "expected MessageTooLarge: compaction must not rescue a frame the \
+                 ceiling can never admit, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            reader.front_buf.available_data(),
+            pending,
+            "an unsatisfiable declared length must still not be consumed"
+        );
+        assert!(
+            reader.readiness.is_error(),
+            "an unsatisfiable declared length must still mark the channel for \
+             closing, whatever the buffer layout it was parsed from"
         );
     }
 }
