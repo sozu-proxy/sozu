@@ -72,8 +72,8 @@ Sōzu is a reverse proxy for load balancing, written in Rust. Its main job is to
 
 ## Citing code from these documents
 
-These documents anchor their claims to code. There are three forms, and the choice between them is
-not stylistic:
+These documents anchor their claims to code, and to each other. There are three forms, and the
+choice between them is not stylistic:
 
 * **The prose names an item** — a function, method, struct, enum, field, constant or macro — so cite
   the *symbol*, qualified as `Type::method` so it stays greppable, with the file path and no line
@@ -93,6 +93,32 @@ its 35 citations wrong: single lines uniformly off by +1 after a `//!` module-do
 above them, and ranges off by +38 to +57 after a `debug_assert!` campaign grew the functions. A range
 that drifts 46 lines does not mislead slightly — it lands the reader in a different branch.
 
+### Citing another document
+
+A cited path may be a `.md` as well as a `.rs`, and the resolver treats the two identically — same
+three rules, no exemption. Prose cites prose all the time: an operations runbook points at the
+reference table that defines the knob it is telling the operator to turn, exactly as it points at
+the function that implements it. Prefer an anchor (`configure.md#h2-flood-detection-thresholds`)
+wherever a whole section is meant, for the same reason a symbol beats a line number in code; keep a
+line only where the prose means one specific row or statement, and then cite the row that carries
+the claim rather than the example that repeats the value. Prose that says "the catalogue" means a
+whole section, so it takes the anchor and stops depending on line arithmetic altogether; a line is
+for the case where one row carries the claim, and then it is the row that carries it rather than
+the example repeating its value. `doc/configure_admin_ops.md` is the worked case — three citations
+into `configure.md`, one anchor for the section and two lines for the two rows.
+
+Until [sozu-proxy/sozu#1444][md-cit] the resolver did not see that form at all. Its pattern matched
+`.rs` alone, so a markdown target was never extracted from the document in the first place, and the
+class it left unguarded was 100% wrong: at main `95dee167` three citation sites carried six line
+targets into `configure.md`, and all six landed on unrelated prose — a `secp384r1` cipher-suite row,
+an `sni_preread_timeout` TOML block, a sentence about gRPC backends — while the `.rs` citations in
+the same file were accurate. One of the six was made *more* precisely wrong by tooling: sozu#1437
+moved that site from line 933 of `configure.md` to line 979 when it shifted lines in that document,
+faithfully tracking a target that had been wrong since the day it was written. A re-anchor preserves
+the pointer, not the claim. (Written without the `path:line` form on purpose — this document is
+inside the guarded surface, so a worked example spelt that way would be resolved as a citation, and
+an illustration of a wrong citation would become one.)
+
 ### Running the resolver locally
 
 The surviving line citations are guarded by the `Doc citations` CI job, which runs on the merge
@@ -105,11 +131,17 @@ python3 .github/scripts/check_doc_citations.py --show          # print every res
 python3 .github/scripts/check_doc_citations.py --self-test     # prove it still fails on a broken fixture
 ```
 
-It scans `doc/**` and every `**/LIFECYCLE.md`, and fails when a cited file does not exist, a cited
-basename is ambiguous, a line number is below 1 or past end-of-file, either end of a range is blank,
-a range is inverted, or the same line repeats inside one citation group — `file.rs:NNN/NNN`, which is
-what a `/` or `,` continuation renumbered on one half only looks like, and which would otherwise
-resolve perfectly.
+It scans `doc/**` and every `**/LIFECYCLE.md`, resolves every `file.rs:NNN` and `file.md:NNN` in
+them, and fails when a cited file does not exist, a cited basename is ambiguous, a line number is
+below 1 or past end-of-file, either end of a range is blank, a range is inverted, or the same line
+repeats inside one citation group — `file.rs:NNN/NNN`, which is what a `/` or `,` continuation
+renumbered on one half only looks like, and which would otherwise resolve perfectly.
+
+A cited path is resolved against the citing document's own directory first, then repo-root-relative,
+then as a unique tree-wide suffix. So `configure.md:NNN` in `doc/configure_admin_ops.md` binds to
+`doc/configure.md` and is well-formed, exactly as a module `LIFECYCLE.md` cites its siblings by bare
+name — but write it repo-root-relative anyway, because a sibling that shadows a repo-root file of
+the same relative path would hide a genuine failure.
 
 ### Reporting a citation that drifted
 
@@ -293,6 +325,7 @@ pre-existing failures, 27 of them in `CHANGELOG.md`, which is an append-only rec
 it stood at each release and must not be renumbered to satisfy a guard. That repair is its own
 changeset, and it would not reach `e2e/COVERAGE.md` either — no rule reads that file today.
 
+[md-cit]: https://github.com/sozu-proxy/sozu/issues/1444
 [cit]: https://github.com/sozu-proxy/sozu/issues/1335
 [drift]: https://github.com/sozu-proxy/sozu/issues/1389
 

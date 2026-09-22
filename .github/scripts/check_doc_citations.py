@@ -3,8 +3,9 @@
 # with, and fail when one of them cannot be resolved. Three citation forms are
 # checked, by four independent rules:
 #
-#   1. `file.rs:NNN(-MMM)?` in `doc/**` and `**/LIFECYCLE.md` — a path and a
-#      line number. See "WHAT THIS CATCHES" below.
+#   1. `file.rs:NNN(-MMM)?` and `file.md:NNN(-MMM)?` in `doc/**` and
+#      `**/LIFECYCLE.md` — a path and a line number. See "WHAT THIS CATCHES"
+#      below, and "MARKDOWN TARGETS" for why the second one is here.
 #   2. the same citations, read at TWO revisions: a citation this changeset did
 #      not touch must still name the same line TEXT it named at the base. See
 #      "DRIFTED CITATIONS" further down. Needs `--base <revision>`.
@@ -115,10 +116,44 @@
 #   unreachable `--base` is an error and exit 1, never a skip. Without `--base`
 #   at all the rule announces that it did not run, on its own line.
 #
-# The regex is deliberately `[A-Za-z0-9_/.-]+\.rs:[0-9]+`. The obvious
+# The regex is deliberately `[A-Za-z0-9_/.-]+\.(?:rs|md):[0-9]+`. The obvious
 # character class `[A-Za-z_/.-]+` has no digit in it and silently skips every
 # citation naming a file with a digit in its name — `h1.rs:NNN`, `h2.rs:NNN`,
 # which in this tree is the majority of them.
+#
+# MARKDOWN TARGETS
+#   A cited path may be a `.md` as well as a `.rs`, and it is resolved by all
+#   three rules above, with no exemption of its own. Prose cites prose: an
+#   operations runbook points at the reference table that defines the knob it
+#   is telling the operator to turn, exactly as it points at the function that
+#   implements it. A line number into a document rots the same way a line
+#   number into a module does — faster, if anything, since a document grows by
+#   whole sections.
+#
+#   That half of the extraction was missing until sozu-proxy/sozu#1444. `PATH`
+#   named `.rs` alone, so `CITATION` walked straight past a markdown target:
+#   the citation was never extracted at all, and no rule below it — not the
+#   blank-line floor, not the drift comparison — was ever handed one. The
+#   surface it left unguarded was not hypothetical: at main `95dee167` the tree
+#   carried three markdown-target citation sites holding six line targets
+#   between them, all three in `doc/configure_admin_ops.md` and all six
+#   pointing into `doc/configure.md`, and SIX OF SIX pointed at unrelated
+#   prose — a cipher-suite table row, an `sni_preread_timeout` TOML block, a
+#   sentence about gRPC backends. The class the resolver could see was
+#   accurate; the class it could not see was wrong in every instance.
+#
+#   The drift rule was blind to them for the same reason, and that is how the
+#   worst of the six got there. sozu-proxy/sozu#1437 re-anchored
+#   `configure.md:933` to `configure.md:979` when it shifted lines in
+#   `configure.md`, which is mechanically correct — line 933 at `7a223a8f` held
+#   the text line 979 holds at `95dee167` — and carried an already-wrong target
+#   forward intact, and more precisely than before. A re-anchor preserves the
+#   pointer, not the claim, and nothing compares the two.
+#
+#   This stays a floor for markdown exactly as it is for Rust: a citation onto
+#   a real, non-blank, unrelated line resolves and passes, which is what the
+#   `--show` output and the summary lines are for. What it can no longer do is
+#   name nothing at all and be counted as clean.
 #
 # DEAD TEST-NAME CITATIONS
 #   The resolver above only sees a citation that carries a path. A second form
@@ -229,9 +264,12 @@ import tempfile
 # followed by more line references introduced by `,` or `/`:
 #   lib/src/tcp.rs:1563-1567, 1830-1835
 #   lib/src/protocol/mux/answers.rs:209/224
+#   doc/configure.md:1133, 1234
 # A continuation may wrap a line in the prose, so the separator swallows a
-# newline plus that line's leading whitespace.
-PATH = r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.rs"
+# newline plus that line's leading whitespace. The extension alternation is
+# non-capturing on purpose: `match.group("path")` is read by name, but a
+# numbered group here would still renumber anything added after it.
+PATH = r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:rs|md)"
 SPAN = r"[0-9]+(?:-[0-9]+)?"
 CITATION = re.compile(
     rf"(?P<path>{PATH}):(?P<spans>{SPAN}(?:[,/][ \t]*(?:\n[ \t]*)?{SPAN})*)"
@@ -244,13 +282,41 @@ SPAN_SEP = re.compile(r"[,/][ \t]*(?:\n[ \t]*)?")
 SKIP_DIRS = {".git", "target", "node_modules", "testdata"}
 
 
-def rust_files(root):
-    """Every `*.rs` path in the tree, repo-root-relative, with a suffix index."""
+# Every extension a citation may TARGET. `.md` is in it because prose cites
+# prose; see "MARKDOWN TARGETS" in the header for the six wrong ones that
+# measured the gap.
+#
+# This tuple feeds ONLY the tree-wide suffix index, which is `resolve_path`'s
+# third and last branch. A citation that names a sibling of its own document,
+# or names a path from the repository root, is answered by the two `isfile`
+# branches ahead of it and never consults this index at all — so most markdown
+# citations resolve identically whatever is in here, and an entry removed from
+# it shrinks the guarded set in silence.
+#
+# `doc/good.md`'s bare `LIFECYCLE.md:8` is the fixture that makes that audible:
+# it is the one citation in the tree that reaches the third branch, so removing
+# `.md` here turns it into `no such file in the tree` and fails the self-test
+# four ways. Before it existed this tuple was asserted by nothing — reverting
+# it alone left the self-test green at exit 0 — while the three assertions that
+# looked like its guard all belonged to PATH. Keep a citation that resolves
+# only through the index, or this constant is decoration again.
+TARGET_SUFFIXES = (".rs", ".md")
+
+
+def target_files(root):
+    """Every citable path in the tree, repo-root-relative, with a suffix index.
+
+    Citable is `*.rs` and `*.md`, matching `PATH`. Both have to be in the index
+    `resolve_path` falls back on, or a markdown citation resolves only in the
+    two cases that never reach the index — a target sitting beside the citing
+    document, or one named repo-root-relative — and a correct citation to a
+    document elsewhere in the tree is reported as missing.
+    """
     by_suffix = {}
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for name in filenames:
-            if not name.endswith(".rs"):
+            if not name.endswith(TARGET_SUFFIXES):
                 continue
             rel = os.path.relpath(os.path.join(dirpath, name), root).replace(os.sep, "/")
             parts = rel.split("/")
@@ -346,7 +412,7 @@ def parse_spans(text):
 
 
 def check(root, show=False, out=sys.stdout):
-    by_suffix = rust_files(root)
+    by_suffix = target_files(root)
     cache = {}
     failures = []
     total = 0
@@ -525,7 +591,7 @@ def check_drift(root, base, show=False, out=sys.stdout):
     document or a cited file that the base tree did not carry (both are new
     here), and a line number out of range at either revision.
     """
-    by_suffix = rust_files(root)
+    by_suffix = target_files(root)
     blobs = {}
     head = {}
     failures = []
@@ -889,8 +955,13 @@ def check_pinned_snippets(root, show=False, out=sys.stdout):
     cannot be quoted verbatim simply carries no annotation, which is what
     keeps this rule off the abbreviated and illustrative snippets that are the
     majority of the Rust blocks in this tree.
+
+    The index is `target_files`, not a Rust-only one: `PINNED_FENCE` is built
+    from the shared `PATH`, so a pin may name a `.md` target exactly as a prose
+    citation may, and a narrower index here would silently skip such a block
+    instead of checking it (an unresolvable path is rule 1's to report).
     """
-    by_suffix = rust_files(root)
+    by_suffix = target_files(root)
     cache = {}
     failures = []
     pinned = 0
@@ -1001,16 +1072,29 @@ FIXTURE_EXPECTED = [
     "doc/bad.md:11: `sample.rs:0` — line numbers start at 1",
     "doc/bad.md:13: `sample.rs:3-5` — sample.rs:5 is blank (end of range)",
     "doc/bad.md:15: `h2.rs:99` — past end of h2.rs (3 lines)",
+    "doc/bad.md:17: `reference.md:99` — past end of doc/reference.md (12 lines)",
+    "doc/bad.md:19: `doc/reference.md:10` — doc/reference.md:10 is blank",
 ]
 
 # The exact number of citation groups the fixtures contain. Asserting the total
 # — not a floor — is what makes a SHRINKING extraction surface fail the
-# self-test, and two such shrinks are one edit each:
+# self-test, and each such shrink is one edit:
 #   * dropping the digit from PATH loses every `h2.rs:N` citation. The fixtures
 #     carry three, one of them an expected failure, so both this total and
 #     FIXTURE_EXPECTED go wrong.
 #   * dropping `**/LIFECYCLE.md` from doc_files() loses mod/LIFECYCLE.md's two.
-# Neither is an accidental shape, and neither announces itself: on the real
+#   * dropping `md` from PATH loses every markdown-target citation at once:
+#     four clean in `doc/good.md` and two expected failures in `doc/bad.md`,
+#     which is the exact shape sozu-proxy/sozu#1444 found in the tree — never
+#     extracted, and therefore counted as nothing.
+#   * dropping `.md` from TARGET_SUFFIXES loses only `doc/good.md`'s bare
+#     `LIFECYCLE.md:8`, and that one citation is the whole reason it is there.
+#     The other markdown fixtures resolve through resolve_path's first two
+#     branches and never consult the suffix index at all, so before that
+#     citation existed TARGET_SUFFIXES was assertable but unasserted: reverting
+#     it alone left this self-test green. A constant no fixture can move is not
+#     a guard.
+# None of these is an accidental shape, and none announces itself: on the real
 # tree they report a clean run over a quietly smaller surface.
 # `doc/drift.md` contributes five of these: rule 2's fixture is an ordinary
 # document that rule 1 must also see, and see as clean.
@@ -1021,7 +1105,9 @@ FIXTURE_EXPECTED = [
 # `doc/pinned_nested.md` contributes two: the annotation it DISPLAYS inside a
 # four-tick example is still a citation to rule 1, which is correct — the text
 # names a real span either way — and the real pin after it is the second.
-FIXTURE_TOTAL = 23
+# `doc/good.md` contributes nine, `doc/reference.md` none — it is a citation
+# TARGET, and carries no citation of its own.
+FIXTURE_TOTAL = 29
 
 # Rule 2's half of the fixtures is a PAIR of revisions, so every file that
 # drifts carries its base revision beside it as `<name>.base`. That suffix is
@@ -1054,7 +1140,21 @@ FIXTURE_DRIFT_EXPECTED = [
 # `doc/pinned.md`'s one and `doc/pinned_nested.md`'s two. They are compared
 # here because the fixture base revision already carries them — on the commit
 # that first ADDS a pin, rule 2 exempts it (see "STALE CODE QUOTED IN PROSE").
-FIXTURE_DRIFT_COMPARED = 23
+# Seven more are `doc/good.md`'s markdown-target citations: rule 2 reads a
+# `.md` target through the same `resolve_path`, so a markdown citation left
+# behind by a changeset that moved its target is reported exactly as a Rust one
+# is — which is what sozu-proxy/sozu#1437 re-anchored past unseen, and the
+# durable half of #1444. Rule 1 can only say a markdown target exists; rule 2
+# says its TEXT still reads the way the citing prose claims.
+#
+# This constant is why sozu-proxy/sozu#1444 was rebased onto #1432 rather than
+# merged. Both branches raised it from 17 to 23 — six pin-annotation ends there,
+# six markdown-target ends here — so the ASSIGNMENT merged clean with no marker
+# while the comment above it conflicted, leaving the wrong value one line below
+# the `>>>>>>>` a resolver reads. Two correct edits, silently composed into a
+# third value that is neither. When two branches move the same counter for
+# different reasons, the merge is a sum, and git cannot know that.
+FIXTURE_DRIFT_COMPARED = 30
 
 # Rule 3's half of the fixtures. `tests_bad.rs` and the fixture `CHANGELOG.md`
 # are the broken documents; `tests_good.rs` is the clean one and also carries
@@ -1445,7 +1545,7 @@ def main():
     total, failures = check(root, show=args.show)
     if failures:
         status = 1
-        print("::error::%d of %d `file.rs:NNN` citations in doc/ and **/LIFECYCLE.md do not resolve:" % (len(failures), total))
+        print("::error::%d of %d `file.rs:NNN` / `file.md:NNN` citations in doc/ and **/LIFECYCLE.md do not resolve:" % (len(failures), total))
         for line in failures:
             print("  " + line)
         print("")
@@ -1453,7 +1553,7 @@ def main():
         print("Keep a line or a range only where the prose means a specific branch inside an item.")
         print("Convention and local usage: doc/README.md#citing-code-from-these-documents")
     else:
-        print("OK: all %d `file.rs:NNN` citations in doc/ and **/LIFECYCLE.md resolve to a non-blank line." % total)
+        print("OK: all %d `file.rs:NNN` / `file.md:NNN` citations in doc/ and **/LIFECYCLE.md resolve to a non-blank line." % total)
 
     print("")
     if not args.base:

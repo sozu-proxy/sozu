@@ -341,29 +341,27 @@ jobs:
           echo "OK: every #[ignore] carries a reason string."
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Group C″ — documentation citation resolver                    │
-  # │   Every `file.rs:NNN(-MMM)` in `doc/**` and `**/LIFECYCLE.md` │
-  # │   must name a file that exists and a line that is in range    │
-  # │   and not blank (sozu-proxy/sozu#1335). It runs on the merge  │
-  # │   result, which is the point: the pull request that breaks a  │
-  # │   citation is almost never the one that contains it, so no    │
-  # │   reviewer is ever shown both halves.                         │
-  # │   A second rule reads those same citations at TWO revisions:  │
-  # │   one this changeset did not touch must still name the same   │
-  # │   line TEXT it named at the merge base (sozu-proxy/sozu#1389  │
-  # │   — on #1379's changeset 24 citations moved and the           │
-  # │   blank-line rule alone reported 2). It needs the base in the │
-  # │   object store, which is why this job alone checks out with   │
-  # │   fetch-depth: 0, and an unreachable base is an ERROR here,   │
-  # │   never a skip.                                               │
-  # │   A third rule covers the citation form that carries no       │
-  # │   path: a backticked TEST NAME, in a Rust comment or a        │
-  # │   CHANGELOG/doc paragraph about tests, must name a `fn`       │
-  # │   somewhere in the tree (sozu-proxy/sozu#1380 — three names   │
-  # │   cited in six places named nothing at all).                  │
-  # │   It is still a FLOOR, not a proof: a citation into code this │
-  # │   changeset never touched is not compared at all. Cite        │
-  # │   symbols where the prose names an item; see                  │
-  # │   doc/README.md#citing-code-from-these-documents              │
+  # │   Three rules read `doc/**` and every `**/LIFECYCLE.md`: a    │
+  # │   `file.rs:NNN` / `file.md:NNN` citation must resolve to a    │
+  # │   real, non-blank line; one this changeset did not touch must │
+  # │   still name the same TEXT at the merge base; and a fenced    │
+  # │   block that names the lines it quotes must quote them        │
+  # │   literally. One more rule reads those plus every `*.rs` and  │
+  # │   CHANGELOG.md: a cited test name must name a `fn`.           │
+  # │                                                               │
+  # │   .github/scripts/check_doc_citations.py IS the authority.    │
+  # │   Its header carries every rule, the measurement behind it    │
+  # │   and the issue it came from; doc/README.md carries the       │
+  # │   convention for authors. Both were updated when the          │
+  # │   pinned-block rule shipped and this box was not, so keep it  │
+  # │   to one clause per rule and the pointer: if a rule CHANGES,  │
+  # │   change the script and leave this alone; if one is ADDED,    │
+  # │   add a clause. Each step below documents its own wiring,     │
+  # │   which is why none of it is repeated up here.                │
+  # │                                                               │
+  # │   It runs on the merge result, which is the point: the pull   │
+  # │   request that breaks a citation is almost never the one that │
+  # │   contains it, so no reviewer is ever shown both halves.      │
   # └──────────────────────────────────────────────────────────────┘
   doc-citations:
     name: Doc citations
