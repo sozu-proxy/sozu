@@ -20,6 +20,7 @@ use sozu_command_lib::{
 };
 
 use crate::{
+    BUFFER_SIZE,
     http_utils::{http_ok_response, http_request, immutable_answer},
     mock::{
         aggregator::SimpleAggregator,
@@ -98,29 +99,158 @@ pub fn create_unbound_local_address() -> SocketAddr {
     address
 }
 
-fn receive_with_deadline(client: &mut Client, timeout: Duration) -> Option<String> {
+/// What a bounded, accumulating read of a client socket observed.
+#[derive(Debug)]
+enum ReadOutcome {
+    /// `is_complete` accepted the bytes gathered so far, and the peer had not
+    /// half-closed before that.
+    Complete(String),
+    /// The peer half-closed (`read` returned 0) first; carries what arrived.
+    Closed(String),
+    /// `timeout` elapsed first; carries what arrived, possibly nothing.
+    TimedOut(String),
+    /// The socket could not be read at all; carries the reason.
+    Broken(String),
+}
+
+/// Read from `client`, accumulating, until `is_complete` accepts the bytes
+/// gathered so far, the peer half-closes, or `timeout` elapses.
+///
+/// The single bounded read loop of this module: [`receive_with_deadline`],
+/// [`assert_client_eof`] and `try_msg_close` are all expressed over it.
+/// Accumulating is not optional — a single `read()` sees one segment under
+/// load — and reading the `TcpStream` directly is not optional either, because
+/// [`Client::receive`] collapses a half-close and an expired read timeout into
+/// the same `None`, while a test asserting on a *close* has to tell the two
+/// apart. Pass `|_| false` when only the close matters.
+fn read_until<F>(client: &mut Client, timeout: Duration, is_complete: F) -> ReadOutcome
+where
+    F: Fn(&str) -> bool,
+{
+    let Some(stream) = client.stream.as_mut() else {
+        return ReadOutcome::Broken(String::from("the client is not connected"));
+    };
+    // The stream carries a 100ms read timeout, so an idle loop paces itself.
     let deadline = Instant::now() + timeout;
+    let mut accumulated = Vec::new();
     loop {
-        if let Some(response) = client.receive() {
-            return Some(response);
+        let mut buf = [0u8; BUFFER_SIZE];
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                return ReadOutcome::Closed(String::from_utf8_lossy(&accumulated).into_owned());
+            }
+            Ok(n) => {
+                accumulated.extend_from_slice(&buf[..n]);
+                let seen = String::from_utf8_lossy(&accumulated);
+                if is_complete(&seen) {
+                    return ReadOutcome::Complete(seen.into_owned());
+                }
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(e) => return ReadOutcome::Broken(format!("read error: {e}")),
         }
         if Instant::now() >= deadline {
-            return None;
+            return ReadOutcome::TimedOut(String::from_utf8_lossy(&accumulated).into_owned());
         }
-        thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn assert_client_eof(client: &mut Client) {
-    let stream = client.stream.as_mut().expect("client should be connected");
-    let mut buf = [0; 1];
-    match stream.read(&mut buf) {
-        Ok(0) => {}
-        Ok(n) => panic!("expected frontend connection to close, read {n} byte(s) instead"),
-        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-            panic!("expected frontend connection to close, read timed out")
+/// The first non-empty read from `client`, or `None` if `timeout` elapses
+/// first.
+fn receive_with_deadline(client: &mut Client, timeout: Duration) -> Option<String> {
+    match read_until(client, timeout, |accumulated| !accumulated.is_empty()) {
+        ReadOutcome::Complete(response) => {
+            // `read_until` reads the stream directly, so the accounting
+            // `Client::receive` used to do here has to be restored: several
+            // callers print `responses_received`.
+            client.responses_received += 1;
+            Some(response)
         }
-        Err(e) => panic!("expected frontend connection to close, got read error: {e}"),
+        _ => None,
+    }
+}
+
+/// How long an assertion that the proxy closed a connection waits for the
+/// half-close. One second is the budget the response assertions of this module
+/// already use.
+const CLIENT_CLOSE_BUDGET: Duration = Duration::from_secs(1);
+
+fn assert_client_eof(client: &mut Client) {
+    match read_until(client, CLIENT_CLOSE_BUDGET, |_| false) {
+        ReadOutcome::Closed(trailing) if trailing.is_empty() => {}
+        ReadOutcome::Closed(trailing) => panic!(
+            "expected frontend connection to close, read {} byte(s) instead: {trailing:?}",
+            trailing.len()
+        ),
+        ReadOutcome::Complete(seen) | ReadOutcome::TimedOut(seen) => panic!(
+            "expected frontend connection to close, still open after {CLIENT_CLOSE_BUDGET:?}: {seen:?}"
+        ),
+        ReadOutcome::Broken(reason) => {
+            panic!("expected frontend connection to close, got {reason}")
+        }
+    }
+}
+
+/// Confirm that `client`'s session stays open and idle for `window`: every
+/// peek must time out — no byte pending, and above all no half-close.
+///
+/// A test asserting that a shutdown closed a session needs this first.
+/// Without it "the proxy closed the idle session" and "there was no session
+/// left to close" are the same observation, and a regression that dropped
+/// keep-alive and closed every frontend after one response would pass.
+/// `peek` and not `read`, so an unexpected byte is still on the socket for the
+/// assertion that follows; a window and not a single call, because the
+/// half-close this rules out can be a few milliseconds behind the response.
+/// [`Client::is_connected`] is one unwindowed peek that reports every error,
+/// an expired read timeout included, as still connected, so it cannot answer
+/// this.
+fn confirm_open_and_idle(client: &mut Client, window: Duration) -> Result<(), String> {
+    let Some(stream) = client.stream.as_mut() else {
+        return Err(String::from("the client is not connected"));
+    };
+    let deadline = Instant::now() + window;
+    loop {
+        let mut buf = [0u8; 1];
+        match stream.peek(&mut buf) {
+            Ok(0) => return Err(String::from("it was already half-closed")),
+            Ok(_) => return Err(String::from("it had unread bytes pending")),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(e) => return Err(format!("it could not be peeked: {e}")),
+        }
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+    }
+}
+
+/// Wait up to `timeout` for a worker thread to end, then join it.
+///
+/// [`Worker::wait_for_server_stop`] is `JoinHandle::join`, which blocks until
+/// the thread ends and returns `Err` only when it *panicked*: a worker that
+/// simply never terminates does not fail a test, it hangs the process until
+/// the harness kills it. Polling `JoinHandle::is_finished` — the call
+/// `wait_for_server_stop` already makes before joining — bounds that, and the
+/// join that follows is then known not to block. That join is also the only
+/// site reclaiming the worker's two scm `UnixStream`s, since `Worker` has no
+/// `Drop` impl.
+///
+/// On expiry the worker is deliberately left alone: the thread is still
+/// running and still owns those descriptors, so closing them under it is worse
+/// than the leak, and `repeat_until_error_or` stops at the first failure.
+fn stop_worker_within(worker: Worker, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    while !worker.server_job.is_finished() {
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the worker thread was still running {timeout:?} after the stop request"
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if worker.wait_for_server_stop() {
+        Ok(())
+    } else {
+        Err(String::from("the worker thread panicked"))
     }
 }
 
@@ -2034,6 +2164,91 @@ fn try_https_redirect() -> State {
     State::Success
 }
 
+/// How long `try_msg_close` waits for the keep-alive response. A second is
+/// what the sibling [`receive_with_deadline`] call sites in this module use;
+/// the read below is paced by the client's own 100ms socket timeout, so a
+/// tighter budget buys a handful of attempts and a flake.
+const MSG_CLOSE_RESPONSE_BUDGET: Duration = Duration::from_secs(1);
+/// How long the keep-alive session must stay open and idle before `SoftStop`
+/// is sent. Three of the client's 100ms socket timeouts.
+const MSG_CLOSE_IDLE_WINDOW: Duration = Duration::from_millis(300);
+/// How long `SoftStop` has to close that session.
+const MSG_CLOSE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+/// How long the worker thread then has to terminate.
+const MSG_CLOSE_JOIN_BUDGET: Duration = Duration::from_secs(10);
+
+/// Report `reason`, then stop `worker` and reclaim it.
+///
+/// `hard_stop` and not `soft_stop`: nothing further is being asserted about
+/// the shutdown once a check has failed, and a soft stop waits on sessions
+/// that very failure may have left stuck. What matters is reaching
+/// [`stop_worker_within`], the only site that joins the thread and reclaims
+/// the worker's two scm `UnixStream`s — the early returns of a
+/// `State`-returning test skip a teardown the straight-line body always
+/// reached.
+fn abandon_worker(mut worker: Worker, reason: String) -> State {
+    println!("{reason}");
+    worker.hard_stop();
+    if let Err(cleanup) = stop_worker_within(worker, MSG_CLOSE_JOIN_BUDGET) {
+        println!("could not reclaim the worker after the failure above: {cleanup}");
+    }
+    State::Fail
+}
+
+/// A keep-alive exchange completes and leaves the frontend session open and
+/// idle, then a `SoftStop` must close that session *cleanly*: a bare
+/// half-close, with no extra byte on the wire, followed by the worker actually
+/// terminating.
+///
+/// "HTTP error on close" is what this test is named after and what it now
+/// observes. Four distinct regressions are in scope:
+///
+/// - the keep-alive response never reaching the client at all;
+/// - the frontend being closed *before* the `SoftStop` — a proxy that dropped
+///   keep-alive and closed every session after one response. The EOF the third
+///   check waits for arrives all the same, and reads as a pass, unless the
+///   session is proved open and idle first. That is what
+///   [`confirm_open_and_idle`] is for, and it is the one check with no
+///   equivalent anywhere else in this file;
+/// - the shutting-down proxy answering the idle session with a built-in
+///   default answer (502/503) instead of just closing it — those bytes would
+///   land in `trailing`;
+/// - the idle session surviving the shutdown sweep, which holds the worker up
+///   until the zombie checker fires half an hour later.
+///
+/// The production code under test is `Mux::shutting_down`
+/// (`lib/src/protocol/mux/mod.rs`), reached through `HttpSession::shutting_down`
+/// (`lib/src/http.rs`) from `Server::shut_down_sessions` (`lib/src/server.rs`):
+/// a quiesced, unlinked H1 stream must report that it can stop.
+///
+/// KNOWN LIMITATION: [`confirm_open_and_idle`] proves the session was open at
+/// the *end* of its window, and `SoftStop` is only sent afterwards. A frontend
+/// that closed inside that remaining gap would still read as a pass, so the
+/// close is attributable to `SoftStop` rather than proved to be caused by it.
+/// Nothing else is in flight at that point, which is what makes the
+/// attribution sound in practice; a black-box test cannot do better than a
+/// lower bound here, and the bound is what turns a vacuous EOF into evidence.
+///
+/// To SEE THIS RED, three recipes, one per check:
+///
+/// - in `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) invert the
+///   `if stream.context.keep_alive_frontend` arm that resets the slot to
+///   `Idle` — sozu then closes every frontend after one response, and the
+///   liveness check reports "there was no idle keep-alive session left for
+///   SoftStop to close: it was already half-closed". This is the regression
+///   the close assertion alone could not see: the EOF it waits for arrives
+///   just the same, from a connection that was gone before `SoftStop`.
+///   Setting the backend response header to `Connection: close` does *not*
+///   reproduce it — measured on this tree, the frontend then stays open and
+///   idle for at least three seconds and `SoftStop` still closes it;
+/// - in `Mux::shutting_down_inner` (`lib/src/protocol/mux/mod.rs`) make the
+///   final `if can_stop` arm `return false` instead of `return true` — the
+///   idle session then survives the sweep and the close check reports
+///   "SoftStop did not close the idle keep-alive session";
+/// - invert the HEAD test in `HttpContext::on_response_headers`
+///   (`lib/src/protocol/kawa_h1/editor.rs`) to
+///   `if self.method != Some(Method::Head)` — the body is then never forwarded
+///   and the response check reports an incomplete keep-alive response.
 fn try_msg_close() -> State {
     let front_address = create_local_address();
 
@@ -2065,13 +2280,100 @@ fn try_msg_close() -> State {
     backend.accept(0);
     backend.receive(0);
     backend.send(0);
-    println!("response: {:?}", client.receive());
 
-    thread::sleep(std::time::Duration::from_millis(100));
+    let outcome = read_until(&mut client, MSG_CLOSE_RESPONSE_BUDGET, |accumulated| {
+        accumulated.ends_with("pong")
+    });
+    let response = match outcome {
+        ReadOutcome::Complete(response) => response,
+        ReadOutcome::Closed(seen) => {
+            return abandon_worker(
+                worker,
+                format!("the frontend closed before the keep-alive response completed: {seen:?}"),
+            );
+        }
+        ReadOutcome::TimedOut(seen) if seen.is_empty() => {
+            return abandon_worker(
+                worker,
+                format!(
+                    "the client received no response to the keep-alive request within {MSG_CLOSE_RESPONSE_BUDGET:?}"
+                ),
+            );
+        }
+        // Deliberately not the wording of the assertion below: a read that ran
+        // out of time holding part of a response is a slow or truncated read,
+        // which is not the same event as a proxy that answered wrongly, and
+        // one log line has to say which happened.
+        ReadOutcome::TimedOut(seen) => {
+            return abandon_worker(
+                worker,
+                format!(
+                    "the keep-alive response was still incomplete after {MSG_CLOSE_RESPONSE_BUDGET:?}: {seen:?}"
+                ),
+            );
+        }
+        ReadOutcome::Broken(reason) => {
+            return abandon_worker(
+                worker,
+                format!("the keep-alive response could not be read: {reason}"),
+            );
+        }
+    };
+    println!("response: {response:?}");
+    if !response.starts_with("HTTP/1.1 200 Ok") {
+        return abandon_worker(
+            worker,
+            format!("unexpected keep-alive response: {response:?}"),
+        );
+    }
+
+    if let Err(reason) = confirm_open_and_idle(&mut client, MSG_CLOSE_IDLE_WINDOW) {
+        return abandon_worker(
+            worker,
+            format!("there was no idle keep-alive session left for SoftStop to close: {reason}"),
+        );
+    }
 
     worker.soft_stop();
-    worker.wait_for_server_stop();
-    State::Success
+
+    // The session was open and idle at the end of the window above, so this
+    // half-close is attributable to SoftStop. Not *necessarily* caused by it:
+    // see the known limitation in the doc comment.
+    match read_until(&mut client, MSG_CLOSE_SHUTDOWN_BUDGET, |_| false) {
+        ReadOutcome::Closed(trailing) if trailing.is_empty() => {}
+        ReadOutcome::Closed(trailing) => {
+            return abandon_worker(
+                worker,
+                format!(
+                    "SoftStop wrote {trailing:?} on the idle keep-alive session before closing it"
+                ),
+            );
+        }
+        // `|_| false` never accepts, so `Complete` cannot occur; both arms
+        // carry the same "still open" meaning either way.
+        ReadOutcome::Complete(trailing) | ReadOutcome::TimedOut(trailing) => {
+            return abandon_worker(
+                worker,
+                format!(
+                    "SoftStop did not close the idle keep-alive session within {MSG_CLOSE_SHUTDOWN_BUDGET:?}, trailing bytes: {trailing:?}"
+                ),
+            );
+        }
+        ReadOutcome::Broken(reason) => {
+            return abandon_worker(
+                worker,
+                format!("the close of the idle keep-alive session could not be observed: {reason}"),
+            );
+        }
+    }
+
+    match stop_worker_within(worker, MSG_CLOSE_JOIN_BUDGET) {
+        Ok(()) => State::Success,
+        Err(reason) => {
+            println!("the worker did not terminate after SoftStop: {reason}");
+            State::Fail
+        }
+    }
 }
 
 pub fn try_blue_geen() -> State {
@@ -2977,7 +3279,7 @@ fn test_https_redirect() {
 #[test]
 fn test_msg_close() {
     assert_eq!(
-        repeat_until_error_or(100, "HTTP error on close", try_msg_close),
+        repeat_until_error_or(3, "HTTP error on close", try_msg_close),
         State::Success
     );
 }

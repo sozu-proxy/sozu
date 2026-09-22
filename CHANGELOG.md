@@ -118,6 +118,75 @@
   takes the same injected clock. `SessionMetrics` and the timer wheel elsewhere in `lib/src/metrics/`
   deliberately keep the real clock and are unaffected.
 
+- **`test(e2e)`: `try_msg_close` now asserts the close it is named after, and its repetition drops
+  from 100 to 3.** The body had no failure path: its only `State::` expression was the
+  `State::Success` it ended on, and the response it read went straight into a `println!`
+  ([#1426](https://github.com/sozu-proxy/sozu/issues/1426)). A hundred *consecutive* iterations of
+  an unfalsifiable body — `repeat_until_error_or` is a stability check, not a retry — cost a
+  hundred worker spawns and two hundred ports and could not have caught anything, while its green
+  read as coverage of connection-close behaviour that nothing checked.
+  It now observes four things, each bounded by its own deadline and each returning `State::Fail`:
+  the keep-alive exchange completes (`HTTP/1.1 200 Ok …pong` reaches the client); the frontend
+  session is then still **open and idle**, proved by peeking it over a 300 ms window before
+  `SoftStop` is sent; that `SoftStop` closes it with a bare half-close and no extra byte on the
+  wire, so a shutting-down proxy answering an idle session with a 502/503 default answer is caught
+  rather than printed; and the worker then really terminates. The production code so covered is
+  `Mux::shutting_down` (`lib/src/protocol/mux/mod.rs`) reached through `HttpSession::shutting_down`
+  (`lib/src/http.rs`) from `Server::shut_down_sessions` (`lib/src/server.rs`).
+  **The liveness check is what makes the close assertion mean anything.** A read that ends at EOF
+  cannot tell "`SoftStop` closed the idle session" from "there was no idle session left to close",
+  so without it a regression that dropped keep-alive and closed every frontend after one response
+  would still have gone green. Inverting the `keep_alive_frontend` arm of `ConnectionH1::writable`
+  (`lib/src/protocol/mux/h1.rs`) produces exactly that proxy: the test at the parent commit passes
+  it in 0.02 s, and this one fails it with "there was no idle keep-alive session left for SoftStop
+  to close: it was already half-closed".
+  **The worker-termination check is bounded too.** `Worker::wait_for_server_stop` is
+  `JoinHandle::join`, which returns `Err` only on a *panic*, so a worker that merely never
+  terminates used to hang the process instead of failing the test. It is now reached through a
+  `JoinHandle::is_finished` poll under a 10 s deadline. Every failing path also stops and joins its
+  worker before returning, because that join is the only site reclaiming the two scm `UnixStream`s
+  and `Worker` has no `Drop`.
+  The read loops of `e2e/src/tests/tests.rs` collapse from four to one: `receive_with_deadline`
+  and `assert_client_eof` are now thin wrappers over a single `read_until`, which reads the
+  `TcpStream` directly because `Client::receive` reports a half-close and an expired read timeout
+  as the same `None`. A timed-out partial read is reported as an incomplete response and no longer
+  borrows the wording of the protocol assertion, and the response budget rises from 500 ms to the
+  1 s its siblings in this file already use — at 100 ms per blocking read, 500 ms bought four
+  attempts.
+  **`n = 3`, not 100.** Every step now blocks on its own deadline instead of on a
+  `thread::sleep(100ms)` landing on the right side of a race, so a single iteration already proves
+  the property: nothing the test asserts is statistical, and repetition buys no further assurance
+  about the close itself. Three back-to-back iterations in one process are not three independent
+  draws of the `SoftStop`-versus-event-loop ordering either — the response has just been written
+  and the loop is parked in epoll every time. What the repetition does buy is cheap: it re-exercises
+  worker spawn, port allocation and teardown a few times, which is where state leaks between
+  iterations show up. Nothing distinguishes 3 from 2; what is being removed is 100.
+  The choice rests on what this test proves, not on what the suite does elsewhere — and explicitly
+  not on popularity: counting **source call sites** with a comment-aware, multi-line scan, `main`
+  has 402 real `repeat_until_error_or` calls across 29 files distributed n=1→4, 2→51, 3→117,
+  5→144, 10→74, 100→12, so **n=5 is the modal value, not n=3**. (That is the source-site figure;
+  the four calls inside the `protocol_pair_matrix!` body expand across its six invocations, so the
+  post-expansion count is 422. Two further raw occurrences are not calls and are excluded: the
+  commented-out `test_issue_808` body at `tests.rs:2727`, whose `n` is 100, and a doc comment
+  quoting `repeat_until_error_or(3, ..)` at `socket_log_context_tests.rs:397`.)
+  Seen **red before green, three times**, by breaking `main`'s production code and reverting it:
+  the `keep_alive_frontend` inversion above; making the final `can_stop` arm of
+  `Mux::shutting_down_inner` return `false`, which reddens it with "SoftStop did not close the idle
+  keep-alive session within 5s"; and inverting the `Method::Head` test in
+  `HttpContext::on_response_headers` (`lib/src/protocol/kawa_h1/editor.rs`), which reddens it with
+  "the keep-alive response was still incomplete after 1s". All three recipes are recorded in the
+  test's doc comment, on the `To SEE THIS RED` convention already used in
+  `lib/src/protocol/mux/stream.rs`.
+  The seven TLS handshake tests that also run at `n = 100` were audited and deliberately left
+  untouched: all seven delegate to `try_tls_with_cert`, which returns `State::Fail` when no
+  response resolves and when the backend sent no response of its own — the guard is
+  `aggregator.responses_sent == 1`, and the request count printed beside it is not asserted — so
+  none of them shares this defect. They do share the unbounded join: `try_tls_with_cert` reads
+  `wait_for_server_stop` into a `success` flag, which a worker that never terminates never
+  reaches. Bounding theirs is left out of this changeset rather than claimed. Whether 100
+  consecutive runs is the right number for a deterministic handshake is a separate maintainer
+  decision.
+
 ### 🐛 Fixed
 
 - **`fix(metrics)`: a client renewing its own cardinality lease at a LOWER level no longer trips
