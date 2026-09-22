@@ -139,6 +139,7 @@ mod converter;
 pub mod debug;
 mod h1;
 mod h2;
+mod h2_control_tx;
 mod h2_drain;
 mod h2_flood_detector;
 mod h2_flow_control;
@@ -2017,7 +2018,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             // shut — is reaped and its MAX_CONCURRENT_STREAMS slot freed, instead
             // of lingering until the 30-minute zombie checker. The reaper queues
             // an `RST_STREAM(CANCEL)`; because `has_pending_write()` does NOT
-            // observe `pending_rst_streams` (it gates connection close, so a
+            // observe the `H2ControlTx` queue (it gates connection close, so a
             // queued RST must not read as "keep open"), set `should_write` via
             // the dedicated `has_pending_control_write()` probe so the reset is
             // actually flushed to the peer before the connection closes — without

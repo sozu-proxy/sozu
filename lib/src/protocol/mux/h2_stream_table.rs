@@ -47,7 +47,7 @@
 //! identical wall-clock timing. That order flows directly onto the wire:
 //! `collect_timed_out`'s returned `Vec` order is the order
 //! `ConnectionH2::cancel_timed_out_streams` calls `enqueue_rst` in, which
-//! pushes onto `pending_rst_streams: Vec<(StreamId, H2Error)>`, drained onto
+//! pushes onto [`super::h2_control_tx::H2ControlTx`]'s queue, drained onto
 //! the wire in push order by `flush_pending_control_frames`.
 //!
 //! Both maps are now `BTreeMap`, so `collect_timed_out` walks each guard

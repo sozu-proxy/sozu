@@ -73,7 +73,10 @@ ConnectionH2<Front>
  |                                         // highest_peer_stream_id, expect_read, expect_write,
  |                                         // rst_sent, and the per-stream activity/fc-stall maps
  |-- pending_table_size_update: Option<u32> // RFC 7541 s6.3 directive owed to the peer
- |-- pending_rst_streams: Vec<(StreamId, H2Error)>  // Queued RST_STREAM frames
+ |-- control_tx: H2ControlTx                // Closed API (h2_control_tx.rs, private fields):
+ |                                         // pending_rst_streams: Vec<(StreamId, H2Error)>,
+ |                                         // total_rst_streams_queued (never-decaying, behind the
+ |                                         // CVE-2025-8671 cap) and max_pending
  |-- settings_sent_at: Option<Instant>      // SETTINGS ACK timeout tracking
  |-- zero: GenericHttpStream                // Control-frame write scratch + per-frame
  |                                         // read landing zone for stream 0. No longer a
@@ -101,10 +104,11 @@ back-pressure, gauge-rebalancing and discard-state fields that no section below
 discusses. Read the struct for the full list.
 
 Access patterns use the sub-structure names directly, except `flow_control`,
-`stream_table`, `hpack`, `flood_detector`, `drain` and `scheduler`, which are
-closed APIs (`h2_flow_control.rs`, `h2_stream_table.rs`, `hpack_state.rs`,
-`h2_flood_detector.rs`, `h2_drain.rs` and `h2_scheduler.rs` respectively, all
-six with private fields) reached only through their accessor/mutator methods:
+`stream_table`, `hpack`, `flood_detector`, `drain`, `scheduler` and
+`control_tx`, which are closed APIs (`h2_flow_control.rs`,
+`h2_stream_table.rs`, `hpack_state.rs`, `h2_flood_detector.rs`, `h2_drain.rs`,
+`h2_scheduler.rs` and `h2_control_tx.rs` respectively, all seven with private
+fields) reached only through their accessor/mutator methods:
 
 ```rust
 self.flow_control.consume_send_window(consumed);
@@ -113,9 +117,11 @@ self.drain.enter_final_goaway();
 self.flood_detector.check_flood(self.now);
 self.scheduler.priority(&stream_id);
 self.hpack.encoder_mut();
+self.control_tx.has_pending();
 ```
 
-`drain` is the newest of the five, extracted into `h2_drain.rs` with the
+`control_tx` is the newest of the seven, extracted into `h2_control_tx.rs`
+with the queued-RST state; `drain` came before it, extracted into `h2_drain.rs` with the
 GOAWAY/drain state machine. `h2.rs` reaches it through `draining()` at eleven
 call sites plus `begin_graceful_drain`, `deadline_elapsed`,
 `observe_peer_goaway` and `enter_final_goaway`, and reads none of its five
@@ -446,7 +452,7 @@ must be attributed proportionally.
 
 A **free function**, not a method:
 
-```rust lib/src/protocol/mux/h2.rs:468-476
+```rust lib/src/protocol/mux/h2.rs:462-470
 fn distribute_overhead(
     metrics: &mut SessionMetrics,
     overhead_bin: &mut usize,
@@ -520,7 +526,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:3341-3354
+```rust lib/src/protocol/mux/h2.rs:3178-3191
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -544,7 +550,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:3387-3393
+```rust lib/src/protocol/mux/h2.rs:3224-3230
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -557,13 +563,13 @@ stream.generate_access_log(
 The other three sites take the `&mut self` wrapper
 `ConnectionH2::distribute_overhead` instead, and each emits its own log:
 
-- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3679`) passes a
+- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3516`) passes a
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5225`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5047`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:5931`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:5753`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -572,10 +578,10 @@ Only the last two are reset paths; the first is the idle/stall sweep.
 for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
-taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2332`) and passes
+taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2183`) and passes
 `stream.linked_token()` straight out of it:
 
-```rust lib/src/protocol/mux/h2.rs:2547
+```rust lib/src/protocol/mux/h2.rs:2398
 let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, stream.linked_token());
 ```
 
@@ -593,7 +599,7 @@ the complexity of the H2 state machine:
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:1767-1771
+```rust lib/src/protocol/mux/h2.rs:1618-1622
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -637,7 +643,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:3123-3127
+```rust lib/src/protocol/mux/h2.rs:2960-2964
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -688,15 +694,17 @@ Flushes control data before application frames, in order:
    (`queue_window_update`, keyed by stream ID; `0` is the connection-level
    entry). Drain order is the map's ascending stream-id order, deterministic
    across processes — see that module's doc comment
-6. **Pending RST_STREAM frames**: Drains `pending_rst_streams` into the zero
-   buffer, with flood detection (`MAX_PENDING_RST_STREAMS` cap). Proxy-
-   emitted RSTs (DATA-on-closed, `refuse_stream_and_discard`, `reset_stream`,
-   `cancel_timed_out_streams`) are queued via the canonical
-   `ConnectionH2::enqueue_rst` helper, which
-   dedupes through the wire-map's `rst_sent` set (`H2StreamTable`,
-   `h2_stream_table.rs`), bumps `total_rst_streams_queued`, and arms
-   WRITABLE. The same `MAX_PENDING_RST_STREAMS` bounds the queue at the
-   insert: once `pending_rst_streams` holds 200 entries a further
+6. **Pending RST_STREAM frames**: Asks `H2ControlTx::drain_rst_streams_into`
+   (`h2_control_tx.rs`) to serialize as many whole queued frames as fit into
+   the zero buffer, with flood detection (`MAX_PENDING_RST_STREAMS` cap).
+   A frame that would straddle the end of the buffer stays queued for the next
+   pass. Proxy-emitted RSTs (DATA-on-closed, `refuse_stream_and_discard`,
+   `reset_stream`, `cancel_timed_out_streams`) are queued via the canonical
+   `ConnectionH2::enqueue_rst` helper, which delegates to
+   `H2ControlTx::enqueue_rst` — dedupes through the wire-map's `rst_sent` set
+   (`H2StreamTable`, `h2_stream_table.rs`), bumps the lifetime counter, and
+   arms WRITABLE. The same `MAX_PENDING_RST_STREAMS` bounds the queue at the
+   insert: once that queue holds 200 entries a further
    `enqueue_rst` queues nothing and emits `h2.rst_stream_dropped` plus an
    `error!` line, because the connection has by then already met the
    `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS` half of the condition
@@ -785,7 +793,7 @@ live.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4257
+```rust lib/src/protocol/mux/h2.rs:4092
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -938,7 +946,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5268-5270
+```rust lib/src/protocol/mux/h2.rs:5090-5092
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -946,7 +954,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5282-5288
+```rust lib/src/protocol/mux/h2.rs:5104-5110
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

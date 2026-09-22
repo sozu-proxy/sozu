@@ -77,6 +77,44 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the queued RST_STREAM state moves out of `h2.rs` into a new
+  `lib/src/protocol/mux/h2_control_tx.rs`, behind the same closed API the `hpack_state` /
+  `h2_flow_control` / `h2_stream_table` / `h2_drain` / `h2_flood_detector` /
+  `h2_header_reassembly` / `h2_scheduler` extractions established.** `H2ControlTx` owns the pending
+  `(StreamId, H2Error)` queue, the never-decaying lifetime counter behind the CVE-2025-8671
+  MadeYouReset cap, that cap's value, and the per-insert bound that refuses to grow the queue past
+  it (sozu-proxy/sozu#1413). `H2ControlTx::enqueue_rst` returns an `EnqueueRstOutcome`
+  (`Queued` / `Deduped` / `Dropped`) and tests the bound BEFORE `rst_sent.insert`, so an
+  at-capacity refusal never marks a stream reset without queueing its frame; `ConnectionH2` keeps
+  the `Dropped` accounting — `h2.rst_stream_dropped` plus a session-context `error!` line.
+  Serialization becomes
+  `H2ControlTx::drain_rst_streams_into(&mut [u8]) -> (usize, usize)` — the same caller-supplied-buffer
+  contract `H2FlowControl::drain_window_updates_into` already uses and that `serializer::gen_*`
+  established before either — replacing a serialization loop written inline in
+  `flush_pending_control_frames`. No behaviour change on the wire: emission order is still queue
+  order, a frame is still written whole or not at all, and the frames that do not fit still stay
+  queued for the next `writable()`.
+
+  What the module deliberately does not own is stated in its header with the reason for each: the
+  dedupe set (it lives on `H2StreamTable`, whose removal path asserts it clean), `Readiness`
+  (LIFECYCLE invariant 15 arming), the decision to drain (three gates that all read `ConnectionH2`
+  state), and metrics (a lifetime-cap trip converts to a connection-wide GOAWAY only the connection
+  can return, so accounting stays at queue time — draining emits no metric, or every frame would be
+  counted twice). `ConnectionH2::check_invariants`' RST-accounting clause moves to the module's own
+  `check_invariants` rather than being restated in two places.
+
+  Tests: the five `test_enqueue_rst_into_*` tests move with the state they drive, keeping their
+  names, and `prop_pending_rst_queue_stays_within_its_bound` moves with them — its `Drain` step now
+  goes through the real `drain_rst_streams_into` instead of a bare `Vec::drain`.
+  `mass_reap_keeps_the_pending_rst_queue_within_its_hard_cap` stays in `h2.rs`, where it needs a
+  full `ConnectionH2`, and now reads the queue through `H2ControlTx::pending`. All three
+  `To SEE THIS RED:` recipes are re-pointed at the guard's new home.
+  `drain_rst_streams_into` gets the coverage the inline loop never had — exact-fit, short
+  buffer, a buffer too small for one frame, and an empty queue — plus
+  `draining_does_not_rewind_the_lifetime_cap`, seen red by subtracting the drained count from the
+  lifetime counter, which is exactly how a peer would evade the MadeYouReset cap: drain, re-queue,
+  repeat.
+
 - **`refactor(mux-h2)`: the `peer=` slot of every `MUX-H2` log line is read from a snapshot
   `ConnectionH2` captures at construction, not from the socket handler on every line.** New private
   `ConnectionH2::peer_address: Option<SocketAddr>`, filled once in `ConnectionH2::new` from
