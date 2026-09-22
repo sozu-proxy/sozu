@@ -24,7 +24,7 @@ jobs:
   # └──────────────────────────────────────────────────────────────┘
   pipeline:
     name: ${{ matrix.cell }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     continue-on-error: ${{ matrix.experimental }}
     strategy:
@@ -40,6 +40,7 @@ jobs:
             flags: '--features opentelemetry,splice,simd'
             bench: false
             experimental: false
+            runner: ubuntu-latest
           # `msrv-bare` baseline: only the workspace defaults
           # (`jemallocator + crypto-ring`). Catches breakage when the
           # optional features (`opentelemetry`, `splice`, `simd`) are
@@ -50,6 +51,7 @@ jobs:
             flags: ''
             bench: false
             experimental: false
+            runner: ubuntu-latest
           # The four crypto-provider cells now exercise the full
           # feature matrix (`<crypto>,opentelemetry,splice,simd`) so
           # the CI cells reflect what release artefacts ship with
@@ -62,35 +64,44 @@ jobs:
             flags: '--no-default-features --features crypto-ring,opentelemetry,splice,simd'
             bench: true
             experimental: false
+            runner: ubuntu-latest
           - cell: crypto-aws-lc-rs
             toolchain: '1.93.1'
             flags: '--no-default-features --features crypto-aws-lc-rs,opentelemetry,splice,simd'
             bench: true
             experimental: false
+            runner: ubuntu-latest
           - cell: crypto-openssl
             toolchain: '1.93.1'
             flags: '--no-default-features --features crypto-openssl,opentelemetry,splice,simd'
             bench: true
             experimental: false
+            runner: ubuntu-latest
           - cell: fips
             toolchain: '1.93.1'
             flags: '--no-default-features --features fips,opentelemetry,splice,simd'
             bench: true
             experimental: false
+            runner: ubuntu-latest
           # Toolchain-drift cells: same politics as msrv (default
           # features, no bench). Lint is gated to the 1.91 MSRV cell
           # because newer toolchains (1.95+) fire additional untriaged
           # lints across the workspace.
+          # Canary migration to the self-hosted CKE runner (see ci/runners/), 2026-09-22: only
+          # this cell targets sozu-general so far. Full-matrix migration follows once this proves
+          # stable over a representative traffic window (per ci/runners/README.md's rollout plan).
           - cell: stable
             toolchain: stable
             flags: ''
             bench: false
             experimental: false
+            runner: sozu-general
           - cell: beta
             toolchain: beta
             flags: ''
             bench: false
             experimental: false
+            runner: ubuntu-latest
           # Nightly stays "experimental" — keep building/testing it
           # to catch future-Rust regressions early without gating CI.
           - cell: nightly
@@ -98,6 +109,7 @@ jobs:
             flags: ''
             bench: false
             experimental: true
+            runner: ubuntu-latest
     steps:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
