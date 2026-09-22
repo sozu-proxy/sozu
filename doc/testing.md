@@ -164,6 +164,28 @@ Notes:
   property — see its own doc comment for why — and stay covered by
   `a_refused_stream_keeps_the_hpack_decoder_in_sync` and
   `a_refused_padded_prioritized_stream_keeps_the_hpack_decoder_in_sync`.
+- **The H2 write pass's HPACK encoder is unit-tested with `quickcheck`**
+  (`lib/src/protocol/mux/h2.rs`,
+  `write_pass_property::qc_one_write_pass_prefixes_its_first_header_block_only`),
+  on top of the example-based
+  `one_write_pass_prefixes_its_first_header_block_only_and_shares_one_encoder`.
+  Same `ConnectionH2` state-machine technique as the reassembly property above
+  and a deliberate sibling of it rather than a case inside it: that one drives
+  the READ path and its oracle is "one decoder stays in sync across a
+  fragmented header block", this one drives the WRITE path and its oracle is
+  "one encoder, one RFC 7541 §6.3 size-update prefix, N blocks a single peer
+  decoder replays in order". One `quickcheck` verdict over two unrelated state
+  machines would say nothing about either. It opens 2..=5 streams with real
+  HEADERS frames, gives each sozu's own 404 default answer through
+  `answers::set_default_answer`, runs ONE `writable()` pass, and checks the
+  captured wire bytes. Both properties are invisible to `converter.rs`'s own
+  unit tests, which drive a single `H2BlockConverter` over a single kawa, and
+  both became cross-stream rather than structural when the converter was
+  scoped to a single `kawa.prepare` call — see LIFECYCLE.md invariant 25. The
+  example-based test carries the negative half the property deliberately
+  omits: a peer decoder that never saw the first block must FAIL on the
+  second, which a generated table size small enough to evict the dynamic table
+  would make untrue.
 - `e2e/src/tests/fuzz_tests.rs` is a thin integration wrapper that shells out to
   the four fuzz targets for 10 s each. It *skips gracefully* (prints a notice,
   returns clean) when the nightly toolchain or `cargo-fuzz` is missing, so the
@@ -622,7 +644,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **`decode_status` returns `None` on a size-update-prefixed block, and whether
   that is fail-closed depends on the call site.** `H2BlockConverter::emit_pending_size_update_if_new_block`
   (`lib/src/protocol/mux/converter.rs:112`, armed at
-  `lib/src/protocol/mux/h2.rs:5587`) prepends a `001xxxxx` HPACK dynamic table
+  `lib/src/protocol/mux/h2.rs:5572`) prepends a `001xxxxx` HPACK dynamic table
   size update when a peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e
   call sites send one: `h2_security_tests.rs:2440` (value 0) and
   `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from

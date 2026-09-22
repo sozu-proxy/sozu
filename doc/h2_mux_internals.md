@@ -171,7 +171,7 @@ tokens `u=N` and `i`/`i=?1`/`i=?0`. Malformed tokens are silently ignored.
 
 In `write_streams()`, all active stream IDs are collected and sorted:
 
-```rust lib/src/protocol/mux/h2.rs:2527-2536
+```rust lib/src/protocol/mux/h2.rs:2511-2520
 priorities_buf.clear();
 priorities_buf.extend(self.stream_table.streams().keys().copied());
 // RFC 9218 §4 primary sort: ascending urgency, then stream ID for
@@ -193,7 +193,7 @@ the whole loop and no other `self.hpack` accessor can run until it is dropped.
 The `incremental` flag is applied in a second pass, immediately after the
 primary sort:
 
-```rust lib/src/protocol/mux/h2.rs:2537-2543
+```rust lib/src/protocol/mux/h2.rs:2521-2527
 // RFC 9218 §4: inside each urgency bucket, move incremental streams
 // to the tail and rotate them by the per-connection round-robin
 // cursor so no single slow-draining stream can starve its
@@ -435,9 +435,9 @@ must be attributed proportionally.
 
 ### distribute_overhead()
 
-A **free function** (not a method) to avoid borrow conflicts:
+A **free function**, not a method:
 
-```rust lib/src/protocol/mux/h2.rs:460-468
+```rust lib/src/protocol/mux/h2.rs:468-476
 fn distribute_overhead(
     metrics: &mut SessionMetrics,
     overhead_bin: &mut usize,
@@ -449,12 +449,12 @@ fn distribute_overhead(
 ) {
 ```
 
-It is extracted as a free function because `write_streams()` borrows the HPACK
-encoder out of `self.hpack` (`HpackState::encoder_mut`) for the converter while
-simultaneously needing to update per-stream metrics and connection overhead
-counters. A `&mut self` method would conflict — and so would any other
-`self.hpack` accessor, which is why the scratch buffers are taken out by value
-before the converter is built.
+It is a free function so the seven `test_distribute_overhead_*` unit tests can
+drive the arithmetic directly, with no `ConnectionH2` fixture.
+`ConnectionH2::distribute_overhead` is the `&mut self` wrapper the reset paths
+use. `ConnectionH2::try_recycle_server_stream` calls the free function directly
+instead, which is a spelling choice rather than a constraint — the wrapper would
+credit the same shares at that site.
 
 **Distribution formula**, per direction, in the order the branches are taken:
 
@@ -507,22 +507,24 @@ Bytes are classified as overhead in two places:
 At stream completion the overhead is distributed to the stream's
 `SessionMetrics` before the access log is emitted. On the normal completion
 path that happens inside `ConnectionH2::try_recycle_server_stream`, which calls
-the free function directly because it is itself a static helper holding
-`&mut H2ByteAccounting` rather than `&mut self`:
+the free function directly rather than through the `&mut self` wrapper — a
+spelling choice, not a constraint, since the wrapper would credit the same
+shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:3634-3646
+```rust lib/src/protocol/mux/h2.rs:3620-3633
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
 );
+let active_streams = self.stream_table.streams().len();
 distribute_overhead(
     &mut stream.metrics,
-    &mut bytes.overhead_bin,
-    &mut bytes.overhead_bout,
+    &mut self.bytes.overhead_bin,
+    &mut self.bytes.overhead_bout,
     stream_bytes,
     byte_totals,
-    streams.len(),
-    streams.len() == 1,
+    active_streams,
+    active_streams == 1,
 );
 ```
 
@@ -533,7 +535,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:3679-3685
+```rust lib/src/protocol/mux/h2.rs:3666-3672
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -546,32 +548,26 @@ stream.generate_access_log(
 The other three sites take the `&mut self` wrapper
 `ConnectionH2::distribute_overhead` instead, and each emits its own log:
 
-- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3971`) passes a
+- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3957`) passes a
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5518`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5503`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6225`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6209`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
 
-`snapshot_rtts` is an associated function taking individual field references
-rather than a `&self` method, for the same reason `try_recycle_server_stream`
-is: inside the per-stream write loop the `H2BlockConverter` holds the encoder
-borrowed out of `self.hpack`, so a `&self` receiver would conflict. The call
-below sits inside the `let stream = &mut context.streams[global_stream_id];`
-borrow taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2608`) and passes
+`snapshot_rtts` is an ordinary `&self` method: the `H2BlockConverter` is built
+for one `kawa.prepare` call rather than held across the per-stream write loop,
+so no borrow of `self.hpack` is outstanding at this call site. The call below
+sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
+taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2593`) and passes
 `stream.linked_token()` straight out of it:
 
-```rust lib/src/protocol/mux/h2.rs:2821-2826
-let (client_rtt, server_rtt) = Self::snapshot_rtts(
-    &self.position,
-    &self.socket,
-    &endpoint,
-    stream.linked_token(),
-);
+```rust lib/src/protocol/mux/h2.rs:2820
+let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, stream.linked_token());
 ```
 
 This ensures `metrics.bin` and `metrics.bout` in the access log include the
@@ -588,7 +584,7 @@ the complexity of the H2 state machine:
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:1993-1997
+```rust lib/src/protocol/mux/h2.rs:2001-2005
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -632,7 +628,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:3408-3412
+```rust lib/src/protocol/mux/h2.rs:3402-3406
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -743,7 +739,8 @@ The main data-plane write path:
 
 1. Resumes any partially-written stream (`stream_table.expect_write()`)
 2. Pre-computes `byte_totals` for overhead distribution
-3. Sets up `H2BlockConverter` borrowing the encoder out of `self.hpack`
+3. Opens a `H2ConverterPass` holding the reusable scratch and the pending
+   RFC 7541 §6.3 size-update signal
 4. Sorts streams by priority (urgency, then stream_id)
 5. For each stream: converts kawa blocks to H2 frames, writes to socket
 6. Recycles completed streams, distributes overhead, emits access logs
@@ -753,16 +750,28 @@ The main data-plane write path:
 8. Returns the scratch buffers to `self.hpack` and shrinks the three converter
    buffers if they grew beyond 16KB (`HpackState::shrink_converter_buffers`)
 
-**Why write_streams() can't be further decomposed**: The `H2BlockConverter`
-borrows `self.hpack`, through `HpackState::encoder_mut`, for the duration of
-the priority loop. This prevents calling any `&mut self` method within the loop
-body — including any other `self.hpack` accessor. The free function
-`distribute_overhead()` works around this for metrics, but the converter setup
-and priority iteration must remain in a single method scope.
+**How the converter borrow is scoped**: `H2BlockConverter` borrows the
+connection's HPACK encoder out of `HpackState`. It is built for exactly ONE
+`kawa.prepare()` call — not once per pass — so that borrow never spans the
+priority loop and every `&self` / `&mut self` method stays callable inside it.
+`H2ConverterPass` carries what has to cross from one stream's `prepare` to the
+next: the three reusable scratch buffers (moved, never copied) and the
+RFC 7541 §6.3 size-update signal, which belongs to the FIRST header block of
+the pass and to no other. LIFECYCLE.md invariant 25 states both properties and
+names the tests that pin them.
+
+What is still deferred to after the loop — RST accounting via
+`freshly_emitted_rsts`, stream retirement via `completed_streams` — is deferred
+for ordering reasons, not borrow reasons: a MadeYouReset cap trip must not
+preempt the remaining streams' writes, and `try_recycle_server_stream` passes
+`is_last_stream` as `streams().len() == 1` — the branch that hands the whole
+remaining overhead pool to one stream — so retiring inline would let a later
+completer of the same pass drain that pool while other streams are still
+live.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4549
+```rust lib/src/protocol/mux/h2.rs:4535
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -915,7 +924,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5561-5563
+```rust lib/src/protocol/mux/h2.rs:5546-5548
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -923,7 +932,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5575-5581
+```rust lib/src/protocol/mux/h2.rs:5560-5566
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
@@ -951,12 +960,14 @@ header block this connection emits.
 
 ### Buffer shrinking after large headers
 
-`converter_buf`, `lowercase_buf` and `cookie_buf` are reusable buffers moved
-into and out of `H2BlockConverter` each `write_streams()` cycle. They belong to
-`HpackState`, so `h2.rs` reclaims them with `self.hpack.put_converter_buf(…)`
-and friends and then calls one method that shrinks all three:
+`converter_buf`, `lowercase_buf` and `cookie_buf` live in `HpackState`. A
+write pass takes all three out by value, hands them to `H2ConverterPass`, and
+`H2ConverterPass::converter` / `::reclaim` move them into and out of each
+per-`prepare` `H2BlockConverter` — a `Vec` move, never a copy of the bytes.
+The pass gives them back at the end, and `HpackState::shrink_converter_buffers`
+then caps each one:
 
-```rust lib/src/protocol/mux/hpack_state.rs:121-131
+```rust lib/src/protocol/mux/hpack_state.rs:122-132
 pub(super) fn shrink_converter_buffers(&mut self) {
     if self.converter_buf.capacity() > 16_384 {
         self.converter_buf.shrink_to(4096);

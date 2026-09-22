@@ -104,10 +104,11 @@ impl HpackState {
 
     /// Takes ownership of the priority-sorted-stream-IDs scratch buffer,
     /// leaving an empty `Vec` in its place. `write_streams` needs this one
-    /// taken out by value too (not just borrowed in place): once the
-    /// converter borrows the encoder out of `self.hpack` for the pass, no
-    /// other `self.hpack` accessor — including one returning `&mut
-    /// priorities_buf` — can run until the converter is dropped.
+    /// taken out by value too (not just borrowed in place): it iterates the
+    /// buffer while re-borrowing the encoder out of `self.hpack` for every
+    /// eligible stream's `kawa.prepare`, so a `&self.hpack` borrow held
+    /// across that loop — which is what iterating in place would be — cannot
+    /// coexist with the `&mut self.hpack` each converter takes.
     pub(super) fn take_priorities_buf(&mut self) -> Vec<StreamId> {
         std::mem::take(&mut self.priorities_buf)
     }
