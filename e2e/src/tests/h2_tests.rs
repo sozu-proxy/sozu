@@ -229,23 +229,58 @@ impl Drop for ContentLengthMismatchBackend {
     }
 }
 
+/// Upper bound on how long [`DelayedH2Backend::start_held`] withholds a
+/// response while waiting to be released. This is a hang bound, not a pacing
+/// knob: a caller that forgets to call [`DelayedH2Backend::release`] gets a
+/// failed test instead of a wedged suite. Every caller's own deadline is an
+/// order of magnitude shorter, so this never participates in a passing run.
+const DELAYED_BACKEND_HOLD_CAP: Duration = Duration::from_secs(30);
+
 /// An H2 backend that delays its response by a configurable duration.
 /// Used to test that in-flight requests complete when GoAway is sent.
 struct DelayedH2Backend {
     stop: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
     requests_received: Arc<AtomicUsize>,
     responses_sent: Arc<AtomicUsize>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl DelayedH2Backend {
+    /// Answer every request `delay` after receiving it.
     fn start(address: SocketAddr, delay: Duration, body: impl Into<String>) -> Self {
+        Self::spawn(address, delay, body, true)
+    }
+
+    /// Accept requests and hold their responses open until [`Self::release`]
+    /// is called, instead of betting a fixed duration on how long the test
+    /// will need them in flight.
+    ///
+    /// A test that needs a request to still be unresolved when some other
+    /// event lands is asserting an ordering, and a fixed delay only makes
+    /// that ordering *likely*: the moment the work before the release takes
+    /// longer than the delay — which is exactly what a loaded machine
+    /// does — the request resolves early and the scenario silently stops
+    /// being the one under test. Holding until released makes the ordering
+    /// hold by construction, at any load.
+    fn start_held(address: SocketAddr, body: impl Into<String>) -> Self {
+        Self::spawn(address, Duration::ZERO, body, false)
+    }
+
+    fn spawn(
+        address: SocketAddr,
+        delay: Duration,
+        body: impl Into<String>,
+        released: bool,
+    ) -> Self {
         let body: Bytes = Bytes::from(body.into());
         let stop = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(released));
         let requests_received = Arc::new(AtomicUsize::new(0));
         let responses_sent = Arc::new(AtomicUsize::new(0));
 
         let stop_clone = stop.clone();
+        let release_clone = release.clone();
         let req_count = requests_received.clone();
         let resp_count = responses_sent.clone();
 
@@ -271,6 +306,7 @@ impl DelayedH2Backend {
                     let body = body.clone();
                     let req_count = req_count.clone();
                     let resp_count = resp_count.clone();
+                    let release = release_clone.clone();
 
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
@@ -279,9 +315,24 @@ impl DelayedH2Backend {
                                 let body = body.clone();
                                 let req_count = req_count.clone();
                                 let resp_count = resp_count.clone();
+                                let release = release.clone();
                                 async move {
                                     req_count.fetch_add(1, Ordering::Relaxed);
                                     tokio::time::sleep(delay).await;
+
+                                    // Pre-released for `start`, so this loop
+                                    // never runs there and that path keeps its
+                                    // exact previous behaviour. For
+                                    // `start_held` it is the whole point: the
+                                    // response stays owed until the test says
+                                    // otherwise.
+                                    let held_since = tokio::time::Instant::now();
+                                    while !release.load(Ordering::Relaxed) {
+                                        if held_since.elapsed() > DELAYED_BACKEND_HOLD_CAP {
+                                            break;
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(5)).await;
+                                    }
 
                                     let response = Response::builder()
                                         .status(200)
@@ -303,10 +354,18 @@ impl DelayedH2Backend {
 
         Self {
             stop,
+            release,
             requests_received,
             responses_sent,
             thread: Some(thread),
         }
+    }
+
+    /// Let every held request answer, and every later one answer at once.
+    /// Sticky on purpose: a request that has not arrived yet — a stream whose
+    /// header block only completes after the release — must not be held again.
+    fn release(&self) {
+        self.release.store(true, Ordering::Relaxed);
     }
 
     #[allow(dead_code)]
@@ -320,6 +379,9 @@ impl DelayedH2Backend {
     }
 
     fn stop(&mut self) {
+        // Unblock anything still held first: a caller that stops without
+        // releasing must not wait out `DELAYED_BACKEND_HOLD_CAP`.
+        self.release.store(true, Ordering::Relaxed);
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             thread::sleep(Duration::from_millis(100));
@@ -435,6 +497,78 @@ fn query_worker_metrics(worker: &mut Worker) -> WorkerMetricSnapshot {
         zombies,
     }
 }
+
+/// Read ONE proxy-level metric by name over the worker's command channel.
+///
+/// [`query_worker_metrics`] above answers a fixed two-metric question and
+/// panics on anything unexpected, which suits a one-shot assertion. This is
+/// the same `RequestType::QueryMetrics` round-trip parameterised by name and
+/// made total instead: every "not what I asked for" outcome collapses to
+/// `None` so a *bounded poll* can watch one counter or gauge evolve without
+/// a stray response turning a slow run into a panic.
+///
+/// Returning `None` rather than asserting on `response.id` is deliberate. The
+/// worker answers `SoftStop` only once the last session is gone
+/// (`Server::shut_down_sessions`), so no interleaved response is expected
+/// while a drain is still in flight — but a poll loop must not be the thing
+/// that discovers otherwise by panicking. A skipped sample just costs one
+/// more iteration.
+fn query_proxy_metric(worker: &mut Worker, metric_name: &str) -> Option<filtered_metrics::Inner> {
+    // A worker that has already exited cannot answer, and reading its closed
+    // command channel panics inside `Worker::read_proxy_response`. Every
+    // caller below polls while holding work open precisely so the worker
+    // CANNOT finish, so observing a finished one is always a failure — but it
+    // should surface as that caller's own timeout and diagnostic, not as a
+    // panic thrown from inside a query helper.
+    if worker.server_job.is_finished() {
+        return None;
+    }
+    worker.send_proxy_request_type(RequestType::QueryMetrics(QueryMetricsOptions {
+        list: false,
+        cluster_ids: vec![],
+        backend_ids: vec![],
+        metric_names: vec![metric_name.to_owned()],
+        no_clusters: true,
+        workers: false,
+    }));
+    let response = worker.read_proxy_response()?;
+    let content = response.content.and_then(|content| content.content_type)?;
+    let ContentType::WorkerMetrics(metrics) = content else {
+        return None;
+    };
+    metrics
+        .proxy
+        .get(metric_name)
+        .and_then(|metric| metric.inner.clone())
+}
+
+/// [`query_proxy_metric`] for a `count!` metric. An absent key reads as 0:
+/// a counter that has never been touched and a counter at zero are the same
+/// observation, and both are "no progress yet" to a poll.
+fn query_proxy_count(worker: &mut Worker, metric_name: &str) -> i64 {
+    match query_proxy_metric(worker, metric_name) {
+        Some(filtered_metrics::Inner::Count(value)) => value,
+        _ => 0,
+    }
+}
+
+/// [`query_proxy_metric`] for a `gauge!` metric. `None` means "not readable
+/// this sample" and is NOT folded into a value, because a gauge's zero is a
+/// meaningful state here (`server.live == 0` is exactly what the drain gate
+/// below waits for) and must not be indistinguishable from an absent read.
+fn query_proxy_gauge(worker: &mut Worker, metric_name: &str) -> Option<u64> {
+    match query_proxy_metric(worker, metric_name) {
+        Some(filtered_metrics::Inner::Gauge(value)) => Some(value),
+        _ => None,
+    }
+}
+
+/// Per-frame-type RX counter key for HEADERS, from `h2_frame_rx_metric_key`
+/// in `lib/src/protocol/mux/h2.rs`. That table is a bare `&'static str` match
+/// with no constant in `sozu_lib::metrics::names::h2` to import, so the
+/// literal is repeated here. A rename upstream makes the poll below time out
+/// and the test fail loudly — never pass quietly.
+const H2_FRAMES_RX_HEADERS: &str = "h2.frames.rx.headers";
 
 // ============================================================================
 // Test 1: Basic H2 request/response smoke test
@@ -726,19 +860,28 @@ fn try_h2_goaway_graceful_drain() -> State {
 /// real graceful shutdown racing a real split HEADERS/CONTINUATION send.
 ///
 /// A raw connection opens two streams: stream 1 is a complete, ordinary
-/// request that reaches a deliberately slow backend and stays unresolved for
-/// `ANCHOR_DELAY` — the in-flight work that makes the worker actually drain
-/// instead of exiting immediately with nothing to wait for. Stream 3's
+/// request that reaches a backend which holds its response open until this
+/// test releases it — the in-flight work that makes the worker actually drain
+/// instead of exiting immediately with nothing to wait for, and which stays
+/// in flight for however long the steps below take. Stream 3's
 /// HEADERS frame (no END_HEADERS) is sent once stream 1 is confirmed to have
 /// reached the backend; `soft_stop()` then fires while stream 3's block is
 /// still incomplete, and stream 3's CONTINUATION is sent only after that.
 ///
-/// `drain_witnessed` (a GOAWAY frame observed in the response) is a required
-/// part of success, not just `anchor_ok`/`stream3_ok`: without it, a run
-/// proves nothing about the race this test exists to exercise — the two
-/// fixed `150ms` sleeps could simply have missed the drain window entirely,
-/// and the corruption check would then pass vacuously on a run that never
-/// actually raced anything.
+/// Both of those orderings are established by waiting on an observable state
+/// change, not by sleeping: `h2.frames.rx.headers` proves sozu decoded the
+/// partial HEADERS and is in reassembly, and `server.live` dropping to 0
+/// proves the soft-stop drain has already reached this connection. Both are
+/// read over the worker's command channel, because the connection itself can
+/// witness neither — no frame may legally be interleaved into an open header
+/// block, and the initial GOAWAY is deliberately deferred for the duration of
+/// the reassembly this test creates.
+///
+/// `drain_witnessed` (a GOAWAY frame observed in the response) remains a
+/// required part of success, not just `anchor_ok`/`stream3_ok`: without it, a
+/// run proves nothing about the race this test exists to exercise, and the
+/// corruption check would pass vacuously on a run that never actually raced
+/// anything.
 fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
@@ -784,9 +927,13 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
     )));
     worker.read_to_last();
 
-    const ANCHOR_DELAY: Duration = Duration::from_millis(600);
-    let mut delayed_backend =
-        DelayedH2Backend::start(back_address, ANCHOR_DELAY, "anchor-response-body");
+    // Held, not merely slow. Stream 1 has to still be unresolved when the
+    // drain lands, and that is an ordering requirement, not a duration:
+    // establishing reassembly and confirming the drain both cost control-plane
+    // round-trips whose cost is set by machine load, so any fixed delay is a
+    // bet this test loses precisely when the machine is busy. It is released
+    // explicitly once the CONTINUATION is on the wire.
+    let mut delayed_backend = DelayedH2Backend::start_held(back_address, "anchor-response-body");
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
     let mut tls = raw_h2_connection(front_addr);
@@ -809,6 +956,7 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
     while delayed_backend.get_requests_received() == 0 {
         if wait_start.elapsed() > Duration::from_secs(5) {
             println!("H2 CONTINUATION+drain - anchor request never reached the backend");
+            delayed_backend.release();
             worker.soft_stop();
             let _ = worker.wait_for_server_stop();
             delayed_backend.stop();
@@ -816,6 +964,12 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
         }
         thread::sleep(Duration::from_millis(10));
     }
+
+    // Baseline for the reassembly gate below. The anchor's HEADERS block has
+    // necessarily been decoded already — its request reached the backend,
+    // which cannot happen before sozu processed the frame — so this counter
+    // has settled, and the next increment on it can only be stream 3's.
+    let headers_rx_before_stream3 = query_proxy_count(&mut worker, H2_FRAMES_RX_HEADERS);
 
     // Stream 3: a real, complete request header block — the same builder the
     // Chromium-146 e2e tests use — split roughly in half so the first half
@@ -833,37 +987,115 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
     let headers_frame = H2Frame::headers(3, first_half.to_vec(), false, true);
     if tls.write_all(&headers_frame.encode()).is_err() || tls.flush().is_err() {
         println!("H2 CONTINUATION+drain - stream 3 HEADERS write failed");
+        delayed_backend.release();
         worker.soft_stop();
         let _ = worker.wait_for_server_stop();
         delayed_backend.stop();
         return State::Fail;
     }
 
-    // Give sozu's event loop a moment to read the HEADERS frame and enter
-    // the CONTINUATION-reassembly state before the drain lands.
-    thread::sleep(Duration::from_millis(150));
+    // Wait until sozu has ENTERED CONTINUATION reassembly, rather than
+    // sleeping and hoping it has. `ConnectionH2::handle_frame` counts the
+    // frame by type (`h2.frames.rx.headers`) immediately before dispatching
+    // to `handle_headers_frame`, and that call — END_HEADERS being clear —
+    // is precisely what assigns `H2State::ContinuationHeader`. Counter and
+    // state transition happen inside ONE synchronous event-loop pass, so a
+    // command-channel round-trip that observes the increment was necessarily
+    // answered in a later pass: the reassembly state is already live.
+    //
+    // Nothing on the connection itself can witness this. RFC 9113 §6.2/§6.10
+    // forbid any frame between a HEADERS and its CONTINUATION, and sozu
+    // enforces it (`handle_continuation_header_state` answers GOAWAY(
+    // PROTOCOL_ERROR) for a non-CONTINUATION header), so a PING round-trip —
+    // the obvious in-band probe — would destroy the connection it was meant
+    // to measure. The control plane is the only legal vantage point.
+    let reassembly_start = Instant::now();
+    while query_proxy_count(&mut worker, H2_FRAMES_RX_HEADERS) <= headers_rx_before_stream3 {
+        if reassembly_start.elapsed() > Duration::from_secs(5) {
+            println!("H2 CONTINUATION+drain - sozu never read stream 3's partial HEADERS");
+            delayed_backend.release();
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            delayed_backend.stop();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 
     // Trigger a graceful shutdown WHILE stream 3's block is still incomplete
     // — exactly the window #1401/#1423 describe — while stream 1 is still
-    // unresolved on the deliberately slow backend, so the worker actually
+    // unresolved on the backend holding its response, so the worker actually
     // drains instead of exiting with nothing to wait for. `soft_stop()` only
     // signals the worker; the drain itself runs asynchronously on the
-    // worker's own event loop, leaving a real race window before the
-    // CONTINUATION below is sent.
+    // worker's own event loop.
     worker.soft_stop();
-    thread::sleep(Duration::from_millis(150));
 
-    // Now complete stream 3's block.
+    // Wait for that drain to LAND on this connection. `Server::run` writes
+    // `server.live` at the tail of every loop iteration — 0 once
+    // `shutting_down` is set — and calls `shut_down_sessions()` immediately
+    // after that write, in the same iteration; `shut_down_sessions()` is what
+    // reaches `Mux::shutting_down` -> `ConnectionH2::graceful_goaway` on this
+    // very connection. Command responses are produced EARLIER in the loop
+    // body, so a query returning 0 was answered no earlier than the following
+    // iteration — by which time the iteration that wrote it, and therefore
+    // the `graceful_goaway` call that followed it, has completed.
+    //
+    // The wire cannot witness this either, and here the absence is by design:
+    // `graceful_goaway` DEFERS the initial GOAWAY while reassembly is in
+    // progress (`GracefulDrainDecision::DeferInitial`) precisely so it does
+    // not clobber the block being reassembled. In the interleaving this test
+    // exists to exercise, no GOAWAY is emitted until the CONTINUATION below
+    // completes the block — so gating on one would wait for a frame that
+    // correct behaviour guarantees will not come, and would only ever proceed
+    // in the runs where the premise had already been missed.
+    let drain_start = Instant::now();
+    while query_proxy_gauge(&mut worker, sozu_lib::metrics::names::server::LIVE) != Some(0) {
+        if drain_start.elapsed() > Duration::from_secs(5) {
+            println!("H2 CONTINUATION+drain - the soft-stop drain never landed");
+            delayed_backend.release();
+            let _ = worker.wait_for_server_stop();
+            delayed_backend.stop();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Now complete stream 3's block. Everything this test set up — reassembly
+    // live, drain landed — held until this write, by observation rather than
+    // by timing.
     let continuation_frame = H2Frame::continuation(3, second_half.to_vec(), true);
     let sent = tls.write_all(&continuation_frame.encode()).is_ok() && tls.flush().is_ok();
 
-    // Poll past the anchor's delay so both streams have a chance to resolve.
-    let frames = collect_response_frames(
-        &mut tls,
-        50,
-        30,
-        (ANCHOR_DELAY.as_millis() as u64 / 30).max(50),
-    );
+    // Wait for sozu to have CONSUMED that CONTINUATION before letting the
+    // anchor answer. The `(H2State::ContinuationFrame(_), _)` arm re-enters
+    // `handle_frame(Frame::Headers(..))` with the reassembled block, so this
+    // same counter ticks a second time exactly when the block completes.
+    //
+    // Order matters: stream 1 finishing is what lets the drain conclude the
+    // connection has nothing left to wait for, and a connection torn down on
+    // that basis never reads the CONTINUATION at all. Releasing the anchor
+    // first therefore races the drain against the frame this test exists to
+    // deliver, and loses often enough to matter — the "stream 1 served, no
+    // stream 3, single trailing GOAWAY" outcome.
+    let block_completed = Instant::now();
+    while query_proxy_count(&mut worker, H2_FRAMES_RX_HEADERS) <= headers_rx_before_stream3 + 1 {
+        if block_completed.elapsed() > Duration::from_secs(5) {
+            println!("H2 CONTINUATION+drain - sozu never completed stream 3's header block");
+            delayed_backend.release();
+            let _ = worker.wait_for_server_stop();
+            delayed_backend.stop();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // The anchor has done its job of keeping the drain occupied; let it and
+    // stream 3 answer. The release is sticky, so stream 3 — whose request
+    // reaches the backend only now — is served immediately rather than held.
+    delayed_backend.release();
+
+    // Collect both streams' responses.
+    let frames = collect_response_frames(&mut tls, 50, 30, 50);
     log_frames("H2 CONTINUATION+drain", &frames);
 
     // Both streams hit the same `DelayedH2Backend`, which always answers
@@ -893,12 +1125,15 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
         && stream_served(3);
     // Witness: without at least one GOAWAY in the response, `stream3_ok`'s
     // `is_none_or` check above is vacuously true and this run proves
-    // NOTHING about the race this test exists to exercise — soft_stop()'s
-    // drain may simply not have reached the point of emitting a GOAWAY
-    // before the two fixed `thread::sleep(150ms)` windows elapsed. Treat a
-    // missing witness as a failed (inconclusive) run rather than a silent
-    // pass, so `repeat_until_error_or`'s retries have a chance to land one
-    // that actually raced the drain.
+    // NOTHING about the race this test exists to exercise. The `server.live`
+    // gate has already established that the drain reached this connection
+    // before the CONTINUATION went out, so the deferred initial GOAWAY is
+    // owed — but it is emitted by a later `flush_pending_control_frames`
+    // pass, and this assertion is what holds the run to actually observing
+    // it rather than assuming it. Treat a missing witness as a failed
+    // (inconclusive) run rather than a silent pass, so
+    // `repeat_until_error_or`'s retries have a chance to land one that
+    // actually raced the drain.
     let drain_witnessed = contains_goaway(&frames);
 
     if !anchor_ok || !stream3_ok || !drain_witnessed {

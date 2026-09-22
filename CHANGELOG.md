@@ -675,6 +675,21 @@
   independently choosing per interleave point whether it lands between two frames or inside one
   frame's own TCP-level write — the two shapes are not interchangeable, and only the latter reaches
   the guard the HUP finding above needed — see `doc/testing.md`.
+  End-to-end, `test_h2_continuation_survives_a_graceful_drain_mid_reassembly`
+  (`e2e/src/tests/h2_tests.rs`) drives the same shape through a real worker's event loop: stream 1
+  parks on a backend that holds its response open, stream 3's HEADERS arrives without END_HEADERS,
+  `soft_stop()` lands while that block is still incomplete, and the CONTINUATION completes it.
+  Every ordering the test depends on is established by waiting on observable worker state over the
+  command channel, never by sleeping — `h2.frames.rx.headers` ticking once proves sozu decoded the
+  partial HEADERS and is in `H2State::ContinuationHeader`; `server.live` dropping to 0 proves
+  `Server::run` has completed an iteration with `shutting_down` set, and therefore that
+  `shut_down_sessions()` → `Mux::shutting_down` → `ConnectionH2::graceful_goaway` has already run on
+  that connection; a second tick of the same counter proves the reassembled block was consumed
+  before the held response is released. Neither ordering is observable on the connection itself:
+  RFC 9113 §6.2/§6.10 forbid interleaving any frame into an open header block and sozu enforces that
+  with `GOAWAY(PROTOCOL_ERROR)`, so there is no legal in-band probe, and the initial GOAWAY is
+  deliberately deferred for precisely the duration of the reassembly under test, so its absence —
+  not its arrival — is what the correct interleaving produces.
   **Copy cost**: the single-frame fast path (the common case — most requests never need
   CONTINUATION) is unchanged: no new copy, straight from `zero.storage`. The multi-frame path gains
   one `memcpy` per frame (`HeaderBlockAccumulator::begin`/`append`), where the previous design kept
