@@ -1098,7 +1098,7 @@ pub enum HttpListenerCmd {
         h2_max_concurrent_streams: Option<u32>,
         #[clap(
             long,
-            help = "Shrink threshold ratio for recycled stream slots; must be >= 1"
+            help = "Shrink threshold ratio for recycled stream slots; must be >= 2"
         )]
         h2_stream_shrink_ratio: Option<u32>,
         #[clap(
@@ -1370,7 +1370,7 @@ pub enum HttpsListenerCmd {
         h2_max_concurrent_streams: Option<u32>,
         #[clap(
             long,
-            help = "Shrink threshold ratio for recycled stream slots; must be >= 1"
+            help = "Shrink threshold ratio for recycled stream slots; must be >= 2"
         )]
         h2_stream_shrink_ratio: Option<u32>,
         #[clap(

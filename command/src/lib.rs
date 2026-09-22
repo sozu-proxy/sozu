@@ -3,6 +3,47 @@
 #[macro_use]
 extern crate serde;
 
+/// The floor each H2 listener knob must meet — the single list, expanded once
+/// per validator that enforces it (sozu-proxy/sozu#1418).
+///
+/// Expands `$callback!($config, <field>, <minimum>)` once per knob, in a fixed
+/// order, so the five doors into a listener configuration share one list
+/// instead of five copies of it: `ListenerBuilder::validate_h2_thresholds`
+/// (`crate::config`, the config file and `sozu ctl add listener`),
+/// `validate_h2_flood_knobs_http`/`_https` (`crate::state`,
+/// `UpdateHttp(s)Listener`) and `validate_h2_flood_knobs_http_listener`/
+/// `_https_listener` (`crate::state`, a raw protobuf
+/// `Add{Http,Https}Listener`). Each supplies its own one-knob callback because
+/// the error types differ — `ConfigError::H2ThresholdBelowMinimum` names the
+/// listener, `StateError::InvalidValue` names the field — but none supplies
+/// its own list. Adding a knob to one door and forgetting another is what
+/// reopens sozu#1418 one level up; with the list here it is not expressible.
+///
+/// `h2_graceful_shutdown_deadline_seconds` is deliberately absent: `0` there
+/// means "wait forever (no forced close after GOAWAY)".
+macro_rules! for_each_h2_knob_floor {
+    ($callback:ident, $config:ident) => {
+        $callback!($config, h2_max_rst_stream_per_window, 1);
+        $callback!($config, h2_max_ping_per_window, 1);
+        $callback!($config, h2_max_settings_per_window, 1);
+        $callback!($config, h2_max_empty_data_per_window, 1);
+        $callback!($config, h2_max_window_update_stream0_per_window, 1);
+        $callback!($config, h2_max_continuation_frames, 1);
+        $callback!($config, h2_max_glitch_count, 1);
+        $callback!($config, h2_max_rst_stream_lifetime, 1);
+        $callback!($config, h2_max_rst_stream_abusive_lifetime, 1);
+        $callback!($config, h2_max_rst_stream_emitted_lifetime, 1);
+        $callback!($config, h2_max_header_list_size, 1);
+        $callback!($config, h2_max_header_table_size, 1);
+        $callback!($config, h2_max_header_fields, 1);
+        $callback!($config, h2_max_concurrent_streams, 1);
+        // The runtime floor is 2 (`lib/src/protocol/mux/h2.rs`'s `.max(2)`);
+        // anything lower is silently promoted, so refuse it instead.
+        $callback!($config, h2_stream_shrink_ratio, 2);
+    };
+}
+pub(crate) use for_each_h2_knob_floor;
+
 #[macro_use]
 /// custom made logging macros
 pub mod logging;

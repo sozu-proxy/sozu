@@ -230,7 +230,7 @@ cause:
   the listener has `disable_http11 = true`
   (`lib/src/https.rs:466, 496`).
 
-The startup-time validator at `command/src/config.rs:1129-1133, 1151-1157`
+The startup-time validator at `command/src/config.rs:1233-1237, 1255-1261`
 catches the obvious operator mistake of pairing `disable_http11 = true` with
 `alpn_protocols` that still contains `"http/1.1"`.
 
@@ -380,7 +380,8 @@ The H2 mux owns a few invariants that are easy to break by accident:
   `ping_{window,lifetime}`, `settings_{window,lifetime}`,
   `empty_data_window`, `continuation_per_block`,
   `window_update_stream0_window`, `header_size_per_block`,
-  `glitch_window`; see `lib/src/protocol/mux/h2_flood_detector.rs:342-948` and
+  `glitch_window`; see `H2FloodViolation` in
+  `lib/src/protocol/mux/h2_flood_detector.rs` and
   `ConnectionH2::handle_flood_violation`).
   GOAWAY and RST_STREAM sends/receives are attributed by error code
   via `h2.{goaway,rst_stream}.{sent,received}.<code>`

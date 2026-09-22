@@ -875,61 +875,28 @@ impl L7ListenerHandler for HttpListener {
     }
 
     fn get_h2_flood_config(&self) -> crate::protocol::mux::H2FloodConfig {
-        let defaults = crate::protocol::mux::H2FloodConfig::default();
-        crate::protocol::mux::H2FloodConfig {
-            max_rst_stream_per_window: self
-                .config
-                .h2_max_rst_stream_per_window
-                .unwrap_or(defaults.max_rst_stream_per_window),
-            max_ping_per_window: self
-                .config
-                .h2_max_ping_per_window
-                .unwrap_or(defaults.max_ping_per_window),
-            max_settings_per_window: self
-                .config
-                .h2_max_settings_per_window
-                .unwrap_or(defaults.max_settings_per_window),
-            max_empty_data_per_window: self
-                .config
-                .h2_max_empty_data_per_window
-                .unwrap_or(defaults.max_empty_data_per_window),
-            max_window_update_stream0_per_window: self
-                .config
-                .h2_max_window_update_stream0_per_window
-                .unwrap_or(defaults.max_window_update_stream0_per_window),
-            max_continuation_frames: self
-                .config
-                .h2_max_continuation_frames
-                .unwrap_or(defaults.max_continuation_frames),
-            max_glitch_count: self
-                .config
-                .h2_max_glitch_count
-                .unwrap_or(defaults.max_glitch_count),
-            max_rst_stream_lifetime: self
-                .config
-                .h2_max_rst_stream_lifetime
-                .unwrap_or(defaults.max_rst_stream_lifetime),
-            max_rst_stream_abusive_lifetime: self
-                .config
-                .h2_max_rst_stream_abusive_lifetime
-                .unwrap_or(defaults.max_rst_stream_abusive_lifetime),
-            max_rst_stream_emitted_lifetime: self
-                .config
-                .h2_max_rst_stream_emitted_lifetime
-                .unwrap_or(defaults.max_rst_stream_emitted_lifetime),
-            max_header_list_size: self
-                .config
-                .h2_max_header_list_size
-                .unwrap_or(defaults.max_header_list_size),
-            max_header_table_size: self
-                .config
-                .h2_max_header_table_size
-                .unwrap_or(defaults.max_header_table_size),
-            max_header_fields: self
-                .config
-                .h2_max_header_fields
-                .unwrap_or(defaults.max_header_fields),
-        }
+        // `H2FloodConfig`'s fields are private and `from_optional` applies the
+        // `.max(1)` clamp `new` carries (sozu-proxy/sozu#1418). This used to be
+        // a raw struct literal, which skipped that clamp on the only path that
+        // carries operator-set thresholds: config load rejects an out-of-range
+        // knob (`ConfigError::H2ThresholdBelowMinimum`), and the clamp is the
+        // structural backstop for a raw protobuf `AddHttpListener` or a
+        // state file saved before that gate existed.
+        crate::protocol::mux::H2FloodConfig::from_optional(
+            self.config.h2_max_rst_stream_per_window,
+            self.config.h2_max_ping_per_window,
+            self.config.h2_max_settings_per_window,
+            self.config.h2_max_empty_data_per_window,
+            self.config.h2_max_window_update_stream0_per_window,
+            self.config.h2_max_continuation_frames,
+            self.config.h2_max_glitch_count,
+            self.config.h2_max_rst_stream_lifetime,
+            self.config.h2_max_rst_stream_abusive_lifetime,
+            self.config.h2_max_rst_stream_emitted_lifetime,
+            self.config.h2_max_header_list_size,
+            self.config.h2_max_header_table_size,
+            self.config.h2_max_header_fields,
+        )
     }
 
     fn get_h2_connection_config(&self) -> crate::protocol::mux::H2ConnectionConfig {
@@ -1338,6 +1305,14 @@ impl HttpListener {
     /// `AddHttpListener` to its `ConfigState` and fanning it out, so an invalid
     /// listener never reserves its address and blocks a corrected reload
     /// (sozu#1301).
+    ///
+    /// Buildability only. The H2 knob floors are deliberately NOT checked
+    /// here (sozu#1418): a worker *can* build a listener whose threshold is
+    /// out of range — `H2FloodConfig::from_optional` clamps it — so refusing
+    /// it is a policy the command socket applies to what an operator is
+    /// authoring, not a statement about what a worker can construct. That
+    /// gate lives beside its audience, in
+    /// `bin/src/command/requests.rs::validate_h2_knob_floors`.
     pub fn validate_config(config: &HttpListenerConfig) -> Result<(), ListenerError> {
         Self::build_answers(config)?;
         Ok(())
@@ -1972,6 +1947,94 @@ mod tests {
         },
         response::{Backend, HttpFrontend},
     };
+
+    /// Regression for sozu-proxy/sozu#1418: `get_h2_flood_config` built
+    /// `H2FloodConfig` with a raw struct literal, so `H2FloodConfig::new`'s
+    /// `.max(1)` clamp never ran on the only path that carries
+    /// operator-configured thresholds. A `HttpListenerConfig` reaching the
+    /// worker with `h2_max_rst_stream_per_window = Some(0)` — from a raw
+    /// protobuf `AddHttpListener`, or a state file saved before config load
+    /// gained its gate — handed that zero straight to `H2FloodDetector::new`,
+    /// whose `check_flood` compares `count > threshold`: the first counted
+    /// RST_STREAM of every H2 connection tripped the detector and the listener
+    /// answered `ENHANCE_YOUR_CALM` to every client. In a debug build the
+    /// detector's own pre-condition `debug_assert!` fired instead, at
+    /// connection setup.
+    ///
+    /// Config load now rejects the value outright
+    /// (`ConfigError::H2ThresholdBelowMinimum`); this is the structural
+    /// backstop for anything that never passed through it.
+    #[test]
+    fn get_h2_flood_config_clamps_a_zero_threshold_that_bypassed_config_load() {
+        let mut config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8080))
+            .to_http(None)
+            .expect("could not create listener config");
+        // Exactly what a raw protobuf `AddHttpListener` or a replayed state
+        // file can still carry — `to_http` itself now refuses this value.
+        config.h2_max_rst_stream_per_window = Some(0);
+        config.h2_max_glitch_count = Some(0);
+
+        let listener =
+            HttpListener::new(config, Token(0)).expect("could not build the HTTP listener");
+        let flood_config = listener.get_h2_flood_config();
+
+        assert!(
+            flood_config.max_rst_stream_per_window() >= 1,
+            "max_rst_stream_per_window must be clamped to >= 1, got {}",
+            flood_config.max_rst_stream_per_window()
+        );
+        assert!(
+            flood_config.max_glitch_count() >= 1,
+            "max_glitch_count must be clamped to >= 1, got {}",
+            flood_config.max_glitch_count()
+        );
+    }
+
+    /// Pin the listener-config → [`H2FloodConfig`] mapping, field by field
+    /// (sozu-proxy/sozu#1418). `get_h2_flood_config` hands
+    /// `H2FloodConfig::from_optional` thirteen positional arguments — ten
+    /// `Option<u32>` and three `Option<u64>` — so a transposition inside
+    /// either group compiles silently and quietly re-points a CVE mitigation
+    /// at the wrong counter. `from_optional`'s own tests cover its internals;
+    /// nothing covered the wiring into it until here. Every value is distinct,
+    /// so any swap fails an assertion.
+    #[test]
+    fn get_h2_flood_config_maps_every_listener_knob_to_its_own_threshold() {
+        let mut config = ListenerBuilder::new_http(SocketAddress::new_v4(127, 0, 0, 1, 8080))
+            .to_http(None)
+            .expect("could not create listener config");
+        config.h2_max_rst_stream_per_window = Some(101);
+        config.h2_max_ping_per_window = Some(102);
+        config.h2_max_settings_per_window = Some(103);
+        config.h2_max_empty_data_per_window = Some(104);
+        config.h2_max_window_update_stream0_per_window = Some(105);
+        config.h2_max_continuation_frames = Some(106);
+        config.h2_max_glitch_count = Some(107);
+        config.h2_max_rst_stream_lifetime = Some(108);
+        config.h2_max_rst_stream_abusive_lifetime = Some(109);
+        config.h2_max_rst_stream_emitted_lifetime = Some(110);
+        config.h2_max_header_list_size = Some(111);
+        config.h2_max_header_table_size = Some(112);
+        config.h2_max_header_fields = Some(113);
+
+        let listener =
+            HttpListener::new(config, Token(0)).expect("could not build the HTTP listener");
+        let flood = listener.get_h2_flood_config();
+
+        assert_eq!(flood.max_rst_stream_per_window(), 101);
+        assert_eq!(flood.max_ping_per_window(), 102);
+        assert_eq!(flood.max_settings_per_window(), 103);
+        assert_eq!(flood.max_empty_data_per_window(), 104);
+        assert_eq!(flood.max_window_update_stream0_per_window(), 105);
+        assert_eq!(flood.max_continuation_frames(), 106);
+        assert_eq!(flood.max_glitch_count(), 107);
+        assert_eq!(flood.max_rst_stream_lifetime(), 108);
+        assert_eq!(flood.max_rst_stream_abusive_lifetime(), 109);
+        assert_eq!(flood.max_rst_stream_emitted_lifetime(), 110);
+        assert_eq!(flood.max_header_list_size(), 111);
+        assert_eq!(flood.max_header_table_size(), 112);
+        assert_eq!(flood.max_header_fields(), 113);
+    }
 
     #[test]
     fn round_trip() {

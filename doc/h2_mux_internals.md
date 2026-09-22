@@ -237,11 +237,53 @@ Configurable thresholds with safe compile-time defaults:
 | `max_header_fields` | 128 | (HPACK memory) | Indexed-reference "header bomb" |
 | `max_glitch_count` | 100 | (cumulative) | General protocol abuse |
 
-The sliding window duration is 1 second (`FLOOD_WINDOW_DURATION`). Every
-threshold is clamped to at least 1 by `H2FloodConfig::new` (a zero threshold
-would trip on the very first frame). The three `*_lifetime` counters
-deliberately never decay: a half-decaying window counter cannot see a patient
-attacker who stays under the per-second ceiling forever.
+The sliding window duration is 1 second (`FLOOD_WINDOW_DURATION`). The three
+`*_lifetime` counters deliberately never decay: a half-decaying window counter
+cannot see a patient attacker who stays under the per-second ceiling forever.
+The fields are private: `H2FloodConfig::new` and `H2FloodConfig::from_optional` are the
+only ways to build one, and both clamp every threshold to at least 1 — a zero
+threshold does not disable a check, it makes the first event that counter sees
+a violation, since `check_flood` compares `count > threshold`. For
+`max_header_list_size` and `max_header_fields` — which are also the HPACK
+decode budget — that is every request: a stream reset for a header block that
+fits one HEADERS frame, and a connection `GOAWAY(ENHANCE_YOUR_CALM)` for one
+that spans CONTINUATION frames.
+`get_h2_flood_config` in `lib/src/http.rs` and `lib/src/https.rs` calls
+`from_optional`, which resolves each unset listener knob to its default above.
+
+Every door that *states* a listener configuration refuses an out-of-range knob
+before the clamp can be reached: the configuration file and
+`sozu ctl add listener` via `ConfigError::H2ThresholdBelowMinimum`
+(`command/src/config.rs`), `UpdateHttp(s)Listener` via
+`validate_h2_flood_knobs_http`/`_https` (`command/src/state.rs`), and a raw
+protobuf `Add{Http,Https}Listener` sent straight to the command socket via
+`validate_h2_flood_knobs_http(s)_listener`, which
+`bin/src/command/requests.rs::validate_h2_knob_floors` runs from the main
+process before `ConfigState::dispatch`. All five validators expand the single
+`for_each_h2_knob_floor!` list in `command/src/lib.rs`, so the knob set cannot
+drift between them.
+
+Replay is deliberately not one of those doors. `LoadState` skips an entry its
+pre-dispatch validation rejects, and a skipped listener never binds — so
+applying the rejection there would take every frontend behind an already-
+serving listener offline to prevent one clamped threshold. `load_state`
+instead keeps the listener, logs `keeping a listener whose H2 knob is out of
+range …` at `warn!` and counts `config.load_h2_knob_clamped`. The clamp is what
+serves that case, and it is worth being exact about its direction: `flag` is
+`count > threshold`, so `0` trips on the first counted event and the clamped
+`1` trips on the second. The clamp *loosens* every knob it touches, by exactly
+one event. It is still the right thing on replay, because `0` is not "no limit"
+and not a protection level anyone tuned — the whole difference between the
+stated value and the clamped one is that one event, against an unbound
+listener.
+
+The rejection lives on the command-plane paths, not in listener construction:
+`HttpListener::new` / `HttpsListener::try_new` still accept an out-of-range
+knob and clamp it, so an embedder driving the library directly gets the
+fail-safe rather than the error. That is deliberate — the rejection is a policy
+about what an operator may state, and every entry point sozu itself offers
+(the configuration file, `sozu ctl`, the command socket) goes through
+`ListenerBuilder` or `validate_h2_knob_floors`.
 
 ### H2FloodDetector
 
@@ -813,8 +855,11 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5333-5336
-let cap = self.flood_detector.config().max_header_table_size;
+```rust lib/src/protocol/mux/h2.rs:5330-5336
+parser::SETTINGS_HEADER_TABLE_SIZE => {
+// Cap to the configured maximum — a malicious peer can
+// advertise up to 4 GB to inflate HPACK encoder memory.
+let cap = self.flood_detector.config().max_header_table_size();
 let capped = v.min(cap);
 self.peer_settings.settings_header_table_size = capped;
 self.hpack.set_encoder_max_table_size(capped as usize);

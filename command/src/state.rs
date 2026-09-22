@@ -2996,141 +2996,91 @@ impl ConfigState {
     }
 }
 
+/// One knob's floor, in the shape [`crate::for_each_h2_knob_floor`] expands
+/// (sozu-proxy/sozu#1418). The list itself lives there, shared with
+/// `ListenerBuilder::validate_h2_thresholds` in `crate::config`, so this file
+/// carries the `StateError` wording and not a second copy of the knobs.
+///
+/// `u64::from` covers both the `u32` and the `u64` knobs; every field is
+/// unsigned, so `< 1` is exactly `== 0`.
+macro_rules! require_h2_knob_floor {
+    ($config:ident, $field:ident, $minimum:literal) => {
+        if let Some(value) = $config.$field
+            && u64::from(value) < $minimum
+        {
+            return Err(StateError::InvalidValue {
+                field: stringify!($field),
+                reason: concat!("must be >= ", stringify!($minimum)),
+            });
+        }
+    };
+}
+
 /// Validate all H2 flood knobs in an HTTP listener patch.
 ///
 /// Every flood-detector knob (including stream-0 WINDOW_UPDATE) requires a
-/// value `>= 1`. Passing `0` would disable the detector entirely and leave the
-/// proxy open to CVE-2023-44487 and related attacks. The runtime constructor
-/// `H2FloodConfig::new()` applies the same `.max(1)` clamping, but a raw
-/// protobuf client can bypass the CLI layer, so we enforce the bound here too.
+/// value `>= 1`. `0` does not disable the detector — `check_flood` compares
+/// `count > threshold`, so it makes the first event that counter sees a
+/// violation, which is every request for `h2_max_header_list_size` and
+/// `h2_max_header_fields` (also the HPACK decode budget) and the first
+/// matching frame for the per-window and lifetime counters. The runtime
+/// constructor `H2FloodConfig::new()` clamps with `.max(1)` instead, but a
+/// clamp rewrites the operator's stated value, so the control plane refuses
+/// it here.
 ///
-/// `h2_max_concurrent_streams` and `h2_stream_shrink_ratio` are connection-
-/// config knobs that also require `>= 1`.
+/// `h2_max_concurrent_streams` is a connection-config knob that also requires
+/// `>= 1`; `h2_stream_shrink_ratio` requires `>= 2`.
 ///
 /// `h2_graceful_shutdown_deadline_seconds = 0` is intentionally **allowed** —
 /// it means "wait forever (no forced close after GOAWAY)".
 pub fn validate_h2_flood_knobs_http(patch: &UpdateHttpListenerConfig) -> Result<(), StateError> {
-    macro_rules! require_ge1 {
-        ($field:expr, $name:literal) => {
-            if let Some(0) = $field {
-                return Err(StateError::InvalidValue {
-                    field: $name,
-                    reason: "must be >= 1",
-                });
-            }
-        };
-    }
-    require_ge1!(
-        patch.h2_max_rst_stream_per_window,
-        "h2_max_rst_stream_per_window"
-    );
-    require_ge1!(patch.h2_max_ping_per_window, "h2_max_ping_per_window");
-    require_ge1!(
-        patch.h2_max_settings_per_window,
-        "h2_max_settings_per_window"
-    );
-    require_ge1!(
-        patch.h2_max_empty_data_per_window,
-        "h2_max_empty_data_per_window"
-    );
-    require_ge1!(
-        patch.h2_max_continuation_frames,
-        "h2_max_continuation_frames"
-    );
-    require_ge1!(patch.h2_max_glitch_count, "h2_max_glitch_count");
-    require_ge1!(
-        patch.h2_max_window_update_stream0_per_window,
-        "h2_max_window_update_stream0_per_window"
-    );
-    require_ge1!(patch.h2_max_concurrent_streams, "h2_max_concurrent_streams");
-    // Shrink ratio runtime floor is 2 (lib/src/protocol/mux/h2.rs ~448 .max(2));
-    // anything lower is silently promoted so reject at control plane.
-    if let Some(v) = patch.h2_stream_shrink_ratio
-        && v < 2
-    {
-        return Err(StateError::InvalidValue {
-            field: "h2_stream_shrink_ratio",
-            reason: "must be >= 2",
-        });
-    }
-    // Lifetime caps and HPACK limits — must be >= 1 or the runtime trips on the
-    // first qualifying frame. doc/configure.md advertises "u64 (>= 1)" etc.
-    require_ge1!(
-        patch.h2_max_rst_stream_lifetime,
-        "h2_max_rst_stream_lifetime"
-    );
-    require_ge1!(
-        patch.h2_max_rst_stream_abusive_lifetime,
-        "h2_max_rst_stream_abusive_lifetime"
-    );
-    require_ge1!(
-        patch.h2_max_rst_stream_emitted_lifetime,
-        "h2_max_rst_stream_emitted_lifetime"
-    );
-    require_ge1!(patch.h2_max_header_list_size, "h2_max_header_list_size");
-    require_ge1!(patch.h2_max_header_table_size, "h2_max_header_table_size");
-    require_ge1!(patch.h2_max_header_fields, "h2_max_header_fields");
+    crate::for_each_h2_knob_floor!(require_h2_knob_floor, patch);
     Ok(())
 }
 
 /// Validate all H2 flood knobs in an HTTPS listener patch (same rules as HTTP).
 pub fn validate_h2_flood_knobs_https(patch: &UpdateHttpsListenerConfig) -> Result<(), StateError> {
-    macro_rules! require_ge1 {
-        ($field:expr, $name:literal) => {
-            if let Some(0) = $field {
-                return Err(StateError::InvalidValue {
-                    field: $name,
-                    reason: "must be >= 1",
-                });
-            }
-        };
-    }
-    require_ge1!(
-        patch.h2_max_rst_stream_per_window,
-        "h2_max_rst_stream_per_window"
-    );
-    require_ge1!(patch.h2_max_ping_per_window, "h2_max_ping_per_window");
-    require_ge1!(
-        patch.h2_max_settings_per_window,
-        "h2_max_settings_per_window"
-    );
-    require_ge1!(
-        patch.h2_max_empty_data_per_window,
-        "h2_max_empty_data_per_window"
-    );
-    require_ge1!(
-        patch.h2_max_continuation_frames,
-        "h2_max_continuation_frames"
-    );
-    require_ge1!(patch.h2_max_glitch_count, "h2_max_glitch_count");
-    require_ge1!(
-        patch.h2_max_window_update_stream0_per_window,
-        "h2_max_window_update_stream0_per_window"
-    );
-    require_ge1!(patch.h2_max_concurrent_streams, "h2_max_concurrent_streams");
-    if let Some(v) = patch.h2_stream_shrink_ratio
-        && v < 2
-    {
-        return Err(StateError::InvalidValue {
-            field: "h2_stream_shrink_ratio",
-            reason: "must be >= 2",
-        });
-    }
-    require_ge1!(
-        patch.h2_max_rst_stream_lifetime,
-        "h2_max_rst_stream_lifetime"
-    );
-    require_ge1!(
-        patch.h2_max_rst_stream_abusive_lifetime,
-        "h2_max_rst_stream_abusive_lifetime"
-    );
-    require_ge1!(
-        patch.h2_max_rst_stream_emitted_lifetime,
-        "h2_max_rst_stream_emitted_lifetime"
-    );
-    require_ge1!(patch.h2_max_header_list_size, "h2_max_header_list_size");
-    require_ge1!(patch.h2_max_header_table_size, "h2_max_header_table_size");
-    require_ge1!(patch.h2_max_header_fields, "h2_max_header_fields");
+    crate::for_each_h2_knob_floor!(require_h2_knob_floor, patch);
+    Ok(())
+}
+
+/// Validate the H2 knobs of a complete HTTP listener configuration, on the
+/// `AddHttpListener` path (sozu-proxy/sozu#1418).
+///
+/// `UpdateHttpListener` has refused these values since the knobs existed
+/// ([`validate_h2_flood_knobs_http`]) and `ListenerBuilder::to_http`
+/// (`command/src/config.rs`) now refuses them at config load — but a raw
+/// protobuf `AddHttpListener` straight to the command socket went through
+/// neither. `ConfigState::add_http_listener` clones the config in with no
+/// validation, `SaveState` re-serialises it, every replay re-injects it, and
+/// each worker then rewrites the operator's `0` to `1` with the runtime clamp.
+/// The main process's pre-dispatch validation
+/// (`bin/src/command/requests.rs::validate_h2_knob_floors`) closes that door.
+///
+/// It closes it for what an operator is STATING, not for replay.
+/// `bin/src/command/requests.rs` runs this only for
+/// `RequestOrigin::Authored`; on `LoadState` it calls it to `warn!` and count,
+/// then keeps the listener. An entry the replay gate rejects is skipped, and a
+/// skipped listener never binds — dropping every frontend behind it to prevent
+/// one clamped threshold is the worse outcome. The clamp does not tighten the
+/// knob, it loosens it by one event (`count > threshold` trips on the first
+/// counted event at `0`, on the second at `1`), but `0` is not "no limit" and
+/// not a protection level anyone tuned. The worker-side clamp is what serves
+/// that case.
+pub fn validate_h2_flood_knobs_http_listener(
+    config: &HttpListenerConfig,
+) -> Result<(), StateError> {
+    crate::for_each_h2_knob_floor!(require_h2_knob_floor, config);
+    Ok(())
+}
+
+/// Validate the H2 knobs of a complete HTTPS listener configuration, on the
+/// `AddHttpsListener` path (same rules as
+/// [`validate_h2_flood_knobs_http_listener`]).
+pub fn validate_h2_flood_knobs_https_listener(
+    config: &HttpsListenerConfig,
+) -> Result<(), StateError> {
+    crate::for_each_h2_knob_floor!(require_h2_knob_floor, config);
     Ok(())
 }
 

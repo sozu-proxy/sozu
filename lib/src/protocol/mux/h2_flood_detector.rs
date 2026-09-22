@@ -13,10 +13,10 @@
 //! methods declared below — `check_flood_or_return!` and the per-frame
 //! `record_*` calls in `h2.rs` are the only way counters move.
 //!
-//! `H2FloodConfig` is the one exception to "closed API": its fields stay
-//! `pub`, unchanged from before this extraction, because `lib/src/http.rs`
-//! and `lib/src/https.rs` build it with a struct literal from listener
-//! config — it crosses the crate boundary, not just the `mux` one.
+//! `H2FloodConfig` follows the same "closed API" shape: its fields are
+//! private and [`H2FloodConfig::new`] is the only way to build one, even
+//! though the type itself is `pub` because `lib/src/http.rs` and
+//! `lib/src/https.rs` hand it their listener configuration.
 //! `MAX_HEADER_LIST_SIZE` (the compile-time default for
 //! `H2FloodConfig::max_header_list_size`) stays declared in `h2.rs` for the
 //! same reason in reverse: `converter.rs` and `pkawa.rs` reference it
@@ -26,18 +26,21 @@
 //! module reaches it via `super::h2::MAX_HEADER_LIST_SIZE`, same as
 //! `converter.rs`/`pkawa.rs` do.
 //!
-//! Staying `pub` has a consequence worth naming here so the next reader does
-//! not have to rediscover it: `lib/src/http.rs`/`lib/src/https.rs` build
-//! `H2FloodConfig` with a raw struct literal and never call
-//! `H2FloodConfig::new`, so the `.max(1)` clamp below is bypassed on the only
-//! production path that takes operator-configured thresholds — only
-//! `Default::default()`'s compile-time constants go through validation. An
-//! operator setting a threshold to zero gets it unclamped. This is
-//! pre-existing (unaffected by this extraction, which moved the struct and
-//! its constructor unchanged), fail-closed (a zero threshold trips
-//! `ENHANCE_YOUR_CALM` on the first frame rather than disabling detection),
-//! and not attacker-reachable (only an operator's own listener config can set
-//! it), so it is not fixed here.
+//! The fields were `pub` until sozu-proxy/sozu#1418, and that is exactly what
+//! went wrong: `lib/src/http.rs`/`lib/src/https.rs` built `H2FloodConfig` with
+//! a raw struct literal and never called `H2FloodConfig::new`, so the `.max(1)`
+//! clamp below was bypassed on the only production path that carries
+//! operator-configured thresholds — only `Default::default()`'s compile-time
+//! constants, which never needed validation, went through it. An operator
+//! setting a threshold to zero got it unclamped, and since `check_flood`
+//! compares `count > threshold`, the first event that counter saw was already
+//! a violation — for `max_header_list_size`/`max_header_fields`, which are
+//! also the HPACK decode budget, that is every request on the listener; for a
+//! per-window or lifetime frame counter, the first client that sends the frame
+//! it counts. Private fields make that literal a compile error instead of a
+//! comment, which is what the three sibling extractions
+//! (`hpack_state`, `h2_flow_control`, `h2_stream_table`) already did for their
+//! own invariants.
 //!
 //! This module owns exactly what `check_flood` polices:
 //!
@@ -122,7 +125,8 @@
 //! compiles to nothing outside debug/test builds).
 //! `H2FloodConfig::new`'s `.max(1)` clamp (every threshold is at least 1, so
 //! a zero-threshold misconfiguration cannot make the detector trip on the
-//! very first frame) is unmoved and unmodified.
+//! very first frame) is unchanged in what it computes; sozu-proxy/sozu#1418
+//! only changed who reaches it, by making the constructor the sole entry.
 
 use std::time::Instant;
 
@@ -213,47 +217,47 @@ const DEFAULT_MAX_GLITCH_COUNT: u32 = 100;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct H2FloodConfig {
     /// Maximum RST_STREAM frames per second window (CVE-2023-44487, CVE-2019-9514)
-    pub max_rst_stream_per_window: u32,
+    max_rst_stream_per_window: u32,
     /// Maximum PING frames per second window (CVE-2019-9512)
-    pub max_ping_per_window: u32,
+    max_ping_per_window: u32,
     /// Maximum SETTINGS frames per second window (CVE-2019-9515)
-    pub max_settings_per_window: u32,
+    max_settings_per_window: u32,
     /// Maximum empty DATA frames per second window (CVE-2019-9518)
-    pub max_empty_data_per_window: u32,
+    max_empty_data_per_window: u32,
     /// Maximum connection-level (stream 0) WINDOW_UPDATE frames per sliding
     /// window. Caps the CPU cost of a peer sending a flood of non-zero
     /// stream-0 WINDOW_UPDATEs — each is individually legal so the generic
     /// glitch counter does not trip, yet millions per connection still burn
     /// server CPU parsing and updating the flow window.
-    pub max_window_update_stream0_per_window: u32,
+    max_window_update_stream0_per_window: u32,
     /// Maximum CONTINUATION frames per header block (CVE-2024-27316)
-    pub max_continuation_frames: u32,
+    max_continuation_frames: u32,
     /// Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM
-    pub max_glitch_count: u32,
+    max_glitch_count: u32,
     /// Absolute lifetime cap on RST_STREAM frames received on a single
     /// connection (CVE-2023-44487). Never decays — provides a ceiling the
     /// per-window counter cannot.
-    pub max_rst_stream_lifetime: u64,
+    max_rst_stream_lifetime: u64,
     /// Lifetime cap on "abusive" (pre-response-start) RST_STREAM frames —
     /// the Rapid Reset signature (CVE-2023-44487).
-    pub max_rst_stream_abusive_lifetime: u64,
+    max_rst_stream_abusive_lifetime: u64,
     /// Absolute lifetime cap on **server-emitted** RST_STREAM frames for this
     /// connection (CVE-2025-8671 "MadeYouReset"). Only non-`NoError` resets
     /// count — graceful cancels are exempt.
-    pub max_rst_stream_emitted_lifetime: u64,
+    max_rst_stream_emitted_lifetime: u64,
     /// Maximum accumulated HPACK-decoded header list size per request
     /// (SETTINGS_MAX_HEADER_LIST_SIZE, RFC 9113 §6.5.2).
-    pub max_header_list_size: u32,
+    max_header_list_size: u32,
     /// Maximum HPACK dynamic table size (SETTINGS_HEADER_TABLE_SIZE) accepted
     /// from the peer. Caps the value the peer advertises in SETTINGS frames to
     /// prevent unbounded HPACK encoder memory growth.
-    pub max_header_table_size: u32,
+    max_header_table_size: u32,
     /// Maximum number of materialized header fields, enforced per HEADERS block
     /// and (independently) per trailers block — HPACK fields plus expanded
     /// cookie crumbs (RFC 9113 §8.2.3). Bounds the HPACK indexed-reference
     /// header bomb, where many 1-byte indexed references each materialize a
     /// `Pair` of per-entry bookkeeping.
-    pub max_header_fields: u32,
+    max_header_fields: u32,
 }
 
 impl Default for H2FloodConfig {
@@ -279,6 +283,11 @@ impl Default for H2FloodConfig {
 impl H2FloodConfig {
     /// Create a validated config, clamping all thresholds to at least 1.
     /// Zero thresholds would cause immediate flood detection on any frame.
+    ///
+    /// With [`Self::from_optional`], this is the **only** way to build an
+    /// `H2FloodConfig`: the fields above are private, so the clamp below cannot
+    /// be routed around by a raw struct literal the way `lib/src/http.rs` and
+    /// `lib/src/https.rs` used to route around it (sozu-proxy/sozu#1418).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         max_rst_stream_per_window: u32,
@@ -336,6 +345,143 @@ impl H2FloodConfig {
             "every lifetime/size flood threshold must be clamped to >= 1"
         );
         config
+    }
+
+    /// Build a validated config from a listener's per-knob overrides: each
+    /// `None` takes the compile-time default, then [`Self::new`] clamps.
+    /// Mirrors [`super::h2::H2ConnectionConfig::from_optional`], which the
+    /// adjacent `get_h2_connection_config` already uses for the connection
+    /// knobs read out of the very same listener config.
+    ///
+    /// This is what `lib/src/http.rs` and `lib/src/https.rs` call. They used to
+    /// spell the same `unwrap_or(default)` table into a raw struct literal,
+    /// which skipped `new` and therefore skipped the clamp on the one
+    /// production path that carries operator-set thresholds
+    /// (sozu-proxy/sozu#1418). A zero that survives to here does not disable a
+    /// check, it makes the first event its counter sees a violation, and how
+    /// far that reaches depends on the knob: `max_header_list_size` and
+    /// `max_header_fields` are also the HPACK decode budget
+    /// `pkawa::decode_headers_with_budget` enforces, so `0` refuses every
+    /// request on the listener with `ENHANCE_YOUR_CALM` — per stream for a
+    /// header block that fits one HEADERS frame, and as a connection
+    /// `GOAWAY` for one that spans CONTINUATION frames, where
+    /// [`Self::record_continuation_frame`] lifts `accumulated_header_size`
+    /// above the zero threshold and `h2.rs`'s `check_flood_or_return!` fires
+    /// before the explicit size test. `max_rst_stream_per_window = 0` (and
+    /// every other per-window or lifetime frame counter) is inert until a
+    /// client actually sends the frame it counts — `check_flood` compares
+    /// `count > threshold`, and `0 > 0` is false.
+    ///
+    /// Every door that STATES a listener configuration now rejects an
+    /// out-of-range knob outright — the configuration file and
+    /// `sozu ctl add listener` via `ConfigError::H2ThresholdBelowMinimum`
+    /// (`command/src/config.rs`), `UpdateHttp(s)Listener` and a raw protobuf
+    /// `Add{Http,Https}Listener` via `command/src/state.rs`'s four
+    /// `validate_h2_flood_knobs_*` — so the operator is told which key to fix
+    /// rather than having their stated value silently rewritten. The clamp
+    /// reached through here is the backstop for the one path that deliberately
+    /// does NOT reject: replay of a state file saved before those gates
+    /// existed, where dropping the listener would be a worse outcome than
+    /// clamping one threshold (`bin/src/command/requests.rs`'s
+    /// `RequestOrigin::Replayed`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_optional(
+        max_rst_stream_per_window: Option<u32>,
+        max_ping_per_window: Option<u32>,
+        max_settings_per_window: Option<u32>,
+        max_empty_data_per_window: Option<u32>,
+        max_window_update_stream0_per_window: Option<u32>,
+        max_continuation_frames: Option<u32>,
+        max_glitch_count: Option<u32>,
+        max_rst_stream_lifetime: Option<u64>,
+        max_rst_stream_abusive_lifetime: Option<u64>,
+        max_rst_stream_emitted_lifetime: Option<u64>,
+        max_header_list_size: Option<u32>,
+        max_header_table_size: Option<u32>,
+        max_header_fields: Option<u32>,
+    ) -> Self {
+        let defaults = Self::default();
+        Self::new(
+            max_rst_stream_per_window.unwrap_or(defaults.max_rst_stream_per_window),
+            max_ping_per_window.unwrap_or(defaults.max_ping_per_window),
+            max_settings_per_window.unwrap_or(defaults.max_settings_per_window),
+            max_empty_data_per_window.unwrap_or(defaults.max_empty_data_per_window),
+            max_window_update_stream0_per_window
+                .unwrap_or(defaults.max_window_update_stream0_per_window),
+            max_continuation_frames.unwrap_or(defaults.max_continuation_frames),
+            max_glitch_count.unwrap_or(defaults.max_glitch_count),
+            max_rst_stream_lifetime.unwrap_or(defaults.max_rst_stream_lifetime),
+            max_rst_stream_abusive_lifetime.unwrap_or(defaults.max_rst_stream_abusive_lifetime),
+            max_rst_stream_emitted_lifetime.unwrap_or(defaults.max_rst_stream_emitted_lifetime),
+            max_header_list_size.unwrap_or(defaults.max_header_list_size),
+            max_header_table_size.unwrap_or(defaults.max_header_table_size),
+            max_header_fields.unwrap_or(defaults.max_header_fields),
+        )
+    }
+
+    /// Maximum RST_STREAM frames per rate window (CVE-2023-44487, CVE-2019-9514).
+    pub fn max_rst_stream_per_window(&self) -> u32 {
+        self.max_rst_stream_per_window
+    }
+
+    /// Maximum PING frames per rate window (CVE-2019-9512).
+    pub fn max_ping_per_window(&self) -> u32 {
+        self.max_ping_per_window
+    }
+
+    /// Maximum SETTINGS frames per rate window (CVE-2019-9515).
+    pub fn max_settings_per_window(&self) -> u32 {
+        self.max_settings_per_window
+    }
+
+    /// Maximum empty DATA frames per rate window (CVE-2019-9518).
+    pub fn max_empty_data_per_window(&self) -> u32 {
+        self.max_empty_data_per_window
+    }
+
+    /// Maximum connection-level (stream 0) WINDOW_UPDATE frames per rate window.
+    pub fn max_window_update_stream0_per_window(&self) -> u32 {
+        self.max_window_update_stream0_per_window
+    }
+
+    /// Maximum CONTINUATION frames per header block (CVE-2024-27316).
+    pub fn max_continuation_frames(&self) -> u32 {
+        self.max_continuation_frames
+    }
+
+    /// Maximum accumulated protocol anomalies before ENHANCE_YOUR_CALM.
+    pub fn max_glitch_count(&self) -> u32 {
+        self.max_glitch_count
+    }
+
+    /// Absolute lifetime cap on RST_STREAM frames received (CVE-2023-44487).
+    pub fn max_rst_stream_lifetime(&self) -> u64 {
+        self.max_rst_stream_lifetime
+    }
+
+    /// Lifetime cap on pre-response-start RST_STREAM frames (CVE-2023-44487).
+    pub fn max_rst_stream_abusive_lifetime(&self) -> u64 {
+        self.max_rst_stream_abusive_lifetime
+    }
+
+    /// Lifetime cap on server-emitted RST_STREAM frames (CVE-2025-8671).
+    pub fn max_rst_stream_emitted_lifetime(&self) -> u64 {
+        self.max_rst_stream_emitted_lifetime
+    }
+
+    /// Maximum accumulated HPACK-decoded header list size (RFC 9113 §6.5.2).
+    pub fn max_header_list_size(&self) -> u32 {
+        self.max_header_list_size
+    }
+
+    /// Maximum HPACK dynamic table size accepted from the peer.
+    pub fn max_header_table_size(&self) -> u32 {
+        self.max_header_table_size
+    }
+
+    /// Maximum number of materialized header fields per HEADERS/trailers block.
+    pub fn max_header_fields(&self) -> u32 {
+        self.max_header_fields
     }
 }
 
@@ -441,16 +587,37 @@ impl H2FloodDetector {
     /// [`Self::check_flood`] then advances from the `now` it is handed.
     pub(super) fn new(config: H2FloodConfig, now: Instant) -> Self {
         // Pre-condition: thresholds are already validated (clamped to >= 1 by
-        // `H2FloodConfig::new`). A zero per-window threshold would trip on the
-        // first counted frame; assert it here so a config that bypassed `new`
-        // (raw struct literal in a future caller) is caught in debug.
+        // `H2FloodConfig::new`, the only constructor — `H2FloodConfig`'s fields
+        // are private, so no caller can assemble one with a struct literal).
+        // A zero threshold would make the first event its counter sees a
+        // violation. The assertion outlived the hole it was written for
+        // (sozu-proxy/sozu#1418: `get_h2_flood_config` WAS that raw struct
+        // literal) and is kept as the debug-build tripwire for any future
+        // construction path inside this module.
+        //
+        // It covers all thirteen fields, not the five it used to: `impl
+        // Default` above is still an in-module struct literal, so a future
+        // `DEFAULT_MAX_HEADER_LIST_SIZE = 0` would otherwise pass unnoticed —
+        // and that is the worst of the thirteen, since `max_header_list_size`
+        // is also the HPACK decode budget and `0` refuses every request.
         debug_assert!(
             config.max_rst_stream_per_window >= 1
                 && config.max_ping_per_window >= 1
                 && config.max_settings_per_window >= 1
+                && config.max_empty_data_per_window >= 1
+                && config.max_window_update_stream0_per_window >= 1
                 && config.max_continuation_frames >= 1
                 && config.max_glitch_count >= 1,
-            "flood detector must be constructed with validated (>= 1) thresholds"
+            "flood detector must be constructed with validated (>= 1) per-window thresholds"
+        );
+        debug_assert!(
+            config.max_rst_stream_lifetime >= 1
+                && config.max_rst_stream_abusive_lifetime >= 1
+                && config.max_rst_stream_emitted_lifetime >= 1
+                && config.max_header_list_size >= 1
+                && config.max_header_table_size >= 1
+                && config.max_header_fields >= 1,
+            "flood detector must be constructed with validated (>= 1) lifetime/size thresholds"
         );
         let detector = Self {
             rst_stream_count: 0,
@@ -1479,5 +1646,123 @@ mod tests {
             ..H2FloodConfig::default()
         };
         assert_ne!(config_a, config_c);
+    }
+
+    /// An unset knob keeps the compile-time default, exactly as the
+    /// `unwrap_or(defaults.<field>)` table `lib/src/http.rs` and
+    /// `lib/src/https.rs` used to carry did.
+    #[test]
+    fn test_flood_config_from_optional_all_none_is_default() {
+        let config = H2FloodConfig::from_optional(
+            None, None, None, None, None, None, None, None, None, None, None, None, None,
+        );
+        assert_eq!(config, H2FloodConfig::default());
+    }
+
+    /// `from_optional` takes thirteen same-typed positional arguments, so a
+    /// transposed pair compiles silently and would quietly apply one operator
+    /// knob's value to a different CVE's threshold. Thirteen distinct values,
+    /// each asserted against its own field, is what makes that a test failure
+    /// instead of a production surprise.
+    #[test]
+    fn test_flood_config_from_optional_maps_each_knob_to_its_own_field() {
+        let config = H2FloodConfig::from_optional(
+            Some(11),
+            Some(12),
+            Some(13),
+            Some(14),
+            Some(15),
+            Some(16),
+            Some(17),
+            Some(18),
+            Some(19),
+            Some(20),
+            Some(21),
+            Some(22),
+            Some(23),
+        );
+        assert_eq!(config.max_rst_stream_per_window, 11);
+        assert_eq!(config.max_ping_per_window, 12);
+        assert_eq!(config.max_settings_per_window, 13);
+        assert_eq!(config.max_empty_data_per_window, 14);
+        assert_eq!(config.max_window_update_stream0_per_window, 15);
+        assert_eq!(config.max_continuation_frames, 16);
+        assert_eq!(config.max_glitch_count, 17);
+        assert_eq!(config.max_rst_stream_lifetime, 18);
+        assert_eq!(config.max_rst_stream_abusive_lifetime, 19);
+        assert_eq!(config.max_rst_stream_emitted_lifetime, 20);
+        assert_eq!(config.max_header_list_size, 21);
+        assert_eq!(config.max_header_table_size, 22);
+        assert_eq!(config.max_header_fields, 23);
+    }
+
+    /// Regression for sozu-proxy/sozu#1418: a zero that reached the runtime
+    /// without passing config load must be clamped, not carried. `check_flood`
+    /// compares `count > threshold`, so a zero per-window threshold trips on
+    /// the first counted frame of every connection.
+    #[test]
+    fn test_flood_config_from_optional_clamps_every_zero_to_one() {
+        let config = H2FloodConfig::from_optional(
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+        );
+        assert_eq!(config.max_rst_stream_per_window, 1);
+        assert_eq!(config.max_ping_per_window, 1);
+        assert_eq!(config.max_settings_per_window, 1);
+        assert_eq!(config.max_empty_data_per_window, 1);
+        assert_eq!(config.max_window_update_stream0_per_window, 1);
+        assert_eq!(config.max_continuation_frames, 1);
+        assert_eq!(config.max_glitch_count, 1);
+        assert_eq!(config.max_rst_stream_lifetime, 1);
+        assert_eq!(config.max_rst_stream_abusive_lifetime, 1);
+        assert_eq!(config.max_rst_stream_emitted_lifetime, 1);
+        assert_eq!(config.max_header_list_size, 1);
+        assert_eq!(config.max_header_table_size, 1);
+        assert_eq!(config.max_header_fields, 1);
+    }
+
+    /// Every accessor reads back its own field — the same transposition guard
+    /// as above, on the read side that `h2.rs` uses.
+    #[test]
+    fn test_flood_config_accessors_read_their_own_field() {
+        let config = H2FloodConfig::from_optional(
+            Some(11),
+            Some(12),
+            Some(13),
+            Some(14),
+            Some(15),
+            Some(16),
+            Some(17),
+            Some(18),
+            Some(19),
+            Some(20),
+            Some(21),
+            Some(22),
+            Some(23),
+        );
+        assert_eq!(config.max_rst_stream_per_window(), 11);
+        assert_eq!(config.max_ping_per_window(), 12);
+        assert_eq!(config.max_settings_per_window(), 13);
+        assert_eq!(config.max_empty_data_per_window(), 14);
+        assert_eq!(config.max_window_update_stream0_per_window(), 15);
+        assert_eq!(config.max_continuation_frames(), 16);
+        assert_eq!(config.max_glitch_count(), 17);
+        assert_eq!(config.max_rst_stream_lifetime(), 18);
+        assert_eq!(config.max_rst_stream_abusive_lifetime(), 19);
+        assert_eq!(config.max_rst_stream_emitted_lifetime(), 20);
+        assert_eq!(config.max_header_list_size(), 21);
+        assert_eq!(config.max_header_table_size(), 22);
+        assert_eq!(config.max_header_fields(), 23);
     }
 }

@@ -707,10 +707,9 @@ a threaded parameter because the read sites are unreachable from a `context`:
 `handle_ping_frame` takes no context at all, and the ten
 `check_flood_or_return!` sites are spread across six frame handlers.
 `H2FloodDetector` likewise takes `now` as a parameter
-(`check_flood`, `h2_flood_detector.rs:785`; `maybe_reset_window`,
-`h2_flood_detector.rs:728`) and keeps `window_start`
-(`h2_flood_detector.rs:433`) private, so nothing can advance the rate window
-against a clock the connection is not reading.
+(`check_flood` and `maybe_reset_window`, `h2_flood_detector.rs`) and keeps
+`window_start` (`h2_flood_detector.rs`) private, so nothing can advance the
+rate window against a clock the connection is not reading.
 
 **Consequence.** Every deadline armed or evaluated inside a pass is accurate to
 within that pass, **in either direction**. The error is not one-sided, and the
@@ -734,8 +733,9 @@ asymmetry that produces it is architectural:
   clock and the comparison was exact. This is the cost of the snapshot, and it
   is bounded by one pass.
 
-The flood window (`h2_flood_detector.rs:729`) and the RFC 9113 §5.1.2
-back-pressure window (`h2.rs:3987`) are the one asymmetric case, and they
+The flood window (`maybe_reset_window`, `h2_flood_detector.rs`) and the
+RFC 9113 §5.1.2 back-pressure window (`h2.rs:3987`) are the one asymmetric case,
+and they
 **fail closed**: `now` is
 constant for the whole pass, so a window cannot decay part-way through one. A
 burst arriving during a pass is weighed in full against the window that was open
