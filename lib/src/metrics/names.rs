@@ -165,6 +165,13 @@ pub mod h2 {
     pub const RST_STREAM_RECEIVED_PRE_RESPONSE_START: &str =
         "h2.rst_stream.received.pre_response_start";
 
+    /// A proxy-emitted RST_STREAM that was never queued because
+    /// `pending_rst_streams` was already at `MAX_PENDING_RST_STREAMS`.
+    /// Sibling of `WINDOW_UPDATE_DROPPED` below, same "control queue full"
+    /// semantics; a non-zero value means the connection is on its way to
+    /// `GOAWAY(ENHANCE_YOUR_CALM)`.
+    pub const RST_STREAM_DROPPED: &str = "h2.rst_stream_dropped";
+
     // Writable-rearm signal counters — one per rearm reason.
     pub const SIGNAL_WRITABLE_REARMED_CONTROL_QUEUE: &str =
         "h2.signal.writable.rearmed.control_queue";

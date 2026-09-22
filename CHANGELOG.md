@@ -922,6 +922,66 @@
 
 ### 🔐 Security
 
+- **`fix(mux-h2)`: bound `pending_rst_streams` at the insert, so one mass idle-timeout reap cannot
+  grow the queue past the cap `check_invariants` asserts.** `enqueue_rst_into` had no per-insert
+  cap. The only bound was `flush_pending_control_frames`'s
+  `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS` short-circuit, which runs *before* the drain
+  loop — it bounds what is written and says nothing about how large the queue got before anyone
+  looked. `handle_frame` runs `check_invariants` after each dispatch, so the `enqueue_rst` calls
+  reached through it are inspected between inserts — but it is the only production caller of
+  `check_invariants`, and two insert paths do not go through it. `cancel_timed_out_streams` is the
+  larger one: it walks the entire timed-out set and calls `enqueue_rst` for every entry in one sweep
+  — an unbounded number of inserts between two checks — deliberately discarding the flood-violation
+  signal each call returns, and from `Mux::timeout` it runs when `handle_frame` does not run at all.
+  The DATA-on-closed-stream reset is the other: it sits in `handle_header_state`, which `readable`
+  returns into directly on a branch that never reaches `handle_frame`. That second path is
+  separately rate-limited — `record_glitch` + `check_flood_or_return!` cap it at
+  `DEFAULT_MAX_GLITCH_COUNT` (100) inside one flood window, and the window can only half-decay when
+  `Mux::ready_inner` resamples `context.now`, strictly after an inner iteration that already ran
+  `writable()` — so it cannot fill the queue on its own; its inserts are simply not inspected
+  either. With `max_concurrent_streams` raised above 200 (operator-settable up to
+  `MAX_SAFE_CONCURRENT_STREAMS` = 10 000) and enough streams idling or window-stalling into the same
+  sweep — that setting bounds the live set one sweep walks, not the queue, which holds what every
+  caller queued since the last successful drain —
+  `pending_rst_streams.len()` passed the `<= MAX_PENDING_RST_STREAMS + 1` bound invariant 3
+  asserts: a debug/test/fuzz build panicked on the next inbound frame, a release build grew the
+  queue unbounded. The reaper is reached from `readable()`, where a later `handle_frame` trips the
+  assertion, and from `Mux::timeout`, where — against the fully silent peer that produces a mass
+  reap — `handle_frame`, the only caller of `check_invariants`, never runs at all.
+  `enqueue_rst_into` now takes `max_pending` and returns an `EnqueueRstOutcome`
+  (`Queued` / `Deduped` / `Dropped`), mirroring `H2FlowControl::queue_window_update`'s
+  `max_pending`-gated `QueueWindowUpdateOutcome::Dropped`. At capacity it queues nothing, bumps no
+  counter, records nothing in `rst_sent` — the cap is tested *before* the dedupe insert, so an id is
+  never marked reset without its frame being queued — and does not re-arm `WRITABLE`;
+  `ConnectionH2::enqueue_rst` answers with the new `h2.rst_stream_dropped` counter and a
+  session-context `error!` line, the drop + metric + log shape `h2.window_update_dropped` already
+  uses for the sibling control queue.
+  No RST that would have reached the wire is lost, and the peer is not left believing a refused
+  stream is live. Invariant 3 keeps `total_rst_streams_queued >= pending_rst_streams.len()`, so a
+  full queue implies `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS` — the counter half of the
+  condition `flush_pending_control_frames` tests before draining, where it emits
+  `GOAWAY(ENHANCE_YOUR_CALM)` (RFC 9113 §6.8, the documented answer to RST_STREAM abuse since
+  CVE-2023-44487) and the connection is torn down instead. The other half is a state gate,
+  `!matches!(self.state, H2State::GoAway | H2State::Error)`, and the RST drain beneath it has none,
+  so the implication holds only until the first GOAWAY: `goaway()` sets `H2State::GoAway` without
+  clearing `pending_rst_streams`, and a `Mux::timeout` reap landing in that window is dropped with
+  no second escalation while the drain still serialises what is queued. The window is bounded and
+  benign — the peer already holds the GOAWAY that made the connection terminal and `writable()`'s
+  `GoAway` arm force-disconnects on the same pass. The 200 enqueues that filled the queue each armed
+  `WRITABLE`, so that escalation runs on the next writable tick on both reaper call paths. No new
+  GOAWAY site is added:
+  raising one from `enqueue_rst` would re-enter `goaway()` once per remaining reaped stream,
+  clobbering `zero.storage` and inflating `h2.goaway.sent.*`.
+  Seen red: `mass_reap_keeps_the_pending_rst_queue_within_its_hard_cap` reaps
+  `MAX_PENDING_RST_STREAMS + 32` streams in one sweep and, without the guard, panics at
+  `lib/src/protocol/mux/h2.rs` with `pending RST queue must stay within its hard cap (escalates at
+  the cap)`. Covered by that test, by
+  `test_enqueue_rst_into_refuses_at_capacity_without_side_effects` (no queue, no counter, no
+  `rst_sent`, no `WRITABLE`), and by the quickcheck property
+  `prop_pending_rst_queue_stays_within_its_bound`, which holds the bound, the lifetime-counter
+  floor and the dedupe invariant across any interleaving of single resets, mass reaps and partial
+  drains. (sozu-proxy/sozu#1413)
+
 - **`fix(mux-h2)`: decode a refused stream's HPACK field block instead of dropping it, so the
   connection-level decoder cannot desynchronise from the peer's encoder.** RFC 9113 §4.3 scopes
   field-compression state to the whole connection, not to a stream: when `H2State::Discard` is

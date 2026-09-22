@@ -253,6 +253,7 @@ fn render_floods(f: &mut Frame<'_>, area: Rect, app: &App, skin: &Skin, m: &Aggr
         (names::h2::FLOOD_VIOLATION_SETTINGS, "settings_flood"),
         (names::h2::FLOOD_VIOLATION_PRIORITY, "priority_flood"),
         (names::h2::WINDOW_UPDATE_DROPPED, "window_update_dropped"),
+        (names::h2::RST_STREAM_DROPPED, "rst_stream_dropped"),
         (
             names::h2::CLOSE_WITH_ACTIVE_STREAMS,
             "close_with_active_streams",
