@@ -101,9 +101,11 @@ reference table that defines the knob it is telling the operator to turn, exactl
 the function that implements it. Prefer an anchor (`configure.md#h2-flood-detection-thresholds`)
 wherever a whole section is meant, for the same reason a symbol beats a line number in code; keep a
 line only where the prose means one specific row or statement, and then cite the row that carries
-the claim rather than the example that repeats the value. Prose that says "the catalogue" means the
-table, the row carries the mechanism description the surrounding sentence leans on, and rows drawn
-from two tables stay internally consistent where a row plus an example line would not.
+the claim rather than the example that repeats the value. Prose that says "the catalogue" means a
+whole section, so it takes the anchor and stops depending on line arithmetic altogether; a line is
+for the case where one row carries the claim, and then it is the row that carries it rather than
+the example repeating its value. `doc/configure_admin_ops.md` is the worked case — three citations
+into `configure.md`, one anchor for the section and two lines for the two rows.
 
 Until [sozu-proxy/sozu#1444][md-cit] the resolver did not see that form at all. Its pattern matched
 `.rs` alone, so a markdown target was never extracted from the document in the first place, and the

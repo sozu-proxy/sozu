@@ -346,18 +346,18 @@ jobs:
   # │   real, non-blank line; one this changeset did not touch must │
   # │   still name the same TEXT at the merge base; and a fenced    │
   # │   block that names the lines it quotes must quote them        │
-  # │   literally. A fourth reads those plus every `*.rs` and       │
+  # │   literally. One more rule reads those plus every `*.rs` and  │
   # │   CHANGELOG.md: a cited test name must name a `fn`.           │
   # │                                                               │
   # │   .github/scripts/check_doc_citations.py IS the authority.    │
   # │   Its header carries every rule, the measurement behind it    │
   # │   and the issue it came from; doc/README.md carries the       │
-  # │   convention for authors. Both were updated when the fourth   │
-  # │   rule shipped and this box was not, so keep it to one clause │
-  # │   per rule and the pointer: if a rule CHANGES, change the     │
-  # │   script and leave this alone; if one is ADDED, add a clause. │
-  # │   Each step below documents its own wiring, which is why none │
-  # │   of it is repeated up here.                                  │
+  # │   convention for authors. Both were updated when the          │
+  # │   pinned-block rule shipped and this box was not, so keep it  │
+  # │   to one clause per rule and the pointer: if a rule CHANGES,  │
+  # │   change the script and leave this alone; if one is ADDED,    │
+  # │   add a clause. Each step below documents its own wiring,     │
+  # │   which is why none of it is repeated up here.                │
   # │                                                               │
   # │   It runs on the merge result, which is the point: the pull   │
   # │   request that breaks a citation is almost never the one that │

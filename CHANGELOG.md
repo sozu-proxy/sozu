@@ -370,20 +370,26 @@
   same file the `.rs` citations were accurate — `lib/src/https.rs:483` is the `incr!` the
   surrounding prose describes, inside the function it names. The class the gate checked was right;
   the class it could not see was wrong in every instance.
-  The three sites now cite the rows that carry the claim: `doc/configure.md:1133, 1234` for the two
-  flood caps, `doc/configure.md:1197` for `h2_stream_shrink_ratio`, and `doc/configure.md:2860` for
-  the metrics-table row that defines the counter. The prose asks for "the catalogue", and a
-  catalogue is the table; the row carries the mechanism description the word "cap" leans on; and two
-  rows drawn from two tables is internally consistent where a row plus a TOML example line would not
-  be. (Not because the examples lack the CVE — `doc/configure.md:1149` carries both the default and
-  CVE-2024-27316; only the emitted-lifetime example is bare.)
+  The three sites now cite what carries the claim rather than a line that happens to sit near it,
+  and the form differs with what the prose means. The CVE catalogue site takes an **anchor**,
+  `doc/configure.md#h2-flood-detection-thresholds`: its sentence asks for "the catalogue", a
+  catalogue is a whole section, and a whole section is precisely the case
+  `doc/README.md#citing-another-document` reserves the anchor form for. The trade is worth stating
+  rather than leaving implied — an anchor cannot be shifted by an insertion above it, so that site
+  leaves this failure mode permanently, but it also leaves the resolver's reach, and a renamed
+  heading would break it with no rule watching. The other two sites keep a line because each means
+  one specific row: the `h2_stream_shrink_ratio` row of the per-listener tuning table, and the
+  `https.alpn.rejected.unsupported` row of the metrics table that defines the counter. Each row
+  carries the mechanism description its sentence leans on, where the TOML example that repeats the
+  same value carries only the value.
   The resolver now treats `.md` and `.rs` identically, under all three of its rules and with no
   exemption of its own: `PATH` accepts either extension and the suffix index behind `resolve_path`
   carries both, so a markdown citation resolves through the same document-directory-first,
   repo-root-relative, unique-suffix order — which is also what makes `configure.md:NNN` inside
   `doc/` well-formed rather than malformed. Five fixture citations pin it, three clean and two
-  expected failures, covering the multi-target `a.md:N, M, K` and bare-range `a.md:N-M` shapes that
-  appear in the tree and neither of which was exercised before; `--self-test` asserts the exact
+  expected failures, covering the multi-target `a.md:N, M, K` and bare-range `a.md:N-M` shapes the
+  three unrepaired sites used, neither of which was exercised before; `--self-test` asserts the
+  exact
   totals, so dropping `md` from `PATH` fails three assertions instead of reporting a clean run over
   a quietly smaller surface. A sixth fixture citation, the bare `LIFECYCLE.md:8`, exists only to
   reach `resolve_path`'s third branch — the tree-wide suffix index — because every other markdown
@@ -397,15 +403,17 @@
   all. It catches the common rot: someone edits `doc/configure.md`, a table row's text changes under
   a citation that did not move, and the gate names it in the pull request that caused it rather than
   years later.
-  Measured, and with the bound stated rather than implied: these four repaired line ends contribute
-  **zero** comparisons to *this* changeset's own `--base` run, because rule 2 exempts a citation
-  whose path and line numbers changed — which is exactly what repairing one does. From the next
-  changeset onward they are compared like any other. Verified on a scratch revision whose base is
-  this branch: editing the `h2_stream_shrink_ratio` row's text in place, without moving it, raises
-  the compared count from 370 to 374 and reports
-  `doc/configure_admin_ops.md:157 … doc/configure.md:1197 moved`, exit 1. Before this changeset that
-  same edit was silent. Rule 2 still cannot catch a re-anchor, which is how one of these six got
-  here; it catches the rot that follows.
+  Measured, and with the bound stated rather than implied: the two repaired line citations
+  contribute **zero** comparisons to *this* changeset's own `--base` run, because rule 2 exempts a
+  citation whose path and line numbers changed — which is exactly what repairing one does. Against
+  `c359eafb` the run compares 364 cited lines and exits 0; against this branch it compares 366, and
+  the two extra are exactly these. From the next changeset onward they are compared like any other:
+  editing the `h2_stream_shrink_ratio` row's text in place, without moving it, exits 1 naming
+  `doc/configure.md:1219 moved`. Before this changeset that same edit was silent, because the
+  citation was never extracted at all. The anchored catalogue site sits outside both counts and
+  stays there — it trades rule 2's reach for immunity to the shift that broke it, which is the
+  trade the convention now recommends wherever a whole section is meant. Rule 2 still cannot catch
+  a re-anchor, which is how one of these six got here; it catches the rot that follows.
   What nothing mechanical closes is the re-anchor: sozu#1437 moved this file's counter citation from
   line 933 to line 979 while shifting lines in `doc/configure.md`, mechanically correctly, carrying a
   target that was wrong the day it was written forward intact and more precisely. A re-anchor
