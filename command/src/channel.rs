@@ -580,10 +580,65 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
             // first 8 bytes of a frame can declare an arbitrarily large
             // message and drive `Buffer::grow` toward the
             // `max_buffer_size` ceiling before any byte of payload has
-            // been read. Reject as `MessageTooLarge` so the read loop
-            // disconnects cleanly instead of running the doubling growth
-            // strategy on attacker-supplied numbers.
+            // been read. Reject as `MessageTooLarge` before the doubling
+            // growth strategy ever runs on attacker-supplied numbers.
+            //
+            // Unlike the `MessageLengthUnderDelimiter` case below, this one
+            // must NOT consume and re-sync. That one can: a declared length
+            // under `delimiter_size()` is a value no writer can produce for
+            // any payload, so those bytes are provably not a real header and
+            // skipping exactly them re-aligns the stream. Here the declared
+            // length may be honest, in which case the bytes behind the header
+            // are payload -- dropping the header and re-framing on them would
+            // decode peer-chosen bytes as a fresh control-plane request. And
+            // the frame can never complete either way: a length above
+            // `max_buffer_size` does not fit a buffer bounded by
+            // `max_buffer_size`, however much more is read.
+            //
+            // So it is fatal for that peer, which is already the stance taken
+            // for the mirror condition on the write side
+            // (`is_transient_overflow`, `bin/src/command/sessions.rs`: "a
+            // frame bigger than the ceiling itself, which no amount of
+            // draining will ever admit"). That is a statement about this end,
+            // NOT about the peer's good faith: the two ends size their
+            // channels from their own configuration, so a peer built with a
+            // larger `max_command_buffer_size` emits frames this end refuses
+            // while conforming perfectly -- `write_delimited_message` below
+            // bounds an outgoing frame against the *writer's* ceiling, and the
+            // two configurations shipped here already disagree tenfold
+            // (`bin/config.toml` 163_840, `os-build/config.toml` 1_638_400).
+            // A `sozu ctl --config` pointed at one while the supervisor was
+            // started from the other, or two binaries built with different
+            // `SOZU_CONFIG` defaults (`bin/build.rs`, `bin/src/util.rs`), is
+            // all it takes. Closing is still the only correct exit for this
+            // end, which can neither complete nor
+            // re-sync the frame; the log line says what to reconcile instead
+            // of implying an attack. Mark the channel errored -- the single
+            // signal `ClientSession::ready`, `WorkerSession::ready` and
+            // `wants_to_tick` all key on -- so the supervisor drops the
+            // session. Without it the header is re-parsed forever,
+            // `extract_messages` swallows the error with a bare `Err(_)`, and
+            // the session wedges while pinning its file descriptor and buffer
+            // (sozu-proxy/sozu#1428).
+            //
+            // `insert`, never assignment: on the worker's own channel
+            // (`lib/src/server.rs`) `interest` carries only READABLE and
+            // WRITABLE, so `readiness()` masks ERROR away and nothing there
+            // reads `is_error()`. An assignment's only effect on that side
+            // would be clearing WRITABLE, and `Server::send_queue` gates on
+            // `channel.readiness.is_writable()`, so already-queued worker
+            // responses would stall until the next edge-triggered writability
+            // event.
             if message_len > self.max_buffer_size {
+                error!(
+                    "peer declared a {}-byte frame, above this end's {}-byte ceiling; closing \
+                     the connection. The two ends size their channels independently, so this is \
+                     more often a configuration mismatch than a hostile peer: reconcile \
+                     `max_command_buffer_size` (and `command_buffer_size`, which must stay below \
+                     it) between this end and the peer's",
+                    message_len, self.max_buffer_size
+                );
+                self.readiness.insert(Ready::ERROR);
                 return Err(ChannelError::MessageTooLarge {
                     message_len,
                     capacity: self.front_buf.capacity(),
@@ -637,8 +692,35 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                     buffer.len(),
                     "available_data must equal the data slice length we validated against"
                 );
-                let message = Rx::decode(&buffer[delimiter_size()..message_len])
-                    .map_err(ChannelError::InvalidProtobufMessage)?;
+                // Decode first, consume unconditionally, propagate a decode
+                // failure only afterwards. Returning before the consume (as
+                // this did until sozu-proxy/sozu#1428) left the whole frame at
+                // the head of the buffer and moved no readiness bit, and
+                // `extract_messages` (`bin/src/command/sessions.rs`) swallows
+                // the error with its bare `Err(_)` arm, so the session
+                // re-decoded the same bytes on every later read and wedged.
+                //
+                // Note what does NOT justify this. `message_len` is only
+                // range-checked above -- at least `delimiter_size()`, at most
+                // `max_buffer_size`, no larger than what is buffered. It is
+                // not proven to be a real frame boundary, so on a
+                // desynchronised stream consuming it re-frames on bytes the
+                // sender never framed, which is the very hazard that argues
+                // against consuming in the `MessageTooLarge` branch above.
+                // Nor is this the `MessageLengthUnderDelimiter` stance: that
+                // one consumes exactly `delimiter_size()` on a value no writer
+                // can emit for any payload, an impossibility proof this branch
+                // does not have.
+                //
+                // What justifies it is coherence with the success path four
+                // lines down, which already consumes this same peer-supplied
+                // `message_len` and re-frames on whatever follows. The
+                // desynchronisation hazard is therefore identical whether the
+                // payload decodes or not, and it predates this change.
+                // Closing the peer only on the failing half would punish the
+                // case more likely to be honest protobuf skew while silently
+                // accepting the case that is not.
+                let decoded = Rx::decode(&buffer[delimiter_size()..message_len]);
                 let consumed = self.front_buf.consume(message_len);
                 // The whole frame (delimiter + payload) is consumed exactly:
                 // pair-assert that consume advanced by message_len and the data
@@ -652,11 +734,33 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                     available_before - message_len,
                     "available_data must drop by exactly the consumed frame length"
                 );
+                let message = decoded.map_err(|decode_error| {
+                    error!(
+                        "could not decode a {}-byte frame from the peer; that frame is dropped \
+                         and the channel re-syncs on the next one: {}",
+                        message_len, decode_error
+                    );
+                    ChannelError::InvalidProtobufMessage(decode_error)
+                })?;
                 return Ok(Some(message));
             }
         }
 
         if self.front_buf.available_space() == 0 {
+            // KNOWN REMAINING, tracked as sozu-proxy/sozu#1436 and
+            // deliberately not folded into sozu-proxy/sozu#1428: this arm
+            // returns without consuming and without moving a readiness bit, so
+            // it wedges its session exactly as the oversize arm above used to.
+            // It is reachable -- decode a frame of at most `capacity / 2` out
+            // of a buffer filled to `capacity` and `Buffer::consume` advances
+            // `position` without reaching its shift threshold, which leaves
+            // `available_space() == 0` while the next declared length no longer
+            // fits the data that remains. Its recovery is NOT this branch's,
+            // though: those bytes are still buffered and a `Buffer::shift`
+            // would make room, so the frame can still complete and the peer is
+            // blameless. Marking the channel errored here would drop a
+            // conforming peer over an internal buffer-management detail, which
+            // is precisely the conflation this changeset corrects above.
             if self.front_buf.capacity() >= self.max_buffer_size {
                 return Err(ChannelError::BufferFull {
                     capacity: self.front_buf.capacity(),
@@ -1287,6 +1391,209 @@ mod tests {
             reader.front_buf.capacity() <= 32,
             "front buffer capacity {} must never exceed max_buffer_size 32",
             reader.front_buf.capacity()
+        );
+    }
+
+    /// Regression for sozu-proxy/sozu#1428: a peer that declares a frame
+    /// length above `max_buffer_size` must mark the channel for closing.
+    ///
+    /// The oversize guard rejects the frame but cannot re-sync past it. The
+    /// declared length is *unsatisfiable* — the frame can never fit a buffer
+    /// capped at `max_buffer_size`, so no amount of further reading completes
+    /// it — and the bytes behind the delimiter are of unknown provenance:
+    /// dropping the eight header bytes and re-framing would decode
+    /// peer-chosen payload bytes as a fresh control-plane command. That is
+    /// why this branch must NOT consume, while its sibling
+    /// `MessageLengthUnderDelimiter` must: a declared length below
+    /// `delimiter_size()` is one no writer can emit for any payload, so those
+    /// eight bytes are provably not a real header and skipping exactly them
+    /// re-aligns the stream.
+    ///
+    /// Left unconsumed AND unsignalled, the delimiter is re-parsed on every
+    /// later read forever: `read_message_nonblocking` propagates the error
+    /// with no log, `extract_messages` (`bin/src/command/sessions.rs`)
+    /// discards it with a bare `Err(_)`, and neither `ClientSession::ready`
+    /// nor `WorkerSession::ready` closes the session because both key on
+    /// `readiness.is_error() || is_hup()`, which no parse error ever sets.
+    /// The session then wedges permanently, pinning its file descriptor and
+    /// up to `max_buffer_size` of buffer, and `doc/configure_admin_ops.md`
+    /// §5.2's "the supervisor logs and drops the offending peer's session"
+    /// never happens.
+    #[test]
+    fn oversized_declared_length_marks_the_channel_for_closing() {
+        let (mut reader, mut writer): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate_nonblocking(1000, 10000)
+            .expect("could not generate nonblocking channels");
+
+        // One byte past this reader's `max_buffer_size`. Written raw only
+        // because both ends of this pair share one ceiling, so the writer's own
+        // `write_delimited_message` would refuse it. That is not true of a real
+        // deployment: the two ends size their channels from their own
+        // `max_command_buffer_size` (`bin/config.toml` ships 163_840,
+        // `os-build/config.toml` 1_638_400, the compiled default is 2_000_000),
+        // so a peer configured higher puts this frame on the wire through the
+        // ordinary write path while conforming perfectly. What follows is
+        // therefore about what this end can do with the frame, not about the
+        // peer's good faith.
+        let oversized: usize = 10_001;
+        std::io::Write::write_all(&mut writer.sock, &oversized.to_le_bytes())
+            .expect("raw write of the oversized delimiter");
+
+        reader.handle_events(Ready::READABLE);
+        reader
+            .readable()
+            .expect("reader must buffer the delimiter bytes");
+
+        let available_before = reader.front_buf.available_data();
+        assert_eq!(
+            available_before,
+            delimiter_size(),
+            "the delimiter must be buffered before the parse under test"
+        );
+
+        // Arm writability before the parse that marks the channel, so the
+        // assertion at the end of this test can tell an `insert` from an
+        // assignment.
+        reader.handle_events(Ready::WRITABLE);
+
+        match reader.read_message() {
+            Err(ChannelError::MessageTooLarge {
+                message_len, max, ..
+            }) => {
+                assert_eq!(message_len, oversized);
+                assert_eq!(max, 10000);
+            }
+            other => panic!("expected MessageTooLarge, got {other:?}"),
+        }
+
+        // The bytes stay put -- deliberately, see the doc comment above.
+        assert_eq!(
+            reader.front_buf.available_data(),
+            available_before,
+            "an unsatisfiable declared length must not be consumed: re-framing \
+             on the bytes behind it would decode peer-chosen bytes as a command"
+        );
+
+        // So a second parse returns the identical error against the identical
+        // bytes. The parser alone can never make progress on this stream.
+        match reader.read_message() {
+            Err(ChannelError::MessageTooLarge { message_len, .. }) => {
+                assert_eq!(message_len, oversized)
+            }
+            other => panic!("expected the identical MessageTooLarge, got {other:?}"),
+        }
+        assert_eq!(reader.front_buf.available_data(), available_before);
+
+        // Which leaves closing the peer as the only correct exit, and the channel
+        // must say so through the one signal `ClientSession::ready`,
+        // `WorkerSession::ready` and `wants_to_tick` all key on
+        // (`bin/src/command/sessions.rs`).
+        assert!(
+            reader.readiness.is_error(),
+            "an oversized declaration must mark the channel errored so the \
+             supervisor drops the session; without it the same delimiter is \
+             re-parsed forever, the error is swallowed by `extract_messages`'s \
+             `Err(_)` arm, and the session wedges holding its fd and buffer"
+        );
+        // And it must INSERT that bit rather than assign it. On the worker's
+        // own channel (`lib/src/server.rs`) `interest` carries only READABLE
+        // and WRITABLE, so `readiness()` masks ERROR away and nothing there
+        // reads `is_error()`: an assignment's only effect on that side is
+        // clearing WRITABLE, and `Server::send_queue` gates on
+        // `channel.readiness.is_writable()`, so responses already queued for
+        // the supervisor would stall until the next edge-triggered writability
+        // event.
+        assert!(
+            reader.readiness.is_writable(),
+            "marking the channel errored must not clear the other readiness \
+             bits; wiping WRITABLE stalls `Server::send_queue` until the next \
+             writability event"
+        );
+    }
+
+    /// Regression for the second shape of sozu-proxy/sozu#1428: a frame whose
+    /// declared length is valid but whose payload does not decode must be
+    /// consumed, so the channel re-syncs on the next frame instead of
+    /// re-decoding the same bytes for the life of the session.
+    ///
+    /// `try_read_delimited_message` propagated `InvalidProtobufMessage` from
+    /// the `?` on `Rx::decode`, one line *before* the `consume`. The malformed
+    /// frame therefore stayed at the head of `front_buf`, no readiness bit
+    /// moved, `extract_messages` (`bin/src/command/sessions.rs`) discarded the
+    /// error with its bare `Err(_)` arm, and the session wedged exactly as the
+    /// oversize branch above did. Eight valid length bytes followed by garbage
+    /// reach it, and so does protobuf skew between two builds.
+    ///
+    /// Consuming is coherent with the success path rather than provably safe:
+    /// `message_len` is only range-checked, but the success path already
+    /// consumes that same peer-supplied length and re-frames on whatever
+    /// follows, so the decode-failure path now re-frames on exactly the bytes
+    /// the decode-success path already did. One undecodable payload therefore
+    /// costs its frame rather than the peer.
+    ///
+    /// SCOPE: this asserts the channel contract, not a session one.
+    /// `extract_messages` (`bin/src/command/sessions.rs`) returns on the first
+    /// `Err(_)` with the capacity unchanged, so a valid frame already
+    /// pipelined behind the malformed one is not handed to the session on that
+    /// tick, and `wants_to_tick` does not re-schedule it; it is delivered on
+    /// that session's next readable event. Unlike the oversize branch above,
+    /// this shape deliberately has no `ClientSession`-level test, so nothing
+    /// here proves a session-level property.
+    #[test]
+    fn malformed_payload_is_consumed_so_the_channel_resyncs() {
+        let (mut reader, mut writer): (
+            Channel<ProtobufMessage, ProtobufMessage>,
+            Channel<ProtobufMessage, ProtobufMessage>,
+        ) = Channel::generate_nonblocking(1000, 10000)
+            .expect("could not generate nonblocking channels");
+
+        // A well-formed frame whose payload is not a `ProtobufMessage`: a
+        // leading zero byte is field number 0, which no protobuf decoder
+        // accepts. The length prefix itself is entirely valid. Hand-crafted
+        // rather than random so the failure is deterministic and independent
+        // of how much arbitrary input prost happens to accept.
+        let frame_len: usize = delimiter_size() + 8;
+        let mut malformed = frame_len.to_le_bytes().to_vec();
+        malformed.extend_from_slice(&[0x00_u8; 8]);
+        std::io::Write::write_all(&mut writer.sock, &malformed)
+            .expect("raw write of the malformed frame");
+
+        // ... immediately followed by a perfectly good one.
+        writer
+            .write_message(&ProtobufMessage { inner: 7 })
+            .expect("could not queue the following message");
+        writer.handle_events(Ready::WRITABLE);
+        writer.run().expect("could not flush the following message");
+
+        reader.handle_events(Ready::READABLE);
+        reader.readable().expect("reader must buffer both frames");
+
+        let available_before = reader.front_buf.available_data();
+        assert!(
+            available_before > frame_len,
+            "both frames must be buffered before the parse under test"
+        );
+
+        match reader.read_message() {
+            Err(ChannelError::InvalidProtobufMessage(_)) => {}
+            other => panic!("expected InvalidProtobufMessage, got {other:?}"),
+        }
+
+        assert_eq!(
+            reader.front_buf.available_data(),
+            available_before - frame_len,
+            "a malformed payload behind a valid length must be consumed: the \
+             frame boundary is exact, so dropping exactly those bytes re-syncs \
+             the stream"
+        );
+
+        assert_eq!(
+            reader.read_message().expect("the next frame must decode"),
+            ProtobufMessage { inner: 7 },
+            "the channel must make progress past a malformed frame instead of \
+             re-decoding it on every later read"
         );
     }
 }
