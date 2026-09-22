@@ -133,9 +133,12 @@ authoritative until connection-pinning helpers land):
   cleartext path with raw TCP socket holds. Same connection-pinning
   prerequisite as 429.
 
-Each feature × cell pair runs in `repeat_until_error_or(2, ...)` so a
-single transient failure surfaces as a stable fail — the harness
-matches the existing redirect/auth tests' retry budget.
+Each feature × cell pair runs in `repeat_until_error_or(2, ...)`, which is
+a stability check, not a retry: it requires 2 **consecutive** clean runs
+and fails on the first bad trial, so a single transient failure fails the
+whole cell immediately rather than being retried — the harness matches the
+existing redirect/auth tests' `n`, not a "retry budget". See
+`e2e/src/tests/mod.rs::repeat_until_error_or` and issue #1410.
 
 ## Out of e2e reach by construction
 

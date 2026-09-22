@@ -69,6 +69,9 @@ Rules every change is expected to follow:
 - **No hardcoded ports in e2e** (allocate via `e2e/src/port_registry.rs`); drain responses with the
   `loop_read_*` / `receive_until_eof` helpers; prefer deadlines / `repeat_until_error_or` over `sleep`; and
   assert *provable* invariants rather than statistical fractions when an input varies between runs.
+  `repeat_until_error_or(n, ..)` is a stability check, not a retry — it requires `n` *consecutive*
+  clean runs and fails on the first bad trial, so choose `n` for what the test proves
+  (`doc/testing.md`), and do not copy a neighbour's.
 - **`#[ignore]` must carry a reason string** and only gate an environment dependency or a tracked follow-up —
   it must never hide a failing test. CI rejects a bare `#[ignore]`.
 - **Docs are code:** a change to a public metric, config key, or CLI flag updates its documentation in the same

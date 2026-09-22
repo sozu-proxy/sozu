@@ -50,7 +50,13 @@ activation.
 ## Test scenarios
 
 Six tests cover the upgrade mechanism, each validating a different aspect.
-All use `repeat_until_error_or(10, ...)` to account for timing sensitivity.
+All six use `repeat_until_error_or(10, ...)`, which is a **stability check, not
+a retry**: it loops while the inner test keeps succeeding and returns `Fail` on
+the first bad trial, so it requires ten *consecutive* clean runs. `n = 10`
+therefore does not account for timing sensitivity — it multiplies the exposure
+to it by ten. The value is left as it stands because changing it changes what
+these tests assert; read `repeat_until_error_or`'s doc comment in
+`e2e/src/tests/mod.rs` and issue #1410 before copying it into a new test.
 
 ### 1. `try_upgrade` — Original test (preserved)
 

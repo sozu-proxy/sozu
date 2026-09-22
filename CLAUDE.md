@@ -105,7 +105,7 @@ pattern — see `doc/udp_simulation.md`.
 
 - **Never hardcode ports.** Allocate via `e2e/src/port_registry.rs`.
 - **Always `loop_read_*` / `receive_until_eof` when asserting on TCP responses.** A single `read()` sees one segment under load. Commits `7a7e87d9`, `6bd85a3f`, `73341f4f` exist only to paper over this being skipped.
-- **Prefer `repeat_until_error_or` / explicit deadlines over `sleep`** for timing-sensitive tests. Assert *provable* invariants, not statistical fractions, when an input (e.g. dynamically-allocated ports) varies between runs.
+- **Prefer `repeat_until_error_or` / explicit deadlines over `sleep`** for timing-sensitive tests. `repeat_until_error_or(n, ..)` is a stability check, not a retry: it requires `n` *consecutive* clean runs and fails on the first bad trial, so pick `n` for what the test proves rather than copying a neighbour's — see `doc/testing.md` and issue #1410. Assert *provable* invariants, not statistical fractions, when an input (e.g. dynamically-allocated ports) varies between runs.
 - **Upgrade work**: read `doc/upgrade_e2e_tests.md` and run `cargo test -p sozu-e2e test_upgrade`.
 - **H2 parser / HPACK changes**: run the focused e2e tests plus the cargo-fuzz targets.
 - **`#[ignore]` must carry a reason string** and only gate an environment dependency or a tracked follow-up — never hide a failing test.

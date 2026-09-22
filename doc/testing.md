@@ -535,6 +535,19 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **Prefer deadlines / repeat-until-error over `sleep`.** Use
   `repeat_until_error_or` (`e2e/src/tests/mod.rs`) or an explicit deadline for
   timing-sensitive assertions. A fixed `sleep` is both slow and flaky.
+  `repeat_until_error_or(n, ..)` is a **stability check, not a retry**: it
+  loops while the inner test keeps succeeding and returns `Fail` on the
+  first bad trial, so it requires `n` **consecutive** clean runs — pick `n`
+  for what the test is trying to prove (a timing/race property that must
+  hold every run wants several consecutive passes; a property one clean
+  delivery already proves gets no extra assurance from repeating it, only
+  more exposure to unrelated per-trial harness flake). All three of its
+  outcome lines start with `stability check`, so one
+  `grep 'stability check'` over a run log finds the passes, the failures and
+  the interrupted checks alike; `n = 1` claims no consecutiveness property it
+  does not have — its FAIL and INTERRUPTED lines end `(a single clean run is
+  required)`, and its pass line reads `stability check PASSED: the single
+  required run succeeded`. See issue #1410.
 - **Assert a status by decoding it, never by scanning a field block for its
   digits.** An HPACK block is not text. `payload.windows(3).any(|w| w == b"421")`
   matches any three adjacent bytes, and every Sōzu response carries a `Sozu-Id`
