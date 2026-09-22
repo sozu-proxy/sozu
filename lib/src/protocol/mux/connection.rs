@@ -30,6 +30,7 @@ use super::{
     BackendStatus, ConnectionH1, ConnectionH2, Context, Endpoint, GlobalStreamId, MuxResult,
     Position, Router,
     h2::{self, H2StreamId},
+    h2_flood_detector,
 };
 use crate::metrics::names;
 use crate::{
@@ -137,7 +138,7 @@ impl<Front: SocketHandler> Connection<Front> {
         front_stream: Front,
         pool: Weak<RefCell<Pool>>,
         timeout_duration: Duration,
-        flood_config: h2::H2FloodConfig,
+        flood_config: h2_flood_detector::H2FloodConfig,
         connection_config: h2::H2ConnectionConfig,
         stream_idle_timeout: std::time::Duration,
         graceful_shutdown_deadline: Option<std::time::Duration>,
@@ -165,7 +166,7 @@ impl<Front: SocketHandler> Connection<Front> {
         backend: Rc<RefCell<Backend>>,
         pool: Weak<RefCell<Pool>>,
         timeout_duration: Duration,
-        flood_config: h2::H2FloodConfig,
+        flood_config: h2_flood_detector::H2FloodConfig,
         connection_config: h2::H2ConnectionConfig,
         stream_idle_timeout: std::time::Duration,
         graceful_shutdown_deadline: Option<std::time::Duration>,

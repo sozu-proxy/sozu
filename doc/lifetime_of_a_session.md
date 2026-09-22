@@ -380,7 +380,7 @@ The H2 mux owns a few invariants that are easy to break by accident:
   `ping_{window,lifetime}`, `settings_{window,lifetime}`,
   `empty_data_window`, `continuation_per_block`,
   `window_update_stream0_window`, `header_size_per_block`,
-  `glitch_window`; see `lib/src/protocol/mux/h2.rs:1064-1269` and
+  `glitch_window`; see `lib/src/protocol/mux/h2_flood_detector.rs:342-948` and
   `ConnectionH2::handle_flood_violation`).
   GOAWAY and RST_STREAM sends/receives are attributed by error code
   via `h2.{goaway,rst_stream}.{sent,received}.<code>`

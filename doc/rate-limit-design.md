@@ -31,7 +31,7 @@ tuning, addresses #1057's noisy-neighbour pattern).
 - No cross-worker / cross-process state. Each worker enforces its own counter independently. A 4-worker deployment with cap=`100` effectively allows 400 concurrent connections per (cluster, IP). Documented trade-off; cross-worker sync is deferred (§6).
 - Not a request-rate limit. The cap counts **concurrent connections**, not requests-per-second. Token-bucket request-rate limiting is a separate feature (§6).
 - Not a path/method-scoped limit. Path/method limits belong in router middleware, not the listener.
-- Does not touch the H2 flood detector (`H2FloodDetector` in `lib/src/protocol/mux/h2.rs`). Protocol-layer abuse stays separate.
+- Does not touch the H2 flood detector (`H2FloodDetector` in `lib/src/protocol/mux/h2_flood_detector.rs`). Protocol-layer abuse stays separate.
 
 ## 3. Mechanism — per-(cluster, source-IP) concurrent connection cap
 

@@ -139,6 +139,7 @@ mod converter;
 pub mod debug;
 mod h1;
 mod h2;
+mod h2_flood_detector;
 mod h2_flow_control;
 mod h2_stream_table;
 mod hpack_state;
@@ -178,7 +179,7 @@ pub use crate::protocol::mux::{
     h2::H2ByteAccounting,
     h2::H2ConnectionConfig,
     h2::H2DrainState,
-    h2::H2FloodConfig,
+    h2_flood_detector::H2FloodConfig,
     parser::H2Error,
     router::Router,
     stream::{Stream, StreamParts, StreamState},
@@ -2576,7 +2577,10 @@ mod tests {
     use super::*;
     use crate::{
         pool::Pool,
-        protocol::mux::h2::{ConnectionH2, H2ConnectionConfig, H2FloodConfig, H2State},
+        protocol::mux::{
+            h2::{ConnectionH2, H2ConnectionConfig, H2State},
+            h2_flood_detector::H2FloodConfig,
+        },
         timer::TimeoutContainer,
     };
 

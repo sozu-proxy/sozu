@@ -23,6 +23,54 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: H2 flood/abuse detection moves into its own
+  `lib/src/protocol/mux/h2_flood_detector.rs`, behind the same closed-API shape `hpack_state.rs`,
+  `h2_flow_control.rs` and `h2_stream_table.rs` established in the three prior extraction steps.**
+  `H2FloodConfig` (the CVE-tagged thresholds — its fields stay `pub`, unchanged, because
+  `lib/src/http.rs`/`lib/src/https.rs` build it with a struct literal from listener config),
+  `H2FloodViolation`, `H2FloodDetector` and `check_flood` all move; `ConnectionH2` keeps a single
+  private `flood_detector: h2_flood_detector::H2FloodDetector` field and calls its new
+  `record_glitch` / `record_continuation_frame` / `begin_header_block_if_new` /
+  `record_empty_data_frame` / `record_rst_stream_window` / `record_settings_frame` /
+  `record_ping_frame` / `record_window_update_stream0` / `config` / `accumulated_header_size` /
+  `total_rst_received_lifetime` / `total_rst_streams_emitted_lifetime` methods instead of touching
+  the thirteen raw counter/config fields directly at fourteen call sites across six frame handlers.
+  `MAX_HEADER_LIST_SIZE` (the compile-time default for `max_header_list_size`) stays declared in
+  `h2.rs`, reached from the new module via `super::h2::MAX_HEADER_LIST_SIZE`: unlike the rest of the
+  moved thresholds, `converter.rs` and `pkawa.rs` also reference it directly as a general HPACK
+  encode/decode safety ceiling, independent of any one connection's configured value, so moving it
+  would have widened this extraction into two unrelated modules for no benefit.
+  Every counter's increment operator (`+=` vs. `.saturating_add(...)`) moved verbatim, per field, and
+  every `check_flood` threshold comparison is character-for-character the same `count > threshold`
+  check against the same field and the same `H2FloodConfig` value — this is a pure relocation of the
+  CVE-2023-44487 (Rapid Reset), CVE-2024-27316 (CONTINUATION flood) and CVE-2025-8671 (MadeYouReset)
+  mitigations, not a behaviour change. `record_glitch`'s five call sites gain a symmetric
+  before/after `debug_assert!` they previously lacked (every sibling counter already had one),
+  which is debug-only and cannot change release behaviour. `H2FloodDetector` holds no map, set or
+  `Vec` — every field is a scalar counter, a `Copy` config, or a single `Instant` — so unlike the
+  two prior extraction steps this one found no ordering leak to fix: `check_flood`'s `.or_else()`
+  chain is a fixed sequence written into the source text, not an iteration over anything whose order
+  could vary between runs. See the new module's doc comment for the full enumeration.
+  One exception is deliberately removed rather than carried forward: `impl Default for
+  H2FloodDetector` sampled `Instant::now()` for test convenience and was documented
+  (`LIFECYCLE.md` invariant 20) as the one other clock-sampling exception under `ConnectionH2`
+  besides its own constructor. Verified test-only and reachable from nowhere else
+  (`H2FloodDetector::new(flood_config, now)`, called once, from `ConnectionH2::new`'s own
+  accept-time sample, is the sole production construction path), this extraction removes `impl
+  Default` outright instead of moving it: every former `H2FloodDetector::default()` call site now
+  reads `H2FloodDetector::new(H2FloodConfig::default(), Instant::now())`, pushing the same sample to
+  the call site instead of hiding it behind a second constructor. The one test whose entire premise
+  was comparing `default()` against `new()` is deleted along with the impl it was pinning, rather
+  than adapted, because there is no longer a second constructor left for it to compare against.
+  `LIFECYCLE.md` invariant 20 now has zero exceptions under `ConnectionH2` beyond its own
+  constructor. `H2FloodDetector` carries `debug_assert!` pre/post-conditions on every mutating
+  method plus a `#[cfg(debug_assertions)] check_invariants()` sweep (the abusive-RST lifetime
+  counter is a subset of the total-RST lifetime counter) run as a post-condition of each, exactly as
+  `h2_flow_control::H2FlowControl`, `h2_stream_table::H2StreamTable` and
+  `protocol::udp::manager::UdpManager` do. `H2FloodDetector`'s own unit tests (24 of them, covering
+  every CVE-tagged threshold, the half-decay window, the lifetime ceilings, and metric-key
+  uniqueness) moved into the new module's `#[cfg(test)] mod tests` alongside the type.
+
 - **`refactor(metrics)`: `Aggregator::lease_apply` now takes an injected `now: Instant` instead of
   reading `Instant::now()` directly.** Every other clock-dependent entry point on the lease table —
   `lease_tick`, and by extension the janitor `lease_tick_due` gates — already took `now` as a
