@@ -139,6 +139,7 @@ mod converter;
 pub mod debug;
 mod h1;
 mod h2;
+mod h2_close;
 mod h2_control_tx;
 mod h2_drain;
 mod h2_flood_detector;

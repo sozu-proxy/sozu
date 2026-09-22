@@ -34,7 +34,9 @@ use crate::{
     protocol::mux::{
         BackendStatus, Context, DebugEvent, DebugHistory, Endpoint, GenericHttpStream,
         GlobalStreamId, MuxResult, Position, Stream, StreamId, StreamState, converter,
-        forcefully_terminate_answer, h2_control_tx,
+        forcefully_terminate_answer,
+        h2_close::{self, CloseAction, TlsFlushPhase},
+        h2_control_tx,
         h2_drain::{self, GracefulDrainDecision},
         h2_flood_detector::{self, H2FloodConfig, H2FloodViolation},
         h2_flow_control, h2_header_reassembly, h2_scheduler, h2_stream_table, h2_transmit,
@@ -2968,11 +2970,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
         match (&self.state, &self.position) {
             (H2State::Error, Position::Server) => {
-                if self.socket.socket_wants_write() {
-                    self.ensure_tls_flushed();
-                    MuxResult::Continue
-                } else {
-                    MuxResult::CloseSession
+                // The preamble above already attempted this pass's flush, so
+                // this arm reads the post-flush answer and has no `Flush` of
+                // its own — see `h2_close`'s module doc.
+                match h2_close::error_close_action(self.socket.socket_wants_write()) {
+                    CloseAction::ReArmAndContinue => {
+                        self.ensure_tls_flushed();
+                        MuxResult::Continue
+                    }
+                    CloseAction::CloseSession => MuxResult::CloseSession,
+                    // Named rather than `other =>`: a wildcard arm would turn a
+                    // new `CloseAction` variant into a release-mode panic in the
+                    // proxy write path instead of a compile error.
+                    action @ (CloseAction::Flush | CloseAction::Disconnect) => {
+                        unreachable!("error_close_action yielded {action:?}")
+                    }
                 }
             }
             (H2State::Error, _)
@@ -2992,22 +3004,41 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // the remaining frame payload.
             (H2State::Discard, _) => MuxResult::Continue,
             (H2State::GoAway, _) => {
-                if self.peer_gone_after_final_goaway() {
-                    return MuxResult::CloseSession;
-                }
-                // Flush any remaining TLS response data before disconnecting.
-                // The GoAway state only enters after control frames (our GOAWAY
-                // response) are flushed above, but response DATA frames may still
-                // be in rustls's TLS output buffer — accepted by socket_write_vectored
-                // during write_streams() but not yet flushed to TCP. Under TCP
-                // backpressure (HAProxy chain), this is the primary truncation vector.
-                if self.socket.socket_wants_write() {
-                    self.socket.socket_write(&[]);
-                    if self.socket.socket_wants_write() {
-                        // TLS data still pending (TCP backpressure) — don't disconnect
-                        // yet. Re-arm WRITABLE so the event loop retries the flush.
-                        self.ensure_tls_flushed();
-                        return MuxResult::Continue;
+                // Response DATA frames may still sit in rustls's output
+                // buffer — accepted by socket_write_vectored during
+                // write_streams() but not yet flushed to TCP. Under TCP
+                // backpressure (HAProxy chain) this is the primary truncation
+                // vector, so the decision lives in `h2_close`, exhaustively
+                // unit-tested there rather than inline here. Why the two
+                // `socket_wants_write()` queries are two DIFFERENT questions,
+                // and why the flush between them stays inside this call: see
+                // `h2_close::TlsFlushPhase`.
+                match h2_close::goaway_close_action(
+                    TlsFlushPhase::BeforeFlush,
+                    self.peer_gone_after_final_goaway(),
+                    self.socket.socket_wants_write(),
+                ) {
+                    CloseAction::CloseSession => return MuxResult::CloseSession,
+                    CloseAction::Flush => {
+                        self.socket.socket_write(&[]);
+                        match h2_close::goaway_close_action(
+                            TlsFlushPhase::AfterFlush,
+                            false,
+                            self.socket.socket_wants_write(),
+                        ) {
+                            CloseAction::ReArmAndContinue => {
+                                self.ensure_tls_flushed();
+                                return MuxResult::Continue;
+                            }
+                            CloseAction::Disconnect => {}
+                            action @ (CloseAction::CloseSession | CloseAction::Flush) => {
+                                unreachable!("AfterFlush yielded {action:?}")
+                            }
+                        }
+                    }
+                    CloseAction::Disconnect => {}
+                    action @ CloseAction::ReArmAndContinue => {
+                        unreachable!("BeforeFlush yielded {action:?}")
                     }
                 }
                 self.force_disconnect()
@@ -5518,22 +5549,34 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
             Position::Server => {
-                if self.peer_gone_after_final_goaway() {
-                    return MuxResult::CloseSession;
-                }
                 // Don't disconnect immediately if rustls still has buffered TLS
                 // records. Returning CloseSession here triggers shutdown(Write)
                 // which sends FIN — but any TLS records still in rustls's buffer
                 // (not yet flushed to the TCP send buffer) are lost, causing the
                 // client to see "TLS decode error / unexpected eof".
                 // Instead, keep WRITABLE interest and let the writable path flush.
-                if self.socket.socket_wants_write() {
+                // The decision itself is `h2_close::force_disconnect_action`,
+                // exhaustively unit-tested there.
+                //
+                // The answer is read ONCE and reported by both log lines. A
+                // literal `wants_write=` in either arm is a second copy of a
+                // fact the socket already owns, and the closing arm is reached
+                // with records still pending whenever the peer is gone — an
+                // operator diagnosing a truncation under HAProxy chaining would
+                // read the opposite of the socket's state.
+                let tls_wants_write = self.socket.socket_wants_write();
+                if h2_close::force_disconnect_action(
+                    self.peer_gone_after_final_goaway(),
+                    tls_wants_write,
+                ) == CloseAction::ReArmAndContinue
+                {
                     debug!(
-                        "{} H2 force_disconnect delaying close: state={:?}, streams={}, expect_write={:?}, wants_write=true, readiness={:?}",
+                        "{} H2 force_disconnect delaying close: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
                         log_context!(self),
                         self.state,
                         self.stream_table.streams().len(),
                         self.stream_table.expect_write(),
+                        tls_wants_write,
                         self.readiness
                     );
                     self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
@@ -5541,11 +5584,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     MuxResult::Continue
                 } else {
                     debug!(
-                        "{} H2 force_disconnect closing session: state={:?}, streams={}, expect_write={:?}, wants_write=false, readiness={:?}",
+                        "{} H2 force_disconnect closing session: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
                         log_context!(self),
                         self.state,
                         self.stream_table.streams().len(),
                         self.stream_table.expect_write(),
+                        tls_wants_write,
                         self.readiness
                     );
                     MuxResult::CloseSession
@@ -6948,6 +6992,231 @@ mod tests {
     // the core would still "work" in production — it would just be reading a
     // second clock — so these two tests advance ONLY the connection's
     // snapshot and prove the decision moves with it. Neither sleeps.
+
+    // ── TLS backpressure: the GoAway truncation vector (#1454) ──────────
+    //
+    // Until this harness existed, NO test anywhere instantiated a
+    // `ConnectionH2` over a handler whose `socket_wants_write()` could return
+    // `true`. `mio::net::TcpStream` and `SessionTcpStream` both take the
+    // trait's `false` default and only `FrontRustls` overrides it, so every
+    // branch that asks "does rustls still hold records?" was statically dead
+    // in the test suite — including the one whose own comment calls it the
+    // primary truncation vector. These are the first tests that branch class
+    // has ever had against a handler that answers `true`.
+
+    /// A `SocketHandler` that models rustls-over-a-blocked-kernel: it holds
+    /// `pending` records, and each empty-buffer flush drains `drain_per_flush`
+    /// of them. `drain_per_flush = 0` is a kernel that accepts nothing, which
+    /// is the backpressure case; a positive value is a kernel that takes them.
+    ///
+    /// Modelling the state rather than scripting an answer sequence is
+    /// deliberate: the close path queries `socket_wants_write()` a number of
+    /// times that depends on which branches it takes, so a positional script
+    /// would pin the query COUNT instead of the behaviour and would have to be
+    /// rewritten by anyone who added a query.
+    struct BackpressuredTlsSocket {
+        stream: mio::net::TcpStream,
+        pending: std::cell::Cell<usize>,
+        drain_per_flush: usize,
+        flushes: std::cell::Cell<usize>,
+    }
+
+    impl BackpressuredTlsSocket {
+        fn new(stream: mio::net::TcpStream, pending: usize, drain_per_flush: usize) -> Self {
+            Self {
+                stream,
+                pending: std::cell::Cell::new(pending),
+                drain_per_flush,
+                flushes: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl SocketHandler for BackpressuredTlsSocket {
+        fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
+            self.stream.socket_read(buf)
+        }
+
+        fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+            if buf.is_empty() {
+                self.flushes.set(self.flushes.get() + 1);
+                let drained = self.drain_per_flush.min(self.pending.get());
+                self.pending.set(self.pending.get() - drained);
+                return (0, SocketResult::Continue);
+            }
+            self.stream.socket_write(buf)
+        }
+
+        fn socket_write_vectored(&mut self, bufs: &[IoSlice]) -> (usize, SocketResult) {
+            self.stream.socket_write_vectored(bufs)
+        }
+
+        /// The override that makes this harness worth having.
+        fn socket_wants_write(&self) -> bool {
+            self.pending.get() > 0
+        }
+
+        fn socket_ref(&self) -> &mio::net::TcpStream {
+            &self.stream
+        }
+
+        fn socket_mut(&mut self) -> &mut mio::net::TcpStream {
+            &mut self.stream
+        }
+
+        fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+            mio::net::TcpStream::peer_addr(&self.stream).ok()
+        }
+
+        fn protocol(&self) -> crate::socket::TransportProtocol {
+            crate::socket::TransportProtocol::Tls1_3
+        }
+
+        fn read_error(&self) {}
+
+        fn write_error(&self) {}
+    }
+
+    fn goaway_connection_with_backpressure(
+        pool: &Rc<RefCell<Pool>>,
+        pending: usize,
+        drain_per_flush: usize,
+    ) -> (ConnectionH2<BackpressuredTlsSocket>, std::net::TcpStream) {
+        let (socket, peer) = connected_socket();
+        let mut connection = ConnectionH2::new(
+            Ulid::generate(),
+            BackpressuredTlsSocket::new(socket, pending, drain_per_flush),
+            Position::Server,
+            Rc::downgrade(pool),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
+            Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        connection.state = H2State::GoAway;
+        (connection, peer)
+    }
+
+    /// Records that survive the flush hold the connection open.
+    ///
+    /// This is the branch whose own comment calls it the primary truncation
+    /// vector: closing here sends FIN and destroys the records rustls is still
+    /// holding, which the client reads as a truncated response.
+    ///
+    /// TO SEE THIS RED: delete the `self.ensure_tls_flushed();` call in the
+    /// `CloseAction::ReArmAndContinue` arm of `ConnectionH2::writable`'s
+    /// `H2State::GoAway` branch. The WRITABLE *event* bit is then never
+    /// re-signalled and this test fails on its OWN assertion, `the WRITABLE
+    /// event must be re-signalled so the event loop retries the flush`. The
+    /// recipe deliberately does not swap `TlsFlushPhase::AfterFlush` for
+    /// `BeforeFlush`: that reddens through the production `unreachable!`, which
+    /// is someone else's assertion and would pass whatever this test claimed.
+    #[test]
+    fn a_flush_that_does_not_drain_keeps_the_connection_open() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        // A kernel that accepts nothing: every flush leaves the records.
+        let (mut connection, _peer) = goaway_connection_with_backpressure(&pool, 2, 0);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        // Premise: the handler really does report buffered records. Without
+        // this the assertions below would pass against a handler taking the
+        // trait's `false` default, which is exactly the blind spot #1454 names.
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: this harness must report buffered TLS records"
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "records still buffered: the session must stay open, got {result:?}"
+        );
+        // `Continue` alone does not discriminate: `force_disconnect`'s server
+        // arm also returns it for a live peer with records pending. The re-arm
+        // path returns from the GoAway arm BEFORE reaching `force_disconnect`,
+        // so the state is still `GoAway`; the fall-through would have gone
+        // through `force_disconnect`, which sets `H2State::Error` first.
+        assert!(
+            matches!(connection.state, H2State::GoAway),
+            "the GoAway arm must re-arm and return, not fall through to \
+             force_disconnect, got {:?}",
+            connection.state
+        );
+        // Not `readiness.interest`: that bit is this fixture's own argument to
+        // `ConnectionH2::new` and nothing on this path clears it, so asserting
+        // on it would assert on the harness. The edge-triggered re-arm is the
+        // EVENT bit, set by `ensure_tls_flushed` -> `signal_pending_write`.
+        assert!(
+            connection.readiness.event.is_writable(),
+            "the WRITABLE event must be re-signalled so the event loop retries \
+             the flush, got {:?}",
+            connection.readiness
+        );
+        // Not `socket_wants_write()`: with `drain_per_flush = 0` that can never
+        // change, so it is a tautology of the harness no production edit can
+        // falsify. The flush COUNT is falsifiable — a GoAway arm that skipped
+        // its own flush would leave it at 1.
+        assert!(
+            connection.socket.flushes.get() >= 2,
+            "the preamble and the GoAway arm must each attempt a flush, got {}",
+            connection.socket.flushes.get()
+        );
+    }
+
+    /// A flush the kernel accepts closes within ONE `writable()` call.
+    ///
+    /// This is the tick-count assertion. The pre-image asked its second
+    /// question inline, immediately after the flush; a split that returned
+    /// `Continue` and waited to be called again would still deliver the bytes,
+    /// but would double the latency of every close under backpressure and
+    /// would strand the connection against a peer that never re-arms.
+    ///
+    /// TO SEE THIS RED: in the `H2State::GoAway` arm, add
+    /// `return MuxResult::Continue;` immediately after the
+    /// `self.socket.socket_write(&[]);` inside the `CloseAction::Flush` body —
+    /// the deferred shape, which still performs the flush. The first call then
+    /// returns `Continue` and the final assertion fails with `a drained flush
+    /// must reach the disconnect in the SAME writable call`. Dropping the flush
+    /// as well would redden the premise at the top of the test instead, with a
+    /// different message.
+    #[test]
+    fn a_flush_that_succeeds_closes_within_one_writable_call() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        // Two records, one drained per flush: the preamble takes one and the
+        // GoAway arm's own flush takes the other, so the post-flush query is
+        // the first one that can answer `false`.
+        let (mut connection, _peer) = goaway_connection_with_backpressure(&pool, 2, 1);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: this harness must report buffered TLS records"
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            !connection.socket.socket_wants_write(),
+            "premise: both flushes landed, so nothing is pending any more"
+        );
+        assert!(
+            connection.socket.flushes.get() >= 2,
+            "the preamble and the GoAway arm must each attempt a flush, got {}",
+            connection.socket.flushes.get()
+        );
+        assert!(
+            !matches!(result, MuxResult::Continue),
+            "a drained flush must reach the disconnect in the SAME writable \
+             call, not defer it to another tick: got {result:?}"
+        );
+    }
 
     /// Build a bare server-side `ConnectionH2` for tests that only exercise
     /// connection-level bookkeeping. The socket is never read or written.

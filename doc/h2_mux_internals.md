@@ -452,7 +452,7 @@ must be attributed proportionally.
 
 A **free function**, not a method:
 
-```rust lib/src/protocol/mux/h2.rs:463-471
+```rust lib/src/protocol/mux/h2.rs:465-473
 fn distribute_overhead(
     metrics: &mut SessionMetrics,
     overhead_bin: &mut usize,
@@ -526,7 +526,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:3162-3175
+```rust lib/src/protocol/mux/h2.rs:3193-3206
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -550,7 +550,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:3208-3214
+```rust lib/src/protocol/mux/h2.rs:3239-3245
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -563,13 +563,13 @@ stream.generate_access_log(
 The other three sites take the `&mut self` wrapper
 `ConnectionH2::distribute_overhead` instead, and each emits its own log:
 
-- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3500`) passes a
+- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3531`) passes a
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5031`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5062`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:5737`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:5781`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -578,10 +578,10 @@ Only the last two are reset paths; the first is the idle/stall sweep.
 for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
-taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2184`) and passes
+taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2186`) and passes
 `stream.linked_token()` straight out of it:
 
-```rust lib/src/protocol/mux/h2.rs:2399
+```rust lib/src/protocol/mux/h2.rs:2401
 let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, stream.linked_token());
 ```
 
@@ -608,7 +608,7 @@ the complexity of the H2 state machine:
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:1619-1623
+```rust lib/src/protocol/mux/h2.rs:1621-1625
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -652,7 +652,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:2946-2950
+```rust lib/src/protocol/mux/h2.rs:2948-2952
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -832,7 +832,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4076
+```rust lib/src/protocol/mux/h2.rs:4107
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -985,7 +985,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5074-5076
+```rust lib/src/protocol/mux/h2.rs:5105-5107
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -993,7 +993,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5088-5094
+```rust lib/src/protocol/mux/h2.rs:5119-5125
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

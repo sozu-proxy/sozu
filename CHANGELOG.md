@@ -77,6 +77,56 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the three close-under-TLS-backpressure decisions move out of `h2.rs` into a
+  new `lib/src/protocol/mux/h2_close.rs`, where they become pure functions with exhaustive
+  tables.** The `H2State::GoAway` arm of `ConnectionH2::writable`, the
+  `(H2State::Error, Position::Server)` arm beside it, and `force_disconnect`'s server arm all
+  decide whether a connection may close while rustls may still hold encrypted records. Closing
+  with records pending sends FIN and destroys them, which the client reads as a truncated
+  response — the GoAway arm's own comment calls it the primary truncation vector under HAProxy
+  chaining. The same queries, the same flush and the same results, with two deliberate exceptions,
+  both in `force_disconnect`'s server arm. Its two `debug!` lines hard-coded `wants_write=true` and
+  `wants_write=false`, and that arm is reached with records still PENDING whenever the peer is
+  gone, so the line an operator reads while diagnosing a truncation under HAProxy chaining could
+  state the opposite of the socket's state; both now interpolate one binding. Taking that binding
+  also swaps the read order — `socket_wants_write()` is now read before
+  `peer_gone_after_final_goaway()` — which is inert because both are `&self` pure reads, and is
+  stated here rather than folded into a blanket "no behaviour change" that would only hold under
+  an unstated premise.
+
+  The decision is now a pure function of `(peer gone, records pending, have we flushed yet)`. Why
+  that third input exists — the two `socket_wants_write()` calls are two different questions, and
+  `socket_write(&[])`'s returned `size` and `SocketResult` are both discarded at the site — is
+  stated once, in `h2_close`'s module doc under `TlsFlushPhase`, rather than restated here.
+
+  **First coverage these branches have had against a handler that reports buffered records.** No
+  test anywhere instantiated a `ConnectionH2` over a handler whose `socket_wants_write()` could
+  return `true`: `mio::net::TcpStream` and `SessionTcpStream` take the trait's `false` default and
+  only `FrontRustls` overrides it. Every branch in this invariant was statically dead in the
+  suite. `BackpressuredTlsSocket` models rustls over a kernel that accepts a configurable number
+  of records per flush, and drives a real `ConnectionH2` through the `H2State::GoAway` arm, where
+  both post-flush outcomes are now pinned:
+  `a_flush_that_does_not_drain_keeps_the_connection_open` (records survive, session stays open,
+  the WRITABLE event re-signalled, connection still in `GoAway`) and
+  `a_flush_that_succeeds_closes_within_one_writable_call` (kernel takes them, disconnect reached
+  in the same call). Each is red against a distinct mutation, on its own assertion, and each
+  asserts its own premise — that the harness really does report buffered records — first.
+
+  **What is still uncovered.** The `(H2State::Error, Position::Server)` arm and
+  `force_disconnect`'s re-arm branch are exercised only as pure functions in `h2_close`'s tables;
+  no test reaches them through a connection whose handler answers `true`. The
+  `ConnectionH2<FrontRustls>` fixture that would close that gap is sozu-proxy/sozu#1454, which
+  this changeset does not resolve — `BackpressuredTlsSocket` is a TCP handler with a modelled
+  `socket_wants_write`, which is the shape that issue explicitly rules out for closing it.
+
+  One operator-visible detail changes with the extraction: `force_disconnect`'s two `debug!` lines
+  hard-coded `wants_write=true` / `wants_write=false`, and the second is also reached with records
+  still pending when the peer is gone — so the line an operator reads while diagnosing a
+  truncation could state the opposite of the socket's state. Both now interpolate the single
+  `socket_wants_write()` answer the decision itself was taken on.
+
+  LIFECYCLE.md gains invariant 27 for the two-question rule and the tick-count constraint.
+
 - **`refactor(mux)`: `Endpoint::socket(token) -> Option<&TcpStream>` is replaced by
   `Endpoint::peer_rtt(token) -> Option<Duration>`, so the trait no longer hands one connection
   another connection's socket.** The method existed for exactly one purpose — sampling TCP_INFO RTT
