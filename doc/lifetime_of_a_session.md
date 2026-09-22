@@ -414,12 +414,35 @@ Routing happens after the request headers are parsed. The router asks
 "which cluster does this `(host, path, method)` match?" and returns a
 `cluster_id`. From there the load-balancer picks a backend.
 
-The available algorithms live in `lib/src/load_balancing.rs`:
+The available algorithms all live in `lib/src/load_balancing.rs`:
 
-- `RoundRobin` (`lib/src/load_balancing.rs`)
-- `Random`
-- `LeastLoaded` (`lib/src/load_balancing.rs`)
-- `PowerOfTwo` (`lib/src/load_balancing.rs`)
+- `RoundRobin` — the next backend in declaration order. Reads no load.
+- `Random` — one backend drawn at random, weighted by its configured
+  `weight`. Reads no load.
+- `LeastLoaded` — reads the load of every backend and takes the minimum.
+  The best balance available, at `O(n)` load reads per request.
+- `PowerOfTwo` — power-of-two-choices: draws two backends at random and
+  keeps the less loaded of the two, breaking an exact tie with a coin flip.
+  It reads two backend loads whatever the cluster size, against
+  `LeastLoaded`'s `n`, and stays close to `LeastLoaded`'s balance. Because
+  no worker ever computes a global minimum, independently seeded workers
+  cannot herd onto the same backend.
+- `Rendezvous` (`HRW`) and `Maglev` — flow-affine hashing for UDP clusters;
+  the backend is a function of the flow key, so they read no load either.
+  Both DO read `weight` on that keyed path — `Rendezvous::score` scales the
+  rendezvous score by it, `Maglev::rebuild` hands out table slots in
+  proportion to it — and both fall back to `RoundRobin`, which ignores it,
+  when they are called with no key.
+
+`LeastLoaded` and `PowerOfTwo` are the two policies that read load, through
+the cluster's `load_metric`.
+
+Those load-read counts are not the per-request cost of a policy. Whatever the
+policy, `BackendList::next_available_backend_with_key` first builds the
+candidate set with `BackendList::available_backends`, which walks the
+cluster's backend list and clones every healthy backend into a fresh `Vec`.
+Every policy is `O(n)` per request because of that walk; power-of-two-choices
+only removes the `n` load reads layered on top of it.
 
 Sticky sessions are implemented as an opt-in cookie-based override:
 when a request carries a sticky cookie that names a still-healthy

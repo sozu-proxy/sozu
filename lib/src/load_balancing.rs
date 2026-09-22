@@ -398,6 +398,41 @@ impl LoadBalancingAlgorithm for LeastLoaded {
 /// Power-of-two-choices (P2C) load-aware selection: sample two candidates,
 /// keep the lighter one, and coin-flip a tie.
 ///
+/// # Cost: two load reads per selection, whatever the cluster size
+///
+/// The two candidates are drawn uniformly at random from the candidate set
+/// and only those two are measured, so a selection costs `O(1)` load reads
+/// against [`LeastLoaded`]'s `O(n)` scan.
+///
+/// That is a statement about load READS and nothing more. It is NOT a claim
+/// that a selection is `O(1)`: every selection, under every policy, first
+/// builds the candidate set in [`crate::backends::BackendList::available_backends`], which
+/// walks the cluster's backend list and clones each healthy backend into a
+/// fresh `Vec` before any policy runs. That walk is in the caller, this
+/// policy does not remove it, and no policy here is sub-linear per request.
+/// So P2C is not the "cheap" alternative to a scan — picking it to shorten a
+/// per-request walk that lives somewhere else buys nothing.
+///
+/// What the two-read bound does buy is real but narrower: under
+/// [`LoadMetric::ConnectionTime`] a load read is a `PeakEWMA::observe` call
+/// that takes an `Instant::now()` stamp and decays the backend's average, so
+/// two of them per selection instead of `n` is measurable work removed —
+/// under `Connections`/`Requests` a load read is a field read and the saving
+/// is small.
+///
+/// The reason to choose this policy over [`LeastLoaded`] is balance, not
+/// cost: P2C buys most of least-loaded's balance — the classic result is a
+/// maximum load of `O(log log n)` where uniform-random gives `O(log n)` —
+/// without ever computing a global minimum. Sōzu's workers each select from
+/// their own view, and that missing global minimum is what keeps them from
+/// herding: no worker can steer toward "the least loaded backend" because no
+/// worker ever computes one.
+///
+/// `power_of_two_touches_exactly_two_backends` pins the read count, and
+/// `power_of_two_sample_size_is_two_not_the_whole_set` measures the same
+/// property from the selection distribution alone. Both exist because a test
+/// that only checks "a backend came back" passes for an `O(n)` scan too.
+///
 /// # Tie-break: seeded-random, deliberately NOT deterministic-by-id
 ///
 /// Unlike [`Rendezvous`]/[`Maglev`], `PowerOfTwo` carries no affinity `key` —
@@ -463,6 +498,20 @@ impl PowerOfTwo {
             rng: StdRng::seed_from_u64(seed),
         }
     }
+
+    /// Read ONE backend's load under the configured metric.
+    ///
+    /// Called exactly twice per selection, whatever the cluster size — that
+    /// call count is the algorithm, not an implementation detail of it. The
+    /// `ConnectionTime` arm needs `borrow_mut` because `peak_ewma_connection`
+    /// decays the EWMA as it reads it.
+    fn measure(&self, backend: &Rc<RefCell<Backend>>) -> f64 {
+        match self.metric {
+            LoadMetric::Connections => backend.borrow().active_connections as f64,
+            LoadMetric::Requests => backend.borrow().active_requests as f64,
+            LoadMetric::ConnectionTime => backend.borrow_mut().peak_ewma_connection(),
+        }
+    }
 }
 
 impl LoadBalancingAlgorithm for PowerOfTwo {
@@ -472,69 +521,62 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
         backends: &mut Vec<Rc<RefCell<Backend>>>,
     ) -> Option<Rc<RefCell<Backend>>> {
         let len = backends.len();
-        let mut first = None;
-        let mut second = None;
-
-        for backend in backends.iter_mut() {
-            let measure = match self.metric {
-                LoadMetric::Connections => backend.borrow().active_connections as f64,
-                LoadMetric::Requests => backend.borrow().active_requests as f64,
-                LoadMetric::ConnectionTime => backend.borrow_mut().peak_ewma_connection(),
-            };
-
-            if first.is_none() {
-                first = Some((measure, backend));
-            } else if second.is_none() {
-                if first.as_ref().unwrap().0 <= measure {
-                    second = Some((measure, backend));
-                } else {
-                    second = first.take();
-                    first = Some((measure, backend));
-                }
-            } else if first.as_ref().unwrap().0 <= measure && measure < second.as_ref().unwrap().0 {
-                second = Some((measure, backend));
-                // other case: we don't change anything
-            } else {
-                second = first.take();
-                first = Some((measure, backend));
-            }
+        match len {
+            0 => return None,
+            // A singleton set has no second candidate to compare against, so
+            // the sample degenerates to the only backend there is.
+            1 => return backends.first().cloned(),
+            _ => {}
         }
 
-        // `first` holds the lighter of the two tracked candidates and `second`
-        // the heavier — the running fold keeps `first.measure <= second.measure`
-        // — and the candidates populate in step with the set size (none for an
-        // empty set, only `first` for a singleton, both for >= 2 backends).
+        // Sample two DISTINCT backends uniformly at random. The second index
+        // is drawn from the `len - 1` remaining slots and shifted past the
+        // first, which is a uniform draw over "every index except `first`"
+        // with no rejection loop — so the sampling has no unbounded worst
+        // case, and the whole selection reads exactly two backends whatever
+        // the cluster size.
+        let first = self.rng.random_range(0..len);
+        let mut second = self.rng.random_range(0..len - 1);
+        if second >= first {
+            second += 1;
+        }
+        debug_assert_ne!(
+            first, second,
+            "power-of-two must sample two distinct backends"
+        );
         debug_assert!(
-            match (&first, &second) {
-                (Some((f, _)), Some((s, _))) => f <= s,
-                _ => true,
-            },
-            "power-of-two: first candidate must be no heavier than second"
-        );
-        debug_assert_eq!(
-            first.is_some(),
-            len > 0,
-            "power-of-two must hold a primary candidate iff the set is non-empty"
-        );
-        debug_assert_eq!(
-            second.is_some(),
-            len > 1,
-            "power-of-two holds a second candidate iff the set has >= 2 backends"
+            second < len,
+            "the shifted second index must stay inside the candidate set"
         );
 
-        match (first, second) {
-            (None, None) => None,
-            (Some((_, b)), None) => Some(b.clone()),
-            // should not happen, but let's be exhaustive
-            (None, Some((_, b))) => Some(b.clone()),
-            (Some((_, b1)), Some((_, b2))) => {
-                if self.rng.random_bool(0.5) {
-                    Some(b1.clone())
-                } else {
-                    Some(b2.clone())
-                }
-            }
-        }
+        let first_measure = self.measure(&backends[first]);
+        let second_measure = self.measure(&backends[second]);
+
+        // Keep the lighter of the two samples. An exact tie is broken by a
+        // coin flip rather than by index order: ties are the common case
+        // (every backend starts at zero load), and always awarding them to
+        // the lower index would reintroduce the herding P2C exists to avoid
+        // — see the struct docs.
+        let chosen = if first_measure < second_measure {
+            first
+        } else if second_measure < first_measure {
+            second
+        } else if self.rng.random_bool(0.5) {
+            first
+        } else {
+            second
+        };
+        // Asserted on the already-computed measures on purpose: re-reading a
+        // backend under `LoadMetric::ConnectionTime` decays its EWMA, and a
+        // `debug_assert!` that mutates would make debug and release builds
+        // diverge.
+        debug_assert!(
+            (chosen == first && first_measure <= second_measure)
+                || (chosen == second && second_measure <= first_measure),
+            "power-of-two must never keep the strictly heavier of its two samples"
+        );
+
+        backends.get(chosen).cloned()
     }
 }
 
@@ -975,7 +1017,10 @@ impl LoadBalancingAlgorithm for Maglev {
 
 #[cfg(test)]
 mod test {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        time::Instant,
+    };
 
     use super::*;
     use crate::{
@@ -1613,8 +1658,9 @@ mod test {
 
     #[test]
     fn power_of_two_tie_break_is_deterministic_and_matches_an_expected_sequence() {
-        // All backends report the same load (0 active connections), so every
-        // call reaches the two-candidate tie-break branch.
+        // All backends report the same load (0 active connections), so both
+        // sampled candidates always tie and every call reaches the coin-flip
+        // branch.
         let backends = make_backends(4);
         let mut p1 = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
         let mut p2 = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
@@ -1649,21 +1695,51 @@ mod test {
             "PowerOfTwo::with_seed must reproduce the same tie-break sequence for the same seed"
         );
 
-        // Absolute-value check: the two tracked candidates are always
-        // backends 2 and 3 (the last two processed by the fold, since every
-        // measure ties at 0), so this also pins which two backends the
-        // tie-break alternates between, not just that it is reproducible.
+        // Absolute-value check: the sequence ranges over all four backends,
+        // because each call samples a fresh uniformly random PAIR and the
+        // tie then resolves inside that pair. That is the visible signature
+        // of random sampling — the O(n) fold this replaced could only ever
+        // emit backends 2 and 3, the last two it happened to retain.
         //
         // Brittleness note: this literal is coupled to `rand` 0.10.2's exact
-        // `StdRng` algorithm (ChaCha12) and `seed_from_u64`'s splitmix64
-        // expansion. A `rand` version bump that changes either (the type's
-        // own docs disclaim portability/reproducibility across versions) will
-        // break this assertion for reasons unrelated to Sōzu's load-balancing
-        // logic — recapture the sequence, don't "fix" the algorithm.
-        let expected: Vec<u8> = vec![2, 3, 2, 2, 3, 3, 3, 2, 2, 3, 2, 3, 3, 2, 3, 3, 3, 3, 2, 3];
+        // `StdRng` algorithm (ChaCha12), to `seed_from_u64`'s splitmix64
+        // expansion, AND to the exact order and shape of the draws
+        // `PowerOfTwo::next_available_backend` makes. TWO kinds of change
+        // move it legitimately, not one: a `rand` version bump that alters
+        // either generator (the type's own docs disclaim
+        // portability/reproducibility across versions), and a deliberate
+        // change to the selection procedure itself. The second is not
+        // hypothetical — this literal was recaptured once already, when the
+        // two-lightest fold became real power-of-two-choices and the
+        // sequence stopped being confined to backends 2 and 3.
+        //
+        // HOW TO TELL A LEGITIMATE RECAPTURE FROM PAPERING OVER A
+        // REGRESSION. Every other `power_of_two_*` test in this module
+        // asserts a SEMANTIC property that no RNG stream can shift. There
+        // are EIGHT of them — `grep -cE '^\s+fn power_of_two_'` in this file
+        // gives nine, this test included — and the rule below covers all
+        // eight, not a convenient subset. The pattern is anchored on
+        // purpose: unanchored it also counts this very comment, reports
+        // ten, and sends the reader after a test that does not exist. The
+        // eight are:
+        // `power_of_two_new_instances_are_not_correlated`,
+        // `power_of_two_tie_break_distribution_does_not_collapse`,
+        // `power_of_two_tie_break_is_decided_by_the_coin_flip_not_by_sample_position`,
+        // `power_of_two_touches_exactly_two_backends`,
+        // `power_of_two_always_returns_the_lighter_of_two_backends`,
+        // `power_of_two_handles_empty_and_singleton_sets_without_panic`,
+        // `power_of_two_never_returns_the_strictly_heaviest_backend` and
+        // `power_of_two_sample_size_is_two_not_the_whole_set`.
+        // Recapture only when THIS assertion is the only failing one and all
+        // eight are green with their bodies untouched. If any of them is
+        // red, or one had to be edited to get green, the algorithm regressed
+        // and the new sequence is evidence of it — do not capture it. Check
+        // the grep count first: a `power_of_two_*` test added after this
+        // comment was written belongs in the rule too.
+        let expected: Vec<u8> = vec![1, 3, 1, 1, 1, 2, 1, 2, 0, 1, 2, 3, 1, 3, 3, 3, 0, 2, 0, 2];
         assert_eq!(
             seq1, expected,
-            "PowerOfTwo tie-break sequence for DEFAULT_HASH_SEED regressed"
+            "PowerOfTwo selection sequence for DEFAULT_HASH_SEED regressed"
         );
     }
 
@@ -1698,9 +1774,9 @@ mod test {
             })
             .collect();
 
-        // Each draw is a 1-bit choice between the two tracked candidates, so
-        // 48 draws give a ~2^-48 collision probability if the two instances
-        // are genuinely independently seeded — not a flaky assertion.
+        // Each draw picks one of four backends, so 48 draws give a collision
+        // probability well under 2^-48 if the two instances are genuinely
+        // independently seeded — not a flaky assertion.
         assert_ne!(
             seq1, seq2,
             "two PowerOfTwo::new() instances must NOT draw from a shared/correlated keystream"
@@ -1709,16 +1785,23 @@ mod test {
 
     #[test]
     fn power_of_two_tie_break_distribution_does_not_collapse() {
-        // The seeded RNG must still alternate between the two tied
-        // candidates over many draws rather than pinning one — otherwise the
-        // fix would trade "ambient nondeterminism" for "deterministic bias",
-        // which is exactly the regression the herding argument in
-        // `PowerOfTwo`'s doc comment warns about.
+        // Every backend reports the same load, so the pair sample is uniform
+        // and the tie inside it resolves by coin flip: the selection must
+        // spread over ALL FOUR backends, not pin one — otherwise the seeded
+        // RNG would have traded "ambient nondeterminism" for "deterministic
+        // bias", the regression the herding argument in `PowerOfTwo`'s doc
+        // comment warns about.
         //
-        // Smoke check, not a uniformity test: the +/-35% band (~25 sigma at
-        // p=0.5, total=5000) reliably catches full collapse onto one
-        // candidate but would pass a systematic skew — see the equivalent
-        // note on `random_distribution_does_not_collapse`.
+        // This assertion got STRICTER when the O(n) scan became real
+        // power-of-two-choices: it used to require backends 0 and 1 to win
+        // exactly ZERO times, because the old fold could only ever retain
+        // the last two backends it walked. Requiring all four to take a
+        // roughly equal share is a stronger statement about the same draws.
+        //
+        // Smoke check, not a uniformity test: the +/-35% band (~14 sigma at
+        // p=0.25, total=5000) reliably catches a collapse onto a subset but
+        // would pass a systematic skew — see the equivalent note on
+        // `random_distribution_does_not_collapse`.
         let backends = make_backends(4);
         let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
         let mut sel = backends.clone();
@@ -1732,21 +1815,289 @@ mod test {
             counts[idx as usize] += 1;
         }
 
-        // Only backends 2 and 3 are ever tracked as candidates (see the test
-        // above); each must get a substantial share, and 0/1 must never be
-        // picked.
-        assert_eq!(counts[0], 0, "backend 0 is never a tracked candidate");
-        assert_eq!(counts[1], 0, "backend 1 is never a tracked candidate");
-        let expected = total / 2;
+        // Uniform pair sampling over four equally loaded backends makes
+        // every backend equally likely, so each must take roughly a quarter
+        // and none may be starved.
+        let expected = total / 4;
+        for (idx, &c) in counts.iter().enumerate() {
+            assert!(
+                c > expected * 65 / 100 && c < expected * 135 / 100,
+                "PowerOfTwo distribution skewed for backend {idx}: got {c}, expected ~{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn power_of_two_tie_break_is_decided_by_the_coin_flip_not_by_sample_position() {
+        // `power_of_two_tie_break_distribution_does_not_collapse` CANNOT see
+        // the coin flip, and neither can any other distribution test here.
+        // The sampler draws an ordered pair uniformly — `first` over
+        // `0..len`, `second` uniformly over the rest — so the two positions
+        // are exchangeable, and "always keep `first`" has exactly the same
+        // marginal distribution as a fair coin. Replacing
+        // `self.rng.random_bool(0.5)` with `true` leaves every other test in
+        // this module green except the captured-sequence one, which would
+        // only fail through RNG-stream drift — the same way a `rand` upgrade
+        // fails it, and whose own comment invites a recapture. A dropped
+        // coin flip could ride in behind such a recapture unnoticed.
+        //
+        // This test makes the tie-break directly observable instead. Under
+        // `LoadMetric::ConnectionTime` each measurement runs
+        // `PeakEWMA::observe`, which stamps `last_event = Instant::now()`,
+        // and `next_available_backend` measures its samples in order: the
+        // backend it drew as `first` carries the EARLIER stamp. So the pair's
+        // order is readable from outside, and "which member of a tie won" is
+        // decidable.
+        //
+        // The decay has to be frozen for the tie to exist at all. `observe`
+        // ages `rtt` by `exp(-elapsed / decay)`, so at the default 1s decay
+        // the backend measured second has aged longer, comes back strictly
+        // lighter, and the coin-flip branch is never reached. With a decay
+        // this large the weight rounds to exactly 1.0 and `rtt` survives
+        // bit-for-bit, so both measures tie exactly while `observe` still
+        // stamps `last_event`.
+        const TOTAL: usize = 2_000;
+        let backends = make_backends(2);
+        for backend in &backends {
+            backend.borrow_mut().connection_time.decay = 1e300;
+        }
+
+        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::ConnectionTime);
+        let mut sel = backends.clone();
+        let mut decided = 0usize;
+        let mut second_measured_won = 0usize;
+        for _ in 0..TOTAL {
+            let picked = addr_index(chosen_addr(
+                &p.next_available_backend(None, &mut sel).unwrap(),
+            ));
+            let stamp_0 = backends[0].borrow().connection_time.last_event;
+            let stamp_1 = backends[1].borrow().connection_time.last_event;
+            // Two reads that the monotonic clock could not separate leave the
+            // pair's order unknowable, so the sample is dropped rather than
+            // guessed. `decided` is asserted below so dropping them all can
+            // never be mistaken for a pass.
+            if stamp_0 == stamp_1 {
+                continue;
+            }
+            decided += 1;
+            let measured_second = u8::from(stamp_0 < stamp_1);
+            if picked == measured_second {
+                second_measured_won += 1;
+            }
+        }
+
         assert!(
-            counts[2] > expected * 65 / 100 && counts[2] < expected * 135 / 100,
-            "PowerOfTwo tie-break skewed toward backend 3: backend 2 got {}, expected ~{expected}",
-            counts[2]
+            decided >= TOTAL / 2,
+            "only {decided} of {TOTAL} selections had distinguishable measurement stamps; the \
+             clock is too coarse to decide this test rather than the tie-break being wrong"
         );
+
+        // A fair coin gives the second-measured backend half the ties. The
+        // band is +/-20 percentage points around 50%, so its half-width is
+        // `0.2 * decided` against a standard deviation of
+        // `sqrt(decided * 0.25)`. Quote it at the FLOOR the guard above
+        // permits, which is the only bound that has to hold: at
+        // decided = 1000 that is 200 against sigma 15.8, ~12.6 sigma (~17.9
+        // sigma at the full 2000). It cannot flake, and it is two-sided:
+        // pinning the tie-break to `first` drives this to 0, pinning it to
+        // `second` drives it to `decided`.
+        let low = decided * 30 / 100;
+        let high = decided * 70 / 100;
         assert!(
-            counts[3] > expected * 65 / 100 && counts[3] < expected * 135 / 100,
-            "PowerOfTwo tie-break skewed toward backend 2: backend 3 got {}, expected ~{expected}",
-            counts[3]
+            second_measured_won > low && second_measured_won < high,
+            "power-of-two resolved {second_measured_won} of {decided} exact ties in favour of \
+             the second-measured sample; a coin flip must land near {}, and a count at either \
+             end means the tie is being awarded by sample position instead",
+            decided / 2
+        );
+    }
+
+    // ----- PowerOfTwo: the sampling itself, not just the outcome -----
+
+    #[test]
+    fn power_of_two_touches_exactly_two_backends() {
+        // The two-load-reads claim, MEASURED rather than asserted
+        // structurally. It is a claim about how many backends the POLICY
+        // reads, not about the cost of a selection: the caller has already
+        // walked every backend in `BackendList::available_backends` to build
+        // the candidate set handed in here, so a selection is `O(n)` whatever
+        // this policy does. `LoadMetric::ConnectionTime` reads a backend's load
+        // through `Backend::peak_ewma_connection` -> `PeakEWMA::get` ->
+        // `PeakEWMA::observe`, and `observe` stamps `last_event =
+        // Instant::now()`. That stamp is an exact per-backend receipt saying
+        // "this backend's load was measured", so the number of fresh stamps
+        // after one selection IS the number of backends the algorithm
+        // consulted: a full scan leaves `n` of them, power-of-two-choices
+        // leaves exactly 2.
+        //
+        // This is the assertion a "did a backend come back?" test cannot
+        // make: the scan-then-coin-flip shape this replaced also returned a
+        // backend, it just read all 64 first.
+        const N: u8 = 64;
+        let mut backends = make_backends(N);
+
+        // Stamp every backend with one instant, then spin until the
+        // monotonic clock is strictly past it. After that point every
+        // `Instant::now()` is `> before`, so "was this backend measured?"
+        // is decidable without depending on the clock's resolution.
+        let before = Instant::now();
+        for backend in &backends {
+            backend.borrow_mut().connection_time.last_event = before;
+        }
+        while Instant::now() <= before {
+            std::hint::spin_loop();
+        }
+
+        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::ConnectionTime);
+        assert!(p.next_available_backend(None, &mut backends).is_some());
+
+        let touched = backends
+            .iter()
+            .filter(|backend| backend.borrow().connection_time.last_event > before)
+            .count();
+        assert_eq!(
+            touched, 2,
+            "power-of-two must measure exactly 2 of the {N} backends; measuring {touched} means \
+             the policy reads every backend's load, which the name exists to rule out"
+        );
+    }
+
+    #[test]
+    fn power_of_two_always_returns_the_lighter_of_two_backends() {
+        // With exactly two backends the sample IS the whole set, so P2C is
+        // fully determined and needs no statistics: the lighter backend must
+        // win every single call. The scan-then-coin-flip shape this replaced
+        // computed both measures, asserted their order, and then discarded
+        // that order for a coin flip — returning the HEAVIER backend about
+        // half the time.
+        let backends = make_backends(2);
+        backends[0].borrow_mut().active_connections = 7;
+        backends[1].borrow_mut().active_connections = 1;
+
+        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+        let mut sel = backends.clone();
+        for call in 0..200 {
+            let picked = addr_index(chosen_addr(
+                &p.next_available_backend(None, &mut sel).unwrap(),
+            ));
+            assert_eq!(
+                picked, 1,
+                "power-of-two must keep the lighter of the two sampled backends (call {call} \
+                 picked backend {picked}, which carries 7 connections against 1)"
+            );
+        }
+    }
+
+    #[test]
+    fn power_of_two_handles_empty_and_singleton_sets_without_panic() {
+        // Sampling a second DISTINCT index draws from `len - 1` slots, which
+        // is an empty range for a one-backend set — `random_range` panics on
+        // an empty range, so the singleton case must short-circuit before the
+        // draw. A cluster scaled down to one backend is ordinary, not exotic.
+        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+
+        let mut empty: Vec<Rc<RefCell<Backend>>> = vec![];
+        assert!(
+            p.next_available_backend(None, &mut empty).is_none(),
+            "power-of-two selects nothing from an empty candidate set"
+        );
+
+        let mut single = make_backends(1);
+        for _ in 0..10 {
+            assert_eq!(
+                addr_index(chosen_addr(
+                    &p.next_available_backend(None, &mut single).unwrap()
+                )),
+                0,
+                "power-of-two returns the only backend of a singleton set"
+            );
+        }
+    }
+
+    #[test]
+    fn power_of_two_never_returns_the_strictly_heaviest_backend() {
+        // Regression guard for the load profile that broke the O(n) fold
+        // this replaced. With three strictly ordered loads the heaviest
+        // backend loses EVERY pairing it can be drawn into, so P2C can never
+        // return it — a deterministic assertion over any number of calls.
+        //
+        // The previous implementation walked every backend keeping a
+        // `(first, second)` pair, and its "otherwise" branch fired both when
+        // the new measure was lighter than `first` AND when it was heavier
+        // than `second`, evicting both candidates in the second case. On
+        // loads [0, 1, 5] that left `first = 5` and `second = 0`, tripping
+        // its own `first <= second` invariant (a debug-build panic) and, in
+        // a release build, coin-flipping the HEAVIEST backend into the
+        // result half the time.
+        let backends = make_backends(3);
+        backends[0].borrow_mut().active_connections = 0;
+        backends[1].borrow_mut().active_connections = 1;
+        backends[2].borrow_mut().active_connections = 5;
+
+        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+        let mut sel = backends.clone();
+        for call in 0..2_000 {
+            let picked = addr_index(chosen_addr(
+                &p.next_available_backend(None, &mut sel).unwrap(),
+            ));
+            assert_ne!(
+                picked, 2,
+                "power-of-two returned the strictly heaviest backend on call {call}: it is \
+                 heavier than either backend it can be paired against"
+            );
+        }
+    }
+
+    #[test]
+    fn power_of_two_sample_size_is_two_not_the_whole_set() {
+        // Same two-load-reads property as `power_of_two_touches_exactly_two_backends`,
+        // measured from the OUTSIDE — through the selection distribution
+        // alone, with no access to a backend's internals.
+        //
+        // Give one backend a uniquely light load among `N`. A policy that
+        // samples `k` backends uniformly and keeps the lightest returns that
+        // backend with probability exactly `k / N`, so the observed hit rate
+        // MEASURES the sample size: `k = hit_rate * N`. Power-of-two-choices
+        // gives `k = 2`.
+        //
+        // The fold this replaced scores worse here than ANY sample size.
+        // Restored under this exact test it gives `k_est = 0.00`: the unique
+        // minimum came back 0 times out of 100_000. It was `first` after
+        // backend 0, but from backend 2 on every remaining measure tied
+        // `second`, so the fold's "otherwise" branch fired on every step,
+        // shifting `first` into `second` and evicting the minimum for good.
+        // What it returned was a coin flip between the last two backends it
+        // happened to walk.
+        const N: u8 = 100;
+        let backends = make_backends(N);
+        for backend in backends.iter().skip(1) {
+            backend.borrow_mut().active_connections = 1_000;
+        }
+        // `backends[0]` keeps 0 active connections: the unique minimum.
+
+        let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
+        let mut sel = backends.clone();
+        let total = 100_000u32;
+        let mut hits = 0u32;
+        for _ in 0..total {
+            if addr_index(chosen_addr(
+                &p.next_available_backend(None, &mut sel).unwrap(),
+            )) == 0
+            {
+                hits += 1;
+            }
+        }
+
+        // At k = 2, N = 100 and total = 100_000 the standard deviation of
+        // `k_est` is `N * sqrt(p * (1 - p) / total)` ~ 0.044, so the
+        // [1.5, 2.5] band is a ~11-sigma envelope: wide enough never to
+        // flake, narrow enough to exclude k = 1 (plain random), k = 3, and
+        // the k_est = 0.00 the old fold produced.
+        let k_est = f64::from(hits) / f64::from(total) * f64::from(N);
+        assert!(
+            (1.5..=2.5).contains(&k_est),
+            "power-of-two consulted ~{k_est:.2} of {N} backends (unique minimum returned \
+             {hits}/{total} times); the algorithm must sample exactly 2"
         );
     }
 }

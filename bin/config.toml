@@ -492,7 +492,34 @@ protocol = "http"
 
 # per cluster load balancing algorithm. The possible values are
 # "ROUND_ROBIN", "RANDOM", "LEAST_LOADED", "POWER_OF_TWO", "HRW" and "MAGLEV".
-# HRW and MAGLEV are flow-affine policies designed for UDP clusters.
+#
+#   ROUND_ROBIN  - next backend in declaration order. No load reads.
+#   RANDOM       - one backend drawn at random, weighted by `weight`.
+#   LEAST_LOADED - reads the load of EVERY backend and takes the minimum.
+#                  The best balance a single worker can compute.
+#   POWER_OF_TWO - draws two backends at random and keeps the less loaded of
+#                  the two, so it reads two backend loads instead of every
+#                  one. Close to LEAST_LOADED's balance without ever
+#                  computing a global minimum, which is what stops several
+#                  independently seeded workers from converging on the same
+#                  "least loaded" backend.
+#   HRW, MAGLEV  - flow-affine policies designed for UDP clusters. Both read
+#                  `weight` — HRW scales its rendezvous score by it, MAGLEV
+#                  gives each backend a proportional share of lookup-table
+#                  slots — but only when a flow key is supplied; with none
+#                  they fall back to ROUND_ROBIN and ignore it.
+#
+# `weight` is honoured by RANDOM, HRW and MAGLEV, and ignored by ROUND_ROBIN,
+# LEAST_LOADED and POWER_OF_TWO. It defaults to 100 wherever it is read.
+#
+# The load-read counts above are NOT the per-request cost of the policy:
+# every selection first walks the backend list to build the candidate set,
+# whatever the policy, so all six are O(n) per request and POWER_OF_TWO does
+# not shorten that walk. Choose between LEAST_LOADED and POWER_OF_TWO on
+# balance, not on an expected latency win. See doc/configure.md.
+#
+# LEAST_LOADED, POWER_OF_TWO and the load_metric below are the only settings
+# here that read backend load.
 # Defaults to "ROUND_ROBIN"
 load_balancing = "ROUND_ROBIN"
 # metric evaluating the load on the backend. available options: connections, requests, connection_time
