@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "^0.4.13"
 loona-hpack = "^0.4.3"
 sozu-lib = { path = "../lib", default-features = false, features = ["crypto-ring"] }
+sozu-command-lib = { path = "../command" }
 
 # Prevent this from joining the workspace
 [workspace]
@@ -33,4 +34,9 @@ doc = false
 [[bin]]
 name = "fuzz_tcp_clienthello"
 path = "fuzz_targets/fuzz_tcp_clienthello.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_command_channel"
+path = "fuzz_targets/fuzz_command_channel.rs"
 doc = false
