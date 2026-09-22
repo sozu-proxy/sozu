@@ -77,6 +77,58 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the per-stream vectored write splits into a gather/confirm pair in a new
+  `lib/src/protocol/mux/h2_transmit.rs`, putting the `unsafe` lifetime extension and the clear that
+  discharges it in one place.** `ConnectionH2::flush_stream_out`'s loop body built `IoSlice`s
+  pointing into `kawa.storage`, transmuted them to `'static`, wrote them, cleared the vector and
+  consumed. `h2_transmit::gather` now produces the descriptors and `h2_transmit::confirm` clears
+  them before `kawa.consume`. No behaviour change: the same bytes, the same single write per round,
+  the same consume.
+
+  **What this does not do**, since the first version of this entry overstated it: the pre-image
+  already cleared before the consume and already carried the same `debug_assert!`, and the gap
+  between the `unsafe` and that clear was six lines, not eleven — the debug event, byte counters
+  and READABLE re-arm all came after the clear, not between. Nor is anything now enforced at the
+  type level: two free functions each taking an independent `&mut Vec` is co-location, not
+  enforcement, and a caller can still reach `Kawa::consume` without asking this module. A guard
+  type owning the vector would earn the word "structural". The real gains are one place to read the
+  obligation and its discharge, a `gather` reusable from a second call site, and both halves
+  drivable in a unit test over a `SliceBuffer` with no pool and no socket.
+
+  The module header states why this is a two-call protocol rather than a `poll_transmit`: a pure
+  `poll_transmit(&mut self, buf: &mut [u8])` would introduce a copy this path does not make today,
+  and unlike a QUIC datagram a TLS byte stream accepts partial writes, so `kawa.consume(size)` needs
+  a number only the shell knows. It is explicitly not `quinn-proto`'s shape, and it does not copy
+  the sibling UDP core's `Transmit`, whose owned `Vec<u8>` payload is the opposite of what this
+  path wants. `protocol/udp/` is a sibling of `protocol/mux/`, not a layer above it, and its
+  `UdpManager::poll_output` drains a manager-wide queue where `gather` sees one stream's `Kawa`.
+
+  It also records where the scheduler's fairness limitation meets this code. What LIFECYCLE
+  invariant 26 scopes to the leading bucket is the **commit**, not the rotation:
+  `apply_incremental_rotation` rotates every same-urgency run, but `Prioriser`'s single
+  connection-global cursor is a foreign id range in every bucket except the one that supplied the
+  pass leader, so `partition_point` returns a constant there and the rotation, though it runs, is a
+  no-op. The result is positional
+  unfairness while a pass completes — but becomes byte starvation when a pass stalls, because the
+  streams after the stalled one are simply not written, and a frozen order presents them last
+  again. That interaction had no home before; it has one now.
+
+  Tests: three deterministic cases (every block in order, an empty queue, a delimiter bounding the
+  offer), `confirm_leaves_no_descriptor_for_the_next_round`, and a sibling `partial_write_property`
+  module. The deterministic test is named for what it can actually observe: an earlier version was
+  called `confirm_clears_the_descriptors_before_consuming` and could not detect that ordering at
+  all, because it inspects the vector only after `confirm` returns, where both orderings leave it
+  empty — verified by moving the clear after the consume AND deleting the internal `debug_assert!`,
+  which leaves the whole suite green. The ordering's real guard is that `debug_assert!`, which is a
+  positional check and compiles out in release; the test doc now says so and carries a separate red
+  recipe for each. The property drives multi-round gather/confirm over an arbitrary block split,
+  arbitrary interleaved `Delimiter`s and an arbitrary cycle of accepts **including zero** —
+  production's `WouldBlock`, and the only way to reach the stalled pass the module header discusses,
+  which an earlier generator made structurally unreachable by emitting `1 + arbitrary % len`. Its
+  oracle is a prefix of the payload the test itself built, plus full delivery exactly when the
+  queue drained; it asserts nothing about liveness or turn-taking across streams, which this
+  repository does not guarantee.
+
 - **`refactor(mux-h2)`: the queued RST_STREAM state moves out of `h2.rs` into a new
   `lib/src/protocol/mux/h2_control_tx.rs`, behind the same closed API the `hpack_state` /
   `h2_flow_control` / `h2_stream_table` / `h2_drain` / `h2_flood_detector` /

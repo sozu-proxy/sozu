@@ -37,7 +37,8 @@ use crate::{
         forcefully_terminate_answer, h2_control_tx,
         h2_drain::{self, GracefulDrainDecision},
         h2_flood_detector::{self, H2FloodConfig, H2FloodViolation},
-        h2_flow_control, h2_header_reassembly, h2_scheduler, h2_stream_table, hpack_state,
+        h2_flow_control, h2_header_reassembly, h2_scheduler, h2_stream_table, h2_transmit,
+        hpack_state,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
         pkawa, remove_backend_stream, serializer, set_default_answer,
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
@@ -2512,33 +2513,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             if let Some(flag) = wrote.as_deref_mut() {
                 *flag = true;
             }
-            io_slices.clear();
-            let buffer = kawa.storage.buffer();
-            for block in kawa.out.iter() {
-                match block {
-                    kawa::OutBlock::Delimiter => break,
-                    kawa::OutBlock::Store(store) => {
-                        let data = store.data(buffer);
-                        // SAFETY: the IoSlice references point into kawa's
-                        // storage buffer. They are used only for the
-                        // socket_write_vectored call below and cleared
-                        // immediately after, before kawa.consume() which may
-                        // relocate the buffer via ptr::copy (shift). No
-                        // dangling 'static refs exist during consume().
-                        let data: &'static [u8] =
-                            unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-                        io_slices.push(IoSlice::new(data));
-                    }
-                }
-            }
+            // Gather / write / confirm. The gather borrows `kawa.storage`
+            // and hands back descriptors with an extended lifetime; `confirm`
+            // discharges that obligation before the consume. Both halves and
+            // the `unsafe` between them live in `h2_transmit`.
+            let offered = h2_transmit::gather(kawa, io_slices);
             let (size, status) = socket.socket_write_vectored(io_slices);
-            io_slices.clear();
             debug_assert!(
-                io_slices.is_empty(),
-                "IoSlice refs must be cleared before consume"
+                size <= offered,
+                "the socket reported {size} bytes written for an offer of {offered}"
             );
             debug.push(DebugEvent::SocketIO(debug_site, global_stream_id, size));
-            kawa.consume(size);
+            h2_transmit::confirm(kawa, io_slices, size);
             position.count_bytes_out_counter(size);
             position.count_bytes_out(metrics, size);
             if let Some(counter) = bytes_written.as_deref_mut() {
