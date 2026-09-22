@@ -1,0 +1,5 @@
+# Defaults are used; kept as an explicit anchor for future overrides.
+# Chart: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller
+# Pinned version: 0.14.2 (resolved 2026-09-22, digest sha256:3081ba15c41f0aa791058dedd2a7406fece24c9aeaa94956c268e5099427a452)
+# Installed as Helm release "arc" in namespace arc-systems on cluster runner.github.sozu
+# (kubernetes_01M34VCSSCE2XZKE5HJKD234C2, org orga_858600a8-74f4-4d75-a8a3-f5b868be093c).
