@@ -800,7 +800,7 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// frame-payload discard.
     control_tx: h2_control_tx::H2ControlTx,
     /// Set by [`Self::refuse_stream_and_discard`], consumed once by the
-    /// `H2State::Discard` arm of [`Self::readable`]. Carries enough of the
+    /// `H2State::Discard` arm of [`Self::handle_read`]. Carries enough of the
     /// refused frame's shape to still hand the connection-level HPACK
     /// decoder a complete field block before its bytes are dropped — RFC
     /// 9113 §4.3: field-compression state is scoped to the connection, not
@@ -938,8 +938,104 @@ pub enum H2StreamId {
     Other { id: StreamId, gid: GlobalStreamId },
 }
 
+/// What [`ConnectionH2::poll_read_target`] wants its caller to do before it
+/// may call [`ConnectionH2::handle_read`].
+///
+/// The three variants are the three shapes one frontend read pass takes, and
+/// [`Self::Skip`] is deliberately not folded into a `Fill { amount: 0 }`: that
+/// would have the caller issue a zero-length read, and
+/// `update_readiness_after_read` reads its `(0, SocketResult::Continue)`
+/// answer as "nothing arrived, stop" — so every frame carrying no payload (an
+/// empty SETTINGS, an empty DATA, a SETTINGS ACK) would stop being parsed at
+/// all. The variant is what stops a caller from having to know that.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum H2ReadTarget {
+    /// The core ended the pass by itself: a SETTINGS-ACK timeout, nothing owed
+    /// by the peer, or no room left for what is owed. No read, and no
+    /// [`ConnectionH2::handle_read`] — this is the pass's result.
+    Done(MuxResult),
+    /// Every byte the core is waiting for already sits in `stream_id`'s
+    /// buffer, because the frame in flight carries a zero-length payload.
+    /// Perform no read and answer with [`H2ReadOutcome::Skipped`].
+    Skip(H2StreamId),
+    /// Read into the space [`read_space`] returns for `stream_id`, which is
+    /// exactly `amount` bytes and never less than one, then answer with
+    /// [`H2ReadOutcome::Filled`].
+    Fill {
+        stream_id: H2StreamId,
+        amount: usize,
+    },
+}
+
+/// What the caller of [`ConnectionH2::poll_read_target`] actually did, handed
+/// back to [`ConnectionH2::handle_read`]. Each variant answers the
+/// [`H2ReadTarget`] of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum H2ReadOutcome {
+    /// Answers [`H2ReadTarget::Skip`]: no read was performed.
+    Skipped,
+    /// Answers [`H2ReadTarget::Fill`]: `amount` bytes of space were offered,
+    /// and the socket returned `size` bytes with `status`.
+    ///
+    /// `amount` is echoed back rather than re-read from `expect_read` inside
+    /// [`ConnectionH2::handle_read`], so the byte debt the core settles is the
+    /// one it actually offered and not whatever the table happens to hold by
+    /// then.
+    Filled {
+        amount: usize,
+        size: usize,
+        status: SocketResult,
+    },
+}
+
+/// The buffer an [`H2ReadTarget`] names, resolved to the `Kawa` owning it.
+///
+/// [`H2StreamId::Zero`] is the connection-level scratch every control frame
+/// and every header block is read into; [`H2StreamId::Other`] is one
+/// application stream's *read* buffer, which [`Stream::split`] reports as the
+/// front buffer at [`Position::Server`] and the back buffer at
+/// [`Position::Client`].
+///
+/// Taking `zero` and `streams` apart instead of a whole `&mut ConnectionH2`
+/// and `&mut Context` is what makes the split compile: `ConnectionH2::socket`
+/// and `Context::debug` stay borrowable while the buffer this returns is live,
+/// which a method returning a borrow of all of `*self` would forbid.
+fn read_buffer<'a>(
+    zero: &'a mut GenericHttpStream,
+    streams: &'a mut [Stream],
+    position: &Position,
+    stream_id: H2StreamId,
+) -> &'a mut GenericHttpStream {
+    match stream_id {
+        H2StreamId::Zero => zero,
+        H2StreamId::Other {
+            gid: global_stream_id,
+            ..
+        } => streams[global_stream_id].split(position).rbuffer,
+    }
+}
+
+/// The exact space [`H2ReadTarget::Fill`] offers its caller: `amount` bytes of
+/// [`read_buffer`]'s free storage, never the whole of it.
+///
+/// The cap is load-bearing. `expect_read` is a byte debt for *one* frame, and
+/// [`ConnectionH2::handle_read`] parses everything the read appended as that
+/// frame's body — so a caller reading past `amount` would fold the next
+/// frame's header into this frame's payload.
+fn read_space<'a>(
+    zero: &'a mut GenericHttpStream,
+    streams: &'a mut [Stream],
+    position: &Position,
+    stream_id: H2StreamId,
+    amount: usize,
+) -> &'a mut [u8] {
+    &mut read_buffer(zero, streams, position, stream_id)
+        .storage
+        .space()[..amount]
+}
+
 /// What [`ConnectionH2::refuse_stream_and_discard`] hands the `H2State::Discard`
-/// arm of [`ConnectionH2::readable`] to locate a refused stream's HPACK field
+/// arm of [`ConnectionH2::handle_read`] to locate a refused stream's HPACK field
 /// block, so the connection decoder can still be advanced before the bytes are
 /// dropped (RFC 9113 §4.3).
 ///
@@ -976,7 +1072,7 @@ enum DiscardedFieldBlock {
 /// for how any earlier frames' bytes are threaded in).
 ///
 /// A free function rather than a `ConnectionH2` method: the caller in the
-/// `H2State::Discard` arm of [`ConnectionH2::readable`] already holds
+/// `H2State::Discard` arm of [`ConnectionH2::handle_read`] already holds
 /// `zero.storage` borrowed as `kawa`, and a method needing the whole
 /// `&mut self` would conflict with that borrow. Taking `decoder` and
 /// `payload` as disjoint parameters keeps the borrow legal.
@@ -1618,7 +1714,34 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
-    pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
+    /// Ask the core what it wants read from the socket, so the caller can
+    /// perform that read and report it back through [`Self::handle_read`].
+    ///
+    /// This is the read half of the same **two-call protocol** the write half
+    /// already uses: `h2_transmit::gather` borrows the bytes to send, the
+    /// caller writes them, `h2_transmit::confirm` is told how many landed.
+    /// Here the core names the buffer it wants filled, the caller
+    /// performs the read, and [`Self::handle_read`] is told how many bytes
+    /// arrived and with what status.
+    ///
+    /// **This is not `AsyncRead::poll_read`.** Nothing here is a future,
+    /// `context` is this module's [`Context`] and not a `task::Context`, and
+    /// `lib/` holds no asynchronous function. The name follows
+    /// `UdpManager::poll_output` (`protocol/udp/manager.rs`), this
+    /// repository's existing spelling for "ask the core what it has for its
+    /// caller", the way [`Self::handle_read`] follows that module's
+    /// `UdpManager::handle_input`.
+    ///
+    /// Everything up to and including the decision of *which* buffer needs
+    /// *how many* bytes lives on this side of the split, because two of the
+    /// three answers are produced by that prelude: a SETTINGS-ACK timeout and
+    /// an idle `expect_read` both end the pass with no read at all. A poll
+    /// that could not say "nothing" would not be the core's answer.
+    pub(super) fn poll_read_target<E, L>(
+        &mut self,
+        context: &mut Context<L>,
+        endpoint: &mut E,
+    ) -> H2ReadTarget
     where
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
@@ -1629,7 +1752,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Pass 4 Medium #3: per-stream idle guard. Slow-multiplex Slowloris
         // sends one byte or a control frame per stream just often enough to
         // reset the connection-level timer; per-stream deadlines catch it.
-        self.cancel_timed_out_streams(context, &mut endpoint);
+        self.cancel_timed_out_streams(context, endpoint);
 
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
         if let Some(sent_at) = self.settings_sent_at
@@ -1640,7 +1763,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 log_context!(self),
                 SETTINGS_ACK_TIMEOUT
             );
-            return self.goaway(H2Error::SettingsTimeout);
+            return H2ReadTarget::Done(self.goaway(H2Error::SettingsTimeout));
         }
 
         // Don't reset the timeout unconditionally here. Only application data
@@ -1650,37 +1773,88 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // The timeout is reset:
         // - Below, when reading DATA payload (H2StreamId::Other)
         // - In handle_frame(), when processing HEADERS frames
-        let (stream_id, kawa) = if let Some((stream_id, amount)) = self.stream_table.expect_read() {
-            let (kawa, did) = match stream_id {
-                H2StreamId::Zero => (&mut self.zero, usize::MAX),
-                H2StreamId::Other {
-                    gid: global_stream_id,
-                    ..
-                } => {
-                    // Reading DATA frame payload for an application stream.
-                    // This is real application activity — reset the timeout.
-                    self.arm_timeout();
-                    (
-                        context.streams[global_stream_id]
-                            .split(&self.position)
-                            .rbuffer,
-                        global_stream_id,
-                    )
-                }
-            };
-            trace!(
-                "{} {:?}({:?}, {})",
-                log_context!(self),
-                self.state,
-                stream_id,
-                amount
-            );
-            if amount > 0 {
-                if amount > kawa.storage.available_space() {
-                    self.readiness.interest.remove(Ready::READABLE);
-                    return MuxResult::Continue;
-                }
-                let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..amount]);
+        let Some((stream_id, amount)) = self.stream_table.expect_read() else {
+            self.readiness.event.remove(Ready::READABLE);
+            return H2ReadTarget::Done(MuxResult::Continue);
+        };
+        match stream_id {
+            H2StreamId::Zero => {}
+            H2StreamId::Other { .. } => {
+                // Reading DATA frame payload for an application stream.
+                // This is real application activity — reset the timeout.
+                self.arm_timeout();
+            }
+        }
+        let kawa = read_buffer(
+            &mut self.zero,
+            &mut context.streams,
+            &self.position,
+            stream_id,
+        );
+        trace!(
+            "{} {:?}({:?}, {})",
+            log_context!(self),
+            self.state,
+            stream_id,
+            amount
+        );
+        if amount > 0 {
+            if amount > kawa.storage.available_space() {
+                self.readiness.interest.remove(Ready::READABLE);
+                return H2ReadTarget::Done(MuxResult::Continue);
+            }
+            H2ReadTarget::Fill { stream_id, amount }
+        } else {
+            self.stream_table.set_expect_read(None);
+            H2ReadTarget::Skip(stream_id)
+        }
+    }
+
+    /// Tell the core what the caller's read actually did, then let it consume
+    /// the bytes and dispatch the frame they completed.
+    ///
+    /// The second half of [`Self::poll_read_target`]'s protocol. `stream_id`
+    /// is the one the matching [`H2ReadTarget`] named, and `outcome` answers
+    /// that same variant: [`H2ReadOutcome::Skipped`] for
+    /// [`H2ReadTarget::Skip`], [`H2ReadOutcome::Filled`] for
+    /// [`H2ReadTarget::Fill`].
+    ///
+    /// `read_buffer` is called a second time here rather than carried across
+    /// the split: `StreamParts` borrows `context`, so a buffer held across the
+    /// caller's read would pin `context.debug` and `Self::handle_frame`'s whole
+    /// `&mut Context` with it. Re-deriving it from a `Copy` [`H2StreamId`] is
+    /// a match and a field projection.
+    fn handle_read<E, L>(
+        &mut self,
+        context: &mut Context<L>,
+        endpoint: E,
+        stream_id: H2StreamId,
+        outcome: H2ReadOutcome,
+    ) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        let kawa = read_buffer(
+            &mut self.zero,
+            &mut context.streams,
+            &self.position,
+            stream_id,
+        );
+        match outcome {
+            H2ReadOutcome::Skipped => {}
+            H2ReadOutcome::Filled {
+                amount,
+                size,
+                status,
+            } => {
+                let did = match stream_id {
+                    H2StreamId::Zero => usize::MAX,
+                    H2StreamId::Other {
+                        gid: global_stream_id,
+                        ..
+                    } => global_stream_id,
+                };
                 context.debug.push(DebugEvent::SocketIO(0, did, size));
                 kawa.storage.fill(size);
                 self.position.count_bytes_in_counter(size);
@@ -1713,14 +1887,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                     return MuxResult::Continue;
                 }
-            } else {
-                self.stream_table.set_expect_read(None);
             }
-            (stream_id, kawa)
-        } else {
-            self.readiness.event.remove(Ready::READABLE);
-            return MuxResult::Continue;
-        };
+        }
         match (&self.state, &self.position) {
             (H2State::Error, _)
             | (H2State::GoAway, _)
@@ -1894,6 +2062,48 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
         }
         MuxResult::Continue
+    }
+
+    /// Drive one frontend read pass.
+    ///
+    /// The core lives in [`Self::poll_read_target`] and [`Self::handle_read`];
+    /// this function is the caller that sits between them, and its
+    /// `self.socket.socket_read` is the only socket touch on the whole H2 read
+    /// path. Keeping it *here* rather than inside the core is the point of the
+    /// split: a later change can move this body next to the socket without
+    /// reopening the frame state machine, exactly as
+    /// `h2_transmit::gather`/`confirm` already bracket the vectored write.
+    pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        match self.poll_read_target(context, &mut endpoint) {
+            H2ReadTarget::Done(result) => result,
+            H2ReadTarget::Skip(stream_id) => {
+                self.handle_read(context, endpoint, stream_id, H2ReadOutcome::Skipped)
+            }
+            H2ReadTarget::Fill { stream_id, amount } => {
+                let space = read_space(
+                    &mut self.zero,
+                    &mut context.streams,
+                    &self.position,
+                    stream_id,
+                    amount,
+                );
+                let (size, status) = self.socket.socket_read(space);
+                self.handle_read(
+                    context,
+                    endpoint,
+                    stream_id,
+                    H2ReadOutcome::Filled {
+                        amount,
+                        size,
+                        status,
+                    },
+                )
+            }
+        }
     }
 
     /// Update the H2 connection-level *aggregate* gauges with this connection's
@@ -3576,7 +3786,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///   in a single sweep and, from `Mux::timeout` against a silent peer,
     ///   runs when `handle_frame` does not run at all;
     /// * the DATA-on-closed-stream reset, which sits in
-    ///   [`Self::handle_header_state`] — `readable` returns into that helper
+    ///   [`Self::handle_header_state`] — `handle_read` returns into that helper
     ///   directly and that branch never reaches `handle_frame`.
     ///
     /// The second path is separately rate-limited: it is preceded by
@@ -3688,7 +3898,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// [`Self::apply_mcs_backpressure`].
     ///
     /// `discarded` is stashed in [`Self::discarded_field_block`] for the
-    /// `H2State::Discard` arm of [`Self::readable`] to consume — see
+    /// `H2State::Discard` arm of [`Self::handle_read`] to consume — see
     /// [`DiscardedFieldBlock`] for why the HPACK field block cannot simply be
     /// dropped with the rest of the payload.
     fn refuse_stream_and_discard(
@@ -4657,7 +4867,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // re-entry from `(H2State::ContinuationFrame(headers), _)`
                 // already appended THIS frame's own payload to the
                 // accumulator before calling back in here (see that match
-                // arm in `readable()`), so there is nothing left to copy.
+                // arm in `handle_read()`), so there is nothing left to copy.
                 //
                 // `data_opt` (bounds-checked), not `data` (panics on OOB):
                 // `header_block_fragment` is network-facing-derived — the
@@ -7359,7 +7569,7 @@ mod tests {
 
     /// The RFC 9113 §6.5 SETTINGS-ACK deadline is evaluated against
     /// `ConnectionH2::now`. `flush_pending_control_frames` is the `writable`
-    /// half of the pair; the `readable` half at `h2.rs` shares the predicate.
+    /// half of the pair; the `poll_read_target` half at `h2.rs` shares the predicate.
     ///
     /// To SEE THIS RED: restore `sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT` in
     /// `flush_pending_control_frames`. No real time passes in this test, so the
@@ -7472,7 +7682,7 @@ mod tests {
     /// production caller of `check_invariants`, never runs at all. The reaper
     /// is not the only insert path outside that caller: the
     /// DATA-on-closed-stream reset sits in `handle_header_state`, which
-    /// `readable` returns into without ever reaching `handle_frame`. That one
+    /// `handle_read` returns into without ever reaching `handle_frame`. That one
     /// is rate-limited by `record_glitch` + `check_flood_or_return!` and
     /// cannot by itself fill the queue — see `ConnectionH2::enqueue_rst`.
     ///
@@ -7819,6 +8029,226 @@ mod tests {
         );
     }
 
+    // ── The read-side two-call protocol (poll_read_target / handle_read) ──
+
+    /// `read_space` hands out the buffer the core named, and hands out the
+    /// stream's READ buffer — the one `Stream::split` labels `rbuffer` for the
+    /// connection's position — not its write buffer.
+    ///
+    /// This is the only genuinely new logic in the read-side inversion: every
+    /// other line moved. Both halves are pinned because the two failure modes
+    /// differ — offering the wrong *kawa* corrupts the peer's request while
+    /// the response is parsed as H2 payload, offering the wrong *stream*
+    /// writes one stream's DATA into another's.
+    ///
+    /// To SEE THIS RED: in `read_buffer` (h2.rs), return
+    /// `streams[global_stream_id].split(position).wbuffer` in place of
+    /// `.rbuffer`.
+    #[test]
+    fn read_space_offers_the_read_buffer_of_the_stream_the_core_named() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+
+        let gid = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+
+        // Premise: the two per-stream buffers really are distinct allocations,
+        // so a pointer comparison below can tell them apart at all.
+        let front = context.streams[gid].front.storage.space().as_ptr();
+        let back = context.streams[gid].back.storage.space().as_ptr();
+        let zero = connection.zero.storage.space().as_ptr();
+        assert_ne!(
+            front, back,
+            "a stream's request and response buffers must be distinct allocations"
+        );
+
+        let offered = read_space(
+            &mut connection.zero,
+            &mut context.streams,
+            &connection.position,
+            H2StreamId::Zero,
+            9,
+        );
+        assert_eq!(
+            offered.as_ptr(),
+            zero,
+            "H2StreamId::Zero must offer the connection-level scratch buffer"
+        );
+        assert_eq!(
+            offered.len(),
+            9,
+            "the offer is capped at the byte debt, never the whole free space"
+        );
+
+        let offered = read_space(
+            &mut connection.zero,
+            &mut context.streams,
+            &connection.position,
+            H2StreamId::Other { id: 1, gid },
+            7,
+        );
+        assert_eq!(
+            offered.as_ptr(),
+            front,
+            "a server position must offer the stream's request (front) buffer"
+        );
+        assert_ne!(
+            offered.as_ptr(),
+            back,
+            "the offered buffer must not be the stream's response (back) buffer"
+        );
+        assert_eq!(
+            offered.len(),
+            7,
+            "the offer is capped at the byte debt, never the whole free space"
+        );
+    }
+
+    /// A frame whose payload is zero bytes long owes the socket nothing, and
+    /// the core says so with its own variant rather than an `amount` of 0.
+    ///
+    /// That distinction is load-bearing, not cosmetic. A caller handed
+    /// `Fill { amount: 0 }` would issue a zero-length read, and
+    /// `update_readiness_after_read(0, SocketResult::Continue, ..)` returns
+    /// `true` for it — "nothing arrived, stop" — so `handle_read` would return
+    /// before the frame state machine ever ran, and every empty SETTINGS,
+    /// empty DATA and SETTINGS ACK would stop being parsed.
+    ///
+    /// To SEE THIS RED: in `poll_read_target` (h2.rs), replace the trailing
+    /// `if amount > 0 { .. } else { .. }` with its `Fill` half alone —
+    /// keep the `available_space` guard and end the function with
+    /// `H2ReadTarget::Fill { stream_id, amount }`, dropping the
+    /// `set_expect_read(None)` / `H2ReadTarget::Skip(stream_id)` branch.
+    #[test]
+    fn poll_read_target_skips_the_read_when_the_frame_carries_no_payload() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        connection.state = H2State::Header;
+        connection
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 0)));
+
+        let target = connection.poll_read_target(&mut context, &mut EndpointClient(&mut router));
+        assert!(
+            matches!(target, H2ReadTarget::Skip(H2StreamId::Zero)),
+            "a zero-length payload must be a Skip, not a zero-length Fill: {target:?}"
+        );
+        assert!(
+            connection.stream_table.expect_read().is_none(),
+            "the settled byte debt must be cleared before the frame is dispatched"
+        );
+    }
+
+    /// The core is told how many bytes arrived, and it subtracts exactly that
+    /// many from the debt it offered — a short read leaves the remainder owed,
+    /// it does not restart the frame.
+    ///
+    /// 6 is neither of the two numbers the test hands in, so this cannot pass
+    /// by echoing the fixture: `amount` is 9 and `size` is 3.
+    ///
+    /// To SEE THIS RED: in `handle_read` (h2.rs), pass `amount` in place of
+    /// `amount - size` to `set_expect_read`.
+    #[test]
+    fn handle_read_subtracts_the_byte_count_the_caller_reported() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        // Not ClientPreface: a short read there runs the early-preface check
+        // instead, which is a different branch with its own coverage.
+        connection.state = H2State::Header;
+        connection
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+
+        let result = connection.handle_read(
+            &mut context,
+            EndpointClient(&mut router),
+            H2StreamId::Zero,
+            H2ReadOutcome::Filled {
+                amount: 9,
+                size: 3,
+                status: SocketResult::Continue,
+            },
+        );
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a short read keeps the connection running: {result:?}"
+        );
+        assert_eq!(
+            connection.stream_table.expect_read(),
+            Some((H2StreamId::Zero, 6)),
+            "a 3-byte answer to a 9-byte offer must leave 6 bytes owed"
+        );
+        assert_eq!(
+            connection.zero.storage.data().len(),
+            3,
+            "the core must consume exactly the bytes the caller reported"
+        );
+    }
+
+    /// A read that returned nothing clears the READABLE **event** and leaves
+    /// the READABLE **interest** alone, so the connection is re-armed for the
+    /// next epoll wake-up instead of being taken off the loop.
+    ///
+    /// The interest half is asserted on purpose: `signal_pending_write` and
+    /// this path both touch `Readiness.event` only, and an assertion written
+    /// against `interest` cannot see either of them move.
+    ///
+    /// To SEE THIS RED: in `handle_read` (h2.rs), call
+    /// `update_readiness_after_write` in place of `update_readiness_after_read`
+    /// — the WRITABLE bit is cleared instead and the READABLE event survives.
+    #[test]
+    fn handle_read_clears_the_readable_event_not_the_interest_when_nothing_arrived() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        connection.state = H2State::Header;
+        connection
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+        connection.readiness.event = Ready::READABLE;
+        connection.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+
+        let result = connection.handle_read(
+            &mut context,
+            EndpointClient(&mut router),
+            H2StreamId::Zero,
+            H2ReadOutcome::Filled {
+                amount: 9,
+                size: 0,
+                status: SocketResult::WouldBlock,
+            },
+        );
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "an empty read is not a close: {result:?}"
+        );
+        assert!(
+            !connection.readiness.event.is_readable(),
+            "an empty read must clear the READABLE event"
+        );
+        assert!(
+            connection.readiness.interest.is_readable(),
+            "an empty read must NOT drop the READABLE interest"
+        );
+        assert_eq!(
+            connection.stream_table.expect_read(),
+            Some((H2StreamId::Zero, 9)),
+            "an empty read settles no part of the byte debt"
+        );
+    }
+
     // ── RFC 9113 §4.3: a refused stream must not desynchronise HPACK ──────
     //
     // Field compression state is scoped to the whole connection, not to a
@@ -7831,7 +8261,7 @@ mod tests {
     // resolves the wrong dynamic entry or fails outright.
 
     /// To SEE THIS RED: in the `(H2State::Discard, _)` arm of
-    /// [`ConnectionH2::readable`], remove the `if let Some(discarded) =
+    /// [`ConnectionH2::handle_read`], remove the `if let Some(discarded) =
     /// self.discarded_field_block.take() && ...` block that calls
     /// [`decode_discarded_field_block`], restoring the unconditional
     /// `kawa.storage.clear()`. The peer's second block is then a one-byte

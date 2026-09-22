@@ -77,6 +77,68 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: `ConnectionH2::readable` becomes a two-call protocol — the core names the
+  buffer it wants filled, the caller reads, the core is told how many bytes arrived and with what
+  status.** This is the read-side mirror of `h2_transmit::gather` / `confirm`, which already split
+  the vectored write the same way. `ConnectionH2::poll_read_target` runs the pass prelude (the
+  `context.now` mirror, `prune_inactive_streams_while_closing`, `cancel_timed_out_streams`, the
+  RFC 9113 §6.5 SETTINGS-ACK deadline) and answers `H2ReadTarget::Done`, `Skip` or
+  `Fill { stream_id, amount }`; `ConnectionH2::handle_read` takes `H2ReadOutcome::Skipped` or
+  `Filled { amount, size, status }`, consumes the bytes, settles the `expect_read` debt and
+  dispatches the frame. `readable()` is now the thin caller between them and holds the only
+  `self.socket.socket_read` on the whole H2 read path. No behaviour change: the same prelude in the
+  same order, the same debug event, the same byte counters, the same stall classification through
+  `update_readiness_after_read`, the same frame dispatch.
+
+  **`Skip` is a variant, not `Fill { amount: 0 }`, and that is load-bearing.** A zero-length read
+  answers `(0, SocketResult::Continue)`, which `update_readiness_after_read` reads as "nothing
+  arrived, stop" — so a caller handed a zero-length `Fill` would return before the frame state
+  machine ran, and every frame carrying no payload (an empty SETTINGS, an empty DATA, a SETTINGS
+  ACK) would stop being parsed. `poll_read_target_skips_the_read_when_the_frame_carries_no_payload`
+  pins it.
+
+  **Naming.** `poll_read_target` / `handle_read` follow the sibling UDP core's
+  `UdpManager::poll_output` / `UdpManager::handle_input` (`lib/src/protocol/udp/manager.rs`), which
+  is this repository's existing spelling for the two directions. There is still no `poll_transmit`
+  anywhere in the tree, and this is deliberately not spelled `poll_read`: that is
+  `AsyncRead::poll_read`'s name, its first parameter is a `task::Context`, and this one's is the
+  mux's own `Context` — `lib/` and `bin/` hold no asynchronous function. UDP's `Transmit` is not copied
+  either; it carries an owned `Vec<u8>` where this path needs a borrowed view into live
+  `kawa.storage`.
+
+  **Only one piece of new logic, and it is the one under test.** Everything else moved verbatim.
+  `read_buffer` resolves an `H2StreamId` to the kawa it names and `read_space` caps the offer at
+  the byte debt; taking `zero` and `streams` apart rather than `&mut self` and `&mut Context` is
+  what keeps `ConnectionH2::socket` and `Context::debug` borrowable while the offered buffer is
+  live. `read_space_offers_the_read_buffer_of_the_stream_the_core_named` pins the resolution by
+  pointer identity against the stream's *write* buffer,
+  `handle_read_subtracts_the_byte_count_the_caller_reported` pins that a 3-byte answer to a 9-byte
+  offer leaves 6 owed, and `handle_read_clears_the_readable_event_not_the_interest_when_nothing_arrived`
+  pins that an empty read clears the READABLE **event** and leaves the **interest** alone — the
+  half an assertion written against `interest` cannot see. Each is red against a distinct
+  single-token mutation, on its own assertion.
+
+  Docs: `doc/h2_mux_internals.md`'s `readable()` section describes the protocol, and every
+  LIFECYCLE.md sentence that named an arm of `readable` now names the half it actually lives in —
+  the `H2State::Discard` and `H2State::ContinuationFrame` arms in `handle_read`, the DATA-payload
+  `arm_timeout()` site in `poll_read_target`. Against the `d8b8546e` base, 46 citations carrying
+  63 line numbers are renumbered by a difflib alignment map over the cited file; the three the map
+  could not follow correctly — the `read_buffer` dereference, the SETTINGS-ACK deadline block and
+  one pinned code block, all of whose lines this change moves out of `readable` wholesale — were
+  re-anchored by hand from the code, the pin by its literal content.
+
+  Ten prose references that named `readable` as the *location* or the *actor* of code this change
+  moved are re-pointed at the half that now holds it: in LIFECYCLE.md, the `ClientSettings` →
+  `ServerSettings` bullet, the §7.5 SETTINGS-ACK eval site, the `ConnectionH2.now` mirror (whose
+  `self.now = context.now;` is at the top of `poll_read_target`, not of `readable`) and the
+  `read_buffer` caller list (`poll_read_target` and `handle_read`; `readable` reaches the slice
+  through `read_space`); four `h2.rs` doc comments — the three naming the `H2State::Discard` arm
+  and the one naming the helper `handle_header_state` is returned into; and `mod.rs`'s clock-skew
+  note, which named `readable` as the thing that runs `cancel_timed_out_streams` first — the call
+  is at the top of `poll_read_target`, which `readable` invokes before any read. A sweep of
+  every `readable` mention in `lib/**/*.rs` doc and line comments found no other: the rest name
+  either `ConnectionH1::readable` or the pass, which still starts there, and are unchanged.
+
 - **`refactor(mux-h2)`: the three close-under-TLS-backpressure decisions move out of `h2.rs` into a
   new `lib/src/protocol/mux/h2_close.rs`, where they become pure functions with exhaustive
   tables.** The `H2State::GoAway` arm of `ConnectionH2::writable`, the

@@ -520,7 +520,7 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// snapshot taken at the START of that pass, so the stored instant is
     /// older than the event it records; an eval site runs near the top of a
     /// pass (`cancel_timed_out_streams` is the first thing
-    /// [`h2::ConnectionH2::readable`] does). The measured age is therefore
+    /// [`h2::ConnectionH2::poll_read_target`] does). The measured age is therefore
     /// inflated by the arm site's depth, and a deadline can fire up to one
     /// pass EARLY as well as one pass late. At base both ends read the real
     /// clock and the comparison was exact; this is the cost of the snapshot.
