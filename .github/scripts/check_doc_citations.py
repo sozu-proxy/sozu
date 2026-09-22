@@ -54,6 +54,25 @@
 #   in the tree today, so it pays for itself — but write the repo-root-relative
 #   path when a citation leaves its own module.
 #
+#   A THIRD GAP, not deliberate, just unguarded: every rule here resolves
+#   SOURCE targets only. A prose-to-prose citation — `configure.md:933` — is
+#   matched by no rule, so it is never resolved, never drift-checked, and a
+#   changeset that inserts lines into the cited document rots it invisibly.
+#   That is not hypothetical: the changeset that added this note shifted
+#   `doc/configure.md` by 46 lines under `doc/configure_admin_ops.md:230`,
+#   with this script green throughout. Note what the stale citation pointed
+#   AT — not a blank line and not a missing one, but line 933's ordinary
+#   prose about flow keys, and at an intermediate revision a line holding a
+#   lone `]`. Both resolve, both read as a real place in the document, and
+#   neither is what the citing sentence is about. That is the whole failure
+#   mode: nothing about a rotted prose citation looks wrong.
+#
+#   There are exactly three such citations in the tree
+#   (`doc/configure_admin_ops.md:79`, `:157` and `:230`, all into
+#   `doc/configure.md`), which is too few to justify a fourth rule — so it is
+#   a hand check: edit a document that any of those three cites, and re-point
+#   them.
+#
 #   The remedy for the rest is to cite a *symbol*
 #   (`ExpectProxyProtocol::readable`) wherever the prose names an item, and to
 #   keep a line or a range only where the prose means a specific branch or

@@ -106,6 +106,76 @@
   every CVE-tagged threshold, the half-decay window, the lifetime ceilings, and metric-key
   uniqueness) moved into the new module's `#[cfg(test)] mod tests` alongside the type.
 
+- **BREAKING — `fix(load-balancing)`: `POWER_OF_TWO` now implements power-of-two-choices instead
+  of scanning every backend.** Operators running a cluster with `load_balancing = "POWER_OF_TWO"`
+  must read the traffic-distribution change below before upgrading; nothing else in the change is
+  operator-visible.
+  `PowerOfTwo::next_available_backend` (`lib/src/load_balancing.rs`) walked the whole candidate set
+  keeping the two lightest backends, then coin-flipped between them. That is neither the algorithm
+  the name promises nor cheaper than `LEAST_LOADED`: it paid the same `O(n)` load reads per request
+  and then discarded the ordering it had just computed (sozu-proxy/sozu#1411). It now draws two
+  DISTINCT backends uniformly at random and keeps the less loaded of the two, reading two backend
+  loads whatever the cluster size. An exact tie is still broken by the seeded coin flip introduced
+  in #1412 — ties are the common case, since every backend starts at zero load, and awarding them
+  by index would herd every worker onto the same backend.
+  **This changes how traffic is distributed for any cluster configured with `POWER_OF_TWO`.** No
+  configuration, CLI value, protobuf tag, saved state file or hot-upgrade payload changes —
+  `LoadBalancingAlgorithms::POWER_OF_TWO` keeps its name and its wire tag `3`, and
+  `Cluster.load_balancing` was always encoded as that integer, never as the name. Only the traffic
+  moves, and **no setting reproduces the old distribution**, because the old distribution was not a
+  policy anyone would have chosen. Restoring the old fold under the new tests measures it: over
+  5000 selections across four equally loaded backends, backends 0 and 1 received **zero** requests
+  and the other two split the rest — the fold could only ever retain the last two backends it
+  walked; and on two backends carrying 7 and 1 connections it returned the 7-connection backend on
+  the very first call. It was not "near least loaded", and it was not `LEAST_LOADED`. An operator
+  on `POWER_OF_TWO` now chooses deliberately: `LEAST_LOADED` for the best balance a single worker
+  can compute, or `POWER_OF_TWO` for a balance close to it that independently-seeded workers cannot
+  herd on. Either is a change from what that cluster was actually doing.
+  **Neither load-aware policy is `O(1)` per request, and this change does not make one so.** Every
+  selection, whatever the policy, first builds the candidate set in
+  `BackendList::available_backends` (`lib/src/backends.rs`), which walks the cluster's backend list
+  and clones every healthy backend into a fresh `Vec`; `next_available_backend_with_key` calls it
+  before dispatching to the policy. All six policies are therefore `O(n)` per request and none of
+  them removes that walk. What power-of-two-choices removes is the load reads layered on top of it:
+  2 instead of `n`. That saving is largest under `load_metric = "connection_time"`, where each load
+  read is a `PeakEWMA::observe` call that takes an `Instant::now()` stamp and decays the backend's
+  average; under `connections` or `requests` a load read is a field read and the saving is small.
+  The rewrite also removes a latent bug in the old fold: its "otherwise" branch fired both when the
+  new measure was lighter than the first candidate AND when it was heavier than the second,
+  evicting both candidates in the second case. On backend loads `[0, 1, 5]` that left the two
+  candidates inverted, tripping the function's own `first <= second` `debug_assert!` (a debug-build
+  panic) and, in a release build, coin-flipping the HEAVIEST backend into the result half the time.
+  `power_of_two_never_returns_the_strictly_heaviest_backend` pins that profile, and
+  `power_of_two_handles_empty_and_singleton_sets_without_panic` pins the one-backend cluster:
+  drawing a second distinct index samples `len - 1` slots, an empty range for a singleton.
+  The two-load-reads claim is measured, not asserted structurally, because a test that only checks
+  "a backend came back" passes for the scan too: `power_of_two_touches_exactly_two_backends` counts
+  the per-backend `PeakEWMA::observe` timestamps one selection leaves behind (64 backends in,
+  exactly 2 measured; the old fold measured all 64), and
+  `power_of_two_sample_size_is_two_not_the_whole_set` recovers the same sample size from the
+  selection distribution alone, by giving one backend a uniquely light load among 100 and checking
+  it is returned at the `2/n` rate a two-sample policy implies. That second test also measures how
+  far the old fold was from least-loaded: restored under it, the estimated sample size is **0.00**,
+  because the unique minimum came back 0 times out of 100 000 — the fold evicted it at the third
+  backend and never took it back.
+  `power_of_two_tie_break_distribution_does_not_collapse` got stricter in the same move: it used to
+  require backends 0 and 1 to win exactly zero times — an assertion that only held because the old
+  fold could keep nothing but the last two backends it walked — and now requires all four to take a
+  roughly equal share. It cannot see the tie-break itself, though, because the sampled pair is
+  uniform and the marginal distribution is the same whichever member of a tie wins, so
+  `power_of_two_tie_break_is_decided_by_the_coin_flip_not_by_sample_position` pins the coin flip
+  directly: it freezes the peak-EWMA decay so two equally loaded backends tie exactly while
+  `PeakEWMA::observe` still stamps `last_event`, which makes the ORDER the two samples were
+  measured in observable, and requires the winner to be the second-measured backend roughly half
+  the time. Replacing the coin flip with a constant leaves the distribution test green and turns
+  that one red.
+  `doc/configure.md`, `doc/lifetime_of_a_session.md`, `doc/architecture.md` and `bin/config.toml`
+  now state what each policy selects, how much of the backend set it reads, where the per-request
+  walk actually is, and which policies read `weight` — `RANDOM`, `HRW` and `MAGLEV` do,
+  `ROUND_ROBIN`, `LEAST_LOADED` and `POWER_OF_TWO` do not, and `HRW`/`MAGLEV` only on the
+  flow-keyed path, falling back to `ROUND_ROBIN` without a key. `POWER_OF_TWO` and `LEAST_LOADED`
+  can now be told apart before one is chosen over the other.
+
 - **`refactor(metrics)`: `Aggregator::lease_apply` now takes an injected `now: Instant` instead of
   reading `Instant::now()` directly.** Every other clock-dependent entry point on the lease table —
   `lease_tick`, and by extension the janitor `lease_tick_due` gates — already took `now` as a

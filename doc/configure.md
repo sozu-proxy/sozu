@@ -910,6 +910,52 @@ backends  = [
 ]
 ```
 
+The load balancing policies differ in what they select and in how much of the
+backend set they read on every request:
+
+| value | selection | load reads per request |
+|---|---|---|
+| `ROUND_ROBIN` | next backend in declaration order | none |
+| `RANDOM` | one backend drawn at random, weighted by `weight` | none |
+| `LEAST_LOADED` | the least loaded backend of the whole set | `n` |
+| `POWER_OF_TWO` | two backends drawn at random, the less loaded of the two wins | 2 |
+| `HRW` | rendezvous hashing on the flow key, scaled by `weight` (see "UDP clusters") | none |
+| `MAGLEV` | consistent hashing on the flow key, slot share proportional to `weight` (see "UDP clusters") | none |
+
+**Three policies honour `weight` and three ignore it.** `RANDOM`, `HRW` and
+`MAGLEV` read it; `ROUND_ROBIN`, `LEAST_LOADED` and `POWER_OF_TWO` do not, so
+a `weight` set on a cluster using one of those three has no effect. `RANDOM`
+feeds it straight into its weighted draw. `HRW` multiplies each backend's
+rendezvous score by it, and `MAGLEV` gives each backend a share of lookup-table
+slots proportional to it — but both only on the flow-keyed path: asked for a
+backend with no flow key, each falls back to `ROUND_ROBIN` and the weight stops
+being read. In practice that means `weight` is live for `HRW`/`MAGLEV` on UDP
+clusters (the datapath that supplies a flow key) and inert for them elsewhere.
+An unset `weight` defaults to 100 wherever one is read.
+
+**The "load reads" column is not the per-request cost of the policy.** Every
+selection, under every policy, first builds the candidate set: Sōzu walks the
+cluster's backend list, keeps the healthy backends and collects them into a
+fresh vector (`BackendList::available_backends`, `lib/src/backends.rs`) before
+the policy is consulted at all. All six policies are therefore `O(n)` per
+request, and none of them removes that walk. What `POWER_OF_TWO` removes is
+the load reads layered on top of it — two instead of `n`. That saving is
+largest with `load_metric = "connection_time"`, where every load read decays
+and re-stamps a backend's peak-EWMA average; with `connections` or `requests`
+a load read is a field read and the saving is small.
+
+So do not switch a cluster to `POWER_OF_TWO` expecting a latency win from a
+shorter scan: there is no shorter scan. Choose between the two load-aware
+policies on balance instead. `LEAST_LOADED` gives the best balance a single
+worker can compute. `POWER_OF_TWO` gives up a little of it — the
+power-of-two-choices result is a maximum load of `O(log log n)` against
+`O(log n)` for `RANDOM` — in exchange for never computing a global minimum,
+which is what stops several independently seeded workers from all sending
+their next request to the same "least loaded" backend.
+
+`LEAST_LOADED` and `POWER_OF_TWO` both read the load through `load_metric`
+(see below); the other four ignore it.
+
 #### HTTP/2 backend connections (h2c)
 
 By default, Sōzu speaks HTTP/1.1 to backend servers. You can enable cleartext
