@@ -258,6 +258,26 @@ Before sozu-proxy/sozu#1428 none of that happened: the oversized header was
 left at the head of the read buffer, the error was discarded without a log,
 and the session stayed open and wedged.
 
+Do not confuse that ceiling with the read buffer's momentary shape. A frame
+whose declared length is *within* the cap but larger than the free tail of the
+read buffer is not rejected at all: the buffer is compacted, and the supervisor's
+own drain loop performs the read that completes the frame, in the same tick. The
+channel's read buffer reports its free space as the room after the last byte
+written, so once a decoded frame leaves the read cursor part-way in, a full
+buffer can report no space while still holding reusable room at its head. Before
+sozu-proxy/sozu#1436 that state was reported as a full buffer and the session
+wedged on it exactly as an oversized header used to — reached by a peer whose
+every frame was correctly formed and under the shared cap, so there is nothing
+for an operator to reconcile in that case and nothing is logged. Only a length
+above the cap closes the peer.
+
+Completing it in the same tick is load-bearing, not an optimisation. A peer that
+writes its request and then waits for the response owes no further byte, and the
+supervisor's event loop is edge-triggered: a session that is merely readable is
+not re-scheduled, since that decision keys on queued output, hangup and error
+only. A drain that stopped one read short of the compacted frame would therefore
+never resume, which is the same operator symptom as the defect above.
+
 ### 5.3 Drop-on-register-fail for the unix command socket
 
 Commit: `b8c8fc61`. Reference:

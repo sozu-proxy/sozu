@@ -580,28 +580,68 @@ where
     Rx: Debug + Default + Message,
 {
     let mut messages = Vec::new();
+    // Spin guard for the compaction retry below. A compaction frees space
+    // without consuming anything, so "it freed space" cannot be trusted as
+    // progress on its own — a parser that consumes nothing conserves bytes
+    // trivially (sozu-proxy/sozu#1436). At most ONE compaction retry is
+    // granted between two delivered messages; it is reset on every `Ok`, so
+    // the loop can only keep going by either delivering a message or growing
+    // capacity, and capacity is capped at `max_buffer_size`. Both bounds are
+    // finite and independent of anything the peer chooses.
+    let mut retried_after_compaction = false;
     loop {
         let status = channel.readable();
         trace!("Channel readable: {:?}", status);
         let old_capacity = channel.front_buf.capacity();
+        let old_space = channel.front_buf.available_space();
         let message = channel.read_message();
         match message {
-            Ok(message) => messages.push(message),
+            Ok(message) => {
+                messages.push(message);
+                retried_after_compaction = false;
+            }
             Err(_) => {
                 let new_capacity = channel.front_buf.capacity();
+                let new_space = channel.front_buf.available_space();
                 // INVARIANT: the read buffer only ever grows while we drain it
                 // (the channel doubles capacity on a partial read, never
                 // shrinks mid-loop). A shrink here would mean `read_message`
                 // reallocated downward and dropped buffered bytes — silent
-                // message corruption. This is also the loop-termination
-                // anchor: we stop precisely when capacity stopped growing.
+                // message corruption.
                 debug_assert!(
                     new_capacity >= old_capacity,
                     "channel read buffer must not shrink while draining messages"
                 );
-                if old_capacity == new_capacity {
-                    return messages;
+                // Termination anchor. It used to be "capacity stopped growing",
+                // which was the only way `read_message` could make room for a
+                // frame it could not yet complete. Since sozu-proxy/sozu#1436 it
+                // is not: `try_read_delimited_message` compacts the front buffer
+                // when its free tail runs out, which frees space WITHOUT
+                // changing capacity. Anchored on capacity alone the loop
+                // returned on exactly the parse that made the room — one
+                // iteration short of the `readable()` that completes the frame —
+                // and nothing scheduled that read: `wants_to_tick` below keys
+                // only on writability, hup and error, mio is edge-triggered so
+                // the readable edge was already spent, and there is no periodic
+                // sweep. The bytes sat in the socket forever, which is
+                // sozu-proxy/sozu#1436's operator symptom with the channel-level
+                // half fixed. So room made is room to be used, whichever way it
+                // was made.
+                if new_capacity > old_capacity {
+                    continue;
                 }
+                if new_space > old_space && !retried_after_compaction {
+                    // One more pass suffices for a compaction: it leaves
+                    // `available_space() == capacity - pending`, and the ceiling
+                    // guard in `try_read_delimited_message` has already proven
+                    // the declared length is within `max_buffer_size`, so the
+                    // rest of the frame arrives in a single `readable()`. If the
+                    // peer has not sent it yet, its next write raises a fresh
+                    // edge — a peer mid-write is not a peer waiting.
+                    retried_after_compaction = true;
+                    continue;
+                }
+                return messages;
             }
         }
     }
@@ -621,7 +661,7 @@ mod tests {
     use mio::Token;
     use sozu_command_lib::{
         channel::Channel,
-        proto::command::{Request, Response},
+        proto::command::{Request, Response, request::RequestType},
         ready::Ready,
     };
 
@@ -869,6 +909,129 @@ mod tests {
             "the supervisor must drop a peer that declared an unsatisfiable \
              frame length, instead of leaving the session wedged on a delimiter \
              it can neither complete nor re-sync past"
+        );
+    }
+
+    /// Regression for the session half of sozu-proxy/sozu#1436: making the
+    /// channel *recoverable* is not making the session *recover*.
+    ///
+    /// `try_read_delimited_message` now compacts the front buffer instead of
+    /// returning `BufferFull`, which frees space without changing capacity. But
+    /// `extract_messages`' loop terminated on `old_capacity == new_capacity`, so
+    /// it returned on exactly the parse that made the room -- one iteration
+    /// short of the `readable()` that completes the frame. The remaining bytes
+    /// then sat unread in the socket with nothing to schedule another tick:
+    /// `wants_to_tick` keys only on `(writable && back_buf.available_data() > 0)
+    /// || hup || error`, READABLE is not among them, mio is edge-triggered so
+    /// the readable edge was already consumed, and there is no periodic sweep.
+    /// For the canonical peer -- write a request, wait for the response --
+    /// "recoverable on the peer's next byte" means never.
+    ///
+    /// The shape, at `capacity == max_buffer_size == 64`: an 8-byte frame (an
+    /// empty `Request` is a bare delimiter) at most half the capacity, then a
+    /// 64-byte `LoadState` frame, written together in ONE 72-byte write. The
+    /// first `readable()` fills the buffer to the brim at `position == 0`
+    /// (`Buffer::fill` compacts when a read reaches the end), the decode of the
+    /// first frame leaves `position == 8` without reaching `Buffer::consume`'s
+    /// `capacity / 2` threshold, and the second frame -- 64 bytes declared, 56
+    /// buffered -- lands on the compaction path with 8 bytes still in the
+    /// socket.
+    ///
+    /// Both frames arrive in one tick, so `ready`'s `requests.pop()` returns the
+    /// second and logs "more than one request at a time" over the first. That
+    /// pipelining loss is pre-existing `ready` behaviour, unrelated to this fix;
+    /// what this test pins is that the second frame is delivered at all.
+    #[test]
+    fn client_session_completes_a_compacted_frame_without_another_peer_write() {
+        let capacity = 64u64;
+        let (channel, mut writer): (Channel<Response, Request>, Channel<Request, Response>) =
+            Channel::generate_nonblocking(capacity, capacity)
+                .expect("could not generate nonblocking channels");
+
+        let mut client = ClientSession::new(
+            channel,
+            1,
+            Token(1),
+            PeerCred {
+                uid: None,
+                gid: None,
+                pid: None,
+            },
+            None,
+            None,
+            Arc::from("/tmp/sozu-test.sock"),
+        );
+
+        // Frame one: an empty `Request` frames to nothing but its delimiter, so
+        // it is 8 bytes -- comfortably under `Buffer::consume`'s 32-byte shift
+        // threshold, which is what leaves `position` stranded mid-buffer.
+        writer
+            .write_delimited_message(&Request::default())
+            .expect("could not frame the first request");
+        let mut wire = writer.back_buf.data().to_vec();
+        writer.back_buf.consume(wire.len());
+        assert!(
+            wire.len() <= capacity as usize / 2,
+            "the first frame ({} bytes) must stay under the {}-byte shift \
+             threshold or the layout under test never forms",
+            wire.len(),
+            capacity / 2
+        );
+
+        // Frame two: a real `LoadState` whose path is sized so the frame is
+        // exactly `capacity` -- the largest frame this end may legitimately be
+        // asked to accept, and one that cannot fit behind the first frame's
+        // leftover offsets.
+        let payload = capacity as usize - wire.len() - 2;
+        let expected = Request {
+            request_type: Some(RequestType::LoadState("x".repeat(payload))),
+        };
+        writer
+            .write_delimited_message(&expected)
+            .expect("could not frame the second request");
+        let second = writer.back_buf.data().to_vec();
+        writer.back_buf.consume(second.len());
+        assert_eq!(
+            second.len(),
+            capacity as usize,
+            "the second frame must be exactly the ceiling"
+        );
+        wire.extend_from_slice(&second);
+
+        // ONE write, then the peer waits for its response -- it owes no further
+        // byte, and no further byte is what the defect needed.
+        assert_eq!(wire.len(), 72);
+        std::io::Write::write_all(&mut writer.sock, &wire)
+            .expect("raw write of both frames in a single write");
+
+        client.update_readiness(Ready::READABLE);
+
+        match client.ready() {
+            ClientResult::NewRequest(request) => assert_eq!(
+                request, expected,
+                "the compacted frame must be delivered on this tick: the peer \
+                 sent every byte it owes and nothing will schedule another one"
+            ),
+            other => panic!(
+                "expected the second frame to be delivered, got {other:?}\n\
+                 NOTE: this is the session half of #1436 -- the channel \
+                 compacted, but `extract_messages` returned before the read \
+                 that completes the frame"
+            ),
+        }
+
+        assert_eq!(
+            client.channel.front_buf.available_data(),
+            0,
+            "the whole 72-byte write must have been drained"
+        );
+
+        // And this is why the drain loop, not `wants_to_tick`, had to be the
+        // fix: nothing re-schedules a session that is merely readable.
+        assert!(
+            !wants_to_tick(&client.channel),
+            "no queued response, no hup, no error: had the drain stopped early \
+             the session would never have been ticked again"
         );
     }
 }

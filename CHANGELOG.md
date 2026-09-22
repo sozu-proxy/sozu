@@ -558,13 +558,9 @@
   `malformed_payload_is_consumed_so_the_channel_resyncs`, also seen red first — a channel-level test:
   `extract_messages` returns on the first `Err(_)` with the capacity unchanged, so a valid frame
   already pipelined behind the malformed one reaches the session only on its next readable event, and
-  that residual is deliberately untested and unfixed here. A third instance is **known-remaining and
-  deliberately untouched**, now tracked as #1436: the `BufferFull` arm at the ceiling likewise
-  returns without consuming and without moving a readiness bit, and is reachable once a decoded frame
-  of at most half the capacity leaves `Buffer::consume` short of its shift threshold. Its recovery is
-  neither of the other two — those bytes are still buffered and a `Buffer::shift` would make room for
-  the pending frame, so closing there would drop a conforming peer over an internal
-  buffer-management detail.
+  that residual is deliberately untested and unfixed here. A third instance of the same
+  return-without-consuming shape sat in the `BufferFull` arm at the ceiling, tracked as #1436; it is
+  closed by the entry below, whose recovery is neither of these two.
   Reachability: the command socket is a unix socket chmod'd `0o600` and there is no
   control-plane TCP listener, so this is a robustness fix rather than a remotely triggerable one —
   but the same parser serves the master↔worker socketpair, where a worker compromised through the
@@ -635,6 +631,86 @@
   value — the configuration file, `sozu ctl`, and a raw protobuf `Add{Http,Https}Listener` — because
   there an error names the key while the operator is still typing. Fix the source and save the state
   again to clear the warning.
+
+- **`fix(command)`: compact the channel's front buffer instead of declaring it full, so a frame that
+  fits the ceiling but not the current buffer layout completes rather than wedging the session.**
+  `try_read_delimited_message` (`command/src/channel.rs`) returned `ChannelError::BufferFull` as soon
+  as `front_buf.available_space()` hit zero at `max_buffer_size` — without consuming and without
+  moving a readiness bit, the same shape #1428 removed from the two branches above it, and with the
+  same downstream consequences: `extract_messages` (`bin/src/command/sessions.rs`) discards the error
+  with a bare `Err(_)`, and `ClientSession::ready` / `WorkerSession::ready` close only on
+  `readiness.is_error() || is_hup()`. `available_space()` is `capacity - end`: it measures the free
+  *tail*, not the free room. `Buffer::consume` (`command/src/buffer/growable.rs`) compacts only once
+  `position` passes `capacity / 2`, so decoding one frame of at most half the capacity out of a
+  buffer filled to capacity advances `position` without reaching that threshold and leaves zero
+  space with `capacity - frame` bytes still pending — at `163_840`, `bin/config.toml`'s
+  `max_command_buffer_size`, a frame of at most `81_920` bytes followed by one larger than that, both
+  under the shared ceiling and both correctly framed. The wedge was then permanent: the three
+  `front_buf` mutators that can trigger a `Buffer::shift` are all unreachable afterwards. `fill`
+  needs a successful read, but `readable()` sees no space, gets `None` from `grow_size` at the
+  ceiling and executes `interest.remove(Ready::READABLE)`, so every later `readable()` returns
+  `Err(Connection(None))`; `consume` needs a decoded frame or an under-delimiter length, neither of
+  which that return path reaches; and `try_shrink_front_buf` is only called after a frame decoded,
+  with both of its own early returns stopping it anyway — `capacity <= initial_buffer_size`, which
+  holds whenever the channel was configured with `command_buffer_size == max_command_buffer_size`,
+  and `available_data() * 4 < initial_buffer_size`, which is false with that much pending. Not
+  because it shrinks rather than shifts: `Buffer::shrink` calls `shift` unconditionally before its
+  own size bail, so reaching it would have compacted. The session stayed registered for the life of
+  the process, pinning its file descriptor and a full `max_command_buffer_size` of buffer, with
+  nothing logged — reached by a **conforming** peer, unlike #1428's oversize branch.
+  The recovery is therefore compaction, not a close. Those bytes are already buffered and the
+  declared length is under this end's ceiling, so only the buffer's internal offsets stand in the
+  way, and one `Buffer::shift` hands back exactly the room the consumed frame left behind; the arm
+  now shifts before it concludes anything about the space. Closing instead would drop a peer that did
+  nothing wrong over an internal buffer-management detail — the precise conflation #1428's fix was
+  written to avoid. The boundary between the two is the *ordering* of the guards, unchanged: a
+  declared length above `max_buffer_size` still returns `MessageTooLarge` and still marks the channel
+  errored at the guard above, before control reaches the zero-space arm, so compaction cannot rescue
+  a frame the ceiling can never admit whatever the layout it is parsed from. Past the compaction,
+  `BufferFull` survives only for a capacity too small to hold the eight-byte length prefix at all — a
+  configuration that can never frame a message — which a new `debug_assert!` states. The compaction
+  sits ahead of the ceiling check, so it also changes the sub-ceiling path: a front buffer still
+  below `max_buffer_size` now compacts on its first zero-space parse and doubles on the next one
+  instead of doubling straight away. The frame still completes — the compacted buffer refills to
+  `end == capacity` at `position == 0`, where the shift is a no-op and the grow runs — one
+  read-parse round later, against one fewer doubling.
+
+  Making the channel recoverable is not making the session recover, and the second half of this
+  changeset is in `extract_messages` (`bin/src/command/sessions.rs`). Its drain loop terminated on
+  `old_capacity == new_capacity`, which was exhaustive only while growth was the one way a parse
+  could make room for a frame it could not yet complete. A compaction frees space *without* changing
+  capacity, so the loop returned on precisely the parse that made the room — one iteration short of
+  the `readable()` that completes the frame — leaving the remaining bytes unread in the socket with
+  nothing to schedule another tick: `wants_to_tick` keys only on
+  `(writable && back_buf.available_data() > 0) || hup || error`, READABLE is not among them, mio is
+  edge-triggered so the readable edge was already spent, and there is no periodic sweep. For the
+  canonical peer — write a request, wait for the response — "recoverable on the peer's next byte"
+  means never, and the operator symptom would have been #1436's with a line beside it saying it was
+  fixed. The anchor is now "the parse made room", by growth or by compaction. Its spin guard is
+  explicit, because #1436's own analysis established that a parser which consumes nothing conserves
+  bytes trivially, so freed space cannot be trusted as progress on its own: at most ONE
+  compaction-driven retry is granted between two delivered messages, reset on every `Ok`, so the
+  loop can only continue by delivering a message or by growing capacity — and capacity is capped at
+  `max_buffer_size`. One extra pass is also all a compaction ever needs, since it leaves
+  `available_space() == capacity - pending` and the ceiling guard has already proven the declared
+  length fits `max_buffer_size`.
+  Pinned by `a_frame_within_the_ceiling_is_rescued_by_compaction`, seen red first (it returned
+  `Err(BufferFull { capacity: 64, max: 64 })` where the frame must complete), and by
+  `a_frame_above_the_ceiling_still_closes_from_the_same_layout`, which drives the #1428 path from
+  that identical wedged layout and is green on both sides of the change by design — it pins the guard
+  ordering the fix must not disturb, it is not a second regression. The session half is pinned by
+  `client_session_completes_a_compacted_frame_without_another_peer_write`, seen red first: a
+  `ClientSession` at capacity 64 whose peer writes 72 bytes in a single write and then waits
+  delivered only the first frame. A channel-level test cannot see that defect, which is the same
+  shape as #1428's "the test proves the channel re-syncs, not the session" — for any change in
+  `command/src/channel.rs` whose claim is about the session, the unit of proof is a `ClientSession`
+  test driven through `extract_messages`. `doc/configure_admin_ops.md` §5.2 now draws the same
+  ceiling-versus-layout line. The command socket is a unix socket chmod'd `0o600` with no
+  control-plane TCP listener, so this is a robustness fix rather than a remotely triggerable one —
+  the same parser does serve the master↔worker socketpair, but no claim is made here about which
+  real traffic reaches the shape: the reproduction is the unit-level construction above (a frame of
+  at most half the capacity out of a buffer filled to `max_buffer_size`, then one larger than what
+  remains), not an observation against a running master. Closes #1436.
 
 ### 🔐 Security
 
