@@ -394,14 +394,14 @@ fn try_tls_socket_log_peer_is_the_advertised_client() -> State {
     }
 }
 
-/// `repeat_until_error_or(3, ..)` is NOT a retry: all three iterations must
-/// return `Success`, so this is three independent chances to go red, not three
-/// chances to go green. That matters because the capture depends on two fixed
-/// sleeps (300 ms for the worker to read the corrupt record and write its line,
-/// 200 ms after the client goes away). A sufficiently loaded box could capture
-/// zero peer= slots and fail on the `peer_slot_lines.is_empty()` arm, whose
-/// message says exactly that. Measured 12/12 green across four runs here; if it
-/// ever flakes, lengthen the first sleep rather than weakening an assertion.
+/// What `n = 3` costs and buys is on `repeat_until_error_or`'s doc comment in
+/// `e2e/src/tests/mod.rs`; this note keeps only what is local to this test.
+/// The capture depends on two fixed sleeps (300 ms for the worker to read the
+/// corrupt record and write its line, 200 ms after the client goes away), so a
+/// sufficiently loaded box could capture zero peer= slots and fail on the
+/// `peer_slot_lines.is_empty()` arm, whose message says exactly that. Measured
+/// 12/12 green across four runs here; if it ever flakes, lengthen the first
+/// sleep rather than weakening an assertion.
 #[test]
 fn test_tls_socket_log_peer_is_the_advertised_client() {
     assert_eq!(

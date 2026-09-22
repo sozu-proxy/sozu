@@ -2458,6 +2458,85 @@
   sync with the code it bounds. `doc/h2_mux_internals.md`'s large-asset coverage section is updated
   in the same changeset, since it restated the old 8 s figure. Closes cause D of
   [#1393](https://github.com/sozu-proxy/sozu/issues/1393).
+- **`test(e2e)`: `repeat_until_error_or`'s three outcome lines now share one `stability check`
+  vocabulary and name the failing iteration out of the total, and its doc comment states plainly
+  that it is a stability check, not a retry.** `repeat_until_error_or(n, ..)` loops WHILE the inner
+  test keeps returning `State::Success` and returns `Fail` on the first bad trial, so it requires
+  `n` **consecutive** clean runs — a single bad trial fails the whole check, it does not spend a
+  retry budget. The old failure line, `Test not successful after: 3 iterations`, read as an
+  exhausted retry budget; it now reads `stability check FAILED: iteration 3 of 5 did not succeed
+  (5 consecutive successes are required)` (and the mirrored `State::Undecided` message the same
+  way), so a reader cannot mistake "the third of five iterations failed" for "three retries were
+  attempted and all failed". The success line moved into the same vocabulary rather than keeping
+  the very "after N iterations" phrasing this entry argues against: it now reads `stability check
+  PASSED: all 5 consecutive iterations succeeded`, so one `grep 'stability check'` over a run log
+  finds the passes as well as the failures. All three lines are built by pure functions
+  (`stability_check_failure_message`, `stability_check_interrupted_message`,
+  `stability_check_success_message`) sharing a `stability_check_requirement` clause that is
+  grammatical and true at `n == 1`: a single run is not a consecutiveness property, so the four
+  live `n = 1` sites (two in `e2e/src/tests/redirect_rewrite_auth_tests.rs`, two in
+  `e2e/src/tests/h2_tests.rs`) now report `(a single clean run is required)` instead of the false
+  and ungrammatical `(1 consecutive successes are required)`.
+- **`test(e2e)`: the `repeat_until_error_or` loop itself is now unit-tested, not just its message
+  strings.** The loop body moved into a private `run_stability_check` that returns the outcome and
+  the line describing it instead of printing; `repeat_until_error_or` keeps its exact signature and
+  is now a thin printing wrapper. The *extraction* changes nothing observable — same signature,
+  same three prints in the same order, same separator line. The outcome lines themselves do change
+  in this changeset, for the vocabulary reason in the entry above, so a log filter on
+  `Test successful after` stops matching and has to become `stability check`; that is the
+  vocabulary change, not the extraction. Message-only tests could not catch a regression in the
+  loop: injecting `0..times` in place of `1..=times`, or swapping the `(iteration, total)`
+  arguments, left the previous two tests green. Tests now drive the real loop — a closure failing
+  on trial 3 of 5, an undecided trial 2 of 3, a clean 5-trial run, and a failing one-run check —
+  and assert the exact emitted line plus the trial count, so both injections turn the suite red.
+  The coverage stops at `run_stability_check`, and that boundary is measured rather than assumed:
+  fully reversing the wrapper's three prints leaves the suite at `7 passed; 0 failed`. A print
+  reordering therefore remains a silent regression — invisible to the suite, visible in every e2e
+  run log. Covering
+  it needs stdout capture, which this crate can only buy with a new dependency or a writer
+  parameter threaded through a helper with 402 call sites; neither is worth six lines of printing,
+  so the gap is recorded here instead of being claimed away.
+- **`test(e2e)`: the helper keeps its name, and the alternatives are recorded rather than
+  strawmanned.** Measured on this tree: `grep -rno 'repeat_until_error_or(' e2e/src/tests/` minus
+  `e2e/src/tests/mod.rs` yields 403 occurrences, of which one is the commented-out `test_issue_808`
+  body in `e2e/src/tests/tests.rs`, leaving **402 real call sites across 29 files** — that is the
+  edit surface, not the runtime count. Four of those 402 live in the `protocol_pair_matrix!`
+  `macro_rules!` body in `e2e/src/tests/protocol_pair_matrix.rs`, which is invoked six times, so
+  **422 calls exist after expansion**. Their `n` distribution over real call sites is 5 × 144,
+  3 × 117, 10 × 74, 2 × 51, 100 × 12 and 1 × 4. A mechanical rename of all 402 was rejected as
+  worse than the confusion it fixes. A `#[deprecated(note = ..)]` alias forwarding to a
+  correctly-named function was also considered — it costs a few lines and no call-site churn — and
+  rejected on a concrete blocker. `.github/workflows/ci.yml:158` runs
+  `cargo clippy --all-targets --locked ${{ matrix.flags }} -- -D warnings`, gated one line above on
+  `matrix.toolchain == '1.93.1'`: six of the nine matrix cells lint, `stable`, `beta` and `nightly`
+  do not, and six is enough to block a merge. `-D warnings` implies `-D deprecated`; `e2e` is a
+  workspace member; and `--all-targets` is the part that makes it bite, because the call sites sit
+  under `e2e`'s `#[cfg(test)] mod tests` (`e2e/src/lib.rs`) and are compiled only by the test
+  targets. So the alias would turn all 402 call sites into hard CI errors on the commit that
+  introduced it. (The shorter `cargo clippy --all-targets --locked -- -D warnings` quoted in
+  `CLAUDE.md` and `doc/testing.md` is the local pre-push chain, not what CI runs.) It stays
+  available to whoever does the rename, as the migration step *after* the call sites move, not
+  before.
+- **`test(e2e)`: the prose around the helper is corrected in the same changeset.**
+  `e2e/COVERAGE.md` described `repeat_until_error_or(2, ...)` as making "a single transient failure
+  surface as a stable fail" via a "retry budget" — the same misreading the helper's name invites.
+  `doc/upgrade_e2e_tests.md` carried the mirror image of it, saying the six upgrade tests "all use
+  `repeat_until_error_or(10, ...)` to account for timing sensitivity" — ten *required consecutive*
+  runs multiply a timing-sensitive test's exposure, they do not absorb it. `doc/testing.md`,
+  `CLAUDE.md` and `CONTRIBUTING.md` each recommended the helper over `sleep` without saying what it
+  actually does; all three now carry the caveat. No call site's `n` was changed, because choosing a
+  different `n` changes what a test asserts and belongs to whoever owns that test — several sites
+  (the seven TLS cert/cipher smoke tests at `n = 100` in `e2e/src/tests/tests.rs`, and those six
+  upgrade tests) look like a single clean run would already prove the property. Call sites that
+  already reasoned in stability-check terms keep what is local to them and defer the rule itself:
+  the `n = 1` note on `test_h2_settings_flood_triggers_goaway`
+  (`e2e/src/tests/h2_tests.rs`) records an observed CI flake on its second iteration and states no
+  general rule, so it is left verbatim, while the comment on
+  `test_tls_socket_log_peer_is_the_advertised_client`
+  (`e2e/src/tests/socket_log_context_tests.rs`) did restate the rule and now points at the helper's
+  doc for it, keeping the two fixed sleeps, the `is_empty()` arm they can trip, and the 12/12
+  measurement. Neither `n` is changed.
+  See [#1410](https://github.com/sozu-proxy/sozu/issues/1410).
 
 ## 2.2.1 - 2026-08-28
 
