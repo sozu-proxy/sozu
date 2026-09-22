@@ -34,8 +34,10 @@ use super::{
 };
 use crate::metrics::names;
 use crate::{
-    L7ListenerHandler, ListenerHandler, Readiness, backends::Backend, pool::Pool,
-    socket::SocketHandler,
+    L7ListenerHandler, ListenerHandler, Readiness,
+    backends::Backend,
+    pool::Pool,
+    socket::{SocketHandler, stats::socket_rtt},
 };
 
 /// Module-level prefix used on every log line emitted from this module.
@@ -599,8 +601,8 @@ impl<Front: SocketHandler + Debug> Endpoint for EndpointServer<'_, Front> {
     fn readiness_mut(&mut self, _token: Token) -> &mut Readiness {
         self.0.readiness_mut()
     }
-    fn socket(&self, _token: Token) -> Option<&TcpStream> {
-        Some(self.0.socket())
+    fn peer_rtt(&self, _token: Token) -> Option<Duration> {
+        socket_rtt(self.0.socket())
     }
 
     fn end_stream<L>(&mut self, _token: Token, stream: GlobalStreamId, context: &mut Context<L>)
@@ -654,8 +656,11 @@ impl Endpoint for EndpointClient<'_> {
             }
         }
     }
-    fn socket(&self, token: Token) -> Option<&TcpStream> {
-        self.0.backends.get(&token).map(|c| c.socket())
+    fn peer_rtt(&self, token: Token) -> Option<Duration> {
+        self.0
+            .backends
+            .get(&token)
+            .and_then(|c| socket_rtt(c.socket()))
     }
 
     fn end_stream<L>(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context<L>)

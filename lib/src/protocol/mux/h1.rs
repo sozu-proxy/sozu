@@ -699,10 +699,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             debug!("{} ============== HANDLE UPGRADE!", log_context!(self));
                             stream.metrics.backend_stop();
                             let client_rtt = socket_rtt(self.socket.socket_ref());
-                            let server_rtt = stream
-                                .linked_token()
-                                .and_then(|t| endpoint.socket(t))
-                                .and_then(socket_rtt);
+                            let server_rtt =
+                                stream.linked_token().and_then(|t| endpoint.peer_rtt(t));
                             stream.generate_access_log(
                                 false,
                                 Some("H1::Upgrade"),
@@ -747,10 +745,8 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             } else {
                                 stream.metrics.backend_stop();
                                 let client_rtt = socket_rtt(self.socket.socket_ref());
-                                let server_rtt = stream
-                                    .linked_token()
-                                    .and_then(|t| endpoint.socket(t))
-                                    .and_then(socket_rtt);
+                                let server_rtt =
+                                    stream.linked_token().and_then(|t| endpoint.peer_rtt(t));
                                 stream.generate_access_log(
                                     false,
                                     Some("H1::EarlyHint"),
@@ -766,10 +762,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     incr!(names::http::E2E_HTTP11);
                     stream.metrics.backend_stop();
                     let client_rtt = socket_rtt(self.socket.socket_ref());
-                    let server_rtt = stream
-                        .linked_token()
-                        .and_then(|t| endpoint.socket(t))
-                        .and_then(socket_rtt);
+                    let server_rtt = stream.linked_token().and_then(|t| endpoint.peer_rtt(t));
                     stream.generate_access_log(
                         false,
                         Some("H1::Complete"),

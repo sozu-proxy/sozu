@@ -77,6 +77,31 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux)`: `Endpoint::socket(token) -> Option<&TcpStream>` is replaced by
+  `Endpoint::peer_rtt(token) -> Option<Duration>`, so the trait no longer hands one connection
+  another connection's socket.** The method existed for exactly one purpose — sampling TCP_INFO RTT
+  for the side a connection does not own, for the access log's `server_rtt` cell — and every one of
+  its four call sites (`ConnectionH2::snapshot_rtts`, plus H1's upgrade, early-hint and complete
+  paths) immediately did `.and_then(socket_rtt)`. Moving that `socket_rtt` call into the two
+  implementors returns the value instead of the handle.
+
+  No behaviour change: the same `getsockopt(TCP_INFO)` on the same socket at the same moment, with
+  the same `None` on an unresolvable token. What changes is the boundary — a concrete
+  `mio::net::TcpStream` leaves the `Endpoint` trait, which was both an authority leak (any
+  connection could reach any other's socket for any purpose) and the reason no in-memory transport
+  could ever implement the trait. RTT is intrinsically a live-socket property and stays on the
+  embedder's side; the cores receive a value captured for them. This is the Q11 half of the sans-io
+  boundary work.
+
+  Tests: `endpoint_client_peer_rtt_is_keyed_by_token` pins the token-keyed lookup — an unknown
+  token must yield `None` rather than the only backend in the map — and asserts its own premise
+  first, that a KNOWN token returns `Some`, without which it would pass against a `peer_rtt` that
+  always answered `None`. Seen red by swapping `.get(&token)` for `.values().next()`.
+  `endpoint_server_peer_rtt_ignores_the_token` pins the other implementor, seen red by returning
+  `None`. The pair matters because the two sides populate different access-log cells, so a lookup
+  returning the wrong connection's RTT would mislabel the value rather than lose it — which no
+  downstream assertion would have caught.
+
 - **`refactor(mux-h2)`: the per-stream vectored write splits into a gather/confirm pair in a new
   `lib/src/protocol/mux/h2_transmit.rs`, putting the `unsafe` lifetime extension and the clear that
   discharges it in one place.** `ConnectionH2::flush_stream_out`'s loop body built `IoSlice`s

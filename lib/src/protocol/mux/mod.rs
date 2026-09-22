@@ -339,18 +339,28 @@ pub enum MuxResult {
 pub trait Endpoint: Debug {
     fn readiness(&self, token: Token) -> &Readiness;
     fn readiness_mut(&mut self, token: Token) -> &mut Readiness;
-    /// Returns the underlying TCP socket for the peer side of a stream.
+    /// Smoothed round-trip time of the peer side of a stream, already
+    /// sampled.
     ///
-    /// Used by access-log emission to capture TCP_INFO RTT for the side the
+    /// Used by access-log emission to report TCP_INFO RTT for the side the
     /// caller does NOT own directly: a frontend connection (Position::Server)
-    /// reads the backend socket through this method, and a backend connection
-    /// (Position::Client) reads the frontend socket the same way. `token` is
+    /// reports the backend's RTT through this method, and a backend connection
+    /// (Position::Client) reports the frontend's the same way. `token` is
     /// ignored by [`super::connection::EndpointServer`] (which has a single
     /// frontend connection) and used as a key by
     /// [`super::connection::EndpointClient`] (which keys backends by token).
     /// Returns `None` when the token doesn't resolve, mirroring the existing
-    /// fallback paths in `readiness`/`readiness_mut`.
-    fn socket(&self, token: Token) -> Option<&TcpStream>;
+    /// fallback paths in `readiness`/`readiness_mut`, and also when the
+    /// platform declines to answer.
+    ///
+    /// This returns the VALUE, not the socket it came from. The predecessor,
+    /// `fn socket(&self, token) -> Option<&TcpStream>`, handed out a
+    /// `mio::net::TcpStream` — a concrete OS type — so any connection could
+    /// reach any other connection's socket for any purpose, and no in-memory
+    /// transport could ever satisfy the trait. RTT is intrinsically a live
+    /// socket property and stays on the embedder's side of the boundary; the
+    /// cores receive an `Option<Duration>` that was captured for them.
+    fn peer_rtt(&self, token: Token) -> Option<Duration>;
     /// If end_stream is called on a client it means the stream has PROPERLY finished,
     /// the server has completed serving the response and informs the endpoint that this stream won't be used anymore.
     /// If end_stream is called on a server it means the stream was BROKEN, the client was most likely disconnected or encountered an error
@@ -3346,6 +3356,70 @@ mod tests {
             !mux.timeouts.contains_key(&backend_token),
             "a departed backend must not leave a wheel handle behind"
         );
+    }
+
+    // ── Endpoint::peer_rtt is keyed by token ────────────────────────────
+    //
+    // `EndpointClient` keys backends by token; `EndpointServer` has a single
+    // frontend and ignores the token. The pair matters because the two sides
+    // populate DIFFERENT access-log cells — `snapshot_rtts` reads the local
+    // socket for `client_rtt` and this trait method for `server_rtt` — so a
+    // lookup that returned the wrong connection's RTT would mislabel the
+    // value rather than lose it, which no downstream assertion would catch.
+
+    /// An unknown token yields `None`, not some other backend's RTT.
+    ///
+    /// The premise is asserted first: on a live loopback socket
+    /// `getsockopt(TCP_INFO)` succeeds, so a KNOWN token really does return
+    /// `Some`. Without that half, this test would pass against a
+    /// `peer_rtt` that always answered `None`.
+    ///
+    /// TO SEE THIS RED: in `EndpointClient::peer_rtt` (`connection.rs`),
+    /// replace `.get(&token)` with `.values().next()`. The unknown token then
+    /// resolves to the only backend in the map and the final assertion fails
+    /// with `an unknown token must not resolve to another backend's RTT`.
+    #[test]
+    fn endpoint_client_peer_rtt_is_keyed_by_token() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut mux, _frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(30));
+        let backend_token = Token(1);
+        let (connection, _backend_peer) = test_backend_connection(&mux, Duration::from_secs(30));
+        mux.router.backends.insert(backend_token, connection);
+
+        let endpoint = EndpointClient(&mut mux.router);
+
+        assert!(
+            endpoint.peer_rtt(backend_token).is_some(),
+            "premise: TCP_INFO answers on a live loopback backend, so a known \
+             token returns Some — otherwise the assertion below proves nothing"
+        );
+        assert!(
+            endpoint.peer_rtt(Token(99)).is_none(),
+            "an unknown token must not resolve to another backend's RTT"
+        );
+    }
+
+    /// `EndpointServer` ignores the token: it holds one frontend, and every
+    /// token must report that frontend's RTT rather than `None`.
+    ///
+    /// TO SEE THIS RED: in `EndpointServer::peer_rtt` (`connection.rs`),
+    /// return `None` instead of `socket_rtt(self.0.socket())`. It fails on
+    /// the first loop iteration with `EndpointServer must report its single
+    /// frontend's RTT for any token` — the second never runs, which is why
+    /// the loop is two tokens rather than an assertion about "any".
+    #[test]
+    fn endpoint_server_peer_rtt_ignores_the_token() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut mux, _frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(30));
+
+        let endpoint = EndpointServer(&mut mux.frontend);
+
+        for token in [Token(0), Token(7)] {
+            assert!(
+                endpoint.peer_rtt(token).is_some(),
+                "EndpointServer must report its single frontend's RTT for any token"
+            );
+        }
     }
 
     /// An H1 backend connection on a live loopback socket, plus the peer the

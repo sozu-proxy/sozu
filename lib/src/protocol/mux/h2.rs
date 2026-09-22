@@ -3106,9 +3106,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         (
             socket_rtt(self.socket.socket_ref()),
-            linked_token
-                .and_then(|t| endpoint.socket(t))
-                .and_then(socket_rtt),
+            linked_token.and_then(|t| endpoint.peer_rtt(t)),
         )
     }
 

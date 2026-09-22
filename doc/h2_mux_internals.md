@@ -526,7 +526,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:3164-3177
+```rust lib/src/protocol/mux/h2.rs:3162-3175
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -550,7 +550,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:3210-3216
+```rust lib/src/protocol/mux/h2.rs:3208-3214
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -563,13 +563,13 @@ stream.generate_access_log(
 The other three sites take the `&mut self` wrapper
 `ConnectionH2::distribute_overhead` instead, and each emits its own log:
 
-- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3502`) passes a
+- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3500`) passes a
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5033`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5031`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:5739`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:5737`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -589,6 +589,15 @@ This ensures `metrics.bin` and `metrics.bout` in the access log include the
 stream's proportional share of connection overhead, and that the
 TCP_INFO-derived `client_rtt` / `server_rtt` cells are populated from
 the live frontend/backend sockets at emission time.
+`snapshot_rtts` reads the peer side through `Endpoint::peer_rtt(token)`, which
+returns an `Option<Duration>` already sampled by the embedder. It deliberately
+does NOT return the socket: the predecessor,
+`Endpoint::socket(token) -> Option<&TcpStream>`, handed out a concrete
+`mio::net::TcpStream`, so any connection could reach any other connection's
+socket for any purpose, and no in-memory transport could satisfy the trait.
+RTT is intrinsically a live-socket property and stays on the embedder's side
+of the boundary; the cores receive a value captured for them.
+
 
 ---
 
@@ -823,7 +832,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4078
+```rust lib/src/protocol/mux/h2.rs:4076
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -976,7 +985,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5076-5078
+```rust lib/src/protocol/mux/h2.rs:5074-5076
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -984,7 +993,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5090-5096
+```rust lib/src/protocol/mux/h2.rs:5088-5094
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
