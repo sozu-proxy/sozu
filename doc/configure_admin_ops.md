@@ -76,7 +76,7 @@ connections opened after the patch acknowledge see the tighter limits.
 The CONTINUATION-flood cap (CVE-2024-27316) and the server-emitted
 RST_STREAM cap (CVE-2025-8671) follow the same pattern with their own
 `--h2-max-continuation-frames` and `--h2-max-rst-stream-emitted-lifetime`
-flags. See `configure.md:560-567` for the catalogue.
+flags. See `doc/configure.md:1133, 1234` for the catalogue.
 
 The relevant counters to watch on the receiving side are
 `h2.flood.violation.<kind>` (per CVE) and
@@ -154,7 +154,7 @@ already in `configure.md`.
 
 ### 5.1 Per-connection H2 stream-Vec shrink
 
-Commit: `e478cf8b`. Reference: `doc/configure.md:442, 458, 570`.
+Commit: `e478cf8b`. Reference: `doc/configure.md:1197`.
 
 Each `ConnectionH2` keeps a `Vec<Stream>` of per-stream slots in the
 mux `Context`. Recycled slots accumulate over the connection's lifetime;
@@ -295,7 +295,7 @@ ratebar matches the sum of the labelled buckets.
 ### 5.5 `https.alpn.rejected.unsupported` counter
 
 Source: `HttpsSession::upgrade_handshake` (`lib/src/https.rs:483`).
-Documented in `doc/configure.md:979`.
+Documented in `doc/configure.md:2860`.
 
 Fires on the rustls accept path when the negotiated ALPN protocol is
 not one of the explicitly handled values (`h2`, `http/1.1`, or absent).

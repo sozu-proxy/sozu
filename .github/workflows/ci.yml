@@ -341,12 +341,15 @@ jobs:
           echo "OK: every #[ignore] carries a reason string."
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Group C″ — documentation citation resolver                    │
-  # │   Every `file.rs:NNN(-MMM)` in `doc/**` and `**/LIFECYCLE.md` │
-  # │   must name a file that exists and a line that is in range    │
-  # │   and not blank (sozu-proxy/sozu#1335). It runs on the merge  │
-  # │   result, which is the point: the pull request that breaks a  │
-  # │   citation is almost never the one that contains it, so no    │
-  # │   reviewer is ever shown both halves.                         │
+  # │   Every `file.rs:NNN(-MMM)` and `file.md:NNN(-MMM)` in        │
+  # │   `doc/**` and `**/LIFECYCLE.md` must name a file that        │
+  # │   exists and a line that is in range and not blank            │
+  # │   (sozu-proxy/sozu#1335; markdown targets are                 │
+  # │   sozu-proxy/sozu#1444, where six of the six markdown         │
+  # │   line targets in the tree pointed at unrelated prose).       │
+  # │   It runs on the merge result, which is the point: the pull   │
+  # │   request that breaks a citation is almost never the one      │
+  # │   that contains it, so no reviewer is ever shown both halves. │
   # │   A second rule reads those same citations at TWO revisions:  │
   # │   one this changeset did not touch must still name the same   │
   # │   line TEXT it named at the merge base (sozu-proxy/sozu#1389  │
