@@ -79,29 +79,31 @@
 //!    a hard post-condition every time, not inferred from typical green
 //!    runs.
 //!
-//! # A pre-existing defect this harness deliberately does NOT explore
+//! # #1408, resolved: renewals draw freely, both directions
 //!
-//! `lease_apply` treats any call with an already-present `client_id` as a
-//! "renewal" regardless of whether the caller's `level` matches the
-//! PREVIOUSLY stored one. A renewal that LOWERS the level can lower
-//! `effective`, which trips `lease_apply`'s own
-//! `debug_assert!(self.effective >= previous_effective, "lease_apply must
-//! not lower the effective detail level")` (`lib/src/metrics/mod.rs`) —
-//! confirmed with a throwaway reproduction, not fixed here: this is a
-//! pre-existing defect independent of the clock parameterisation and the
-//! simulator this file adds, and fixing it is outside this task's scope
-//! (tracked as #1408).
+//! `lease_apply` used to carry a `debug_assert!(self.effective >=
+//! previous_effective, "lease_apply must not lower the effective detail
+//! level")` that assumed a renewal could only ever raise `effective`. That
+//! was wrong: a lease exists to let a client temporarily ELEVATE
+//! cardinality on its own behalf, so a client renewing at a LOWER level
+//! than its own previous one is withdrawing part of its own request, and
+//! `effective` recomputing downward in response is correct, not a defect.
+//! The assertion was deleted and the comment corrected in
+//! `lib/src/metrics/mod.rs` (#1408); `recompute_effective`'s
+//! `max(configured, max over live leases)` already computed the right
+//! answer throughout.
 //!
-//! The exclusion is narrow and precise, not a blanket ban on level
-//! variation across a renewal: [`level_for_client`] rerolls a draw to the
-//! client's EXISTING shadow level ONLY when that draw would be strictly
-//! LOWER than the existing one. A RAISING renewal (e.g. Cluster -> Backend
-//! on a second apply for the same client id) is let through — it does not
-//! trip #1408's assertion, is common real input, and exercises
-//! `lease_apply`'s renewal branch unconditionally overwriting `level` and
-//! recomputing `effective` upward. See this file's accompanying report for
-//! the exact repro of #1408 and confirmation that raising renewals surface
-//! no other latent defect under the full sweep.
+//! Every level drawn for [`Action::LeaseApply`] — fresh insert or renewal —
+//! is now an unconstrained fresh draw (see `random_level` at the
+//! `Action::LeaseApply` call site). Nothing reroutes a lowering draw to the
+//! client's existing level anymore: lowering renewals are ordinary input,
+//! not an excluded corner. Both the 256-seed default sweep and a deeper
+//! 2048-seed sweep (`SOZU_METRICS_LEASE_SIM_SEEDS=2048`) pass cleanly with
+//! lowering renewals exercised throughout, alongside raising ones, with no
+//! new failure surfaced. The shadow [`Model::apply`] needed no change: it
+//! already recomputed `expected_effective()` as a pure `max(configured,
+//! every currently-stored lease's level)` on every call, with no
+//! elevate-only assumption baked in.
 //!
 //! # What this harness does NOT cover
 //!
@@ -227,26 +229,6 @@ fn client_id_for_apply(ctx: &SimContext) -> String {
         return "x".repeat(over);
     }
     pooled_client_id(ctx)
-}
-
-/// A `client_id`'s level for `Action::LeaseApply`. A fresh id gets a fresh
-/// random draw. A RENEWAL (same id already present) also draws fresh, but a
-/// draw that would be STRICTLY LOWER than the client's existing level is
-/// rerolled to the existing one instead — narrowly excluding only
-/// LOWERING renewals, pending #1408 (see this file's module doc, "A
-/// pre-existing defect this harness deliberately does NOT explore"). A
-/// RAISING renewal (e.g. Cluster -> Backend on a second apply for the same
-/// client id) is common real input and does NOT trip #1408's
-/// `debug_assert!`, so it is let through: this exercises `lease_apply`'s
-/// renewal branch unconditionally overwriting `level` and recomputing
-/// `effective` upward, on the same client_id, same TTL cadence, same
-/// binding-authorisation path as any other renewal.
-fn level_for_client(ctx: &SimContext, model: &Model, client_id: &str) -> MetricDetailLevel {
-    let drawn = random_level(ctx);
-    match model.leases.get(client_id) {
-        Some(existing) if drawn < existing.level => existing.level,
-        _ => drawn,
-    }
 }
 
 /// A TTL drawn to hit all three interesting regions: comfortably inside the
@@ -928,7 +910,12 @@ impl Workload for MetricsLeaseSimWorkload {
             match action {
                 Action::LeaseApply => {
                     let client_id = client_id_for_apply(ctx);
-                    let level = level_for_client(ctx, &model, &client_id);
+                    // Every apply -- fresh insert or renewal, raising or
+                    // lowering -- draws an unconstrained fresh level. #1408
+                    // established that a renewal is ordinary input in
+                    // either direction; nothing here reroutes a lowering
+                    // draw to the client's existing level anymore.
+                    let level = random_level(ctx);
                     let ttl = random_ttl(ctx);
                     let binding = pooled_binding(ctx);
                     let t = now(ctx);
