@@ -58,6 +58,46 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the RFC 9113 §6.8 double-GOAWAY drain STATE moves into its own
+  `lib/src/protocol/mux/h2_drain.rs`, behind the same closed-API shape `hpack_state.rs`,
+  `h2_flow_control.rs`, `h2_stream_table.rs` and `h2_flood_detector.rs` established in the four
+  prior extraction steps.** `H2DrainState` (`draining`, `peer_last_stream_id`, `started_at`,
+  `graceful_shutdown_deadline`, `initial_goaway_pending`) was already socket-free; what moves is the
+  DECISION the six functions around it made. `H2DrainState::begin_graceful_drain` replaces the
+  state-mutating half of `ConnectionH2::graceful_goaway`, returning a `GracefulDrainDecision`
+  (`AlreadyDraining` / `DeferInitial` / `SendInitial`) that tells the caller which I/O to perform —
+  send the final GOAWAY, defer and arm `WRITABLE`, or send the initial one now.
+  `H2DrainState::take_deferred_initial_goaway` replaces the check-and-clear at the top of
+  `flush_pending_control_frames`'s GOAWAY stage; `H2DrainState::enter_final_goaway` replaces the
+  two-field mutation in `ConnectionH2::goaway`; `H2DrainState::observe_peer_goaway` replaces it in
+  `ConnectionH2::handle_goaway_frame`, which now reads back its own recorded
+  `peer_last_stream_id()` for the retry-loop comparison instead of re-reading the frame's field
+  directly; `H2DrainState::deadline_elapsed` replaces `graceful_shutdown_deadline_elapsed`'s body
+  outright, taking `now: Instant` as an explicit parameter rather than reading a clock (same shape
+  `h2_flood_detector::H2FloodDetector::check_flood` uses — LIFECYCLE.md invariant 20). Every
+  decision method that needs the header-block-reassembly guard takes it as a caller-computed `bool`
+  rather than reaching for `self.zero`/`self.state` itself — `h2_drain.rs` has neither — which is
+  deliberate: it keeps the module structurally unable to reintroduce the `zero.storage`
+  dual-role clobber LIFECYCLE.md's new invariant 24 documents (provenance: sozu-proxy/sozu#1396,
+  #1397, #1401 — three bugs in one day from the same unnamed hazard, closed stage by stage before
+  this extraction paid down the documentation debt). `ConnectionH2::peer_gone_after_final_goaway`
+  and `ConnectionH2::force_disconnect` stay on `ConnectionH2` untouched — the former reads
+  `self.drain.draining()` in one line but is otherwise all socket/readiness state this module does
+  not have reason to hold, and the latter never referenced `self.drain` at all. Every read/write
+  site across `h2.rs`, `mod.rs` and `connection.rs` now goes through an accessor or decision method;
+  three tests that need to observe or force internal drain state directly
+  (`shutting_down_refreshes_the_snapshot_so_the_drain_budget_expires` in `mod.rs`, plus two `h2.rs`
+  fixtures) use new `#[cfg(any(test, feature = "e2e-hooks"))]` backdoors
+  (`__test_started_at`, `__test_initial_goaway_pending`, `__test_set_draining`,
+  `__test_arm_draining`) mirroring the `H2StreamTable::__test_insert_wire_mapping_only` precedent.
+  This is a pure relocation — no behaviour change, proved by the compiler and the existing suite,
+  including the two regression tests for #1397/#1401
+  (`a_legitimate_continuation_survives_an_unrelated_window_update_flush`,
+  `a_legitimate_continuation_survives_a_graceful_goaway`) passing unmodified. Found but NOT fixed
+  here (reported as a live gap of the same #1396/#1397/#1401 class): `flush_pending_control_frames`'s
+  `frontend_hung_up_while_draining()` stage clears `zero.storage` without checking
+  `header_block_reassembly_in_progress()`, unlike every stage below it in the same function.
+
 - **`refactor(mux-h2)`: H2 flood/abuse detection moves into its own
   `lib/src/protocol/mux/h2_flood_detector.rs`, behind the same closed-API shape `hpack_state.rs`,
   `h2_flow_control.rs` and `h2_stream_table.rs` established in the three prior extraction steps.**

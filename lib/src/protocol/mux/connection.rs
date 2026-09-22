@@ -395,7 +395,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub(super) fn is_draining(&self) -> bool {
         match self {
             Connection::H1(_) => false,
-            Connection::H2(c) => c.drain.draining,
+            Connection::H2(c) => c.drain.draining(),
         }
     }
 

@@ -139,6 +139,7 @@ mod converter;
 pub mod debug;
 mod h1;
 mod h2;
+mod h2_drain;
 mod h2_flood_detector;
 mod h2_flow_control;
 mod h2_stream_table;
@@ -178,7 +179,6 @@ pub use crate::protocol::mux::{
     h2::ConnectionH2,
     h2::H2ByteAccounting,
     h2::H2ConnectionConfig,
-    h2::H2DrainState,
     h2_flood_detector::H2FloodConfig,
     parser::H2Error,
     router::Router,
@@ -2632,8 +2632,7 @@ mod tests {
         // already-draining branch, which never calls `graceful_goaway`.
         let armed_at = Instant::now() - Duration::from_secs(60);
         h2.state = H2State::Header;
-        h2.drain.draining = true;
-        h2.drain.started_at = Some(armed_at);
+        h2.drain.__test_arm_draining(armed_at);
         let mut frontend = Connection::H2(h2);
 
         let mut context = test_context(&pool);
