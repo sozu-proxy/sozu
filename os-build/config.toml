@@ -47,12 +47,13 @@ command_socket = "/run/sozu/sozu.sock"
 
 # size in bytes of the buffer used by the command socket protocol. If the message
 # sent to sozu is too large, or the data that sozu must return is too large, the
-# buffer will grow up to max_command_buffer_size. If the buffer is still not large
-# enough sozu will close the connection
+# buffer will grow up to max_command_buffer_size. A frame declaring a length above
+# that ceiling is rejected; what happens to the connection afterwards is the
+# subject of sozu-proxy/sozu#1428
 # defaults to 1000000
 command_buffer_size = 163_840
 
-# defaults to command_buffer_size * 2
+# defaults to 2000000
 max_command_buffer_size = 1_638_400
 
 # the number of worker processes that will handle traffic

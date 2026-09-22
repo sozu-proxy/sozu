@@ -47,11 +47,12 @@ Each frame on the wire is:
   `x86_64-unknown-freebsd`).
 - `length` is the **total** frame length **including** the prefix
   itself. A 100-byte protobuf body has `length = 108`.
-- The receiver bounds `length` by `max_buffer_size` (default 2 MiB,
+- The receiver bounds `length` by `max_buffer_size` (default 2 MB,
   configured via the `max_command_buffer_size` global TOML key) to
   defeat allocation-pressure attacks. Frames declaring a length above
-  the cap are rejected with `MessageTooLarge` and the channel is
-  closed.
+  the cap are rejected with `MessageTooLarge`; what the receiver does
+  with the connection afterwards is the subject of the open issue
+  sozu-proxy/sozu#1428.
 
 The reference Rust implementation lives at
 [`command/src/channel.rs`](../command/src/channel.rs); the helpers
@@ -212,7 +213,7 @@ the prost-generated `Request` / `Response` types.
 
 ## Hardening / observability
 
-- **Allocation pressure**: `max_command_buffer_size` (default 2 MiB)
+- **Allocation pressure**: `max_command_buffer_size` (default 2 MB)
   bounds the per-channel buffer.
 - **UID allowlist**: `command_allowed_uids: Vec<u32>` rejects
   non-allowlisted UIDs at the socket boundary.
