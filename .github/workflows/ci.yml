@@ -111,12 +111,20 @@ jobs:
             experimental: true
             runner: ubuntu-latest
     steps:
+      # Skipped on the self-hosted runner: ci/runners/Dockerfile already bakes in
+      # protobuf-compiler/cmake, and its pod's securityContext (drop: ["ALL"] capabilities,
+      # runAsNonRoot) correctly blocks `sudo apt-get install` — this is hardening working as
+      # intended, not a bug, so the fix is skipping the now-redundant step rather than loosening
+      # the pod's capabilities.
       - name: Install system dependencies
+        if: matrix.runner == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
 
       # h2spec is needed by `tests::test_h2spec_conformance` (e2e). The
-      # release tarball is small; install once per job.
+      # release tarball is small; install once per job. Skipped on the self-hosted runner for the
+      # same reason as above — ci/runners/Dockerfile bakes in h2spec 2.6.0 already.
       - name: Install h2spec
+        if: matrix.runner == 'ubuntu-latest'
         run: |
           H2SPEC_VERSION=2.6.0
           curl -fsSL "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" \
