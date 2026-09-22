@@ -83,7 +83,7 @@ not stylistic:
   log line — so cite a line or a range: `lib/src/tcp.rs:NNN-MMM, NNN-MMM`. Keep the path
   repo-root-relative; a bare `manager.rs` is ambiguous in this tree.
 * **The prose QUOTES code in a fenced block** — so put the citation in the fence's info string and
-  let the checker compare the quote to its source, character for character. See
+  let the checker compare the quote to its source, modulo leading and trailing whitespace. See
   [Pinning a quoted code block](#pinning-a-quoted-code-block).
 
 A line number carries no anchor. It rots the moment anyone edits the file it points into, and the
@@ -203,9 +203,28 @@ The checker reads those lines and compares them to the block, line by line. Comp
 block is not a mismatch — every other character is. A citation may carry several spans
 (`lib/src/protocol/mux/hpack_state.rs:121-131, 139`), and the block must then be their concatenation
 in order. There is no elision
-syntax, on purpose. And because the fence line is part of the document body, the annotation is an
-ordinary citation: a pinned block is range-checked by the resolver and compared against the base
-revision by the drift rule as well.
+syntax, on purpose.
+
+Because the fence line is part of the document body, the annotation is an ordinary citation — with
+one wrinkle worth knowing. The resolver range-checks a pinned block from the moment it lands, but
+the drift rule only compares it **from the next commit onward**: it exempts a citation that the base
+revision of its own document did not carry, and on the commit that introduces a pin, every pin is
+absent. Measured when the seventeen pins in `doc/h2_mux_internals.md` landed — the cited-line total
+went 219 to 238 while the compared count stayed at exactly 325, so every one of them was exempt that
+day. Renumbering a pin's spans later re-exempts it the same way. Rule 1 still range-checks the new
+span and rule 4 still holds the quote to it, so the hole is narrow, but it is the same re-anchoring
+the drift rule accepts everywhere else and it is not closed here.
+
+**A pin guards the quote, not the claim beside it.** This is the limit worth internalising before
+any of the others. Rule 4 proves that the lines between the fences still match the lines they name;
+it has nothing to say about the sentence above them, and a green run says nothing about whether the
+prose explains the code correctly. The failure is not hypothetical: the review of the changeset that
+introduced this rule found five wrong explanations sitting immediately beside blocks the checker was
+certifying byte-exact and exiting 0 over — a fabricated borrow-checker rationale, a miscounted set
+of fields, an `any`/`each` inversion, a wrong call-site count, and a helper attributed to the wrong
+file. Pinning a block makes the page *look* more trustworthy while leaving that class untouched, so
+a reviewer must read the prose against the source exactly as before. The pin buys one thing only,
+and it is worth having: the quote cannot silently stop being the code.
 
 **The rule is opt-in, and that is the design, not an oversight.** Two alternatives were measured on
 this tree first:

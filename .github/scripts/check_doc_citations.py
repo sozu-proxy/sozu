@@ -194,8 +194,13 @@
 #   be quoted verbatim simply carries no annotation — and it gives the author
 #   the thing no rule here offered before: a way to say "this is a quote, hold
 #   me to it". Because the fence line is part of the document body, rules 1
-#   and 2 see the annotation too, so a pinned block is range-checked and
-#   drift-checked as well.
+#   and 2 see the annotation too: rule 1 range-checks a pinned block from the
+#   moment it lands, and rule 2 drift-checks it FROM THE NEXT COMMIT ONWARD —
+#   not on the commit that introduces it. Rule 2 exempts a citation absent
+#   from the base revision of its own document, and on that commit every pin
+#   is absent. Measured when the 17 pins in `doc/h2_mux_internals.md` landed:
+#   the cited-line total went 219 -> 238 while `compared` stayed at exactly
+#   325, so every one of them was exempt that day.
 #
 #   Be honest about what opt-in costs: a quote nobody pins is a quote nobody
 #   checks, and this rule would not have caught #1424's four blocks on its own.
@@ -766,36 +771,81 @@ def check_test_citations(root, renamed=None, not_a_test=None, show=False, out=sy
 #
 # It is also, deliberately, an ordinary citation: rules 1 and 2 already see it
 # because the fence line is part of the document body, so a pinned block gets
-# range-checking and drift-checking for free and this rule only adds the
-# literal comparison on top.
+# range-checking immediately and drift-checking from the NEXT commit onward —
+# rule 2 exempts a citation the base revision of the document did not carry —
+# and this rule only adds the literal comparison on top.
+#
+# Both patterns match the INFO STRING — the text after the opening fence's
+# backticks — never the whole line. The fence shape is `FENCE`'s business
+# alone, so there is one place that knows how a fence is spelled.
 PINNED_FENCE = re.compile(
-    rf"^```[A-Za-z0-9_+#-]*[ \t]+(?P<path>{PATH}):(?P<spans>{SPAN}(?:[,/][ \t]*{SPAN})*)[ \t]*$"
+    rf"^[A-Za-z0-9_+#-]*[ \t]+(?P<path>{PATH}):(?P<spans>{SPAN}(?:[,/][ \t]*{SPAN})*)[ \t]*$"
 )
 # The same shape without a citation — a plain ```rust — which this rule does
 # NOT look at. Named so the count of unpinned Rust blocks can be reported
 # beside the pinned ones: the rule's honest coverage number is that ratio.
-RUST_FENCE = re.compile(r"^```(?:rust|rs)[ \t]*$")
+RUST_FENCE = re.compile(r"^(?:rust|rs)[ \t]*$")
+
+# A fence LINE: optional indentation, a run of three or more backticks, then
+# the info string. The run's LENGTH is load-bearing and the `startswith("```")`
+# scan that stood here was blind to it.
+#
+# CommonMark closes a fenced block only on a fence AT LEAST AS LONG as the one
+# that opened it, carrying nothing after it but whitespace. That is the only
+# way a document can SHOW an annotated fence without pinning it, and
+# `doc/README.md` documents this very rule by doing exactly that. A scanner
+# that closed on any ``` mistakes such an inner example for its enclosing
+# block's closing fence and then runs one block OUT OF PHASE for the rest of
+# the document.
+#
+# Measured on this repository's own fixtures before the fix: a document
+# holding an unmatched inner opening fence took the pinned count from 3 to 2,
+# left a deliberately stale pin unreported, and exited 0. A count that SHRINKS
+# reads exactly like a pass, which is why `fenced_blocks` is worth getting
+# right rather than approximating.
+#
+# Two limits, both deliberate. Tilde fences are not recognised: this tree has
+# none, and PINNED_FENCE names backticks anyway. And an opening fence is
+# accepted at any indentation rather than CommonMark's three columns — a fence
+# this scanner cannot see is a fence it cannot PAIR, and an unpaired one is the
+# phase error above, so erring toward seeing too many is the safe direction.
+FENCE = re.compile(r"^[ \t]*(?P<ticks>`{3,})(?P<info>.*)$")
 
 
 def fenced_blocks(body):
     """Every fenced block in a markdown body as `(info, lines, first_line)`.
 
+    `info` is the info string — what follows the opening fence's backticks —
+    with surrounding whitespace kept, since PINNED_FENCE anchors on it.
+
     `first_line` is the 1-based line of the OPENING fence, which is the line
     an annotation sits on and therefore the line a failure must name.
+
+    Closing follows CommonMark: at least as many backticks as the opener, and
+    nothing but whitespace after them. See `FENCE` for what that buys.
     """
     lines = body.splitlines()
     blocks = []
     index = 0
     while index < len(lines):
-        if lines[index].startswith("```"):
-            open_at = index
+        opening = FENCE.match(lines[index])
+        if opening is None:
             index += 1
-            while index < len(lines) and not lines[index].startswith("```"):
-                index += 1
-            blocks.append((lines[open_at], lines[open_at + 1 : index], open_at + 1))
+            continue
+        open_at = index
+        ticks = len(opening.group("ticks"))
+        index += 1
+        while index < len(lines):
+            closing = FENCE.match(lines[index])
+            if (
+                closing is not None
+                and len(closing.group("ticks")) >= ticks
+                and not closing.group("info").strip()
+            ):
+                break
             index += 1
-        else:
-            index += 1
+        blocks.append((opening.group("info"), lines[open_at + 1 : index], open_at + 1))
+        index += 1
     return blocks
 
 
@@ -957,7 +1007,10 @@ FIXTURE_EXPECTED = [
 # reason and with more force: rule 4's annotation lives in the document body,
 # so rule 1 resolves it exactly as it resolves a citation written in prose —
 # which is what lets a pinned block be range-checked without a second parser.
-FIXTURE_TOTAL = 21
+# `doc/pinned_nested.md` contributes two: the annotation it DISPLAYS inside a
+# four-tick example is still a citation to rule 1, which is correct — the text
+# names a real span either way — and the real pin after it is the second.
+FIXTURE_TOTAL = 23
 
 # Rule 2's half of the fixtures is a PAIR of revisions, so every file that
 # drifts carries its base revision beside it as `<name>.base`. That suffix is
@@ -986,9 +1039,11 @@ FIXTURE_DRIFT_EXPECTED = [
 # asserted for the same reason FIXTURE_TOTAL is: a rule that quietly stopped
 # comparing would otherwise report a clean run. Losing the document-directory
 # binding, the range-end comparison or a whole fixture document each move it.
-# Two of these are `doc/pinned.md`'s annotation, whose range has two ends like
-# any other: a pinned block is drift-checked as well as compared literally.
-FIXTURE_DRIFT_COMPARED = 19
+# Six of these are pin annotations, whose ranges have two ends like any other:
+# `doc/pinned.md`'s one and `doc/pinned_nested.md`'s two. They are compared
+# here because the fixture base revision already carries them — on the commit
+# that first ADDS a pin, rule 2 exempts it (see "STALE CODE QUOTED IN PROSE").
+FIXTURE_DRIFT_COMPARED = 23
 
 # Rule 3's half of the fixtures. `tests_bad.rs` and the fixture `CHANGELOG.md`
 # are the broken documents; `tests_good.rs` is the clean one and also carries
@@ -1040,7 +1095,14 @@ FIXTURE_PINNED_EXPECTED = [
 # would otherwise report a clean run over nothing; `unpinned` is the rule's own
 # coverage number, so a fixture that silently stopped carrying an UNannotated
 # Rust block would stop proving that such a block is left alone.
-FIXTURE_PINNED = 2
+#
+# `doc/pinned_nested.md` is the third pin, and it is here to hold the FENCE
+# pairing specifically: it shows an annotated fence inside a four-tick block
+# without pinning it, then carries a real pin after it. A scanner that closed
+# the outer block on that inner opener runs out of phase and never sees the
+# real pin — measured at 2 instead of 3, with a stale pin unreported and exit
+# 0. Only an exact total turns that into a failure, because the count SHRINKS.
+FIXTURE_PINNED = 3
 FIXTURE_UNPINNED = 1
 
 # Every fixture document that is MEANT to fail, removed for the clean-tree run.

@@ -55,6 +55,8 @@
   doctests cannot substitute: a doctest compiles as a separate crate against the public API, and
   every snippet at issue reads a private field of a private type inside `impl ConnectionH2`.
   Convention and the measurements behind it: `doc/README.md#pinning-a-quoted-code-block`.
+  Note the one wrinkle: the drift rule compares a pin only from the *next* commit onward, because
+  it exempts a citation the base revision of the document did not carry.
 
 - **`test(sim)`: deterministic simulation of the metrics cardinality-lease core.**
   `sim/tests/metrics_lease_sim.rs` drives `sozu_lib::metrics::Aggregator`'s `lease_apply` /
