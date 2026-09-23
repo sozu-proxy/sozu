@@ -77,12 +77,12 @@
 //! enumerated by reading (not just grepping for `.iter()/.keys()/.values()/
 //! .drain()`, which misses the `for (&k, &v) in &map` shape):
 //!
-//! - `write_streams`'s `priorities_buf.extend(self.streams.keys().copied())`
-//!   feeds the RFC 9218 priority scheduler, but the very next statement
-//!   sorts by `(urgency, *id)` — a total order, because `*id` is a unique
-//!   tiebreaker. The `HashMap` order the `extend` produced is discarded by
-//!   the sort; wire HEADERS/DATA order is the sorted order, not the map
-//!   order.
+//! - `write_streams` hands `self.streams.keys().copied()` to
+//!   `H2Scheduler::begin_pass`, which `extend`s its order buffer with them
+//!   and then immediately sorts by `(urgency, *id)` — a total order, because
+//!   `*id` is a unique tiebreaker. The `HashMap` order the `extend` produced
+//!   is discarded by the sort; wire HEADERS/DATA order is the sorted order,
+//!   not the map order.
 //! - `compute_stream_byte_totals`'s `for &gid in self.streams.values()` only
 //!   accumulates two `usize` sums — addition is commutative, so map order
 //!   cannot change the result.
@@ -96,7 +96,7 @@
 //!   `pending_links` / notified via `endpoint.end_stream` first) — not the
 //!   literal bytes emitted for a fixed frame set. Every actual DATA/HEADERS/
 //!   RST_STREAM frame byte these streams eventually produce is still
-//!   ordered later by `write_streams`'s deterministic `priorities_buf` sort.
+//!   ordered later by `H2Scheduler::begin_pass`'s deterministic sort.
 //!   Reconnection/dial order to a *new* backend is already subject to real
 //!   network-timing nondeterminism, unlike a single synchronous
 //!   `drain_*_into` pass — the class of leak issue #1338 and step 2's

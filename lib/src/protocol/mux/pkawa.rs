@@ -21,7 +21,7 @@ use crate::{
         http::parser::compare_no_case,
         mux::{
             GenericHttpStream, StreamId,
-            h2::Prioriser,
+            h2_scheduler::Prioriser,
             parser::{H2Error, PriorityPart},
         },
     },

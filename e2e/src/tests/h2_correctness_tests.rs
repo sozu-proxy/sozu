@@ -1773,7 +1773,7 @@ fn data_frame_stream_order(frames: &[(u8, u8, u32, Vec<u8>)]) -> Vec<u32> {
 /// starves sozu of per-stream send window during setup so all three
 /// backend responses sit in sozu's kawa buffers, then releases the three
 /// stream windows back-to-back. That forces the scheduler to iterate the
-/// full `priorities_buf = [1, 3, 5]` inside a single `writable()` pass,
+/// full pass order `[1, 3, 5]` inside a single `writable()` pass,
 /// which is exactly the regime the round-robin logic governs.
 fn try_h2_rfc9218_incremental_round_robin() -> State {
     // Three backends so each stream is served by a fresh TCP connection to
@@ -1809,7 +1809,7 @@ fn try_h2_rfc9218_incremental_round_robin() -> State {
     // Pack all four WINDOW_UPDATEs into a single TCP write so sozu sees
     // every stream's window lifted in one `readable()` pass and only runs
     // `writable()` afterwards — at which point the scheduler iterates a
-    // fully-populated priorities_buf of length 3. If we flush between
+    // fully-populated pass order of length 3. If we flush between
     // frames, sozu's event loop may interleave `readable()` and
     // `writable()` and emit DATA for stream 1 alone before the other
     // windows are lifted, producing a non-RR wire trace for timing
@@ -3051,8 +3051,8 @@ fn test_h2_coalesced_chrome_firefox_streams_drain() {
 //   yield-after-one-DATA branch and stranding the rest of the body
 //   because `finalize_write` strips `Ready::WRITABLE` on a voluntary
 //   yield with no `expect_write`. Fixed by `3f9f5e38`, which scopes the
-//   count via the per-bucket `ready_incremental_by_urgency` HashMap in
-//   `h2.rs::write_streams` and looks it up per-stream by urgency.
+//   count per urgency bucket and looks it up per-stream by urgency —
+//   today `ReadyIncrementalCensus` in `mux/h2_scheduler.rs`.
 // * **Bug 1 (H1→H2 wake-gap)**: `mux/h1.rs:324` wraps the Linked-peer
 //   `signal_pending_write()` call inside `if kawa.is_main_phase()`.
 //   kawa 0.6.8 `storage/repr.rs` declares `Terminated` as a main-phase
@@ -3083,9 +3083,10 @@ fn test_h2_coalesced_chrome_firefox_streams_drain() {
 /// `Ready::WRITABLE` on the voluntary yield, edge-triggered epoll did
 /// not re-fire, and the remaining body bytes stranded in `kawa.out`
 /// until `front_timeout` (60 s default). `3f9f5e38` replaced the global
-/// read with `ready_incremental_by_urgency`, so a solo-in-bucket
-/// incremental stream now sees `incremental_peer_count = 1` (itself)
-/// and does not yield.
+/// read with a per-urgency-bucket count — today
+/// `ReadyIncrementalCensus::incremental_peer_count` in
+/// `mux/h2_scheduler.rs` — so a solo-in-bucket incremental stream now
+/// sees `incremental_peer_count = 1` (itself) and does not yield.
 ///
 /// Lock-in regression guard: MUST PASS on HEAD post-`3f9f5e38`. A
 /// regression that reintroduces the global-count path would fail this

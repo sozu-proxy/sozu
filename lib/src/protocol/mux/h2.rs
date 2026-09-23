@@ -37,7 +37,7 @@ use crate::{
         forcefully_terminate_answer,
         h2_drain::{self, GracefulDrainDecision},
         h2_flood_detector::{self, H2FloodConfig, H2FloodViolation},
-        h2_flow_control, h2_header_reassembly, h2_stream_table, hpack_state,
+        h2_flow_control, h2_header_reassembly, h2_scheduler, h2_stream_table, hpack_state,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
         pkawa, remove_backend_stream, serializer, set_default_answer,
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
@@ -804,287 +804,6 @@ impl Default for H2Settings {
     }
 }
 
-/// RFC 9218 Extensible Priorities for HTTP stream scheduling.
-///
-/// Stores per-stream urgency (0-7, lower = more important) and incremental
-/// flag. Used by `writable()` to sort streams: lower urgency first, then
-/// stream ID for stability among same-urgency non-incremental streams.
-///
-/// Within a same-urgency bucket the scheduler (see
-/// [`ConnectionH2::write_streams`]) drains non-incremental streams
-/// sequentially, then applies RFC 9218 §4 round-robin to the incremental
-/// streams starting from [`Self::incremental_cursor`], so multiple concurrent
-/// downloads at the same urgency interleave their DATA frames fairly.
-///
-/// Streams without an explicit `priority` header get the RFC 9218 defaults:
-/// urgency 3, incremental false.
-#[derive(Default)]
-pub struct Prioriser {
-    /// Per-stream priority: stream_id -> (urgency 0-7, incremental flag)
-    priorities: HashMap<StreamId, (u8, bool)>,
-    /// RFC 9218 §4 round-robin cursor: stream ID that fired first in the
-    /// last write pass over the incremental tail of the lowest-urgency
-    /// bucket that contained at least one incremental stream. The next pass
-    /// starts from the stream immediately after this ID (wrapping around),
-    /// so a single slow-draining stream cannot hog the connection.
-    ///
-    /// `0` is the "no cursor yet" sentinel and means "start from the
-    /// smallest ID in the bucket" — H2 stream IDs are always > 0.
-    incremental_cursor: StreamId,
-}
-
-/// RFC 9218 §4 default urgency value.
-const DEFAULT_URGENCY: u8 = 3;
-
-/// Maximum entries in the priority map to prevent flooding via PRIORITY frames.
-const MAX_PRIORITIES: usize = 4096;
-
-/// Small look-ahead window (in stream IDs) for PRIORITY frames that arrive
-/// slightly before the peer opens the corresponding stream. RFC 9218 allows
-/// PRIORITY to be sent for an idle stream that the peer intends to open
-/// soon. Past this budget we assume the ID will never be used and drop the
-/// entry, preventing flooding with far-future stream IDs.
-const PRIORITY_IDLE_LOOKAHEAD: u32 = 64;
-
-impl Prioriser {
-    /// Record or update the priority for a stream that we know exists or are
-    /// currently processing (used from pkawa's header-handling path where the
-    /// owning stream's HEADERS frame is being decoded).
-    ///
-    /// Returns `true` if the priority is invalid (self-dependency for RFC 7540),
-    /// signalling the caller should reset the stream with a protocol error.
-    pub fn push_priority(&mut self, stream_id: StreamId, priority: parser::PriorityPart) -> bool {
-        trace!(
-            "{} PRIORITY REQUEST FOR {}: {:?}",
-            log_module_context!(),
-            stream_id,
-            priority
-        );
-        // Pre-condition: the priority map never grows past MAX_PRIORITIES.
-        // The cap is the only thing standing between a PRIORITY flood and
-        // unbounded memory; assert it holds on entry (each insert path below
-        // either updates an existing key or is gated by this check).
-        debug_assert!(
-            self.priorities.len() <= MAX_PRIORITIES,
-            "priority map must never exceed MAX_PRIORITIES entries"
-        );
-        // Cap the priority map to prevent flooding via PRIORITY frames
-        if !self.priorities.contains_key(&stream_id) && self.priorities.len() >= MAX_PRIORITIES {
-            return false;
-        }
-        match priority {
-            parser::PriorityPart::Rfc7540 {
-                stream_dependency,
-                weight: _,
-            } => {
-                // RFC 9113 §5.3.1: a stream cannot depend on itself; signal
-                // the caller to RST_STREAM with PROTOCOL_ERROR. Otherwise the
-                // RFC 7540 priority tree is deprecated and silently ignored.
-                stream_dependency.stream_id == stream_id
-            }
-            parser::PriorityPart::Rfc9218 {
-                urgency,
-                incremental,
-            } => {
-                // RFC 9218 §7.1: a malformed or out-of-range priority field
-                // MUST be "treated as absent", NOT as a stream error. Clamping
-                // an urgency > 7 to 7 is the policy-correct interpretation:
-                // the field is still present (so defaulting would lose
-                // information) but its value is normalised to the RFC's
-                // allowed range [0..=7]. Intentionally not PROTOCOL_ERROR.
-                self.priorities
-                    .insert(stream_id, (urgency.min(7), incremental));
-                // Post-conditions: the entry now exists with a clamped urgency
-                // in [0, 7] (the writable scheduler buckets by urgency and would
-                // mis-order on a value above 7), and the map stays within its
-                // memory cap.
-                debug_assert!(
-                    self.priorities
-                        .get(&stream_id)
-                        .is_some_and(|(u, _)| *u <= 7),
-                    "stored RFC 9218 urgency must be clamped to [0, 7]"
-                );
-                debug_assert!(
-                    self.priorities.len() <= MAX_PRIORITIES,
-                    "priority map must stay within MAX_PRIORITIES after insert"
-                );
-                false
-            }
-        }
-    }
-
-    /// Record or update the priority for a stream ID that arrived via a
-    /// standalone PRIORITY frame.
-    ///
-    /// Pass 3 Medium #4: without this guard, a peer could send PRIORITY for
-    /// arbitrary stream IDs (e.g. 2^31 ever-increasing IDs) and pin up to
-    /// `MAX_PRIORITIES` entries of memory. Accept only:
-    /// - an ID that corresponds to a currently-open stream (`open_streams`);
-    /// - an idle ID slightly ahead of `last_stream_id` (within
-    ///   [`PRIORITY_IDLE_LOOKAHEAD`]), matching RFC 9218's "set priority for
-    ///   a stream about to be opened" pattern.
-    ///
-    /// IDs in the past that we do not currently track (already closed) and
-    /// IDs too far in the future are silently dropped. The `MAX_PRIORITIES`
-    /// ceiling is preserved as a defensive backstop if both filters are ever
-    /// circumvented.
-    ///
-    /// Returns the same value semantics as [`Self::push_priority`].
-    pub fn push_priority_guarded(
-        &mut self,
-        stream_id: StreamId,
-        priority: parser::PriorityPart,
-        last_stream_id: StreamId,
-        open_streams: &HashMap<StreamId, GlobalStreamId>,
-    ) -> bool {
-        if !self.is_acceptable(stream_id, last_stream_id, open_streams) {
-            trace!(
-                "{} PRIORITY dropped for unknown/far stream {} (last_stream_id={})",
-                log_module_context!(),
-                stream_id,
-                last_stream_id
-            );
-            return false;
-        }
-        self.push_priority(stream_id, priority)
-    }
-
-    fn is_acceptable(
-        &self,
-        stream_id: StreamId,
-        last_stream_id: StreamId,
-        open_streams: &HashMap<StreamId, GlobalStreamId>,
-    ) -> bool {
-        if open_streams.contains_key(&stream_id) {
-            return true;
-        }
-        // Idle stream ahead of the current counter: accept a small look-ahead.
-        // Past IDs that are NOT in `open_streams` are closed — drop them.
-        let upper = last_stream_id.saturating_add(PRIORITY_IDLE_LOOKAHEAD);
-        stream_id > last_stream_id && stream_id <= upper
-    }
-
-    /// Remove a stream's priority entry (called when the stream is recycled).
-    pub fn remove(&mut self, stream_id: &StreamId) {
-        let had = self.priorities.contains_key(stream_id);
-        let before = self.priorities.len();
-        self.priorities.remove(stream_id);
-        // Post-conditions: the entry is truly gone, and the map shrinks by
-        // exactly one iff it was present. A leak here re-introduces the
-        // PRIORITY-flood memory exposure the cap defends against.
-        debug_assert!(
-            !self.priorities.contains_key(stream_id),
-            "remove must evict the priority entry"
-        );
-        debug_assert_eq!(
-            self.priorities.len(),
-            before - had as usize,
-            "priority map length drops by exactly one iff the id was present"
-        );
-    }
-
-    /// Look up the priority for a stream, returning RFC 9218 defaults if absent.
-    #[inline]
-    pub fn get(&self, stream_id: &StreamId) -> (u8, bool) {
-        self.priorities
-            .get(stream_id)
-            .copied()
-            .unwrap_or((DEFAULT_URGENCY, false))
-    }
-
-    /// Reorder a pre-sorted slice of writable stream IDs so that inside each
-    /// urgency bucket, incremental streams appear after non-incremental ones,
-    /// and the incremental tail is rotated by [`Self::incremental_cursor`]
-    /// (RFC 9218 §4).
-    ///
-    /// The input `buf` must already be sorted by `(urgency, stream_id)`:
-    /// this routine only partitions and rotates inside same-urgency
-    /// contiguous runs, it does not re-sort.
-    ///
-    /// Returns the total number of incremental streams seen, so callers that
-    /// need to update the cursor at the end of the write pass can early-exit
-    /// when the count is zero.
-    pub fn apply_incremental_rotation(&self, buf: &mut [StreamId]) -> usize {
-        // Pre-condition: callers must hand a slice already sorted by urgency so
-        // same-urgency runs are contiguous (this routine only partitions/rotates
-        // within a run, it does not re-sort across urgencies). A non-monotonic
-        // urgency sequence would split one logical bucket into several and
-        // mis-schedule the round-robin. `windows(2)` over a slice of size N is
-        // dead code in release.
-        #[cfg(debug_assertions)]
-        debug_assert!(
-            buf.windows(2)
-                .all(|w| self.get(&w[0]).0 <= self.get(&w[1]).0),
-            "apply_incremental_rotation requires input pre-sorted by urgency"
-        );
-        let len_before = buf.len();
-        #[cfg(debug_assertions)]
-        let expected_incremental = buf.iter().filter(|id| self.get(id).1).count();
-        let mut total_incremental = 0usize;
-        let mut i = 0;
-        while i < buf.len() {
-            let (urgency_i, _) = self.get(&buf[i]);
-            let mut j = i + 1;
-            while j < buf.len() {
-                let (urgency_j, _) = self.get(&buf[j]);
-                if urgency_j != urgency_i {
-                    break;
-                }
-                j += 1;
-            }
-            // `buf[i..j]` is a contiguous run of same-urgency stream IDs.
-            let bucket = &mut buf[i..j];
-            if bucket.len() > 1 {
-                // Stable partition: non-incremental first, incremental last,
-                // each subrange staying in ascending stream-id order.
-                bucket.sort_by_key(|id| self.get(id).1);
-                let split = bucket.partition_point(|id| !self.get(id).1);
-                let incremental_tail = &mut bucket[split..];
-                if incremental_tail.len() > 1 {
-                    // Rotate so the pass starts right after the stream that
-                    // fired first previously. `partition_point` returns the
-                    // first index whose stream ID > cursor (so cursor itself
-                    // is still drained, but after the streams ahead of it).
-                    let start =
-                        incremental_tail.partition_point(|id| *id <= self.incremental_cursor);
-                    incremental_tail.rotate_left(start);
-                }
-                total_incremental += incremental_tail.len();
-            } else if bucket.len() == 1 && self.get(&bucket[0]).1 {
-                total_incremental += 1;
-            }
-            i = j;
-        }
-        // Post-conditions: the routine is a permutation — it reorders in place
-        // and never drops a stream id (len unchanged), and the returned count is
-        // exactly the number of incremental streams present (the cursor-advance
-        // callers rely on this being the true incremental-tail size).
-        debug_assert_eq!(
-            buf.len(),
-            len_before,
-            "rotation must preserve the slice (no streams dropped or added)"
-        );
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            total_incremental, expected_incremental,
-            "reported incremental count must equal the incremental streams in buf"
-        );
-        total_incremental
-    }
-
-    /// Advance the RFC 9218 §4 round-robin cursor after a write pass.
-    ///
-    /// `first_incremental_fired` is the stream ID that headed the incremental
-    /// tail we just drained; the next pass will start at the next stream
-    /// after that ID. Callers may pass `None` when no incremental streams
-    /// were eligible, leaving the cursor where it was.
-    pub fn advance_incremental_cursor(&mut self, first_incremental_fired: Option<StreamId>) {
-        if let Some(id) = first_incremental_fired {
-            self.incremental_cursor = id;
-        }
-    }
-}
-
 /// Byte accounting for connection overhead attribution.
 pub struct H2ByteAccounting {
     /// Bytes read on the zero stream not yet attributed to a stream.
@@ -1102,15 +821,21 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// macros.
     pub session_ulid: Ulid,
     /// HPACK decoder/encoder pair and their reusable scratch buffers
-    /// (`converter_buf`, `lowercase_buf`, `cookie_buf`, `priorities_buf`),
-    /// encapsulated so nothing outside `hpack_state.rs` can reach the raw
-    /// fields — see [`hpack_state::HpackState`].
+    /// (`converter_buf`, `lowercase_buf`, `cookie_buf`), encapsulated so
+    /// nothing outside `hpack_state.rs` can reach the raw fields — see
+    /// [`hpack_state::HpackState`]. The pass-ordering buffer that used to sit
+    /// beside them belongs to [`h2_scheduler::H2Scheduler`].
     hpack: hpack_state::HpackState,
     pub last_stream_id: StreamId,
     pub local_settings: H2Settings,
     pub peer_settings: H2Settings,
     pub position: Position,
-    pub prioriser: Prioriser,
+    /// RFC 9218 priority state and the per-write-pass scheduling decision
+    /// (stream order, the same-urgency ready-incremental census, the
+    /// round-robin cursor), encapsulated so nothing outside
+    /// `h2_scheduler.rs` can reach the raw fields — see
+    /// [`h2_scheduler::H2Scheduler`].
+    scheduler: h2_scheduler::H2Scheduler,
     pub readiness: Readiness,
     pub socket: Front,
     pub state: H2State,
@@ -1201,9 +926,10 @@ pub struct ConnectionH2<Front: SocketHandler> {
     max_pending_window_updates: usize,
     /// Ready incremental streams observed on the last completed write pass,
     /// summed across urgency buckets (RFC 9218 §4). Sampled at the END of
-    /// `write_streams`, where `ready_incremental_by_urgency` is final: the
-    /// entry call to [`Self::gauge_connection_state`] runs *before* that map
-    /// is built, so sampling there would publish the previous pass's value.
+    /// `write_streams` from [`h2_scheduler::ReadyIncrementalCensus::ready_total`],
+    /// where the pass census is final: the entry call to
+    /// [`Self::gauge_connection_state`] runs *before* that census exists, so
+    /// sampling there would publish the previous pass's value.
     ///
     /// Carried as connection state rather than emitted inline because the
     /// aggregate it feeds must be a signed delta, not an absolute set — see
@@ -1517,7 +1243,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             local_settings,
             peer_settings: H2Settings::default(),
             position,
-            prioriser: Prioriser::default(),
+            scheduler: h2_scheduler::H2Scheduler::default(),
             readiness: crate::Readiness {
                 interest: readiness_interest,
                 event: Ready::EMPTY,
@@ -2479,11 +2205,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             b"http"
         };
         let mut completed_streams = Vec::new();
-        // Taken out (by value) rather than iterated in place: the per-stream
-        // loop below re-borrows the encoder out of `self.hpack` for every
-        // eligible stream, so no `self.hpack` borrow may stay live across the
-        // loop. Restored alongside the pass's scratch at the end.
-        let mut priorities_buf = self.hpack.take_priorities_buf();
         // The converter is built for ONE `kawa.prepare` call at a time (see
         // [`converter::H2ConverterPass`]), so its encoder borrow never spans
         // the per-stream loop and every `&self` / `&mut self` method stays
@@ -2508,65 +2229,43 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.hpack.take_cookie_buf(),
             self.pending_table_size_update,
         );
-        priorities_buf.clear();
-        priorities_buf.extend(self.stream_table.streams().keys().copied());
-        // RFC 9218 §4 primary sort: ascending urgency, then stream ID for
-        // stability. The incremental flag is handled by
-        // `apply_incremental_rotation` below so it does not perturb the
-        // non-incremental fast path.
-        priorities_buf.sort_by_cached_key(|id| {
-            let (urgency, _) = self.prioriser.get(id);
-            (urgency, *id)
-        });
-        // RFC 9218 §4: inside each urgency bucket, move incremental streams
-        // to the tail and rotate them by the per-connection round-robin
-        // cursor so no single slow-draining stream can starve its
-        // same-urgency incremental peers.
-        let incremental_count = self
-            .prioriser
-            .apply_incremental_rotation(&mut priorities_buf);
-
-        // RFC 9218 §4 refinement (Tier 3a): the connection-global
-        // `incremental_count` is too coarse for `converter.incremental_peer_count`.
-        // A solo `u=0, i` stream with an unrelated `u=7, i` peer in a
-        // different urgency bucket would still see `incremental_peer_count > 1`
-        // and voluntarily yield — stranding bytes the invariant-15/16 guards
-        // were meant to prevent. Scope the count to same-urgency streams that
-        // are actually ready to emit this pass (eligibility mirrors the check
-        // in the write loop below).
-        let mut ready_incremental_by_urgency: HashMap<u8, usize> = HashMap::new();
-        for &sid in priorities_buf.iter() {
-            let (urgency, is_incremental) = self.prioriser.get(&sid);
-            if !is_incremental {
-                continue;
-            }
-            let Some(&gid) = self.stream_table.streams().get(&sid) else {
-                continue;
-            };
-            let wbuffer = match self.position {
-                Position::Server => &context.streams[gid].back,
-                Position::Client(..) => &context.streams[gid].front,
-            };
-            if wbuffer.is_main_phase()
-                || (wbuffer.is_terminated() && !wbuffer.is_completed())
-                || (wbuffer.is_error() && !self.stream_table.rst_sent_contains(sid))
-            {
-                *ready_incremental_by_urgency.entry(urgency).or_insert(0) += 1;
-            }
-        }
+        // The whole RFC 9218 ordering decision — ascending urgency, stream
+        // id for stability, incremental streams to the tail of their bucket,
+        // that tail rotated by the round-robin cursor — plus the pass's
+        // same-urgency ready-peer census, belongs to
+        // [`h2_scheduler::H2Scheduler`]. It runs over state that module
+        // owns; the ONE fact it cannot own is whether a stream has anything
+        // to send, which it takes as this closure. The closure is called for
+        // incremental streams only, so it costs exactly what the inline
+        // census cost. `order` is returned by value for the same reason the
+        // scratch buffers are moved into the converter pass: the per-stream
+        // loop below re-borrows the encoder out of `self.hpack` for every
+        // eligible stream, so no borrow of a connection field may span it.
+        let is_server = matches!(self.position, Position::Server);
+        let (order, mut census) =
+            self.scheduler
+                .begin_pass(self.stream_table.streams().keys().copied(), |stream_id| {
+                    let Some(&gid) = self.stream_table.streams().get(&stream_id) else {
+                        return false;
+                    };
+                    let wbuffer = if is_server {
+                        &context.streams[gid].back
+                    } else {
+                        &context.streams[gid].front
+                    };
+                    wbuffer.is_main_phase()
+                        || (wbuffer.is_terminated() && !wbuffer.is_completed())
+                        || (wbuffer.is_error() && !self.stream_table.rst_sent_contains(stream_id))
+                });
 
         trace!(
             "{} PRIORITIES: {:?} (incremental_count={}, per_bucket={:?})",
             log_context!(self),
-            priorities_buf,
-            incremental_count,
-            ready_incremental_by_urgency
+            order,
+            census.incremental_count(),
+            census.ready_buckets()
         );
         let mut socket_write = false;
-        // RFC 9218 §4 round-robin: remember the first incremental stream we
-        // served this pass so we can advance `Prioriser::incremental_cursor`
-        // to it, causing the next pass to start with the stream just after.
-        let mut first_incremental_fired: Option<StreamId> = None;
         // Total outbound bytes emitted across all stream flushes this pass —
         // `finalize_write` uses this to distinguish a voluntary scheduler
         // yield (progress + pending back-buffer, LIFECYCLE §9 invariant 16)
@@ -2577,10 +2276,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // so we can run `account_emitted_rst` for each one AFTER the loop.
         // This is an ORDERING requirement, not a borrow workaround: a
         // MadeYouReset cap trip makes `account_emitted_rst` return a GOAWAY
-        // result that ends the pass, and every stream in `priorities_buf`
-        // must get its write before that preemption.
+        // result that ends the pass, and every stream in the pass's
+        // `order` must get its write before that preemption.
         let mut freshly_emitted_rsts: Vec<H2Error> = Vec::new();
-        'outer: for &stream_id in &priorities_buf {
+        'outer: for &stream_id in &order {
             let Some(&global_stream_id) = self.stream_table.streams().get(&stream_id) else {
                 error!(
                     "{} stream_id {} from sorted keys missing in streams map",
@@ -2589,7 +2288,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 continue;
             };
-            let (urgency, is_incremental) = self.prioriser.get(&stream_id);
+            let (urgency, is_incremental) = self.scheduler.priority(&stream_id);
             let stream = &mut context.streams[global_stream_id];
             let stream_state = stream.state;
             let parts = stream.split(&self.position);
@@ -2610,25 +2309,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // count would wrongly yield for a solo incremental stream
                 // when another urgency bucket happens to contain an
                 // incremental peer.
-                let incremental_peer_count = ready_incremental_by_urgency
-                    .get(&urgency)
-                    .copied()
-                    .unwrap_or(0);
+                let incremental_peer_count = census.incremental_peer_count(urgency);
                 // Track RST_STREAM dedup: if kawa is in error state, the converter
                 // will generate a RST_STREAM frame via `initialize`. Mark it so we
                 // don't send a duplicate on the next writable cycle.
                 if kawa.is_error() {
                     let freshly_rst = self.stream_table.rst_sent_mut().insert(stream_id);
                     // LIFECYCLE §9 invariant 17: any transition to ineligible
-                    // mid-pass MUST decrement ready_incremental_by_urgency so
-                    // later streams in the same 'outer iteration see the live
-                    // count, not the snapshot. Missing this costs one voluntary
-                    // yield per same-urgency peer that trails the RST.
-                    if freshly_rst
-                        && is_incremental
-                        && let Some(c) = ready_incremental_by_urgency.get_mut(&urgency)
-                    {
-                        *c = c.saturating_sub(1);
+                    // mid-pass MUST leave the pass census so later streams in
+                    // the same 'outer iteration see the live count, not the
+                    // snapshot. Missing this costs one voluntary yield per
+                    // same-urgency peer that trails the RST.
+                    if freshly_rst {
+                        census.note_ineligible(urgency, is_incremental);
                     }
                     // Account for the RST that `initialize` is about to emit
                     // for this stream. Without this the MadeYouReset lifetime
@@ -2726,17 +2419,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     // Deferred to after the loop; same reason as the
                     // pre-prepare collector above.
                     freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
-                    if is_incremental
-                        && let Some(c) = ready_incremental_by_urgency.get_mut(&urgency)
-                    {
-                        *c = c.saturating_sub(1);
-                    }
+                    census.note_ineligible(urgency, is_incremental);
                 }
                 *parts.window = parts.window.saturating_sub(consumed);
                 self.flow_control.consume_send_window(consumed);
-                if is_incremental && consumed > 0 && first_incremental_fired.is_none() {
-                    first_incremental_fired = Some(stream_id);
-                }
+                census.note_fired(stream_id, is_incremental, consumed);
             }
             context.debug.push(DebugEvent::S(
                 stream_id,
@@ -2830,26 +2517,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     server_rtt,
                 ) {
                     completed_streams.push((dead_id, global_stream_id, token, close_frontend));
-                    // LIFECYCLE §9 invariant 17: decrement INSIDE 'outer so
-                    // later iterations see the reduced count. The post-loop
-                    // retirement at remove_dead_stream is too late.
-                    if is_incremental
-                        && let Some(c) = ready_incremental_by_urgency.get_mut(&urgency)
-                    {
-                        *c = c.saturating_sub(1);
-                    }
+                    // LIFECYCLE §9 invariant 17: leave the census INSIDE
+                    // 'outer so later iterations see the reduced count. The
+                    // post-loop retirement at remove_dead_stream is too late.
+                    census.note_ineligible(urgency, is_incremental);
                 }
             }
         }
         // Sample the pass's final bucket totals. Publication is deferred to
         // the `gauge_connection_state` call below because the value must
         // reach the gauge in the SAME pass that computed it — the entry call
-        // at the top of `write_streams` runs before
-        // `ready_incremental_by_urgency` exists.
-        self.ready_incremental_streams = ready_incremental_by_urgency
-            .values()
-            .copied()
-            .sum::<usize>();
+        // at the top of `write_streams` runs before the pass census exists,
+        // so sampling there would publish the previous pass's value.
+        self.ready_incremental_streams = census.ready_total();
         // RFC 7541 §6.3: clear our mirror of the pending size-update only
         // AFTER the pass confirmed the signal reached a header block. A
         // DATA-only pass leaves `size_update_emitted` as `false` so the
@@ -2877,13 +2557,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.hpack.put_converter_buf(converter_out);
         self.hpack.put_lowercase_buf(lowercase_buf);
         self.hpack.put_cookie_buf(cookie_buf);
-        self.hpack.put_priorities_buf(priorities_buf);
         self.hpack.shrink_converter_buffers();
-        // RFC 9218 §4: commit the round-robin cursor so the next writable
-        // cycle begins with the stream immediately after the one we fired
-        // first this pass.
-        self.prioriser
-            .advance_incremental_cursor(first_incremental_fired);
+        // RFC 9218 §4: end the pass — take the order buffer back and commit
+        // the round-robin cursor so the next writable cycle begins with the
+        // stream immediately after the one we fired first this pass
+        // (LIFECYCLE §9 invariant 26). Placed here, after the deferred RST
+        // accounting above, so a MadeYouReset cap trip that returns a GOAWAY
+        // early skips both exactly as it did before the extraction.
+        self.scheduler.end_pass(order, census);
         let mut close_frontend_after_completed_stream = false;
         for (dead_id, global_stream_id, token, close_frontend) in completed_streams {
             // Retirement is deferred out of the loop on purpose, and this is
@@ -3041,7 +2722,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 stream_id
             );
         }
-        self.prioriser.remove(&stream_id);
+        self.scheduler.remove_stream(&stream_id);
     }
 
     /// Drop stream-id mappings for streams that never became active before a
@@ -3849,7 +3530,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // through `readable`, so adopt the mux's snapshot here too.
         self.now = context.now;
         // Per-connection scratch Vecs (`converter_buf`, `lowercase_buf`,
-        // `cookie_buf`, `priorities_buf`) grow to a
+        // `cookie_buf`, and the scheduler's own pass-order buffer) grow to a
         // high-water mark and never shrink. On a long-lived idle H2
         // connection that briefly carried a flurry of large headers, the
         // backing memory stays pinned indefinitely. Reclaim past
@@ -3861,6 +3542,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // out a stream).
         const SCRATCH_BUF_RETAIN: usize = 16 * 1024;
         self.hpack.reclaim_idle_buffers(SCRATCH_BUF_RETAIN);
+        self.scheduler.reclaim_idle_buffer(SCRATCH_BUF_RETAIN);
 
         if self.stream_table.is_empty()
             || (self.stream_table.activity_is_empty() && self.stream_table.fc_stall_is_empty())
@@ -5152,7 +4834,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.stream_table.touch_activity(stream_id, self.now);
 
         if let Some(priority) = &headers.priority
-            && self.prioriser.push_priority(stream_id, priority.clone())
+            && self.scheduler.push_priority(stream_id, priority.clone())
         {
             // This HEADERS frame's own block just completed (single-frame,
             // or the final CONTINUATION of a multi-frame sequence) — but
@@ -5209,7 +4891,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let elide_x_real_ip = parts.context.elide_x_real_ip;
         let status = pkawa::handle_header(
             self.hpack.decoder_mut(),
-            &mut self.prioriser,
+            self.scheduler.prioriser_mut(),
             stream_id,
             parts.rbuffer,
             buffer,
@@ -5331,7 +5013,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // peer-chosen stream ID. Accept only currently-open streams and a
         // small idle look-ahead window; everything else is dropped before
         // it can feed memory into the priority map.
-        if self.prioriser.push_priority_guarded(
+        if self.scheduler.push_priority_guarded(
             priority.stream_id,
             priority.inner,
             self.last_stream_id,
@@ -5384,7 +5066,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return self.goaway(H2Error::ProtocolError);
         }
         let (urgency, incremental) = pkawa::parse_rfc9218_priority(&pu.priority_field_value);
-        let (prev_urgency, _) = self.prioriser.get(&pu.prioritized_stream_id);
+        let (prev_urgency, _) = self.scheduler.priority(&pu.prioritized_stream_id);
         trace!(
             "{} PRIORITY_UPDATE stream={} urgency={}->{} incremental={} rearmed_writable=true",
             log_context!(self),
@@ -5393,7 +5075,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             urgency,
             incremental
         );
-        let _ = self.prioriser.push_priority_guarded(
+        let _ = self.scheduler.push_priority_guarded(
             pu.prioritized_stream_id,
             parser::PriorityPart::Rfc9218 {
                 urgency,
@@ -6482,439 +6164,18 @@ mod tests {
     // self-sampling-clock exception), so there is no second constructor left
     // for it to compare against.
 
-    // ── Prioriser ────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_prioriser_defaults_for_unknown_stream() {
-        let p = Prioriser::default();
-        // Unknown stream -> RFC 9218 defaults: urgency 3, incremental false
-        assert_eq!(p.get(&1), (3, false));
-        assert_eq!(p.get(&999), (3, false));
-    }
-
-    #[test]
-    fn test_prioriser_push_rfc9218_and_get() {
-        let mut p = Prioriser::default();
-
-        let invalid = p.push_priority(
-            1,
-            parser::PriorityPart::Rfc9218 {
-                urgency: 0,
-                incremental: true,
-            },
-        );
-        assert!(!invalid);
-        assert_eq!(p.get(&1), (0, true));
-
-        let invalid = p.push_priority(
-            3,
-            parser::PriorityPart::Rfc9218 {
-                urgency: 7,
-                incremental: false,
-            },
-        );
-        assert!(!invalid);
-        assert_eq!(p.get(&3), (7, false));
-    }
-
-    #[test]
-    fn test_prioriser_urgency_clamped_to_7() {
-        let mut p = Prioriser::default();
-
-        p.push_priority(
-            1,
-            parser::PriorityPart::Rfc9218 {
-                urgency: 255,
-                incremental: false,
-            },
-        );
-        assert_eq!(p.get(&1), (7, false));
-    }
-
-    #[test]
-    fn test_prioriser_update_priority() {
-        let mut p = Prioriser::default();
-
-        p.push_priority(
-            1,
-            parser::PriorityPart::Rfc9218 {
-                urgency: 3,
-                incremental: false,
-            },
-        );
-        assert_eq!(p.get(&1), (3, false));
-
-        // Update same stream
-        p.push_priority(
-            1,
-            parser::PriorityPart::Rfc9218 {
-                urgency: 1,
-                incremental: true,
-            },
-        );
-        assert_eq!(p.get(&1), (1, true));
-    }
-
-    #[test]
-    fn test_prioriser_remove() {
-        let mut p = Prioriser::default();
-
-        p.push_priority(
-            1,
-            parser::PriorityPart::Rfc9218 {
-                urgency: 0,
-                incremental: true,
-            },
-        );
-        assert_eq!(p.get(&1), (0, true));
-
-        p.remove(&1);
-        // After removal, falls back to defaults
-        assert_eq!(p.get(&1), (3, false));
-    }
-
-    #[test]
-    fn test_prioriser_rfc7540_self_dependency() {
-        let mut p = Prioriser::default();
-
-        // Self-dependency should return true (invalid)
-        let invalid = p.push_priority(
-            5,
-            parser::PriorityPart::Rfc7540 {
-                stream_dependency: parser::StreamDependency {
-                    exclusive: false,
-                    stream_id: 5, // same as stream_id
-                },
-                weight: 16,
-            },
-        );
-        assert!(invalid);
-    }
-
-    #[test]
-    fn test_prioriser_rfc7540_valid_dependency() {
-        let mut p = Prioriser::default();
-
-        // Non-self dependency is valid (but ignored for scheduling)
-        let invalid = p.push_priority(
-            5,
-            parser::PriorityPart::Rfc7540 {
-                stream_dependency: parser::StreamDependency {
-                    exclusive: false,
-                    stream_id: 3, // different stream
-                },
-                weight: 16,
-            },
-        );
-        assert!(!invalid);
-        // Still returns defaults since RFC 7540 priority is ignored
-        assert_eq!(p.get(&5), (3, false));
-    }
-
-    #[test]
-    fn test_prioriser_max_entries_cap() {
-        let mut p = Prioriser::default();
-
-        // Fill up to MAX_PRIORITIES
-        for i in 0..MAX_PRIORITIES as u32 {
-            let stream_id = i * 2 + 1; // odd stream IDs
-            p.push_priority(
-                stream_id,
-                parser::PriorityPart::Rfc9218 {
-                    urgency: (i % 8) as u8,
-                    incremental: false,
-                },
-            );
-        }
-
-        // Next insert for a new stream should be silently rejected
-        let next_id = (MAX_PRIORITIES as u32) * 2 + 1;
-        let invalid = p.push_priority(
-            next_id,
-            parser::PriorityPart::Rfc9218 {
-                urgency: 0,
-                incremental: true,
-            },
-        );
-        assert!(!invalid); // not a protocol error, just silently dropped
-        assert_eq!(p.get(&next_id), (3, false)); // defaults, not stored
-    }
-
-    #[test]
-    fn test_prioriser_update_existing_at_cap() {
-        let mut p = Prioriser::default();
-
-        // Fill to cap
-        for i in 0..MAX_PRIORITIES as u32 {
-            p.push_priority(
-                i * 2 + 1,
-                parser::PriorityPart::Rfc9218 {
-                    urgency: 3,
-                    incremental: false,
-                },
-            );
-        }
-
-        // Updating an existing entry should still work even at cap
-        p.push_priority(
-            1,
-            parser::PriorityPart::Rfc9218 {
-                urgency: 0,
-                incremental: true,
-            },
-        );
-        assert_eq!(p.get(&1), (0, true));
-    }
-
-    #[test]
-    fn test_prioriser_guarded_accepts_open_stream() {
-        let mut p = Prioriser::default();
-        let mut open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
-        open.insert(3, 0);
-        let invalid = p.push_priority_guarded(
-            3,
-            parser::PriorityPart::Rfc9218 {
-                urgency: 1,
-                incremental: false,
-            },
-            7,
-            &open,
-        );
-        assert!(!invalid);
-        assert_eq!(p.get(&3), (1, false));
-    }
-
-    #[test]
-    fn test_prioriser_guarded_accepts_idle_lookahead() {
-        let mut p = Prioriser::default();
-        let open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
-        // Just ahead of last_stream_id, within PRIORITY_IDLE_LOOKAHEAD.
-        let invalid = p.push_priority_guarded(
-            105,
-            parser::PriorityPart::Rfc9218 {
-                urgency: 2,
-                incremental: true,
-            },
-            99,
-            &open,
-        );
-        assert!(!invalid);
-        assert_eq!(p.get(&105), (2, true));
-    }
-
-    #[test]
-    fn test_prioriser_guarded_drops_far_future_stream() {
-        let mut p = Prioriser::default();
-        let open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
-        // Beyond the 64-slot lookahead window.
-        let invalid = p.push_priority_guarded(
-            1_000_001,
-            parser::PriorityPart::Rfc9218 {
-                urgency: 0,
-                incremental: false,
-            },
-            3,
-            &open,
-        );
-        assert!(!invalid); // not a protocol error, just dropped
-        // Default priority returned — no entry stored.
-        assert_eq!(p.get(&1_000_001), (DEFAULT_URGENCY, false));
-    }
-
-    #[test]
-    fn test_prioriser_guarded_drops_closed_past_stream() {
-        let mut p = Prioriser::default();
-        let open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
-        // Past the counter and not open = already closed. Drop.
-        let invalid = p.push_priority_guarded(
-            3,
-            parser::PriorityPart::Rfc9218 {
-                urgency: 5,
-                incremental: false,
-            },
-            99,
-            &open,
-        );
-        assert!(!invalid);
-        assert_eq!(p.get(&3), (DEFAULT_URGENCY, false));
-    }
-
-    #[test]
-    fn test_prioriser_guarded_cannot_flood_with_far_ids() {
-        // Previously an attacker could pack MAX_PRIORITIES entries by picking
-        // far-future stream IDs. The guard rejects them before the cap helps.
-        let mut p = Prioriser::default();
-        let open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
-        for delta in 10_000..(10_000 + MAX_PRIORITIES as u32) {
-            p.push_priority_guarded(
-                delta,
-                parser::PriorityPart::Rfc9218 {
-                    urgency: 0,
-                    incremental: false,
-                },
-                0,
-                &open,
-            );
-        }
-        assert_eq!(p.priorities.len(), 0);
-    }
-
-    // ── RFC 9218 §4 round-robin rotation ───────────────────────────────
-
-    /// Helper: mark `stream_id` as (urgency, incremental) in the map.
-    fn set_prio(p: &mut Prioriser, stream_id: StreamId, urgency: u8, incremental: bool) {
-        p.push_priority(
-            stream_id,
-            parser::PriorityPart::Rfc9218 {
-                urgency,
-                incremental,
-            },
-        );
-    }
-
-    #[test]
-    fn test_apply_incremental_rotation_all_non_incremental_is_noop() {
-        // Non-incremental streams keep the existing (urgency, stream_id) sort.
-        let mut p = Prioriser::default();
-        set_prio(&mut p, 1, 3, false);
-        set_prio(&mut p, 3, 3, false);
-        set_prio(&mut p, 5, 3, false);
-
-        let mut buf = vec![1u32, 3, 5];
-        let count = p.apply_incremental_rotation(&mut buf);
-        assert_eq!(count, 0);
-        assert_eq!(buf, vec![1, 3, 5]);
-    }
-
-    #[test]
-    fn test_apply_incremental_rotation_moves_incremental_to_tail() {
-        // Within a same-urgency bucket non-incremental must come before
-        // incremental, each subrange staying ascending.
-        let mut p = Prioriser::default();
-        set_prio(&mut p, 1, 3, true);
-        set_prio(&mut p, 3, 3, false);
-        set_prio(&mut p, 5, 3, true);
-        set_prio(&mut p, 7, 3, false);
-
-        let mut buf = vec![1u32, 3, 5, 7];
-        let count = p.apply_incremental_rotation(&mut buf);
-        assert_eq!(count, 2);
-        // Non-incremental first (3, 7), then incremental (1, 5) — ascending
-        // within each subrange before the cursor rotation.
-        assert_eq!(buf, vec![3, 7, 1, 5]);
-    }
-
-    #[test]
-    fn test_apply_incremental_rotation_respects_urgency_buckets() {
-        // Different urgency buckets must not be mixed.
-        let mut p = Prioriser::default();
-        set_prio(&mut p, 1, 0, true); // urgent incremental
-        set_prio(&mut p, 3, 3, false); // default non-incremental
-        set_prio(&mut p, 5, 3, true); // default incremental
-        set_prio(&mut p, 7, 5, false); // low-priority non-incremental
-
-        // Input is pre-sorted by (urgency, id) as the scheduler does.
-        let mut buf = vec![1u32, 3, 5, 7];
-        let count = p.apply_incremental_rotation(&mut buf);
-        assert_eq!(count, 2);
-        // Bucket 0: [1] (alone, stays). Bucket 3: [3] non-inc, [5] inc.
-        // Bucket 5: [7] alone. Cross-bucket order is preserved.
-        assert_eq!(buf, vec![1, 3, 5, 7]);
-    }
-
-    #[test]
-    fn test_apply_incremental_rotation_rotates_by_cursor() {
-        // Three same-urgency incremental streams: cursor advancement shifts
-        // the bucket so the next pass starts after the previously fired ID.
-        let mut p = Prioriser::default();
-        set_prio(&mut p, 1, 3, true);
-        set_prio(&mut p, 3, 3, true);
-        set_prio(&mut p, 5, 3, true);
-
-        let base = vec![1u32, 3, 5];
-
-        // Pass 1: cursor is 0 (initial), so order stays 1, 3, 5.
-        let mut buf = base.clone();
-        assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
-        assert_eq!(buf, vec![1, 3, 5]);
-        p.advance_incremental_cursor(Some(1));
-
-        // Pass 2: cursor is 1, rotate so 3 comes first.
-        let mut buf = base.clone();
-        assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
-        assert_eq!(buf, vec![3, 5, 1]);
-        p.advance_incremental_cursor(Some(3));
-
-        // Pass 3: cursor is 3, rotate so 5 comes first.
-        let mut buf = base.clone();
-        assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
-        assert_eq!(buf, vec![5, 1, 3]);
-        p.advance_incremental_cursor(Some(5));
-
-        // Pass 4: cursor is 5 (largest in bucket), wrap to 1.
-        let mut buf = base;
-        assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
-        assert_eq!(buf, vec![1, 3, 5]);
-    }
-
-    #[test]
-    fn test_apply_incremental_rotation_cursor_unknown_id() {
-        // Cursor points at an ID no longer active (stream completed). Rotation
-        // should still start from the smallest ID greater than the cursor.
-        let mut p = Prioriser::default();
-        set_prio(&mut p, 3, 3, true);
-        set_prio(&mut p, 5, 3, true);
-        set_prio(&mut p, 7, 3, true);
-        p.advance_incremental_cursor(Some(4)); // 4 is not in the bucket
-
-        let mut buf = vec![3u32, 5, 7];
-        assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
-        assert_eq!(buf, vec![5, 7, 3]);
-    }
-
-    #[test]
-    fn test_apply_incremental_rotation_single_stream_buckets() {
-        // Single-stream buckets are a degenerate fast path: no reordering.
-        let mut p = Prioriser::default();
-        set_prio(&mut p, 1, 1, true);
-        set_prio(&mut p, 3, 2, false);
-        set_prio(&mut p, 5, 3, true);
-
-        let mut buf = vec![1u32, 3, 5];
-        let count = p.apply_incremental_rotation(&mut buf);
-        assert_eq!(count, 2);
-        assert_eq!(buf, vec![1, 3, 5]);
-    }
-
-    #[test]
-    fn test_advance_incremental_cursor_none_is_noop() {
-        // If no incremental stream fires (only non-incremental served), the
-        // cursor must stay put so fairness is preserved for the next pass.
-        let mut p = Prioriser::default();
-        p.advance_incremental_cursor(Some(5));
-        p.advance_incremental_cursor(None);
-        assert_eq!(p.incremental_cursor, 5);
-    }
-
-    #[test]
-    fn test_apply_incremental_rotation_mixed_bucket_with_cursor() {
-        // Same-urgency bucket with a mix: non-inc served first in ascending
-        // order, then the incremental tail rotated by cursor.
-        let mut p = Prioriser::default();
-        set_prio(&mut p, 1, 3, true);
-        set_prio(&mut p, 3, 3, false);
-        set_prio(&mut p, 5, 3, true);
-        set_prio(&mut p, 7, 3, false);
-        set_prio(&mut p, 9, 3, true);
-        p.advance_incremental_cursor(Some(5));
-
-        let mut buf = vec![1u32, 3, 5, 7, 9];
-        let count = p.apply_incremental_rotation(&mut buf);
-        assert_eq!(count, 3);
-        // Non-inc (3, 7) first, then incremental rotated: cursor 5 means
-        // next-after-5 = 9, then 1, then 5 (wrap).
-        assert_eq!(buf, vec![3, 7, 9, 1, 5]);
-    }
+    // ── Prioriser / scheduler ───────────────────────────────────────────
+    //
+    // `Prioriser`'s own unit tests (defaults, the RFC 9218 urgency clamp,
+    // the `MAX_PRIORITIES` cap, the standalone-PRIORITY acceptance filter,
+    // the same-urgency incremental rotation) moved to `h2_scheduler.rs`'s
+    // `#[cfg(test)] mod tests` alongside the type — its fields are private
+    // to that module now, matching `HpackState`, `H2FlowControl`,
+    // `H2StreamTable` and `H2FloodDetector`. The pass-scoped scheduling
+    // tests that used to re-implement `ready_incremental_by_urgency`'s
+    // arithmetic inline in the test body moved there too, and now drive
+    // `ReadyIncrementalCensus`'s production methods instead of a copy of
+    // them.
 
     // ── H2FlowControl ───────────────────────────────────────────────────
     //
@@ -7693,54 +6954,17 @@ mod tests {
         assert!(any_stream_has_pending_back(&streams_map, &[stream]));
     }
 
-    // ── ready_incremental_by_urgency mid-pass consistency ────────────────
+    // ── Mid-pass ready-incremental census consistency ───────────────────
     //
-    // The full RED is in e2e and currently #[ignore]'d (timing-sensitive).
-    // The scalar logic below pins the saturating_sub + bucket-scoped
-    // decrement contract the scheduler at h2.rs:2412-2414 + h2.rs:2481
-    // relies on: a same-urgency transition-to-ineligible MUST drop the
-    // per-bucket count by exactly 1 and never underflow the u64.
-
-    fn make_bucket(counts: &[(u8, usize)]) -> HashMap<u8, usize> {
-        counts.iter().copied().collect()
-    }
-
-    #[test]
-    fn ready_incremental_bucket_decrement_reduces_same_urgency_only() {
-        let mut map = make_bucket(&[(1, 3), (3, 2)]);
-        let urgency: u8 = 1;
-        let is_incremental = true;
-        // Simulate a stream in urgency=1 going ineligible mid-pass.
-        if is_incremental && let Some(c) = map.get_mut(&urgency) {
-            *c = c.saturating_sub(1);
-        }
-        assert_eq!(map.get(&1), Some(&2), "urgency-1 bucket must drop to 2");
-        assert_eq!(map.get(&3), Some(&2), "urgency-3 bucket untouched");
-    }
-
-    #[test]
-    fn ready_incremental_bucket_decrement_saturates_at_zero() {
-        let mut map = make_bucket(&[(0, 0)]);
-        let urgency: u8 = 0;
-        if let Some(c) = map.get_mut(&urgency) {
-            *c = c.saturating_sub(1);
-        }
-        assert_eq!(map.get(&0), Some(&0), "saturating_sub must not underflow");
-    }
-
-    #[test]
-    fn ready_incremental_bucket_decrement_skipped_for_non_incremental() {
-        let mut map = make_bucket(&[(1, 3)]);
-        let is_incremental = false;
-        if is_incremental && let Some(c) = map.get_mut(&1) {
-            *c = c.saturating_sub(1);
-        }
-        assert_eq!(
-            map.get(&1),
-            Some(&3),
-            "non-incremental transitions must not touch the bucket"
-        );
-    }
+    // The three scalar bucket-decrement tests moved to `h2_scheduler.rs`.
+    // They were named after `ready_incremental_by_urgency`, the local
+    // `HashMap` this step replaced with `ReadyIncrementalCensus`; no symbol
+    // of that name exists anywhere in the tree any more.
+    // They used to re-implement the `saturating_sub` + bucket-scoped
+    // decrement inline in the test body — a copy of the scheduler's
+    // arithmetic, which could not catch the scheduler getting it wrong.
+    // They now call `ReadyIncrementalCensus::note_ineligible` and
+    // `::incremental_peer_count`, which is the code `write_streams` runs.
 
     // ── h2.streams.ready_incremental.by_urgency aggregate ────────────────
 

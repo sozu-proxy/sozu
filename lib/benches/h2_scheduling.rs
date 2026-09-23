@@ -20,7 +20,7 @@ type StreamId = u32;
 struct MockPrioriser {
     priorities: HashMap<StreamId, (u8, bool)>,
     /// RFC 9218 §4 round-robin cursor. Mirrors
-    /// `sozu_lib::protocol::mux::h2::Prioriser::incremental_cursor`.
+    /// `sozu_lib::protocol::mux::h2_scheduler::Prioriser::incremental_cursor`.
     incremental_cursor: StreamId,
 }
 

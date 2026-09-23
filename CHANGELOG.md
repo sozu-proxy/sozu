@@ -77,6 +77,72 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the RFC 9218 priority and write-pass scheduling decision moves out of
+  `h2.rs` into a new `lib/src/protocol/mux/h2_scheduler.rs`, behind the same closed API the
+  `hpack_state` / `h2_flow_control` / `h2_stream_table` / `h2_drain` / `h2_flood_detector` /
+  `h2_header_reassembly` extractions established.** `H2Scheduler` owns `Prioriser` (the per-stream
+  `(urgency, incremental)` map, its `MAX_PRIORITIES` flood cap, the idle look-ahead filter, the
+  same-urgency incremental rotation and the round-robin cursor), plus the reusable pass-order
+  buffer — which was sitting on `HpackState` as `priorities_buf` since the first extraction step
+  although it holds priority-sorted stream ids and never HPACK bytes. `ConnectionH2::write_streams`
+  now asks `H2Scheduler::begin_pass` for the pass order and its same-urgency ready-incremental
+  census, and closes with `H2Scheduler::end_pass` at exactly the point it used to call
+  `put_priorities_buf` and `advance_incremental_cursor`, so a MadeYouReset cap trip that returns a
+  GOAWAY early still skips both. The one fact the scheduler cannot own — whether a stream has
+  anything to send, which lives in `Context.streams[gid].{front,back}` and
+  `H2StreamTable::rst_sent` — is taken as data: a `FnMut(StreamId) -> bool` projection the caller
+  computes, invoked for incremental streams only, so it costs exactly what the inline census cost.
+  There is no `&mut Context`, no `Kawa`, no socket and no clock anywhere in the new module.
+  No behaviour change on the wire. The per-pass `HashMap<u8, usize>` ready census becomes a fixed
+  `[usize; 8]` — RFC 9218 §4.1 urgency is `[0, 7]` and `Prioriser::push_priority` already clamps to
+  it. The allocation saving is conditional and worth stating exactly, measured with a counting
+  `GlobalAlloc`: `HashMap::new()` allocates nothing, the first `entry().or_insert()` allocates one
+  block and a fifth distinct bucket allocates a second on the grow. So this is one heap allocation
+  fewer on every write pass that carries at least one ready incremental stream, two when five or
+  more urgency buckets are populated, and nothing at all on a pass with no ready incremental
+  stream — the common case, since RFC 9218's default is `i=0`. The pass still allocates once inside
+  `sort_by_cached_key` for two or more streams, before and after alike. What is unconditional is an
+  array index in place of a hash lookup at each of the four sites that read or decrement the census.
+  The only visible difference is that the `PRIORITIES` `trace!` line now prints the eight buckets in
+  a fixed order instead of a `HashMap`'s per-process-seeded one. The three mid-pass decrements of LIFECYCLE.md invariant 17
+  become one `ReadyIncrementalCensus::note_ineligible` method, so the non-incremental guard and the
+  `saturating_sub` exist once rather than three times. `converter.rs` is untouched — byte-identical
+  to its parent commit. Collapsing `incremental_mode && incremental_peer_count > 1` into one
+  scheduler-computed `may_interleave` is sound (only `next_closes_stream` needs `kawa.blocks.front()`
+  and it would stay put), but it is deferred because editing that file forfeits the byte-identity
+  that is the evidence for this step's no-new-copy claim on the write path.
+  Docs: LIFECYCLE.md gains invariant 26 — **RFC 9218 §4 incremental leadership rotates inside the
+  bucket that leads the pass: rotate AND commit, or a stream starves, and no further** — naming
+  scheduler fairness as a checkable rule for the first time, *with its boundary*. `incremental_cursor`
+  is one connection-global stream id, so only the lowest-numbered urgency bucket with a firing
+  incremental stream rotates; measured, u=0 `{1, 3}` alternates while u=3 `{5, 7}` is frozen in
+  every pass and stream 7 never leads. That is pre-existing — `Prioriser` is byte-identical and its
+  field doc always scoped the cursor this way — and it is now pinned as observed behaviour by
+  `the_round_robin_cursor_is_connection_global_so_only_the_leading_bucket_rotates` rather than left
+  for a later step to assume away. Per-bucket rotation changes wire ordering on multi-bucket
+  connections and belongs in its own changeset. Invariants 15 and 17 are rewritten against the new
+  home. Citation endpoints across LIFECYCLE.md and `doc/testing.md` are re-derived from the
+  `git diff` hunk map, with a symbol citation wherever the cited text is not unique in the file.
+  Tests: `Prioriser`'s fourteen unit tests and the nine rotation tests move with the type. The three
+  scalar `ready_incremental_bucket_decrement_*` tests are replaced by
+  `note_ineligible_reduces_only_its_own_bucket` / `_saturates_at_zero` /
+  `note_ineligible_is_a_no_op_for_a_non_incremental_stream`, which drive the production method — the
+  ones they replace re-implemented the `saturating_sub` inline in the test body and could not have
+  caught the scheduler getting it wrong. Fairness gets deterministic coverage
+  (`incremental_leadership_rotates_one_position_per_pass`,
+  `no_incremental_peer_is_starved_over_a_full_cycle`,
+  `a_window_blocked_stream_does_not_take_the_lead`,
+  `a_pass_with_no_incremental_progress_leaves_the_cursor_alone`) and a `quickcheck` property
+  (`fairness_property::qc_incremental_leadership_visits_every_peer_once_per_cycle`) over 2..=8
+  peers, their ids, the shared urgency bucket, 1..=4 cycles and a distractor set. Every one carries
+  a `TO SEE THIS RED` recipe with the exact statement to delete and the panic it produces; all six
+  recipes were executed. The exception is
+  `the_round_robin_cursor_is_connection_global_so_only_the_leading_bucket_rotates`, which asserts
+  what the code already does and says so in place of a recipe. What these tests close is the
+  composition, not the primitive: at the parent commit, deleting the `advance_incremental_cursor`
+  call site from `write_streams` leaves the whole `protocol::mux` suite green (402 passed), because
+  the rotation was pinned and the rotate-and-commit pair was not.
+
 - **`refactor(mux-h2)`: `write_streams` builds its `H2BlockConverter` for ONE `kawa.prepare` call
   instead of one per write pass, so the converter's `&mut self.hpack` encoder borrow no longer spans
   the per-stream loop.** That borrow was the reason the loop could not call a single `&self` /

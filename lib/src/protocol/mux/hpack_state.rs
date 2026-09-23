@@ -10,12 +10,15 @@
 //!
 //! This is a pure relocation of fields that previously lived directly on
 //! `ConnectionH2` (`decoder`, `encoder`, `converter_buf`, `lowercase_buf`,
-//! `cookie_buf`, `priorities_buf`) — no behaviour change. See `h2.rs`'s call
-//! sites (constructor, the two SETTINGS table-size-adjustment paths, the
+//! `cookie_buf`) — no behaviour change. See `h2.rs`'s call sites
+//! (constructor, the two SETTINGS table-size-adjustment paths, the
 //! `write_streams` converter borrow, and the scratch-buffer reclaim logic)
 //! for how they're used.
-
-use super::StreamId;
+//!
+//! The pass-ordering buffer `priorities_buf` arrived here with that
+//! relocation and left again with the scheduler extraction: it holds
+//! priority-sorted stream ids, never HPACK bytes, and now lives on
+//! [`super::h2_scheduler::H2Scheduler`] with the decision that fills it.
 
 /// The connection-level HPACK decoder/encoder pair plus their reusable
 /// scratch buffers.
@@ -28,9 +31,6 @@ pub(super) struct HpackState {
     lowercase_buf: Vec<u8>,
     /// Reusable buffer for assembling cookie values in the H2 block converter.
     cookie_buf: Vec<u8>,
-    /// Reusable buffer for priority-sorted stream IDs in write_streams().
-    /// Cleared and reused each call to avoid per-frame allocation.
-    priorities_buf: Vec<StreamId>,
 }
 
 impl HpackState {
@@ -49,7 +49,6 @@ impl HpackState {
             converter_buf: Vec::new(),
             lowercase_buf: Vec::new(),
             cookie_buf: Vec::new(),
-            priorities_buf: Vec::new(),
         }
     }
 
@@ -102,21 +101,6 @@ impl HpackState {
         self.cookie_buf = buf;
     }
 
-    /// Takes ownership of the priority-sorted-stream-IDs scratch buffer,
-    /// leaving an empty `Vec` in its place. `write_streams` needs this one
-    /// taken out by value too (not just borrowed in place): it iterates the
-    /// buffer while re-borrowing the encoder out of `self.hpack` for every
-    /// eligible stream's `kawa.prepare`, so a `&self.hpack` borrow held
-    /// across that loop — which is what iterating in place would be — cannot
-    /// coexist with the `&mut self.hpack` each converter takes.
-    pub(super) fn take_priorities_buf(&mut self) -> Vec<StreamId> {
-        std::mem::take(&mut self.priorities_buf)
-    }
-
-    pub(super) fn put_priorities_buf(&mut self, buf: Vec<StreamId>) {
-        self.priorities_buf = buf;
-    }
-
     /// Shrink reusable converter buffers when they grow beyond 16 KB to avoid
     /// holding memory after a burst of large headers.
     pub(super) fn shrink_converter_buffers(&mut self) {
@@ -131,12 +115,12 @@ impl HpackState {
         }
     }
 
-    /// Quiet-time reclaim of every scratch buffer (including
-    /// `priorities_buf`, which [`Self::shrink_converter_buffers`] does not
-    /// touch) once it holds 4x `retain_size`. Called from
-    /// `cancel_timed_out_streams`, which only runs on a session idle long
-    /// enough to risk timing out a stream — see that call site for why this
-    /// is the right place to reclaim a high-water-mark buffer.
+    /// Quiet-time reclaim of every scratch buffer once it holds 4x
+    /// `retain_size`. Called from `cancel_timed_out_streams`, which only runs
+    /// on a session idle long enough to risk timing out a stream — see that
+    /// call site for why this is the right place to reclaim a high-water-mark
+    /// buffer. The scheduler's own order buffer is reclaimed beside this call
+    /// by [`super::h2_scheduler::H2Scheduler::reclaim_idle_buffer`].
     pub(super) fn reclaim_idle_buffers(&mut self, retain_size: usize) {
         if self.converter_buf.capacity() > retain_size * 4 {
             self.converter_buf.shrink_to(retain_size);
@@ -146,9 +130,6 @@ impl HpackState {
         }
         if self.cookie_buf.capacity() > retain_size * 4 {
             self.cookie_buf.shrink_to(retain_size);
-        }
-        if self.priorities_buf.capacity() > retain_size * 4 {
-            self.priorities_buf.shrink_to(retain_size);
         }
     }
 }

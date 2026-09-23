@@ -593,7 +593,7 @@ fn test_h2_backend_silent_headers_data_peer_signal() {
 /// streams (A, C) MUST complete their full bodies cleanly.
 ///
 /// This is a **structural** regression guard for the mid-pass mutation
-/// of `ready_incremental_by_urgency`. We do not attempt to observe the
+/// of the scheduler's ready-incremental census. We do not attempt to observe the
 /// one-yield-saved delta directly — that would require an `e2e-hooks`
 /// probe on `incremental_peer_count`, and the wire delta (≤ 1 DATA
 /// frame) sits below CI timing noise. Instead, we verify that the
