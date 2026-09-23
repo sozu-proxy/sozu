@@ -20,17 +20,21 @@
 # writable path plus emptyDir mounts before it's safe) and automountServiceAccountToken: false
 # (unconfirmed whether the runner pod itself ever needs K8s API access under ARC's default,
 # non-Kubernetes containerMode — verify against ARC's runner-pod source before disabling).
-# Concurrency (2026-09-23): the `default` NodeGroup has autoscaling enabled (min 0, max 256 —
-# unlike `bench`, which is deliberately pinned; general jobs need floor capacity, not physical
+# Concurrency (2026-09-23): the `default` NodeGroup has autoscaling enabled (min 8, max 256 —
+# raised from min 0 the same day once real matrix load showed the floor was too low; unlike
+# `bench`, which is deliberately pinned; general jobs need floor capacity, not physical
 # exclusivity). Without a `resources.requests` on the runner pod, Kubernetes always considers it
 # trivially schedulable on the single existing node, so the autoscaler never sees a pending pod and
-# never scales out regardless of maxRunners. The requests below (4 vCPU / 4Gi per runner) are a
-# scheduling/autoscaling hint, not a throttle (no limits set, same pattern as values-bench.yaml) —
-# 4 concurrent general jobs per XL node (cpu-bound), each with real headroom instead of being
-# squeezed by neighbors; the autoscaler adds another XL node past that. maxRunners raised 6 -> 12
-# to give headroom for roughly two concurrent PRs across the 5-cell general matrix
-# (stable/msrv-full/msrv-bare/beta/nightly, once Task 12 completes) — worst case up to 3 XL nodes
-# under full load.
+# never scales out regardless of maxRunners. maxRunners raised 6 -> 12 to give headroom for roughly
+# two concurrent PRs across the general-pool jobs.
+#
+# Speed over spread (2026-09-23, raised from 4 vCPU/4Gi): with the 8-node floor in place, the
+# bottleneck for a single PR's wall-clock time is per-job compile speed, not how many nodes are
+# occupied — a Rust build/test job benefits from more real cores far more than the cluster benefits
+# from cramming extra idle-headroom pods per node. 8 vCPU/8Gi means 2 concurrent general jobs per
+# XL node (cpu-bound) instead of 4, but each one compiles meaningfully faster; the autoscaler
+# (min 8, max 256) still adds nodes past that, so overall concurrency isn't reduced, just packed
+# less tightly per node.
 #
 # hostAliases (root-caused 2026-09-22): sozu's e2e suite resolves three fixed test hostnames
 # (cluster-a.localhost, cluster-b.localhost, other.localhost — grepped from e2e/src/, no dynamic
@@ -72,7 +76,7 @@ template:
         type: RuntimeDefault
     containers:
       - name: runner
-        image: clevercloud/sozu-ci-runner@sha256:3425e7d5438218d2237a8304cc3b5624bc4f8d85997834da6c021c6a4d410667
+        image: clevercloud/sozu-ci-runner@sha256:ced2e7e53baecea7d44c610502ed83976d0880adf650600d7def9196fc06af21
         imagePullPolicy: IfNotPresent
         command: ["/home/runner/run.sh"]
         securityContext:
@@ -81,5 +85,5 @@ template:
             drop: ["ALL"]
         resources:
           requests:
-            cpu: "4"
-            memory: "4Gi"
+            cpu: "8"
+            memory: "8Gi"

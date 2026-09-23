@@ -3,14 +3,22 @@
 # Helm release name "sozu-bench" IS the runs-on label: runs-on: sozu-bench
 #
 # Isolation mechanism (per design, refined during planning): the `bench` NodeGroup is fixed at
-# exactly 4 XL nodes with autoscaling explicitly disabled (clever k8s nodegroups create silently
-# inherits the cluster's autoscaling setting — a nodegroups update --disable-autoscaling was
-# required after creation, see ci/runners/runbook.md). maxRunners is capped at 4 to match node
-# count 1:1. The resources.requests below reserve nearly the entire node's allocatable capacity
-# (measured live: cpu=16, memory=30481788Ki on bench-node0), so no other pod can ever be
-# co-scheduled on a bench node regardless of nodeSelector correctness elsewhere — this is what
-# actually buys bench reproducibility (Heracles ISCA 2015: cgroup/QoS isolation alone is
-# insufficient against LLC/DRAM-bandwidth interference; only physical node exclusivity holds).
+# exactly 8 XL nodes (raised from 4 on 2026-09-23) with autoscaling explicitly disabled (clever
+# k8s nodegroups create silently inherits the cluster's autoscaling setting — a nodegroups update
+# --disable-autoscaling was required after creation, see ci/runners/runbook.md). maxRunners is
+# capped at 8 to match node count 1:1. The resources.requests below reserve nearly the entire
+# node's allocatable capacity (measured live: cpu=16, memory=30481788Ki ≈ 29.07Gi on bench-node0),
+# so no other pod can ever be co-scheduled on a bench node regardless of nodeSelector correctness
+# elsewhere — this is what actually buys bench reproducibility (Heracles ISCA 2015: cgroup/QoS
+# isolation alone is insufficient against LLC/DRAM-bandwidth interference; only physical node
+# exclusivity holds).
+#
+# memory sized at 28Gi, not the node's full ~29.07Gi (2026-09-23, root-caused once the first real
+# bench workload ever scheduled here — the original 29Gi request left only ~71Mi headroom, and
+# every bench node already reserves 208-504Mi for daemonsets (cilium, konnectivity-agent,
+# cc-collector, kubelet-csr-approver), so the runner pod was Insufficient-memory on all 8 nodes
+# simultaneously. 28Gi leaves ~1Gi of headroom — comfortably above the observed worst case — while
+# still leaving no room for a second same-sized pod, so the exclusivity guarantee above is intact.
 # Fork-PR exposure and pod hardening notes: same as values-general.yaml — see there for the full
 # rationale (ephemeral pods + Task 10's repo setting as the fork-PR gate; digest pin + safe
 # securityContext subset applied 2026-09-22 per automated security review; readOnlyRootFilesystem
@@ -19,11 +27,15 @@
 # hostAliases: same CoreDNS-reliability root cause as values-general.yaml (see there for the full
 # investigation) — the bench cells run the identical e2e suite (bench only gates the separate
 # Criterion step), so they hit the exact same three-hostname DNS dependency.
+#
+# hostAliases, sozu.io block (2026-09-23, bench-bombardier migration): replaces that job's former
+# "Host mapping sozu.io domains" step, which did `sudo tee -a /etc/hosts` — same 0.0.0.0 target,
+# same NSS "files" mechanism, just applied at the pod level instead of at runtime with root.
 githubConfigUrl: "https://github.com/sozu-proxy/sozu"
 githubConfigSecret: sozu-runner-github-app
 
 minRunners: 0
-maxRunners: 4
+maxRunners: 8
 
 template:
   spec:
@@ -33,6 +45,12 @@ template:
           - "cluster-a.localhost"
           - "cluster-b.localhost"
           - "other.localhost"
+      - ip: "0.0.0.0"
+        hostnames:
+          - "sozu.io"
+          - "rsa-2048.sozu.io"
+          - "rsa-4096.sozu.io"
+          - "ecdsa.sozu.io"
     nodeSelector:
       clever-cloud.com/nodegroup: bench
     securityContext:
@@ -42,7 +60,7 @@ template:
         type: RuntimeDefault
     containers:
       - name: runner
-        image: clevercloud/sozu-ci-runner@sha256:3425e7d5438218d2237a8304cc3b5624bc4f8d85997834da6c021c6a4d410667
+        image: clevercloud/sozu-ci-runner@sha256:ced2e7e53baecea7d44c610502ed83976d0880adf650600d7def9196fc06af21
         imagePullPolicy: IfNotPresent
         command: ["/home/runner/run.sh"]
         securityContext:
@@ -52,4 +70,4 @@ template:
         resources:
           requests:
             cpu: "15"
-            memory: "29Gi"
+            memory: "28Gi"
