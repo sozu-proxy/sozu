@@ -656,28 +656,21 @@ jobs:
   bench-logs:
     name: Bench logger
     # Migrated 2026-09-23: a real benchmark (logging overhead), so it belongs on sozu-bench for
-    # the same physical-node-exclusivity reason as bench-bombardier below — no sudo/etc-hosts/CA
+    # the same physical-node-exclusivity reason as bench-bombardier above — no sudo/etc-hosts/CA
     # dependency here (unlike bench-bombardier), so nothing blocks it under the hardened pod.
     runs-on: sozu-bench
     needs: [pipeline, build-bench-logger]
+    # No Rust toolchain, no cargo cache and no `sozu` build in this job, deliberately.
+    # `bench_logs.py` runs `./bench_logger` and nothing else, and `command/examples/bench_logger.rs`
+    # only calls `sozu_command_lib::logging::setup_logging` — it never spawns, execs or connects to
+    # a proxy. The release `sozu` this job used to build and stage was therefore never executed by
+    # the benchmark: 402 s of compiling plus 79 s of cache upload for a 5 s benchmark (measured on
+    # run 35923383722). Nothing stopped being verified when it went: `Bombardier bench
+    # (crypto-ring)` compiles the byte-identical `-p sozu --no-default-features --features
+    # jemallocator,crypto-ring` in the same run, so that configuration still gets its compile and
+    # its diagnostics. Do not reintroduce a build here — give the binary to bench.py's job instead.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - name: Install rust 1.93.1
-        uses: dtolnay/rust-toolchain@1.93.1
-
-      # Reuse the crypto-ring pipeline cache for the release sozu
-      # build that the logger bench drives.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
-        with:
-          cache-all-crates: true
-          prefix-key: ci-crypto-ring
-
-      - name: Build sozu (release, crypto-ring)
-        run: cargo build --release -p sozu --no-default-features --features jemallocator,crypto-ring
-
-      - name: Stage sozu binary
-        run: cp target/release/sozu .github/workflows/sozu
 
       - name: Download bench_logger
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
@@ -687,9 +680,7 @@ jobs:
 
       - name: Fix rights
         working-directory: .github/workflows
-        run: |
-          chmod +x sozu
-          chmod +x bench_logger
+        run: chmod +x bench_logger
 
       # ubuntu-latest carries Python preinstalled; the runner image doesn't (deliberately kept
       # Rust/C-toolchain-focused). Same pattern already used by bench-bombardier and doc-citations.

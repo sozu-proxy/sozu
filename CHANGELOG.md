@@ -4404,6 +4404,22 @@
 
 ### 🤖 CI
 
+- **`ci(bench-logs)`: drop the release `sozu` build the logger benchmark never ran.**
+  `Bench logger` installed a Rust toolchain, restored a cargo cache, ran `cargo build --release -p
+  sozu --no-default-features --features jemallocator,crypto-ring`, copied the binary next to
+  `bench_logs.py` and then uploaded a 470 MB cache — for a benchmark that never executes it.
+  `.github/workflows/bench_logs.py` spawns `./bench_logger` and nothing else, and
+  `command/examples/bench_logger.rs` calls `sozu_command_lib::logging::setup_logging` and never
+  spawns, execs or connects to a proxy, so the staged `sozu` was dead weight from the first run.
+  Measured on run 35923383722: 402 s building, 79 s uploading the cache, 5 s benchmarking, in a
+  513 s job. The job now checks out, downloads the `bench_logger` artifact and runs the benchmark.
+  **No verification was lost.** `Bombardier bench (crypto-ring)` compiles the byte-identical
+  crate, profile, toolchain and feature set in the same run, so that configuration still gets its
+  compile and every diagnostic it emits; this was a duplicate of a binary that was itself unused.
+  The job's ~470 MB × per-ref cache entries also stop competing for the repository's Actions cache
+  budget, which was measured at 15.98 GB across 31 entries with the `ci-fuzz`, `ci-crypto-ring`,
+  `ci-crypto-openssl` and `ci-fips` pipeline caches already evicted.
+
 - **`ci(doc)`: a `file.rs:NNN` citation whose line MOVED is now reported, not just one that landed
   on a blank line.**
   The resolver below failed a citation only when the cited line was blank, and said so in its own
