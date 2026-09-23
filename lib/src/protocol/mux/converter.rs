@@ -167,6 +167,136 @@ impl H2BlockConverter<'_> {
     }
 }
 
+/// Everything an [`H2BlockConverter`] must carry from one stream's
+/// `kawa.prepare` call to the next stream's, inside a single
+/// [`super::h2::ConnectionH2::write_streams`] pass.
+///
+/// `H2BlockConverter` borrows the connection's HPACK encoder out of
+/// `HpackState`. A converter that lives for the whole per-stream loop holds
+/// that borrow for the whole loop, and an outstanding `&mut self.hpack`
+/// forecloses every `&self` / `&mut self` method in the loop body — which is
+/// why `snapshot_rtts` and `try_recycle_server_stream` were once associated
+/// functions taking individual field references, and why RST accounting and
+/// stream retirement had to be collected into `Vec`s. So the converter is
+/// built for exactly ONE `prepare` call, and this value holds what must
+/// cross from one call to the next:
+///
+/// - the three reusable scratch buffers, **moved** (pointer, length,
+///   capacity) and never copied, so scoping the converter costs no memcpy;
+/// - the RFC 7541 §6.3 dynamic-table-size-update signal, which must be
+///   emitted on the FIRST header block of the pass and on no other. Threading
+///   it through [`Self::reclaim`] rather than by hand at each `prepare` site
+///   is what keeps a second stream in the same pass from re-emitting the
+///   prefix (or from losing it).
+///
+/// The encoder itself is not here: it stays in `HpackState`, and each
+/// [`Self::converter`] call re-borrows it for the length of one `prepare`.
+/// That is what keeps the HPACK dynamic table continuous across the streams
+/// of a pass.
+pub struct H2ConverterPass {
+    /// Peer `SETTINGS_MAX_FRAME_SIZE`, constant for the pass.
+    max_frame_size: usize,
+    /// `b"https"` or `b"http"`, constant for the pass.
+    scheme: &'static [u8],
+    /// `true` when the owning connection is a backend client, constant for
+    /// the pass. Scopes the `backend.flow_control.paused` metric.
+    position_is_client: bool,
+    out: Vec<u8>,
+    lowercase_buf: Vec<u8>,
+    cookie_buf: Vec<u8>,
+    pending_table_size_update: Option<u32>,
+    size_update_emitted: bool,
+}
+
+impl H2ConverterPass {
+    /// Start a write pass. The three buffers come from the connection's
+    /// `HpackState` pool and go back to it via [`Self::into_buffers`].
+    pub fn new(
+        max_frame_size: usize,
+        scheme: &'static [u8],
+        position_is_client: bool,
+        mut out: Vec<u8>,
+        lowercase_buf: Vec<u8>,
+        cookie_buf: Vec<u8>,
+        pending_table_size_update: Option<u32>,
+    ) -> Self {
+        out.clear();
+        Self {
+            max_frame_size,
+            scheme,
+            position_is_client,
+            out,
+            lowercase_buf,
+            cookie_buf,
+            pending_table_size_update,
+            size_update_emitted: false,
+        }
+    }
+
+    /// Build the converter for ONE `kawa.prepare` call, borrowing `encoder`
+    /// and moving this pass's scratch into it. Pair every call with
+    /// [`Self::reclaim`]: the pass is left holding empty buffers until then.
+    pub fn converter<'a>(
+        &mut self,
+        encoder: &'a mut loona_hpack::Encoder<'static>,
+        stream_id: StreamId,
+        window: i32,
+        incremental_mode: bool,
+        incremental_peer_count: usize,
+    ) -> H2BlockConverter<'a> {
+        H2BlockConverter {
+            max_frame_size: self.max_frame_size,
+            window,
+            stream_id,
+            encoder,
+            out: std::mem::take(&mut self.out),
+            scheme: self.scheme,
+            lowercase_buf: std::mem::take(&mut self.lowercase_buf),
+            cookie_buf: std::mem::take(&mut self.cookie_buf),
+            position_is_client: self.position_is_client,
+            incremental_mode,
+            incremental_peer_count,
+            pending_table_size_update: self.pending_table_size_update,
+            size_update_emitted: false,
+            // `finalize` resets this itself at the end of every `prepare`,
+            // so a per-call `false` is what the shared converter also saw.
+            pending_oversized_abort: false,
+        }
+    }
+
+    /// Take the scratch and the RFC 7541 §6.3 signal back out of a converter
+    /// built by [`Self::converter`], releasing its encoder borrow, and return
+    /// the window the converter has left. The caller's
+    /// `consumed = window - remaining` is the flow-control debit for the
+    /// stream it just prepared.
+    pub fn reclaim(&mut self, mut converter: H2BlockConverter<'_>) -> i32 {
+        self.out = std::mem::take(&mut converter.out);
+        self.lowercase_buf = std::mem::take(&mut converter.lowercase_buf);
+        self.cookie_buf = std::mem::take(&mut converter.cookie_buf);
+        // `emit_pending_size_update_if_new_block` `take()`s the signal the
+        // moment it writes the prefix, so carrying the converter's value
+        // back is what makes "first header block of the pass, and only
+        // that one" hold across streams.
+        self.pending_table_size_update = converter.pending_table_size_update;
+        self.size_update_emitted |= converter.size_update_emitted;
+        converter.window
+    }
+
+    /// `true` once some stream in this pass actually wrote the
+    /// dynamic-table-size-update prefix. The connection clears its own
+    /// mirror of the pending update only then: a DATA-only pass emits no
+    /// header block, so the signal must stay queued.
+    pub fn size_update_emitted(&self) -> bool {
+        self.size_update_emitted
+    }
+
+    /// End the pass, handing the three reusable buffers back to the
+    /// connection's `HpackState` pool in `(out, lowercase, cookie)` order.
+    pub fn into_buffers(self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        (self.out, self.lowercase_buf, self.cookie_buf)
+    }
+}
+
 impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
     fn initialize(&mut self, kawa: &mut Kawa<T>) {
         // This is very ugly... we may add a h2 variant in kawa::ParsingErrorKind

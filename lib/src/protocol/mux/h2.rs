@@ -454,9 +454,17 @@ fn error_nom_to_h2(error: nom::Err<parser::ParserError>) -> H2Error {
 /// Falls back to even distribution (1/active_streams) when no stream has
 /// transferred any bytes yet (total is zero).
 ///
-/// Extracted as a free function to avoid borrow conflicts when `self` fields
-/// (e.g. `encoder`) are borrowed by the converter while we need to update
-/// per-stream metrics and connection overhead counters.
+/// A free function rather than a method: the seven `test_distribute_overhead_*`
+/// cases drive this arithmetic directly, with no `ConnectionH2` fixture, the
+/// same reason [`any_stream_id_matches`] is split out.
+/// [`ConnectionH2::distribute_overhead`] is the `&mut self` wrapper the reset
+/// paths use. [`ConnectionH2::try_recycle_server_stream`] calls this function
+/// directly instead, which is a spelling choice and not a constraint: the
+/// wrapper would credit the same shares at that site, because it reads
+/// `self.stream_table.streams().len()` at call time — which is the same count,
+/// the pass retiring nothing until after its loop — and its `len() <= 1`
+/// cannot differ from the `len() == 1` spelled out there while the stream
+/// being retired is still in the map.
 fn distribute_overhead(
     metrics: &mut SessionMetrics,
     overhead_bin: &mut usize,
@@ -2355,9 +2363,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// stream, prepares new frames via the H2 block converter, flushes them to
     /// the socket, and recycles completed streams.
     ///
-    /// NOTE: The priority iteration loop and converter setup remain inline here
-    /// because the converter borrows `self.hpack` (for its encoder), preventing
-    /// further decomposition into `&mut self` methods within the loop body.
+    /// The [`converter::H2BlockConverter`] is scoped to a single
+    /// `kawa.prepare` call rather than to the whole per-stream loop, so the
+    /// `&mut self.hpack` borrow it takes for the connection's HPACK encoder
+    /// never spans the loop. Every `&self` / `&mut self` method is therefore
+    /// callable inside the loop body; what remains deferred to after it —
+    /// RST accounting and stream retirement — is deferred for its own
+    /// ordering reasons, documented at each site.
+    /// [`converter::H2ConverterPass`] carries the scratch buffers and the
+    /// RFC 7541 §6.3 size-update signal from one stream's `prepare` to the
+    /// next by moving them, so the narrower scope costs no copy.
     fn write_streams<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
     where
         E: Endpoint,
@@ -2426,17 +2441,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 && kawa.is_completed()
                 && !Self::handle_1xx_reset(kawa, stream_state, &mut endpoint)
             {
-                let (client_rtt, server_rtt) = Self::snapshot_rtts(
-                    &self.position,
-                    &self.socket,
-                    &endpoint,
-                    stream.linked_token(),
-                );
+                let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, stream.linked_token());
 
-                if let Some((dead_id, token)) = Self::try_recycle_server_stream(
-                    &self.position,
-                    &mut self.bytes,
-                    self.stream_table.streams(),
+                if let Some((dead_id, token)) = self.try_recycle_server_stream(
                     stream,
                     global_stream_id,
                     stream_id,
@@ -2472,58 +2479,35 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             b"http"
         };
         let mut completed_streams = Vec::new();
-        let mut converter_buf = self.hpack.take_converter_buf();
-        converter_buf.clear();
-        let lowercase_buf = self.hpack.take_lowercase_buf();
-        let cookie_buf = self.hpack.take_cookie_buf();
-        // Taken out (by value) before `encoder_mut()` below for the same
-        // reason: once the converter holds the encoder borrow, no other
-        // `self.hpack` accessor can run until it is dropped. Restored
-        // alongside the other scratch buffers at the end of this pass.
+        // Taken out (by value) rather than iterated in place: the per-stream
+        // loop below re-borrows the encoder out of `self.hpack` for every
+        // eligible stream, so no `self.hpack` borrow may stay live across the
+        // loop. Restored alongside the pass's scratch at the end.
         let mut priorities_buf = self.hpack.take_priorities_buf();
-        let mut converter = converter::H2BlockConverter {
-            max_frame_size: self.peer_settings.settings_max_frame_size as usize,
-            window: 0,
-            stream_id: 0,
-            // Must be the last `self.hpack` accessor called before
-            // `converter` is fully built: it borrows `self.hpack` for as
-            // long as `converter` is alive, so every other `self.hpack.*`
-            // buffer needed by this struct literal is taken out above.
-            encoder: self.hpack.encoder_mut(),
-            out: converter_buf,
+        // The converter is built for ONE `kawa.prepare` call at a time (see
+        // [`converter::H2ConverterPass`]), so its encoder borrow never spans
+        // the per-stream loop and every `&self` / `&mut self` method stays
+        // callable inside it. The pass carries the three reusable scratch
+        // buffers — moved, never copied — plus the RFC 7541 §6.3 pending
+        // size-update, so the first header block of this pass prepends the
+        // signal and no later one repeats it. We clear the connection-side
+        // mirror only AFTER the pass confirms emission via
+        // `pass.size_update_emitted()`, so a DATA-only write pass (no header
+        // block) does not drop the signal.
+        let mut pass = converter::H2ConverterPass::new(
+            self.peer_settings.settings_max_frame_size as usize,
             scheme,
-            lowercase_buf,
-            cookie_buf,
             // When this connection is a backend client we are writing
             // toward the upstream backend — flow-control stalls in that
             // direction are scoped to `backend.flow_control.paused` (in
             // addition to the existing direction-agnostic
             // `h2.flow_control_stall`).
-            position_is_client: self.position.is_client(),
-            // RFC 9218 §4: toggled per-stream in the loop below, driven by
-            // `Prioriser::get(stream_id).1`. Non-incremental by default so
-            // unit tests and non-scheduled callers (e.g. the resume path
-            // above) keep the sequential semantics.
-            incremental_mode: false,
-            // Populated once per write pass from `apply_incremental_rotation`
-            // below. The converter uses `incremental_peer_count <= 1` to skip
-            // the RFC 9218 yield-after-one-DATA behaviour when there is no
-            // peer to interleave with (solo-bucket fast path).
-            incremental_peer_count: 0,
-            // RFC 7541 §6.3: move the pending size-update onto the converter
-            // so the first header block of this pass prepends the signal.
-            // We clear the connection-side mirror only AFTER the write pass
-            // confirms emission via `converter.size_update_emitted`, so a
-            // DATA-only write pass (no header block) does not drop the
-            // signal.
-            pending_table_size_update: self.pending_table_size_update,
-            size_update_emitted: false,
-            // Reset on every write pass; `check_header_capacity` flips it
-            // mid-call and `finalize` commits the abort by flipping
-            // `kawa.parsing_phase` to Error so the next pass emits
-            // RST_STREAM(InternalError).
-            pending_oversized_abort: false,
-        };
+            self.position.is_client(),
+            self.hpack.take_converter_buf(),
+            self.hpack.take_lowercase_buf(),
+            self.hpack.take_cookie_buf(),
+            self.pending_table_size_update,
+        );
         priorities_buf.clear();
         priorities_buf.extend(self.stream_table.streams().keys().copied());
         // RFC 9218 §4 primary sort: ascending urgency, then stream ID for
@@ -2590,10 +2574,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         let mut total_bytes_written: usize = 0;
         // Collect every fresh RST_STREAM emitted via the converter
         // (`initialize` chokepoint or the HPACK over-budget abort path)
-        // so we can run `account_emitted_rst` for each one AFTER the
-        // converter is dropped — the converter holds the encoder borrowed
-        // out of `self.hpack` for the loop body so we cannot take `&mut
-        // self` until then.
+        // so we can run `account_emitted_rst` for each one AFTER the loop.
+        // This is an ORDERING requirement, not a borrow workaround: a
+        // MadeYouReset cap trip makes `account_emitted_rst` return a GOAWAY
+        // result that ends the pass, and every stream in `priorities_buf`
+        // must get its write before that preemption.
         let mut freshly_emitted_rsts: Vec<H2Error> = Vec::new();
         'outer: for &stream_id in &priorities_buf {
             let Some(&global_stream_id) = self.stream_table.streams().get(&stream_id) else {
@@ -2617,11 +2602,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 || (kawa.is_error() && !self.stream_table.rst_sent_contains(stream_id))
             {
                 let window = min(*parts.window, self.flow_control.window());
-                converter.window = window;
-                converter.stream_id = stream_id;
-                // RFC 9218 §4: incremental streams yield the converter after
-                // a single DATA frame so same-urgency peers interleave.
-                converter.incremental_mode = is_incremental;
                 // Same-urgency-bucket ready-peer count (Tier 3a, LIFECYCLE §9
                 // invariant 17). The converter skips the yield when there is
                 // no peer in the same bucket to interleave with — prevents
@@ -2630,7 +2610,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // count would wrongly yield for a solo incremental stream
                 // when another urgency bucket happens to contain an
                 // incremental peer.
-                converter.incremental_peer_count = ready_incremental_by_urgency
+                let incremental_peer_count = ready_incremental_by_urgency
                     .get(&urgency)
                     .copied()
                     .unwrap_or(0);
@@ -2655,10 +2635,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     // cap is evadable: any path that flips `parsing_phase` to
                     // Error before reaching this gate (oversized inbound
                     // trailers, malformed bodies, etc.) would land an
-                    // unaccounted RST on the wire. We defer the actual
-                    // accounting call until after `drop(converter)` — the
-                    // converter holds the encoder borrowed out of
-                    // `self.hpack` here.
+                    // unaccounted RST on the wire. The accounting call is
+                    // deferred to after the loop so a cap trip cannot
+                    // preempt the remaining streams' writes; see
+                    // `freshly_emitted_rsts` above.
                     if freshly_rst {
                         freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
                     }
@@ -2696,8 +2676,28 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     let edits = std::mem::take(&mut parts.context.headers_response);
                     super::shared::apply_response_header_edits(kawa, &edits);
                 }
+                // One converter for exactly this `prepare` call. It borrows
+                // the encoder out of `self.hpack`; keeping that borrow no
+                // longer than the call is what leaves the rest of this loop
+                // body free to take `&self` / `&mut self`. The scratch and
+                // the RFC 7541 §6.3 signal are moved in here and moved back
+                // out by `reclaim` below — no buffer is copied.
+                //
+                // RFC 9218 §4: `incremental_mode` makes an incremental
+                // stream yield the converter after a single DATA frame so
+                // same-urgency peers interleave; a non-scheduled caller
+                // (the resume path above, the converter's own unit tests)
+                // keeps the sequential semantics with `false`.
+                let mut converter = pass.converter(
+                    self.hpack.encoder_mut(),
+                    stream_id,
+                    window,
+                    is_incremental,
+                    incremental_peer_count,
+                );
                 kawa.prepare(&mut converter);
-                // The pre-prepare gate at line 2483 only inserts into
+                consumed = window - pass.reclaim(converter);
+                // The pre-prepare gate above only inserts into
                 // `rst_sent` when `kawa.is_error()` is already true on
                 // entry. The HPACK over-budget abort path
                 // (`H2BlockConverter::check_header_capacity` →
@@ -2723,8 +2723,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 let freshly_rst_post_prepare =
                     kawa.is_error() && self.stream_table.rst_sent_mut().insert(stream_id);
                 if freshly_rst_post_prepare {
-                    // Defer accounting until after `drop(converter)`; same
-                    // reason as the pre-prepare collector above.
+                    // Deferred to after the loop; same reason as the
+                    // pre-prepare collector above.
                     freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
                     if is_incremental
                         && let Some(c) = ready_incremental_by_urgency.get_mut(&urgency)
@@ -2732,7 +2732,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         *c = c.saturating_sub(1);
                     }
                 }
-                consumed = window - converter.window;
                 *parts.window = parts.window.saturating_sub(consumed);
                 self.flow_control.consume_send_window(consumed);
                 if is_incremental && consumed > 0 && first_incremental_fired.is_none() {
@@ -2818,17 +2817,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             {
                 let close_frontend =
                     matches!(self.position, Position::Server) && !parts.context.keep_alive_frontend;
-                let (client_rtt, server_rtt) = Self::snapshot_rtts(
-                    &self.position,
-                    &self.socket,
-                    &endpoint,
-                    stream.linked_token(),
-                );
+                let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, stream.linked_token());
 
-                if let Some((dead_id, token)) = Self::try_recycle_server_stream(
-                    &self.position,
-                    &mut self.bytes,
-                    self.stream_table.streams(),
+                if let Some((dead_id, token)) = self.try_recycle_server_stream(
                     stream,
                     global_stream_id,
                     stream_id,
@@ -2851,33 +2842,27 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
         }
         // Sample the pass's final bucket totals. Publication is deferred to
-        // the `gauge_connection_state` call below: `converter` still borrows
-        // the encoder out of `self.hpack` here, and the value must reach the
-        // gauge in the SAME pass that computed it — the entry call at the
-        // top of `write_streams` runs before `ready_incremental_by_urgency`
-        // exists.
+        // the `gauge_connection_state` call below because the value must
+        // reach the gauge in the SAME pass that computed it — the entry call
+        // at the top of `write_streams` runs before
+        // `ready_incremental_by_urgency` exists.
         self.ready_incremental_streams = ready_incremental_by_urgency
             .values()
             .copied()
             .sum::<usize>();
-        // Reclaim the converter's reusable buffers before any &mut self.hpack
-        // calls, since the converter borrows the encoder out of self.hpack.
-        let converter_out = std::mem::take(&mut converter.out);
-        let lowercase_buf = std::mem::take(&mut converter.lowercase_buf);
-        let cookie_buf = std::mem::take(&mut converter.cookie_buf);
         // RFC 7541 §6.3: clear our mirror of the pending size-update only
-        // AFTER the converter confirmed the signal was emitted to its
-        // output buffer. A DATA-only pass leaves `size_update_emitted` as
-        // `false` so the signal stays queued for the next pass with a
-        // header block.
-        let size_update_emitted = converter.size_update_emitted;
-        drop(converter);
-        if size_update_emitted {
+        // AFTER the pass confirmed the signal reached a header block. A
+        // DATA-only pass leaves `size_update_emitted` as `false` so the
+        // signal stays queued for the next pass with a header block.
+        if pass.size_update_emitted() {
             self.pending_table_size_update = None;
         }
+        // End the pass and take its three reusable buffers back. They are
+        // moved, not copied: the pass never owned an allocation of its own.
+        let (converter_out, lowercase_buf, cookie_buf) = pass.into_buffers();
         // Publish `ready_incremental_streams` (and any window/stream drift the
-        // pass produced) now that the converter borrow is released, and before
-        // the two early returns below, so no pass samples without emitting.
+        // pass produced) before the two early returns below, so no pass
+        // samples without emitting.
         self.gauge_connection_state();
         // Account every RST that the converter emitted during this pass
         // (pre-prepare gate + post-prepare HPACK over-budget abort) so
@@ -2901,11 +2886,20 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             .advance_incremental_cursor(first_incremental_fired);
         let mut close_frontend_after_completed_stream = false;
         for (dead_id, global_stream_id, token, close_frontend) in completed_streams {
-            // The main write loop borrows the encoder out of self.hpack, so
-            // we can't mutate the H2 maps inline. Retire the recycled stream
-            // immediately after the converter borrow ends, before
-            // endpoint.end_stream() can trigger teardown and observe a
-            // stale `Recycle` entry in self.stream_table.streams().
+            // Retirement is deferred out of the loop on purpose, and this is
+            // an ORDERING requirement rather than a borrow workaround:
+            // `try_recycle_server_stream` passes `is_last_stream` as
+            // `streams().len() == 1`, and that branch hands the WHOLE
+            // remaining connection overhead pool to one stream instead of a
+            // proportional share. Retiring inline would let a later completer
+            // of the same pass read `len() == 1` while other streams are still
+            // live, and drain the pool early. (`active_streams` is passed
+            // too, but it is only the even-split divisor of the fallback
+            // branch, reached while the connection-wide byte total is still
+            // zero — on every other pass the divisor is that total.)
+            // Retiring here also runs
+            // before `endpoint.end_stream()` can trigger teardown and observe
+            // a stale `Recycle` entry in `self.stream_table.streams()`.
             self.remove_dead_stream(dead_id, global_stream_id);
             close_frontend_after_completed_stream |= close_frontend;
             if let Some(token) = token {
@@ -3558,22 +3552,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// paths so the backend lookup does not depend on
     /// `EndpointClient::end_stream` continuing to leave entries in
     /// `Router.backends`.
-    ///
-    /// Takes individual field references (not `&self`) for the same reason
-    /// `try_recycle_server_stream` does — to avoid borrow conflicts with the
-    /// `H2BlockConverter` that holds the encoder borrowed out of `self.hpack`
-    /// during the per-stream write loop.
     fn snapshot_rtts<E: Endpoint>(
-        position: &Position,
-        socket: &Front,
+        &self,
         endpoint: &E,
         linked_token: Option<mio::Token>,
     ) -> (Option<Duration>, Option<Duration>) {
-        if !position.is_server() {
+        if !self.position.is_server() {
             return (None, None);
         }
         (
-            socket_rtt(socket.socket_ref()),
+            socket_rtt(self.socket.socket_ref()),
             linked_token
                 .and_then(|t| endpoint.socket(t))
                 .and_then(socket_rtt),
@@ -3587,16 +3575,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// caller can add `stream_id` to the dead-streams list and call `endpoint.end_stream()`
     /// if a token was returned. Returns `None` if recycling was deferred or not applicable.
     ///
-    /// Takes individual field references instead of `&mut self` to avoid borrow
-    /// conflicts when the H2 block converter holds the encoder borrowed out
-    /// of `self.hpack`.
-    /// `client_rtt`/`server_rtt` are snapshotted by the caller (which still
-    /// owns `&self.socket` and `&endpoint`) and forwarded into the access log.
+    /// `client_rtt`/`server_rtt` are snapshotted by the caller — which must
+    /// do so BEFORE `endpoint.end_stream(...)`, see [`Self::snapshot_rtts`] —
+    /// and forwarded into the access log. `stream` stays a parameter rather
+    /// than being looked up here because the caller already holds it as
+    /// `&mut context.streams[global_stream_id]`.
     #[allow(clippy::too_many_arguments)]
     fn try_recycle_server_stream<L>(
-        position: &Position,
-        bytes: &mut H2ByteAccounting,
-        streams: &HashMap<StreamId, GlobalStreamId>,
+        &mut self,
         stream: &mut crate::protocol::mux::Stream,
         global_stream_id: GlobalStreamId,
         stream_id: StreamId,
@@ -3609,7 +3595,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        match position {
+        match self.position {
             Position::Client(..) => None,
             Position::Server => {
                 // Already logged by a reset path; retire the stream after its RST is flushed.
@@ -3635,14 +3621,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     stream.metrics.bin + stream.metrics.backend_bin,
                     stream.metrics.bout + stream.metrics.backend_bout,
                 );
+                let active_streams = self.stream_table.streams().len();
                 distribute_overhead(
                     &mut stream.metrics,
-                    &mut bytes.overhead_bin,
-                    &mut bytes.overhead_bout,
+                    &mut self.bytes.overhead_bin,
+                    &mut self.bytes.overhead_bout,
                     stream_bytes,
                     byte_totals,
-                    streams.len(),
-                    streams.len() == 1,
+                    active_streams,
+                    active_streams == 1,
                 );
                 debug.push(DebugEvent::StreamEvent(4, global_stream_id));
                 trace!(
@@ -3663,8 +3650,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// `endpoint.end_stream()` with the full `Context` (which can't be passed here
     /// because `stream` borrows from `context.streams`).
     ///
-    /// Callers must distribute overhead *before* calling this, since the converter
-    /// borrow may prevent `distribute_overhead()`.
+    /// Callers must distribute overhead *before* calling this: it resets
+    /// `stream.metrics`, so a share credited afterwards would be discarded.
     fn complete_server_stream<L>(
         stream: &mut crate::protocol::mux::Stream,
         listener: std::rc::Rc<std::cell::RefCell<L>>,
@@ -3954,8 +3941,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // Check if stream is linked to a backend — borrow must be scoped
                 // so end_stream can take &mut context.
                 let linked_token = context.streams[global_stream_id].linked_token();
-                let (client_rtt, server_rtt) =
-                    Self::snapshot_rtts(&self.position, &self.socket, &*endpoint, linked_token);
+                let (client_rtt, server_rtt) = self.snapshot_rtts(&*endpoint, linked_token);
                 if let Some(token) = linked_token {
                     endpoint.end_stream(token, global_stream_id, context);
                 }
@@ -4100,8 +4086,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///     RST_STREAM frames straight into `kawa.out` from inside
     ///     `kawa.prepare`. We collect those `H2Error` codes during the
     ///     `write_streams` loop and call this helper for each one
-    ///     after `drop(converter)` (because the converter holds the
-    ///     encoder borrowed out of `self.hpack`).
+    ///     after the loop, so a lifetime-cap trip cannot preempt the
+    ///     writes of the streams that follow.
     ///
     /// Returning `Some(MuxResult)` means the caller MUST short-circuit
     /// with that result — the flood detector tripped its lifetime cap
@@ -5497,8 +5483,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             let stream = &mut context.streams[global_stream_id];
             self.attribute_bytes_to_stream(&mut stream.metrics);
             let linked_token = stream.linked_token();
-            let (client_rtt, server_rtt) =
-                Self::snapshot_rtts(&self.position, &self.socket, &endpoint, linked_token);
+            let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, linked_token);
             if let Some(token) = linked_token {
                 endpoint.end_stream(token, global_stream_id, context);
             }
@@ -6212,8 +6197,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         } else {
             None
         };
-        let (client_rtt, server_rtt) =
-            Self::snapshot_rtts(&self.position, &self.socket, &endpoint, linked_token);
+        let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, linked_token);
         if let Some(token) = linked_token {
             endpoint.end_stream(token, stream_id, context);
         }
@@ -9861,6 +9845,367 @@ mod tests {
              not clobbered by a HUP-while-draining event landing between \
              two TCP segments of the same CONTINUATION frame"
         );
+    }
+
+    // ── The HPACK encoder across one multi-stream write pass ────────────
+    //
+    // `converter.rs`'s own unit tests drive ONE `H2BlockConverter` over ONE
+    // kawa. Nothing there can see a property that only exists across the
+    // streams of a single `write_streams` pass, and those are precisely the
+    // two the per-`kawa.prepare` converter scoping has to preserve: the
+    // RFC 7541 §6.3 size-update prefix belongs to the first header block of
+    // the pass and to no other, and every block of the pass is encoded
+    // against the SAME encoder dynamic table.
+
+    /// Split a captured H2 byte stream into its HEADERS frame payloads,
+    /// each paired with the stream it belongs to, in wire order. DATA and
+    /// control frames are skipped; a truncated capture is a test bug and
+    /// asserts rather than silently returning a short list.
+    fn headers_blocks(wire: &[u8]) -> Vec<(StreamId, Vec<u8>)> {
+        let mut blocks = Vec::new();
+        let mut offset = 0usize;
+        while offset + parser::FRAME_HEADER_SIZE <= wire.len() {
+            let payload_len = ((wire[offset] as usize) << 16)
+                | ((wire[offset + 1] as usize) << 8)
+                | wire[offset + 2] as usize;
+            let frame_type = wire[offset + 3];
+            let stream_id = u32::from_be_bytes([
+                wire[offset + 5],
+                wire[offset + 6],
+                wire[offset + 7],
+                wire[offset + 8],
+            ]) & 0x7fff_ffff;
+            let start = offset + parser::FRAME_HEADER_SIZE;
+            let end = start + payload_len;
+            assert!(
+                end <= wire.len(),
+                "captured frame must be complete: {payload_len} payload bytes \
+                 declared at offset {offset} of a {} byte capture",
+                wire.len()
+            );
+            if frame_type == 1 {
+                blocks.push((stream_id, wire[start..end].to_vec()));
+            }
+            offset = end;
+        }
+        blocks
+    }
+
+    /// `true` when `block` opens with an RFC 7541 §6.3 dynamic-table-size
+    /// update. The representation prefixes partition the first byte with no
+    /// overlap — `1xxxxxxx` indexed, `01xxxxxx` literal-with-indexing,
+    /// `0001xxxx` literal-never-indexed, `0000xxxx` literal-without-indexing
+    /// — so the `001xxxxx` pattern identifies the update on its own,
+    /// whatever integer follows it.
+    fn starts_with_size_update(block: &[u8]) -> bool {
+        block.first().is_some_and(|b| b & 0xE0 == 0x20)
+    }
+
+    /// Drive exactly ONE `write_streams` pass that emits a response header
+    /// block on every `stream_ids` entry, and return those blocks in the
+    /// order they reached the wire together with whatever size-update the
+    /// connection still has queued afterwards.
+    ///
+    /// Each stream is opened by a real HEADERS frame from the peer and then
+    /// filled with sozu's own 404 default answer through
+    /// `answers::set_default_answer`, the same chokepoint the routing layer
+    /// uses — so the blocks captured here are the ones production encodes.
+    ///
+    /// `pending_table_size_update` is installed the way `handle_settings_frame`
+    /// installs it: the encoder cap and the queued signal move together.
+    fn drive_one_write_pass(
+        stream_ids: &[StreamId],
+        pending_table_size_update: Option<u32>,
+    ) -> (Vec<(StreamId, Vec<u8>)>, Option<u32>) {
+        use std::io::{Read, Write};
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(8, 40, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        connection.state = H2State::Header;
+        connection
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+
+        let mut peer_encoder = loona_hpack::Encoder::new();
+        for &stream_id in stream_ids {
+            let field_block = peer_encoder.encode([
+                (&b":method"[..], &b"GET"[..]),
+                (&b":scheme"[..], &b"https"[..]),
+                (&b":authority"[..], &b"example.com"[..]),
+                (&b":path"[..], &b"/write-pass"[..]),
+            ]);
+            let mut frame = Vec::with_capacity(parser::FRAME_HEADER_SIZE + field_block.len());
+            frame.extend_from_slice(&(field_block.len() as u32).to_be_bytes()[1..]);
+            frame.push(1); // HEADERS
+            frame.push(parser::FLAG_END_STREAM | parser::FLAG_END_HEADERS);
+            frame.extend_from_slice(&stream_id.to_be_bytes());
+            frame.extend_from_slice(&field_block);
+            peer.write_all(&frame)
+                .expect("loopback write must complete");
+            peer.flush().expect("loopback flush must complete");
+            for _ in 0..64 {
+                connection.readable(&mut context, EndpointClient(&mut router));
+                if connection.stream_table.streams().contains_key(&stream_id) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            assert!(
+                connection.stream_table.streams().contains_key(&stream_id),
+                "stream {stream_id} must be accepted before the write pass"
+            );
+        }
+
+        let answers = context.listener.borrow().get_answers().clone();
+        let open: Vec<GlobalStreamId> = connection
+            .stream_table
+            .streams()
+            .values()
+            .copied()
+            .collect();
+        for global_stream_id in open {
+            crate::protocol::mux::answers::set_default_answer(
+                &mut context.streams[global_stream_id],
+                &mut connection.readiness,
+                404,
+                &answers.borrow(),
+            );
+        }
+
+        // Discard whatever the handshake already put on the wire, so the
+        // capture below holds this write pass and nothing else.
+        let mut discard = Vec::new();
+        let _ = peer.read_to_end(&mut discard);
+
+        if let Some(size) = pending_table_size_update {
+            connection.hpack.set_encoder_max_table_size(size as usize);
+        }
+        connection.pending_table_size_update = pending_table_size_update;
+        connection.writable(&mut context, EndpointClient(&mut router));
+
+        let mut wire = Vec::new();
+        let _ = peer.read_to_end(&mut wire);
+        (headers_blocks(&wire), connection.pending_table_size_update)
+    }
+
+    /// Two properties of a `write_streams` pass, both invisible to any
+    /// single-stream test, pinned on the bytes two streams actually receive:
+    ///
+    /// 1. the RFC 7541 §6.3 dynamic-table-size-update prefix is written to
+    ///    the FIRST header block of the pass and to no other, and the
+    ///    connection's mirror is cleared only because a block carried it;
+    /// 2. both blocks are encoded against ONE encoder dynamic table, so a
+    ///    peer replaying them in order with a single decoder stays in sync —
+    ///    and a decoder that never saw the first block CANNOT read the
+    ///    second, which is the negative half that makes assertion 2
+    ///    discriminating rather than vacuous.
+    ///
+    /// Scoping the `H2BlockConverter` to a single `kawa.prepare` call is
+    /// what puts both at risk: the converter no longer spans the per-stream
+    /// loop, so the signal and the encoder now cross from one stream to the
+    /// next through [`converter::H2ConverterPass`] rather than through one
+    /// long-lived struct.
+    ///
+    /// TO SEE THIS RED, break either half:
+    /// (a) delete `self.pending_table_size_update = converter.pending_table_size_update;`
+    ///     from `converter::H2ConverterPass::reclaim` — every block of the
+    ///     pass then re-emits the prefix, and the second assertion fails with
+    ///     `only the FIRST header block of a pass carries the size update;
+    ///     stream 3 opened with 0x3f`;
+    /// (b) pass a fresh `loona_hpack::Encoder::new()` to `pass.converter(..)`
+    ///     in `write_streams` instead of `self.hpack.encoder_mut()` — every
+    ///     block becomes self-contained and the LAST assertion fails with
+    ///     `the second block must depend on the dynamic table the first one
+    ///     built`.
+    #[test]
+    fn one_write_pass_prefixes_its_first_header_block_only_and_shares_one_encoder() {
+        // 4096 is the HPACK default table size, so `[0x3f, 0xe1, 0x1f]` below
+        // is the canonical §6.3 encoding: prefix bits `001`, a 5-bit prefix
+        // integer saturated to 31, then 4096 - 31 = 4065 as two continuation
+        // octets (0x61 | 0x80, 0x1f). Written out rather than produced with
+        // the same encoder the production path uses, so the test cannot
+        // agree with a broken encoder.
+        const TABLE_SIZE: u32 = 4096;
+        const SIZE_UPDATE_PREFIX: [u8; 3] = [0x3f, 0xe1, 0x1f];
+
+        let (blocks, residual) = drive_one_write_pass(&[1, 3], Some(TABLE_SIZE));
+
+        assert_eq!(
+            blocks.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1, 3],
+            "one pass must emit one header block per open stream, in the \
+             priority order (equal urgency, ascending stream id)"
+        );
+
+        assert_eq!(
+            &blocks[0].1[..SIZE_UPDATE_PREFIX.len()],
+            &SIZE_UPDATE_PREFIX,
+            "the first header block of the pass must open with the \
+             dynamic-table-size-update for {TABLE_SIZE}"
+        );
+        assert!(
+            !starts_with_size_update(&blocks[1].1),
+            "only the FIRST header block of a pass carries the size update; \
+             stream {} opened with {:#04x}",
+            blocks[1].0,
+            blocks[1].1[0]
+        );
+        assert_eq!(
+            residual, None,
+            "the connection clears its mirror once a block carried the signal"
+        );
+
+        // Positive half: the peer's single decoder replays the pass in order.
+        let mut peer_decoder = loona_hpack::Decoder::new();
+        peer_decoder.set_max_allowed_table_size(TABLE_SIZE as usize);
+        for (stream_id, block) in &blocks {
+            let mut decoded = Vec::new();
+            let status = peer_decoder.decode_with_cb(block, |key, value| {
+                decoded.push((key.into_owned(), value.into_owned()));
+            });
+            assert!(
+                status.is_ok(),
+                "a peer replaying the pass in order must decode stream \
+                 {stream_id}'s block: {status:?}"
+            );
+            assert!(
+                decoded.contains(&(b":status".to_vec(), b"404".to_vec())),
+                "stream {stream_id}'s block must carry the 404 status line, \
+                 got {decoded:?}"
+            );
+        }
+
+        // Negative half: the second block is not self-contained. It indexes
+        // dynamic-table entries only the first block created, so a decoder
+        // that never saw the first block cannot read it. Without this, a
+        // per-stream encoder would satisfy every assertion above.
+        let mut fresh_decoder = loona_hpack::Decoder::new();
+        fresh_decoder.set_max_allowed_table_size(TABLE_SIZE as usize);
+        let status = fresh_decoder.decode_with_cb(&blocks[1].1, |_, _| {});
+        assert!(
+            status.is_err(),
+            "the second block must depend on the dynamic table the first one \
+             built — a decoder that never saw the first block must fail on \
+             it, otherwise the two blocks came from two encoders"
+        );
+    }
+
+    // ── Property coverage: the HPACK encoder across a multi-stream pass ──
+    //
+    // The deterministic test above fixes ONE shape: two streams, the HPACK
+    // default table size, the size update landing on the first of exactly
+    // two blocks. This property generalises the stream count (2..=5) and the
+    // advertised table size, which decides both how many octets the §6.3
+    // prefix occupies and how much dynamic table the later blocks can index.
+    //
+    // It is a sibling of `reassembly_property` below rather than a case
+    // inside it: that one drives the READ path and its oracle is "one
+    // decoder stays in sync across a fragmented header block", while this
+    // one drives the WRITE path and its oracle is "one encoder, one prefix,
+    // N blocks a single peer decoder replays". One `quickcheck` verdict over
+    // two unrelated state machines would say nothing about either.
+    //
+    // The negative half of the deterministic test — a fresh decoder must
+    // FAIL on a later block — is deliberately left out here: a generated
+    // table size small enough to evict the dynamic table makes every block
+    // self-contained, which is correct behaviour and would fail that
+    // assertion.
+    mod write_pass_property {
+        use quickcheck::{Arbitrary, Gen, TestResult, quickcheck};
+
+        use super::*;
+
+        /// One generated write pass: how many streams share it, and the
+        /// `SETTINGS_HEADER_TABLE_SIZE` the peer advertised just before it.
+        #[derive(Debug, Clone, Copy)]
+        struct WritePassPlan {
+            streams: u8,
+            table_size: u16,
+        }
+
+        impl Arbitrary for WritePassPlan {
+            fn arbitrary(g: &mut Gen) -> Self {
+                WritePassPlan {
+                    streams: *g.choose(&[2u8, 3, 4, 5]).expect("non-empty slice"),
+                    // Bounded by the HPACK default a fresh `Decoder`
+                    // accepts, mirrored onto the peer decoder below; a
+                    // larger advertisement is a SETTINGS-path concern, not
+                    // a write-pass one.
+                    table_size: u16::arbitrary(g) % 4097,
+                }
+            }
+        }
+
+        fn drive(plan: WritePassPlan) -> TestResult {
+            let stream_ids: Vec<StreamId> =
+                (0..u32::from(plan.streams)).map(|i| 1 + 2 * i).collect();
+            let (blocks, residual) =
+                drive_one_write_pass(&stream_ids, Some(u32::from(plan.table_size)));
+
+            if blocks
+                .iter()
+                .map(|(id, _)| *id)
+                .ne(stream_ids.iter().copied())
+            {
+                return TestResult::error(format!(
+                    "plan {plan:?}: expected one block per stream in priority \
+                     order {stream_ids:?}, got {:?}",
+                    blocks.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+                ));
+            }
+            if !starts_with_size_update(&blocks[0].1) {
+                return TestResult::error(format!(
+                    "plan {plan:?}: the first block must open with the \
+                     size update, got {:#04x}",
+                    blocks[0].1[0]
+                ));
+            }
+            for (stream_id, block) in blocks.iter().skip(1) {
+                if starts_with_size_update(block) {
+                    return TestResult::error(format!(
+                        "plan {plan:?}: stream {stream_id} re-emitted the \
+                         size update the first block already carried"
+                    ));
+                }
+            }
+            if residual.is_some() {
+                return TestResult::error(format!(
+                    "plan {plan:?}: the mirror must be cleared once a block \
+                     carried the signal, still {residual:?}"
+                ));
+            }
+
+            let mut peer_decoder = loona_hpack::Decoder::new();
+            peer_decoder.set_max_allowed_table_size(usize::from(plan.table_size));
+            for (stream_id, block) in &blocks {
+                let mut decoded = Vec::new();
+                let status = peer_decoder.decode_with_cb(block, |key, value| {
+                    decoded.push((key.into_owned(), value.into_owned()));
+                });
+                if status.is_err() {
+                    return TestResult::error(format!(
+                        "plan {plan:?}: a peer replaying the pass in order \
+                         desynced on stream {stream_id}: {status:?}"
+                    ));
+                }
+                if !decoded.contains(&(b":status".to_vec(), b"404".to_vec())) {
+                    return TestResult::error(format!(
+                        "plan {plan:?}: stream {stream_id} decoded to \
+                         {decoded:?}, expected the 404 status line"
+                    ));
+                }
+            }
+            TestResult::passed()
+        }
+
+        quickcheck! {
+            fn qc_one_write_pass_prefixes_its_first_header_block_only(plan: WritePassPlan) -> TestResult {
+                drive(plan)
+            }
+        }
     }
 
     // ── Property coverage: interleaved reassembly + control-frame flushes ──

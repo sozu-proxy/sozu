@@ -77,6 +77,42 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: `write_streams` builds its `H2BlockConverter` for ONE `kawa.prepare` call
+  instead of one per write pass, so the converter's `&mut self.hpack` encoder borrow no longer spans
+  the per-stream loop.** That borrow was the reason the loop could not call a single `&self` /
+  `&mut self` method: `snapshot_rtts` and `try_recycle_server_stream` were associated functions
+  taking individual field references, and both said so in their own doc comments. Both are now
+  ordinary methods — `self.snapshot_rtts(&endpoint, linked_token)` and
+  `self.try_recycle_server_stream(stream, …)`, the former exactly the shape
+  `doc/h2_mux_internals.md` had already been describing — dropping five parameters across five call
+  sites. New `converter::H2ConverterPass` carries what has to cross from one stream's `prepare` to
+  the next: the three reusable scratch buffers, which are MOVED (`Vec` pointer/length/capacity) and
+  never copied, and the RFC 7541 §6.3 dynamic-table-size-update signal, which must land on the first
+  header block of the pass and on no other. Threading that signal through `reclaim` rather than by
+  hand at each `prepare` site is what keeps a second stream from re-emitting the prefix:
+  `emit_pending_size_update_if_new_block` `take()`s it the moment it writes it. The encoder itself
+  stays in `HpackState`, re-borrowed per `prepare`, so the HPACK dynamic table remains continuous
+  across the streams of a pass. Copy count on the write path is unchanged: the eleven
+  buffer-copying sites in `converter.rs` are the same eleven, byte for byte, and the `IoSlice`
+  gather in `flush_stream_out` still borrows straight out of `kawa.storage.buffer()`.
+  No behaviour change. What is still deferred to after the loop is deferred for ordering reasons
+  that the comments now state instead of citing the borrow: RST accounting via `freshly_emitted_rsts`
+  (a MadeYouReset cap trip returns a GOAWAY result that must not preempt the remaining streams'
+  writes) and stream retirement via `completed_streams` (`try_recycle_server_stream` passes
+  `is_last_stream` as `streams().len() == 1`, the branch that hands the whole remaining overhead
+  pool to one stream, so retiring inline would let a later completer of the same pass drain it
+  while other streams are still live). `distribute_overhead` stays a free function, now documented
+  for the reason that survives — the seven `test_distribute_overhead_*` cases drive its arithmetic
+  with no `ConnectionH2` fixture. New LIFECYCLE.md invariant 25 states the two cross-stream
+  properties and names their tests:
+  `one_write_pass_prefixes_its_first_header_block_only_and_shares_one_encoder` pins both on the wire
+  (two streams, one pass, the §6.3 prefix on the first block only, one peer decoder replaying both
+  blocks — and, as the negative half, a fresh decoder that must FAIL on the second because it
+  indexes dynamic-table entries only the first block created), and
+  `write_pass_property::qc_one_write_pass_prefixes_its_first_header_block_only` generalises the
+  stream count (2..=5) and the advertised table size with `quickcheck`. Neither property is visible
+  to `converter.rs`'s own unit tests, which drive one converter over one kawa.
+
 - **`refactor(mux-h2)`: the RFC 9113 §6.8 double-GOAWAY drain STATE moves into its own
   `lib/src/protocol/mux/h2_drain.rs`, behind the same closed-API shape `hpack_state.rs`,
   `h2_flow_control.rs`, `h2_stream_table.rs` and `h2_flood_detector.rs` established in the four
