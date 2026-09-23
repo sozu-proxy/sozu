@@ -7291,6 +7291,36 @@ mod tests {
         pending: std::cell::Cell<usize>,
         drain_per_flush: usize,
         flushes: std::cell::Cell<usize>,
+        /// Scripted `(size, status)` answers for `socket_write_vectored`,
+        /// consumed front to back. An EMPTY script — the default, and what
+        /// every test written before this field had — delegates to the real
+        /// loopback socket, so those tests are byte-for-byte unaffected.
+        ///
+        /// The record model above cannot express the pair this scripts.
+        /// `pending`/`drain_per_flush` answer "does rustls still hold
+        /// records?"; they say nothing about what a *vectored* write
+        /// reported, because that method delegated to the kernel and the
+        /// kernel only ever answers `(0, WouldBlock)` when it blocks.
+        /// `FrontRustls` does not: `socket_write_vectored` accumulates
+        /// `buffered_size` from `session.writer().write(..)` — plaintext
+        /// rustls took off the caller's hands — and separately sets
+        /// `can_write = false` when `write_tls` hits `WouldBlock` against the
+        /// kernel (`socket.rs`). The two are independent, so
+        /// `(size > 0, WouldBlock)` is a shape ONLY the TLS handler returns.
+        /// That is why the script lives on this fixture rather than on a
+        /// second one: it is the same handler answering the same question the
+        /// record model already answers, one layer down.
+        vectored_script: std::collections::VecDeque<(usize, SocketResult)>,
+        /// How many times `socket_write_vectored` was called, whether the
+        /// answer came from the script or from the delegated loopback socket.
+        ///
+        /// Counting BOTH is what makes this a falsifiable witness. Counting
+        /// only the scripted answers bounds the total by the script's length,
+        /// so an assertion that the loop did NOT go round again could only
+        /// ever deviate downwards and could never fail — and the extra
+        /// delegated rounds are exactly what such an assertion has to be able
+        /// to see.
+        vectored_calls: usize,
     }
 
     impl BackpressuredTlsSocket {
@@ -7300,7 +7330,25 @@ mod tests {
                 pending: std::cell::Cell::new(pending),
                 drain_per_flush,
                 flushes: std::cell::Cell::new(0),
+                vectored_script: std::collections::VecDeque::new(),
+                vectored_calls: 0,
             }
+        }
+
+        /// Script the `(size, status)` pairs `socket_write_vectored` returns.
+        ///
+        /// A builder rather than two more `new` parameters, so the three tests
+        /// that predate the script keep calling `new` unchanged. Each `size`
+        /// is a CAP, clamped to what the gather actually offered: a scripted
+        /// count above the offer would trip `flush_stream_out`'s own
+        /// `debug_assert!(size <= offered)`, and reddening through a
+        /// production assertion is the tree noticing rather than the test.
+        fn with_vectored_script(
+            mut self,
+            script: impl IntoIterator<Item = (usize, SocketResult)>,
+        ) -> Self {
+            self.vectored_script = script.into_iter().collect();
+            self
         }
     }
 
@@ -7320,7 +7368,14 @@ mod tests {
         }
 
         fn socket_write_vectored(&mut self, bufs: &[IoSlice]) -> (usize, SocketResult) {
-            self.stream.socket_write_vectored(bufs)
+            self.vectored_calls += 1;
+            match self.vectored_script.pop_front() {
+                Some((cap, status)) => {
+                    let offered: usize = bufs.iter().map(|slice| slice.len()).sum();
+                    (cap.min(offered), status)
+                }
+                None => self.stream.socket_write_vectored(bufs),
+            }
         }
 
         /// The override that makes this harness worth having.
@@ -7614,6 +7669,425 @@ mod tests {
             !connection.readiness.interest.is_writable(),
             "a pass that owes nothing must relinquish WRITABLE interest, got              {:?}",
             connection.readiness
+        );
+    }
+
+    // ── The vectored write loop: a partial write that reports WouldBlock ──
+    //
+    // First, which shape each neighbour targets, because #1454 asks for that
+    // and the shapes are near-identical. `h2.rs` has FOUR `socket_write(&[])`
+    // sites. Three are the `query / socket_write(&[]) / query` TRIPLE, where
+    // the middle call discards both `size` and `status` and only the second
+    // query says whether the flush landed:
+    //
+    //   - `finalize_write`, the BeforeFlush/AfterFlush pair — covered by
+    //     `a_finalized_write_pass_flushes_once_and_re_arms_while_records_survive`.
+    //   - `writable`'s `H2State::GoAway` arm — covered by
+    //     `a_flush_that_does_not_drain_keeps_the_connection_open` and
+    //     `a_flush_that_succeeds_closes_within_one_writable_call`.
+    //   - `writable`'s preamble paired with the `H2State::Error` arm's
+    //     `error_close_action` query. Only the preamble half is covered (the
+    //     two GoAway tests assert its flush); the second query is read solely
+    //     in the `(H2State::Error, Position::Server)` arm, which no fixture
+    //     enters. **Uncovered.**
+    //
+    // The fourth, in `flush_zero_buffer`, is NOT a triple: it keeps the
+    // `status` the flush returned instead of re-querying. Also uncovered.
+    //
+    // The tests below target none of those. They target **the vectored loop
+    // the triples bracket** — `flush_stream_out`'s `while !kawa.out.is_empty()`
+    // — so naming a triple for them would be naming the wrong shape.
+    //
+    // What had never run against production code: a `socket_write_vectored`
+    // that moves bytes AND reports `WouldBlock`. `update_readiness` (`mux/mod.rs`)
+    // classifies a pass as stalled **iff `size == 0`** — `status` only clears
+    // the event bit — so `size > 0 && status == WouldBlock` is NOT a stall and
+    // the loop must go round again. A write machine that treated
+    // `status != Continue` as a pass terminator would drop that second write
+    // and truncate the response, and would pass every test that existed.
+    //
+    // Why no test could see it. `BackpressuredTlsSocket::socket_write_vectored`
+    // delegated to a real loopback socket, and a kernel that blocks answers
+    // `(0, WouldBlock)` — never `(size > 0, WouldBlock)`. Only `FrontRustls`
+    // returns that pair, and it does so structurally: `buffered_size` counts
+    // plaintext `session.writer().write(..)` accepted, while `can_write` goes
+    // false when `write_tls` blocks against the kernel. Two independent
+    // quantities, one return value.
+    //
+    // `h2_transmit`'s `qc_partial_writes_preserve_the_byte_stream` does drive
+    // partial writes, but through `drive`, a loop written in its own test
+    // module that calls neither `flush_stream_out` nor
+    // `update_readiness_after_write`; its `WritePlan` carries an accept COUNT
+    // and no `SocketResult` at all. A mirror cannot constrain the thing it
+    // mirrors, and that plan cannot express this pair in the first place.
+
+    /// A server-side `Stream` whose response buffer already holds `blocks` as
+    /// queued output, ready for `flush_stream_out` to drain.
+    ///
+    /// `Store::Static` rather than a slice into `kawa.storage`: a partial
+    /// `consume` on a static store re-queues the untaken tail
+    /// (`Store::Static(&data[amount..])`), which is exactly the partial-write
+    /// bookkeeping under test, and it needs no fill of the pooled buffer.
+    fn response_stream_with_out_blocks(
+        pool: &Rc<RefCell<Pool>>,
+        blocks: &[&'static [u8]],
+    ) -> Stream {
+        let mut stream = make_stream_for_invariant_16(pool, Ulid::generate());
+        for block in blocks {
+            stream
+                .back
+                .out
+                .push_back(kawa::OutBlock::Store(kawa::Store::Static(block)));
+        }
+        stream
+    }
+
+    /// Drive `flush_stream_out` over `blocks` with `script` as the socket's
+    /// answers, returning what the loop did.
+    ///
+    /// Calls the production associated function directly. That is deliberate:
+    /// reaching this loop through `writable()` needs a stream carrying
+    /// response bytes through the scheduler, which is the boundary the tests
+    /// above already sit on — and driving it directly is what lets the
+    /// `(size, status)` pair be chosen rather than negotiated with a kernel.
+    fn drive_flush_stream_out(
+        pool: &Rc<RefCell<Pool>>,
+        blocks: &[&'static [u8]],
+        script: &[(usize, SocketResult)],
+    ) -> (FlushOutcome, usize, usize, bool, Readiness) {
+        let (raw_socket, _peer) = connected_socket();
+        let mut socket = BackpressuredTlsSocket::new(raw_socket, 0, 0)
+            .with_vectored_script(script.iter().copied());
+        let mut stream = response_stream_with_out_blocks(pool, blocks);
+        let position = Position::Server;
+        let parts = stream.split(&position);
+        let mut readiness = Readiness {
+            event: Ready::WRITABLE,
+            interest: Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        };
+        let mut debug = DebugHistory::default();
+        let mut io_slices: Vec<IoSlice<'static>> = Vec::new();
+        let mut bytes_written = 0usize;
+
+        let outcome = ConnectionH2::<BackpressuredTlsSocket>::flush_stream_out(
+            &mut socket,
+            parts.wbuffer,
+            parts.metrics,
+            &position,
+            &mut readiness,
+            &mut debug,
+            3,
+            0,
+            None,
+            None,
+            &mut io_slices,
+            Some(&mut bytes_written),
+        );
+
+        let out_is_empty = parts.wbuffer.out.is_empty();
+        (
+            outcome,
+            bytes_written,
+            socket.vectored_calls,
+            out_is_empty,
+            readiness,
+        )
+    }
+
+    /// Bytes the two blocks below carry, and the whole response as far as
+    /// this stream is concerned.
+    const FIRST_BLOCK: &[u8] = b"HTTP/2 response prefix";
+    const SECOND_BLOCK: &[u8] = b" and its continuation";
+    const TOTAL_QUEUED: usize = FIRST_BLOCK.len() + SECOND_BLOCK.len();
+
+    /// A write that moved bytes but reported `WouldBlock` does NOT end the
+    /// pass: the loop goes round again and delivers the rest.
+    ///
+    /// This is the truncation vector of #1454 at the vectored loop — not at
+    /// any of the three `socket_wants_write()` triples. `FrontRustls` returns
+    /// `(buffered_size, WouldBlock)` with `buffered_size > 0` whenever rustls
+    /// took plaintext off our hands while the kernel was full, and
+    /// `update_readiness` deliberately calls that NOT stalled. A machine that
+    /// terminated the pass on `status != Continue` would leave
+    /// `SECOND_BLOCK` queued and send the response short.
+    ///
+    /// TO SEE THIS RED: in `flush_stream_out`, change
+    /// `if update_readiness_after_write(size, status, readiness) {`
+    /// to
+    /// `if update_readiness_after_write(size, status, readiness)
+    ///      || !matches!(status, SocketResult::Continue) {`
+    /// — the pass-terminator shape the `write_streams` inversion could
+    /// introduce. Measured on that mutation: this test fails on its own first
+    /// assertion, `a vectored write that moved bytes but reported WouldBlock
+    /// must not end the pass`, with `left: 5, right: 43`, and it is the ONLY
+    /// failure in the 1083-test `sozu-lib` suite — the other 1082, including
+    /// the three `BackpressuredTlsSocket` tests above and both controls below,
+    /// pass. No production `debug_assert!` fires: every scripted size is
+    /// clamped to the gather's offer.
+    #[test]
+    fn a_partial_write_reporting_would_block_continues_the_pass() {
+        let pool = make_pool_for_invariant_16();
+        // Round 1 accepts 5 of the 43 offered and reports WouldBlock; round 2
+        // takes everything still queued and reports Continue.
+        // The event bit is deliberately not read here: `update_readiness`
+        // removes WRITABLE on the WouldBlock round and the Continue round does
+        // not put it back, so its final value is identical under the correct
+        // and the broken machine. An assertion on it could not fail.
+        let (outcome, bytes_written, vectored_calls, out_is_empty, _readiness) =
+            drive_flush_stream_out(
+                &pool,
+                &[FIRST_BLOCK, SECOND_BLOCK],
+                &[
+                    (5, SocketResult::WouldBlock),
+                    (TOTAL_QUEUED, SocketResult::Continue),
+                ],
+            );
+
+        assert_eq!(
+            bytes_written, TOTAL_QUEUED,
+            "a vectored write that moved bytes but reported WouldBlock must \
+             not end the pass: the loop must go round again and deliver the \
+             remaining bytes, or the response is truncated"
+        );
+        assert_eq!(
+            vectored_calls, 2,
+            "the loop must issue a SECOND socket_write_vectored after the \
+             partial write, not settle for the first"
+        );
+        assert!(
+            out_is_empty,
+            "every queued block must be consumed once the pass drains"
+        );
+        assert!(
+            matches!(outcome, FlushOutcome::Drained),
+            "a queue emptied within the pass is Drained, got {outcome:?}"
+        );
+    }
+
+    /// A write the socket takes whole, in one round, reporting `Continue`.
+    ///
+    /// **This test does not discriminate, and that is its job.** It is the
+    /// `status == Continue` path — the one every existing test already takes,
+    /// because a real loopback socket with room answers exactly this. It
+    /// passes against the correct loop AND against the pass-terminator
+    /// mutation in the test above, since a terminator keyed on
+    /// `status != Continue` never fires here. Kept as the standing
+    /// demonstration that coverage of this shape proves nothing about the
+    /// truncation vector: the suite was full of it and #1454 was open anyway.
+    #[test]
+    fn a_fully_accepted_write_drains_in_one_round() {
+        let pool = make_pool_for_invariant_16();
+        let (outcome, bytes_written, vectored_calls, out_is_empty, _readiness) =
+            drive_flush_stream_out(
+                &pool,
+                &[FIRST_BLOCK, SECOND_BLOCK],
+                &[(TOTAL_QUEUED, SocketResult::Continue)],
+            );
+
+        assert_eq!(
+            bytes_written, TOTAL_QUEUED,
+            "a socket that takes the whole offer delivers the whole queue"
+        );
+        assert_eq!(
+            vectored_calls, 1,
+            "nothing is left to write, so the loop must not go round again"
+        );
+        assert!(out_is_empty, "the queue must be empty after a full accept");
+        assert!(
+            matches!(outcome, FlushOutcome::Drained),
+            "a fully accepted offer is Drained, got {outcome:?}"
+        );
+    }
+
+    /// A write that moves NO bytes stalls the pass and drops WRITABLE.
+    ///
+    /// The other side of `update_readiness`'s single decision: `size == 0` is
+    /// the stall, whatever the status. Together with the partial-write test
+    /// above this pins that the discriminator is the SIZE and not the status —
+    /// both rounds there reported a non-`Continue` status, and only this one
+    /// stops.
+    ///
+    /// Like `a_fully_accepted_write_drains_in_one_round`, this passes under
+    /// the pass-terminator mutation too: `(0, WouldBlock)` stalls either way.
+    /// The size arm is the covered one; the partial arm was not.
+    ///
+    /// TO SEE THIS RED: in `update_readiness` (`mux/mod.rs`), change the
+    /// `else` arm's trailing `true` to `false`, so no size ever reports a
+    /// stall. Measured: the first assertion fails with `a write that moved no
+    /// bytes must stall the pass, got Drained`. It does not hang — the script
+    /// here is a single round, so the loop re-enters, finds the script spent,
+    /// delegates to the live loopback socket and drains.
+    #[test]
+    fn a_write_that_moves_no_bytes_stalls_the_pass() {
+        let pool = make_pool_for_invariant_16();
+        let (outcome, bytes_written, vectored_calls, out_is_empty, readiness) =
+            drive_flush_stream_out(
+                &pool,
+                &[FIRST_BLOCK, SECOND_BLOCK],
+                &[(0, SocketResult::WouldBlock)],
+            );
+
+        assert!(
+            matches!(outcome, FlushOutcome::Stalled),
+            "a write that moved no bytes must stall the pass, got {outcome:?}"
+        );
+        assert_eq!(
+            vectored_calls, 1,
+            "a stalled pass must not retry the socket within the same pass"
+        );
+        assert_eq!(bytes_written, 0, "a stalled write delivered nothing");
+        assert!(
+            !out_is_empty,
+            "the undelivered blocks must stay queued for the next pass, or \
+             they are lost"
+        );
+        assert!(
+            !readiness.event.is_writable(),
+            "a stalled pass must clear the WRITABLE event so the pass is not \
+             re-entered before the socket says it can take more, got {readiness:?}"
+        );
+    }
+
+    // ── force_disconnect's server arm with records pending ──────────────
+    //
+    // `h2_close::force_disconnect_action` is exhaustively tabled over its two
+    // booleans in that module. Nothing called `ConnectionH2::force_disconnect`
+    // itself, so the CALLER half — the `socket_wants_write()` query that feeds
+    // the table and the wiring of `ReArmAndContinue` to interest, flush and
+    // return value — had no coverage. #1454 asks for this site by name.
+    //
+    // Shape targeted: a SINGLE query, not a triple. `force_disconnect` reads
+    // the answer once into `tls_wants_write`, feeds the table and reports the
+    // same value from both debug arms; there is no `socket_write(&[])` here
+    // and so no second question to reconstruct.
+
+    /// A server connection whose TLS records are still buffered re-arms
+    /// instead of closing the session.
+    ///
+    /// `MuxResult::CloseSession` triggers `shutdown(Write)`, which sends FIN
+    /// and destroys whatever rustls is still holding — the client reads a
+    /// truncated response. So the live-peer, records-pending row of
+    /// `force_disconnect_action` must keep WRITABLE and let the writable path
+    /// flush.
+    ///
+    /// TO SEE THIS RED: in `force_disconnect`'s `Position::Server` arm, pass
+    /// `false` in place of `tls_wants_write` to `force_disconnect_action`.
+    /// Measured: this test fails on its own first assertion, `a server still
+    /// holding TLS records must not close: CloseSession sends FIN and destroys
+    /// them, got CloseSession`, while `h2_close`'s own
+    /// `force_disconnect_arm_is_exhaustive` stays green — the table is not the
+    /// caller, which is why this test exists. Passing `true` instead would NOT
+    /// redden this test; catching that constant ON THIS DIRECT PATH is what
+    /// the sibling below is for — it is not the suite's only witness against
+    /// `true`, and its own doc says which other test is.
+    ///
+    /// The interest assertion has its own recipe: delete
+    /// `self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;`
+    /// from the same arm. Measured: `the re-arm must restore WRITABLE interest
+    /// so the writable path is called again to flush`, `left: Hup, right:
+    /// Writable | Error | Hup`. That recipe only bites because the test
+    /// withdraws the bit first — asserting it against the fixture's own
+    /// constructor argument passed under this very mutation.
+    #[test]
+    fn force_disconnect_re_arms_while_tls_records_are_pending() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        // A kernel that accepts nothing, so the records outlive any flush.
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 2, 0, H2State::GoAway);
+
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: this harness must report buffered TLS records"
+        );
+        assert!(
+            !connection.peer_gone_after_final_goaway(),
+            "premise: the peer must still be live, or the table short-circuits \
+             to CloseSession on the first boolean and the record count is never \
+             read"
+        );
+        // Withdraw WRITABLE interest first. `connection_with_backpressure`
+        // hands `WRITABLE | HUP | ERROR` to `ConnectionH2::new` as the
+        // connection's INTEREST, so asserting on it untouched would be reading
+        // this fixture's own argument back and would hold even if the re-arm
+        // arm never assigned it. Starting from `HUP` alone makes the
+        // assignment the only thing that can restore the bit.
+        connection.readiness.interest = Ready::HUP;
+        assert!(
+            !connection.readiness.event.is_writable(),
+            "premise: the WRITABLE event must start clear, so the signal below \
+             is the only thing that can set it, got {:?}",
+            connection.readiness
+        );
+
+        let result = connection.force_disconnect();
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a server still holding TLS records must not close: CloseSession \
+             sends FIN and destroys them, got {result:?}"
+        );
+        assert_eq!(
+            connection.readiness.interest,
+            Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+            "the re-arm must restore WRITABLE interest so the writable path is \
+             called again to flush, got {:?}",
+            connection.readiness
+        );
+        assert!(
+            connection.readiness.event.is_writable(),
+            "the re-arm must signal the edge-triggered WRITABLE event, or the \
+             event loop never revisits this connection, got {:?}",
+            connection.readiness
+        );
+    }
+
+    /// The same call with nothing buffered closes the session.
+    ///
+    /// The other row of the table. It does NOT rest on being the only thing
+    /// that catches a hard-wired `true`: the suite already caught that
+    /// constant without it. Measured on that mutation, `1081 passed; 2
+    /// failed` — this test AND
+    /// `a_flush_that_succeeds_closes_within_one_writable_call` above, which
+    /// predates it and reaches `force_disconnect` through `writable()`'s
+    /// GoAway fall-through, failing with `a drained flush must reach the
+    /// disconnect in the SAME writable call, not defer it to another tick:
+    /// got Continue`.
+    ///
+    /// What this test adds is the PATH, not the count: it calls
+    /// `ConnectionH2::force_disconnect` directly, so a red here names the
+    /// query under test, where the fall-through route arrives through a write
+    /// pass and a state machine that can each shift for reasons of their own.
+    ///
+    /// TO SEE THIS RED: pass `true` in place of `tls_wants_write` to
+    /// `force_disconnect_action` in `force_disconnect`'s `Position::Server`
+    /// arm. Measured: this test fails with `a server holding nothing must
+    /// close rather than wait for a flush that has nothing to flush, got
+    /// Continue`, while the sibling above stays green. The mirror constant
+    /// `false` is measured at `1082 passed; 1 failed`, and that one failure is
+    /// the sibling above — so neither constant can replace the query, and the
+    /// sibling is the suite's only witness against `false`.
+    #[test]
+    fn force_disconnect_closes_when_no_tls_records_are_pending() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        // Same fixture, zero records: the query answers `false`.
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 0, 0, H2State::GoAway);
+
+        assert!(
+            !connection.socket.socket_wants_write(),
+            "premise: nothing buffered, so the table reads its second boolean \
+             as false"
+        );
+        assert!(
+            !connection.peer_gone_after_final_goaway(),
+            "premise: the peer must still be live, so the close comes from the \
+             record count and not from the first boolean"
+        );
+
+        let result = connection.force_disconnect();
+
+        assert!(
+            matches!(result, MuxResult::CloseSession),
+            "a server holding nothing must close rather than wait for a flush \
+             that has nothing to flush, got {result:?}"
         );
     }
 
