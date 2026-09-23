@@ -427,6 +427,43 @@
   all. The quoted `debug_assert!` is the one that need not stay unreachable, and the pin puts it
   under the fenced-block rule from the next changeset onward.
 
+- **`fix(command)`: re-arm `Ready::READABLE` on the read failures a channel can parse past, and
+  count retired bytes as drain progress.** `Channel::read_message_nonblocking`
+  (`command/src/channel.rs`) re-armed `Ready::READABLE` only on its `NothingRead` path; every error
+  reached the caller through the `?` one line above it. `readable()` refuses to run at all while
+  that bit is missing, and it drops the bit itself whenever it fills `front_buf` to a capacity it
+  may not grow past — correct backpressure, undone by whichever parse frees room. So a frame the
+  parser rejected and then re-synchronised past re-aligned a buffer it could no longer refill, and
+  the peer's next frame, still in the socket, was stranded on a session `wants_to_tick`
+  (`bin/src/command/sessions.rs`) does not re-schedule for being merely readable: no hangup, no
+  error, nothing logged. Two parse outcomes reach it — `MessageLengthUnderDelimiter`, which
+  consumes a length prefix no writer can emit precisely so the stream re-aligns, and
+  `InvalidProtobufMessage`, which has consumed the whole undecodable frame since #1428. The
+  re-arm is now per-variant through
+  `rearms_readable`, whose doc comment carries the disposition of all fifteen `ChannelError`
+  variants and whose `match` is exhaustive with no wildcard arm, so a variant added later fails to
+  compile rather than inheriting someone else's answer: those two and `NothingRead` re-arm, the
+  other twelve do not, and `MessageTooLarge` in particular keeps closing the peer rather than
+  re-asserting readability on a buffer it left off a frame boundary. Half the defect sat in
+  `extract_messages`, which returned on the very parse that re-synchronised the stream:
+  `Buffer::consume` advances `position` and shifts only past `capacity / 2`, so retiring an
+  eight-byte prefix moved neither the capacity nor the `available_space()` the loop's two anchors
+  watch. A failed parse that RETIRED bytes is now a third anchor, checked first and needing no spin
+  guard, since `consume` is the sole writer of `position` and the iteration count is therefore
+  bounded by what the peer writes. Both halves were measured necessary: with either one alone the
+  regression test is red. That test,
+  `client_session_delivers_the_frame_behind_a_malformed_length_prefix`, is a session-level one — a
+  `ClientSession` driven through `extract_messages`, because a channel-level test proves the channel
+  re-syncs and says nothing about whether the session is ever ticked again. It counts the frames the
+  drain hands back rather than asserting a readiness bit, no bit reachable from a merely-readable
+  channel re-scheduling a session. This supersedes one sentence of the #1428 entry below, which said
+  `extract_messages` "returns on the first `Err(_)` with the capacity unchanged, so a valid frame
+  already pipelined behind the malformed one reaches the session only on its next readable event":
+  it now reaches the session on the same tick, and that residual is no longer untested. Neither
+  frame is charged to the peer — a bad length prefix or an undecodable payload costs that frame
+  only, the first silently and the second with an `error!` line, an asymmetry
+  `doc/configure_admin_ops.md` §5.2 now records along with the recovery itself. Closes #1445.
+
 - **`fix(doc)`: repair the six wrong `configure.md` line targets, and make the citation resolver
   see markdown targets at all.**
   `.github/scripts/check_doc_citations.py` matched `.rs` alone, so its `CITATION` pattern walked

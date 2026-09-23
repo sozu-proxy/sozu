@@ -282,6 +282,32 @@ not re-scheduled, since that decision keys on queued output, hangup and error
 only. A drain that stopped one read short of the compacted frame would therefore
 never resume, which is the same operator symptom as the defect above.
 
+A third class of frame is neither rejected for its size nor merely awkward to
+buffer: one this end can parse past. A declared length *below* the eight-byte
+prefix is a value no writer emits for any payload, so the supervisor skips
+exactly those eight bytes; a frame whose length is honest but whose payload does
+not decode is consumed whole, on the reasoning that the decode-success path
+already re-frames on whatever follows that same peer-supplied length. Either way
+the cost is that one frame, not the peer: the connection stays open and the
+frames behind the bad one are delivered on the same tick.
+
+"On the same tick" is again load-bearing rather than incidental, and until
+sozu-proxy/sozu#1445 it did not hold. Skipping the bad bytes re-framed what was
+already in the read buffer, but the buffer may hold only part of what the peer
+wrote, and the supervisor had stopped treating that channel as readable — so the
+rest stayed in the socket on a session that, being merely readable, is never
+re-scheduled. The symptom is the one described twice above, reached this time
+only by a peer that emitted a malformed frame.
+
+Note what is and is not logged here, because the volume of the log is not a
+measure of the damage. An undecodable payload logs one `error!` naming the
+frame's length; an under-delimiter length prefix logs nothing at all. A silent
+command channel is therefore not evidence that every frame on it was well
+formed. If you are chasing a CLI or worker whose requests seem to go missing in
+pairs, that silence is the case to rule out — and unlike the size ceiling above
+there is no configuration to reconcile, because no conforming writer produces
+either shape.
+
 ### 5.3 Drop-on-register-fail for the unix command socket
 
 Commit: `b8c8fc61`. Reference:

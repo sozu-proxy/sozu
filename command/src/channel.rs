@@ -75,6 +75,116 @@ pub enum ChannelError {
     MismatchBufferSize,
 }
 
+/// Does this read failure leave a channel that could parse the peer's next
+/// frame, if only it were allowed to refill from the socket?
+///
+/// `readable()` drops `Ready::READABLE` from `interest` whenever it fills
+/// `front_buf` to a capacity it may not grow past, and then refuses to run at
+/// all while the bit is missing (`if !(self.interest & self.readiness)
+/// .is_readable()`). That is correct backpressure, and the parse that frees
+/// room is what undoes it -- but until sozu-proxy/sozu#1445 only ONE parse
+/// outcome did: `read_message_nonblocking` re-armed on its `NothingRead` path
+/// and propagated every error through `?` before reaching it. A frame the
+/// parser rejected and then re-synchronised past therefore re-aligned a buffer
+/// it could no longer refill, and the bytes still in the socket were stranded
+/// on a session `wants_to_tick` (`bin/src/command/sessions.rs`) does not
+/// re-schedule for being merely readable.
+///
+/// The answer is per-variant, not a blanket re-arm before the `?`: a socket
+/// that just failed a `read(2)`, or a peer this end has decided to drop, must
+/// not have its readability re-asserted. The match below is exhaustive with no
+/// wildcard arm ON PURPOSE -- a variant added to `ChannelError` must fail to
+/// compile here rather than inherit someone else's disposition.
+///
+/// Re-arm (the channel retired bytes and is framed on a boundary again; the
+/// only thing missing is more bytes):
+///
+/// - `NothingRead` -- the frame is simply incomplete. The pre-existing case,
+///   and the reason the bit is ever re-armed at all.
+/// - `MessageLengthUnderDelimiter` -- the parser consumed exactly
+///   `delimiter_size()` bytes carrying a declared length no writer can emit for
+///   any payload, so those bytes are provably not a header and skipping them
+///   re-aligns the stream. Re-syncing a buffer that may never refill only
+///   re-syncs the bytes already in hand, which is the case #1445 was filed on.
+/// - `InvalidProtobufMessage` -- since sozu-proxy/sozu#1428 the whole frame is
+///   consumed before the decode failure is returned, so the buffer is left
+///   exactly as the decode-success path leaves it. The frame is lost; the
+///   channel is not.
+///
+/// Do not re-arm:
+///
+/// - `MessageTooLarge` -- twice not, and the first reason does not depend on
+///   the second. It consumes NOTHING: unlike its two siblings above it cannot,
+///   because the bytes behind the header may be payload rather than a fresh
+///   delimiter and re-framing on them would decode peer-chosen bytes as a
+///   control-plane request. So the buffer is not on a boundary and refilling
+///   only re-parses the same header -- a busy loop, not a recovery, and the
+///   frame could not complete anyway, a length above `max_buffer_size` not
+///   fitting a buffer bounded by `max_buffer_size` however much more is read.
+///   On top of that the branch has marked `Ready::ERROR` since #1428, so
+///   re-arming would assert readability on a channel this end has already
+///   decided to close.
+/// - `BufferFull` -- past #1436's compaction this arm means a compacted buffer
+///   at the ceiling whose whole capacity cannot hold a length prefix, so
+///   `available_space()` is zero and cannot grow. `readable()` would read zero
+///   bytes and immediately remove the bit again; refilling cannot change the
+///   outcome.
+/// - `MismatchBufferSize` -- "this should never happen": a `try_into` on a
+///   slice whose length was just checked against `delimiter_size()`. It is an
+///   internal invariant violation, and the same slice fails identically on
+///   every retry, so re-arming would spin instead of recovering.
+/// - `NoByteToRead` -- `read(2)` returned zero, the peer is gone.
+///   `readable()` has already set `interest = Ready::EMPTY` and raised HUP;
+///   re-arming would contradict the hangup it just recorded.
+/// - `Read` -- a hard socket read failure, where `readable()` has already
+///   cleared both `interest` and `readiness`.
+/// - `Connection` -- either a failed `connect(2)` or `readable()`/`writable()`
+///   rejecting the call because the interest gate is shut. Restoring from here
+///   the very bit that gate just refused is the loop this function exists to
+///   avoid.
+/// - `NoByteWritten`, `Write` -- back-buffer/socket write failures, raised on
+///   the write path and terminal there (`NoByteWritten` raises HUP); nothing
+///   about them says the read side may refill.
+/// - `TimeoutReached` -- the blocking read path's deadline
+///   (`read_message_blocking_timeout`), an operator-visible bound rather than a
+///   framing state.
+/// - `SetTimeout`, `BlockingStatus` -- `setsockopt`/`fcntl` failures on the
+///   underlying stream, i.e. blocking-mode plumbing.
+/// - `InvalidCharSet` -- declared here but constructed nowhere; the live
+///   variant of that name is `ScmSocketError::InvalidCharSet`
+///   (`command/src/scm_socket.rs`). It is listed so the match stays exhaustive,
+///   and it is not a framing state either way.
+///
+/// Exactly six of the fifteen reach this function today.
+/// `try_read_delimited_message` raises five of them -- `MessageTooLarge`,
+/// `MessageLengthUnderDelimiter`, `InvalidProtobufMessage`, `BufferFull` and
+/// `MismatchBufferSize` -- and `read_message_nonblocking` mints the sixth,
+/// `NothingRead`, from its `Ok(None)`. The other nine (`NoByteToRead`, `Read`,
+/// `Connection`, `NoByteWritten`, `Write`, `TimeoutReached`, `SetTimeout`,
+/// `BlockingStatus`, `InvalidCharSet`) are dispositioned anyway rather than
+/// left to a wildcard, because a future call site is exactly how a wildcard
+/// becomes a wrong answer nobody wrote down.
+fn rearms_readable(error: &ChannelError) -> bool {
+    match error {
+        ChannelError::NothingRead
+        | ChannelError::MessageLengthUnderDelimiter { .. }
+        | ChannelError::InvalidProtobufMessage(_) => true,
+
+        ChannelError::MessageTooLarge { .. }
+        | ChannelError::BufferFull { .. }
+        | ChannelError::MismatchBufferSize
+        | ChannelError::NoByteToRead
+        | ChannelError::Read(_)
+        | ChannelError::Connection(_)
+        | ChannelError::NoByteWritten
+        | ChannelError::Write(_)
+        | ChannelError::TimeoutReached(_)
+        | ChannelError::SetTimeout { .. }
+        | ChannelError::BlockingStatus { .. }
+        | ChannelError::InvalidCharSet(_) => false,
+    }
+}
+
 /// Channel meant for communication between Sōzu processes over a UNIX socket.
 /// It wraps a unix socket using the mio crate, and transmit prost messages
 /// by serializing them in a binary format, with a fix-sized delimiter.
@@ -502,13 +612,25 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
 
     /// Parse a message from the front buffer, without waiting
     fn read_message_nonblocking(&mut self) -> Result<Rx, ChannelError> {
-        if let Some(message) = self.try_read_delimited_message()? {
-            self.try_shrink_front_buf();
-            return Ok(message);
-        }
+        // `NothingRead` is not a special case, it is one row of
+        // [`rearms_readable`]'s table: an incomplete frame and a frame the
+        // parser rejected and re-synchronised past are the same situation from
+        // `readable()`'s point of view, and propagating the second through `?`
+        // before the re-arm is what stranded the socket bytes behind it
+        // (sozu-proxy/sozu#1445).
+        let error = match self.try_read_delimited_message() {
+            Ok(Some(message)) => {
+                self.try_shrink_front_buf();
+                return Ok(message);
+            }
+            Ok(None) => ChannelError::NothingRead,
+            Err(error) => error,
+        };
 
-        self.interest.insert(Ready::READABLE);
-        Err(ChannelError::NothingRead)
+        if rearms_readable(&error) {
+            self.interest.insert(Ready::READABLE);
+        }
+        Err(error)
     }
 
     /// Wait for the front buffer to be filled, and parses a message from it.
@@ -652,11 +774,13 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
             // ceiling makes `&buffer[delimiter_size()..message_len]` slice
             // backwards and panic; reject it the same way as oversized frames.
             //
-            // Drop the bogus delimiter bytes before returning so the channel
-            // can re-sync on the peer's next frame. Without this, every
-            // subsequent `read_message()` re-reads the same bad header from
-            // the front buffer and the worker burns CPU on the same error
+            // Drop the bogus delimiter bytes before returning. Without this,
+            // every subsequent `read_message()` re-reads the same bad header
+            // from the front buffer and the worker burns CPU on the same error
             // until the peer disconnects.
+            //
+            // This re-aligns what is already in `front_buf`, and nothing more;
+            // `rearms_readable` above carries the refill half.
             if message_len < delimiter_size() {
                 self.front_buf.consume(delimiter_size());
                 return Err(ChannelError::MessageLengthUnderDelimiter {
@@ -1592,14 +1716,13 @@ mod tests {
     /// the decode-success path already did. One undecodable payload therefore
     /// costs its frame rather than the peer.
     ///
-    /// SCOPE: this asserts the channel contract, not a session one.
-    /// `extract_messages` (`bin/src/command/sessions.rs`) returns on the first
-    /// `Err(_)` with the capacity unchanged, so a valid frame already
-    /// pipelined behind the malformed one is not handed to the session on that
-    /// tick, and `wants_to_tick` does not re-schedule it; it is delivered on
-    /// that session's next readable event. Unlike the oversize branch above,
-    /// this shape deliberately has no `ClientSession`-level test, so nothing
-    /// here proves a session-level property.
+    /// SCOPE: this asserts the channel contract, not a session one. Unlike the
+    /// oversize branch above, this shape has no `ClientSession`-level test, so
+    /// nothing here proves a session-level property. A frame pipelined behind
+    /// the malformed one is delivered on the same tick; the session-level proof
+    /// of that is
+    /// `client_session_delivers_the_frame_behind_a_malformed_length_prefix`,
+    /// built on the sibling `MessageLengthUnderDelimiter` shape.
     #[test]
     fn malformed_payload_is_consumed_so_the_channel_resyncs() {
         let (mut reader, mut writer): (
