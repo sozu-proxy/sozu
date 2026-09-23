@@ -1413,7 +1413,7 @@ impl HttpsListener {
     /// rustls context and the answer templates — WITHOUT constructing the full
     /// listener or binding a socket. Runs the exact fallible steps of
     /// [`Self::try_new`] (via the shared [`Self::create_rustls_context`] /
-    /// [`Self::build_answers`] helpers), so master-side validation is faithful
+    /// `Self::build_answers` helpers), so master-side validation is faithful
     /// to what the worker will do.
     ///
     /// The main process calls this before committing an `AddHttpsListener` to
@@ -1828,7 +1828,7 @@ impl HttpsListener {
     /// Variant of [`Self::add_https_front`] that records the origin of
     /// `tls_front.hsts` so listener-default patches can reflow inheriting
     /// frontends without disturbing explicit per-frontend overrides. The
-    /// caller passes [`HstsOrigin::InheritedFromListenerDefault`] when
+    /// caller passes [`crate::router::HstsOrigin::InheritedFromListenerDefault`] when
     /// the value was filled in from `self.config.hsts` rather than from
     /// the operator's per-frontend configuration.
     pub fn add_https_front_with_hsts_origin(
@@ -2091,7 +2091,7 @@ impl HttpsProxy {
 
     /// What this proxy would do with a socket handed to
     /// [`activate_listener`](Self::activate_listener) for `addr`. See
-    /// [`InheritedSocketFate`].
+    /// [`crate::InheritedSocketFate`].
     ///
     /// The event loop is single-threaded, so nothing can change the listener's
     /// `active` flag between this answer and the `activate_listener` call that

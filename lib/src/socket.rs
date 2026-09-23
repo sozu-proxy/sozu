@@ -86,7 +86,7 @@ pub trait SocketHandler {
     fn read_error(&self);
     fn write_error(&self);
     /// Returns the owning connection's session ULID when known. Used by
-    /// [`log_socket_context!`] to render the `[<session_ulid> - - -]` segment
+    /// `log_socket_context!` to render the `[<session_ulid> - - -]` segment
     /// of the socket-layer log prefix, matching the format used by the
     /// rest of the mux stack. Returns `None` for contextless implementations
     /// (e.g. raw `mio::TcpStream`); the macro renders `-` in the ULID slot.
@@ -476,7 +476,7 @@ pub struct SessionTcpStream {
     /// `TcpStream`, this is the client's peer address — identical to what a
     /// live `getpeername(2)` would return, but threaded through the same
     /// plumbing for uniformity. Used as the preferred source of truth for
-    /// the `peer=` slot in [`log_socket_module_prefix`], falling back to a
+    /// the `peer=` slot in `log_socket_module_prefix`, falling back to a
     /// live lookup when `None`.
     pub configured_peer: Option<SocketAddr>,
 }

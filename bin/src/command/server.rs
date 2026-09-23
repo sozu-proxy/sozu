@@ -1093,7 +1093,7 @@ impl Server {
 
     /// Append a JSON-encoded audit record to the dedicated JSON sink, if
     /// one is configured. One line per record so SIEM parsers can stream
-    /// `tail -F`. Same best-effort behaviour as [`append_audit_line`].
+    /// `tail -F`. Same best-effort behaviour as [`Self::append_audit_line`].
     pub fn append_audit_json(&self, json: &str) {
         let Some(writer) = self.audit_log_json_writer.as_ref() else {
             return;
@@ -1221,7 +1221,7 @@ impl Server {
     }
 
     /// Queue an audit event for fan-out to subscribed clients. Drained by
-    /// [CommandHub::flush_pending_audit_events] after every request handler.
+    /// `CommandHub::flush_pending_audit_events` after every request handler.
     pub fn push_audit_event(&mut self, event: Event) {
         self.pending_audit_events.push_back(event);
     }

@@ -797,7 +797,7 @@ impl<V: Debug + Clone> TrieNode<V> {
     /// candidate that ANSWERED: the walk rewinds the ones it tried and
     /// abandoned.
     ///
-    /// `accept` filters candidates — see [`TrieNode::lookup_recursive`]
+    /// `accept` filters candidates — see `TrieNode::lookup_recursive`
     /// for the precedence order it is applied in. Pass
     /// `&mut |_: &KeyValue<Key, V>| true` to take the first leaf found.
     pub fn lookup_with_path<'a, 'b>(
@@ -814,7 +814,7 @@ impl<V: Debug + Clone> TrieNode<V> {
     /// Request-addressed lookup: which entry serves `partial_key`.
     ///
     /// Same walk and same precedence as [`TrieNode::lookup_with_path`] —
-    /// stated once, in [`TrieNode::lookup_recursive`] — without recording
+    /// stated once, in `TrieNode::lookup_recursive` — without recording
     /// the segments it matched. This is the resolver SNI goes through
     /// (`lib/src/tls.rs`, `lib/src/protocol/tcp_preread/`), so certificate
     /// selection follows the same order as HTTP routing.

@@ -10,7 +10,7 @@
 //!
 //! Pure: every entry point that depends on time takes `now: Instant`; the hash
 //! seed is injected at construction. The shell drives the manager with
-//! [`ManagerInput`] and drains [`Output`] via [`poll_output`].
+//! [`ManagerInput`] and drains [`Output`] via [`UdpManager::poll_output`].
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -520,7 +520,7 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
     /// with a 100 ms tick the entry arrives up to 50 ms EARLY on the tick grid
     /// (up to 99 ms off it; see `duration_to_tick`) and no flow need be due at
     /// all. Either way the shell now holds nothing, so
-    /// `armed_deadline` is cleared on entry and [`reschedule`](Self::reschedule)
+    /// `armed_deadline` is cleared on entry and `reschedule`
     /// re-emits `ArmTimer` even when the minimum deadline has not moved.
     /// Without that, an early expiry is a LOST WAKEUP: nothing is closed,
     /// nothing is re-armed, and the flow is never reaped until some other
@@ -584,7 +584,7 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
     }
 
     /// The next manager-wide deadline, or `None` if no flow is armed. After a
-    /// [`handle_timeout`] at deadline `d`, the value returned here is guaranteed
+    /// [`Self::handle_timeout`] at deadline `d`, the value returned here is guaranteed
     /// `> d` (or `None`) — the strict-advance invariant `handle_timeout` asserts
     /// in debug builds, which is what stops the shell busy-looping.
     pub fn poll_timeout(&self) -> Option<Instant> {

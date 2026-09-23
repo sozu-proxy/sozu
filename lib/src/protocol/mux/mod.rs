@@ -348,9 +348,9 @@ pub trait Endpoint: Debug {
     /// caller does NOT own directly: a frontend connection (Position::Server)
     /// reports the backend's RTT through this method, and a backend connection
     /// (Position::Client) reports the frontend's the same way. `token` is
-    /// ignored by [`super::connection::EndpointServer`] (which has a single
+    /// ignored by `connection::EndpointServer` (which has a single
     /// frontend connection) and used as a key by
-    /// [`super::connection::EndpointClient`] (which keys backends by token).
+    /// `connection::EndpointClient` (which keys backends by token).
     /// Returns `None` when the token doesn't resolve, mirroring the existing
     /// fallback paths in `readiness`/`readiness_mut`, and also when the
     /// platform declines to answer.
@@ -512,7 +512,7 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// once per outer [`Mux::ready`] pass and at the top of [`Mux::timeout`]
     /// and [`Mux::shutting_down`]. Every time-based decision in the H2 core
     /// reads this snapshot — mirrored into
-    /// [`h2::ConnectionH2::now`] at each public entry point — instead of
+    /// `h2::ConnectionH2::now` at each public entry point — instead of
     /// calling [`Instant::now`] itself, so one pass sees one consistent
     /// "now". Every deadline armed or evaluated inside a pass is therefore
     /// accurate to within that pass — **in either direction**. The error is
@@ -521,7 +521,7 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// snapshot taken at the START of that pass, so the stored instant is
     /// older than the event it records; an eval site runs near the top of a
     /// pass (`cancel_timed_out_streams` is the first thing
-    /// [`h2::ConnectionH2::poll_read_target`] does). The measured age is therefore
+    /// `h2::ConnectionH2::poll_read_target` does). The measured age is therefore
     /// inflated by the arm site's depth, and a deadline can fire up to one
     /// pass EARLY as well as one pass late. At base both ends read the real
     /// clock and the comparison was exact; this is the cost of the snapshot.
@@ -742,7 +742,7 @@ pub struct Mux<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     ///
     /// The H1/H2 cores no longer own a `TimeoutContainer`: they publish the
     /// instant they want to be called back at through `Connection::poll_timeout`
-    /// and [`Mux::reschedule`] reflects that onto `crate::timer`, arming only
+    /// and `Mux::reschedule` reflects that onto `crate::timer`, arming only
     /// when what the wheel holds differs from what the core wants. This map is
     /// the ONLY thing in the mux that talks to the timer wheel.
     ///
@@ -1049,8 +1049,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> SessionState
     for Mux<Front, L>
 {
-    /// Thin wrapper over [`Mux::ready_inner`] whose only job is to run
-    /// [`Mux::reschedule`] on the way out. `ready_inner` has a dozen `return`
+    /// Thin wrapper over `Mux::ready_inner` whose only job is to run
+    /// `Mux::reschedule` on the way out. `ready_inner` has a dozen `return`
     /// sites; arming the wheel at each of them by hand is precisely the
     /// discipline this refactor exists to remove.
     fn ready(
@@ -1074,7 +1074,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         }
     }
 
-    /// Thin wrapper over [`Mux::timeout_inner`]: reschedule on the way out,
+    /// Thin wrapper over `Mux::timeout_inner`: reschedule on the way out,
     /// then check the two properties carried over from `UdpManager`.
     fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> StateResult {
         let result = self.timeout_inner(token, metrics);
@@ -1331,7 +1331,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         self.context.backend_streams.clear();
     }
 
-    /// Thin wrapper over [`Mux::shutting_down_inner`]: it drives frontend I/O
+    /// Thin wrapper over `Mux::shutting_down_inner`: it drives frontend I/O
     /// and can change a core deadline, so it owes the wheel a reschedule on
     /// every exit.
     fn shutting_down(&mut self) -> SessionIsToBeClosed {

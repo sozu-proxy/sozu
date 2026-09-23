@@ -15,9 +15,9 @@
 //!
 //! Two-level split (mirrors the H2 `ConnectionH2` / `Context` split in
 //! `protocol/mux/`):
-//! - [`UdpManager`](manager::UdpManager): flow table + admission + cap/shedding
+//! - [`manager::UdpManager`]: flow table + admission + cap/shedding
 //!   + flow-key extraction + LB request + timer scheduling.
-//! - [`UdpFlow`](flow::UdpFlow): per-admitted-flow teardown counters, idle /
+//! - [`flow::UdpFlow`]: per-admitted-flow teardown counters, idle /
 //!   lifetime deadlines, PPv2 bookkeeping, chosen backend, forward/return
 //!   decisions, and a `timer_gen`.
 //!

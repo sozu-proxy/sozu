@@ -19,7 +19,7 @@
 //! [`Input::Bytes`] carries the FULL accumulated window from wire offset 0,
 //! not a delta.
 //!
-//! [`parser`] owns the nom-based wire format (TLS record layer, ClientHello,
+//! `parser` owns the nom-based wire format (TLS record layer, ClientHello,
 //! and extensions); this module owns the PROXY-v2 stripping, the SNI/ALPN
 //! routing decision against [`crate::router::pattern_trie::TrieNode`], and
 //! the decided/deadline state machine.

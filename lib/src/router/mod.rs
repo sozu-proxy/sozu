@@ -1021,16 +1021,16 @@ pub enum DomainRule {
     /// the leading `*` stripped) and the remaining leftmost prefix is
     /// non-empty and contains no `.`. Comparison is byte-exact and no
     /// IDN/punycode normalisation is performed here: the pattern was
-    /// already lowercased by [`DomainRule::from_str`]'s
+    /// already lowercased by `DomainRule::from_str`'s
     /// `idna::domain_to_ascii`, and the hostname it is handed has been
-    /// through [`normalize_hostname`] in [`Router::lookup`], so both
+    /// through `normalize_hostname` in [`Router::lookup`], so both
     /// sides are ASCII-lowercase by the time they meet. Stored with the
     /// leading `*`.
     Wildcard(String),
-    /// Anchored full-host regex built by [`convert_regex_domain_rule`].
+    /// Anchored full-host regex built by `convert_regex_domain_rule`.
     /// Unlike the other variants its source is NOT lowercased — it is
     /// compiled case-insensitively instead, so an uppercase literal
-    /// still matches the normalised key. See [`DomainRule::from_str`]
+    /// still matches the normalised key. See `DomainRule::from_str`
     /// for why that folding is Unicode-aware while the hostnames it is
     /// ever handed are ASCII.
     Regex(Regex),
@@ -1585,7 +1585,7 @@ fn rebuild_with_listener_hsts(frontend: &Frontend, new_edit: Option<&HeaderEdit>
 /// optional `; includeSubDomains`, then optional `; preload`. No
 /// trailing semicolon. `includeSubDomains` is the RFC §6.1 spelling
 /// (camelCase); `preload` is lowercase per the de-facto Chrome/HSTS
-/// preload-list convention (https://hstspreload.org/).
+/// preload-list convention (<https://hstspreload.org/>).
 ///
 /// Returns `None` when the config has no `max_age` (the caller should
 /// have substituted the default at config-load via
@@ -1647,7 +1647,7 @@ enum RewritePart {
     Path(usize),
 }
 
-/// A pre-parsed rewrite template, decomposed into [`RewritePart`]s.
+/// A pre-parsed rewrite template, decomposed into `RewritePart`s.
 ///
 /// `RewriteParts` is built once at frontend registration time
 /// ([`Frontend::new`]) and then re-applied at lookup time via

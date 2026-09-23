@@ -41,7 +41,7 @@ pub struct HttpFrontend {
     pub tags: Option<BTreeMap<String, String>>,
     /// Resolved frontend-level policy carried over from
     /// [`RequestHttpFrontend`]. The router consults these to build a
-    /// [`Route::Frontend(Rc<Frontend>)`] when any are non-default,
+    /// `Route::Frontend(Rc<Frontend>)` when any are non-default,
     /// otherwise falls back to the legacy `Route::ClusterId` /
     /// `Route::Deny` shapes.
     #[serde(default)]

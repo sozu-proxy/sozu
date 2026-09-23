@@ -13,7 +13,7 @@
 //! the connect handshake.
 //!
 //! This module intentionally emits its OWN `tcp.sni_preread.*` decision
-//! metrics (routed / rejected.<reason>) and log lines, but does **not** own
+//! metrics (routed / `rejected.<reason>`) and log lines, but does **not** own
 //! the `tcp.sni_preread.active` gauge lifecycle or the eventual state
 //! transition out of `SniPreread` -- both live in `lib/src/tcp.rs` (gauge:
 //! +1 on entry in `TcpSession::new_sni_preread`, -1 in

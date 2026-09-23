@@ -5,7 +5,7 @@
 //! underlying [`ConnectionH1`] or [`ConnectionH2`] implementation — the
 //! local `forward!` macro removes the boilerplate.
 //!
-//! The two `Endpoint` adaptors ([`EndpointServer`], [`EndpointClient`]) are
+//! The two `Endpoint` adaptors (`EndpointServer`, `EndpointClient`) are
 //! also defined here: they let a connection call back into either the
 //! frontend connection or the backend [`Router`] map without knowing which
 //! direction it faces.

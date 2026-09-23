@@ -1003,7 +1003,7 @@ impl HttpProxy {
 
     /// What this proxy would do with a socket handed to
     /// [`activate_listener`](Self::activate_listener) for `addr`. See
-    /// [`InheritedSocketFate`].
+    /// [`crate::InheritedSocketFate`].
     ///
     /// The event loop is single-threaded, so nothing can change the listener's
     /// `active` flag between this answer and the `activate_listener` call that

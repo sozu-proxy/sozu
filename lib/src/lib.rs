@@ -996,7 +996,7 @@ pub trait L7Proxy {
 
     fn clusters(&self) -> &HashMap<ClusterId, Cluster>;
 
-    /// Access the worker's [`SessionManager`] for per-(cluster, source-IP)
+    /// Access the worker's [`crate::server::SessionManager`] for per-(cluster, source-IP)
     /// connection-limit accounting. The mux uses this to track / untrack
     /// stream-granular `(cluster_id, ip)` entries and consult the
     /// `cluster_ip_at_limit` gate before each backend connect.
