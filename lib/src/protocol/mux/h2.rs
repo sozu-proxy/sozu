@@ -668,7 +668,7 @@ pub struct H2ByteAccounting {
 }
 
 pub struct ConnectionH2<Front: SocketHandler> {
-    /// Connection/session ULID propagated from the parent [`Mux`]. Used to
+    /// Connection/session ULID propagated from the parent [`super::Mux`]. Used to
     /// stamp the session slot of the `[session req cluster backend]` log
     /// prefix emitted by this module's `log_context!` / `log_context_stream!`
     /// macros.
@@ -737,7 +737,7 @@ pub struct ConnectionH2<Front: SocketHandler> {
     stream_table: h2_stream_table::H2StreamTable,
     /// Configured idle timeout for this connection. The core never arms a
     /// wheel entry itself: it publishes the next instant it wants to be called
-    /// back at through [`ConnectionH2::poll_timeout`], and the embedder — the
+    /// back at through `ConnectionH2::poll_timeout`, and the embedder — the
     /// `Mux` adapter — owns the `TimeoutContainer` that reflects it onto the
     /// real timer. See `LIFECYCLE.md` §7.7.
     pub timeout_duration: Duration,
@@ -754,7 +754,7 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// `Some(new_size)` when a peer SETTINGS frame adjusted
     /// `SETTINGS_HEADER_TABLE_SIZE` and we have not yet prepended the
     /// matching `001xxxxx` HPACK directive to a header block. Consumed and
-    /// cleared by [`H2BlockConverter::emit_pending_size_update_if_new_block`]
+    /// cleared by `H2BlockConverter::emit_pending_size_update_if_new_block`
     /// on the next `Block::StatusLine` or `Block::Header` encoded for the
     /// connection. Until then the peer's decoder still has its previous
     /// (possibly larger) table cap, so emitting is a correctness
@@ -769,7 +769,7 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// SETTINGS) and the read landing zone for every stream-0 frame's own
     /// header/payload bytes for the duration of ONE frame's read. It no
     /// longer doubles as a HEADERS+CONTINUATION reassembly buffer — that
-    /// role moved to [`Self::header_reassembly`]; see that field's doc and
+    /// role moved to `Self::header_reassembly`; see that field's doc and
     /// `h2_header_reassembly.rs` for why, and LIFECYCLE.md invariant 24 for
     /// the bugs the split closes.
     pub zero: GenericHttpStream,
@@ -838,7 +838,7 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// Per-stream idle cap. Streams with no activity for longer than this are
     /// RST_STREAM(CANCEL)'d by [`Self::cancel_timed_out_streams`]. Compared
     /// against `stream_table`'s per-stream activity/flow-control-stall
-    /// caches — see [`h2_stream_table::H2StreamTable::collect_timed_out`].
+    /// caches — see `h2_stream_table::H2StreamTable::collect_timed_out`.
     pub stream_idle_timeout: std::time::Duration,
     /// RFC 9113 §5.1.2 back-pressure: count of stream refusals
     /// (REFUSED_STREAM emitted via [`Self::refuse_stream_and_discard`]) within
@@ -910,7 +910,7 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
 }
 
 /// Symmetric tear-down for the four aggregate gauges
-/// [`ConnectionH2::gauge_connection_state`] feeds — the three
+/// `ConnectionH2::gauge_connection_state` feeds — the three
 /// `h2.connection.*` metrics and `h2.streams.ready_incremental.by_urgency`:
 /// whatever positive contribution this connection made is subtracted back out
 /// when the connection is dropped.
@@ -2066,7 +2066,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     /// Drive one frontend read pass.
     ///
-    /// The core lives in [`Self::poll_read_target`] and [`Self::handle_read`];
+    /// The core lives in `Self::poll_read_target` and `Self::handle_read`;
     /// this function is the caller that sits between them, and its
     /// `self.socket.socket_read` is the only socket touch on the whole H2 read
     /// path. Keeping it *here* rather than inside the core is the point of the
@@ -3672,7 +3672,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///
     /// A stream is considered idle when no meaningful application data (non-empty
     /// DATA frames or HEADERS) has been received since the last activity timestamp
-    /// in [`Self::stream_last_activity_at`].
+    /// in `H2StreamTable::stream_last_activity_at`.
     ///
     /// Mitigates slow-multiplex Slowloris (Pass 4 Medium #3): the connection-level
     /// idle timer resets on every frame, so a peer sending periodic control frames
@@ -4030,7 +4030,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// Log a flood violation with full session context and emit the GOAWAY.
     ///
     /// Centralises the "flood detected" reporting so every site that observes a
-    /// [`H2FloodViolation`] gets the same session-scoped log line, matching the
+    /// `H2FloodViolation` gets the same session-scoped log line, matching the
     /// RUSTLS log-context convention. Also emits the per-kind statsd counter
     /// (`h2.flood.violation.<kind>`) so SOC dashboards can window the trip
     /// rate without parsing logs — every CVE-mitigation in the H2 family
@@ -4217,7 +4217,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// were processed.
     ///
     /// `now` is the caller's clock snapshot and is what arms the forced-close
-    /// budget. It is a parameter rather than a read of [`Self::now`] because
+    /// budget. It is a parameter rather than a read of `Self::now` because
     /// the caller that matters — `Mux::shutting_down` — runs outside
     /// `ready()` and therefore outside the pass that last refreshed the
     /// mirror. In-module callers pass `self.now`.
@@ -4346,7 +4346,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     }
 
     /// True when the reaper has queued control frames (`RST_STREAM`) into
-    /// [`h2_control_tx::H2ControlTx`] that have not yet been serialized. Kept SEPARATE
+    /// `h2_control_tx::H2ControlTx` that have not yet been serialized. Kept SEPARATE
     /// from [`Self::has_pending_write`] because that probe gates connection close
     /// (the `mod.rs` close-gating sites) and must NOT treat a queued RST as a
     /// reason to keep the connection open; this probe is consulted ONLY by the
@@ -4501,7 +4501,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         Some(issued)
     }
 
-    /// Test-only setter: jump `last_stream_id` close to [`STREAM_ID_MAX`] so
+    /// Test-only setter: jump `last_stream_id` close to `STREAM_ID_MAX` so
     /// that the next call to [`Self::new_stream_id`] exhausts the 31-bit
     /// space. FIX-22 ("Stream-ID exhaustion disconnects backend gracefully")
     /// exercises the `None`-return branch — reaching it through normal API
@@ -6004,8 +6004,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// `wire_stream_id` is the on-wire `StreamId`; `stream_id` is the internal
     /// `GlobalStreamId` slot. Callers already carry both so we pass them
     /// explicitly rather than scanning `self.streams`. The wire id is threaded
-    /// into [`Self::enqueue_rst`] which queues the frame for serialisation in
-    /// [`Self::flush_pending_control_frames`] on the next writable tick —
+    /// into `Self::enqueue_rst` which queues the frame for serialisation in
+    /// `Self::flush_pending_control_frames` on the next writable tick —
     /// independent of whether the caller immediately evicts the slot via
     /// `remove_dead_stream` (which they usually do). This is what guarantees
     /// the RST reaches the peer for malformed HEADERS / flow-control /

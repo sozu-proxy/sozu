@@ -36,7 +36,7 @@
 //!
 //! The pre-image fused two different questions into one nested `if`:
 //!
-//! ```ignore
+//! ```text
 //! if self.socket.socket_wants_write() {      // (1) does rustls hold records?
 //!     self.socket.socket_write(&[]);         //     try to push them
 //!     if self.socket.socket_wants_write() {  // (2) did the kernel take them?
