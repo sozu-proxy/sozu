@@ -570,6 +570,12 @@ fn query_proxy_gauge(worker: &mut Worker, metric_name: &str) -> Option<u64> {
 /// and the test fail loudly — never pass quietly.
 const H2_FRAMES_RX_HEADERS: &str = "h2.frames.rx.headers";
 
+/// RFC 9113 §4.1: every HTTP/2 frame is a fixed 9-octet header (3 length,
+/// 1 type, 1 flags, 4 stream id) followed by its payload, and
+/// `H2Frame::encode` writes exactly that. A prefix of this length is a
+/// complete frame header carrying no payload byte at all.
+const H2_FRAME_HEADER_LEN: usize = 9;
+
 // ============================================================================
 // Test 1: Basic H2 request/response smoke test
 // ============================================================================
@@ -865,17 +871,39 @@ fn try_h2_goaway_graceful_drain() -> State {
 /// instead of exiting immediately with nothing to wait for, and which stays
 /// in flight for however long the steps below take. Stream 3's
 /// HEADERS frame (no END_HEADERS) is sent once stream 1 is confirmed to have
-/// reached the backend; `soft_stop()` then fires while stream 3's block is
-/// still incomplete, and stream 3's CONTINUATION is sent only after that.
+/// reached the backend; stream 3's CONTINUATION is then split across TWO TLS
+/// writes, and `soft_stop()` fires BETWEEN them.
 ///
-/// Both of those orderings are established by waiting on an observable state
+/// **The drain must land mid-FRAME, not merely mid-BLOCK** (sozu#1453). An
+/// earlier revision of this test sent the whole CONTINUATION in one write, so
+/// the drain always landed on a frame boundary: reassembly in progress, but
+/// `zero.storage` empty, the accumulated block safe in
+/// `ConnectionH2::header_reassembly` where no write-side site can reach it.
+/// `graceful_goaway`'s `GracefulDrainDecision::DeferInitial` therefore
+/// protected nothing this test could observe — forcing its
+/// `reassembly_in_progress` argument to `false` left the test GREEN, which
+/// means the production guarantee could have been deleted outright without
+/// this test noticing. The window that decision still guards is the one
+/// `h2_header_reassembly.rs` names: a single CONTINUATION frame whose payload
+/// is *mid-`socket_read()`*, its already-read bytes sitting in `zero.storage`
+/// with more still to come. `send_initial_goaway` clears `zero.storage` to
+/// serialize the GOAWAY into it, so landing the drain in that window destroys
+/// those bytes unless the decision defers. Splitting the CONTINUATION is what
+/// puts this test inside it — the same shape
+/// `reassembly_property::qc_h2_header_reassembly_survives_interleaved_control_frame_flushes`
+/// covers at the unit level, driven here through a real worker and a real TLS
+/// socket.
+///
+/// All three orderings are established by waiting on an observable state
 /// change, not by sleeping: `h2.frames.rx.headers` proves sozu decoded the
-/// partial HEADERS and is in reassembly, and `server.live` dropping to 0
-/// proves the soft-stop drain has already reached this connection. Both are
-/// read over the worker's command channel, because the connection itself can
-/// witness neither — no frame may legally be interleaved into an open header
-/// block, and the initial GOAWAY is deliberately deferred for the duration of
-/// the reassembly this test creates.
+/// partial HEADERS and is in reassembly; `bytes_in` advancing by exactly the
+/// first chunk's length proves sozu read those bytes and no others, so the
+/// half-read frame really is parked in `zero.storage`; and `server.live`
+/// dropping to 0 proves the soft-stop drain has already reached this
+/// connection. All three are read over the worker's command channel, because
+/// the connection itself can witness none of them — no frame may legally be
+/// interleaved into an open header block, and the initial GOAWAY is
+/// deliberately deferred for the duration of the reassembly this test creates.
 ///
 /// `drain_witnessed` (a GOAWAY frame observed in the response) remains a
 /// required part of success, not just `anchor_ok`/`stream3_ok`: without it, a
@@ -1022,12 +1050,101 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
         thread::sleep(Duration::from_millis(10));
     }
 
-    // Trigger a graceful shutdown WHILE stream 3's block is still incomplete
-    // — exactly the window #1401/#1423 describe — while stream 1 is still
-    // unresolved on the backend holding its response, so the worker actually
-    // drains instead of exiting with nothing to wait for. `soft_stop()` only
-    // signals the worker; the drain itself runs asynchronously on the
-    // worker's own event loop.
+    // Stream 3's CONTINUATION, split across two TLS writes so the drain
+    // below lands while this ONE FRAME is half-read: its first bytes already
+    // in `zero.storage`, `expect_read` still owing the rest. That is the
+    // window `graceful_goaway`'s defer decision actually guards (sozu#1453).
+    // A CONTINUATION written whole only ever presents a frame BOUNDARY —
+    // `zero.storage` empty, the accumulated block already copied into
+    // `ConnectionH2::header_reassembly` — where `send_initial_goaway`'s
+    // `clear()` has nothing left to destroy and the defer decision is inert.
+    assert!(
+        second_half.len() >= 2,
+        "stream 3's CONTINUATION payload must be at least 2 bytes to split \
+         mid-payload: a first chunk stopping exactly on the frame header \
+         leaves `zero.storage` empty and reopens the hole this test closes"
+    );
+    let continuation = H2Frame::continuation(3, second_half.to_vec(), true).encode();
+    // The 9-byte frame header — so sozu reaches `H2State::ContinuationFrame`
+    // and knows how much payload it is still owed — plus half that payload,
+    // so `zero.storage` genuinely holds unretired bytes when the drain lands.
+    let first_chunk_len = H2_FRAME_HEADER_LEN + second_half.len() / 2;
+    let (first_chunk, second_chunk) = continuation.split_at(first_chunk_len);
+
+    // Baseline for the mid-frame gate below. `ConnectionH2::handle_read`
+    // counts every frontend socket read through
+    // `Position::count_bytes_in_counter` — PARTIAL reads included, which is
+    // what makes this counter able to witness a frame that has not finished
+    // arriving, unlike `h2.frames.rx.headers` which ticks only on a frame
+    // completed. This raw TLS connection is the only frontend session on this
+    // worker, and the backend side counts under a different key
+    // (`back_bytes_in`, `Position::Client`), so from here on `bytes_in` moves
+    // by exactly what this test writes and by nothing else.
+    let bytes_in_before_first_chunk =
+        query_proxy_count(&mut worker, sozu_lib::metrics::names::backend::BYTES_IN);
+
+    if tls.write_all(first_chunk).is_err() || tls.flush().is_err() {
+        println!("H2 CONTINUATION+drain - stream 3 CONTINUATION first chunk write failed");
+        delayed_backend.release();
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        delayed_backend.stop();
+        return State::Fail;
+    }
+
+    // Wait until sozu has read that first chunk — and, just as importantly,
+    // established that it read no more than it. `read_space` caps every
+    // socket read at exactly the bytes the current frame stage still expects,
+    // so consuming this chunk is two reads (9 for the frame header, then the
+    // partial payload) totalling exactly `first_chunk.len()`. Reaching that
+    // total is what proves `zero.storage` is now holding a half-read
+    // CONTINUATION rather than nothing: `handle_read` saw `size != amount`,
+    // left `expect_read` owing the remainder, and returned with the bytes
+    // parked. The drain below therefore cannot land on a frame boundary.
+    let expected_bytes_in = bytes_in_before_first_chunk + first_chunk.len() as i64;
+    let first_chunk_start = Instant::now();
+    let mut bytes_in_now =
+        query_proxy_count(&mut worker, sozu_lib::metrics::names::backend::BYTES_IN);
+    while bytes_in_now < expected_bytes_in {
+        if first_chunk_start.elapsed() > Duration::from_secs(5) {
+            println!(
+                "H2 CONTINUATION+drain - sozu never read stream 3's partial CONTINUATION \
+                 (bytes_in {bytes_in_now}, expected {expected_bytes_in}, baseline \
+                 {bytes_in_before_first_chunk})"
+            );
+            delayed_backend.release();
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            delayed_backend.stop();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+        bytes_in_now = query_proxy_count(&mut worker, sozu_lib::metrics::names::backend::BYTES_IN);
+    }
+    // An overshoot would mean something OTHER than this test's own writes
+    // feeds `bytes_in` — precisely the assumption the gate above rests on, so
+    // it fails loudly here instead of being rounded away by the `<`.
+    if bytes_in_now != expected_bytes_in {
+        println!(
+            "H2 CONTINUATION+drain - bytes_in overshot the first chunk ({bytes_in_now} > \
+             {expected_bytes_in}): something other than this test's own writes feeds the \
+             frontend byte counter, so the mid-frame gate proves nothing"
+        );
+        delayed_backend.release();
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        delayed_backend.stop();
+        return State::Fail;
+    }
+
+    // Trigger a graceful shutdown WHILE stream 3's CONTINUATION is still
+    // half-read — the mid-`socket_read()` window `h2_header_reassembly.rs`
+    // names as the one `graceful_goaway`'s defer decision still guards, and
+    // the wire-level twin of the mid-frame interleave `reassembly_property`
+    // generates — while stream 1 is still unresolved on the backend holding
+    // its response, so the worker actually drains instead of exiting with
+    // nothing to wait for. `soft_stop()` only signals the worker; the drain
+    // itself runs asynchronously on the worker's own event loop.
     worker.soft_stop();
 
     // Wait for that drain to LAND on this connection. `Server::run` writes
@@ -1060,11 +1177,11 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
         thread::sleep(Duration::from_millis(10));
     }
 
-    // Now complete stream 3's block. Everything this test set up — reassembly
-    // live, drain landed — held until this write, by observation rather than
-    // by timing.
-    let continuation_frame = H2Frame::continuation(3, second_half.to_vec(), true);
-    let sent = tls.write_all(&continuation_frame.encode()).is_ok() && tls.flush().is_ok();
+    // Now deliver the rest of the half-read CONTINUATION. Everything this
+    // test set up — reassembly live, this frame's first bytes parked in
+    // `zero.storage`, the drain landed on top of them — held until this
+    // write, by observation rather than by timing.
+    let sent = tls.write_all(second_chunk).is_ok() && tls.flush().is_ok();
 
     // Wait for sozu to have CONSUMED that CONTINUATION before letting the
     // anchor answer. The `(H2State::ContinuationFrame(_), _)` arm re-enters
@@ -1127,7 +1244,8 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
     // `is_none_or` check above is vacuously true and this run proves
     // NOTHING about the race this test exists to exercise. The `server.live`
     // gate has already established that the drain reached this connection
-    // before the CONTINUATION went out, so the deferred initial GOAWAY is
+    // while the CONTINUATION was half-read — before its remaining bytes went
+    // out, and after the ones that put it mid-frame — so the deferred GOAWAY is
     // owed — but it is emitted by a later `flush_pending_control_frames`
     // pass, and this assertion is what holds the run to actually observing
     // it rather than assuming it. Treat a missing witness as a failed

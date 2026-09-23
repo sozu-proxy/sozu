@@ -629,6 +629,27 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   does not have — its FAIL and INTERRUPTED lines end `(a single clean run is
   required)`, and its pass line reads `stability check PASSED: the single
   required run succeeded`. See issue #1410.
+- **A test for a guarantee that protects a *mid-frame* window has to reach
+  that window — a whole-frame write never does.** Writing a frame in one
+  `write_all` only ever presents the peer with a frame **boundary**, and a
+  guard that exists for the half-read state is inert there, so the test stays
+  green with the guard deleted. Check it the only way that settles it: invert
+  the production decision and confirm the test turns red. sozu#1453 is the
+  worked example —
+  `test_h2_continuation_survives_a_graceful_drain_mid_reassembly`
+  (`e2e/src/tests/h2_tests.rs`) sent its whole CONTINUATION in one TLS write,
+  so `graceful_goaway`'s `GracefulDrainDecision::DeferInitial` could be forced
+  to `SendInitial` without the test noticing; splitting that frame across two
+  TLS writes with the drain triggered between them is what put the test inside
+  the window. Sequencing the two writes needs an observable that a **partial**
+  read moves: a per-frame counter such as `h2.frames.rx.headers` ticks only on
+  a frame completed and cannot witness one still arriving, whereas `bytes_in`
+  (`ConnectionH2::handle_read`) advances on every socket read, and `read_space`
+  caps each read at exactly the bytes the current frame stage expects, so the
+  total is exact rather than approximate. Gate on that total — and fail the
+  run on an overshoot, which would mean something else feeds the counter and
+  the gate proves nothing. Never sequence the two writes with a `sleep`: a
+  second write that lands "usually after" is the same defect in a new costume.
 - **Assert a status by decoding it, never by scanning a field block for its
   digits.** An HPACK block is not text. `payload.windows(3).any(|w| w == b"421")`
   matches any three adjacent bytes, and every Sōzu response carries a `Sozu-Id`
