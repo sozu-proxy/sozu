@@ -324,8 +324,13 @@ impl H2ControlTx {
 
     /// True once the CVE-2025-8671 MadeYouReset lifetime cap has been reached
     /// and the connection must escalate to `GOAWAY(ENHANCE_YOUR_CALM)`.
+    ///
+    /// Reads `self.max_pending`, the same bound [`Self::enqueue_rst`] tests at
+    /// the insert and [`Self::check_invariants`] asserts as a post-condition.
+    /// One instance carries one cap; a predicate that read the constant
+    /// instead would answer for a bound this instance does not have.
     pub(super) fn lifetime_cap_reached(&self) -> bool {
-        self.total_rst_streams_queued >= MAX_PENDING_RST_STREAMS
+        self.total_rst_streams_queued >= self.max_pending
     }
 
     /// Drop every queued frame without serializing it, leaving the lifetime
@@ -805,6 +810,43 @@ mod tests {
         assert!(
             tx.lifetime_cap_reached(),
             "the cap must stay tripped after the queue drains"
+        );
+    }
+
+    /// The three cap predicates — the per-insert bound in [`H2ControlTx::enqueue_rst`],
+    /// the escalation tripwire in [`H2ControlTx::lifetime_cap_reached`] and the
+    /// post-condition in `H2ControlTx::check_invariants` — must all read the
+    /// SAME bound. Under [`H2ControlTx::new`] they are indistinguishable,
+    /// because `max_pending` IS `MAX_PENDING_RST_STREAMS` there; only a
+    /// `with_cap` instance can separate them, which is why this test exists
+    /// beside the four that drive `new()`.
+    ///
+    /// TO SEE THIS RED: in [`H2ControlTx::lifetime_cap_reached`], compare
+    /// against `MAX_PENDING_RST_STREAMS` instead of `self.max_pending`, then
+    /// run `cargo test -p sozu-lib --locked
+    /// the_lifetime_cap_tracks_the_instance_bound`. The queue fills to its own
+    /// cap of 4 while the tripwire still waits for 200, and the final
+    /// assertion fails with `a queue at its own cap must have reached its own
+    /// lifetime cap`.
+    #[test]
+    fn the_lifetime_cap_tracks_the_instance_bound_not_the_constant() {
+        const MAX: usize = 4;
+        let mut tx = H2ControlTx::with_cap(MAX);
+        let mut sent: HashSet<StreamId> = HashSet::new();
+        let mut readiness = readiness();
+
+        for sid in [1u32, 3, 5] {
+            tx.enqueue_rst(&mut sent, &mut readiness, sid, H2Error::Cancel);
+        }
+        assert!(
+            !tx.lifetime_cap_reached(),
+            "one below the instance cap must not trip it"
+        );
+
+        tx.enqueue_rst(&mut sent, &mut readiness, 7, H2Error::Cancel);
+        assert!(
+            tx.lifetime_cap_reached(),
+            "a queue at its own cap must have reached its own lifetime cap"
         );
     }
 

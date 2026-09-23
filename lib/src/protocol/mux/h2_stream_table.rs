@@ -345,8 +345,8 @@ impl H2StreamTable {
     }
 
     /// Narrow escape hatch for the two sites that need raw `&mut
-    /// HashSet<StreamId>` access: `enqueue_rst_into` (a free function,
-    /// unit-tested independently of `ConnectionH2` — see `LIFECYCLE.md`
+    /// HashSet<StreamId>` access: `h2_control_tx::H2ControlTx::enqueue_rst`
+    /// (unit-tested independently of `ConnectionH2` — see `LIFECYCLE.md`
     /// §8.2) and `end_stream`'s direct `rst_sent.insert` on the dedupe-check
     /// path. Both call sites only ever `.insert()`; nothing about this
     /// accessor is `pub` outside `h2.rs`.

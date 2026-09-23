@@ -36,7 +36,12 @@
 //! `debug_assert!`; the `unsafe` and that clear were six lines apart, not
 //! eleven, with a push, three braces and the vectored write between them —
 //! the debug event, byte counters and READABLE re-arm all came *after* the
-//! clear. So this is not a correctness fix and it does not make anything
+//! clear. One of those moved: the caller now pushes its `DebugEvent::SocketIO`
+//! *before* calling `confirm`, so the clear follows the debug event instead of
+//! preceding it. That is inert — `debug.push` does not touch `kawa` — and the
+//! obligation this module states is "clear before the consume", which still
+//! holds because both now happen inside `confirm`, in that order.
+//! So this is not a correctness fix and it does not make anything
 //! type-level: two free functions each taking an independent `&mut Vec` is
 //! co-location, not enforcement, and a caller can still call `Kawa::consume`
 //! without ever asking this module. A guard type owning the vector would earn

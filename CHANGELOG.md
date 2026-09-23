@@ -77,6 +77,32 @@
 
 ### 🔄 Changed
 
+- **`fix(mux-h2)`: `H2ControlTx::lifetime_cap_reached` reads the instance's own bound instead of the
+  `MAX_PENDING_RST_STREAMS` constant.** The type carries one cap per instance, `max_pending`, and
+  three predicates that must all read it: the per-insert bound in `enqueue_rst`, the post-condition
+  in `check_invariants`, and the escalation tripwire in `lifetime_cap_reached`. The first two read
+  `self.max_pending`; the third read the constant, so a `with_cap(n)` instance had a per-insert
+  bound of `n` and a tripwire still waiting for 200.
+
+  Not reachable in production — `new()` is the only non-test constructor and passes the constant, so
+  all three agree there, and no `with_cap` caller consults the tripwire. The defect is latent and
+  specific: a natural extension of
+  `test_enqueue_rst_into_refuses_at_capacity_without_side_effects` that asserted on the tripwire
+  would have compared a queue at its own cap of 4 against 200, reported "not reached", and passed
+  for the wrong reason — on the type that carries the CVE-2025-8671 MadeYouReset cap. The three
+  predicates are indistinguishable under `new()`, so the regression builds the instance that
+  separates them: `the_lifetime_cap_tracks_the_instance_bound_not_the_constant` fills a
+  `with_cap(4)` queue to its own cap and asserts the tripwire has fired, seen red by restoring the
+  constant.
+
+  Two doc pointers left behind by the `h2_control_tx.rs` extraction are repaired in the same pass.
+  `H2StreamTable::rst_sent_mut` named `enqueue_rst_into`, a free function that no longer exists, and
+  now names `h2_control_tx::H2ControlTx::enqueue_rst`. `h2_transmit.rs`'s module header described
+  the pre-image call order; the split did move one thing — the caller now pushes its
+  `DebugEvent::SocketIO` before calling `confirm`, so the clear follows the debug event instead of
+  preceding it, which is inert because `debug.push` does not touch `kawa`, and the module's stated
+  obligation ("clear before the consume") still holds because both now happen inside `confirm`.
+
 - **`refactor(mux-h2)`: the end of an H2 write pass becomes a decision instead of a flush triple —
   `ConnectionH2::finalize_write` asks `h2_close::finalize_action` and performs the answer.**
   `finalize_write` held the last unconverted instance of the query / flush / query shape the close
