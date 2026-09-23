@@ -1,0 +1,24 @@
+// Fixture source for the two identity defects in the drifted-citation rule.
+// Not compiled: it lives under testdata/, and the keyed.rs.base beside it is
+// the revision the self-test commits as the base.
+pub struct Keyed;
+
+impl Keyed {
+    pub fn added(&self) -> u8 {
+        0
+    }
+
+    pub fn grouped(&self) -> u8 {
+        let sibling = 1;
+        sibling
+    }
+
+    pub fn reused(&self) -> u8 {
+        2
+    }
+
+    pub fn tail(&self) -> u8 {
+        let far = 3;
+        far
+    }
+}
