@@ -1602,11 +1602,12 @@ Whether a rule **ends** that scan decides everything, and that depends on its
 `method`, which has three cases and not two: it may match the request, be
 absent, or be set to something the request does not match. The third case
 removes the rule from the contest altogether, whatever its `path_type`. Note
-that matching is case-insensitive only for the eight methods Sōzu knows
-(`GET`, `POST`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`, `TRACE`, `CONNECT`) — any
-other value is compared verbatim, so `method = "patch"` does **not** match a
-`PATCH` request and lands silently in that third case. Write unknown methods in
-the exact case the client sends. So:
+that matching is case-**sensitive**, for every method and not just the unknown
+ones. RFC 9110 §9.1 makes the method token case-sensitive and the backend
+receives the bytes the client sent, so Sōzu compares them verbatim: `method =
+"patch"` does not match a `PATCH` request, and `method = "get"` no longer
+matches a `GET` one — each lands silently in that third case. Write every
+method in the exact case the client sends. So:
 
 - **`EQUALS` / `REGEX` carrying a `method` that matches the request** — ends the
   scan on the spot, so the **first declared wins**. Nothing compares two
@@ -2855,7 +2856,12 @@ re-issuing is unobservable — and only when all of the following hold:
   diagnosis. A fresh dial has not been idle, so it is never re-issued;
 - the method is idempotent (RFC 9110 §9.2.2): `GET`, `HEAD`, `PUT`, `DELETE`,
   `OPTIONS`, `TRACE`. `POST`, `CONNECT` and any method Sōzu does not
-  recognise — including `PATCH` — are never re-issued;
+  recognise — including `PATCH` — are never re-issued. Those six spellings
+  are matched **case-sensitively**, exactly as the routing `method` rule above
+  is: a client sending `get` carries a method Sōzu does not recognise, so it
+  is not replayable. That is deliberate — the origin receives the `get` bytes
+  and is free to treat them as an extension method with side effects of its
+  own, so re-issuing them would not be the no-op RFC 9110 §9.2.2 promises;
 - the serialized request fits in one front buffer. The bound the code applies
   is the front kawa's `storage.capacity()` (`ConnectionH1::writable`,
   `lib/src/protocol/mux/h1.rs`), not the configured `buffer_size` itself: a

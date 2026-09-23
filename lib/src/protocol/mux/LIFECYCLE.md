@@ -1191,8 +1191,11 @@ memory bound:
 - **Idempotent methods only** (`Method::is_idempotent`, RFC 9110 §9.2.2).
   nginx keeps `non_idempotent` out of the `proxy_next_upstream` default;
   pingora's default `error_while_proxy` vetoes `!method.is_idempotent()`.
-  `Method::Custom` — which is how sozu parses `PATCH` — counts as
-  non-idempotent. Enforced TWICE since sozu-proxy/sozu#1450:
+  `Method::Custom` — which is how sozu parses `PATCH`, and, since
+  sozu-proxy/sozu#1451 made `Method::new` case-sensitive, also how it parses a
+  lowercase `get` — counts as non-idempotent. A non-canonical spelling is
+  therefore NOT replayable: the origin receives those exact bytes and may give
+  them semantics of its own. Enforced TWICE since sozu-proxy/sozu#1450:
   `Stream::arm_upstream_replay` refuses to capture a non-idempotent request at
   all, so it spends no capture budget, and `can_replay_on_fresh_upstream`
   keeps its own conjunct as defense in depth. The method is known at arm time

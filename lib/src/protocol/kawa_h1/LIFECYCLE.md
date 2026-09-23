@@ -292,7 +292,7 @@ a wedged session, or a security regression.
    the tolerant variant is enabled only via the `tolerant-http1-parser`
    feature on `sozu-lib` and `sozu-bin` (`lib/Cargo.toml:121`,
    `bin/Cargo.toml:100`). Tolerant mode relaxes the hostname charset rules
-   (`parser.rs:158-181`). It must not be enabled in security-sensitive
+   (`parser.rs:156-179`). It must not be enabled in security-sensitive
    deployments without measuring the risk against the upstream backends'
    strictness.
 

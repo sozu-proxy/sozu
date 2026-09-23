@@ -2463,6 +2463,42 @@ mod tests {
     use super::*;
     use quickcheck::{Arbitrary, Gen, TestResult, quickcheck};
 
+    /// A frontend's `method` is classified by the same case-sensitive
+    /// [`Method::new`] as the request's (sozu-proxy/sozu#1451), so the
+    /// operator-facing rule is "declare the method in the exact case the
+    /// client sends". A frontend declared `method = "get"` is a custom-method
+    /// rule: it no longer answers a canonical `GET` request, and it answers a
+    /// literal `get` one instead.
+    #[test]
+    fn method_rule_is_case_sensitive() {
+        let declared_lowercase = MethodRule::new(Some("get".to_owned()));
+
+        assert_eq!(
+            declared_lowercase.inner,
+            Some(Method::Custom("get".to_owned())),
+            "a lowercase declaration must not collapse onto Method::Get"
+        );
+        assert!(
+            declared_lowercase.matches(&Method::Get) == MethodRuleResult::None,
+            "a lowercase declaration must not match a canonical GET request"
+        );
+        assert!(
+            declared_lowercase.matches(&Method::new(b"get")) == MethodRuleResult::Equals,
+            "a lowercase declaration must match a literal lowercase request"
+        );
+
+        let declared_canonical = MethodRule::new(Some("GET".to_owned()));
+
+        assert!(
+            declared_canonical.matches(&Method::Get) == MethodRuleResult::Equals,
+            "a canonical declaration must still match a canonical GET request"
+        );
+        assert!(
+            declared_canonical.matches(&Method::new(b"get")) == MethodRuleResult::None,
+            "a canonical declaration must not match a lowercase request"
+        );
+    }
+
     fn test_http_frontend() -> HttpFrontend {
         HttpFrontend {
             cluster_id: Some("cluster".to_owned()),

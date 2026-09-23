@@ -64,25 +64,25 @@ impl fmt::Debug for Method {
 }
 
 impl Method {
+    /// Classify a method token.
+    ///
+    /// RFC 9110 §9.1 makes the method token case-SENSITIVE, and the origin
+    /// server receives the bytes the client actually sent. The match is
+    /// therefore exact: anything that is not one of the eight canonical
+    /// spellings becomes [`Method::Custom`], carrying the token verbatim.
+    /// A lowercase `get` is a custom method, not [`Method::Get`]
+    /// (sozu-proxy/sozu#1451).
     pub fn new(s: &[u8]) -> Method {
-        if compare_no_case(s, b"GET") {
-            Method::Get
-        } else if compare_no_case(s, b"POST") {
-            Method::Post
-        } else if compare_no_case(s, b"HEAD") {
-            Method::Head
-        } else if compare_no_case(s, b"OPTIONS") {
-            Method::Options
-        } else if compare_no_case(s, b"PUT") {
-            Method::Put
-        } else if compare_no_case(s, b"DELETE") {
-            Method::Delete
-        } else if compare_no_case(s, b"TRACE") {
-            Method::Trace
-        } else if compare_no_case(s, b"CONNECT") {
-            Method::Connect
-        } else {
-            Method::Custom(String::from_utf8_lossy(s).into_owned())
+        match s {
+            b"GET" => Method::Get,
+            b"POST" => Method::Post,
+            b"HEAD" => Method::Head,
+            b"OPTIONS" => Method::Options,
+            b"PUT" => Method::Put,
+            b"DELETE" => Method::Delete,
+            b"TRACE" => Method::Trace,
+            b"CONNECT" => Method::Connect,
+            _ => Method::Custom(String::from_utf8_lossy(s).into_owned()),
         }
     }
 
@@ -103,15 +103,13 @@ impl Method {
     /// idempotent, and sozu upgrades it out of the request/response path
     /// anyway.
     ///
-    /// Caveat, pre-existing and not introduced here: [`Method::new`] matches
-    /// case-INSENSITIVELY (`compare_no_case`), while RFC 9110 §9.1 makes the
-    /// method token case-sensitive. So `get` parses to [`Method::Get`] and is
-    /// judged idempotent here, while the origin receives the original `get`
-    /// bytes and may treat them as an unrecognised method with semantics of
-    /// its own. The stale-upstream replay (sozu-proxy/sozu#1442) is the first
-    /// caller for which that gap is load-bearing. Narrowing `Method::new`
-    /// would change routing, metrics and access-log behaviour well beyond
-    /// this gate, so it is tracked separately rather than folded in here.
+    /// The classification this reads is case-sensitive, so it agrees with
+    /// what the origin sees: [`Method::new`] matches the eight canonical
+    /// spellings exactly (RFC 9110 §9.1), and a lowercase `get` is a
+    /// [`Method::Custom`] judged non-idempotent here rather than a
+    /// [`Method::Get`] judged replayable. That divergence was real until
+    /// sozu-proxy/sozu#1451 made the match exact; the stale-upstream replay
+    /// (sozu-proxy/sozu#1442) was the caller for which it was load-bearing.
     pub fn is_idempotent(&self) -> bool {
         match self {
             Method::Get
@@ -363,4 +361,44 @@ fn is_hostname_char_admits_only_ascii() {
     assert!(remaining.is_empty());
     assert_eq!(host, b"cafe.example.com");
     assert_eq!(port, None);
+}
+
+#[test]
+fn lowercase_verb_is_custom_and_not_idempotent() {
+    // RFC 9110 §9.1 makes the method token case-sensitive, and the origin
+    // receives the bytes the client actually sent. A lowercase or mixed-case
+    // spelling must therefore NOT be classified as the canonical verb it
+    // resembles — above all it must not inherit that verb's idempotence and
+    // become replayable on a fresh upstream (sozu-proxy/sozu#1451).
+    let spellings: [&[u8]; 11] = [
+        b"get", b"Get", b"gEt", b"put", b"Put", b"delete", b"head", b"options", b"trace", b"post",
+        b"Post",
+    ];
+
+    for raw in spellings {
+        let method = Method::new(raw);
+        let spelling = String::from_utf8_lossy(raw).into_owned();
+
+        assert_eq!(
+            method,
+            Method::Custom(spelling.clone()),
+            "{spelling} must parse as a custom method, not as a known verb"
+        );
+        assert!(
+            !method.is_idempotent(),
+            "{spelling} must not be judged idempotent"
+        );
+    }
+}
+
+#[test]
+fn canonical_verbs_keep_their_variant() {
+    assert_eq!(Method::new(b"GET"), Method::Get);
+    assert_eq!(Method::new(b"POST"), Method::Post);
+    assert_eq!(Method::new(b"HEAD"), Method::Head);
+    assert_eq!(Method::new(b"OPTIONS"), Method::Options);
+    assert_eq!(Method::new(b"PUT"), Method::Put);
+    assert_eq!(Method::new(b"DELETE"), Method::Delete);
+    assert_eq!(Method::new(b"TRACE"), Method::Trace);
+    assert_eq!(Method::new(b"CONNECT"), Method::Connect);
 }

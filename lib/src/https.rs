@@ -1239,7 +1239,7 @@ impl L7ListenerHandler for HttpsListener {
         // we already verified that there are only ascii
         // chars in there
         // SAFETY: `hostname` was just produced by `hostname_and_port` (see
-        // `lib/src/protocol/kawa_h1/parser.rs:133`), which only accepts
+        // `lib/src/protocol/kawa_h1/parser.rs:182`), which only accepts
         // bytes matching `is_hostname_char` (alphanumeric, `-`, `.`, plus
         // `_` under the tolerant-http1-parser feature). All accepted
         // bytes are ASCII (≤ 0x7F), so the slice is valid single-byte UTF-8.

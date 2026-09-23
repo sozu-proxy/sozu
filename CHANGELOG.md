@@ -848,6 +848,74 @@
 
 ### 🐛 Fixed
 
+- **`fix(parser)`: the HTTP method token is matched case-sensitively, so Sōzu and the origin
+  agree on what method a request carries.** `Method::new`
+  (`lib/src/protocol/kawa_h1/parser.rs`) compared with `compare_no_case`, so a request line
+  reading `get /path HTTP/1.1` produced `Method::Get`. RFC 9110 §9.1 makes the method token
+  case-sensitive and the backend receives the original `get` bytes, so the proxy's view and the
+  origin's could disagree. The match is now exact against the eight canonical spellings; anything
+  else — `get`, `Get`, `gEt`, `patch` — is `Method::Custom`, carrying the token verbatim
+  (sozu-proxy/sozu#1451).
+  Long harmless, made load-bearing by the stale-upstream replay (sozu-proxy/sozu#1442):
+  `is_idempotent` gates whether a request already written to a pooled upstream may be **replayed
+  on a fresh one**, and `Method::Custom` is deliberately not idempotent. A lowercase `get` was
+  therefore judged replayable while the origin was free to treat the token as an extension method
+  with side effects of its own. The doc note #1442 left at `is_idempotent` recording that gap is
+  replaced by the closed statement. The narrow scoping — "make only the replay decision
+  case-sensitive" — is not available: `context.method` is already normalised by the time the
+  replay decision runs (`lib/src/protocol/kawa_h1/editor.rs:684` is the sole production site that
+  derives it from the request, shared by the H1 request line and the H2 `:method` pseudo-header via
+  `mux/pkawa.rs`; the only other production assignment is the keep-alive reset to `None` at
+  `lib/src/protocol/kawa_h1/editor.rs:1219`), and the raw token is gone.
+  **Four observable consequences, measured rather than assumed.** *Routing*: `MethodRule::new`
+  (`lib/src/router/mod.rs:1450`) classifies a frontend's declared `method` through the same
+  `Method::new`, so this cuts both ways. A frontend declared without a `method` is unaffected —
+  it yields `MethodRuleResult::All` and still matches everything. A frontend declared `method =
+  "GET"` no longer matches a client sending `get`: the rule is skipped, and if nothing else
+  matches, the request gets the builtin `404`
+  (`lib/src/protocol/mux/mod.rs:1853`). Symmetrically, a frontend declared `method = "get"` is now
+  a custom-method rule and stops answering canonical `GET` requests — **operators who declared a
+  method in non-canonical case must correct it to the exact case the client sends**;
+  `doc/configure.md`'s routing section, which documented the old lenient behaviour explicitly, is
+  updated. *Metric cardinality*: unaffected, and checked before changing rather than after. No
+  metric key or label is derived from the method anywhere in the tree — the `http.status.*`
+  keys come only from `context.status: u16` through a closed eighteen-code list plus buckets
+  (`lib/src/metrics/mod.rs:87`, `lib/src/protocol/mux/stream.rs:692`), and the only labels the
+  emission sites pass are `cluster_id` and `backend_id`, both operator-declared. A peer cannot mint
+  label values by varying case, before or after this change. *Access log*: the method is echoed
+  verbatim, as it already was for every custom method
+  (`lib/src/protocol/mux/stream.rs:721`); a client sending `get` is now logged as `get` instead of
+  `GET`, which is what it actually sent. *Response framing*: `Method::Head` is what terminates the
+  response parse after the headers (`lib/src/protocol/kawa_h1/editor.rs:1117`,
+  `lib/src/protocol/mux/h2.rs:4674`), and a client sending `head` no longer reaches that arm, so the
+  response is framed by `Content-Length` like any other. This is a net improvement, and the trade
+  runs in the direction worth having: **before**, `head` was treated as `Method::Head` and the parse
+  was terminated after the headers, so an RFC-conforming origin — which sees an unrecognised
+  method and answers `405` **with** a body — left that body unread on a pooled keep-alive
+  upstream, desyncing the next request on it. That was the *common* pairing. **After**, the cost
+  lands only on the rare non-conforming pairing: a case-**folding** origin that answers `head`
+  HEAD-style, bodiless, while advertising a `Content-Length`. There Sōzu waits for a body that
+  never arrives and serves `504` at `configured_backend_timeout`
+  (`lib/src/protocol/mux/mod.rs:1521`, `:2185-2186`) — a bounded stall holding one frontend
+  session and one backend connection for that timeout, not a hang. *Debug-log redaction widens*:
+  `Method`'s `Debug` renders a custom method as `Custom(bytes=N)` rather than its text
+  (`lib/src/protocol/kawa_h1/parser.rs:61`), and three sites print `context.method` with
+  `{method:?}` (`lib/src/protocol/mux/mod.rs:129`, `:1192`, `lib/src/protocol/mux/router.rs:65`).
+  A `get` request that logged `method=Some(Get)` now logs `method=Some(Custom(bytes=3))`. That is
+  the same bounded rendering every custom method already got, but the population it covers is now
+  exactly the one an operator debugging “why is my frontend 404ing?” is looking at; the
+  access log above still carries the token verbatim.
+  Explicitly not added: no case-insensitive fallback and no alias table preserving the old
+  behaviour for known verbs — either would reintroduce the same proxy/origin divergence in a
+  form that is harder to see. Coverage: two of the three new tests are
+  falsifiable regression tests, reproduced red against unmodified production —
+  `lowercase_verb_is_custom_and_not_idempotent`
+  (`lib/src/protocol/kawa_h1/parser.rs`) and `method_rule_is_case_sensitive`
+  (`lib/src/router/mod.rs`), pinning the peer side and the operator-config side respectively.
+  `canonical_verbs_keep_their_variant` passes against unmodified production and is therefore not a
+  regression test but an inverse guard, pinning the eight canonical spellings against a future
+  over-narrowing of the match.
+
 - **`fix(mux-h1)`: the stale-upstream replay captures are bounded by a worker-wide ceiling of 512
   armed captures and are now visible to two metrics.** `Stream::retry_buffer` (added with the
   replay itself, sozu-proxy/sozu#1442) is a plain allocation on the global allocator, outside the

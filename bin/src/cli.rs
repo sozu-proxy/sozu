@@ -699,7 +699,11 @@ pub enum HttpFrontendCmd {
             help = "the frontend URL path should equal this regex"
         )]
         path_equals: Option<String>,
-        #[clap(short = 'm', long = "method", help = "HTTP method")]
+        #[clap(
+            short = 'm',
+            long = "method",
+            help = "HTTP method, matched case-sensitively (RFC 9110 §9.1): write it in the exact case the client sends"
+        )]
         method: Option<String>,
         #[clap(long = "tags", help = "Specify tag (key-value pair) to apply on front-end (example: 'key=value, other-key=other-value')", value_parser = parse_tags)]
         tags: Option<BTreeMap<String, String>>,
@@ -794,7 +798,11 @@ pub enum HttpFrontendCmd {
             help = "the frontend URL path should equal this regex"
         )]
         path_equals: Option<String>,
-        #[clap(short = 'm', long = "method", help = "HTTP method")]
+        #[clap(
+            short = 'm',
+            long = "method",
+            help = "HTTP method, matched case-sensitively (RFC 9110 §9.1): write it in the exact case the client sends"
+        )]
         method: Option<String>,
     },
 }

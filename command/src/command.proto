@@ -871,6 +871,15 @@ message RequestHttpFrontend {
     required SocketAddress address = 2;
     required string hostname = 3;
     required PathRule path = 4;
+    // Matched case-SENSITIVELY against the request's method token, per RFC
+    // 9110 §9.1 (sozu-proxy/sozu#1451). Write it in the exact case the client
+    // sends: `GET` does not match a request reading `get`, and `get` does not
+    // match a canonical `GET`. Note this is the opposite precedent from its
+    // siblings in the same configuration file — `redirect`, `redirect_scheme`
+    // and a header `position` are all parsed case-insensitively
+    // (`parse_redirect_policy`, `parse_redirect_scheme` in
+    // `command/src/config.rs`), and header names match case-insensitively per
+    // RFC 9110 §5.1, as documented on `Header` above.
     optional string method = 5;
     required RulePosition position = 6 [default = TREE];
     // custom tags to identify the frontend in the access logs
