@@ -1,0 +1,85 @@
+# Chart: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+# Pinned version: 0.14.2
+# Helm release name "sozu-general" IS the runs-on label: runs-on: sozu-general
+#
+# Known follow-up, not handled by this initial deploy: release.yml's docker-release job
+# builds/pushes clevercloud/sozu:* via buildx. This scale-set does NOT enable containerMode: dind
+# (privileged pods) — that job stays on ubuntu-latest until dind (or an equivalent docker-socket
+# sidecar) is deliberately added here, since that's a real security-posture escalation and
+# shouldn't ride in silently with the rest of the matrix migration.
+#
+# Fork-PR exposure (flagged by automated security review 2026-09-22): sozu is a public repo, so
+# this scale-set is only safe under the two-layer gate the design chose — ephemeral pods (below)
+# plus GitHub's "Require approval for first-time contributors" repo setting (Task 10, operator-run,
+# not verifiable via API — no REST field exists for it as of this writing).
+#
+# Pod hardening applied 2026-09-22 per the same review: runAsNonRoot/no-new-privileges/dropped
+# capabilities/seccomp, all safe no-behavior-change additions (container already runs as uid 1001
+# per the Dockerfile's `USER runner`). Deliberately NOT applied: readOnlyRootFilesystem (a Rust
+# build writes extensively — target/, ~/.cargo, /tmp — this would need a full audit of every
+# writable path plus emptyDir mounts before it's safe) and automountServiceAccountToken: false
+# (unconfirmed whether the runner pod itself ever needs K8s API access under ARC's default,
+# non-Kubernetes containerMode — verify against ARC's runner-pod source before disabling).
+# Concurrency (2026-09-23): the `default` NodeGroup has autoscaling enabled (min 0, max 256 —
+# unlike `bench`, which is deliberately pinned; general jobs need floor capacity, not physical
+# exclusivity). Without a `resources.requests` on the runner pod, Kubernetes always considers it
+# trivially schedulable on the single existing node, so the autoscaler never sees a pending pod and
+# never scales out regardless of maxRunners. The requests below (4 vCPU / 4Gi per runner) are a
+# scheduling/autoscaling hint, not a throttle (no limits set, same pattern as values-bench.yaml) —
+# 4 concurrent general jobs per XL node (cpu-bound), each with real headroom instead of being
+# squeezed by neighbors; the autoscaler adds another XL node past that. maxRunners raised 6 -> 12
+# to give headroom for roughly two concurrent PRs across the 5-cell general matrix
+# (stable/msrv-full/msrv-bare/beta/nightly, once Task 12 completes) — worst case up to 3 XL nodes
+# under full load.
+#
+# hostAliases (root-caused 2026-09-22): sozu's e2e suite resolves three fixed test hostnames
+# (cluster-a.localhost, cluster-b.localhost, other.localhost — grepped from e2e/src/, no dynamic
+# variants exist) via real getaddrinfo() calls (hyper's default HttpConnector, not a hardcoded
+# 127.0.0.1). On this CKE cluster, any name requiring an actual DNS round-trip to CoreDNS
+# (172.24.0.10) shows a persistent ~25-35% failure rate ("failed to lookup address information")
+# even at modest concurrency — reproduced directly with `getent ahosts`, confirmed NOT an ndots
+# search-domain amplification artifact (trailing-dot absolute names failed at the same rate), and
+# confirmed NOT a generic resolver bug (bare "localhost", pure /etc/hosts, never failed in 400
+# concurrent lookups). This is a real capacity/reliability limit of this cluster's DNS path under
+# any query load, not a sozu bug — GitHub-hosted runners never exhibit it because these exact
+# hostnames are pre-existing keys in the runner's own network setup only by coincidence of not
+# depending on DNS in the same way. Routing these three names to loopback via hostAliases (NSS
+# "files", zero network calls) eliminates the exposure entirely — verified 5/5 clean runs after
+# the fix vs. 2/2 deterministic failures before it, same commit, same pod. This is a workaround
+# for a platform DNS reliability issue, not a code fix — the underlying CoreDNS capacity limit
+# should still be reported to the CKE platform team since it could affect any workload with
+# bursty DNS resolution, and is unrelated to this project's scope to fix.
+githubConfigUrl: "https://github.com/sozu-proxy/sozu"
+githubConfigSecret: sozu-runner-github-app
+
+minRunners: 0
+maxRunners: 12
+
+template:
+  spec:
+    hostAliases:
+      - ip: "127.0.0.1"
+        hostnames:
+          - "cluster-a.localhost"
+          - "cluster-b.localhost"
+          - "other.localhost"
+    nodeSelector:
+      clever-cloud.com/nodegroup: default
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1001
+      seccompProfile:
+        type: RuntimeDefault
+    containers:
+      - name: runner
+        image: clevercloud/sozu-ci-runner@sha256:3425e7d5438218d2237a8304cc3b5624bc4f8d85997834da6c021c6a4d410667
+        imagePullPolicy: IfNotPresent
+        command: ["/home/runner/run.sh"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        resources:
+          requests:
+            cpu: "4"
+            memory: "4Gi"

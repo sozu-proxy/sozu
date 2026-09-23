@@ -1,0 +1,55 @@
+# Chart: oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+# Pinned version: 0.14.2
+# Helm release name "sozu-bench" IS the runs-on label: runs-on: sozu-bench
+#
+# Isolation mechanism (per design, refined during planning): the `bench` NodeGroup is fixed at
+# exactly 4 XL nodes with autoscaling explicitly disabled (clever k8s nodegroups create silently
+# inherits the cluster's autoscaling setting — a nodegroups update --disable-autoscaling was
+# required after creation, see ci/runners/runbook.md). maxRunners is capped at 4 to match node
+# count 1:1. The resources.requests below reserve nearly the entire node's allocatable capacity
+# (measured live: cpu=16, memory=30481788Ki on bench-node0), so no other pod can ever be
+# co-scheduled on a bench node regardless of nodeSelector correctness elsewhere — this is what
+# actually buys bench reproducibility (Heracles ISCA 2015: cgroup/QoS isolation alone is
+# insufficient against LLC/DRAM-bandwidth interference; only physical node exclusivity holds).
+# Fork-PR exposure and pod hardening notes: same as values-general.yaml — see there for the full
+# rationale (ephemeral pods + Task 10's repo setting as the fork-PR gate; digest pin + safe
+# securityContext subset applied 2026-09-22 per automated security review; readOnlyRootFilesystem
+# and automountServiceAccountToken:false deliberately deferred, not silently skipped).
+#
+# hostAliases: same CoreDNS-reliability root cause as values-general.yaml (see there for the full
+# investigation) — the bench cells run the identical e2e suite (bench only gates the separate
+# Criterion step), so they hit the exact same three-hostname DNS dependency.
+githubConfigUrl: "https://github.com/sozu-proxy/sozu"
+githubConfigSecret: sozu-runner-github-app
+
+minRunners: 0
+maxRunners: 4
+
+template:
+  spec:
+    hostAliases:
+      - ip: "127.0.0.1"
+        hostnames:
+          - "cluster-a.localhost"
+          - "cluster-b.localhost"
+          - "other.localhost"
+    nodeSelector:
+      clever-cloud.com/nodegroup: bench
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1001
+      seccompProfile:
+        type: RuntimeDefault
+    containers:
+      - name: runner
+        image: clevercloud/sozu-ci-runner@sha256:3425e7d5438218d2237a8304cc3b5624bc4f8d85997834da6c021c6a4d410667
+        imagePullPolicy: IfNotPresent
+        command: ["/home/runner/run.sh"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        resources:
+          requests:
+            cpu: "15"
+            memory: "29Gi"
