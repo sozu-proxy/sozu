@@ -718,6 +718,16 @@ pub enum BackendConnectionError {
     /// pipelines can attribute the rejection.
     #[error("per-(cluster, source-IP) connection limit reached for cluster {cluster_id:?}")]
     TooManyConnectionsPerIp { cluster_id: String },
+    /// A stale-upstream replay could not be carried out. `Stream::retry_buffer`
+    /// holds H1 wire bytes captured under the FIRST attempt's routing
+    /// decision, so the replay is valid only while that decision still holds:
+    /// the cluster must still be known and must still speak H1. When it does
+    /// not, the protocol layer answers 502 Bad Gateway — the same answer the
+    /// stream received before the replay existed (sozu-proxy/sozu#1442) —
+    /// rather than framing raw H1 text as an HTTP/2 DATA payload or
+    /// re-routing a front kawa whose blocks are already drained.
+    #[error("stale-upstream replay refused: {0}")]
+    ReplayRefused(&'static str),
 }
 
 /// Route-extraction failures raised by `kawa_h1::editor::HttpContext` and

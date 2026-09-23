@@ -102,6 +102,7 @@ impl<Front: SocketHandler> Connection<Front> {
             parked_on_buffer_pressure: false,
             close_notify_sent: false,
             session_ulid,
+            reused_from_pool: false,
         })
     }
     pub fn new_h1_client(
@@ -129,6 +130,7 @@ impl<Front: SocketHandler> Connection<Front> {
             parked_on_buffer_pressure: false,
             close_notify_sent: false,
             session_ulid,
+            reused_from_pool: false,
         })
     }
 

@@ -866,7 +866,7 @@ and `tracestate` headers are extracted from inbound requests:
 At access log emission time (`Stream::generate_access_log`, in
 `lib/src/protocol/mux/stream.rs`):
 
-```rust lib/src/protocol/mux/stream.rs:444-447
+```rust lib/src/protocol/mux/stream.rs:588-591
 #[cfg(feature = "opentelemetry")]
 otel: context.otel.as_ref(),
 #[cfg(not(feature = "opentelemetry"))]
@@ -1078,7 +1078,9 @@ locks those fixes in:
 
 - `test_h2_php_apache_chunked_flush_drains_fully` — 312 KiB chunked body with
   per-chunk flush cadence exercising the peer-readiness re-arm in
-  `ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs:440-446`) (C1).
+  `ConnectionH1::readable` — its three `peer.arm_writable()` sites, cited by
+  symbol because no single range covers them (`lib/src/protocol/mux/h1.rs`)
+  (C1).
 - `test_h2_slow_backend_idle_timeout_cancels` — 64 KiB chunked body streamed
   over 4 s, exercising the outbound refresh of `stream_last_activity_at` (C2).
 - `test_h2_chunked_backend_crash_mid_stream_rsts` — verifies the chunked-EOF

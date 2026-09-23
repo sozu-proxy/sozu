@@ -41,6 +41,16 @@ pub(super) enum EndStreamAction {
     /// No response is available and the request is untouched, so the caller may
     /// link the stream to a fresh backend and retry.
     Reconnect,
+    /// No response is available and the request WAS written, but it went onto a
+    /// reused keep-alive upstream whose peer had already closed it, and the
+    /// whole request is still buffered: the caller may queue the captured bytes
+    /// back onto the front kawa and link the stream to a fresh backend.
+    ///
+    /// Distinct from [`Self::Reconnect`] because the caller has extra work to
+    /// do — `Stream::queue_upstream_replay` — before the stream can be linked.
+    /// See `Stream::can_replay_on_fresh_upstream` for the boundary and its
+    /// sources (sozu-proxy/sozu#1442).
+    ReplayOnFreshBackend,
 }
 
 /// Compute the canonical end-of-stream decision for a server-side stream.
@@ -58,7 +68,15 @@ pub(super) fn end_stream_decision(stream: &Stream) -> EndStreamAction {
             EndStreamAction::ForwardUnterminated
         }
     } else if stream.front.consumed {
-        EndStreamAction::SendDefault(502)
+        // The request reached the upstream. That is only replayable in the
+        // stale-keep-alive case: no response byte was received, the method is
+        // idempotent so re-issuing is permitted (RFC 9110 §9.2.2), and the
+        // bytes were captured for exactly this. Every other shape stays 502.
+        if stream.can_replay_on_fresh_upstream() {
+            EndStreamAction::ReplayOnFreshBackend
+        } else {
+            EndStreamAction::SendDefault(502)
+        }
     } else {
         EndStreamAction::Reconnect
     }

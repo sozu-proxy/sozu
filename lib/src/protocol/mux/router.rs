@@ -171,13 +171,45 @@ impl Router {
         // redirect_location / www_authenticate / original_authority /
         // headers_response). We split-borrow manually to keep the rest of
         // `connect` working with `stream_context` aliasing `stream.context`.
-        let (front_ref, stream_context_ref) = {
-            let stream_split = &mut *stream;
-            (&mut stream_split.front, &mut stream_split.context)
+        //
+        // A REPLAY skips routing entirely. `front.consumed` is the exact
+        // discriminator: it is false on every first connect and on the
+        // untouched-request `EndStreamAction::Reconnect`, and true only once
+        // request bytes have left the front kawa — which is precisely the
+        // `EndStreamAction::ReplayOnFreshBackend` case. Routing already ran
+        // on the first attempt and every decision it made (cluster, legacy
+        // HTTPS redirect, SNI/authority binding, authentication, request-side
+        // header edits) is baked into the captured bytes.
+        //
+        // Re-running it against a front kawa whose blocks are drained cannot
+        // reproduce them: the request line and headers it rewrites are no
+        // longer in `front.blocks`, and `end_of_headers_index` has no anchor
+        // to place injected headers at. Whatever the next `prepare` did emit
+        // would land BEHIND the replayed bytes, because `Kawa::prepare`
+        // appends to `out` while `Stream::queue_upstream_replay` prepends —
+        // a second, partial copy of the request trailing the first on the
+        // same connection.
+        //
+        // So a replay whose routing decision did not survive is refused
+        // outright rather than re-routed against that drained kawa: 502 is
+        // what the stream would have received before the replay existed.
+        let replaying = stream.front.consumed;
+        let cluster_id = if replaying {
+            stream
+                .context
+                .cluster_id
+                .clone()
+                .ok_or(BackendConnectionError::ReplayRefused(
+                    "no cluster_id survived the first attempt",
+                ))?
+        } else {
+            let (front_ref, stream_context_ref) = {
+                let stream_split = &mut *stream;
+                (&mut stream_split.front, &mut stream_split.context)
+            };
+            self.route_from_request(stream_context_ref, front_ref, &context.listener, &proxy)
+                .map_err(BackendConnectionError::RetrieveClusterError)?
         };
-        let cluster_id = self
-            .route_from_request(stream_context_ref, front_ref, &context.listener, &proxy)
-            .map_err(BackendConnectionError::RetrieveClusterError)?;
         let stream_context = &mut stream.context;
         stream_context.cluster_id = Some(cluster_id.to_owned());
 
@@ -201,6 +233,22 @@ impl Router {
                 )
             })
             .unwrap_or((false, false, false, None, None));
+
+        // A replay carries H1 wire bytes in `front.out` (the H1 write path is
+        // the only one that captures), so its cluster must still resolve to
+        // H1 or the H2 converter would frame raw H1 text as a DATA payload.
+        // It is expected to: `clusters()` is owned by the worker's command
+        // loop, and a replay is drained from `pending_links` inside the very
+        // `ready()` pass that queued it, so no cluster update should
+        // interleave. That argument is not load-bearing here — the cost of it
+        // being wrong is silent protocol corruption on the wire, which is not
+        // a thing to leave to an assertion that compiles out of every release
+        // build. Refuse the replay instead and let the caller answer 502.
+        if replaying && h2 {
+            return Err(BackendConnectionError::ReplayRefused(
+                "the cluster switched to HTTP/2 between attempts",
+            ));
+        }
 
         // ── Legacy `cluster.https_redirect` short-circuit ──
         //

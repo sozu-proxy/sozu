@@ -136,6 +136,28 @@ pub struct ConnectionH1<Front: SocketHandler> {
     /// stamp the session slot of the `[session req cluster backend]` log
     /// prefix emitted by the local `log_context!` macro.
     pub session_ulid: Ulid,
+    /// True once this backend connection has served a stream that it picked
+    /// up out of the H1 keep-alive pool, rather than on the fresh dial that
+    /// created it.
+    ///
+    /// This is pingora's `client_reused` bit — the provenance the protocol
+    /// layer cannot see but the retry decision needs.
+    ///
+    /// It does NOT prove what the peer did. An EOF with no response is
+    /// indistinguishable at this layer from a stale pool socket, from an
+    /// origin that half-closed after processing the request but before
+    /// answering, and from one that crashed mid-request: `readable` treats
+    /// every `size == 0` alike, and an empty back buffer proves only that no
+    /// response byte arrived. What this bit does is bound the window in
+    /// which sozu is willing to re-issue: a connection that came out of the
+    /// pool has been idle long enough for its peer to have closed it
+    /// unobserved, a freshly dialled one has not. What makes re-issuing
+    /// permissible at all is the idempotence gate (RFC 9110 §9.2.2) in
+    /// `Stream::can_replay_on_fresh_upstream`; this bit only narrows when
+    /// that permission is exercised, so only a reused connection arms
+    /// request capture (sozu-proxy/sozu#1442). Always false on a
+    /// `Position::Server` connection.
+    pub reused_from_pool: bool,
 }
 
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
@@ -145,6 +167,7 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
             .field("readiness", &self.readiness)
             .field("socket", &self.socket.socket_ref())
             .field("stream", &self.stream)
+            .field("reused_from_pool", &self.reused_from_pool)
             .finish()
     }
 }
@@ -312,6 +335,13 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             "socket_read returned more bytes than the buffer could hold"
         );
         context.debug.push(DebugEvent::StreamEvent(0, size));
+        if size > 0 && self.position.is_client() {
+            // The upstream answered, so this attempt is past the replay
+            // boundary (`Stream::can_replay_on_fresh_upstream`) whatever the
+            // bytes turn out to parse as. Drop the captured request now
+            // instead of carrying it to the end of the response.
+            *parts.retry_buffer = None;
+        }
         kawa.storage.fill(size);
         debug_assert_eq!(
             kawa.storage.available_space(),
@@ -583,6 +613,59 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             size <= queued,
             "socket_write_vectored reported more bytes written than were queued"
         );
+        // Capture the bytes the socket accepted BEFORE `kawa::Kawa::consume`
+        // drops them from the front buffer and shifts the storage: past that
+        // point sozu no longer holds the request, so a stale pooled upstream
+        // could not be retried without this copy. Every proxy that retries a
+        // request already written upstream pays the same copy — HAProxy
+        // ("requires to allocate a buffer and copy the whole request into
+        // it, so it has memory and performance impacts"), pingora
+        // (`enable_retry_buffering`, a fixed 64 KiB `FixedBuffer`).
+        //
+        // It is charged ONLY to a connection that came out of the keep-alive
+        // pool: `reused_from_pool` is set by `start_stream` on the
+        // KeepAlive -> Connected transition and nowhere else, so a freshly
+        // dialled upstream and every `Position::Server` write cost nothing.
+        // That is pingora's `RetryType::ReusedOnly` boundary, argued in
+        // `Stream::can_replay_on_fresh_upstream` (sozu-proxy/sozu#1442).
+        //
+        // Overflowing one front buffer truncates the capture to `None` and
+        // the request stops being replayable, rather than the buffer
+        // growing: HAProxy, same reason — "Requests not fitting in a single
+        // buffer will never be retried".
+        //
+        // The bytes are appended straight onto the capture, with the budget
+        // decided first: `size` is already known, `kawa` was moved out of
+        // `parts` above so `parts.retry_buffer` is independently borrowable,
+        // and the slices still alias `kawa.storage` until `consume` below.
+        // Staging them through a temporary `Vec` first would cost one extra
+        // allocation, one extra copy and one free on every write of every
+        // pooled connection.
+        let retry_budget = kawa.storage.capacity();
+        if self.reused_from_pool {
+            match parts.retry_buffer.as_mut() {
+                // The capture has to stay a byte-exact prefix of what the
+                // socket accepted, so a write that would carry it past one
+                // front buffer drops it whole rather than truncating it.
+                Some(buffer) if size <= retry_budget.saturating_sub(buffer.len()) => {
+                    buffer.reserve(size);
+                    let mut remaining = size;
+                    for slice in &io_slices {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let take = remaining.min(slice.len());
+                        buffer.extend_from_slice(&slice[..take]);
+                        remaining -= take;
+                    }
+                    debug_assert_eq!(
+                        remaining, 0,
+                        "the replay capture must mirror every byte the socket accepted"
+                    );
+                }
+                _ => *parts.retry_buffer = None,
+            }
+        }
         context.debug.push(DebugEvent::StreamEvent(1, size));
         kawa.consume(size);
         self.position.count_bytes_out_counter(size);
@@ -712,6 +795,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         stream.front.clear();
                         // do not stream.front.storage.clear() because of H1 pipelining
                         stream.attempts = 0;
+                        // The next pipelined request gets its own replay
+                        // decision: `start_stream` re-arms capture only if it
+                        // again picks a connection out of the keep-alive pool.
+                        stream.forget_upstream_replay();
                         // Transition back to Idle so buffered pipelined requests
                         // trigger a phase transition on the next readable() call.
                         stream.state = StreamState::Idle;
@@ -1036,11 +1123,43 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     stream.state = StreamState::Link;
                     context.pending_links.push_back(stream_id);
                 }
+                EndStreamAction::ReplayOnFreshBackend => match stream.queue_upstream_replay() {
+                    Some(len) => {
+                        debug!(
+                            "{} H1 REPLAY {} request bytes on a fresh backend",
+                            log_context!(self),
+                            len
+                        );
+                        incr!(
+                            names::backend::RETRY_STALE_UPSTREAM,
+                            stream.context.cluster_id.as_deref(),
+                            stream.context.backend_id.as_deref()
+                        );
+                        stream.state = StreamState::Link;
+                        context.pending_links.push_back(stream_id);
+                        // `Router::connect` still gates on `stream.attempts`
+                        // against `CONN_RETRIES`, so a cluster whose backends
+                        // are all stale cannot loop: the budget runs out and
+                        // the caller answers 503.
+                    }
+                    None => {
+                        // Unreachable while `end_stream_decision` only picks
+                        // this action behind `can_replay_on_fresh_upstream`,
+                        // which requires the buffer. Degrade to the answer
+                        // the old code sent rather than stranding the stream.
+                        error!(
+                            "{} replay selected with no captured request",
+                            log_context!(self)
+                        );
+                        let answers = answers_rc.borrow();
+                        set_default_answer(stream, &mut self.readiness, 502, &answers);
+                    }
+                },
             },
         }
     }
 
-    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, _context: &mut Context<L>) -> bool
+    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>) -> bool
     where
         L: ListenerHandler + L7ListenerHandler,
     {
@@ -1060,6 +1179,13 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         match &mut self.position {
             Position::Client(_, _, status @ BackendStatus::KeepAlive) => {
                 *status = BackendStatus::Connected;
+                // This stream is being written onto a socket that has been
+                // idle in the pool, so the peer may already have closed it
+                // without sozu noticing. Record the provenance and arm
+                // request capture so the write path below can keep the bytes
+                // needed to replay elsewhere (sozu-proxy/sozu#1442).
+                self.reused_from_pool = true;
+                context.streams[stream].arm_upstream_replay();
                 // A keep-alive client transitions to Connected when it picks up
                 // a new stream; it must not stay parked in KeepAlive.
                 debug_assert!(

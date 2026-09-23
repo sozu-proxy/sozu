@@ -2831,6 +2831,65 @@ Incremented when Sōzu generates a default error response instead of proxying:
 | `backend.down`                      | counter | proxy            | Backend marked as unhealthy (retry policy triggered)                                                                                                                                                                                                                                                                                   |
 | `backend.connections.error`         | counter | proxy            | Backend connection failures                                                                                                                                                                                                                                                                                                            |
 | `backend.connect.retries_exhausted` | counter | cluster, backend | Per-session backend-connect retry budget (`CONN_RETRIES = 3`) was exhausted. Emitted once per event at the TCP, HTTP/1, and HTTP/2-mux gates. Alert on this counter's rate instead of grepping `WARN` / `ERROR` logs — the underlying log line is `warn!` since the condition is peer-driven backpressure, not a Sōzu invariant break. |
+| `backend.retry.stale_upstream`      | counter | cluster, backend | A request written onto a POOLED H1 keep-alive backend connection that then closed without answering was re-issued on a fresh backend instead of being answered `502 Bad Gateway`. Labelled with the **stale** backend — the one that did not answer. One client request can increment this more than once. See "Stale-upstream retry" below, which covers how to read a rate that tracks the request rate. |
+
+#### Stale-upstream retry
+
+An H1 keep-alive backend connection sitting in the pool can be closed by its
+peer at any time, and Sōzu may not have processed that event when the next
+request is routed. The request is then written onto a dead socket, the read
+returns EOF, and there is no response to forward.
+
+Sōzu re-issues that request on a fresh backend chosen by the load balancer
+instead of answering `502 Bad Gateway`. The retry is allowed only while **no
+response byte has been received** — nothing was observed by the client, so
+re-issuing is unobservable — and only when all of the following hold:
+
+- the connection came out of the keep-alive pool, not a fresh dial. Sōzu
+  cannot tell *why* the upstream went away — a stale pool socket, a backend
+  that half-closed after processing the request, and one that crashed
+  mid-request all arrive as the same EOF — so this is a policy that narrows
+  the retry to the case where an unobserved idle close is plausible, not a
+  diagnosis. A fresh dial has not been idle, so it is never re-issued;
+- the method is idempotent (RFC 9110 §9.2.2): `GET`, `HEAD`, `PUT`, `DELETE`,
+  `OPTIONS`, `TRACE`. `POST`, `CONNECT` and any method Sōzu does not
+  recognise — including `PATCH` — are never re-issued;
+- the serialized request fits in one front buffer. The bound the code applies
+  is the front kawa's `storage.capacity()` (`ConnectionH1::writable`,
+  `lib/src/protocol/mux/h1.rs`), not the configured `buffer_size` itself: a
+  checked-out buffer holds *at least* `buffer_size` (default 16393 bytes), and
+  the pool rounds the per-entry extra up to `align_of::<Entry>`, so that
+  default yields 16400 bytes of usable capacity (`lib/src/pool.rs`). A request
+  larger than that is not re-issued.
+
+The re-issued request is byte-identical to the first attempt, `Sozu-Id`
+included, so one client request still produces one access-log line. Retries
+consume the same per-session budget as connection attempts
+(`CONN_RETRIES = 3`); exhausting it answers `503` and increments
+`backend.connect.retries_exhausted`. That budget is the only bound: a re-issued
+request that again lands on a pooled connection may be re-issued again, so
+`backend.retry.stale_upstream` can increment more than once for one client
+request, and the counter is not the number of replays that reached a backend.
+It is incremented in `ConnectionH1::end_stream` / `ConnectionH2::end_stream`
+*before* the stream is pushed back onto `pending_links`, so `Router::connect`
+has not yet had the chance to refuse it. With `CONN_RETRIES = 3` that is at
+most three increments for one client request, of which at most two replays are
+actually written to a backend: the third increment is immediately followed by
+the exhausted-budget `503`.
+
+**Reading the counter.** It says "an upstream went away before answering", not
+"the pool held a closed socket". If its rate tracks the request rate, check the
+backends' own error rate and restart/OOM history first. Backends dying
+mid-request land on this counter too, and for them raising the keep-alive idle
+timeout changes nothing. If the backends are healthy, their keep-alive idle
+timeout is shorter than Sōzu's and should be raised — the retry is correct, but
+it is costing a dial per request.
+
+This is deliberately narrower than nginx's default `proxy_next_upstream error
+timeout`, which also re-issues an idempotent request that failed on a freshly
+dialled upstream, and narrower than HAProxy's opt-in `retry-on
+empty-response`. There is no configuration knob: the conditions above are not
+tunable.
 
 #### Backend pool
 

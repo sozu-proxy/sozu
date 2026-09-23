@@ -693,9 +693,9 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **A test that only reddens under CI load is not automatically a flake — find
   the production site first.** Before retrying or quarantining, ask whether the
   symptom is reachable at all. #1353's 421 has exactly one emission site
-  (`lib/src/protocol/mux/mod.rs:1856`), reachable only through
+  (`lib/src/protocol/mux/mod.rs:1857`), reachable only through
   `RetrieveClusterError::SniAuthorityMismatch`, which is constructed at exactly
-  one site (`lib/src/protocol/mux/router.rs:672`) immediately after
+  one site (`lib/src/protocol/mux/router.rs:720`) immediately after
   `incr!(names::http::SNI_AUTHORITY_MISMATCH)` — and the failing run reported
   that counter unmoved, alongside a correct backend request count. The proxy was
   innocent by construction, and sixteen serial local reproductions were never

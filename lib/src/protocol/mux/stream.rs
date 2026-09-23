@@ -18,8 +18,9 @@ use sozu_command::logging::ansi_palette;
 use super::{GenericHttpStream, Position};
 use crate::metrics::names;
 use crate::{
-    L7ListenerHandler, ListenerHandler, Protocol, SessionMetrics, pool::Pool,
-    protocol::http::editor::HttpContext,
+    L7ListenerHandler, ListenerHandler, Protocol, SessionMetrics,
+    pool::Pool,
+    protocol::http::{editor::HttpContext, parser::Method},
 };
 
 /// Module-level prefix used on every log line emitted from the stream module.
@@ -71,6 +72,23 @@ pub struct Stream {
     pub request_counted: bool,
     pub front: GenericHttpStream,
     pub back: GenericHttpStream,
+    /// The serialized request already written to the upstream, kept so it can
+    /// be replayed on a fresh connection when a POOLED keep-alive upstream
+    /// turns out to have been closed by its peer before it answered.
+    ///
+    /// `None` means "not replayable" and is the state on every path that is
+    /// not the stale-pool race: a freshly dialled upstream never fills it
+    /// (see [`super::h1::ConnectionH1`]'s `reused_from_pool`), a response
+    /// byte clears it, and a request too large to fit one front buffer
+    /// truncates it back to `None`. `Some` therefore carries both the bytes
+    /// and the proof that replay is allowed.
+    ///
+    /// This mirrors pingora's `RetryType::ReusedOnly` + `retry_buffer_
+    /// truncated()` pair and HAProxy's "requires to allocate a buffer and
+    /// copy the whole request into it […] Requests not fitting in a single
+    /// buffer will never be retried" — replaying a request that kawa has
+    /// already consumed is impossible without holding its bytes.
+    pub retry_buffer: Option<Vec<u8>>,
     pub context: HttpContext,
     pub metrics: SessionMetrics,
 }
@@ -111,6 +129,10 @@ impl Debug for Stream {
             .field("request_counted", &self.request_counted)
             .field("front", &KawaSummary(&self.front))
             .field("back", &KawaSummary(&self.back))
+            .field(
+                "retry_buffer",
+                &self.retry_buffer.as_ref().map(|bytes| bytes.len()),
+            )
             .field("context", &self.context)
             .field("metrics", &self.metrics)
             .finish()
@@ -129,6 +151,10 @@ pub struct StreamParts<'a> {
     pub data_received: &'a mut usize,
     pub context: &'a mut HttpContext,
     pub metrics: &'a mut SessionMetrics,
+    /// [`Stream::retry_buffer`], reachable from the write path so the H1
+    /// client can record the exact bytes it hands the upstream socket before
+    /// `kawa::Kawa::consume` drops them from the front buffer.
+    pub retry_buffer: &'a mut Option<Vec<u8>>,
 }
 
 impl Stream {
@@ -152,6 +178,7 @@ impl Stream {
             request_counted: false,
             front: GenericHttpStream::new(kawa::Kind::Request, kawa::Buffer::new(front_buffer)),
             back: GenericHttpStream::new(kawa::Kind::Response, kawa::Buffer::new(back_buffer)),
+            retry_buffer: None,
             context,
             metrics: SessionMetrics::new(None),
         };
@@ -263,6 +290,7 @@ impl Stream {
                 data_received: &mut self.back_data_received,
                 context: &mut self.context,
                 metrics: &mut self.metrics,
+                retry_buffer: &mut self.retry_buffer,
             },
             Position::Server => StreamParts {
                 window: &mut self.window,
@@ -272,9 +300,125 @@ impl Stream {
                 data_received: &mut self.front_data_received,
                 context: &mut self.context,
                 metrics: &mut self.metrics,
+                retry_buffer: &mut self.retry_buffer,
             },
         }
     }
+
+    /// Arm request capture for an attempt on a reused keep-alive upstream.
+    ///
+    /// Idempotent WITHIN one attempt: an already-armed buffer is left alone
+    /// so a multi-pass write keeps accumulating into the same allocation.
+    ///
+    /// It is NOT once per request. `super::h1::ConnectionH1::start_stream`
+    /// calls this on every `KeepAlive -> Connected` transition and
+    /// `reused_from_pool` is never cleared, so a replay that lands on
+    /// another pooled connection re-arms a fresh capture and may itself be
+    /// replayed. `Router::connect`'s `stream.attempts >= CONN_RETRIES` gate
+    /// is the only bound on how many times one request is re-issued.
+    pub fn arm_upstream_replay(&mut self) {
+        if self.retry_buffer.is_none() {
+            self.retry_buffer = Some(Vec::new());
+        }
+    }
+
+    /// Forget the captured request.
+    ///
+    /// Called as soon as the upstream produces its first byte: past that
+    /// point the attempt is no longer replayable (the boundary below), so
+    /// holding the copy would only cost memory.
+    pub fn forget_upstream_replay(&mut self) {
+        self.retry_buffer = None;
+    }
+
+    /// May this stream's request be re-issued on a fresh upstream
+    /// connection?
+    ///
+    /// The boundary is **no response byte has been received**, narrowed to
+    /// the stale-pool race:
+    ///
+    /// - `retry_buffer.is_some()` proves BOTH that the whole serialized
+    ///   request is still held AND that it went onto a reused keep-alive
+    ///   connection, because that is the only path that arms the capture.
+    ///   This is pingora's `RetryType::ReusedOnly`. It is a POLICY, not a
+    ///   diagnosis: sozu cannot tell a stale pool socket from an origin
+    ///   that half-closed after processing the request, or from one that
+    ///   crashed mid-request — `super::h1::ConnectionH1::readable` treats
+    ///   every `size == 0` alike. Restricting replay to pooled connections
+    ///   narrows it to the case where an unobserved idle close is
+    ///   plausible; the conjunct below is what makes re-issuing permissible.
+    /// - the method is idempotent, which RFC 9110 §9.2.2 defines as exactly
+    ///   this permission: re-issuing it has the same intended effect as
+    ///   issuing it once, so a client cannot observe the difference. That is
+    ///   the load-bearing justification for the whole feature. nginx refuses
+    ///   `POST, LOCK, PATCH` "if a request has been sent to an upstream
+    ///   server" unless `non_idempotent` is set; pingora vetoes on
+    ///   `!method.is_idempotent()`; HAProxy provides an
+    ///   `http-request disable-l7-retry` action and gives POST as the
+    ///   rationale for reaching for it.
+    /// - the upstream produced nothing at all: no byte forwarded
+    ///   (`!back.consumed`) and no byte even buffered
+    ///   (`back.storage.is_empty()`). nginx: "passing a request to the next
+    ///   server is only possible if nothing has been sent to a client yet".
+    ///   Requiring an empty back buffer is stricter than that — a partial
+    ///   status line is HAProxy's `junk-response`, which it keeps out of
+    ///   every default.
+    ///
+    /// The caller must additionally have established that no response is
+    /// available at all; `super::shared::end_stream_decision` owns that part
+    /// and is the only caller.
+    pub fn can_replay_on_fresh_upstream(&self) -> bool {
+        self.retry_buffer.is_some()
+            && self
+                .context
+                .method
+                .as_ref()
+                .is_some_and(Method::is_idempotent)
+            && !self.back.consumed
+            && self.back.storage.is_empty()
+    }
+
+    /// Queue the captured request for re-serialization onto a fresh upstream.
+    ///
+    /// The bytes go back into `front.out` as an owned `Store::Alloc`, and
+    /// they are PREPENDED. `out` is not necessarily empty at this point:
+    /// [`super::h1::ConnectionH1::writable`] answers a partial
+    /// `socket_write_vectored` by signalling a pending write and returning,
+    /// and `kawa::Kawa::consume` pushes the partially consumed store back to
+    /// the FRONT of `out` (kawa-0.7.1 `storage/repr.rs`), so the bytes the
+    /// kernel refused are still queued here. The capture holds exactly the
+    /// bytes the socket DID accept, so capture and remainder are the
+    /// complementary halves of one serialization and the capture belongs
+    /// ahead of the remainder. `kawa::Kawa::push_out` appends, which would
+    /// put `[tail][head]` on the wire — a request mangled mid-token.
+    ///
+    /// `VecDeque::push_front` preserves the relative order of what is already
+    /// queued, so this is correct however many entries the remainder spans:
+    /// `consume` pushes back at most ONE partially consumed store and drops
+    /// every entry ahead of it.
+    ///
+    /// Prepending an owned `Store::Alloc` is also safe for kawa's storage
+    /// bookkeeping. `Kawa::leftmost_ref` scans `out` for the first
+    /// `Store::Slice` and skips an `Alloc`, so buffer reclamation is
+    /// unchanged, and `Store::push_left` is a no-op on an `Alloc`, whose
+    /// bytes live outside `storage` and survive a shift.
+    ///
+    /// `front.blocks` was drained by the `prepare` that preceded the write,
+    /// so the next `writable` pass's `prepare` contributes nothing of its
+    /// own. Replaying the SERIALIZED form (rather than re-running the block
+    /// converter) also makes the retried request byte-identical to the first
+    /// attempt, `Sozu-Id` and `X-Forwarded-*` included.
+    ///
+    /// Returns the number of bytes queued, or `None` when nothing was held.
+    pub fn queue_upstream_replay(&mut self) -> Option<usize> {
+        let request = self.retry_buffer.take()?;
+        let len = request.len();
+        self.front
+            .out
+            .push_front(kawa::OutBlock::Store(kawa::Store::from_vec(request)));
+        Some(len)
+    }
+
     /// Emit the access log for this stream.
     ///
     /// `client_rtt`/`server_rtt` are passed in by the caller because the
