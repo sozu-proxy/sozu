@@ -924,6 +924,13 @@ LINE_COMMENT = re.compile(r"//.*$", re.MULTILINE)
 # change leaves a trace. The checker holds the forwarding pointer live: the
 # value must itself name a `fn`, or the citation is reported.
 RENAMED_TESTS = {
+    # Renamed because the old name claimed an ordering the body could not
+    # observe: it inspects the IoSlice vector only after `confirm` returns,
+    # where clear-before-consume and clear-after-consume both leave it empty.
+    # The CHANGELOG cites the old name on purpose, to record that the rename
+    # is the fix.
+    "confirm_clears_the_descriptors_before_consuming":
+        "confirm_leaves_no_descriptor_for_the_next_round",
     # sozu#1356 inverted the test that pinned the hostname-segment anchoring
     # defect instead of deleting it, as that test's own comment asked.
     "an_alternating_regex_hostname_segment_is_still_anchored_at_one_end_only":

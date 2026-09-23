@@ -12,7 +12,7 @@
 
 use std::{
     cmp::min,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io::{IoSlice, Write as _},
     time::{Duration, Instant},
 };
@@ -35,9 +35,12 @@ use crate::{
         BackendStatus, Context, DebugEvent, DebugHistory, Endpoint, GenericHttpStream,
         GlobalStreamId, MuxResult, Position, Stream, StreamId, StreamState, converter,
         forcefully_terminate_answer,
+        h2_close::{self, CloseAction, FinalizeAction, TlsFlushPhase},
+        h2_control_tx,
         h2_drain::{self, GracefulDrainDecision},
         h2_flood_detector::{self, H2FloodConfig, H2FloodViolation},
-        h2_flow_control, h2_header_reassembly, h2_scheduler, h2_stream_table, hpack_state,
+        h2_flow_control, h2_header_reassembly, h2_scheduler, h2_stream_table, h2_transmit,
+        hpack_state,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
         pkawa, remove_backend_stream, serializer, set_default_answer,
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
@@ -84,7 +87,7 @@ macro_rules! log_context {
             gray = gray,
             white = white,
             ulid = $self.session_ulid,
-            peer = $self.socket.peer_addr(),
+            peer = $self.peer_address,
             position = $self.position,
             state = $self.state,
             streams = $self.stream_table.len(),
@@ -118,7 +121,7 @@ macro_rules! log_context_stream {
             req = $http_context.id,
             cluster = $http_context.cluster_id.as_deref().unwrap_or("-"),
             backend = $http_context.backend_id.as_deref().unwrap_or("-"),
-            peer = $self.socket.peer_addr(),
+            peer = $self.peer_address,
             position = $self.position,
             state = $self.state,
             streams = $self.stream_table.len(),
@@ -419,12 +422,6 @@ impl H2ConnectionConfig {
 #[cfg(test)]
 const DEFAULT_MAX_PENDING_WINDOW_UPDATES: usize = 1 + DEFAULT_MAX_CONCURRENT_STREAMS as usize * 4;
 
-/// Maximum number of pending RST_STREAM frames before triggering GOAWAY.
-/// When a peer causes excessive RST_STREAM queueing (e.g. rapid stream creation
-/// beyond MAX_CONCURRENT_STREAMS), this cap prevents unbounded memory growth
-/// and triggers an ENHANCE_YOUR_CALM connection error.
-const MAX_PENDING_RST_STREAMS: usize = 200;
-
 /// RFC 9113 §6.5: maximum time (in seconds) to wait for SETTINGS ACK before
 /// sending GOAWAY with SETTINGS_TIMEOUT error code.
 const SETTINGS_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -617,150 +614,6 @@ fn fc_stall_budget_decision(
     }
 }
 
-/// Outcome of [`enqueue_rst_into`]. Mirrors
-/// [`h2_flow_control::QueueWindowUpdateOutcome`]: the primitive stays log- and
-/// metrics-free and [`ConnectionH2::enqueue_rst`] maps each variant to its
-/// accounting.
-#[derive(Debug, PartialEq, Eq)]
-enum EnqueueRstOutcome {
-    /// Freshly queued. The caller must account it: tx counter, per-error
-    /// breakdown, and the CVE-2025-8671 MadeYouReset emitted-lifetime cap.
-    Queued,
-    /// The wire id was already in `rst_sent` — a benign re-entrant
-    /// idempotency, NOT a new wire emission. Nothing was queued and nothing
-    /// is accounted.
-    Deduped,
-    /// The pending queue was already at `max_pending`: not queued, not
-    /// accounted.
-    ///
-    /// Nothing that would have reached the wire is lost here, and — as long as
-    /// the connection has not already entered `H2State::GoAway`/`H2State::Error`
-    /// — the drop is not silent to the peer. `ConnectionH2::check_invariants`
-    /// invariant 3 holds `total_rst_streams_queued >= pending_rst_streams.len()`,
-    /// so a full queue implies
-    /// `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS`, which is the
-    /// counter half of the condition `flush_pending_control_frames` tests
-    /// *before* its drain loop, returning `goaway(EnhanceYourCalm)` instead of
-    /// serialising anything. The 200 enqueues that filled the queue each armed
-    /// `Ready::WRITABLE`, so that escalation runs on the next writable tick on
-    /// both `cancel_timed_out_streams` call paths, including `Mux::timeout`
-    /// against a silent peer. The peer is told to back off with
-    /// `GOAWAY(ENHANCE_YOUR_CALM)` (RFC 9113 §6.8, the documented answer to
-    /// RST_STREAM abuse since CVE-2023-44487) and the connection is torn down,
-    /// rather than being left believing a stream is still live.
-    ///
-    /// The other half of that condition is a state gate —
-    /// `!matches!(self.state, H2State::GoAway | H2State::Error)` — and the RST
-    /// drain underneath it has none, so the implication holds only until the
-    /// first GOAWAY. `ConnectionH2::goaway` sets `H2State::GoAway` without
-    /// clearing `pending_rst_streams`, so a `Mux::timeout` reap landing in that
-    /// window is refused here and raises no second escalation while the drain
-    /// still serialises what is queued. The window is bounded and benign: the
-    /// peer already holds the GOAWAY that made the connection terminal, and
-    /// `writable()`'s `H2State::GoAway` arm force-disconnects on the same pass
-    /// once the TLS buffer is flushed.
-    Dropped,
-}
-
-/// Core of [`ConnectionH2::enqueue_rst`], extracted so the RST-queueing
-/// semantics (dedupe, queued-cap counter bump, invariant-15 readiness rearm)
-/// can be unit-tested without building a full `ConnectionH2<Front>` fixture.
-///
-/// Invariants enforced:
-/// - **Dedupe** via `rst_sent`: at most one queued RST per wire stream id.
-///   `HashSet::insert` returns `false` when the id is already present; we
-///   short-circuit on that branch to keep `pending_rst_streams`,
-///   `total_rst_streams_queued` and the wire counts consistent.
-/// - **MadeYouReset queued cap** (`MAX_PENDING_RST_STREAMS`): each freshly
-///   queued RST bumps `total_rst_streams_queued`, which
-///   `flush_pending_control_frames` polices to escalate to
-///   `GOAWAY(ENHANCE_YOUR_CALM)` when exceeded.
-/// - **Per-insert queue bound** (`max_pending`): the queue itself refuses to
-///   grow past the cap, so the bound holds however many RSTs ONE caller
-///   queues between two `flush_pending_control_frames` passes.
-///   `cancel_timed_out_streams` is the largest such caller: it walks the whole
-///   timed-out set in a single sweep, and a reap of more than
-///   `MAX_PENDING_RST_STREAMS` streams — which needs an operator-raised
-///   `max_concurrent_streams`, because that is what bounds the live set the
-///   reaper walks — used to push `pending_rst_streams` past the bound
-///   `ConnectionH2::check_invariants` asserts, panicking on the next inbound
-///   frame in a debug build or growing unbounded in release
-///   (sozu-proxy/sozu#1413). `max_concurrent_streams` bounds one sweep, not
-///   the queue: the queue holds what every caller queued since the last
-///   successful drain, and the DATA-on-closed-stream enqueue is a second
-///   caller `check_invariants` never inspects — see
-///   [`ConnectionH2::enqueue_rst`].
-/// - **Invariant 15** (edge-triggered epoll): pair `Ready::WRITABLE` interest
-///   with the event bit so `writable()` is scheduled on the next tick.
-///
-/// The returned [`EnqueueRstOutcome`] lets [`ConnectionH2::enqueue_rst`]
-/// account the RST only on the freshly-queued path, so neither a duplicate
-/// call nor an at-capacity refusal inflates the per-error counter or trips
-/// the MadeYouReset flood cap for a frame that never reaches the wire.
-fn enqueue_rst_into(
-    pending: &mut Vec<(StreamId, H2Error)>,
-    max_pending: usize,
-    total: &mut usize,
-    rst_sent: &mut HashSet<StreamId>,
-    readiness: &mut Readiness,
-    wire_stream_id: StreamId,
-    error: H2Error,
-) -> EnqueueRstOutcome {
-    let pending_before = pending.len();
-    let total_before = *total;
-    // Queue bound, tested BEFORE `rst_sent` is touched. Recording an id whose
-    // RST was never queued would make a later, legitimate `enqueue_rst` for
-    // that same stream dedupe against a frame that does not exist.
-    if pending_before >= max_pending {
-        return EnqueueRstOutcome::Dropped;
-    }
-    if !rst_sent.insert(wire_stream_id) {
-        // Dedupe short-circuit: the id was already queued/flushed. We must NOT
-        // touch any of the wire-count state, otherwise duplicate calls inflate
-        // the MadeYouReset (CVE-2025-8671) lifetime cap with frames that never
-        // reach the wire.
-        debug_assert!(
-            rst_sent.contains(&wire_stream_id),
-            "dedupe path requires the id to already be present in rst_sent"
-        );
-        debug_assert_eq!(
-            pending.len(),
-            pending_before,
-            "dedupe path must not enqueue a new pending RST"
-        );
-        debug_assert_eq!(
-            *total, total_before,
-            "dedupe path must not bump the queued-RST lifetime counter"
-        );
-        return EnqueueRstOutcome::Deduped;
-    }
-    pending.push((wire_stream_id, error));
-    *total += 1;
-    readiness.arm_writable();
-    // Post-condition: a freshly-queued RST advances both the pending Vec and the
-    // lifetime counter by exactly one, and the id is now tracked for dedupe.
-    debug_assert!(
-        rst_sent.contains(&wire_stream_id),
-        "freshly-queued RST must be recorded in rst_sent for future dedupe"
-    );
-    debug_assert_eq!(
-        pending.len(),
-        pending_before + 1,
-        "a freshly-queued RST must push exactly one pending entry"
-    );
-    debug_assert_eq!(
-        *total,
-        total_before + 1,
-        "a freshly-queued RST must bump the queued-RST lifetime counter by one"
-    );
-    debug_assert_eq!(
-        pending.last().map(|(id, _)| *id),
-        Some(wire_stream_id),
-        "the just-pushed entry must be the requested wire stream id"
-    );
-    EnqueueRstOutcome::Queued
-}
-
 #[derive(Debug)]
 pub enum H2State {
     ClientPreface,
@@ -837,6 +690,43 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// [`h2_scheduler::H2Scheduler`].
     scheduler: h2_scheduler::H2Scheduler,
     pub readiness: Readiness,
+    /// Peer address of this connection, captured once at construction from
+    /// [`SocketHandler::peer_addr`](crate::socket::SocketHandler::peer_addr)
+    /// and never re-read.
+    ///
+    /// This is the `peer=` slot of every line `log_context!` /
+    /// `log_context_stream!` render, and those two macros expand at 113
+    /// production callsites in this file — so sourcing the slot from
+    /// `self.socket` made *every logging method* socket-coupled, including
+    /// the ones that touch no I/O at all.
+    ///
+    /// Both production handlers *prefer* a cached address and fall back to
+    /// a live `getpeername(2)` when they have none — `SessionTcpStream` and
+    /// `FrontRustls` each answer
+    /// `self.configured_peer.or_else(|| self.stream.peer_addr().ok())`
+    /// (`socket.rs`). **That fallback arm is reachable**, it is pinned by its
+    /// own tests, and `FrontRustls`' arm carries a comment saying so and
+    /// naming the test that fails without it. So this snapshot is not
+    /// unconditionally the same value a per-line call would have produced,
+    /// and nothing here may be read as licence to delete those arms.
+    ///
+    /// It is at least as good on every path, which is the actual argument.
+    /// The snapshot is taken after the handshake, so wherever the fallback
+    /// would have answered, it answers here too — and it then survives the
+    /// peer's reset, where a later live lookup returns `ENOTCONN` and renders
+    /// `peer=None` on exactly the error lines an operator reads during an
+    /// incident. On the direct-HTTPS frontend route, where `HttpsSession::new`
+    /// seeds `peer_address` with a best-effort `peer_addr().ok()`, a line
+    /// emitted after a reset now renders `peer=Some(addr)` where it used to
+    /// render `peer=None`. That is a rendered-line change, and it is
+    /// `df52d83d`'s intent applied one level further in.
+    ///
+    /// No production caller reaches [`SocketHandler::peer_addr`] on a bare
+    /// `mio::net::TcpStream`. The impl exists and `MioTcpStream` is
+    /// instantiated in production (`TcpStateMachine`, `tcp.rs`), but the TCP
+    /// proxy reads its peer through mio's inherent method; only tests call
+    /// the trait method on a bare stream.
+    peer_address: Option<std::net::SocketAddr>,
     pub socket: Front,
     pub state: H2State,
     /// Wire `StreamId -> GlobalStreamId` map, `expect_read`/`expect_write`,
@@ -901,17 +791,16 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// If the peer does not ACK within SETTINGS_ACK_TIMEOUT, we send GOAWAY
     /// with SettingsTimeout error.
     pub settings_sent_at: Option<Instant>,
-    /// Queued RST_STREAM frames to send: Vec<(stream_id, error_code)>.
-    /// Used when refusing streams (MAX_CONCURRENT_STREAMS, buffer exhaustion)
-    /// during readable — the actual write happens in the writable preamble
-    /// to avoid conflicting with kawa.storage usage for frame payload discard.
-    pub pending_rst_streams: Vec<(StreamId, H2Error)>,
-    /// Lifetime counter of RST_STREAM frames queued (pending + already flushed).
-    /// Used to detect sustained misbehavior even when writable() drains the
-    /// pending queue between readable() calls.
-    pub total_rst_streams_queued: usize,
+    /// Queued proxy-emitted RST_STREAM frames and the never-decaying
+    /// lifetime counter behind the CVE-2025-8671 MadeYouReset cap,
+    /// encapsulated so nothing outside `h2_control_tx.rs` can reach the raw
+    /// fields — see [`h2_control_tx::H2ControlTx`]. Frames are queued while
+    /// refusing streams during `readable()`; the write happens in the
+    /// writable preamble so it cannot conflict with `zero.storage`'s use for
+    /// frame-payload discard.
+    control_tx: h2_control_tx::H2ControlTx,
     /// Set by [`Self::refuse_stream_and_discard`], consumed once by the
-    /// `H2State::Discard` arm of [`Self::readable`]. Carries enough of the
+    /// `H2State::Discard` arm of [`Self::handle_read`]. Carries enough of the
     /// refused frame's shape to still hand the connection-level HPACK
     /// decoder a complete field block before its bytes are dropped — RFC
     /// 9113 §4.3: field-compression state is scoped to the connection, not
@@ -1012,7 +901,10 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
             )
             .field("header_reassembly_len", &self.header_reassembly.len())
             .field("window", &self.flow_control.window())
-            .field("total_rst_streams_queued", &self.total_rst_streams_queued)
+            .field(
+                "total_rst_streams_queued",
+                &self.control_tx.lifetime_queued(),
+            )
             .finish()
     }
 }
@@ -1046,8 +938,104 @@ pub enum H2StreamId {
     Other { id: StreamId, gid: GlobalStreamId },
 }
 
+/// What [`ConnectionH2::poll_read_target`] wants its caller to do before it
+/// may call [`ConnectionH2::handle_read`].
+///
+/// The three variants are the three shapes one frontend read pass takes, and
+/// [`Self::Skip`] is deliberately not folded into a `Fill { amount: 0 }`: that
+/// would have the caller issue a zero-length read, and
+/// `update_readiness_after_read` reads its `(0, SocketResult::Continue)`
+/// answer as "nothing arrived, stop" — so every frame carrying no payload (an
+/// empty SETTINGS, an empty DATA, a SETTINGS ACK) would stop being parsed at
+/// all. The variant is what stops a caller from having to know that.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum H2ReadTarget {
+    /// The core ended the pass by itself: a SETTINGS-ACK timeout, nothing owed
+    /// by the peer, or no room left for what is owed. No read, and no
+    /// [`ConnectionH2::handle_read`] — this is the pass's result.
+    Done(MuxResult),
+    /// Every byte the core is waiting for already sits in `stream_id`'s
+    /// buffer, because the frame in flight carries a zero-length payload.
+    /// Perform no read and answer with [`H2ReadOutcome::Skipped`].
+    Skip(H2StreamId),
+    /// Read into the space [`read_space`] returns for `stream_id`, which is
+    /// exactly `amount` bytes and never less than one, then answer with
+    /// [`H2ReadOutcome::Filled`].
+    Fill {
+        stream_id: H2StreamId,
+        amount: usize,
+    },
+}
+
+/// What the caller of [`ConnectionH2::poll_read_target`] actually did, handed
+/// back to [`ConnectionH2::handle_read`]. Each variant answers the
+/// [`H2ReadTarget`] of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum H2ReadOutcome {
+    /// Answers [`H2ReadTarget::Skip`]: no read was performed.
+    Skipped,
+    /// Answers [`H2ReadTarget::Fill`]: `amount` bytes of space were offered,
+    /// and the socket returned `size` bytes with `status`.
+    ///
+    /// `amount` is echoed back rather than re-read from `expect_read` inside
+    /// [`ConnectionH2::handle_read`], so the byte debt the core settles is the
+    /// one it actually offered and not whatever the table happens to hold by
+    /// then.
+    Filled {
+        amount: usize,
+        size: usize,
+        status: SocketResult,
+    },
+}
+
+/// The buffer an [`H2ReadTarget`] names, resolved to the `Kawa` owning it.
+///
+/// [`H2StreamId::Zero`] is the connection-level scratch every control frame
+/// and every header block is read into; [`H2StreamId::Other`] is one
+/// application stream's *read* buffer, which [`Stream::split`] reports as the
+/// front buffer at [`Position::Server`] and the back buffer at
+/// [`Position::Client`].
+///
+/// Taking `zero` and `streams` apart instead of a whole `&mut ConnectionH2`
+/// and `&mut Context` is what makes the split compile: `ConnectionH2::socket`
+/// and `Context::debug` stay borrowable while the buffer this returns is live,
+/// which a method returning a borrow of all of `*self` would forbid.
+fn read_buffer<'a>(
+    zero: &'a mut GenericHttpStream,
+    streams: &'a mut [Stream],
+    position: &Position,
+    stream_id: H2StreamId,
+) -> &'a mut GenericHttpStream {
+    match stream_id {
+        H2StreamId::Zero => zero,
+        H2StreamId::Other {
+            gid: global_stream_id,
+            ..
+        } => streams[global_stream_id].split(position).rbuffer,
+    }
+}
+
+/// The exact space [`H2ReadTarget::Fill`] offers its caller: `amount` bytes of
+/// [`read_buffer`]'s free storage, never the whole of it.
+///
+/// The cap is load-bearing. `expect_read` is a byte debt for *one* frame, and
+/// [`ConnectionH2::handle_read`] parses everything the read appended as that
+/// frame's body — so a caller reading past `amount` would fold the next
+/// frame's header into this frame's payload.
+fn read_space<'a>(
+    zero: &'a mut GenericHttpStream,
+    streams: &'a mut [Stream],
+    position: &Position,
+    stream_id: H2StreamId,
+    amount: usize,
+) -> &'a mut [u8] {
+    &mut read_buffer(zero, streams, position, stream_id)
+        .storage
+        .space()[..amount]
+}
+
 /// What [`ConnectionH2::refuse_stream_and_discard`] hands the `H2State::Discard`
-/// arm of [`ConnectionH2::readable`] to locate a refused stream's HPACK field
+/// arm of [`ConnectionH2::handle_read`] to locate a refused stream's HPACK field
 /// block, so the connection decoder can still be advanced before the bytes are
 /// dropped (RFC 9113 §4.3).
 ///
@@ -1084,7 +1072,7 @@ enum DiscardedFieldBlock {
 /// for how any earlier frames' bytes are threaded in).
 ///
 /// A free function rather than a `ConnectionH2` method: the caller in the
-/// `H2State::Discard` arm of [`ConnectionH2::readable`] already holds
+/// `H2State::Discard` arm of [`ConnectionH2::handle_read`] already holds
 /// `zero.storage` borrowed as `kawa`, and a method needing the whole
 /// `&mut self` would conflict with that borrow. Taking `decoder` and
 /// `payload` as disjoint parameters keeps the borrow legal.
@@ -1248,6 +1236,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 interest: readiness_interest,
                 event: Ready::EMPTY,
             },
+            // The one read of `peer_addr()` on this connection's whole
+            // lifetime. Taken before `socket` is moved into the struct.
+            peer_address: socket.peer_addr(),
             socket,
             state: H2State::ClientPreface,
             timeout_duration,
@@ -1269,8 +1260,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             },
             flood_detector: h2_flood_detector::H2FloodDetector::new(flood_config, now),
             settings_sent_at: None,
-            pending_rst_streams: Vec::new(),
-            total_rst_streams_queued: 0,
+            control_tx: h2_control_tx::H2ControlTx::new(),
             discarded_field_block: None,
             close_notify_sent: false,
             max_pending_window_updates: 1 + connection_config.max_concurrent_streams as usize * 4,
@@ -1724,7 +1714,34 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
-    pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
+    /// Ask the core what it wants read from the socket, so the caller can
+    /// perform that read and report it back through [`Self::handle_read`].
+    ///
+    /// This is the read half of the same **two-call protocol** the write half
+    /// already uses: `h2_transmit::gather` borrows the bytes to send, the
+    /// caller writes them, `h2_transmit::confirm` is told how many landed.
+    /// Here the core names the buffer it wants filled, the caller
+    /// performs the read, and [`Self::handle_read`] is told how many bytes
+    /// arrived and with what status.
+    ///
+    /// **This is not `AsyncRead::poll_read`.** Nothing here is a future,
+    /// `context` is this module's [`Context`] and not a `task::Context`, and
+    /// `lib/` holds no asynchronous function. The name follows
+    /// `UdpManager::poll_output` (`protocol/udp/manager.rs`), this
+    /// repository's existing spelling for "ask the core what it has for its
+    /// caller", the way [`Self::handle_read`] follows that module's
+    /// `UdpManager::handle_input`.
+    ///
+    /// Everything up to and including the decision of *which* buffer needs
+    /// *how many* bytes lives on this side of the split, because two of the
+    /// three answers are produced by that prelude: a SETTINGS-ACK timeout and
+    /// an idle `expect_read` both end the pass with no read at all. A poll
+    /// that could not say "nothing" would not be the core's answer.
+    pub(super) fn poll_read_target<E, L>(
+        &mut self,
+        context: &mut Context<L>,
+        endpoint: &mut E,
+    ) -> H2ReadTarget
     where
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
@@ -1735,7 +1752,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // Pass 4 Medium #3: per-stream idle guard. Slow-multiplex Slowloris
         // sends one byte or a control frame per stream just often enough to
         // reset the connection-level timer; per-stream deadlines catch it.
-        self.cancel_timed_out_streams(context, &mut endpoint);
+        self.cancel_timed_out_streams(context, endpoint);
 
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
         if let Some(sent_at) = self.settings_sent_at
@@ -1746,7 +1763,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 log_context!(self),
                 SETTINGS_ACK_TIMEOUT
             );
-            return self.goaway(H2Error::SettingsTimeout);
+            return H2ReadTarget::Done(self.goaway(H2Error::SettingsTimeout));
         }
 
         // Don't reset the timeout unconditionally here. Only application data
@@ -1756,37 +1773,88 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // The timeout is reset:
         // - Below, when reading DATA payload (H2StreamId::Other)
         // - In handle_frame(), when processing HEADERS frames
-        let (stream_id, kawa) = if let Some((stream_id, amount)) = self.stream_table.expect_read() {
-            let (kawa, did) = match stream_id {
-                H2StreamId::Zero => (&mut self.zero, usize::MAX),
-                H2StreamId::Other {
-                    gid: global_stream_id,
-                    ..
-                } => {
-                    // Reading DATA frame payload for an application stream.
-                    // This is real application activity — reset the timeout.
-                    self.arm_timeout();
-                    (
-                        context.streams[global_stream_id]
-                            .split(&self.position)
-                            .rbuffer,
-                        global_stream_id,
-                    )
-                }
-            };
-            trace!(
-                "{} {:?}({:?}, {})",
-                log_context!(self),
-                self.state,
-                stream_id,
-                amount
-            );
-            if amount > 0 {
-                if amount > kawa.storage.available_space() {
-                    self.readiness.interest.remove(Ready::READABLE);
-                    return MuxResult::Continue;
-                }
-                let (size, status) = self.socket.socket_read(&mut kawa.storage.space()[..amount]);
+        let Some((stream_id, amount)) = self.stream_table.expect_read() else {
+            self.readiness.event.remove(Ready::READABLE);
+            return H2ReadTarget::Done(MuxResult::Continue);
+        };
+        match stream_id {
+            H2StreamId::Zero => {}
+            H2StreamId::Other { .. } => {
+                // Reading DATA frame payload for an application stream.
+                // This is real application activity — reset the timeout.
+                self.arm_timeout();
+            }
+        }
+        let kawa = read_buffer(
+            &mut self.zero,
+            &mut context.streams,
+            &self.position,
+            stream_id,
+        );
+        trace!(
+            "{} {:?}({:?}, {})",
+            log_context!(self),
+            self.state,
+            stream_id,
+            amount
+        );
+        if amount > 0 {
+            if amount > kawa.storage.available_space() {
+                self.readiness.interest.remove(Ready::READABLE);
+                return H2ReadTarget::Done(MuxResult::Continue);
+            }
+            H2ReadTarget::Fill { stream_id, amount }
+        } else {
+            self.stream_table.set_expect_read(None);
+            H2ReadTarget::Skip(stream_id)
+        }
+    }
+
+    /// Tell the core what the caller's read actually did, then let it consume
+    /// the bytes and dispatch the frame they completed.
+    ///
+    /// The second half of [`Self::poll_read_target`]'s protocol. `stream_id`
+    /// is the one the matching [`H2ReadTarget`] named, and `outcome` answers
+    /// that same variant: [`H2ReadOutcome::Skipped`] for
+    /// [`H2ReadTarget::Skip`], [`H2ReadOutcome::Filled`] for
+    /// [`H2ReadTarget::Fill`].
+    ///
+    /// `read_buffer` is called a second time here rather than carried across
+    /// the split: `StreamParts` borrows `context`, so a buffer held across the
+    /// caller's read would pin `context.debug` and `Self::handle_frame`'s whole
+    /// `&mut Context` with it. Re-deriving it from a `Copy` [`H2StreamId`] is
+    /// a match and a field projection.
+    fn handle_read<E, L>(
+        &mut self,
+        context: &mut Context<L>,
+        endpoint: E,
+        stream_id: H2StreamId,
+        outcome: H2ReadOutcome,
+    ) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        let kawa = read_buffer(
+            &mut self.zero,
+            &mut context.streams,
+            &self.position,
+            stream_id,
+        );
+        match outcome {
+            H2ReadOutcome::Skipped => {}
+            H2ReadOutcome::Filled {
+                amount,
+                size,
+                status,
+            } => {
+                let did = match stream_id {
+                    H2StreamId::Zero => usize::MAX,
+                    H2StreamId::Other {
+                        gid: global_stream_id,
+                        ..
+                    } => global_stream_id,
+                };
                 context.debug.push(DebugEvent::SocketIO(0, did, size));
                 kawa.storage.fill(size);
                 self.position.count_bytes_in_counter(size);
@@ -1819,14 +1887,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     }
                     return MuxResult::Continue;
                 }
-            } else {
-                self.stream_table.set_expect_read(None);
             }
-            (stream_id, kawa)
-        } else {
-            self.readiness.event.remove(Ready::READABLE);
-            return MuxResult::Continue;
-        };
+        }
         match (&self.state, &self.position) {
             (H2State::Error, _)
             | (H2State::GoAway, _)
@@ -2000,6 +2062,48 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
         }
         MuxResult::Continue
+    }
+
+    /// Drive one frontend read pass.
+    ///
+    /// The core lives in [`Self::poll_read_target`] and [`Self::handle_read`];
+    /// this function is the caller that sits between them, and its
+    /// `self.socket.socket_read` is the only socket touch on the whole H2 read
+    /// path. Keeping it *here* rather than inside the core is the point of the
+    /// split: a later change can move this body next to the socket without
+    /// reopening the frame state machine, exactly as
+    /// `h2_transmit::gather`/`confirm` already bracket the vectored write.
+    pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        match self.poll_read_target(context, &mut endpoint) {
+            H2ReadTarget::Done(result) => result,
+            H2ReadTarget::Skip(stream_id) => {
+                self.handle_read(context, endpoint, stream_id, H2ReadOutcome::Skipped)
+            }
+            H2ReadTarget::Fill { stream_id, amount } => {
+                let space = read_space(
+                    &mut self.zero,
+                    &mut context.streams,
+                    &self.position,
+                    stream_id,
+                    amount,
+                );
+                let (size, status) = self.socket.socket_read(space);
+                self.handle_read(
+                    context,
+                    endpoint,
+                    stream_id,
+                    H2ReadOutcome::Filled {
+                        amount,
+                        size,
+                        status,
+                    },
+                )
+            }
+        }
     }
 
     /// Update the H2 connection-level *aggregate* gauges with this connection's
@@ -2621,33 +2725,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             if let Some(flag) = wrote.as_deref_mut() {
                 *flag = true;
             }
-            io_slices.clear();
-            let buffer = kawa.storage.buffer();
-            for block in kawa.out.iter() {
-                match block {
-                    kawa::OutBlock::Delimiter => break,
-                    kawa::OutBlock::Store(store) => {
-                        let data = store.data(buffer);
-                        // SAFETY: the IoSlice references point into kawa's
-                        // storage buffer. They are used only for the
-                        // socket_write_vectored call below and cleared
-                        // immediately after, before kawa.consume() which may
-                        // relocate the buffer via ptr::copy (shift). No
-                        // dangling 'static refs exist during consume().
-                        let data: &'static [u8] =
-                            unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-                        io_slices.push(IoSlice::new(data));
-                    }
-                }
-            }
+            // Gather / write / confirm. The gather borrows `kawa.storage`
+            // and hands back descriptors with an extended lifetime; `confirm`
+            // discharges that obligation before the consume. Both halves and
+            // the `unsafe` between them live in `h2_transmit`.
+            let offered = h2_transmit::gather(kawa, io_slices);
             let (size, status) = socket.socket_write_vectored(io_slices);
-            io_slices.clear();
             debug_assert!(
-                io_slices.is_empty(),
-                "IoSlice refs must be cleared before consume"
+                size <= offered,
+                "the socket reported {size} bytes written for an offer of {offered}"
             );
             debug.push(DebugEvent::SocketIO(debug_site, global_stream_id, size));
-            kawa.consume(size);
+            h2_transmit::confirm(kawa, io_slices, size);
             position.count_bytes_out_counter(size);
             position.count_bytes_out(metrics, size);
             if let Some(counter) = bytes_written.as_deref_mut() {
@@ -2795,53 +2884,115 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return self.graceful_goaway(self.now);
         }
 
-        if self.socket.socket_wants_write() {
-            if !socket_write {
-                self.socket.socket_write(&[]);
-            }
-            // Edge-triggered epoll: re-arm WRITABLE if rustls still has
-            // pending encrypted data (first check triggers flush, second re-checks).
-            self.ensure_tls_flushed();
-        } else if self.stream_table.expect_write().is_none() {
-            // LIFECYCLE §9 invariant 16: retain `Ready::WRITABLE` when a
-            // voluntary scheduler yield leaves stranded bytes in a stream's
-            // `back.out`/`back.blocks` *after* the pass made forward
-            // progress. Requiring progress avoids the degenerate no-progress
-            // loop (e.g. flow-control-starved streams) that would otherwise
-            // busy-spin against the session dispatcher.
-            if bytes_written_this_pass > 0
-                && any_stream_has_pending_back(self.stream_table.streams(), &context.streams)
-            {
+        // The flush triple and the readiness policy behind it are one
+        // decision, taken in `h2_close` where it is enumerable without a
+        // socket. Why it is a sibling of `CloseAction` rather than four more
+        // of its variants, why the conditional middle flush is an INPUT
+        // instead of an `if` kept here, and why the invariant-16 probe is
+        // passed as a closure: `h2_close::finalize_action`.
+        // Bound rather than matched inline: the invariant-16 probe below
+        // borrows `self.stream_table` and `context.streams`, and a `match`
+        // keeps its scrutinee's temporaries alive for every arm — including
+        // the arms that need `&mut self.readiness` and `&mut context.debug`.
+        let action = h2_close::finalize_action(
+            TlsFlushPhase::BeforeFlush,
+            self.socket.socket_wants_write(),
+            socket_write,
+            self.stream_table.expect_write().is_some(),
+            bytes_written_this_pass > 0,
+            || any_stream_has_pending_back(self.stream_table.streams(), &context.streams),
+            self.control_tx.has_pending() || !self.flow_control.pending_window_updates_is_empty(),
+        );
+        match action {
+            // A parked `expect_write` owns the next tick: no bit moves.
+            FinalizeAction::Parked => return MuxResult::Continue,
+            // LIFECYCLE §9 invariant 16: a voluntary scheduler yield left
+            // stranded bytes in a stream's `back.out`/`back.blocks` after a
+            // pass that made forward progress. Retaining `Ready::WRITABLE` is
+            // the ABSENCE of the withdrawal below, so this arm changes no bit
+            // — it only narrates.
+            FinalizeAction::RetainPendingBack => {
                 #[cfg(debug_assertions)]
                 context.debug.push(DebugEvent::Str(
                     "finalize_write: invariant 16 retained WRITABLE (pending back-buffer)"
                         .to_owned(),
                 ));
-            } else if !self.pending_rst_streams.is_empty()
-                || !self.flow_control.pending_window_updates_is_empty()
-            {
-                // Control-frame liveness: `flush_pending_control_frames` is
-                // gated on `expect_write.is_none()`, so when a prior partial
-                // write deferred the flush the RST / WINDOW_UPDATE queues
-                // stay non-empty after `expect_write` finally drains. Without
-                // this rearm the next tick would drop `Ready::WRITABLE` and
-                // the queued RST would stall until an unrelated event
-                // re-triggered writable — which is exactly the scenario
-                // h2spec trips by sending back-to-back malformed streams.
+                return MuxResult::Continue;
+            }
+            // Control-frame liveness: `flush_pending_control_frames` is gated
+            // on `expect_write.is_none()`, so when a prior partial write
+            // deferred the flush the RST / WINDOW_UPDATE queues stay non-empty
+            // after `expect_write` finally drains. Without this rearm the next
+            // tick would drop `Ready::WRITABLE` and the queued RST would stall
+            // until an unrelated event re-triggered writable — which is
+            // exactly the scenario h2spec trips by sending back-to-back
+            // malformed streams.
+            FinalizeAction::ArmControlQueue => {
                 #[cfg(debug_assertions)]
                 context.debug.push(DebugEvent::Str(
                     "finalize_write: retained WRITABLE (control queue non-empty)".to_owned(),
                 ));
                 self.readiness.arm_writable();
                 incr!(names::h2::SIGNAL_WRITABLE_REARMED_CONTROL_QUEUE);
-            } else {
-                // We wrote everything
+                return MuxResult::Continue;
+            }
+            // We wrote everything.
+            FinalizeAction::Quiesce => {
                 #[cfg(debug_assertions)]
                 context.debug.push(DebugEvent::Str(format!(
                     "Wrote everything: {:?}",
                     self.stream_table.streams()
                 )));
                 self.readiness.interest.remove(Ready::WRITABLE);
+                return MuxResult::Continue;
+            }
+            // The two TLS answers differ only in the step performed here, and
+            // both fall through to the single post-flush query below.
+            FinalizeAction::Flush => {
+                self.socket.socket_write(&[]);
+            }
+            FinalizeAction::SkipFlush => {}
+            // Named rather than `other =>`: a wildcard arm would turn a new
+            // `FinalizeAction` variant into a release-mode panic on the proxy
+            // write path instead of a compile error.
+            action @ (FinalizeAction::ReArm | FinalizeAction::Settled) => {
+                unreachable!("BeforeFlush yielded {action:?}")
+            }
+        }
+
+        // Edge-triggered epoll: the second query is not a repeat of the first.
+        // It is the only way this site learns whether the flush landed —
+        // `socket_write(&[])`'s `(size, status)` is discarded — so it re-arms
+        // WRITABLE when rustls still holds encrypted data. The readiness
+        // policy above is deliberately NOT reopened here: once records were
+        // found pending, this pass leaves the bits to the next one. The
+        // degenerate arguments are the shape `goaway_close_action`'s own
+        // post-flush call already uses: the inputs the flush could not change
+        // are not re-read.
+        let action = h2_close::finalize_action(
+            TlsFlushPhase::AfterFlush,
+            self.socket.socket_wants_write(),
+            false,
+            false,
+            false,
+            || false,
+            false,
+        );
+        match action {
+            // `ensure_tls_flushed` asks a third time rather than re-arming
+            // outright, which is redundant — nothing mutates the socket
+            // between the two — and deliberate: it keeps every post-decision
+            // TLS re-arm in this file spelled the same way, as the GoAway and
+            // Error arms of `writable` already do.
+            FinalizeAction::ReArm => self.ensure_tls_flushed(),
+            FinalizeAction::Settled => {}
+            action @ (FinalizeAction::Flush
+            | FinalizeAction::SkipFlush
+            | FinalizeAction::Parked
+            | FinalizeAction::RetainPendingBack
+            | FinalizeAction::ArmControlQueue
+            | FinalizeAction::Quiesce) => {
+                unreachable!("AfterFlush yielded {action:?}")
             }
         }
         MuxResult::Continue
@@ -2922,7 +3073,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.zero.storage.clear();
             }
             self.flow_control.clear_pending_window_updates();
-            self.pending_rst_streams.clear();
+            self.control_tx.clear_pending();
         }
 
         // RFC 9113 §6.5: check if peer has timed out on SETTINGS ACK
@@ -3020,13 +3171,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // pending count alone may never reach the cap even under sustained
         // misbehavior.
         if !matches!(self.state, H2State::GoAway | H2State::Error)
-            && self.total_rst_streams_queued >= MAX_PENDING_RST_STREAMS
+            && self.control_tx.lifetime_cap_reached()
         {
             error!(
                 "{} total RST_STREAM count {} exceeds cap {}, sending GOAWAY(ENHANCE_YOUR_CALM)",
                 log_context!(self),
-                self.total_rst_streams_queued,
-                MAX_PENDING_RST_STREAMS
+                self.control_tx.lifetime_queued(),
+                h2_control_tx::MAX_PENDING_RST_STREAMS
             );
             return Some(self.goaway(H2Error::EnhanceYourCalm));
         }
@@ -3040,30 +3191,16 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // `self.zero.storage` reuse reason as the WINDOW_UPDATE stage above
         // — `Self::enqueue_rst` already arms WRITABLE, so this is a delay,
         // not a drop.
-        if !self.pending_rst_streams.is_empty()
+        if self.control_tx.has_pending()
             && self.stream_table.expect_write().is_none()
             && !self.header_block_reassembly_in_progress()
         {
             let kawa = &mut self.zero;
             kawa.storage.clear();
             let buf = kawa.storage.space();
-            let mut offset = 0;
-            let mut written_count = 0;
-            for &(stream_id, ref error) in &self.pending_rst_streams {
-                let frame_size =
-                    parser::FRAME_HEADER_SIZE + parser::RST_STREAM_PAYLOAD_SIZE as usize;
-                if offset + frame_size > buf.len() {
-                    break;
-                }
-                match serializer::gen_rst_stream(&mut buf[offset..], stream_id, error.to_owned()) {
-                    Ok((_, _)) => {
-                        offset += frame_size;
-                        written_count += 1;
-                    }
-                    Err(_) => break,
-                }
-            }
-            self.pending_rst_streams.drain(..written_count);
+            // Emission order is queue order, which is arrival order over
+            // already-deduped stream ids — see `h2_control_tx`'s module doc.
+            let (offset, _frames_written) = self.control_tx.drain_rst_streams_into(buf);
             if offset > 0 {
                 kawa.storage.fill(offset);
                 if self.flush_zero_to_socket() {
@@ -3105,11 +3242,21 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
         match (&self.state, &self.position) {
             (H2State::Error, Position::Server) => {
-                if self.socket.socket_wants_write() {
-                    self.ensure_tls_flushed();
-                    MuxResult::Continue
-                } else {
-                    MuxResult::CloseSession
+                // The preamble above already attempted this pass's flush, so
+                // this arm reads the post-flush answer and has no `Flush` of
+                // its own — see `h2_close`'s module doc.
+                match h2_close::error_close_action(self.socket.socket_wants_write()) {
+                    CloseAction::ReArmAndContinue => {
+                        self.ensure_tls_flushed();
+                        MuxResult::Continue
+                    }
+                    CloseAction::CloseSession => MuxResult::CloseSession,
+                    // Named rather than `other =>`: a wildcard arm would turn a
+                    // new `CloseAction` variant into a release-mode panic in the
+                    // proxy write path instead of a compile error.
+                    action @ (CloseAction::Flush | CloseAction::Disconnect) => {
+                        unreachable!("error_close_action yielded {action:?}")
+                    }
                 }
             }
             (H2State::Error, _)
@@ -3129,22 +3276,41 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // the remaining frame payload.
             (H2State::Discard, _) => MuxResult::Continue,
             (H2State::GoAway, _) => {
-                if self.peer_gone_after_final_goaway() {
-                    return MuxResult::CloseSession;
-                }
-                // Flush any remaining TLS response data before disconnecting.
-                // The GoAway state only enters after control frames (our GOAWAY
-                // response) are flushed above, but response DATA frames may still
-                // be in rustls's TLS output buffer — accepted by socket_write_vectored
-                // during write_streams() but not yet flushed to TCP. Under TCP
-                // backpressure (HAProxy chain), this is the primary truncation vector.
-                if self.socket.socket_wants_write() {
-                    self.socket.socket_write(&[]);
-                    if self.socket.socket_wants_write() {
-                        // TLS data still pending (TCP backpressure) — don't disconnect
-                        // yet. Re-arm WRITABLE so the event loop retries the flush.
-                        self.ensure_tls_flushed();
-                        return MuxResult::Continue;
+                // Response DATA frames may still sit in rustls's output
+                // buffer — accepted by socket_write_vectored during
+                // write_streams() but not yet flushed to TCP. Under TCP
+                // backpressure (HAProxy chain) this is the primary truncation
+                // vector, so the decision lives in `h2_close`, exhaustively
+                // unit-tested there rather than inline here. Why the two
+                // `socket_wants_write()` queries are two DIFFERENT questions,
+                // and why the flush between them stays inside this call: see
+                // `h2_close::TlsFlushPhase`.
+                match h2_close::goaway_close_action(
+                    TlsFlushPhase::BeforeFlush,
+                    self.peer_gone_after_final_goaway(),
+                    self.socket.socket_wants_write(),
+                ) {
+                    CloseAction::CloseSession => return MuxResult::CloseSession,
+                    CloseAction::Flush => {
+                        self.socket.socket_write(&[]);
+                        match h2_close::goaway_close_action(
+                            TlsFlushPhase::AfterFlush,
+                            false,
+                            self.socket.socket_wants_write(),
+                        ) {
+                            CloseAction::ReArmAndContinue => {
+                                self.ensure_tls_flushed();
+                                return MuxResult::Continue;
+                            }
+                            CloseAction::Disconnect => {}
+                            action @ (CloseAction::CloseSession | CloseAction::Flush) => {
+                                unreachable!("AfterFlush yielded {action:?}")
+                            }
+                        }
+                    }
+                    CloseAction::Disconnect => {}
+                    action @ CloseAction::ReArmAndContinue => {
+                        unreachable!("BeforeFlush yielded {action:?}")
                     }
                 }
                 self.force_disconnect()
@@ -3243,9 +3409,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         (
             socket_rtt(self.socket.socket_ref()),
-            linked_token
-                .and_then(|t| endpoint.socket(t))
-                .and_then(socket_rtt),
+            linked_token.and_then(|t| endpoint.peer_rtt(t)),
         )
     }
 
@@ -3587,14 +3751,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 other => debug!("{} unexpected reap reason {}", log_context!(self), other),
             }
             // Route through the canonical chokepoint so dedupe (rst_sent),
-            // queued-cap accounting (MAX_PENDING_RST_STREAMS via
-            // total_rst_streams_queued), and edge-triggered-epoll arming
+            // queued-cap accounting (`H2ControlTx`'s MadeYouReset lifetime
+            // counter against MAX_PENDING_RST_STREAMS), and edge-triggered-epoll arming
             // (Readiness::arm_writable) all stay consistent — see LIFECYCLE
             // §8.2. The previous direct push bypassed all three: a peer
             // that opens 200 streams and lets them all idle past
             // stream_idle_timeout could push past the queued cap silently
             // (no GOAWAY(ENHANCE_YOUR_CALM) escalation), a double-cancel
-            // pass would grow pending_rst_streams instead of short-
+            // pass would grow the pending queue instead of short-
             // circuiting on the existing rst_sent membership, and the
             // hand-rolled `interest.insert(WRITABLE) + signal_pending_write`
             // pair below skipped invariant 15. Counting these RSTs against
@@ -3668,13 +3832,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// existing in `self.streams`, which is what lets us emit even after a
     /// caller has already called [`Self::remove_dead_stream`].
     ///
-    /// Delegates the primitive work to [`enqueue_rst_into`] so the invariants
-    /// are covered by unit tests that don't need a full `ConnectionH2`
-    /// fixture. See that function's doc-comment for the four invariants
-    /// (dedupe via `rst_sent`, MadeYouReset queued cap via
-    /// `total_rst_streams_queued`, the per-insert queue bound via
-    /// `max_pending`, edge-triggered-epoll arm via
-    /// [`Readiness::arm_writable`]).
+    /// Delegates the queueing itself to [`h2_control_tx::H2ControlTx::enqueue_rst`],
+    /// which owns the four invariants (dedupe via `rst_sent`, MadeYouReset
+    /// queued cap, the per-insert queue bound, edge-triggered-epoll arm via
+    /// [`Readiness::arm_writable`]) and covers them with unit tests that need no
+    /// `ConnectionH2` fixture. What stays here is the accounting, because a
+    /// lifetime-cap trip converts to a connection-wide GOAWAY only this type
+    /// can return.
     ///
     /// Two of the call paths that reach here are never inspected by
     /// [`Self::check_invariants`], whose only production caller is
@@ -3684,7 +3848,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///   in a single sweep and, from `Mux::timeout` against a silent peer,
     ///   runs when `handle_frame` does not run at all;
     /// * the DATA-on-closed-stream reset, which sits in
-    ///   [`Self::handle_header_state`] — `readable` returns into that helper
+    ///   [`Self::handle_header_state`] — `handle_read` returns into that helper
     ///   directly and that branch never reaches `handle_frame`.
     ///
     /// The second path is separately rate-limited: it is preceded by
@@ -3695,13 +3859,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// inner iteration that already ran `writable()`, since `arm_writable`
     /// raises both the WRITABLE interest and its event bit. So it cannot
     /// accumulate across windows without a `flush_pending_control_frames`
-    /// pass in between. The bound below is what makes that reasoning
+    /// pass in between. The per-insert bound inside
+    /// [`h2_control_tx::H2ControlTx::enqueue_rst`] is what makes that reasoning
     /// unnecessary for correctness.
     fn enqueue_rst(&mut self, wire_stream_id: StreamId, error: H2Error) -> Option<MuxResult> {
-        let outcome = enqueue_rst_into(
-            &mut self.pending_rst_streams,
-            MAX_PENDING_RST_STREAMS,
-            &mut self.total_rst_streams_queued,
+        let outcome = self.control_tx.enqueue_rst(
             self.stream_table.rst_sent_mut(),
             &mut self.readiness,
             wire_stream_id,
@@ -3724,8 +3886,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // DATA-on-closed-stream paths bypassing the lifetime cap
         // (security review LISA-001 on commit `da845c71`).
         match outcome {
-            EnqueueRstOutcome::Queued => self.account_emitted_rst(error),
-            EnqueueRstOutcome::Deduped => None,
+            h2_control_tx::EnqueueRstOutcome::Queued => self.account_emitted_rst(error),
+            h2_control_tx::EnqueueRstOutcome::Deduped => None,
             // Drop + metric + contextual log, never a panic on the release
             // path. No GOAWAY is raised here: reaching the cap implies
             // `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS`, which
@@ -3737,11 +3899,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // second one from here would re-enter `goaway()` once per
             // remaining reaped stream, clobbering `self.zero` and inflating
             // `h2.goaway.sent.*`.
-            EnqueueRstOutcome::Dropped => {
+            h2_control_tx::EnqueueRstOutcome::Dropped => {
                 error!(
                     "{} RST_STREAM dropped: pending queue already at capacity ({}), stream={} error={:?}",
                     log_context!(self),
-                    MAX_PENDING_RST_STREAMS,
+                    h2_control_tx::MAX_PENDING_RST_STREAMS,
                     wire_stream_id,
                     error
                 );
@@ -3798,7 +3960,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// [`Self::apply_mcs_backpressure`].
     ///
     /// `discarded` is stashed in [`Self::discarded_field_block`] for the
-    /// `H2State::Discard` arm of [`Self::readable`] to consume — see
+    /// `H2State::Discard` arm of [`Self::handle_read`] to consume — see
     /// [`DiscardedFieldBlock`] for why the HPACK field block cannot simply be
     /// dropped with the rest of the payload.
     fn refuse_stream_and_discard(
@@ -4186,14 +4348,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     }
 
     /// True when the reaper has queued control frames (`RST_STREAM`) into
-    /// `pending_rst_streams` that have not yet been serialized. Kept SEPARATE
+    /// [`h2_control_tx::H2ControlTx`] that have not yet been serialized. Kept SEPARATE
     /// from [`Self::has_pending_write`] because that probe gates connection close
     /// (the `mod.rs` close-gating sites) and must NOT treat a queued RST as a
     /// reason to keep the connection open; this probe is consulted ONLY by the
     /// `MuxState::timeout` flush gate to push a silent-peer `RST_STREAM(CANCEL)`
     /// onto the wire before the connection closes.
     pub fn has_pending_control_write(&self) -> bool {
-        !self.pending_rst_streams.is_empty()
+        self.control_tx.has_pending()
     }
 
     /// Connection-level [`Self::has_pending_write`] extended with a per-stream
@@ -4383,11 +4545,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///    ids — a leak here would let a removed stream keep an idle timer and
     ///    mis-fire `cancel_timed_out_streams`. (`rst_sent` is intentionally NOT
     ///    a subset: a queued RST for an already-removed stream is legal.)
-    /// 3. **RST queue accounting**: the never-decaying `total_rst_streams_queued`
-    ///    lifetime counter is always `>=` the currently-pending queue length
-    ///    (CVE-2025-8671 MadeYouReset cap relies on the lifetime counter never
-    ///    under-counting), and the pending queue stays within its hard cap +1
-    ///    (the escalation tripwire fires at the cap).
+    /// 3. **RST queue accounting** is checked by
+    ///    [`h2_control_tx::H2ControlTx::check_invariants`] as a post-condition
+    ///    of its own mutating methods, so it is not restated here — a second
+    ///    copy of a rule drifts from the first.
     /// 4. **Pending WINDOW_UPDATE bound**: the coalescing map never exceeds the
     ///    per-connection cap derived from `max_concurrent_streams`.
     /// 5. **Drain/state coupling**: a terminal `GoAway`/`Error` state implies the
@@ -4420,18 +4581,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 .values()
                 .all(|&gid| gid < context.streams.len()),
             "every stream mapping must point at a valid context slot"
-        );
-
-        // (3) RST queue accounting.
-        debug_assert!(
-            self.total_rst_streams_queued >= self.pending_rst_streams.len(),
-            "queued-RST lifetime counter ({}) must be >= currently-pending queue ({})",
-            self.total_rst_streams_queued,
-            self.pending_rst_streams.len()
-        );
-        debug_assert!(
-            self.pending_rst_streams.len() <= MAX_PENDING_RST_STREAMS + 1,
-            "pending RST queue must stay within its hard cap (escalates at the cap)"
         );
 
         // (4) Pending WINDOW_UPDATE coalescing map bound.
@@ -4780,7 +4929,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // re-entry from `(H2State::ContinuationFrame(headers), _)`
                 // already appended THIS frame's own payload to the
                 // accumulator before calling back in here (see that match
-                // arm in `readable()`), so there is nothing left to copy.
+                // arm in `handle_read()`), so there is nothing left to copy.
                 //
                 // `data_opt` (bounds-checked), not `data` (panics on OOB):
                 // `header_block_fragment` is network-facing-derived — the
@@ -5672,22 +5821,34 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
             Position::Server => {
-                if self.peer_gone_after_final_goaway() {
-                    return MuxResult::CloseSession;
-                }
                 // Don't disconnect immediately if rustls still has buffered TLS
                 // records. Returning CloseSession here triggers shutdown(Write)
                 // which sends FIN — but any TLS records still in rustls's buffer
                 // (not yet flushed to the TCP send buffer) are lost, causing the
                 // client to see "TLS decode error / unexpected eof".
                 // Instead, keep WRITABLE interest and let the writable path flush.
-                if self.socket.socket_wants_write() {
+                // The decision itself is `h2_close::force_disconnect_action`,
+                // exhaustively unit-tested there.
+                //
+                // The answer is read ONCE and reported by both log lines. A
+                // literal `wants_write=` in either arm is a second copy of a
+                // fact the socket already owns, and the closing arm is reached
+                // with records still pending whenever the peer is gone — an
+                // operator diagnosing a truncation under HAProxy chaining would
+                // read the opposite of the socket's state.
+                let tls_wants_write = self.socket.socket_wants_write();
+                if h2_close::force_disconnect_action(
+                    self.peer_gone_after_final_goaway(),
+                    tls_wants_write,
+                ) == CloseAction::ReArmAndContinue
+                {
                     debug!(
-                        "{} H2 force_disconnect delaying close: state={:?}, streams={}, expect_write={:?}, wants_write=true, readiness={:?}",
+                        "{} H2 force_disconnect delaying close: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
                         log_context!(self),
                         self.state,
                         self.stream_table.streams().len(),
                         self.stream_table.expect_write(),
+                        tls_wants_write,
                         self.readiness
                     );
                     self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
@@ -5695,11 +5856,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     MuxResult::Continue
                 } else {
                     debug!(
-                        "{} H2 force_disconnect closing session: state={:?}, streams={}, expect_write={:?}, wants_write=false, readiness={:?}",
+                        "{} H2 force_disconnect closing session: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
                         log_context!(self),
                         self.state,
                         self.stream_table.streams().len(),
                         self.stream_table.expect_write(),
+                        tls_wants_write,
                         self.readiness
                     );
                     MuxResult::CloseSession
@@ -7103,6 +7265,358 @@ mod tests {
     // second clock — so these two tests advance ONLY the connection's
     // snapshot and prove the decision moves with it. Neither sleeps.
 
+    // ── TLS backpressure: the GoAway truncation vector (#1454) ──────────
+    //
+    // Until this harness existed, NO test anywhere instantiated a
+    // `ConnectionH2` over a handler whose `socket_wants_write()` could return
+    // `true`. `mio::net::TcpStream` and `SessionTcpStream` both take the
+    // trait's `false` default and only `FrontRustls` overrides it, so every
+    // branch that asks "does rustls still hold records?" was statically dead
+    // in the test suite — including the one whose own comment calls it the
+    // primary truncation vector. These are the first tests that branch class
+    // has ever had against a handler that answers `true`.
+
+    /// A `SocketHandler` that models rustls-over-a-blocked-kernel: it holds
+    /// `pending` records, and each empty-buffer flush drains `drain_per_flush`
+    /// of them. `drain_per_flush = 0` is a kernel that accepts nothing, which
+    /// is the backpressure case; a positive value is a kernel that takes them.
+    ///
+    /// Modelling the state rather than scripting an answer sequence is
+    /// deliberate: the close path queries `socket_wants_write()` a number of
+    /// times that depends on which branches it takes, so a positional script
+    /// would pin the query COUNT instead of the behaviour and would have to be
+    /// rewritten by anyone who added a query.
+    struct BackpressuredTlsSocket {
+        stream: mio::net::TcpStream,
+        pending: std::cell::Cell<usize>,
+        drain_per_flush: usize,
+        flushes: std::cell::Cell<usize>,
+    }
+
+    impl BackpressuredTlsSocket {
+        fn new(stream: mio::net::TcpStream, pending: usize, drain_per_flush: usize) -> Self {
+            Self {
+                stream,
+                pending: std::cell::Cell::new(pending),
+                drain_per_flush,
+                flushes: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl SocketHandler for BackpressuredTlsSocket {
+        fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
+            self.stream.socket_read(buf)
+        }
+
+        fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+            if buf.is_empty() {
+                self.flushes.set(self.flushes.get() + 1);
+                let drained = self.drain_per_flush.min(self.pending.get());
+                self.pending.set(self.pending.get() - drained);
+                return (0, SocketResult::Continue);
+            }
+            self.stream.socket_write(buf)
+        }
+
+        fn socket_write_vectored(&mut self, bufs: &[IoSlice]) -> (usize, SocketResult) {
+            self.stream.socket_write_vectored(bufs)
+        }
+
+        /// The override that makes this harness worth having.
+        fn socket_wants_write(&self) -> bool {
+            self.pending.get() > 0
+        }
+
+        fn socket_ref(&self) -> &mio::net::TcpStream {
+            &self.stream
+        }
+
+        fn socket_mut(&mut self) -> &mut mio::net::TcpStream {
+            &mut self.stream
+        }
+
+        fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+            mio::net::TcpStream::peer_addr(&self.stream).ok()
+        }
+
+        fn protocol(&self) -> crate::socket::TransportProtocol {
+            crate::socket::TransportProtocol::Tls1_3
+        }
+
+        fn read_error(&self) {}
+
+        fn write_error(&self) {}
+    }
+
+    /// `state` is a parameter rather than a second copy of this fixture: the
+    /// close decision reads it as `H2State::GoAway` and the write-pass
+    /// finalization reads it as `H2State::Header`, and both need the same
+    /// handler underneath.
+    fn connection_with_backpressure(
+        pool: &Rc<RefCell<Pool>>,
+        pending: usize,
+        drain_per_flush: usize,
+        state: H2State,
+    ) -> (ConnectionH2<BackpressuredTlsSocket>, std::net::TcpStream) {
+        let (socket, peer) = connected_socket();
+        let mut connection = ConnectionH2::new(
+            Ulid::generate(),
+            BackpressuredTlsSocket::new(socket, pending, drain_per_flush),
+            Position::Server,
+            Rc::downgrade(pool),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
+            Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        connection.state = state;
+        (connection, peer)
+    }
+
+    /// Records that survive the flush hold the connection open.
+    ///
+    /// This is the branch whose own comment calls it the primary truncation
+    /// vector: closing here sends FIN and destroys the records rustls is still
+    /// holding, which the client reads as a truncated response.
+    ///
+    /// TO SEE THIS RED: delete the `self.ensure_tls_flushed();` call in the
+    /// `CloseAction::ReArmAndContinue` arm of `ConnectionH2::writable`'s
+    /// `H2State::GoAway` branch. The WRITABLE *event* bit is then never
+    /// re-signalled and this test fails on its OWN assertion, `the WRITABLE
+    /// event must be re-signalled so the event loop retries the flush`. The
+    /// recipe deliberately does not swap `TlsFlushPhase::AfterFlush` for
+    /// `BeforeFlush`: that reddens through the production `unreachable!`, which
+    /// is someone else's assertion and would pass whatever this test claimed.
+    #[test]
+    fn a_flush_that_does_not_drain_keeps_the_connection_open() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        // A kernel that accepts nothing: every flush leaves the records.
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 2, 0, H2State::GoAway);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        // Premise: the handler really does report buffered records. Without
+        // this the assertions below would pass against a handler taking the
+        // trait's `false` default, which is exactly the blind spot #1454 names.
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: this harness must report buffered TLS records"
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "records still buffered: the session must stay open, got {result:?}"
+        );
+        // `Continue` alone does not discriminate: `force_disconnect`'s server
+        // arm also returns it for a live peer with records pending. The re-arm
+        // path returns from the GoAway arm BEFORE reaching `force_disconnect`,
+        // so the state is still `GoAway`; the fall-through would have gone
+        // through `force_disconnect`, which sets `H2State::Error` first.
+        assert!(
+            matches!(connection.state, H2State::GoAway),
+            "the GoAway arm must re-arm and return, not fall through to \
+             force_disconnect, got {:?}",
+            connection.state
+        );
+        // Not `readiness.interest`: that bit is this fixture's own argument to
+        // `ConnectionH2::new` and nothing on this path clears it, so asserting
+        // on it would assert on the harness. The edge-triggered re-arm is the
+        // EVENT bit, set by `ensure_tls_flushed` -> `signal_pending_write`.
+        assert!(
+            connection.readiness.event.is_writable(),
+            "the WRITABLE event must be re-signalled so the event loop retries \
+             the flush, got {:?}",
+            connection.readiness
+        );
+        // Not `socket_wants_write()`: with `drain_per_flush = 0` that can never
+        // change, so it is a tautology of the harness no production edit can
+        // falsify. The flush COUNT is falsifiable — a GoAway arm that skipped
+        // its own flush would leave it at 1.
+        assert!(
+            connection.socket.flushes.get() >= 2,
+            "the preamble and the GoAway arm must each attempt a flush, got {}",
+            connection.socket.flushes.get()
+        );
+    }
+
+    /// A flush the kernel accepts closes within ONE `writable()` call.
+    ///
+    /// This is the tick-count assertion. The pre-image asked its second
+    /// question inline, immediately after the flush; a split that returned
+    /// `Continue` and waited to be called again would still deliver the bytes,
+    /// but would double the latency of every close under backpressure and
+    /// would strand the connection against a peer that never re-arms.
+    ///
+    /// TO SEE THIS RED: in the `H2State::GoAway` arm, add
+    /// `return MuxResult::Continue;` immediately after the
+    /// `self.socket.socket_write(&[]);` inside the `CloseAction::Flush` body —
+    /// the deferred shape, which still performs the flush. The first call then
+    /// returns `Continue` and the final assertion fails with `a drained flush
+    /// must reach the disconnect in the SAME writable call`. Dropping the flush
+    /// as well would redden the premise at the top of the test instead, with a
+    /// different message.
+    #[test]
+    fn a_flush_that_succeeds_closes_within_one_writable_call() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        // Two records, one drained per flush: the preamble takes one and the
+        // GoAway arm's own flush takes the other, so the post-flush query is
+        // the first one that can answer `false`.
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 2, 1, H2State::GoAway);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: this harness must report buffered TLS records"
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            !connection.socket.socket_wants_write(),
+            "premise: both flushes landed, so nothing is pending any more"
+        );
+        assert!(
+            connection.socket.flushes.get() >= 2,
+            "the preamble and the GoAway arm must each attempt a flush, got {}",
+            connection.socket.flushes.get()
+        );
+        assert!(
+            !matches!(result, MuxResult::Continue),
+            "a drained flush must reach the disconnect in the SAME writable \
+             call, not defer it to another tick: got {result:?}"
+        );
+    }
+
+    // ── The write pass's own flush triple (`finalize_write`) ────────────
+    //
+    // `ConnectionH2::finalize_write` ends every write pass with the same
+    // query / flush / query shape the close sites use, and its decision now
+    // lives beside theirs in `h2_close::finalize_action`. The two tests below
+    // are the CALLER half — that `h2.rs` performs the step each answer names
+    // and wires the inputs to the right parameters. The answers themselves are
+    // enumerated exhaustively in `h2_close`'s own tables, which no socket can
+    // reach: `SkipFlush`, `Parked` and `RetainPendingBack` are covered there
+    // only, because reaching them through `writable()` needs a stream carrying
+    // response bytes through the scheduler and none of this module's fixtures
+    // builds one. Same boundary `h2_close`'s `force_disconnect` re-arm branch
+    // already sits on.
+
+    /// The pass flushes once of its own and re-arms when records survive it.
+    ///
+    /// Three records, one drained per flush: `writable`'s preamble takes the
+    /// first, `finalize_write`'s own flush takes the second, and the third is
+    /// still pending when the post-flush query runs — so the re-arm branch is
+    /// reached with the socket genuinely still holding data, not by a fixture
+    /// that can only answer one way.
+    ///
+    /// TO SEE THIS RED, either half independently:
+    /// (a) empty the `FinalizeAction::Flush` arm of `finalize_write` (the
+    ///     `SkipFlush` behaviour, which is what a caller that dropped the
+    ///     `socket_write` input would do for every pass). The flush count
+    ///     assertion fails with `finalize_write must attempt exactly one
+    ///     empty-buffer flush of its own`.
+    /// (b) empty the `FinalizeAction::ReArm` arm. The event assertion fails
+    ///     with `the WRITABLE event must be re-signalled`.
+    /// Neither recipe reddens through a production `unreachable!`.
+    #[test]
+    fn a_finalized_write_pass_flushes_once_and_re_arms_while_records_survive() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 3, 1, H2State::Header);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: this harness must report buffered TLS records"
+        );
+        // Not the interest bit: `signal_pending_write` touches `event` only,
+        // and this fixture hands `Ready::WRITABLE` to `ConnectionH2::new` as
+        // its INTEREST, so an assertion written against interest would be
+        // reading the fixture's own argument back and could not see the
+        // re-arm at all.
+        assert!(
+            !connection.readiness.event.is_writable(),
+            "premise: the WRITABLE event must start clear so the re-arm below              is the only thing that can set it, got {:?}",
+            connection.readiness
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a write pass with records still buffered continues, got {result:?}"
+        );
+        assert_eq!(
+            connection.socket.flushes.get(),
+            2,
+            "finalize_write must attempt exactly one empty-buffer flush of its              own on top of the preamble's"
+        );
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: one record must survive both flushes, or the post-flush              query could only answer one way"
+        );
+        assert!(
+            connection.readiness.event.is_writable(),
+            "the WRITABLE event must be re-signalled so the event loop retries              the flush, got {:?}",
+            connection.readiness
+        );
+    }
+
+    /// A pass that owes nothing withdraws `Ready::WRITABLE` interest.
+    ///
+    /// This is the other side of the same decision: no TLS records (a plain
+    /// `mio::net::TcpStream` takes `socket_wants_write()`'s `false` default),
+    /// no parked `expect_write`, no bytes written, no queued control frame.
+    /// Forward progress must come from an external trigger, so the connection
+    /// relinquishes the bit rather than busy-spinning against the dispatcher.
+    ///
+    /// TO SEE THIS RED: delete `self.readiness.interest.remove(Ready::WRITABLE);`
+    /// from the `FinalizeAction::Quiesce` arm of `finalize_write`, leaving its
+    /// debug narration in place. The final assertion fails with `a pass that
+    /// owes nothing must relinquish WRITABLE interest`. The interest bit is
+    /// asserted here rather than the event bit because withdrawal is what this
+    /// branch does, and it is set by the test rather than by the fixture —
+    /// `test_h2_connection` arms `READABLE | HUP | ERROR` only.
+    #[test]
+    fn a_write_pass_that_owes_nothing_withdraws_writable_interest() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        connection.state = H2State::Header;
+        connection.readiness.interest.insert(Ready::WRITABLE);
+
+        assert!(
+            !connection.socket.socket_wants_write(),
+            "premise: a plain TcpStream holds no TLS records, so the readiness              policy is reached at all"
+        );
+        assert!(
+            connection.stream_table.expect_write().is_none(),
+            "premise: no parked partial write, or the policy is suppressed"
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "an empty write pass continues, got {result:?}"
+        );
+        assert!(
+            !connection.readiness.interest.is_writable(),
+            "a pass that owes nothing must relinquish WRITABLE interest, got              {:?}",
+            connection.readiness
+        );
+    }
+
     /// Build a bare server-side `ConnectionH2` for tests that only exercise
     /// connection-level bookkeeping. The socket is never read or written.
     ///
@@ -7244,7 +7758,7 @@ mod tests {
 
     /// The RFC 9113 §6.5 SETTINGS-ACK deadline is evaluated against
     /// `ConnectionH2::now`. `flush_pending_control_frames` is the `writable`
-    /// half of the pair; the `readable` half at `h2.rs` shares the predicate.
+    /// half of the pair; the `poll_read_target` half at `h2.rs` shares the predicate.
     ///
     /// To SEE THIS RED: restore `sent_at.elapsed() >= SETTINGS_ACK_TIMEOUT` in
     /// `flush_pending_control_frames`. No real time passes in this test, so the
@@ -7315,7 +7829,7 @@ mod tests {
         context.now = armed_at + idle_timeout;
         connection.cancel_timed_out_streams(&mut context, &mut EndpointClient(&mut router));
         assert!(
-            connection.pending_rst_streams.is_empty(),
+            connection.control_tx.pending().is_empty(),
             "a stream exactly at its idle deadline must not be reaped"
         );
 
@@ -7323,11 +7837,11 @@ mod tests {
         context.now = armed_at + idle_timeout + Duration::from_millis(1);
         connection.cancel_timed_out_streams(&mut context, &mut EndpointClient(&mut router));
         assert!(
-            !connection.pending_rst_streams.is_empty(),
+            !connection.control_tx.pending().is_empty(),
             "advancing only the mux snapshot past the idle deadline must reap the stream"
         );
         assert_eq!(
-            connection.pending_rst_streams[0],
+            connection.control_tx.pending()[0],
             (1, H2Error::Cancel),
             "the reaper must queue RST_STREAM(CANCEL) for the timed-out stream"
         );
@@ -7357,23 +7871,28 @@ mod tests {
     /// production caller of `check_invariants`, never runs at all. The reaper
     /// is not the only insert path outside that caller: the
     /// DATA-on-closed-stream reset sits in `handle_header_state`, which
-    /// `readable` returns into without ever reaching `handle_frame`. That one
+    /// `handle_read` returns into without ever reaching `handle_frame`. That one
     /// is rate-limited by `record_glitch` + `check_flood_or_return!` and
     /// cannot by itself fill the queue — see `ConnectionH2::enqueue_rst`.
     ///
-    /// To SEE THIS RED: delete the `pending.len() >= max_pending` guard at the
-    /// top of `enqueue_rst_into`, then run
+    /// To SEE THIS RED: delete the `pending_before >= self.max_pending` guard
+    /// at the top of `H2ControlTx::enqueue_rst` (`h2_control_tx.rs`), then run
     /// `cargo test -p sozu-lib --locked mass_reap` (one positional filter —
     /// cargo rejects a second one). Every reaped stream is then queued
-    /// unconditionally and invariant 3 fires with `pending RST queue must stay
-    /// within its hard cap (escalates at the cap)`.
+    /// unconditionally and `H2ControlTx::check_invariants` — the post-condition
+    /// every mutating method on that type runs — panics inside the sweep with
+    /// `pending RST queue must stay within its hard cap (escalates at the
+    /// cap)`. That clause moved to the module with this commit and is NOT
+    /// restated in `ConnectionH2::check_invariants`, so the explicit call
+    /// below no longer covers the queue bound — the assertion at the end of
+    /// this test is what pins it from the connection's side.
     #[test]
     fn mass_reap_keeps_the_pending_rst_queue_within_its_hard_cap() {
         // `Stream::new` checks out two buffers per stream and the connection
         // itself holds one for its zero buffer, so the ceiling has to clear
         // `2 * REAPED` with room to spare or `create_stream` hands back
         // `None` — which is how the first draft of this test failed.
-        const REAPED: usize = MAX_PENDING_RST_STREAMS + 32;
+        const REAPED: usize = h2_control_tx::MAX_PENDING_RST_STREAMS + 32;
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2 * REAPED + 4, 16384)));
         let (mut connection, _peer) = test_h2_connection(&pool, None);
         let mut context = test_context(&pool);
@@ -7399,345 +7918,10 @@ mod tests {
         #[cfg(debug_assertions)]
         connection.check_invariants(&context);
         assert!(
-            connection.pending_rst_streams.len() <= MAX_PENDING_RST_STREAMS,
+            connection.control_tx.pending().len() <= h2_control_tx::MAX_PENDING_RST_STREAMS,
             "a mass reap must stop queueing at the cap, got {} entries",
-            connection.pending_rst_streams.len()
+            connection.control_tx.pending().len()
         );
-    }
-
-    // ── enqueue_rst: queue / dedupe / counter / arm invariants ───────────
-    //
-    // `enqueue_rst_into` is the free-function primitive shared by all three
-    // RST push sites (DATA-on-closed, refuse_stream_and_discard,
-    // reset_stream). The method delegates; the invariants live here.
-
-    #[test]
-    fn test_enqueue_rst_into_populates_queue_and_dedupe() {
-        let mut pending: Vec<(StreamId, H2Error)> = Vec::new();
-        let mut total: usize = 0;
-        let mut sent: HashSet<StreamId> = HashSet::new();
-        let mut readiness = Readiness::new();
-
-        let first = enqueue_rst_into(
-            &mut pending,
-            MAX_PENDING_RST_STREAMS,
-            &mut total,
-            &mut sent,
-            &mut readiness,
-            5,
-            H2Error::ProtocolError,
-        );
-        assert_eq!(
-            first,
-            EnqueueRstOutcome::Queued,
-            "first call must report a fresh queue"
-        );
-        // Second call for the same stream must be a no-op AND report
-        // `Deduped` so accounting in `Self::enqueue_rst` skips this case.
-        let second = enqueue_rst_into(
-            &mut pending,
-            MAX_PENDING_RST_STREAMS,
-            &mut total,
-            &mut sent,
-            &mut readiness,
-            5,
-            H2Error::InternalError,
-        );
-        assert_eq!(
-            second,
-            EnqueueRstOutcome::Deduped,
-            "second call for same stream must report Deduped"
-        );
-
-        assert_eq!(pending.len(), 1, "dedupe must collapse to a single entry");
-        assert_eq!(
-            pending[0],
-            (5, H2Error::ProtocolError),
-            "the first error wins — second push is ignored"
-        );
-        assert_eq!(total, 1, "queued-cap counter must bump exactly once");
-        assert!(sent.contains(&5), "rst_sent must record the id");
-    }
-
-    #[test]
-    fn test_enqueue_rst_into_bumps_total_for_distinct_ids() {
-        let mut pending: Vec<(StreamId, H2Error)> = Vec::new();
-        let mut total: usize = 0;
-        let mut sent: HashSet<StreamId> = HashSet::new();
-        let mut readiness = Readiness::new();
-
-        for sid in [1u32, 3, 5, 7] {
-            enqueue_rst_into(
-                &mut pending,
-                MAX_PENDING_RST_STREAMS,
-                &mut total,
-                &mut sent,
-                &mut readiness,
-                sid,
-                H2Error::ProtocolError,
-            );
-        }
-
-        assert_eq!(pending.len(), 4);
-        assert_eq!(total, 4);
-        assert_eq!(sent.len(), 4);
-    }
-
-    #[test]
-    fn test_enqueue_rst_into_arms_writable_in_invariant_15_form() {
-        let mut pending: Vec<(StreamId, H2Error)> = Vec::new();
-        let mut total: usize = 0;
-        let mut sent: HashSet<StreamId> = HashSet::new();
-        let mut readiness = Readiness::new();
-
-        // Precondition: no WRITABLE bits set.
-        assert!(!readiness.interest.is_writable());
-        assert!(!readiness.event.is_writable());
-
-        enqueue_rst_into(
-            &mut pending,
-            MAX_PENDING_RST_STREAMS,
-            &mut total,
-            &mut sent,
-            &mut readiness,
-            9,
-            H2Error::FlowControlError,
-        );
-
-        // Postcondition: invariant-15 — both `interest` and `event` WRITABLE
-        // are raised so the next tick runs `writable()` under edge-triggered
-        // epoll.
-        assert!(
-            readiness.interest.is_writable(),
-            "arm_writable must raise the interest bit"
-        );
-        assert!(
-            readiness.event.is_writable(),
-            "arm_writable must raise the event bit (edge-triggered epoll)"
-        );
-    }
-
-    #[test]
-    fn test_enqueue_rst_into_dedupe_does_not_rearm_writable() {
-        // Dedupe is a pure short-circuit: if the stream id is already in
-        // `rst_sent`, we do not touch the readiness. This matters because
-        // a re-entrant reset_stream call during a cascading error path
-        // would otherwise re-raise WRITABLE unnecessarily — harmless but
-        // noisy in metrics.
-        let mut pending: Vec<(StreamId, H2Error)> = Vec::new();
-        let mut total: usize = 0;
-        let mut sent: HashSet<StreamId> = HashSet::new();
-        sent.insert(11);
-        let mut readiness = Readiness::new();
-
-        enqueue_rst_into(
-            &mut pending,
-            MAX_PENDING_RST_STREAMS,
-            &mut total,
-            &mut sent,
-            &mut readiness,
-            11,
-            H2Error::ProtocolError,
-        );
-
-        assert!(
-            pending.is_empty(),
-            "already-sent ids must not queue a second frame"
-        );
-        assert_eq!(total, 0);
-        assert!(!readiness.interest.is_writable());
-        assert!(!readiness.event.is_writable());
-    }
-
-    // ── enqueue_rst_into: per-insert queue bound (sozu-proxy/sozu#1413) ──
-    //
-    // The bound has to hold at the INSERT, not at the drain: one
-    // `cancel_timed_out_streams` sweep queues an RST per timed-out stream
-    // with no `flush_pending_control_frames` pass in between, so a drain-side
-    // check bounds only what is written and never what is held.
-
-    /// At capacity the primitive queues nothing, accounts nothing, records
-    /// nothing in `rst_sent`, and does not re-arm WRITABLE — the same
-    /// no-side-effect shape as the dedupe short-circuit above.
-    ///
-    /// `rst_sent` is the load-bearing one: marking an id as reset without
-    /// queuing its frame would make a later, legitimate `enqueue_rst` for that
-    /// stream dedupe against a frame that was never queued.
-    ///
-    /// To SEE THIS RED: move the `pending.len() >= max_pending` guard in
-    /// `enqueue_rst_into` below the `rst_sent.insert(wire_stream_id)` call,
-    /// then run `cargo test -p sozu-lib --locked
-    /// test_enqueue_rst_into_refuses_at_capacity_without_side_effects`. The
-    /// `rst_sent` assertion fails with `an at-capacity refusal must not
-    /// record the id as reset`.
-    #[test]
-    fn test_enqueue_rst_into_refuses_at_capacity_without_side_effects() {
-        const MAX: usize = 4;
-        let mut pending: Vec<(StreamId, H2Error)> = Vec::new();
-        let mut total: usize = 0;
-        let mut sent: HashSet<StreamId> = HashSet::new();
-        let mut readiness = Readiness::new();
-
-        for sid in [1u32, 3, 5, 7] {
-            assert_eq!(
-                enqueue_rst_into(
-                    &mut pending,
-                    MAX,
-                    &mut total,
-                    &mut sent,
-                    &mut readiness,
-                    sid,
-                    H2Error::Cancel,
-                ),
-                EnqueueRstOutcome::Queued,
-                "every insert below the cap must be queued"
-            );
-        }
-        assert_eq!(pending.len(), MAX, "the queue must fill to exactly the cap");
-
-        let mut at_capacity = Readiness::new();
-        assert_eq!(
-            enqueue_rst_into(
-                &mut pending,
-                MAX,
-                &mut total,
-                &mut sent,
-                &mut at_capacity,
-                9,
-                H2Error::Cancel,
-            ),
-            EnqueueRstOutcome::Dropped,
-            "an insert at the cap must be refused"
-        );
-
-        assert_eq!(
-            pending.len(),
-            MAX,
-            "a refused insert must leave the queue at the cap"
-        );
-        assert_eq!(
-            total, MAX,
-            "a refused insert must not bump the queued-RST lifetime counter"
-        );
-        assert!(
-            !sent.contains(&9),
-            "an at-capacity refusal must not record the id as reset"
-        );
-        assert!(
-            !at_capacity.interest.is_writable() && !at_capacity.event.is_writable(),
-            "a refused insert must not arm WRITABLE for a frame it did not queue"
-        );
-    }
-
-    // ── quickcheck: the bound survives any reap/enqueue/drain interleaving ─
-
-    use quickcheck::{Arbitrary, Gen, quickcheck};
-
-    /// One step of an abstract RST workload against the queue primitive.
-    #[derive(Clone, Debug)]
-    enum RstStep {
-        /// A single proxy-emitted reset (`reset_stream`, DATA-on-closed,
-        /// `refuse_stream_and_discard`) on a small, deliberately colliding id
-        /// space so the dedupe path is exercised too.
-        Enqueue(u8),
-        /// One `cancel_timed_out_streams` sweep: up to 96 never-before-seen
-        /// wire ids queued back-to-back with no drain in between.
-        Reap(u8),
-        /// One `flush_pending_control_frames` drain: the serializer wrote the
-        /// first `n` entries and `drain(..n)` removed them.
-        Drain(u8),
-    }
-
-    impl Arbitrary for RstStep {
-        fn arbitrary(g: &mut Gen) -> Self {
-            match u8::arbitrary(g) % 3 {
-                0 => RstStep::Enqueue(u8::arbitrary(g)),
-                1 => RstStep::Reap(u8::arbitrary(g)),
-                _ => RstStep::Drain(u8::arbitrary(g)),
-            }
-        }
-    }
-
-    /// Property: for ANY interleaving of single resets, mass reaps and partial
-    /// drains, the pending queue stays within `max_pending`, the never-decaying
-    /// lifetime counter never under-counts it, and every queued id is recorded
-    /// exactly once — the four facts `ConnectionH2::check_invariants`
-    /// invariant 3 and the dedupe invariant assert on the live connection.
-    ///
-    /// `MAX` is 16 rather than the production `MAX_PENDING_RST_STREAMS` so a
-    /// generated `Reap` reaches the cap on almost every run; reachability
-    /// itself is pinned deterministically by
-    /// `test_enqueue_rst_into_refuses_at_capacity_without_side_effects` and
-    /// `mass_reap_keeps_the_pending_rst_queue_within_its_hard_cap`.
-    ///
-    /// To SEE THIS RED: delete the `pending.len() >= max_pending` guard in
-    /// `enqueue_rst_into`, then run `cargo test -p sozu-lib --locked
-    /// prop_pending_rst_queue_stays_within_its_bound`. The first `Reap` longer
-    /// than 16 pushes the queue past the bound and quickcheck reports the
-    /// shrunk counterexample, `[quickcheck] TEST FAILED. Arguments:
-    /// ([Reap(118)])` on the run that produced this comment.
-    #[test]
-    fn prop_pending_rst_queue_stays_within_its_bound() {
-        fn prop(steps: Vec<RstStep>) -> bool {
-            const MAX: usize = 16;
-            let mut pending: Vec<(StreamId, H2Error)> = Vec::new();
-            let mut total: usize = 0;
-            let mut sent: HashSet<StreamId> = HashSet::new();
-            let mut readiness = Readiness::new();
-            // Disjoint from the `Enqueue` id space (odd, 1..=127) so a reap
-            // always queues ids the workload has not used before.
-            let mut next_reaped: StreamId = 1001;
-
-            for step in steps {
-                match step {
-                    RstStep::Enqueue(id) => {
-                        enqueue_rst_into(
-                            &mut pending,
-                            MAX,
-                            &mut total,
-                            &mut sent,
-                            &mut readiness,
-                            2 * (id as StreamId % 64) + 1,
-                            H2Error::ProtocolError,
-                        );
-                    }
-                    RstStep::Reap(n) => {
-                        for _ in 0..=(n % 96) {
-                            enqueue_rst_into(
-                                &mut pending,
-                                MAX,
-                                &mut total,
-                                &mut sent,
-                                &mut readiness,
-                                next_reaped,
-                                H2Error::Cancel,
-                            );
-                            next_reaped += 2;
-                        }
-                    }
-                    RstStep::Drain(n) => {
-                        let written = (n as usize % 8).min(pending.len());
-                        pending.drain(..written);
-                    }
-                }
-
-                if pending.len() > MAX {
-                    return false;
-                }
-                if total < pending.len() {
-                    return false;
-                }
-                if !pending.iter().all(|(id, _)| sent.contains(id)) {
-                    return false;
-                }
-                let unique: HashSet<StreamId> = pending.iter().map(|(id, _)| *id).collect();
-                if unique.len() != pending.len() {
-                    return false;
-                }
-            }
-            true
-        }
-        quickcheck(prop as fn(Vec<RstStep>) -> bool);
     }
 
     // ── forcefully_terminate_answer arms WRITABLE for ET epoll ───────────
@@ -7846,9 +8030,17 @@ mod tests {
 
     /// To SEE THIS RED: in `log_context!` (h2.rs), put
     /// `peer = $self.socket.socket_ref().peer_addr().ok(),` back in place of
-    /// `peer = $self.socket.peer_addr(),`. The rendered line then carries the
+    /// `peer = $self.peer_address,`. The rendered line then carries the
     /// loopback address the socket is really connected to, so the first
     /// assertion fails on the missing cached address.
+    ///
+    /// Substituting the pre-snapshot `peer = $self.socket.peer_addr(),` does
+    /// NOT turn this red, and that is worth stating: for a handler that
+    /// already caches, reading the cache and reading a snapshot taken from
+    /// that cache agree by construction. What the snapshot changed is WHICH
+    /// object is read on a log line, not what comes back — so the call-count
+    /// property, not this one, is what distinguishes them. It is pinned by
+    /// [`log_context_reads_the_peer_address_once_per_connection`].
     #[test]
     fn log_context_renders_the_cached_peer_not_a_live_lookup() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
@@ -7878,7 +8070,7 @@ mod tests {
 
     /// To SEE THIS RED: in `log_context_stream!` (h2.rs), put
     /// `peer = $self.socket.socket_ref().peer_addr().ok(),` back in place of
-    /// `peer = $self.socket.peer_addr(),`. The per-stream envelope then
+    /// `peer = $self.peer_address,`. The per-stream envelope then
     /// diverges from the connection envelope, which is worse than either being
     /// wrong alone: the same session renders two different peers depending on
     /// whether a stream happened to be in scope at the callsite.
@@ -7909,6 +8101,343 @@ mod tests {
         );
     }
 
+    /// A [`SocketHandler`] that counts how often it is asked for the peer
+    /// address, delegating every other method to a real loopback stream.
+    ///
+    /// The two tests above pin WHICH address the log prefix renders. Neither
+    /// can see how many times the connection reaches into the socket to get
+    /// it, because both production handlers answer from a cache and so give
+    /// the same answer however often they are asked. This handler makes the
+    /// count observable.
+    struct PeerAddrCountingSocket {
+        stream: mio::net::TcpStream,
+        peer: std::net::SocketAddr,
+        calls: Rc<std::cell::Cell<usize>>,
+    }
+
+    impl SocketHandler for PeerAddrCountingSocket {
+        fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
+            self.stream.socket_read(buf)
+        }
+
+        fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+            self.stream.socket_write(buf)
+        }
+
+        fn socket_write_vectored(&mut self, bufs: &[IoSlice]) -> (usize, SocketResult) {
+            self.stream.socket_write_vectored(bufs)
+        }
+
+        fn socket_ref(&self) -> &mio::net::TcpStream {
+            &self.stream
+        }
+
+        fn socket_mut(&mut self) -> &mut mio::net::TcpStream {
+            &mut self.stream
+        }
+
+        fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+            self.calls.set(self.calls.get() + 1);
+            Some(self.peer)
+        }
+
+        fn protocol(&self) -> crate::socket::TransportProtocol {
+            crate::socket::TransportProtocol::Tcp
+        }
+
+        fn read_error(&self) {}
+
+        fn write_error(&self) {}
+    }
+
+    /// The `peer=` slot is read from the socket exactly ONCE per connection —
+    /// at construction — however many log lines the connection renders.
+    ///
+    /// This is the property that makes `peer_address` worth having. It is not
+    /// about which address appears (the two tests above own that); it is about
+    /// `log_context!` no longer being a socket operation. The macro expands at
+    /// 113 production callsites in this file, so before the snapshot every
+    /// method that logged was `Front`-coupled whether or not it did any I/O —
+    /// which is 113 of the ~140 total `Front` touch points in `h2.rs`.
+    ///
+    /// TO SEE THIS RED: in `log_context!` (h2.rs), put
+    /// `peer = $self.socket.peer_addr(),` back in place of
+    /// `peer = $self.peer_address,`. The count then rises by one per rendered
+    /// line and the final assertion fails with
+    /// `the peer address must be read once, at construction, not once per log line:
+    /// left: 4, right: 1`.
+    #[test]
+    fn log_context_reads_the_peer_address_once_per_connection() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (_listener, stream, _live_peer) = connected_loopback_stream();
+        let calls = Rc::new(std::cell::Cell::new(0usize));
+        let session_ulid = Ulid::generate();
+        let socket = PeerAddrCountingSocket {
+            stream,
+            peer: CACHED_PEER
+                .parse()
+                .expect("the cached peer literal must parse"),
+            calls: Rc::clone(&calls),
+        };
+        let connection = ConnectionH2::new(
+            session_ulid,
+            socket,
+            Position::Server,
+            Rc::downgrade(&pool),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "construction takes exactly one peer_addr() snapshot"
+        );
+
+        // Premise: the rendered lines really do carry the address, so a zero
+        // count below would mean the slot went missing rather than that it
+        // became free.
+        for _ in 0..3 {
+            let rendered = log_context!(connection);
+            assert!(
+                rendered.contains(&format!("peer=Some({CACHED_PEER})")),
+                "each rendered line must still carry the peer: {rendered}"
+            );
+        }
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the peer address must be read once, at construction, not once per log line"
+        );
+    }
+
+    // ── The read-side two-call protocol (poll_read_target / handle_read) ──
+
+    /// `read_space` hands out the buffer the core named, and hands out the
+    /// stream's READ buffer — the one `Stream::split` labels `rbuffer` for the
+    /// connection's position — not its write buffer.
+    ///
+    /// This is the only genuinely new logic in the read-side inversion: every
+    /// other line moved. Both halves are pinned because the two failure modes
+    /// differ — offering the wrong *kawa* corrupts the peer's request while
+    /// the response is parsed as H2 payload, offering the wrong *stream*
+    /// writes one stream's DATA into another's.
+    ///
+    /// To SEE THIS RED: in `read_buffer` (h2.rs), return
+    /// `streams[global_stream_id].split(position).wbuffer` in place of
+    /// `.rbuffer`.
+    #[test]
+    fn read_space_offers_the_read_buffer_of_the_stream_the_core_named() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+
+        let gid = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+
+        // Premise: the two per-stream buffers really are distinct allocations,
+        // so a pointer comparison below can tell them apart at all.
+        let front = context.streams[gid].front.storage.space().as_ptr();
+        let back = context.streams[gid].back.storage.space().as_ptr();
+        let zero = connection.zero.storage.space().as_ptr();
+        assert_ne!(
+            front, back,
+            "a stream's request and response buffers must be distinct allocations"
+        );
+
+        let offered = read_space(
+            &mut connection.zero,
+            &mut context.streams,
+            &connection.position,
+            H2StreamId::Zero,
+            9,
+        );
+        assert_eq!(
+            offered.as_ptr(),
+            zero,
+            "H2StreamId::Zero must offer the connection-level scratch buffer"
+        );
+        assert_eq!(
+            offered.len(),
+            9,
+            "the offer is capped at the byte debt, never the whole free space"
+        );
+
+        let offered = read_space(
+            &mut connection.zero,
+            &mut context.streams,
+            &connection.position,
+            H2StreamId::Other { id: 1, gid },
+            7,
+        );
+        assert_eq!(
+            offered.as_ptr(),
+            front,
+            "a server position must offer the stream's request (front) buffer"
+        );
+        assert_ne!(
+            offered.as_ptr(),
+            back,
+            "the offered buffer must not be the stream's response (back) buffer"
+        );
+        assert_eq!(
+            offered.len(),
+            7,
+            "the offer is capped at the byte debt, never the whole free space"
+        );
+    }
+
+    /// A frame whose payload is zero bytes long owes the socket nothing, and
+    /// the core says so with its own variant rather than an `amount` of 0.
+    ///
+    /// That distinction is load-bearing, not cosmetic. A caller handed
+    /// `Fill { amount: 0 }` would issue a zero-length read, and
+    /// `update_readiness_after_read(0, SocketResult::Continue, ..)` returns
+    /// `true` for it — "nothing arrived, stop" — so `handle_read` would return
+    /// before the frame state machine ever ran, and every empty SETTINGS,
+    /// empty DATA and SETTINGS ACK would stop being parsed.
+    ///
+    /// To SEE THIS RED: in `poll_read_target` (h2.rs), replace the trailing
+    /// `if amount > 0 { .. } else { .. }` with its `Fill` half alone —
+    /// keep the `available_space` guard and end the function with
+    /// `H2ReadTarget::Fill { stream_id, amount }`, dropping the
+    /// `set_expect_read(None)` / `H2ReadTarget::Skip(stream_id)` branch.
+    #[test]
+    fn poll_read_target_skips_the_read_when_the_frame_carries_no_payload() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        connection.state = H2State::Header;
+        connection
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 0)));
+
+        let target = connection.poll_read_target(&mut context, &mut EndpointClient(&mut router));
+        assert!(
+            matches!(target, H2ReadTarget::Skip(H2StreamId::Zero)),
+            "a zero-length payload must be a Skip, not a zero-length Fill: {target:?}"
+        );
+        assert!(
+            connection.stream_table.expect_read().is_none(),
+            "the settled byte debt must be cleared before the frame is dispatched"
+        );
+    }
+
+    /// The core is told how many bytes arrived, and it subtracts exactly that
+    /// many from the debt it offered — a short read leaves the remainder owed,
+    /// it does not restart the frame.
+    ///
+    /// 6 is neither of the two numbers the test hands in, so this cannot pass
+    /// by echoing the fixture: `amount` is 9 and `size` is 3.
+    ///
+    /// To SEE THIS RED: in `handle_read` (h2.rs), pass `amount` in place of
+    /// `amount - size` to `set_expect_read`.
+    #[test]
+    fn handle_read_subtracts_the_byte_count_the_caller_reported() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        // Not ClientPreface: a short read there runs the early-preface check
+        // instead, which is a different branch with its own coverage.
+        connection.state = H2State::Header;
+        connection
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+
+        let result = connection.handle_read(
+            &mut context,
+            EndpointClient(&mut router),
+            H2StreamId::Zero,
+            H2ReadOutcome::Filled {
+                amount: 9,
+                size: 3,
+                status: SocketResult::Continue,
+            },
+        );
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a short read keeps the connection running: {result:?}"
+        );
+        assert_eq!(
+            connection.stream_table.expect_read(),
+            Some((H2StreamId::Zero, 6)),
+            "a 3-byte answer to a 9-byte offer must leave 6 bytes owed"
+        );
+        assert_eq!(
+            connection.zero.storage.data().len(),
+            3,
+            "the core must consume exactly the bytes the caller reported"
+        );
+    }
+
+    /// A read that returned nothing clears the READABLE **event** and leaves
+    /// the READABLE **interest** alone, so the connection is re-armed for the
+    /// next epoll wake-up instead of being taken off the loop.
+    ///
+    /// The interest half is asserted on purpose: `signal_pending_write` and
+    /// this path both touch `Readiness.event` only, and an assertion written
+    /// against `interest` cannot see either of them move.
+    ///
+    /// To SEE THIS RED: in `handle_read` (h2.rs), call
+    /// `update_readiness_after_write` in place of `update_readiness_after_read`
+    /// — the WRITABLE bit is cleared instead and the READABLE event survives.
+    #[test]
+    fn handle_read_clears_the_readable_event_not_the_interest_when_nothing_arrived() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        connection.state = H2State::Header;
+        connection
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+        connection.readiness.event = Ready::READABLE;
+        connection.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+
+        let result = connection.handle_read(
+            &mut context,
+            EndpointClient(&mut router),
+            H2StreamId::Zero,
+            H2ReadOutcome::Filled {
+                amount: 9,
+                size: 0,
+                status: SocketResult::WouldBlock,
+            },
+        );
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "an empty read is not a close: {result:?}"
+        );
+        assert!(
+            !connection.readiness.event.is_readable(),
+            "an empty read must clear the READABLE event"
+        );
+        assert!(
+            connection.readiness.interest.is_readable(),
+            "an empty read must NOT drop the READABLE interest"
+        );
+        assert_eq!(
+            connection.stream_table.expect_read(),
+            Some((H2StreamId::Zero, 9)),
+            "an empty read settles no part of the byte debt"
+        );
+    }
+
     // ── RFC 9113 §4.3: a refused stream must not desynchronise HPACK ──────
     //
     // Field compression state is scoped to the whole connection, not to a
@@ -7921,7 +8450,7 @@ mod tests {
     // resolves the wrong dynamic entry or fails outright.
 
     /// To SEE THIS RED: in the `(H2State::Discard, _)` arm of
-    /// [`ConnectionH2::readable`], remove the `if let Some(discarded) =
+    /// [`ConnectionH2::handle_read`], remove the `if let Some(discarded) =
     /// self.discarded_field_block.take() && ...` block that calls
     /// [`decode_discarded_field_block`], restoring the unconditional
     /// `kawa.storage.clear()`. The peer's second block is then a one-byte
@@ -7985,7 +8514,7 @@ mod tests {
                     connection.stream_table.expect_read(),
                     Some((H2StreamId::Zero, 9))
                 )
-                && !connection.pending_rst_streams.is_empty()
+                && !connection.control_tx.pending().is_empty()
             {
                 break;
             }
@@ -7995,7 +8524,7 @@ mod tests {
         // Premise of the test: we really went through the refusal path, the
         // stream was refused rather than created, and the connection survived.
         assert_eq!(
-            connection.pending_rst_streams,
+            connection.control_tx.pending(),
             vec![(1, H2Error::RefusedStream)],
             "the drain gate must refuse stream 1 with RST_STREAM(REFUSED_STREAM)"
         );
@@ -8121,7 +8650,7 @@ mod tests {
                     connection.stream_table.expect_read(),
                     Some((H2StreamId::Zero, 9))
                 )
-                && !connection.pending_rst_streams.is_empty()
+                && !connection.control_tx.pending().is_empty()
             {
                 break;
             }
@@ -8129,7 +8658,7 @@ mod tests {
         }
 
         assert_eq!(
-            connection.pending_rst_streams,
+            connection.control_tx.pending(),
             vec![(1, H2Error::RefusedStream)],
             "the drain gate must refuse stream 1 with RST_STREAM(REFUSED_STREAM)"
         );

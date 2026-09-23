@@ -77,6 +77,397 @@
 
 ### 🔄 Changed
 
+- **`fix(mux-h2)`: `H2ControlTx::lifetime_cap_reached` reads the instance's own bound instead of the
+  `MAX_PENDING_RST_STREAMS` constant.** The type carries one cap per instance, `max_pending`, and
+  three predicates that must all read it: the per-insert bound in `enqueue_rst`, the post-condition
+  in `check_invariants`, and the escalation tripwire in `lifetime_cap_reached`. The first two read
+  `self.max_pending`; the third read the constant, so a `with_cap(n)` instance had a per-insert
+  bound of `n` and a tripwire still waiting for 200.
+
+  Not reachable in production — `new()` is the only non-test constructor and passes the constant, so
+  all three agree there, and no `with_cap` caller consults the tripwire. The defect is latent and
+  specific: a natural extension of
+  `test_enqueue_rst_into_refuses_at_capacity_without_side_effects` that asserted on the tripwire
+  would have compared a queue at its own cap of 4 against 200, reported "not reached", and passed
+  for the wrong reason — on the type that carries the CVE-2025-8671 MadeYouReset cap. The three
+  predicates are indistinguishable under `new()`, so the regression builds the instance that
+  separates them: `the_lifetime_cap_tracks_the_instance_bound_not_the_constant` fills a
+  `with_cap(4)` queue to its own cap and asserts the tripwire has fired, seen red by restoring the
+  constant.
+
+  Two doc pointers left behind by the `h2_control_tx.rs` extraction are repaired in the same pass.
+  `H2StreamTable::rst_sent_mut` named `enqueue_rst_into`, a free function that no longer exists, and
+  now names `h2_control_tx::H2ControlTx::enqueue_rst`. `h2_transmit.rs`'s module header described
+  the pre-image call order; the split did move one thing — the caller now pushes its
+  `DebugEvent::SocketIO` before calling `confirm`, so the clear follows the debug event instead of
+  preceding it, which is inert because `debug.push` does not touch `kawa`, and the module's stated
+  obligation ("clear before the consume") still holds because both now happen inside `confirm`.
+
+- **`refactor(mux-h2)`: the end of an H2 write pass becomes a decision instead of a flush triple —
+  `ConnectionH2::finalize_write` asks `h2_close::finalize_action` and performs the answer.**
+  `finalize_write` held the last unconverted instance of the query / flush / query shape the close
+  sites already delegate: `socket_wants_write()`, a conditional `socket_write(&[])`, then
+  `ensure_tls_flushed()`'s second `socket_wants_write()`. It is now one
+  `h2_close::finalize_action(TlsFlushPhase::BeforeFlush, …)` call followed by the same function at
+  `AfterFlush`, with `h2.rs` performing whichever step each answer names. The same flush between
+  them, the same `Readiness` mutations, the same debug narration, the same `MuxResult::Continue`,
+  and zero lines of `write_streams`' `'outer` loop move — **with one declared exception, on one
+  path.** Counting `socket_wants_write()` per write pass:
+
+  | path | base | now |
+  | --- | --- | --- |
+  | no TLS backpressure — the common case | 1 | **1** |
+  | backpressure, the flush clears the records (`Settled`) | 2 | 2 |
+  | backpressure, records survive the flush (`ReArm`) | 2 | **3** |
+
+  `finalize_action` returns `Flush`/`SkipFlush` only when `tls_wants_write` is true
+  (`h2_close.rs`); every other `BeforeFlush` answer returns early in `h2.rs`, so an uncongested
+  pass still asks exactly once, as the pre-image did — its `ensure_tls_flushed()` also sat inside
+  the `if self.socket.socket_wants_write()` branch. The third query is `FinalizeAction::ReArm`
+  (`h2.rs:2987`) calling `ensure_tls_flushed()`, whose own `socket_wants_write()` (`h2.rs:2786`)
+  re-asks what the `AfterFlush` decision (`h2.rs:2974`) already knows. It is redundant — nothing
+  mutates the socket between them — and deliberate: it keeps every post-decision TLS re-arm in this
+  file spelled the same way, as the GoAway and Error arms of `writable` already do, and keeps this
+  commit free of an unrelated change. It is also cheap: `FrontRustls::socket_wants_write` is
+  `!self.peer_reset && self.session.wants_write()` (`lib/src/socket.rs`), and rustls' `wants_write`
+  is an `is_empty()` on the sendable-TLS deque — two L1-hot loads and two branches, no syscall and
+  no record encode, on the congested path immediately before a WRITABLE re-arm and another
+  event-loop trip.
+
+  **What that cheapness rests on, stated rather than inferred:** `FrontRustls` is the only
+  *production* `SocketHandler` that overrides `socket_wants_write()`; every other one takes the
+  trait's `false` default (`lib/src/socket.rs`), so no other production handler reaches the query
+  at all. A future handler — kTLS, or OpenSSL via `SSL_has_pending` — could make it a syscall, at
+  which point the `ReArm` arm should carry the answer it already has instead of re-asking. The one
+  non-`FrontRustls` handler that does override it is this changeset's own `BackpressuredTlsSocket`
+  test harness (`h2.rs`), which is what drives the backpressure path under test.
+
+  `signal_pending_write()` still has exactly 13 production call sites; `self.socket` in `h2.rs`
+  goes 34 → 35 raw and 27 → 28 effective (7 doc-comment mentions at both revisions).
+
+  **A sibling `FinalizeAction`, not a widened `CloseAction`.** Every `CloseAction` variant answers
+  "may this connection close, or must it keep draining". `finalize_write`'s non-flush branch
+  answers a different question — which `Readiness` bits the next tick needs, which is LIFECYCLE §9
+  invariant 16's readiness policy — and decides nothing about closing. Widening `CloseAction` would
+  have forced a named-impossible arm into every exhaustive `match` `ConnectionH2::writable` already
+  writes over it, for variants that can never reach those arms. `TlsFlushPhase` is shared rather
+  than duplicated, because the two-query distinction is the identical one.
+
+  **The conditional middle flush becomes a third input.** `finalize_write`'s flush is guarded by
+  `if !socket_write`: a pass that already pushed bytes through `socket_write_vectored` attempted
+  this pass's flush as a side effect, and the GOAWAY arm has no analogue for that. The `if` does
+  not stay behind in `h2.rs` — it becomes the `socket_write` input and surfaces as two distinct
+  pre-flush answers, `Flush` and `SkipFlush`, which differ only in the step the caller performs and
+  both lead to the same post-flush query. Eight variants in all — `Flush`, `SkipFlush`, `Parked`,
+  `RetainPendingBack`, `ArmControlQueue`, `Quiesce` before the flush, `ReArm` and `Settled` after
+  it — and both caller matches are exhaustive with named-impossible arms. No `_`, and no
+  `other => unreachable!`: a wildcard in either spelling compiles when a variant is added and
+  becomes a release-mode panic on the proxy write path instead of a compile error.
+
+  **The invariant-16 probe is passed as a closure, and that is a cost decision rather than taste.**
+  `any_stream_has_pending_back` walks every open stream of the connection, and the pre-image
+  reached it only under `!socket_wants_write && expect_write.is_none() && bytes_written > 0`. A
+  `bool` parameter — the one-bit projection every other input uses — would have made the caller run
+  that walk on every write pass instead, including every TLS-backpressured one and every
+  zero-progress one, which is a cost regression wearing "no behaviour change" as a disguise.
+  `FnOnce` keeps the short-circuit inside the decision, where it is testable:
+  `the_invariant_16_probe_is_not_walked_while_rustls_holds_records` and
+  `the_invariant_16_probe_is_not_walked_without_progress` pin that it stays uncalled, the second
+  against a mutation that changes no answer at all — `&&` is commutative in value — and only moves
+  the work.
+
+  **No `SocketResult` reaches the decision.** `finalize_write` discards `socket_write(&[])`'s
+  `(size, status)` exactly as the close sites do; the post-flush `socket_wants_write()` query is
+  how it learns whether the flush landed. That is worth stating rather than assuming, because
+  `update_readiness` treats `size > 0` with a `WouldBlock` status as NOT stalled — it clears the
+  WRITABLE event bit and returns `false`, so `flush_stream_out` issues another write — and a
+  decision function that took a status and read `status != Continue` as a terminator would silently
+  drop that second attempt. `flush_zero_buffer` is the one write-path site that does consume a
+  status; it is a different symbol and stays inline.
+
+  Ten pure tables in `h2_close` and two `writable()` tests in `h2.rs`. The tables sweep full cross
+  products rather than re-deriving the priority chain: TLS backpressure dominates all sixteen
+  readiness-input combinations, a parked `expect_write` dominates the remaining eight, the
+  pre-flush and post-flush answer sets are proved disjoint in both directions, and invariant 16's
+  retain/withdraw decision is written as eight explicit rows.
+  `a_finalized_write_pass_flushes_once_and_re_arms_while_records_survive` drives a real
+  `ConnectionH2` over `BackpressuredTlsSocket` in `H2State::Header` with three records and one
+  drained per flush, so `writable`'s preamble takes the first, `finalize_write`'s own flush takes
+  the second, and the third survives — which is what lets the post-flush query answer something the
+  fixture could not have answered by construction;
+  `a_write_pass_that_owes_nothing_withdraws_writable_interest` covers the withdrawal. The other
+  four answers — `SkipFlush`, `Parked`, `RetainPendingBack` and `ArmControlQueue` — are pinned by
+  the pure rows only; no assertion in `h2.rs` reads any of them, and reaching the first three
+  through `writable()` needs a stream carrying response bytes through the scheduler that no fixture
+  in `h2.rs` builds. That is the same boundary `h2_close`'s `force_disconnect` re-arm branch already
+  sits on. Every "TO SEE THIS RED" recipe was executed rather than asserted; each reddens its own
+  test on its own assertion, none through a production `unreachable!` or `debug_assert!`.
+
+  Docs: `doc/h2_mux_internals.md` gains a `finalize_write()` section carrying the answer table,
+  LIFECYCLE.md's invariant 16 and invariant 27 name the decision's new home while `finalize_write`
+  keeps the `Readiness` bits, and §8.2's control-queue retain names its answer. Against its parent,
+  32 citations into `h2.rs`, carrying 46 line numbers, change number by a difflib alignment map
+  over the cited file, each landing on byte-identical text inside the same `fn`. One citation is
+  converted to a symbol — §5.2's `try_resume_reading` dereference becomes "the `expect_read`
+  block", because that read is the file's only
+  `let stream = &context.streams[global_stream_id];`, so the symbol resolves unambiguously while a
+  line number there cannot. Its REASON changed rather than whether it happens: it used to be a
+  collision with a number a different bullet held, and `d8b8546e` retired that collision by
+  replacing the `Link` bullet's six numbers with eight symbols and the `Recycle` bullet's four with
+  four. §3.1's `Link` transition list, which this step also used to convert, therefore needs
+  nothing.
+
+- **`refactor(mux-h2)`: `ConnectionH2::readable` becomes a two-call protocol — the core names the
+  buffer it wants filled, the caller reads, the core is told how many bytes arrived and with what
+  status.** This is the read-side mirror of `h2_transmit::gather` / `confirm`, which already split
+  the vectored write the same way. `ConnectionH2::poll_read_target` runs the pass prelude (the
+  `context.now` mirror, `prune_inactive_streams_while_closing`, `cancel_timed_out_streams`, the
+  RFC 9113 §6.5 SETTINGS-ACK deadline) and answers `H2ReadTarget::Done`, `Skip` or
+  `Fill { stream_id, amount }`; `ConnectionH2::handle_read` takes `H2ReadOutcome::Skipped` or
+  `Filled { amount, size, status }`, consumes the bytes, settles the `expect_read` debt and
+  dispatches the frame. `readable()` is now the thin caller between them and holds the only
+  `self.socket.socket_read` on the whole H2 read path. No behaviour change: the same prelude in the
+  same order, the same debug event, the same byte counters, the same stall classification through
+  `update_readiness_after_read`, the same frame dispatch.
+
+  **`Skip` is a variant, not `Fill { amount: 0 }`, and that is load-bearing.** A zero-length read
+  answers `(0, SocketResult::Continue)`, which `update_readiness_after_read` reads as "nothing
+  arrived, stop" — so a caller handed a zero-length `Fill` would return before the frame state
+  machine ran, and every frame carrying no payload (an empty SETTINGS, an empty DATA, a SETTINGS
+  ACK) would stop being parsed. `poll_read_target_skips_the_read_when_the_frame_carries_no_payload`
+  pins it.
+
+  **Naming.** `poll_read_target` / `handle_read` follow the sibling UDP core's
+  `UdpManager::poll_output` / `UdpManager::handle_input` (`lib/src/protocol/udp/manager.rs`), which
+  is this repository's existing spelling for the two directions. There is still no `poll_transmit`
+  anywhere in the tree, and this is deliberately not spelled `poll_read`: that is
+  `AsyncRead::poll_read`'s name, its first parameter is a `task::Context`, and this one's is the
+  mux's own `Context` — `lib/` and `bin/` hold no asynchronous function. UDP's `Transmit` is not copied
+  either; it carries an owned `Vec<u8>` where this path needs a borrowed view into live
+  `kawa.storage`.
+
+  **Only one piece of new logic, and it is the one under test.** Everything else moved verbatim.
+  `read_buffer` resolves an `H2StreamId` to the kawa it names and `read_space` caps the offer at
+  the byte debt; taking `zero` and `streams` apart rather than `&mut self` and `&mut Context` is
+  what keeps `ConnectionH2::socket` and `Context::debug` borrowable while the offered buffer is
+  live. `read_space_offers_the_read_buffer_of_the_stream_the_core_named` pins the resolution by
+  pointer identity against the stream's *write* buffer,
+  `handle_read_subtracts_the_byte_count_the_caller_reported` pins that a 3-byte answer to a 9-byte
+  offer leaves 6 owed, and `handle_read_clears_the_readable_event_not_the_interest_when_nothing_arrived`
+  pins that an empty read clears the READABLE **event** and leaves the **interest** alone — the
+  half an assertion written against `interest` cannot see. Each is red against a distinct
+  single-token mutation, on its own assertion.
+
+  Docs: `doc/h2_mux_internals.md`'s `readable()` section describes the protocol, and every
+  LIFECYCLE.md sentence that named an arm of `readable` now names the half it actually lives in —
+  the `H2State::Discard` and `H2State::ContinuationFrame` arms in `handle_read`, the DATA-payload
+  `arm_timeout()` site in `poll_read_target`. Against the `d8b8546e` base, 46 citations carrying
+  63 line numbers are renumbered by a difflib alignment map over the cited file; the three the map
+  could not follow correctly — the `read_buffer` dereference, the SETTINGS-ACK deadline block and
+  one pinned code block, all of whose lines this change moves out of `readable` wholesale — were
+  re-anchored by hand from the code, the pin by its literal content.
+
+  Ten prose references that named `readable` as the *location* or the *actor* of code this change
+  moved are re-pointed at the half that now holds it: in LIFECYCLE.md, the `ClientSettings` →
+  `ServerSettings` bullet, the §7.5 SETTINGS-ACK eval site, the `ConnectionH2.now` mirror (whose
+  `self.now = context.now;` is at the top of `poll_read_target`, not of `readable`) and the
+  `read_buffer` caller list (`poll_read_target` and `handle_read`; `readable` reaches the slice
+  through `read_space`); four `h2.rs` doc comments — the three naming the `H2State::Discard` arm
+  and the one naming the helper `handle_header_state` is returned into; and `mod.rs`'s clock-skew
+  note, which named `readable` as the thing that runs `cancel_timed_out_streams` first — the call
+  is at the top of `poll_read_target`, which `readable` invokes before any read. A sweep of
+  every `readable` mention in `lib/**/*.rs` doc and line comments found no other: the rest name
+  either `ConnectionH1::readable` or the pass, which still starts there, and are unchanged.
+
+- **`refactor(mux-h2)`: the three close-under-TLS-backpressure decisions move out of `h2.rs` into a
+  new `lib/src/protocol/mux/h2_close.rs`, where they become pure functions with exhaustive
+  tables.** The `H2State::GoAway` arm of `ConnectionH2::writable`, the
+  `(H2State::Error, Position::Server)` arm beside it, and `force_disconnect`'s server arm all
+  decide whether a connection may close while rustls may still hold encrypted records. Closing
+  with records pending sends FIN and destroys them, which the client reads as a truncated
+  response — the GoAway arm's own comment calls it the primary truncation vector under HAProxy
+  chaining. The same queries, the same flush and the same results, with two deliberate exceptions,
+  both in `force_disconnect`'s server arm. Its two `debug!` lines hard-coded `wants_write=true` and
+  `wants_write=false`, and that arm is reached with records still PENDING whenever the peer is
+  gone, so the line an operator reads while diagnosing a truncation under HAProxy chaining could
+  state the opposite of the socket's state; both now interpolate one binding. Taking that binding
+  also swaps the read order — `socket_wants_write()` is now read before
+  `peer_gone_after_final_goaway()` — which is inert because both are `&self` pure reads, and is
+  stated here rather than folded into a blanket "no behaviour change" that would only hold under
+  an unstated premise.
+
+  The decision is now a pure function of `(peer gone, records pending, have we flushed yet)`. Why
+  that third input exists — the two `socket_wants_write()` calls are two different questions, and
+  `socket_write(&[])`'s returned `size` and `SocketResult` are both discarded at the site — is
+  stated once, in `h2_close`'s module doc under `TlsFlushPhase`, rather than restated here.
+
+  **First coverage these branches have had against a handler that reports buffered records.** No
+  test anywhere instantiated a `ConnectionH2` over a handler whose `socket_wants_write()` could
+  return `true`: `mio::net::TcpStream` and `SessionTcpStream` take the trait's `false` default and
+  only `FrontRustls` overrides it. Every branch in this invariant was statically dead in the
+  suite. `BackpressuredTlsSocket` models rustls over a kernel that accepts a configurable number
+  of records per flush, and drives a real `ConnectionH2` through the `H2State::GoAway` arm, where
+  both post-flush outcomes are now pinned:
+  `a_flush_that_does_not_drain_keeps_the_connection_open` (records survive, session stays open,
+  the WRITABLE event re-signalled, connection still in `GoAway`) and
+  `a_flush_that_succeeds_closes_within_one_writable_call` (kernel takes them, disconnect reached
+  in the same call). Each is red against a distinct mutation, on its own assertion, and each
+  asserts its own premise — that the harness really does report buffered records — first.
+
+  **What is still uncovered.** The `(H2State::Error, Position::Server)` arm and
+  `force_disconnect`'s re-arm branch are exercised only as pure functions in `h2_close`'s tables;
+  no test reaches them through a connection whose handler answers `true`. The
+  `ConnectionH2<FrontRustls>` fixture that would close that gap is sozu-proxy/sozu#1454, which
+  this changeset does not resolve — `BackpressuredTlsSocket` is a TCP handler with a modelled
+  `socket_wants_write`, which is the shape that issue explicitly rules out for closing it.
+
+  One operator-visible detail changes with the extraction: `force_disconnect`'s two `debug!` lines
+  hard-coded `wants_write=true` / `wants_write=false`, and the second is also reached with records
+  still pending when the peer is gone — so the line an operator reads while diagnosing a
+  truncation could state the opposite of the socket's state. Both now interpolate the single
+  `socket_wants_write()` answer the decision itself was taken on.
+
+  LIFECYCLE.md gains invariant 27 for the two-question rule and the tick-count constraint.
+
+- **`refactor(mux)`: `Endpoint::socket(token) -> Option<&TcpStream>` is replaced by
+  `Endpoint::peer_rtt(token) -> Option<Duration>`, so the trait no longer hands one connection
+  another connection's socket.** The method existed for exactly one purpose — sampling TCP_INFO RTT
+  for the side a connection does not own, for the access log's `server_rtt` cell — and every one of
+  its four call sites (`ConnectionH2::snapshot_rtts`, plus H1's upgrade, early-hint and complete
+  paths) immediately did `.and_then(socket_rtt)`. Moving that `socket_rtt` call into the two
+  implementors returns the value instead of the handle.
+
+  No behaviour change: the same `getsockopt(TCP_INFO)` on the same socket at the same moment, with
+  the same `None` on an unresolvable token. What changes is the boundary — a concrete
+  `mio::net::TcpStream` leaves the `Endpoint` trait, which was both an authority leak (any
+  connection could reach any other's socket for any purpose) and the reason no in-memory transport
+  could ever implement the trait. RTT is intrinsically a live-socket property and stays on the
+  embedder's side; the cores receive a value captured for them. This is the Q11 half of the sans-io
+  boundary work.
+
+  Tests: `endpoint_client_peer_rtt_is_keyed_by_token` pins the token-keyed lookup — an unknown
+  token must yield `None` rather than the only backend in the map — and asserts its own premise
+  first, that a KNOWN token returns `Some`, without which it would pass against a `peer_rtt` that
+  always answered `None`. Seen red by swapping `.get(&token)` for `.values().next()`.
+  `endpoint_server_peer_rtt_ignores_the_token` pins the other implementor, seen red by returning
+  `None`. The pair matters because the two sides populate different access-log cells, so a lookup
+  returning the wrong connection's RTT would mislabel the value rather than lose it — which no
+  downstream assertion would have caught.
+
+- **`refactor(mux-h2)`: the per-stream vectored write splits into a gather/confirm pair in a new
+  `lib/src/protocol/mux/h2_transmit.rs`, putting the `unsafe` lifetime extension and the clear that
+  discharges it in one place.** `ConnectionH2::flush_stream_out`'s loop body built `IoSlice`s
+  pointing into `kawa.storage`, transmuted them to `'static`, wrote them, cleared the vector and
+  consumed. `h2_transmit::gather` now produces the descriptors and `h2_transmit::confirm` clears
+  them before `kawa.consume`. No behaviour change: the same bytes, the same single write per round,
+  the same consume.
+
+  **What this does not do**, since the first version of this entry overstated it: the pre-image
+  already cleared before the consume and already carried the same `debug_assert!`, and the gap
+  between the `unsafe` and that clear was six lines, not eleven — the debug event, byte counters
+  and READABLE re-arm all came after the clear, not between. Nor is anything now enforced at the
+  type level: two free functions each taking an independent `&mut Vec` is co-location, not
+  enforcement, and a caller can still reach `Kawa::consume` without asking this module. A guard
+  type owning the vector would earn the word "structural". The real gains are one place to read the
+  obligation and its discharge, a `gather` reusable from a second call site, and both halves
+  drivable in a unit test over a `SliceBuffer` with no pool and no socket.
+
+  The module header states why this is a two-call protocol rather than a `poll_transmit`: a pure
+  `poll_transmit(&mut self, buf: &mut [u8])` would introduce a copy this path does not make today,
+  and unlike a QUIC datagram a TLS byte stream accepts partial writes, so `kawa.consume(size)` needs
+  a number only the shell knows. It is explicitly not `quinn-proto`'s shape, and it does not copy
+  the sibling UDP core's `Transmit`, whose owned `Vec<u8>` payload is the opposite of what this
+  path wants. `protocol/udp/` is a sibling of `protocol/mux/`, not a layer above it, and its
+  `UdpManager::poll_output` drains a manager-wide queue where `gather` sees one stream's `Kawa`.
+
+  It also records where the scheduler's fairness limitation meets this code. What LIFECYCLE
+  invariant 26 scopes to the leading bucket is the **commit**, not the rotation:
+  `apply_incremental_rotation` rotates every same-urgency run, but `Prioriser`'s single
+  connection-global cursor is a foreign id range in every bucket except the one that supplied the
+  pass leader, so `partition_point` returns a constant there and the rotation, though it runs, is a
+  no-op. The result is positional
+  unfairness while a pass completes — but becomes byte starvation when a pass stalls, because the
+  streams after the stalled one are simply not written, and a frozen order presents them last
+  again. That interaction had no home before; it has one now.
+
+  Tests: three deterministic cases (every block in order, an empty queue, a delimiter bounding the
+  offer), `confirm_leaves_no_descriptor_for_the_next_round`, and a sibling `partial_write_property`
+  module. The deterministic test is named for what it can actually observe: an earlier version was
+  called `confirm_clears_the_descriptors_before_consuming` and could not detect that ordering at
+  all, because it inspects the vector only after `confirm` returns, where both orderings leave it
+  empty — verified by moving the clear after the consume AND deleting the internal `debug_assert!`,
+  which leaves the whole suite green. The ordering's real guard is that `debug_assert!`, which is a
+  positional check and compiles out in release; the test doc now says so and carries a separate red
+  recipe for each. The property drives multi-round gather/confirm over an arbitrary block split,
+  arbitrary interleaved `Delimiter`s and an arbitrary cycle of accepts **including zero** —
+  production's `WouldBlock`, and the only way to reach the stalled pass the module header discusses,
+  which an earlier generator made structurally unreachable by emitting `1 + arbitrary % len`. Its
+  oracle is a prefix of the payload the test itself built, plus full delivery exactly when the
+  queue drained; it asserts nothing about liveness or turn-taking across streams, which this
+  repository does not guarantee.
+
+- **`refactor(mux-h2)`: the queued RST_STREAM state moves out of `h2.rs` into a new
+  `lib/src/protocol/mux/h2_control_tx.rs`, behind the same closed API the `hpack_state` /
+  `h2_flow_control` / `h2_stream_table` / `h2_drain` / `h2_flood_detector` /
+  `h2_header_reassembly` / `h2_scheduler` extractions established.** `H2ControlTx` owns the pending
+  `(StreamId, H2Error)` queue, the never-decaying lifetime counter behind the CVE-2025-8671
+  MadeYouReset cap, that cap's value, and the per-insert bound that refuses to grow the queue past
+  it (sozu-proxy/sozu#1413). `H2ControlTx::enqueue_rst` returns an `EnqueueRstOutcome`
+  (`Queued` / `Deduped` / `Dropped`) and tests the bound BEFORE `rst_sent.insert`, so an
+  at-capacity refusal never marks a stream reset without queueing its frame; `ConnectionH2` keeps
+  the `Dropped` accounting — `h2.rst_stream_dropped` plus a session-context `error!` line.
+  Serialization becomes
+  `H2ControlTx::drain_rst_streams_into(&mut [u8]) -> (usize, usize)` — the same caller-supplied-buffer
+  contract `H2FlowControl::drain_window_updates_into` already uses and that `serializer::gen_*`
+  established before either — replacing a serialization loop written inline in
+  `flush_pending_control_frames`. No behaviour change on the wire: emission order is still queue
+  order, a frame is still written whole or not at all, and the frames that do not fit still stay
+  queued for the next `writable()`.
+
+  What the module deliberately does not own is stated in its header with the reason for each: the
+  dedupe set (it lives on `H2StreamTable`, whose removal path asserts it clean), `Readiness`
+  (LIFECYCLE invariant 15 arming), the decision to drain (three gates that all read `ConnectionH2`
+  state), and metrics (a lifetime-cap trip converts to a connection-wide GOAWAY only the connection
+  can return, so accounting stays at queue time — draining emits no metric, or every frame would be
+  counted twice). `ConnectionH2::check_invariants`' RST-accounting clause moves to the module's own
+  `check_invariants` rather than being restated in two places.
+
+  Tests: the five `test_enqueue_rst_into_*` tests move with the state they drive, keeping their
+  names, and `prop_pending_rst_queue_stays_within_its_bound` moves with them — its `Drain` step now
+  goes through the real `drain_rst_streams_into` instead of a bare `Vec::drain`.
+  `mass_reap_keeps_the_pending_rst_queue_within_its_hard_cap` stays in `h2.rs`, where it needs a
+  full `ConnectionH2`, and now reads the queue through `H2ControlTx::pending`. All three
+  `To SEE THIS RED:` recipes are re-pointed at the guard's new home.
+  `drain_rst_streams_into` gets the coverage the inline loop never had — exact-fit, short
+  buffer, a buffer too small for one frame, and an empty queue — plus
+  `draining_does_not_rewind_the_lifetime_cap`, seen red by subtracting the drained count from the
+  lifetime counter, which is exactly how a peer would evade the MadeYouReset cap: drain, re-queue,
+  repeat.
+
+- **`refactor(mux-h2)`: the `peer=` slot of every `MUX-H2` log line is read from a snapshot
+  `ConnectionH2` captures at construction, not from the socket handler on every line.** New private
+  `ConnectionH2::peer_address: Option<SocketAddr>`, filled once in `ConnectionH2::new` from
+  `SocketHandler::peer_addr`; `log_context!` and `log_context_stream!` interpolate the field. No
+  wire behaviour changes. There IS a rendered-line change, and it is the intended one: both
+  production handlers (`SessionTcpStream`, `FrontRustls`) *prefer* a cached address but keep a
+  reachable live-`getpeername(2)` fallback, pinned by its own tests, so on the direct-HTTPS
+  frontend route a `MUX-H2` line emitted after the peer resets now renders `peer=Some(addr)` where
+  it used to render `peer=None`. The snapshot is taken after the handshake, so it answers wherever
+  the fallback would have answered and additionally survives the reset — `df52d83d`'s intent
+  applied one level further in. Nothing here licenses deleting those fallback arms.
+
+  What changes structurally is that rendering a log line is no longer a socket operation.
+  `log_context!` has 113 production callsites in `h2.rs` and `log_context_stream!` has none, and
+  counting production lines that are not comments, the type's `Front` touch points go from **140 to
+  27** — the remaining 27 are direct `self.socket` calls that later steps address. Measured against
+  `d8b8546e`; these are facts about a diff, so they are pinned to their base. This commit
+  itself *grows* `h2.rs` by 165 lines (+169/-4); the file only shrinks once the later extractions land. First
+  step of removing the `Front` parameter from `ConnectionH2`; it moves a value and nothing else.
+  `log_context_reads_the_peer_address_once_per_connection` pins the count at exactly one per
+  connection through a counting `SocketHandler`, which is a property neither existing peer-slot test
+  could observe: both production handlers answer from a cache, so they return the same address
+  however often they are asked.
+
 - **`refactor(mux-h2)`: the RFC 9218 priority and write-pass scheduling decision moves out of
   `h2.rs` into a new `lib/src/protocol/mux/h2_scheduler.rs`, behind the same closed API the
   `hpack_state` / `h2_flow_control` / `h2_stream_table` / `h2_drain` / `h2_flood_detector` /

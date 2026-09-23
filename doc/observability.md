@@ -191,9 +191,13 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
 - Use the macro defined in the file. Do not call `log::info!`/`log::error!`
   directly from protocol code — the prefix tag is load-bearing for
   log-search.
-- The `peer` slot of a `MUX-H2` line is a snapshot taken when the socket
-  handler was built (`SocketHandler::peer_addr`, `lib/src/socket.rs`), not
-  a live `getpeername(2)`. Two consequences an operator should expect.
+- The `peer` slot of a `MUX-H2` line is a snapshot, not a live
+  `getpeername(2)`. It is captured once when `ConnectionH2` is constructed
+  (`ConnectionH2::peer_address`, `lib/src/protocol/mux/h2.rs`), reading the
+  snapshot the socket handler itself took when it was built
+  (`SocketHandler::peer_addr`, `lib/src/socket.rs`). The two agree for every
+  production handler, which is why rendering the line costs no socket access
+  at all. Two consequences an operator should expect.
   First, it stays populated after the peer resets — `getpeername(2)`
   answers `ENOTCONN` there, so a live lookup renders `peer=None` on exactly
   the error lines being read during an incident. Do not match `peer=None`
