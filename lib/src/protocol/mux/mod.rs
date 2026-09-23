@@ -2494,11 +2494,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 }
             }
         }
-        if can_stop {
-            return true;
-        }
-
-        false
+        can_stop
     }
 }
 
