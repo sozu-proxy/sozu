@@ -1908,11 +1908,23 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     instantiates — so before it every branch named in this invariant was
     statically dead in the suite. It drives a real `ConnectionH2` through the
     `H2State::GoAway` arm and covers both post-flush outcomes. The other two
-    sites are covered only as pure functions in `h2_close`'s own tables: the
-    `(H2State::Error, Position::Server)` arm and `force_disconnect`'s re-arm
-    branch are still not reached through a connection whose handler answers
-    `true`. The `ConnectionH2<FrontRustls>` fixture that would close that gap
-    is sozu-proxy/sozu#1454, and it is still open.
+    sites are now reached over the production handler itself.
+    `handshaken_front_rustls` (`h2.rs`) settles a real TLS 1.3 session in
+    memory and attaches it to a loopback socket whose kernel queues are pinned
+    small, so `socket_wants_write()` answers `true` because rustls really is
+    holding records it could not push;
+    `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain` drives
+    the `(H2State::Error, Position::Server)` arm over it,
+    `force_disconnect_over_a_real_rustls_frontend_waits_for_the_records_to_drain`
+    drives `force_disconnect`'s server arm, and
+    `a_rustls_frontend_in_goaway_re_arms_until_its_records_drain` drives the
+    `H2State::GoAway` arm, each asserting both answers on one connection whose
+    only change between them is whether the peer read. The GoAway one also
+    asserts the state is still `GoAway`, because falling through that arm
+    reaches `force_disconnect`, whose own record guard answers
+    `MuxResult::Continue` as well — the result alone cannot tell the two
+    apart. That is what sozu-proxy/sozu#1454 asked for. `h2_close`'s tables
+    remain the exhaustive statement of the decisions; these are their callers.
 
     **A fourth site shares the shape without deciding a close.**
     `ConnectionH2::finalize_write` ends every write pass with the same

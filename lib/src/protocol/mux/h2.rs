@@ -11593,4 +11593,864 @@ mod tests {
             }
         }
     }
+
+    // ── #1454: the write path over a REAL `FrontRustls` ─────────────────
+    //
+    // Every `socket_wants_write()` branch exercised above this point is
+    // exercised over `BackpressuredTlsSocket` — a TCP handler with a modelled
+    // answer. #1454 rules that shape out for closing it: `FrontRustls` is the
+    // only production handler that can answer `true`, and a fixture that fakes
+    // the answer on a TCP handler tests the fake. These are the first tests in
+    // the tree that build a `ConnectionH2<FrontRustls>`;
+    // `git grep -cE 'ConnectionH2<FrontRustls>' -- '*.rs'` answered 0 on every
+    // commit before this one, including on the `write_streams` inversion's head.
+    //
+    // What only the real handler can settle: `(size > 0, WouldBlock)` is not a
+    // scripted pair here. It is what `FrontRustls::socket_write_vectored`
+    // returns when rustls absorbs plaintext into its own record buffer while
+    // `write_tls` blocks against a full kernel send queue — `buffered_size` and
+    // `can_write` are two independent quantities sharing one return value.
+    // `update_readiness` classifies a pass as stalled iff `size == 0`, so that
+    // pair is NOT a stall and the flush loop must go round again. Everything
+    // written against a scripted pair assumes the production handler produces
+    // it; nothing proved it until these tests.
+    //
+    // The handshake runs in memory between a real `rustls::ServerConnection`
+    // and a real `rustls::ClientConnection`, and only then is the settled
+    // server session attached to a loopback socket whose kernel queues are
+    // pinned small. That order matters: a flight never has to fit through the
+    // shrunken queue, so the backpressure under test is entirely the test's
+    // and never the handshake's.
+
+    use crate::socket::FrontRustls;
+
+    /// Accepts whatever certificate the frontend serves.
+    ///
+    /// `lib/assets/certificate.pem` is self-signed and carries NO
+    /// subjectAltName, so rustls's own web-PKI verifier rejects it whatever
+    /// root store it is given — a CN-only certificate is not verifiable under
+    /// RFC 6125 §6.4.4 as rustls implements it. The client here is a
+    /// decryption oracle for bytes the frontend wrote, not a party whose trust
+    /// decision is under test, so it asserts validity outright. Same shape as
+    /// `e2e`'s `Verifier`, which exists for the same certificate.
+    #[derive(Debug)]
+    struct AcceptAnyServerCertificate;
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCertificate {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA384,
+                rustls::SignatureScheme::RSA_PKCS1_SHA512,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+                rustls::SignatureScheme::ED25519,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA512,
+            ]
+        }
+    }
+
+    /// SNI the test certificate is registered under.
+    const TEST_SNI: &str = "lolcatho.st";
+
+    /// Kernel send/receive queue size for the loopback pair, in bytes. Linux
+    /// doubles and floors the request, so the effective queue is a few KiB —
+    /// an order of magnitude under rustls's own 64 KiB record buffer, which is
+    /// what makes `socket_write_vectored` return a partial count AND
+    /// `WouldBlock` together instead of one or the other.
+    const PINNED_SOCKET_QUEUE: usize = 4096;
+
+    /// Bytes the tests below queue as a response. Larger than rustls's record
+    /// buffer, so one `socket_write_vectored` cannot absorb it all.
+    const QUEUED_RESPONSE_LEN: usize = 256 * 1024;
+
+    /// Blocks the response is split into, so a gather offers several slices.
+    const QUEUED_RESPONSE_CHUNK_LEN: usize = QUEUED_RESPONSE_LEN / 8;
+
+    /// Hard bound on the drive loops below. Reaching it is a test failure with
+    /// the byte shortfall attached, never a silent pass.
+    const MAX_DRIVE_TICKS: usize = 4096;
+
+    /// The response bytes, leaked once so blocks can be `Store::Static`.
+    ///
+    /// A repeating non-trivial pattern rather than a constant fill: a
+    /// comparison against a constant fill cannot see bytes delivered out of
+    /// order or a block delivered twice, which is half of what "no truncation"
+    /// has to mean.
+    fn queued_response_body() -> &'static [u8] {
+        static BODY: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+        BODY.get_or_init(|| {
+            let body: Vec<u8> = (0..QUEUED_RESPONSE_LEN)
+                .map(|index| (index % 251) as u8)
+                .collect();
+            Box::leak(body.into_boxed_slice())
+        })
+    }
+
+    /// Move one TLS flight from `from` to `to`, in memory.
+    fn pump_tls<A, B>(
+        from: &mut rustls::ConnectionCommon<A>,
+        to: &mut rustls::ConnectionCommon<B>,
+    ) {
+        let mut wire = Vec::new();
+        while from.wants_write() {
+            from.write_tls(&mut wire)
+                .expect("a TLS flight must serialize into memory");
+        }
+        if wire.is_empty() {
+            return;
+        }
+        let mut cursor = std::io::Cursor::new(wire.as_slice());
+        while (cursor.position() as usize) < wire.len() {
+            to.read_tls(&mut cursor)
+                .expect("a TLS flight must be readable from memory");
+            to.process_new_packets()
+                .expect("a TLS flight must process cleanly");
+        }
+    }
+
+    /// A settled TLS 1.3 `FrontRustls` over a loopback socket whose kernel
+    /// queues are pinned small, the peer end of that socket, and the client
+    /// session that decrypts what the frontend writes.
+    ///
+    /// The peer and the client session are returned rather than kept here
+    /// because dropping either would close the connection under the handler
+    /// being tested, and because together they are the only oracle for "the
+    /// bytes actually arrived".
+    fn handshaken_front_rustls() -> (FrontRustls, std::net::TcpStream, rustls::ClientConnection) {
+        let provider = std::sync::Arc::new(crate::crypto::default_provider());
+
+        let resolver = std::sync::Arc::new(crate::tls::MutexCertificateResolver::default());
+        resolver
+            .0
+            .lock()
+            .expect("the test resolver lock must be available")
+            .add_certificate(&sozu_command::proto::command::AddCertificate {
+                address: sozu_command::proto::command::SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate: sozu_command::proto::command::CertificateAndKey {
+                    certificate: include_str!("../../../assets/certificate.pem").to_owned(),
+                    key: include_str!("../../../assets/key.pem").to_owned(),
+                    names: vec![TEST_SNI.to_owned()],
+                    ..Default::default()
+                },
+                expired_at: None,
+            })
+            .expect("the test certificate must load into the resolver");
+
+        let mut server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("the test provider must support TLS 1.3")
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+        // TLS 1.3 queues NewSessionTicket straight after the client Finished.
+        // A server that sends tickets answers `socket_wants_write()` with
+        // `true` before this fixture has queued a single response byte, and
+        // every test below would then read `true` for the wrong reason.
+        server_config.send_tls13_tickets = 0;
+
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("the test provider must support TLS 1.3")
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyServerCertificate))
+            .with_no_client_auth();
+
+        let mut server = rustls::ServerConnection::new(std::sync::Arc::new(server_config))
+            .expect("the test server session must initialize");
+        let mut client = rustls::ClientConnection::new(
+            std::sync::Arc::new(client_config),
+            rustls::pki_types::ServerName::try_from(TEST_SNI)
+                .expect("the test SNI must be a valid DNS name"),
+        )
+        .expect("the test client session must initialize");
+
+        for _ in 0..MAX_DRIVE_TICKS {
+            if !client.is_handshaking()
+                && !server.is_handshaking()
+                && !client.wants_write()
+                && !server.wants_write()
+            {
+                break;
+            }
+            pump_tls(&mut client, &mut server);
+            pump_tls(&mut server, &mut client);
+        }
+
+        assert!(
+            !server.is_handshaking() && !client.is_handshaking(),
+            "premise: the in-memory handshake must complete, or the session \
+             under test buffers plaintext instead of encrypting it"
+        );
+        assert!(
+            !server.wants_write(),
+            "premise: a settled handshake must leave the server holding no \
+             records, or socket_wants_write() answers true before this fixture \
+             has queued one response byte"
+        );
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("the test listener must bind");
+        // Set on the listener so the accepted socket inherits it and the
+        // advertised window starts small.
+        socket2::SockRef::from(&listener)
+            .set_recv_buffer_size(PINNED_SOCKET_QUEUE)
+            .expect("the test listener receive queue must shrink");
+        let address = listener
+            .local_addr()
+            .expect("the test listener must expose its address");
+        let front = std::net::TcpStream::connect(address).expect("the loopback connect must land");
+        let (peer, _peer_address) = listener.accept().expect("the test peer must be accepted");
+        socket2::SockRef::from(&front)
+            .set_send_buffer_size(PINNED_SOCKET_QUEUE)
+            .expect("the frontend send queue must shrink");
+        socket2::SockRef::from(&peer)
+            .set_recv_buffer_size(PINNED_SOCKET_QUEUE)
+            .expect("the peer receive queue must shrink");
+        front
+            .set_nonblocking(true)
+            .expect("mio requires a non-blocking stream");
+        peer.set_nonblocking(true)
+            .expect("the peer must not block the drive loop");
+
+        let socket = FrontRustls {
+            stream: mio::net::TcpStream::from_std(front),
+            session: server,
+            peer_disconnected: false,
+            peer_reset: false,
+            session_ulid: Ulid::generate(),
+            configured_peer: None,
+        };
+        (socket, peer, client)
+    }
+
+    /// A server `ConnectionH2` over that handler.
+    ///
+    /// `state` is a parameter for the same reason
+    /// `connection_with_backpressure` takes one: the close decision reads it
+    /// as `H2State::GoAway` and the write pass reads it as `H2State::Header`.
+    fn rustls_h2_connection(
+        pool: &Rc<RefCell<Pool>>,
+        state: H2State,
+    ) -> (
+        ConnectionH2<FrontRustls>,
+        std::net::TcpStream,
+        rustls::ClientConnection,
+    ) {
+        let (socket, peer, client) = handshaken_front_rustls();
+        let mut connection = ConnectionH2::new(
+            Ulid::generate(),
+            socket,
+            Position::Server,
+            Rc::downgrade(pool),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
+            Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        connection.state = state;
+        (connection, peer, client)
+    }
+
+    /// Read every TLS record the peer's kernel currently holds, decrypt it,
+    /// and append the plaintext to `received`.
+    fn drain_peer(
+        client: &mut rustls::ClientConnection,
+        peer: &mut std::net::TcpStream,
+        received: &mut Vec<u8>,
+    ) {
+        loop {
+            match client.read_tls(peer) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    panic!("the peer must read the frontend's TLS records: {error:?}")
+                }
+            }
+            client
+                .process_new_packets()
+                .expect("the peer must decrypt what the frontend wrote");
+            take_plaintext(client, received);
+        }
+        take_plaintext(client, received);
+    }
+
+    /// Drain the client session's decrypted plaintext buffer.
+    ///
+    /// `WouldBlock` here means "nothing decrypted yet", not an error, and
+    /// `read_to_end` appends whatever it did read before reporting it.
+    fn take_plaintext(client: &mut rustls::ClientConnection, received: &mut Vec<u8>) {
+        use std::io::Read as _;
+        let mut plaintext = Vec::new();
+        match client.reader().read_to_end(&mut plaintext) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("the peer must decrypt the frontend's records: {error:?}"),
+        }
+        received.extend_from_slice(&plaintext);
+    }
+
+    /// Keep flushing the handler's buffered records while the peer reads,
+    /// until rustls holds nothing. Returns whether it got there.
+    fn flush_until_drained(
+        socket: &mut FrontRustls,
+        client: &mut rustls::ClientConnection,
+        peer: &mut std::net::TcpStream,
+        received: &mut Vec<u8>,
+    ) -> bool {
+        for _ in 0..MAX_DRIVE_TICKS {
+            if !socket.socket_wants_write() {
+                return true;
+            }
+            // Loopback delivery is softirq-driven, not synchronous with
+            // `write_tls`: give it a slot rather than spinning the CPU.
+            std::thread::yield_now();
+            drain_peer(client, peer, received);
+            socket.socket_write(&[]);
+        }
+        !socket.socket_wants_write()
+    }
+
+    /// `FrontRustls` answers a blocked write with bytes taken AND `WouldBlock`,
+    /// and `update_readiness` calls that pair not-stalled.
+    ///
+    /// This is the premise every scripted `(size > 0, WouldBlock)` test in this
+    /// file rests on, taken here from the production handler instead of from a
+    /// fixture: rustls absorbs plaintext into its record buffer while
+    /// `write_tls` blocks against the kernel, so `buffered_size` and
+    /// `can_write` disagree and one return value carries both answers.
+    ///
+    /// TO SEE THIS RED: in `FrontRustls::socket_write_vectored`, report
+    /// nothing absorbed on a blocked write — change the `!can_write` arm of
+    /// the final result from `(buffered_size, SocketResult::WouldBlock)` to
+    /// `(0, SocketResult::WouldBlock)`. That is the under-reporting half of
+    /// the same class the over-reporting one below belongs to, and the caller
+    /// then re-offers bytes rustls already holds. This test fails on `rustls
+    /// takes plaintext off the caller's hands even while the kernel is full,
+    /// so the handler must report the bytes it absorbed`. Measured: `1092
+    /// passed; 6 failed` — every test in this block and nothing else, so the
+    /// whole class was invisible to the suite.
+    ///
+    /// Not a red recipe, and measured as such: deleting `can_write = false;`
+    /// from the `ErrorKind::WouldBlock` arm of the partial-absorb draining
+    /// loop leaves the entire suite green. The post-loop flush block sets the
+    /// same flag for the same reason a moment later, so the `WouldBlock` half
+    /// of this pair is guarded twice in production and no single-site deletion
+    /// of it is observable here.
+    #[test]
+    fn a_real_rustls_frontend_reports_bytes_taken_and_would_block_together() {
+        let (mut socket, _peer, _client) = handshaken_front_rustls();
+        let body = queued_response_body();
+
+        assert!(
+            !socket.socket_wants_write(),
+            "premise: the fixture must start with rustls holding nothing"
+        );
+
+        let (size, status) = socket.socket_write_vectored(&[IoSlice::new(body)]);
+
+        assert!(
+            size > 0,
+            "rustls takes plaintext off the caller's hands even while the \
+             kernel is full, so the handler must report the bytes it absorbed"
+        );
+        assert!(
+            size < body.len(),
+            "premise: the offer must exceed what one call can absorb, or the \
+             partial-write path that produces this pair is never entered \
+             (absorbed {size} of {})",
+            body.len()
+        );
+        assert_eq!(
+            status,
+            SocketResult::WouldBlock,
+            "a frontend whose kernel send queue is full must report WouldBlock"
+        );
+        assert!(
+            socket.socket_wants_write(),
+            "the records rustls could not push must still be waiting, which is \
+             the only reason any close path has to ask"
+        );
+
+        let mut readiness = Readiness {
+            event: Ready::WRITABLE,
+            interest: Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        };
+        assert!(
+            !update_readiness_after_write(size, status, &mut readiness),
+            "a write that moved bytes is not a stall however it reported its \
+             status: a pass that ends here leaves the rest of the response \
+             queued behind a WouldBlock the rule does not treat as one"
+        );
+    }
+
+    /// The empty flush the close paths issue really does hand rustls's records
+    /// to the kernel — `true` before it and `false` after, once the peer reads.
+    ///
+    /// `socket_write(&[])` is the middle call of every flush triple in
+    /// `h2.rs`: those sites discard its `(size, status)` entirely and learn
+    /// whether it landed only by asking `socket_wants_write()` again. That
+    /// reconstruction is only sound if a zero-length write flushes at all, and
+    /// `FrontRustls::socket_write`'s main loop exits immediately for an empty
+    /// buffer — the flush lives in a block after it, reached by no other path.
+    ///
+    /// TO SEE THIS RED: in `FrontRustls::socket_write`, delete the post-loop
+    /// `if !is_error && !is_closed && can_write && self.session.wants_write()`
+    /// block. `socket_write(&[])` becomes a no-op, the records never reach the
+    /// kernel, and this test fails on `once the peer reads, the empty flush
+    /// must hand every record to the kernel: rustls still holds records after
+    /// 4096 flushes against a draining peer`. Measured: `1093 passed; 5
+    /// failed` — five of the six here and nothing that predates them, so the
+    /// block that comment calls load-bearing had no unit coverage at all.
+    #[test]
+    fn an_empty_flush_drains_the_records_a_blocked_write_left_behind() {
+        let (mut socket, mut peer, mut client) = handshaken_front_rustls();
+        let body = queued_response_body();
+
+        let (absorbed, _status) = socket.socket_write_vectored(&[IoSlice::new(body)]);
+        assert!(
+            socket.socket_wants_write(),
+            "premise: a blocked kernel must leave records pending, or neither \
+             arm below is reachable"
+        );
+
+        // The kernel is still full: the flush cannot land and the query
+        // answers `true` on both sides of it. This is the "true twice" arm.
+        socket.socket_write(&[]);
+        assert!(
+            socket.socket_wants_write(),
+            "a flush against a full kernel leaves the records where they were, \
+             so the triple's second query must still answer true"
+        );
+
+        // Now the peer reads, and the same flush must land. This is the
+        // "true then false" arm.
+        let mut received = Vec::new();
+        assert!(
+            flush_until_drained(&mut socket, &mut client, &mut peer, &mut received),
+            "once the peer reads, the empty flush must hand every record to \
+             the kernel: rustls still holds records after {MAX_DRIVE_TICKS} \
+             flushes against a draining peer"
+        );
+
+        for _ in 0..MAX_DRIVE_TICKS {
+            if received.len() >= absorbed {
+                break;
+            }
+            std::thread::yield_now();
+            drain_peer(&mut client, &mut peer, &mut received);
+        }
+        assert_eq!(
+            received.len(),
+            absorbed,
+            "every plaintext byte rustls reported absorbing must reach the peer"
+        );
+        assert_eq!(
+            received.as_slice(),
+            &body[..absorbed],
+            "the peer must receive those bytes unchanged and in order"
+        );
+    }
+
+    /// A response larger than one pass can deliver reaches the peer in full,
+    /// driven through `writable()` over the production TLS handler.
+    ///
+    /// This is #1454's truncation vector end to end, with no scripted answer
+    /// anywhere: the `(size > 0, WouldBlock)` and `(0, WouldBlock)` pairs come
+    /// from `FrontRustls` against a real full kernel, the stall and its resume
+    /// come from `write_streams`, and the oracle is the bytes a real
+    /// `rustls::ClientConnection` decrypts on the other end of the socket. The
+    /// assertion is byte equality, not a call count, so it says nothing about
+    /// how the write machine is shaped and everything about what it delivers.
+    ///
+    /// TO SEE THIS RED: in `FrontRustls::socket_write_vectored`, report the
+    /// full offer instead of what rustls took — replace the final
+    /// `(buffered_size, SocketResult::WouldBlock)` with
+    /// `(total_len, SocketResult::WouldBlock)`. That is the over-reporting
+    /// shape `socket_write`/`socket_write_vectored`'s own comments call the
+    /// 4.5 MB truncation-class bug: `h2_transmit::confirm` then consumes bytes
+    /// the socket never encrypted and they are gone. Measured: `1095 passed; 3
+    /// failed`, this one on `the response was truncated at 65536 of 262144
+    /// bytes after 4096 passes, with 0 blocks still queued`. The pass empties
+    /// `kawa.out` against bytes that were never sent, `finalize_write` reads
+    /// that as everything written and quiesces, and the remaining 196608 bytes
+    /// have no route to the wire at all — the connection is not short, it is
+    /// hung, and the tick cap is what converts that into a failure instead of
+    /// a wait. Nothing that predates this block moves.
+    #[test]
+    fn a_blocked_rustls_frontend_delivers_every_queued_byte_across_passes() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, mut peer, mut client) = rustls_h2_connection(&pool, H2State::Header);
+        let mut context = test_context(&pool);
+        let body = queued_response_body();
+
+        let gid = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        connection
+            .stream_table
+            .register(REGISTERED_STREAM_ID, gid, connection.now);
+        for chunk in body.chunks(QUEUED_RESPONSE_CHUNK_LEN) {
+            context.streams[gid]
+                .back
+                .out
+                .push_back(kawa::OutBlock::Store(kawa::Store::Static(chunk)));
+        }
+        assert_prepare_gate_is_shut(&context, gid);
+        assert_eq!(
+            connection.stream_table.expect_write(),
+            None,
+            "premise: no parked write, so the first pass takes the main loop"
+        );
+
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let mut received = Vec::new();
+        let mut ticks = 0usize;
+
+        loop {
+            // What the event loop does: report the socket writable, run the
+            // pass, and let the peer read whatever reached the kernel.
+            connection.readiness.event.insert(Ready::WRITABLE);
+            connection.writable(&mut context, EndpointClient(&mut router));
+            std::thread::yield_now();
+            drain_peer(&mut client, &mut peer, &mut received);
+
+            if received.len() >= body.len() {
+                break;
+            }
+            ticks += 1;
+            assert!(
+                ticks < MAX_DRIVE_TICKS,
+                "the response was truncated at {} of {} bytes after {ticks} \
+                 passes, with {} blocks still queued",
+                received.len(),
+                body.len(),
+                context.streams[gid].back.out.len()
+            );
+            // Owed, not undelivered: once `kawa.out` is empty and rustls
+            // holds nothing, every byte has been handed to the kernel and
+            // `finalize_write` may legitimately quiesce while the last of it
+            // is still crossing loopback. Asserting on `received` here would
+            // blame the write machine for the harness's own race.
+            let still_owed =
+                !context.streams[gid].back.out.is_empty() || connection.socket.socket_wants_write();
+            assert!(
+                !still_owed || connection.readiness.interest.is_writable(),
+                "a pass that still owes bytes must keep WRITABLE interest, or \
+                 no later event reaches this connection and the response is \
+                 truncated at {} of {} bytes with {} blocks queued",
+                received.len(),
+                body.len(),
+                context.streams[gid].back.out.len()
+            );
+        }
+
+        assert_eq!(
+            received.len(),
+            body.len(),
+            "the peer must receive every queued byte"
+        );
+        assert_eq!(
+            received.as_slice(),
+            body,
+            "the peer must receive the queued bytes unchanged and in order"
+        );
+        assert!(
+            context.streams[gid].back.out.is_empty(),
+            "every queued block must be consumed once the response is delivered"
+        );
+        assert_eq!(
+            context.streams[gid].metrics.bout,
+            body.len(),
+            "the stream must account exactly the bytes the socket took"
+        );
+    }
+
+    /// `force_disconnect`'s server arm, over the handler whose
+    /// `socket_wants_write()` is the only production implementation that can
+    /// answer `true`: it re-arms while rustls holds records and closes once
+    /// they are gone.
+    ///
+    /// One test for both arms because the TRANSITION is the claim — the same
+    /// connection, the same records, and the only thing that changes is
+    /// whether the peer read them. A pair of connections would prove the two
+    /// answers of a table `h2_close::force_disconnect_action` already tables
+    /// exhaustively; what has never been proved is that this caller reads a
+    /// real handler's answer at all.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::force_disconnect`'s server arm,
+    /// replace `let tls_wants_write = self.socket.socket_wants_write();` with
+    /// `let tls_wants_write = false;` — the decision stops reading the socket,
+    /// and the call closes the session while records are pending, which sends
+    /// FIN and destroys them. This test fails on `a disconnect with records
+    /// pending must not close the session: closing sends FIN and destroys the
+    /// records rustls still holds, which the peer reads as a truncated
+    /// response`. Measured: `1096 passed; 2 failed` — this test and
+    /// `force_disconnect_re_arms_while_tls_records_are_pending`, the same
+    /// decision with one witness over a modelled handler and one over the
+    /// production one.
+    #[test]
+    fn force_disconnect_over_a_real_rustls_frontend_waits_for_the_records_to_drain() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, mut peer, mut client) = rustls_h2_connection(&pool, H2State::GoAway);
+        let body = queued_response_body();
+
+        let (absorbed, _status) = connection
+            .socket
+            .socket_write_vectored(&[IoSlice::new(body)]);
+        assert!(
+            absorbed > 0 && connection.socket.socket_wants_write(),
+            "premise: the blocked kernel must leave real records pending"
+        );
+        assert!(
+            !connection.peer_gone_after_final_goaway(),
+            "premise: the peer must still be live, or the decision \
+             short-circuits on its first boolean and never reads the socket"
+        );
+
+        assert!(
+            matches!(connection.force_disconnect(), MuxResult::Continue),
+            "a disconnect with records pending must not close the session: \
+             closing sends FIN and destroys the records rustls still holds, \
+             which the peer reads as a truncated response"
+        );
+        assert!(
+            connection.readiness.interest.is_writable(),
+            "the delayed close must keep WRITABLE interest so the write path \
+             can still flush"
+        );
+        assert!(
+            connection.readiness.event.is_writable(),
+            "ensure_tls_flushed must re-signal the WRITABLE event: nothing \
+             else wakes an edge-triggered connection whose records are stuck \
+             in rustls rather than in the kernel"
+        );
+
+        let mut received = Vec::new();
+        assert!(
+            flush_until_drained(
+                &mut connection.socket,
+                &mut client,
+                &mut peer,
+                &mut received
+            ),
+            "premise for the second arm: the records must actually drain once \
+             the peer reads"
+        );
+
+        assert!(
+            matches!(connection.force_disconnect(), MuxResult::CloseSession),
+            "with rustls holding nothing, the same call must close: delaying \
+             further would strand a connection with no reason left to wait"
+        );
+    }
+
+    /// `writable`'s `(H2State::Error, Position::Server)` arm reads the real
+    /// handler's POST-flush answer: it re-arms while rustls still holds
+    /// records and closes only once they are gone.
+    ///
+    /// That arm has no flush of its own — the preamble a few lines above it
+    /// already issued this pass's `socket_write(&[])` and discarded both the
+    /// size and the status it returned, so `socket_wants_write()` is the only
+    /// thing that can tell this site whether the flush landed. Until now the
+    /// arm was exercised only as `h2_close::error_close_action`'s pure table;
+    /// no test reached it through a connection whose handler could answer
+    /// `true`, because none existed.
+    ///
+    /// TO SEE THIS RED: in that arm, replace
+    /// `h2_close::error_close_action(self.socket.socket_wants_write())` with
+    /// `h2_close::error_close_action(false)` — the decision stops reading the
+    /// socket and closes with records pending, sending FIN over plaintext the
+    /// peer never received. Measured, this test fails on `a pass that finds
+    /// records still pending after its own flush must not close the session:
+    /// the close destroys plaintext the peer has not received and it reads the
+    /// response as truncated`. Measured: `1097 passed; 1 failed` — it is the
+    /// only test in the crate that moves.
+    #[test]
+    fn a_rustls_frontend_in_error_state_re_arms_until_its_records_drain() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, mut peer, mut client) = rustls_h2_connection(&pool, H2State::Error);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let body = queued_response_body();
+
+        let (absorbed, _status) = connection
+            .socket
+            .socket_write_vectored(&[IoSlice::new(body)]);
+        assert!(
+            absorbed > 0 && connection.socket.socket_wants_write(),
+            "premise: the blocked kernel must leave real records pending, or \
+             this arm reads its only input as false and the test proves nothing"
+        );
+
+        connection.readiness.event.insert(Ready::WRITABLE);
+        assert!(
+            matches!(
+                connection.writable(&mut context, EndpointClient(&mut router)),
+                MuxResult::Continue
+            ),
+            "a pass that finds records still pending after its own flush must \
+             not close the session: the close destroys plaintext the peer has \
+             not received and it reads the response as truncated"
+        );
+        assert!(
+            connection.readiness.event.is_writable(),
+            "ensure_tls_flushed must re-signal the WRITABLE event, since \
+             nothing else wakes a connection whose bytes are stuck in rustls \
+             rather than in the kernel"
+        );
+
+        let mut received = Vec::new();
+        assert!(
+            flush_until_drained(
+                &mut connection.socket,
+                &mut client,
+                &mut peer,
+                &mut received
+            ),
+            "premise for the second arm: the records must actually drain once \
+             the peer reads"
+        );
+
+        connection.readiness.event.insert(Ready::WRITABLE);
+        assert!(
+            matches!(
+                connection.writable(&mut context, EndpointClient(&mut router)),
+                MuxResult::CloseSession
+            ),
+            "with rustls holding nothing, the same pass must close: the bytes \
+             are all in the kernel and waiting longer strands the session"
+        );
+    }
+
+    /// `writable`'s `H2State::GoAway` arm — the triple whose own comment calls
+    /// it the primary truncation vector under HAProxy chaining — over the
+    /// production TLS handler: it re-arms while rustls still holds records and
+    /// disconnects only once they are gone.
+    ///
+    /// This is the triple #1454 names. Of the three, `finalize_write`'s is
+    /// driven by `a_blocked_rustls_frontend_delivers_every_queued_byte_across_passes`
+    /// above and `writable`'s Error arm by
+    /// `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain`; this
+    /// one completes the set. The fourth `socket_write(&[])` site,
+    /// `flush_zero_buffer`, is deliberately not targeted here: it keeps the
+    /// status its flush returned instead of re-querying, so it is not this
+    /// shape and a test aimed at it would prove nothing about the vector.
+    ///
+    /// The state assertion is not decoration. Falling through this arm reaches
+    /// `force_disconnect`, which has a record guard of its own and answers
+    /// `MuxResult::Continue` too — so the result alone cannot tell a correct
+    /// re-arm from a fall-through that only looks correct. `H2State::Error` is
+    /// what the fall-through leaves behind, and nothing else sets it here.
+    ///
+    /// TO SEE THIS RED: in that arm, replace the post-flush
+    /// `h2_close::goaway_close_action(TlsFlushPhase::AfterFlush, false,
+    /// self.socket.socket_wants_write())` third argument with `false`. The arm
+    /// stops reading whether its own flush landed, falls through to
+    /// `force_disconnect`, and this test fails on `a GoAway pass whose flush
+    /// did not land must stay in GoAway`. Measured: `1096 passed; 2 failed` —
+    /// this test and `a_flush_that_does_not_drain_keeps_the_connection_open`,
+    /// the same arm with one witness over a modelled handler and one over the
+    /// production one.
+    #[test]
+    fn a_rustls_frontend_in_goaway_re_arms_until_its_records_drain() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, mut peer, mut client) = rustls_h2_connection(&pool, H2State::GoAway);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let body = queued_response_body();
+
+        let (absorbed, _status) = connection
+            .socket
+            .socket_write_vectored(&[IoSlice::new(body)]);
+        assert!(
+            absorbed > 0 && connection.socket.socket_wants_write(),
+            "premise: the blocked kernel must leave real records pending"
+        );
+        assert!(
+            !connection.peer_gone_after_final_goaway(),
+            "premise: the peer must still be live, or the decision \
+             short-circuits on its first boolean and never reads the socket"
+        );
+
+        connection.readiness.event.insert(Ready::WRITABLE);
+        assert!(
+            matches!(
+                connection.writable(&mut context, EndpointClient(&mut router)),
+                MuxResult::Continue
+            ),
+            "a GoAway pass that finds records still pending after its own \
+             flush must not close: FIN here destroys plaintext the peer never \
+             received"
+        );
+        assert!(
+            matches!(connection.state, H2State::GoAway),
+            "a GoAway pass whose flush did not land must stay in GoAway: \
+             reaching Error means the arm fell through to force_disconnect \
+             and its own record guard, not this one, kept the session alive"
+        );
+        assert!(
+            connection.readiness.event.is_writable(),
+            "ensure_tls_flushed must re-signal the WRITABLE event so the loop \
+             comes back and retries the flush"
+        );
+
+        let mut received = Vec::new();
+        assert!(
+            flush_until_drained(
+                &mut connection.socket,
+                &mut client,
+                &mut peer,
+                &mut received
+            ),
+            "premise for the second arm: the records must actually drain once \
+             the peer reads"
+        );
+
+        connection.readiness.event.insert(Ready::WRITABLE);
+        assert!(
+            matches!(
+                connection.writable(&mut context, EndpointClient(&mut router)),
+                MuxResult::CloseSession
+            ),
+            "with rustls holding nothing, the same pass must disconnect: every \
+             byte is in the kernel and waiting longer strands the session"
+        );
+    }
 }

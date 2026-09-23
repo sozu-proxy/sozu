@@ -4,6 +4,78 @@
 
 ### ✨ Added
 
+- **`test(mux-h2)`: the first `ConnectionH2<FrontRustls>` in the tree — the H2 write path under TLS
+  backpressure now has coverage against the production handler instead of a modelled one.**
+  `git grep -cE 'ConnectionH2<FrontRustls>' -- '*.rs'` answers 0 at `c0f01021` and on every commit
+  before it: every `socket_wants_write()` branch that had coverage had it over
+  `BackpressuredTlsSocket`, a TCP handler with a modelled answer, which sozu-proxy/sozu#1454
+  explicitly rules out for closing itself — `mio::net::TcpStream` and `SessionTcpStream` take the
+  trait's `false` default and `FrontRustls` is the only production override, so a fixture that
+  fakes the answer elsewhere tests the fake. `handshaken_front_rustls` settles a real TLS 1.3
+  session in memory between a `rustls::ServerConnection` and a `rustls::ClientConnection`, then
+  attaches the settled server session to a loopback socket whose kernel send and receive queues are
+  pinned to a few KiB. The handshake never has to fit through those queues, so the backpressure
+  under test is entirely the test's; `send_tls13_tickets = 0` keeps the server from queueing a
+  NewSessionTicket, which would otherwise make `socket_wants_write()` answer `true` before a single
+  response byte exists. The surviving `ClientConnection` is the oracle: what it decrypts is what the
+  peer received.
+
+  Six tests. `a_real_rustls_frontend_reports_bytes_taken_and_would_block_together` takes the
+  `(size > 0, WouldBlock)` pair from the production handler rather than from a script — rustls
+  absorbs plaintext into its record buffer while `write_tls` blocks against the kernel, so
+  `buffered_size` and `can_write` disagree and one return value carries both — and pins that
+  `update_readiness` calls that pair not-stalled.
+  `an_empty_flush_drains_the_records_a_blocked_write_left_behind` pins both answers of the flush
+  triples' middle call, `true` on both sides while the kernel is full and `true` then `false` once
+  the peer reads. `a_blocked_rustls_frontend_delivers_every_queued_byte_across_passes` queues 256
+  KiB on a registered stream and drives `writable()` until the client has decrypted all of it,
+  asserting byte equality rather than a call count.
+  `force_disconnect_over_a_real_rustls_frontend_waits_for_the_records_to_drain`,
+  `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain` and
+  `a_rustls_frontend_in_goaway_re_arms_until_its_records_drain` drive `force_disconnect`'s server
+  arm, `writable`'s `(H2State::Error, Position::Server)` arm and `writable`'s `H2State::GoAway` arm
+  over that handler, each asserting both outcomes on ONE connection whose only change between them
+  is whether the peer read. The GoAway one also asserts the connection is still in `H2State::GoAway`:
+  falling through that arm reaches `force_disconnect`, whose own record guard answers
+  `MuxResult::Continue` too, so the result alone cannot tell a correct re-arm from a fall-through
+  that only looks correct. All three `query / socket_write(&[]) / query` triples now have a witness
+  over the production handler — `finalize_write`'s through the byte-conservation test, and these two
+  arms directly; the fourth `socket_write(&[])` site, `flush_zero_buffer`, is not one of them,
+  because it keeps the status its flush returned instead of re-querying. LIFECYCLE §9 invariant 27's
+  "what is tested, and what is not" paragraph is updated accordingly: those sites were covered only
+  as `h2_close` tables, and now have callers.
+
+  **The two `FlushOutcome::Stalled` consumers are reached for the first time.** Measured by planted
+  probes on this branch, one run of the byte-conservation test enters
+  `write_streams`'s resume-path consumer 30 times and its main-loop `break 'outer` consumer once,
+  along with `writable`'s preamble flush (42), `finalize_write`'s `Flush` arm (11) and its `ReArm`
+  arm into `ensure_tls_flushed` (12). Both consumers were previously measured as reached by zero
+  tests. The same probes on sozu-proxy/sozu#1479's head, `98745bba`, report the same counts through
+  its `poll_write_target`/`handle_write` shape — 30 resume-path stalls, one main-loop stall, 42
+  preamble flushes — and `handle_write` answers `stalled = false` for 33 `WouldBlock` writes that
+  moved bytes, so the inversion did not turn `status` into a pass terminator. All six tests compile
+  and pass unchanged on that head; they name none of the symbols it deletes.
+
+  **Two findings recorded rather than fixed.** `FrontRustls::socket_write`'s post-loop flush block —
+  the one whose own comment says that without it "the main loop above exits immediately for empty
+  buffers and `write_tls` is never called" — had no unit coverage at all: deleting it measures
+  `1093 passed; 5 failed`, five of these six and nothing that predates them. And the `WouldBlock`
+  half of the `(size > 0, WouldBlock)` pair is guarded TWICE in production, so deleting
+  `can_write = false` from the partial-absorb draining loop is not observable at all — the post-loop
+  block sets the same flag a moment later and the whole suite stays green. Each test carries its
+  verified red recipe and the measured failure text; the under-reporting mutation
+  (`(0, SocketResult::WouldBlock)`) measures `1092 passed; 6 failed` — every test in this block and
+  nothing else, which is the size of the blind spot.
+
+  **Still uncovered, measured rather than assumed.** Probes planted at each of the following printed
+  nothing across all six tests: `initiate_close_notify`, `has_pending_write`'s TLS disjunct,
+  `flush_zero_to_socket`, `flush_zero_buffer`, `close`'s `tls_pending_before`, and
+  `flush_pending_control_frames`'s two queries — that function is entered 43 times in one
+  byte-conservation run, but both queries sit behind stages needing queued control frames or a
+  parked zero-buffer write, and this fixture opens neither. `shared.rs`'s two in
+  `drain_tls_close_notify` are uncovered because nothing calls that function at all. Test-only: no
+  production code, no dependency and no `Cargo.lock` entry changes.
+
 - **`test(fuzz)`: cargo-fuzz target for the command channel's length-delimited IPC framing.**
   `fuzz/fuzz_targets/fuzz_command_channel.rs` drives `Channel::try_read_delimited_message` and
   `Channel::write_delimited_message` (`command/src/channel.rs`) through their public, purely
