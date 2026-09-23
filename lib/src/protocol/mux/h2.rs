@@ -6341,7 +6341,7 @@ mod tests {
             mux::{
                 connection::EndpointClient,
                 router::Router,
-                test_support::{connected_socket, test_context},
+                test_support::{TestListener, connected_socket, test_context},
             },
         },
     };
@@ -7291,6 +7291,35 @@ mod tests {
         pending: std::cell::Cell<usize>,
         drain_per_flush: usize,
         flushes: std::cell::Cell<usize>,
+        /// Scripted answers for `socket_write_vectored`, armed by
+        /// [`Self::arm_vectored_script`]. See `ScriptedWrite`.
+        script: std::collections::VecDeque<ScriptedWrite>,
+        /// `false` until the script is armed, and while it is false
+        /// `socket_write_vectored` delegates to the real stream exactly as it
+        /// did before the script existed — so the four tests above, which
+        /// never arm it, are untouched by any of this.
+        vectored_scripted: bool,
+        /// Every byte the socket accepted through the vectored path, in order.
+        accepted: Vec<u8>,
+        /// Bytes offered to the first vectored call since the script was armed.
+        first_offer: Option<usize>,
+        vectored_calls: usize,
+        /// Scripted answers actually served. A test asserts on this before
+        /// anything else: a pass that never reached the vectored path would
+        /// otherwise satisfy every outcome assertion while the injected fault
+        /// sat unused in the queue.
+        scripted_answers_used: usize,
+    }
+
+    /// One scripted answer from [`BackpressuredTlsSocket::socket_write_vectored`].
+    #[derive(Clone, Copy, Debug)]
+    struct ScriptedWrite {
+        /// Bytes the kernel takes from the offer, clamped to it — so a script
+        /// can never trip `flush_stream_out`'s own
+        /// `debug_assert!(size <= offered)` and redden a test through someone
+        /// else's assertion.
+        accept: usize,
+        status: SocketResult,
     }
 
     impl BackpressuredTlsSocket {
@@ -7300,7 +7329,32 @@ mod tests {
                 pending: std::cell::Cell::new(pending),
                 drain_per_flush,
                 flushes: std::cell::Cell::new(0),
+                script: std::collections::VecDeque::new(),
+                vectored_scripted: false,
+                accepted: Vec::new(),
+                first_offer: None,
+                vectored_calls: 0,
+                scripted_answers_used: 0,
             }
+        }
+
+        /// Arm the vectored fault and forget the setup.
+        ///
+        /// Called between opening a stream and the one `writable()` pass under
+        /// test, so every counter the assertions read describes that pass
+        /// alone. Resetting `pending` and `flushes` here is what lets the same
+        /// handler serve both models: the flush-driven one the tests above use,
+        /// and the write-driven one below, where `socket_wants_write()` is
+        /// DERIVED from the vectored status rather than seeded up front.
+        fn arm_vectored_script(&mut self, script: Vec<ScriptedWrite>) {
+            self.script = script.into();
+            self.vectored_scripted = true;
+            self.pending.set(0);
+            self.flushes.set(0);
+            self.accepted.clear();
+            self.first_offer = None;
+            self.vectored_calls = 0;
+            self.scripted_answers_used = 0;
         }
     }
 
@@ -7320,10 +7374,68 @@ mod tests {
         }
 
         fn socket_write_vectored(&mut self, bufs: &[IoSlice]) -> (usize, SocketResult) {
-            self.stream.socket_write_vectored(bufs)
+            if !self.vectored_scripted {
+                return self.stream.socket_write_vectored(bufs);
+            }
+            let offered: usize = bufs.iter().map(|slice| slice.len()).sum();
+            self.vectored_calls += 1;
+            if self.first_offer.is_none() {
+                self.first_offer = Some(offered);
+            }
+            let scripted = match self.script.pop_front() {
+                Some(scripted) => {
+                    self.scripted_answers_used += 1;
+                    scripted
+                }
+                // An exhausted script is a healthy kernel. Every fault is
+                // therefore explicit and bounded: a test injects exactly the
+                // answers it names and the socket behaves for the rest of the
+                // pass.
+                None => ScriptedWrite {
+                    accept: usize::MAX,
+                    status: SocketResult::Continue,
+                },
+            };
+            let accept = scripted.accept.min(offered);
+            let mut taken = 0usize;
+            for slice in bufs {
+                if taken >= accept {
+                    break;
+                }
+                let take = (accept - taken).min(slice.len());
+                self.accepted.extend_from_slice(&slice[..take]);
+                taken += take;
+            }
+            match scripted.status {
+                SocketResult::Continue => self.pending.set(0),
+                SocketResult::WouldBlock => self.pending.set(self.pending.get() + accept),
+                // Refused rather than approximated. `socket_wants_write()` is
+                // DERIVED here so that no test can assert a combination a TLS
+                // socket cannot produce, and these two are exactly where one
+                // rule stops covering both. In `FrontRustls` (`socket.rs`) a
+                // `Closed` sets `peer_reset`, which makes `socket_wants_write()`
+                // answer `false` however many records rustls still holds; an
+                // `Error` leaves `peer_reset` alone, so it keeps answering
+                // `true`. Folding either into the `WouldBlock` arm would make
+                // this handler contradict the file it claims to model.
+                status @ (SocketResult::Closed | SocketResult::Error) => panic!(
+                    "BackpressuredTlsSocket does not model {status:?}: `Closed` clears \
+                     `socket_wants_write()` through `peer_reset` and `Error` does not, so \
+                     scripting one needs that distinction modelled first"
+                ),
+            }
+            (accept, scripted.status)
         }
 
         /// The override that makes this harness worth having.
+        ///
+        /// Two producers, one meaning — "rustls is still holding something the
+        /// kernel has not taken". The flush-driven tests seed it through
+        /// `new` and drain it through the empty-buffer flush; the write-driven
+        /// tests never seed it and let a `WouldBlock` from the vectored path
+        /// fill it, which is `FrontRustls`'s own invariant (`socket.rs`): a
+        /// `WouldBlock` means rustls accepted the plaintext and the kernel
+        /// refused the records, so `session.wants_write()` is true.
         fn socket_wants_write(&self) -> bool {
             self.pending.get() > 0
         }
@@ -10321,6 +10433,727 @@ mod tests {
             fn qc_h2_header_reassembly_survives_interleaved_control_frame_flushes(plan: ReassemblyPlan) -> TestResult {
                 drive(plan)
             }
+        }
+    }
+
+    // ── #1454: the `socket_wants_write()` sites the harness above left ──
+    //
+    // `BackpressuredTlsSocket` (above) is the first handler in this
+    // repository whose `socket_wants_write()` can answer `true`, and the four
+    // tests beside it own two of the sites #1454 names: the `H2State::GoAway`
+    // arm (`a_flush_that_does_not_drain_keeps_the_connection_open`,
+    // `a_flush_that_succeeds_closes_within_one_writable_call`) and
+    // `finalize_write`'s `Flush` / `Quiesce` answers
+    // (`a_finalized_write_pass_flushes_once_and_re_arms_while_records_survive`,
+    // `a_write_pass_that_owes_nothing_withdraws_writable_interest`).
+    //
+    // This module is the FIRST coverage of every site they left, and of the
+    // write loop underneath all of them. It re-claims none of theirs.
+    //
+    // #1454 names three structurally near-identical triples of the shape
+    //
+    //     if self.socket.socket_wants_write() {
+    //         self.socket.socket_write(&[]);
+    //         if self.socket.socket_wants_write() {
+    //
+    // by their line numbers at `cd904815`. Re-derived against this tree —
+    // the decisions moved into `h2_close.rs` as pure functions, but every
+    // live query is still in this file, and none moved to `h2_transmit.rs`
+    // or `h2_control_tx.rs`:
+    //
+    //  * `3038-3044` — `writable`'s preamble flush fused with the
+    //    `(H2State::Error, Position::Server)` arm that reads its result.
+    //    Now the preamble's `socket_write(&[])` and the
+    //    `h2_close::error_close_action(self.socket.socket_wants_write())`
+    //    below it. The middle flush and the second query sit in different
+    //    statements, which is what makes it a triple rather than two pairs:
+    //    the arm has no flush of its own and is only correct because the
+    //    preamble ran. **Covered here** — `an_error_connection_*`.
+    //  * `3077-3079` — the `(H2State::GoAway, _)` arm, the one whose own
+    //    comment calls it the primary truncation vector. Now the two
+    //    `h2_close::goaway_close_action` calls around `socket_write(&[])`.
+    //    Covered ABOVE; nothing here touches it.
+    //  * `4152-4154` — `flush_zero_buffer`. The odd one of the three: it is
+    //    the only site that reads the flush's `status` instead of asking a
+    //    second question, and it pins `size` to a literal `0`, so
+    //    `update_readiness` reports the stall and clears the WRITABLE event
+    //    bit whatever the status was. **Covered here** —
+    //    `flush_zero_buffer_*`.
+    //
+    // Plus `force_disconnect`'s `Position::Server` arm (`5573` at
+    // `cd904815`, now the `h2_close::force_disconnect_action` call).
+    // `h2_close`'s own table enumerates the decision; these are its first
+    // CALLER-side tests. **Covered here** — `force_disconnect_*`.
+    //
+    // And the site that is none of the triples but carries all of them:
+    // `flush_stream_out`'s `while !kawa.out.is_empty()` loop. See
+    // `scripted_vectored_writes` at the end of this module.
+    mod tls_backpressure_first_coverage {
+        use super::*;
+
+        // ── Triple `3038-3044`: the preamble flush and the error arm ────
+        //
+        // Both tests are the decision comment's two scripts, run against the
+        // one site: `true` then `true` (the flush did not land) and `true`
+        // then `false` (it did). Neither may truncate — the first by holding
+        // FIN back, the second by having already delivered the records.
+
+        /// Records that survive the preamble flush hold an errored
+        /// connection open.
+        ///
+        /// Targets the `3038-3044` triple: `writable`'s preamble asks the
+        /// first question and performs the flush, and the
+        /// `(H2State::Error, Position::Server)` arm asks the second. Closing
+        /// here sends FIN and destroys records rustls is still holding,
+        /// which the client reads as a truncated response.
+        ///
+        /// TO SEE THIS RED: replace `h2_close::error_close_action(...)` in
+        /// that arm with `CloseAction::CloseSession`. The first assertion
+        /// fails with `records still buffered: an errored connection must
+        /// stay open`. Emptying the `ReArmAndContinue` arm instead reddens
+        /// the event assertion with its own message.
+        #[test]
+        fn an_error_connection_whose_records_survive_the_flush_stays_open() {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+            // A kernel that accepts nothing: the preamble's flush leaves both
+            // records, so the arm's query is answered with records pending.
+            let (mut connection, _peer) = connection_with_backpressure(&pool, 2, 0, H2State::Error);
+            let mut context = test_context(&pool);
+            let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+            assert!(
+                connection.socket.socket_wants_write(),
+                "premise: this harness must report buffered TLS records, or the \
+                 preamble never flushes and the arm reads a `false` this test \
+                 did not set up"
+            );
+            assert!(
+                !connection.readiness.event.is_writable(),
+                "premise: the WRITABLE event must start clear so the re-arm \
+                 below is the only thing that can set it, got {:?}",
+                connection.readiness
+            );
+
+            let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+            assert!(
+                matches!(result, MuxResult::Continue),
+                "records still buffered: an errored connection must stay open \
+                 rather than send FIN over them, got {result:?}"
+            );
+            assert!(
+                connection.readiness.event.is_writable(),
+                "the WRITABLE event must be re-signalled so the event loop \
+                 retries the flush, got {:?}",
+                connection.readiness
+            );
+            // Not `socket_wants_write()`: with `drain_per_flush = 0` that can
+            // never change, so it is a tautology of the harness. The flush
+            // COUNT is falsifiable — an arm reached without the preamble's
+            // flush would leave it at 0.
+            assert_eq!(
+                connection.socket.flushes.get(),
+                1,
+                "the preamble must attempt exactly one empty-buffer flush, and \
+                 the error arm must add none of its own, got {}",
+                connection.socket.flushes.get()
+            );
+        }
+
+        /// A preamble flush the kernel accepts lets the error arm close.
+        ///
+        /// Targets the same `3038-3044` triple, from the other side: the
+        /// first query answers `true`, the flush lands, and the second
+        /// answers `false`. Nothing is left to truncate, so the session
+        /// closes instead of spinning on a socket that owes nothing.
+        ///
+        /// TO SEE THIS RED: replace the arm's
+        /// `h2_close::error_close_action(...)` with
+        /// `CloseAction::ReArmAndContinue`. The last assertion fails with
+        /// `a drained flush leaves nothing to truncate`. Deleting the
+        /// preamble's flush instead reddens the premise above it, with a
+        /// different message.
+        #[test]
+        fn an_error_connection_whose_records_drain_closes_the_session() {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+            // One record, one drained per flush: the preamble's own flush is
+            // the one that empties it, so the arm's query is the first that
+            // can answer `false`.
+            let (mut connection, _peer) = connection_with_backpressure(&pool, 1, 1, H2State::Error);
+            let mut context = test_context(&pool);
+            let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+            assert!(
+                connection.socket.socket_wants_write(),
+                "premise: this harness must report buffered TLS records"
+            );
+
+            let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+            assert!(
+                !connection.socket.socket_wants_write(),
+                "premise: the preamble's flush must have landed, or the arm \
+                 reads the same `true` the other test sets up"
+            );
+            assert!(
+                matches!(result, MuxResult::CloseSession),
+                "a drained flush leaves nothing to truncate: the errored \
+                 connection must close, got {result:?}"
+            );
+        }
+
+        // ── Triple `4152-4154`: `flush_zero_buffer` ──────────────────────
+        //
+        // The third triple, and the only one whose second step is the
+        // flush's `status` rather than a second query. It passes a literal
+        // `0` for `size`, so `update_readiness_after_write` takes its
+        // `size == 0` branch unconditionally and clears `Ready::WRITABLE`
+        // from the EVENT set however the flush went. Both tests below pin
+        // that, which is why each seeds the event bit first: it is the one
+        // observable this site moves, and it is not one the fixture would
+        // otherwise be setting.
+
+        /// A pending record makes `flush_zero_buffer` spend its flush and
+        /// park the connection on the event loop.
+        ///
+        /// Targets the `4152-4154` triple. `expect_write` is cleared and the
+        /// empty-buffer flush is attempted; because the site reports `size =
+        /// 0` whatever the flush did, the WRITABLE event bit is withdrawn
+        /// and forward progress waits for the next epoll wake-up.
+        ///
+        /// TO SEE THIS RED, either half independently:
+        /// (a) delete the `if self.socket.socket_wants_write() { ... }` block
+        ///     — the flush-count assertion fails with `a connection holding
+        ///     records must spend exactly one empty-buffer flush`;
+        /// (b) delete the `let _ = update_readiness_after_write(0, status,
+        ///     &mut self.readiness);` line — the event assertion fails with
+        ///     `the WRITABLE event must be withdrawn`.
+        #[test]
+        fn flush_zero_buffer_flushes_and_withdraws_the_event_when_records_are_pending() {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+            let (mut connection, _peer) =
+                connection_with_backpressure(&pool, 1, 0, H2State::Header);
+            connection
+                .stream_table
+                .set_expect_write(Some(H2StreamId::Zero));
+            // Seeded, not inherited: `ConnectionH2::new` is handed WRITABLE as
+            // this fixture's INTEREST and leaves the event set empty, so
+            // without this the withdrawal below would be indistinguishable
+            // from never having been set.
+            connection.readiness.event.insert(Ready::WRITABLE);
+
+            assert!(
+                connection.socket.socket_wants_write(),
+                "premise: this harness must report buffered TLS records, or the \
+                 flush arm is never entered"
+            );
+            assert!(
+                connection.zero.storage.is_empty(),
+                "premise: the zero buffer must already be drained, or \
+                 `flush_zero_to_socket` returns before the triple"
+            );
+
+            connection.flush_zero_buffer();
+
+            assert!(
+                connection.stream_table.expect_write().is_none(),
+                "a drained zero buffer must release its parked write, got {:?}",
+                connection.stream_table.expect_write()
+            );
+            assert_eq!(
+                connection.socket.flushes.get(),
+                1,
+                "a connection holding records must spend exactly one \
+                 empty-buffer flush here, got {}",
+                connection.socket.flushes.get()
+            );
+            assert!(
+                !connection.readiness.event.is_writable(),
+                "the WRITABLE event must be withdrawn: this site reports `size \
+                 = 0` to `update_readiness_after_write` whatever the flush did, \
+                 got {:?}",
+                connection.readiness
+            );
+        }
+
+        /// With nothing buffered, `flush_zero_buffer` spends no flush and
+        /// leaves the event bit alone.
+        ///
+        /// The `false` arm of the same triple, and the discriminating
+        /// negative for the test above: the withdrawal there is the site's
+        /// doing, not something that happens on every call.
+        ///
+        /// TO SEE THIS RED: change the site's condition to `if true`. The
+        /// flush-count assertion fails with `a connection holding nothing
+        /// must not spend a flush`, and the event assertion follows.
+        #[test]
+        fn flush_zero_buffer_spends_no_flush_when_nothing_is_buffered() {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+            let (mut connection, _peer) =
+                connection_with_backpressure(&pool, 0, 0, H2State::Header);
+            connection
+                .stream_table
+                .set_expect_write(Some(H2StreamId::Zero));
+            connection.readiness.event.insert(Ready::WRITABLE);
+
+            assert!(
+                !connection.socket.socket_wants_write(),
+                "premise: this harness must report nothing buffered"
+            );
+
+            connection.flush_zero_buffer();
+
+            assert!(
+                connection.stream_table.expect_write().is_none(),
+                "releasing the parked write does not depend on the TLS answer, \
+                 got {:?}",
+                connection.stream_table.expect_write()
+            );
+            assert_eq!(
+                connection.socket.flushes.get(),
+                0,
+                "a connection holding nothing must not spend a flush, got {}",
+                connection.socket.flushes.get()
+            );
+            assert!(
+                connection.readiness.event.is_writable(),
+                "the event bit must survive a call that took no flush, or the \
+                 withdrawal asserted by the sibling test proves nothing, got \
+                 {:?}",
+                connection.readiness
+            );
+        }
+
+        // ── `force_disconnect`'s `Position::Server` arm ──────────────────
+
+        /// `force_disconnect` withholds FIN while rustls still holds records.
+        ///
+        /// Targets `force_disconnect`'s server arm. `CloseSession` here
+        /// triggers `shutdown(Write)`, and every record still inside rustls
+        /// dies with it — the "TLS decode error / unexpected eof" the arm's
+        /// own comment describes. `h2_close::force_disconnect_action` is
+        /// enumerated in its own table; this is the first test that the
+        /// CALLER passes it live socket state and performs what it answers.
+        ///
+        /// TO SEE THIS RED: delete `self.ensure_tls_flushed();` from the
+        /// `ReArmAndContinue` branch. The event assertion fails with `the
+        /// WRITABLE event must be re-signalled`. Returning `CloseSession`
+        /// from the branch instead reddens the first assertion, with its own
+        /// message.
+        #[test]
+        fn force_disconnect_delays_the_close_while_records_are_pending() {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+            let (mut connection, _peer) =
+                connection_with_backpressure(&pool, 2, 0, H2State::Header);
+
+            assert!(
+                connection.socket.socket_wants_write(),
+                "premise: this harness must report buffered TLS records"
+            );
+            assert!(
+                !connection.peer_gone_after_final_goaway(),
+                "premise: a live peer, or the arm closes for that reason \
+                 instead of the one under test"
+            );
+            assert!(
+                !connection.readiness.event.is_writable(),
+                "premise: the WRITABLE event must start clear, got {:?}",
+                connection.readiness
+            );
+
+            let result = connection.force_disconnect();
+
+            assert!(
+                matches!(result, MuxResult::Continue),
+                "records still buffered: force_disconnect must keep the session \
+                 alive so the writable path can flush them, got {result:?}"
+            );
+            assert!(
+                connection.readiness.event.is_writable(),
+                "the WRITABLE event must be re-signalled so the event loop \
+                 comes back for the flush, got {:?}",
+                connection.readiness
+            );
+        }
+
+        /// With nothing buffered, `force_disconnect` closes.
+        ///
+        /// The `false` arm of the same site. It is what makes the test above
+        /// discriminating: delaying the close is the socket's answer being
+        /// honoured, not this arm's unconditional behaviour.
+        ///
+        /// TO SEE THIS RED: replace the arm's
+        /// `h2_close::force_disconnect_action(...) ==
+        /// CloseAction::ReArmAndContinue` with `true`. The assertion fails
+        /// with `nothing is buffered: force_disconnect must close`.
+        #[test]
+        fn force_disconnect_closes_when_nothing_is_buffered() {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+            let (mut connection, _peer) =
+                connection_with_backpressure(&pool, 0, 0, H2State::Header);
+
+            assert!(
+                !connection.socket.socket_wants_write(),
+                "premise: this harness must report nothing buffered"
+            );
+
+            let result = connection.force_disconnect();
+
+            assert!(
+                matches!(result, MuxResult::CloseSession),
+                "nothing is buffered: force_disconnect must close rather than \
+                 hold a session open against a socket that owes nothing, got \
+                 {result:?}"
+            );
+        }
+    }
+
+    // ── `flush_stream_out`'s write loop (#1454's uncovered carrier) ──────
+    //
+    // Every site above asks the socket a QUESTION. This one takes its
+    // ANSWER — `(size, status)` from `socket_write_vectored` — and decides
+    // whether the pass is over. `mux::update_readiness` reports a stall iff
+    // `size == 0`; `status` only clears the event bit. So
+    // `size > 0 && status == WouldBlock` is NOT a stall, and
+    // `while !kawa.out.is_empty()` owes the stream another
+    // `socket_write_vectored` in the same pass.
+    //
+    // Nothing in this repository exercised that, and the gap was in the
+    // handler rather than in the tests: until the script was added,
+    // `BackpressuredTlsSocket::socket_write_vectored` delegated straight to a
+    // real `mio::net::TcpStream`, which cannot be made to report a partial
+    // write on demand. `h2_transmit`'s
+    // `qc_partial_writes_preserve_the_byte_stream` does drive partial writes,
+    // but over a REPLICA of this loop (`drive`) that models accept counts and
+    // no status at all. A write machine that treated `status != Continue` as
+    // a pass terminator would drop the second write — silent truncation on
+    // the hot path — and pass both.
+    //
+    // The script lives on `BackpressuredTlsSocket` rather than on a second
+    // handler beside it. One fault-injecting `SocketHandler` per file is the
+    // point: a reader who finds two near-identical ones has the same problem
+    // #1454 describes one level up, where three near-identical triples mean a
+    // test written against the wrong one looks correct and proves nothing.
+    mod scripted_vectored_writes {
+        use super::*;
+
+        /// Report `(frame count, whether the frames tile the capture
+        /// exactly, whether the last one carries END_STREAM)`.
+        ///
+        /// `headers_blocks` above cannot answer this: it ASSERTS the capture
+        /// is complete, so it may only be used on one already known to be
+        /// whole. Truncation is the thing under test here, so it has to come
+        /// back as a value.
+        fn frame_tiling(wire: &[u8]) -> (usize, bool, bool) {
+            let mut offset = 0usize;
+            let mut frames = 0usize;
+            let mut last_end_stream = false;
+            while offset + parser::FRAME_HEADER_SIZE <= wire.len() {
+                let payload_len = ((wire[offset] as usize) << 16)
+                    | ((wire[offset + 1] as usize) << 8)
+                    | wire[offset + 2] as usize;
+                let end = offset + parser::FRAME_HEADER_SIZE + payload_len;
+                if end > wire.len() {
+                    return (frames, false, last_end_stream);
+                }
+                last_end_stream = wire[offset + 4] & parser::FLAG_END_STREAM != 0;
+                frames += 1;
+                offset = end;
+            }
+            (frames, offset == wire.len(), last_end_stream)
+        }
+
+        /// The one stream every test here writes.
+        const STREAM_ID: StreamId = 1;
+
+        /// Open `STREAM_ID` on a scripted connection and fill it with sozu's
+        /// own 404 answer, so one `writable()` pass has real response bytes
+        /// to push through `flush_stream_out`.
+        ///
+        /// The opening half is `drive_one_write_pass`'s recipe narrowed to a
+        /// single stream — a real HEADERS frame from the loopback peer, then
+        /// `set_default_answer`, the same chokepoint the routing layer uses.
+        /// It cannot call that helper: it builds a
+        /// `ConnectionH2<mio::net::TcpStream>` and reads the response back
+        /// off the wire, and an armed `BackpressuredTlsSocket`'s vectored
+        /// path never reaches the wire at all.
+        fn connection_with_a_pending_response(
+            pool: &Rc<RefCell<Pool>>,
+        ) -> (
+            ConnectionH2<BackpressuredTlsSocket>,
+            Context<TestListener>,
+            std::net::TcpStream,
+            GlobalStreamId,
+        ) {
+            let (socket, mut peer) = connected_socket();
+            let mut connection = ConnectionH2::new(
+                Ulid::generate(),
+                BackpressuredTlsSocket::new(socket, 0, 0),
+                Position::Server,
+                Rc::downgrade(pool),
+                H2FloodConfig::default(),
+                H2ConnectionConfig::default(),
+                Duration::from_secs(30),
+                None,
+                Duration::from_secs(30),
+                Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
+                Ready::READABLE | Ready::HUP | Ready::ERROR,
+            )
+            .expect("a pool with free buffers must yield an H2 connection");
+            let mut context = test_context(pool);
+            let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+            connection.state = H2State::Header;
+            connection
+                .stream_table
+                .set_expect_read(Some((H2StreamId::Zero, 9)));
+
+            let mut peer_encoder = loona_hpack::Encoder::new();
+            let field_block = peer_encoder.encode([
+                (&b":method"[..], &b"GET"[..]),
+                (&b":scheme"[..], &b"https"[..]),
+                (&b":authority"[..], &b"example.com"[..]),
+                (&b":path"[..], &b"/backpressure"[..]),
+            ]);
+            let mut frame = Vec::with_capacity(parser::FRAME_HEADER_SIZE + field_block.len());
+            frame.extend_from_slice(&(field_block.len() as u32).to_be_bytes()[1..]);
+            frame.push(1); // HEADERS
+            frame.push(parser::FLAG_END_STREAM | parser::FLAG_END_HEADERS);
+            frame.extend_from_slice(&STREAM_ID.to_be_bytes());
+            frame.extend_from_slice(&field_block);
+            peer.write_all(&frame)
+                .expect("loopback write must complete");
+            peer.flush().expect("loopback flush must complete");
+            for _ in 0..64 {
+                connection.readable(&mut context, EndpointClient(&mut router));
+                if connection.stream_table.streams().contains_key(&STREAM_ID) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let global_stream_id = *connection
+                .stream_table
+                .streams()
+                .get(&STREAM_ID)
+                .expect("the peer's HEADERS frame must open the stream");
+
+            let answers = context.listener.borrow().get_answers().clone();
+            set_default_answer(
+                &mut context.streams[global_stream_id],
+                &mut connection.readiness,
+                404,
+                &answers.borrow(),
+            );
+
+            (connection, context, peer, global_stream_id)
+        }
+
+        /// A partial write the kernel would block on does NOT end the pass.
+        ///
+        /// Targets `flush_stream_out`'s `while !kawa.out.is_empty()` loop —
+        /// none of #1454's three triples, but the code every one of them
+        /// finalizes. The kernel takes one byte and reports `WouldBlock`;
+        /// `update_readiness` sees `size > 0`, reports not-stalled, and the
+        /// loop must issue another `socket_write_vectored` before the pass
+        /// ends. A write machine that read `status != Continue` as a
+        /// terminator would stop after that one byte and hand the peer a
+        /// response cut off mid-frame.
+        ///
+        /// TO SEE THIS RED: in `flush_stream_out`, make the stall condition
+        /// `if update_readiness_after_write(size, status, readiness)
+        ///     || !matches!(status, SocketResult::Continue)`.
+        /// The pass then stops after the scripted byte and the test fails on
+        /// `the bytes the socket accepted must be whole H2 frames, not a
+        /// response cut off mid-frame: 0 frames over 1 bytes, tiling=false`,
+        /// then on the call count behind it. No `debug_assert!` or
+        /// `unreachable!` of the production path is
+        /// involved: the script's `accept` is clamped to the offer, so
+        /// `debug_assert!(size <= offered)` holds throughout.
+        #[test]
+        fn a_write_pass_resumes_after_a_partial_write_the_kernel_would_block_on() {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(8, 40, 16_384)));
+            let (mut connection, mut context, _peer, global_stream_id) =
+                connection_with_a_pending_response(&pool);
+            let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+            connection.socket.arm_vectored_script(vec![ScriptedWrite {
+                accept: 1,
+                status: SocketResult::WouldBlock,
+            }]);
+
+            connection.writable(&mut context, EndpointClient(&mut router));
+
+            assert_eq!(
+                connection.socket.scripted_answers_used, 1,
+                "premise: the scripted partial write must have been served, or \
+                 the pass never reached the vectored path and everything below \
+                 is about nothing"
+            );
+            assert!(
+                connection
+                    .socket
+                    .first_offer
+                    .is_some_and(|offered| offered > 1),
+                "premise: the first offer must exceed the single byte the \
+                 kernel took, or the write was not partial, got {:?}",
+                connection.socket.first_offer
+            );
+            // The harm first, the mechanism second: a reader of a red run
+            // should see the truncation before the call count that explains
+            // it.
+            let (frames, tiles, ends_stream) = frame_tiling(&connection.socket.accepted);
+            assert!(
+                frames > 0 && tiles,
+                "the bytes the socket accepted must be whole H2 frames, not a \
+                 response cut off mid-frame: {frames} frames over {} bytes, \
+                 tiling={tiles}",
+                connection.socket.accepted.len()
+            );
+            assert!(
+                ends_stream,
+                "the last frame the socket accepted must carry END_STREAM — a \
+                 response that stops short is the truncation this branch class \
+                 exists to prevent"
+            );
+            assert!(
+                connection.socket.vectored_calls >= 2,
+                "`size > 0` is not a stall however the status reads, so the \
+                 pass must come back for the rest: got {} vectored writes",
+                connection.socket.vectored_calls
+            );
+            assert!(
+                connection.stream_table.expect_write().is_none(),
+                "a socket that is still taking bytes must not leave the stream \
+                 parked, got {:?}",
+                connection.stream_table.expect_write()
+            );
+            assert!(
+                context.streams[global_stream_id].back.out.is_empty(),
+                "the response must leave the stream's queue in the pass that \
+                 was writing it"
+            );
+        }
+
+        /// The control: a socket that never blocks completes in one write.
+        ///
+        /// Same fixture, same assertions, empty script. This test passes
+        /// against the broken write machine described above as readily as
+        /// against the correct one, and that is exactly why it is here: it
+        /// is the shape of every `socket_wants_write()`-related test this
+        /// repository had before #1454 — the `false` path, which already
+        /// works — and it demonstrates that the sibling above discriminates
+        /// where it does not. Do not read a green here as coverage of the
+        /// backpressure branch.
+        #[test]
+        fn a_write_pass_over_a_socket_that_never_blocks_completes_in_one_write() {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(8, 40, 16_384)));
+            let (mut connection, mut context, _peer, global_stream_id) =
+                connection_with_a_pending_response(&pool);
+            let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+            connection.socket.arm_vectored_script(Vec::new());
+
+            connection.writable(&mut context, EndpointClient(&mut router));
+
+            // One write, not "at most one": today's 404 answer gathers in a
+            // single round because nothing separates its blocks with a
+            // `Delimiter`. An answer that gained one would raise this count
+            // legitimately — that would be a change to `answers`, not a write
+            // -path regression, and the sibling test above is where a real
+            // one shows up.
+            assert_eq!(
+                connection.socket.vectored_calls, 1,
+                "a kernel taking everything it is offered needs one write, got \
+                 {}",
+                connection.socket.vectored_calls
+            );
+            assert!(
+                !connection.socket.socket_wants_write(),
+                "a `Continue` leaves rustls holding nothing"
+            );
+            let (frames, tiles, ends_stream) = frame_tiling(&connection.socket.accepted);
+            assert!(
+                frames > 0 && tiles && ends_stream,
+                "the response must reach the socket whole: {frames} frames \
+                 over {} bytes, tiling={tiles}, END_STREAM={ends_stream}",
+                connection.socket.accepted.len()
+            );
+            assert!(
+                connection.stream_table.expect_write().is_none(),
+                "nothing is owed, so nothing is parked, got {:?}",
+                connection.stream_table.expect_write()
+            );
+            assert!(
+                context.streams[global_stream_id].back.out.is_empty(),
+                "the response must leave the stream's queue"
+            );
+        }
+
+        /// A vectored write that left records re-arms WITHOUT a second flush.
+        ///
+        /// Targets `finalize_write`'s `FinalizeAction::SkipFlush` answer —
+        /// the one variant of that decision reachable only with a stream
+        /// carrying response bytes, which is why `h2_close`'s table covers
+        /// it and no caller-side test did. The kernel takes the whole offer
+        /// but reports `WouldBlock`, so records are pending AND the pass
+        /// already wrote: `socket_write_vectored` attempted the flush as a
+        /// side effect, and spending an empty-buffer write on top of it
+        /// would be a syscall for nothing.
+        ///
+        /// TO SEE THIS RED, either half independently:
+        /// (a) return `FinalizeAction::Flush` from `finalize_action`'s
+        ///     `socket_write` branch — the flush assertion fails with `a
+        ///     vectored write already attempted the flush`;
+        /// (b) empty `finalize_write`'s `FinalizeAction::ReArm` arm — the
+        ///     event assertion fails with `the WRITABLE event must be
+        ///     re-signalled`.
+        #[test]
+        fn a_pass_whose_vectored_write_left_records_re_arms_without_a_second_flush() {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(8, 40, 16_384)));
+            let (mut connection, mut context, _peer, _global_stream_id) =
+                connection_with_a_pending_response(&pool);
+            let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+            // The kernel takes the whole offer and still reports WouldBlock:
+            // rustls holds the records, so the pass ends owing a flush it has
+            // already attempted.
+            connection.socket.arm_vectored_script(vec![ScriptedWrite {
+                accept: usize::MAX,
+                status: SocketResult::WouldBlock,
+            }]);
+            connection.readiness.event.remove(Ready::WRITABLE);
+
+            connection.writable(&mut context, EndpointClient(&mut router));
+
+            assert_eq!(
+                connection.socket.scripted_answers_used, 1,
+                "premise: the scripted answer must have been served"
+            );
+            assert!(
+                connection.socket.socket_wants_write(),
+                "premise: a WouldBlock leaves the records rustls accepted \
+                 buffered, or this pass finalizes down the settled path"
+            );
+            assert_eq!(
+                connection.socket.flushes.get(),
+                0,
+                "a vectored write already attempted the flush, so the pass \
+                 must not spend an empty-buffer write on top of it, got {}",
+                connection.socket.flushes.get()
+            );
+            assert!(
+                connection.readiness.event.is_writable(),
+                "the WRITABLE event must be re-signalled so the event loop \
+                 comes back for the records, got {:?}",
+                connection.readiness
+            );
+            let (frames, tiles, _) = frame_tiling(&connection.socket.accepted);
+            assert!(
+                frames > 0 && tiles,
+                "records held by rustls are still whole frames: {frames} \
+                 frames over {} bytes, tiling={tiles}",
+                connection.socket.accepted.len()
+            );
         }
     }
 }
