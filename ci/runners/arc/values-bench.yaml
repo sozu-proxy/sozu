@@ -2,25 +2,30 @@
 # Pinned version: 0.14.2
 # Helm release name "sozu-bench" IS the runs-on label: runs-on: sozu-bench
 #
-# Isolation mechanism (per design, refined during planning): the `bench` NodeGroup is fixed at
-# exactly 4 XL nodes (halved back from 8 on 2026-09-23, infra-cost reduction — operator explicitly
-# chose to keep per-pod resources at near-whole-node and cut node count instead of per-pod
-# resources, to preserve the physical-exclusivity guarantee below) with autoscaling explicitly
-# disabled (clever k8s nodegroups create silently inherits the cluster's autoscaling setting — a
-# nodegroups update --disable-autoscaling was required after creation, see ci/runners/runbook.md).
-# maxRunners is capped at 4 to match node count 1:1. The resources.requests below reserve nearly the entire
-# node's allocatable capacity (measured live: cpu=16, memory=30481788Ki ≈ 29.07Gi on bench-node0),
-# so no other pod can ever be co-scheduled on a bench node regardless of nodeSelector correctness
-# elsewhere — this is what actually buys bench reproducibility (Heracles ISCA 2015: cgroup/QoS
-# isolation alone is insufficient against LLC/DRAM-bandwidth interference; only physical node
-# exclusivity holds).
+# Isolation mechanism (per design, refined during planning): the `bench` NodeGroup gives every
+# bench job its own dedicated node — no other pod is ever co-scheduled — which is what actually
+# buys bench reproducibility (Heracles ISCA 2015: cgroup/QoS isolation alone is insufficient
+# against LLC/DRAM-bandwidth interference; only physical node exclusivity holds). Autoscaling is
+# explicitly disabled (clever k8s nodegroups create silently inherits the cluster's autoscaling
+# setting — a nodegroups update --disable-autoscaling was required after creation, see
+# ci/runners/runbook.md).
 #
-# memory sized at 28Gi, not the node's full ~29.07Gi (2026-09-23, root-caused once the first real
-# bench workload ever scheduled here — the original 29Gi request left only ~71Mi headroom, and
-# every bench node already reserves 208-504Mi for daemonsets (cilium, konnectivity-agent,
-# cc-collector, kubelet-csr-approver), so the runner pod was Insufficient-memory on all 8 nodes
-# simultaneously. 28Gi leaves ~1Gi of headroom — comfortably above the observed worst case — while
-# still leaving no room for a second same-sized pod, so the exclusivity guarantee above is intact.
+# Redesigned 2026-09-24 (see values-general.yaml for the full investigation): node flavor switched
+# XL -> S (8 vCPU / 12Gi) as part of a cluster-wide move to a uniform 1 job = 1 pod = 1 node model
+# for BOTH pools — `general` used to pack 2 pods/XL-node, which turned out to be unsafe (real free
+# disk on an XL node is only ~15Gi once the base OS/containerd footprint is accounted for, not the
+# ~35Gi kubelet advertises). `bench` was already 1:1, so this redesign only changes its flavor and
+# node count, not its isolation model. Node count set to 1.5x a single PR's real bench-job fan-out
+# (4 concurrent sozu-bench jobs per PR push, from ci.yml's job graph: crypto-ring/aws-lc-rs/
+# openssl/fips) = 4 x 1.5 = 6 nodes; maxRunners capped at 6 to match 1:1. The resources.requests
+# below reserve nearly the entire S node (7 vCPU / 10Gi, ~1 vCPU / ~1.2Gi headroom for daemonsets —
+# same sizing as values-general.yaml, since both pools now share the same near-whole-node
+# methodology), so no other pod can ever be co-scheduled regardless of nodeSelector correctness
+# elsewhere. Trade-off accepted explicitly: absolute per-job compute drops from XL's 16vCPU/30Gi
+# to S's 8vCPU/12Gi, so historical Criterion baselines gathered on XL are not directly comparable
+# to numbers gathered after this change — run-to-run reproducibility (the actual guarantee this
+# isolation buys) is unaffected, since every bench job still gets a fully dedicated node.
+#
 # Fork-PR exposure and pod hardening notes: same as values-general.yaml — see there for the full
 # rationale (ephemeral pods + Task 10's repo setting as the fork-PR gate; digest pin + safe
 # securityContext subset applied 2026-09-22 per automated security review; readOnlyRootFilesystem
@@ -37,7 +42,7 @@ githubConfigUrl: "https://github.com/sozu-proxy/sozu"
 githubConfigSecret: sozu-runner-github-app
 
 minRunners: 0
-maxRunners: 4
+maxRunners: 6
 
 template:
   spec:
@@ -71,5 +76,5 @@ template:
             drop: ["ALL"]
         resources:
           requests:
-            cpu: "15"
-            memory: "28Gi"
+            cpu: "7"
+            memory: "10Gi"

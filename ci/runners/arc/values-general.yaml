@@ -43,6 +43,30 @@
 # half the always-on vCPU footprint; per-job compile time regresses back to the pre-2026-09-23
 # level as a deliberate cost/speed trade-off.
 #
+# SUPERSEDED same day: the 2-pods/XL-node packing above turned out to be unsafe on real disk.
+# `df -h /` on a `default` node showed the base OS + containerd root filesystem alone already
+# consumes ~21.8Gi of the node's ~39.1Gi capacity — kubelet's advertised ephemeral-storage
+# "allocatable" (~35Gi) doesn't know about this baseline, so the scheduler happily co-located 2
+# heavy Rust builds per node while the REAL free disk was only ~15Gi, and one `msrv-bare` pod got
+# hard `Evicted` (ephemeral-storage) mid-build once 2 builds' target/ + ~/.cargo actually
+# collided. An ephemeral-storage request/limit can't reliably fix this (any value small enough to
+# still allow 2/node is checked against the same wrong ~35Gi ceiling).
+#
+# Redesigned 2026-09-24 to 1 job = 1 pod = 1 node (same physical model `bench` already used, now
+# applied here too) — this eliminates the disk-collision class of failure entirely, since a single
+# job's ~5-8Gi footprint fits comfortably in a node's real ~15Gi free disk. Node flavor switched
+# XL -> S (8 vCPU / 12Gi, per Clever's Kubernetes flavor table) — cheaper per node now that we're
+# not relying on XL's extra headroom for 2-pod packing. Sizing target: the `default` nodegroup
+# node count is set to 1.5x a single PR's real job fan-out (computed from ci.yml's job graph,
+# `needs:` accounted for: 5 `pipeline` cells + 8 standalone jobs = 13 concurrent sozu-general jobs
+# per PR push) plus the 3 extra jobs from simulation-sweep.yml's nightly cron (03:17 UTC) in case
+# it overlaps an active PR: 13 x 1.5 = 19.5 -> 20, + 3 = 23 nodes. GitHub imposes no concurrency
+# cap on self-hosted runners (docs.github.com/en/actions/reference/limits) — 23 is a deliberate
+# cost/capacity choice, not a platform limit. Per-pod resources.requests below (7 vCPU / 10Gi)
+# reserve nearly the entire S node, leaving ~1 vCPU / ~1.2Gi headroom for daemonsets — the same
+# near-whole-node methodology `bench` already used, now shared by both pools since both are 1:1
+# node:pod.
+#
 # hostAliases (root-caused 2026-09-22): sozu's e2e suite resolves three fixed test hostnames
 # (cluster-a.localhost, cluster-b.localhost, other.localhost — grepped from e2e/src/, no dynamic
 # variants exist) via real getaddrinfo() calls (hyper's default HttpConnector, not a hardcoded
@@ -64,7 +88,7 @@ githubConfigUrl: "https://github.com/sozu-proxy/sozu"
 githubConfigSecret: sozu-runner-github-app
 
 minRunners: 0
-maxRunners: 12
+maxRunners: 23
 
 template:
   spec:
@@ -92,5 +116,5 @@ template:
             drop: ["ALL"]
         resources:
           requests:
-            cpu: "4"
-            memory: "4Gi"
+            cpu: "7"
+            memory: "10Gi"
