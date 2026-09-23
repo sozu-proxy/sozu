@@ -1016,6 +1016,47 @@
   re-anchored, expected exactly 3"; with the two range tests swapped back to the old order, with
   "2 cited lines were exempt ... expected exactly 3" — the missing one being the grown-tail case.
 
+- **`test(e2e)`: the CONTINUATION+drain e2e test now reaches the mid-frame window its production
+  guarantee protects, instead of staying green when that guarantee is deleted.**
+  `test_h2_continuation_survives_a_graceful_drain_mid_reassembly` (`e2e/src/tests/h2_tests.rs`)
+  wrote stream 3's CONTINUATION in a single TLS write, so the soft-stop drain always landed on a
+  frame **boundary**: reassembly in progress, but `zero.storage` empty and the accumulated block
+  already copied into `ConnectionH2::header_reassembly`, where no write-side site names it.
+  `graceful_goaway`'s `GracefulDrainDecision::DeferInitial` therefore protected nothing the test
+  could observe — forcing its `reassembly_in_progress` argument to `false` left the test green,
+  measured 3/3 at `04fade63`, so the production guarantee could have been deleted outright without
+  this test noticing (sozu-proxy/sozu#1453). The window that decision still guards is the one
+  `h2_header_reassembly.rs` names: one CONTINUATION frame mid-`socket_read()`, its already-read
+  bytes parked in `zero.storage` while `expect_read` still owes the rest, which
+  `send_initial_goaway`'s `zero.storage.clear()` destroys on its way to serializing the GOAWAY. The
+  CONTINUATION is now split across two TLS writes with the drain triggered between them — the
+  wire-level twin of the mid-frame interleave
+  `reassembly_property::qc_h2_header_reassembly_survives_interleaved_control_frame_flushes`
+  already generates at the unit level. No production code changed.
+  **The ordering holds by construction, not by timing**; no sleep sequences the two writes. The new
+  gate is `bytes_in`, which `ConnectionH2::handle_read` advances on every frontend socket read
+  — **partial ones included**, which is precisely what `h2.frames.rx.headers` cannot do, since
+  `handle_frame` ticks it only on a frame *completed* and so it can never witness a frame still
+  arriving. `read_space` caps each read at exactly the bytes the current frame stage expects, so
+  the first chunk costs exactly two reads (the 9-byte frame header, then the partial payload) and
+  the counter settles at exactly `baseline + first_chunk.len()`; reaching that total is what proves
+  the half-read frame is parked in `zero.storage`, and an **overshoot fails the run loudly** rather
+  than being rounded away by the poll's `<`, because an overshoot would mean something other than
+  this test's own writes feeds the counter and the gate would be proving nothing.
+  Discrimination re-measured after the change, since this test's colour has been observed to track
+  machine load rather than behaviour and a single red on a quiet box therefore settles nothing:
+  inverting `reassembly_in_progress` to `false` reds it **63 invocations out of 63, with no green
+  at all** — 15/15 sequentially at 1-minute load 2.2–6.4, and 48/48 under a 6-concurrent
+  harness at load 4.5–31 — every one of them through the same
+  `StringDecodingError(NotEnoughOctets)` HPACK decoder desync #1397/#1401 already showed, and none
+  through any other mechanism. The unmodified guarantee is green 25/25 sequentially and 36/36 under
+  6-way concurrency. Under artificial 2×-CPU-oversubscription (peak 1-minute load 47.6) the
+  changed test fails 4/48, and the **unchanged** test measured the same way (peak 49.1) fails
+  11/48, both with the identical `anchor_ok=true stream3_ok=false drain_witnessed=true` shape:
+  `collect_response_frames`'s fixed 30×50ms collection window, a pre-existing property this
+  changeset deliberately does not widen — a deadline raised to make a run land is the defect
+  #1453 exists to remove.
+
 - **`fix(parser)`: the HTTP method token is matched case-sensitively, so Sōzu and the origin
   agree on what method a request carries.** `Method::new`
   (`lib/src/protocol/kawa_h1/parser.rs`) compared with `compare_no_case`, so a request line
