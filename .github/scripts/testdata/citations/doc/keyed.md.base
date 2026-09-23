@@ -1,0 +1,9 @@
+# Identity fixture — the base revision rule 2 keys its comparison against
+
+Every citation here resolves to a non-blank line at both revisions, so the
+blank-line rule passes this document in both directions and only a comparison
+against the base revision separates the two cases below.
+
+The two bindings this document tracks sit at `keyed.rs:8/17`.
+
+The tail helper is declared at `keyed.rs:16`.

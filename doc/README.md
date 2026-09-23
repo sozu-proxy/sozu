@@ -139,7 +139,9 @@ One rule does not reach the bare form, and it is the one nearest to it. A writte
 group is rejected when the same line repeats inside it, which is what a continuation renumbered on
 one half only looks like; a bare **group** is checked the same way, but a bare span written as its
 own separate code span is a separate citation, so a path cited once and then continued bare at the
-same line number is not caught. See [sozu-proxy/sozu#1457][ident] for that gap.
+same line number is not caught. [sozu-proxy/sozu#1457][ident] closed the drift half of that
+identity problem — the drift rule keys its exemption per span, below — but this is rule 1's half, a
+duplicate across two citation groups, and it is still open.
 
 (This section is spelt without a real line number for the reason the one below it is: this document
 is inside the guarded surface, so a worked example written out in full would be resolved as a
@@ -210,9 +212,25 @@ all landed on code. Worse, the green job read as "the citations are right" when 
 the same way — the document's own directory first, so a module `LIFECYCLE.md` keeps citing its
 siblings by bare name — and the *text* of the cited line is read at the merge base of `<revision>`
 and HEAD as well as at HEAD. Different text is reported, blank or not, at both ends of a range. A
-citation this changeset **re-anchored** is not reported: only one that carries the same path and the
-same line numbers it carried at the base while the text underneath it changed. Comparison is on the
+span this changeset **re-anchored** is not reported: only one that carries the same path and the
+same line span it carried at the base while the text underneath it changed. Comparison is on the
 stripped line, so a re-indent is not drift.
+
+The exemption is keyed **per span, not per citation**. Keyed on the whole group, correcting one
+number in a four-span `file.rs:NNN/MMM/PPP/QQQ` changed the identity of the entire citation and
+bought every sibling an exemption, so the author who half-applied a renumbering hid the rest — and
+the more careful the partial fix looked, the more numbers it hid. A group where element 1 is freshly
+correct reads as maintained, which is worse than one that is uniformly stale. That was
+[sozu-proxy/sozu#1457][ident]. `06fc2708` is the worked case: it moved element 1 of three groups
+in the mux `LIFECYCLE.md` by the correct shift, left seven sibling numbers on unrelated code, and
+the job was green. The per-span key reports six of the seven. The seventh escapes it too, because
+the text at the line it names happens to equal the text at the line it used to name — a comparison
+of text cannot see a number that moved between two identical lines.
+
+Both ends of a **range** stay one span, so correcting only the end of a `file.rs:NNN-MMM` re-anchors
+its start as well. The two ends of a range describe one construct and move together, and keying per
+end instead would compare a fresh single `file.rs:MMM` against the end of an older
+`file.rs:NNN-MMM` — a new false positive for no coverage.
 
 The `Doc citations` CI job passes the pull request's base sha, and checks out with `fetch-depth: 0`
 because the default shallow checkout has no base commit to read. An unreachable `--base` is an
@@ -222,6 +240,34 @@ the rule did not run.
 
 It remains a floor in one direction: a citation into code that this changeset never touched is not
 compared. Cite a symbol wherever the prose names an item.
+
+**A number this changeset reused for different code is reported, and no edit fixes it.** The
+exemption keys on a number, and a number is not stable under the edits the rule exists to police, so
+renumbering a citation onto a line whose number the base revision spent on something else produces a
+report against a *correct* citation. [sozu-proxy/sozu#1447][reuse] found it in the H2 stack: at
+`595920e9` the mux `LIFECYCLE.md` cited one `h2.rs` line for the `handle_goaway_frame` retry loop,
+and on a branch that renumbered after a large `h2.rs` edit the `StreamState::Link` transition landed
+on that very line, so repointing the Link citation at its true new line was reported as drift with
+no edit available that would silence it. Nothing guesses here. The rule has a path,
+a number and two revisions of a line; it does not have the claim the number was attached to, and the
+honest re-anchor and the reused number are indistinguishable from that evidence. So it over-reports
+rather than suppress: a rule that stopped comparing would be worse than one that occasionally
+over-reports, and a heuristic that guessed wrong *quietly* would be worse than both. Read such a
+report against the claim before renumbering — and cite a symbol, which has no number to reuse.
+
+**Every run prints how many spans it did not look at.** A compared total reports what the rule
+examined and never what it declined to examine, so its coverage can fall to zero for a whole
+changeset with every counter it emits still healthy. Measured in #1447 on a changeset that repaired
+six markdown citations: 370 cited ends compared with `.md` targets on, 370 with them off, and *zero*
+of the six entered the rule — repairing a citation changes its span, which is exactly what the
+exemption covers. The run said "none of the 370 cited lines changed their text" and was telling the
+truth about the 370 while saying nothing about the six. `compared` and `exempt` now partition every
+cited end that resolved and was in range at HEAD, and `--show` lists each exempt span as
+`|re-anchored`. "38 compared, 12 exempt" says there is something to disposition where "38 compared"
+reads as complete coverage. A span renumbered into the **grown tail** of a file — past the end the
+base revision had — counts as exempt like any other, which matters because an insertion of any size
+pushes later citations past the old end by construction; binding the exempt count to the base range
+would have dropped exactly the changesets that re-anchor the most.
 
 `--self-test` is what keeps the checker honest. It asserts the exact failures a deliberately broken
 fixture must produce, *and* runs the real command line in a subprocess to require exit `1` on that
@@ -299,7 +345,9 @@ absent. Measured when the seventeen pins in `doc/h2_mux_internals.md` landed —
 went 219 to 238 while the compared count stayed at exactly 325, so every one of them was exempt that
 day. Renumbering a pin's spans later re-exempts it the same way. Rule 1 still range-checks the new
 span and rule 4 still holds the quote to it, so the hole is narrow, but it is the same re-anchoring
-the drift rule accepts everywhere else and it is not closed here.
+the drift rule accepts everywhere else and it is not closed here. It is no longer *silent*, though:
+that run would now print the exempt count beside the compared one, which is the number that said
+nothing while 325 held steady.
 
 **A pin guards the quote, not the claim beside it.** This is the limit worth internalising before
 any of the others. Rule 4 proves that the lines between the fences still match the lines they name;
@@ -383,6 +431,7 @@ changeset, and it would not reach `e2e/COVERAGE.md` either — no rule reads tha
 [bare]: https://github.com/sozu-proxy/sozu/issues/1459
 [bare-eg]: https://github.com/sozu-proxy/sozu/pull/1465
 [ident]: https://github.com/sozu-proxy/sozu/issues/1457
+[reuse]: https://github.com/sozu-proxy/sozu/issues/1447
 [cit]: https://github.com/sozu-proxy/sozu/issues/1335
 [drift]: https://github.com/sozu-proxy/sozu/issues/1389
 

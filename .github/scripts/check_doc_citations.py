@@ -109,12 +109,86 @@
 #   base and at HEAD. Different text is reported, blank or not, which makes
 #   this a strict superset of rule 1 for every line the changeset touched.
 #
-#   An author who RE-ANCHORS a citation is not drifting it, so a citation is
-#   compared only when the identical `path` and line numbers are also present
-#   in the BASE revision of its own document. Identity is the citation, not its
-#   position in the file: moving a paragraph does not excuse a stale number,
-#   and repointing `editor.rs:1131` at `editor.rs:1152` is silently accepted.
-#   Comparison is on the STRIPPED line, so a pure re-indent is not drift.
+#   An author who RE-ANCHORS a citation is not drifting it, so a SPAN is
+#   compared only when the identical `path` and that same line span are also
+#   present in the BASE revision of its own document. Identity is the citation,
+#   not its position in the file: moving a paragraph does not excuse a stale
+#   number, and repointing `editor.rs:1131` at `editor.rs:1152` is silently
+#   accepted. Comparison is on the STRIPPED line, so a pure re-indent is not
+#   drift.
+#
+#   PER SPAN, not per group — sozu-proxy/sozu#1457. Keyed on the whole tuple,
+#   correcting ONE number in `h2.rs:5676/5860/5885/5903` changed the identity
+#   of the entire citation, so all four spans were classified "re-anchored"
+#   and the three stale ones were never compared. That is the half-applied
+#   renumbering this file names in its own WHAT THIS CATCHES list, and the
+#   whole-tuple key handed it an exemption: the author who fixed one number
+#   bought silence for the rest, and the more careful the partial fix looked,
+#   the more numbers it hid. It is worse than leaving the group alone — an
+#   all-stale group reads as uniformly suspect, while a group whose first
+#   element is freshly correct reads as maintained. Measured on `06fc2708`
+#   ("refactor(mux): hand the Endpoint trait an RTT value, not a peer
+#   socket"), which moved element 1 of three groups in
+#   `lib/src/protocol/mux/LIFECYCLE.md` by the correct shift and left seven
+#   sibling numbers on unrelated code with this job green: the per-span key
+#   reports six of the seven.
+#
+#   The seventh, `mod.rs:2152`, escapes the per-span key too, because the text
+#   at that line happens to equal the text at the line it used to name. A
+#   comparison of TEXT cannot see a number that moved between two identical
+#   lines, and nothing short of resolving the enclosing construct could.
+#
+#   One residual inside a RANGE: `8-13` is one span, so fixing only its end to
+#   `8-14` re-anchors the start along with it. Both ends of a range describe
+#   one construct and move together far more often than two group elements do,
+#   and splitting the key per END would compare a fresh single `x.rs:13`
+#   against an old `x.rs:8-13`'s end — a new false positive for no coverage.
+#   Left as it is, deliberately.
+#
+# A NUMBER REUSED FOR DIFFERENT CODE — A LIMITATION, NOT A BUG
+#   The exemption keys on a NUMBER, and a number is not stable under the edits
+#   this rule exists to police. When a changeset renumbers a citation onto a
+#   line whose number the base revision spent on something else, the span is
+#   not new, the exemption does not apply, and a CORRECT citation is reported
+#   as drift. sozu-proxy/sozu#1447 found it in the H2 sans-io stack: at merge
+#   base `595920e9`, `lib/src/protocol/mux/LIFECYCLE.md:469` cited
+#   `h2.rs:6248` for the `handle_goaway_frame` retry loop; on a branch that
+#   renumbered citations after a large `h2.rs` edit, the `StreamState::Link`
+#   transition landed ON line 6248, and renumbering the Link citation to its
+#   true new line was reported as drift. No edit to the document fixes it.
+#
+#   This is not rare arithmetic. `doc/h2_mux_internals.md` alone carries 18
+#   pinned blocks into `h2.rs`, one branch renumbered 75 citations in a single
+#   pass, and number reuse across a document with ~100 citations into an
+#   8800-line file is a coincidence you buy once per citation.
+#
+#   NOTHING HERE GUESSES. The rule has a path, a number and two revisions of a
+#   line; it does not have the claim the number was attached to, and the
+#   honest re-anchor and the reused number are indistinguishable from that
+#   evidence — head text that existed elsewhere at the base fires on every
+#   insertion, genuine drift included. So this reports rather than suppresses,
+#   and says so in its own output. A rule that stopped comparing would be
+#   worse than one that occasionally over-reports, and a heuristic that
+#   guessed wrong QUIETLY would be worse than both. `doc/keyed.md`'s
+#   `keyed.rs:16` pins the over-report as an expected verdict, so widening the
+#   exemption to make it disappear turns the self-test red.
+#
+#   The remedy is the same one the rest of this file keeps naming: cite a
+#   SYMBOL wherever the prose names an item. A symbol has no number to reuse.
+#
+#   AND THE EXEMPTION IS COUNTED. A compared total reports what the rule
+#   looked at and never what it declined to look at, so this rule's coverage
+#   could fall to zero for a whole changeset with every counter it emitted
+#   still healthy. #1447 measured that too: on a changeset repairing six
+#   markdown citations, 370 cited ends compared with `.md` targets enabled and
+#   370 with them disabled — zero of the six entered the rule, because
+#   repairing a citation changes its span, which is exactly what the exemption
+#   covers. The run said "none of the 370 cited lines changed their text" and
+#   was telling the truth about the 370 while saying nothing about the six.
+#   Every run now prints the exempt count beside the compared one, and
+#   `--show` lists each exempt span as `|re-anchored`. It is the cheapest
+#   mitigation for the reuse case above as well: a reviewer who reads
+#   "38 compared, 12 exempt" knows there is something to disposition.
 #
 #   It FAILS CLOSED. The base revision has to be in the object store, and the
 #   default `actions/checkout` is shallow, so `git merge-base` exits non-zero
@@ -260,8 +334,10 @@
 #   What this does NOT catch. A bare GROUP goes through the repeated-line check
 #   like any other group, so `` `:3/3` `` is reported — but `x.rs:3` followed by
 #   a SEPARATE bare `` `:3` `` is two citation groups, and that check only ever
-#   looks inside one. That is #1457's identity gap in another costume and it is
-#   not closed here. A backtick inside a fenced block is not code-span syntax to
+#   looks inside one. Rule 2 now keys its exemption per SPAN rather than per
+#   group (sozu-proxy/sozu#1457), which closes the drift half of that identity
+#   problem; this is rule 1's half — a duplicate ACROSS two citation groups —
+#   and it is still open, here or anywhere. A backtick inside a fenced block is not code-span syntax to
 #   CommonMark although it is to this pattern; no such span exists in the
 #   guarded surface.
 #
@@ -814,8 +890,14 @@ def quote_pair(was, now):
 def check_drift(root, base, show=False, out=sys.stdout):
     """A citation this changeset left alone must still name the same line TEXT.
 
-    Returns `(compared, failures)`: how many cited line ENDS were resolvable at
-    both revisions and therefore actually compared, and the drifts among them.
+    Returns `(compared, exempt, failures)`: how many cited line ENDS were
+    resolvable at both revisions and therefore actually compared, how many were
+    resolvable and skipped because this changeset re-anchored them, and the
+    drifts among the compared ones. The two counts partition every cited end
+    that resolved and was in range at HEAD, which is what makes `exempt`
+    readable:
+    "38 compared, 12 exempt" says there is something to disposition where
+    "38 compared" reads as complete coverage.
 
     Resolution is rule 1's own `resolve_path` on the HEAD tree, so a bare
     `mod.rs` in `mux/LIFECYCLE.md` binds to that directory's sibling exactly as
@@ -825,16 +907,23 @@ def check_drift(root, base, show=False, out=sys.stdout):
     matching the blank-line rule so this stays a strict superset of it.
 
     Three things are deliberately not compared, each because rule 1 already
-    owns it or because there is nothing to compare against: a citation absent
-    from the base revision of its own document (the author re-anchored it), a
+    owns it or because there is nothing to compare against: a SPAN absent from
+    the base revision of its own document (the author re-anchored that span), a
     document or a cited file that the base tree did not carry (both are new
-    here), and a line number out of range at either revision.
+    here), and a line number out of range at either revision. Only the first is
+    counted in `exempt`; the other two have their own owners.
+
+    The exemption is keyed per SPAN, so a group whose first number moved still
+    has its siblings compared (sozu-proxy/sozu#1457). It cannot be keyed on
+    anything better than a number, which is a real limitation and not a bug to
+    be heuristically papered over: see "A NUMBER REUSED FOR DIFFERENT CODE".
     """
     by_suffix = target_files(root)
     blobs = {}
     head = {}
     failures = []
     compared = 0
+    exempt = 0
 
     for doc in doc_files(root):
         base_body = blob(root, base, doc, blobs)
@@ -844,10 +933,20 @@ def check_drift(root, base, show=False, out=sys.stdout):
         # still carries the same claim, so moving it does not excuse a stale
         # number. Keying on the PARSED spans rather than their text also makes
         # `3/6` and `3, 6` the same citation, which they are.
+        #
+        # The key is ONE SPAN, never the whole group. Keying the group meant
+        # that correcting a single number in `h2.rs:5676/5860/5885/5903`
+        # changed the tuple, so every sibling was classified "re-anchored" and
+        # none was compared however stale it was. That is sozu-proxy/sozu#1457,
+        # and it is the exact half-applied renumbering this file exists to
+        # catch: the more careful the partial fix looked, the more numbers it
+        # hid. Per span, the author who fixes one number buys no exemption for
+        # the rest, and `3/6` is still the same citation as `3, 6`.
         untouched = {
-            (path, tuple(spans))
+            (path, span)
             for path, _text, spans, _offset in citations(base_body)
             if path is not None
+            for span in spans
         }
 
         doc_dir = os.path.dirname(doc)
@@ -858,8 +957,6 @@ def check_drift(root, base, show=False, out=sys.stdout):
         for cited, _spans_text, spans, offset in citations(body):
             if cited is None:
                 continue  # rule 1 reports a continuation that binds to nothing
-            if (cited, tuple(spans)) not in untouched:
-                continue  # re-anchored by this changeset, which is not drift
 
             target, _ = resolve_path(cited, by_suffix, root, doc_dir)
             if target is None:
@@ -877,9 +974,25 @@ def check_drift(root, base, show=False, out=sys.stdout):
             for start, end in spans:
                 span = str(start) if start == end else "%d-%d" % (start, end)
                 edges = [(start, "")] if start == end else [(start, ""), (end, " (end of range)")]
+                # Per span, so a sibling this changeset moved does not cover
+                # for one it left behind.
+                anchored = (cited, (start, end)) in untouched
                 for number, edge in edges:
-                    if not 1 <= number <= min(len(base_lines), len(head_lines)):
+                    if not 1 <= number <= len(head_lines):
                         continue  # rule 1 owns out-of-range at HEAD
+                    if not anchored:
+                        # Re-anchored by this changeset, which is not drift —
+                        # but COUNTED. A compared total reports what the rule
+                        # looked at and never what it declined to look at, so
+                        # this rule's coverage could fall to zero for a whole
+                        # changeset with every counter it emits still healthy
+                        # (sozu-proxy/sozu#1447).
+                        exempt += 1
+                        if show:
+                            out.write("%s  %s:%d  |re-anchored\n" % (where, target, number))
+                        continue
+                    if number > len(base_lines):
+                        continue  # no line at the base revision to compare against
                     compared += 1
                     was = base_lines[number - 1].strip()
                     now = head_lines[number - 1].strip()
@@ -893,7 +1006,7 @@ def check_drift(root, base, show=False, out=sys.stdout):
                         % (where, cited, span, target, number, edge, was_quoted, now_quoted)
                     )
 
-    return compared, failures
+    return compared, exempt, failures
 
 
 # ── Rule 3: dead test-name citations ──────────────────────────────────────
@@ -1421,12 +1534,17 @@ FIXTURE_BARE_GROUP_EXPECTED = "doc/bad.md:24: `sample.rs:3/3` — line 3 repeate
 # `doc/pinned_nested.md` contributes two: the annotation it DISPLAYS inside a
 # four-tick example is still a citation to rule 1, which is correct — the text
 # names a real span either way — and the real pin after it is the second.
+# `doc/keyed.md` contributes three, all naming `keyed.rs`, and they are rule 2's
+# IDENTITY fixture: a two-span group with one span moved and one left behind
+# (#1457), and a single span whose number named different code at the base
+# revision (#1447). Rule 1 must pass all three at both revisions, or the
+# document is testing the resolver instead of the comparison.
 # `doc/bad.md` contributes seventeen, six of them bare continuations: two bound
 # and wrong, one bound GROUP, one unbindable group, and two unbindable spans
-# that pin the scope. `doc/good.md` contributes nine; `doc/reference.md` and
-# `doc/wide.md` none —
+# that pin the scope. `doc/good.md` contributes nine; `doc/reference.md`,
+# `doc/wide.md` and `keyed.rs` none —
 # each is a citation TARGET, and carries no citation of its own.
-FIXTURE_TOTAL = 41
+FIXTURE_TOTAL = 44
 
 # Rule 2's half of the fixtures is a PAIR of revisions, so every file that
 # drifts carries its base revision beside it as `<name>.base`. That suffix is
@@ -1450,6 +1568,25 @@ DRIFT_BASE_SUFFIX = ".base"
 #     silent, because it is absent from the base revision of the document
 #   * `wide.md:11` moved only past the clip                     — reported,
 #     and asserted apart from this list: see FIXTURE_DRIFT_WIDE_PREFIX
+#
+# `doc/keyed.md` adds the two the IDENTITY defects turn on, and they fail for
+# opposite reasons — one was invisible, the other is reported and cannot be
+# fixed:
+#   * `keyed.rs:17` is the sibling of a two-span group whose FIRST span this
+#     changeset moved (`keyed.rs:8/17` -> `keyed.rs:12/17`). Keyed on the whole
+#     tuple the group was classified re-anchored and this span was never
+#     compared, which is sozu-proxy/sozu#1457's false NEGATIVE — and the worse
+#     half of it, because a group whose first element is freshly correct reads
+#     as maintained. Seen red: with the per-span key reverted to
+#     `tuple(spans)`, this entry disappears and the self-test prints
+#     "expected 5 drifted citations, got 4".
+#   * `keyed.rs:16` is sozu-proxy/sozu#1447's false POSITIVE, pinned here
+#     deliberately. The citation is CORRECT — the helper it names really is on
+#     line 16 at HEAD — but 16 named a different helper at the base revision,
+#     so the span is not new and the exemption does not apply. No edit to the
+#     document makes this report go away, and it is asserted so that a future
+#     attempt to silence it by widening the exemption goes red instead of
+#     quietly turning the rule off. See "A NUMBER REUSED FOR DIFFERENT CODE".
 FIXTURE_DRIFT_EXPECTED = [
     "doc/drift.md:11: `drift.rs:12` — drift.rs:12 moved: "
     "was `pub fn moved(&self) -> u8 {`, now `pub fn inserted(&self) -> u8 {`",
@@ -1457,6 +1594,10 @@ FIXTURE_DRIFT_EXPECTED = [
     "was `1`, now `0`",
     "doc/drift.md:15: `drift.rs:8-13` — drift.rs:13 moved (end of range): "
     "was `1`, now `0`",
+    "doc/keyed.md:16: `keyed.rs:16` — keyed.rs:16 moved: "
+    "was `pub fn tail(&self) -> u8 {`, now `pub fn reused(&self) -> u8 {`",
+    "doc/keyed.md:7: `keyed.rs:17` — keyed.rs:17 moved: "
+    "was `let far = 3;`, now `2`",
 ]
 
 # The sixth citation's drift is held OUT of the list above deliberately.
@@ -1514,7 +1655,37 @@ REPORTED_PAIR = re.compile(r": was `(.*)`, now `(.*)`$")
 # the `>>>>>>>` a resolver reads. Two correct edits, silently composed into a
 # third value that is neither. When two branches move the same counter for
 # different reasons, the merge is a sum, and git cannot know that.
-FIXTURE_DRIFT_COMPARED = 32
+# The thirty-third and thirty-fourth are `doc/keyed.md`'s: the sibling span a
+# half-applied renumbering used to exempt, and the reused number. Both are
+# spans the WHOLE-TUPLE key skipped or kept by accident rather than by rule,
+# so this counter moving from 32 to 34 is the coverage the per-span key buys.
+FIXTURE_DRIFT_COMPARED = 34
+
+
+# The exact number of cited line ENDS the rule declined to compare because this
+# changeset re-anchored their span, and the reason it is asserted beside the
+# compared total rather than left implicit: a compared count reports what the
+# rule LOOKED AT and never what it declined to look at, so this rule's coverage
+# can fall to zero for a whole class of work while every counter it emits stays
+# healthy. Measured in sozu-proxy/sozu#1447 on a changeset that repaired six
+# markdown citations: 370 cited ends compared with `.md` targets enabled, 370
+# with them disabled, and ZERO of the six entered the rule — repairing a
+# citation changes its span, which is exactly what the exemption covers. The
+# run reported "none of the 370 cited lines changed their text" and was telling
+# the truth about the 370 while saying nothing about the six.
+#
+# `compared` and `exempt` PARTITION every cited end that resolved and was in
+# range AT HEAD, which is what makes the pair readable and what decides the
+# order of the two range tests. An exempt span reads no base text, so only the
+# HEAD range can bind it, and rule 1 already owns HEAD out-of-range; testing
+# `min(base, head)` first instead would drop every citation renumbered into the
+# GROWN TAIL of a file — which is not a corner, it is the dominant re-anchoring
+# shape, since an insertion of any size pushes later citations past the old end
+# by construction. `doc/drift.md:18`'s `drift.rs:16` is exactly that case: 16
+# exceeds the base revision's 15 lines, and it is the third of these three.
+# The base range is still checked, after the exemption, because a COMPARED span
+# does need a line at the base to compare against.
+FIXTURE_DRIFT_EXEMPT = 3
 
 # Rule 3's half of the fixtures. `tests_bad.rs` and the fixture `CHANGELOG.md`
 # are the broken documents; `tests_good.rs` is the clean one and also carries
@@ -1747,7 +1918,7 @@ def self_test():
             ok = False
             print("FAIL self-test: the base revision did not resolve: %s" % why)
 
-        compared, drifted = check_drift(repo, base_sha)
+        compared, exempt, drifted = check_drift(repo, base_sha)
         drifted = sorted(drifted)
 
         # The wide-line drift, separated before the exact comparison because
@@ -1813,6 +1984,22 @@ def self_test():
                 "FAIL self-test: compared %d cited lines against the base revision, expected "
                 "exactly %d — the scanned surface or the comparison has shrunk"
                 % (compared, FIXTURE_DRIFT_COMPARED)
+            )
+
+        # The exemption, asserted rather than described. Every other count here
+        # measures what the rule looked at; only this one measures what it
+        # declined to look at, which is the single number that separates "38
+        # compared" read as complete coverage from "38 compared, 12 exempt"
+        # read as something to disposition. A build that stopped emitting it —
+        # or an exemption widened until it swallowed the comparison — moves
+        # this and nothing else.
+        if exempt != FIXTURE_DRIFT_EXEMPT:
+            ok = False
+            print(
+                "FAIL self-test: %d cited lines were exempt from the comparison as re-anchored, "
+                "expected exactly %d. A compared total reports what the rule looked at and never "
+                "what it declined to look at, so this rule can report a healthy count while "
+                "covering nothing — sozu-proxy/sozu#1447." % (exempt, FIXTURE_DRIFT_EXEMPT)
             )
 
         # The same tree, without a base: every drift above is invisible to the
@@ -1952,16 +2139,26 @@ def self_test():
     if ok:
         print(
             "OK self-test: %d fixture line citations, %d of them compared against a base "
-            "revision, %d examined test names (%d checked), and %d pinned blocks compared "
-            "(%d unpinned Rust blocks left alone); %d + %d + %d + %d expected failures "
-            "reported, exit 1 on the broken tree and 0 on the clean one, and an unreachable "
-            "base refused instead of skipped."
+            "revision (%d more exempt as re-anchored), %d examined test names (%d checked), "
+            "and %d pinned blocks compared (%d unpinned Rust blocks left alone); %d + %d + %d "
+            "+ %d expected failures reported, exit 1 on the broken tree and 0 on the clean "
+            "one, and an unreachable base refused instead of skipped."
             % (
-                total, compared, examined, checked, pinned, unpinned,
+                total, compared, exempt, examined, checked, pinned, unpinned,
                 len(bad), len(drifted), len(dead), len(mismatched),
             )
         )
     return 0 if ok else 1
+
+
+def _spans(count):
+    """`3 re-anchored spans were` / `1 re-anchored span was`, for a report line.
+
+    The exempt count exists to be READ by a reviewer deciding whether a green
+    run covered anything, so it is worth the four lines it takes to not say
+    "1 spans were".
+    """
+    return "%d re-anchored span%s" % (count, " was" if count == 1 else "s were")
 
 
 def main():
@@ -2012,20 +2209,24 @@ def main():
             print("with a clean run would be green forever while comparing nothing, which is the")
             print("shape of defect this file exists to close.")
             return 1
-        compared, drifted = check_drift(root, base, show=args.show)
+        compared, exempt, drifted = check_drift(root, base, show=args.show)
         if drifted:
             status = 1
             print(
-                "::error::%d of %d compared citations drifted since %s:"
-                % (len(drifted), compared, base[:12])
+                "::error::%d of %d compared citations drifted since %s (%d re-anchored span%s exempt):"
+                % (len(drifted), compared, base[:12], exempt, "" if exempt == 1 else "s")
             )
             for line in drifted:
                 print("  " + line)
             print("")
             print("The cited line moved and the citation did not follow it. Renumber it, or better,")
             print("replace it with the symbol the prose already names — a symbol cannot drift.")
-            print("A citation this changeset re-anchored on purpose is not reported: only one left")
-            print("pointing at text that changed underneath it.")
+            print("A span this changeset re-anchored is exempt and counted above, never silent; a")
+            print("sibling it left behind in the same group is still compared.")
+            print("Read each against the claim before renumbering. A number this changeset REUSED")
+            print("for different code is compared against whatever the base revision put on it, so a")
+            print("citation that is ALREADY correct can appear here with no edit that removes it —")
+            print("sozu-proxy/sozu#1447. Citing a symbol leaves that class behind for good.")
         else:
             print(
                 "OK: none of the %d cited lines compared against %s changed their text."
@@ -2033,6 +2234,10 @@ def main():
             )
             print("Still a floor for a line this changeset did not touch: only drift SINCE the base")
             print("is visible, so cite a symbol wherever the prose names an item.")
+            print(
+                "%s exempt from the comparison and never checked at all; `--show` lists them, "
+                "and a compared total cannot report them." % _spans(exempt)
+            )
 
     print("")
     examined, checked, dead = check_test_citations(root, show=args.show)

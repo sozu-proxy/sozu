@@ -890,6 +890,86 @@
 
 ### 🐛 Fixed
 
+- **`fix(ci)`: the drifted-citation rule keys its exemption per span, so correcting one number in a
+  citation group no longer exempts the siblings left behind.** `check_doc_citations.py` built its
+  base-revision set from the whole parsed span tuple, so a group written `file.rs:NNN/MMM/PPP/QQQ`
+  whose first number an author corrected produced a tuple absent from the base, was classified
+  "re-anchored by this changeset, which is not drift", and `continue`d — the three stale siblings
+  were never compared, however far they had rotted. That is precisely the **half-applied
+  renumbering** the file's own header names as a thing it means to catch, and the whole-tuple key
+  handed it an exemption: the author who fixed one number bought silence for the rest, and the more
+  careful the partial fix looked, the more numbers it hid. It is worse than leaving the group
+  alone. An all-stale group reads as uniformly suspect; a group whose first element is freshly
+  correct reads as maintained, and a reader following the second element lands on unrelated code
+  with no signal that anything is wrong (sozu-proxy/sozu#1457).
+  `06fc2708` ("refactor(mux): hand the Endpoint trait an RTT value, not a peer socket") is the
+  worked case: it moved element 1 of three groups in `lib/src/protocol/mux/LIFECYCLE.md` by the
+  correct shift and left seven sibling numbers on unrelated code, with the `Doc citations` job
+  green. The build before this changeset reports nothing there — `OK: none of the 233 cited lines
+  compared against 80cd162a3334 changed their text` — and the per-span key reports six of the
+  seven:
+
+      $ python3 .github/scripts/check_doc_citations.py --root <06fc2708> --base 06fc2708^
+      ::error::6 of 240 compared citations drifted since 80cd162a3334 (92 re-anchored spans exempt):
+        …LIFECYCLE.md:308: `h2.rs:5860`  was `where`,                 now `{`
+        …LIFECYCLE.md:308: `h2.rs:5885`  was `return false;`,         now `trace!(`
+        …LIFECYCLE.md:308: `h2.rs:5903`  was a comment,               now a different comment
+        …LIFECYCLE.md:328: `mod.rs:2068` was `} else {`,              now `set_default_answer(…)`
+        …LIFECYCLE.md:328: `mod.rs:2163` was `log_module_context!()`, now `);`
+        …LIFECYCLE.md:329: `h2.rs:5756`  was `let buf = …space();`,   now `buf[..frame.len()]…`
+
+  The seventh, `mod.rs:2152`, escapes the per-span key too, because the text at that line happens
+  to equal the text at the line it used to name — a comparison of text cannot see a number that
+  moved between two identical lines, and nothing short of resolving the enclosing construct could.
+  Keying per span keeps the property the parsed-span key was chosen for: `3/6` and `3, 6` are still
+  the same citation. Both ends of a **range** deliberately stay one span, so correcting only the end
+  of `NNN-MMM` re-anchors its start as well — the two ends describe one construct and move
+  together, and keying per end instead would compare a fresh single `file.rs:MMM` against an older
+  `file.rs:NNN-MMM`'s end, a new false positive for no coverage. `testdata/citations/doc/keyed.md`
+  is the fixture and `FIXTURE_DRIFT_COMPARED` goes 32 -> 34. Seen red: with the key reverted to the
+  span tuple and the fixture kept, `--self-test` exits 1 with "expected 5 drifted citations, got 4"
+  — the missing one being the stale sibling — plus "compared 33 ... expected exactly 34" and "4
+  cited lines were exempt ... expected exactly 3".
+
+- **`fix(ci)`: every drifted-citation run reports how many spans it did NOT compare, and a line
+  number reused for different code is stated as a limitation instead of guessed at.** The rule
+  exempts a span the base revision of its own document did not carry, which is correct — an author
+  who re-anchors a citation is not drifting it — but a compared total reports what the rule looked
+  at and never what it declined to look at, so this rule's coverage can fall to zero for a whole
+  class of work while every counter it emits stays healthy. Measured on a changeset that repaired
+  six markdown citations: 370 cited ends compared with `.md` targets enabled, 370 with them
+  disabled, and **zero** of the six entered the rule — repairing a citation changes its span, which
+  is exactly what the exemption covers. The run reported "none of the 370 cited lines changed their
+  text" and was telling the truth about the 370 while saying nothing about the six
+  (sozu-proxy/sozu#1447). Every run now prints the exempt count beside the compared one and
+  `--show` lists each exempt span as `|re-anchored`; `compared` and `exempt` partition every cited
+  end that resolved and was in range at HEAD, so "38 compared, 12 exempt" says there is
+  something to disposition where "38 compared" reads as complete coverage. The HEAD range is tested
+  before the exemption and the base range after it, deliberately: an exempt span reads no base text,
+  so binding it to `min(base, head)` would have dropped every citation renumbered into the grown
+  tail of a file — not a corner case but the dominant re-anchoring shape, since an insertion of any
+  size pushes later citations past the old end by construction.
+  The same issue's **false positive is not fixed, and is documented rather than papered over.** The
+  exemption keys on a number, and a number is not stable under the edits the rule polices: when a
+  changeset renumbers a citation onto a line whose number the base revision spent on something
+  else, the span is not new, the exemption does not apply, and a *correct* citation is reported. At
+  `595920e9` the mux `LIFECYCLE.md` cited an `h2.rs` line for the `handle_goaway_frame` retry loop,
+  and on a branch that renumbered after a large `h2.rs` edit the `StreamState::Link` transition
+  landed on that very line — repointing the Link citation at its true new line was reported as
+  drift, with no edit available that would silence it. Nothing here guesses. The rule has a path, a
+  number and two revisions of a line; it does not have the claim the number was attached to, and an
+  honest re-anchor is indistinguishable from a reused number on that evidence — "the head text
+  existed elsewhere at the base" fires on every insertion, genuine drift included. A rule that
+  stopped comparing would be worse than one that occasionally over-reports, and a heuristic that
+  guessed wrong *quietly* would be worse than both, so the rule over-reports and says so in its own
+  output. `testdata/citations/doc/keyed.md` pins the over-report as an expected verdict, so a later
+  attempt to silence it by widening the exemption turns `--self-test` red instead of quietly turning
+  the rule off. The remedy is the one the file keeps naming: cite a **symbol**, which has no number
+  to reuse. Seen red twice, each production change reverted alone and the fixture kept. With the
+  counter reverted, `--self-test` exits 1 with "0 cited lines were exempt from the comparison as
+  re-anchored, expected exactly 3"; with the two range tests swapped back to the old order, with
+  "2 cited lines were exempt ... expected exactly 3" — the missing one being the grown-tail case.
+
 - **`fix(parser)`: the HTTP method token is matched case-sensitively, so Sōzu and the origin
   agree on what method a request carries.** `Method::new`
   (`lib/src/protocol/kawa_h1/parser.rs`) compared with `compare_no_case`, so a request line
