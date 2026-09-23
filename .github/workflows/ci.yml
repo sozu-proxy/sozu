@@ -40,7 +40,7 @@ jobs:
             flags: '--features opentelemetry,splice,simd'
             bench: false
             experimental: false
-            runner: ubuntu-latest
+            runner: sozu-general
           # `msrv-bare` baseline: only the workspace defaults
           # (`jemallocator + crypto-ring`). Catches breakage when the
           # optional features (`opentelemetry`, `splice`, `simd`) are
@@ -51,7 +51,7 @@ jobs:
             flags: ''
             bench: false
             experimental: false
-            runner: ubuntu-latest
+            runner: sozu-general
           # The four crypto-provider cells now exercise the full
           # feature matrix (`<crypto>,opentelemetry,splice,simd`) so
           # the CI cells reflect what release artefacts ship with
@@ -64,32 +64,33 @@ jobs:
             flags: '--no-default-features --features crypto-ring,opentelemetry,splice,simd'
             bench: true
             experimental: false
-            runner: ubuntu-latest
+            runner: sozu-bench
           - cell: crypto-aws-lc-rs
             toolchain: '1.93.1'
             flags: '--no-default-features --features crypto-aws-lc-rs,opentelemetry,splice,simd'
             bench: true
             experimental: false
-            runner: ubuntu-latest
+            runner: sozu-bench
           - cell: crypto-openssl
             toolchain: '1.93.1'
             flags: '--no-default-features --features crypto-openssl,opentelemetry,splice,simd'
             bench: true
             experimental: false
-            runner: ubuntu-latest
+            runner: sozu-bench
           - cell: fips
             toolchain: '1.93.1'
             flags: '--no-default-features --features fips,opentelemetry,splice,simd'
             bench: true
             experimental: false
-            runner: ubuntu-latest
+            runner: sozu-bench
           # Toolchain-drift cells: same politics as msrv (default
           # features, no bench). Lint is gated to the 1.91 MSRV cell
           # because newer toolchains (1.95+) fire additional untriaged
           # lints across the workspace.
-          # Canary migration to the self-hosted CKE runner (see ci/runners/), 2026-09-22: only
-          # this cell targets sozu-general so far. Full-matrix migration follows once this proves
-          # stable over a representative traffic window (per ci/runners/README.md's rollout plan).
+          # Full-matrix migration to the self-hosted CKE runners (see ci/runners/) completed
+          # 2026-09-23, after the `stable` canary (PR #1455) proved stable. Compile-only cells
+          # (no bench) run on sozu-general; the four crypto-provider cells above run on
+          # sozu-bench for physical-node reproducibility.
           - cell: stable
             toolchain: stable
             flags: ''
@@ -101,7 +102,7 @@ jobs:
             flags: ''
             bench: false
             experimental: false
-            runner: ubuntu-latest
+            runner: sozu-general
           # Nightly stays "experimental" — keep building/testing it
           # to catch future-Rust regressions early without gating CI.
           - cell: nightly
@@ -109,28 +110,12 @@ jobs:
             flags: ''
             bench: false
             experimental: true
-            runner: ubuntu-latest
+            runner: sozu-general
     steps:
-      # Skipped on the self-hosted runner: ci/runners/Dockerfile already bakes in
-      # protobuf-compiler/cmake, and its pod's securityContext (drop: ["ALL"] capabilities,
-      # runAsNonRoot) correctly blocks `sudo apt-get install` — this is hardening working as
-      # intended, not a bug, so the fix is skipping the now-redundant step rather than loosening
-      # the pod's capabilities.
-      - name: Install system dependencies
-        if: matrix.runner == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
-
-      # h2spec is needed by `tests::test_h2spec_conformance` (e2e). The
-      # release tarball is small; install once per job. Skipped on the self-hosted runner for the
-      # same reason as above — ci/runners/Dockerfile bakes in h2spec 2.6.0 already.
-      - name: Install h2spec
-        if: matrix.runner == 'ubuntu-latest'
-        run: |
-          H2SPEC_VERSION=2.6.0
-          curl -fsSL "https://github.com/summerwind/h2spec/releases/download/v${H2SPEC_VERSION}/h2spec_linux_amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin h2spec
-          h2spec --version
-
+      # protobuf-compiler/cmake/h2spec no longer need an install step here: every `pipeline`
+      # cell now runs on a self-hosted sozu-general/sozu-bench pod, and ci/runners/Dockerfile
+      # already bakes all three in (h2spec 2.6.0). Removed 2026-09-23 with the full-matrix
+      # migration — see ci/runners/README.md.
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -231,12 +216,9 @@ jobs:
   # └──────────────────────────────────────────────────────────────┘
   fuzz:
     name: Fuzz (nightly)
-    runs-on: ubuntu-latest
+    runs-on: sozu-general
     timeout-minutes: 45
     steps:
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
-
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -300,12 +282,9 @@ jobs:
   # └──────────────────────────────────────────────────────────────┘
   cargo-audit:
     name: cargo audit
-    runs-on: ubuntu-latest
+    runs-on: sozu-general
     timeout-minutes: 10
     steps:
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -344,7 +323,7 @@ jobs:
   # └──────────────────────────────────────────────────────────────┘
   test-hygiene:
     name: Test hygiene
-    runs-on: ubuntu-latest
+    runs-on: sozu-general
     timeout-minutes: 5
     steps:
       - name: Checkout sources
@@ -385,7 +364,7 @@ jobs:
   # └──────────────────────────────────────────────────────────────┘
   doc-citations:
     name: Doc citations
-    runs-on: ubuntu-latest
+    runs-on: sozu-general
     timeout-minutes: 5
     steps:
       - name: Checkout sources
@@ -459,7 +438,7 @@ jobs:
   # └──────────────────────────────────────────────────────────────┘
   udp-simulation:
     name: UDP simulation (moonpool)
-    runs-on: ubuntu-latest
+    runs-on: sozu-general
     timeout-minutes: 30
     env:
       # Scopes the unstable flag to THIS job; cfg-gated deps mean the rest of the
@@ -504,7 +483,10 @@ jobs:
   # └──────────────────────────────────────────────────────────────┘
   build-bombardier:
     name: Build bombardier
-    runs-on: ubuntu-latest
+    # Produces a linux/amd64 binary either way (ubuntu-latest and the sozu-general XL nodes are
+    # both linux/x86_64), so the artifact stays consumable by bench-bombardier below even though
+    # that job stays on ubuntu-latest (see its own comment for why).
+    runs-on: sozu-general
     steps:
       - name: Clone bombardier
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -528,7 +510,7 @@ jobs:
 
   build-lagging_server:
     name: Build lagging_server
-    runs-on: ubuntu-latest
+    runs-on: sozu-general
     steps:
       - name: Install rust 1.93.1
         uses: dtolnay/rust-toolchain@1.93.1
@@ -555,11 +537,8 @@ jobs:
 
   build-bench-logger:
     name: Build bench_logger
-    runs-on: ubuntu-latest
+    runs-on: sozu-general
     steps:
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
       - name: Install rust 1.93.1
         uses: dtolnay/rust-toolchain@1.93.1
 
@@ -583,6 +562,16 @@ jobs:
 
   bench-bombardier:
     name: Bombardier bench (${{ matrix.provider }})
+    # NOT migrated to sozu-bench (2026-09-23 full-matrix pass), unlike every other bench-relevant
+    # job — this is the primary motivating "bench" workload, but its "Host mapping sozu.io
+    # domains" and "Generate TLS key *" steps below rely on `sudo tee -a /etc/hosts` and `sudo
+    # update-ca-certificates` at runtime (per-run generated self-signed CAs, not something
+    # hostAliases or a baked image can substitute for). That needs real root, which the hardened
+    # pod's dropped capabilities correctly block — same class of problem as the earlier apt-get
+    # install steps, but NOT fixable by baking packages into the image since the certs are
+    # generated fresh every run. Fixing this for real means changing bench.py to trust the
+    # generated CA via an env var (e.g. SSL_CERT_FILE) instead of installing it system-wide —
+    # untouched, unvalidated follow-up, tracked separately rather than rushed through here.
     runs-on: ubuntu-latest
     needs: [pipeline, build-bombardier, build-lagging_server]
     strategy:
@@ -680,13 +669,13 @@ jobs:
 
   bench-logs:
     name: Bench logger
-    runs-on: ubuntu-latest
+    # Migrated 2026-09-23: a real benchmark (logging overhead), so it belongs on sozu-bench for
+    # the same physical-node-exclusivity reason as bench-bombardier below — no sudo/etc-hosts/CA
+    # dependency here (unlike bench-bombardier), so nothing blocks it under the hardened pod.
+    runs-on: sozu-bench
     needs: [pipeline, build-bench-logger]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install rust 1.93.1
         uses: dtolnay/rust-toolchain@1.93.1
