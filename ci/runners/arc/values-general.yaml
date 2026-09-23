@@ -20,8 +20,9 @@
 # writable path plus emptyDir mounts before it's safe) and automountServiceAccountToken: false
 # (unconfirmed whether the runner pod itself ever needs K8s API access under ARC's default,
 # non-Kubernetes containerMode — verify against ARC's runner-pod source before disabling).
-# Concurrency (2026-09-23): the `default` NodeGroup has autoscaling enabled (min 0, max 256 —
-# unlike `bench`, which is deliberately pinned; general jobs need floor capacity, not physical
+# Concurrency (2026-09-23): the `default` NodeGroup has autoscaling enabled (min 8, max 256 —
+# raised from min 0 the same day once real matrix load showed the floor was too low; unlike
+# `bench`, which is deliberately pinned; general jobs need floor capacity, not physical
 # exclusivity). Without a `resources.requests` on the runner pod, Kubernetes always considers it
 # trivially schedulable on the single existing node, so the autoscaler never sees a pending pod and
 # never scales out regardless of maxRunners. The requests below (4 vCPU / 4Gi per runner) are a
