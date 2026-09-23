@@ -6,8 +6,9 @@
 //! time without fighting the borrow checker.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt::Debug,
+    ops::{Deref, DerefMut},
     rc::{Rc, Weak},
     time::Duration,
 };
@@ -54,6 +55,146 @@ impl StreamState {
     }
 }
 
+/// Ceiling on the request captures one worker may hold armed at once
+/// (sozu-proxy/sozu#1450).
+///
+/// Captures live on the global allocator, outside the buffer [`Pool`], so no
+/// `max_buffers` accounting sees them. Before this ceiling their only bound
+/// was transitive: a capture can exist only on a live [`Stream`], and
+/// [`Stream::new`] takes exactly two `pool.checkout()` calls, so at most
+/// `max_buffers / 2` captures can be armed at once. At the defaults
+/// (`max_buffers` 1000, `buffer_size` 16393) that is 500 captures of at most
+/// 16400 bytes each, about 8.2 MB — and it scales with `max_buffers`, so
+/// raising that knob to 20000 would take the same heap to roughly 164 MB.
+///
+/// 512 is chosen so the ceiling does NOT bite at the defaults: 500 possible
+/// captures fit under it, so a stock deployment replays exactly what it
+/// replayed before. What it removes is the growth: the heap stops tracking
+/// `max_buffers` and becomes a constant.
+///
+/// The bound is `2 * MAX_ARMED_REPLAY_CAPTURES * buffer_size` and not a byte
+/// budget, because each capture is independently bounded — a write that would
+/// carry one past its front kawa's `storage.capacity()` drops it whole
+/// (`super::h1::ConnectionH1::writable`), which is HAProxy's "Requests not
+/// fitting in a single buffer will never be retried". Counting captures is
+/// therefore a memory bound, not a proxy for one.
+///
+/// The factor of two is `Vec`'s amortized growth and is part of the bound,
+/// not a footnote to it. `ConnectionH1::writable` calls `Vec::reserve`, which
+/// grows to `max(2 * old_capacity, required)`, while the guard beside it
+/// bounds `len` — not `capacity` — by `storage.capacity()`. A capture written
+/// in one pass has `capacity == len`; one assembled over several partial
+/// writes can reach twice it. Measured on this tree at the defaults: a single
+/// 16393-byte write gives `len 16393 / capacity 16393`, and writes of
+/// `[8192, 8192, 9]` give `len 16393 / capacity 32768`. So 512 captures carry
+/// at most about 8.4 MB and may have allocated about 16.8 MB.
+///
+/// Past the ceiling nothing is refused and no frontend parks:
+/// [`Stream::arm_upstream_replay`] installs no buffer, the request proceeds
+/// un-replayable, and a stale pooled upstream answers the same
+/// `502 Bad Gateway` it answered before the replay existed. That graceful
+/// degradation is the reason the captures are not pool-allocated, where the
+/// same memory pressure would answer `503` and park frontends instead.
+pub const MAX_ARMED_REPLAY_CAPTURES: usize = 512;
+
+thread_local! {
+    /// Request captures currently armed on this worker, the quantity
+    /// [`MAX_ARMED_REPLAY_CAPTURES`] bounds.
+    ///
+    /// Thread-local rather than a process-wide static because that is the
+    /// scope of everything it is reconciled against: a Sōzu worker is one
+    /// event-loop thread, its [`Pool`] is an `Rc<RefCell<Pool>>` that cannot
+    /// leave it, and the `backend.retry.captures_armed` gauge this counter
+    /// feeds lives in the `thread_local!` `crate::metrics::METRICS`. A shared
+    /// static would let one worker thread in a multi-worker test process
+    /// exhaust another's budget while their gauges disagreed about it.
+    static ARMED_REPLAY_CAPTURES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// A request capture that owns its charge against
+/// [`MAX_ARMED_REPLAY_CAPTURES`].
+///
+/// The charge is acquired by [`ReplayCapture::try_arm`] and released by
+/// [`Drop`], so it is released wherever the capture is — `Option::take`,
+/// assigning `None` through [`StreamParts`], or the [`Stream`] being dropped
+/// on a client hangup, an idle timeout or a session teardown. That last path
+/// has no code site of its own, and wiring decrements into the four that do
+/// would leak a charge on every torn-down armed request until the ceiling
+/// disarmed replay for the rest of the worker's life. This is the reasoning
+/// `super::h2::ConnectionH2`'s gauge teardown and `crate::pool::Checkout`
+/// already apply: teardown in `Drop` is symmetric whichever path ran.
+///
+/// Derefs to the captured bytes, so the write path appends to it exactly as
+/// it appended to the bare `Vec<u8>` this replaced.
+pub struct ReplayCapture {
+    bytes: Vec<u8>,
+}
+
+impl ReplayCapture {
+    /// Charge one capture against this worker's budget, or refuse.
+    ///
+    /// `None` means the budget is full; the caller emits
+    /// `backend.retry.captures_declined` and carries on without a capture.
+    fn try_arm() -> Option<Self> {
+        let armed = ARMED_REPLAY_CAPTURES.get();
+        if armed >= MAX_ARMED_REPLAY_CAPTURES {
+            return None;
+        }
+        ARMED_REPLAY_CAPTURES.set(armed + 1);
+        gauge_add!(names::backend::RETRY_CAPTURES_ARMED, 1);
+        Some(Self { bytes: Vec::new() })
+    }
+
+    /// Take the captured bytes out, releasing the charge as `self` drops.
+    ///
+    /// `Vec` cannot be moved out of a type that implements [`Drop`], so the
+    /// bytes are swapped for an empty `Vec` and the husk is dropped normally
+    /// — which is what keeps the release on the single `Drop` site.
+    ///
+    /// Do NOT "simplify" this with `std::mem::forget(self)` to skip the drop.
+    /// The drop IS the release: forgetting it leaks one charge per replay
+    /// until the ceiling disarms replay for the rest of the worker's life,
+    /// with `backend.retry.captures_armed` pinned at
+    /// [`MAX_ARMED_REPLAY_CAPTURES`] to show it. `tests::
+    /// queueing_a_replay_releases_the_capture_charge` is the guard, and it is
+    /// the only test in the suite that catches that mutation.
+    fn into_bytes(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for ReplayCapture {
+    fn drop(&mut self) {
+        let armed = ARMED_REPLAY_CAPTURES.get();
+        // Budget-accounting invariant: every live `ReplayCapture` was paired
+        // with a `set(armed + 1)` in `try_arm`, so the counter must be
+        // strictly positive when one is dropped. A zero here is an unbalanced
+        // arm/release, which would wrap the counter to `usize::MAX` and
+        // disarm replay for the life of the worker. Mirrors the same guard on
+        // `crate::pool::Checkout`'s buffer gauge.
+        debug_assert!(
+            armed >= 1,
+            "armed-capture budget underflow on release: count was {armed} before decrement"
+        );
+        ARMED_REPLAY_CAPTURES.set(armed.saturating_sub(1));
+        gauge_add!(names::backend::RETRY_CAPTURES_ARMED, -1);
+    }
+}
+
+impl Deref for ReplayCapture {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+impl DerefMut for ReplayCapture {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.bytes
+    }
+}
+
 pub struct Stream {
     pub window: i32,
     pub attempts: u8,
@@ -88,7 +229,10 @@ pub struct Stream {
     /// copy the whole request into it […] Requests not fitting in a single
     /// buffer will never be retried" — replaying a request that kawa has
     /// already consumed is impossible without holding its bytes.
-    pub retry_buffer: Option<Vec<u8>>,
+    ///
+    /// The capture is charged against [`MAX_ARMED_REPLAY_CAPTURES`] for as
+    /// long as it is `Some`; see [`ReplayCapture`].
+    pub retry_buffer: Option<ReplayCapture>,
     pub context: HttpContext,
     pub metrics: SessionMetrics,
 }
@@ -154,7 +298,7 @@ pub struct StreamParts<'a> {
     /// [`Stream::retry_buffer`], reachable from the write path so the H1
     /// client can record the exact bytes it hands the upstream socket before
     /// `kawa::Kawa::consume` drops them from the front buffer.
-    pub retry_buffer: &'a mut Option<Vec<u8>>,
+    pub retry_buffer: &'a mut Option<ReplayCapture>,
 }
 
 impl Stream {
@@ -316,9 +460,53 @@ impl Stream {
     /// another pooled connection re-arms a fresh capture and may itself be
     /// replayed. `Router::connect`'s `stream.attempts >= CONN_RETRIES` gate
     /// is the only bound on how many times one request is re-issued.
+    ///
+    /// Arming is BEST EFFORT. Past [`MAX_ARMED_REPLAY_CAPTURES`] no buffer is
+    /// installed, `backend.retry.captures_declined` is incremented, and the
+    /// request proceeds un-replayable: [`Stream::can_replay_on_fresh_upstream`]
+    /// reads the absent buffer as "not replayable", so a stale pooled upstream
+    /// yields the same `502 Bad Gateway` it yielded before the replay existed.
+    /// Nothing is refused and no frontend parks — which is exactly what
+    /// pool-allocating the captures would have cost under the same memory
+    /// pressure (sozu-proxy/sozu#1450).
+    ///
+    /// A NON-IDEMPOTENT request is not captured at all, and does not spend a
+    /// charge. [`Stream::can_replay_on_fresh_upstream`] vetoes the method, so
+    /// such a capture could only ever be held for the life of the attempt and
+    /// thrown away. Before the ceiling that was pure waste; with one it is
+    /// also a slot a replayable request cannot have — on a POST-heavy pooled
+    /// workload it would be most of the budget, while
+    /// `backend.retry.captures_armed` sat at the ceiling showing an operator
+    /// nothing about why.
+    ///
+    /// The method is known here. `crate::protocol::http::editor::HttpContext`
+    /// sets it in `on_request_headers` during the frontend parse, and
+    /// `super::router::Router::connect` routes on it — `route_from_request`,
+    /// which fails with `RetrieveClusterError::NoMethod` without it — before
+    /// it reaches `super::h1::ConnectionH1::start_stream`, the sole caller of
+    /// this function.
+    ///
+    /// This makes the idempotence conjunct in
+    /// [`Stream::can_replay_on_fresh_upstream`] unreachable in production
+    /// rather than redundant by accident. It is deliberately KEPT as defense
+    /// in depth: it is the conjunct a later widening of this guard would
+    /// silently undo, and it is the one the replay's whole justification
+    /// rests on (RFC 9110 §9.2.2).
     pub fn arm_upstream_replay(&mut self) {
-        if self.retry_buffer.is_none() {
-            self.retry_buffer = Some(Vec::new());
+        if self.retry_buffer.is_some() {
+            return;
+        }
+        if !self
+            .context
+            .method
+            .as_ref()
+            .is_some_and(Method::is_idempotent)
+        {
+            return;
+        }
+        match ReplayCapture::try_arm() {
+            Some(capture) => self.retry_buffer = Some(capture),
+            None => incr!(names::backend::RETRY_CAPTURES_DECLINED),
         }
     }
 
@@ -411,7 +599,7 @@ impl Stream {
     ///
     /// Returns the number of bytes queued, or `None` when nothing was held.
     pub fn queue_upstream_replay(&mut self) -> Option<usize> {
-        let request = self.retry_buffer.take()?;
+        let request = self.retry_buffer.take()?.into_bytes();
         let len = request.len();
         self.front
             .out
@@ -599,9 +787,378 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use rusty_ulid::Ulid;
+    use sozu_command::proto::command::filtered_metrics;
 
     use super::*;
-    use crate::protocol::mux::test_support::TestListener;
+    use crate::{
+        metrics::METRICS,
+        protocol::mux::{
+            shared::{self, EndStreamAction},
+            test_support::TestListener,
+        },
+    };
+
+    /// A bare `Stream` holding two real pool buffers, built the way the
+    /// sibling test above builds one. Enough for the capture-budget tests:
+    /// they exercise `Stream`'s own arm/release surface, not a mux.
+    ///
+    /// `context.method` is left UNSET deliberately. `arm_upstream_replay`
+    /// captures only an idempotent request, so every test that means to arm
+    /// one states its own method and none of them inherits that precondition
+    /// from the fixture.
+    fn test_stream(pool: &Rc<RefCell<Pool>>) -> Stream {
+        let context = HttpContext::new(
+            Ulid::generate(),
+            Ulid::generate(),
+            Protocol::HTTP,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                54321,
+            )),
+            "SERVERID".to_owned(),
+            "Sozu-Id".to_owned(),
+            false,
+            false,
+        );
+        Stream::new(Rc::downgrade(pool), context, 65535).expect("test stream checkout")
+    }
+
+    /// The current value of one proxy-level metric for this test thread.
+    /// `METRICS` is a `thread_local!`, so this reads what this thread emitted;
+    /// every assertion below is nonetheless a DELTA against a baseline taken
+    /// at the top of the test, which stays correct under `--test-threads=1`
+    /// where libtest reuses one thread. Mirrors `server.rs`'s
+    /// `active_flows_gauge`.
+    fn proxy_metric(name: &str) -> i64 {
+        METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(name)
+                .and_then(|metric| match metric.inner {
+                    Some(filtered_metrics::Inner::Gauge(value)) => Some(value as i64),
+                    Some(filtered_metrics::Inner::Count(value)) => Some(value),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// Take every charge the budget has left, and hold them.
+    ///
+    /// Bounded by construction rather than by `while try_arm().is_some()`: a
+    /// ceiling-less `try_arm` would never end that loop, and a test that hangs
+    /// instead of failing proves nothing. Charges are taken through the same
+    /// `ReplayCapture::try_arm` `Stream::arm_upstream_replay` calls, so this
+    /// fills the real budget and not a stand-in for it.
+    fn fill_the_capture_budget() -> Vec<ReplayCapture> {
+        let held: Vec<ReplayCapture> = (0..MAX_ARMED_REPLAY_CAPTURES)
+            .filter_map(|_| ReplayCapture::try_arm())
+            .collect();
+        // Reachability, not the property under test: the budget was empty, so
+        // every charge was granted and it is now exactly full. It holds with
+        // or without the CEILING, so removing the ceiling never reddens a test
+        // here — but it does NOT hold under a mutation that leaks charges,
+        // where it fires at `left: 511 / right: 512` before the assertion the
+        // test is actually about. Any release-path mutation must therefore be
+        // checked against a test that does not call this helper;
+        // `queueing_a_replay_releases_the_capture_charge` is that test.
+        assert_eq!(
+            held.len(),
+            MAX_ARMED_REPLAY_CAPTURES,
+            "an empty budget must grant every one of its charges"
+        );
+        held
+    }
+
+    /// `queue_upstream_replay` is the one release path that works AROUND
+    /// [`Drop`]: a `Vec` cannot be moved out of a type that implements it, so
+    /// [`ReplayCapture::into_bytes`] swaps in an empty `Vec` and lets the husk
+    /// drop. The simplification a later contributor reaches for — a
+    /// `std::mem::forget(self)` to "avoid the pointless drop" — leaks the
+    /// charge instead, one per replay, until the ceiling disarms replay for
+    /// the rest of the worker's life with `backend.retry.captures_armed`
+    /// pinned at 512.
+    ///
+    /// This is the release path that most needs a test. The other three
+    /// clearing sites are plain `= None` assignments, where drop-on-assign is
+    /// not something an edit can quietly remove; this one is a hand-written
+    /// dance around `Drop`. `super::tests::
+    /// queueing_a_replay_moves_the_captured_bytes_into_the_front_buffer`
+    /// covers the bytes and the taken buffer, and looks at neither the budget
+    /// nor the gauge.
+    ///
+    /// Deliberately does not call `fill_the_capture_budget`: that helper's own
+    /// reachability assertion fires under a leaking mutation, and would hide
+    /// this one.
+    ///
+    /// To SEE THIS RED: insert `std::mem::forget(self);` before the returned
+    /// `bytes` in [`ReplayCapture::into_bytes`].
+    #[test]
+    fn queueing_a_replay_releases_the_capture_charge() {
+        setup_test_logger!();
+        const REQUEST: &[u8] = b"GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2, 16384)));
+        let charged_before = ARMED_REPLAY_CAPTURES.get();
+        let gauged_before = proxy_metric(names::backend::RETRY_CAPTURES_ARMED);
+
+        let mut stream = test_stream(&pool);
+        stream.context.method = Some(Method::Get);
+        stream.arm_upstream_replay();
+        stream
+            .retry_buffer
+            .as_mut()
+            .expect("an idempotent request under the ceiling must be captured")
+            .extend_from_slice(REQUEST);
+
+        let queued = stream
+            .queue_upstream_replay()
+            .expect("the armed stream carries a capture");
+
+        // Reachability: the capture really carried the request and really was
+        // spent, so what is asserted below is the release of a SPENT capture
+        // and not of an empty one.
+        assert_eq!(
+            queued,
+            REQUEST.len(),
+            "the whole captured request must be queued for the fresh upstream"
+        );
+
+        assert_eq!(
+            ARMED_REPLAY_CAPTURES.get(),
+            charged_before,
+            "queueing a replay must release the capture's charge"
+        );
+        assert_eq!(
+            proxy_metric(names::backend::RETRY_CAPTURES_ARMED),
+            gauged_before,
+            "queueing a replay must return the armed gauge to where it started"
+        );
+    }
+
+    /// A non-idempotent request is not captured and spends no charge.
+    /// [`Stream::can_replay_on_fresh_upstream`] vetoes the method, so the
+    /// capture could only ever be held for the life of the attempt and thrown
+    /// away. Before the ceiling that was waste; with one it is also a slot a
+    /// replayable request cannot have — on a POST-heavy pooled workload it
+    /// would be most of the budget.
+    ///
+    /// The idempotent half is load-bearing: without it this test would pass
+    /// against an `arm_upstream_replay` that captured nothing at all.
+    ///
+    /// The final assertion pins the metric's MEANING, not just its value:
+    /// `backend.retry.captures_declined` counts refusals for BUDGET, and a
+    /// method veto is not one. Counting it there would make the counter read
+    /// as lost retries when nothing was lost.
+    ///
+    /// To SEE THIS RED: delete the `Method::is_idempotent` early return from
+    /// [`Stream::arm_upstream_replay`].
+    #[test]
+    fn a_non_idempotent_request_is_never_charged_to_the_capture_budget() {
+        setup_test_logger!();
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2, 16384)));
+        let charged_before = ARMED_REPLAY_CAPTURES.get();
+        let declined_before = proxy_metric(names::backend::RETRY_CAPTURES_DECLINED);
+
+        let mut idempotent = test_stream(&pool);
+        idempotent.context.method = Some(Method::Get);
+        idempotent.arm_upstream_replay();
+        assert!(
+            idempotent.retry_buffer.is_some(),
+            "an idempotent request under the ceiling must be captured"
+        );
+        assert_eq!(
+            ARMED_REPLAY_CAPTURES.get(),
+            charged_before + 1,
+            "an idempotent request must spend a charge"
+        );
+        drop(idempotent);
+
+        // `PATCH` parses as `Method::Custom`, which is how sozu refuses every
+        // method whose semantics it does not know.
+        for method in [Method::Post, Method::new(b"PATCH")] {
+            let mut stream = test_stream(&pool);
+            stream.context.method = Some(method);
+
+            stream.arm_upstream_replay();
+
+            assert!(
+                stream.retry_buffer.is_none(),
+                "a non-idempotent request must not be captured"
+            );
+            assert_eq!(
+                ARMED_REPLAY_CAPTURES.get(),
+                charged_before,
+                "a non-idempotent request must not spend a capture charge"
+            );
+        }
+
+        assert_eq!(
+            proxy_metric(names::backend::RETRY_CAPTURES_DECLINED) - declined_before,
+            0,
+            "a method veto is not a budget refusal and must not be counted as one"
+        );
+    }
+
+    /// The ceiling of sozu-proxy/sozu#1450. Past [`MAX_ARMED_REPLAY_CAPTURES`]
+    /// armed captures, [`Stream::arm_upstream_replay`] installs NO buffer —
+    /// and the request it belongs to still completes, un-replayable, answered
+    /// with exactly the `502 Bad Gateway` `end_stream_decision` returned for
+    /// every consumed request before the replay existed. Nothing is refused,
+    /// no frontend parks, no session is answered `503`: that graceful
+    /// degradation is the whole reason the captures were not moved into the
+    /// buffer [`Pool`].
+    ///
+    /// The under-ceiling half is load-bearing. Without it this test would pass
+    /// against an `arm_upstream_replay` that armed nothing at all, which is
+    /// the same observation as "past the ceiling it arms nothing".
+    ///
+    /// To SEE THIS RED: in [`ReplayCapture::try_arm`], delete the
+    /// `if armed >= MAX_ARMED_REPLAY_CAPTURES { return None; }` early return so
+    /// the budget is never consulted.
+    #[test]
+    fn past_the_ceiling_a_pooled_request_is_armed_with_no_buffer_and_still_completes() {
+        setup_test_logger!();
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2, 16384)));
+
+        let mut under_the_ceiling = test_stream(&pool);
+        under_the_ceiling.context.method = Some(Method::Get);
+        under_the_ceiling.arm_upstream_replay();
+        assert!(
+            under_the_ceiling.retry_buffer.is_some(),
+            "under the ceiling arm_upstream_replay must install a capture"
+        );
+        // Releases both the charge and the two pool buffers the next stream
+        // checks out.
+        drop(under_the_ceiling);
+
+        let _held = fill_the_capture_budget();
+
+        let mut stream = test_stream(&pool);
+        stream.context.method = Some(Method::Get);
+        stream.arm_upstream_replay();
+        assert!(
+            stream.retry_buffer.is_none(),
+            "past the ceiling arm_upstream_replay must install no capture"
+        );
+
+        // The request was written to the upstream (`front.consumed`) and the
+        // upstream produced nothing — the exact shape sozu-proxy/sozu#1442
+        // replays. With no capture it is not replayable, and the answer is the
+        // pre-#1442 one rather than a refusal.
+        stream.front.consumed = true;
+        assert_eq!(
+            shared::end_stream_decision(&stream),
+            EndStreamAction::SendDefault(502),
+            "a request the budget declined to capture must still be answered, \
+             un-replayable, exactly as it was before the replay existed"
+        );
+    }
+
+    /// The two metrics of sozu-proxy/sozu#1450.
+    /// `backend.retry.captures_armed` follows arm and release;
+    /// `backend.retry.captures_declined` moves when — and only when — a
+    /// request is refused a capture for budget. An invisible heap
+    /// proportional to a fraction of the pool is not an operational signal;
+    /// these two are.
+    ///
+    /// To SEE THIS RED, one revert per assertion:
+    /// - the arm gauge: delete the
+    ///   `gauge_add!(names::backend::RETRY_CAPTURES_ARMED, 1)` from
+    ///   [`ReplayCapture::try_arm`];
+    /// - the release gauge: delete the matching
+    ///   `gauge_add!(names::backend::RETRY_CAPTURES_ARMED, -1)` from
+    ///   `ReplayCapture`'s `impl Drop`;
+    /// - the declined counter: replace
+    ///   `None => incr!(names::backend::RETRY_CAPTURES_DECLINED)` in
+    ///   [`Stream::arm_upstream_replay`] with `None => {}`.
+    #[test]
+    fn the_armed_gauge_and_the_declined_counter_track_the_capture_budget() {
+        setup_test_logger!();
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2, 16384)));
+        let armed_before = proxy_metric(names::backend::RETRY_CAPTURES_ARMED);
+        let declined_before = proxy_metric(names::backend::RETRY_CAPTURES_DECLINED);
+
+        let mut stream = test_stream(&pool);
+        stream.context.method = Some(Method::Get);
+        stream.arm_upstream_replay();
+        assert_eq!(
+            proxy_metric(names::backend::RETRY_CAPTURES_ARMED) - armed_before,
+            1,
+            "arming a capture must raise the armed gauge by exactly one"
+        );
+        assert_eq!(
+            proxy_metric(names::backend::RETRY_CAPTURES_DECLINED) - declined_before,
+            0,
+            "a capture the budget granted must not be counted as declined"
+        );
+
+        stream.forget_upstream_replay();
+        assert_eq!(
+            proxy_metric(names::backend::RETRY_CAPTURES_ARMED) - armed_before,
+            0,
+            "releasing a capture must return the armed gauge to where it started"
+        );
+
+        let _held = fill_the_capture_budget();
+        let armed_at_the_ceiling = proxy_metric(names::backend::RETRY_CAPTURES_ARMED);
+
+        stream.arm_upstream_replay();
+
+        assert_eq!(
+            proxy_metric(names::backend::RETRY_CAPTURES_DECLINED) - declined_before,
+            1,
+            "a capture refused for budget must increment the declined counter \
+             exactly once"
+        );
+        assert_eq!(
+            proxy_metric(names::backend::RETRY_CAPTURES_ARMED),
+            armed_at_the_ceiling,
+            "a declined capture installs nothing, so it must not move the \
+             armed gauge"
+        );
+    }
+
+    /// A stream torn down while a capture is still armed — a client hangup, an
+    /// idle timeout, a session teardown — must release its charge.
+    ///
+    /// That path has no code site of its own: nothing clears `retry_buffer`
+    /// there, the `Stream` is simply dropped. Releasing at the four sites that
+    /// DO clear the field would leak a charge on every one of those teardowns
+    /// until the budget was exhausted, at which point replay would be silently
+    /// disarmed for the rest of the worker's life. So the release belongs to
+    /// [`ReplayCapture`]'s `impl Drop` and nowhere else — the reasoning
+    /// `super::super::h2::ConnectionH2`'s gauge teardown and
+    /// [`crate::pool::Checkout`] already apply.
+    ///
+    /// To SEE THIS RED: delete the `ARMED_REPLAY_CAPTURES.set(...)` line from
+    /// `ReplayCapture`'s `impl Drop`, leaving its `gauge_add!` in place. Its
+    /// `debug_assert!` does not fire on this path — the counter is 1, not 0 —
+    /// so the failure is this test's own.
+    #[test]
+    fn a_stream_dropped_with_a_capture_armed_releases_its_charge() {
+        setup_test_logger!();
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2, 16384)));
+        let armed_before = ARMED_REPLAY_CAPTURES.get();
+
+        let mut stream = test_stream(&pool);
+        stream.context.method = Some(Method::Get);
+        stream.arm_upstream_replay();
+        assert_eq!(
+            ARMED_REPLAY_CAPTURES.get(),
+            armed_before + 1,
+            "arming a capture must charge the budget"
+        );
+
+        drop(stream);
+
+        assert_eq!(
+            ARMED_REPLAY_CAPTURES.get(),
+            armed_before,
+            "a stream dropped with a capture still armed must release its charge"
+        );
+    }
 
     /// A backend response status line is wire data, not a Sōzu-side invariant.
     ///

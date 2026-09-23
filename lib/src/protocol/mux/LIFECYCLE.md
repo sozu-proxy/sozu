@@ -1125,8 +1125,9 @@ millisecond — a fast wrong answer no latency budget can see. Measured
 failure, so a run performs between 1 and `n` trials, not `n`.)
 
 The boundary is **no response byte has been received**, because nothing was
-observed by the client, so re-issuing is unobservable. It is narrowed by three
-further conditions, each carrying its precedent:
+observed by the client, so re-issuing is unobservable. It is narrowed by four
+further conditions, the first three carrying their precedent and the fourth a
+memory bound:
 
 - **Pooled connections only.** `ConnectionH1::reused_from_pool` is set on the
   `KeepAlive -> Connected` transition in `start_stream` and nowhere else, and
@@ -1142,20 +1143,51 @@ further conditions, each carrying its precedent:
   nginx keeps `non_idempotent` out of the `proxy_next_upstream` default;
   pingora's default `error_while_proxy` vetoes `!method.is_idempotent()`.
   `Method::Custom` — which is how sozu parses `PATCH` — counts as
-  non-idempotent.
+  non-idempotent. Enforced TWICE since sozu-proxy/sozu#1450:
+  `Stream::arm_upstream_replay` refuses to capture a non-idempotent request at
+  all, so it spends no capture budget, and `can_replay_on_fresh_upstream`
+  keeps its own conjunct as defense in depth. The method is known at arm time
+  — `HttpContext::on_request_headers` sets it during the frontend parse, and
+  `Router::connect` routes on it before reaching `start_stream`.
 - **One front buffer.** `ConnectionH1::writable` copies the bytes it hands the
   socket into `Stream::retry_buffer` before `kawa::Kawa::consume` drops them,
   and truncates the capture to `None` past `front.storage.capacity()`. HAProxy
   states the same trade: retrying past `conn-failure` "requires to allocate a
   buffer and copy the whole request into it", and "Requests not fitting in a
-  single buffer will never be retried".
+  single buffer will never be retried". That guard bounds the capture's
+  *length*, not its capacity: the copy grows through `Vec::reserve`, which
+  allocates `max(2 * old_capacity, required)`, so a capture assembled over
+  several partial writes can have allocated twice what it carries (measured:
+  one 16393-byte write gives `len/cap 16393/16393`, `[8192, 8192, 9]` gives
+  `16393/32768`). Every heap figure here says which of the two it is.
+- **Capture budget available** (`MAX_ARMED_REPLAY_CAPTURES`, `stream.rs`, 512
+  per worker). A capture is a plain allocation on the global allocator,
+  outside the buffer `Pool`, so no `max_buffers` accounting sees it. Its only
+  bound used to be transitive — a capture exists only on a live `Stream` and
+  `Stream::new` takes two `pool.checkout()` calls, so `max_buffers / 2` of
+  them, ≈8.2 MB carried at the defaults and linear in `max_buffers` from
+  there. The ceiling makes it a constant instead: `512 * 16400` ≈ 8.4 MB
+  carried, ≈16.8 MB allocated, whatever `max_buffers` becomes. 512 sits just
+  above the 500 the defaults can reach, so a stock deployment replays exactly
+  what it replayed before. Past the ceiling `arm_upstream_replay` installs no
+  buffer and increments `backend.retry.captures_declined`; the request
+  proceeds un-replayable and a stale upstream answers the 502 it answered
+  before the replay existed. Nothing is refused and no frontend parks — which is
+  precisely what pool-allocating the captures would have cost under the same
+  memory pressure, and why they are not pooled. The charge is owned by the
+  `ReplayCapture` newtype and released by its `impl Drop`, so it is released
+  wherever the capture is, including the `Stream` simply being dropped.
+  `doc/configure.md`'s "Capture budget" carries the operator-facing version.
 
-The replay is bounded by `CONN_RETRIES` alone. The capture is *taken*, not
-cloned, so it does not survive its own replay — but that does not make one
-request one replay: `start_stream` re-arms a fresh capture on every
-`KeepAlive -> Connected` transition and `reused_from_pool` is never cleared,
-so a replay that lands on another pooled connection may itself be replayed.
-The bound is the re-link going back through `Router::connect`, whose
+`CONN_RETRIES` is what bounds how many times a replay may be RE-ISSUED, but it
+is no longer the only thing that decides whether a replay happens at all —
+the capture budget above can decline the capture before any of this is
+reached. Given a capture, the capture is *taken*, not cloned, so it does not
+survive its own replay — but that does not make one request one replay:
+`start_stream` re-arms a fresh capture on every `KeepAlive -> Connected`
+transition and `reused_from_pool` is never cleared, so a replay that lands on
+another pooled connection may itself be replayed, budget permitting. The bound
+on that is the re-link going back through `Router::connect`, whose
 `stream.attempts >= CONN_RETRIES` gate (3, `server.rs`) answers 503 once the
 budget is spent. `backend.retry.stale_upstream` can therefore increment more
 than once for one client request.
@@ -1173,7 +1205,12 @@ what the stream would have received before the replay existed.
 The captured bytes are PREPENDED to `front.out`, because `out` need not be
 empty: a partial `socket_write_vectored` leaves the refused remainder queued
 (`kawa::Kawa::consume` pushes the partially consumed store back to the front),
-and appending behind it would put `[tail][head]` on the wire.
+and appending behind it would put `[tail][head]` on the wire. Once queued they
+live in `front.out` as an owned `kawa::Store::Alloc` — still off-pool, and no
+longer charged to the capture budget, which `queue_upstream_replay` releases
+as it takes the capture. That window is bounded by `CONN_RETRIES` and by the
+same one-front-buffer limit the bytes were captured under, and it is not
+separately accounted.
 
 Replaying the serialized form rather than re-running the block converter makes
 the retried request byte-identical to the first attempt: same `Sozu-Id`, same
