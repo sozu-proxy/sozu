@@ -480,9 +480,10 @@ jobs:
   # └──────────────────────────────────────────────────────────────┘
   build-bombardier:
     name: Build bombardier
-    # Produces a linux/amd64 binary either way (ubuntu-latest and the sozu-general XL nodes are
-    # both linux/x86_64), so the artifact stays consumable by bench-bombardier below even though
-    # that job stays on ubuntu-latest (see its own comment for why).
+    # Produces a linux/amd64 binary, consumable by bench-bombardier below: both scale sets pin the
+    # same runner image digest, so a sozu-general build runs on a sozu-bench node unchanged. (This
+    # comment used to say bench-bombardier "stays on ubuntu-latest"; that stopped being true with
+    # the 2026-09-23 full-matrix migration to the self-hosted CKE runners.)
     runs-on: sozu-general
     steps:
       - name: Clone bombardier
@@ -541,8 +542,12 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      # Reuse the crypto-ring pipeline cache so the example build is
-      # incremental over its compiled deps.
+      # This job's own cache. NOTE: the `ci-crypto-ring` prefix does NOT restore the crypto-ring
+      # pipeline cell's cache, despite what this comment claimed before. Swatinem/rust-cache puts
+      # `GITHUB_JOB` in the key unless `shared-key` is set (`add-job-id-key` defaults to true), so
+      # the key here is `ci-crypto-ring-build-bench-logger-…`, distinct from
+      # `ci-crypto-ring-pipeline-…`. The prefix is kept only so the key stays stable across runs;
+      # changing it would just discard the existing entry. Use `shared-key` to share for real.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
         with:
           cache-all-crates: true
@@ -557,15 +562,31 @@ jobs:
           name: bench_logger
           path: target/release/examples/bench_logger
 
-  bench-bombardier:
-    name: Bombardier bench (${{ matrix.provider }})
-    # Migrated 2026-09-23: the former "Host mapping sozu.io domains" step (`sudo tee -a
-    # /etc/hosts`) is replaced by the hostAliases sozu.io block in values-bench.yaml. The per-run
-    # generated self-signed certs are trusted via SSL_CERT_FILE (Go's crypto/x509 honors it on
-    # Linux) instead of `sudo update-ca-certificates` — see "Build local CA bundle for bombardier"
-    # and "Launch bench" below. No sudo usage left in this job.
-    runs-on: sozu-bench
-    needs: [pipeline, build-bombardier, build-lagging_server]
+  # Each provider's release `sozu` is compiled ONCE here and handed to the bench jobs as an
+  # artifact, the same shape `build-bombardier`, `build-lagging_server` and `build-bench-logger`
+  # above already use. `bench-bombardier` used to run this exact `cargo build` inside each of its
+  # four cells, on a bench node, AFTER `needs: [pipeline]` was satisfied — so 258-314 s of
+  # compilation per cell (measured, run 35923383722, on the pre-2026-09-24 XL bench nodes; expect
+  # roughly double on the 7 vCPU pods #1476 moved to) sat on the critical path behind a ~2700 s
+  # pipeline matrix. Pipeline cells shrank by the same ratio, so what matters is the ratio, not
+  # the absolute number. With no `needs:` this job starts at t=0 and finishes inside that shadow.
+  #
+  # This relocates compilation, it does not remove any: the same four provider configurations are
+  # still compiled once each per run, with the same crate, profile, toolchain and features, so the
+  # same diagnostics are still emitted. The `run:` line below is byte-identical to the one it
+  # replaced; keep it that way.
+  build-sozu:
+    name: Build sozu (${{ matrix.provider }})
+    # sozu-general, NOT sozu-bench. The bench pool is a deliberately PINNED, non-autoscaling set of
+    # nodes sized for the bench fan-out, running one job per pod per node so a benchmark never
+    # shares hardware (ci/runners/arc/values-bench.yaml); general autoscales behind it. Spending
+    # that fixed capacity on a compile is what this job exists to stop, and a compile co-scheduled
+    # with the crypto cells' `Bench (Criterion)` step is exactly the LLC/DRAM-bandwidth
+    # interference the pool is designed to exclude. Nothing is lost by moving: since the
+    # 2026-09-24 redesign both scale sets request the same 7 vCPU / 10Gi per pod, so the build is
+    # no slower here, and both pin the same runner image digest, so the binary runs on a bench node
+    # unchanged — `lagging_server` and `bombardier` already cross that boundary the same way.
+    runs-on: sozu-general
     strategy:
       fail-fast: false
       matrix:
@@ -580,18 +601,59 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      # Restore the per-provider pipeline cache so the release build
-      # of `sozu` is incremental over warm registry + compiled deps.
+      # This job's OWN cache, deliberately not keyed `ci-<provider>`. Swatinem/rust-cache composes
+      # its key as `<prefix-key>-<GITHUB_JOB>-<os>-<arch>-<env hash>-<lockfile hash>`:
+      # `add-job-id-key` defaults to true and no `shared-key` is set anywhere in this file, so a
+      # `prefix-key` borrowed from another job NEVER restores that job's cache — it only makes the
+      # key look shared. Verified against the pinned action source and against the repository's
+      # live cache listing, which carries one entry per job id (`ci-fips-bench-bombardier-…`,
+      # `ci-msrv-full-pipeline-…`). The `release` in the prefix is there so nobody re-reads this
+      # as pipeline sharing. To make two jobs genuinely share one cache you must set `shared-key`.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
         with:
           cache-all-crates: true
-          prefix-key: ci-${{ matrix.provider }}
+          prefix-key: ci-release-${{ matrix.provider }}
 
       - name: Build sozu (release, ${{ matrix.provider }})
         run: cargo build --release -p sozu --no-default-features --features jemallocator,${{ matrix.provider }}
 
-      - name: Stage sozu binary
-        run: cp target/release/sozu .github/workflows/sozu
+      - name: Upload sozu
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: sozu-${{ matrix.provider }}
+          path: target/release/sozu
+
+  bench-bombardier:
+    name: Bombardier bench (${{ matrix.provider }})
+    # Migrated 2026-09-23: the former "Host mapping sozu.io domains" step (`sudo tee -a
+    # /etc/hosts`) is replaced by the hostAliases sozu.io block in values-bench.yaml. The per-run
+    # generated self-signed certs are trusted via SSL_CERT_FILE (Go's crypto/x509 honors it on
+    # Linux) instead of `sudo update-ca-certificates` — see "Build local CA bundle for bombardier"
+    # and "Launch bench" below. No sudo usage left in this job.
+    runs-on: sozu-bench
+    needs: [pipeline, build-sozu, build-bombardier, build-lagging_server]
+    strategy:
+      fail-fast: false
+      matrix:
+        provider:
+          - crypto-ring
+          - crypto-aws-lc-rs
+          - crypto-openssl
+          - fips
+    # No Rust toolchain and no cargo cache here: `build-sozu` above compiles this provider's
+    # release binary once, off the critical path, and this job downloads it. A bench node is a
+    # dedicated machine from a fixed pool, held for the whole job (ci/runners/arc/values-bench.yaml);
+    # it should be running bench.py, not a compiler. `needs: build-sozu` costs nothing in
+    # wall-clock — that job has no `needs:` of its own and finishes long before the ~2700 s
+    # pipeline matrix this job already waits on.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Download sozu
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
+        with:
+          name: sozu-${{ matrix.provider }}
+          path: .github/workflows
 
       - name: Download bombardier
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
