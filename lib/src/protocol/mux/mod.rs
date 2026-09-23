@@ -148,6 +148,7 @@ mod h2_header_reassembly;
 mod h2_scheduler;
 mod h2_stream_table;
 mod h2_transmit;
+mod h2_write_pass;
 mod hpack_state;
 pub mod parser;
 mod pkawa;

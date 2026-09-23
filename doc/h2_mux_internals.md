@@ -526,7 +526,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:3465-3478
+```rust lib/src/protocol/mux/h2.rs:3463-3476
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -550,7 +550,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:3511-3517
+```rust lib/src/protocol/mux/h2.rs:3509-3515
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -563,13 +563,13 @@ stream.generate_access_log(
 The other three sites take the `&mut self` wrapper
 `ConnectionH2::distribute_overhead` instead, and each emits its own log:
 
-- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3803`) passes a
+- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3801`) passes a
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5334`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5332`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6053`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6051`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -578,10 +578,10 @@ Only the last two are reset paths; the first is the idle/stall sweep.
 for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
-taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2396`) and passes
+taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2381`) and passes
 `stream.linked_token()` straight out of it:
 
-```rust lib/src/protocol/mux/h2.rs:2611
+```rust lib/src/protocol/mux/h2.rs:2600
 let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, stream.linked_token());
 ```
 
@@ -690,7 +690,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:3220-3224
+```rust lib/src/protocol/mux/h2.rs:3218-3222
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -820,6 +820,19 @@ The main data-plane write path:
    then ends the pass with `H2Scheduler::end_pass`, which takes the order
    buffer back and commits the RFC 9218 §4 round-robin cursor
 
+**Where the pass's own state lives**: the counters, flags and scratch vectors
+one pass carries — the byte totals, the resume counter, the socket-write flag,
+the pass byte total, `freshly_emitted_rsts`, `completed_streams`, and the
+per-stream `consumed` / `stream_bytes` — are fields of `H2WritePass`
+(`h2_write_pass.rs`), a plain struct built at the top of `write_streams` and
+dropped when it returns. It is a local threaded by `&mut`, never a field on
+`ConnectionH2`: resumption ACROSS calls is `H2StreamTable::expect_write`, not
+this struct. Three things a pass uses are deliberately NOT in it — the
+`H2ConverterPass`, the scheduler's loaned `order` buffer and its
+`ReadyIncrementalCensus` — because all three are built after the `expect_write`
+resume path has run, and that path can retire a stream through
+`remove_dead_stream` which `H2Scheduler::begin_pass` then does not see.
+
 **How the converter borrow is scoped**: `H2BlockConverter` borrows the
 connection's HPACK encoder out of `HpackState`. It is built for exactly ONE
 `kawa.prepare()` call — not once per pass — so that borrow never spans the
@@ -899,7 +912,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4379
+```rust lib/src/protocol/mux/h2.rs:4377
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -1052,7 +1065,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5377-5379
+```rust lib/src/protocol/mux/h2.rs:5375-5377
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1060,7 +1073,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5391-5397
+```rust lib/src/protocol/mux/h2.rs:5389-5395
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

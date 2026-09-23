@@ -7,7 +7,7 @@
 //!
 //! * [`test_h2_backend_silent_triggers_504_within_back_timeout`] —
 //!   defence-in-depth for invariant 15 on the `set_default_answer` path.
-//!   On HEAD the synchronous drain loop at `mux/mod.rs:1402-1423` already
+//!   On HEAD the synchronous drain loop at `mux/mod.rs:1403-1424` already
 //!   flushes the 504 body before the session closes, so this test is a
 //!   lock-in regression guard rather than a RED-to-green flip. The
 //!   matching RED that exercises `set_default_answer` directly lives in
@@ -169,12 +169,12 @@ fn teardown_simple<T>(tls: T, front_port: u16, mut worker: Worker) -> bool {
 
 /// Single H2 stream → backend that accepts the TCP connection and never
 /// replies. `back_timeout = 2 s` on the listener. After the timeout,
-/// `timeout_backend` in `mux/mod.rs:1343-1391` must:
+/// `timeout_backend` in `mux/mod.rs:1344-1392` must:
 ///
 /// 1. Render a 504 default answer via `set_default_answer`.
 /// 2. Queue the response bytes into the H2 out buffer.
 /// 3. Either (a) rely on the synchronous drain loop at
-///    `mux/mod.rs:1402-1423` to flush before teardown, or (b) arm the
+///    `mux/mod.rs:1403-1424` to flush before teardown, or (b) arm the
 ///    writable readiness + signal so the next scheduler tick delivers
 ///    the body.
 ///
