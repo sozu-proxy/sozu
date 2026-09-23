@@ -36,6 +36,13 @@
 # (min 8, max 256) still adds nodes past that, so overall concurrency isn't reduced, just packed
 # less tightly per node.
 #
+# Reverted back to 4 vCPU/4Gi (2026-09-23, infra cost): operator asked to halve overall infra
+# consumption. Halving the per-pod request restores 2 pods/XL-node packing, and the floor was
+# halved 12 -> 6 in lockstep (see clever k8s nodegroups), so 6 nodes x 2 pods/node = 12 concurrent
+# slots — same ceiling as maxRunners below, unchanged. Net effect: same worst-case concurrency,
+# half the always-on vCPU footprint; per-job compile time regresses back to the pre-2026-09-23
+# level as a deliberate cost/speed trade-off.
+#
 # hostAliases (root-caused 2026-09-22): sozu's e2e suite resolves three fixed test hostnames
 # (cluster-a.localhost, cluster-b.localhost, other.localhost — grepped from e2e/src/, no dynamic
 # variants exist) via real getaddrinfo() calls (hyper's default HttpConnector, not a hardcoded
@@ -85,5 +92,5 @@ template:
             drop: ["ALL"]
         resources:
           requests:
-            cpu: "8"
-            memory: "8Gi"
+            cpu: "4"
+            memory: "4Gi"

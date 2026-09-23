@@ -3,10 +3,12 @@
 # Helm release name "sozu-bench" IS the runs-on label: runs-on: sozu-bench
 #
 # Isolation mechanism (per design, refined during planning): the `bench` NodeGroup is fixed at
-# exactly 8 XL nodes (raised from 4 on 2026-09-23) with autoscaling explicitly disabled (clever
-# k8s nodegroups create silently inherits the cluster's autoscaling setting — a nodegroups update
-# --disable-autoscaling was required after creation, see ci/runners/runbook.md). maxRunners is
-# capped at 8 to match node count 1:1. The resources.requests below reserve nearly the entire
+# exactly 4 XL nodes (halved back from 8 on 2026-09-23, infra-cost reduction — operator explicitly
+# chose to keep per-pod resources at near-whole-node and cut node count instead of per-pod
+# resources, to preserve the physical-exclusivity guarantee below) with autoscaling explicitly
+# disabled (clever k8s nodegroups create silently inherits the cluster's autoscaling setting — a
+# nodegroups update --disable-autoscaling was required after creation, see ci/runners/runbook.md).
+# maxRunners is capped at 4 to match node count 1:1. The resources.requests below reserve nearly the entire
 # node's allocatable capacity (measured live: cpu=16, memory=30481788Ki ≈ 29.07Gi on bench-node0),
 # so no other pod can ever be co-scheduled on a bench node regardless of nodeSelector correctness
 # elsewhere — this is what actually buys bench reproducibility (Heracles ISCA 2015: cgroup/QoS
@@ -35,7 +37,7 @@ githubConfigUrl: "https://github.com/sozu-proxy/sozu"
 githubConfigSecret: sozu-runner-github-app
 
 minRunners: 0
-maxRunners: 8
+maxRunners: 4
 
 template:
   spec:
