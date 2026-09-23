@@ -77,6 +77,82 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: `write_streams` becomes a drive loop over `poll_write_target` /
+  `handle_write`, and `flush_stream_out` is deleted.** The write path now mirrors the read side's
+  `poll_read_target` / `handle_read` split: the core names the next transmit, the shell performs
+  it, the core is told what the socket did. `write_streams` keeps only the socket, the
+  `Vec<IoSlice<'static>>`, and the three adjacent statements that gather, write and confirm — so
+  the `unsafe` lifetime-extension window `h2_transmit::gather` opens is exactly as wide as it was
+  and does not span the poll/handle boundary. `write_buffer` joins `read_buffer` as its mirror,
+  taking `zero` and `streams` apart rather than a whole `&mut ConnectionH2` plus `&mut Context`,
+  for the same borrowck reason. No behaviour changes: same order of streams, same cut point for a
+  stall, same counters, same metrics, same debug events.
+
+  **One forced divergence from the read side.** A `readable()` pass performs exactly ONE
+  `socket_read`, so the read side is a two-call protocol that ends with `handle_read`. A write pass
+  performs an unbounded number of writes — one stream's queue may need several rounds and the pass
+  walks several streams — so `H2WriteTarget::Transmit` is not terminal and `handle_write` returns
+  `()`: nothing a settled transmit reports can end a write pass. The pass's result comes from
+  `H2WriteTarget::Done(MuxResult)` or `H2WriteTarget::Finalize { socket_write, bytes_written }`.
+  `Finalize` carries the byte total as well as the flag because `finalize_write` reads it as
+  `made_progress`, which is what selects `FinalizeAction::RetainPendingBack` over `Quiesce`. Three
+  sites end the pass with `Done` and must NOT finalize — the resume path's stall, the MadeYouReset
+  emitted-RST cap trip, and the close-frontend GOAWAY — because running LIFECYCLE §9 invariant 16's
+  readiness policy over any of them would decide a question that pass does not owe.
+
+  **`size > 0` with `WouldBlock` is not a stall, and the split is what keeps it that way.**
+  `update_readiness` calls a write stalled **iff `size == 0`**; `status` clears the event bit and
+  decides nothing else. `FrontRustls` returns `(buffered_size > 0, WouldBlock)` structurally
+  whenever rustls took plaintext while the kernel was full, so a machine that ended the pass on
+  `status != Continue` would truncate responses on the hot path. `SocketResult` therefore reaches
+  exactly ONE place on the write core — `handle_write`'s parameter — and is consumed by its single
+  `pass.stalled = update_readiness_after_write(size, status, &mut self.readiness)` statement.
+  `poll_write_target` never sees the type, so that terminator cannot be reintroduced without first
+  adding a parameter to its signature, which is a visible change rather than a one-token edit. The
+  round-again is `!pass.stalled && !kawa.out.is_empty()` re-yielding `Transmit` for the same
+  stream: the deleted `while !kawa.out.is_empty()` re-expressed as a resumption state.
+
+  **Where the pass resumes from, and why it needs no `Option`.** `H2WritePass` gains one field,
+  `phase: H2WritePhase`, with exactly two variants. `Unscheduled` covers the `expect_write` resume
+  path and the terminal stage; `Scheduled` owns the scheduler pass. The three values a pass may not
+  hold from its start — the `H2ConverterPass`, the scheduler's loaned `order` buffer and its
+  `ReadyIncrementalCensus` — live together in an `H2ScheduledPass` that exists ONLY inside that
+  variant and is consumed by value at the pass tail. So no code path anywhere asks whether a
+  converter is there: a step that needs one is reached only by a `match` arm that already bound it,
+  and the inversion adds no `unwrap`, no `expect` and no absent-value state on any of the three.
+  The two-variant shape is also what keeps `handle_write`'s attribution `match` total with no
+  fallback arm — which of the two flush sites a round belongs to is the only question it asks. The
+  variant is boxed: the three total 216 bytes against `H2WriteStage`'s 48 and
+  `clippy::large_enum_variant` rejects the gap, while consuming them through a `&mut` instead would
+  need a `Default` on `ReadyIncrementalCensus` and a `mem::take` variant of
+  `H2ConverterPass::into_buffers` to reach a half-emptied scheduler pass that is an absent value
+  wearing a different name. One 216-byte allocation per pass that reaches the scheduler buys a
+  48-byte phase, which is what the step machine moves.
+
+  The `Prepare` / `Flush` split inside the scheduled half is load-bearing. A `Transmit` re-entry
+  that re-ran `Prepare` would issue a second `kawa.prepare`, a second `census.note_fired`, a
+  duplicate `freshly_emitted_rsts` push and a duplicate `DebugEvent::S`, and would fire
+  `names::h2::FLOW_CONTROL_STALL` for a stream that never stalled — the bytes are safe because
+  `consumed` debits both `*parts.window` and `flow_control`, but the counters are not.
+  `a_yielded_incremental_stream_is_prepared_once_per_pass` reddens at `left: 65535, right: 32768`
+  both on a doubled walk of the order and on a `Flush` step that falls back to `Prepare`.
+
+  **The MadeYouReset cap trip still drops the three pooled buffers, deliberately.** `into_buffers`
+  runs before the `account_emitted_rst` loop and the three `put_*` calls run after it, so a cap trip
+  that returns a GOAWAY early lets the buffers fall out of scope and leaves `H2Scheduler::end_pass`
+  uncalled. That is the pre-image's behaviour on a connection being torn down, and moving either
+  across that `return` would be a behaviour change this changeset does not make.
+
+  The three tests that called `flush_stream_out` directly keep their names and now drive
+  `writable()` over `writable_fixture`, whose shut prepare gate makes the pass a pure flush — the
+  same region the direct call reached, with the `(size, status)` pairs still chosen rather than
+  negotiated with a kernel. Their stall bit is read off the park a stall leaves behind, which does
+  couple them to `set_expect_write`: deleting the scheduler loop's park reddens
+  `a_write_that_moves_no_bytes_stalls_the_pass` alongside
+  `a_stalled_stream_parks_expect_write_for_the_next_pass`. Two witnesses to one defect, not a
+  weaker one. `doc/h2_mux_internals.md`, `doc/architecture.md`, `doc/configure.md` and
+  `LIFECYCLE.md` follow the two deleted symbols and the moved line numbers.
+
 - **`refactor(mux-h2)`: the locals of one `write_streams` pass become the fields of an
   `H2WritePass` struct in a new `h2_write_pass.rs`.** Pure state extraction, ahead of the
   control-flow inversion that turns the write path into a `poll` / write / `handle` drive loop the

@@ -452,7 +452,7 @@ must be attributed proportionally.
 
 A **free function**, not a method:
 
-```rust lib/src/protocol/mux/h2.rs:465-473
+```rust lib/src/protocol/mux/h2.rs:458-466
 fn distribute_overhead(
     metrics: &mut SessionMetrics,
     overhead_bin: &mut usize,
@@ -526,7 +526,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:3463-3476
+```rust lib/src/protocol/mux/h2.rs:3947-3960
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -550,7 +550,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:3509-3515
+```rust lib/src/protocol/mux/h2.rs:3993-3999
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -563,13 +563,13 @@ stream.generate_access_log(
 The other three sites take the `&mut self` wrapper
 `ConnectionH2::distribute_overhead` instead, and each emits its own log:
 
-- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3801`) passes a
+- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:4285`) passes a
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5332`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5816`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6051`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6535`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -578,11 +578,11 @@ Only the last two are reset paths; the first is the idle/stall sweep.
 for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
-taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2381`) and passes
+taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2916`) and passes
 `stream.linked_token()` straight out of it:
 
-```rust lib/src/protocol/mux/h2.rs:2600
-let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, stream.linked_token());
+```rust lib/src/protocol/mux/h2.rs:2996
+let (client_rtt, server_rtt) = self.snapshot_rtts(&*endpoint, stream.linked_token());
 ```
 
 This ensures `metrics.bin` and `metrics.bout` in the access log include the
@@ -608,7 +608,7 @@ the complexity of the H2 state machine:
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:2076-2080
+```rust lib/src/protocol/mux/h2.rs:2147-2151
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -690,7 +690,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:3218-3222
+```rust lib/src/protocol/mux/h2.rs:3702-3706
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -797,9 +797,37 @@ is still sent once reassembly completes rather than silently dropped.
 
 Returns `Some(MuxResult)` if the caller should return early, `None` to proceed.
 
-### write_streams()
+### write_streams(), poll_write_target(), handle_write()
 
-The main data-plane write path:
+The main data-plane write path, split into a shell and a core. `write_streams`
+is the shell: it owns the socket and the `Vec<IoSlice<'static>>`, and its whole
+body is a loop over three answers from `ConnectionH2::poll_write_target`.
+
+| answer | what the shell does |
+|---|---|
+| `H2WriteTarget::Done(result)` | nothing; `result` is the pass's result |
+| `H2WriteTarget::Transmit { stream_id }` | gather that stream's queued blocks, `socket_write_vectored`, confirm, then report `(size, status)` to `ConnectionH2::handle_write` |
+| `H2WriteTarget::Finalize { socket_write, bytes_written }` | call `finalize_write` with both; its answer is the pass's result |
+
+This is the write mirror of the read side's `poll_read_target` / `handle_read`,
+with one forced divergence: a `readable()` pass performs exactly ONE
+`socket_read`, so the read side is a two-call protocol. A write pass performs an
+unbounded number of writes — one stream's queue may need several rounds and the
+pass walks several streams — so the write side is a drive loop and `Transmit` is
+not terminal.
+
+Three sites end the pass with `Done` and must NOT reach `finalize_write`: the
+resume path's stall (`expect_write` is already parked and owes nothing), the
+MadeYouReset emitted-RST cap trip, and the close-frontend GOAWAY. Folding any of
+them into `Finalize` would run LIFECYCLE §9 invariant 16's readiness policy over
+a pass that must not take it.
+
+`Finalize` carries `bytes_written` as well as `socket_write` because
+`finalize_write` reads it as `made_progress`, which is what selects
+`FinalizeAction::RetainPendingBack` over `Quiesce`. It is accumulated stream by
+stream inside the pass, so only the pass knows it.
+
+What the core does, in order:
 
 1. Resumes any partially-written stream (`stream_table.expect_write()`)
 2. Pre-computes `byte_totals` for overhead distribution
@@ -827,11 +855,34 @@ per-stream `consumed` / `stream_bytes` — are fields of `H2WritePass`
 (`h2_write_pass.rs`), a plain struct built at the top of `write_streams` and
 dropped when it returns. It is a local threaded by `&mut`, never a field on
 `ConnectionH2`: resumption ACROSS calls is `H2StreamTable::expect_write`, not
-this struct. Three things a pass uses are deliberately NOT in it — the
+this struct.
+
+**Where the pass resumes from** is that struct's `phase`, an `H2WritePhase` with
+exactly two variants. `Unscheduled` covers the `expect_write` resume path and
+the terminal stage; `Scheduled` owns the scheduler pass and the cursor into it.
+The `Prepare` / `Flush` split inside the scheduled half is load-bearing: a
+`Transmit` re-entry that re-ran `Prepare` would issue a second `kawa.prepare`, a
+second `census.note_fired`, a duplicate `freshly_emitted_rsts` push and a
+duplicate `DebugEvent::S`, and would fire the flow-control-stall counters for a
+stream that never stalled.
+
+**The three values the pass may not own from its start** — the
 `H2ConverterPass`, the scheduler's loaned `order` buffer and its
-`ReadyIncrementalCensus` — because all three are built after the `expect_write`
-resume path has run, and that path can retire a stream through
-`remove_dead_stream` which `H2Scheduler::begin_pass` then does not see.
+`ReadyIncrementalCensus` — live in `H2ScheduledPass`, which exists ONLY inside
+`H2WritePhase::Scheduled` and is consumed by value at the pass tail. They are
+excluded from pass start for two different reasons. `order` and `census` because
+`H2Scheduler::begin_pass` enumerates the wire map and the resume path that runs
+first can retire a stream from it through `remove_dead_stream`, so building them
+earlier would change which streams the pass visits. The converter because its
+constructor takes the three reusable scratch buffers out of `HpackState` and
+only the tail hands them back, so a converter built before the resume path would
+be dropped on every stalled resume and the pool would lose its buffers.
+
+Holding them in the phase variant rather than behind `Option` fields is what
+makes "the scheduler pass exists exactly in the scheduler phases" a fact of the
+type: no code path asks whether a converter is there, because a step that needs
+one is reached only by a `match` arm that already bound it. The variant is boxed
+so the two variants stay within `clippy::large_enum_variant`'s bound.
 
 **How the converter borrow is scoped**: `H2BlockConverter` borrows the
 connection's HPACK encoder out of `HpackState`. It is built for exactly ONE
@@ -883,7 +934,8 @@ consume a status, through `update_readiness_after_write`.
 
 ### The gather/confirm pair (`h2_transmit.rs`)
 
-`flush_stream_out` does not write a stream's bytes in one call. Each round:
+The write pass does not put a stream's bytes on the wire in one call. Each round
+is one `H2WriteTarget::Transmit` answered by the shell:
 
 1. `h2_transmit::gather(kawa, io_slices)` walks `kawa.out` up to the first
    `Delimiter` and pushes one `IoSlice` per `Store`, borrowed straight out of
@@ -905,14 +957,22 @@ repository at all, and the sibling UDP core's coarser `UdpManager::poll_output`
 drains a manager-wide queue rather than one stream's `Kawa`.
 
 A partial write is ordinary. `size` may be the whole offer, less than it, or
-zero (`WouldBlock`); `update_readiness_after_write` classifies the last as
-`FlushOutcome::Stalled` and ends the pass. Note that a stalled pass is not
+zero (`WouldBlock`); `handle_write` classifies it in ONE statement,
+`pass.stalled = update_readiness_after_write(size, status, &mut self.readiness)`,
+and only `size == 0` is a stall. `status` clears the event bit and decides
+nothing else, so `(size > 0, WouldBlock)` — which `FrontRustls` returns
+structurally whenever rustls took plaintext while the kernel was full — is NOT a
+stall, and `poll_write_target` re-yields `Transmit` for the same stream. A
+machine that ended the pass on `status != Continue` would truncate the response.
+`handle_write` is the only place on the write core that names a `SocketResult`,
+which is what keeps that terminator from being reintroduced by a one-token edit.
+Note that a stalled pass is not
 fair to the streams it did not reach — see the module header and LIFECYCLE
 invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4377
+```rust lib/src/protocol/mux/h2.rs:4861
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -1065,7 +1125,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5375-5377
+```rust lib/src/protocol/mux/h2.rs:5859-5861
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1073,7 +1133,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5389-5395
+```rust lib/src/protocol/mux/h2.rs:5873-5879
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

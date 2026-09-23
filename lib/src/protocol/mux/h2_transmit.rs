@@ -342,9 +342,9 @@ mod tests {
     // stall was structurally ungenerable and the header described a path no
     // test could enter.
     //
-    // `drive` mirrors `flush_stream_out`'s loop rather than approximating it:
+    // `drive` mirrors the write pass's flush loop rather than approximating it:
     // it stops on a zero accept against a non-zero offer, which is exactly
-    // what `update_readiness_after_write` reports as `FlushOutcome::Stalled`.
+    // what `update_readiness_after_write` reports as a stalled flush.
     // An earlier version broke on `offered == 0` instead, which production
     // never does — that reading would skip a leading `Delimiter` rather than
     // consuming it.
@@ -430,7 +430,7 @@ mod tests {
 
         /// Returns the bytes handed to the shell, and whether the queue
         /// drained (false means the pass stalled, production's
-        /// `FlushOutcome::Stalled`).
+        /// a stalled flush).
         fn drive(plan: &WritePlan) -> (Vec<u8>, bool) {
             let mut buf = vec![0u8; plan.payload.len() * 4 + 64];
             let mut kawa = kawa_for(&mut buf, plan);

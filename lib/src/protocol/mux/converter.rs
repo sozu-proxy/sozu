@@ -583,7 +583,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         // succeeds when the backend acknowledges window
                         // updates, so the stall metric is the only signal
                         // available without plumbing an explicit boundary
-                        // through `flush_stream_out`.
+                        // through the write pass's flush.
                         incr!(names::backend::FLOW_CONTROL_PAUSED);
                     }
                     kawa.blocks.push_front(Block::Chunk(Chunk { data }));
@@ -764,7 +764,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
         if self.pending_oversized_abort {
             self.pending_oversized_abort = false;
             // Push the RST_STREAM frame to `kawa.out` IN THIS PASS so the
-            // very next `flush_stream_out` call drains it onto the wire.
+            // very next flush round drains it onto the wire.
             //
             // Why we cannot rely on the next prepare cycle's `initialize`:
             // `write_streams` retires a stream the moment
@@ -1689,7 +1689,7 @@ mod tests {
 
     /// `finalize` commits the abort in the SAME prepare pass:
     /// - `kawa.out` carries one RST_STREAM(InternalError) frame so the
-    ///   following `flush_stream_out` ships it before the retirement
+    ///   following flush ships it before the retirement
     ///   gate retires the stream;
     /// - `kawa.parsing_phase` becomes `Error{Processing(InternalError)}`;
     /// - `kawa.blocks` is cleared so no follow-on HEADERS/DATA leak;

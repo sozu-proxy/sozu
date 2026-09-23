@@ -123,7 +123,7 @@
 //! flush landed — so no `SocketResult` reaches [`finalize_action`]. That
 //! matters because `super::update_readiness` treats `size > 0` with a
 //! `WouldBlock` status as NOT stalled (it clears the WRITABLE event bit and
-//! returns `false`, so `flush_stream_out` issues another write), and any
+//! returns `false`, so the flush issues another write), and any
 //! decision function that took a `SocketResult` and treated
 //! `status != Continue` as a terminator would silently drop that second
 //! attempt. `ConnectionH2::flush_zero_buffer` is the site that does consume a

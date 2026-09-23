@@ -225,9 +225,10 @@ The H2 state machine:
      └──────────────────────┘
 ```
 
-For writing, the `writable()` method delegates to `write_streams()` which iterates over
-all streams sorted by RFC 9218 urgency (lower urgency = higher priority), then by stream
-ID for FIFO within the same urgency level. Each stream's Kawa blocks are converted to H2
+For writing, the `writable()` method delegates to `write_streams()`, a drive loop that
+asks `poll_write_target()` what to send next, performs that write, and reports it back
+through `handle_write()`. The core walks all streams sorted by RFC 9218 urgency (lower
+urgency = higher priority), then by stream ID for FIFO within the same urgency level. Each stream's Kawa blocks are converted to H2
 frames via `H2BlockConverter`. Connection-level and stream-level flow control windows
 limit how many DATA bytes can be sent per iteration.
 
