@@ -4,8 +4,12 @@
 # checked, by four independent rules:
 #
 #   1. `file.rs:NNN(-MMM)?` and `file.md:NNN(-MMM)?` in `doc/**` and
-#      `**/LIFECYCLE.md` — a path and a line number. See "WHAT THIS CATCHES"
-#      below, and "MARKDOWN TARGETS" for why the second one is here.
+#      `**/LIFECYCLE.md` — a path and a line number — plus the bare `` `:NNN` ``
+#      CONTINUATION of one, which names no path and inherits the one from the
+#      citation earlier on its own line. See "WHAT THIS CATCHES" below,
+#      "MARKDOWN TARGETS" for why a `.md` target is here, and "BARE
+#      CONTINUATIONS" for the form that no rule could see at all until
+#      sozu-proxy/sozu#1459.
 #   2. the same citations, read at TWO revisions: a citation this changeset did
 #      not touch must still name the same line TEXT it named at the base. See
 #      "DRIFTED CITATIONS" further down. Needs `--base <revision>`.
@@ -35,6 +39,9 @@
 #     form is real in this tree (`answers.rs:209/224`, `mod.rs:1218/1233/1311/1321`)
 #     and a rewrite that touches only its first half produces a duplicate that
 #     resolves perfectly and is therefore invisible to every other check here
+#   - a bare `` `:NNN` `` continuation with no citation earlier on its own line
+#     to inherit a path from, which is reported rather than skipped: see "BARE
+#     CONTINUATIONS"
 #
 # WHAT RULE 1 ALONE DOES NOT CATCH — READ THIS BEFORE TRUSTING A GREEN RUN
 #   Rule 1 is a floor, not a proof. It cannot tell whether a citation lands on
@@ -155,6 +162,109 @@
 #   `--show` output and the summary lines are for. What it can no longer do is
 #   name nothing at all and be counted as clean.
 #
+# BARE CONTINUATIONS
+#   `CITATION` requires a path, so the idiom that names a file once and then
+#   continues with a bare line number — `` `lib/src/tcp.rs:183` and `:305` `` —
+#   put its SECOND half outside every rule in this file. Not rule 1, not rule
+#   2, not rule 3, not rule 4: the bare span was never extracted, so it was
+#   never even reported as unresolvable. The first half was checked on every CI
+#   run and the second half had never been checked once (sozu-proxy/sozu#1459).
+#
+#   That is worse than an unchecked citation. The two halves name sibling sites
+#   in the same function, so they rot TOGETHER, and a reader who watches the
+#   guarded half land correctly infers the unguarded half is as maintained.
+#
+#   sozu-proxy/sozu#1465 is the worked case, and it is why this tree carried a
+#   wrong citation rather than three correct ones. `3e9c271c` moved both call
+#   sites of `h2_handshake_chromium_146` down one line; it bumped the half a
+#   rule could see and left the half no rule could:
+#
+#       -  `h2_correctness_tests.rs:3604` and `:3708`. No test that decodes …
+#       +  `h2_correctness_tests.rs:3605` and `:3708`. No test that decodes …
+#
+#   Both numbers were right at `3e9c271c^` and only the first was right after.
+#   Run THIS file over that changeset and it reports the other one:
+#
+#       $ git worktree add --detach /tmp/repro 3e9c271c
+#       $ python3 check_doc_citations.py --root /tmp/repro --base 3e9c271c^
+#       ::error::1 of 215 compared citations drifted since 970b92c5678a:
+#         doc/testing.md:680: `h2_correctness_tests.rs:3708` — …:3708 moved:
+#         was `let _server_settings = h2_handshake_chromium_146(&mut tls);`,
+#         now `let mut tls = raw_h2_connection(front_addr);`
+#
+#   The `Doc citations` job was green on `3e9c271c` as it shipped, because the
+#   only rule that could have seen `:3708` never extracted it.
+#
+#   So the tree carried three continuations and the class was one in three
+#   wrong. `doc/testing.md`'s `:3709` was written `:3708`, which is
+#   `let mut tls = raw_h2_connection(front_addr);` — the line above the call
+#   site the prose means. `grep -n` puts the two sites at 3605 and 3709, and
+#   the citation was re-derived from that grep rather than by offsetting the
+#   stale number. The other two are exact: `lib/src/tcp.rs:183`/`:305` are that
+#   file's only two `let frontend_address = socket.peer_addr().ok();` lines,
+#   and `router.rs:394`/`:574` its only two `context.link_stream(` calls.
+#
+#   A bare `:NNN` is ORDINARY PROSE, so the extraction is deliberately narrow
+#   and both discriminators were measured on this tree rather than guessed.
+#   Every count below is read at `ce80b00c`, the revision this changeset
+#   departed from. Documenting the form is itself an edit to the guarded
+#   surface: this changeset's own prose adds seven colon-leading code spans,
+#   so the SECOND count re-measured at the commit that carries this comment
+#   reads 55 rather than 48. The other two are unaffected by prose, and the
+#   bare-span total stays 3 either way.
+#     * THE WHOLE CODE SPAN, backticks included. The guarded surface holds 154
+#       bare `:NNN` that are neither part of a written-out citation nor a code
+#       span of their own, and not one of them is a citation: TOML listen
+#       addresses (`0.0.0.0:8443`, `[::1]:8080`), `curl` URLs, statsd lines
+#       (`sozu.WRK-00.http.requests:1|c`), log timestamps (`14:01:51Z`), a
+#       `1:100` ratio, `--ulimit nofile=262144:262144`. Requiring the span to
+#       be a whole `` `…` `` drops all 154.
+#     * A COLON, ONE SPAN GROUP, AND NOTHING ELSE inside it. A range and a
+#       `,`/`/` group both count, matching `CITATION`. 48 code spans in the
+#       guarded surface begin with a colon and 45 are HTTP/2 pseudo-headers
+#       and prose
+#       (`:status`, `:method`, `:authority`, `:scheme`, `:path`, `:reason`,
+#       `::reclaim`, `:status 404`). Requiring a colon plus one line span and
+#       nothing else leaves exactly the three real ones — and note
+#       `doc/testing.md` writes `` `:status` `` one sentence after its own
+#       continuation, so this is not a hypothetical collision.
+#   Together they take the tree from 232 extracted citations to 235: the three
+#   that exist, and no others.
+#
+#   SCOPE. The path is inherited from the nearest written-out citation EARLIER
+#   ON THE SAME LINE, which is the tightest scope that covers all three sites —
+#   each is written `` `path:N` and `:M` `` on one source line. Wider is not
+#   free: all three sit inside bullet lists that run 15, 16 and 101 lines
+#   without a blank, so a paragraph-scoped carry would search 101 lines back in
+#   `doc/testing.md` and bind a stray `:443` to whatever path it found there. A
+#   WRONG binding is worse than none, because it reads like a resolved citation
+#   and rule 1 will happily confirm it lands on a non-blank line.
+#
+#   And a bare span that finds nothing on its line is REPORTED, never skipped.
+#   That is what keeps the narrow scope honest: without it, a prose reflow that
+#   moved `:305` onto the next line would silently restore the exact hole this
+#   section closes, and silence is the whole defect. The author is asked to
+#   write the path, which is always available. No site in the tree takes that
+#   branch today.
+#
+#   Each bare span is its own citation carrying the inherited path, so rule 1
+#   resolves, range-checks and blank-checks it and rule 2 drift-compares it,
+#   exactly as for a written-out one — rule 2 reads the BASE revision through
+#   the same `citations()`, so `(router.rs, ((574, 574),))` is an identity at
+#   both revisions and #1465's shape — the written-out half re-anchored, the
+#   bare half left behind — is reported instead of invisible. On the
+#   changeset that first makes one VISIBLE, rule 2 is vacuous rather than
+#   absent: the identity is present at both revisions and compares equal,
+#   because nothing here edits the files they cite.
+#
+#   What this does NOT catch. A bare GROUP goes through the repeated-line check
+#   like any other group, so `` `:3/3` `` is reported — but `x.rs:3` followed by
+#   a SEPARATE bare `` `:3` `` is two citation groups, and that check only ever
+#   looks inside one. That is #1457's identity gap in another costume and it is
+#   not closed here. A backtick inside a fenced block is not code-span syntax to
+#   CommonMark although it is to this pattern; no such span exists in the
+#   guarded surface.
+#
 # DEAD TEST-NAME CITATIONS
 #   The resolver above only sees a citation that carries a path. A second form
 #   carries none: prose that names a TEST as its evidence — "`<name>` pinned
@@ -269,12 +379,34 @@ import tempfile
 # newline plus that line's leading whitespace. The extension alternation is
 # non-capturing on purpose: `match.group("path")` is read by name, but a
 # numbered group here would still renumber anything added after it.
+# A continuation written as a separate code span carries no path at all
+# (`` `lib/src/tcp.rs:183` and `:305` ``); that form is `BARE_CITATION` below
+# and it is bound to a path by `citations()`, never by this pattern.
 PATH = r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:rs|md)"
 SPAN = r"[0-9]+(?:-[0-9]+)?"
 CITATION = re.compile(
     rf"(?P<path>{PATH}):(?P<spans>{SPAN}(?:[,/][ \t]*(?:\n[ \t]*)?{SPAN})*)"
 )
 SPAN_SEP = re.compile(r"[,/][ \t]*(?:\n[ \t]*)?")
+# A CONTINUATION THAT NAMES NO PATH: `` `:305` ``, written after a full citation
+# to name a second site in the same file without repeating its path. `CITATION`
+# requires a path, so until sozu-proxy/sozu#1459 this form was extracted by
+# nothing and therefore checked by nothing. See "BARE CONTINUATIONS" in the
+# header for the two discriminators below and the measurements behind them: the
+# whole code span must be a colon and one span GROUP, which is what separates
+# the three real ones from 154 ports, IPv6 addresses, log timestamps and statsd
+# lines in the same documents.
+#
+# The span group mirrors `CITATION`'s own, so `` `:3/5` `` and `` `:3, 5` `` are
+# extracted exactly as `` `:3` `` and `` `:3-5` `` are. Writing `{SPAN}` alone
+# here reads as the narrower, safer choice and is the opposite: this tree uses
+# `/` groups heavily (`answers.rs:209/224`, `mod.rs:1218/1233/1311/1321`), so a
+# bare one is a form an author will reach for, and a pattern that does not match
+# it puts that citation back where #1459 found it — extracted by nothing,
+# checked by nothing, and not reported as unresolvable either. There is no
+# `\n` in it, unlike `CITATION`'s: a continuation binds on its own line, so a
+# group that wrapped could not bind anyway.
+BARE_CITATION = re.compile(rf"`:(?P<spans>{SPAN}(?:[,/][ \t]*{SPAN})*)`")
 # `testdata` holds this script's own fixtures, including a deliberately broken
 # document and a `sample.rs` that must never answer a real citation. Skipping
 # the directory by name keeps it out of the repository walk while leaving the
@@ -411,6 +543,48 @@ def parse_spans(text):
     return out
 
 
+def citations(body):
+    """Every citation in `body`, in document order, with bare ones bound.
+
+    Yields `(path, spans_text, spans, offset)`: the cited path, the normalized
+    span text a report quotes, the parsed spans, and the match offset the
+    caller turns into a document line with `doc_line_finder`.
+
+    `path` is `None` for a BARE continuation that found nothing to inherit
+    from, which is a reported failure rather than a skip — a silent one is the
+    exact defect this form carried until sozu-proxy/sozu#1459.
+
+    Rule 1 and rule 2 both read documents through this function, base revision
+    included, so the two can never disagree about what a document cites and a
+    bare continuation's drift identity is its inherited `(path, spans)` exactly
+    as a written-out one's is.
+    """
+    found = [
+        (m.start(), m.end(), m.group("path"), m.group("spans"))
+        for m in CITATION.finditer(body)
+    ]
+    # `PATH` admits no backtick, so a bare span can never sit inside a full
+    # citation's match today. The guard is here so that widening `PATH` later
+    # cannot silently count one span twice.
+    written = [(start, end) for start, end, _, _ in found]
+    for match in BARE_CITATION.finditer(body):
+        if any(start < match.end() and match.start() < end for start, end in written):
+            continue
+        found.append((match.start(), match.end(), None, match.group("spans")))
+    found.sort()
+
+    binder = None  # (end offset, path) of the last full citation seen
+    for start, end, path, spans_text in found:
+        if path is not None:
+            binder = (end, path)
+        elif binder is not None and "\n" not in body[binder[0]:start]:
+            # SAME LINE and no wider: see "BARE CONTINUATIONS" for why the
+            # blank-line paragraph those three sites sit in is 15, 16 and 101
+            # lines long, and what a carry that wide would bind.
+            path = binder[1]
+        yield path, " ".join(spans_text.split()), parse_spans(spans_text), start
+
+
 def check(root, show=False, out=sys.stdout):
     by_suffix = target_files(root)
     cache = {}
@@ -424,12 +598,19 @@ def check(root, show=False, out=sys.stdout):
         # Line number of the citation itself, for the error message.
         doc_line = doc_line_finder(body)
 
-        for match in CITATION.finditer(body):
+        for cited, spans_text, spans, offset in citations(body):
             total += 1
-            where = "%s:%d" % (doc, doc_line(match.start()))
-            cited = match.group("path")
-            spans_text = " ".join(match.group("spans").split())
-            spans = parse_spans(match.group("spans"))
+            where = "%s:%d" % (doc, doc_line(offset))
+            if cited is None:
+                # A bare continuation with nothing on its line to inherit from.
+                # Reported rather than skipped: the author always has the path,
+                # and a skip here is the hole #1459 measured.
+                failures.append(
+                    "%s: `:%s` — a bare continuation with no citation earlier on "
+                    "its own line to inherit a path from; write the path out"
+                    % (where, spans_text)
+                )
+                continue
 
             target, why = resolve_path(cited, by_suffix, root, doc_dir)
             if target is None:
@@ -664,8 +845,9 @@ def check_drift(root, base, show=False, out=sys.stdout):
         # number. Keying on the PARSED spans rather than their text also makes
         # `3/6` and `3, 6` the same citation, which they are.
         untouched = {
-            (m.group("path"), tuple(parse_spans(m.group("spans"))))
-            for m in CITATION.finditer(base_body)
+            (path, tuple(spans))
+            for path, _text, spans, _offset in citations(base_body)
+            if path is not None
         }
 
         doc_dir = os.path.dirname(doc)
@@ -673,9 +855,9 @@ def check_drift(root, base, show=False, out=sys.stdout):
             body = handle.read()
         doc_line = doc_line_finder(body)
 
-        for match in CITATION.finditer(body):
-            cited = match.group("path")
-            spans = parse_spans(match.group("spans"))
+        for cited, _spans_text, spans, offset in citations(body):
+            if cited is None:
+                continue  # rule 1 reports a continuation that binds to nothing
             if (cited, tuple(spans)) not in untouched:
                 continue  # re-anchored by this changeset, which is not drift
 
@@ -691,7 +873,7 @@ def check_drift(root, base, show=False, out=sys.stdout):
                     head[target] = handle.read().splitlines()
             head_lines = head[target]
 
-            where = "%s:%d" % (doc, doc_line(match.start()))
+            where = "%s:%d" % (doc, doc_line(offset))
             for start, end in spans:
                 span = str(start) if start == end else "%d-%d" % (start, end)
                 edges = [(start, "")] if start == end else [(start, ""), (end, " (end of range)")]
@@ -1129,12 +1311,64 @@ FIXTURE_EXPECTED = [
     "doc/bad.md:5: `sample.rs:4` — sample.rs:4 is blank",
     "doc/bad.md:7: `nowhere.rs:1` — no such file in the tree",
     "doc/bad.md:9: `sample.rs:3/3` — line 3 repeated inside one citation",
+    "doc/bad.md:9: `sample.rs:99` — past end of sample.rs (10 lines)",
     "doc/bad.md:11: `sample.rs:0` — line numbers start at 1",
     "doc/bad.md:13: `sample.rs:3-5` — sample.rs:5 is blank (end of range)",
     "doc/bad.md:15: `h2.rs:99` — past end of h2.rs (3 lines)",
     "doc/bad.md:17: `reference.md:99` — past end of doc/reference.md (12 lines)",
     "doc/bad.md:19: `doc/reference.md:10` — doc/reference.md:10 is blank",
+    "doc/bad.md:22: `sample.rs:99` — past end of sample.rs (10 lines)",
+    "doc/bad.md:24: `sample.rs:3/3` — line 3 repeated inside one citation",
+    "doc/bad.md:26: `:1/2` — a bare continuation with no citation earlier on its own line",
+    "doc/bad.md:30: `:7` — a bare continuation with no citation earlier on its own line",
+    "doc/bad.md:33: `:7` — a bare continuation with no citation earlier on its own line",
 ]
+
+# The bare continuation on `doc/bad.md:9`, asserted ON ITS OWN and not only as
+# an entry in the list above. It names line 99 of a 10-line file, so it is a
+# failure of the plainest kind — and until sozu-proxy/sozu#1459 no rule in this
+# file could report it, because `CITATION` requires a path and this citation
+# carries none. It is extracted only by `citations()` binding it to the
+# `sample.rs` earlier on its own line.
+#
+# The list assertion above cannot stand in for this one: when the binding is
+# removed it prints "expected 11 failures, got 10" followed by the ten it DID
+# find, which names every citation except the one that went missing. A count
+# that shrinks is evidence something is gone; only this assertion says WHAT.
+FIXTURE_BARE_EXPECTED = "doc/bad.md:9: `sample.rs:99` — past end of sample.rs (10 lines)"
+
+# THE SCOPE, asserted rather than described. `citations()` inherits a path from
+# the nearest written-out citation EARLIER ON THE SAME LINE, and each of the
+# three ways that sentence can be weakened has a fixture whose verdict CHANGES
+# under it. Measured, because the first version of this file asserted none of
+# them and claimed otherwise: with only a blank-line-separated bare span to go
+# on, widening the scope to the paragraph, or binding to the FIRST citation on
+# the line instead of the nearest, both left `--self-test` at exit 0 — and on
+# the real tree the paragraph widening produced byte-identical `--show` output,
+# so nothing anywhere would have reported it.
+#
+#   * NEAREST, not first. `doc/bad.md:22` puts `h2.rs:1` and `sample.rs:3` on
+#     one line and continues bare at `:99`. Binding to the nearest reports it
+#     against `sample.rs` (10 lines); binding to the first reports `h2.rs`
+#     (3 lines). Both are failures, so only the exact TEXT separates them —
+#     which is why this one is a list entry above as well as a named constant.
+FIXTURE_BARE_NEAREST_EXPECTED = "doc/bad.md:22: `sample.rs:99` — past end of sample.rs (10 lines)"
+
+#   * SAME LINE, not the paragraph. `doc/bad.md:30` is a bare `:7` one line
+#     below a `sample.rs:3` in its own paragraph. Same-line scope cannot bind
+#     it and reports it; paragraph scope binds it to `sample.rs:7`, which is a
+#     real non-blank line, so the failure DISAPPEARS and the run goes green
+#     over a scope one paragraph wider than the header claims. `doc/bad.md:33`
+#     is the same span with no citation in its paragraph at all, which is the
+#     weaker document-wide case and the only one the first version caught.
+FIXTURE_BARE_SAME_LINE_EXPECTED = "doc/bad.md:30: `:7` — a bare continuation with no citation earlier on its own line"
+
+#   * THE GROUP FORM. `doc/bad.md:24` continues bare as `:3/3`, which is the
+#     half-applied renumbering of a `/` group with the path dropped. It is
+#     extracted only because `BARE_CITATION` carries `CITATION`'s span group;
+#     with a single `{SPAN}` there it matches nothing at all, and the citation
+#     goes back to being checked by no rule — #1459 one syntax step along.
+FIXTURE_BARE_GROUP_EXPECTED = "doc/bad.md:24: `sample.rs:3/3` — line 3 repeated inside one citation"
 
 # The exact number of citation groups the fixtures contain. Asserting the total
 # — not a floor — is what makes a SHRINKING extraction surface fail the
@@ -1147,6 +1381,18 @@ FIXTURE_EXPECTED = [
 #     four clean in `doc/good.md` and two expected failures in `doc/bad.md`,
 #     which is the exact shape sozu-proxy/sozu#1444 found in the tree — never
 #     extracted, and therefore counted as nothing.
+#   * dropping the bare-continuation binding from citations() loses eight at
+#     once — `doc/bad.md`'s six and `doc/drift.md`'s `:13`, plus the group
+#     `:1/2` — which is the exact shape sozu-proxy/sozu#1459 found in the tree:
+#     a citation extracted by nothing, and therefore never reported as
+#     unresolvable either.
+#   * narrowing `BARE_CITATION` back to a single `{SPAN}` loses only the two
+#     GROUP continuations, `doc/bad.md`'s `:3/3` and `:1/2`.
+#     WIDENING the scope a bound continuation inherits over is the opposite
+#     edit and this total cannot see it — every citation is still extracted,
+#     just bound to a different path or bound where it should not be. That is
+#     what FIXTURE_BARE_NEAREST_EXPECTED and FIXTURE_BARE_SAME_LINE_EXPECTED
+#     are for, and neither is a count.
 #   * dropping `.md` from TARGET_SUFFIXES loses only `doc/good.md`'s bare
 #     `LIFECYCLE.md:8`, and that one citation is the whole reason it is there.
 #     The other markdown fixtures resolve through resolve_path's first two
@@ -1156,10 +1402,11 @@ FIXTURE_EXPECTED = [
 #     a guard.
 # None of these is an accidental shape, and none announces itself: on the real
 # tree they report a clean run over a quietly smaller surface.
-# `doc/drift.md` contributes six of these: rule 2's fixture is an ordinary
-# document that rule 1 must also see, and see as clean. Five of the six name
-# `drift.rs`; the sixth names `doc/wide.md`, whose catalogue row is the drift
-# whose text changes only PAST the width a quote is clipped at (#1448).
+# `doc/drift.md` contributes seven of these: rule 2's fixture is an ordinary
+# document that rule 1 must also see, and see as clean. Six of the seven name
+# `drift.rs` — one of them the bare `:13` continuing the range beside it — and
+# the seventh names `doc/wide.md`, whose catalogue row is the drift whose text
+# changes only PAST the width a quote is clipped at (#1448).
 # `doc/pinned.md` and `doc/pinned_bad.md` contribute one each, for the same
 # reason and with more force: rule 4's annotation lives in the document body,
 # so rule 1 resolves it exactly as it resolves a citation written in prose —
@@ -1167,9 +1414,12 @@ FIXTURE_EXPECTED = [
 # `doc/pinned_nested.md` contributes two: the annotation it DISPLAYS inside a
 # four-tick example is still a citation to rule 1, which is correct — the text
 # names a real span either way — and the real pin after it is the second.
-# `doc/good.md` contributes nine; `doc/reference.md` and `doc/wide.md` none —
+# `doc/bad.md` contributes seventeen, six of them bare continuations: two bound
+# and wrong, one bound GROUP, one unbindable group, and two unbindable spans
+# that pin the scope. `doc/good.md` contributes nine; `doc/reference.md` and
+# `doc/wide.md` none —
 # each is a citation TARGET, and carries no citation of its own.
-FIXTURE_TOTAL = 30
+FIXTURE_TOTAL = 41
 
 # Rule 2's half of the fixtures is a PAIR of revisions, so every file that
 # drifts carries its base revision beside it as `<name>.base`. That suffix is
@@ -1185,6 +1435,10 @@ DRIFT_BASE_SUFFIX = ".base"
 #   * `drift.rs:8` and `drift.rs:8-10` did not move   — must stay silent
 #   * `drift.rs:12` moved onto another method's signature       — reported
 #   * `drift.rs:8-13` kept its start and moved its end          — reported
+#   * the bare `:13` beside it inherits `drift.rs` from that same
+#     citation and moved with it                                 — reported,
+#     which is what proves rule 2 reads a pathless continuation through
+#     `citations()` exactly as rule 1 does, rather than only counting it
 #   * `drift.rs:16` is the re-anchored form of the first drift  — must stay
 #     silent, because it is absent from the base revision of the document
 #   * `wide.md:11` moved only past the clip                     — reported,
@@ -1192,6 +1446,8 @@ DRIFT_BASE_SUFFIX = ".base"
 FIXTURE_DRIFT_EXPECTED = [
     "doc/drift.md:11: `drift.rs:12` — drift.rs:12 moved: "
     "was `pub fn moved(&self) -> u8 {`, now `pub fn inserted(&self) -> u8 {`",
+    "doc/drift.md:15: `drift.rs:13` — drift.rs:13 moved: "
+    "was `1`, now `0`",
     "doc/drift.md:15: `drift.rs:8-13` — drift.rs:13 moved (end of range): "
     "was `1`, now `0`",
 ]
@@ -1238,7 +1494,11 @@ REPORTED_PAIR = re.compile(r": was `(.*)`, now `(.*)`$")
 # durable half of #1444. Rule 1 can only say a markdown target exists; rule 2
 # says its TEXT still reads the way the citing prose claims.
 # The thirty-first is `doc/wide.md`'s catalogue row: one more markdown-target
-# end, and the only one whose two revisions differ solely past the clip.
+# end, and the only one whose two revisions differ solely past the clip. The
+# thirty-second is `doc/drift.md:15`'s bare `:13`: rule 2 resolves the path it
+# inherited and compares it like any other, so a build of `citations()` that
+# bound continuations for rule 1 alone would report a clean run over a surface
+# one citation smaller than rule 1 just scanned.
 #
 # This constant is why sozu-proxy/sozu#1444 was rebased onto #1432 rather than
 # merged. Both branches raised it from 17 to 23 — six pin-annotation ends there,
@@ -1247,7 +1507,7 @@ REPORTED_PAIR = re.compile(r": was `(.*)`, now `(.*)`$")
 # the `>>>>>>>` a resolver reads. Two correct edits, silently composed into a
 # third value that is neither. When two branches move the same counter for
 # different reasons, the merge is a sum, and git cannot know that.
-FIXTURE_DRIFT_COMPARED = 31
+FIXTURE_DRIFT_COMPARED = 32
 
 # Rule 3's half of the fixtures. `tests_bad.rs` and the fixture `CHANGELOG.md`
 # are the broken documents; `tests_good.rs` is the clean one and also carries
@@ -1421,6 +1681,43 @@ def self_test():
             if not actual.startswith(expected):
                 ok = False
                 print("FAIL self-test: expected a failure starting %r, got %r" % (expected, actual))
+
+    # The bare continuation, asserted by name. Every other assertion in this
+    # block reads a COUNT, and a count that shrinks says only that something is
+    # gone; this one says which citation.
+    if not any(line.startswith(FIXTURE_BARE_EXPECTED) for line in bad):
+        ok = False
+        print(
+            "FAIL self-test: the bare continuation `:99` on doc/bad.md:9 was not reported. "
+            "It inherits `sample.rs` from the citation earlier on its own line and names "
+            "line 99 of a 10-line file, so expected a failure starting %r. A citation that "
+            "is extracted by nothing is checked by nothing and is never reported as "
+            "unresolvable either — sozu-proxy/sozu#1459." % FIXTURE_BARE_EXPECTED
+        )
+
+    # The scope and the group form, each asserted by the fixture whose verdict
+    # CHANGES when it is weakened. A count cannot stand in for any of these:
+    # widening the scope keeps every citation extracted and only moves what it
+    # binds to.
+    for expected, what in (
+        (FIXTURE_BARE_NEAREST_EXPECTED,
+         "a continuation must inherit from the NEAREST citation on its line, not the first: "
+         "doc/bad.md:22 carries `h2.rs:1` and `sample.rs:3` before its bare `:99`, so binding "
+         "to the first would report `h2.rs` (3 lines) instead"),
+        (FIXTURE_BARE_SAME_LINE_EXPECTED,
+         "a continuation must inherit on its OWN LINE only: doc/bad.md:30's bare `:7` sits one "
+         "line below a `sample.rs:3` in the same paragraph, and a paragraph-wide carry binds it "
+         "to a real non-blank line, so this failure disappears and the scope silently widens"),
+        (FIXTURE_BARE_GROUP_EXPECTED,
+         "a bare GROUP continuation must be extracted: doc/bad.md:24's `:3/3` is the "
+         "half-applied renumbering of a `/` group with its path dropped, and a `BARE_CITATION` "
+         "without CITATION's span group matches it not at all"),
+    ):
+        if not any(line.startswith(expected) for line in bad):
+            ok = False
+            print(
+                "FAIL self-test: expected a failure starting %r — %s." % (expected, what)
+            )
 
     if total != FIXTURE_TOTAL:
         ok = False
@@ -1682,15 +1979,16 @@ def main():
     total, failures = check(root, show=args.show)
     if failures:
         status = 1
-        print("::error::%d of %d `file.rs:NNN` / `file.md:NNN` citations in doc/ and **/LIFECYCLE.md do not resolve:" % (len(failures), total))
+        print("::error::%d of %d `file.rs:NNN` / `file.md:NNN` citations (bare `:NNN` continuations included) in doc/ and **/LIFECYCLE.md do not resolve:" % (len(failures), total))
         for line in failures:
             print("  " + line)
         print("")
         print("Cite a symbol (`Type::method`) where the prose names an item — a symbol cannot drift.")
         print("Keep a line or a range only where the prose means a specific branch inside an item.")
+        print("A bare `:NNN` continues the citation earlier on its own line; with none there, write the path.")
         print("Convention and local usage: doc/README.md#citing-code-from-these-documents")
     else:
-        print("OK: all %d `file.rs:NNN` / `file.md:NNN` citations in doc/ and **/LIFECYCLE.md resolve to a non-blank line." % total)
+        print("OK: all %d `file.rs:NNN` / `file.md:NNN` citations (bare `:NNN` continuations included) in doc/ and **/LIFECYCLE.md resolve to a non-blank line." % total)
 
     print("")
     if not args.base:

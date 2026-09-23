@@ -457,6 +457,124 @@
 
 ### 🐛 Fixed
 
+- **`fix(ci)`: extract the bare `:NNN` CONTINUATION of a citation, so the second half of a pair is
+  checked at all — and repair the two copies of the one that was wrong.**
+  `.github/scripts/check_doc_citations.py`'s `CITATION` pattern required a path, so the idiom that
+  names a file once and continues with a bare line number — `` `lib/src/tcp.rs:183` and `:305` `` —
+  produced a second citation that no rule in the file could see. Not rule 1, not rule 2, not rule 3,
+  not rule 4: it was never extracted, so it was never resolved, never drift-compared, and never
+  reported as unresolvable either. The first half of every pair was checked on every CI run and the
+  second half had never been checked once (sozu-proxy/sozu#1459). That is worse than an unguarded
+  citation, because the two halves name sibling sites in the same function and therefore rot
+  together, so a reader who watches the guarded half land correctly infers the other is as
+  maintained.
+
+  **#1465 is the worked case, and it is why this tree carried a wrong citation rather than three
+  correct ones.** `3e9c271c` moved both call sites of `h2_handshake_chromium_146` down one line; it
+  bumped the half a rule could see and left the half no rule could:
+
+  ```diff
+  -  `h2_correctness_tests.rs:3604` and `:3708`. No test that decodes a `:status`
+  +  `h2_correctness_tests.rs:3605` and `:3708`. No test that decodes a `:status`
+  ```
+
+  Both numbers were right at `3e9c271c^` and only the first was right after, with the `Doc
+  citations` job green throughout — the only rule that could have seen `:3708` never extracted it.
+  Run the new gate over that changeset and it reports the other half:
+
+  ```
+  $ git worktree add --detach /tmp/repro 3e9c271c
+  $ python3 .github/scripts/check_doc_citations.py --root /tmp/repro --base 3e9c271c^
+  ::error::1 of 215 compared citations drifted since 970b92c5678a:
+    doc/testing.md:680: `h2_correctness_tests.rs:3708` — e2e/src/tests/h2_correctness_tests.rs:3708
+    moved: was `let _server_settings = h2_handshake_chromium_146(&mut tls);`,
+    now `let mut tls = raw_h2_connection(front_addr);`
+  ```
+
+  A bare `:NNN` is ordinary prose, so the extraction is narrow and both discriminators were measured
+  on this tree rather than guessed. It must be a **code span of its own**: the guarded surface holds
+  154 bare `:NNN` that are not, and not one is a citation — TOML listen addresses
+  (`0.0.0.0:8443`, `[::1]:8080`), `curl` URLs, statsd lines (`sozu.WRK-00.http.requests:1|c`), log
+  timestamps, a `1:100` ratio, `--ulimit nofile=262144:262144`. And it must hold **a colon, one span
+  group, and nothing else**: 48 code spans here begin with a colon and 45 are HTTP/2 pseudo-headers
+  or prose (`` `:authority` `` ×13, `` `:status` `` ×7, `` `:method` ``, `` `:scheme` ``,
+  `` `:path` ``, `` `:reason` ``, `` `::reclaim` ``, `` `:status 404` ``), with `doc/testing.md`
+  writing `` `:status` `` in the very paragraph that carries a continuation of its own. Together
+  they take the tree from 232 extracted citations to 235: the three that exist, and no others. Both
+  counts are read at `ce80b00c`; documenting the form adds seven colon-leading code spans of its
+  own, so re-measuring the second at this commit reads 55 rather than 48. The bare-span total is 3
+  either way, which is the number that matters.
+
+  The span group is `CITATION`'s own, so `` `:3/5` `` and `` `:3, 5` `` are extracted exactly as
+  `` `:3` `` and `` `:3-5` `` are. A single span there reads as the narrower, safer choice and is
+  the opposite: this tree uses `/` groups heavily (`answers.rs:209/224`,
+  `mod.rs:1218/1233/1311/1321`), so a bare one is a form an author reaches for, and a pattern that
+  does not match it puts that citation back where #1459 found it. A bare group goes through the
+  repeated-line check like any other, so `` `:3/3` `` — a group renumbered on one half only, with
+  its path dropped — is now reported.
+
+  The path is inherited from the nearest written-out citation **earlier on the same source line**,
+  the tightest scope that covers all three sites — each is written `` `path:N` and `:M` `` on one
+  line. Wider is not free: all three sit inside bullet lists that run 15, 16 and 101 lines without a
+  blank line, so a paragraph-scoped carry would search a hundred lines back in `doc/testing.md` and
+  bind a stray port number to whatever path it found there. A WRONG binding is worse than none,
+  because rule 1 then confirms it lands on a non-blank line and it reads as resolved. A bare span
+  that finds nothing on its own line is **reported**, never skipped — that is what keeps the narrow
+  scope honest, since without it a prose reflow onto the next line would silently restore the exact
+  hole. No site in the tree takes that branch today.
+
+  **That scope is asserted, not described.** Three ways the sentence above can be weakened, each
+  with a fixture whose verdict changes under it: binding to the FIRST citation on the line instead
+  of the nearest (`doc/bad.md:22` puts two paths on one line, so the report names `h2.rs` instead
+  of `sample.rs`), carrying over the whole PARAGRAPH (`doc/bad.md:30` is a bare span one line below
+  a citation in its own paragraph, and a paragraph carry binds it to a real non-blank line so the
+  failure disappears), and carrying over the whole DOCUMENT (`doc/bad.md:33`). All three exit 1
+  now; the first two exited 0 against the first version of these fixtures, and on the real tree the
+  paragraph widening produced byte-identical `--show` output, so nothing anywhere would have
+  reported it.
+
+  **One of the three continuations was wrong the day it became visible, in two places.**
+  `doc/testing.md:680` cited `` `h2_correctness_tests.rs:3605` and `:3708` `` for the two call sites
+  of `h2_handshake_chromium_146`, and `:3708` was `let mut tls = raw_h2_connection(front_addr);` —
+  the line above the one the prose means. `grep -n` puts the two call sites at 3605 and 3709, and
+  the citation is now `:3709`, re-derived from that grep rather than by offsetting the stale
+  number. `e2e/src/tests/h2_utils.rs`'s `decode_status` doc comment carries a near-duplicate of that
+  paragraph, outside the guarded surface where no rule reaches it, and it had drifted further: its
+  own bare continuation read `:3663` (a bare `}`), its written-out half `:3559` (a `use` list), and
+  its arming site `lib/src/protocol/mux/h2.rs:5838` (a bare `}`) against a real site at `:5254`
+  (`self.pending_table_size_update = Some(capped);`). All three repaired by grep; `converter.rs:112`
+  and `h2_security_tests.rs:2440` were verified correct and left alone. Repairing one copy of a fact
+  and knowingly leaving the other is the defect this changeset is about. The remaining two
+  continuations are exact and stay as written, both verified by grep rather than by trusting the
+  issue's list: `lib/src/tcp.rs:183`/`:305` are that file's only two
+  `let frontend_address = socket.peer_addr().ok();` lines, and `mux/router.rs:394`/`:574` its only
+  two `context.link_stream(stream_id, token);` calls.
+
+  Rules 1 and 2 read every document through one `citations()` generator, base revision included, so
+  a bare span's drift identity is its inherited `(path, spans)` exactly as a written-out one's is.
+  Be precise about what that buys on THIS changeset rather than in general: the two correct
+  continuations are compared and read unmoved (`--base` goes from 358 compared line ends to 360),
+  and the repaired one is exempt as re-anchored, so it carries rule 1 alone here. Nothing is
+  retroactively drift-checked. #1457's identity gap is untouched: a bare GROUP is now caught by the
+  repeated-line check, but `x.rs:3` followed by a SEPARATE bare `` `:3` `` is two citation groups
+  and that check only ever looks inside one.
+
+  Seen red before green. With the extraction deleted and the fixtures, the named assertions and the
+  new constants kept, `--self-test` exits 1 reporting that the bare continuation on `doc/bad.md:9`
+  was not reported. `doc/bad.md` carries six continuations now — two bound and wrong, one bound
+  group, one unbindable group, and two unbindable spans that pin the scope — and `doc/drift.md`
+  and its base revision carry one whose inherited line moved, so rule 2 must report it through the
+  same extractor instead of merely counting it. `FIXTURE_TOTAL` 30 -> 41, `FIXTURE_DRIFT_COMPARED`
+  31 -> 32, `FIXTURE_EXPECTED` 9 -> 15 entries, `FIXTURE_DRIFT_EXPECTED` 2 -> 3, plus
+  `FIXTURE_BARE_EXPECTED`, `FIXTURE_BARE_NEAREST_EXPECTED`, `FIXTURE_BARE_SAME_LINE_EXPECTED` and
+  `FIXTURE_BARE_GROUP_EXPECTED`, each naming the citation a count assertion can only report as
+  missing. Every other fixture constant is unchanged. `doc/README.md` gains the form, its three
+  constraints and the measurement behind each, written without a real line number because that
+  document is inside the guarded surface; `lib/src/protocol/mux/LIFECYCLE.md` names the form in its
+  own anchoring preamble, which uses it. The job box in `.github/workflows/ci.yml` is deliberately
+  untouched: it asks for one clause per RULE, and this changes rule 1's extraction rather than
+  adding a fifth.
+
 - **`fix(ci)`: clip a drift report's two quoted lines around their first DIFFERENCE, so a wide
   line's before and after stop printing identically.**
   `.github/scripts/check_doc_citations.py` rendered every quoted line through one left-anchored
@@ -752,7 +870,8 @@
   computed by offsetting the stale number. All nine line citations in `doc/testing.md` were read
   against their targets for this changeset — the eight `path.rs:NNN` groups
   `.github/scripts/check_doc_citations.py` resolves, plus the bare `:3708` continuation its regex
-  cannot see because that form carries no path — and this was the only one landing on an unrelated
+  cannot see because that form carries no path (closed by #1459, which extracts that form and
+  repaired this very citation to `:3709`) — and this was the only one landing on an unrelated
   construct. The other eight are correct, including the two that anchor on the explanatory comment
   above the code rather than the code line (`redirect_rewrite_auth_tests.rs:264`,
   `h2_security_tests.rs:2440`), which were left as they are. `check_doc_citations.py` exits 0 both
