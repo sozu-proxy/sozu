@@ -450,9 +450,10 @@ impl SniPrereadCore {
     }
 
     /// TigerStyle invariant sweep, run at both the head and tail of
-    /// [`Self::handle_input`] (mirrors `udp/manager.rs`'s
-    /// `check_invariants`, see `lib/src/protocol/udp/manager.rs:686-817`).
-    /// Read-only; must never change behavior.
+    /// [`Self::handle_input`] (mirrors `UdpManager::check_invariants` and
+    /// `UdpManager::debug_assert_invariants` in
+    /// `lib/src/protocol/udp/manager.rs`). Read-only; must never change
+    /// behavior.
     #[cfg(debug_assertions)]
     fn check_invariants(&self) {
         // Positive: `NeedMore` is the only non-terminal `Output` variant, so

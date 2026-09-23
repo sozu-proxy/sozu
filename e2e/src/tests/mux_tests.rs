@@ -2266,11 +2266,12 @@ fn test_h1_rejects_ambiguous_cl_te() {
 
 /// Issue #899 asked whether sozu forwards HTTP/1.1 chunked trailers through
 /// unchanged. Audit of the stack shows the plumbing is already in place
-/// — kawa's H1 parser has `ParsingPhase::Trailers` (`kawa::protocol::h1::
-/// parser::mod.rs:343`) and kawa's H1 converter serializes `Block::Header`
-/// identically whether the block originated before the body (regular
-/// header) or after (trailer). The whole chain just needs an e2e to lock
-/// the behaviour down so a future refactor cannot silently drop trailers.
+/// — kawa's H1 parser has `ParsingPhase::Trailers`
+/// (`kawa::protocol::h1::parser`) and kawa's H1 converter serializes
+/// `Block::Header` identically whether the block originated before the
+/// body (regular header) or after (trailer). The whole chain just needs an
+/// e2e to lock the behaviour down so a future refactor cannot silently
+/// drop trailers.
 ///
 /// Test shape: a sync backend sends a chunked RESPONSE whose wire layout
 /// includes `Trailer:` in the headers, body chunks, a `0\r\n` terminator,

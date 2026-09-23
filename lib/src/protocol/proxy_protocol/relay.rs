@@ -1028,15 +1028,16 @@ mod relay_test {
 
     /// The same missing-guard defect class one function up, in `readable`.
     /// `tcp_socket_read` returns `(0, SocketResult::Continue)` the moment the
-    /// slice it is handed is empty (`lib/src/socket.rs:196-198`), which is
-    /// exactly what `frontend_buffer.space()` yields once the buffer is full.
-    /// A client that declares a large `len` and then stops fills the buffer,
-    /// the streaming parser answers `Incomplete`, and `readable` returns
-    /// `Continue` with READABLE still set in both readiness words — so
-    /// `ready_inner` calls it again immediately, with no space to read into.
-    /// `MAX_LOOP_ITERATIONS` bounds that OUTER loop, so this is CPU
-    /// amplification and a spurious close rather than a wedge, but it is the
-    /// same guard that was missing below. `expect.rs:183` drops READABLE on any
+    /// slice it is handed is empty (`lib/src/socket.rs`), which is exactly what
+    /// `frontend_buffer.space()` yields once the buffer is full. A client that
+    /// declares a large `len` and then stops fills the buffer, the streaming
+    /// parser answers `Incomplete`, and `readable` returns `Continue` with
+    /// READABLE still set in both readiness words — so `ready_inner` calls it
+    /// again immediately, with no space to read into. `MAX_LOOP_ITERATIONS`
+    /// bounds that OUTER loop, so this is CPU amplification and a spurious
+    /// close rather than a wedge, but it is the same guard that was missing
+    /// below. `ExpectProxyProtocol::readable`
+    /// (`lib/src/protocol/proxy_protocol/expect.rs`) drops READABLE on any
     /// non-positive read; this now matches it.
     ///
     /// To SEE THIS RED: delete the `else` branch `readable` takes when
@@ -1109,18 +1110,19 @@ mod relay_test {
     /// `back_writable`'s `Interrupted` arm, exercised for real.
     ///
     /// The arm is DEFENSIVE: it is unreachable in production, because the
-    /// backend socket is built by `mio::net::TcpStream::connect`
-    /// (`lib/src/backends.rs:332`) and is therefore always non-blocking, and a
-    /// non-blocking `send` answers EAGAIN, never EINTR. Reaching it at all
-    /// needs a blocking socket, so this test builds one. The seam is that
-    /// `mio::net::TcpStream::from_std` only wraps a descriptor and accepts any
-    /// socket fd: a `socketpair(AF_UNIX, SOCK_STREAM)` -- deliberately not a
-    /// pipe, whose fd answers `send(2)` with `ENOTSOCK` (os error 88) -- is
-    /// filled until it refuses another byte, so the next blocking send PARKS
-    /// with nothing written. That is what makes the outcome deterministic:
-    /// with zero free space a partial `Ok(n)` is impossible and EINTR is the
-    /// only way out. SIGUSR1 is installed WITHOUT `SA_RESTART`, so the parked
-    /// send returns `Interrupted` instead of being resumed by the kernel.
+    /// backend socket is built by `mio::net::TcpStream::connect` in
+    /// `Backend::try_connect` (`lib/src/backends.rs`) and is therefore always
+    /// non-blocking, and a non-blocking `send` answers EAGAIN, never EINTR.
+    /// Reaching it at all needs a blocking socket, so this test builds one.
+    /// The seam is that `mio::net::TcpStream::from_std` only wraps a
+    /// descriptor and accepts any socket fd: a `socketpair(AF_UNIX,
+    /// SOCK_STREAM)` -- deliberately not a pipe, whose fd answers `send(2)`
+    /// with `ENOTSOCK` (os error 88) -- is filled until it refuses another
+    /// byte, so the next blocking send PARKS with nothing written. That is
+    /// what makes the outcome deterministic: with zero free space a partial
+    /// `Ok(n)` is impossible and EINTR is the only way out. SIGUSR1 is
+    /// installed WITHOUT `SA_RESTART`, so the parked send returns
+    /// `Interrupted` instead of being resumed by the kernel.
     ///
     /// The contract under test: a signal is not a socket state change, so
     /// edge-triggered epoll owes no new edge and BOTH readiness words must

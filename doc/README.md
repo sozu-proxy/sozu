@@ -73,7 +73,8 @@ Sōzu is a reverse proxy for load balancing, written in Rust. Its main job is to
 ## Citing code from these documents
 
 These documents anchor their claims to code, and to each other. There are three forms, and the
-choice between them is not stylistic:
+choice between them is not stylistic. They govern prose inside Rust source too, with one narrowing
+— see [Citing code from a Rust comment](#citing-code-from-a-rust-comment):
 
 * **The prose names an item** — a function, method, struct, enum, field, constant or macro — so cite
   the *symbol*, qualified as `Type::method` so it stays greppable, with the file path and no line
@@ -94,6 +95,38 @@ ever shown both halves. In [sozu-proxy/sozu#1335][cit] an audit of one module do
 its 35 citations wrong: single lines uniformly off by +1 after a `//!` module-doc block was inserted
 above them, and ranges off by +38 to +57 after a `debug_assert!` campaign grew the functions. A range
 that drifts 46 lines does not mislead slightly — it lands the reader in a different branch.
+
+### Citing code from a Rust comment
+
+The same three forms govern prose inside Rust source, with one narrowing: **in a `//`, `///` or
+`//!` comment, cite the symbol and never a line number.** A comment that means one specific branch
+names that branch in words — the `FlushOutcome::Stalled` arm of `ConnectionH2::write_streams` —
+rather than reaching for the second form.
+
+The narrowing is not stylistic either. The resolver scans `doc/**` and every `**/LIFECYCLE.md`; a
+citation inside a comment is outside its scope entirely, so the second form there is a line number
+with no checker behind it, and the pull request that breaks it is still never the one that contains
+it. Measured at main `19fd5d8c`, before this convention reached the source: the tree carried 90
+`path.rs:NNN` citation tokens in Rust comments across 25 files, holding 113 line targets between
+them. **Sixty-eight of the 90 had drifted** since the commit that last wrote or re-anchored them.
+Forty-three of those 68 broke on the very NEXT commit that touched the file they point into; the
+median citation survived **one** such commit and zero days, and 65 of 68 were wrong within a week.
+A pointer with that half-life is not a maintenance problem to be tightened — it is a form that does
+not work. The worked case is the one that reaches furthest: `h2.rs:NNN` written for
+`ConnectionH2::write_streams` now lands on an unrelated `H2State::ClientPreface` match arm, which
+resolves cleanly, is not blank, and reads like a real place in the file.
+
+Extending the resolver over `**/*.rs` was the alternative, and it was measured rather than argued.
+Switched on at that revision it would have had to reject those 68 drifted citations, plus 14 naming
+a basename that is ambiguous in this tree — four files here are called `h2.rs` and nineteen
+`mod.rs` — plus two pointing into the `kawa` dependency, which is not in this repository at all. A
+gate that fails on most of the population it guards is a gate that gets bypassed rather than
+satisfied, which is the argument `check_doc_citations.py`'s own header makes about `--all-features`.
+The symbol form costs a reader one `git grep` and cannot drift at all.
+
+Nothing mechanical enforces this in Rust source yet: the resolver's scope is unchanged, so this is
+a review convention there until a rule rejects the `path.rs:NNN` form inside a comment. The
+population it was applied to was converted whole, so such a rule would start green.
 
 ### Continuing a citation without repeating the path
 

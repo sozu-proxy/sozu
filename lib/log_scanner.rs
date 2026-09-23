@@ -59,11 +59,11 @@ const LOOKAHEAD_LINES: usize = 12;
 
 /// Backward window before a log call. Covers the hoisted-local shape
 /// (`let context = log_context!(self);` before a mutably-borrowed
-/// `match &mut self.position { ... }` — see `mux/h2.rs:5468`-`5480` for
-/// the canonical case where the macro reads `self.position` while the
-/// match arm holds it mutably). 24 = longest observed hoist (~12 lines)
-/// plus a comfort margin so future re-shuffling of those blocks does not
-/// have to revisit this constant.
+/// `match &mut self.position { ... }` — see `ConnectionH2::start_stream`
+/// (`lib/src/protocol/mux/h2.rs`) for the canonical case where the macro
+/// reads `self.position` while the match arm holds it mutably). 24 =
+/// longest observed hoist (~12 lines) plus a comfort margin so future
+/// re-shuffling of those blocks does not have to revisit this constant.
 const LOOKBEHIND_LINES: usize = 24;
 
 /// True iff `trimmed` starts with one of the level-keyed log macros and

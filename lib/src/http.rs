@@ -618,8 +618,9 @@ impl ProxySession for HttpSession {
         let front_socket = self.state.front_socket();
         // invariant: write-only shutdown — Shutdown::Both on a TLS frontend
         // discards the receive buffer and elicits TCP RST, truncating the
-        // already-queued response. Canonical write-up: `lib/src/https.rs:650-655`.
-        // Backend sockets follow the same discipline for symmetry.
+        // already-queued response. Canonical write-up: the `Shutdown::Write`
+        // block of `HttpsSession::close` (`lib/src/https.rs`). Backend sockets
+        // follow the same discipline for symmetry.
         if let Err(e) = front_socket.shutdown(Shutdown::Write) {
             // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
             if e.kind() != ErrorKind::NotConnected {
@@ -845,8 +846,8 @@ impl L7ListenerHandler for HttpListener {
           host
         }
         */
-        // SAFETY: `hostname` was just produced by `hostname_and_port` (see
-        // `lib/src/protocol/kawa_h1/parser.rs:182`), which only accepts
+        // SAFETY: `hostname` was just produced by `hostname_and_port`
+        // (`lib/src/protocol/kawa_h1/parser.rs`), which only accepts
         // bytes matching `is_hostname_char` (alphanumeric, `-`, `.`, plus
         // `_` under the tolerant-http1-parser feature). All accepted
         // bytes are ASCII (≤ 0x7F), so the slice is valid single-byte UTF-8.

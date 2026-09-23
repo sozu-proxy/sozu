@@ -20,7 +20,8 @@
 //!   cancelled by the per-stream idle timer while the write path is parked on
 //!   that stream's [`expect_write`], opening a new stream recycles the slot and
 //!   may shrink the context streams Vec — the stranded [`expect_write`] must
-//!   not panic on the next `writable()` call (h2.rs:1896 OOB regression).
+//!   not panic on the next `writable()` call — the OOB regression in
+//!   `ConnectionH2::write_streams` (`lib/src/protocol/mux/h2.rs`).
 //! * [`test_h2_stranded_expect_write_peer_rst_survives_cancellation`][] — same
 //!   invariant as above but triggered via **peer-initiated RST_STREAM**; the
 //!   `handle_rst_stream_frame` eviction path must also invalidate any cached
@@ -827,7 +828,8 @@ fn try_h2_window_stall_silent_reaped() -> State {
         .to_tls(None)
         .unwrap();
     listener_config.h2_stream_idle_timeout_seconds = Some(2);
-    // Frontend timer is armed with `request_timeout` (https.rs:170).
+    // Frontend timer is armed with `request_timeout` in
+    // `HttpsSession::new` (`lib/src/https.rs`).
     listener_config.request_timeout = 3;
     listener_config.front_timeout = 3;
 
@@ -1348,7 +1350,8 @@ fn test_h2_idle_stream_no_data_cancelled() {
 // Test 7: Stranded `expect_write` survives per-stream idle cancellation
 // ============================================================================
 
-/// Regression for the OOB panic at `h2.rs:1896`:
+/// Regression for the OOB panic in `ConnectionH2::write_streams`
+/// (`lib/src/protocol/mux/h2.rs`):
 /// `index out of bounds: the len is 1 but the index is 1`.
 ///
 /// Reproduction sequence (precise ordering matters):
@@ -1357,19 +1360,23 @@ fn test_h2_idle_stream_no_data_cancelled() {
 ///    The client intentionally stops reading from the TLS/TCP socket so the
 ///    kernel send buffer and TLS write queue fill, and sozu's write path
 ///    stalls mid-frame — parking `self.expect_write = Some(H2StreamId::Other
-///    { id: 1, gid: G })` at `h2.rs:2043`.
-/// 2. Per-stream idle timer fires (>2 s): `cancel_timed_out_streams`
-///    (`h2.rs:2823`) evicts stream 1. `self.streams.remove(&1)` is called
-///    and `context.streams[G].state` is set to `Recycle`, but
-///    `expect_write` still references gid `G`.
+///    { id: 1, gid: G })` in the `FlushOutcome::Stalled` branch of
+///    `ConnectionH2::write_streams` (`lib/src/protocol/mux/h2.rs`).
+/// 2. Per-stream idle timer fires (>2 s):
+///    `ConnectionH2::cancel_timed_out_streams`
+///    (`lib/src/protocol/mux/h2.rs`) evicts stream 1.
+///    `self.streams.remove(&1)` is called and `context.streams[G].state`
+///    is set to `Recycle`, but `expect_write` still references gid `G`.
 /// 3. Fresh HEADERS opens **stream 3** → `Context::create_stream`
-///    (`mod.rs:430`) finds the `Recycle` slot at `G`, reuses it, then runs
-///    `shrink_trailing_recycle` (`mod.rs:491`). If the recycled slot is the
-///    last element (common in the 1-active-stream case), the shrink may
-///    reduce `context.streams.len()` — leaving the stranded `expect_write`
+///    (`lib/src/protocol/mux/mod.rs`) finds the `Recycle` slot at `G`,
+///    reuses it, then runs `Context::shrink_trailing_recycle`
+///    (`lib/src/protocol/mux/mod.rs`). If the recycled slot is the last
+///    element (common in the 1-active-stream case), the shrink may reduce
+///    `context.streams.len()` — leaving the stranded `expect_write`
 ///    pointing past the end of the Vec.
-/// 4. Next `writable()` → `write_streams` (`h2.rs:1879`) dereferences
-///    `context.streams[global_stream_id]` at `h2.rs:1896` → OOB panic.
+/// 4. Next `writable()` → `ConnectionH2::write_streams`
+///    (`lib/src/protocol/mux/h2.rs`) dereferences
+///    `context.streams[global_stream_id]` → OOB panic.
 ///
 /// The fix (see `remove_dead_stream` and the idle-cancellation path) must
 /// clear `expect_write` / `expect_read` whenever the referenced gid is
@@ -1549,14 +1556,16 @@ fn test_h2_stranded_expect_write_survives_cancellation() {
 
 // ============================================================================
 // Test 8: Stranded expect_write via peer-initiated RST_STREAM — covers the
-//        `handle_rst_stream_frame` eviction path at h2.rs:3752
+//        `ConnectionH2::handle_rst_stream_frame` eviction path in
+//        `lib/src/protocol/mux/h2.rs`
 // ============================================================================
 
 /// Sibling to [`test_h2_stranded_expect_write_survives_cancellation`] — same
 /// invariant, different eviction trigger. Where the original test uses the
 /// per-stream idle timer to evict a stream whose gid may still be cached in
 /// `self.expect_write`, this test drives the **peer-initiated RST_STREAM**
-/// path in `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:3752`),
+/// path in `ConnectionH2::handle_rst_stream_frame`
+/// (`lib/src/protocol/mux/h2.rs`),
 /// which was previously an inline `self.streams.remove(...)` that did not
 /// go through `remove_dead_stream` and therefore did not clear
 /// `expect_write`/`expect_read`.
@@ -1571,12 +1580,14 @@ fn test_h2_stranded_expect_write_survives_cancellation() {
 ///    to `Recycle`, and (with the fix) invalidates
 ///    `expect_write`/`expect_read` if they referenced `gid`.
 /// 3. Client opens a new GET stream — `Context::create_stream`
-///    (`mod.rs:430`) reuses the recycled slot, then runs
-///    `shrink_trailing_recycle` (`mod.rs:491`), potentially shrinking
-///    `context.streams.len()`.
+///    (`lib/src/protocol/mux/mod.rs`) reuses the recycled slot, then runs
+///    `Context::shrink_trailing_recycle` (`lib/src/protocol/mux/mod.rs`),
+///    potentially shrinking `context.streams.len()`.
 /// 4. Client drains — sozu runs `writable()`. With the fix, no OOB index.
-///    Without the fix (pre-refactor of site 3752), the stranded gid in
-///    `expect_write` would panic at `h2.rs:1896`.
+///    Without the fix (pre-refactor of
+///    `ConnectionH2::handle_rst_stream_frame`), the stranded gid in
+///    `expect_write` would panic in `ConnectionH2::write_streams`
+///    (`lib/src/protocol/mux/h2.rs`).
 ///
 /// As with the idle-cancel test, the exact panic conditions depend on
 /// timing (rustls buffering, H2 INITIAL_WINDOW_SIZE, kernel TCP send
@@ -1664,7 +1675,8 @@ fn try_h2_stranded_expect_write_peer_rst_survives() -> State {
         thread::sleep(Duration::from_millis(150));
 
         // Peer-initiated RST_STREAM(CANCEL = 0x8). Exercises
-        // handle_rst_stream_frame (h2.rs:3752), which now routes through
+        // `ConnectionH2::handle_rst_stream_frame`
+        // (`lib/src/protocol/mux/h2.rs`), which now routes through
         // remove_dead_stream and must clear expect_write/expect_read if
         // they reference the evicted gid.
         let rst = H2Frame::rst_stream(victim, 0x8);
@@ -1674,7 +1686,8 @@ fn try_h2_stranded_expect_write_peer_rst_survives() -> State {
 
         // Fresh stream: drives Context::create_stream → recycle +
         // shrink_trailing_recycle. A stranded expect_write would panic
-        // at h2.rs:1896 on the next writable() tick.
+        // in `ConnectionH2::write_streams` (`lib/src/protocol/mux/h2.rs`)
+        // on the next writable() tick.
         let fresh = next_sid;
         let h_fresh = H2Frame::headers(fresh, get_headers.clone(), true, true);
         let _ = tls.write_all(&h_fresh.encode());
@@ -1728,7 +1741,7 @@ fn test_h2_stranded_expect_write_peer_rst_survives_cancellation() {
 /// `incremental=true` and `"i=?0"` to explicitly opt out. The priority header
 /// is encoded as a literal-without-indexing field with a new name so sozu's
 /// HPACK decoder takes the `compare_no_case(&k, b"priority")` branch in
-/// `pkawa.rs:732`.
+/// `handle_header` (`lib/src/protocol/mux/pkawa.rs`).
 fn build_get_headers_with_priority(urgency: u8, inc_token: &str) -> Vec<u8> {
     let mut block = vec![
         0x82, // :method GET (indexed)
@@ -2236,14 +2249,16 @@ fn test_h2_incremental_round_robin_closes_every_stream() {
 /// default since Chrome 107) must drain its full response body promptly.
 ///
 /// With only one stream in the urgency-0 incremental bucket, the round-robin
-/// yield at `converter.rs:434` has no peer to rotate to; yielding strands the
-/// stream because `finalize_write:2634-2641` removes `Ready::WRITABLE` on a
-/// clean drain when `expect_write.is_none()`. Edge-triggered epoll never
-/// re-fires (kernel TCP buffer barely touched) and no new peer frame is
-/// coming (Chrome's 6 MiB per-stream window is not yet exhausted), so the
-/// stream parks silently. `front_timeout` (60 s default per
-/// `command/src/config.rs:118 DEFAULT_FRONT_TIMEOUT`) eventually tears the
-/// TCP connection down and Chrome reports `ERR_CONNECTION_CLOSED`.
+/// yield in `H2BlockConverter::call` (`lib/src/protocol/mux/converter.rs`)
+/// has no peer to rotate to; yielding strands the stream because
+/// `ConnectionH2::finalize_write` (`lib/src/protocol/mux/h2.rs`) removes
+/// `Ready::WRITABLE` on a clean drain when `expect_write.is_none()`.
+/// Edge-triggered epoll never re-fires (kernel TCP buffer barely touched)
+/// and no new peer frame is coming (Chrome's 6 MiB per-stream window is not
+/// yet exhausted), so the stream parks silently. `front_timeout` (60 s
+/// default per `DEFAULT_FRONT_TIMEOUT` in `command/src/config.rs`)
+/// eventually tears the TCP connection down and Chrome reports
+/// `ERR_CONNECTION_CLOSED`.
 ///
 /// Test shape:
 /// - One backend serving an 80 KB body (= 5 full 16 384-byte DATA frames).
@@ -2380,8 +2395,9 @@ fn test_h2_solo_incremental_drains_fully() {
 /// Firefox-shape header block: same pseudo-headers as
 /// [`build_get_headers_with_priority`] but WITHOUT the `priority` literal.
 /// Firefox does not emit `priority: u=0, i` by default, so any truncation
-/// observable on this shape lives outside the RFC 9218 solo-bucket fix
-/// at `converter.rs:437-450`.
+/// observable on this shape lives outside the RFC 9218 solo-bucket fix in
+/// the incremental-yield branch of `H2BlockConverter::call`
+/// (`lib/src/protocol/mux/converter.rs`).
 fn build_get_headers_no_priority() -> Vec<u8> {
     vec![
         0x82, // :method GET (indexed)
@@ -2523,8 +2539,9 @@ fn setup_single_h1_backend_listener(
 
 /// Firefox shape: no `priority` header, H1 backend with Content-Length,
 /// 80 892 bytes (HAR-exact value from Sébastien Brunat's 2026-04-23 AM
-/// report). Exercises `mux/h1.rs:241-347` on the write path — the site
-/// where C1 (`signal_pending_write` missing on `Ready::WRITABLE` insert)
+/// report). Exercises `ConnectionH1::readable`
+/// (`lib/src/protocol/mux/h1.rs`) on the write path — the site where C1
+/// (`signal_pending_write` missing on `Ready::WRITABLE` insert)
 /// historically parked large asset deliveries.
 ///
 /// Expected on HEAD (post-C1 fix): PASS within 3 s. Before the fix: would
@@ -2588,8 +2605,10 @@ fn test_h2_firefox_shape_h1_cl_drains_fully() {
 // ----------------------------------------------------------------------------
 
 /// Chrome shape: `priority: u=0, i`, H1 backend with Content-Length,
-/// 100 KiB. Locks in the RFC 9218 solo-bucket fix (`converter.rs:437-450`,
-/// commit `f6c02912`) on the H1-backend code path — the existing
+/// 100 KiB. Locks in the RFC 9218 solo-bucket fix (the incremental-yield
+/// branch of `H2BlockConverter::call` in
+/// `lib/src/protocol/mux/converter.rs`, commit `f6c02912`) on the
+/// H1-backend code path — the existing
 /// `test_h2_solo_incremental_drains_fully` uses an H2 backend via
 /// `setup_h2_test_with_large_bodies`, which internally spawns
 /// `AsyncBackend::http_handler` — so this test adds coverage for the
@@ -2654,10 +2673,10 @@ fn test_h2_chrome_shape_h1_cl_drains_fully() {
 
 /// PHP/Apache shape: chunked + per-chunk `flush()` cadence from
 /// [`ChunkedFlushH1Backend`], 312 215 bytes (HAR-exact `big.svg`). Pre-C1
-/// fix this would park because `mux/h1.rs:341-346, 351-357` flipped
-/// `Ready::WRITABLE` on the peer without `signal_pending_write()` and
-/// edge-triggered epoll never re-fired for the queued bytes. Post-fix the
-/// stream drains within 5 s.
+/// fix this would park because `ConnectionH1::readable`
+/// (`lib/src/protocol/mux/h1.rs`) flipped `Ready::WRITABLE` on the peer
+/// without `signal_pending_write()` and edge-triggered epoll never
+/// re-fired for the queued bytes. Post-fix the stream drains within 5 s.
 fn try_h2_php_apache_chunked_flush_drains_fully() -> State {
     use crate::mock::chunked_flush_h1_backend::{
         ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
@@ -2745,10 +2764,11 @@ fn test_h2_php_apache_chunked_flush_drains_fully() {
 /// across 4 ticks (~64 KiB total, 4-second wall clock). Listener config
 /// sets `h2_stream_idle_timeout_seconds = 2` (well below the total
 /// delivery time). Pre-C2 fix the per-stream idle timer refreshed only on
-/// inbound DATA/HEADERS (`h2.rs:3887-3895, 4026-4031`) — a long-running
-/// response without any inbound client frames would be cancelled mid-
-/// delivery. Post-fix the outbound write path refreshes the timer and
-/// the response drains to completion.
+/// inbound DATA/HEADERS (`ConnectionH2::handle_data_frame` and
+/// `ConnectionH2::handle_headers_frame` in `lib/src/protocol/mux/h2.rs`) —
+/// a long-running response without any inbound client frames would be
+/// cancelled mid-delivery. Post-fix the outbound write path refreshes the
+/// timer and the response drains to completion.
 fn try_h2_slow_backend_idle_timeout_cancels() -> State {
     use crate::mock::chunked_flush_h1_backend::{
         ChunkedFlushConfig, ChunkedFlushH1Backend, TransferEncoding,
@@ -3053,17 +3073,19 @@ fn test_h2_coalesced_chrome_firefox_streams_drain() {
 //   yield with no `expect_write`. Fixed by `3f9f5e38`, which scopes the
 //   count per urgency bucket and looks it up per-stream by urgency —
 //   today `ReadyIncrementalCensus` in `mux/h2_scheduler.rs`.
-// * **Bug 1 (H1→H2 wake-gap)**: `mux/h1.rs:324` wraps the Linked-peer
+// * **Bug 1 (H1→H2 wake-gap)**: `ConnectionH1::readable`
+//   (`lib/src/protocol/mux/h1.rs`) wraps the Linked-peer
 //   `signal_pending_write()` call inside `if kawa.is_main_phase()`.
 //   kawa 0.6.8 `storage/repr.rs` declares `Terminated` as a main-phase
 //   state (see the `is_main_phase` match arms), so a keep-alive H1
 //   backend that emits headers + small Content-Length body in a single
 //   parse round trip still signals correctly *today*. The historical
 //   regression covered by this test set lives in the `Headers → Body →
-//   Terminated` boundary where an older kawa returned false at line 324
-//   and skipped the peer wake. The close-delimited fallback at lines
-//   385-395 is gated on `!is_keep_alive_backend`, so it only papers
-//   over the gap on non-keep-alive backends.
+//   Terminated` boundary where an older kawa returned false at that
+//   `kawa.is_main_phase()` guard and skipped the peer wake. The
+//   close-delimited fallback in the same method is gated on
+//   `!is_keep_alive_backend`, so it only papers over the gap on
+//   non-keep-alive backends.
 //
 // The three tests below exercise each bug in isolation, then together.
 
@@ -3211,13 +3233,15 @@ fn test_h2_mixed_urgency_incremental_solo_drains() {
 ///
 /// sōzu's H1 reader at `mux/h1.rs` receives headers+body in a single
 /// `socket_read` cycle. `kawa::h1::parse` transitions kawa from
-/// `Headers` → `Body` → `Terminated` within one call. At `h1.rs:324`,
-/// `kawa.is_main_phase() == false` after the transition, so the
-/// `signal_pending_write()` call at line 367 is skipped. The close-
-/// delimited fallback at lines 385-395 requires `status == Closed`, which
-/// does not fire for keep-alive backends. The frontend has DATA+END_STREAM
-/// queued in `kawa.out` but never receives the wake-up; edge-triggered
-/// epoll never re-fires; the body strands until `front_timeout`.
+/// `Headers` → `Body` → `Terminated` within one call. At the
+/// `kawa.is_main_phase()` guard of `ConnectionH1::readable`
+/// (`lib/src/protocol/mux/h1.rs`), `kawa.is_main_phase() == false` after
+/// the transition, so the Linked-peer `signal_pending_write()` call inside
+/// that guard is skipped. The close-delimited fallback in the same method
+/// requires `status == Closed`, which does not fire for keep-alive
+/// backends. The frontend has DATA+END_STREAM queued in `kawa.out` but
+/// never receives the wake-up; edge-triggered epoll never re-fires; the
+/// body strands until `front_timeout`.
 ///
 /// MUST FAIL on HEAD (Bug 1). MUST PASS after the signal-gap fix.
 fn try_h2_h1_keepalive_single_read_cl_drains() -> State {
@@ -3614,7 +3638,8 @@ fn try_h2_large_gzipped_chunked_drains_fully() -> State {
     // 1 MiB WU cadence (not 32 KiB): on slow CI runners the per-frame
     // WINDOW_UPDATE pace can stack late writes past sozu's end-of-stream
     // close. Each post-close WU increments `H2FloodDetector::glitch_count`
-    // (lib/src/protocol/mux/h2.rs:4985) and a cumulative 100+ trips a
+    // in `ConnectionH2::handle_window_update_frame`
+    // (`lib/src/protocol/mux/h2.rs`) and a cumulative 100+ trips a
     // GOAWAY(ENHANCE_YOUR_CALM) that truncates the tail of the response.
     // The 6 MiB initial stream window (CHROME146_INITIAL_WINDOW_SIZE) plus
     // a single 1 MiB refresh is plenty of credit for a 7.77 MiB body.
@@ -3717,7 +3742,8 @@ fn try_h2_large_chunked_7mb_drains_fully() -> State {
     // 1 MiB WU cadence (not 32 KiB): on slow CI runners the per-frame
     // WINDOW_UPDATE pace can stack late writes past sozu's end-of-stream
     // close. Each post-close WU increments `H2FloodDetector::glitch_count`
-    // (lib/src/protocol/mux/h2.rs:4985) and a cumulative 100+ trips a
+    // in `ConnectionH2::handle_window_update_frame`
+    // (`lib/src/protocol/mux/h2.rs`) and a cumulative 100+ trips a
     // GOAWAY(ENHANCE_YOUR_CALM) that truncates the tail of the response.
     // The 6 MiB initial stream window (CHROME146_INITIAL_WINDOW_SIZE) plus
     // a single 1 MiB refresh is plenty of credit for a 7.77 MiB body.

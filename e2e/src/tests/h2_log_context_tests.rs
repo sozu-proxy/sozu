@@ -278,9 +278,9 @@ fn try_h2_proxy_protocol_peer_is_the_advertised_client() -> State {
     let mux_lines = capture.lines_containing(MUX_H2_TAG);
     let advertised = format!("peer=Some(127.0.0.1:{PROXY_ADVERTISED_CLIENT_PORT})");
     let raw = format!("peer=Some({raw_peer})");
-    // `log_context_lite!` (`h2.rs:139`) renders the bare `MUX-H2` tag with no
-    // session block, so not every tagged line carries a `peer=` slot. Only the
-    // ones that do are under test.
+    // `log_module_context!` (`lib/src/protocol/mux/h2.rs`) renders the bare
+    // `MUX-H2` tag with no session block, so not every tagged line carries a
+    // `peer=` slot. Only the ones that do are under test.
     let peer_slot_lines: Vec<&String> = mux_lines.iter().filter(|l| l.contains("peer=")).collect();
     let advertised_lines = peer_slot_lines
         .iter()

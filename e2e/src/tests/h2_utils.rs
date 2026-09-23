@@ -1452,12 +1452,16 @@ pub(crate) fn contains_headers_response(frames: &[(u8, u8, u32, Vec<u8>)]) -> bo
 /// which includes a trailers block and a block opening with a dynamic
 /// table size update. That last case is real, not hypothetical:
 /// `H2BlockConverter::emit_pending_size_update_if_new_block`
-/// (`lib/src/protocol/mux/converter.rs:112`, armed at
-/// `lib/src/protocol/mux/h2.rs:5254`) prepends a `001xxxxx` update when a
+/// (`lib/src/protocol/mux/converter.rs`), armed by
+/// `ConnectionH2::handle_settings_frame`
+/// (`lib/src/protocol/mux/h2.rs`), prepends a `001xxxxx` update when a
 /// peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e call sites do
-/// send one — `h2_security_tests.rs:2440` with value 0, and
-/// `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
-/// `h2_correctness_tests.rs:3605` and `:3709`. None of the three decodes a
+/// send one — `try_h2_hpack_table_size_zero`
+/// (`e2e/src/tests/h2_security_tests.rs`) with value 0, and
+/// `h2_handshake_chromium_146` (`e2e/src/tests/h2_utils.rs`, value 65 536)
+/// from `try_h2_large_gzipped_chunked_drains_fully` and
+/// `try_h2_large_chunked_7mb_drains_fully`
+/// (`e2e/src/tests/h2_correctness_tests.rs`). None of the three decodes a
 /// status, and `h2_handshake` sends empty SETTINGS, so no assertion meets
 /// the update today. The first one that does gets `None`, which reads as
 /// "no status" — fail-closed wherever a decoded status is asserted
@@ -1540,10 +1544,10 @@ pub(crate) fn headers_status_matches(frames: &[(u8, u8, u32, Vec<u8>)], code: &[
 ///   `got_400` and reported itself as a rejection.
 /// * It is a byte scan, so it also fires on a length octet or a raw value
 ///   byte anywhere in the block. RFC 7541 §5.1 writes a 268-byte header
-///   value as `7f 8d 01`, and
-///   `lib/src/protocol/mux/converter.rs:388-391` forwards raw value bytes
-///   ≥ `0x80` verbatim. That is issue #1353's mechanism pointed at a
-///   security assertion.
+///   value as `7f 8d 01`, and the header-value control-character check in
+///   `H2BlockConverter::call` (`lib/src/protocol/mux/converter.rs`)
+///   forwards raw value bytes ≥ `0x80` verbatim. That is issue #1353's
+///   mechanism pointed at a security assertion.
 ///
 /// [`decode_status`] reads the first field of the block instead, so
 /// neither a later field nor a length octet can answer for the status.

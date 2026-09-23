@@ -74,8 +74,8 @@ macro_rules! audit_verb {
 /// otherwise — see [`sozu_command_lib::logging::ansi_palette`]). Bracketed
 /// fields are emitted only when set on [`AuditEntry`] / the caller.
 ///
-/// Bracket layout mirrors `log_context!` in `lib/src/protocol/mux/mod.rs:50`
-/// so operators can grep `AUDIT` alongside `MUX` / `RUSTLS` / `PIPE` / `TCP`.
+/// Bracket layout mirrors `log_context!` (`lib/src/protocol/mux/mod.rs`) so
+/// operators can grep `AUDIT` alongside `MUX` / `RUSTLS` / `PIPE` / `TCP`.
 /// Uses the `Command(...)` keyword (vs. `Session(...)` in MUX lines) because
 /// the payload describes a control-plane command, not a proxy session. The
 /// line is self-contained — no `\t >>>` continuation marker since nothing
@@ -2803,10 +2803,11 @@ pub fn worker_request(
     // and we re-check it here at the request boundary. NOTE: we deliberately
     // do NOT assert the success path *changed* the hash — many "mutating"
     // verbs (ConfigureMetrics, SetMetricDetail, SetMaxConnectionsPerIp,
-    // Logging) are runtime/worker-only and `dispatch` is `Ok(())` no-op on
-    // ConfigState for them (see state.rs:138). `hash_state()` is a cheap
-    // per-cluster map; the snapshot is read ONLY inside the debug_assert
-    // below, so it is dead code in release but must stay ungated (E0425).
+    // Logging) are runtime/worker-only and `ConfigState::dispatch` is
+    // `Ok(())` no-op on ConfigState for them (see its runtime-only `Ok(())`
+    // arm in `command/src/state.rs`). `hash_state()` is a cheap per-cluster
+    // map; the snapshot is read ONLY inside the debug_assert below, so it is
+    // dead code in release but must stay ungated (E0425).
     let state_hash_before = server.state.hash_state();
 
     // sozu#1301 + sozu#1313: validate the request the way the worker will apply
@@ -3404,8 +3405,9 @@ pub fn set_metric_detail_request(
 
     let started_at = Instant::now();
     // Snapshot the cluster-hash so we can confirm SetMetricDetail is a
-    // ConfigState no-op (it is runtime-only — `dispatch` returns `Ok(())`
-    // without touching persisted state; see state.rs:138). Read only inside
+    // ConfigState no-op (it is runtime-only — `ConfigState::dispatch`
+    // returns `Ok(())` without touching persisted state; see its
+    // runtime-only `Ok(())` arm in `command/src/state.rs`). Read only inside
     // the post-dispatch assert → ungated for the release build (E0425).
     let state_hash_before = server.state.hash_state();
     let request: Request = RequestType::SetMetricDetail(req).into();
@@ -4543,9 +4545,9 @@ mod audit_format_tests {
     //! consumers (SIEM pipelines, operator shell recipes).
     //!
     //! The default thread-local logger reports `is_logger_colored() == false`
-    //! (see `command/src/logging/logs.rs:30`), so `ansi_palette()` returns
-    //! empty strings and the rendered line is ANSI-free — stable to match
-    //! with a plain regex.
+    //! (see `LOGGER_COLORED` in `command/src/logging/logs.rs`), so
+    //! `ansi_palette()` returns empty strings and the rendered line is
+    //! ANSI-free — stable to match with a plain regex.
     use super::{
         AUDIT_LEASE_ID_MAX_CHARS, AUDIT_REASON_MAX_CHARS, AuditEntry, AuditErrorCode, AuditExtras,
         AuditResult, FanoutStatus, FanoutSummary, SOZU_BUILD_GIT_SHA, SOZU_VERSION, actor_role,

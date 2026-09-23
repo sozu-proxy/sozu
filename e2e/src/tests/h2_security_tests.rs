@@ -4211,8 +4211,8 @@ fn e2e_h2_flood_window_update_on_closed_stream() {
 /// Rebuild the `:status 200` response HEADERS block Sōzu emits for a
 /// proxied request: `88` (indexed static 8 = `:status 200`), `0f 0d 01 '8'`
 /// (`content-length: 8`), then `40 07 "sozu-id" 1a <26-byte ULID>` — the
-/// `Sozu-Id` correlation header of
-/// `lib/src/protocol/kawa_h1/editor.rs:1131`. Same byte sequence as
+/// `Sozu-Id` correlation header of `HttpContext::on_response_headers`
+/// (`lib/src/protocol/kawa_h1/editor.rs`). Same byte sequence as
 /// `captured_200_headers` in `h2_security_sni.rs`, which carries the
 /// capture's provenance; Kawa's HPACK encoder never sets the Huffman bit,
 /// so every literal value reaches the block as plain ASCII.

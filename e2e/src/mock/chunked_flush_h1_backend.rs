@@ -2,10 +2,12 @@
 //! flushed segments — reproducing the wire cadence of PHP/Apache responses
 //! (`mod_deflate`, `flush()`, `SendfileMaxPipeSize`). Used by the H2
 //! large-asset repro suite to characterise the cross-connection edge-triggered
-//! `WRITABLE` wake-gap (see `lib/src/protocol/mux/h1.rs:341-346, 351-357` and
-//! memory entry `project_sozu_h1_missing_signal_pending_write.md`).
+//! `WRITABLE` wake-gap (see the `StreamState::Linked` /
+//! `interest.insert(Ready::WRITABLE)` flip of `ConnectionH1::readable` in
+//! `lib/src/protocol/mux/h1.rs` and memory entry
+//! `project_sozu_h1_missing_signal_pending_write.md`).
 //!
-//! Divergence from [`CloseDelimitedBackend`] in `h2_tests.rs:3237-3327`:
+//! Divergence from [`CloseDelimitedBackend`] in `e2e/src/tests/h2_tests.rs`:
 //! that backend batches all writes (no `flush()` between chunks, no
 //! `TCP_NODELAY`) because its role is to probe HUP regression, not write
 //! fragmentation. This backend is the opposite: `TCP_NODELAY` + per-chunk

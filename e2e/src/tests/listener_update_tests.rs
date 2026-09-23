@@ -519,7 +519,8 @@ fn try_strict_sni_binding_toggle() -> State {
     // The `payload.contains(&0x88)` probe it replaces had no false negative
     // for a Sōzu 200; `decode_status` returns `None` — hence `got_200 =
     // false` — for a block prefixed with an HPACK dynamic table size update
-    // (`lib/src/protocol/mux/converter.rs:112`). `got_200` now enters
+    // from `H2BlockConverter::emit_pending_size_update_if_new_block`
+    // (`lib/src/protocol/mux/converter.rs`). `got_200` now enters
     // `phase1_ok` below as the conjunct `&& !got_200`, so that false
     // negative can no longer carry the assertion on its own — it only fails
     // to *block* a phase that already produced a 421 or a real rejection.
@@ -1160,8 +1161,10 @@ fn test_timeout_patch() {
 
 /// Patch a listener while it is deactivated, then reactivate it.
 ///
-/// Guards against the `active` flag stale-state fragility noted at
-/// `lib/src/http.rs:754/920` and `lib/src/server.rs:1400`.
+/// Guards against the `active` flag stale-state fragility noted in
+/// `HttpProxy::activate_listener` and `HttpProxy::hard_stop`
+/// (`lib/src/http.rs`) and `Server::notify_activate_listener`
+/// (`lib/src/server.rs`).
 ///
 /// Steps:
 /// 1. Deactivate the HTTPS listener.
@@ -1403,8 +1406,9 @@ fn test_alpn_validation() {
             "ALPN-VALID: alpn_protocols after reset: {:?}",
             l.alpn_protocols
         );
-        // Empty in the stored config means "use runtime default"; runtime default
-        // at https.rs:900 is ["h2", "http/1.1"].
+        // Empty in the stored config means "use runtime default"; runtime
+        // default in `HttpsListener::try_new` (`lib/src/https.rs`) is
+        // ["h2", "http/1.1"].
     }
 
     worker.soft_stop();

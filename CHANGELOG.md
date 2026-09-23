@@ -119,6 +119,52 @@
   accumulation recipe. The two `TO SEE THIS RED` comments naming those expressions were updated to
   the form they now take.
 
+- **`docs`: a citation inside a Rust comment names a symbol, never a line.** `check_doc_citations.py`
+  resolves `doc/**` and `**/LIFECYCLE.md`, so a `path.rs:NNN` inside a `//`, `///` or `//!` comment
+  was read by no rule at all — not the existence floor, not the drift comparison, not once. The two
+  `SAFETY:` comments justifying `from_utf8_unchecked` in `lib/src/http.rs` and `lib/src/https.rs`
+  are how it surfaced (sozu-proxy/sozu#1473): both cited a `Method` match arm for the function
+  `hostname_and_port`, and drifted there with CI green throughout, until #1474 re-pointed them.
+
+  The population was measured before the form was chosen, at main `19fd5d8c`: 90 citation tokens
+  across 29 files, holding 113 line targets. **Sixty-eight of the 90 had drifted** from the text
+  they named at the commit that last wrote or re-anchored them, and only 16 still land on a line
+  that is neither a bare delimiter, a blank, nor past end-of-file. The half-life is what decided
+  it: 43 of those 68 broke on the very NEXT commit that touched the file they point into, the
+  median citation survived **one** such commit and zero days, and 65 of 68 were wrong inside a
+  week. Every one of the tree's 18 `h2.rs:NNN` tokens had drifted.
+
+  Extending the resolver over `**/*.rs` was the alternative, and it was measured rather than
+  argued. Switched on at that revision it would have had to reject those 68, plus 14 naming a
+  basename that is ambiguous here — four files are called `h2.rs`, nineteen `mod.rs` — plus two
+  pointing into the `kawa` dependency, which is not in this repository at all. A gate that fails on
+  most of the population it guards gets bypassed rather than satisfied, which is the argument the
+  script's own header makes about `--all-features`. The symbol form costs a reader one `git grep`
+  and cannot drift; it was already the first of `doc/README.md`'s three forms, and had simply never
+  been scoped to the source.
+
+  So the three forms now govern Rust comments too, with one narrowing — the symbol form only, and a
+  comment that means one specific branch names that branch in words. All 82 outside `lib/src/protocol/mux/`
+  were converted to it, across 25 files, each re-pointed at the symbol recovered by reading the cited file **at the
+  commit that wrote the citation** rather than at `HEAD`, since two thirds of them no longer mean
+  what the line holds today. The convention and the measurements are in
+  `doc/README.md#citing-code-from-a-rust-comment`, and the rule is in `CLAUDE.md`'s code-style list
+  so it meets the next contributor who writes one.
+
+  Behaviour, public API and test expectations are untouched — this changeset is comments and
+  documentation. Rewrapping the comments shifted lines inside
+  `e2e/src/tests/h2_correctness_tests.rs`, and the drift rule caught two citations in
+  `doc/testing.md` that pointed into it — the guarded half of exactly the pair #1465 was about.
+  They now name `try_h2_large_gzipped_chunked_drains_fully` and
+  `try_h2_large_chunked_7mb_drains_fully` instead, which also retires that pair's bare
+  `` `:NNN` `` continuation (one remains, in `doc/rate-limit-design.md`). Two limits are stated
+  rather than papered over. Nothing mechanical enforces the
+  convention yet: the resolver's scope is unchanged, so no rule rejects a new `path.rs:NNN` in a
+  comment, though the converted population means such a rule would start green. And the eight sites
+  under `lib/src/protocol/mux/` are left for a separate pass to keep this sweep off a module under
+  concurrent change; two of those eight, pointing into pinned `kawa` 0.7.1, are the one class in
+  the population where a line number genuinely cannot rot.
+
 - **`fix(mux-h2)`: `H2ControlTx::lifetime_cap_reached` reads the instance's own bound instead of the
   `MAX_PENDING_RST_STREAMS` constant.** The type carries one cap per instance, `max_pending`, and
   three predicates that must all read it: the per-insert bound in `enqueue_rst`, the post-condition
