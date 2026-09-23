@@ -559,17 +559,12 @@ jobs:
 
   bench-bombardier:
     name: Bombardier bench (${{ matrix.provider }})
-    # NOT migrated to sozu-bench (2026-09-23 full-matrix pass), unlike every other bench-relevant
-    # job — this is the primary motivating "bench" workload, but its "Host mapping sozu.io
-    # domains" and "Generate TLS key *" steps below rely on `sudo tee -a /etc/hosts` and `sudo
-    # update-ca-certificates` at runtime (per-run generated self-signed CAs, not something
-    # hostAliases or a baked image can substitute for). That needs real root, which the hardened
-    # pod's dropped capabilities correctly block — same class of problem as the earlier apt-get
-    # install steps, but NOT fixable by baking packages into the image since the certs are
-    # generated fresh every run. Fixing this for real means changing bench.py to trust the
-    # generated CA via an env var (e.g. SSL_CERT_FILE) instead of installing it system-wide —
-    # untouched, unvalidated follow-up, tracked separately rather than rushed through here.
-    runs-on: ubuntu-latest
+    # Migrated 2026-09-23: the former "Host mapping sozu.io domains" step (`sudo tee -a
+    # /etc/hosts`) is replaced by the hostAliases sozu.io block in values-bench.yaml. The per-run
+    # generated self-signed certs are trusted via SSL_CERT_FILE (Go's crypto/x509 honors it on
+    # Linux) instead of `sudo update-ca-certificates` — see "Build local CA bundle for bombardier"
+    # and "Launch bench" below. No sudo usage left in this job.
+    runs-on: sozu-bench
     needs: [pipeline, build-bombardier, build-lagging_server]
     strategy:
       fail-fast: false
@@ -580,9 +575,6 @@ jobs:
           - crypto-openssl
           - fips
     steps:
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler cmake
-
       - name: Install rust 1.93.1
         uses: dtolnay/rust-toolchain@1.93.1
 
@@ -613,21 +605,12 @@ jobs:
           name: lagging_server
           path: .github/workflows
 
-      - name: Host mapping sozu.io domains
-        run: |
-          sudo echo "0.0.0.0 sozu.io" | sudo tee -a /etc/hosts
-          sudo echo "0.0.0.0 rsa-2048.sozu.io" | sudo tee -a /etc/hosts
-          sudo echo "0.0.0.0 rsa-4096.sozu.io" | sudo tee -a /etc/hosts
-          sudo echo "0.0.0.0 ecdsa.sozu.io" | sudo tee -a /etc/hosts
-
       - name: Generate TLS key rsa 2048
         working-directory: .github/workflows
         run: |
           openssl req -newkey rsa:2048 -nodes -keyout rsa-2048.key -out rsa-2048.csr -config rsa-2048.cnf
           openssl x509 -req -days 365 -in rsa-2048.csr -signkey rsa-2048.key -out rsa-2048.pem -extensions req_ext -extfile rsa-2048.cnf
           openssl x509 -in rsa-2048.pem -noout -checkhost rsa-2048.sozu.io
-          sudo cp rsa-2048.pem /usr/local/share/ca-certificates/rsa-2048.crt
-          sudo update-ca-certificates
 
       - name: Generate TLS key rsa 4096
         working-directory: .github/workflows
@@ -635,8 +618,6 @@ jobs:
           openssl req -newkey rsa:4096 -nodes -keyout rsa-4096.key -out rsa-4096.csr -config rsa-4096.cnf
           openssl x509 -req -days 365 -in rsa-4096.csr -signkey rsa-4096.key -out rsa-4096.pem -extensions req_ext -extfile rsa-4096.cnf
           openssl x509 -in rsa-4096.pem -noout -checkhost rsa-4096.sozu.io
-          sudo cp rsa-4096.pem /usr/local/share/ca-certificates/rsa-4096.crt
-          sudo update-ca-certificates
 
       - name: Generate TLS key ecdsa
         working-directory: .github/workflows
@@ -645,8 +626,14 @@ jobs:
           openssl req -new -key ecdsa.key -out ecdsa.csr -config ecdsa.cnf
           openssl x509 -req -days 365 -in ecdsa.csr -signkey ecdsa.key -out ecdsa.pem -extensions req_ext -extfile ecdsa.cnf
           openssl x509 -in ecdsa.pem -noout -checkhost ecdsa.sozu.io
-          sudo cp ecdsa.pem /usr/local/share/ca-certificates/ecdsa.crt
-          sudo update-ca-certificates
+
+      # Trust the three self-signed certs above via SSL_CERT_FILE (Go's crypto/x509 honors it on
+      # Linux) instead of installing them into the system CA store — the hardened pod's dropped
+      # capabilities correctly block `sudo update-ca-certificates`. Each cert is self-signed (its
+      # own CA), so bundling the three leaf certs together is sufficient.
+      - name: Build local CA bundle for bombardier
+        working-directory: .github/workflows
+        run: cat rsa-2048.pem rsa-4096.pem ecdsa.pem > sozu-bench-ca-bundle.pem
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -662,6 +649,8 @@ jobs:
 
       - name: Launch bench
         working-directory: .github/workflows
+        env:
+          SSL_CERT_FILE: ${{ github.workspace }}/.github/workflows/sozu-bench-ca-bundle.pem
         run: python bench.py
 
   bench-logs:
