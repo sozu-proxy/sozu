@@ -92,8 +92,9 @@
 //! ready and all consuming: u=0 alternates `1, 3, 1, 3, …` while u=3 is
 //! `5, 7` in every single pass. Stream 7 never leads its bucket. That is
 //! positional starvation, and it becomes byte starvation the moment a pass
-//! is cut short — a `FlushOutcome::Stalled` at stream 5 means 7 writes
-//! nothing, pass after pass.
+//! is cut short — a stalled flush at stream 5 (`H2WritePass::stalled`,
+//! which ends the pass at `H2WritePhase::End`) means 7 writes nothing, pass
+//! after pass.
 //!
 //! Pinned, as observed behaviour rather than as an aspiration, by
 //! [`tests::the_round_robin_cursor_is_connection_global_so_only_the_leading_bucket_rotates`].
@@ -1315,8 +1316,8 @@ mod tests {
     ///
     /// It is positional starvation here because every stream still gets its
     /// DATA frame; it becomes byte starvation as soon as a pass is cut short,
-    /// since a `FlushOutcome::Stalled` at stream 5 leaves 7 unwritten, pass
-    /// after pass.
+    /// since a stalled flush at stream 5 (`H2WritePass::stalled`, which ends
+    /// the pass) leaves 7 unwritten, pass after pass.
     ///
     /// This is NOT a regression: `Prioriser` is byte-identical to its parent
     /// commit and the field's own doc has always scoped the cursor to "the

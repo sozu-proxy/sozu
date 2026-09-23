@@ -1360,8 +1360,8 @@ fn test_h2_idle_stream_no_data_cancelled() {
 ///    The client intentionally stops reading from the TLS/TCP socket so the
 ///    kernel send buffer and TLS write queue fill, and sozu's write path
 ///    stalls mid-frame — parking `self.expect_write = Some(H2StreamId::Other
-///    { id: 1, gid: G })` in the `FlushOutcome::Stalled` branch of
-///    `ConnectionH2::write_streams` (`lib/src/protocol/mux/h2.rs`).
+///    { id: 1, gid: G })` in the stalled branch of `H2WritePhase::Flush`
+///    in `ConnectionH2::poll_write_target` (`lib/src/protocol/mux/h2.rs`).
 /// 2. Per-stream idle timer fires (>2 s):
 ///    `ConnectionH2::cancel_timed_out_streams`
 ///    (`lib/src/protocol/mux/h2.rs`) evicts stream 1.

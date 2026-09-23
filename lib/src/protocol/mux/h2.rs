@@ -40,7 +40,8 @@ use crate::{
         h2_drain::{self, GracefulDrainDecision},
         h2_flood_detector::{self, H2FloodConfig, H2FloodViolation},
         h2_flow_control, h2_header_reassembly, h2_scheduler, h2_stream_table, h2_transmit,
-        h2_write_pass, hpack_state,
+        h2_write_pass::{H2WritePass, H2WritePhase},
+        hpack_state,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
         pkawa, remove_backend_stream, serializer, set_default_answer,
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
@@ -158,16 +159,6 @@ macro_rules! check_flood_or_return {
             return $self.handle_flood_violation(violation);
         }
     };
-}
-
-/// Outcome of a single-stream write flush in write_streams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FlushOutcome {
-    /// All queued bytes were drained to the socket.
-    Drained,
-    /// The socket blocked before the queue was drained. The caller must
-    /// arrange to resume (set expect_write or return from write_streams).
-    Stalled,
 }
 
 // ── RFC 9113 §6.5.2 Settings Defaults ───────────────────────────────────────
@@ -1012,6 +1003,81 @@ fn read_buffer<'a>(
             gid: global_stream_id,
             ..
         } => streams[global_stream_id].split(position).rbuffer,
+    }
+}
+
+/// What [`ConnectionH2::poll_write_target`] wants its caller to do before it
+/// may call [`ConnectionH2::handle_write`].
+///
+/// The write half of [`H2ReadTarget`]'s protocol, with ONE forced divergence:
+/// a `readable()` pass performs exactly one `socket_read`, so the read side is
+/// a two-call protocol that ENDS with `handle_read`. A write pass performs an
+/// unbounded number of `socket_write_vectored` calls — the pre-image's
+/// `while !kawa.out.is_empty()` inside a loop over the scheduler's order — so
+/// the write side is a DRIVE LOOP. [`ConnectionH2::handle_write`] settles one
+/// transmit and answers nothing; the pass's result comes from [`Self::Done`]
+/// or from the [`ConnectionH2::finalize_write`] the caller runs for
+/// [`Self::Finalize`].
+#[derive(Debug, Clone, Copy)]
+pub(super) enum H2WriteTarget {
+    /// The core ended the pass by itself. No write, no
+    /// [`ConnectionH2::handle_write`], and no finalize — this is the pass's
+    /// result.
+    ///
+    /// Three sites, and none of them may become a [`Self::Finalize`]: the
+    /// resume path's stall, the MadeYouReset emitted-RST cap trip, and the
+    /// close-frontend GOAWAY. Folding any of them into `Finalize` would run
+    /// LIFECYCLE §9 invariant 16's readiness policy over a pass that must not
+    /// reach it.
+    Done(MuxResult),
+    /// Gather `stream_id`'s queued blocks with [`h2_transmit::gather`], hand
+    /// the descriptors to `socket_write_vectored`, discharge them with
+    /// [`h2_transmit::confirm`], then answer with
+    /// [`ConnectionH2::handle_write`].
+    ///
+    /// `stream_id` is never [`H2StreamId::Zero`]. Several sites park `Zero` in
+    /// `expect_write`, but the resume phase matches [`H2StreamId::Other`]
+    /// only and the scheduler loop walks real stream ids; `self.zero` is
+    /// flushed by [`ConnectionH2::flush_zero_to_socket`], outside this pass
+    /// entirely.
+    Transmit { stream_id: H2StreamId },
+    /// The pass is over and owes the readiness decision of LIFECYCLE §9
+    /// invariant 16. Run
+    /// `ConnectionH2::finalize_write(socket_write, bytes_written, context)`;
+    /// its answer is the pass's result.
+    ///
+    /// `bytes_written` rides along with `socket_write` because
+    /// `finalize_write` reads it as `made_progress`, and that is what selects
+    /// `FinalizeAction::RetainPendingBack` over `Quiesce`. It is accumulated
+    /// stream by stream inside the loop, so only the pass knows it.
+    Finalize {
+        socket_write: bool,
+        bytes_written: usize,
+    },
+}
+
+/// The buffer an [`H2WriteTarget::Transmit`] names, resolved to the `Kawa`
+/// owning it — the exact mirror of [`read_buffer`], and taking `zero` and
+/// `streams` apart for the same reason: `ConnectionH2::socket` and
+/// `Context::debug` must stay borrowable while the buffer this returns is
+/// live, which a method returning a borrow of all of `*self` would forbid.
+/// The write shell needs precisely that, since it holds the gathered
+/// descriptors across its `socket_write_vectored`.
+///
+/// [`H2StreamId::Zero`] resolves to the connection-level scratch for
+/// totality; no [`H2WriteTarget::Transmit`] names it.
+fn write_buffer<'a>(
+    zero: &'a mut GenericHttpStream,
+    streams: &'a mut [Stream],
+    position: &Position,
+    stream_id: H2StreamId,
+) -> &'a mut GenericHttpStream {
+    match stream_id {
+        H2StreamId::Zero => zero,
+        H2StreamId::Other {
+            gid: global_stream_id,
+            ..
+        } => streams[global_stream_id].split(position).wbuffer,
     }
 }
 
@@ -2193,6 +2259,28 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// stream, prepares new frames via the H2 block converter, flushes them to
     /// the socket, and recycles completed streams.
     ///
+    /// The core lives in [`Self::poll_write_target`] and [`Self::handle_write`];
+    /// this function is the caller that sits between them, and its
+    /// `self.socket.socket_write_vectored` is the only socket touch on the H2
+    /// stream-write path. Keeping it *here* rather than inside the core is the
+    /// point of the split, exactly as `readable()` keeps `socket_read` outside
+    /// [`Self::poll_read_target`].
+    ///
+    /// Unlike `readable()` this is a LOOP and not a match: one read pass
+    /// performs one `socket_read`, while one write pass performs an unbounded
+    /// number of vectored writes — the pre-image's `while !kawa.out.is_empty()`
+    /// nested inside its walk of the scheduler's order. Every iteration here is
+    /// one of those rounds.
+    ///
+    /// The `Vec<IoSlice<'static>>` stays on this side of the split on purpose.
+    /// [`h2_transmit::gather`] hands back descriptors carrying a lifetime they
+    /// do not have, and [`h2_transmit::confirm`] must discharge them before the
+    /// consume that may relocate `kawa.storage`; bracketing the two around the
+    /// write in three adjacent statements keeps that `unsafe` window exactly as
+    /// wide as the pre-image's loop body kept it, and stops it from spanning a
+    /// `pub(super)` poll/handle boundary a future caller could interleave
+    /// `context` mutations into.
+    ///
     /// The [`converter::H2BlockConverter`] is scoped to a single
     /// `kawa.prepare` call rather than to the whole per-stream loop, so the
     /// `&mut self.hpack` borrow it takes for the connection's HPACK encoder
@@ -2210,97 +2298,643 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         self.arm_timeout();
         // Pre-compute byte totals for proportional overhead distribution.
-        let mut write_pass =
-            h2_write_pass::H2WritePass::new(self.compute_stream_byte_totals(context));
+        let mut pass = H2WritePass::new(self.compute_stream_byte_totals(context));
         let mut io_slices: Vec<IoSlice<'static>> = Vec::new();
 
-        if let Some(
-            write_stream @ H2StreamId::Other {
-                id: stream_id,
-                gid: global_stream_id,
-            },
-        ) = self.stream_table.expect_write()
-        {
-            let stream = &mut context.streams[global_stream_id];
-            let stream_state = stream.state;
-            let parts = stream.split(&self.position);
-            let kawa = parts.wbuffer;
-            // Resume path: if the same stream is parked waiting for buffer
-            // space (expect_read matches write_stream), pass the amount so
-            // flush_stream_out can re-enable READABLE as soon as we drain.
-            let cross_read_amount = match self.stream_table.expect_read() {
-                Some((read_stream, amount)) if write_stream == read_stream => Some(amount),
-                _ => None,
-            };
-            write_pass.stalled = Self::flush_stream_out(
-                &mut self.socket,
-                kawa,
-                parts.metrics,
-                &self.position,
-                &mut self.readiness,
-                &mut context.debug,
-                2,
-                global_stream_id,
-                None,
-                cross_read_amount,
-                &mut io_slices,
-                Some(&mut write_pass.resume_bytes),
-            ) == FlushOutcome::Stalled;
-            // Refresh the per-stream idle timer when outbound bytes move: a
-            // large response delivered at low bandwidth is "active", not idle,
-            // even when the peer sends no inbound frames.
-            if write_pass.resume_bytes > 0 {
-                self.stream_table.touch_activity(stream_id, self.now);
-                // Clear the flow-control-stall deadline ONLY when the effective
-                // send window is genuinely open — that alone is a real un-stall.
-                // A window-stalled stream can flush a `WINDOW_UPDATE(+1)`-drip
-                // byte HERE via socket-backpressure resume; clearing on that
-                // would reset the deadline at 1-byte granularity and re-open the
-                // drip the M2 cumulative-stall budget closes. While still blocked,
-                // leave the deadline (and its progress accumulator) for the main
-                // write loop's budget to govern — keeping the two maps in lockstep.
-                if min(*parts.window, self.flow_control.window()) > 0 {
-                    self.stream_table.clear_fc_stall(stream_id);
-                }
-            }
-            if write_pass.stalled {
-                return MuxResult::Continue;
-            }
-            self.stream_table.set_expect_write(None);
-            if (kawa.is_terminated() || kawa.is_error())
-                && kawa.is_completed()
-                && !Self::handle_1xx_reset(kawa, stream_state, &mut endpoint)
-            {
-                let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, stream.linked_token());
-
-                if let Some((dead_id, token)) = self.try_recycle_server_stream(
-                    stream,
-                    global_stream_id,
-                    stream_id,
-                    write_pass.byte_totals,
-                    &mut context.debug,
-                    context.listener.clone(),
-                    client_rtt,
-                    server_rtt,
-                ) {
-                    // Remove the recycled stream from the connection maps
-                    // before endpoint.end_stream() can trigger teardown.
-                    // Otherwise session close can observe a stale `Recycle`
-                    // entry in self.streams and mis-handle the connection as
-                    // if it still had an active H2 stream.
-                    self.remove_dead_stream(dead_id, global_stream_id);
-                    if let Some(token) = token {
-                        remove_backend_stream(
-                            &mut context.backend_streams,
-                            token,
-                            global_stream_id,
-                        );
-                        endpoint.end_stream(token, global_stream_id, context);
-                    }
+        loop {
+            match self.poll_write_target(context, &mut endpoint, &mut pass) {
+                H2WriteTarget::Done(result) => return result,
+                H2WriteTarget::Finalize {
+                    socket_write,
+                    bytes_written,
+                } => return self.finalize_write(socket_write, bytes_written, context),
+                H2WriteTarget::Transmit { stream_id } => {
+                    // Gather / write / confirm. The gather borrows
+                    // `kawa.storage` and hands back descriptors with an
+                    // extended lifetime; `confirm` discharges that obligation
+                    // before the consume. Both halves and the `unsafe` between
+                    // them live in `h2_transmit`.
+                    let kawa = write_buffer(
+                        &mut self.zero,
+                        &mut context.streams,
+                        &self.position,
+                        stream_id,
+                    );
+                    let offered = h2_transmit::gather(kawa, &mut io_slices);
+                    let (size, status) = self.socket.socket_write_vectored(&io_slices);
+                    debug_assert!(
+                        size <= offered,
+                        "the socket reported {size} bytes written for an offer of {offered}"
+                    );
+                    h2_transmit::confirm(kawa, &mut io_slices, size);
+                    self.handle_write(context, stream_id, size, status, &mut pass);
                 }
             }
         }
+    }
 
+    /// Ask the core what it wants written to the socket, so the caller can
+    /// perform that write and report it back through [`Self::handle_write`].
+    ///
+    /// The write half of [`Self::poll_read_target`]'s protocol, with ONE forced
+    /// divergence: a read pass ENDS with `handle_read`, while a write pass
+    /// performs an unbounded number of writes, so this is re-entered until it
+    /// answers [`H2WriteTarget::Done`] or [`H2WriteTarget::Finalize`]. The
+    /// `pass` parameter is what makes that re-entry meaningful: 9.6a needed no
+    /// stash because `expect_read` already lived on `stream_table`, whereas one
+    /// write pass builds a dozen values that have to survive the round trip.
+    ///
+    /// It is a `&mut` local of [`Self::write_streams`] and not an
+    /// `Option<H2WritePass>` field on `self`: every exit ends the pass, so it
+    /// never outlives one call, and resumption ACROSS calls is already
+    /// `H2StreamTable::expect_write`.
+    ///
+    /// **A caller that stops driving after an [`H2WriteTarget::Transmit`]
+    /// strands the pass's converter**, and with it the three HPACK scratch
+    /// buffers it took out of [`hpack_state::HpackState`] — silently, and for
+    /// the life of the connection. Between the transition into
+    /// [`H2WritePhase::Prepare`] and the first statement of
+    /// [`H2WritePhase::End`] this function has exactly one `return`, the
+    /// `Transmit` yield, so the drive loop is the whole guarantee;
+    /// `H2WritePass`'s [`Drop`] carries the matching `debug_assert!`. A
+    /// re-entry AFTER the pass answered is the other half of that argument and
+    /// is handled separately: `End` moves the pass to
+    /// [`H2WritePhase::Ended`], whose arm answers `Done` rather than
+    /// re-entering an arm whose first statement takes three `Option`s it has
+    /// already emptied.
+    ///
+    /// Unlike [`Self::handle_write`] this never sees a [`SocketResult`]. The
+    /// pass terminator is `pass.stalled`, written in exactly one statement over
+    /// there, and `size > 0` with `SocketResult::WouldBlock` is NOT a stall —
+    /// `update_readiness` decides on the size alone. A terminator keyed on the
+    /// status would truncate every response a TLS frontend accepts in two
+    /// rounds, which is why adding that parameter here has to be a visible
+    /// signature change rather than a one-token edit.
+    pub(super) fn poll_write_target<E, L>(
+        &mut self,
+        context: &mut Context<L>,
+        endpoint: &mut E,
+        pass: &mut H2WritePass,
+    ) -> H2WriteTarget
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        loop {
+            match pass.phase {
+                H2WritePhase::Start => {
+                    if let Some(
+                        write_stream @ H2StreamId::Other {
+                            id: stream_id,
+                            gid: global_stream_id,
+                        },
+                    ) = self.stream_table.expect_write()
+                    {
+                        // Resume path: if the same stream is parked waiting for
+                        // buffer space (expect_read matches write_stream), keep
+                        // the amount so `handle_write` can re-enable READABLE as
+                        // soon as we drain.
+                        let cross_read_amount = match self.stream_table.expect_read() {
+                            Some((read_stream, amount)) if write_stream == read_stream => {
+                                Some(amount)
+                            }
+                            _ => None,
+                        };
+                        pass.phase = H2WritePhase::Resume {
+                            stream_id,
+                            gid: global_stream_id,
+                            cross_read_amount,
+                            // Read BEFORE the flush, where the pre-image read
+                            // it, and carried across the transmits rather than
+                            // re-read after them: its consumer is
+                            // `handle_1xx_reset`, so a stream retired mid-flush
+                            // must not change which state that check sees.
+                            stream_state: context.streams[global_stream_id].state,
+                        };
+                    } else {
+                        self.begin_scheduler_pass(context, pass);
+                    }
+                }
+                H2WritePhase::Resume {
+                    stream_id,
+                    gid: global_stream_id,
+                    stream_state,
+                    ..
+                } => {
+                    let write_stream = H2StreamId::Other {
+                        id: stream_id,
+                        gid: global_stream_id,
+                    };
+                    // The pre-image's `while !kawa.out.is_empty()`, as a
+                    // resumption state. `pass.stalled` is the loop's ONLY
+                    // terminator, and it is false on the first entry.
+                    if !pass.stalled {
+                        let kawa = write_buffer(
+                            &mut self.zero,
+                            &mut context.streams,
+                            &self.position,
+                            write_stream,
+                        );
+                        if !kawa.out.is_empty() {
+                            return H2WriteTarget::Transmit {
+                                stream_id: write_stream,
+                            };
+                        }
+                    }
+                    let stream = &mut context.streams[global_stream_id];
+                    let parts = stream.split(&self.position);
+                    let kawa = parts.wbuffer;
+                    // Refresh the per-stream idle timer when outbound bytes move: a
+                    // large response delivered at low bandwidth is "active", not idle,
+                    // even when the peer sends no inbound frames.
+                    if pass.resume_bytes > 0 {
+                        self.stream_table.touch_activity(stream_id, self.now);
+                        // Clear the flow-control-stall deadline ONLY when the effective
+                        // send window is genuinely open — that alone is a real un-stall.
+                        // A window-stalled stream can flush a `WINDOW_UPDATE(+1)`-drip
+                        // byte HERE via socket-backpressure resume; clearing on that
+                        // would reset the deadline at 1-byte granularity and re-open the
+                        // drip the M2 cumulative-stall budget closes. While still blocked,
+                        // leave the deadline (and its progress accumulator) for the main
+                        // write loop's budget to govern — keeping the two maps in lockstep.
+                        if min(*parts.window, self.flow_control.window()) > 0 {
+                            self.stream_table.clear_fc_stall(stream_id);
+                        }
+                    }
+                    if pass.stalled {
+                        // The FIRST of the three terminators that must not
+                        // finalize: the scheduler pass never began, so LIFECYCLE
+                        // §9 invariant 16's readiness policy has nothing to
+                        // decide and the park must survive untouched.
+                        return H2WriteTarget::Done(MuxResult::Continue);
+                    }
+                    self.stream_table.set_expect_write(None);
+                    if (kawa.is_terminated() || kawa.is_error())
+                        && kawa.is_completed()
+                        && !Self::handle_1xx_reset(kawa, stream_state, endpoint)
+                    {
+                        let (client_rtt, server_rtt) =
+                            self.snapshot_rtts(endpoint, stream.linked_token());
+
+                        if let Some((dead_id, token)) = self.try_recycle_server_stream(
+                            stream,
+                            global_stream_id,
+                            stream_id,
+                            pass.byte_totals,
+                            &mut context.debug,
+                            context.listener.clone(),
+                            client_rtt,
+                            server_rtt,
+                        ) {
+                            // Remove the recycled stream from the connection maps
+                            // before endpoint.end_stream() can trigger teardown.
+                            // Otherwise session close can observe a stale `Recycle`
+                            // entry in self.streams and mis-handle the connection as
+                            // if it still had an active H2 stream.
+                            self.remove_dead_stream(dead_id, global_stream_id);
+                            if let Some(token) = token {
+                                remove_backend_stream(
+                                    &mut context.backend_streams,
+                                    token,
+                                    global_stream_id,
+                                );
+                                endpoint.end_stream(token, global_stream_id, context);
+                            }
+                        }
+                    }
+                    self.begin_scheduler_pass(context, pass);
+                }
+                H2WritePhase::Prepare { cursor } => {
+                    let Some(&stream_id) = pass.order().get(cursor) else {
+                        pass.phase = H2WritePhase::End;
+                        continue;
+                    };
+                    let Some(&global_stream_id) = self.stream_table.streams().get(&stream_id)
+                    else {
+                        error!(
+                            "{} stream_id {} from sorted keys missing in streams map",
+                            log_context!(self),
+                            stream_id
+                        );
+                        pass.phase = H2WritePhase::Prepare { cursor: cursor + 1 };
+                        continue;
+                    };
+                    let (urgency, is_incremental) = self.scheduler.priority(&stream_id);
+                    let stream = &mut context.streams[global_stream_id];
+                    // Read BEFORE the flush, where the pre-image read it, and
+                    // carried through `H2WritePhase::Flush` — see that field's
+                    // doc.
+                    let stream_state = stream.state;
+                    let parts = stream.split(&self.position);
+                    let kawa = parts.wbuffer;
+                    pass.consumed = 0;
+                    // The pre-image re-ASSIGNED `stalled` from each
+                    // `flush_stream_out` call, and a stream with an empty queue
+                    // flushed zero rounds and read Drained. Clearing it here is
+                    // what keeps one stream's stall from terminating the next
+                    // stream's flush before its first transmit.
+                    pass.stalled = false;
+                    if kawa.is_main_phase()
+                        || (kawa.is_terminated() && !kawa.is_completed())
+                        || (kawa.is_error() && !self.stream_table.rst_sent_contains(stream_id))
+                    {
+                        let window = min(*parts.window, self.flow_control.window());
+                        // Same-urgency-bucket ready-peer count (Tier 3a, LIFECYCLE §9
+                        // invariant 17). The converter skips the yield when there is
+                        // no peer in the same bucket to interleave with — prevents
+                        // the `finalize_write` WRITABLE-withdrawal strand (see
+                        // `test_h2_solo_incremental_drains_fully`). A connection-wide
+                        // count would wrongly yield for a solo incremental stream
+                        // when another urgency bucket happens to contain an
+                        // incremental peer.
+                        let incremental_peer_count =
+                            pass.census_mut().incremental_peer_count(urgency);
+                        // Track RST_STREAM dedup: if kawa is in error state, the converter
+                        // will generate a RST_STREAM frame via `initialize`. Mark it so we
+                        // don't send a duplicate on the next writable cycle.
+                        if kawa.is_error() {
+                            let freshly_rst = self.stream_table.rst_sent_mut().insert(stream_id);
+                            // LIFECYCLE §9 invariant 17: any transition to ineligible
+                            // mid-pass MUST leave the pass census so later streams in
+                            // the same iteration see the live count, not the
+                            // snapshot. Missing this costs one voluntary yield per
+                            // same-urgency peer that trails the RST.
+                            if freshly_rst {
+                                pass.census_mut().note_ineligible(urgency, is_incremental);
+                            }
+                            // Account for the RST that `initialize` is about to emit
+                            // for this stream. Without this the MadeYouReset lifetime
+                            // cap is evadable: any path that flips `parsing_phase` to
+                            // Error before reaching this gate (oversized inbound
+                            // trailers, malformed bodies, etc.) would land an
+                            // unaccounted RST on the wire. The accounting call is
+                            // deferred to after the loop so a cap trip cannot
+                            // preempt the remaining streams' writes; see
+                            // `H2WritePass::freshly_emitted_rsts`.
+                            if freshly_rst {
+                                pass.freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
+                            }
+                        }
+                        // Apply per-frontend response-side header edits
+                        // (set/replace/delete) stashed by the routing layer at
+                        // request time. H2 frontends always run as Server
+                        // position; the back-side H2 client (when sozu speaks
+                        // H2 to a backend) is a request emission and was
+                        // already mutated by Router::route_from_request.
+                        //
+                        // The snapshot is **drained** via `mem::take` so the
+                        // injection runs exactly once per response. Without
+                        // this, a re-entry of `write_streams` for the same
+                        // stream (multi-frame body, flow-control yield, or
+                        // RFC 9218 same-urgency round-robin) would re-call
+                        // `apply_response_header_edits` after `kawa.prepare`
+                        // had already consumed the `Block::Flags{end_header}`
+                        // anchor — the helper falls back to
+                        // `kawa.blocks.len()` and appends the edit AFTER all
+                        // remaining DATA blocks. The next prepare cycle then
+                        // encodes that orphan `Block::Header` into
+                        // `H2BlockConverter.out` with no closing
+                        // `Block::Flags{end_header}` to flush it as a HEADERS
+                        // frame, and `H2BlockConverter::finalize` trips the
+                        // "out buffer not empty (38 bytes remaining), clearing"
+                        // defense-in-depth log on every re-entry. 38 bytes is
+                        // the static-table HPACK encoding of a typical HSTS
+                        // header, which is how the symptom surfaces in
+                        // production once the listener-default HSTS reaches a
+                        // non-trivial share of frontends.
+                        if matches!(self.position, super::Position::Server)
+                            && !parts.context.headers_response.is_empty()
+                        {
+                            let edits = std::mem::take(&mut parts.context.headers_response);
+                            super::shared::apply_response_header_edits(kawa, &edits);
+                        }
+                        // One converter for exactly this `prepare` call. It borrows
+                        // the encoder out of `self.hpack`; keeping that borrow no
+                        // longer than the call is what leaves the rest of this
+                        // phase free to take `&self` / `&mut self`. The scratch and
+                        // the RFC 7541 §6.3 signal are moved in here and moved back
+                        // out by `reclaim` below — no buffer is copied.
+                        //
+                        // RFC 9218 §4: `incremental_mode` makes an incremental
+                        // stream yield the converter after a single DATA frame so
+                        // same-urgency peers interleave; a non-scheduled caller
+                        // (the resume phase above, the converter's own unit tests)
+                        // keeps the sequential semantics with `false`.
+                        let mut converter = pass.converter_mut().converter(
+                            self.hpack.encoder_mut(),
+                            stream_id,
+                            window,
+                            is_incremental,
+                            incremental_peer_count,
+                        );
+                        kawa.prepare(&mut converter);
+                        let remaining = pass.converter_mut().reclaim(converter);
+                        pass.consumed = window - remaining;
+                        // The pre-prepare gate above only inserts into
+                        // `rst_sent` when `kawa.is_error()` is already true on
+                        // entry. The HPACK over-budget abort path
+                        // (`H2BlockConverter::check_header_capacity` →
+                        // `finalize`) flips `parsing_phase` to Error AND pushes
+                        // its own RST_STREAM frame inside this same prepare
+                        // pass; without a post-prepare insert here the next
+                        // writable cycle would gate-pass and double-emit a
+                        // RST_STREAM via the existing `initialize` chokepoint.
+                        //
+                        // Per Codex P2: the converter's direct RST emission
+                        // bypasses the metric/flood accounting that
+                        // `Self::reset_stream` performs. Mirror it here so a
+                        // peer that drives oversized headers across many
+                        // streams cannot escape the MadeYouReset emitted-RST
+                        // lifetime cap and so dashboards see the per-error
+                        // counter and the global tx counter.
+                        //
+                        // Per Codex P3: when an incremental stream flips to
+                        // Error mid-prepare, the RFC 9218 §4 yield-after-one
+                        // accounting must drop this stream from the
+                        // same-urgency ready bucket so trailing peers see the
+                        // live count.
+                        let freshly_rst_post_prepare =
+                            kawa.is_error() && self.stream_table.rst_sent_mut().insert(stream_id);
+                        if freshly_rst_post_prepare {
+                            // Deferred to after the loop; same reason as the
+                            // pre-prepare collector above.
+                            pass.freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
+                            pass.census_mut().note_ineligible(urgency, is_incremental);
+                        }
+                        *parts.window = parts.window.saturating_sub(pass.consumed);
+                        self.flow_control.consume_send_window(pass.consumed);
+                        let consumed = pass.consumed;
+                        pass.census_mut()
+                            .note_fired(stream_id, is_incremental, consumed);
+                    }
+                    context.debug.push(DebugEvent::S(
+                        stream_id,
+                        global_stream_id,
+                        kawa.parsing_phase,
+                        kawa.blocks.len(),
+                        kawa.out.len(),
+                    ));
+                    pass.stream_bytes = 0;
+                    pass.phase = H2WritePhase::Flush {
+                        cursor,
+                        stream_id,
+                        gid: global_stream_id,
+                        stream_state,
+                        urgency,
+                        is_incremental,
+                    };
+                }
+                H2WritePhase::Flush {
+                    cursor,
+                    stream_id,
+                    gid: global_stream_id,
+                    stream_state,
+                    urgency,
+                    is_incremental,
+                } => {
+                    let write_stream = H2StreamId::Other {
+                        id: stream_id,
+                        gid: global_stream_id,
+                    };
+                    // THE ROUND-AGAIN: the pre-image's
+                    // `while !kawa.out.is_empty()`, re-expressed as a resumption
+                    // state over the same stream. `pass.stalled` is the only
+                    // terminator, and `update_readiness` sets it on `size == 0`
+                    // alone — a write that moved bytes under `WouldBlock` comes
+                    // straight back here for another round.
+                    if !pass.stalled {
+                        let kawa = write_buffer(
+                            &mut self.zero,
+                            &mut context.streams,
+                            &self.position,
+                            write_stream,
+                        );
+                        if !kawa.out.is_empty() {
+                            // The pre-image raised this flag at the top of every
+                            // round of the SCHEDULER loop's flush and never in
+                            // the resume path's, which passed `None` for it.
+                            pass.socket_write = true;
+                            return H2WriteTarget::Transmit {
+                                stream_id: write_stream,
+                            };
+                        }
+                    }
+                    let stream = &mut context.streams[global_stream_id];
+                    let parts = stream.split(&self.position);
+                    let kawa = parts.wbuffer;
+                    // Refresh the per-stream idle timer on outbound bytes. Without
+                    // this, a long-running response trickled at low bandwidth would
+                    // be killed by `cancel_timed_out_streams` mid-delivery — the
+                    // inbound-only refreshes in `handle_data_frame` (non-empty DATA)
+                    // and `handle_headers_frame` never fire while the peer is idle.
+                    if pass.stream_bytes > 0 {
+                        self.stream_table.touch_activity(stream_id, self.now);
+                    }
+                    // Arm/age the dedicated flow-control-stall deadline that catches a
+                    // window-stalled stream — a buffered RESPONSE to a slow frontend
+                    // (`Position::Server`) OR a buffered request UPLOAD to a slow H2
+                    // backend (`Position::Client`): window-stall reaping is bidirectional
+                    // by design (M4), so there is no position gate here. Set only when the
+                    // stream holds sendable buffered data it cannot send because its
+                    // effective send window is exhausted; unlike `stream_last_activity_at`
+                    // it is NEVER refreshed by inbound DATA/HEADERS, so a peer dribbling
+                    // 1-byte DATA cannot keep it warm.
+                    //
+                    // M2 cumulative-stall budget: a genuinely OPEN window clears the
+                    // deadline immediately (real un-stall). While the window stays
+                    // blocked, accumulate this pass's outbound drain; only cumulative
+                    // progress reaching `FC_STALL_CLEAR_FLOOR` (a full frame of real
+                    // delivery) clears it. A `WINDOW_UPDATE(+1)` drip drains ~1 byte/pass
+                    // straight back to a zero window, so it never reaches the floor — the
+                    // deadline ages out and `cancel_timed_out_streams` RST(CANCEL)s the
+                    // slot-pinning stream after `stream_idle_timeout`.
+                    let outbound_window_blocked = has_sendable_response(kawa)
+                        && min(*parts.window, self.flow_control.window()) <= 0
+                        && (!kawa.blocks.is_empty() || !kawa.out.is_empty());
+                    match fc_stall_budget_decision(
+                        outbound_window_blocked,
+                        pass.consumed,
+                        self.stream_table.fc_stall_progress(stream_id),
+                    ) {
+                        FcStallAction::Clear => {
+                            self.stream_table.clear_fc_stall(stream_id);
+                        }
+                        FcStallAction::Arm { progress } => {
+                            self.stream_table
+                                .arm_fc_stall(stream_id, self.now, progress);
+                        }
+                    }
+                    pass.total_bytes_written =
+                        pass.total_bytes_written.saturating_add(pass.stream_bytes);
+                    if pass.stalled {
+                        self.stream_table.set_expect_write(Some(write_stream));
+                        pass.phase = H2WritePhase::End;
+                        continue;
+                    }
+                    self.stream_table.set_expect_write(None);
+                    if (kawa.is_terminated() || kawa.is_error())
+                        && kawa.is_completed()
+                        && !Self::handle_1xx_reset(kawa, stream_state, endpoint)
+                    {
+                        let close_frontend = matches!(self.position, Position::Server)
+                            && !parts.context.keep_alive_frontend;
+                        let (client_rtt, server_rtt) =
+                            self.snapshot_rtts(endpoint, stream.linked_token());
+
+                        if let Some((dead_id, token)) = self.try_recycle_server_stream(
+                            stream,
+                            global_stream_id,
+                            stream_id,
+                            pass.byte_totals,
+                            &mut context.debug,
+                            context.listener.clone(),
+                            client_rtt,
+                            server_rtt,
+                        ) {
+                            pass.completed_streams.push((
+                                dead_id,
+                                global_stream_id,
+                                token,
+                                close_frontend,
+                            ));
+                            // LIFECYCLE §9 invariant 17: leave the census INSIDE
+                            // the scheduler loop so later streams see the reduced
+                            // count. The post-loop retirement at remove_dead_stream
+                            // is too late.
+                            pass.census_mut().note_ineligible(urgency, is_incremental);
+                        }
+                    }
+                    pass.phase = H2WritePhase::Prepare { cursor: cursor + 1 };
+                }
+                H2WritePhase::Ended => {
+                    // The pass already answered. `write_streams` never gets
+                    // here — it returns on `Done` and on `Finalize` — but this
+                    // function is `pub(super)`, and `End` below takes the
+                    // scheduler-pass values out as its first statement, so a
+                    // second poll re-entering that arm would `expect` on three
+                    // empty `Option`s. Answering `Done` keeps a hand-driven
+                    // caller on the ordinary terminator instead of a panic.
+                    return H2WriteTarget::Done(MuxResult::Continue);
+                }
+                H2WritePhase::End => {
+                    // FIRST statement of the arm, before any `return` it can
+                    // take: this is what makes the converter's three pooled
+                    // buffers reach `HpackState` on the close-frontend GOAWAY
+                    // exit below, and it leaves the pass holding `None` for the
+                    // rest of its life. The phase moves to `Ended` in the same
+                    // breath so a re-entry cannot reach this statement twice.
+                    let (converter_pass, order, census) = pass.release_scheduler_pass();
+                    pass.phase = H2WritePhase::Ended;
+                    // Sample the pass's final bucket totals. Publication is deferred to
+                    // the `gauge_connection_state` call below because the value must
+                    // reach the gauge in the SAME pass that computed it — the entry call
+                    // in `begin_scheduler_pass` runs before the pass census exists,
+                    // so sampling there would publish the previous pass's value.
+                    self.ready_incremental_streams = census.ready_total();
+                    // RFC 7541 §6.3: clear our mirror of the pending size-update only
+                    // AFTER the pass confirmed the signal reached a header block. A
+                    // DATA-only pass leaves `size_update_emitted` as `false` so the
+                    // signal stays queued for the next pass with a header block.
+                    if converter_pass.size_update_emitted() {
+                        self.pending_table_size_update = None;
+                    }
+                    // End the pass and take its three reusable buffers back. They are
+                    // moved, not copied: the pass never owned an allocation of its own.
+                    let (converter_out, lowercase_buf, cookie_buf) = converter_pass.into_buffers();
+                    // Publish `ready_incremental_streams` (and any window/stream drift the
+                    // pass produced) before the two early returns below, so no pass
+                    // samples without emitting.
+                    self.gauge_connection_state();
+                    // Account every RST that the converter emitted during this pass
+                    // (pre-prepare gate + post-prepare HPACK over-budget abort) so
+                    // the global tx counter, the per-error breakdown, and the
+                    // MadeYouReset emitted-RST lifetime cap stay in step. If the
+                    // cap trips, propagate the GOAWAY result.
+                    //
+                    // The SECOND terminator that must not finalize. It also sits
+                    // between `into_buffers` and the `put_*` calls, so a cap trip
+                    // drops the three buffers — the pre-image's behaviour, kept
+                    // deliberately: the connection is sending a GOAWAY.
+                    for error in std::mem::take(&mut pass.freshly_emitted_rsts) {
+                        if let Some(result) = self.account_emitted_rst(error) {
+                            return H2WriteTarget::Done(result);
+                        }
+                    }
+                    self.hpack.put_converter_buf(converter_out);
+                    self.hpack.put_lowercase_buf(lowercase_buf);
+                    self.hpack.put_cookie_buf(cookie_buf);
+                    self.hpack.shrink_converter_buffers();
+                    // RFC 9218 §4: end the pass — take the order buffer back and commit
+                    // the round-robin cursor so the next writable cycle begins with the
+                    // stream immediately after the one we fired first this pass
+                    // (LIFECYCLE §9 invariant 26). Placed here, after the deferred RST
+                    // accounting above, so a MadeYouReset cap trip that returns a GOAWAY
+                    // early skips both exactly as it did before the inversion.
+                    self.scheduler.end_pass(order, census);
+                    let mut close_frontend_after_completed_stream = false;
+                    for (dead_id, global_stream_id, token, close_frontend) in
+                        std::mem::take(&mut pass.completed_streams)
+                    {
+                        // Retirement is deferred out of the loop on purpose, and this is
+                        // an ORDERING requirement rather than a borrow workaround:
+                        // `try_recycle_server_stream` passes `is_last_stream` as
+                        // `streams().len() == 1`, and that branch hands the WHOLE
+                        // remaining connection overhead pool to one stream instead of a
+                        // proportional share. Retiring inline would let a later completer
+                        // of the same pass read `len() == 1` while other streams are still
+                        // live, and drain the pool early. (`active_streams` is passed
+                        // too, but it is only the even-split divisor of the fallback
+                        // branch, reached while the connection-wide byte total is still
+                        // zero — on every other pass the divisor is that total.)
+                        // Retiring here also runs
+                        // before `endpoint.end_stream()` can trigger teardown and observe
+                        // a stale `Recycle` entry in `self.stream_table.streams()`.
+                        self.remove_dead_stream(dead_id, global_stream_id);
+                        close_frontend_after_completed_stream |= close_frontend;
+                        if let Some(token) = token {
+                            remove_backend_stream(
+                                &mut context.backend_streams,
+                                token,
+                                global_stream_id,
+                            );
+                            endpoint.end_stream(token, global_stream_id, context);
+                        }
+                    }
+                    // The THIRD terminator that must not finalize: this pass ends
+                    // in a GOAWAY, so invariant 16 has no readiness to decide.
+                    if close_frontend_after_completed_stream && !self.drain.draining() {
+                        return H2WriteTarget::Done(if self.stream_table.streams().is_empty() {
+                            self.goaway(H2Error::NoError)
+                        } else {
+                            self.graceful_goaway(self.now)
+                        });
+                    }
+                    return H2WriteTarget::Finalize {
+                        socket_write: pass.socket_write,
+                        bytes_written: pass.total_bytes_written,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Open the scheduler half of one write pass: the gauge sample, the
+    /// converter, the RFC 9218 ordering and its census.
+    ///
+    /// Called once per pass, from [`H2WritePhase::Start`] when nothing is
+    /// parked and from [`H2WritePhase::Resume`] once the parked stream drained.
+    /// It is NOT part of `H2WritePass::new`, and the reason is behavioural
+    /// rather than stylistic: the resume path can retire a stream through
+    /// [`Self::remove_dead_stream`], and `H2Scheduler::begin_pass` enumerates
+    /// the same `stream_table.streams()` map — so building the order at pass
+    /// start would change which streams the pass visits. The converter is
+    /// excluded for a different reason again: its constructor `mem::take`s
+    /// three scratch buffers out of [`hpack_state::HpackState`], and the
+    /// resume path's stall ends the pass before anything hands them back.
+    fn begin_scheduler_pass<L>(&mut self, context: &mut Context<L>, pass: &mut H2WritePass)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         self.gauge_connection_state();
 
         let scheme: &'static [u8] = if context.listener.borrow().protocol() == Protocol::HTTPS {
@@ -2316,9 +2950,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // size-update, so the first header block of this pass prepends the
         // signal and no later one repeats it. We clear the connection-side
         // mirror only AFTER the pass confirms emission via
-        // `pass.size_update_emitted()`, so a DATA-only write pass (no header
+        // `size_update_emitted()`, so a DATA-only write pass (no header
         // block) does not drop the signal.
-        let mut pass = converter::H2ConverterPass::new(
+        let converter_pass = converter::H2ConverterPass::new(
             self.peer_settings.settings_max_frame_size as usize,
             scheme,
             // When this connection is a backend client we are writing
@@ -2342,10 +2976,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // incremental streams only, so it costs exactly what the inline
         // census cost. `order` is returned by value for the same reason the
         // scratch buffers are moved into the converter pass: the per-stream
-        // loop below re-borrows the encoder out of `self.hpack` for every
-        // eligible stream, so no borrow of a connection field may span it.
+        // phases below re-borrow the encoder out of `self.hpack` for every
+        // eligible stream, so no borrow of a connection field may span them.
         let is_server = matches!(self.position, Position::Server);
-        let (order, mut census) =
+        let (order, census) =
             self.scheduler
                 .begin_pass(self.stream_table.streams().keys().copied(), |stream_id| {
                     let Some(&gid) = self.stream_table.streams().get(&stream_id) else {
@@ -2368,392 +3002,99 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             census.incremental_count(),
             census.ready_buckets()
         );
-        'outer: for &stream_id in &order {
-            let Some(&global_stream_id) = self.stream_table.streams().get(&stream_id) else {
-                error!(
-                    "{} stream_id {} from sorted keys missing in streams map",
-                    log_context!(self),
-                    stream_id
-                );
-                continue;
-            };
-            let (urgency, is_incremental) = self.scheduler.priority(&stream_id);
-            let stream = &mut context.streams[global_stream_id];
-            let stream_state = stream.state;
-            let parts = stream.split(&self.position);
-            let kawa = parts.wbuffer;
-            write_pass.consumed = 0;
-            if kawa.is_main_phase()
-                || (kawa.is_terminated() && !kawa.is_completed())
-                || (kawa.is_error() && !self.stream_table.rst_sent_contains(stream_id))
-            {
-                let window = min(*parts.window, self.flow_control.window());
-                // Same-urgency-bucket ready-peer count (Tier 3a, LIFECYCLE §9
-                // invariant 17). The converter skips the yield when there is
-                // no peer in the same bucket to interleave with — prevents
-                // the `finalize_write` WRITABLE-withdrawal strand (see
-                // `test_h2_solo_incremental_drains_fully`). A connection-wide
-                // count would wrongly yield for a solo incremental stream
-                // when another urgency bucket happens to contain an
-                // incremental peer.
-                let incremental_peer_count = census.incremental_peer_count(urgency);
-                // Track RST_STREAM dedup: if kawa is in error state, the converter
-                // will generate a RST_STREAM frame via `initialize`. Mark it so we
-                // don't send a duplicate on the next writable cycle.
-                if kawa.is_error() {
-                    let freshly_rst = self.stream_table.rst_sent_mut().insert(stream_id);
-                    // LIFECYCLE §9 invariant 17: any transition to ineligible
-                    // mid-pass MUST leave the pass census so later streams in
-                    // the same 'outer iteration see the live count, not the
-                    // snapshot. Missing this costs one voluntary yield per
-                    // same-urgency peer that trails the RST.
-                    if freshly_rst {
-                        census.note_ineligible(urgency, is_incremental);
-                    }
-                    // Account for the RST that `initialize` is about to emit
-                    // for this stream. Without this the MadeYouReset lifetime
-                    // cap is evadable: any path that flips `parsing_phase` to
-                    // Error before reaching this gate (oversized inbound
-                    // trailers, malformed bodies, etc.) would land an
-                    // unaccounted RST on the wire. The accounting call is
-                    // deferred to after the loop so a cap trip cannot
-                    // preempt the remaining streams' writes; see
-                    // `H2WritePass::freshly_emitted_rsts`.
-                    if freshly_rst {
-                        write_pass
-                            .freshly_emitted_rsts
-                            .push(rst_error_from_kawa(kawa));
-                    }
-                }
-                // Apply per-frontend response-side header edits
-                // (set/replace/delete) stashed by the routing layer at
-                // request time. H2 frontends always run as Server
-                // position; the back-side H2 client (when sozu speaks
-                // H2 to a backend) is a request emission and was
-                // already mutated by Router::route_from_request.
-                //
-                // The snapshot is **drained** via `mem::take` so the
-                // injection runs exactly once per response. Without
-                // this, a re-entry of `write_streams` for the same
-                // stream (multi-frame body, flow-control yield, or
-                // RFC 9218 same-urgency round-robin) would re-call
-                // `apply_response_header_edits` after `kawa.prepare`
-                // had already consumed the `Block::Flags{end_header}`
-                // anchor — the helper falls back to
-                // `kawa.blocks.len()` and appends the edit AFTER all
-                // remaining DATA blocks. The next prepare cycle then
-                // encodes that orphan `Block::Header` into
-                // `H2BlockConverter.out` with no closing
-                // `Block::Flags{end_header}` to flush it as a HEADERS
-                // frame, and `H2BlockConverter::finalize` trips the
-                // "out buffer not empty (38 bytes remaining), clearing"
-                // defense-in-depth log on every re-entry. 38 bytes is
-                // the static-table HPACK encoding of a typical HSTS
-                // header, which is how the symptom surfaces in
-                // production once the listener-default HSTS reaches a
-                // non-trivial share of frontends.
-                if matches!(self.position, super::Position::Server)
-                    && !parts.context.headers_response.is_empty()
-                {
-                    let edits = std::mem::take(&mut parts.context.headers_response);
-                    super::shared::apply_response_header_edits(kawa, &edits);
-                }
-                // One converter for exactly this `prepare` call. It borrows
-                // the encoder out of `self.hpack`; keeping that borrow no
-                // longer than the call is what leaves the rest of this loop
-                // body free to take `&self` / `&mut self`. The scratch and
-                // the RFC 7541 §6.3 signal are moved in here and moved back
-                // out by `reclaim` below — no buffer is copied.
-                //
-                // RFC 9218 §4: `incremental_mode` makes an incremental
-                // stream yield the converter after a single DATA frame so
-                // same-urgency peers interleave; a non-scheduled caller
-                // (the resume path above, the converter's own unit tests)
-                // keeps the sequential semantics with `false`.
-                let mut converter = pass.converter(
-                    self.hpack.encoder_mut(),
-                    stream_id,
-                    window,
-                    is_incremental,
-                    incremental_peer_count,
-                );
-                kawa.prepare(&mut converter);
-                write_pass.consumed = window - pass.reclaim(converter);
-                // The pre-prepare gate above only inserts into
-                // `rst_sent` when `kawa.is_error()` is already true on
-                // entry. The HPACK over-budget abort path
-                // (`H2BlockConverter::check_header_capacity` →
-                // `finalize`) flips `parsing_phase` to Error AND pushes
-                // its own RST_STREAM frame inside this same prepare
-                // pass; without a post-prepare insert here the next
-                // writable cycle would gate-pass and double-emit a
-                // RST_STREAM via the existing `initialize` chokepoint.
-                //
-                // Per Codex P2: the converter's direct RST emission
-                // bypasses the metric/flood accounting that
-                // `Self::reset_stream` performs. Mirror it here so a
-                // peer that drives oversized headers across many
-                // streams cannot escape the MadeYouReset emitted-RST
-                // lifetime cap and so dashboards see the per-error
-                // counter and the global tx counter.
-                //
-                // Per Codex P3: when an incremental stream flips to
-                // Error mid-prepare, the RFC 9218 §4 yield-after-one
-                // accounting must drop this stream from the
-                // same-urgency ready bucket so trailing peers see the
-                // live count.
-                let freshly_rst_post_prepare =
-                    kawa.is_error() && self.stream_table.rst_sent_mut().insert(stream_id);
-                if freshly_rst_post_prepare {
-                    // Deferred to after the loop; same reason as the
-                    // pre-prepare collector above.
-                    write_pass
-                        .freshly_emitted_rsts
-                        .push(rst_error_from_kawa(kawa));
-                    census.note_ineligible(urgency, is_incremental);
-                }
-                *parts.window = parts.window.saturating_sub(write_pass.consumed);
-                self.flow_control.consume_send_window(write_pass.consumed);
-                census.note_fired(stream_id, is_incremental, write_pass.consumed);
-            }
-            context.debug.push(DebugEvent::S(
-                stream_id,
-                global_stream_id,
-                kawa.parsing_phase,
-                kawa.blocks.len(),
-                kawa.out.len(),
-            ));
-            write_pass.stream_bytes = 0;
-            write_pass.stalled = Self::flush_stream_out(
-                &mut self.socket,
-                kawa,
-                parts.metrics,
+        pass.adopt_scheduler_pass(converter_pass, order, census);
+        pass.phase = H2WritePhase::Prepare { cursor: 0 };
+    }
+
+    /// Tell the core what the caller's write actually did.
+    ///
+    /// The second half of [`Self::poll_write_target`]'s protocol, and the
+    /// pre-image flush loop's BODY minus the three statements the shell now
+    /// owns: [`h2_transmit::gather`] has already run, the write has happened,
+    /// and [`h2_transmit::confirm`] has already discharged the `'static`
+    /// descriptors, so nothing here holds a borrow of `kawa.storage`.
+    ///
+    /// It answers nothing, because nothing in this body can end a pass: the
+    /// pass continues after a transmit, and the decision to stop is taken by
+    /// [`Self::poll_write_target`] reading [`H2WritePass::stalled`].
+    ///
+    /// **This is the only place on the write core that sees a
+    /// [`SocketResult`]**, and the only place that writes `pass.stalled` — in
+    /// one statement, the verbatim move of the pre-image's flush test.
+    /// `update_readiness_after_write` returns stalled **iff `size == 0`**;
+    /// `status` only clears the event bit. `FrontRustls` answers
+    /// `(buffered_size > 0, WouldBlock)` structurally whenever rustls accepted
+    /// plaintext while the kernel was full, and that is NOT a stall.
+    ///
+    /// Which counter the bytes land in, and which `debug_site` they are logged
+    /// under, are decided by the PASS PHASE and not by the stream: the resume
+    /// path's bytes are socket catch-up rather than the voluntary scheduler
+    /// yield LIFECYCLE §9 invariant 16 retains `Ready::WRITABLE` for, so
+    /// [`H2WritePass::resume_bytes`] must never reach `finalize_write`.
+    fn handle_write<L>(
+        &mut self,
+        context: &mut Context<L>,
+        stream_id: H2StreamId,
+        size: usize,
+        status: SocketResult,
+        pass: &mut H2WritePass,
+    ) where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        let resuming = matches!(pass.phase, H2WritePhase::Resume { .. });
+        // `2` for the resume path and `3` for the scheduler loop, the two
+        // `debug_site` values the pre-image passed from its two call sites.
+        let debug_site = if resuming { 2 } else { 3 };
+        let cross_read_amount = match pass.phase {
+            H2WritePhase::Resume {
+                cross_read_amount, ..
+            } => cross_read_amount,
+            _ => None,
+        };
+        let global_stream_id = match stream_id {
+            H2StreamId::Zero => usize::MAX,
+            H2StreamId::Other {
+                gid: global_stream_id,
+                ..
+            } => global_stream_id,
+        };
+        context
+            .debug
+            .push(DebugEvent::SocketIO(debug_site, global_stream_id, size));
+        self.position.count_bytes_out_counter(size);
+        if let H2StreamId::Other {
+            gid: global_stream_id,
+            ..
+        } = stream_id
+        {
+            self.position
+                .count_bytes_out(&mut context.streams[global_stream_id].metrics, size);
+        }
+        if resuming {
+            pass.resume_bytes = pass.resume_bytes.saturating_add(size);
+        } else {
+            pass.stream_bytes = pass.stream_bytes.saturating_add(size);
+        }
+        if let Some(amount) = cross_read_amount {
+            // Resume path: same stream is parked waiting for buffer space.
+            // Re-enable READABLE once the write freed enough room.
+            let kawa = write_buffer(
+                &mut self.zero,
+                &mut context.streams,
                 &self.position,
-                &mut self.readiness,
-                &mut context.debug,
-                3,
-                global_stream_id,
-                Some(&mut write_pass.socket_write),
-                None,
-                &mut io_slices,
-                Some(&mut write_pass.stream_bytes),
-            ) == FlushOutcome::Stalled;
-            // Refresh the per-stream idle timer on outbound bytes. Without
-            // this, a long-running response trickled at low bandwidth would
-            // be killed by `cancel_timed_out_streams` mid-delivery — the
-            // inbound-only refreshes in `handle_data_frame` (non-empty DATA)
-            // and `handle_headers_frame` never fire while the peer is idle.
-            if write_pass.stream_bytes > 0 {
-                self.stream_table.touch_activity(stream_id, self.now);
-            }
-            // Arm/age the dedicated flow-control-stall deadline that catches a
-            // window-stalled stream — a buffered RESPONSE to a slow frontend
-            // (`Position::Server`) OR a buffered request UPLOAD to a slow H2
-            // backend (`Position::Client`): window-stall reaping is bidirectional
-            // by design (M4), so there is no position gate here. Set only when the
-            // stream holds sendable buffered data it cannot send because its
-            // effective send window is exhausted; unlike `stream_last_activity_at`
-            // it is NEVER refreshed by inbound DATA/HEADERS, so a peer dribbling
-            // 1-byte DATA cannot keep it warm.
-            //
-            // M2 cumulative-stall budget: a genuinely OPEN window clears the
-            // deadline immediately (real un-stall). While the window stays
-            // blocked, accumulate this pass's outbound drain; only cumulative
-            // progress reaching `FC_STALL_CLEAR_FLOOR` (a full frame of real
-            // delivery) clears it. A `WINDOW_UPDATE(+1)` drip drains ~1 byte/pass
-            // straight back to a zero window, so it never reaches the floor — the
-            // deadline ages out and `cancel_timed_out_streams` RST(CANCEL)s the
-            // slot-pinning stream after `stream_idle_timeout`.
-            let outbound_window_blocked = has_sendable_response(kawa)
-                && min(*parts.window, self.flow_control.window()) <= 0
-                && (!kawa.blocks.is_empty() || !kawa.out.is_empty());
-            match fc_stall_budget_decision(
-                outbound_window_blocked,
-                write_pass.consumed,
-                self.stream_table.fc_stall_progress(stream_id),
-            ) {
-                FcStallAction::Clear => {
-                    self.stream_table.clear_fc_stall(stream_id);
-                }
-                FcStallAction::Arm { progress } => {
-                    self.stream_table
-                        .arm_fc_stall(stream_id, self.now, progress);
-                }
-            }
-            write_pass.total_bytes_written = write_pass
-                .total_bytes_written
-                .saturating_add(write_pass.stream_bytes);
-            if write_pass.stalled {
-                self.stream_table.set_expect_write(Some(H2StreamId::Other {
-                    id: stream_id,
-                    gid: global_stream_id,
-                }));
-                break 'outer;
-            }
-            self.stream_table.set_expect_write(None);
-            if (kawa.is_terminated() || kawa.is_error())
-                && kawa.is_completed()
-                && !Self::handle_1xx_reset(kawa, stream_state, &mut endpoint)
-            {
-                let close_frontend =
-                    matches!(self.position, Position::Server) && !parts.context.keep_alive_frontend;
-                let (client_rtt, server_rtt) = self.snapshot_rtts(&endpoint, stream.linked_token());
-
-                if let Some((dead_id, token)) = self.try_recycle_server_stream(
-                    stream,
-                    global_stream_id,
-                    stream_id,
-                    write_pass.byte_totals,
-                    &mut context.debug,
-                    context.listener.clone(),
-                    client_rtt,
-                    server_rtt,
-                ) {
-                    write_pass.completed_streams.push((
-                        dead_id,
-                        global_stream_id,
-                        token,
-                        close_frontend,
-                    ));
-                    // LIFECYCLE §9 invariant 17: leave the census INSIDE
-                    // 'outer so later iterations see the reduced count. The
-                    // post-loop retirement at remove_dead_stream is too late.
-                    census.note_ineligible(urgency, is_incremental);
-                }
-            }
-        }
-        // Sample the pass's final bucket totals. Publication is deferred to
-        // the `gauge_connection_state` call below because the value must
-        // reach the gauge in the SAME pass that computed it — the entry call
-        // at the top of `write_streams` runs before the pass census exists,
-        // so sampling there would publish the previous pass's value.
-        self.ready_incremental_streams = census.ready_total();
-        // RFC 7541 §6.3: clear our mirror of the pending size-update only
-        // AFTER the pass confirmed the signal reached a header block. A
-        // DATA-only pass leaves `size_update_emitted` as `false` so the
-        // signal stays queued for the next pass with a header block.
-        if pass.size_update_emitted() {
-            self.pending_table_size_update = None;
-        }
-        // End the pass and take its three reusable buffers back. They are
-        // moved, not copied: the pass never owned an allocation of its own.
-        let (converter_out, lowercase_buf, cookie_buf) = pass.into_buffers();
-        // Publish `ready_incremental_streams` (and any window/stream drift the
-        // pass produced) before the two early returns below, so no pass
-        // samples without emitting.
-        self.gauge_connection_state();
-        // Account every RST that the converter emitted during this pass
-        // (pre-prepare gate + post-prepare HPACK over-budget abort) so
-        // the global tx counter, the per-error breakdown, and the
-        // MadeYouReset emitted-RST lifetime cap stay in step. If the
-        // cap trips, propagate the GOAWAY result.
-        for error in write_pass.freshly_emitted_rsts {
-            if let Some(result) = self.account_emitted_rst(error) {
-                return result;
-            }
-        }
-        self.hpack.put_converter_buf(converter_out);
-        self.hpack.put_lowercase_buf(lowercase_buf);
-        self.hpack.put_cookie_buf(cookie_buf);
-        self.hpack.shrink_converter_buffers();
-        // RFC 9218 §4: end the pass — take the order buffer back and commit
-        // the round-robin cursor so the next writable cycle begins with the
-        // stream immediately after the one we fired first this pass
-        // (LIFECYCLE §9 invariant 26). Placed here, after the deferred RST
-        // accounting above, so a MadeYouReset cap trip that returns a GOAWAY
-        // early skips both exactly as it did before the extraction.
-        self.scheduler.end_pass(order, census);
-        let mut close_frontend_after_completed_stream = false;
-        for (dead_id, global_stream_id, token, close_frontend) in write_pass.completed_streams {
-            // Retirement is deferred out of the loop on purpose, and this is
-            // an ORDERING requirement rather than a borrow workaround:
-            // `try_recycle_server_stream` passes `is_last_stream` as
-            // `streams().len() == 1`, and that branch hands the WHOLE
-            // remaining connection overhead pool to one stream instead of a
-            // proportional share. Retiring inline would let a later completer
-            // of the same pass read `len() == 1` while other streams are still
-            // live, and drain the pool early. (`active_streams` is passed
-            // too, but it is only the even-split divisor of the fallback
-            // branch, reached while the connection-wide byte total is still
-            // zero — on every other pass the divisor is that total.)
-            // Retiring here also runs
-            // before `endpoint.end_stream()` can trigger teardown and observe
-            // a stale `Recycle` entry in `self.stream_table.streams()`.
-            self.remove_dead_stream(dead_id, global_stream_id);
-            close_frontend_after_completed_stream |= close_frontend;
-            if let Some(token) = token {
-                remove_backend_stream(&mut context.backend_streams, token, global_stream_id);
-                endpoint.end_stream(token, global_stream_id, context);
-            }
-        }
-        if close_frontend_after_completed_stream && !self.drain.draining() {
-            return if self.stream_table.streams().is_empty() {
-                self.goaway(H2Error::NoError)
-            } else {
-                self.graceful_goaway(self.now)
-            };
-        }
-        self.finalize_write(
-            write_pass.socket_write,
-            write_pass.total_bytes_written,
-            context,
-        )
-    }
-
-    /// Remove streams that completed their lifecycle from all tracking maps.
-    /// After forwarding a 1xx informational response (100 Continue, 103 Early Hints),
-    /// reset the back buffer and re-enable backend readable so the final response
-    /// can arrive on the same stream. Returns true if the response was 1xx.
-    #[allow(clippy::too_many_arguments)]
-    fn flush_stream_out(
-        socket: &mut Front,
-        kawa: &mut GenericHttpStream,
-        metrics: &mut SessionMetrics,
-        position: &Position,
-        readiness: &mut Readiness,
-        debug: &mut DebugHistory,
-        debug_site: usize,
-        global_stream_id: GlobalStreamId,
-        mut wrote: Option<&mut bool>,
-        cross_read_amount: Option<usize>,
-        io_slices: &mut Vec<IoSlice<'static>>,
-        mut bytes_written: Option<&mut usize>,
-    ) -> FlushOutcome {
-        while !kawa.out.is_empty() {
-            if let Some(flag) = wrote.as_deref_mut() {
-                *flag = true;
-            }
-            // Gather / write / confirm. The gather borrows `kawa.storage`
-            // and hands back descriptors with an extended lifetime; `confirm`
-            // discharges that obligation before the consume. Both halves and
-            // the `unsafe` between them live in `h2_transmit`.
-            let offered = h2_transmit::gather(kawa, io_slices);
-            let (size, status) = socket.socket_write_vectored(io_slices);
-            debug_assert!(
-                size <= offered,
-                "the socket reported {size} bytes written for an offer of {offered}"
+                stream_id,
             );
-            debug.push(DebugEvent::SocketIO(debug_site, global_stream_id, size));
-            h2_transmit::confirm(kawa, io_slices, size);
-            position.count_bytes_out_counter(size);
-            position.count_bytes_out(metrics, size);
-            if let Some(counter) = bytes_written.as_deref_mut() {
-                *counter = counter.saturating_add(size);
-            }
-            if let Some(amount) = cross_read_amount {
-                // Resume path: same stream is parked waiting for buffer space.
-                // Re-enable READABLE once the write freed enough room.
-                if kawa.storage.available_space() >= amount {
-                    readiness.interest.insert(Ready::READABLE);
-                }
-            }
-            if update_readiness_after_write(size, status, readiness) {
-                return FlushOutcome::Stalled;
+            if kawa.storage.available_space() >= amount {
+                self.readiness.interest.insert(Ready::READABLE);
             }
         }
-        FlushOutcome::Drained
+        pass.stalled = update_readiness_after_write(size, status, &mut self.readiness);
     }
 
+    /// After forwarding a 1xx informational response (100 Continue, 103 Early
+    /// Hints), reset the back buffer and re-enable backend readable so the
+    /// final response can arrive on the same stream. Returns true if the
+    /// response was 1xx.
     fn handle_1xx_reset<E: Endpoint>(
         kawa: &mut GenericHttpStream,
         stream_state: StreamState,
@@ -7308,6 +7649,11 @@ mod tests {
         /// That is why the script lives on this fixture rather than on a
         /// second one: it is the same handler answering the same question the
         /// record model already answers, one layer down.
+        ///
+        /// Each `size` is a CAP, clamped to what the gather actually offered:
+        /// a scripted count above the offer would trip the write shell's own
+        /// `debug_assert!(size <= offered)`, and reddening through a
+        /// production assertion is the tree noticing rather than the test.
         vectored_script: std::collections::VecDeque<(usize, SocketResult)>,
         /// How many times `socket_write_vectored` was called, whether the
         /// answer came from the script or from the delegated loopback socket.
@@ -7331,22 +7677,6 @@ mod tests {
                 vectored_script: std::collections::VecDeque::new(),
                 vectored_calls: 0,
             }
-        }
-
-        /// Script the `(size, status)` pairs `socket_write_vectored` returns.
-        ///
-        /// A builder rather than two more `new` parameters, so the three tests
-        /// that predate the script keep calling `new` unchanged. Each `size`
-        /// is a CAP, clamped to what the gather actually offered: a scripted
-        /// count above the offer would trip `flush_stream_out`'s own
-        /// `debug_assert!(size <= offered)`, and reddening through a
-        /// production assertion is the tree noticing rather than the test.
-        fn with_vectored_script(
-            mut self,
-            script: impl IntoIterator<Item = (usize, SocketResult)>,
-        ) -> Self {
-            self.vectored_script = script.into_iter().collect();
-            self
         }
     }
 
@@ -7693,8 +8023,9 @@ mod tests {
     // `status` the flush returned instead of re-querying. Also uncovered.
     //
     // The tests below target none of those. They target **the vectored loop
-    // the triples bracket** — `flush_stream_out`'s `while !kawa.out.is_empty()`
-    // — so naming a triple for them would be naming the wrong shape.
+    // the triples bracket** — the pre-image's `while !kawa.out.is_empty()`,
+    // now `poll_write_target`'s round-again over `H2WritePhase::Flush` — so
+    // naming a triple for them would be naming the wrong shape.
     //
     // What had never run against production code: a `socket_write_vectored`
     // that moves bytes AND reports `WouldBlock`. `update_readiness` (`mux/mod.rs`)
@@ -7714,81 +8045,82 @@ mod tests {
     //
     // `h2_transmit`'s `qc_partial_writes_preserve_the_byte_stream` does drive
     // partial writes, but through `drive`, a loop written in its own test
-    // module that calls neither `flush_stream_out` nor
+    // module that calls neither `ConnectionH2::handle_write` nor
     // `update_readiness_after_write`; its `WritePlan` carries an accept COUNT
     // and no `SocketResult` at all. A mirror cannot constrain the thing it
     // mirrors, and that plan cannot express this pair in the first place.
 
-    /// A server-side `Stream` whose response buffer already holds `blocks` as
-    /// queued output, ready for `flush_stream_out` to drain.
+    /// What the pre-image's `FlushOutcome` said about one stream's flush,
+    /// re-derived here because production no longer has the type.
     ///
-    /// `Store::Static` rather than a slice into `kawa.storage`: a partial
-    /// `consume` on a static store re-queues the untaken tail
-    /// (`Store::Static(&data[amount..])`), which is exactly the partial-write
-    /// bookkeeping under test, and it needs no fill of the pooled buffer.
-    fn response_stream_with_out_blocks(
-        pool: &Rc<RefCell<Pool>>,
-        blocks: &[&'static [u8]],
-    ) -> Stream {
-        let mut stream = make_stream_for_invariant_16(pool, Ulid::generate());
-        for block in blocks {
-            stream
-                .back
-                .out
-                .push_back(kawa::OutBlock::Store(kawa::Store::Static(block)));
-        }
-        stream
+    /// The inversion deleted it along with `flush_stream_out`: the flush loop
+    /// is now the `Transmit`/`handle_write` round trip, whose exit condition
+    /// is read by `poll_write_target` from `kawa.out` and `pass.stalled`
+    /// rather than reported as a return value. `Drained` is therefore derived
+    /// from the queue being empty — the pre-image's own
+    /// `while !kawa.out.is_empty()` exit condition, verbatim — and NOT from
+    /// `expect_write` being parked. The distinction matters: the park has its
+    /// own dedicated tests below, and deriving the outcome from it would make
+    /// this classification move under edits those tests already cover.
+    ///
+    /// **It is therefore the same fact as the `out_is_empty` element of
+    /// [`drive_flush_stream_out`]'s tuple, and the three tests below assert
+    /// both.** Stated rather than removed: their bodies are unchanged from
+    /// before the inversion, which is what makes them evidence that spans it,
+    /// and the alternatives were measured worse. Deriving this from
+    /// `expect_write` would couple it to the park, which the stall tests
+    /// already pin — the double-assertion would become a second test reddening
+    /// under the `set_expect_write` recipe. Deriving it from the WRITABLE
+    /// event bit cannot work either: `update_readiness` clears that bit on
+    /// every non-`Continue` round, so a drained two-round pass and a stalled
+    /// one leave it identical.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FlushOutcome {
+        /// All queued bytes were drained to the socket.
+        Drained,
+        /// The socket blocked before the queue was drained.
+        Stalled,
     }
 
-    /// Drive `flush_stream_out` over `blocks` with `script` as the socket's
-    /// answers, returning what the loop did.
+    /// Drive one write pass over `blocks` with `script` as the socket's
+    /// answers, returning what the flush did.
     ///
-    /// Calls the production associated function directly. That is deliberate:
-    /// reaching this loop through `writable()` needs a stream carrying
-    /// response bytes through the scheduler, which is the boundary the tests
-    /// above already sit on — and driving it directly is what lets the
-    /// `(size, status)` pair be chosen rather than negotiated with a kernel.
+    /// Retargeted by the poll/handle inversion. There is no associated
+    /// function left to call: the loop this drives is spread across
+    /// `poll_write_target`'s round-again, the shell's gather / write / confirm
+    /// and `handle_write`, and the smallest production seam that contains all
+    /// three is `write_streams`. It is called directly rather than through
+    /// `writable()` so that the preamble's pending-control-frame flush and TLS
+    /// flush stay out of the measurement; `pending = 0` keeps
+    /// `socket_wants_write()` false for the whole pass, and nothing below
+    /// asserts on time, so skipping `writable`'s `self.now = context.now` is
+    /// inert.
+    ///
+    /// What is unchanged is the point of the harness: `vectored_script` still
+    /// lets the `(size, status)` pair be CHOSEN rather than negotiated with a
+    /// kernel, which is the only way `(size > 0, WouldBlock)` is expressible
+    /// at all.
     fn drive_flush_stream_out(
         pool: &Rc<RefCell<Pool>>,
         blocks: &[&'static [u8]],
         script: &[(usize, SocketResult)],
     ) -> (FlushOutcome, usize, usize, bool, Readiness) {
-        let (raw_socket, _peer) = connected_socket();
-        let mut socket = BackpressuredTlsSocket::new(raw_socket, 0, 0)
-            .with_vectored_script(script.iter().copied());
-        let mut stream = response_stream_with_out_blocks(pool, blocks);
-        let position = Position::Server;
-        let parts = stream.split(&position);
-        let mut readiness = Readiness {
-            event: Ready::WRITABLE,
-            interest: Ready::WRITABLE | Ready::HUP | Ready::ERROR,
-        };
-        let mut debug = DebugHistory::default();
-        let mut io_slices: Vec<IoSlice<'static>> = Vec::new();
-        let mut bytes_written = 0usize;
+        let (mut connection, mut context, gid, _peer) = writable_fixture(pool, blocks, script);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
-        let outcome = ConnectionH2::<BackpressuredTlsSocket>::flush_stream_out(
-            &mut socket,
-            parts.wbuffer,
-            parts.metrics,
-            &position,
-            &mut readiness,
-            &mut debug,
-            3,
-            0,
-            None,
-            None,
-            &mut io_slices,
-            Some(&mut bytes_written),
-        );
+        connection.write_streams(&mut context, EndpointClient(&mut router));
 
-        let out_is_empty = parts.wbuffer.out.is_empty();
+        let out_is_empty = context.streams[gid].back.out.is_empty();
         (
-            outcome,
-            bytes_written,
-            socket.vectored_calls,
+            if out_is_empty {
+                FlushOutcome::Drained
+            } else {
+                FlushOutcome::Stalled
+            },
+            context.streams[gid].metrics.bout,
+            connection.socket.vectored_calls,
             out_is_empty,
-            readiness,
+            connection.readiness.clone(),
         )
     }
 
@@ -7809,19 +8141,22 @@ mod tests {
     /// terminated the pass on `status != Continue` would leave
     /// `SECOND_BLOCK` queued and send the response short.
     ///
-    /// TO SEE THIS RED: in `flush_stream_out`, change
-    /// `if update_readiness_after_write(size, status, readiness) {`
+    /// TO SEE THIS RED: in `handle_write`, change
+    /// `pass.stalled = update_readiness_after_write(size, status, &mut self.readiness);`
     /// to
-    /// `if update_readiness_after_write(size, status, readiness)
-    ///      || !matches!(status, SocketResult::Continue) {`
+    /// `pass.stalled = update_readiness_after_write(size, status, &mut self.readiness)
+    ///      || !matches!(status, SocketResult::Continue);`
     /// — the pass-terminator shape the `write_streams` inversion could
-    /// introduce. Measured on that mutation: this test fails on its own first
-    /// assertion, `a vectored write that moved bytes but reported WouldBlock
-    /// must not end the pass`, with `left: 5, right: 43`, and it is the ONLY
-    /// failure in the 1083-test `sozu-lib` suite — the other 1082, including
-    /// the three `BackpressuredTlsSocket` tests above and both controls below,
-    /// pass. No production `debug_assert!` fires: every scripted size is
-    /// clamped to the gather's offer.
+    /// introduce, and the reason `SocketResult` is confined to this one
+    /// statement and this one parameter. Measured on that mutation: this test
+    /// fails on its own first assertion, `a vectored write that moved bytes
+    /// but reported WouldBlock must not end the pass`, with
+    /// `left: 5, right: 43`. It is one of THREE failures, the siblings being
+    /// `a_partial_write_reporting_would_block_continues_the_pass_through_writable`
+    /// and `a_yielded_incremental_stream_is_prepared_once_per_pass`; every
+    /// other test in the suite passes, including both controls below. No
+    /// production `debug_assert!` fires: every scripted size is clamped to the
+    /// gather's offer.
     #[test]
     fn a_partial_write_reporting_would_block_continues_the_pass() {
         let pool = make_pool_for_invariant_16();
@@ -7948,25 +8283,29 @@ mod tests {
 
     // ── The two write-path sites `writable()` had never reached ──────────
     //
-    // `flush_stream_out` has ONE producer of `FlushOutcome::Stalled` and
+    // A stalled flush has ONE producer — the `pass.stalled` assignment in
+    // `handle_write`, `FlushOutcome::Stalled` before the inversion — and
     // exactly two consumers, and both consumers were dead code as far as the
     // suite was concerned:
     //
-    //   - the resume path's `return MuxResult::Continue`, reached from the
-    //     `flush_stream_out` call the top-of-`write_streams`
-    //     `expect_write == Some(H2StreamId::Other { .. })` block makes with
-    //     `debug_site = 2`;
-    //   - the main loop's `set_expect_write(Some(H2StreamId::Other { .. }))`
-    //     followed by `break 'outer`.
+    //   - the resume path's `H2WriteTarget::Done(MuxResult::Continue)`, taken
+    //     in `H2WritePhase::Resume` for the stream `expect_write` parked, whose
+    //     transmits carry `debug_site = 2`;
+    //   - `H2WritePhase::Flush`'s
+    //     `set_expect_write(Some(H2StreamId::Other { .. }))` followed by the
+    //     move to `H2WritePhase::End` — `break 'outer` before the inversion.
     //
-    // Measured on this commit's parent, `38fe5851`: a `panic!` planted at
-    // BOTH consumers at once still leaves the whole suite green — neither is
-    // reached by any test. A `panic!` on the `return FlushOutcome::Stalled`
-    // they both read fails exactly ONE test,
-    // `a_write_that_moves_no_bytes_stalls_the_pass` above, which calls the
-    // associated function directly and never enters `write_streams` at all.
+    // Measured on `38fe5851`, against the linear pre-image these tests were
+    // written for: a `panic!` planted at BOTH consumers at once still leaves
+    // the whole suite green — neither is reached by any test. A `panic!` on
+    // the `return FlushOutcome::Stalled` they both read fails exactly ONE
+    // test, `a_write_that_moves_no_bytes_stalls_the_pass` above, which called
+    // `flush_stream_out` directly and never entered `write_streams` at all.
     // A `panic!` on the first line of the resume block leaves the suite green
-    // as well: `debug_site = 2` had no caller in it.
+    // as well: `debug_site = 2` had no caller in it. Those measurements are a
+    // record of the revision named, not a claim about this one — the three
+    // tests above now reach `write_streams` too, since `flush_stream_out` is
+    // gone and there is no associated function left to call.
     //
     // No absolute pass count appears in this block or in any recipe below, on
     // purpose. A count of the whole `sozu-lib` suite is falsified by a test
@@ -7974,20 +8313,22 @@ mod tests {
     // `check_doc_citations.py` reads only `doc/` and `**/LIFECYCLE.md`. The
     // failing test NAMES and the `left:`/`right:` values are what survive.
     //
-    // Why the gap existed. `Stalled` needs `size == 0` against a non-empty
+    // Why the gap existed. A stall needs `size == 0` against a non-empty
     // `kawa.out`. The two `BackpressuredTlsSocket` `writable()` tests above
     // sit in `H2State::GoAway` and take that arm of `writable`, never
     // `write_streams`; the two after them do reach `write_streams`, but with
-    // an empty stream table, so `'outer` iterates zero times. Every other
-    // `writable()` test writes to a live loopback socket with room, and a
-    // kernel with room never answers 0.
+    // an empty stream table, so the scheduler loop visits no stream. Every
+    // other `writable()` test writes to a live loopback socket with room, and
+    // a kernel with room never answers 0.
     //
-    // The missing step was never the socket — `with_vectored_script` already
+    // The missing step was never the socket — `vectored_script` already
     // scripts any `(size, status)` pair, including ones no kernel produces.
     // It was REGISTERING a stream that carries response bytes, so the
     // scheduler reaches it through `writable()`. That is what
-    // `writable_fixture` below adds, and it is the whole difference between
-    // these tests and `drive_flush_stream_out`'s.
+    // `writable_fixture` below adds. It is now what `drive_flush_stream_out`
+    // builds on too: the difference left between the two is only that this
+    // group enters through `writable()` and that one through `write_streams`
+    // directly.
 
     /// The stream id every test below registers. Odd, because a server's peer
     /// opens odd-numbered streams (RFC 9113 §5.1.1).
@@ -8002,9 +8343,9 @@ mod tests {
     /// stay out of the way: the readiness bits these tests read are decided by
     /// the write pass alone.
     ///
-    /// The script is assigned to the field rather than through
-    /// `with_vectored_script`, which takes `self` by value and so cannot be
-    /// applied to a handler already moved into `ConnectionH2::new`.
+    /// The script is assigned to the field directly: a builder taking `self`
+    /// by value cannot be applied to a handler already moved into
+    /// `ConnectionH2::new`.
     ///
     /// The peer end of the loopback pair is returned for the caller to hold:
     /// dropping it would close the connection under the socket being tested.
@@ -8057,23 +8398,23 @@ mod tests {
     }
 
     /// A write that moved bytes but reported `WouldBlock` does not end the
-    /// pass — driven through `writable()`, over a registered stream, rather
-    /// than by calling `flush_stream_out` directly.
+    /// pass — driven through `writable()`, over a registered stream.
     ///
     /// `a_partial_write_reporting_would_block_continues_the_pass` above pins
-    /// the same contract on the associated function. This one pins that the
-    /// SCHEDULER honours it: the `(size > 0, WouldBlock)` answer has to travel
-    /// back out through `write_streams`'s `FlushOutcome` comparison at the
-    /// `break 'outer` site and through `finalize_write` without anything on
-    /// the way deciding the pass is over. A write machine that treated
-    /// `status != Continue` as a pass terminator would park `expect_write`,
-    /// leave `SECOND_BLOCK` queued, and truncate the response.
+    /// the same contract one layer down, entering at `write_streams` and
+    /// reading the flush's own outcome. This one pins that the SCHEDULER
+    /// honours it: the `(size > 0, WouldBlock)` answer has to travel back out
+    /// through `poll_write_target`'s round-again at `H2WritePhase::Flush`,
+    /// past the `set_expect_write` park, and through `finalize_write` without
+    /// anything on the way deciding the pass is over. A write machine that
+    /// treated `status != Continue` as a pass terminator would park
+    /// `expect_write`, leave `SECOND_BLOCK` queued, and truncate the response.
     ///
-    /// TO SEE THIS RED: in `flush_stream_out`, change
-    /// `if update_readiness_after_write(size, status, readiness) {`
+    /// TO SEE THIS RED: in `handle_write`, change
+    /// `pass.stalled = update_readiness_after_write(size, status, &mut self.readiness);`
     /// to
-    /// `if update_readiness_after_write(size, status, readiness)
-    ///      || !matches!(status, SocketResult::Continue) {`
+    /// `pass.stalled = update_readiness_after_write(size, status, &mut self.readiness)
+    ///      || !matches!(status, SocketResult::Continue);`
     /// Measured: this test fails on its own first assertion, `every queued
     /// byte must reach the socket within the pass`, with `left: 5, right: 43`.
     /// That edit also reddens two siblings, so THREE tests fail and not one:
@@ -8081,9 +8422,9 @@ mod tests {
     /// contract on the direct path, documenting the same recipe (`left: 5,
     /// right: 43`); and
     /// `a_yielded_incremental_stream_is_prepared_once_per_pass` below, whose
-    /// first stream stalls on its `WouldBlock` round so the pass breaks
-    /// 'outer before the second stream is ever prepared (`left: 16384, right:
-    /// 32768`). Three witnesses to one truncation vector, at three different
+    /// first stream stalls on its `WouldBlock` round so the pass goes to
+    /// `H2WritePhase::End` before the second stream is ever prepared
+    /// (`left: 16384, right: 32768`). Three witnesses to one truncation vector, at three different
     /// depths — not a duplicate. No production `debug_assert!` fires: every
     /// scripted size is clamped to the gather's offer.
     #[test]
@@ -8139,18 +8480,20 @@ mod tests {
     /// A zero-byte write parks `expect_write` on the stalled stream and ends
     /// the pass, so the next tick resumes exactly it.
     ///
-    /// This is `write_streams`'s stall consumer — the
-    /// `set_expect_write(Some(H2StreamId::Other { .. })); break 'outer;` pair.
-    /// Without the park, the next `writable()` would re-enter the scheduler
-    /// from the top and re-run the priority ordering for a stream that is
-    /// merely waiting on the socket, and `finalize_write` would read
-    /// `expect_write_parked == false` and fall through to `Quiesce`, stripping
-    /// `Ready::WRITABLE` from a connection that has bytes to deliver.
+    /// This is `poll_write_target`'s stall consumer — the
+    /// `set_expect_write(Some(write_stream));` plus the move to
+    /// `H2WritePhase::End` in the `H2WritePhase::Flush` arm, `break 'outer`
+    /// before the inversion. Without the park, the next `writable()` would
+    /// re-enter the scheduler from the top and re-run the priority ordering
+    /// for a stream that is merely waiting on the socket, and `finalize_write`
+    /// would read `expect_write_parked == false` and fall through to
+    /// `Quiesce`, stripping `Ready::WRITABLE` from a connection that has bytes
+    /// to deliver.
     ///
     /// TO SEE THIS RED: delete the
-    /// `self.stream_table.set_expect_write(Some(H2StreamId::Other { id:
-    /// stream_id, gid: global_stream_id, }));` statement from that arm,
-    /// keeping the `break 'outer`. Measured: this test fails on its own first
+    /// `self.stream_table.set_expect_write(Some(write_stream));` statement
+    /// from that arm, keeping the `pass.phase = H2WritePhase::End;` that
+    /// follows it. Measured: this test fails on its own first
     /// assertion, `a stalled stream must park expect_write so the next pass
     /// resumes it`, with `left: None, right: Some(Other { id: 1, gid: 0 })`,
     /// and it is the ONLY failure in the suite.
@@ -8210,8 +8553,8 @@ mod tests {
 
     /// A stalled resume returns before the scheduler pass begins.
     ///
-    /// This is the OTHER stall consumer — the resume path's
-    /// `if outcome == FlushOutcome::Stalled { return MuxResult::Continue; }`.
+    /// This is the OTHER stall consumer — `H2WritePhase::Resume`'s
+    /// `if pass.stalled { return H2WriteTarget::Done(MuxResult::Continue); }`.
     /// The park it leaves standing is the point: falling through would clear
     /// `expect_write` on a stream the socket has just refused, and then run
     /// the whole priority ordering, converter pass and census for a
@@ -8220,12 +8563,13 @@ mod tests {
     /// The stream is registered even though the resume path reads its gid
     /// straight out of `expect_write` and needs no registration. That is what
     /// makes `vectored_calls` a witness: with the stream in the table, a pass
-    /// that continued into `'outer` would reach it again and issue a second
-    /// `socket_write_vectored`.
+    /// that fell through into the scheduler phases would reach it again and
+    /// issue a second `socket_write_vectored`.
     ///
-    /// TO SEE THIS RED: delete the `return MuxResult::Continue;` from that
-    /// arm, leaving the `if` with an empty body so control falls through to
-    /// `self.stream_table.set_expect_write(None);`. Measured: this test fails
+    /// TO SEE THIS RED: delete the
+    /// `return H2WriteTarget::Done(MuxResult::Continue);` from that arm,
+    /// leaving the `if pass.stalled {}` with an empty body so control falls
+    /// through to `self.stream_table.set_expect_write(None);`. Measured: this test fails
     /// on its own first assertion, `a stalled resume must leave expect_write
     /// parked`, with `left: None, right: Some(Other { id: 1, gid: 0 })`, and
     /// it is the ONLY failure in the suite. The
@@ -8282,8 +8626,9 @@ mod tests {
     /// `made_progress`, and `made_progress && any_pending_back()` is LIFECYCLE
     /// §9 invariant 16: it RETAINS `Ready::WRITABLE` because a pass that moved
     /// bytes and left blocks behind is a voluntary scheduler yield that will
-    /// resume itself. The resume path's drain is not that. It happens before
-    /// `'outer` runs, it is a socket-backpressure catch-up rather than a
+    /// resume itself. The resume path's drain is not that. It happens in
+    /// `H2WritePhase::Resume`, before the scheduler pass opens at all; it is a
+    /// socket-backpressure catch-up rather than a
     /// yield, and the stranded blocks it leaves belong to a stream the
     /// converter never reached this pass. Counting it as progress would keep
     /// WRITABLE armed on a connection whose scheduler pass did nothing, and
@@ -8295,14 +8640,15 @@ mod tests {
     /// `FinalizeAction::Quiesce`, which withdraws `Ready::WRITABLE` and waits
     /// for an external trigger.
     ///
-    /// TO SEE THIS RED: in `write_streams`, seed the pass total from the
-    /// resume counter — `write_pass.total_bytes_written =
-    /// write_pass.resume_bytes;` immediately before the `'outer` loop, where
-    /// the pre-field code declared `let mut total_bytes_written: usize = 0;`.
-    /// The hoist that recipe used to open with is now structural: both
-    /// counters are fields of `H2WritePass`, and keeping them apart is the
-    /// whole point. That is the shape a refactor unifying the two flush
-    /// sites would reach for. Measured: this test fails on its own first
+    /// TO SEE THIS RED: in `begin_scheduler_pass`, seed the pass total from
+    /// the resume counter — insert `pass.total_bytes_written =
+    /// pass.resume_bytes;` immediately before
+    /// `pass.adopt_scheduler_pass(converter_pass, order, census);`, which is
+    /// where the pre-image seeded `let mut total_bytes_written: usize = 0;`
+    /// ahead of its per-stream loop. Both counters are fields of
+    /// `H2WritePass` and keeping them apart is the whole point, so the shape
+    /// a refactor unifying the two flush paths would reach for is exactly this
+    /// one statement. Measured: this test fails on its own first
     /// assertion, `a pass whose scheduler loop wrote nothing must withdraw
     /// WRITABLE interest`, with `left: Writable | Error | Hup, right: Error |
     /// Hup`, and it is the ONLY failure in the suite.
@@ -8325,7 +8671,7 @@ mod tests {
                 gid,
             }));
         // A pending back-buffer, which is the OTHER half of invariant 16's
-        // condition. `flush_stream_out` drains `out` and never touches
+        // condition. The flush drains `out` and never touches
         // `blocks`, so this block survives the resume and makes
         // `any_stream_has_pending_back` answer true — leaving `made_progress`
         // as the single input that decides Quiesce against RetainPendingBack.
@@ -8385,9 +8731,9 @@ mod tests {
     // gate at `if kawa.is_main_phase() || ...` — `kawa.prepare`, the
     // `*parts.window` debit, `flow_control.consume_send_window`,
     // `census.note_fired` and the `freshly_emitted_rsts` push — ONCE per
-    // stream per pass, outside `flush_stream_out`'s `while !kawa.out.is_empty()`
-    // loop. A restructure that lifted those rounds up into `write_streams`
-    // and brought the prepare with them would debit the send window twice for
+    // stream per pass, in `H2WritePhase::Prepare` and outside the round-again
+    // `H2WritePhase::Flush` re-enters. A restructure that lifted those rounds
+    // up beside the prepare would debit the send window twice for
     // one stream's single scheduling turn: a connection would believe it had
     // spent credit it never put on the wire, and would stall itself short of
     // the peer's real window.
@@ -8528,16 +8874,15 @@ mod tests {
     ///
     /// WHAT THE EXISTING FIXTURE CANNOT SEE. `a_partial_write_reporting_would_block_continues_the_pass`
     /// drives the identical two-round flush and stays green under every edit
-    /// below, because it calls `flush_stream_out` directly: no `Context`, no
-    /// scheduler, no converter, no `H2FlowControl` — it never runs a prepare
-    /// at all, so no amount of re-preparing is representable in it. Its
-    /// through-`writable()` twin cannot see it either: that stream's parsing
-    /// phase leaves the prepare gate shut by construction.
+    /// below: its stream's parsing phase leaves the prepare gate shut by
+    /// construction, so it never runs a prepare at all and no amount of
+    /// re-preparing is representable in it. Its through-`writable()` twin
+    /// cannot see it either, for the same reason.
     ///
-    /// TO SEE THIS RED: in `write_streams`, change
-    /// `'outer: for &stream_id in &order {` to
-    /// `'outer: for &stream_id in order.iter().chain(order.iter()) {`, so each
-    /// stream takes a second turn — prepare included — within one pass.
+    /// TO SEE THIS RED: in `begin_scheduler_pass`, insert
+    /// `let order: Vec<StreamId> = order.iter().chain(order.iter()).copied().collect();`
+    /// immediately before `pass.adopt_scheduler_pass(converter_pass, order, census);`,
+    /// so each stream takes a second turn — prepare included — within one pass.
     /// Measured: this test fails on its own first assertion, `one write pass
     /// must debit the connection send window once per stream`, with
     /// `left: 65535, right: 32768`, and it is the ONLY failure in the suite.
@@ -8552,13 +8897,13 @@ mod tests {
     /// where it reads `left: 16384, right: 32768` because stream 1's stall
     /// ends the pass before stream 3 is prepared.
     ///
-    /// This is NOT keyed on the partial write, and the name says so. A
-    /// round-again-keyed edit is not expressible in `write_streams`:
-    /// `flush_stream_out` drains `kawa.out` completely or stalls, so the rounds
-    /// are invisible above it and there is no `if the flush went round again`
-    /// to hang a second prepare on. Forcing a second visit is the smallest
-    /// honest statement of the same bug, and it is what the refactor would
-    /// actually produce.
+    /// This is NOT keyed on the partial write, and the name says so. The
+    /// inversion makes the rounds visible — `H2WritePhase::Flush` is re-entered
+    /// once per round — but the prepare is not in that phase to be repeated:
+    /// it lives in `H2WritePhase::Prepare`, which a round-again never returns
+    /// to. Forcing a second visit of the whole order is the smallest honest
+    /// statement of the same bug, and it is what a restructure that folded the
+    /// two phases together would actually produce.
     #[test]
     fn a_yielded_incremental_stream_is_prepared_once_per_pass() {
         let pool = make_pool_for_invariant_16();
@@ -8633,8 +8978,8 @@ mod tests {
     /// A pass's byte total accumulates across streams: a later stream that
     /// writes nothing must not erase what an earlier one delivered.
     ///
-    /// `write_pass.total_bytes_written.saturating_add(write_pass.stream_bytes)`
-    /// is the whole of it, and nothing pinned it. `finalize_write` hands the
+    /// `pass.total_bytes_written.saturating_add(pass.stream_bytes)` in
+    /// `H2WritePhase::Flush` is the whole of it, and nothing pinned it. `finalize_write` hands the
     /// total to `h2_close::finalize_action` as `made_progress`, and
     /// `made_progress && any_pending_back()` is LIFECYCLE §9 invariant 16 — the
     /// arm that RETAINS `Ready::WRITABLE` for a pass that moved bytes and left
@@ -8653,11 +8998,12 @@ mod tests {
     /// flow-control-stall arm, which returns the chunk untouched and leaves
     /// `kawa.out` empty so its flush never calls the socket at all.
     ///
-    /// TO SEE THIS RED: in `write_streams`, change the accumulation into
-    /// `write_pass.total_bytes_written = write_pass.stream_bytes;` — the shape
-    /// a rewrite that
-    /// folds the resume and main flush paths into one per-stream counter
-    /// naturally reaches for. Measured: this test fails on its own first
+    /// TO SEE THIS RED: in `poll_write_target`'s `H2WritePhase::Flush` arm,
+    /// change the accumulation
+    /// `pass.total_bytes_written = pass.total_bytes_written.saturating_add(pass.stream_bytes);`
+    /// into `pass.total_bytes_written = pass.stream_bytes;` — the shape a
+    /// rewrite that folds the resume and main flush paths into one per-stream
+    /// counter naturally reaches for. Measured: this test fails on its own first
     /// assertion, `a pass that delivered bytes and left blocks queued must
     /// RETAIN WRITABLE interest`, with `left: Error | Hup, right: Writable |
     /// Error | Hup`, and it is the only failure in the suite. Measured without
