@@ -1706,11 +1706,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     {
                         // RFC 9113 §6.8: after sending a GOAWAY, the proxy
                         // MUST NOT accept new streams.
-                        // `graceful_goaway` sets `drain.draining = true`
-                        // and sends an initial GOAWAY with last_stream_id =
+                        // `graceful_goaway` marks the connection draining
+                        // through `H2DrainState::begin_graceful_drain`, then
+                        // sends an initial GOAWAY with last_stream_id =
                         // STREAM_ID_MAX (so in-flight requests are still
-                        // accepted), but the contract for *new* peer-
-                        // initiated streams is that they must be refused.
+                        // accepted); *new* peer streams must still be refused.
                         // Without this check, a peer racing the drain
                         // window could open arbitrary new streams between
                         // the initial and final GOAWAY emission.

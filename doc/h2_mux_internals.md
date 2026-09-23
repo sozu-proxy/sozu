@@ -215,7 +215,10 @@ Priority entries are removed at 4 lifecycle sites to prevent HashMap growth:
 
 1. **dead_streams loop** (end of `write_streams`): `self.prioriser.remove(&stream_id)`
 2. **RST_STREAM received** (in `handle_frame`): cleaned via stream removal
-3. **GoAway processing** (`close_all_streams`): streams map is cleared
+3. **GoAway processing** (`handle_goaway_frame`, plus
+   `prune_inactive_streams_while_closing` for streams that never opened):
+   cleaned via stream removal, one retired stream at a time — neither site
+   clears the map wholesale
 4. **`end_stream`** (backend-initiated close): `self.prioriser.remove(&id)`
 
 ---

@@ -355,6 +355,42 @@
 
 ### 🐛 Fixed
 
+- **`docs(mux-h2)`: correct five places that still described `H2DrainState`'s fields as reachable
+  from `h2.rs`, two of them false rather than merely loose.** #1425 moved the RFC 9113 §6.8
+  GOAWAY/drain state machine into `lib/src/protocol/mux/h2_drain.rs` and made all five of
+  `H2DrainState`'s fields — `draining`, `peer_last_stream_id`, `started_at`,
+  `graceful_shutdown_deadline`, `initial_goaway_pending` — private to that module.
+  `lib/src/protocol/mux/LIFECYCLE.md` §8.3 still attributed `drain.started_at = Some(now)` to
+  `ConnectionH2::graceful_goaway`, a site that cannot perform it: `graceful_goaway` reads and
+  writes none of the five, delegating the decision to `H2DrainState::begin_graceful_drain`. The
+  passage now names that method and pins the `debug_assert!` guarding the assignment as a fenced
+  quote of `h2_drain.rs`, so the invariant it encodes — the
+  forced-close budget is armed exactly once, on the first call — is carried by the source itself
+  rather than paraphrased beside it and free to drift. A later drain returns
+  `GracefulDrainDecision::AlreadyDraining` before reaching the assignment, so it can neither
+  re-arm nor extend the budget. The same false attribution sat in production source: the
+  RFC 9113 §6.8 comment guarding new peer-initiated streams in `ConnectionH2::readable` said
+  `graceful_goaway` sets `drain.draining = true`. Only that mechanism clause changed; the argument
+  around it — why a peer racing the drain window must still be refused a new stream — was correct
+  and is kept. `doc/h2_mux_internals.md`'s priority-cleanup list cited `close_all_streams` for its
+  GOAWAY step. No such function has ever existed under `lib/`, at any revision, so this predates
+  #1425 and is not extraction fallout; `ConnectionH2::goaway` is the nearest-sounding real
+  function and is the wrong target, touching neither the prioriser nor the stream map. GOAWAY-time
+  priority removal is `handle_goaway_frame` plus `prune_inactive_streams_while_closing`, both
+  reaching `remove_dead_stream` once per retired stream, and neither clears the map wholesale as
+  the entry claimed. `doc/lifetime_of_a_session.md` placed `H2DrainState::draining` in
+  `lib/src/protocol/mux/h2.rs`; it lives in `h2_drain.rs`. `doc/architecture.md`'s sub-struct list
+  credited `H2DrainState` with "pending RST streams", which are `H2StreamTable`'s
+  `pending_rst_streams`. Replacing a wrong five-field list with a right one would have kept the
+  copy that drifted, so the bullet now names the struct's role and the module its fields are
+  private to and enumerates nothing. None of
+  the five was reachable by any rule in `.github/scripts/check_doc_citations.py` when written: the
+  drift rule compares a cited line at two revisions and these documents do not modify `h2.rs`, so
+  their cited text is identical at base and head; the dead-name rule resolves test names only,
+  never a production function such as `close_all_streams`; and a code comment is inside no rule at
+  all. The quoted `debug_assert!` is the one that need not stay unreachable, and the pin puts it
+  under the fenced-block rule from the next changeset onward.
+
 - **`fix(doc)`: repair the six wrong `configure.md` line targets, and make the citation resolver
   see markdown targets at all.**
   `.github/scripts/check_doc_citations.py` matched `.rs` alone, so its `CITATION` pattern walked

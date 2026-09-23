@@ -365,7 +365,7 @@ The H2 mux owns a few invariants that are easy to break by accident:
   interactive request.
 - **GOAWAY and graceful drain.** After GOAWAY(NO_ERROR) the connection
   enters draining mode (`H2DrainState::draining`,
-  `lib/src/protocol/mux/h2.rs`); new
+  `lib/src/protocol/mux/h2_drain.rs`); new
   peer streams must be refused (RFC 9113 §6.8) and existing streams
   must complete. The graceful-shutdown deadline is driven from the
   listener config (`HttpsListener::get_h2_graceful_shutdown_deadline`,

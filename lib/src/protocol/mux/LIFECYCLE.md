@@ -1039,9 +1039,23 @@ shutdown or listener reload. It:
    complete and consumed.
 5. Returns `true` when no `Linked` or non-quiesced `Unlinked` streams remain.
 
-The forced-close deadline is armed the first time `graceful_goaway`
-(`h2.rs`) transitions `drain.draining` to `true`: that site sets
-`drain.started_at = Some(now)` from the caller's snapshot — `now` is
+The forced-close deadline is armed inside
+[`H2DrainState::begin_graceful_drain`](h2_drain.rs), which
+`ConnectionH2::graceful_goaway` (`h2.rs`) delegates the decision to —
+`graceful_goaway` itself reads and writes none of `H2DrainState`'s five
+private fields. `begin_graceful_drain` arms `started_at` from the `now` it is
+handed, and the `debug_assert!` guarding that assignment states the invariant
+the budget rests on:
+
+```rust lib/src/protocol/mux/h2_drain.rs:234-237
+debug_assert!(
+    self.started_at.is_none(),
+    "begin_graceful_drain must arm started_at exactly once, on the first call"
+);
+```
+
+A later drain returns `GracefulDrainDecision::AlreadyDraining` before reaching
+the assignment, so it can neither re-arm nor extend the budget. `now` is
 `graceful_goaway`'s one parameter precisely because its caller,
 `Mux::shutting_down`, runs outside the pass that last refreshed the mirror. The budget itself comes from the
 listener knob `h2_graceful_shutdown_deadline_seconds` (proto field
