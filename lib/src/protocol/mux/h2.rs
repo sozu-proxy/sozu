@@ -35,7 +35,7 @@ use crate::{
         BackendStatus, Context, DebugEvent, DebugHistory, Endpoint, GenericHttpStream,
         GlobalStreamId, MuxResult, Position, Stream, StreamId, StreamState, converter,
         forcefully_terminate_answer,
-        h2_close::{self, CloseAction, TlsFlushPhase},
+        h2_close::{self, CloseAction, FinalizeAction, TlsFlushPhase},
         h2_control_tx,
         h2_drain::{self, GracefulDrainDecision},
         h2_flood_detector::{self, H2FloodConfig, H2FloodViolation},
@@ -2884,53 +2884,115 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return self.graceful_goaway(self.now);
         }
 
-        if self.socket.socket_wants_write() {
-            if !socket_write {
-                self.socket.socket_write(&[]);
-            }
-            // Edge-triggered epoll: re-arm WRITABLE if rustls still has
-            // pending encrypted data (first check triggers flush, second re-checks).
-            self.ensure_tls_flushed();
-        } else if self.stream_table.expect_write().is_none() {
-            // LIFECYCLE §9 invariant 16: retain `Ready::WRITABLE` when a
-            // voluntary scheduler yield leaves stranded bytes in a stream's
-            // `back.out`/`back.blocks` *after* the pass made forward
-            // progress. Requiring progress avoids the degenerate no-progress
-            // loop (e.g. flow-control-starved streams) that would otherwise
-            // busy-spin against the session dispatcher.
-            if bytes_written_this_pass > 0
-                && any_stream_has_pending_back(self.stream_table.streams(), &context.streams)
-            {
+        // The flush triple and the readiness policy behind it are one
+        // decision, taken in `h2_close` where it is enumerable without a
+        // socket. Why it is a sibling of `CloseAction` rather than four more
+        // of its variants, why the conditional middle flush is an INPUT
+        // instead of an `if` kept here, and why the invariant-16 probe is
+        // passed as a closure: `h2_close::finalize_action`.
+        // Bound rather than matched inline: the invariant-16 probe below
+        // borrows `self.stream_table` and `context.streams`, and a `match`
+        // keeps its scrutinee's temporaries alive for every arm — including
+        // the arms that need `&mut self.readiness` and `&mut context.debug`.
+        let action = h2_close::finalize_action(
+            TlsFlushPhase::BeforeFlush,
+            self.socket.socket_wants_write(),
+            socket_write,
+            self.stream_table.expect_write().is_some(),
+            bytes_written_this_pass > 0,
+            || any_stream_has_pending_back(self.stream_table.streams(), &context.streams),
+            self.control_tx.has_pending() || !self.flow_control.pending_window_updates_is_empty(),
+        );
+        match action {
+            // A parked `expect_write` owns the next tick: no bit moves.
+            FinalizeAction::Parked => return MuxResult::Continue,
+            // LIFECYCLE §9 invariant 16: a voluntary scheduler yield left
+            // stranded bytes in a stream's `back.out`/`back.blocks` after a
+            // pass that made forward progress. Retaining `Ready::WRITABLE` is
+            // the ABSENCE of the withdrawal below, so this arm changes no bit
+            // — it only narrates.
+            FinalizeAction::RetainPendingBack => {
                 #[cfg(debug_assertions)]
                 context.debug.push(DebugEvent::Str(
                     "finalize_write: invariant 16 retained WRITABLE (pending back-buffer)"
                         .to_owned(),
                 ));
-            } else if self.control_tx.has_pending()
-                || !self.flow_control.pending_window_updates_is_empty()
-            {
-                // Control-frame liveness: `flush_pending_control_frames` is
-                // gated on `expect_write.is_none()`, so when a prior partial
-                // write deferred the flush the RST / WINDOW_UPDATE queues
-                // stay non-empty after `expect_write` finally drains. Without
-                // this rearm the next tick would drop `Ready::WRITABLE` and
-                // the queued RST would stall until an unrelated event
-                // re-triggered writable — which is exactly the scenario
-                // h2spec trips by sending back-to-back malformed streams.
+                return MuxResult::Continue;
+            }
+            // Control-frame liveness: `flush_pending_control_frames` is gated
+            // on `expect_write.is_none()`, so when a prior partial write
+            // deferred the flush the RST / WINDOW_UPDATE queues stay non-empty
+            // after `expect_write` finally drains. Without this rearm the next
+            // tick would drop `Ready::WRITABLE` and the queued RST would stall
+            // until an unrelated event re-triggered writable — which is
+            // exactly the scenario h2spec trips by sending back-to-back
+            // malformed streams.
+            FinalizeAction::ArmControlQueue => {
                 #[cfg(debug_assertions)]
                 context.debug.push(DebugEvent::Str(
                     "finalize_write: retained WRITABLE (control queue non-empty)".to_owned(),
                 ));
                 self.readiness.arm_writable();
                 incr!(names::h2::SIGNAL_WRITABLE_REARMED_CONTROL_QUEUE);
-            } else {
-                // We wrote everything
+                return MuxResult::Continue;
+            }
+            // We wrote everything.
+            FinalizeAction::Quiesce => {
                 #[cfg(debug_assertions)]
                 context.debug.push(DebugEvent::Str(format!(
                     "Wrote everything: {:?}",
                     self.stream_table.streams()
                 )));
                 self.readiness.interest.remove(Ready::WRITABLE);
+                return MuxResult::Continue;
+            }
+            // The two TLS answers differ only in the step performed here, and
+            // both fall through to the single post-flush query below.
+            FinalizeAction::Flush => {
+                self.socket.socket_write(&[]);
+            }
+            FinalizeAction::SkipFlush => {}
+            // Named rather than `other =>`: a wildcard arm would turn a new
+            // `FinalizeAction` variant into a release-mode panic on the proxy
+            // write path instead of a compile error.
+            action @ (FinalizeAction::ReArm | FinalizeAction::Settled) => {
+                unreachable!("BeforeFlush yielded {action:?}")
+            }
+        }
+
+        // Edge-triggered epoll: the second query is not a repeat of the first.
+        // It is the only way this site learns whether the flush landed —
+        // `socket_write(&[])`'s `(size, status)` is discarded — so it re-arms
+        // WRITABLE when rustls still holds encrypted data. The readiness
+        // policy above is deliberately NOT reopened here: once records were
+        // found pending, this pass leaves the bits to the next one. The
+        // degenerate arguments are the shape `goaway_close_action`'s own
+        // post-flush call already uses: the inputs the flush could not change
+        // are not re-read.
+        let action = h2_close::finalize_action(
+            TlsFlushPhase::AfterFlush,
+            self.socket.socket_wants_write(),
+            false,
+            false,
+            false,
+            || false,
+            false,
+        );
+        match action {
+            // `ensure_tls_flushed` asks a third time rather than re-arming
+            // outright, which is redundant — nothing mutates the socket
+            // between the two — and deliberate: it keeps every post-decision
+            // TLS re-arm in this file spelled the same way, as the GoAway and
+            // Error arms of `writable` already do.
+            FinalizeAction::ReArm => self.ensure_tls_flushed(),
+            FinalizeAction::Settled => {}
+            action @ (FinalizeAction::Flush
+            | FinalizeAction::SkipFlush
+            | FinalizeAction::Parked
+            | FinalizeAction::RetainPendingBack
+            | FinalizeAction::ArmControlQueue
+            | FinalizeAction::Quiesce) => {
+                unreachable!("AfterFlush yielded {action:?}")
             }
         }
         MuxResult::Continue
@@ -7287,10 +7349,15 @@ mod tests {
         fn write_error(&self) {}
     }
 
-    fn goaway_connection_with_backpressure(
+    /// `state` is a parameter rather than a second copy of this fixture: the
+    /// close decision reads it as `H2State::GoAway` and the write-pass
+    /// finalization reads it as `H2State::Header`, and both need the same
+    /// handler underneath.
+    fn connection_with_backpressure(
         pool: &Rc<RefCell<Pool>>,
         pending: usize,
         drain_per_flush: usize,
+        state: H2State,
     ) -> (ConnectionH2<BackpressuredTlsSocket>, std::net::TcpStream) {
         let (socket, peer) = connected_socket();
         let mut connection = ConnectionH2::new(
@@ -7307,7 +7374,7 @@ mod tests {
             Ready::WRITABLE | Ready::HUP | Ready::ERROR,
         )
         .expect("a pool with free buffers must yield an H2 connection");
-        connection.state = H2State::GoAway;
+        connection.state = state;
         (connection, peer)
     }
 
@@ -7329,7 +7396,7 @@ mod tests {
     fn a_flush_that_does_not_drain_keeps_the_connection_open() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
         // A kernel that accepts nothing: every flush leaves the records.
-        let (mut connection, _peer) = goaway_connection_with_backpressure(&pool, 2, 0);
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 2, 0, H2State::GoAway);
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
@@ -7401,7 +7468,7 @@ mod tests {
         // Two records, one drained per flush: the preamble takes one and the
         // GoAway arm's own flush takes the other, so the post-flush query is
         // the first one that can answer `false`.
-        let (mut connection, _peer) = goaway_connection_with_backpressure(&pool, 2, 1);
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 2, 1, H2State::GoAway);
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
@@ -7425,6 +7492,128 @@ mod tests {
             !matches!(result, MuxResult::Continue),
             "a drained flush must reach the disconnect in the SAME writable \
              call, not defer it to another tick: got {result:?}"
+        );
+    }
+
+    // ── The write pass's own flush triple (`finalize_write`) ────────────
+    //
+    // `ConnectionH2::finalize_write` ends every write pass with the same
+    // query / flush / query shape the close sites use, and its decision now
+    // lives beside theirs in `h2_close::finalize_action`. The two tests below
+    // are the CALLER half — that `h2.rs` performs the step each answer names
+    // and wires the inputs to the right parameters. The answers themselves are
+    // enumerated exhaustively in `h2_close`'s own tables, which no socket can
+    // reach: `SkipFlush`, `Parked` and `RetainPendingBack` are covered there
+    // only, because reaching them through `writable()` needs a stream carrying
+    // response bytes through the scheduler and none of this module's fixtures
+    // builds one. Same boundary `h2_close`'s `force_disconnect` re-arm branch
+    // already sits on.
+
+    /// The pass flushes once of its own and re-arms when records survive it.
+    ///
+    /// Three records, one drained per flush: `writable`'s preamble takes the
+    /// first, `finalize_write`'s own flush takes the second, and the third is
+    /// still pending when the post-flush query runs — so the re-arm branch is
+    /// reached with the socket genuinely still holding data, not by a fixture
+    /// that can only answer one way.
+    ///
+    /// TO SEE THIS RED, either half independently:
+    /// (a) empty the `FinalizeAction::Flush` arm of `finalize_write` (the
+    ///     `SkipFlush` behaviour, which is what a caller that dropped the
+    ///     `socket_write` input would do for every pass). The flush count
+    ///     assertion fails with `finalize_write must attempt exactly one
+    ///     empty-buffer flush of its own`.
+    /// (b) empty the `FinalizeAction::ReArm` arm. The event assertion fails
+    ///     with `the WRITABLE event must be re-signalled`.
+    /// Neither recipe reddens through a production `unreachable!`.
+    #[test]
+    fn a_finalized_write_pass_flushes_once_and_re_arms_while_records_survive() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 3, 1, H2State::Header);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: this harness must report buffered TLS records"
+        );
+        // Not the interest bit: `signal_pending_write` touches `event` only,
+        // and this fixture hands `Ready::WRITABLE` to `ConnectionH2::new` as
+        // its INTEREST, so an assertion written against interest would be
+        // reading the fixture's own argument back and could not see the
+        // re-arm at all.
+        assert!(
+            !connection.readiness.event.is_writable(),
+            "premise: the WRITABLE event must start clear so the re-arm below              is the only thing that can set it, got {:?}",
+            connection.readiness
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a write pass with records still buffered continues, got {result:?}"
+        );
+        assert_eq!(
+            connection.socket.flushes.get(),
+            2,
+            "finalize_write must attempt exactly one empty-buffer flush of its              own on top of the preamble's"
+        );
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: one record must survive both flushes, or the post-flush              query could only answer one way"
+        );
+        assert!(
+            connection.readiness.event.is_writable(),
+            "the WRITABLE event must be re-signalled so the event loop retries              the flush, got {:?}",
+            connection.readiness
+        );
+    }
+
+    /// A pass that owes nothing withdraws `Ready::WRITABLE` interest.
+    ///
+    /// This is the other side of the same decision: no TLS records (a plain
+    /// `mio::net::TcpStream` takes `socket_wants_write()`'s `false` default),
+    /// no parked `expect_write`, no bytes written, no queued control frame.
+    /// Forward progress must come from an external trigger, so the connection
+    /// relinquishes the bit rather than busy-spinning against the dispatcher.
+    ///
+    /// TO SEE THIS RED: delete `self.readiness.interest.remove(Ready::WRITABLE);`
+    /// from the `FinalizeAction::Quiesce` arm of `finalize_write`, leaving its
+    /// debug narration in place. The final assertion fails with `a pass that
+    /// owes nothing must relinquish WRITABLE interest`. The interest bit is
+    /// asserted here rather than the event bit because withdrawal is what this
+    /// branch does, and it is set by the test rather than by the fixture —
+    /// `test_h2_connection` arms `READABLE | HUP | ERROR` only.
+    #[test]
+    fn a_write_pass_that_owes_nothing_withdraws_writable_interest() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        connection.state = H2State::Header;
+        connection.readiness.interest.insert(Ready::WRITABLE);
+
+        assert!(
+            !connection.socket.socket_wants_write(),
+            "premise: a plain TcpStream holds no TLS records, so the readiness              policy is reached at all"
+        );
+        assert!(
+            connection.stream_table.expect_write().is_none(),
+            "premise: no parked partial write, or the policy is suppressed"
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "an empty write pass continues, got {result:?}"
+        );
+        assert!(
+            !connection.readiness.interest.is_writable(),
+            "a pass that owes nothing must relinquish WRITABLE interest, got              {:?}",
+            connection.readiness
         );
     }
 

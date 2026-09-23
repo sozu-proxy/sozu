@@ -179,7 +179,7 @@ Declared in `h2.rs` (`pub enum H2State`):
   (`h2.rs:1928` — one of four identical `self.expect_header();` lines, so the
   enclosing arm is named as well).
 - `Continuation*` states handle multi-frame HEADERS per RFC 9113 §4.3 — enter at
-  `h2.rs:4900`.
+  `h2.rs:4962`.
 - **Discard does not skip HPACK.** HPACK field-compression state is scoped to
   the *connection* (RFC 9113 §4.3), not the stream, so the bytes `Discard`
   drops on a refused stream are still a field block the peer's encoder has
@@ -467,8 +467,10 @@ Dereference sites:
   the `H2StreamId::Other` arm of `ConnectionH2::write_streams`'s `expect_write`
   block (`h2.rs`). By symbol, not line: that read is one of fourteen identical
   `let stream = &mut context.streams[global_stream_id];` lines.
-- `try_resume_reading` — reads `context.streams[global_stream_id]` at
-  `h2.rs:3586`.
+- `try_resume_reading` — reads `context.streams[global_stream_id]` in its
+  `expect_read` block (`h2.rs`). By symbol, not line: that read is the file's
+  only `let stream = &context.streams[global_stream_id];`, so the symbol
+  resolves unambiguously and cannot drift, which a line number here would.
 - `read_buffer` — indexes `context.streams[global_stream_id]` on behalf of
   both halves of the read protocol: `ConnectionH2::poll_read_target` and
   `ConnectionH2::handle_read` each hand it `&mut context.streams`, and its
@@ -522,12 +524,12 @@ routing discipline is compiler-enforced, not just documented):
 
 - `write_streams` after end-of-stream — `h2.rs:2291`/`h2.rs:2688`.
 - `prune_inactive_streams_while_closing` — `h2.rs:2849`.
-- `handle_window_update_frame` zero-increment path — `h2.rs:5585`.
-- `cancel_timed_out_streams` slow-multiplex guard — `h2.rs:3755`.
+- `handle_window_update_frame` zero-increment path — `h2.rs:5647`.
+- `cancel_timed_out_streams` slow-multiplex guard — `h2.rs:3817`.
 - `handle_continuation_header_state` CONTINUATION oversize — `h2.rs:1657`.
-- `handle_rst_stream_frame` peer RST — `h2.rs:5289`.
-- `handle_goaway_frame` retry loop — `h2.rs:5535`.
-- `end_stream` client-side retirement — `h2.rs:6069`.
+- `handle_rst_stream_frame` peer RST — `h2.rs:5351`.
+- `handle_goaway_frame` retry loop — `h2.rs:5597`.
+- `end_stream` client-side retirement — `h2.rs:6131`.
 
 No call site in this file performs `self.streams.remove(...)` inline: it
 cannot — `streams` is a private field of `h2_stream_table.rs`, so that
@@ -536,7 +538,7 @@ reintroduced inline `self.streams.remove(...)` inside `ConnectionH2` fails
 with `E0609: no field 'streams'`). The one exception below does not remove at
 all:
 
-- `close` backend-stream teardown — `h2.rs:5935-5937` (does not remove, only
+- `close` backend-stream teardown — `h2.rs:5997-5999` (does not remove, only
   notifies the endpoint — the surrounding `close` path drops the whole
   connection, and every entry in the wire map (`self.stream_table`) with it,
   shortly after).
@@ -613,7 +615,7 @@ re-validates every delivery and puts an early one back — §7.6.
   (`mod.rs:734`) while any stream is live, or the shorter `request_timeout`
   until the first `Link` transition (`mod.rs:1808-1810`).
 - Reset: on meaningful activity — HEADERS for an existing stream, DATA bytes —
-  see `h2.rs:4856` and the `arm_timeout()` call in the DATA-payload arm of
+  see `h2.rs:4918` and the `arm_timeout()` call in the DATA-payload arm of
   `ConnectionH2::poll_read_target` (`h2.rs`). That second one is by symbol, not line:
   the number it would carry is one the `context.streams[global_stream_id]`
   dereference bullet in §5.2 used at the base revision, and the drift rule
@@ -724,7 +726,7 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
    SETTINGS ACK is overdue (`h2.rs:1757-1767`) — before any read is offered.
 3. Then `ConnectionH2::handle_read` consumes the frame / payload.
 4. `writable()` mirrors this check, via `flush_pending_control_frames`
-   (`h2.rs:3017-3027`).
+   (`h2.rs:3079-3089`).
 5. If the frontend timer fires while streams are linked, the timeout logic in
    `Mux::timeout` (`mod.rs`) decides per-stream; backend timer fires independently.
 6. Loop budget (`MAX_LOOP_ITERATIONS = 10_000`, `mod.rs`) is a hard backstop
@@ -777,14 +779,14 @@ asymmetry that produces it is architectural:
 - An **arm** site runs at an arbitrary depth into its pass — the liveness
   refreshes in the DATA-payload arm of `ConnectionH2::poll_read_target` (`h2.rs`, by
   symbol for the collision the liveness `Reset:` bullet above records — do not
-  convert it back) and at `h2.rs:4887` (HEADERS), the
+  convert it back) and at `h2.rs:4949` (HEADERS), the
   outbound-byte refreshes at `h2.rs:2253` / `h2.rs:2559-2561`, the
   `FcStallAction::Arm` branch of `write_streams` (`h2.rs`) — and stamps the
   snapshot taken at the START of that pass. The
   stored instant is therefore OLDER than the event it records.
 - An **eval** site runs near the top of a pass: `cancel_timed_out_streams` is
   the first thing `readable` does (§7.4 step 1), and the SETTINGS-ACK check
-  (`h2.rs:1926` in `poll_read_target`, `h2.rs:3228` in `flush_pending_control_frames`)
+  (`h2.rs:1926` in `poll_read_target`, `h2.rs:3290` in `flush_pending_control_frames`)
   is step 2.
 - The measured age is therefore inflated by the arm site's depth, so a deadline
   can fire up to one pass **early** as well as one pass late. Worked against the
@@ -796,7 +798,7 @@ asymmetry that produces it is architectural:
   is bounded by one pass.
 
 The flood window (`maybe_reset_window`, `h2_flood_detector.rs`) and the
-RFC 9113 §5.1.2 back-pressure window (`h2.rs:3932`) are the one asymmetric case,
+RFC 9113 §5.1.2 back-pressure window (`h2.rs:3994`) are the one asymmetric case,
 and they
 **fail closed**: `now` is
 constant for the whole pass, so a window cannot decay part-way through one. A
@@ -962,8 +964,8 @@ Two GOAWAY frames in `ConnectionH2::graceful_goaway` (`h2.rs`):
    can still arrive. Called first time from `Mux::shutting_down` at
    `mod.rs:2380`. Draining flag set.
 2. **Final GOAWAY** — on the second invocation (draining already true), call
-   `goaway(NoError)` (`h2.rs:4178`) with the actual `highest_peer_stream_id`,
-   remove `READABLE` interest (`h2.rs:4134`), transition to `H2State::GoAway`.
+   `goaway(NoError)` (`h2.rs:4240`) with the actual `highest_peer_stream_id`,
+   remove `READABLE` interest (`h2.rs:4196`), transition to `H2State::GoAway`.
    Caller is `finalize_write` when all streams drain (`h2.rs:2884`).
 
 `peer_gone_after_final_goaway` (`h2.rs`) guards against deadlock on a
@@ -1075,7 +1077,9 @@ caller performs synchronously after return.
 completes but `pending_rst_streams` or `flow_control.pending_window_updates` are
 still non-empty — otherwise a partial write that deferred the RST_STREAM drain
 stage (gated on `expect_write.is_none()`) would strand a queued RST until an
-unrelated event re-raised the writable bit. This guard, together with the
+unrelated event re-raised the writable bit. The decision is
+`h2_close::finalize_action`'s `FinalizeAction::ArmControlQueue`;
+`finalize_write` owns the bits and calls `Readiness::arm_writable`. This guard, together with the
 invariant-15 arm
 inside `enqueue_rst`, closes the 18-check h2spec 2.0 gap previously reported in
 RFC 9113 §§5.3, 6.9, 8.1.2.
@@ -1135,11 +1139,11 @@ soft-stop.
 `ConnectionH2::end_stream` (`h2.rs`) is the server-side wiper for a single
 stream that has completed on the backend. Behavior depends on `Position`:
 
-- **Client** position (i.e. the backend's view) — `h2.rs:6031-6080`. Sends
+- **Client** position (i.e. the backend's view) — `h2.rs:6093-6142`. Sends
   RST_STREAM(CANCEL) unless both request and response have terminated, removes
   the wire mapping, marks the stream `Unlinked` if not already `Recycle`.
 - **Server** position — the `Position::Server` arm of `ConnectionH2::end_stream`
-  (`h2.rs:6081-6188`; the range start is one of eight identical
+  (`h2.rs:6143-6250`; the range start is one of eight identical
   `Position::Server => {` lines, hence the symbol). Dispatches on
   `end_stream_decision` (`shared.rs`): either `ForwardTerminated`,
   `CloseDelimited`, `ForwardUnterminated`, `SendDefault(status)`, `Reconnect`,
@@ -1267,8 +1271,8 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
    number here would anchor on text that says nothing about the rule. Do not
    convert it back.
 8. **No new streams during drain.** `create_stream` and `start_stream` both
-   short-circuit when `self.drain.draining()` (`h2.rs:4385-4392`,
-   `h2.rs:6202-6209`).
+   short-circuit when `self.drain.draining()` (`h2.rs:4447-4454`,
+   `h2.rs:6264-6271`).
 9. **Connection-level timer resets only on application activity.** H2 control
    frames (PING / WINDOW_UPDATE / SETTINGS) do **not** push
    `ConnectionH2.timeout_deadline` out. `arm_timeout()` has exactly three call
@@ -1328,7 +1332,13 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `Ready::WRITABLE` so the session dispatcher does not busy-spin — the next
     wake-up arrives from `WINDOW_UPDATE`, backend readable, or a new request.
     Enforced at runtime via the file-private helper
-    `any_stream_has_pending_back` (`h2.rs`). A voluntary scheduler yield (RFC
+    `any_stream_has_pending_back` (`h2.rs`), which `finalize_write` hands to
+    `h2_close::finalize_action` as a closure rather than a `bool` so the walk
+    stays behind the same short-circuit it had inline. The decision is that
+    function's `FinalizeAction::RetainPendingBack` (keep the bit) versus
+    `FinalizeAction::Quiesce` (withdraw it); `finalize_write` performs whichever
+    it is handed. The table is
+    `h2_close::tests::invariant_16_retains_writable_only_with_progress_and_pending_back`. A voluntary scheduler yield (RFC
     9218 incremental rotation and any future yield site) can leave bytes
     buffered without `expect_write` being set; stripping `WRITABLE` in that
     state strands the stream because edge-triggered epoll never re-fires for
@@ -1415,7 +1425,7 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     outside any pass — it seeds `now`, `refuse_window_start` and the flood
     detector's `window_start` from that one value. The reviewer check is
     `grep -nE 'Instant::now|SystemTime::now|\.elapsed\(\)' lib/src/protocol/mux/h2.rs`.
-    Every hit must be inside `#[cfg(test)] mod tests` (`h2.rs:6270` onward) or
+    Every hit must be inside `#[cfg(test)] mod tests` (`h2.rs:6332` onward) or
     that one constructor — there is no third carve-out any more.
     `h2_flood_detector.rs` (extracted from `h2.rs`; not covered by the
     `h2.rs`-scoped grep above) used to hold exactly that third exception —
@@ -1862,6 +1872,29 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `true`. The `ConnectionH2<FrontRustls>` fixture that would close that gap
     is sozu-proxy/sozu#1454, and it is still open.
 
+    **A fourth site shares the shape without deciding a close.**
+    `ConnectionH2::finalize_write` ends every write pass with the same
+    query / flush / query triple, and its answer is
+    `h2_close::finalize_action`. It is a sibling `FinalizeAction` and not four
+    more `CloseAction` variants because its non-flush branch is invariant 16's
+    readiness policy above, which decides nothing about closing — widening
+    `CloseAction` would force a named-impossible arm into every exhaustive
+    `match` `writable` already writes over it. Its middle flush is also
+    CONDITIONAL (`if !socket_write`), a third input the GOAWAY arm has no
+    analogue for; that `if` becomes an input and surfaces as two distinct
+    pre-flush answers rather than staying in `h2.rs`. Both points are argued
+    once in `h2_close`'s module doc; do not restate them here.
+    `a_finalized_write_pass_flushes_once_and_re_arms_while_records_survive`
+    (`h2.rs`) drives the flush-and-re-arm path through
+    `BackpressuredTlsSocket` in `H2State::Header` and
+    `a_write_pass_that_owes_nothing_withdraws_writable_interest` covers the
+    withdrawal. The other four answers — `SkipFlush`, `Parked`,
+    `RetainPendingBack` and `ArmControlQueue` — are pinned by `h2_close`'s pure
+    rows only; no assertion in `h2.rs` reads any of them. Reaching the first
+    three through `writable()` needs a stream carrying response bytes through
+    the scheduler, which no fixture in `h2.rs` builds.
+
+
 ---
 
 ## 10. Pointers for First Steps
@@ -1878,7 +1911,7 @@ If you are fixing a bug in this module:
 - **Truncated response / TLS decode error** — check `has_pending_write`
   (`h2.rs`), `delay_close_for_frontend_flush` (`mod.rs`), and the TLS
   drain logic in the `Position::Server` arm of `ConnectionH2::close`
-  (`h2.rs:5825-5923`; the range start is one of eight identical
+  (`h2.rs:5887-5985`; the range start is one of eight identical
   `Position::Server => {` lines, hence the symbol).
 - **Stream count underflows `max_concurrent_streams`** — see
   `prune_inactive_streams_while_closing` (`h2.rs`) and make sure every
@@ -1895,12 +1928,12 @@ current when you touch the file — greppable as "Last revision date".
 
 ## 11. Close-path log severity tiers
 
-The TLS-drain warning at `ConnectionH2::close` (`h2.rs:5862-5922`, `Position::Server`
+The TLS-drain warning at `ConnectionH2::close` (`h2.rs:5924-5984`, `Position::Server`
 arm) fires when `socket_wants_write()` is still true after `MAX_DRAIN_ROUNDS`
 empty `socket_write_vectored(&[])` calls. The severity is tiered along
 **stream-count + close-state**, not peer-vs-operator. The tier is intentionally
 orthogonal to — and composes with — the send-side `H2Error`-variant tier in
-`goaway()` (`h2.rs:4116-4120`); both rules demote benign paths and keep
+`goaway()` (`h2.rs:4178-4182`); both rules demote benign paths and keep
 loss-bearing paths loud.
 
 | Stream count   | `H2State`           | Severity | Rationale                                                                                                                                                                                                                                                                         |

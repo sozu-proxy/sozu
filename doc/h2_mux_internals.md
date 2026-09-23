@@ -526,7 +526,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:3403-3416
+```rust lib/src/protocol/mux/h2.rs:3465-3478
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -550,7 +550,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:3449-3455
+```rust lib/src/protocol/mux/h2.rs:3511-3517
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -563,13 +563,13 @@ stream.generate_access_log(
 The other three sites take the `&mut self` wrapper
 `ConnectionH2::distribute_overhead` instead, and each emits its own log:
 
-- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3741`) passes a
+- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3803`) passes a
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5272`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5334`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:5991`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6053`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -690,7 +690,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:3158-3162
+```rust lib/src/protocol/mux/h2.rs:3220-3224
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -839,6 +839,35 @@ remaining overhead pool to one stream — so retiring inline would let a later
 completer of the same pass drain that pool while other streams are still
 live.
 
+### finalize_write()
+
+`write_streams` ends by asking `finalize_write` what the pass owes the next
+tick. After the RFC 9113 §6.8 graceful-GOAWAY check (draining with every stream
+gone), the rest is one decision taken in `h2_close::finalize_action` and
+performed here:
+
+| answer | what `finalize_write` does |
+|---|---|
+| `Flush` | rustls holds records and the pass wrote nothing: `socket_write(&[])`, then re-ask with `TlsFlushPhase::AfterFlush` |
+| `SkipFlush` | rustls holds records but `socket_write_vectored` already attempted this pass's flush: go straight to the post-flush query |
+| `Parked` | a partial write set `expect_write`: it owns the next tick, no bit moves |
+| `RetainPendingBack` | LIFECYCLE §9 invariant 16: progress plus queued response bytes, so `Ready::WRITABLE` survives (the absence of the withdrawal below) |
+| `ArmControlQueue` | a deferred RST_STREAM / WINDOW_UPDATE is still queued: `Readiness::arm_writable` |
+| `Quiesce` | nothing owed anywhere: withdraw `Ready::WRITABLE` interest |
+| `ReArm` | post-flush: records survived, re-arm the edge-triggered WRITABLE event |
+| `Settled` | post-flush: the kernel took everything |
+
+Two things about that list are worth knowing before changing it. The pre-flush
+answers and the post-flush answers are disjoint, and the caller matches both
+sets exhaustively with named-impossible arms rather than a wildcard — a `_` arm
+would turn a new variant into a release-mode panic on the write path instead of
+a compile error. And `socket_write(&[])`'s `(size, status)` is discarded here,
+as it is at the close sites: the post-flush `socket_wants_write()` query is how
+this path learns whether the flush landed, so no `SocketResult` reaches the
+decision. `flush_zero_buffer()` is the one site on the write path that does
+consume a status, through `update_readiness_after_write`.
+
+
 ### The gather/confirm pair (`h2_transmit.rs`)
 
 `flush_stream_out` does not write a stream's bytes in one call. Each round:
@@ -870,7 +899,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4317
+```rust lib/src/protocol/mux/h2.rs:4379
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -1023,7 +1052,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5315-5317
+```rust lib/src/protocol/mux/h2.rs:5377-5379
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1031,7 +1060,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5329-5335
+```rust lib/src/protocol/mux/h2.rs:5391-5397
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

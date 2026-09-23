@@ -77,6 +77,120 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the end of an H2 write pass becomes a decision instead of a flush triple —
+  `ConnectionH2::finalize_write` asks `h2_close::finalize_action` and performs the answer.**
+  `finalize_write` held the last unconverted instance of the query / flush / query shape the close
+  sites already delegate: `socket_wants_write()`, a conditional `socket_write(&[])`, then
+  `ensure_tls_flushed()`'s second `socket_wants_write()`. It is now one
+  `h2_close::finalize_action(TlsFlushPhase::BeforeFlush, …)` call followed by the same function at
+  `AfterFlush`, with `h2.rs` performing whichever step each answer names. The same flush between
+  them, the same `Readiness` mutations, the same debug narration, the same `MuxResult::Continue`,
+  and zero lines of `write_streams`' `'outer` loop move — **with one declared exception, on one
+  path.** Counting `socket_wants_write()` per write pass:
+
+  | path | base | now |
+  | --- | --- | --- |
+  | no TLS backpressure — the common case | 1 | **1** |
+  | backpressure, the flush clears the records (`Settled`) | 2 | 2 |
+  | backpressure, records survive the flush (`ReArm`) | 2 | **3** |
+
+  `finalize_action` returns `Flush`/`SkipFlush` only when `tls_wants_write` is true
+  (`h2_close.rs`); every other `BeforeFlush` answer returns early in `h2.rs`, so an uncongested
+  pass still asks exactly once, as the pre-image did — its `ensure_tls_flushed()` also sat inside
+  the `if self.socket.socket_wants_write()` branch. The third query is `FinalizeAction::ReArm`
+  (`h2.rs:2987`) calling `ensure_tls_flushed()`, whose own `socket_wants_write()` (`h2.rs:2786`)
+  re-asks what the `AfterFlush` decision (`h2.rs:2974`) already knows. It is redundant — nothing
+  mutates the socket between them — and deliberate: it keeps every post-decision TLS re-arm in this
+  file spelled the same way, as the GoAway and Error arms of `writable` already do, and keeps this
+  commit free of an unrelated change. It is also cheap: `FrontRustls::socket_wants_write` is
+  `!self.peer_reset && self.session.wants_write()` (`lib/src/socket.rs`), and rustls' `wants_write`
+  is an `is_empty()` on the sendable-TLS deque — two L1-hot loads and two branches, no syscall and
+  no record encode, on the congested path immediately before a WRITABLE re-arm and another
+  event-loop trip.
+
+  **What that cheapness rests on, stated rather than inferred:** `FrontRustls` is the only
+  *production* `SocketHandler` that overrides `socket_wants_write()`; every other one takes the
+  trait's `false` default (`lib/src/socket.rs`), so no other production handler reaches the query
+  at all. A future handler — kTLS, or OpenSSL via `SSL_has_pending` — could make it a syscall, at
+  which point the `ReArm` arm should carry the answer it already has instead of re-asking. The one
+  non-`FrontRustls` handler that does override it is this changeset's own `BackpressuredTlsSocket`
+  test harness (`h2.rs`), which is what drives the backpressure path under test.
+
+  `signal_pending_write()` still has exactly 13 production call sites; `self.socket` in `h2.rs`
+  goes 34 → 35 raw and 27 → 28 effective (7 doc-comment mentions at both revisions).
+
+  **A sibling `FinalizeAction`, not a widened `CloseAction`.** Every `CloseAction` variant answers
+  "may this connection close, or must it keep draining". `finalize_write`'s non-flush branch
+  answers a different question — which `Readiness` bits the next tick needs, which is LIFECYCLE §9
+  invariant 16's readiness policy — and decides nothing about closing. Widening `CloseAction` would
+  have forced a named-impossible arm into every exhaustive `match` `ConnectionH2::writable` already
+  writes over it, for variants that can never reach those arms. `TlsFlushPhase` is shared rather
+  than duplicated, because the two-query distinction is the identical one.
+
+  **The conditional middle flush becomes a third input.** `finalize_write`'s flush is guarded by
+  `if !socket_write`: a pass that already pushed bytes through `socket_write_vectored` attempted
+  this pass's flush as a side effect, and the GOAWAY arm has no analogue for that. The `if` does
+  not stay behind in `h2.rs` — it becomes the `socket_write` input and surfaces as two distinct
+  pre-flush answers, `Flush` and `SkipFlush`, which differ only in the step the caller performs and
+  both lead to the same post-flush query. Eight variants in all — `Flush`, `SkipFlush`, `Parked`,
+  `RetainPendingBack`, `ArmControlQueue`, `Quiesce` before the flush, `ReArm` and `Settled` after
+  it — and both caller matches are exhaustive with named-impossible arms. No `_`, and no
+  `other => unreachable!`: a wildcard in either spelling compiles when a variant is added and
+  becomes a release-mode panic on the proxy write path instead of a compile error.
+
+  **The invariant-16 probe is passed as a closure, and that is a cost decision rather than taste.**
+  `any_stream_has_pending_back` walks every open stream of the connection, and the pre-image
+  reached it only under `!socket_wants_write && expect_write.is_none() && bytes_written > 0`. A
+  `bool` parameter — the one-bit projection every other input uses — would have made the caller run
+  that walk on every write pass instead, including every TLS-backpressured one and every
+  zero-progress one, which is a cost regression wearing "no behaviour change" as a disguise.
+  `FnOnce` keeps the short-circuit inside the decision, where it is testable:
+  `the_invariant_16_probe_is_not_walked_while_rustls_holds_records` and
+  `the_invariant_16_probe_is_not_walked_without_progress` pin that it stays uncalled, the second
+  against a mutation that changes no answer at all — `&&` is commutative in value — and only moves
+  the work.
+
+  **No `SocketResult` reaches the decision.** `finalize_write` discards `socket_write(&[])`'s
+  `(size, status)` exactly as the close sites do; the post-flush `socket_wants_write()` query is
+  how it learns whether the flush landed. That is worth stating rather than assuming, because
+  `update_readiness` treats `size > 0` with a `WouldBlock` status as NOT stalled — it clears the
+  WRITABLE event bit and returns `false`, so `flush_stream_out` issues another write — and a
+  decision function that took a status and read `status != Continue` as a terminator would silently
+  drop that second attempt. `flush_zero_buffer` is the one write-path site that does consume a
+  status; it is a different symbol and stays inline.
+
+  Ten pure tables in `h2_close` and two `writable()` tests in `h2.rs`. The tables sweep full cross
+  products rather than re-deriving the priority chain: TLS backpressure dominates all sixteen
+  readiness-input combinations, a parked `expect_write` dominates the remaining eight, the
+  pre-flush and post-flush answer sets are proved disjoint in both directions, and invariant 16's
+  retain/withdraw decision is written as eight explicit rows.
+  `a_finalized_write_pass_flushes_once_and_re_arms_while_records_survive` drives a real
+  `ConnectionH2` over `BackpressuredTlsSocket` in `H2State::Header` with three records and one
+  drained per flush, so `writable`'s preamble takes the first, `finalize_write`'s own flush takes
+  the second, and the third survives — which is what lets the post-flush query answer something the
+  fixture could not have answered by construction;
+  `a_write_pass_that_owes_nothing_withdraws_writable_interest` covers the withdrawal. The other
+  four answers — `SkipFlush`, `Parked`, `RetainPendingBack` and `ArmControlQueue` — are pinned by
+  the pure rows only; no assertion in `h2.rs` reads any of them, and reaching the first three
+  through `writable()` needs a stream carrying response bytes through the scheduler that no fixture
+  in `h2.rs` builds. That is the same boundary `h2_close`'s `force_disconnect` re-arm branch already
+  sits on. Every "TO SEE THIS RED" recipe was executed rather than asserted; each reddens its own
+  test on its own assertion, none through a production `unreachable!` or `debug_assert!`.
+
+  Docs: `doc/h2_mux_internals.md` gains a `finalize_write()` section carrying the answer table,
+  LIFECYCLE.md's invariant 16 and invariant 27 name the decision's new home while `finalize_write`
+  keeps the `Readiness` bits, and §8.2's control-queue retain names its answer. Against its parent,
+  32 citations into `h2.rs`, carrying 46 line numbers, change number by a difflib alignment map
+  over the cited file, each landing on byte-identical text inside the same `fn`. One citation is
+  converted to a symbol — §5.2's `try_resume_reading` dereference becomes "the `expect_read`
+  block", because that read is the file's only
+  `let stream = &context.streams[global_stream_id];`, so the symbol resolves unambiguously while a
+  line number there cannot. Its REASON changed rather than whether it happens: it used to be a
+  collision with a number a different bullet held, and `d8b8546e` retired that collision by
+  replacing the `Link` bullet's six numbers with eight symbols and the `Recycle` bullet's four with
+  four. §3.1's `Link` transition list, which this step also used to convert, therefore needs
+  nothing.
+
 - **`refactor(mux-h2)`: `ConnectionH2::readable` becomes a two-call protocol — the core names the
   buffer it wants filled, the caller reads, the core is told how many bytes arrived and with what
   status.** This is the read-side mirror of `h2_transmit::gather` / `confirm`, which already split
