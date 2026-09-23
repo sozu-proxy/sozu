@@ -2765,13 +2765,26 @@ mod tests {
     ) {
         let (mut mux, peer) = h1_mux_with_idle_stream(pool, Duration::from_secs(60));
         let stream = &mut mux.context.streams[0];
-        stream.context.method = Some(method);
+        // The capture is armed while the method is still `Get`, and the method
+        // under test is set afterwards. Since sozu-proxy/sozu#1450
+        // `arm_upstream_replay` refuses to capture a non-idempotent request at
+        // all, so arming under `method` would leave the POST and `PATCH` cases
+        // below with no capture — and they would then be observing the ARM
+        // guard rather than the conjunct they exist to pin. Staging it this way
+        // keeps `Stream::can_replay_on_fresh_upstream`'s own idempotence
+        // conjunct as the thing under test: dropping that conjunct still
+        // reddens them. Production cannot reach this state any more, because a
+        // request's method does not change after its headers are parsed, which
+        // is exactly why the conjunct is now defense in depth and why these
+        // tests are what keep it honest.
+        stream.context.method = Some(Method::Get);
         stream.arm_upstream_replay();
         stream
             .retry_buffer
             .as_mut()
             .expect("arm_upstream_replay must install a buffer")
             .extend_from_slice(b"GET /api HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        stream.context.method = Some(method);
         stream.front.consumed = true;
         // The upstream produced nothing: not in body phase, nothing forwarded,
         // nothing buffered.
@@ -2833,7 +2846,15 @@ mod tests {
             .checked_sub(unwritten_tail)
             .expect("the unwritten tail must fit inside the serialized request");
         stream.context.method = Some(Method::Get);
-        stream.retry_buffer = Some(serialized[..accepted].to_vec());
+        // Through `arm_upstream_replay` rather than by assigning the field:
+        // the capture owns a charge against `MAX_ARMED_REPLAY_CAPTURES`, so a
+        // hand-built one would release a charge it never took.
+        stream.arm_upstream_replay();
+        stream
+            .retry_buffer
+            .as_mut()
+            .expect("arm_upstream_replay must install a buffer")
+            .extend_from_slice(&serialized[..accepted]);
         stream.front.consume(accepted);
         stream.front.consumed = true;
         serialized
@@ -3032,7 +3053,7 @@ mod tests {
             .retry_buffer
             .as_ref()
             .expect("the staged stream carries a capture")
-            .clone();
+            .to_vec();
 
         assert_eq!(stream.queue_upstream_replay(), Some(captured.len()));
 

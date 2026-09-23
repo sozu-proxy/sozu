@@ -39,7 +39,7 @@ by the main process and workers (like the log level):
 | `disable_cluster_metrics`     | if `true`, per-cluster metrics are not registered. Defaults to `false` (cluster metrics enabled)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | `true`, `false`                           |
 | `handle_process_affinity`     | bind workers to cpu cores.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |                                           |
 | `max_connections`             | maximum number of simultaneous / opened connections                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |                                           |
-| `max_buffers`                 | maximum number of buffers use to proxying                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |                                           |
+| `max_buffers`                 | maximum number of buffers use to proxying. It is also the real bound on the stale-upstream replay captures: a capture lives only on a request stream and `Stream::new` performs exactly two `pool.checkout()` calls, so at most `(max_buffers / 2) * buffer_size` bytes of captured request exist at once, on the global allocator, where no buffer accounting sees them. At the defaults (1000, 16393) that is ~8.2 MB carried; the obvious `max_connections * buffer_size` estimate gives ~160 MB, wrong by 20x. A worker-wide ceiling of 512 armed captures makes that heap a constant instead, ~16.8 MB allocated at worst, however high this value is raised. See "Capture budget"                                                    |                                           |
 | `min_buffers`                 | minimum number of buffers preallocated for proxying                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |                                           |
 | `buffer_size`                 | size, in bytes, of requests buffer used by the workers. Must be at least 16393 for HTTP/2 (16384 max frame size + 9 byte frame header)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |                                           |
 | `slab_entries_per_connection` | how many slab entries each `max_connections` reserves. Defaults to 4 (1 frontend + up to 3 backend H2 connections). Raise for fan-out topologies that exceed 4 backends per session; clamped to [2, 32]. Slab capacity is `10 + slab_entries_per_connection * max_connections`.                                                                                                                                                                                                                                                                                                                                                                                                                                                            | integer 2-32                              |
@@ -2832,6 +2832,8 @@ Incremented when Sōzu generates a default error response instead of proxying:
 | `backend.connections.error`         | counter | proxy            | Backend connection failures                                                                                                                                                                                                                                                                                                            |
 | `backend.connect.retries_exhausted` | counter | cluster, backend | Per-session backend-connect retry budget (`CONN_RETRIES = 3`) was exhausted. Emitted once per event at the TCP, HTTP/1, and HTTP/2-mux gates. Alert on this counter's rate instead of grepping `WARN` / `ERROR` logs — the underlying log line is `warn!` since the condition is peer-driven backpressure, not a Sōzu invariant break. |
 | `backend.retry.stale_upstream`      | counter | cluster, backend | A request written onto a POOLED H1 keep-alive backend connection that then closed without answering was re-issued on a fresh backend instead of being answered `502 Bad Gateway`. Labelled with the **stale** backend — the one that did not answer. One client request can increment this more than once. See "Stale-upstream retry" below, which covers how to read a rate that tracks the request rate. |
+| `backend.retry.captures_armed`      | gauge   | proxy            | Request captures currently armed for a stale-upstream replay, summed over every live stream of this worker. Ceiling 512. To read the capture heap the bound is `2 * gauge * buffer_size`, not `gauge * buffer_size` — the write path grows a capture with `Vec::reserve`, so a multi-write capture can allocate twice what it carries. See "Capture budget" below. |
+| `backend.retry.captures_declined`   | counter | proxy            | An idempotent request written onto a pooled keep-alive upstream was not captured because 512 captures were already armed on this worker. Nothing was refused: the request proceeds un-replayable, and answers normally unless its upstream turns out to be stale. An **upper bound on lost retries, not a count of them** — most declined requests never needed the capture. Compare against `backend.retry.stale_upstream` before reading anything into its rate. Non-idempotent requests are never captured, so they never appear here. Only moves while `backend.retry.captures_armed` sits at the ceiling. |
 
 #### Stale-upstream retry
 
@@ -2889,7 +2891,87 @@ This is deliberately narrower than nginx's default `proxy_next_upstream error
 timeout`, which also re-issues an idempotent request that failed on a freshly
 dialled upstream, and narrower than HAProxy's opt-in `retry-on
 empty-response`. There is no configuration knob: the conditions above are not
-tunable.
+tunable, and neither is the capture budget below.
+
+#### Capture budget
+
+Capturing a request costs memory that no `max_buffers` accounting sees. The
+captures are plain allocations on the global allocator, deliberately NOT taken
+from the buffer pool: pooling them would turn "we decline to retry, and the
+client gets the `502` it would have got anyway" into "we refuse new sessions
+with `503` and park frontends", under exactly the memory pressure the bound
+exists to manage.
+
+**What bounds it without a ceiling.** A capture can exist only on a live
+request stream, and `Stream::new` takes exactly two `pool.checkout()` calls, so
+no more than `max_buffers / 2` captures can be armed at once. The capture heap
+is therefore `(max_buffers / 2) * buffer_size` — about **8.2 MB carried** at
+the defaults (`max_buffers` 1000, `buffer_size` 16393), and up to twice that
+allocated for the `Vec` reason set out below. The obvious
+`max_connections * buffer_size` estimate gives ~160 MB and is wrong by a factor
+of 20: `max_buffers` does not permit 10000 concurrent requests. Reaching 160 MB
+needs `max_buffers` raised to about 20000. That relationship is also stated on
+the `max_buffers` row of the configuration table above, because it is where an
+operator sizing that value will be looking.
+
+**The ceiling.** `MAX_ARMED_REPLAY_CAPTURES` (`lib/src/protocol/mux/stream.rs`)
+caps the captures one worker holds armed at once at **512**. It is a constant,
+not a configuration key: the value it wants is "high enough not to bite at the
+stock defaults", the ceiling is a memory-safety bound rather than a tuning
+knob, and `backend.retry.captures_declined` is the operational signal for the
+case where it does bite. Sōzu states this class of bound as a constant
+elsewhere too — `CONN_RETRIES`, `MAX_PENDING_RST_STREAMS`.
+
+512 is chosen against the arithmetic above. The defaults can produce at most
+500 concurrent captures, which fits under it, so a stock deployment replays
+exactly what it replayed before the ceiling existed. What the ceiling removes
+is the growth: the capture heap stops tracking `max_buffers` and becomes a
+constant, where before it grew linearly with it.
+
+**The size of that constant.** 512 captures carry at most `512 * 16400` ≈
+**8.4 MB** at the defaults, and may have **allocated up to twice that, ≈16.8
+MB**. Size RSS against the larger figure. The factor of two is real and is
+part of the bound: `ConnectionH1::writable` grows a capture with
+`Vec::reserve`, which allocates `max(2 * old_capacity, required)`, while the
+guard beside it bounds the capture's *length* — not its capacity — by
+`storage.capacity()`. Measured on this tree at the defaults, a single
+16393-byte write gives `len 16393 / capacity 16393`, while writes of
+`[8192, 8192, 9]` give `len 16393 / capacity 32768`. A request written in one
+pass, the common case, costs the smaller figure.
+
+**The budget counts captures, not bytes**, and that is still a memory bound
+rather than a proxy for one, because each capture is independently bounded: a
+write that would carry one past its front kawa's `storage.capacity()` drops it
+whole (`ConnectionH1::writable`), the HAProxy rule stated above. The `Vec`
+slack loosens the constant by a factor of two; it does not make it depend on
+`max_buffers` again, which is the property the ceiling exists to deliver.
+
+**Only idempotent requests are captured.** A capture for a non-idempotent
+request could never be spent — the method veto above would refuse the replay —
+so `Stream::arm_upstream_replay` does not take one, and does not spend a
+budget slot on it. Without that, a POST-heavy pooled workload would fill the
+budget with charges no replay could ever use: at 80% POST only about one slot
+in five would be spendable, and `backend.retry.captures_armed` sitting at 512
+would tell an operator nothing about why.
+
+**Past the ceiling nothing is refused.** `Stream::arm_upstream_replay` installs
+no buffer, `backend.retry.captures_declined` is incremented, and the request
+proceeds un-replayable; if its upstream then turns out to be stale it answers
+the same `502 Bad Gateway` it answered before the retry existed. No session is
+refused, no frontend parks, and no request fails *because of* the ceiling.
+
+**Reading `backend.retry.captures_declined`.** It is an *upper bound* on lost
+retries, not a count of them. It counts requests left un-replayable; the great
+majority of those get a normal answer from an upstream that was never stale and
+would never have used the capture. Only the fraction that then hits the
+stale-pool race becomes a `502` the ceiling turned into a lost retry. Compare
+its rate against `backend.retry.stale_upstream`, which is how often that race
+actually fires on this worker, before reading anything into it.
+
+The budget is per worker. A Sōzu worker is a single event-loop thread with its
+own buffer pool, which is the same scope `max_buffers` has, so an `N`-worker
+deployment's capture heap is at most `N * 2 * 512 * buffer_size` exactly as its
+pool footprint is `N * max_buffers * buffer_size`.
 
 #### Backend pool
 

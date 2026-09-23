@@ -261,7 +261,7 @@ template-rendered Kawa streams. The relevant pieces:
 
 Status mapping `DefaultAnswer → u16` lives at `mod.rs:110`, and the status
 bucket / per-code metrics are emitted once, from
-`mux::stream::generate_access_log` (`lib/src/protocol/mux/stream.rs:500-524`).
+`mux::stream::generate_access_log` (`lib/src/protocol/mux/stream.rs`).
 
 ---
 

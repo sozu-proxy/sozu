@@ -78,6 +78,51 @@ pub mod backend {
     /// reaching for it — if they are dying mid-request, this counter is
     /// reporting that, and the idle timeout will not move it.
     pub const RETRY_STALE_UPSTREAM: &str = "backend.retry.stale_upstream";
+
+    /// Gauge: request captures currently armed for a stale-upstream replay,
+    /// summed over every live stream of this worker (sozu-proxy/sozu#1450).
+    ///
+    /// A capture is armed when an IDEMPOTENT request is written onto a POOLED
+    /// keep-alive upstream, and released the moment the attempt stops being
+    /// replayable — the upstream answered, the request overflowed one front
+    /// buffer, the replay was queued, or the stream was torn down. Emitted as
+    /// a signed `gauge_add!` delta from `ReplayCapture`'s constructor and its
+    /// `impl Drop`, so teardown is symmetric whichever of those paths ran.
+    ///
+    /// To read the capture heap from it, the bound is `2 * gauge *
+    /// buffer_size`, NOT `gauge * buffer_size`. Each capture's CONTENT is
+    /// bounded by one front kawa's `storage.capacity()`, but the write path
+    /// grows it with `Vec::reserve`, which allocates
+    /// `max(2 * old_capacity, required)`: a capture written in one pass has
+    /// `capacity == len`, and one assembled over several partial writes can
+    /// have twice it. The single-write case is the common one, so the true
+    /// figure sits between the two.
+    pub const RETRY_CAPTURES_ARMED: &str = "backend.retry.captures_armed";
+
+    /// An IDEMPOTENT request written onto a pooled keep-alive upstream was NOT
+    /// captured, because `MAX_ARMED_REPLAY_CAPTURES` captures were already
+    /// armed on this worker (sozu-proxy/sozu#1450).
+    ///
+    /// Nothing is refused and no frontend parks: the request proceeds
+    /// un-replayable, and if its upstream turns out to be stale it answers the
+    /// same `502 Bad Gateway` it answered before the replay existed.
+    ///
+    /// It is an UPPER BOUND on lost retries, not a count of them. It counts
+    /// requests that were left un-replayable; the overwhelming majority of
+    /// them get a normal answer from an upstream that was not stale at all,
+    /// and would never have used the capture. Only the fraction that then hit
+    /// the stale-pool race becomes a `502` that the ceiling turned into a lost
+    /// retry. Compare it against `backend.retry.stale_upstream` to see how
+    /// often that race actually fires on this worker before reading anything
+    /// into this counter's rate.
+    ///
+    /// Non-idempotent requests are not counted here. They are never captured
+    /// and never charged (`Stream::arm_upstream_replay`), so a POST-heavy
+    /// workload does not inflate this counter.
+    ///
+    /// Read it against [`RETRY_CAPTURES_ARMED`]: this counter only moves while
+    /// that gauge sits at the ceiling.
+    pub const RETRY_CAPTURES_DECLINED: &str = "backend.retry.captures_declined";
 }
 
 /// Buffer-pool gauges and counters.

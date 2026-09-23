@@ -457,6 +457,114 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux-h1)`: the stale-upstream replay captures are bounded by a worker-wide ceiling of 512
+  armed captures and are now visible to two metrics.** `Stream::retry_buffer` (added with the
+  replay itself, sozu-proxy/sozu#1442) is a plain allocation on the global allocator, outside the
+  buffer `Pool`. It is neither a leak nor unbounded, but it was **unaccounted**, and the bound it
+  had was an accident of a different knob: a capture can exist only on a live stream and
+  `Stream::new` takes exactly two `pool.checkout()` calls, so captures were transitively bounded at
+  `(max_buffers / 2) * buffer_size` — about 8.2 MB at the defaults (`max_buffers` 1000,
+  `buffer_size` 16393), and linear in `max_buffers` from there. The obvious
+  `max_connections * buffer_size` estimate gives ~160 MB and is wrong by a factor of 20, because
+  `max_buffers` does not permit 10000 concurrent requests; reaching 160 MB needs `max_buffers`
+  raised to about 20000. No `max_buffers` accounting could see any of it
+  (sozu-proxy/sozu#1450).
+  The captures were deliberately **not** moved into the `Pool`. `max_buffers` defaults to 1000
+  against `max_connections` 10000, oversubscribed 10:1 and rationed by `parked_on_buffer_pressure`
+  / `MaxBuffers`, so pooling the captures would convert today's graceful degradation — *"we decline
+  to retry, the client gets the `502` it would have got anyway"* — into *"we refuse new sessions
+  with `503` and park frontends"*, under exactly the memory pressure the bound is meant to manage.
+  Instead `MAX_ARMED_REPLAY_CAPTURES` (`lib/src/protocol/mux/stream.rs`, 512) disarms capture past
+  the ceiling: `Stream::arm_upstream_replay` installs no buffer, the request proceeds
+  un-replayable, and a stale pooled upstream yields the same `502 Bad Gateway` it yielded before
+  the replay existed. Nothing is refused and no frontend parks. 512 is chosen against that
+  arithmetic: the defaults can produce at most 500 concurrent captures, which fits under the
+  ceiling, so a stock deployment replays exactly what it replayed before — what the ceiling removes
+  is the growth, making the capture heap a constant instead of something linear in `max_buffers`.
+  That constant is `512 * 16400` ≈ 8.4 MB **carried** and up to **≈16.8 MB allocated**: the write
+  path grows a capture with `Vec::reserve`, which allocates `max(2 * old_capacity, required)`, while
+  the guard beside it bounds the capture's length rather than its capacity. Measured on this tree at
+  the defaults, a single 16393-byte write gives `len/capacity 16393/16393` and writes of
+  `[8192, 8192, 9]` give `16393/32768`. Every surface states the larger figure and says which is
+  which; a one-pass request, the common case, costs the smaller. It is a constant rather than a
+  configuration key because the only value it wants is "high
+  enough not to bite at the stock defaults", it is a memory-safety bound rather than a tuning knob,
+  and the declined counter below is the signal for the case where it binds; `CONN_RETRIES` and
+  `MAX_PENDING_RST_STREAMS` are the same class of bound stated the same way.
+  The budget counts **captures, not bytes**, and that is a memory bound rather than a proxy for
+  one because each capture is already independently bounded: a write that would carry one past its
+  front kawa's `storage.capacity()` drops it whole (`ConnectionH1::writable`) — HAProxy's "Requests
+  not fitting in a single buffer will never be retried". The `Vec` slack above loosens that constant
+  by a factor of two; it does not make it depend on `max_buffers` again, which is the property the
+  ceiling exists to deliver. A byte budget would have to be maintained on every
+  `extend_from_slice` of the write path to bound the same product, and would additionally be able
+  to refuse a capture mid-growth that the code had already decided to hold.
+  **Only idempotent requests are captured.** A capture for a non-idempotent request could never be
+  spent, since `can_replay_on_fresh_upstream` vetoes the method, so `arm_upstream_replay` no longer
+  takes one — before the ceiling that was waste, with one it is also a slot a replayable request
+  cannot have. At 80% POST on a pooled workload only about one armed charge in five would have been
+  spendable, giving an effective ceiling near 102 while `backend.retry.captures_armed` sat at 512
+  telling an operator nothing about why. The method is known at arm time:
+  `HttpContext::on_request_headers` sets it during the frontend parse and `Router::connect` routes
+  on it — `route_from_request` fails with `RetrieveClusterError::NoMethod` without it — before
+  reaching `start_stream`. `can_replay_on_fresh_upstream`'s own idempotence conjunct is now
+  unreachable in production and is deliberately KEPT as defense in depth: it is the conjunct a later
+  widening of the arm guard would silently undo, and the one the whole feature's justification rests
+  on. Its two `mod.rs` tests keep it honest and still redden when it is dropped; their fixture now
+  arms under `Method::Get` and sets the method under test afterwards, with the reason stated in
+  place.
+  The charge is owned by a new `ReplayCapture` newtype and released by its `impl Drop`, not by the
+  sites that clear the field. `retry_buffer` goes `Some -> None` on four code paths
+  (`forget_upstream_replay`, the first response byte in `ConnectionH1::readable`, the
+  one-front-buffer overflow in `ConnectionH1::writable`, and `queue_upstream_replay`) and on a
+  fifth that has no code site at all — the `Stream` simply being dropped on a client hangup, an
+  idle timeout or a session teardown. Wired into the four, the counter would climb on every one of
+  those teardowns until the ceiling silently disarmed replay for the rest of the worker's life.
+  This is the reasoning `ConnectionH2`'s gauge teardown and `pool::Checkout` already apply:
+  teardown in `Drop` is symmetric whichever path ran.
+  Two new proxy-level metrics, both `lib/src/metrics/names.rs` constants: the gauge
+  `backend.retry.captures_armed` (captures currently armed on this worker; multiply by
+  `buffer_size` for the capture heap) and the counter `backend.retry.captures_declined` (a pooled
+  request refused a capture for budget). The counter only moves while the gauge sits at the
+  ceiling. It is an **upper bound on lost retries, not a count of them**: it counts requests left
+  un-replayable, and the great majority of those are answered normally by an upstream that was never
+  stale and would never have used the capture — only the fraction that then hits the stale-pool race
+  becomes a `502` the ceiling turned into a lost retry, so it is read against
+  `backend.retry.stale_upstream`. Non-idempotent requests never reach it. The gauge's heap
+  instruction is `2 * gauge * buffer_size`, not `gauge * buffer_size`, for the `Vec` reason above.
+  The budget is per worker, the same scope `max_buffers` and the buffer `Pool` have.
+  Three tests in `lib/src/protocol/mux/stream.rs`, each seen red against a distinct single-line
+  revert: `past_the_ceiling_a_pooled_request_is_armed_with_no_buffer_and_still_completes` (red on
+  deleting the ceiling comparison in `ReplayCapture::try_arm`; its under-ceiling half is what keeps
+  it from passing against an `arm_upstream_replay` that armed nothing at all),
+  `the_armed_gauge_and_the_declined_counter_track_the_capture_budget` (red on deleting either
+  `gauge_add!`, and on replacing the declined `incr!` with a no-op — three separate reverts, three
+  separate assertions), and `a_stream_dropped_with_a_capture_armed_releases_its_charge` (red on
+  deleting the budget release from `impl Drop` while leaving its `gauge_add!` in place, so the
+  underflow `debug_assert!` does not fire and the failure is the test's own). Two more cover the
+  paths the first three left open: `queueing_a_replay_releases_the_capture_charge` guards the one
+  release path that works AROUND `Drop` — `into_bytes` must `mem::take` and let the husk drop, and
+  the natural `mem::forget(self)` simplification leaks one charge per replay until the ceiling
+  disarms replay for the worker's life; before this test that mutation passed the whole unit suite,
+  and it now reddens exactly one test with "queueing a replay must release the capture's charge".
+  `a_non_idempotent_request_is_never_charged_to_the_capture_budget` reddens on deleting the
+  idempotence early return, and its last assertion pins the declined counter's MEANING by requiring
+  that a method veto is NOT counted as a budget refusal. `doc/configure.md`
+  states the transitive `(max_buffers / 2) * buffer_size` relationship on the `max_buffers` row
+  itself, because that is where an operator sizing the value looks, and a new "Capture budget"
+  subsection carries the ceiling, the arithmetic and both metrics.
+  `lib/src/protocol/mux/LIFECYCLE.md` — the canonical on-branch mux reference `CLAUDE.md` tells the
+  next author to read first — gains the fourth arming condition beside the three it already
+  enumerated, the `Vec` capacity slack on its "one front buffer" bullet, and a correction to its
+  "The replay is bounded by `CONN_RETRIES` alone" claim, which this changeset made false as a
+  statement about whether a replay happens at all. No citation check could have caught that: they
+  prove cited lines resolve and have not drifted, not that prose is still true.
+  The status-bucket citation in `lib/src/protocol/kawa_h1/LIFECYCLE.md` is now made by SYMBOL
+  rather than by a line range. It drifted twice inside this one changeset, and the drift rule
+  exempts a citation the changeset itself re-anchored, so the second staleness passed both gates and
+  was found by reading the cited lines back. The prose already names
+  `mux::stream::generate_access_log`; a symbol cannot drift.
+
 - **`fix(ci)`: extract the bare `:NNN` CONTINUATION of a citation, so the second half of a pair is
   checked at all — and repair the two copies of the one that was wrong.**
   `.github/scripts/check_doc_citations.py`'s `CITATION` pattern required a path, so the idiom that
