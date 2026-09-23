@@ -563,9 +563,12 @@ fn test_hsts_on_https_redirect_301() {
 /// HTTPS frontend with `hsts.enabled = true` AND
 /// `redirect = unauthorized` returns the `Strict-Transport-Security`
 /// header on the proxy-generated 401 default answer. Same hoist path
-/// as the 301 test above; covers the auth-deny early return at
-/// `mux/router.rs:762` separately because the 301 short-circuit lives
-/// at `:714` and the snapshot must precede both.
+/// as the 301 test above; covers the auth-deny early return — the
+/// `RedirectPolicy::Unauthorized` arm of
+/// `Router::route_from_request` (`lib/src/protocol/mux/router.rs`) —
+/// separately because the 301 short-circuit (its
+/// `RedirectPolicy::Permanent` → `HttpsRedirect` arm) lives earlier
+/// in the same function and the snapshot must precede both.
 pub fn try_hsts_on_https_unauthorized_401() -> State {
     let front_port = provide_port();
     let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);

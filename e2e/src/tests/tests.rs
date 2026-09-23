@@ -484,7 +484,7 @@ const RECONNECT_BUDGET: Duration = Duration::from_millis(RECONNECT_BUDGET_MS);
 ///
 /// Derived from [`RECONNECT_BUDGET`] rather than written out, because the
 /// ordering is the point: `Client::connect` applies a 100 ms read timeout
-/// (`e2e/src/mock/client.rs:44`), exactly the budget, so a reconnect slow
+/// (`e2e/src/mock/client.rs`), exactly the budget, so a reconnect slow
 /// enough to breach the budget makes `receive` time out *first* and the
 /// comparison is never reached. The socket has to outlast the budget for the
 /// budget to be the thing that decides.

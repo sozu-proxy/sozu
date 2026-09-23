@@ -82,10 +82,10 @@
 //! This does not depend on `debug_assert!` to find anything: `cargo-fuzz`
 //! unconditionally builds with `-Cdebug-assertions` regardless of profile,
 //! which is why a reintroduced defect here surfaces as the
-//! `debug_assert!` at `command/src/channel.rs:589` rather than the raw
-//! slice-index panic at `command/src/channel.rs:607`
-//! (`Rx::decode(&buffer[delimiter_size()..message_len])`; see
-//! `fuzz/README.md`'s `5af7daea` regression-seed entry for the
+//! `debug_assert!` in `Channel::try_read_delimited_message`
+//! (`command/src/channel.rs`) rather than the raw slice-index panic at
+//! that function's `Rx::decode(&buffer[delimiter_size()..message_len])`
+//! (see `fuzz/README.md`'s `5af7daea` regression-seed entry for the
 //! from-scratch `--release`-without-assertions confirmation that reaches
 //! the latter instead). The underlying gap is a reachable-input DoS in
 //! every build profile either way: the slice-range check is a

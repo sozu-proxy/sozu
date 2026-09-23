@@ -7,8 +7,9 @@
 //! An attacker holding a valid certificate for tenant A should not be able to
 //! reach tenant B's backend simply by changing `:authority` on an H2 stream
 //! opened with SNI=A. When the router detects the mismatch it increments
-//! `http.sni_authority_mismatch` (see `lib/src/protocol/mux/router.rs:338`)
-//! and returns `421 Misdirected Request` per RFC 9110 §15.5.20.
+//! `http.sni_authority_mismatch` (see `Router::route_from_request` in
+//! `lib/src/protocol/mux/router.rs`) and returns `421 Misdirected Request`
+//! per RFC 9110 §15.5.20.
 //!
 //! Recipes covered (see `tasks/e2e-recipe.md` §2 group 8B):
 //! - happy path: SNI=foo, `:authority`=foo → 200 OK
@@ -128,7 +129,8 @@ fn setup_sni_two_tenant_listener(
         .to_tls(None)
         .expect("build https listener");
     // The listener stores `strict_sni_binding` as `Option<bool>`; leaving it
-    // `None` means "default = true" (see `lib/src/https.rs:772`).
+    // `None` means "default = true", resolved by
+    // `HttpsListener::get_strict_sni_binding` (`lib/src/https.rs`).
     https_listener.strict_sni_binding = strict;
     worker.send_proxy_request_type(RequestType::AddHttpsListener(https_listener));
     worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
@@ -863,11 +865,13 @@ fn captured_421_headers(sozu_id: &str) -> Vec<u8> {
 /// the observed CI signature of #1353: `got_ok=true got_421=true
 /// metric_stable=true bar_reqs=1` on both iterations, then green on a re-run
 /// of the same commit. No 421 was ever emitted — the only production site
-/// that can emit one on this path is `lib/src/protocol/mux/mod.rs:1306`,
-/// reachable solely through `RetrieveClusterError::SniAuthorityMismatch`,
-/// constructed at the single site `lib/src/protocol/mux/router.rs:672`
-/// immediately after `incr!(names::http::SNI_AUTHORITY_MISMATCH)`, and that
-/// counter did not move.
+/// that can emit one on this path is the `SniAuthorityMismatch` arm of
+/// `SessionState::ready` (`lib/src/protocol/mux/mod.rs`), reachable solely
+/// through `RetrieveClusterError::SniAuthorityMismatch`, constructed at the
+/// single site in `Router::route_from_request`
+/// (`lib/src/protocol/mux/router.rs`) immediately after
+/// `incr!(names::http::SNI_AUTHORITY_MISMATCH)`, and that counter did not
+/// move.
 ///
 /// To SEE THIS RED, either:
 /// - restore the historical body of `headers_status_matches`,
@@ -920,11 +924,12 @@ fn h2_status_checks_decode_the_status_field_not_any_matching_bytes() {
     // value — an ordinary `Location`, `Set-Cookie` or CSP header — writes
     // `7f 88 01` with no status anywhere near it (1542 distinct lengths
     // below 100 000 produce a `0x88` octet). A raw value byte ≥ `0x80` gets
-    // there too: `lib/src/protocol/mux/converter.rs:388-391` rejects only
-    // `0x00..=0x08 | 0x0A..=0x1F | 0x7F` and passes the rest verbatim. Since
-    // `headers_ok_response` runs on *proxied* responses in the strict-off
-    // and coalescing tests, where backend headers are arbitrary, the
-    // historical `contains(&0x88)` scan was falsifiable on the wire. A
+    // there too: the header-value control-character check in
+    // `H2BlockConverter::call` (`lib/src/protocol/mux/converter.rs`) rejects
+    // only `0x00..=0x08 | 0x0A..=0x1F | 0x7F` and passes the rest verbatim.
+    // Since `headers_ok_response` runs on *proxied* responses in the
+    // strict-off and coalescing tests, where backend headers are arbitrary,
+    // the historical `contains(&0x88)` scan was falsifiable on the wire. A
     // trailing indexed `0x88` is the cheapest block carrying that byte
     // without a 200, and it pins what `decode_status` promises: the first
     // field decides the status, and a later field — even one that looks

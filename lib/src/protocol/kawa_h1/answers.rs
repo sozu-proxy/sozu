@@ -1507,14 +1507,15 @@ mod tests {
             .expect("every bundled default template + fallback must parse");
     }
 
-    /// `HttpAnswers::template`'s `_ =>` arm (answers.rs:1128) builds an
-    /// unrecognised answer name with `Template::new(None, …)`, so the
-    /// `InvalidStatusCode` guard that protects every named template
-    /// ("301", "302", "308", "400" … "507") never runs for it. The map
-    /// `HttpAnswers::templates` iterates is `BTreeMap<String, String>` taken
-    /// straight from the listener configuration and from a listener patch over
-    /// the command socket, so both the key and the body are operator input
-    /// arriving as a control-plane request.
+    /// `HttpAnswers::template`'s `_ =>` arm
+    /// (`lib/src/protocol/kawa_h1/answers.rs`) builds an unrecognised answer
+    /// name with `Template::new(None, …)`, so the `InvalidStatusCode` guard
+    /// that protects every named template ("301", "302", "308", "400" … "507")
+    /// never runs for it. The map `HttpAnswers::templates` iterates is
+    /// `BTreeMap<String, String>` taken straight from the listener
+    /// configuration and from a listener patch over the command socket, so both
+    /// the key and the body are operator input arriving as a control-plane
+    /// request.
     ///
     /// kawa applies no range check to a status line (`take(3)` then
     /// `str::parse::<u16>()`), so a custom answer whose body starts

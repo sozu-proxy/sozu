@@ -7,7 +7,8 @@
 //!
 //! * [`test_h2_backend_silent_triggers_504_within_back_timeout`] —
 //!   defence-in-depth for invariant 15 on the `set_default_answer` path.
-//!   On HEAD the synchronous drain loop at `mux/mod.rs:1403-1424` already
+//!   On HEAD the synchronous `should_write` drain loop in
+//!   `Mux::timeout_inner` (`lib/src/protocol/mux/mod.rs`) already
 //!   flushes the 504 body before the session closes, so this test is a
 //!   lock-in regression guard rather than a RED-to-green flip. The
 //!   matching RED that exercises `set_default_answer` directly lives in
@@ -168,15 +169,16 @@ fn teardown_simple<T>(tls: T, front_port: u16, mut worker: Worker) -> bool {
 // ============================================================================
 
 /// Single H2 stream → backend that accepts the TCP connection and never
-/// replies. `back_timeout = 2 s` on the listener. After the timeout,
-/// `timeout_backend` in `mux/mod.rs:1344-1392` must:
+/// replies. `back_timeout = 2 s` on the listener. After the timeout, the
+/// `timeout_backend` branch of `Mux::timeout_inner`
+/// (`lib/src/protocol/mux/mod.rs`) must:
 ///
 /// 1. Render a 504 default answer via `set_default_answer`.
 /// 2. Queue the response bytes into the H2 out buffer.
-/// 3. Either (a) rely on the synchronous drain loop at
-///    `mux/mod.rs:1403-1424` to flush before teardown, or (b) arm the
-///    writable readiness + signal so the next scheduler tick delivers
-///    the body.
+/// 3. Either (a) rely on the synchronous `should_write` drain loop in
+///    `Mux::timeout_inner` (`lib/src/protocol/mux/mod.rs`) to flush
+///    before teardown, or (b) arm the writable readiness + signal so
+///    the next scheduler tick delivers the body.
 ///
 /// On HEAD, path (a) masks the missing `signal_pending_write` pairing
 /// in `set_default_answer`. This test therefore passes on HEAD and

@@ -4,18 +4,19 @@
 //! app returning a small JSON payload. The point is to make sōzu's H1 parser
 //! observe the response in ONE `socket_read` cycle that transitions kawa
 //! directly from `Headers` to `Terminated`, which hits the wake-gap where
-//! `mux/h1.rs:324` guards the `signal_pending_write()` call inside an
-//! `if kawa.is_main_phase()` branch that is FALSE by the end of a single
-//! successful parse.
+//! `ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs`) guards the
+//! `signal_pending_write()` call inside an `if kawa.is_main_phase()` branch
+//! that is FALSE by the end of a single successful parse.
 //!
 //! Divergence from [`AsyncBackend::http_handler`]: that handler also writes
 //! the response in one `write_all`, but the callback returns after the write,
 //! so the `TcpStream` is dropped and the peer observes a TCP FIN. A `FIN`
 //! marks the connection non-keep-alive for sōzu's H1 reader path (via
 //! `status == SocketResult::Closed`), which routes cleanup through the
-//! close-delimited path in `mux/h1.rs:385-395`. The customer's real-world
-//! Clever Cloud backend keeps the connection alive, so the close-delimited
-//! wake never fires — which is exactly the scenario this mock reproduces.
+//! close-delimited path of `ConnectionH1::readable`
+//! (`lib/src/protocol/mux/h1.rs`). The customer's real-world Clever Cloud
+//! backend keeps the connection alive, so the close-delimited wake never
+//! fires — which is exactly the scenario this mock reproduces.
 //!
 //! Divergence from [`ChunkedFlushH1Backend`]: that backend flushes between
 //! headers and each body chunk and serves both `Content-Length` and

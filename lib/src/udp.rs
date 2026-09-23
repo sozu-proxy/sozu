@@ -1404,8 +1404,9 @@ impl UdpListenerSession {
                 return;
             }
         };
-        // Multi-token pattern (template tcp.rs:1029-1053): a fresh slab slot
-        // under the SAME listener-session Rc, registered READABLE so its
+        // Multi-token pattern, templated on the back-token allocation in
+        // `TcpSession::connect_to_backend` (`lib/src/tcp.rs`): a fresh slab
+        // slot under the SAME listener-session Rc, registered READABLE so its
         // readiness reaches `Server::ready` → demuxed back to this session by
         // `update_readiness`. The flow-table cap (`max_flows`) already bounds
         // how many upstream sockets/slots can exist, so the slab cannot grow

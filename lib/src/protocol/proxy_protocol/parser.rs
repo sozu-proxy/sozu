@@ -87,16 +87,17 @@ pub fn parse_v2_header(i: &[u8]) -> IResult<&[u8], HeaderV2> {
     // so that block used to reach every consumer of `HeaderV2::addr`. There are
     // six of them, not three. Four are TCP-side and read this `ProxyAddr`
     // directly: `expect.rs`, `relay.rs`, `tcp_preread/mod.rs`, and
-    // `TcpSession::effective_session_address` (`lib/src/tcp.rs:373`), which
-    // reads `ExpectProxyProtocol::addresses` / `RelayProxyProtocol::addresses`
-    // itself rather than through `into_pipe` and feeds the raw-TCP
-    // `max_connections_per_ip` gate at `lib/src/tcp.rs:1638`. The other two are
-    // the HTTP and HTTPS expect upgrades, which read the same value back out of
-    // `ExpectProxyProtocol::addresses` (`lib/src/http.rs:316`,
-    // `lib/src/https.rs:334`). All six attribute `ProxyAddr::source()` to the
-    // client: any peer could therefore forge the source address Sōzu records in
-    // its access logs, injects as `X-Real-IP`, and counts against
-    // `max_connections_per_ip`.
+    // `TcpSession::effective_session_address` (`lib/src/tcp.rs`), which reads
+    // `ExpectProxyProtocol::addresses` / `RelayProxyProtocol::addresses` itself
+    // rather than through `into_pipe` and feeds the raw-TCP
+    // `max_connections_per_ip` gate in `TcpSession::connect_to_backend`
+    // (`lib/src/tcp.rs`). The other two are the HTTP and HTTPS expect upgrades,
+    // which read the same value back out of `ExpectProxyProtocol::addresses` in
+    // `HttpSession::upgrade_expect` (`lib/src/http.rs`) and
+    // `HttpsSession::upgrade` (`lib/src/https.rs`). All six attribute
+    // `ProxyAddr::source()` to the client: any peer could therefore forge the
+    // source address Sōzu records in its access logs, injects as `X-Real-IP`,
+    // and counts against `max_connections_per_ip`.
     //
     // Discarding it here rather than at each of those six keeps one decision
     // in one place: none of them reads `command` or `family`, none
@@ -110,11 +111,12 @@ pub fn parse_v2_header(i: &[u8]) -> IResult<&[u8], HeaderV2> {
     // * the four TCP-side consumers fall back to the front socket's
     //   `peer_addr`, so the session proceeds, attributed to the real peer;
     // * the HTTP and HTTPS expect upgrades require BOTH endpoints and get
-    //   neither -- `AfUnspec` returns `None` from `source()` and
-    //   `destination()` alike (`header.rs:303`, `header.rs:311`) -- so
-    //   `upgrade_expect` returns `None` and `upgrade` reports
-    //   `SessionIsToBeClosed` (`lib/src/http.rs:254`). Such a session is closed
-    //   at the expect stage, not re-attributed to `peer_addr`.
+    //   neither -- `AfUnspec` returns `None` from `ProxyAddr::source()` and
+    //   `ProxyAddr::destination()` alike
+    //   (`lib/src/protocol/proxy_protocol/header.rs`) -- so `upgrade_expect`
+    //   returns `None` and `HttpSession::upgrade` reports `SessionIsToBeClosed`
+    //   (`lib/src/http.rs`). Such a session is closed at the expect stage, not
+    //   re-attributed to `peer_addr`.
     //
     // That close is not a regression for legitimate traffic: HAProxy pairs
     // `LOCAL` with `AF_UNSPEC`, which already parsed to `AfUnspec`, so those

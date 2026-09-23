@@ -2086,13 +2086,14 @@ fn try_h1_custom_answer_with_out_of_range_status_does_not_kill_the_worker() -> S
     );
 
     worker.send_proxy_request_type(RequestType::AddHttpListener(listener_config));
-    // No `None` arm: `read_proxy_response` (`e2e/src/sozu/worker.rs:267`)
-    // `.expect()`s on the command channel and always returns `Some`, so a
-    // `State::Fail` branch here would be unreachable code dressed up as error
-    // handling. That `.expect()` IS this test's failure path: a worker that
-    // died compiling the answer map drops its end of the channel, and the read
-    // panics with "Could not read message on command channel" — which is
-    // exactly the red this test was seen producing.
+    // No `None` arm: `Worker::read_proxy_response`
+    // (`e2e/src/sozu/worker.rs`) `.expect()`s on the command channel and
+    // always returns `Some`, so a `State::Fail` branch here would be
+    // unreachable code dressed up as error handling. That `.expect()` IS this
+    // test's failure path: a worker that died compiling the answer map drops
+    // its end of the channel, and the read panics with "Could not read message
+    // on command channel" — which is exactly the red this test was seen
+    // producing.
     let add_response = worker
         .read_proxy_response()
         .expect("read_proxy_response never yields None");
