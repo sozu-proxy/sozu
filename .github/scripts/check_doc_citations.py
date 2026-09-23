@@ -500,8 +500,11 @@ def check(root, show=False, out=sys.stdout):
 #
 # See "DRIFTED CITATIONS" in the header for the measurements this rule closes.
 
-# A drifted line is quoted in the report, and a quoted line of Rust can be very
-# long. Enough to recognise the construct, not enough to wrap the log.
+# A quoted line is clipped to this many characters, its ellipses included: a
+# quoted line of Rust, or a markdown table row, can be very long, and this is
+# enough to recognise the construct without wrapping the log. It bounds the
+# WIDTH of the window and says nothing about where that window sits — which is
+# `quote_pair`'s business, and the reason this constant never had to be raised.
 QUOTE_WIDTH = 72
 
 
@@ -566,10 +569,65 @@ def blob(root, rev, path, cache):
     return cache[key]
 
 
-def quote(line):
-    """One source line, stripped and clipped, for a report the log can hold."""
-    line = line.strip()
-    return line if len(line) <= QUOTE_WIDTH else line[: QUOTE_WIDTH - 1] + "…"
+def _window_start(was, now):
+    """The offset BOTH quotes are clipped from, chosen so the difference shows.
+
+    Column 0 is right whenever the two lines diverge inside the first window:
+    a leading ellipsis would cost a character and buy nothing. Past that, a
+    left-anchored window renders the two revisions to the SAME string, and the
+    report fires correctly while naming nothing that moved. A markdown table
+    row is the canonical case — its meaning sits in the last column and its
+    first 72 characters are a padded name and a default (sozu-proxy/sozu#1448)
+    — but nothing here knows that: the window follows the difference, so a
+    Rust line whose only edit is far to the right is served the same way and
+    no rule needs per-file-type knowledge to get a readable report.
+
+    Half a window of the common prefix is kept ahead of the difference, so the
+    reader still sees what the changed text is part of.
+    """
+    shared = 0
+    limit = min(len(was), len(now))
+    while shared < limit and was[shared] == now[shared]:
+        shared += 1
+    # A clipped left-anchored quote shows offsets 0 to QUOTE_WIDTH - 2; the
+    # last character is its ellipsis. A difference inside that range is already
+    # visible, and so is the case where one line is a prefix of the other.
+    if shared < QUOTE_WIDTH - 1:
+        return 0
+    return shared - QUOTE_WIDTH // 2
+
+
+def _clip(line, start):
+    """`line` from `start`, never wider than QUOTE_WIDTH, ellipses included."""
+    head = "…" if start > 0 else ""
+    span = QUOTE_WIDTH - len(head)
+    if start + span < len(line):
+        return head + line[start : start + span - 1] + "…"
+    return head + line[start:]
+
+
+def quote_pair(was, now):
+    """One BEFORE/AFTER pair, both clipped around their first difference.
+
+    Every quote this script prints is half of such a pair — rule 2's drifted
+    line and rule 4's stale block line, neither of which is ever quoted alone —
+    so the window is chosen from the two together rather than from either one.
+    Clipping each of them from column 0 prints two identical strings whenever
+    they diverge past the clip, which is a report a reviewer learns nothing
+    from (sozu-proxy/sozu#1448).
+
+    Both are stripped, matching what the two rules compare, and both are
+    clipped from the SAME offset so they can be read against each other.
+    Neither result ever exceeds QUOTE_WIDTH: an unbounded quote in a CI log is
+    a different failure, and moving the window is exactly what makes widening
+    it unnecessary. Both callers have already established that the two lines
+    differ; equal lines would simply be clipped around their common end.
+    """
+    was, now = was.strip(), now.strip()
+    if len(was) <= QUOTE_WIDTH and len(now) <= QUOTE_WIDTH:
+        return was, now
+    start = _window_start(was, now)
+    return _clip(was, start), _clip(now, start)
 
 
 def check_drift(root, base, show=False, out=sys.stdout):
@@ -647,9 +705,10 @@ def check_drift(root, base, show=False, out=sys.stdout):
                         if show:
                             out.write("%s  %s:%d  |unmoved\n" % (where, target, number))
                         continue
+                    was_quoted, now_quoted = quote_pair(was, now)
                     failures.append(
                         "%s: `%s:%s` — %s:%d moved%s: was `%s`, now `%s`"
-                        % (where, cited, span, target, number, edge, quote(was), quote(now))
+                        % (where, cited, span, target, number, edge, was_quoted, now_quoted)
                     )
 
     return compared, failures
@@ -1045,6 +1104,7 @@ def check_pinned_snippets(root, show=False, out=sys.stdout):
                 continue
 
             first = differing[0]
+            block_quoted, source_quoted = quote_pair(quoted[first], source[first])
             failures.append(
                 "%s: `%s:%s` — pinned block line %d does not match %s:%d: block has `%s`, "
                 "source has `%s`%s"
@@ -1055,8 +1115,8 @@ def check_pinned_snippets(root, show=False, out=sys.stdout):
                     first + 1,
                     target,
                     numbers[first],
-                    quote(quoted[first]),
-                    quote(source[first]),
+                    block_quoted,
+                    source_quoted,
                     "" if len(differing) == 1 else " (%d of %d lines differ)" % (len(differing), len(source)),
                 )
             )
@@ -1096,8 +1156,10 @@ FIXTURE_EXPECTED = [
 #     a guard.
 # None of these is an accidental shape, and none announces itself: on the real
 # tree they report a clean run over a quietly smaller surface.
-# `doc/drift.md` contributes five of these: rule 2's fixture is an ordinary
-# document that rule 1 must also see, and see as clean.
+# `doc/drift.md` contributes six of these: rule 2's fixture is an ordinary
+# document that rule 1 must also see, and see as clean. Five of the six name
+# `drift.rs`; the sixth names `doc/wide.md`, whose catalogue row is the drift
+# whose text changes only PAST the width a quote is clipped at (#1448).
 # `doc/pinned.md` and `doc/pinned_bad.md` contribute one each, for the same
 # reason and with more force: rule 4's annotation lives in the document body,
 # so rule 1 resolves it exactly as it resolves a citation written in prose —
@@ -1105,9 +1167,9 @@ FIXTURE_EXPECTED = [
 # `doc/pinned_nested.md` contributes two: the annotation it DISPLAYS inside a
 # four-tick example is still a citation to rule 1, which is correct — the text
 # names a real span either way — and the real pin after it is the second.
-# `doc/good.md` contributes nine, `doc/reference.md` none — it is a citation
-# TARGET, and carries no citation of its own.
-FIXTURE_TOTAL = 29
+# `doc/good.md` contributes nine; `doc/reference.md` and `doc/wide.md` none —
+# each is a citation TARGET, and carries no citation of its own.
+FIXTURE_TOTAL = 30
 
 # Rule 2's half of the fixtures is a PAIR of revisions, so every file that
 # drifts carries its base revision beside it as `<name>.base`. That suffix is
@@ -1117,20 +1179,49 @@ FIXTURE_TOTAL = 29
 # its live counterpart, commits that as the base, and restores the tree.
 DRIFT_BASE_SUFFIX = ".base"
 
-# `doc/drift.md` cites `drift.rs` five times and EVERY ONE of them resolves to
-# a non-blank line at both revisions, so rule 1 is green on it in both
+# `doc/drift.md` carries six citations and EVERY ONE of them resolves to a
+# non-blank line at both revisions, so rule 1 is green on it in both
 # directions and only the comparison separates the cases:
 #   * `drift.rs:8` and `drift.rs:8-10` did not move   — must stay silent
 #   * `drift.rs:12` moved onto another method's signature       — reported
 #   * `drift.rs:8-13` kept its start and moved its end          — reported
 #   * `drift.rs:16` is the re-anchored form of the first drift  — must stay
 #     silent, because it is absent from the base revision of the document
+#   * `wide.md:11` moved only past the clip                     — reported,
+#     and asserted apart from this list: see FIXTURE_DRIFT_WIDE_PREFIX
 FIXTURE_DRIFT_EXPECTED = [
     "doc/drift.md:11: `drift.rs:12` — drift.rs:12 moved: "
     "was `pub fn moved(&self) -> u8 {`, now `pub fn inserted(&self) -> u8 {`",
     "doc/drift.md:15: `drift.rs:8-13` — drift.rs:13 moved (end of range): "
     "was `1`, now `0`",
 ]
+
+# The sixth citation's drift is held OUT of the list above deliberately.
+# `doc/wide.md:11` is a 151-character catalogue row whose only edit sits at
+# character 147 — past QUOTE_WIDTH — which is the case sozu-proxy/sozu#1448
+# reported from the real tree: clipped from column 0, the two revisions render
+# to the SAME string, so the rule fires correctly and the report names nothing
+# that moved. `doc/configure_admin_ops.md:158` cites exactly such a row
+# (`doc/configure.md:1219`, 610 characters wide), and #1458 made that whole
+# class reachable by teaching the resolver to read `.md` targets — the
+# citations that point at prose disproportionately point at table rows.
+#
+# What this fixture asserts is a PROPERTY — the two quoted halves differ, and
+# neither is longer than QUOTE_WIDTH — never their text. Pinning the text here
+# would pin the window strategy, so the next person to change how the window is
+# chosen would have to rewrite the assertion meant to be guarding them; and
+# pinning a LENGTH ceiling is what makes "do not fix this by removing the clip"
+# mechanical rather than advisory. The prefix names the citation, which is what
+# separates this entry from the two whose text IS pinned.
+FIXTURE_DRIFT_WIDE_PREFIX = "doc/drift.md:22: `wide.md:11` — doc/wide.md:11 moved: "
+
+# The `was`/`now` halves of one drift report line. Both groups are greedy, so
+# the inner backticks a markdown row carries — `knob` in this fixture — cannot
+# end either one early: the separator `, now ` occurs once in the format string
+# and the line ends with `now`'s closing backtick. A line this does NOT match
+# is a self-test FAILURE and never a skip, because a report that changed shape
+# is exactly when an assertion reading it would otherwise check nothing.
+REPORTED_PAIR = re.compile(r": was `(.*)`, now `(.*)`$")
 
 # The exact number of cited line ENDS compared across the clean fixture tree,
 # asserted for the same reason FIXTURE_TOTAL is: a rule that quietly stopped
@@ -1146,6 +1237,8 @@ FIXTURE_DRIFT_EXPECTED = [
 # is — which is what sozu-proxy/sozu#1437 re-anchored past unseen, and the
 # durable half of #1444. Rule 1 can only say a markdown target exists; rule 2
 # says its TEXT still reads the way the citing prose claims.
+# The thirty-first is `doc/wide.md`'s catalogue row: one more markdown-target
+# end, and the only one whose two revisions differ solely past the clip.
 #
 # This constant is why sozu-proxy/sozu#1444 was rebased onto #1432 rather than
 # merged. Both branches raised it from 17 to 23 — six pin-annotation ends there,
@@ -1154,7 +1247,7 @@ FIXTURE_DRIFT_EXPECTED = [
 # the `>>>>>>>` a resolver reads. Two correct edits, silently composed into a
 # third value that is neither. When two branches move the same counter for
 # different reasons, the merge is a sum, and git cannot know that.
-FIXTURE_DRIFT_COMPARED = 30
+FIXTURE_DRIFT_COMPARED = 31
 
 # Rule 3's half of the fixtures. `tests_bad.rs` and the fixture `CHANGELOG.md`
 # are the broken documents; `tests_good.rs` is the clean one and also carries
@@ -1352,6 +1445,50 @@ def self_test():
 
         compared, drifted = check_drift(repo, base_sha)
         drifted = sorted(drifted)
+
+        # The wide-line drift, separated before the exact comparison because
+        # what it asserts is a property of the REPORT rather than its wording.
+        wide = [line for line in drifted if line.startswith(FIXTURE_DRIFT_WIDE_PREFIX)]
+        drifted = [line for line in drifted if not line.startswith(FIXTURE_DRIFT_WIDE_PREFIX)]
+        if len(wide) != 1:
+            ok = False
+            print(
+                "FAIL self-test: expected exactly 1 drift on `doc/wide.md`'s catalogue row, "
+                "got %d — the fixture whose difference falls past QUOTE_WIDTH is not firing, "
+                "so nothing here proves the report distinguishes the two lines it prints"
+                % len(wide)
+            )
+            for line in wide:
+                print("  " + line)
+        else:
+            pair = REPORTED_PAIR.search(wide[0])
+            if pair is None:
+                ok = False
+                print(
+                    "FAIL self-test: could not read the quoted pair out of the drift report "
+                    "%r — its shape changed and this assertion now checks nothing" % wide[0]
+                )
+            else:
+                was_quoted, now_quoted = pair.group(1), pair.group(2)
+                if was_quoted == now_quoted:
+                    ok = False
+                    print(
+                        "FAIL self-test: the drift on a line whose difference falls past "
+                        "QUOTE_WIDTH (%d) reported the SAME text twice, so the report names "
+                        "nothing that moved:" % QUOTE_WIDTH
+                    )
+                    print("    was: " + was_quoted)
+                    print("    now: " + now_quoted)
+                for half, text in (("was", was_quoted), ("now", now_quoted)):
+                    if len(text) > QUOTE_WIDTH:
+                        ok = False
+                        print(
+                            "FAIL self-test: the `%s` half of that report is %d characters, "
+                            "above QUOTE_WIDTH (%d) — the clip was raised or removed rather "
+                            "than moved onto the difference, and an unbounded quote wraps a "
+                            "CI log" % (half, len(text), QUOTE_WIDTH)
+                        )
+
         if len(drifted) != len(FIXTURE_DRIFT_EXPECTED):
             ok = False
             print(

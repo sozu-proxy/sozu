@@ -1,0 +1,11 @@
+# Wide fixture — a citation TARGET whose drift lands past the report's clip
+
+A catalogue row is wide by construction. The parameter and its default sit in
+the first two columns, and the sentence carrying the mechanism — the half a
+citing document actually leans on — sits in the third, well right of the column
+a quoted line is clipped at. A report that clips both revisions from column 0
+prints such a row twice, character for character, and names nothing that moved.
+
+| Parameter | Default | Protects against                                    |
+| --------- | ------- | --------------------------------------------------- |
+| `knob`    | 20      | Shrink threshold for recycled slots. The pool is shrunk when the total exceeds the active count times this ratio. Minimum: 2. |

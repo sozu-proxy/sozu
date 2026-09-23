@@ -457,6 +457,45 @@
 
 ### 🐛 Fixed
 
+- **`fix(ci)`: clip a drift report's two quoted lines around their first DIFFERENCE, so a wide
+  line's before and after stop printing identically.**
+  `.github/scripts/check_doc_citations.py` rendered every quoted line through one left-anchored
+  window — `line[:71]` and an ellipsis, always from column 0 — and the two halves of a
+  before/after pair went through it independently. A markdown table row is wide by construction and
+  carries its meaning in the last column, so a row whose text changed past character 71 was
+  reported with the same 72 characters printed twice. `doc/configure_admin_ops.md:158` cites
+  `doc/configure.md:1219`, the `h2_stream_shrink_ratio` row of the per-listener tuning table —
+  610 characters wide, its description column beginning at character 70, two short of the clip
+  — and editing that sentence in place reported `` was `| `h2_stream_shrink_ratio`                | 2                       | S…`, now `| `h2_stream_shrink_ratio`                | 2                       | S…` ``.
+  The rule fired correctly, the detection was right, and the operator-facing output named nothing
+  that had moved. Pre-existing, and low-impact while the guarded surface was source files only;
+  #1458 made the whole class reachable by teaching the resolver to read `.md` targets, because the
+  citations that point at prose disproportionately point at table rows — configuration
+  catalogues, metrics tables, threshold listings.
+  The window now follows the difference instead of the line start. `quote_pair` finds the first
+  offset at which the two stripped lines diverge and, when that offset falls outside the anchored
+  window, clips BOTH of them from `offset - QUOTE_WIDTH // 2`, with an ellipsis on whichever side
+  is truncated. The same row now reports `` was `…> active_streams * ratio`. Minimum: 2.                                …`, now `…> active_streams * ratio`. Minimum: 4.                                …` ``.
+  `QUOTE_WIDTH` is unchanged at 72 and is still a hard ceiling on every rendered quote, ellipses
+  included: raising it would have fixed the table row by making every long Rust line wrap a CI log,
+  which is what the constant was chosen against, and removing it would trade one failure for
+  another. Nothing in the rule learns about file types either — a Rust line whose only edit
+  sits far to the right is served by the same window. Both of the script's quote sites take a pair
+  and neither ever quotes a line alone, so rule 2's drifted line and rule 4's stale pinned-block
+  line both go through `quote_pair` now.
+  `--self-test` gains the fixture that specifically fails without this: `doc/wide.md` is a
+  151-character catalogue row whose only edit sits at character 147, cited as `wide.md:11` from the
+  drift fixture at both revisions so the rule compares rather than exempts it. The assertion is
+  deliberately a property and not a string — the two reported halves must differ from each
+  other, and neither may exceed `QUOTE_WIDTH` — so it survives a later change of window
+  strategy, and the second half of it makes "do not fix this by removing the clip" mechanical
+  rather than advisory. Under the old renderer that fixture prints two identical strings and the
+  self-test fails on it. `FIXTURE_TOTAL` 29 → 30 and `FIXTURE_DRIFT_COMPARED` 30 → 31,
+  for the one citation and the one compared line end the fixture adds; every other fixture constant
+  is unchanged, and rule 3's `FIXTURE_TEST_EXAMINED` deliberately stays at 6 because the new
+  document carries no backticked identifier long enough to be a candidate.
+  Closes #1448.
+
 - **`docs(mux-h2)`: correct five places that still described `H2DrainState`'s fields as reachable
   from `h2.rs`, two of them false rather than merely loose.** #1425 moved the RFC 9113 §6.8
   GOAWAY/drain state machine into `lib/src/protocol/mux/h2_drain.rs` and made all five of

@@ -2,7 +2,7 @@
 
 Every citation here resolves to a non-blank line, so the blank-line rule passes
 this document at both revisions. Only a comparison against the base revision
-separates the four cases below.
+separates the five cases below.
 
 Unchanged, and must stay silent: `Drift::stable` is declared at `drift.rs:8`
 and its body spans `drift.rs:8-10`.
@@ -16,3 +16,7 @@ guard fewer: `drift.rs:8-13`.
 
 Re-anchored by this changeset, and must stay silent because the author moved it
 on purpose: `Drift::moved` is declared at `drift.rs:12`.
+
+Drifted PAST the width a quoted line is clipped to, so the report has to clip
+around the difference rather than from column 0 or it prints one string twice:
+`wide.md:11` is a catalogue row whose only edit lands beyond that width.
