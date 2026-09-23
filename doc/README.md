@@ -81,7 +81,9 @@ choice between them is not stylistic:
   edit above it.
 * **The prose means a specific statement or branch inside an item** — one `match` arm, one guard, one
   log line — so cite a line or a range: `lib/src/tcp.rs:NNN-MMM, NNN-MMM`. Keep the path
-  repo-root-relative; a bare `manager.rs` is ambiguous in this tree.
+  repo-root-relative; a bare `manager.rs` is ambiguous in this tree. A second site in the same file
+  may continue from the first without repeating the path — see
+  [Continuing a citation without repeating the path](#continuing-a-citation-without-repeating-the-path).
 * **The prose QUOTES code in a fenced block** — so put the citation in the fence's info string and
   let the checker compare the quote to its source, modulo leading and trailing whitespace. See
   [Pinning a quoted code block](#pinning-a-quoted-code-block).
@@ -92,6 +94,56 @@ ever shown both halves. In [sozu-proxy/sozu#1335][cit] an audit of one module do
 its 35 citations wrong: single lines uniformly off by +1 after a `//!` module-doc block was inserted
 above them, and ranges off by +38 to +57 after a `debug_assert!` campaign grew the functions. A range
 that drifts 46 lines does not mislead slightly — it lands the reader in a different branch.
+
+### Continuing a citation without repeating the path
+
+Prose that names two sibling sites in one file reads badly if it spells the path twice, so the
+second may be written as a bare span — `` `lib/src/tcp.rs:NNN` and `:MMM` ``. The checker resolves
+the bare half by inheriting the path from the citation **earlier on the same source line**, and
+then subjects it to every rule the written-out half gets — with one exception, at the end of this
+section.
+
+Three constraints, and all three are load-bearing. Every count below is read at `ce80b00c`, the
+revision this section was written against; documenting the form adds seven colon-leading code spans
+to the guarded surface, so re-measuring the second count at the commit that added this section
+reads 55 rather than 48:
+
+* **Backticks.** The span must be a code span of its own. Without that the pattern would also claim
+  the 154 bare `:NNN` these documents carry in TOML listen addresses, `curl` URLs, statsd lines and
+  log timestamps.
+* **A colon, one span group, and nothing else inside the span.** A single line, a range and a
+  `,`/`/` group all count, exactly as in a written-out citation — the bare form is a continuation of
+  that grammar, not a narrower one. What it excludes is everything that is not a line number: 48
+  code spans here begin with a colon and 45 are HTTP/2 pseudo-headers or ordinary prose, most of
+  them `` `:authority` `` and `` `:status` ``. `doc/testing.md` writes `` `:status` `` three times,
+  once in the very paragraph that carries a continuation of its own.
+* **The same line.** These sites sit inside bullet lists that run 15, 16 and 101 lines without a
+  blank, so a paragraph-wide carry would bind a stray port number to a path named a hundred lines
+  earlier and report it as resolved. If a reflow moves the bare half onto the next line the checker
+  reports it rather than falling silent, and you write the path out.
+
+Until [sozu-proxy/sozu#1459][bare] the resolver did not see this form at all, for the same reason it
+did not see a markdown target until #1444: the pattern required a path, so a citation carrying none
+was never extracted, never resolved, never drift-checked, and never reported as unresolvable either.
+The first half of every pair was checked on every CI run and the second half had never been checked
+once — and the two halves name sibling sites in the same function, so they rot together.
+[sozu-proxy/sozu#1465][bare-eg] is the worked case, and it is why this tree carried a wrong citation
+rather than three correct ones: it moved both call sites of a test helper down one line, bumped the
+written-out half of the pair in `doc/testing.md`, and left the bare half behind. Both numbers were
+right before it and only one was right after, with the `Doc citations` job green throughout, because
+the only rule that could have seen the bare half never extracted it. Three sites existed when the
+form became visible and that one was wrong — it named the line above the call site the prose is
+about.
+
+One rule does not reach the bare form, and it is the one nearest to it. A written-out `/` or `,`
+group is rejected when the same line repeats inside it, which is what a continuation renumbered on
+one half only looks like; a bare **group** is checked the same way, but a bare span written as its
+own separate code span is a separate citation, so a path cited once and then continued bare at the
+same line number is not caught. See [sozu-proxy/sozu#1457][ident] for that gap.
+
+(This section is spelt without a real line number for the reason the one below it is: this document
+is inside the guarded surface, so a worked example written out in full would be resolved as a
+citation, and a bare one used as an illustration would be reported as a citation with no path.)
 
 ### Citing another document
 
@@ -132,8 +184,10 @@ python3 .github/scripts/check_doc_citations.py --self-test     # prove it still 
 ```
 
 It scans `doc/**` and every `**/LIFECYCLE.md`, resolves every `file.rs:NNN` and `file.md:NNN` in
-them, and fails when a cited file does not exist, a cited basename is ambiguous, a line number is
-below 1 or past end-of-file, either end of a range is blank, a range is inverted, or the same line
+them — bare `:NNN` continuations included, under the path they inherit from the same line — and
+fails when a cited file does not exist, a cited basename is ambiguous, a line number is
+below 1 or past end-of-file, either end of a range is blank, a range is inverted, a bare
+continuation has no citation earlier on its own line to inherit from, or the same line
 repeats inside one citation group — `file.rs:NNN/NNN`, which is what a `/` or `,` continuation
 renumbered on one half only looks like, and which would otherwise resolve perfectly.
 
@@ -326,6 +380,9 @@ it stood at each release and must not be renumbered to satisfy a guard. That rep
 changeset, and it would not reach `e2e/COVERAGE.md` either — no rule reads that file today.
 
 [md-cit]: https://github.com/sozu-proxy/sozu/issues/1444
+[bare]: https://github.com/sozu-proxy/sozu/issues/1459
+[bare-eg]: https://github.com/sozu-proxy/sozu/pull/1465
+[ident]: https://github.com/sozu-proxy/sozu/issues/1457
 [cit]: https://github.com/sozu-proxy/sozu/issues/1335
 [drift]: https://github.com/sozu-proxy/sozu/issues/1389
 

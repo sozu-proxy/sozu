@@ -12,7 +12,7 @@ Drifted, and NOT re-anchored by this changeset — must be reported:
 
 Drifted at the END of a range whose start did not move — must be reported too,
 because the blank-line rule guards both ends of a range and this one must not
-guard fewer: `drift.rs:8-13`.
+guard fewer: `drift.rs:8-13`, whose moved end is also cited bare as `:13`.
 
 Re-anchored by this changeset, and must stay silent because the author moved it
 on purpose: `Drift::moved` is declared at `drift.rs:12`.

@@ -8,7 +8,9 @@ method, a struct, an enum — the anchor is that item plus its file, with no lin
 number, because a line number does not survive an edit above it. A `file.rs:LINE`
 or `file.rs:LINE-LINE` anchor is kept only where the claim is about a specific
 statement or branch inside an item; those were refreshed against `main` at
-`0cb1e2a7` on 2026-09-20.
+`0cb1e2a7` on 2026-09-20. A second site in the same file may continue from the
+first as a bare `` `:LINE` `` on the SAME line, which this document does once;
+see doc/README.md#continuing-a-citation-without-repeating-the-path.
 
 Scope: the server-side frontend path is the primary subject, because that is
 where the dangerous invariants live. The client-side (backend) path is covered
