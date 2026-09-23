@@ -15,9 +15,12 @@
 # for BOTH pools — `general` used to pack 2 pods/XL-node, which turned out to be unsafe (real free
 # disk on an XL node is only ~15Gi once the base OS/containerd footprint is accounted for, not the
 # ~35Gi kubelet advertises). `bench` was already 1:1, so this redesign only changes its flavor and
-# node count, not its isolation model. Node count set to 1.5x a single PR's real bench-job fan-out
-# (4 concurrent sozu-bench jobs per PR push, from ci.yml's job graph: crypto-ring/aws-lc-rs/
-# openssl/fips) = 4 x 1.5 = 6 nodes; maxRunners capped at 6 to match 1:1. The resources.requests
+# node count, not its isolation model. Node count initially set to 1.5x a single PR's real
+# bench-job fan-out (4 concurrent sozu-bench jobs per PR push, from ci.yml's job graph:
+# crypto-ring/aws-lc-rs/openssl/fips) = 4 x 1.5 = 6 nodes, then doubled to 12 the same day once
+# real usage showed 6 was too slow — jobs were queueing behind the fixed pool while `general`
+# kept pace, confirming demand exceeded the 1.5x estimate. maxRunners capped at 12 to match 1:1.
+# The resources.requests
 # below reserve nearly the entire S node (7 vCPU / 10Gi, ~1 vCPU / ~1.2Gi headroom for daemonsets —
 # same sizing as values-general.yaml, since both pools now share the same near-whole-node
 # methodology), so no other pod can ever be co-scheduled regardless of nodeSelector correctness
@@ -42,7 +45,7 @@ githubConfigUrl: "https://github.com/sozu-proxy/sozu"
 githubConfigSecret: sozu-runner-github-app
 
 minRunners: 0
-maxRunners: 6
+maxRunners: 12
 
 template:
   spec:
