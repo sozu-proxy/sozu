@@ -691,6 +691,13 @@ jobs:
           chmod +x sozu
           chmod +x bench_logger
 
+      # ubuntu-latest carries Python preinstalled; the runner image doesn't (deliberately kept
+      # Rust/C-toolchain-focused). Same pattern already used by bench-bombardier and doc-citations.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: 3.12
+
       - name: Bench logs
         working-directory: .github/workflows
         run: python bench_logs.py
