@@ -609,6 +609,51 @@ fn fc_stall_budget_decision(
     }
 }
 
+/// Outcome of [`enqueue_rst_into`]. Mirrors
+/// [`h2_flow_control::QueueWindowUpdateOutcome`]: the primitive stays log- and
+/// metrics-free and [`ConnectionH2::enqueue_rst`] maps each variant to its
+/// accounting.
+#[derive(Debug, PartialEq, Eq)]
+enum EnqueueRstOutcome {
+    /// Freshly queued. The caller must account it: tx counter, per-error
+    /// breakdown, and the CVE-2025-8671 MadeYouReset emitted-lifetime cap.
+    Queued,
+    /// The wire id was already in `rst_sent` — a benign re-entrant
+    /// idempotency, NOT a new wire emission. Nothing was queued and nothing
+    /// is accounted.
+    Deduped,
+    /// The pending queue was already at `max_pending`: not queued, not
+    /// accounted.
+    ///
+    /// Nothing that would have reached the wire is lost here, and — as long as
+    /// the connection has not already entered `H2State::GoAway`/`H2State::Error`
+    /// — the drop is not silent to the peer. `ConnectionH2::check_invariants`
+    /// invariant 3 holds `total_rst_streams_queued >= pending_rst_streams.len()`,
+    /// so a full queue implies
+    /// `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS`, which is the
+    /// counter half of the condition `flush_pending_control_frames` tests
+    /// *before* its drain loop, returning `goaway(EnhanceYourCalm)` instead of
+    /// serialising anything. The 200 enqueues that filled the queue each armed
+    /// `Ready::WRITABLE`, so that escalation runs on the next writable tick on
+    /// both `cancel_timed_out_streams` call paths, including `Mux::timeout`
+    /// against a silent peer. The peer is told to back off with
+    /// `GOAWAY(ENHANCE_YOUR_CALM)` (RFC 9113 §6.8, the documented answer to
+    /// RST_STREAM abuse since CVE-2023-44487) and the connection is torn down,
+    /// rather than being left believing a stream is still live.
+    ///
+    /// The other half of that condition is a state gate —
+    /// `!matches!(self.state, H2State::GoAway | H2State::Error)` — and the RST
+    /// drain underneath it has none, so the implication holds only until the
+    /// first GOAWAY. `ConnectionH2::goaway` sets `H2State::GoAway` without
+    /// clearing `pending_rst_streams`, so a `Mux::timeout` reap landing in that
+    /// window is refused here and raises no second escalation while the drain
+    /// still serialises what is queued. The window is bounded and benign: the
+    /// peer already holds the GOAWAY that made the connection terminal, and
+    /// `writable()`'s `H2State::GoAway` arm force-disconnects on the same pass
+    /// once the TLS buffer is flushed.
+    Dropped,
+}
+
 /// Core of [`ConnectionH2::enqueue_rst`], extracted so the RST-queueing
 /// semantics (dedupe, queued-cap counter bump, invariant-15 readiness rearm)
 /// can be unit-tested without building a full `ConnectionH2<Front>` fixture.
@@ -622,26 +667,45 @@ fn fc_stall_budget_decision(
 ///   queued RST bumps `total_rst_streams_queued`, which
 ///   `flush_pending_control_frames` polices to escalate to
 ///   `GOAWAY(ENHANCE_YOUR_CALM)` when exceeded.
+/// - **Per-insert queue bound** (`max_pending`): the queue itself refuses to
+///   grow past the cap, so the bound holds however many RSTs ONE caller
+///   queues between two `flush_pending_control_frames` passes.
+///   `cancel_timed_out_streams` is the largest such caller: it walks the whole
+///   timed-out set in a single sweep, and a reap of more than
+///   `MAX_PENDING_RST_STREAMS` streams — which needs an operator-raised
+///   `max_concurrent_streams`, because that is what bounds the live set the
+///   reaper walks — used to push `pending_rst_streams` past the bound
+///   `ConnectionH2::check_invariants` asserts, panicking on the next inbound
+///   frame in a debug build or growing unbounded in release
+///   (sozu-proxy/sozu#1413). `max_concurrent_streams` bounds one sweep, not
+///   the queue: the queue holds what every caller queued since the last
+///   successful drain, and the DATA-on-closed-stream enqueue is a second
+///   caller `check_invariants` never inspects — see
+///   [`ConnectionH2::enqueue_rst`].
 /// - **Invariant 15** (edge-triggered epoll): pair `Ready::WRITABLE` interest
 ///   with the event bit so `writable()` is scheduled on the next tick.
 ///
-/// Returns `true` when the RST was freshly queued, `false` when the
-/// stream was already in `rst_sent` (the caller asked to RST the same
-/// stream twice — a benign re-entrant idempotency, NOT a new wire
-/// emission). The boolean lets [`ConnectionH2::enqueue_rst`] account
-/// the RST only on the freshly-queued path so duplicate calls do not
-/// inflate the per-error counter or trip the MadeYouReset flood cap
-/// for frames that never reach the wire.
+/// The returned [`EnqueueRstOutcome`] lets [`ConnectionH2::enqueue_rst`]
+/// account the RST only on the freshly-queued path, so neither a duplicate
+/// call nor an at-capacity refusal inflates the per-error counter or trips
+/// the MadeYouReset flood cap for a frame that never reaches the wire.
 fn enqueue_rst_into(
     pending: &mut Vec<(StreamId, H2Error)>,
+    max_pending: usize,
     total: &mut usize,
     rst_sent: &mut HashSet<StreamId>,
     readiness: &mut Readiness,
     wire_stream_id: StreamId,
     error: H2Error,
-) -> bool {
+) -> EnqueueRstOutcome {
     let pending_before = pending.len();
     let total_before = *total;
+    // Queue bound, tested BEFORE `rst_sent` is touched. Recording an id whose
+    // RST was never queued would make a later, legitimate `enqueue_rst` for
+    // that same stream dedupe against a frame that does not exist.
+    if pending_before >= max_pending {
+        return EnqueueRstOutcome::Dropped;
+    }
     if !rst_sent.insert(wire_stream_id) {
         // Dedupe short-circuit: the id was already queued/flushed. We must NOT
         // touch any of the wire-count state, otherwise duplicate calls inflate
@@ -660,7 +724,7 @@ fn enqueue_rst_into(
             *total, total_before,
             "dedupe path must not bump the queued-RST lifetime counter"
         );
-        return false;
+        return EnqueueRstOutcome::Deduped;
     }
     pending.push((wire_stream_id, error));
     *total += 1;
@@ -686,7 +750,7 @@ fn enqueue_rst_into(
         Some(wire_stream_id),
         "the just-pushed entry must be the requested wire stream id"
     );
-    true
+    EnqueueRstOutcome::Queued
 }
 
 #[derive(Debug)]
@@ -3938,13 +4002,37 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///
     /// Delegates the primitive work to [`enqueue_rst_into`] so the invariants
     /// are covered by unit tests that don't need a full `ConnectionH2`
-    /// fixture. See that function's doc-comment for the three invariants
+    /// fixture. See that function's doc-comment for the four invariants
     /// (dedupe via `rst_sent`, MadeYouReset queued cap via
-    /// `total_rst_streams_queued`, edge-triggered-epoll arm via
+    /// `total_rst_streams_queued`, the per-insert queue bound via
+    /// `max_pending`, edge-triggered-epoll arm via
     /// [`Readiness::arm_writable`]).
+    ///
+    /// Two of the call paths that reach here are never inspected by
+    /// [`Self::check_invariants`], whose only production caller is
+    /// [`Self::handle_frame`]:
+    ///
+    /// * `cancel_timed_out_streams`, which queues one RST per timed-out stream
+    ///   in a single sweep and, from `Mux::timeout` against a silent peer,
+    ///   runs when `handle_frame` does not run at all;
+    /// * the DATA-on-closed-stream reset, which sits in
+    ///   [`Self::handle_header_state`] — `readable` returns into that helper
+    ///   directly and that branch never reaches `handle_frame`.
+    ///
+    /// The second path is separately rate-limited: it is preceded by
+    /// `H2FloodDetector::record_glitch` + `check_flood_or_return!`, whose
+    /// `DEFAULT_MAX_GLITCH_COUNT` (100) bounds it inside one flood window, and
+    /// the window can only half-decay when `Mux::ready_inner` resamples
+    /// `context.now` on a new outer iteration — which is strictly after an
+    /// inner iteration that already ran `writable()`, since `arm_writable`
+    /// raises both the WRITABLE interest and its event bit. So it cannot
+    /// accumulate across windows without a `flush_pending_control_frames`
+    /// pass in between. The bound below is what makes that reasoning
+    /// unnecessary for correctness.
     fn enqueue_rst(&mut self, wire_stream_id: StreamId, error: H2Error) -> Option<MuxResult> {
-        let freshly_queued = enqueue_rst_into(
+        let outcome = enqueue_rst_into(
             &mut self.pending_rst_streams,
+            MAX_PENDING_RST_STREAMS,
             &mut self.total_rst_streams_queued,
             self.stream_table.rst_sent_mut(),
             &mut self.readiness,
@@ -3956,7 +4044,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // (or already-flushed) RST is the dedup short-circuit — counting
         // those would inflate `h2.frames.tx.rst_stream` /
         // `h2.rst_stream.sent.*` and trip the CVE-2025-8671 MadeYouReset
-        // lifetime cap on frames that never reached the wire.
+        // lifetime cap on frames that never reached the wire. An
+        // at-capacity refusal is accounted the same way, and for the same
+        // reason: that frame never reaches the wire either.
         //
         // Account at queue-time, not at drain-time. Doing it later in
         // `flush_pending_control_frames` would double-count any RST that
@@ -3965,10 +4055,31 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // `cancel_timed_out_streams` / `refuse_stream_and_discard` /
         // DATA-on-closed-stream paths bypassing the lifetime cap
         // (security review LISA-001 on commit `da845c71`).
-        if freshly_queued {
-            self.account_emitted_rst(error)
-        } else {
-            None
+        match outcome {
+            EnqueueRstOutcome::Queued => self.account_emitted_rst(error),
+            EnqueueRstOutcome::Deduped => None,
+            // Drop + metric + contextual log, never a panic on the release
+            // path. No GOAWAY is raised here: reaching the cap implies
+            // `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS`, which
+            // `flush_pending_control_frames` escalates to
+            // `GOAWAY(ENHANCE_YOUR_CALM)` before its drain loop for as long as
+            // the connection is not already in `H2State::GoAway`/`Error` — and
+            // once it is, the peer already holds a GOAWAY and `writable()`
+            // force-disconnects. See `EnqueueRstOutcome::Dropped`. Raising a
+            // second one from here would re-enter `goaway()` once per
+            // remaining reaped stream, clobbering `self.zero` and inflating
+            // `h2.goaway.sent.*`.
+            EnqueueRstOutcome::Dropped => {
+                error!(
+                    "{} RST_STREAM dropped: pending queue already at capacity ({}), stream={} error={:?}",
+                    log_context!(self),
+                    MAX_PENDING_RST_STREAMS,
+                    wire_stream_id,
+                    error
+                );
+                incr!(names::h2::RST_STREAM_DROPPED);
+                None
+            }
         }
     }
 
@@ -7980,6 +8091,78 @@ mod tests {
         );
     }
 
+    /// A mass idle-timeout reap is the only path that queues more than one
+    /// RST_STREAM between two `flush_pending_control_frames` passes:
+    /// `cancel_timed_out_streams` walks the whole timed-out set and calls
+    /// `enqueue_rst` for every entry inside ONE pass. The cap therefore has to
+    /// live at the insert, not at the drain — the drain-side
+    /// `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS` short-circuit
+    /// bounds what is *written*, and says nothing about how large the queue got
+    /// before anyone looked. See sozu-proxy/sozu#1413.
+    ///
+    /// Reaching >200 concurrently-tracked streams in one sweep needs an
+    /// operator-raised `max_concurrent_streams` (default 100, clamped at
+    /// `MAX_SAFE_CONCURRENT_STREAMS` = 10 000) — that setting bounds the live
+    /// set the reaper walks, not the queue, which holds what every caller
+    /// queued since the last successful drain. This test registers the wire
+    /// ids on the stream table directly, exactly as its sibling
+    /// `per_stream_liveness_reaping_is_evaluated_against_the_connection_snapshot`
+    /// does, because the accept path is not what is under test here.
+    ///
+    /// `check_invariants` is asserted explicitly because the reaper is also
+    /// reachable from `Mux::timeout` against a fully silent peer — the very
+    /// scenario that produces a mass reap — where `handle_frame`, the only
+    /// production caller of `check_invariants`, never runs at all. The reaper
+    /// is not the only insert path outside that caller: the
+    /// DATA-on-closed-stream reset sits in `handle_header_state`, which
+    /// `readable` returns into without ever reaching `handle_frame`. That one
+    /// is rate-limited by `record_glitch` + `check_flood_or_return!` and
+    /// cannot by itself fill the queue — see `ConnectionH2::enqueue_rst`.
+    ///
+    /// To SEE THIS RED: delete the `pending.len() >= max_pending` guard at the
+    /// top of `enqueue_rst_into`, then run
+    /// `cargo test -p sozu-lib --locked mass_reap` (one positional filter —
+    /// cargo rejects a second one). Every reaped stream is then queued
+    /// unconditionally and invariant 3 fires with `pending RST queue must stay
+    /// within its hard cap (escalates at the cap)`.
+    #[test]
+    fn mass_reap_keeps_the_pending_rst_queue_within_its_hard_cap() {
+        // `Stream::new` checks out two buffers per stream and the connection
+        // itself holds one for its zero buffer, so the ceiling has to clear
+        // `2 * REAPED` with room to spare or `create_stream` hands back
+        // `None` — which is how the first draft of this test failed.
+        const REAPED: usize = MAX_PENDING_RST_STREAMS + 32;
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2 * REAPED + 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let idle_timeout = connection.stream_idle_timeout;
+        let armed_at = connection.now;
+        for i in 0..REAPED {
+            let gid = context
+                .create_stream(Ulid::generate(), 1 << 16)
+                .expect("test context must create a stream");
+            // RFC 9113 §5.1.1: client-initiated stream ids are odd.
+            connection
+                .stream_table
+                .register(2 * i as StreamId + 1, gid, armed_at);
+        }
+
+        // One sweep, every stream past its deadline: the entire set is reaped
+        // and RST-queued with no intervening flush.
+        context.now = armed_at + idle_timeout + Duration::from_millis(1);
+        connection.cancel_timed_out_streams(&mut context, &mut EndpointClient(&mut router));
+
+        #[cfg(debug_assertions)]
+        connection.check_invariants(&context);
+        assert!(
+            connection.pending_rst_streams.len() <= MAX_PENDING_RST_STREAMS,
+            "a mass reap must stop queueing at the cap, got {} entries",
+            connection.pending_rst_streams.len()
+        );
+    }
+
     // ── enqueue_rst: queue / dedupe / counter / arm invariants ───────────
     //
     // `enqueue_rst_into` is the free-function primitive shared by all three
@@ -7995,26 +8178,33 @@ mod tests {
 
         let first = enqueue_rst_into(
             &mut pending,
+            MAX_PENDING_RST_STREAMS,
             &mut total,
             &mut sent,
             &mut readiness,
             5,
             H2Error::ProtocolError,
         );
-        assert!(first, "first call must report freshly_queued = true");
-        // Second call for the same stream must be a no-op AND return
-        // false so accounting in `Self::enqueue_rst` skips this case.
+        assert_eq!(
+            first,
+            EnqueueRstOutcome::Queued,
+            "first call must report a fresh queue"
+        );
+        // Second call for the same stream must be a no-op AND report
+        // `Deduped` so accounting in `Self::enqueue_rst` skips this case.
         let second = enqueue_rst_into(
             &mut pending,
+            MAX_PENDING_RST_STREAMS,
             &mut total,
             &mut sent,
             &mut readiness,
             5,
             H2Error::InternalError,
         );
-        assert!(
-            !second,
-            "second call for same stream must return freshly_queued = false"
+        assert_eq!(
+            second,
+            EnqueueRstOutcome::Deduped,
+            "second call for same stream must report Deduped"
         );
 
         assert_eq!(pending.len(), 1, "dedupe must collapse to a single entry");
@@ -8037,6 +8227,7 @@ mod tests {
         for sid in [1u32, 3, 5, 7] {
             enqueue_rst_into(
                 &mut pending,
+                MAX_PENDING_RST_STREAMS,
                 &mut total,
                 &mut sent,
                 &mut readiness,
@@ -8063,6 +8254,7 @@ mod tests {
 
         enqueue_rst_into(
             &mut pending,
+            MAX_PENDING_RST_STREAMS,
             &mut total,
             &mut sent,
             &mut readiness,
@@ -8098,6 +8290,7 @@ mod tests {
 
         enqueue_rst_into(
             &mut pending,
+            MAX_PENDING_RST_STREAMS,
             &mut total,
             &mut sent,
             &mut readiness,
@@ -8112,6 +8305,197 @@ mod tests {
         assert_eq!(total, 0);
         assert!(!readiness.interest.is_writable());
         assert!(!readiness.event.is_writable());
+    }
+
+    // ── enqueue_rst_into: per-insert queue bound (sozu-proxy/sozu#1413) ──
+    //
+    // The bound has to hold at the INSERT, not at the drain: one
+    // `cancel_timed_out_streams` sweep queues an RST per timed-out stream
+    // with no `flush_pending_control_frames` pass in between, so a drain-side
+    // check bounds only what is written and never what is held.
+
+    /// At capacity the primitive queues nothing, accounts nothing, records
+    /// nothing in `rst_sent`, and does not re-arm WRITABLE — the same
+    /// no-side-effect shape as the dedupe short-circuit above.
+    ///
+    /// `rst_sent` is the load-bearing one: marking an id as reset without
+    /// queuing its frame would make a later, legitimate `enqueue_rst` for that
+    /// stream dedupe against a frame that was never queued.
+    ///
+    /// To SEE THIS RED: move the `pending.len() >= max_pending` guard in
+    /// `enqueue_rst_into` below the `rst_sent.insert(wire_stream_id)` call,
+    /// then run `cargo test -p sozu-lib --locked
+    /// test_enqueue_rst_into_refuses_at_capacity_without_side_effects`. The
+    /// `rst_sent` assertion fails with `an at-capacity refusal must not
+    /// record the id as reset`.
+    #[test]
+    fn test_enqueue_rst_into_refuses_at_capacity_without_side_effects() {
+        const MAX: usize = 4;
+        let mut pending: Vec<(StreamId, H2Error)> = Vec::new();
+        let mut total: usize = 0;
+        let mut sent: HashSet<StreamId> = HashSet::new();
+        let mut readiness = Readiness::new();
+
+        for sid in [1u32, 3, 5, 7] {
+            assert_eq!(
+                enqueue_rst_into(
+                    &mut pending,
+                    MAX,
+                    &mut total,
+                    &mut sent,
+                    &mut readiness,
+                    sid,
+                    H2Error::Cancel,
+                ),
+                EnqueueRstOutcome::Queued,
+                "every insert below the cap must be queued"
+            );
+        }
+        assert_eq!(pending.len(), MAX, "the queue must fill to exactly the cap");
+
+        let mut at_capacity = Readiness::new();
+        assert_eq!(
+            enqueue_rst_into(
+                &mut pending,
+                MAX,
+                &mut total,
+                &mut sent,
+                &mut at_capacity,
+                9,
+                H2Error::Cancel,
+            ),
+            EnqueueRstOutcome::Dropped,
+            "an insert at the cap must be refused"
+        );
+
+        assert_eq!(
+            pending.len(),
+            MAX,
+            "a refused insert must leave the queue at the cap"
+        );
+        assert_eq!(
+            total, MAX,
+            "a refused insert must not bump the queued-RST lifetime counter"
+        );
+        assert!(
+            !sent.contains(&9),
+            "an at-capacity refusal must not record the id as reset"
+        );
+        assert!(
+            !at_capacity.interest.is_writable() && !at_capacity.event.is_writable(),
+            "a refused insert must not arm WRITABLE for a frame it did not queue"
+        );
+    }
+
+    // ── quickcheck: the bound survives any reap/enqueue/drain interleaving ─
+
+    use quickcheck::{Arbitrary, Gen, quickcheck};
+
+    /// One step of an abstract RST workload against the queue primitive.
+    #[derive(Clone, Debug)]
+    enum RstStep {
+        /// A single proxy-emitted reset (`reset_stream`, DATA-on-closed,
+        /// `refuse_stream_and_discard`) on a small, deliberately colliding id
+        /// space so the dedupe path is exercised too.
+        Enqueue(u8),
+        /// One `cancel_timed_out_streams` sweep: up to 96 never-before-seen
+        /// wire ids queued back-to-back with no drain in between.
+        Reap(u8),
+        /// One `flush_pending_control_frames` drain: the serializer wrote the
+        /// first `n` entries and `drain(..n)` removed them.
+        Drain(u8),
+    }
+
+    impl Arbitrary for RstStep {
+        fn arbitrary(g: &mut Gen) -> Self {
+            match u8::arbitrary(g) % 3 {
+                0 => RstStep::Enqueue(u8::arbitrary(g)),
+                1 => RstStep::Reap(u8::arbitrary(g)),
+                _ => RstStep::Drain(u8::arbitrary(g)),
+            }
+        }
+    }
+
+    /// Property: for ANY interleaving of single resets, mass reaps and partial
+    /// drains, the pending queue stays within `max_pending`, the never-decaying
+    /// lifetime counter never under-counts it, and every queued id is recorded
+    /// exactly once — the four facts `ConnectionH2::check_invariants`
+    /// invariant 3 and the dedupe invariant assert on the live connection.
+    ///
+    /// `MAX` is 16 rather than the production `MAX_PENDING_RST_STREAMS` so a
+    /// generated `Reap` reaches the cap on almost every run; reachability
+    /// itself is pinned deterministically by
+    /// `test_enqueue_rst_into_refuses_at_capacity_without_side_effects` and
+    /// `mass_reap_keeps_the_pending_rst_queue_within_its_hard_cap`.
+    ///
+    /// To SEE THIS RED: delete the `pending.len() >= max_pending` guard in
+    /// `enqueue_rst_into`, then run `cargo test -p sozu-lib --locked
+    /// prop_pending_rst_queue_stays_within_its_bound`. The first `Reap` longer
+    /// than 16 pushes the queue past the bound and quickcheck reports the
+    /// shrunk counterexample, `[quickcheck] TEST FAILED. Arguments:
+    /// ([Reap(118)])` on the run that produced this comment.
+    #[test]
+    fn prop_pending_rst_queue_stays_within_its_bound() {
+        fn prop(steps: Vec<RstStep>) -> bool {
+            const MAX: usize = 16;
+            let mut pending: Vec<(StreamId, H2Error)> = Vec::new();
+            let mut total: usize = 0;
+            let mut sent: HashSet<StreamId> = HashSet::new();
+            let mut readiness = Readiness::new();
+            // Disjoint from the `Enqueue` id space (odd, 1..=127) so a reap
+            // always queues ids the workload has not used before.
+            let mut next_reaped: StreamId = 1001;
+
+            for step in steps {
+                match step {
+                    RstStep::Enqueue(id) => {
+                        enqueue_rst_into(
+                            &mut pending,
+                            MAX,
+                            &mut total,
+                            &mut sent,
+                            &mut readiness,
+                            2 * (id as StreamId % 64) + 1,
+                            H2Error::ProtocolError,
+                        );
+                    }
+                    RstStep::Reap(n) => {
+                        for _ in 0..=(n % 96) {
+                            enqueue_rst_into(
+                                &mut pending,
+                                MAX,
+                                &mut total,
+                                &mut sent,
+                                &mut readiness,
+                                next_reaped,
+                                H2Error::Cancel,
+                            );
+                            next_reaped += 2;
+                        }
+                    }
+                    RstStep::Drain(n) => {
+                        let written = (n as usize % 8).min(pending.len());
+                        pending.drain(..written);
+                    }
+                }
+
+                if pending.len() > MAX {
+                    return false;
+                }
+                if total < pending.len() {
+                    return false;
+                }
+                if !pending.iter().all(|(id, _)| sent.contains(id)) {
+                    return false;
+                }
+                let unique: HashSet<StreamId> = pending.iter().map(|(id, _)| *id).collect();
+                if unique.len() != pending.len() {
+                    return false;
+                }
+            }
+            true
+        }
+        quickcheck(prop as fn(Vec<RstStep>) -> bool);
     }
 
     // ── forcefully_terminate_answer arms WRITABLE for ET epoll ───────────

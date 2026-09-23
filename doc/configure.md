@@ -2968,7 +2968,16 @@ of `is_handshaking()` (both through the `readable` and `writable` exit paths).
 control | | `h2.streams.reaped.idle_timeout` | counter | proxy | Streams reaped by the per-stream bidirectional-idle guard (slow-multiplex Slowloris) | | `h2.streams.reaped.window_stall` | counter | proxy | Streams reaped by the outbound flow-control-stall guard (a buffered response or backend upload the peer will not drain — the HTTP/2 window-stall / `WINDOW_UPDATE`-drip vector) | | `h2.streams.reaped.stall_budget` | counter | proxy | Subset of `window_stall`: reaps where the stream dribbled progress below the 16 KiB cumulative-stall floor (the `WINDOW_UPDATE`-drip the budget closes) | | `h2.close_with_active_streams` | counter | proxy | H2 connections
 closed while streams were still active | | `h2.window_update_dropped` | counter
 | proxy | WINDOW_UPDATE frame dropped because the per-connection pending-update
-queue was already at capacity | | `h2.headers_no_stream.error` | counter | proxy
+queue was already at capacity | | `h2.rst_stream_dropped` | counter | proxy |
+Proxy-emitted RST_STREAM never queued because `pending_rst_streams` was already
+at `MAX_PENDING_RST_STREAMS` (200). A non-zero value means the connection has
+already met the queued-RST cap, so it is either on its way to
+`GOAWAY(ENHANCE_YOUR_CALM)` — the escalation only fires while the connection is
+not yet in `GoAway`/`Error` — or already past it and about to be
+force-disconnected. In the first case no dropped frame would have been
+serialised anyway; in the second the peer already holds a GOAWAY, so the
+dropped resets do not change what it can still believe about a stream
+| | `h2.headers_no_stream.error` | counter | proxy
 | HEADERS frame received with no matching stream (protocol error) | |
 `h2.frames.tx.headers` | counter | proxy | HEADERS frames emitted by the H2
 block converter (one per response, plus the first frame of any header block

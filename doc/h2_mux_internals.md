@@ -171,7 +171,7 @@ tokens `u=N` and `i`/`i=?1`/`i=?0`. Malformed tokens are silently ignored.
 
 In `write_streams()`, all active stream IDs are collected and sorted:
 
-```rust lib/src/protocol/mux/h2.rs:2463-2472
+```rust lib/src/protocol/mux/h2.rs:2527-2536
 priorities_buf.clear();
 priorities_buf.extend(self.stream_table.streams().keys().copied());
 // RFC 9218 §4 primary sort: ascending urgency, then stream ID for
@@ -193,7 +193,7 @@ the whole loop and no other `self.hpack` accessor can run until it is dropped.
 The `incremental` flag is applied in a second pass, immediately after the
 primary sort:
 
-```rust lib/src/protocol/mux/h2.rs:2473-2479
+```rust lib/src/protocol/mux/h2.rs:2537-2543
 // RFC 9218 §4: inside each urgency bucket, move incremental streams
 // to the tail and rotate them by the per-connection round-robin
 // cursor so no single slow-draining stream can starve its
@@ -477,7 +477,11 @@ last stream drains them to zero.
 
 ### compute_stream_byte_totals()
 
-```rust lib/src/protocol/mux/h2.rs:3635-3638
+`ConnectionH2::compute_stream_byte_totals` (`lib/src/protocol/mux/h2.rs`) — cited
+as a symbol, not a line: the block below is its signature, so a line number would
+only record where the function currently sits.
+
+```rust
 fn compute_stream_byte_totals<L: ListenerHandler + L7ListenerHandler>(
     &self,
     context: &Context<L>,
@@ -506,7 +510,7 @@ path that happens inside `ConnectionH2::try_recycle_server_stream`, which calls
 the free function directly because it is itself a static helper holding
 `&mut H2ByteAccounting` rather than `&mut self`:
 
-```rust lib/src/protocol/mux/h2.rs:3570-3582
+```rust lib/src/protocol/mux/h2.rs:3634-3646
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -525,7 +529,11 @@ distribute_overhead(
 It then hands the stream to `ConnectionH2::complete_server_stream`, which emits
 the log:
 
-```rust lib/src/protocol/mux/h2.rs:3615-3621
+This one keeps a line rather than a symbol: `generate_access_log` has four call
+sites in `h2.rs` and the paragraph below is about this call's arguments, not the
+method.
+
+```rust lib/src/protocol/mux/h2.rs:3679-3685
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -538,13 +546,13 @@ stream.generate_access_log(
 The other three sites take the `&mut self` wrapper
 `ConnectionH2::distribute_overhead` instead, and each emits its own log:
 
-- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3907`) passes a
+- `cancel_timed_out_streams` (`lib/src/protocol/mux/h2.rs:3971`) passes a
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5407`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5518`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6114`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6225`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -554,10 +562,10 @@ rather than a `&self` method, for the same reason `try_recycle_server_stream`
 is: inside the per-stream write loop the `H2BlockConverter` holds the encoder
 borrowed out of `self.hpack`, so a `&self` receiver would conflict. The call
 below sits inside the `let stream = &mut context.streams[global_stream_id];`
-borrow taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2544`) and passes
+borrow taken at the top of that loop (`lib/src/protocol/mux/h2.rs:2608`) and passes
 `stream.linked_token()` straight out of it:
 
-```rust lib/src/protocol/mux/h2.rs:2757-2762
+```rust lib/src/protocol/mux/h2.rs:2821-2826
 let (client_rtt, server_rtt) = Self::snapshot_rtts(
     &self.position,
     &self.socket,
@@ -580,7 +588,7 @@ the complexity of the H2 state machine:
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:1929-1933
+```rust lib/src/protocol/mux/h2.rs:1993-1997
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -624,7 +632,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:3344-3348
+```rust lib/src/protocol/mux/h2.rs:3408-3412
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -677,11 +685,27 @@ Flushes control data before application frames, in order:
    across processes — see that module's doc comment
 6. **Pending RST_STREAM frames**: Drains `pending_rst_streams` into the zero
    buffer, with flood detection (`MAX_PENDING_RST_STREAMS` cap). Proxy-
-   emitted RSTs (DATA-on-closed, `refuse_stream_and_discard`, `reset_stream`)
-   are queued via the canonical `ConnectionH2::enqueue_rst` helper, which
+   emitted RSTs (DATA-on-closed, `refuse_stream_and_discard`, `reset_stream`,
+   `cancel_timed_out_streams`) are queued via the canonical
+   `ConnectionH2::enqueue_rst` helper, which
    dedupes through the wire-map's `rst_sent` set (`H2StreamTable`,
    `h2_stream_table.rs`), bumps `total_rst_streams_queued`, and arms
-   WRITABLE. This path is independent of the owning `Stream` still being
+   WRITABLE. The same `MAX_PENDING_RST_STREAMS` bounds the queue at the
+   insert: once `pending_rst_streams` holds 200 entries a further
+   `enqueue_rst` queues nothing and emits `h2.rst_stream_dropped` plus an
+   `error!` line, because the connection has by then already met the
+   `total_rst_streams_queued >= MAX_PENDING_RST_STREAMS` half of the condition
+   this stage escalates to `GOAWAY(ENHANCE_YOUR_CALM)` before it drains
+   anything. The other half is the state gate
+   `!matches!(self.state, H2State::GoAway | H2State::Error)`, which the drain
+   below it does not share: after the first GOAWAY the queue can stay full
+   without re-escalating, and a reap arriving then is dropped while the drain
+   still serialises what is queued — bounded by `writable()`'s `GoAway` arm
+   force-disconnecting on the same pass. The
+   insert-side bound is what holds when one caller queues many RSTs in a
+   single pass — `cancel_timed_out_streams` reaps the whole timed-out set
+   without an intervening flush.
+   This path is independent of the owning `Stream` still being
    present in the wire map, so it survives `remove_dead_stream` eviction
    (which the per-stream error callers invoke synchronously after
    `reset_stream` returns). `finalize_write` retains `Ready::WRITABLE`
@@ -738,7 +762,7 @@ and priority iteration must remain in a single method scope.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4438
+```rust lib/src/protocol/mux/h2.rs:4549
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -891,7 +915,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5450-5452
+```rust lib/src/protocol/mux/h2.rs:5561-5563
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -899,7 +923,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5464-5470
+```rust lib/src/protocol/mux/h2.rs:5575-5581
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
