@@ -40,7 +40,7 @@ use crate::{
         h2_drain::{self, GracefulDrainDecision},
         h2_flood_detector::{self, H2FloodConfig, H2FloodViolation},
         h2_flow_control, h2_header_reassembly, h2_scheduler, h2_stream_table, h2_transmit,
-        hpack_state,
+        h2_write_pass, hpack_state,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
         pkawa, remove_backend_stream, serializer, set_default_answer,
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
@@ -2210,7 +2210,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         self.arm_timeout();
         // Pre-compute byte totals for proportional overhead distribution.
-        let byte_totals = self.compute_stream_byte_totals(context);
+        let mut write_pass =
+            h2_write_pass::H2WritePass::new(self.compute_stream_byte_totals(context));
         let mut io_slices: Vec<IoSlice<'static>> = Vec::new();
 
         if let Some(
@@ -2231,8 +2232,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 Some((read_stream, amount)) if write_stream == read_stream => Some(amount),
                 _ => None,
             };
-            let mut resume_bytes: usize = 0;
-            let outcome = Self::flush_stream_out(
+            write_pass.stalled = Self::flush_stream_out(
                 &mut self.socket,
                 kawa,
                 parts.metrics,
@@ -2244,12 +2244,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 None,
                 cross_read_amount,
                 &mut io_slices,
-                Some(&mut resume_bytes),
-            );
+                Some(&mut write_pass.resume_bytes),
+            ) == FlushOutcome::Stalled;
             // Refresh the per-stream idle timer when outbound bytes move: a
             // large response delivered at low bandwidth is "active", not idle,
             // even when the peer sends no inbound frames.
-            if resume_bytes > 0 {
+            if write_pass.resume_bytes > 0 {
                 self.stream_table.touch_activity(stream_id, self.now);
                 // Clear the flow-control-stall deadline ONLY when the effective
                 // send window is genuinely open — that alone is a real un-stall.
@@ -2263,7 +2263,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.stream_table.clear_fc_stall(stream_id);
                 }
             }
-            if outcome == FlushOutcome::Stalled {
+            if write_pass.stalled {
                 return MuxResult::Continue;
             }
             self.stream_table.set_expect_write(None);
@@ -2277,7 +2277,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     stream,
                     global_stream_id,
                     stream_id,
-                    byte_totals,
+                    write_pass.byte_totals,
                     &mut context.debug,
                     context.listener.clone(),
                     client_rtt,
@@ -2308,7 +2308,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         } else {
             b"http"
         };
-        let mut completed_streams = Vec::new();
         // The converter is built for ONE `kawa.prepare` call at a time (see
         // [`converter::H2ConverterPass`]), so its encoder borrow never spans
         // the per-stream loop and every `&self` / `&mut self` method stays
@@ -2369,20 +2368,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             census.incremental_count(),
             census.ready_buckets()
         );
-        let mut socket_write = false;
-        // Total outbound bytes emitted across all stream flushes this pass —
-        // `finalize_write` uses this to distinguish a voluntary scheduler
-        // yield (progress + pending back-buffer, LIFECYCLE §9 invariant 16)
-        // from a no-progress wait state (e.g. flow-control starvation).
-        let mut total_bytes_written: usize = 0;
-        // Collect every fresh RST_STREAM emitted via the converter
-        // (`initialize` chokepoint or the HPACK over-budget abort path)
-        // so we can run `account_emitted_rst` for each one AFTER the loop.
-        // This is an ORDERING requirement, not a borrow workaround: a
-        // MadeYouReset cap trip makes `account_emitted_rst` return a GOAWAY
-        // result that ends the pass, and every stream in the pass's
-        // `order` must get its write before that preemption.
-        let mut freshly_emitted_rsts: Vec<H2Error> = Vec::new();
         'outer: for &stream_id in &order {
             let Some(&global_stream_id) = self.stream_table.streams().get(&stream_id) else {
                 error!(
@@ -2397,9 +2382,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             let stream_state = stream.state;
             let parts = stream.split(&self.position);
             let kawa = parts.wbuffer;
-            // Hoisted out of the gate below so the post-flush flow-control-stall
-            // classification can see how many flow-control bytes this pass moved.
-            let mut consumed: i32 = 0;
+            write_pass.consumed = 0;
             if kawa.is_main_phase()
                 || (kawa.is_terminated() && !kawa.is_completed())
                 || (kawa.is_error() && !self.stream_table.rst_sent_contains(stream_id))
@@ -2435,9 +2418,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     // unaccounted RST on the wire. The accounting call is
                     // deferred to after the loop so a cap trip cannot
                     // preempt the remaining streams' writes; see
-                    // `freshly_emitted_rsts` above.
+                    // `H2WritePass::freshly_emitted_rsts`.
                     if freshly_rst {
-                        freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
+                        write_pass
+                            .freshly_emitted_rsts
+                            .push(rst_error_from_kawa(kawa));
                     }
                 }
                 // Apply per-frontend response-side header edits
@@ -2493,7 +2478,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     incremental_peer_count,
                 );
                 kawa.prepare(&mut converter);
-                consumed = window - pass.reclaim(converter);
+                write_pass.consumed = window - pass.reclaim(converter);
                 // The pre-prepare gate above only inserts into
                 // `rst_sent` when `kawa.is_error()` is already true on
                 // entry. The HPACK over-budget abort path
@@ -2522,12 +2507,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 if freshly_rst_post_prepare {
                     // Deferred to after the loop; same reason as the
                     // pre-prepare collector above.
-                    freshly_emitted_rsts.push(rst_error_from_kawa(kawa));
+                    write_pass
+                        .freshly_emitted_rsts
+                        .push(rst_error_from_kawa(kawa));
                     census.note_ineligible(urgency, is_incremental);
                 }
-                *parts.window = parts.window.saturating_sub(consumed);
-                self.flow_control.consume_send_window(consumed);
-                census.note_fired(stream_id, is_incremental, consumed);
+                *parts.window = parts.window.saturating_sub(write_pass.consumed);
+                self.flow_control.consume_send_window(write_pass.consumed);
+                census.note_fired(stream_id, is_incremental, write_pass.consumed);
             }
             context.debug.push(DebugEvent::S(
                 stream_id,
@@ -2536,8 +2523,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.blocks.len(),
                 kawa.out.len(),
             ));
-            let mut stream_bytes: usize = 0;
-            let outcome = Self::flush_stream_out(
+            write_pass.stream_bytes = 0;
+            write_pass.stalled = Self::flush_stream_out(
                 &mut self.socket,
                 kawa,
                 parts.metrics,
@@ -2546,17 +2533,17 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 &mut context.debug,
                 3,
                 global_stream_id,
-                Some(&mut socket_write),
+                Some(&mut write_pass.socket_write),
                 None,
                 &mut io_slices,
-                Some(&mut stream_bytes),
-            );
+                Some(&mut write_pass.stream_bytes),
+            ) == FlushOutcome::Stalled;
             // Refresh the per-stream idle timer on outbound bytes. Without
             // this, a long-running response trickled at low bandwidth would
             // be killed by `cancel_timed_out_streams` mid-delivery — the
             // inbound-only refreshes in `handle_data_frame` (non-empty DATA)
             // and `handle_headers_frame` never fire while the peer is idle.
-            if stream_bytes > 0 {
+            if write_pass.stream_bytes > 0 {
                 self.stream_table.touch_activity(stream_id, self.now);
             }
             // Arm/age the dedicated flow-control-stall deadline that catches a
@@ -2582,7 +2569,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 && (!kawa.blocks.is_empty() || !kawa.out.is_empty());
             match fc_stall_budget_decision(
                 outbound_window_blocked,
-                consumed,
+                write_pass.consumed,
                 self.stream_table.fc_stall_progress(stream_id),
             ) {
                 FcStallAction::Clear => {
@@ -2593,8 +2580,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         .arm_fc_stall(stream_id, self.now, progress);
                 }
             }
-            total_bytes_written = total_bytes_written.saturating_add(stream_bytes);
-            if outcome == FlushOutcome::Stalled {
+            write_pass.total_bytes_written = write_pass
+                .total_bytes_written
+                .saturating_add(write_pass.stream_bytes);
+            if write_pass.stalled {
                 self.stream_table.set_expect_write(Some(H2StreamId::Other {
                     id: stream_id,
                     gid: global_stream_id,
@@ -2614,13 +2603,18 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     stream,
                     global_stream_id,
                     stream_id,
-                    byte_totals,
+                    write_pass.byte_totals,
                     &mut context.debug,
                     context.listener.clone(),
                     client_rtt,
                     server_rtt,
                 ) {
-                    completed_streams.push((dead_id, global_stream_id, token, close_frontend));
+                    write_pass.completed_streams.push((
+                        dead_id,
+                        global_stream_id,
+                        token,
+                        close_frontend,
+                    ));
                     // LIFECYCLE §9 invariant 17: leave the census INSIDE
                     // 'outer so later iterations see the reduced count. The
                     // post-loop retirement at remove_dead_stream is too late.
@@ -2653,7 +2647,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // the global tx counter, the per-error breakdown, and the
         // MadeYouReset emitted-RST lifetime cap stay in step. If the
         // cap trips, propagate the GOAWAY result.
-        for error in freshly_emitted_rsts {
+        for error in write_pass.freshly_emitted_rsts {
             if let Some(result) = self.account_emitted_rst(error) {
                 return result;
             }
@@ -2670,7 +2664,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // early skips both exactly as it did before the extraction.
         self.scheduler.end_pass(order, census);
         let mut close_frontend_after_completed_stream = false;
-        for (dead_id, global_stream_id, token, close_frontend) in completed_streams {
+        for (dead_id, global_stream_id, token, close_frontend) in write_pass.completed_streams {
             // Retirement is deferred out of the loop on purpose, and this is
             // an ORDERING requirement rather than a borrow workaround:
             // `try_recycle_server_stream` passes `is_last_stream` as
@@ -2699,7 +2693,11 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.graceful_goaway(self.now)
             };
         }
-        self.finalize_write(socket_write, total_bytes_written, context)
+        self.finalize_write(
+            write_pass.socket_write,
+            write_pass.total_bytes_written,
+            context,
+        )
     }
 
     /// Remove streams that completed their lifecycle from all tracking maps.
@@ -8297,11 +8295,13 @@ mod tests {
     /// `FinalizeAction::Quiesce`, which withdraws `Ready::WRITABLE` and waits
     /// for an external trigger.
     ///
-    /// TO SEE THIS RED: in `write_streams`, hoist the resume counter out of
-    /// the `if let Some(write_stream @ H2StreamId::Other { .. })` block —
-    /// `let mut resume_bytes: usize = 0;` moved above the block — and seed the
-    /// pass total from it: `let mut total_bytes_written: usize = resume_bytes;`
-    /// in place of `= 0`. That is the shape a refactor unifying the two flush
+    /// TO SEE THIS RED: in `write_streams`, seed the pass total from the
+    /// resume counter — `write_pass.total_bytes_written =
+    /// write_pass.resume_bytes;` immediately before the `'outer` loop, where
+    /// the pre-field code declared `let mut total_bytes_written: usize = 0;`.
+    /// The hoist that recipe used to open with is now structural: both
+    /// counters are fields of `H2WritePass`, and keeping them apart is the
+    /// whole point. That is the shape a refactor unifying the two flush
     /// sites would reach for. Measured: this test fails on its own first
     /// assertion, `a pass whose scheduler loop wrote nothing must withdraw
     /// WRITABLE interest`, with `left: Writable | Error | Hup, right: Error |
@@ -8633,7 +8633,7 @@ mod tests {
     /// A pass's byte total accumulates across streams: a later stream that
     /// writes nothing must not erase what an earlier one delivered.
     ///
-    /// `total_bytes_written = total_bytes_written.saturating_add(stream_bytes)`
+    /// `write_pass.total_bytes_written.saturating_add(write_pass.stream_bytes)`
     /// is the whole of it, and nothing pinned it. `finalize_write` hands the
     /// total to `h2_close::finalize_action` as `made_progress`, and
     /// `made_progress && any_pending_back()` is LIFECYCLE §9 invariant 16 — the
@@ -8653,9 +8653,9 @@ mod tests {
     /// flow-control-stall arm, which returns the chunk untouched and leaves
     /// `kawa.out` empty so its flush never calls the socket at all.
     ///
-    /// TO SEE THIS RED: in `write_streams`, change
-    /// `total_bytes_written = total_bytes_written.saturating_add(stream_bytes);`
-    /// to `total_bytes_written = stream_bytes;` — the shape a rewrite that
+    /// TO SEE THIS RED: in `write_streams`, change the accumulation into
+    /// `write_pass.total_bytes_written = write_pass.stream_bytes;` — the shape
+    /// a rewrite that
     /// folds the resume and main flush paths into one per-stream counter
     /// naturally reaches for. Measured: this test fails on its own first
     /// assertion, `a pass that delivered bytes and left blocks queued must

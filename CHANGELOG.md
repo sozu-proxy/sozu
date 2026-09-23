@@ -77,6 +77,48 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the locals of one `write_streams` pass become the fields of an
+  `H2WritePass` struct in a new `h2_write_pass.rs`.** Pure state extraction, ahead of the
+  control-flow inversion that turns the write path into a `poll` / write / `handle` drive loop the
+  way `poll_read_target` / `handle_read` already did for the read path. Nine values move out of
+  stack slots and into fields — the connection byte totals, the last flush's stall verdict, the
+  resume path's byte counter, `completed_streams`, the socket-write flag, the pass byte total,
+  `freshly_emitted_rsts`, and the per-stream `consumed` / `stream_bytes` — and nothing else moves:
+  not a condition, not an ordering, not the `saturating_add` boundary. The pass is a local threaded
+  by `&mut`, never an `Option` field on `ConnectionH2`: every exit of `write_streams` ends it and
+  the stalled-stream `break 'outer` falls through to the tail, so it cannot outlive one call, while
+  resumption ACROSS calls stays `H2StreamTable::expect_write`.
+
+  `resume_bytes` stays a SEPARATE counter from `total_bytes_written`, which is behaviour rather
+  than an oversight: the resume path's bytes never reach `finalize_write`, so a resume-only pass
+  does not read as progress and `h2_close::finalize_action` quiesces instead of retaining
+  `Ready::WRITABLE`. `resume_path_bytes_do_not_make_the_pass_progress` pins it.
+
+  Three values a pass uses stay locals, for two measurable reasons rather than one. The scheduler's
+  loaned `order` buffer and its `ReadyIncrementalCensus` are built AFTER the `expect_write` resume
+  path has run, and that path can retire a stream through `remove_dead_stream` which
+  `H2Scheduler::begin_pass` then does not enumerate, so building them at pass start would change
+  which streams the pass visits. That argument cannot apply to `H2ConverterPass`, which enumerates
+  no streams: its reason is buffer stranding. Its constructor `mem::take`s the three reusable
+  scratch buffers out of `HpackState`, and only `into_buffers` after the per-stream loop hands them
+  back through the matching `put_*` calls — both after the resume path's stall returns — so a
+  pass-start converter would be dropped on every stalled resume and leave `HpackState` holding three
+  empty `Vec`s to re-grow. The `Vec<IoSlice<'static>>` a pass lends to `h2_transmit::gather` IS
+  built at pass start and is excluded by design instead: keeping it with the caller keeps the
+  `'static` descriptors' `unsafe` window as narrow as the gather/write/confirm triple that opens and
+  closes it. The `Prepare` / `Flush` phase marker the
+  inversion needs is not introduced here either: with the loop unchanged its variants have no
+  construction site, and `-D warnings` rejects it — `error: variants ‘Flush’ and ‘End’ are
+  never constructed`.
+
+  No test changed, was added, removed or ignored; the suite holds at the same count. All six
+  reddening recipes the parent commit recorded on this region still redden the same tests, with the
+  same `left:` / `right:` values, two of them re-expressed for the field form:
+  `write_pass.total_bytes_written = write_pass.resume_bytes;` before the `'outer` loop for the
+  resume-fold recipe, and `write_pass.total_bytes_written = write_pass.stream_bytes;` for the
+  accumulation recipe. The two `TO SEE THIS RED` comments naming those expressions were updated to
+  the form they now take.
+
 - **`fix(mux-h2)`: `H2ControlTx::lifetime_cap_reached` reads the instance's own bound instead of the
   `MAX_PENDING_RST_STREAMS` constant.** The type carries one cap per instance, `max_pending`, and
   three predicates that must all read it: the per-insert bound in `enqueue_rst`, the post-condition
@@ -124,8 +166,8 @@
   (`h2_close.rs`); every other `BeforeFlush` answer returns early in `h2.rs`, so an uncongested
   pass still asks exactly once, as the pre-image did — its `ensure_tls_flushed()` also sat inside
   the `if self.socket.socket_wants_write()` branch. The third query is `FinalizeAction::ReArm`
-  (`h2.rs:2987`) calling `ensure_tls_flushed()`, whose own `socket_wants_write()` (`h2.rs:2786`)
-  re-asks what the `AfterFlush` decision (`h2.rs:2974`) already knows. It is redundant — nothing
+  (`h2.rs:2985`) calling `ensure_tls_flushed()`, whose own `socket_wants_write()` (`h2.rs:2784`)
+  re-asks what the `AfterFlush` decision (`h2.rs:2972`) already knows. It is redundant — nothing
   mutates the socket between them — and deliberate: it keeps every post-decision TLS re-arm in this
   file spelled the same way, as the GoAway and Error arms of `writable` already do, and keeps this
   commit free of an unrelated change. It is also cheap: `FrontRustls::socket_wants_write` is
