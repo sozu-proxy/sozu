@@ -6341,7 +6341,7 @@ mod tests {
             mux::{
                 connection::EndpointClient,
                 router::Router,
-                test_support::{connected_socket, test_context},
+                test_support::{TestListener, connected_socket, test_context},
             },
         },
     };
@@ -7948,6 +7948,802 @@ mod tests {
         );
     }
 
+    // ── The two write-path sites `writable()` had never reached ──────────
+    //
+    // `flush_stream_out` has ONE producer of `FlushOutcome::Stalled` and
+    // exactly two consumers, and both consumers were dead code as far as the
+    // suite was concerned:
+    //
+    //   - the resume path's `return MuxResult::Continue`, reached from the
+    //     `flush_stream_out` call the top-of-`write_streams`
+    //     `expect_write == Some(H2StreamId::Other { .. })` block makes with
+    //     `debug_site = 2`;
+    //   - the main loop's `set_expect_write(Some(H2StreamId::Other { .. }))`
+    //     followed by `break 'outer`.
+    //
+    // Measured on this commit's parent, `38fe5851`: a `panic!` planted at
+    // BOTH consumers at once still leaves the whole suite green — neither is
+    // reached by any test. A `panic!` on the `return FlushOutcome::Stalled`
+    // they both read fails exactly ONE test,
+    // `a_write_that_moves_no_bytes_stalls_the_pass` above, which calls the
+    // associated function directly and never enters `write_streams` at all.
+    // A `panic!` on the first line of the resume block leaves the suite green
+    // as well: `debug_site = 2` had no caller in it.
+    //
+    // No absolute pass count appears in this block or in any recipe below, on
+    // purpose. A count of the whole `sozu-lib` suite is falsified by a test
+    // added anywhere in the crate, and nothing checks it —
+    // `check_doc_citations.py` reads only `doc/` and `**/LIFECYCLE.md`. The
+    // failing test NAMES and the `left:`/`right:` values are what survive.
+    //
+    // Why the gap existed. `Stalled` needs `size == 0` against a non-empty
+    // `kawa.out`. The two `BackpressuredTlsSocket` `writable()` tests above
+    // sit in `H2State::GoAway` and take that arm of `writable`, never
+    // `write_streams`; the two after them do reach `write_streams`, but with
+    // an empty stream table, so `'outer` iterates zero times. Every other
+    // `writable()` test writes to a live loopback socket with room, and a
+    // kernel with room never answers 0.
+    //
+    // The missing step was never the socket — `with_vectored_script` already
+    // scripts any `(size, status)` pair, including ones no kernel produces.
+    // It was REGISTERING a stream that carries response bytes, so the
+    // scheduler reaches it through `writable()`. That is what
+    // `writable_fixture` below adds, and it is the whole difference between
+    // these tests and `drive_flush_stream_out`'s.
+
+    /// The stream id every test below registers. Odd, because a server's peer
+    /// opens odd-numbered streams (RFC 9113 §5.1.1).
+    const REGISTERED_STREAM_ID: StreamId = 1;
+
+    /// A server connection in `H2State::Header` plus a context holding ONE
+    /// registered stream whose response buffer already carries `blocks`, with
+    /// the socket's `(size, status)` answers scripted.
+    ///
+    /// `pending = 0` keeps `socket_wants_write()` false for the whole pass, so
+    /// `writable`'s preamble flush and both of `finalize_write`'s TLS branches
+    /// stay out of the way: the readiness bits these tests read are decided by
+    /// the write pass alone.
+    ///
+    /// The script is assigned to the field rather than through
+    /// `with_vectored_script`, which takes `self` by value and so cannot be
+    /// applied to a handler already moved into `ConnectionH2::new`.
+    ///
+    /// The peer end of the loopback pair is returned for the caller to hold:
+    /// dropping it would close the connection under the socket being tested.
+    fn writable_fixture(
+        pool: &Rc<RefCell<Pool>>,
+        blocks: &[&'static [u8]],
+        script: &[(usize, SocketResult)],
+    ) -> (
+        ConnectionH2<BackpressuredTlsSocket>,
+        Context<TestListener>,
+        GlobalStreamId,
+        std::net::TcpStream,
+    ) {
+        let (mut connection, peer) = connection_with_backpressure(pool, 0, 0, H2State::Header);
+        connection.socket.vectored_script = script.iter().copied().collect();
+        let mut context = test_context(pool);
+        let gid = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        connection
+            .stream_table
+            .register(REGISTERED_STREAM_ID, gid, connection.now);
+        for block in blocks {
+            context.streams[gid]
+                .back
+                .out
+                .push_back(kawa::OutBlock::Store(kawa::Store::Static(block)));
+        }
+        (connection, context, gid, peer)
+    }
+
+    /// A fresh `Stream`'s response buffer is in `ParsingPhase::StatusLine`,
+    /// which `is_main_phase()` answers `false` for, so the `write_streams`
+    /// prepare gate stays shut and the pass is the flush and nothing else.
+    ///
+    /// Every `writable_fixture` test rests on that, because each one counts
+    /// either bytes or socket calls and a prepare would add both. Asserted as
+    /// a premise rather than assumed: if a future `Stream::new` started life
+    /// in `Body`, those tests would keep passing while measuring something
+    /// else. `a_yielded_incremental_stream_is_prepared_once_per_pass` below
+    /// deliberately opens the gate instead, and builds its own fixture.
+    fn assert_prepare_gate_is_shut(context: &Context<TestListener>, gid: GlobalStreamId) {
+        let back = &context.streams[gid].back;
+        assert!(
+            !back.is_main_phase() && !back.is_terminated() && !back.is_error(),
+            "premise: the prepare gate must stay shut so this pass is a pure \
+             flush, got parsing_phase {:?}",
+            back.parsing_phase
+        );
+    }
+
+    /// A write that moved bytes but reported `WouldBlock` does not end the
+    /// pass — driven through `writable()`, over a registered stream, rather
+    /// than by calling `flush_stream_out` directly.
+    ///
+    /// `a_partial_write_reporting_would_block_continues_the_pass` above pins
+    /// the same contract on the associated function. This one pins that the
+    /// SCHEDULER honours it: the `(size > 0, WouldBlock)` answer has to travel
+    /// back out through `write_streams`'s `FlushOutcome` comparison at the
+    /// `break 'outer` site and through `finalize_write` without anything on
+    /// the way deciding the pass is over. A write machine that treated
+    /// `status != Continue` as a pass terminator would park `expect_write`,
+    /// leave `SECOND_BLOCK` queued, and truncate the response.
+    ///
+    /// TO SEE THIS RED: in `flush_stream_out`, change
+    /// `if update_readiness_after_write(size, status, readiness) {`
+    /// to
+    /// `if update_readiness_after_write(size, status, readiness)
+    ///      || !matches!(status, SocketResult::Continue) {`
+    /// Measured: this test fails on its own first assertion, `every queued
+    /// byte must reach the socket within the pass`, with `left: 5, right: 43`.
+    /// That edit also reddens two siblings, so THREE tests fail and not one:
+    /// `a_partial_write_reporting_would_block_continues_the_pass`, the same
+    /// contract on the direct path, documenting the same recipe (`left: 5,
+    /// right: 43`); and
+    /// `a_yielded_incremental_stream_is_prepared_once_per_pass` below, whose
+    /// first stream stalls on its `WouldBlock` round so the pass breaks
+    /// 'outer before the second stream is ever prepared (`left: 16384, right:
+    /// 32768`). Three witnesses to one truncation vector, at three different
+    /// depths — not a duplicate. No production `debug_assert!` fires: every
+    /// scripted size is clamped to the gather's offer.
+    #[test]
+    fn a_partial_write_reporting_would_block_continues_the_pass_through_writable() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, mut context, gid, _peer) = writable_fixture(
+            &pool,
+            &[FIRST_BLOCK, SECOND_BLOCK],
+            &[
+                (5, SocketResult::WouldBlock),
+                (TOTAL_QUEUED, SocketResult::Continue),
+            ],
+        );
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        assert_eq!(
+            connection.stream_table.expect_write(),
+            None,
+            "premise: no parked write, so the pass takes the main loop and not \
+             the resume path"
+        );
+        assert_prepare_gate_is_shut(&context, gid);
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert_eq!(
+            context.streams[gid].metrics.bout, TOTAL_QUEUED,
+            "every queued byte must reach the socket within the pass: a write \
+             that moved bytes under WouldBlock is not a stall, so the loop must \
+             go round again instead of ending the pass short"
+        );
+        assert_eq!(
+            connection.socket.vectored_calls, 2,
+            "the pass must issue a SECOND socket_write_vectored after the \
+             partial write, not settle for the first"
+        );
+        assert!(
+            context.streams[gid].back.out.is_empty(),
+            "every queued block must be consumed once the pass drains"
+        );
+        assert_eq!(
+            connection.stream_table.expect_write(),
+            None,
+            "a pass that drained must not park expect_write: parking here \
+             would defer a stream that owes nothing to the next writable tick"
+        );
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a drained write pass continues, got {result:?}"
+        );
+    }
+
+    /// A zero-byte write parks `expect_write` on the stalled stream and ends
+    /// the pass, so the next tick resumes exactly it.
+    ///
+    /// This is `write_streams`'s stall consumer — the
+    /// `set_expect_write(Some(H2StreamId::Other { .. })); break 'outer;` pair.
+    /// Without the park, the next `writable()` would re-enter the scheduler
+    /// from the top and re-run the priority ordering for a stream that is
+    /// merely waiting on the socket, and `finalize_write` would read
+    /// `expect_write_parked == false` and fall through to `Quiesce`, stripping
+    /// `Ready::WRITABLE` from a connection that has bytes to deliver.
+    ///
+    /// TO SEE THIS RED: delete the
+    /// `self.stream_table.set_expect_write(Some(H2StreamId::Other { id:
+    /// stream_id, gid: global_stream_id, }));` statement from that arm,
+    /// keeping the `break 'outer`. Measured: this test fails on its own first
+    /// assertion, `a stalled stream must park expect_write so the next pass
+    /// resumes it`, with `left: None, right: Some(Other { id: 1, gid: 0 })`,
+    /// and it is the ONLY failure in the suite.
+    #[test]
+    fn a_stalled_stream_parks_expect_write_for_the_next_pass() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, mut context, gid, _peer) = writable_fixture(
+            &pool,
+            &[FIRST_BLOCK, SECOND_BLOCK],
+            &[(0, SocketResult::WouldBlock)],
+        );
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        assert_eq!(
+            connection.stream_table.expect_write(),
+            None,
+            "premise: nothing parked on entry, so any park below is this \
+             pass's doing"
+        );
+        assert_prepare_gate_is_shut(&context, gid);
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert_eq!(
+            connection.stream_table.expect_write(),
+            Some(H2StreamId::Other {
+                id: REGISTERED_STREAM_ID,
+                gid
+            }),
+            "a stalled stream must park expect_write so the next pass resumes \
+             it instead of re-running the scheduler over a socket-blocked stream"
+        );
+        assert!(
+            !context.streams[gid].back.out.is_empty(),
+            "the undelivered blocks must stay queued for the next pass, or \
+             they are lost"
+        );
+        assert_eq!(
+            connection.socket.vectored_calls, 1,
+            "a stalled pass must not retry the socket within the same pass"
+        );
+        assert_eq!(
+            context.streams[gid].metrics.bout, 0,
+            "a stalled write delivered nothing"
+        );
+        assert!(
+            connection.readiness.interest.is_writable(),
+            "a parked pass leaves every readiness bit alone — stripping \
+             WRITABLE here would strand the parked stream, got {:?}",
+            connection.readiness
+        );
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a parked write pass continues, got {result:?}"
+        );
+    }
+
+    /// A stalled resume returns before the scheduler pass begins.
+    ///
+    /// This is the OTHER stall consumer — the resume path's
+    /// `if outcome == FlushOutcome::Stalled { return MuxResult::Continue; }`.
+    /// The park it leaves standing is the point: falling through would clear
+    /// `expect_write` on a stream the socket has just refused, and then run
+    /// the whole priority ordering, converter pass and census for a
+    /// connection whose socket is known to be full.
+    ///
+    /// The stream is registered even though the resume path reads its gid
+    /// straight out of `expect_write` and needs no registration. That is what
+    /// makes `vectored_calls` a witness: with the stream in the table, a pass
+    /// that continued into `'outer` would reach it again and issue a second
+    /// `socket_write_vectored`.
+    ///
+    /// TO SEE THIS RED: delete the `return MuxResult::Continue;` from that
+    /// arm, leaving the `if` with an empty body so control falls through to
+    /// `self.stream_table.set_expect_write(None);`. Measured: this test fails
+    /// on its own first assertion, `a stalled resume must leave expect_write
+    /// parked`, with `left: None, right: Some(Other { id: 1, gid: 0 })`, and
+    /// it is the ONLY failure in the suite. The
+    /// second assertion moves under the same edit (`left: 2, right: 1`), the
+    /// extra call being the main loop re-flushing the same stream through the
+    /// delegated loopback socket once the one-entry script is spent.
+    #[test]
+    fn a_stalled_resume_does_not_begin_a_scheduler_pass() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, mut context, gid, _peer) = writable_fixture(
+            &pool,
+            &[FIRST_BLOCK, SECOND_BLOCK],
+            &[(0, SocketResult::WouldBlock)],
+        );
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let parked = H2StreamId::Other {
+            id: REGISTERED_STREAM_ID,
+            gid,
+        };
+        connection.stream_table.set_expect_write(Some(parked));
+        assert_prepare_gate_is_shut(&context, gid);
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert_eq!(
+            connection.stream_table.expect_write(),
+            Some(parked),
+            "a stalled resume must leave expect_write parked: clearing it \
+             would hand a socket-blocked stream back to the scheduler"
+        );
+        assert_eq!(
+            connection.socket.vectored_calls, 1,
+            "a stalled resume must return before the scheduler pass begins, so \
+             the registered stream must not be flushed a second time"
+        );
+        assert!(
+            !context.streams[gid].back.out.is_empty(),
+            "the refused blocks must stay queued for the next pass"
+        );
+        assert_eq!(
+            context.streams[gid].metrics.bout, 0,
+            "a stalled resume delivered nothing"
+        );
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a stalled resume continues the session, got {result:?}"
+        );
+    }
+
+    /// Resume-path bytes are not pass progress.
+    ///
+    /// `finalize_write` reads `bytes_written_this_pass > 0` as
+    /// `made_progress`, and `made_progress && any_pending_back()` is LIFECYCLE
+    /// §9 invariant 16: it RETAINS `Ready::WRITABLE` because a pass that moved
+    /// bytes and left blocks behind is a voluntary scheduler yield that will
+    /// resume itself. The resume path's drain is not that. It happens before
+    /// `'outer` runs, it is a socket-backpressure catch-up rather than a
+    /// yield, and the stranded blocks it leaves belong to a stream the
+    /// converter never reached this pass. Counting it as progress would keep
+    /// WRITABLE armed on a connection whose scheduler pass did nothing, and
+    /// the next tick would find the same nothing — a spin, not a resume.
+    ///
+    /// So `resume_bytes` is deliberately NOT accumulated into
+    /// `total_bytes_written`: only the main loop's `stream_bytes` is. With a
+    /// drained resume and a zero-byte scheduler pass, the correct answer is
+    /// `FinalizeAction::Quiesce`, which withdraws `Ready::WRITABLE` and waits
+    /// for an external trigger.
+    ///
+    /// TO SEE THIS RED: in `write_streams`, hoist the resume counter out of
+    /// the `if let Some(write_stream @ H2StreamId::Other { .. })` block —
+    /// `let mut resume_bytes: usize = 0;` moved above the block — and seed the
+    /// pass total from it: `let mut total_bytes_written: usize = resume_bytes;`
+    /// in place of `= 0`. That is the shape a refactor unifying the two flush
+    /// sites would reach for. Measured: this test fails on its own first
+    /// assertion, `a pass whose scheduler loop wrote nothing must withdraw
+    /// WRITABLE interest`, with `left: Writable | Error | Hup, right: Error |
+    /// Hup`, and it is the ONLY failure in the suite.
+    /// No other test reaches the resume path at all, which is why the blast
+    /// radius is one.
+    #[test]
+    fn resume_path_bytes_do_not_make_the_pass_progress() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, mut context, gid, _peer) = writable_fixture(
+            &pool,
+            &[FIRST_BLOCK, SECOND_BLOCK],
+            &[(TOTAL_QUEUED, SocketResult::Continue)],
+        );
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        connection
+            .stream_table
+            .set_expect_write(Some(H2StreamId::Other {
+                id: REGISTERED_STREAM_ID,
+                gid,
+            }));
+        // A pending back-buffer, which is the OTHER half of invariant 16's
+        // condition. `flush_stream_out` drains `out` and never touches
+        // `blocks`, so this block survives the resume and makes
+        // `any_stream_has_pending_back` answer true — leaving `made_progress`
+        // as the single input that decides Quiesce against RetainPendingBack.
+        context.streams[gid]
+            .back
+            .blocks
+            .push_back(kawa::Block::StatusLine);
+        assert_prepare_gate_is_shut(&context, gid);
+        assert!(
+            connection.readiness.interest.is_writable(),
+            "premise: WRITABLE interest must start armed, or the withdrawal \
+             below is unobservable, got {:?}",
+            connection.readiness
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert_eq!(
+            connection.readiness.interest,
+            Ready::HUP | Ready::ERROR,
+            "a pass whose scheduler loop wrote nothing must withdraw WRITABLE \
+             interest: the resume path's drain is socket catch-up, not the \
+             voluntary yield invariant 16 retains the bit for"
+        );
+        assert_eq!(
+            context.streams[gid].metrics.bout, TOTAL_QUEUED,
+            "premise: the resume path really did move every queued byte — \
+             without that this test would assert Quiesce over a pass that \
+             simply had nothing to write"
+        );
+        assert!(
+            !context.streams[gid].back.blocks.is_empty(),
+            "premise: the pending back-buffer must survive the pass, or \
+             any_stream_has_pending_back answers false and RetainPendingBack \
+             is unreachable whatever made_progress says"
+        );
+        assert_eq!(
+            connection.stream_table.expect_write(),
+            None,
+            "a drained resume clears the park before the scheduler pass"
+        );
+        assert_eq!(
+            connection.socket.vectored_calls, 1,
+            "the scheduler pass must find nothing to write: the resume drained \
+             `out`, and the prepare gate is shut"
+        );
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a quiesced write pass continues, got {result:?}"
+        );
+    }
+
+    // ── One pass, one prepare per stream ────────────────────────────────
+    //
+    // The four tests above pin the FLUSH half of a write pass. This one pins
+    // the PREPARE half against the same refactor: `write_streams` runs the
+    // gate at `if kawa.is_main_phase() || ...` — `kawa.prepare`, the
+    // `*parts.window` debit, `flow_control.consume_send_window`,
+    // `census.note_fired` and the `freshly_emitted_rsts` push — ONCE per
+    // stream per pass, outside `flush_stream_out`'s `while !kawa.out.is_empty()`
+    // loop. A restructure that lifted those rounds up into `write_streams`
+    // and brought the prepare with them would debit the send window twice for
+    // one stream's single scheduling turn: a connection would believe it had
+    // spent credit it never put on the wire, and would stall itself short of
+    // the peer's real window.
+    //
+    // MEASURED, and it corrects the obvious way to write this test. A narrow
+    // per-stream window does NOT expose a double prepare. With
+    // `create_stream(ulid, 64)` against a 200-byte body and a two-round flush,
+    // production and an edit that visits every stream twice in one pass give
+    // the same `delta=64 vectored_calls=2 blocks_left=1 bout=73`. The send
+    // window is SELF-LIMITING: `*parts.window =
+    // parts.window.saturating_sub(consumed)` zeroes the stream's credit, the
+    // second prepare computes `min(0, connection_window) == 0`, the converter's
+    // `self.window > 0` gate returns the chunk untouched, and
+    // `consumed = 0 - 0 = 0`. A non-incremental prepare always takes every byte
+    // the window allows, so a second one has nothing left to take.
+    //
+    // INVISIBLE TO THOSE OBSERVABLES IS NOT HARMLESS, and the difference is
+    // the reason this block is worth reading. Two things DO move on that
+    // second visit, measured on the same fixture:
+    //
+    //   - `converter.rs`'s flow-control-stall arm fires. It is the arm reached
+    //     BECAUSE the window is zero, and its `incr!(names::h2::FLOW_CONTROL_STALL)`
+    //     is unconditional once there — on `Position::Client` it also fires
+    //     `incr!(names::backend::FLOW_CONTROL_PAUSED)`. Measured with a `panic!`
+    //     planted on that `incr!`: the fixture does NOT reach it under
+    //     production and DOES under the double visit. Those two counters are
+    //     dashboard signals for a real RFC 9113 §6.9 condition, so a re-entrant
+    //     write loop would inflate them with stalls that never happened on the
+    //     wire — an operator would read backpressure into a connection that had
+    //     none.
+    //   - `context.debug.push(DebugEvent::S(..))` sits OUTSIDE the prepare
+    //     gate's closing brace, so it fires once per VISIT, not once per
+    //     prepare: measured `s_events` 1 -> 2 while `io_events` stays 2. Every
+    //     extra entry evicts a real one from the bounded `DebugHistory` ring.
+    //
+    // So the correct claim is narrow: the BYTES are idempotent, the
+    // TELEMETRY is not.
+    //
+    // And the bytes are idempotent by FOUR independent mechanisms, only one of
+    // which is the window — a future reader must not conclude the window is
+    // the guard:
+    //
+    //   1. `consumed` debits `*parts.window` AND `flow_control`, which is the
+    //      self-limiting above;
+    //   2. `H2Scheduler::note_fired` gates its round-robin lead on
+    //      `consumed > 0`, so a zero-consumption re-entry cannot advance the
+    //      cursor;
+    //   3. the `rst_sent` `HashSet` in `H2StreamTable` dedups RST_STREAM.
+    //      This one is load-bearing rather than incidental:
+    //      `H2BlockConverter::initialize` pushes a RST_STREAM frame on EVERY
+    //      prepare of an errored kawa with no window gate whatsoever, so
+    //      without that set a second visit would put a duplicate RST on the
+    //      wire regardless of the send window;
+    //   4. `std::mem::take(&mut parts.context.headers_response)` drains the
+    //      response-header edits, so a re-entry cannot apply them twice.
+    //
+    // The RFC 9218 §4 incremental yield is the one path that stops a prepare
+    // with BOTH window and blocks remaining: `H2BlockConverter`'s DATA arm
+    // returns `can_continue && !yield_after_data`, and with
+    // `incremental_mode && incremental_peer_count > 1` it yields after a
+    // single DATA frame while the window is still wide open. That is why this
+    // test registers a same-urgency incremental PAIR rather than one stream,
+    // and why the body must exceed `SETTINGS_MAX_FRAME_SIZE` (16 384) so one
+    // frame cannot carry it.
+
+    /// A response body larger than the default 16 384-byte
+    /// `SETTINGS_MAX_FRAME_SIZE`, so one DATA frame cannot carry it and the
+    /// incremental yield leaves the remainder in `blocks`.
+    static YIELDING_BODY: [u8; 40_000] = [b'x'; 40_000];
+
+    /// Payload bytes one yielded prepare converts: the default
+    /// `SETTINGS_MAX_FRAME_SIZE`, which bounds the frame before the window does.
+    const YIELDED_PAYLOAD: i32 = 16_384;
+
+    /// Bytes one yielded prepare puts in `kawa.out`: the DATA frame header
+    /// plus its payload.
+    const YIELDED_FRAME: usize = parser::FRAME_HEADER_SIZE + YIELDED_PAYLOAD as usize;
+
+    /// Two registered, same-urgency INCREMENTAL server streams, each carrying
+    /// `YIELDING_BODY` as one un-prepared chunk and each granted a send window
+    /// far wider than a single frame.
+    ///
+    /// The width is the point: a narrow window would make the prepare stop
+    /// because it ran out of credit, and a second prepare would then be a
+    /// no-op whether or not the code is correct. Here the prepare stops
+    /// because it YIELDED, so credit survives it and a second one would spend
+    /// more.
+    fn incremental_pair_fixture(
+        pool: &Rc<RefCell<Pool>>,
+        script: &[(usize, SocketResult)],
+    ) -> (
+        ConnectionH2<BackpressuredTlsSocket>,
+        Context<TestListener>,
+        [GlobalStreamId; 2],
+        std::net::TcpStream,
+    ) {
+        let (mut connection, peer) = connection_with_backpressure(pool, 0, 0, H2State::Header);
+        connection.socket.vectored_script = script.iter().copied().collect();
+        let mut context = test_context(pool);
+        let mut gids = [0usize; 2];
+        for (slot, stream_id) in [1u32, 3u32].into_iter().enumerate() {
+            let gid = context
+                .create_stream(Ulid::generate(), 1 << 16)
+                .expect("test context must create a stream");
+            gids[slot] = gid;
+            connection
+                .stream_table
+                .register(stream_id, gid, connection.now);
+            // Same urgency for both, so they share one bucket and the pass
+            // census answers `incremental_peer_count == 2`. At 1 the
+            // converter's solo-bucket guard suppresses the yield and the
+            // prepare drains to the window, which is the configuration this
+            // test exists to avoid.
+            connection.scheduler.push_priority(
+                stream_id,
+                parser::PriorityPart::Rfc9218 {
+                    urgency: 3,
+                    incremental: true,
+                },
+            );
+            let back = &mut context.streams[gid].back;
+            back.parsing_phase = kawa::ParsingPhase::Body;
+            back.blocks.push_back(kawa::Block::Chunk(kawa::Chunk {
+                data: kawa::Store::Static(&YIELDING_BODY),
+            }));
+        }
+        (connection, context, gids, peer)
+    }
+
+    /// One write pass debits the connection send window once per stream, even
+    /// when that stream's flush goes round twice.
+    ///
+    /// Stream 1's flush is scripted to take two rounds — `(20, WouldBlock)`
+    /// then the rest — so the pass contains exactly the round-again shape the
+    /// flush tests above pin, and this test says the prepare does NOT come
+    /// along for the second round. Stream 3's single round is the control:
+    /// both streams yield after one frame, and both must cost the same credit.
+    ///
+    /// WHAT THE EXISTING FIXTURE CANNOT SEE. `a_partial_write_reporting_would_block_continues_the_pass`
+    /// drives the identical two-round flush and stays green under every edit
+    /// below, because it calls `flush_stream_out` directly: no `Context`, no
+    /// scheduler, no converter, no `H2FlowControl` — it never runs a prepare
+    /// at all, so no amount of re-preparing is representable in it. Its
+    /// through-`writable()` twin cannot see it either: that stream's parsing
+    /// phase leaves the prepare gate shut by construction.
+    ///
+    /// TO SEE THIS RED: in `write_streams`, change
+    /// `'outer: for &stream_id in &order {` to
+    /// `'outer: for &stream_id in order.iter().chain(order.iter()) {`, so each
+    /// stream takes a second turn — prepare included — within one pass.
+    /// Measured: this test fails on its own first assertion, `one write pass
+    /// must debit the connection send window once per stream`, with
+    /// `left: 65535, right: 32768`, and it is the ONLY failure in the suite.
+    /// The four frames the mutated pass emits instead
+    /// of two also move `vectored_calls` from 3 to 5 and each stream's `bout`
+    /// from 16 393 to 32 786 / 32 785, so the window is not a privileged
+    /// witness here — but it is the only one that names the SPENT CREDIT, and
+    /// a window debited for bytes the wire never carried is the failure that
+    /// stalls a connection. The same assertion is also the third failure under
+    /// the pass-terminator edit documented on
+    /// `a_partial_write_reporting_would_block_continues_the_pass_through_writable`,
+    /// where it reads `left: 16384, right: 32768` because stream 1's stall
+    /// ends the pass before stream 3 is prepared.
+    ///
+    /// This is NOT keyed on the partial write, and the name says so. A
+    /// round-again-keyed edit is not expressible in `write_streams`:
+    /// `flush_stream_out` drains `kawa.out` completely or stalls, so the rounds
+    /// are invisible above it and there is no `if the flush went round again`
+    /// to hang a second prepare on. Forcing a second visit is the smallest
+    /// honest statement of the same bug, and it is what the refactor would
+    /// actually produce.
+    #[test]
+    fn a_yielded_incremental_stream_is_prepared_once_per_pass() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, mut context, gids, _peer) = incremental_pair_fixture(
+            &pool,
+            &[
+                // Stream 1: a partial write that reports WouldBlock, then the
+                // remainder. Stream 3: one round.
+                (20, SocketResult::WouldBlock),
+                (99_999, SocketResult::Continue),
+                (99_999, SocketResult::Continue),
+            ],
+        );
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let window_before = connection.flow_control.window();
+        assert_eq!(
+            window_before, DEFAULT_INITIAL_WINDOW_SIZE as i32,
+            "premise: the connection send window starts at the RFC 9113 \
+             default, so the debit below is the pass's doing"
+        );
+        for gid in gids {
+            assert!(
+                context.streams[gid].back.is_main_phase(),
+                "premise: the prepare gate must be OPEN for both streams, or \
+                 no window is spent at all"
+            );
+        }
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert_eq!(
+            window_before - connection.flow_control.window(),
+            2 * YIELDED_PAYLOAD,
+            "one write pass must debit the connection send window once per \
+             stream: a second prepare would spend credit for bytes this pass \
+             never put on the wire"
+        );
+        assert_eq!(
+            connection.socket.vectored_calls, 3,
+            "the pass must be two flush rounds for stream 1 and one for \
+             stream 3 — without the two-round flush this test would not be \
+             asserting anything about re-entry"
+        );
+        for gid in gids {
+            assert_eq!(
+                context.streams[gid].metrics.bout, YIELDED_FRAME,
+                "each yielded prepare puts exactly one DATA frame on the wire"
+            );
+            assert!(
+                !context.streams[gid].back.blocks.is_empty(),
+                "premise: the yield must leave the rest of the body queued — \
+                 with empty blocks a second prepare could not spend anything \
+                 and this test could not fail"
+            );
+        }
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a yielded write pass continues, got {result:?}"
+        );
+    }
+
+    /// The send window granted to the stream that makes this pass's progress.
+    /// Narrower than `YIELDING_BODY`, so its prepare converts
+    /// `PARTIAL_STREAM_WINDOW` payload bytes and leaves the rest in `blocks`.
+    const PARTIAL_STREAM_WINDOW: u32 = 64;
+
+    /// Bytes that stream reaches the socket with: the DATA frame header plus
+    /// its window-capped payload.
+    const PARTIAL_FRAME: usize = parser::FRAME_HEADER_SIZE + PARTIAL_STREAM_WINDOW as usize;
+
+    /// A pass's byte total accumulates across streams: a later stream that
+    /// writes nothing must not erase what an earlier one delivered.
+    ///
+    /// `total_bytes_written = total_bytes_written.saturating_add(stream_bytes)`
+    /// is the whole of it, and nothing pinned it. `finalize_write` hands the
+    /// total to `h2_close::finalize_action` as `made_progress`, and
+    /// `made_progress && any_pending_back()` is LIFECYCLE §9 invariant 16 — the
+    /// arm that RETAINS `Ready::WRITABLE` for a pass that moved bytes and left
+    /// blocks behind. Drop the accumulation and a two-stream pass reports the
+    /// LAST stream's count: stream 1 delivers a frame and keeps its remainder
+    /// queued, stream 3 is eligible but window-blocked and writes nothing, the
+    /// total reads 0, `expect_write` is parked on neither so `Parked` cannot
+    /// mask it, `RetainPendingBack` is skipped and the pass falls through to
+    /// `Quiesce`. `Quiesce` strips `Ready::WRITABLE`; edge-triggered epoll
+    /// never re-fires; stream 1's body is stranded in `blocks` with nothing
+    /// scheduled to drain it. That is a hung response, not a lost metric.
+    ///
+    /// The two streams differ only in their send window, which is what puts
+    /// one on each side of the accumulation: 64 bytes buys stream 1 one
+    /// window-capped DATA frame, and 0 buys stream 3 the converter's
+    /// flow-control-stall arm, which returns the chunk untouched and leaves
+    /// `kawa.out` empty so its flush never calls the socket at all.
+    ///
+    /// TO SEE THIS RED: in `write_streams`, change
+    /// `total_bytes_written = total_bytes_written.saturating_add(stream_bytes);`
+    /// to `total_bytes_written = stream_bytes;` — the shape a rewrite that
+    /// folds the resume and main flush paths into one per-stream counter
+    /// naturally reaches for. Measured: this test fails on its own first
+    /// assertion, `a pass that delivered bytes and left blocks queued must
+    /// RETAIN WRITABLE interest`, with `left: Error | Hup, right: Writable |
+    /// Error | Hup`, and it is the only failure in the suite. Measured without
+    /// this test in the tree, that same edit leaves every other test green —
+    /// which is what makes this one worth its lines.
+    #[test]
+    fn a_later_zero_byte_stream_does_not_erase_the_pass_progress() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 0, 0, H2State::Header);
+        // One entry: stream 1's frame. Stream 3 puts nothing in `kawa.out`, so
+        // its flush loop never runs and never reaches the socket.
+        connection.socket.vectored_script =
+            [(99_999, SocketResult::Continue)].into_iter().collect();
+        let mut context = test_context(&pool);
+        let mut gids = [0usize; 2];
+        for (slot, (stream_id, window)) in [(1u32, PARTIAL_STREAM_WINDOW), (3u32, 0)]
+            .into_iter()
+            .enumerate()
+        {
+            let gid = context
+                .create_stream(Ulid::generate(), window)
+                .expect("test context must create a stream");
+            gids[slot] = gid;
+            connection
+                .stream_table
+                .register(stream_id, gid, connection.now);
+            let back = &mut context.streams[gid].back;
+            back.parsing_phase = kawa::ParsingPhase::Body;
+            back.blocks.push_back(kawa::Block::Chunk(kawa::Chunk {
+                data: kawa::Store::Static(&YIELDING_BODY),
+            }));
+        }
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        assert!(
+            connection.readiness.interest.is_writable(),
+            "premise: WRITABLE interest starts armed, so retaining it is not \
+             vacuous, got {:?}",
+            connection.readiness
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert_eq!(
+            connection.readiness.interest,
+            Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+            "a pass that delivered bytes and left blocks queued must RETAIN \
+             WRITABLE interest (LIFECYCLE §9 invariant 16): stripping it \
+             strands the remainder, because edge-triggered epoll will not \
+             re-fire on its own"
+        );
+        assert_eq!(
+            context.streams[gids[0]].metrics.bout, PARTIAL_FRAME,
+            "premise: the FIRST stream really did deliver a frame — the \
+             accumulation has nothing to preserve otherwise"
+        );
+        assert_eq!(
+            context.streams[gids[1]].metrics.bout, 0,
+            "premise: the SECOND stream really did write nothing, so it is the \
+             stream whose count would overwrite the total"
+        );
+        assert_eq!(
+            connection.socket.vectored_calls, 1,
+            "only the first stream reaches the socket: a zero window leaves \
+             `kawa.out` empty and its flush loop never runs"
+        );
+        for gid in gids {
+            assert!(
+                !context.streams[gid].back.blocks.is_empty(),
+                "premise: both streams must leave blocks queued, or \
+                 any_pending_back answers false and RetainPendingBack is \
+                 unreachable whatever the byte total says"
+            );
+        }
+        assert_eq!(
+            connection.stream_table.expect_write(),
+            None,
+            "premise: nothing is parked, so `Parked` cannot decide this pass \
+             ahead of the byte total"
+        );
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a retained write pass continues, got {result:?}"
+        );
+    }
+
     // ── force_disconnect's server arm with records pending ──────────────
     //
     // `h2_close::force_disconnect_action` is exhaustively tabled over its two
@@ -8044,8 +8840,8 @@ mod tests {
     ///
     /// The other row of the table. It does NOT rest on being the only thing
     /// that catches a hard-wired `true`: the suite already caught that
-    /// constant without it. Measured on that mutation, `1081 passed; 2
-    /// failed` — this test AND
+    /// constant without it. Measured on that mutation, TWO tests fail — this
+    /// test AND
     /// `a_flush_that_succeeds_closes_within_one_writable_call` above, which
     /// predates it and reaches `force_disconnect` through `writable()`'s
     /// GoAway fall-through, failing with `a drained flush must reach the
@@ -8062,7 +8858,7 @@ mod tests {
     /// arm. Measured: this test fails with `a server holding nothing must
     /// close rather than wait for a flush that has nothing to flush, got
     /// Continue`, while the sibling above stays green. The mirror constant
-    /// `false` is measured at `1082 passed; 1 failed`, and that one failure is
+    /// `false` is measured at exactly ONE failure, and that failure is
     /// the sibling above — so neither constant can replace the query, and the
     /// sibling is the suite's only witness against `false`.
     #[test]
