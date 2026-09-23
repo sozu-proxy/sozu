@@ -3,6 +3,7 @@ FROM ghcr.io/actions/actions-runner:latest
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
         protobuf-compiler cmake build-essential curl git ca-certificates \
+        pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 ARG H2SPEC_VERSION=2.6.0

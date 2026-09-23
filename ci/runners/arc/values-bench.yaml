@@ -43,7 +43,7 @@ template:
         type: RuntimeDefault
     containers:
       - name: runner
-        image: clevercloud/sozu-ci-runner@sha256:3425e7d5438218d2237a8304cc3b5624bc4f8d85997834da6c021c6a4d410667
+        image: clevercloud/sozu-ci-runner@sha256:aede6dde8961d35a40c8c63551467c2bfca82535f7a9ceec973f368c4e58e7d2
         imagePullPolicy: IfNotPresent
         command: ["/home/runner/run.sh"]
         securityContext:

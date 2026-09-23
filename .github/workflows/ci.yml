@@ -456,9 +456,6 @@ jobs:
       SOZU_TCP_PREREAD_SIM_SEEDS: '512'
       SOZU_TCP_PREREAD_SIM_STEPS: '64'
     steps:
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
       - name: Checkout sources
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
