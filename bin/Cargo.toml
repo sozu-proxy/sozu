@@ -2,7 +2,6 @@
 name = "sozu"
 description = "sozu, a fast, reliable, hot reconfigurable HTTP reverse proxy"
 repository = "https://github.com/sozu-proxy/sozu"
-readme = "README.md"
 documentation = "https://docs.rs/sozu"
 homepage = "https://sozu.io"
 version = "2.2.1"

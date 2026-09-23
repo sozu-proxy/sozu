@@ -177,9 +177,9 @@ pub const DEFAULT_ZOMBIE_CHECK_INTERVAL: u32 = 1_800;
 pub const DEFAULT_ACCEPT_QUEUE_TIMEOUT: u32 = 60;
 
 /// Default `Strict-Transport-Security: max-age` value (1 year, 31_536_000
-/// seconds) substituted at config-load when an [hsts] block sets
+/// seconds) substituted at config-load when an `[hsts]` block sets
 /// `enabled = true` but omits `max_age`. Matches the HSTS preload list
-/// minimum (https://hstspreload.org/) and the Caddy / Nginx community
+/// minimum (<https://hstspreload.org/>) and the Caddy / Nginx community
 /// recommendation. Operators can override with any `u32`; `max_age = 0`
 /// is the RFC 6797 §11.4 kill switch and is allowed silently.
 pub const DEFAULT_HSTS_MAX_AGE: u32 = 31_536_000;
@@ -1577,7 +1577,7 @@ fn read_http_answer_file(path: &Option<String>) -> Result<Option<String>, Config
 /// * **Filesystem path** — the value starts with the `file://` URI
 ///   scheme. Everything after the prefix is treated as a path; the
 ///   path is opened and read into a string. Mirrors the on-disk
-///   loading the per-status [`read_http_answer_file`] helper performs
+///   loading the per-status `read_http_answer_file` helper performs
 ///   for the deprecated `answer_301`..`answer_507` fields.
 /// * **Inline literal** (default) — anything else. The value is taken
 ///   verbatim as the template body, including an empty string (a
@@ -2986,7 +2986,7 @@ pub struct TcpFrontendConfig {
     pub address: SocketAddr,
     pub tags: Option<BTreeMap<String, String>>,
     /// `true` when this frontend's address resolves to a `protocol = "udp"`
-    /// listener. Resolved at config-load in [`ConfigBuilder::populate_clusters`]
+    /// listener. Resolved at config-load in `ConfigBuilder::populate_clusters`
     /// from `known_addresses`; selects `AddUdpFrontend` over `AddTcpFrontend`
     /// in [`TcpClusterConfig::generate_requests`]. A UDP cluster is declared as
     /// a `protocol = "tcp"` cluster whose frontends point at UDP listeners and

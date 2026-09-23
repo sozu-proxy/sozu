@@ -365,7 +365,7 @@ impl H2FloodConfig {
     /// request on the listener with `ENHANCE_YOUR_CALM` — per stream for a
     /// header block that fits one HEADERS frame, and as a connection
     /// `GOAWAY` for one that spans CONTINUATION frames, where
-    /// [`Self::record_continuation_frame`] lifts `accumulated_header_size`
+    /// `H2FloodDetector::record_continuation_frame` lifts `accumulated_header_size`
     /// above the zero threshold and `h2.rs`'s `check_flood_or_return!` fires
     /// before the explicit size test. `max_rst_stream_per_window = 0` (and
     /// every other per-window or lifetime frame counter) is inert until a

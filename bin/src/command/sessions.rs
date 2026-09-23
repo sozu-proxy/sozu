@@ -120,7 +120,7 @@ impl ClientSession {
     }
 
     /// Render the connection-accept timestamp as an RFC 3339 UTC string,
-    /// computed via the std-only [`crate::command::requests::rfc3339_utc`]
+    /// computed via the std-only `crate::command::requests::rfc3339_utc`
     /// helper. Caller is `audit_log_context!`.
     pub fn connect_ts_display(&self) -> String {
         crate::command::requests::rfc3339_utc(self.connect_ts)
@@ -454,7 +454,7 @@ impl WorkerSession {
     ///   [`crate::command::server::Server::scatter_on`] can account the
     ///   (entry, worker) pair as a `Failure`.
     /// - a back buffer at `max_buffer_size` is NOT an error: the request is
-    ///   parked in [`Self::pending`] and returns `Ok`, because it IS accepted
+    ///   parked in `Self::pending` and returns `Ok`, because it IS accepted
     ///   for delivery. Raising the ceiling would only move the cliff (it exists
     ///   to bound memory), and flushing the socket synchronously here would
     ///   block the single-threaded supervisor — no client, no worker and no

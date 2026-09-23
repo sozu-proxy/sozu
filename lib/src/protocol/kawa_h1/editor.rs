@@ -354,7 +354,7 @@ pub struct HttpContext {
     /// `None` for plaintext listeners or when no ALPN was negotiated.
     pub tls_alpn: Option<&'static str>,
     /// Name of the correlation header Sozu injects into every request and
-    /// response. Defaults to `"Sozu-Id"` via [`L7ListenerHandler::get_sozu_id_header`].
+    /// response. Defaults to `"Sozu-Id"` via [`crate::L7ListenerHandler::get_sozu_id_header`].
     /// Populated at stream creation from the listener config's `sozu_id_header`
     /// knob. Stored as an owned `String` so it survives a listener hot-reload
     /// that changes the value.

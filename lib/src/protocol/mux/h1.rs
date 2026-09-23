@@ -118,7 +118,7 @@ pub struct ConnectionH1<Front: SocketHandler> {
     pub stream: Option<GlobalStreamId>,
     /// Configured idle timeout for this connection. The core never arms a
     /// wheel entry itself: it publishes the next instant it wants to be called
-    /// back at through [`ConnectionH1::poll_timeout`], and the embedder — the
+    /// back at through `ConnectionH1::poll_timeout`, and the embedder — the
     /// `Mux` adapter — owns the `TimeoutContainer` that reflects it onto the
     /// real timer. See `LIFECYCLE.md` §7.7.
     pub timeout_duration: Duration,
@@ -132,7 +132,7 @@ pub struct ConnectionH1<Front: SocketHandler> {
     pub parked_on_buffer_pressure: bool,
     /// True once we've asked rustls to emit TLS close_notify for this frontend.
     pub close_notify_sent: bool,
-    /// Connection/session ULID propagated from the parent [`Mux`]. Used to
+    /// Connection/session ULID propagated from the parent [`super::Mux`]. Used to
     /// stamp the session slot of the `[session req cluster backend]` log
     /// prefix emitted by the local `log_context!` macro.
     pub session_ulid: Ulid,

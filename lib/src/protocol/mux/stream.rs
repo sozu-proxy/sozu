@@ -114,7 +114,7 @@ thread_local! {
 /// A request capture that owns its charge against
 /// [`MAX_ARMED_REPLAY_CAPTURES`].
 ///
-/// The charge is acquired by [`ReplayCapture::try_arm`] and released by
+/// The charge is acquired by `ReplayCapture::try_arm` and released by
 /// [`Drop`], so it is released wherever the capture is — `Option::take`,
 /// assigning `None` through [`StreamParts`], or the [`Stream`] being dropped
 /// on a client hangup, an idle timeout or a session teardown. That last path

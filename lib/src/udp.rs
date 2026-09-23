@@ -4,7 +4,7 @@
 //! syscall, the buffer copies, the per-flow connected upstream sockets, the
 //! timer arming, the `BackendMap`/health/metrics edges, and the slab/token
 //! bookkeeping. It drives the pure sans-io core in
-//! [`crate::protocol::udp`](crate::protocol::udp) (the `UdpManager` /
+//! [`crate::protocol::udp`] (the `UdpManager` /
 //! `UdpFlow` two-level split) through `ManagerInput` / `Output`.
 //!
 //! Architecture (mirrors `tcp.rs`, but UDP is **one-listener-many-flows**):
@@ -548,7 +548,7 @@ impl UdpProxy {
 
     /// What this proxy would do with a socket handed to
     /// [`activate_listener`](Self::activate_listener) for `addr`. See
-    /// [`InheritedSocketFate`].
+    /// [`crate::InheritedSocketFate`].
     ///
     /// The event loop is single-threaded, so nothing can change the listener's
     /// `active` flag between this answer and the `activate_listener` call that
@@ -1825,7 +1825,7 @@ impl UdpListenerSession {
 
     /// Tear down every active flow on this listener **through the manager**, so
     /// each close emits `FlowEvicted` + `CloseFlow` exactly once and the shell's
-    /// normal [`on_close_flow`](Self::on_close_flow) handler frees the upstream
+    /// normal `on_close_flow` handler frees the upstream
     /// socket + slab slot and decrements `udp.active_flows`. Used on soft/hard
     /// stop, listener remove, and listener deactivate so the worker reaches its
     /// `base_sessions_count` and exits promptly instead of waiting out every

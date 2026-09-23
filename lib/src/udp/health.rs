@@ -157,7 +157,7 @@ impl UdpHealthChecker {
     /// Register (or replace) a cluster's health settings. `None` removes them
     /// (health disabled for that cluster). When removing, in-flight probes for
     /// the cluster are **deregistered from the mio registry before being
-    /// dropped** — mirroring the completion path in [`Self::progress`]. Skipping
+    /// dropped** — mirroring the completion path in `Self::progress`. Skipping
     /// the deregister (as the old code did) leaked the probe fd's registration
     /// until the socket was eventually closed, and could leave a stale token
     /// mapping in the poller.

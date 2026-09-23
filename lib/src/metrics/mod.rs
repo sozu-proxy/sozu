@@ -343,7 +343,7 @@ pub const LEASE_TTL_MAX: Duration = Duration::from_secs(300);
 pub const LEASE_TTL_DEFAULT: Duration = Duration::from_secs(60);
 
 /// Hard cap on the number of simultaneous leases held by the aggregator.
-/// `lease_apply` rejects new entries (with [`LeaseApplyOutcome::Capped`])
+/// `lease_apply` rejects new entries (with [`LeaseApplyOutcome::TableFull`])
 /// once the table reaches this size. Bounds the lease table's memory and
 /// neutralises the CWE-770 vector where a same-UID attacker rolls
 /// `client_id` faster than expiry to grow the map unbounded. 64 is well
@@ -524,7 +524,7 @@ impl Aggregator {
     /// elevate the effective level at runtime; the configured floor is the
     /// lower bound the worker falls back to when no lease is active.
     ///
-    /// See [`MetricDetailLevel`] and [`filter_labels_for_detail`] for the
+    /// See [`MetricDetailLevel`] and `filter_labels_for_detail` for the
     /// per-level filtering rules.
     pub fn set_up_detail(&mut self, detail: MetricDetailLevel) {
         self.configured = detail;
@@ -767,7 +767,7 @@ impl Aggregator {
         }
     }
 
-    /// True when at least [`LEASE_TICK_INTERVAL`] has passed since the last
+    /// True when at least `LEASE_TICK_INTERVAL` has passed since the last
     /// `lease_tick`. Use to gate the polled janitor at the top of `notify`
     /// without paying a HashMap walk on every event-loop iteration.
     pub fn lease_tick_due(&self, now: Instant) -> bool {
@@ -891,7 +891,7 @@ impl Aggregator {
     /// the per-drain tombstone so subsequent emissions for the cluster are
     /// dropped on the floor instead of resurrecting the row via
     /// `entry().or_default()`. Called from the worker IPC dispatch on
-    /// [`RequestType::RemoveCluster`]. Network-side draining the queued
+    /// [`RequestType::RemoveCluster`](sozu_command::proto::command::request::RequestType::RemoveCluster). Network-side draining the queued
     /// `MetricLine`s produces immediate silence on the wire (any unsent
     /// statsd interval for the cluster is discarded).
     ///
@@ -907,7 +907,7 @@ impl Aggregator {
     }
 
     /// Re-arm a previously-removed cluster id across BOTH drains. Called
-    /// from the worker IPC dispatch on [`RequestType::AddCluster`].
+    /// from the worker IPC dispatch on [`RequestType::AddCluster`](sozu_command::proto::command::request::RequestType::AddCluster).
     /// Idempotent on ids that were never removed. Without this hook a
     /// cluster removed then re-added would stay tombstoned forever and
     /// every fresh metric emission would be dropped.
@@ -919,7 +919,7 @@ impl Aggregator {
     }
 
     /// Drop all metric storage for one backend across BOTH drains. Called
-    /// from the worker IPC dispatch on [`RequestType::RemoveBackend`].
+    /// from the worker IPC dispatch on [`RequestType::RemoveBackend`](sozu_command::proto::command::request::RequestType::RemoveBackend).
     /// Does NOT tombstone the cluster (only `remove_cluster` does).
     pub fn remove_backend(&mut self, cluster_id: &str, backend_id: &str) {
         if let Some(ref mut net) = self.network.as_mut() {

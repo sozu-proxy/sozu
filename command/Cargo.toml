@@ -2,7 +2,6 @@
 name = "sozu-command-lib"
 description = "configuration library to command a sozu instance"
 repository = "https://github.com/sozu-proxy/sozu"
-readme = "README.md"
 documentation = "https://docs.rs/sozu-command-lib"
 homepage = "https://sozu.io"
 version = "2.2.1"

@@ -177,7 +177,7 @@ fn pad_for_constant_time_compare(input: &[u8]) -> [u8; AUTH_COMPARE_PAD_LEN + 8]
 /// Compare `candidate` against every entry in `authorized_hashes` using
 /// constant-time equality. Returns `true` if any entry matches.
 ///
-/// Both sides are padded to a fixed [`AUTH_COMPARE_PAD_LEN`] envelope plus
+/// Both sides are padded to a fixed `AUTH_COMPARE_PAD_LEN` envelope plus
 /// a length suffix before [`subtle::ConstantTimeEq`] runs, so:
 ///   * the per-entry compare loop iterates the full padded length even
 ///     when the candidate and the stored hash differ in length (subtle's
@@ -195,7 +195,7 @@ fn pad_for_constant_time_compare(input: &[u8]) -> [u8; AUTH_COMPARE_PAD_LEN + 8]
 /// ── Length-bound prelude ──
 ///
 /// `pad_for_constant_time_compare` silently truncates inputs longer than
-/// [`AUTH_COMPARE_PAD_LEN`]. Two credentials that share their first 256
+/// `AUTH_COMPARE_PAD_LEN`. Two credentials that share their first 256
 /// bytes — for example, the same long username with different password
 /// digests — would produce identical padded buffers (and identical length
 /// suffixes if the inputs share a length), letting a bogus password
