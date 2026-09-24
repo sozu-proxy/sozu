@@ -1512,11 +1512,25 @@ impl HttpListener {
             }
             // Rebuild the listener-level templates and migrate the existing
             // per-cluster overrides over to the new `HttpAnswers`.
+            //
+            // The rebuilt registry is PUBLISHED under a new `Rc`, not written
+            // through the old one. Every request already in flight captured
+            // the old handle when it arrived (`mux::Context::create_stream`)
+            // and renders its default answers from that, so a reload landing
+            // mid-request cannot change the page that request is about to
+            // emit; requests arriving after this point capture the new handle.
+            // That is the one-request staleness window of
+            // `lib/src/protocol/mux/LIFECYCLE.md` §2.5.
+            //
+            // The per-cluster overrides are therefore COPIED, not
+            // `mem::take`n: taking them would empty the registry those
+            // in-flight requests still hold and strip their cluster templates
+            // mid-response. The copy is a map clone over `Rc<Template>`, so
+            // both registries share the compiled templates themselves.
             let mut new_answers = HttpAnswers::new(&answers_map)
                 .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?;
-            let preserved = std::mem::take(&mut self.answers.borrow_mut().cluster_answers);
-            new_answers.cluster_answers = preserved;
-            *self.answers.borrow_mut() = new_answers;
+            new_answers.cluster_answers = self.answers.borrow().cluster_answers.clone();
+            self.answers = Rc::new(RefCell::new(new_answers));
         }
 
         Ok(())
@@ -2519,6 +2533,82 @@ mod tests {
         assert_eq!(
             build(180, Some(0)).get_h2_stream_idle_timeout(),
             Duration::from_secs(1)
+        );
+    }
+
+    /// A listener answer reload PUBLISHES a new registry; it does not rewrite
+    /// the one in-flight requests are holding.
+    ///
+    /// `mux::Context::create_stream` captures `HttpAnswers` by handle when a
+    /// request arrives, and every `set_default_answer` site in the mux renders
+    /// from that captured handle (`lib/src/protocol/mux/LIFECYCLE.md` §2.5).
+    /// The capture is only a snapshot if a reload installs a *new* registry —
+    /// rewriting the old one through its `RefCell` would reach every request
+    /// already in flight and hand it a page its client never asked for.
+    ///
+    /// The second assertion guards the trap in the obvious implementation of
+    /// the first: migrating the per-cluster overrides with `mem::take` empties
+    /// the registry the in-flight requests still hold, stripping their cluster
+    /// templates mid-response. They must be copied.
+    ///
+    /// To SEE THIS RED: in `HttpListener::update_config`, put the two publish
+    /// lines back to their pre-fix form —
+    /// `let preserved = std::mem::take(&mut self.answers.borrow_mut().cluster_answers);`
+    /// `new_answers.cluster_answers = preserved;`
+    /// `*self.answers.borrow_mut() = new_answers;`
+    #[test]
+    fn a_listener_answers_reload_publishes_a_new_registry() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, 1041);
+        let config = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("default HTTP listener config");
+        let mut listener = HttpListener::new(config, Token(0)).expect("build listener");
+
+        // A cluster override, as `HttpProxy::add_cluster` would install it.
+        listener
+            .answers
+            .borrow_mut()
+            .add_cluster_answers(
+                "cluster_1",
+                &BTreeMap::from([(
+                    "503".to_owned(),
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_owned(),
+                )]),
+            )
+            .expect("the cluster override must compile");
+
+        // What a request arriving now would capture.
+        let captured = listener.get_answers().clone();
+
+        listener
+            .update_config(&UpdateHttpListenerConfig {
+                address,
+                answers: BTreeMap::from([(
+                    "404".to_owned(),
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_owned(),
+                )]),
+                ..Default::default()
+            })
+            .expect("the answers patch must apply");
+
+        assert!(
+            !Rc::ptr_eq(&captured, listener.get_answers()),
+            "a reload must publish a NEW answer registry: rewriting the captured \
+             one reaches every request already in flight"
+        );
+        assert!(
+            captured.borrow().cluster_answers.contains_key("cluster_1"),
+            "the registry captured before the reload must keep its cluster \
+             overrides: a request in flight would otherwise lose its custom \
+             pages mid-response"
+        );
+        assert!(
+            listener
+                .get_answers()
+                .borrow()
+                .cluster_answers
+                .contains_key("cluster_1"),
+            "the published registry must carry the cluster overrides forward"
         );
     }
 }

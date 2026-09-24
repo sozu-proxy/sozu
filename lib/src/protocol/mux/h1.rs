@@ -292,8 +292,10 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             return MuxResult::Continue;
         };
         self.arm_timeout(context.now);
-        let answers_rc = context.listener.borrow().get_answers().clone();
         let stream = &mut context.streams[stream_id];
+        // The answer registry this request captured when it arrived, not the
+        // one a reload may have installed since.
+        let answers_rc = stream.answers.clone();
         if stream.metrics.start.is_none() {
             stream.metrics.mark_request_start();
         }
@@ -827,7 +829,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                     || stream.context.authority.is_none()
                                     || stream.context.path.is_none());
                             if is_error || malformed {
-                                let answers_rc = context.listener.borrow().get_answers().clone();
+                                let answers_rc = stream.answers.clone();
                                 let answers = answers_rc.borrow();
                                 set_default_answer(stream, &mut self.readiness, 400, &answers);
                             } else if is_main {
@@ -1025,9 +1027,9 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 "unlink_stream must evict the stream from the backend reverse index"
             );
         }
-        let answers_rc = context.listener.borrow().get_answers().clone();
         let stream_id = stream;
         let stream = &mut context.streams[stream_id];
+        let answers_rc = stream.answers.clone();
         let stream_context = &mut stream.context;
         trace!(
             "{} end H1 stream {:?}: {:#?}",

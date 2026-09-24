@@ -554,7 +554,6 @@ impl Router {
                 frontend_should_stick,
                 stream_context,
                 proxy.clone(),
-                &context.listener,
             )?;
 
             if let Err(e) = socket.set_nodelay(true) {
@@ -1035,13 +1034,20 @@ impl Router {
         Ok(cluster_id)
     }
 
-    pub fn backend_from_request<L: ListenerHandler + L7ListenerHandler>(
+    /// Pick the backend for an already-routed request and stamp its identity
+    /// onto the request's [`HttpContext`].
+    ///
+    /// Takes no listener handle: every listener-derived value this needs —
+    /// `sticky_name` above all — is already on the `HttpContext` that
+    /// `Context::create_stream` filled when the request arrived, and reading
+    /// the listener again here would be exactly the mid-request reload leak
+    /// `LIFECYCLE.md` §2.5 rules out.
+    pub fn backend_from_request(
         &mut self,
         cluster_id: &str,
         frontend_should_stick: bool,
         context: &mut HttpContext,
         proxy: Rc<RefCell<dyn L7Proxy>>,
-        listener: &Rc<RefCell<L>>,
     ) -> Result<(TcpStream, Rc<RefCell<Backend>>), BackendConnectionError> {
         let (backend, conn) = self
             .get_backend_for_sticky_session(
@@ -1056,9 +1062,13 @@ impl Router {
             })?;
 
         if frontend_should_stick {
-            // update sticky name in case it changed I guess?
-            context.sticky_name = listener.borrow().get_sticky_name().to_string();
-
+            // `context.sticky_name` is the name `Context::create_stream`
+            // captured when this request arrived, and it stays that name to
+            // the end of the request. Re-reading the listener here used to
+            // hand an in-flight request a cookie name an operator installed
+            // after it started — the request would then have been matched on
+            // the old name and answered with a `Set-Cookie` under the new one.
+            // A reload applies from the next request (`LIFECYCLE.md` §2.5).
             context.sticky_session = Some(
                 backend
                     .borrow()
@@ -1582,6 +1592,7 @@ mod tests {
             let mut stream = Stream::new(
                 &mut PoolBufferSource::new(Rc::downgrade(&pool)),
                 context,
+                crate::protocol::mux::test_support::test_answers(),
                 65_535,
             )
             .expect("test stream must check out its buffers");

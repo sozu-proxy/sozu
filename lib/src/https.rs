@@ -1772,11 +1772,24 @@ impl HttpsListener {
             if let Some(ref legacy) = self.config.http_answers {
                 crate::protocol::http::answers::merge_legacy_into_map(&mut answers_map, legacy);
             }
+            // The rebuilt registry is PUBLISHED under a new `Rc`, not written
+            // through the old one. Every request already in flight captured
+            // the old handle when it arrived (`mux::Context::create_stream`)
+            // and renders its default answers from that, so a reload landing
+            // mid-request cannot change the page that request is about to
+            // emit; requests arriving after this point capture the new handle.
+            // That is the one-request staleness window of
+            // `lib/src/protocol/mux/LIFECYCLE.md` §2.5.
+            //
+            // The per-cluster overrides are therefore COPIED, not
+            // `mem::take`n: taking them would empty the registry those
+            // in-flight requests still hold and strip their cluster templates
+            // mid-response. The copy is a map clone over `Rc<Template>`, so
+            // both registries share the compiled templates themselves.
             let mut rebuilt = HttpAnswers::new(&answers_map)
                 .map_err(|(name, error)| ListenerError::TemplateParse(name, error))?;
-            let preserved = std::mem::take(&mut self.answers.borrow_mut().cluster_answers);
-            rebuilt.cluster_answers = preserved;
-            *self.answers.borrow_mut() = rebuilt;
+            rebuilt.cluster_answers = self.answers.borrow().cluster_answers.clone();
+            self.answers = Rc::new(RefCell::new(rebuilt));
         }
 
         // HSTS: full-object replacement when present in the patch. Absent
