@@ -371,6 +371,68 @@
   Its absence is deliberate and it goes back in, in its original form, once enforcement lands. No
   public API, no test expectation, no configuration default and no metric changes.
 
+- **`fix(mux)`: a request runs on the listener configuration it arrived under, and a reload
+  applies from the next request
+  ([#1340](https://github.com/sozu-proxy/sozu/issues/1340)).** Question 7 of the H2 sans-io
+  perimeter asked whether the core freezes the listener into an owned snapshot at construction,
+  or keeps `Rc<RefCell<L>>` and goes on taking live borrows on the write, reset and access-log
+  paths. It is neither: the capture is per request, taken when the request arrives, and the
+  staleness window it implies — **exactly one request** — is now stated in
+  `lib/src/protocol/mux/LIFECYCLE.md` §2.5 and `doc/configure_admin_ops.md` §1.1 rather than
+  left to emerge from wherever the next `listener.borrow()` happened to sit.
+
+  Freezing at construction was rejected because hot reconfiguration is the reason this proxy
+  exists: a long-lived H2 connection would have served every stream under the configuration in
+  force when it was accepted. Three knobs were already frozen that way —
+  `Context::strict_sni_binding`, `Context::elide_x_real_ip` and `Context::send_x_real_ip`, each
+  read once in `Context::new` — and all three are patchable through
+  `UpdateHttpListenerConfig` / `UpdateHttpsListenerConfig`, so an operator patching them never
+  reached an open connection at all. They move into `Context::create_stream`, which
+  `ConnectionH2::create_stream` calls from its HEADERS branch, alongside the sticky cookie name
+  and the `Sozu-Id` header name it already captured there.
+
+  The live borrows go the other way. `Router::backend_from_request` re-read
+  `get_sticky_name` after routing, under a comment reading "update sticky name in case it
+  changed I guess?": a request matched on the old cookie name could be answered with a
+  `Set-Cookie` under a new one. That read is gone and the method no longer takes a listener
+  handle at all. The six remaining `get_answers` borrows on the datapath — three in `h1.rs`,
+  one in `h2.rs`, two in `mod.rs`'s connect-error and timeout paths — now read `Stream::answers`,
+  captured with the rest. Two reads stay live on purpose and are named in §2.5:
+  `frontend_from_request`, which is Question 6 and still open, and `get_tags`, the access-log
+  fallback for a request that never finished routing.
+
+  `Stream::answers` is a handle rather than a copy, because `Template` owns a `kawa::Kawa` and
+  cannot be cloned — so a reload now **publishes** a new `HttpAnswers` under a new `Rc` instead
+  of rewriting the one every in-flight request is holding. `HttpAnswers::cluster_answers` holds
+  `Rc<Template>` so those per-cluster overrides can be copied into the published registry;
+  migrating them with `std::mem::take`, as the in-place rewrite did, would empty the registry
+  the in-flight requests still hold and strip their custom pages mid-response.
+
+  `Context::protocol` is captured once per connection instead, and honestly so: a listener's
+  HTTP/HTTPS kind is fixed by its type and no patch can change it. That retires the last
+  datapath listener borrow in `ConnectionH2::begin_scheduler_pass`, which decides the H2
+  `:scheme` once per write pass rather than per stream.
+
+  Two tests, each seen red before it was trusted.
+  `a_listener_reload_between_two_streams_moves_only_the_second` (`mod.rs`) opens a stream,
+  reloads the listener under it, opens a second, and asserts the second moved while the first
+  did not. Reverting the knob capture to a `Context::new` field fails it with *"a request
+  arriving after the reload must use the new X-Real-IP policy"*; capturing the answer registry
+  per connection instead of per request fails it with *"a request arriving after the reload must
+  render from the newly published answer registry"*.
+  `a_listener_answers_reload_publishes_a_new_registry` (`lib/src/http.rs`) fails with *"a reload
+  must publish a NEW answer registry"* against the in-place rewrite, and with *"the registry
+  captured before the reload must keep its cluster overrides"* against the `mem::take`
+  migration. Neither test shares a literal with the production diff, which adds no string
+  literal at all.
+
+  **HTTP/1.1 is not covered by the one-request window and §2.5 says so.** `http.rs` and
+  `https.rs` call `Context::create_stream` once per H1 connection, and `HttpContext::reset`
+  deliberately carries the listener-scoped knobs — along with the session id and the request id —
+  across every keep-alive and pipelined request in that slot. An H1 connection's staleness window
+  is the connection. Narrowing it means giving the keep-alive reset in `ConnectionH1::end_stream`
+  a re-capture of its own, which is a separate change.
+
 - **`docs(mux-h2)`: `LIFECYCLE.md` anchors eleven `h2.rs` citations to symbols instead of lines.**
   Checklist invariant 8 read "`create_stream` and `start_stream` both short-circuit when
   `self.drain.draining()` (`h2.rs:4882-4889`, `h2.rs:6710-6717`)". Both ranges were correct at

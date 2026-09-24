@@ -162,7 +162,7 @@ pub mod stream;
 use crate::metrics::names;
 use crate::{
     BackendConnectionError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerHandler,
-    ProxySession, Readiness, RetrieveClusterError, SessionIsToBeClosed, SessionMetrics,
+    Protocol, ProxySession, Readiness, RetrieveClusterError, SessionIsToBeClosed, SessionMetrics,
     SessionResult, StateResult,
     backends::{Backend, BackendError},
     http::HttpListener,
@@ -481,25 +481,17 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// `:authority` is rejected. `Arc` so the snapshot is shared across
     /// every per-stream `HttpContext` without re-allocation.
     pub tls_cert_names: Option<Arc<Vec<String>>>,
-    /// Whether the routing layer must reject any request whose authority
-    /// host does not exact-match `tls_server_name` (CWE-346 / CWE-444).
-    /// Mirrors `HttpsListenerConfig::strict_sni_binding`; captured once
-    /// at `Context::new` so routing decisions on each stream avoid a
-    /// per-stream `listener.borrow()`.
-    pub strict_sni_binding: bool,
-    /// Whether the request-side block walk must strip any client-supplied
-    /// `X-Real-IP` header before forwarding (anti-spoofing). Mirrors
-    /// `HttpListenerConfig::elide_x_real_ip` /
-    /// `HttpsListenerConfig::elide_x_real_ip`; captured once at
-    /// `Context::new` so per-stream `HttpContext`s do not need to call
-    /// `listener.borrow()` again. Independent of `send_x_real_ip`.
-    pub elide_x_real_ip: bool,
-    /// Whether `on_request_headers` injects a proxy-generated `X-Real-IP`
-    /// header carrying the connection peer IP (post-PROXY-v2 unwrap).
-    /// Mirrors `HttpListenerConfig::send_x_real_ip` /
-    /// `HttpsListenerConfig::send_x_real_ip`; captured once at
-    /// `Context::new`. Independent of `elide_x_real_ip`.
-    pub send_x_real_ip: bool,
+    /// Whether this session's listener speaks HTTPS or plaintext HTTP.
+    ///
+    /// The one listener value that is genuinely per-connection rather than
+    /// per-request: a listener's protocol is fixed by its type and no
+    /// `update_config` patch can change it, so capturing it once in
+    /// [`Self::new`] frees both readers — [`Self::create_stream`] and the H2
+    /// write pass's `:scheme` decision — from borrowing the listener at all.
+    /// Contrast the per-request knobs, which [`Self::create_stream`] re-reads
+    /// on every stream precisely because a reload *can* change them
+    /// (`LIFECYCLE.md` §2.5).
+    pub protocol: Protocol,
     /// Negotiated TLS protocol version short-form (e.g. `"TLSv1.3"`).
     /// Captured once at handshake completion in `https.rs` and propagated
     /// to every per-stream [`HttpContext`] so the access log can record it
@@ -610,9 +602,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             .borrow()
             .get_h2_connection_config()
             .stream_shrink_ratio as usize;
-        let strict_sni_binding = listener.borrow().get_strict_sni_binding();
-        let elide_x_real_ip = listener.borrow().get_elide_x_real_ip();
-        let send_x_real_ip = listener.borrow().get_send_x_real_ip();
+        let protocol = listener.borrow().protocol();
         Self {
             streams: Vec::new(),
             pending_links: VecDeque::new(),
@@ -626,9 +616,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             h2_stream_shrink_ratio,
             tls_server_name: None,
             tls_cert_names: None,
-            strict_sni_binding,
-            elide_x_real_ip,
-            send_x_real_ip,
+            protocol,
             tls_version: None,
             tls_cipher: None,
             tls_alpn: None,
@@ -701,19 +689,35 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
         }
     }
 
+    /// Open (or recycle) the stream slot for a request that has just arrived,
+    /// capturing the listener configuration it will run on.
+    ///
+    /// This is the mux's single listener-snapshot point. `ConnectionH2` calls
+    /// it from its HEADERS branch, so an H2 stream captures the listener as
+    /// the operator had it configured when that request's HEADERS landed, and
+    /// finishes on that capture whatever a concurrent reload does; the next
+    /// HEADERS on the same connection takes a fresh one. The H1 sessions in
+    /// `http.rs` / `https.rs` call it once per connection instead, because one
+    /// H1 connection owns one slot that `HttpContext::reset` deliberately
+    /// carries across keep-alive requests. `LIFECYCLE.md` §2.5 states the
+    /// resulting staleness window for both.
+    ///
+    /// Every value read under the borrow below is re-read on each call for
+    /// that reason. The two that are NOT read here — [`Self::protocol`] and
+    /// the TLS fields — are connection-scoped by nature and captured once.
     pub fn create_stream(&mut self, request_id: Ulid, window: u32) -> Option<GlobalStreamId> {
-        let http_context = {
+        let (http_context, answers) = {
             let listener = self.listener.borrow();
             let mut http_context = HttpContext::new(
                 self.session_ulid,
                 request_id,
-                listener.protocol(),
+                self.protocol,
                 self.public_address,
                 self.session_address,
                 listener.get_sticky_name().to_string(),
                 listener.get_sozu_id_header().to_string(),
-                self.elide_x_real_ip,
-                self.send_x_real_ip,
+                listener.get_elide_x_real_ip(),
+                listener.get_send_x_real_ip(),
             );
             // Propagate the connection-scoped TLS SNI onto every per-stream
             // HttpContext so `route_from_request` can enforce the SNI ↔
@@ -726,7 +730,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             // Mirror the listener's strict_sni_binding flag onto each
             // HttpContext so the routing layer can honor operator opt-outs
             // without reaching back into the listener on every request.
-            http_context.strict_sni_binding = self.strict_sni_binding;
+            http_context.strict_sni_binding = listener.get_strict_sni_binding();
             // Propagate the connection-scoped TLS metadata onto every
             // per-stream HttpContext so the access log can record it without
             // touching the rustls session on every request. These are
@@ -735,7 +739,11 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             http_context.tls_version = self.tls_version;
             http_context.tls_cipher = self.tls_cipher;
             http_context.tls_alpn = self.tls_alpn;
-            http_context
+            // The answer registry this request will render any default answer
+            // from. Cloning the handle here — rather than borrowing the
+            // listener again at each `set_default_answer` site — is what binds
+            // a stream to the templates that were installed when it started.
+            (http_context, listener.get_answers().clone())
         };
         let recycle_slot = self
             .streams
@@ -753,6 +761,10 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             stream.request_counted = false;
             stream.window = i32::try_from(window).unwrap_or(i32::MAX);
             stream.context = http_context;
+            // A recycled slot takes the fresh capture too: the request that
+            // released it ran on whatever the listener held then, and the one
+            // taking it over must not inherit that.
+            stream.answers = answers;
             stream.back.clear();
             stream.back.storage.clear();
             stream.front.clear();
@@ -769,7 +781,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             }
             return Some(stream_id);
         }
-        let stream = Stream::new(&mut *self.buffers, http_context, window)?;
+        let stream = Stream::new(&mut *self.buffers, http_context, answers, window)?;
         self.streams.push(stream);
         Some(self.streams.len() - 1)
     }
@@ -1871,7 +1883,6 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             }
 
             let context = &mut self.context;
-            let answers_rc = context.listener.borrow().get_answers().clone();
             let mut dirty = false;
             while let Some(stream_id) = context.pending_links.pop_front() {
                 let Some(stream) = context.streams.get(stream_id) else {
@@ -1900,6 +1911,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     Err(error) => {
                         trace!("{} Connection error: {}", log_module_context!(), error);
                         let stream = &mut context.streams[stream_id];
+                        // The registry this stream captured when its request
+                        // arrived, not whatever the listener holds now.
+                        let answers_rc = stream.answers.clone();
                         let answers = answers_rc.borrow();
                         use BackendConnectionError as BE;
                         match error {
@@ -2090,7 +2104,6 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             Connection::H1(_) => false,
             Connection::H2(_) => true,
         };
-        let answers_rc = self.context.listener.borrow().get_answers().clone();
         let mut should_close = true;
         let mut should_write = false;
         if self.frontend_token == token {
@@ -2133,6 +2146,10 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         // In h2 an Idle stream doesn't necessarily hold a request yet,
                         // in most cases it was just reserved, so we can just ignore them.
                         if !front_is_h2 {
+                            // Each stream answers out of the registry it
+                            // captured when its request arrived; a listener
+                            // reload since then belongs to the next one.
+                            let answers_rc = self.context.streams[stream_id].answers.clone();
                             let answers = answers_rc.borrow();
                             let stream = &mut self.context.streams[stream_id];
                             stream.context.access_log_message = Some("client_timeout");
@@ -2145,6 +2162,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         // available backend yet. For now, we answer with 503.
                         // Not a timeout-driven outcome from the operator's
                         // perspective — leave access_log_message as None.
+                        let answers_rc = self.context.streams[stream_id].answers.clone();
                         let answers = answers_rc.borrow();
                         let stream = &mut self.context.streams[stream_id];
                         set_default_answer(stream, front_readiness, 503, &answers);
@@ -2156,6 +2174,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         // is also stalled, send a 504 and terminate the stream.
                         if !self.context.streams[stream_id].back.consumed {
                             self.context.unlink_stream(stream_id);
+                            let answers_rc = self.context.streams[stream_id].answers.clone();
                             let answers = answers_rc.borrow();
                             let stream = &mut self.context.streams[stream_id];
                             stream.context.access_log_message =
@@ -2257,6 +2276,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         log_module_context!()
                     );
                     self.context.unlink_stream(stream_id);
+                    let answers_rc = self.context.streams[stream_id].answers.clone();
                     let answers = answers_rc.borrow();
                     let stream = &mut self.context.streams[stream_id];
                     stream.context.access_log_message = Some("backend_timeout");
@@ -2603,17 +2623,49 @@ pub(crate) mod test_support {
     pub(crate) struct TestListener {
         address: SocketAddr,
         answers: Rc<RefCell<HttpAnswers>>,
+        sticky_name: String,
+        elide_x_real_ip: bool,
     }
+
+    pub(crate) const TEST_STICKY_NAME: &str = "SOZUBALANCEID";
 
     impl TestListener {
         pub(crate) fn new() -> Self {
             Self {
                 address: "127.0.0.1:1".parse().expect("test address must parse"),
-                answers: Rc::new(RefCell::new(
-                    HttpAnswers::new(&BTreeMap::new()).expect("default answers must build"),
-                )),
+                answers: test_answers(),
+                sticky_name: TEST_STICKY_NAME.to_owned(),
+                elide_x_real_ip: false,
             }
         }
+
+        /// Stand in for an operator listener reload: change the per-request
+        /// knobs and publish a brand-new answer registry under a new `Rc`,
+        /// exactly as `HttpListener::update_config` does. Returns the newly
+        /// published registry.
+        ///
+        /// The registry must be *published*, not edited: a test that mutated
+        /// the existing one in place would prove nothing about the per-stream
+        /// capture, because both streams would still be holding the same
+        /// object.
+        pub(crate) fn reload(
+            &mut self,
+            sticky_name: &str,
+            elide_x_real_ip: bool,
+        ) -> Rc<RefCell<HttpAnswers>> {
+            self.sticky_name = sticky_name.to_owned();
+            self.elide_x_real_ip = elide_x_real_ip;
+            self.answers = test_answers();
+            self.answers.clone()
+        }
+    }
+
+    /// A fresh, empty answer registry — what a test `Stream` renders from
+    /// when the test is not about templates.
+    pub(crate) fn test_answers() -> Rc<RefCell<HttpAnswers>> {
+        Rc::new(RefCell::new(
+            HttpAnswers::new(&BTreeMap::new()).expect("default answers must build"),
+        ))
     }
 
     impl ListenerHandler for TestListener {
@@ -2634,7 +2686,10 @@ pub(crate) mod test_support {
 
     impl L7ListenerHandler for TestListener {
         fn get_sticky_name(&self) -> &str {
-            "SOZUBALANCEID"
+            &self.sticky_name
+        }
+        fn get_elide_x_real_ip(&self) -> bool {
+            self.elide_x_real_ip
         }
         fn get_connect_timeout(&self) -> u32 {
             10
@@ -2681,7 +2736,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{connected_socket, test_context};
+    use super::test_support::{TEST_STICKY_NAME, connected_socket, test_context};
     use super::*;
     use crate::{
         pool::Pool,
@@ -3682,6 +3737,94 @@ mod tests {
             "precondition: a fully proxied response is not a timeout outcome, \
              so this arm leaves should_write false and reaches \
              delay_close_for_frontend_flush"
+        );
+    }
+
+    /// Q7 of sozu-proxy/sozu#1340: a stream runs on the listener
+    /// configuration that was in force when its request arrived, and the next
+    /// request on the same connection picks up a reload that landed in
+    /// between. The staleness window is therefore exactly one request, and
+    /// this test is where that window is pinned — see `LIFECYCLE.md` §2.5.
+    ///
+    /// Both halves matter and they fail for opposite reasons:
+    ///
+    /// - freezing the listener at [`Context::new`] would satisfy the first
+    ///   half and break the second — the reload would never reach the
+    ///   connection at all, which is the construction-time snapshot the
+    ///   maintainer rejected because hot reconfiguration is the point of this
+    ///   proxy;
+    /// - borrowing the listener live on the datapath satisfies the second and
+    ///   breaks the first — a request already in flight would answer under a
+    ///   cookie name, an `X-Real-IP` policy or an error page installed after
+    ///   it started.
+    ///
+    /// To SEE THIS RED: give `Context` back an `elide_x_real_ip: bool` field
+    /// set in [`Context::new`] from `listener.borrow().get_elide_x_real_ip()`,
+    /// and make [`Context::create_stream`] pass `self.elide_x_real_ip` to
+    /// `HttpContext::new` instead of `listener.get_elide_x_real_ip()`. The
+    /// second stream then still carries the pre-reload value.
+    #[test]
+    fn a_listener_reload_between_two_streams_moves_only_the_second() {
+        setup_test_logger!();
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 10, 16_384)));
+        let mut context = test_context(&pool);
+
+        let before = context.listener.borrow().get_answers().clone();
+        let first = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("the first stream must check out its buffers");
+
+        // The operator reloads the listener while the first request is still
+        // in flight. `reload` publishes a new answer registry under a new
+        // `Rc`, exactly as `HttpListener::update_config` does.
+        let after = context.listener.borrow_mut().reload("RELOADEDID", true);
+        assert!(
+            !Rc::ptr_eq(&before, &after),
+            "precondition: the reload must PUBLISH a registry, not rewrite the \
+             captured one — otherwise this test cannot tell a snapshot from a \
+             shared handle"
+        );
+
+        let second = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("the second stream must check out its buffers");
+        assert_ne!(
+            first, second,
+            "precondition: the second request must land in its own slot, not \
+             recycle the first one's"
+        );
+
+        // The next request picks the reload up.
+        assert_eq!(
+            context.streams[second].context.sticky_name, "RELOADEDID",
+            "a request arriving after the reload must use the new sticky name"
+        );
+        assert!(
+            context.streams[second].context.elide_x_real_ip,
+            "a request arriving after the reload must use the new X-Real-IP \
+             policy: a listener frozen at Context::new never sees a reload on \
+             a connection that is already open"
+        );
+        assert!(
+            Rc::ptr_eq(&context.streams[second].answers, &after),
+            "a request arriving after the reload must render from the newly \
+             published answer registry"
+        );
+
+        // The request already in flight does not.
+        assert_eq!(
+            context.streams[first].context.sticky_name, TEST_STICKY_NAME,
+            "a request in flight keeps the sticky name it started under"
+        );
+        assert!(
+            !context.streams[first].context.elide_x_real_ip,
+            "a request in flight keeps the X-Real-IP policy it started under"
+        );
+        assert!(
+            Rc::ptr_eq(&context.streams[first].answers, &before),
+            "a request in flight keeps the answer registry it captured: a live \
+             listener borrow on the write, reset or access-log path would hand \
+             it a page installed after it started"
         );
     }
 }

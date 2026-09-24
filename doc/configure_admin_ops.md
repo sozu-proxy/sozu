@@ -48,6 +48,35 @@ reference, including defaults, mutability class, and metric impact:
 CLI-level flag-to-field mapping lives in
 `bin/src/cli.rs` and `bin/src/ctl/request_builder.rs`.
 
+### 1.1 When a patch takes effect on traffic already in flight
+
+A patch lands on a worker that is serving requests, so "applied" needs a
+boundary. There are three, and which one a field gets depends on what the
+field controls:
+
+- **From the next request.** The per-request knobs — `sticky_name`,
+  `sozu_id_header`, `strict_sni_binding`, `elide_x_real_ip`, `send_x_real_ip`,
+  and the custom error pages of `--answer` / `http_answers` — are captured by
+  each request when it arrives and held until that request finishes. A request
+  already in flight when you run the update completes under the configuration
+  it started with, including any error page it ends up serving; the next
+  request on the same connection uses the patched values. On an HTTP/2
+  connection, where "the next request" is the next stream, the window is one
+  request. An HTTP/1.1 keep-alive connection captures once when it is accepted,
+  so there the window is the connection: to move an established H1 connection
+  onto new values, it has to be re-established.
+- **From the next connection.** Anything that configures a connection rather
+  than a request: the H2 flood thresholds and tuning knobs, `disable_http11`,
+  `alpn_protocols`, `h2_stream_shrink_ratio`, and the front/back/connect
+  timeouts. Connections already open keep what they negotiated.
+- **Immediately.** Routing: a frontend added or removed by
+  `sozu frontend …` is visible to the very next request to be routed,
+  on any connection, because routing is resolved against the live listener
+  rather than against a per-request capture.
+
+The data-plane statement of the same boundary, with the code that enforces it,
+is `lib/src/protocol/mux/LIFECYCLE.md` §2.5.
+
 ---
 
 ## 2. Worked Example — Tighten H2 Flood Thresholds Under Attack

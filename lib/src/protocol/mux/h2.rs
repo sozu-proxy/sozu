@@ -3126,7 +3126,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     {
         self.gauge_connection_state();
 
-        let scheme: &'static [u8] = if context.listener.borrow().protocol() == Protocol::HTTPS {
+        let scheme: &'static [u8] = if context.protocol == Protocol::HTTPS {
             b"https"
         } else {
             b"http"
@@ -6756,8 +6756,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
             }
             Position::Server => {
-                let answers_rc = context.listener.borrow().get_answers().clone();
                 let stream = &mut context.streams[stream_gid];
+                let answers_rc = stream.answers.clone();
                 match end_stream_decision(stream) {
                     EndStreamAction::ForwardTerminated => {
                         #[cfg(debug_assertions)]
@@ -7692,6 +7692,7 @@ mod tests {
         Stream::new(
             &mut PoolBufferSource::new(Rc::downgrade(pool)),
             http_ctx,
+            crate::protocol::mux::test_support::test_answers(),
             65_535,
         )
         .expect("pool should have capacity for two buffers")

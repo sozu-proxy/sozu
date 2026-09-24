@@ -1262,7 +1262,7 @@ and `tracestate` headers are extracted from inbound requests:
 At access log emission time (`Stream::generate_access_log`, in
 `lib/src/protocol/mux/stream.rs`):
 
-```rust lib/src/protocol/mux/stream.rs:782-785
+```rust lib/src/protocol/mux/stream.rs:801-804
 #[cfg(feature = "opentelemetry")]
 otel: context.otel.as_ref(),
 #[cfg(not(feature = "opentelemetry"))]

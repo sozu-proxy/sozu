@@ -20,7 +20,7 @@ use super::{GenericHttpStream, Position};
 use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Protocol, SessionMetrics,
-    protocol::http::{editor::HttpContext, parser::Method},
+    protocol::http::{answers::HttpAnswers, editor::HttpContext, parser::Method},
 };
 
 /// Module-level prefix used on every log line emitted from the stream module.
@@ -236,6 +236,23 @@ pub struct Stream {
     pub retry_buffer: Option<ReplayCapture>,
     pub context: HttpContext,
     pub metrics: SessionMetrics,
+    /// The listener answer registry this stream renders its default answers
+    /// from, captured when the request that owns the slot arrived and held
+    /// for the rest of the stream's life.
+    ///
+    /// Every `set_default_answer` site in the mux reads this handle instead
+    /// of borrowing [`Context::listener`](super::Context::listener) again, so
+    /// an operator listener reload landing mid-request cannot change the
+    /// template a stream already in flight is about to render.
+    /// `HttpListener::update_config` / `HttpsListener::update_config`
+    /// publish a *new* registry rather than overwriting this one, which is
+    /// what makes the captured handle a snapshot and not just a second name
+    /// for the live one. See `LIFECYCLE.md` §2.5.
+    ///
+    /// `Rc` so the capture is a refcount bump on a path that runs once per
+    /// request; the inner `RefCell` is the registry's own, not a mutation
+    /// point for the mux — nothing under `mux/` ever takes it mutably.
+    pub answers: Rc<RefCell<HttpAnswers>>,
 }
 
 struct KawaSummary<'a>(&'a GenericHttpStream);
@@ -311,6 +328,7 @@ impl Stream {
     pub fn new(
         buffers: &mut dyn super::buffer_source::BufferSource,
         context: HttpContext,
+        answers: Rc<RefCell<HttpAnswers>>,
         window: u32,
     ) -> Option<Self> {
         let (front_buffer, back_buffer) = match (buffers.checkout(), buffers.checkout()) {
@@ -331,6 +349,7 @@ impl Stream {
             retry_buffer: None,
             context,
             metrics: SessionMetrics::new(None),
+            answers,
         };
         // Post: a freshly checked-out stream is a clean, closed slot — no
         // request has been counted yet (so `generate_access_log` won't
@@ -832,6 +851,7 @@ mod tests {
         Stream::new(
             &mut PoolBufferSource::new(Rc::downgrade(pool)),
             context,
+            crate::protocol::mux::test_support::test_answers(),
             65535,
         )
         .expect("test stream checkout")
@@ -1222,6 +1242,7 @@ mod tests {
         let mut stream = Stream::new(
             &mut PoolBufferSource::new(Rc::downgrade(&pool)),
             context,
+            crate::protocol::mux::test_support::test_answers(),
             65535,
         )
         .expect("test stream checkout");

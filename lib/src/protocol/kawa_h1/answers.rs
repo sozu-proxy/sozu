@@ -501,7 +501,20 @@ impl Template {
 /// for templates picked by name rather than by code (currently only the
 /// `Answer*` variants in [`DefaultAnswer`]).
 pub struct HttpAnswers {
-    pub cluster_answers: HashMap<ClusterId, BTreeMap<String, Template>>,
+    /// Per-cluster overrides, each template behind an `Rc`.
+    ///
+    /// The indirection exists so a registry can be *published* rather than
+    /// rewritten: `HttpListener::update_config` / `HttpsListener::update_config`
+    /// build a fresh `HttpAnswers`, carry these overrides into it with a plain
+    /// map clone, and install the result under a new `Rc`, leaving the registry
+    /// that in-flight requests captured at
+    /// `mux::Context::create_stream` untouched. [`Template`] itself cannot be
+    /// cloned — it owns a `kawa::Kawa`, which has no `Clone` — so the shared
+    /// ownership has to sit here. Nothing ever mutates a template through the
+    /// handle: `Template::fill` takes `&self`, and
+    /// [`HttpAnswers::add_cluster_answers`] replaces entries rather than
+    /// editing them.
+    pub cluster_answers: HashMap<ClusterId, BTreeMap<String, Rc<Template>>>,
     pub listener_answers: BTreeMap<String, Template>,
     pub fallback: Template,
 }
@@ -1204,11 +1217,15 @@ impl HttpAnswers {
         if answers.is_empty() {
             return Ok(());
         }
-        let mut compiled = Self::templates(answers)?;
+        let compiled = Self::templates(answers)?;
         self.cluster_answers
             .entry(cluster_id.to_owned())
             .or_default()
-            .append(&mut compiled);
+            .extend(
+                compiled
+                    .into_iter()
+                    .map(|(name, template)| (name, Rc::new(template))),
+            );
         Ok(())
     }
 
@@ -1453,7 +1470,7 @@ impl HttpAnswers {
         };
         let template = cluster_id
             .and_then(|id| self.cluster_answers.get(id))
-            .and_then(|answers| answers.get(name))
+            .and_then(|answers| answers.get(name).map(Rc::as_ref))
             .or_else(|| self.listener_answers.get(name))
             .unwrap_or(&self.fallback);
         // Post (resolved status validity). NOT inherited from `Template::new`,

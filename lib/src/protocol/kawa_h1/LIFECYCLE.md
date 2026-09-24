@@ -214,7 +214,7 @@ short-circuit anything else in kawa — the very next line back in
 `kawa::h1::parse`'s loop re-checks `parsing_phase`, sees `Error`, and returns.
 
 The resulting `ParsingPhase::Error` is observed by the mux H1 connection in
-`ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs:383`), which checks
+`ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs:385`), which checks
 `kawa.is_error()` immediately after `kawa::h1::parse` and, on the server side,
 calls
 `set_default_answer(..., 400, ...)` and returns — before routing or the
@@ -244,8 +244,8 @@ template-rendered Kawa streams. The relevant pieces:
   substitutions go through the corresponding sanitizer to avoid log /
   header injection.
 - `HttpAnswers` (`answers.rs:503`) holds the registry; its `cluster_answers` /
-  `listener_answers` split (`answers.rs:504-505`) lets a cluster override a
-  listener-level template. `HttpAnswers::get` (`answers.rs:1302`) is the
+  `listener_answers` split (`answers.rs:517-518`) lets a cluster override a
+  listener-level template. `HttpAnswers::get` (`answers.rs:1319`) is the
   selection chokepoint: its lookup key is derived from the `DefaultAnswer`
   variant, so only the built-in code names ("301" … "507") and the bundled
   fallback are ever selectable — an operator's custom answer under an

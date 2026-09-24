@@ -408,6 +408,7 @@ mod tests {
         let stream = Stream::new(
             &mut PoolBufferSource::new(Rc::downgrade(&pool)),
             http_ctx,
+            crate::protocol::mux::test_support::test_answers(),
             65_535,
         )
         .expect("pool checkout failed");
