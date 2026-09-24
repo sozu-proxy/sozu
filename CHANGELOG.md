@@ -4445,6 +4445,62 @@
 
 ### 🤖 CI
 
+- **`ci(bench)`: build each provider's release `sozu` once, off the critical path, and share it
+  as an artifact.**
+  `Bombardier bench (<provider>)` ran `cargo build --release -p sozu --no-default-features
+  --features jemallocator,<provider>` inside each of its four cells, on a physically exclusive
+  bench node, and only *after* `needs: [pipeline]` was satisfied — so 258-314 s of compilation per
+  cell (measured, run 35923383722) sat on the critical path behind a ~2700 s pipeline matrix. The
+  three helper binaries (`bombardier`, `lagging_server`, `bench_logger`) were already built once in
+  their own job and shared with `upload-artifact`/`download-artifact`; `sozu` now follows the same
+  shape. A new `build-sozu` matrix job with no `needs:` compiles all four providers on
+  `sozu-general` starting at t=0, and `bench-bombardier` downloads the binary.
+  **This relocates compilation, it does not remove any.** The `run:` line is byte-identical and
+  the same four provider configurations are compiled once each per run, so every diagnostic they
+  emit is still emitted. Counted across the whole workflow, the release `sozu` compiles per run go
+  from five to four, and the one that went was the duplicate removed in the entry below.
+  The trade is CPU-neutral for wall-clock: the same compile-seconds are spent, in parallel with the
+  pipeline matrix instead of after it. The bench pool is a fixed, non-autoscaling set of nodes
+  running one job per pod per node so a benchmark never shares hardware; it stops spending a large
+  share of that held time running a compiler. `build-sozu` is deliberately **not** on `sozu-bench`
+  for the same reason: a four-way parallel compile there would contend with the crypto cells'
+  `Bench (Criterion)` step for LLC and DRAM bandwidth. Nothing is lost by moving — since the
+  2026-09-24 runner redesign both scale sets request the same 7 vCPU / 10Gi per pod, so the build
+  is no slower on `sozu-general`, and both pin the same runner image digest, so the binary crosses
+  pools unchanged, exactly as `lagging_server` and `bombardier` already do.
+  Two behaviour changes worth knowing: one provider's release build failing now skips all four
+  bench cells rather than just its own, and the four builds now start at t=0, so a run whose
+  pipeline fails spends them where previously it would not have.
+
+- **`ci(cache)`: correct three comments that claimed a cache was shared between jobs when it is
+  not.**
+  `Swatinem/rust-cache` composes its key as `<prefix-key>-<GITHUB_JOB>-<os>-<arch>-<env
+  hash>-<lockfile hash>`: `add-job-id-key` defaults to true and no `shared-key` is set anywhere in
+  `ci.yml`, so a `prefix-key` borrowed from another job never restores that job's cache — it only
+  makes the key look shared. Verified against the pinned action source (v2.9.2) and against the
+  repository's live cache listing, which carries one entry per job id
+  (`ci-crypto-ring-pipeline-…`, `ci-fips-bench-bombardier-…`, `ci-crypto-ring-bench-logs-…`).
+  Two of the three claims sat on jobs this changeset rewrites; the third, on `build-bench-logger`,
+  now states the actual key shape and points at `shared-key` as the way to share for real. A
+  pre-existing claim that `bench-bombardier` "stays on ubuntu-latest" — untrue since the
+  2026-09-23 full-matrix migration to the self-hosted CKE runners — is corrected with them.
+
+- **`ci(bench-logs)`: drop the release `sozu` build the logger benchmark never ran.**
+  `Bench logger` installed a Rust toolchain, restored a cargo cache, ran `cargo build --release -p
+  sozu --no-default-features --features jemallocator,crypto-ring`, copied the binary next to
+  `bench_logs.py` and then uploaded a 470 MB cache — for a benchmark that never executes it.
+  `.github/workflows/bench_logs.py` spawns `./bench_logger` and nothing else, and
+  `command/examples/bench_logger.rs` calls `sozu_command_lib::logging::setup_logging` and never
+  spawns, execs or connects to a proxy, so the staged `sozu` was dead weight from the first run.
+  Measured on run 35923383722: 402 s building, 79 s uploading the cache, 5 s benchmarking, in a
+  513 s job. The job now checks out, downloads the `bench_logger` artifact and runs the benchmark.
+  **No verification was lost.** `Bombardier bench (crypto-ring)` compiles the byte-identical
+  crate, profile, toolchain and feature set in the same run, so that configuration still gets its
+  compile and every diagnostic it emits; this was a duplicate of a binary that was itself unused.
+  The job's ~470 MB × per-ref cache entries also stop competing for the repository's Actions cache
+  budget, which was measured at 15.98 GB across 31 entries with the `ci-fuzz`, `ci-crypto-ring`,
+  `ci-crypto-openssl` and `ci-fips` pipeline caches already evicted.
+
 - **`ci(doc)`: a `file.rs:NNN` citation whose line MOVED is now reported, not just one that landed
   on a blank line.**
   The resolver below failed a citation only when the cited line was blank, and said so in its own
