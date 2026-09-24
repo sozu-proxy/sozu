@@ -71,7 +71,7 @@ ConnectionH2<Front>
  |-- local_settings: H2Settings             // Settings we advertise
  |-- peer_settings: H2Settings              // Settings the peer advertised
  |-- stream_table: H2StreamTable             // Closed API (h2_stream_table.rs, private fields):
- |                                         // streams: HashMap<StreamId, GlobalStreamId>,
+ |                                         // streams: BTreeMap<StreamId, GlobalStreamId>,
  |                                         // highest_peer_stream_id, expect_read, expect_write,
  |                                         // rst_sent, and the per-stream activity/fc-stall maps
  |-- pending_table_size_update: Option<u32> // RFC 7541 s6.3 directive owed to the peer
@@ -158,7 +158,7 @@ plus the per-urgency-bucket round-robin `incremental_cursor`.
 | Method | Signature | Behavior |
 |--------|-----------|----------|
 | `push_priority` | `(&mut self, StreamId, PriorityPart) -> bool` | Inserts/updates priority. Returns `true` on self-dependency (protocol error). Clamps urgency to 0-7. Ignores deprecated RFC 7540 tree priorities. |
-| `push_priority_guarded` | `(&mut self, StreamId, PriorityPart, StreamId, &HashMap<StreamId, GlobalStreamId>) -> bool` | Same, behind the open-stream / idle-look-ahead filter that bounds a PRIORITY flood. |
+| `push_priority_guarded` | `(&mut self, StreamId, PriorityPart, StreamId, &BTreeMap<StreamId, GlobalStreamId>) -> bool` | Same, behind the open-stream / idle-look-ahead filter that bounds a PRIORITY flood. |
 | `get` | `(&self, &StreamId) -> (u8, bool)` | Returns `(urgency, incremental)`. Defaults to `(3, false)` if absent. |
 | `remove` | `(&mut self, &StreamId)` | Removes entry at stream cleanup. |
 | `apply_incremental_rotation` | `(&self, &mut [StreamId]) -> usize` | Inside each urgency bucket, moves incremental streams to the tail and rotates that tail past **that bucket's own** entry in `incremental_cursor`. Returns the incremental count. |

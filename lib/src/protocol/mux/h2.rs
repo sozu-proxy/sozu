@@ -12,7 +12,7 @@
 
 use std::{
     cmp::min,
-    collections::HashMap,
+    collections::BTreeMap,
     io::{IoSlice, Write as _},
     time::{Duration, Instant},
 };
@@ -531,7 +531,7 @@ fn distribute_overhead(
 /// treated as "no pending bytes" rather than panicking — defence-in-depth
 /// against a stream-removal race during shutdown.
 fn any_stream_has_pending_back(
-    streams: &HashMap<StreamId, GlobalStreamId>,
+    streams: &BTreeMap<StreamId, GlobalStreamId>,
     context_streams: &[Stream],
 ) -> bool {
     any_stream_id_matches(streams, |gid| {
@@ -544,7 +544,7 @@ fn any_stream_has_pending_back(
 /// Iteration core of [`any_stream_has_pending_back`], split out so the
 /// invariant-16 dispatch is unit-testable without a full [`Stream`] fixture
 /// (the existing test module only covers `H2FloodDetector`).
-fn any_stream_id_matches<F>(streams: &HashMap<StreamId, GlobalStreamId>, mut probe: F) -> bool
+fn any_stream_id_matches<F>(streams: &BTreeMap<StreamId, GlobalStreamId>, mut probe: F) -> bool
 where
     F: FnMut(GlobalStreamId) -> bool,
 {
@@ -6777,7 +6777,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
     use super::*;
     use crate::{
@@ -7325,13 +7325,13 @@ mod tests {
 
     #[test]
     fn test_any_stream_id_matches_empty_map_is_false() {
-        let streams: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let streams: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         assert!(!any_stream_id_matches(&streams, |_| true));
     }
 
     #[test]
     fn test_any_stream_id_matches_all_probe_false_is_false() {
-        let mut streams: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let mut streams: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         streams.insert(1, 0);
         streams.insert(3, 1);
         streams.insert(5, 2);
@@ -7340,7 +7340,7 @@ mod tests {
 
     #[test]
     fn test_any_stream_id_matches_any_probe_true_is_true() {
-        let mut streams: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let mut streams: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         streams.insert(1, 0);
         streams.insert(3, 1);
         streams.insert(5, 2);
@@ -7350,7 +7350,7 @@ mod tests {
 
     #[test]
     fn test_any_stream_id_matches_single_entry() {
-        let mut streams: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let mut streams: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         streams.insert(42, 7);
         assert!(any_stream_id_matches(&streams, |gid| gid == 7));
         assert!(!any_stream_id_matches(&streams, |gid| gid == 8));
@@ -7358,7 +7358,7 @@ mod tests {
 
     #[test]
     fn test_any_stream_id_matches_short_circuits() {
-        let mut streams: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let mut streams: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         streams.insert(1, 0);
         streams.insert(3, 1);
         streams.insert(5, 2);
@@ -7538,7 +7538,7 @@ mod tests {
     fn test_any_stream_has_pending_back_empty_map_is_false() {
         let pool = make_pool_for_invariant_16();
         let ulid = Ulid::generate();
-        let streams_map: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let streams_map: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         let context_streams = vec![make_stream_for_invariant_16(&pool, ulid)];
         assert!(!any_stream_has_pending_back(&streams_map, &context_streams));
     }
@@ -7551,7 +7551,7 @@ mod tests {
             make_stream_for_invariant_16(&pool, ulid),
             make_stream_for_invariant_16(&pool, ulid),
         ];
-        let mut streams_map: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let mut streams_map: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         streams_map.insert(1, 0);
         streams_map.insert(3, 1);
         // Both freshly-built streams have empty back.out and back.blocks
@@ -7567,7 +7567,7 @@ mod tests {
         let pool = make_pool_for_invariant_16();
         let ulid = Ulid::generate();
         let context_streams = vec![make_stream_for_invariant_16(&pool, ulid)];
-        let mut streams_map: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let mut streams_map: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         // GlobalStreamId 42 is out of range for the 1-element slice above.
         streams_map.insert(7, 42);
         assert!(!any_stream_has_pending_back(&streams_map, &context_streams));
@@ -7581,7 +7581,7 @@ mod tests {
         // Push one dummy block — any Block variant is fine; the predicate
         // only checks `blocks.is_empty()`.
         stream.back.blocks.push_back(kawa::Block::StatusLine);
-        let mut streams_map: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let mut streams_map: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         streams_map.insert(1, 0);
         assert!(any_stream_has_pending_back(&streams_map, &[stream]));
     }
@@ -7596,7 +7596,7 @@ mod tests {
             .back
             .out
             .push_back(kawa::OutBlock::Store(kawa::Store::Static(b"partial frame")));
-        let mut streams_map: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let mut streams_map: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         streams_map.insert(1, 0);
         assert!(any_stream_has_pending_back(&streams_map, &[stream]));
     }

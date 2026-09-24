@@ -45,7 +45,7 @@ Two orthogonal structs hold H2 session state:
 - [`ConnectionH2<Front>`] — `lib/src/protocol/mux/h2.rs` —
   **per-connection** wire-level state: HPACK coders, frame-parser state
   (`H2State`), flow control window, flood counters, priority map, and a
-  `HashMap<StreamId, GlobalStreamId>` wire map — private to
+  `BTreeMap<StreamId, GlobalStreamId>` wire map — private to
   [`H2StreamTable`](h2_stream_table.rs), reached via `self.stream_table` (§4.1).
 - [`Context<L>`] — `lib/src/protocol/mux/mod.rs` — **per-session** stream
   buffers and routing data: `context.streams: Vec<Stream>`, `pending_links`,
@@ -59,7 +59,7 @@ index.
 ```
         ConnectionH2 (frontend)      Context                 ConnectionH2 (backend)
         ─────────────────────        ─────────────────        ──────────────────────
-        streams: HashMap             streams: Vec<Stream>    streams: HashMap
+        streams: BTreeMap            streams: Vec<Stream>    streams: BTreeMap
           0x1 ─┐                       [0] ─┐ active          0x1 ──┐
           0x3 ─┼── gid=0 ──▶ ──────▶   [1] ─┘ active  ◀───── 0x5   │
                │                       [2] Recycle              │
@@ -396,8 +396,8 @@ runs — see §6.
 
 ### 4.1 `ConnectionH2.streams` (per-connection wire map)
 
-- Type: `HashMap<StreamId, GlobalStreamId>` — private field of
-  [`H2StreamTable`](h2_stream_table.rs) (`h2_stream_table.rs:125`) since the
+- Type: `BTreeMap<StreamId, GlobalStreamId>` — private field of
+  [`H2StreamTable`](h2_stream_table.rs), named `streams`, since the
   step-3 stream-slot-bookkeeping extraction. `ConnectionH2` holds a single
   `stream_table: H2StreamTable` field (`h2.rs`) and reaches the map only
   through `H2StreamTable`'s closed API — see §5.4.
@@ -1305,7 +1305,7 @@ Mechanical list of invariants. A reviewer can check each one on a PR that
 touches `h2.rs`, `mod.rs`, or `stream.rs`.
 
 1. **Wire-map validity.** For every entry `(sid → gid)` in the wire map
-   (`H2StreamTable.streams`, `h2_stream_table.rs:125`), `gid < context.streams.len()`.
+   (`H2StreamTable.streams`), `gid < context.streams.len()`.
 2. **Backend index consistency.** If
    `context.streams[gid].state == StreamState::Linked(token)`, then
    `context.backend_streams[&token]` contains `gid`. Asserted under
