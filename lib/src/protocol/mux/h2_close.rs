@@ -105,7 +105,7 @@
 //!     if !socket_write {                 // <- the third input
 //!         self.flush_tls_records();
 //!     }
-//!     self.ensure_tls_flushed();
+//!     self.ensure_tls_flushed(self.tls_wants_write());
 //! }
 //! ```
 //!

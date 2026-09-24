@@ -1433,9 +1433,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             self.begin_tls_close();
             self.close_notify_sent = true;
         }
-        if self.tls_wants_write() {
+        let tls_wants_write = self.tls_wants_write();
+        if tls_wants_write {
             self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
-            self.ensure_tls_flushed();
+            self.ensure_tls_flushed(tls_wants_write);
             true
         } else {
             false
@@ -3219,8 +3220,22 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     }
 
     /// Re-arm edge-triggered WRITABLE event if rustls still has buffered TLS data.
-    fn ensure_tls_flushed(&mut self) {
-        if self.tls_wants_write() {
+    ///
+    /// Takes the answer rather than asking for it: `tls_wants_write` is
+    /// [`Self::tls_wants_write`]'s result, read by the caller. That query was
+    /// this composite's whole remaining socket reach, and handing it in is
+    /// what leaves a body a byte-in / byte-out core can keep.
+    ///
+    /// When the caller reads it is not uniform, and cannot be. Five call
+    /// sites already hold the answer — four from the `h2_close` decision
+    /// just taken on it, [`Self::initiate_close_notify`] from its own branch
+    /// condition — and pass that binding: nothing mutates the socket in
+    /// between, so a second query would answer the same. The three
+    /// stalled-drain tails of [`Self::flush_pending_control_frames`] have no
+    /// such binding and must read it AFTER the [`Self::flush_zero_to_socket`]
+    /// whose stall brought them there: that write is what changes the answer.
+    fn ensure_tls_flushed(&mut self, tls_wants_write: bool) {
+        if tls_wants_write {
             self.readiness.signal_pending_write();
         }
     }
@@ -3406,9 +3421,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // degenerate arguments are the shape `goaway_close_action`'s own
         // post-flush call already uses: the inputs the flush could not change
         // are not re-read.
+        let tls_wants_write = self.tls_wants_write();
         let action = h2_close::finalize_action(
             TlsFlushPhase::AfterFlush,
-            self.tls_wants_write(),
+            tls_wants_write,
             false,
             false,
             false,
@@ -3416,12 +3432,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             false,
         );
         match action {
-            // `ensure_tls_flushed` asks a third time rather than re-arming
-            // outright, which is redundant — nothing mutates the socket
-            // between the two — and deliberate: it keeps every post-decision
+            // The post-flush answer is read once, above, and feeds both the
+            // decision and the re-arm: they are one question asked at one
+            // point, and nothing mutates the socket between them. The re-arm
+            // still goes through `ensure_tls_flushed` rather than touching
+            // `signal_pending_write` here, which keeps every post-decision
             // TLS re-arm in this file spelled the same way, as the GoAway and
             // Error arms of `writable` already do.
-            FinalizeAction::ReArm => self.ensure_tls_flushed(),
+            FinalizeAction::ReArm => self.ensure_tls_flushed(tls_wants_write),
             FinalizeAction::Settled => {}
             action @ (FinalizeAction::Flush
             | FinalizeAction::SkipFlush
@@ -3532,7 +3550,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // application-data writes should reset it.
         if let Some(H2StreamId::Zero) = self.stream_table.expect_write() {
             if self.flush_zero_to_socket() {
-                self.ensure_tls_flushed();
+                let tls_wants_write = self.tls_wants_write();
+                self.ensure_tls_flushed(tls_wants_write);
                 return Some(MuxResult::Continue);
             }
             // When H2StreamId::Zero is used to write, READABLE is disabled —
@@ -3593,7 +3612,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.storage.fill(offset);
                 if self.flush_zero_to_socket() {
                     self.stream_table.set_expect_write(Some(H2StreamId::Zero));
-                    self.ensure_tls_flushed();
+                    let tls_wants_write = self.tls_wants_write();
+                    self.ensure_tls_flushed(tls_wants_write);
                     return Some(MuxResult::Continue);
                 }
             }
@@ -3639,7 +3659,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.storage.fill(offset);
                 if self.flush_zero_to_socket() {
                     self.stream_table.set_expect_write(Some(H2StreamId::Zero));
-                    self.ensure_tls_flushed();
+                    let tls_wants_write = self.tls_wants_write();
+                    self.ensure_tls_flushed(tls_wants_write);
                     return Some(MuxResult::Continue);
                 }
             }
@@ -3676,9 +3697,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // The preamble above already attempted this pass's flush, so
                 // this arm reads the post-flush answer and has no `Flush` of
                 // its own — see `h2_close`'s module doc.
-                match h2_close::error_close_action(self.tls_wants_write()) {
+                let tls_wants_write = self.tls_wants_write();
+                match h2_close::error_close_action(tls_wants_write) {
                     CloseAction::ReArmAndContinue => {
-                        self.ensure_tls_flushed();
+                        self.ensure_tls_flushed(tls_wants_write);
                         MuxResult::Continue
                     }
                     CloseAction::CloseSession => MuxResult::CloseSession,
@@ -3724,13 +3746,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     CloseAction::CloseSession => return MuxResult::CloseSession,
                     CloseAction::Flush => {
                         self.flush_tls_records();
+                        let tls_wants_write = self.tls_wants_write();
                         match h2_close::goaway_close_action(
                             TlsFlushPhase::AfterFlush,
                             false,
-                            self.tls_wants_write(),
+                            tls_wants_write,
                         ) {
                             CloseAction::ReArmAndContinue => {
-                                self.ensure_tls_flushed();
+                                self.ensure_tls_flushed(tls_wants_write);
                                 return MuxResult::Continue;
                             }
                             CloseAction::Disconnect => {}
@@ -6298,7 +6321,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         self.readiness
                     );
                     self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
-                    self.ensure_tls_flushed();
+                    self.ensure_tls_flushed(tls_wants_write);
                     MuxResult::Continue
                 } else {
                     debug!(
@@ -7976,14 +7999,15 @@ mod tests {
     /// vector: closing here sends FIN and destroys the records rustls is still
     /// holding, which the client reads as a truncated response.
     ///
-    /// TO SEE THIS RED: delete the `self.ensure_tls_flushed();` call in the
-    /// `CloseAction::ReArmAndContinue` arm of `ConnectionH2::writable`'s
-    /// `H2State::GoAway` branch. The WRITABLE *event* bit is then never
-    /// re-signalled and this test fails on its OWN assertion, `the WRITABLE
-    /// event must be re-signalled so the event loop retries the flush`. The
-    /// recipe deliberately does not swap `TlsFlushPhase::AfterFlush` for
-    /// `BeforeFlush`: that reddens through the production `unreachable!`, which
-    /// is someone else's assertion and would pass whatever this test claimed.
+    /// TO SEE THIS RED: delete the `self.ensure_tls_flushed(tls_wants_write);`
+    /// call in the `CloseAction::ReArmAndContinue` arm of
+    /// `ConnectionH2::writable`'s `H2State::GoAway` branch. The WRITABLE
+    /// *event* bit is then never re-signalled and this test fails on its OWN
+    /// assertion, `the WRITABLE event must be re-signalled so the event loop
+    /// retries the flush`. The recipe deliberately does not swap
+    /// `TlsFlushPhase::AfterFlush` for `BeforeFlush`: that reddens through the
+    /// production `unreachable!`, which is someone else's assertion and would
+    /// pass whatever this test claimed.
     #[test]
     fn a_flush_that_does_not_drain_keeps_the_connection_open() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
