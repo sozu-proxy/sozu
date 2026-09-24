@@ -2252,10 +2252,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             // `router.backends`, so `Mux::reschedule` keeps its handle armed at
             // whatever deadline the core holds, every pass. (`arm_timeout()` at
             // the top of `ConnectionH1::{readable,writable}` and in
-            // `ConnectionH2::{write_streams,handle_headers_frame}` pushes that
-            // deadline out on the first pass, but nothing hangs on it.) That is
-            // what covers the pool-reuse branch of `Router::connect` never
-            // arming a timeout, unlike the fresh-dial branch.
+            // `ConnectionH2::{handle_write,handle_headers_frame}` pushes that
+            // deadline out on the first pass that moves a stream's bytes — not
+            // on every pass, LIFECYCLE §9 invariant 9 — but nothing hangs on
+            // it.) That is what covers the pool-reuse branch of
+            // `Router::connect` never arming a timeout, unlike the fresh-dial
+            // branch.
             //
             // The assertion below is the cheap tripwire for link 3: if the
             // impossible becomes possible (a new arm that skips `end_stream`,

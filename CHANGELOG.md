@@ -1196,6 +1196,44 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux-h2)`: a peer that sends nothing but PINGs no longer holds a stuck HTTP/2 session
+  open indefinitely.** `ConnectionH2::poll_read_target` carries the rule in prose — PING,
+  WINDOW_UPDATE and SETTINGS must not reset the frontend timeout, "otherwise a peer sending
+  periodic PINGs prevents timeout detection on stuck sessions" — and the read path honoured it,
+  arming only on DATA payload and on HEADERS. The write path undid it. `ConnectionH2::write_streams`
+  armed the connection deadline as its first statement, and `writable()` dispatches into that
+  function for every proxying state, so reaching it never meant application data was being written:
+  a connection whose only queued output was the PING ACK or SETTINGS ACK that
+  `flush_pending_control_frames` had just drained is in `H2State::Header` like any other, falls
+  through the preamble's `None`, and armed. Measured with `front_timeout` 600 s and one stream
+  opened at 10 ms, reading `ConnectionH2::poll_timeout` after each pass: HEADERS at 10 ms armed
+  correctly, then a PING at 10 s, a SETTINGS at 40 s and a PING at 500 s each pushed the deadline
+  a further full timeout out. The three that moved are exactly the three that queue an
+  acknowledgement; WINDOW_UPDATE queues nothing, gave the write path no reason to run, and
+  correctly did not move. `front_timeout` therefore never fired on a PING-only peer, which is the
+  Slowloris shape the documented rule exists to prevent.
+
+  The arm moves to the `H2StreamId::Other` arm of `ConnectionH2::handle_write`, gated on
+  `size > 0`. Both halves are load-bearing and neither is implied by reaching the write pass: the
+  stream id is what makes the bytes a stream's rather than `self.zero`'s, and the size is what
+  makes them bytes the socket actually took. `arm_timeout` reads the pass's clock snapshot, so
+  arming per transmit lands on the same instant pass entry would have computed — the gate is the
+  whole change. The per-stream idle deadline is a separate mechanism and is untouched; it is what
+  still retires individual streams. The close and drain paths keep their deadline the same way
+  every other pass does, by flushing a stream's bytes: `Mux::timeout` already re-arms explicitly on
+  each branch that keeps a session alive, and `H2State::GoAway` / `H2State::Error` never reach the
+  stream-write path at all. What ends is `Mux::drive_frontend_shutdown_io` forcing a write pass on
+  every shutting-down poll and renewing a draining session for free, whether or not a byte moved.
+
+  Four tests pin it, each pairing its negative with a positive leg on the same connection —
+  `a_ping_only_peer_does_not_postpone_the_connection_deadline`,
+  `a_settings_only_peer_does_not_postpone_the_connection_deadline`,
+  `a_write_pass_that_moves_stream_bytes_arms_the_connection_deadline` and
+  `a_draining_write_pass_that_moves_stream_bytes_still_arms_the_deadline`. The pairing is the point:
+  a build that never armed at all would satisfy every "the deadline did not move" assertion while
+  turning `front_timeout` into an unconditional session cap, and neutering the new gate to `if false`
+  reddens all four on their positive legs. sozu-proxy/sozu#1489.
+
 - **`fix(mux-h2)`: a short read of 25..=32 octets no longer disconnects a valid HTTP/2 client.**
   `ConnectionH2::readable` arms `expect_read` with `CLIENT_PREFACE_SIZE` — the 24-octet magic
   string plus a 9-octet SETTINGS frame header, 33 in all — and its short-read branch runs an early

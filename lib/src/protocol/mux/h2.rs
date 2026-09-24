@@ -1839,6 +1839,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // The timeout is reset:
         // - Below, when reading DATA payload (H2StreamId::Other)
         // - In handle_frame(), when processing HEADERS frames
+        // - On the write side, in handle_write(), once a stream transmit has
+        //   moved bytes — outbound application data is activity too, and an
+        //   acknowledgement-only write pass moves none of it
         let Some((stream_id, amount)) = self.stream_table.expect_read() else {
             self.readiness.event.remove(Ready::READABLE);
             return H2ReadTarget::Done(MuxResult::Continue);
@@ -2296,7 +2299,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        self.arm_timeout();
+        // No `arm_timeout()` here. `writable()` reaches this function on every
+        // proxying-state pass, including one whose only output was the PING or
+        // SETTINGS acknowledgement `flush_pending_control_frames` drained a few
+        // statements earlier, so arming at pass entry renewed the session for a
+        // peer that had sent nothing but keepalives. The write side's share of
+        // LIFECYCLE §9 invariant 9 now lives in `ConnectionH2::handle_write`,
+        // where the pass knows a real stream's bytes reached the socket.
         // Pre-compute byte totals for proportional overhead distribution.
         let mut pass = H2WritePass::new(self.compute_stream_byte_totals(context));
         let mut io_slices: Vec<IoSlice<'static>> = Vec::new();
@@ -3069,6 +3078,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         {
             self.position
                 .count_bytes_out(&mut context.streams[global_stream_id].metrics, size);
+            // LIFECYCLE §9 invariant 9, write side. Outbound APPLICATION data
+            // is activity; an acknowledgement is not. Both halves of this
+            // condition are load-bearing and neither is implied by reaching
+            // `ConnectionH2::write_streams`: an `H2StreamId::Other` id is what
+            // makes these bytes a stream's rather than `self.zero`'s, and
+            // `size > 0` is what makes them bytes the socket actually took.
+            // `arm_timeout` reads `self.now`, the snapshot `writable()` adopted
+            // at pass entry, so arming from here lands on the same instant the
+            // top of the pass would have computed — the gate is the whole
+            // change, not the moment.
+            if size > 0 {
+                self.arm_timeout();
+            }
         }
         if resuming {
             pass.resume_bytes = pass.resume_bytes.saturating_add(size);
@@ -3715,8 +3737,12 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 MuxResult::Continue
             }
             // Proxying states — writing application data (request/response).
-            // Reset the timeout here, not at the top of writable(), so that
-            // control frame writes (PING, WINDOW_UPDATE) don't reset it.
+            // These arms are NOT a filter on what the pass emits: a connection
+            // whose only queued output is a PING or SETTINGS acknowledgement is
+            // in `H2State::Header` too, so reaching `write_streams` never meant
+            // "application data is being written". The frontend timeout is
+            // therefore armed by `ConnectionH2::handle_write`, per stream
+            // transmit that moved bytes, and not on the way in here.
             (H2State::Header, _)
             | (H2State::Frame(_), _)
             | (H2State::ContinuationFrame(_), _)
@@ -13140,6 +13166,577 @@ mod tests {
             ),
             "with rustls holding nothing, the same pass must disconnect: every \
              byte is in the kernel and waiting longer strands the session"
+        );
+    }
+
+    // ── Connection-level idle deadline: what counts as liveness ────────
+    //
+    // LIFECYCLE §9 invariant 9 says the connection timer resets only on
+    // application activity, and `ConnectionH2::poll_read_target` spells out
+    // the reason in prose: a peer sending periodic PINGs must not prevent
+    // timeout detection on a stuck session. The READ side honoured it. The
+    // WRITE side did not, because `ConnectionH2::write_streams` armed at pass
+    // entry and `writable()` reaches that function on every proxying-state
+    // pass — including the pass whose only output was the PING or SETTINGS
+    // acknowledgement `flush_pending_control_frames` had just drained. So the
+    // rule held in one direction and was undone in the other, for exactly the
+    // frame types it names (sozu-proxy/sozu#1489).
+    //
+    // Every test below pairs the negative with a POSITIVE leg on the same
+    // connection. A test that only asserted "the deadline did not move" would
+    // pass just as well against a build that never armed at all, which is the
+    // opposite defect and a worse one: it turns the frontend timeout into an
+    // unconditional session cap.
+
+    /// Long enough that the per-stream idle deadline — a separate mechanism,
+    /// deliberately untouched here — cannot retire the registered stream part
+    /// way through a measurement and change what the later rows are measuring.
+    const LIVENESS_TIMEOUT: Duration = Duration::from_secs(600);
+
+    /// A server connection whose frontend timeout and per-stream idle cap are
+    /// both [`LIVENESS_TIMEOUT`], with ONE registered stream holding no queued
+    /// response yet, plus the pass-zero instant every assertion below is
+    /// expressed against.
+    ///
+    /// The stream is registered directly rather than opened with a HEADERS
+    /// frame, and it starts EMPTY on purpose: a stream with queued output
+    /// would let the write pass that flushes a PING ACK also flush that
+    /// output, and arm the deadline for a reason the negative leg is not
+    /// trying to measure.
+    fn liveness_fixture(
+        pool: &Rc<RefCell<Pool>>,
+    ) -> (
+        ConnectionH2<BackpressuredTlsSocket>,
+        Context<TestListener>,
+        GlobalStreamId,
+        Instant,
+        std::net::TcpStream,
+    ) {
+        let (mut connection, peer) = connection_with_backpressure(pool, 0, 0, H2State::Header);
+        let t0 = connection.now;
+        connection.timeout_duration = LIVENESS_TIMEOUT;
+        connection.stream_idle_timeout = LIVENESS_TIMEOUT;
+        connection.timeout_deadline = t0.checked_add(LIVENESS_TIMEOUT);
+        connection
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+        let mut context = test_context(pool);
+        let gid = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        connection
+            .stream_table
+            .register(REGISTERED_STREAM_ID, gid, connection.now);
+        (connection, context, gid, t0, peer)
+    }
+
+    /// A non-ACK PING. `ConnectionH2::handle_ping_frame` answers it by
+    /// serialising a PING ACK into `self.zero` and parking
+    /// `expect_write(Some(H2StreamId::Zero))`, which is what gives the write
+    /// path something to send.
+    fn liveness_ping_frame() -> Vec<u8> {
+        let mut frame = vec![0, 0, 8, 6, 0, 0, 0, 0, 0];
+        frame.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        frame
+    }
+
+    /// A non-ACK SETTINGS carrying no entry.
+    /// `ConnectionH2::handle_settings_frame` answers it with
+    /// `serializer::SETTINGS_ACKNOWLEDGEMENT`, parking the same way.
+    fn liveness_settings_frame() -> Vec<u8> {
+        vec![0, 0, 0, 4, 0, 0, 0, 0, 0]
+    }
+
+    /// A connection-level WINDOW_UPDATE. The control frame that queues NO
+    /// acknowledgement, and therefore the one the pre-image already handled
+    /// correctly — it is here so the fix is shown not to have moved it.
+    fn liveness_window_update_frame() -> Vec<u8> {
+        let mut frame = vec![0, 0, 4, 8, 0, 0, 0, 0, 0];
+        frame.extend_from_slice(&1024u32.to_be_bytes());
+        frame
+    }
+
+    /// A HEADERS frame opening `stream_id`, END_STREAM | END_HEADERS.
+    fn liveness_headers_frame(stream_id: u32) -> Vec<u8> {
+        let mut encoder = loona_hpack::Encoder::new();
+        let block = encoder.encode([
+            (&b":method"[..], &b"GET"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/"[..]),
+        ]);
+        let mut frame = Vec::with_capacity(9 + block.len());
+        frame.extend_from_slice(&(block.len() as u32).to_be_bytes()[1..]);
+        frame.push(1);
+        frame.push(parser::FLAG_END_STREAM | parser::FLAG_END_HEADERS);
+        frame.extend_from_slice(&stream_id.to_be_bytes());
+        frame.extend_from_slice(&block);
+        frame
+    }
+
+    /// Spin until `n` bytes the peer wrote have reached the connection's
+    /// socket.
+    ///
+    /// Not belt-and-braces: without it the read loop below can quiesce on a
+    /// `WouldBlock` that only means "not yet", and every assertion downstream
+    /// then measures a frame that was never delivered — which is a test that
+    /// passes for the wrong reason, in the direction of the negative legs.
+    fn liveness_await_bytes(connection: &ConnectionH2<BackpressuredTlsSocket>, n: usize) {
+        let mut buf = vec![0u8; n];
+        for _ in 0..1_000_000 {
+            if let Ok(got) = connection.socket.socket_ref().peek(&mut buf)
+                && got >= n
+            {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("the peer's {n} bytes never reached the connection socket");
+    }
+
+    /// Deliver `frame` at `at` and run the READ half only, the way
+    /// `Mux::ready_inner` runs it: `readable()` while `filter_interest()` is
+    /// readable.
+    ///
+    /// Stopping before the write half is what lets a test assert the premise —
+    /// that the acknowledgement really was queued — instead of inferring it
+    /// from the deadline it is about to measure.
+    fn liveness_read(
+        connection: &mut ConnectionH2<BackpressuredTlsSocket>,
+        context: &mut Context<TestListener>,
+        router: &mut Router,
+        peer: &mut std::net::TcpStream,
+        at: Instant,
+        frame: &[u8],
+    ) {
+        context.now = at;
+        peer.write_all(frame).expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+        liveness_await_bytes(connection, frame.len());
+        connection.readiness.interest.insert(Ready::READABLE);
+        connection.readiness.event.insert(Ready::READABLE);
+        for _ in 0..64 {
+            if !connection.readiness.filter_interest().is_readable() {
+                let mut leftover = [0u8; 1];
+                assert!(
+                    !matches!(connection.socket.socket_ref().peek(&mut leftover), Ok(1)),
+                    "the read half stopped with the frame still unread, so \
+                     nothing below is measuring the frame it names"
+                );
+                return;
+            }
+            connection.readable(context, EndpointClient(&mut *router));
+        }
+        panic!("the read half never settled: {:?}", connection.readiness);
+    }
+
+    /// Run the WRITE half at the clock the read half left: `writable()` while
+    /// `filter_interest()` is writable. This is the pass that used to arm the
+    /// frontend deadline unconditionally.
+    fn liveness_write(
+        connection: &mut ConnectionH2<BackpressuredTlsSocket>,
+        context: &mut Context<TestListener>,
+        router: &mut Router,
+    ) {
+        for _ in 0..64 {
+            if !connection.readiness.filter_interest().is_writable() {
+                return;
+            }
+            connection.writable(context, EndpointClient(&mut *router));
+        }
+        panic!("the write half never settled: {:?}", connection.readiness);
+    }
+
+    /// Queue `blocks` as the registered stream's response and drive ONE
+    /// `writable()` pass at `at`. Returns the bytes that reached the socket
+    /// across the whole connection's lifetime so far.
+    fn liveness_flush_stream(
+        connection: &mut ConnectionH2<BackpressuredTlsSocket>,
+        context: &mut Context<TestListener>,
+        router: &mut Router,
+        gid: GlobalStreamId,
+        at: Instant,
+        blocks: &[&'static [u8]],
+    ) -> usize {
+        for block in blocks {
+            context.streams[gid]
+                .back
+                .out
+                .push_back(kawa::OutBlock::Store(kawa::Store::Static(block)));
+        }
+        context.now = at;
+        connection.readiness.interest.insert(Ready::WRITABLE);
+        connection.readiness.event.insert(Ready::WRITABLE);
+        connection.writable(context, EndpointClient(&mut *router));
+        context.streams[gid].metrics.bout
+    }
+
+    /// The deadline a connection publishes, as an offset from pass zero, so a
+    /// failure reads in the units the issue's table is written in.
+    fn liveness_deadline(
+        connection: &ConnectionH2<BackpressuredTlsSocket>,
+        t0: Instant,
+    ) -> Duration {
+        connection
+            .poll_timeout()
+            .expect("a live H2 connection must publish a deadline")
+            .saturating_duration_since(t0)
+    }
+
+    /// A peer that sends nothing but PINGs must not hold a stuck session open.
+    ///
+    /// The PING is answered — `handle_ping_frame` parks the ACK on
+    /// `expect_write` and arms WRITABLE — so the write path genuinely runs and
+    /// genuinely has bytes to emit. What it must not do is read that as the
+    /// peer being alive on a stream: the ACK is the proxy talking to itself.
+    ///
+    /// TO SEE THIS RED: put `self.arm_timeout();` back as the first statement
+    /// of `ConnectionH2::write_streams`. Measured on that revert, this test
+    /// fails on `a PING is answered but is not stream activity`, with
+    /// `left: 610s, right: 600.01s` — the deadline follows the PING instead of
+    /// staying where the request left it. It is one of FOUR failures, the
+    /// siblings being the three tests below; every other test in the suite
+    /// passes.
+    ///
+    /// Neutering the OTHER half instead — `if size > 0` to `if false` in
+    /// `ConnectionH2::handle_write` — reddens this test too, on its positive
+    /// leg (`left: 600.01s, right: 1130s`). That is the pair that makes it a
+    /// measurement: neither a build that always arms nor a build that never
+    /// arms can satisfy it.
+    #[test]
+    fn a_ping_only_peer_does_not_postpone_the_connection_deadline() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut connection, mut context, gid, t0, mut peer) = liveness_fixture(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        assert_eq!(
+            liveness_deadline(&connection, t0),
+            LIVENESS_TIMEOUT,
+            "premise: the connection starts one full timeout out from pass zero"
+        );
+
+        // The request. The READ side already honoured the rule, and this leg
+        // is the control for it: a build that stopped arming on HEADERS would
+        // make every "did not move" assertion below true for the wrong reason.
+        let request_at = Duration::from_millis(10);
+        liveness_read(
+            &mut connection,
+            &mut context,
+            &mut router,
+            &mut peer,
+            t0 + request_at,
+            &liveness_headers_frame(3),
+        );
+        liveness_write(&mut connection, &mut context, &mut router);
+        assert_eq!(
+            liveness_deadline(&connection, t0),
+            request_at + LIVENESS_TIMEOUT,
+            "HEADERS is application activity and must arm the deadline: \
+             without this leg the assertions below cannot tell a fix from a \
+             build that never arms at all"
+        );
+
+        // The defect. Two PINGs, 490 seconds apart, either of which used to
+        // renew the session on its own.
+        for ping_at in [Duration::from_secs(10), Duration::from_secs(500)] {
+            liveness_read(
+                &mut connection,
+                &mut context,
+                &mut router,
+                &mut peer,
+                t0 + ping_at,
+                &liveness_ping_frame(),
+            );
+            assert_eq!(
+                connection.stream_table.expect_write(),
+                Some(H2StreamId::Zero),
+                "premise: the PING must really have been answered and parked, \
+                 so the write pass below is the ACK-only pass this test is \
+                 about and not a no-op"
+            );
+
+            liveness_write(&mut connection, &mut context, &mut router);
+
+            assert_eq!(
+                connection.stream_table.expect_write(),
+                None,
+                "premise: the ACK flush must have completed, which is what \
+                 lets `flush_pending_control_frames` answer None and fall \
+                 through into the proxying-state write pass"
+            );
+            assert_eq!(
+                liveness_deadline(&connection, t0),
+                request_at + LIVENESS_TIMEOUT,
+                "a PING is answered but is not stream activity: the deadline \
+                 must stay where the request left it, or a peer sending \
+                 periodic PINGs holds a stuck session open indefinitely"
+            );
+        }
+
+        // A WINDOW_UPDATE queues no acknowledgement, so the pre-image already
+        // left it alone. Pinned so the fix is shown not to have moved it.
+        liveness_read(
+            &mut connection,
+            &mut context,
+            &mut router,
+            &mut peer,
+            t0 + Duration::from_secs(520),
+            &liveness_window_update_frame(),
+        );
+        liveness_write(&mut connection, &mut context, &mut router);
+        assert_eq!(
+            liveness_deadline(&connection, t0),
+            request_at + LIVENESS_TIMEOUT,
+            "a WINDOW_UPDATE queues nothing and must not arm the deadline"
+        );
+
+        // The positive leg, on the same connection: outbound application data
+        // IS activity. Without it every assertion above is satisfied by a
+        // build that never arms the deadline at all.
+        let response_at = Duration::from_secs(530);
+        let written = liveness_flush_stream(
+            &mut connection,
+            &mut context,
+            &mut router,
+            gid,
+            t0 + response_at,
+            &[FIRST_BLOCK, SECOND_BLOCK],
+        );
+        assert_eq!(
+            written, TOTAL_QUEUED,
+            "premise for the positive leg: the pass must really have moved the \
+             response bytes, or the deadline below moved without stream data"
+        );
+        assert_eq!(
+            liveness_deadline(&connection, t0),
+            response_at + LIVENESS_TIMEOUT,
+            "a write pass that moved a stream's bytes IS liveness and must arm \
+             the deadline: the fix withdraws arming from acknowledgement-only \
+             passes, not from the write path"
+        );
+    }
+
+    /// The same contract for SETTINGS, the other control frame that queues an
+    /// acknowledgement.
+    ///
+    /// Not a duplicate of the PING test: `handle_settings_frame` reaches the
+    /// park through an entirely different body — the per-identifier apply
+    /// loop, the `pending_table_size_update` signal and
+    /// `serializer::SETTINGS_ACKNOWLEDGEMENT` rather than
+    /// `serializer::gen_ping_acknowledgement` — and the issue's table measured
+    /// both moving independently.
+    ///
+    /// TO SEE THIS RED: put `self.arm_timeout();` back as the first statement
+    /// of `ConnectionH2::write_streams`. Measured on that revert, this test
+    /// fails on `a SETTINGS ACK is not stream activity`, with
+    /// `left: 640s, right: 600.01s`. Neutering the other half instead —
+    /// `if size > 0` to `if false` in `ConnectionH2::handle_write` — reddens
+    /// it on its positive leg, `left: 600.01s, right: 650s`.
+    #[test]
+    fn a_settings_only_peer_does_not_postpone_the_connection_deadline() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut connection, mut context, gid, t0, mut peer) = liveness_fixture(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let request_at = Duration::from_millis(10);
+        liveness_read(
+            &mut connection,
+            &mut context,
+            &mut router,
+            &mut peer,
+            t0 + request_at,
+            &liveness_headers_frame(3),
+        );
+        liveness_write(&mut connection, &mut context, &mut router);
+        assert_eq!(
+            liveness_deadline(&connection, t0),
+            request_at + LIVENESS_TIMEOUT,
+            "premise: the request armed the deadline, so a later move is \
+             attributable to the frame that caused it"
+        );
+
+        liveness_read(
+            &mut connection,
+            &mut context,
+            &mut router,
+            &mut peer,
+            t0 + Duration::from_secs(40),
+            &liveness_settings_frame(),
+        );
+        assert_eq!(
+            connection.stream_table.expect_write(),
+            Some(H2StreamId::Zero),
+            "premise: the SETTINGS must really have been acknowledged and \
+             parked, so the write pass below is the ACK-only pass"
+        );
+
+        liveness_write(&mut connection, &mut context, &mut router);
+
+        assert_eq!(
+            connection.stream_table.expect_write(),
+            None,
+            "premise: the ACK flush must have completed and fallen through \
+             into the proxying-state write pass"
+        );
+        assert_eq!(
+            liveness_deadline(&connection, t0),
+            request_at + LIVENESS_TIMEOUT,
+            "a SETTINGS ACK is not stream activity: the deadline must stay \
+             where the request left it"
+        );
+
+        let response_at = Duration::from_secs(50);
+        let written = liveness_flush_stream(
+            &mut connection,
+            &mut context,
+            &mut router,
+            gid,
+            t0 + response_at,
+            &[FIRST_BLOCK],
+        );
+        assert_eq!(
+            written,
+            FIRST_BLOCK.len(),
+            "premise for the positive leg: the pass must really have moved the \
+             response bytes"
+        );
+        assert_eq!(
+            liveness_deadline(&connection, t0),
+            response_at + LIVENESS_TIMEOUT,
+            "outbound application data must still arm the deadline"
+        );
+    }
+
+    /// A write pass that emits a stream's bytes arms the deadline; the pass
+    /// before it, which had nothing queued, does not.
+    ///
+    /// The PING and SETTINGS tests above each carry a positive leg, so this
+    /// one is not the only guard against a build that never arms. What it adds
+    /// is the pair measured on ONE connection with NOTHING but the queued
+    /// response changing between the two passes: no frame is read, so neither
+    /// `handle_headers_frame` nor `poll_read_target`'s DATA arm can be what
+    /// moved the deadline, and the write path is the only remaining candidate.
+    ///
+    /// TO SEE THIS RED: change the `if size > 0` gate in
+    /// `ConnectionH2::handle_write` to `if false`. The empty-pass assertion
+    /// still holds and this test then fails on `a write pass that moved a
+    /// stream's bytes must arm the deadline`, with `left: 600s, right: 620s`.
+    /// Restoring `self.arm_timeout()` to the top of
+    /// `ConnectionH2::write_streams` reddens the OTHER assertion instead, `a
+    /// write pass that emitted nothing is not liveness`, with
+    /// `left: 610s, right: 600s`.
+    #[test]
+    fn a_write_pass_that_moves_stream_bytes_arms_the_connection_deadline() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut connection, mut context, gid, t0, _peer) = liveness_fixture(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        // A write pass with nothing queued: the control that makes the
+        // assertion below a measurement of the bytes and not of the pass.
+        let empty_at = Duration::from_secs(10);
+        let written = liveness_flush_stream(
+            &mut connection,
+            &mut context,
+            &mut router,
+            gid,
+            t0 + empty_at,
+            &[],
+        );
+        assert_eq!(
+            written, 0,
+            "premise: a pass with nothing queued moves no byte"
+        );
+        assert_eq!(
+            liveness_deadline(&connection, t0),
+            LIVENESS_TIMEOUT,
+            "a write pass that emitted nothing is not liveness"
+        );
+
+        let response_at = Duration::from_secs(20);
+        let written = liveness_flush_stream(
+            &mut connection,
+            &mut context,
+            &mut router,
+            gid,
+            t0 + response_at,
+            &[FIRST_BLOCK, SECOND_BLOCK],
+        );
+        assert_eq!(
+            written, TOTAL_QUEUED,
+            "premise: the pass must really have moved the response bytes"
+        );
+        assert_eq!(
+            liveness_deadline(&connection, t0),
+            response_at + LIVENESS_TIMEOUT,
+            "a write pass that moved a stream's bytes must arm the deadline"
+        );
+    }
+
+    /// Draining changes nothing about what counts as liveness.
+    ///
+    /// `Mux::drive_frontend_shutdown_io` sets `force_h2_write` unconditionally
+    /// for an H2 frontend, so a draining connection still in `H2State::Header`
+    /// reaches `ConnectionH2::write_streams` on every `shutting_down()` poll —
+    /// which is why arming at pass entry made a draining session immune to the
+    /// frontend timeout for the whole drain, whether or not a byte moved. The
+    /// drain keeps its deadline the same way every other pass does: by
+    /// flushing a stream's bytes.
+    ///
+    /// TO SEE THIS RED: change the `if size > 0` gate in
+    /// `ConnectionH2::handle_write` to `if false`. This test then fails on `a
+    /// draining pass that flushed a stream's bytes must arm the deadline`,
+    /// with `left: 600s, right: 620s`. Restoring `self.arm_timeout()` to the
+    /// top of `ConnectionH2::write_streams` reddens the other assertion, `a
+    /// draining pass that emitted nothing is not liveness either`, with
+    /// `left: 610s, right: 600s`.
+    #[test]
+    fn a_draining_write_pass_that_moves_stream_bytes_still_arms_the_deadline() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut connection, mut context, gid, t0, _peer) = liveness_fixture(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection.drain.__test_set_draining();
+
+        let empty_at = Duration::from_secs(10);
+        let written = liveness_flush_stream(
+            &mut connection,
+            &mut context,
+            &mut router,
+            gid,
+            t0 + empty_at,
+            &[],
+        );
+        assert_eq!(
+            written, 0,
+            "premise: a draining pass with nothing queued moves no byte"
+        );
+        assert_eq!(
+            liveness_deadline(&connection, t0),
+            LIVENESS_TIMEOUT,
+            "a draining pass that emitted nothing is not liveness either: \
+             `drive_frontend_shutdown_io` forces a write pass on every \
+             shutting-down poll, so arming here renews the session for free"
+        );
+
+        let response_at = Duration::from_secs(20);
+        let written = liveness_flush_stream(
+            &mut connection,
+            &mut context,
+            &mut router,
+            gid,
+            t0 + response_at,
+            &[FIRST_BLOCK, SECOND_BLOCK],
+        );
+        assert_eq!(
+            written, TOTAL_QUEUED,
+            "premise: the draining pass must really have moved the response \
+             bytes, so the drain has time to finish delivering them"
+        );
+        assert_eq!(
+            liveness_deadline(&connection, t0),
+            response_at + LIVENESS_TIMEOUT,
+            "a draining pass that flushed a stream's bytes must arm the \
+             deadline: the drain has to be able to finish delivering a \
+             response the peer is still reading"
         );
     }
 }
