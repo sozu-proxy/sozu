@@ -211,6 +211,56 @@
 
 ### 🔄 Changed
 
+- **`docs(mux-h2)`: the advertised connection-level receive window is not enforced, and the tree
+  now says so instead of implying the opposite
+  ([#1488](https://github.com/sozu-proxy/sozu/issues/1488)).** Sōzu advertises a connection-level
+  receive window — RFC 9113 §6.9.2's fixed 65535 octets plus every stream-0 `WINDOW_UPDATE` it
+  sends, which is how `h2_initial_connection_window` reaches the peer — and then checks nothing
+  against it. `H2FlowControl::window` is the **send** window, peer-granted credit for our own
+  writes; `H2FlowControl::account_received_bytes` is a counter whose only job is deciding when to
+  hand credit back. No state is decremented by an inbound DATA frame, so none can go negative, and
+  the only `H2Error::FlowControlError` the H2 connection emits at all comes from
+  `ConnectionH2::handle_window_update_frame` on a SEND-window overflow past 2^31-1. Measured:
+  **106496 octets of DATA accepted against an advertised 98303** — the 65535 default plus one 32768
+  grant — with no GOAWAY and no `FLOW_CONTROL_ERROR`.
+
+  RFC 9113 §6.9.1 makes enforcement a MUST, and #1488 offered two defensible resolutions: enforce
+  the advertised window and emit `FLOW_CONTROL_ERROR`, or document that the buffer pool is the real
+  boundary and say what the advertised value means. **This changeset is the second and only the
+  second.** No behaviour changes and no `lib/` code changes: the only two Rust edits are a `//!`
+  block and one `///` line. What the advertised number governs on this side is the size of that
+  one-shot `WINDOW_UPDATE(0, …)` enlargement and the grant-back cadence
+  (`ConnectionH2::handle_data_frame` passes `initial_connection_window / 2` as its threshold); what
+  bounds memory — the thing flow control exists to protect — is the buffer pool, reached through the
+  `BufferSource` contract (`buffer_source.rs`), whose refusal degrades one stream with
+  `RST_STREAM(REFUSED_STREAM)` and never the connection, which is where
+  `refuse_stream_and_discard` spends it. The consequence is stated rather than softened: a peer that
+  trusts the advertisement has no way to discover the real limit — nothing on the wire reports the
+  pool's remaining capacity — and a conformance suite will flag this as a §6.9.1 violation.
+
+  `h2_flow_control.rs`'s module doc holds the canonical statement, as a new section beside the ones
+  it already carries, and `H2ConnectionConfig::initial_connection_window`'s own doc comment — the
+  declaration of the very number under discussion — now carries the qualifier and points there. That
+  one stays a single line on purpose: `h2.rs` is cited by line ~100 times across the guarded prose,
+  so inserting into it would have converted 53 live citations into re-anchors, and #1509 exists
+  precisely because a re-anchor preserves the pointer and not the claim.
+  `doc/h2_mux_internals.md` repeats the statement beside the `H2ConnectionConfig` table
+  that names the knob, and its own file-role row no longer calls `H2FlowControl` a "send/receive
+  window". `lib/src/protocol/mux/LIFECYCLE.md` §1.3 called it a "send/recv window", which is the
+  false claim in miniature, and now names the receive side as the byte accounting it is, with the
+  gap stated under the table. `doc/configure.md` qualifies both rows that called
+  `h2_initial_connection_window` a "receive window" with no qualifier — the operator raising it to
+  bound memory is exactly who that misleads.
+
+  The last is the one a future reader needs most. `doc/testing.md` now records why the H2 simulator
+  ([#1359](https://github.com/sozu-proxy/sozu/issues/1359) C4) carries **no** connection-level
+  flow-control property: the one asserting the connection window is never overcommitted is false
+  against today's code, so it was rewritten into per-stream credit attribution
+  (`h2_inbound_credit_is_attributed_to_the_stream_that_spent_it`) rather than loosened until it
+  passed, because an assertion weak enough to go green would certify the gap as intended behaviour.
+  Its absence is deliberate and it goes back in, in its original form, once enforcement lands. No
+  public API, no test expectation, no configuration default and no metric changes.
+
 - **`docs(mux-h2)`: `LIFECYCLE.md` anchors eleven `h2.rs` citations to symbols instead of lines.**
   Checklist invariant 8 read "`create_stream` and `start_stream` both short-circuit when
   `self.drain.draining()` (`h2.rs:4882-4889`, `h2.rs:6710-6717`)". Both ranges were correct at

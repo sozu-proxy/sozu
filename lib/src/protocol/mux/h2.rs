@@ -299,7 +299,7 @@ const DEFAULT_STREAM_SHRINK_RATIO: u32 = 2;
 /// absent values fall back to compile-time defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct H2ConnectionConfig {
-    /// Connection-level receive window size in bytes (RFC 9113 §6.9.2).
+    /// Connection-level receive window size in bytes (RFC 9113 §6.9.2). Advertised, not enforced — see `h2_flow_control`.
     pub initial_connection_window: u32,
     /// Maximum concurrent streams (SETTINGS_MAX_CONCURRENT_STREAMS).
     pub max_concurrent_streams: u32,

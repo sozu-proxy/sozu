@@ -9,7 +9,7 @@ Source files covered by this document:
 | File | Role |
 |------|------|
 | `lib/src/protocol/mux/h2.rs` | `ConnectionH2` struct, state machine, flow-control orchestration |
-| `lib/src/protocol/mux/h2_flow_control.rs` | `H2FlowControl` — connection-level send/receive window + pending WINDOW_UPDATE queue (RFC 9113 §6.9), closed API |
+| `lib/src/protocol/mux/h2_flow_control.rs` | `H2FlowControl` — connection-level send window, receive-side byte accounting + pending WINDOW_UPDATE queue (RFC 9113 §6.9), closed API. There is no receive *window*: the advertised one is not enforced — see below |
 | `lib/src/protocol/mux/h2_flood_detector.rs` | `H2FloodConfig`, `H2FloodViolation`, `H2FloodDetector` — CVE-2023-44487 / CVE-2024-27316 / CVE-2025-8671 flood/abuse detection, closed API |
 | `lib/src/protocol/mux/pkawa.rs` | HPACK decoding, pseudo-header validation, RFC 9218 priority parsing |
 | `lib/src/protocol/mux/mod.rs` | Mux session, Stream, Router, ready() loop, stream lifecycle |
@@ -438,11 +438,60 @@ When absent (`None`), the built-in defaults apply:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `initial_connection_window` | 1048576 (1MB) | Connection receive window (RFC 9113 §6.9.2), clamped to [65535, 2^31-1] |
+| `initial_connection_window` | 1048576 (1MB) | Connection receive window **advertised** to the peer (RFC 9113 §6.9.2), clamped to [65535, 2^31-1]. Not enforced on inbound DATA — see below |
 | `max_concurrent_streams` | 100 | `SETTINGS_MAX_CONCURRENT_STREAMS`, also sizes the pending WINDOW_UPDATE cap |
 | `stream_shrink_ratio` | 2 | Stream Vec shrink threshold: `total > active * ratio`, minimum 2 |
 
 This allows operators to tune both security and performance per listener.
+
+### The advertised connection-level receive window is not enforced
+
+`initial_connection_window` is advertised, not enforced, and the distinction is
+the whole of [sozu-proxy/sozu#1488](https://github.com/sozu-proxy/sozu/issues/1488).
+
+**What the peer sees.** A peer's connection-level send allowance is RFC 9113
+§6.9.2's fixed 65535-octet initial value — no SETTINGS parameter can change the
+connection-level window; `SETTINGS_INITIAL_WINDOW_SIZE` sizes the *per-stream*
+one — plus every stream-0 `WINDOW_UPDATE` Sōzu sends. Those are the one-shot
+enlargement from 65535 to `initial_connection_window`, queued by
+`ConnectionH2::writable`'s `(H2State::ServerSettings, Position::Server)` arm on
+a frontend connection and by `ConnectionH2::handle_settings_frame` on a backend
+one, followed by the periodic grants back. So the peer reads a number, and the
+number is an invitation to send.
+
+**What it is not.** It is not a ceiling anything checks. On this side the
+configured value governs exactly two things: the size of that one-shot
+enlargement, and how often credit is returned —
+`ConnectionH2::handle_data_frame` passes `initial_connection_window / 2` as the
+grant-back threshold to `H2FlowControl::account_received_bytes`.
+`H2FlowControl::window` is the **send** window, peer-granted credit for our own
+writes; `account_received_bytes` is a counter that only accumulates. No state is
+decremented by an inbound DATA frame, so none can go negative, and no
+connection-level `FLOW_CONTROL_ERROR` is ever raised. Measured: against **98303
+octets advertised** (65535 plus one 32768 grant), **106496 octets of DATA were
+accepted**, with no GOAWAY and no `FLOW_CONTROL_ERROR`.
+
+**What the real boundary is.** Memory, bounded by the buffer pool. Every buffer
+a stream needs comes from the caller-supplied `BufferSource`
+(`lib/src/protocol/mux/buffer_source.rs`), which may refuse; a refusal degrades
+one stream with `RST_STREAM(REFUSED_STREAM)` and never the connection. That
+module's doc is the contract — read it there rather than a restatement. The pool
+bounds the memory flow control exists to protect, and does so without
+per-connection credit bookkeeping. This is a defensible boundary; advertising a
+number nothing enforces is the part that is not.
+
+**The consequence, unsoftened.** A peer that trusts the advertisement has no way
+to discover the real limit — nothing on the wire reports the pool's remaining
+capacity — and RFC 9113 §6.9.1 makes enforcement a MUST, so a conformance suite
+will flag this as a §6.9.1 violation. #1488 offered two defensible resolutions,
+enforce or document, and the decision was to document. Closing the gap means
+tracking outstanding inbound credit and emitting `FLOW_CONTROL_ERROR`, which
+changes observable behaviour and belongs to its own changeset. Until then, do
+not describe this window as enforced, and do not write an assertion that the
+connection window is never overcommitted: `doc/testing.md` records why the H2
+simulator deliberately carries no such property.
+`lib/src/protocol/mux/h2_flow_control.rs`'s module doc carries the same
+statement beside the code.
 
 ---
 
