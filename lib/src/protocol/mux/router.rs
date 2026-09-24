@@ -39,8 +39,12 @@
 //! and not a determinism one.
 //!
 //! A `Token` is the slab index the proxy's session manager handed the backend
-//! socket at dial time, and the slab hands out its lowest free index, so the
-//! order carries no fairness meaning of its own. It does not need one for the
+//! socket at dial time, and it carries no fairness or recency meaning of its
+//! own: `slab::Slab::try_remove` pushes the freed index onto the head of its
+//! vacant list (`self.next = key`) and `insert` pops that head, so a dial
+//! reuses the most recently RELEASED index, not the lowest and not the
+//! oldest. The total order is a stable arbitrary label. It does not need to
+//! be more than that for the
 //! least-loaded arm, and for the reason `h2_stream_table`'s doc had
 //! to spell out and `h2_flow_control`'s could not: a tie there does
 //! not persist across requests. Attaching the stream increments the winner's
@@ -1861,15 +1865,17 @@ mod authority_matched_cert_name_tests {
 /// NOT agree is two SEPARATELY CONSTRUCTED maps — `RandomState::default()`
 /// bumps a thread-local key on every instantiation — so each round below
 /// builds a fresh [`Router`], and therefore a fresh hasher, and asserts the
-/// token the total order on `Token` picks. Measured against the pre-image at
-/// four keys: the minimum came first in 8, 5 and 7 of 24 rounds over three
-/// runs, never in all 24.
+/// token the total order on `Token` picks.
 ///
 /// That makes the red statistical rather than structural, and the bound is
 /// stated so it can be checked rather than trusted: with `n` staged backends
-/// and `r` rounds a `HashMap` survives with probability `n.pow(-r)`, which is
-/// `4^-24` here — about one run in 2.8e14. A `BTreeMap` survives with
-/// probability 1.
+/// and `r` rounds a `HashMap` survives with probability about `n.pow(-r)`,
+/// which is `4^-24` here — about one run in 2.8e14. A `BTreeMap` survives
+/// with probability 1. Measured on the pre-image, with the three production
+/// lines reverted and these guards untouched: three consecutive runs failed
+/// all three at round 0 or round 1. The least-loaded guard was handed
+/// `Token(23)` and `Token(13)` where the total order gives `Token(7)`, and
+/// the last-wins fallback `Token(7)` where it gives `Token(41)`.
 ///
 /// **To SEE THESE RED:** in this module, put `Router::backends` back to
 /// `HashMap<Token, Connection<SessionTcpStream>>`, `Router::new`'s initialiser

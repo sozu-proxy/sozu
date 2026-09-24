@@ -243,19 +243,23 @@
   algorithms are untouched — they pick which backend server to DIAL, this picks among sockets the
   session already holds.
 
-  **Re-derived count: this one container closes 8 of the sites the issue's leak table holds, and
-  adds a ninth the table did not have.** Behind `router.backends`, by reading every use and not
-  just grepping for `.iter()/.values()/.keys()`: `Router::connect`'s scan (the three decisions
+  **Re-derived count: eight named sites, ten order-dependent decisions — and two corrections to
+  the issue's leak table.** The table called the connecting fallback first-seen (it is last-wins)
+  and named the H1 keep-alive arm nowhere at all. Behind `router.backends`, by reading every use
+  and not just grepping for `.iter()/.values()/.keys()`: `Router::connect`'s scan (the three decisions
   above), `Mux::reschedule`'s wheel-insertion order, `Mux::ready`'s `backends.iter_mut()` sweep
   whose `break` on `MuxResult::CloseSession` lets the first dead backend in map order decide the
   pass, `Mux::ready`'s `try_resume_reading` sweep, and `Mux::close`'s `deregister_socket` +
   `shutdown(Write)` + `remove_session` loop, which is the order each backend peer observes FIN.
   Three diagnostic sites go with them: `Mux::print_state`'s per-backend loop and the two
   `BACKENDS: {:#?}` traces in `Mux::ready` and `Mux::close` — `HashMap`'s own `Debug` walks
-  `self.iter()`, so a `{:#?}` dump leaked the seed as surely as a `for` loop did. Eight named sites,
-  ten order-dependent decisions. Two uses were refuted rather than converted: `Mux::cancel_timeouts`
-  clears each backend's deadline independently of every other, and `Mux::reschedule`'s `retain`
-  walks `Mux::timeouts` — a different map — behind a pure `contains_key` predicate.
+  `self.iter()`, so a `{:#?}` dump leaked the seed as surely as a `for` loop did. Two uses were
+  refuted rather than converted: `Mux::cancel_timeouts` clears each backend's deadline
+  independently of every other, and `Mux::reschedule`'s `retain` walks `Mux::timeouts` — a
+  different map — behind a pure `contains_key` predicate. The neighbouring
+  `Context::backend_streams` was swept the same way and is clean: point access everywhere, plus a
+  `#[cfg(debug_assertions)]` invariant that compares one token's ids at a time against a sorted
+  copy.
 
   **The tie-break guard is red against a `HashMap` by construction, not by luck.** `RandomState` is
   seeded per `HashMap`, not per iteration, so two walks of one live map agree and a guard that runs
@@ -268,10 +272,12 @@
   stages four backends under deliberately unordered non-contiguous tokens, drives a real
   `Router::connect` through real routing, and asserts the token the total order picks. With `n`
   staged backends and `r` rounds the pre-image survives with probability `n.pow(-r)` — `4^-24`, one
-  run in 2.8e14. Measured on the pre-image, the minimum token came first in 8, 5 and 7 rounds of 24
-  over three runs, never in all 24; all three guards failed at round 0 or 1 in three consecutive
-  reverted runs and pass in the converted tree. The production diff adds **zero** numeric and
-  **zero** string literals, so it cannot be shaped to the test.
+  run in 2.8e14. Measured on the pre-image — the three production lines reverted, the guards
+  untouched — three consecutive runs failed all three at round 0 or round 1: the least-loaded guard
+  was handed `Token(23)` and `Token(13)` where the total order gives `Token(7)`, and the last-wins
+  fallback `Token(7)` where it gives `Token(41)`. All three pass in the converted tree. The
+  production diff adds **zero** numeric and **zero** string literals, so it cannot be shaped to the
+  test.
 
   **Complexity is unmeasured beyond the default configuration**, and the module doc says so in the
   shape `h2_flow_control.rs` established. `n` is the backend connections of ONE frontend session,
