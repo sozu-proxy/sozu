@@ -2674,7 +2674,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         self.flow_control.consume_send_window(pass.consumed);
                         let consumed = pass.consumed;
                         pass.census_mut()
-                            .note_fired(stream_id, is_incremental, consumed);
+                            .note_fired(urgency, stream_id, is_incremental, consumed);
                     }
                     context.debug.push(DebugEvent::S(
                         stream_id,
@@ -8976,7 +8976,7 @@ mod tests {
     //
     //   1. `consumed` debits `*parts.window` AND `flow_control`, which is the
     //      self-limiting above;
-    //   2. `H2Scheduler::note_fired` gates its round-robin lead on
+    //   2. `H2Scheduler::note_fired` gates its bucket's round-robin lead on
     //      `consumed > 0`, so a zero-consumption re-entry cannot advance the
     //      cursor;
     //   3. the `rst_sent` `HashSet` in `H2StreamTable` dedups RST_STREAM.

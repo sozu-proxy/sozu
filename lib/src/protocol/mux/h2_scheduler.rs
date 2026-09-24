@@ -63,47 +63,51 @@
 //!
 //! ## Fairness, and exactly how far it reaches (LIFECYCLE.md invariant 26)
 //!
-//! Two halves, neither sufficient alone:
+//! Two halves, neither sufficient alone, and both per urgency bucket:
 //!
 //! 1. [`Prioriser::apply_incremental_rotation`] rotates each urgency
 //!    bucket's incremental tail to start at the first stream id strictly
-//!    greater than [`Prioriser::incremental_cursor`], wrapping.
-//! 2. [`H2Scheduler::end_pass`] commits that cursor to the first incremental
-//!    stream which actually consumed send window during the pass.
+//!    greater than THAT bucket's entry in
+//!    [`Prioriser::incremental_cursor`], wrapping.
+//! 2. [`H2Scheduler::end_pass`] commits each bucket's cursor to the first
+//!    incremental stream OF THAT BUCKET which actually consumed send window
+//!    during the pass.
 //!
 //! A rotation that never commits re-reads the same cursor and hands the same
 //! stream the lead forever; a cursor committed without the rotation is read
 //! by nobody. Together they make leadership advance exactly one position per
-//! pass — **in the one urgency bucket that supplied the pass's leader**.
-//! There, K ready incremental peers each lead once every K passes and none
-//! waits longer than K-1.
+//! pass, in **every** urgency bucket that has one to advance: K ready
+//! incremental peers sharing a bucket each lead once every K passes and none
+//! waits longer than K-1, whatever the bucket's urgency and whatever the
+//! other buckets are doing.
 //!
-//! **It reaches no further than that bucket, and this is a real limitation,
-//! not a rounding error.** [`Prioriser::incremental_cursor`] is a single
-//! connection-global stream id. `apply_incremental_rotation` applies it to
-//! EVERY bucket's incremental tail, but `end_pass` can only ever commit an
-//! id drawn from the lowest-numbered urgency bucket that had a ready
-//! incremental stream fire — the pass order is ascending by urgency, so the
-//! first stream to consume window comes from there. Every other bucket is
-//! rotated by a cursor from a foreign id range, and when that cursor sits
-//! entirely below (or entirely above) the bucket's own ids,
-//! `partition_point` returns a constant and the bucket never rotates at all.
-//! Measured, u=0 incremental `{1, 3}` beside u=3 incremental `{5, 7}`, all
-//! ready and all consuming: u=0 alternates `1, 3, 1, 3, …` while u=3 is
-//! `5, 7` in every single pass. Stream 7 never leads its bucket. That is
-//! positional starvation, and it becomes byte starvation the moment a pass
-//! is cut short — a stalled flush at stream 5 (`H2WritePass::stalled`,
-//! which ends the pass at `H2WritePhase::End`) means 7 writes nothing, pass
-//! after pass.
+//! **The per-bucket scope is the fix of sozu-proxy/sozu#1456, and the
+//! connection-global shape it replaced is worth naming so nobody restores
+//! it.** With one cursor for the whole connection, `end_pass` could only ever
+//! commit an id drawn from the lowest-numbered urgency bucket that had a
+//! ready incremental stream fire — the pass order is ascending by urgency, so
+//! the first stream to consume window comes from there. Every other bucket
+//! was then rotated by a cursor from a foreign id range, and when that cursor
+//! sat entirely below (or entirely above) the bucket's own ids,
+//! `partition_point` returned a constant and the bucket never rotated at all.
+//! Measured on that shape, u=0 incremental `{1, 3}` beside u=3 incremental
+//! `{5, 7}`, all ready and all consuming: u=0 alternated `1, 3, 1, 3, …`
+//! while u=3 was `5, 7` in every single pass and stream 7 never led its
+//! bucket. That was positional starvation, and it became byte starvation the
+//! moment a pass was cut short — a stalled flush at stream 5
+//! (`H2WritePass::stalled`, which ends the pass at `H2WritePhase::End`) means
+//! 7 writes nothing, pass after pass.
 //!
-//! Pinned, as observed behaviour rather than as an aspiration, by
-//! [`tests::the_round_robin_cursor_is_connection_global_so_only_the_leading_bucket_rotates`].
-//! Making it per-bucket means `incremental_cursor: [StreamId; URGENCY_LEVELS]`,
-//! which changes wire ordering on multi-bucket connections and therefore
-//! needs its own changeset and its own e2e evidence; this one is a pure
-//! move and deliberately does not attempt it. `fairness_property` generates
-//! its distractors in strictly lower-priority buckets precisely so that its
-//! main bucket is always the leader, which is the scope the invariant claims.
+//! [`ReadyIncrementalCensus::note_fired`] takes the urgency for exactly this
+//! reason: attributing the firing stream to a bucket is what lets `end_pass`
+//! commit one leader per bucket instead of one per connection.
+//!
+//! The multi-bucket case is pinned deterministically by
+//! [`tests::every_urgency_bucket_rotates_its_own_incremental_tail`], on the
+//! wire by `h2_correctness_tests.rs`'s
+//! `test_h2_per_bucket_incremental_rotation`, and generalised by
+//! `fairness_property`, whose oracle now checks every generated bucket
+//! holding two or more incremental peers rather than the main one alone.
 //!
 //! `begin_pass`'s census is bucket-scoped for an unrelated reason: a
 //! connection-global count makes a solo incremental stream yield to a peer
@@ -148,8 +152,9 @@ use super::{GlobalStreamId, StreamId, parser};
 /// Within a same-urgency bucket the scheduler (see
 /// [`ConnectionH2::write_streams`]) drains non-incremental streams
 /// sequentially, then applies RFC 9218 §4 round-robin to the incremental
-/// streams starting from [`Self::incremental_cursor`], so multiple concurrent
-/// downloads at the same urgency interleave their DATA frames fairly.
+/// streams starting from that bucket's own entry in
+/// [`Self::incremental_cursor`], so multiple concurrent downloads at the same
+/// urgency interleave their DATA frames fairly.
 ///
 /// Streams without an explicit `priority` header get the RFC 9218 defaults:
 /// urgency 3, incremental false.
@@ -157,15 +162,27 @@ use super::{GlobalStreamId, StreamId, parser};
 pub struct Prioriser {
     /// Per-stream priority: stream_id -> (urgency 0-7, incremental flag)
     priorities: HashMap<StreamId, (u8, bool)>,
-    /// RFC 9218 §4 round-robin cursor: stream ID that fired first in the
-    /// last write pass over the incremental tail of the lowest-urgency
-    /// bucket that contained at least one incremental stream. The next pass
-    /// starts from the stream immediately after this ID (wrapping around),
-    /// so a single slow-draining stream cannot hog the connection.
+    /// RFC 9218 §4 round-robin cursors, ONE PER URGENCY BUCKET: for each
+    /// urgency, the stream ID that fired first in the last write pass over
+    /// THAT bucket's incremental tail. The next pass starts each bucket from
+    /// the stream immediately after its own cursor (wrapping around), so a
+    /// single slow-draining stream cannot hog the bucket it shares.
+    ///
+    /// The array is EXACT, not a cap: RFC 9218 §4.1 urgency is
+    /// `[0, MAX_URGENCY]` and [`Self::push_priority`] clamps every advertised
+    /// value into that range, so [`bucket`] indexes this array total and no
+    /// out-of-range fallback is reachable.
+    ///
+    /// One cursor per bucket rather than one per connection is
+    /// sozu-proxy/sozu#1456. A single connection-global cursor could only
+    /// ever hold an id from the bucket that supplied the pass's leader — the
+    /// pass order is ascending by urgency — so every other bucket was rotated
+    /// by an id from a foreign range, `partition_point` returned a constant,
+    /// and `rotate_left(0)` was a no-op forever.
     ///
     /// `0` is the "no cursor yet" sentinel and means "start from the
     /// smallest ID in the bucket" — H2 stream IDs are always > 0.
-    incremental_cursor: StreamId,
+    incremental_cursor: [StreamId; URGENCY_LEVELS],
 }
 
 /// RFC 9218 §4 default urgency value.
@@ -329,8 +346,8 @@ impl Prioriser {
 
     /// Reorder a pre-sorted slice of writable stream IDs so that inside each
     /// urgency bucket, incremental streams appear after non-incremental ones,
-    /// and the incremental tail is rotated by [`Self::incremental_cursor`]
-    /// (RFC 9218 §4).
+    /// and the incremental tail is rotated by that bucket's own entry in
+    /// [`Self::incremental_cursor`] (RFC 9218 §4).
     ///
     /// The input `buf` must already be sorted by `(urgency, stream_id)`:
     /// this routine only partitions and rotates inside same-urgency
@@ -367,6 +384,10 @@ impl Prioriser {
                 }
                 j += 1;
             }
+            // This run's own round-robin cursor, read here because the
+            // `bucket` binding below shadows the indexing helper of the same
+            // name for the rest of the iteration.
+            let cursor = self.incremental_cursor[bucket(urgency_i)];
             // `buf[i..j]` is a contiguous run of same-urgency stream IDs.
             let bucket = &mut buf[i..j];
             if bucket.len() > 1 {
@@ -377,11 +398,14 @@ impl Prioriser {
                 let incremental_tail = &mut bucket[split..];
                 if incremental_tail.len() > 1 {
                     // Rotate so the pass starts right after the stream that
-                    // fired first previously. `partition_point` returns the
-                    // first index whose stream ID > cursor (so cursor itself
-                    // is still drained, but after the streams ahead of it).
-                    let start =
-                        incremental_tail.partition_point(|id| *id <= self.incremental_cursor);
+                    // fired first previously IN THIS BUCKET.
+                    // `partition_point` returns the first index whose stream
+                    // ID > cursor (so cursor itself is still drained, but
+                    // after the streams ahead of it). Reading the cursor of
+                    // `urgency_i` rather than one connection-global id is
+                    // what makes every bucket rotate instead of only the one
+                    // that supplies the pass's leader (sozu-proxy/sozu#1456).
+                    let start = incremental_tail.partition_point(|id| *id <= cursor);
                     incremental_tail.rotate_left(start);
                 }
                 total_incremental += incremental_tail.len();
@@ -407,15 +431,29 @@ impl Prioriser {
         total_incremental
     }
 
-    /// Advance the RFC 9218 §4 round-robin cursor after a write pass.
+    /// Advance every RFC 9218 §4 round-robin cursor after a write pass.
     ///
-    /// `first_incremental_fired` is the stream ID that headed the incremental
-    /// tail we just drained; the next pass will start at the next stream
-    /// after that ID. Callers may pass `None` when no incremental streams
-    /// were eligible, leaving the cursor where it was.
-    pub fn advance_incremental_cursor(&mut self, first_incremental_fired: Option<StreamId>) {
-        if let Some(id) = first_incremental_fired {
-            self.incremental_cursor = id;
+    /// `first_incremental_fired[u]` is the stream ID that headed urgency
+    /// `u`'s incremental tail during the pass just drained; that bucket's
+    /// next pass starts at the next stream after it. A bucket whose entry is
+    /// `None` had no incremental stream consume window and keeps the cursor
+    /// it had, so a bucket that was idle this pass does not lose its place —
+    /// and an all-`None` census leaves every cursor untouched.
+    ///
+    /// Each bucket is independent: committing one bucket's leader must never
+    /// move another's, which is the whole of sozu-proxy/sozu#1456.
+    pub fn advance_incremental_cursor(
+        &mut self,
+        first_incremental_fired: &[Option<StreamId>; URGENCY_LEVELS],
+    ) {
+        for (cursor, leader) in self
+            .incremental_cursor
+            .iter_mut()
+            .zip(first_incremental_fired.iter())
+        {
+            if let Some(id) = leader {
+                *cursor = *id;
+            }
         }
     }
 }
@@ -462,10 +500,16 @@ pub(super) struct ReadyIncrementalCensus {
     /// Reported by `write_streams`'s `PRIORITIES` trace line and by nothing
     /// else; deliberately NOT `ready.iter().sum()`.
     incremental_count: usize,
-    /// RFC 9218 §4 round-robin leader: the first incremental stream that
-    /// actually consumed send window this pass. [`H2Scheduler::end_pass`]
-    /// commits it as the next pass's cursor; `None` leaves the cursor alone.
-    first_incremental_fired: Option<StreamId>,
+    /// RFC 9218 §4 round-robin leaders, one per urgency bucket: the first
+    /// incremental stream of THAT bucket which actually consumed send window
+    /// this pass. [`H2Scheduler::end_pass`] commits each as its own bucket's
+    /// next cursor; a `None` entry leaves that bucket's cursor alone.
+    ///
+    /// Per-bucket rather than one id for the connection is
+    /// sozu-proxy/sozu#1456: the pass order is ascending by urgency, so a
+    /// single slot could only ever record a stream from the lowest-numbered
+    /// bucket that fired, and every other bucket's tail stayed frozen.
+    first_incremental_fired: [Option<StreamId>; URGENCY_LEVELS],
 }
 
 impl ReadyIncrementalCensus {
@@ -496,17 +540,32 @@ impl ReadyIncrementalCensus {
         *slot = slot.saturating_sub(1);
     }
 
-    /// RFC 9218 §4: record the pass's round-robin leader — the FIRST
-    /// incremental stream that moved bytes.
+    /// RFC 9218 §4: record `urgency`'s round-robin leader for this pass —
+    /// the FIRST incremental stream of THAT bucket which moved bytes.
+    ///
+    /// `urgency` is what attributes the firing stream to a bucket, and it is
+    /// why this takes the parameter [`Self::note_ineligible`] already took:
+    /// without it the census can only name one leader for the whole
+    /// connection, which is exactly the defect sozu-proxy/sozu#1456 closed.
     ///
     /// `consumed <= 0` is not a lead. A stream that reached the converter and
-    /// emitted nothing (its send window was exhausted) must not advance the
-    /// cursor past the peers that are still waiting for their turn, or a
-    /// permanently window-blocked stream would hand the lead onward every
-    /// pass while never using it.
-    pub(super) fn note_fired(&mut self, stream_id: StreamId, is_incremental: bool, consumed: i32) {
-        if is_incremental && consumed > 0 && self.first_incremental_fired.is_none() {
-            self.first_incremental_fired = Some(stream_id);
+    /// emitted nothing (its send window was exhausted) must not advance its
+    /// bucket's cursor past the peers that are still waiting for their turn,
+    /// or a permanently window-blocked stream would hand the lead onward
+    /// every pass while never using it.
+    pub(super) fn note_fired(
+        &mut self,
+        urgency: u8,
+        stream_id: StreamId,
+        is_incremental: bool,
+        consumed: i32,
+    ) {
+        if !is_incremental || consumed <= 0 {
+            return;
+        }
+        let slot = &mut self.first_incremental_fired[bucket(urgency)];
+        if slot.is_none() {
+            *slot = Some(stream_id);
         }
     }
 
@@ -595,8 +654,9 @@ impl H2Scheduler {
     ///
     /// The order is RFC 9218 §4: ascending urgency, then ascending stream id
     /// for stability, then — inside each urgency bucket — non-incremental
-    /// streams before incremental ones, with the incremental tail rotated to
-    /// start after [`Prioriser::incremental_cursor`].
+    /// streams before incremental ones, with each bucket's incremental tail
+    /// rotated to start after that bucket's own entry in
+    /// [`Prioriser::incremental_cursor`].
     ///
     /// `ready` is the caller's projection of the one fact this module does
     /// not own: whether a stream has something to send this pass. It is
@@ -642,7 +702,7 @@ impl H2Scheduler {
         let mut census = ReadyIncrementalCensus {
             ready: [0; URGENCY_LEVELS],
             incremental_count,
-            first_incremental_fired: None,
+            first_incremental_fired: [None; URGENCY_LEVELS],
         };
         for &stream_id in order.iter() {
             let (urgency, is_incremental) = self.prioriser.get(&stream_id);
@@ -656,14 +716,17 @@ impl H2Scheduler {
         (order, census)
     }
 
-    /// End a write pass: commit the RFC 9218 §4 round-robin cursor to the
-    /// stream that led it, and take the order buffer back.
+    /// End a write pass: commit each urgency bucket's RFC 9218 §4
+    /// round-robin cursor to the stream that led THAT bucket, and take the
+    /// order buffer back.
     ///
     /// This is the second half of LIFECYCLE.md invariant 26. Committing the
-    /// cursor is what makes the next pass's rotation start one position
-    /// further on; without it `begin_pass` re-reads the same cursor and the
+    /// cursors is what makes the next pass's rotation start one position
+    /// further on; without it `begin_pass` re-reads the same cursors and the
     /// same stream leads every pass forever, which is starvation of every
-    /// other incremental peer in the bucket.
+    /// other incremental peer in its bucket. Committing one id for the whole
+    /// connection instead of one per bucket froze every bucket but the
+    /// leading one, which is sozu-proxy/sozu#1456.
     ///
     /// `write_streams` calls this at exactly the point it used to call
     /// `HpackState::put_priorities_buf` and
@@ -673,7 +736,7 @@ impl H2Scheduler {
     pub(super) fn end_pass(&mut self, order: Vec<StreamId>, census: ReadyIncrementalCensus) {
         self.order = order;
         self.prioriser
-            .advance_incremental_cursor(census.first_incremental_fired);
+            .advance_incremental_cursor(&census.first_incremental_fired);
     }
 
     /// Quiet-time reclaim of the order buffer once it holds 4x `retain_size`,
@@ -970,6 +1033,16 @@ mod tests {
     // ── RFC 9218 §4 round-robin rotation ───────────────────────────────
 
     /// Helper: mark `stream_id` as (urgency, incremental) in the map.
+    /// Commit `stream_id` as `urgency`'s round-robin leader and nobody
+    /// else's — the single-bucket shape every rotation unit test below wants
+    /// from [`Prioriser::advance_incremental_cursor`], which takes a whole
+    /// per-bucket census.
+    fn commit_bucket_leader(p: &mut Prioriser, urgency: u8, stream_id: StreamId) {
+        let mut leaders = [None; URGENCY_LEVELS];
+        leaders[bucket(urgency)] = Some(stream_id);
+        p.advance_incremental_cursor(&leaders);
+    }
+
     fn set_prio(p: &mut Prioriser, stream_id: StreamId, urgency: u8, incremental: bool) {
         p.push_priority(
             stream_id,
@@ -1045,19 +1118,19 @@ mod tests {
         let mut buf = base.clone();
         assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
         assert_eq!(buf, vec![1, 3, 5]);
-        p.advance_incremental_cursor(Some(1));
+        commit_bucket_leader(&mut p, 3, 1);
 
         // Pass 2: cursor is 1, rotate so 3 comes first.
         let mut buf = base.clone();
         assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
         assert_eq!(buf, vec![3, 5, 1]);
-        p.advance_incremental_cursor(Some(3));
+        commit_bucket_leader(&mut p, 3, 3);
 
         // Pass 3: cursor is 3, rotate so 5 comes first.
         let mut buf = base.clone();
         assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
         assert_eq!(buf, vec![5, 1, 3]);
-        p.advance_incremental_cursor(Some(5));
+        commit_bucket_leader(&mut p, 3, 5);
 
         // Pass 4: cursor is 5 (largest in bucket), wrap to 1.
         let mut buf = base;
@@ -1073,7 +1146,7 @@ mod tests {
         set_prio(&mut p, 3, 3, true);
         set_prio(&mut p, 5, 3, true);
         set_prio(&mut p, 7, 3, true);
-        p.advance_incremental_cursor(Some(4)); // 4 is not in the bucket
+        commit_bucket_leader(&mut p, 3, 4); // 4 is not in the bucket
 
         let mut buf = vec![3u32, 5, 7];
         assert_eq!(p.apply_incremental_rotation(&mut buf), 3);
@@ -1096,12 +1169,48 @@ mod tests {
 
     #[test]
     fn test_advance_incremental_cursor_none_is_noop() {
-        // If no incremental stream fires (only non-incremental served), the
-        // cursor must stay put so fairness is preserved for the next pass.
+        // If no incremental stream fires in a bucket (only non-incremental
+        // served, or none ready at all), that bucket's cursor must stay put
+        // so fairness is preserved for the next pass.
         let mut p = Prioriser::default();
-        p.advance_incremental_cursor(Some(5));
-        p.advance_incremental_cursor(None);
-        assert_eq!(p.incremental_cursor, 5);
+        commit_bucket_leader(&mut p, 3, 5);
+        p.advance_incremental_cursor(&[None; URGENCY_LEVELS]);
+        assert_eq!(p.incremental_cursor[bucket(3)], 5);
+    }
+
+    /// A leader committed for one bucket must not move any other bucket's
+    /// cursor. This is the primitive half of sozu-proxy/sozu#1456: with a
+    /// single connection-global cursor, committing urgency 0's leader WAS
+    /// how urgency 3's tail got rotated by a foreign id range.
+    ///
+    /// TO SEE THIS RED: in [`Prioriser::advance_incremental_cursor`],
+    /// replace the zip with the pre-#1456 global commit,
+    /// `if let Some(id) = first_incremental_fired.iter().flatten().next() {`
+    /// `self.incremental_cursor = [*id; URGENCY_LEVELS]; }`. Urgency 0's
+    /// leader then lands in urgency 3's slot and it fails with
+    /// `urgency 3 keeps its own leader` / `left: 1` / `right: 7`.
+    #[test]
+    fn test_advance_incremental_cursor_is_per_bucket() {
+        let mut p = Prioriser::default();
+        let mut leaders = [None; URGENCY_LEVELS];
+        leaders[bucket(0)] = Some(1);
+        leaders[bucket(3)] = Some(7);
+        p.advance_incremental_cursor(&leaders);
+        assert_eq!(
+            p.incremental_cursor[bucket(0)],
+            1,
+            "urgency 0 keeps its own leader"
+        );
+        assert_eq!(
+            p.incremental_cursor[bucket(3)],
+            7,
+            "urgency 3 keeps its own leader"
+        );
+        assert_eq!(
+            p.incremental_cursor[bucket(5)],
+            0,
+            "a bucket nobody led keeps its sentinel"
+        );
     }
 
     #[test]
@@ -1114,7 +1223,7 @@ mod tests {
         set_prio(&mut p, 5, 3, true);
         set_prio(&mut p, 7, 3, false);
         set_prio(&mut p, 9, 3, true);
-        p.advance_incremental_cursor(Some(5));
+        commit_bucket_leader(&mut p, 3, 5);
 
         let mut buf = vec![1u32, 3, 5, 7, 9];
         let count = p.apply_incremental_rotation(&mut buf);
@@ -1152,21 +1261,26 @@ mod tests {
 
     /// Drive `passes` write passes over `ids` with every stream ready and
     /// every incremental stream consuming window, and return the RFC 9218 §4
-    /// leader each pass committed — exactly the sequence
+    /// leader `urgency`'s bucket committed each pass — exactly the sequence
     /// `ConnectionH2::write_streams` produces when nothing stalls.
+    ///
+    /// The bucket is named rather than assumed because the census carries one
+    /// leader per urgency (sozu-proxy/sozu#1456); every caller below drives a
+    /// single bucket and reads that one.
     fn drive_leaders(
         scheduler: &mut H2Scheduler,
         ids: &[StreamId],
         passes: usize,
+        urgency: u8,
     ) -> Vec<Option<StreamId>> {
         let mut leaders = Vec::with_capacity(passes);
         for _ in 0..passes {
             let (order, mut census) = scheduler.begin_pass(ids.iter().copied(), |_| true);
             for &stream_id in &order {
-                let (_, is_incremental) = scheduler.priority(&stream_id);
-                census.note_fired(stream_id, is_incremental, 1);
+                let (stream_urgency, is_incremental) = scheduler.priority(&stream_id);
+                census.note_fired(stream_urgency, stream_id, is_incremental, 1);
             }
-            leaders.push(census.first_incremental_fired);
+            leaders.push(census.first_incremental_fired[bucket(urgency)]);
             scheduler.end_pass(order, census);
         }
         leaders
@@ -1196,7 +1310,7 @@ mod tests {
     /// position per pass is what bounds any stream's wait at K-1 passes.
     ///
     /// TO SEE THIS RED: in [`Prioriser::apply_incremental_rotation`], change
-    /// `partition_point(|id| *id <= self.incremental_cursor)` to `*id <`.
+    /// `partition_point(|id| *id <= cursor)` to `*id < cursor`.
     /// The tail then never rotates past the cursor it just committed and
     /// stream 1 leads forever:
     /// `assertion `left == right` failed: leadership must advance exactly one`
@@ -1205,17 +1319,19 @@ mod tests {
     /// The same mutation reds seven tests in all — this one,
     /// `no_incremental_peer_is_starved_over_a_full_cycle`,
     /// `a_pass_with_no_incremental_progress_leaves_the_cursor_alone`,
-    /// `the_round_robin_cursor_is_connection_global_so_only_the_leading_bucket_rotates`,
+    /// `every_urgency_bucket_rotates_its_own_incremental_tail`,
     /// `test_apply_incremental_rotation_rotates_by_cursor`,
     /// `test_apply_incremental_rotation_mixed_bucket_with_cursor` and
     /// `fairness_property::qc_incremental_leadership_visits_every_peer_once_per_cycle`
     /// — because it breaks the rotation primitive the moved unit tests
-    /// already pinned as well as the composition this step adds.
+    /// already pinned as well as the composition this step adds. Re-measured
+    /// after sozu-proxy/sozu#1456: still seven, the multi-bucket case now
+    /// standing where the deleted connection-global pinning test stood.
     #[test]
     fn incremental_leadership_rotates_one_position_per_pass() {
         let mut scheduler =
             scheduler_with(&[(1, 3, true), (3, 3, true), (5, 3, true), (7, 3, true)]);
-        let leaders = drive_leaders(&mut scheduler, &[1, 3, 5, 7], 8);
+        let leaders = drive_leaders(&mut scheduler, &[1, 3, 5, 7], 8, 3);
         assert_eq!(
             leaders,
             vec![
@@ -1249,7 +1365,7 @@ mod tests {
     fn no_incremental_peer_is_starved_over_a_full_cycle() {
         let ids = [1u32, 3, 5, 7, 9];
         let mut scheduler = scheduler_with(&ids.map(|id| (id, 3, true)));
-        let leaders = drive_leaders(&mut scheduler, &ids, 10);
+        let leaders = drive_leaders(&mut scheduler, &ids, 10, 3);
         for id in ids {
             let led = leaders.iter().filter(|l| **l == Some(id)).count();
             assert_eq!(
@@ -1274,11 +1390,11 @@ mod tests {
         let (order, mut census) = scheduler.begin_pass([1u32, 3, 5], |_| true);
         assert_eq!(order, vec![1, 3, 5]);
         // Stream 1 is window-blocked; 3 and 5 send.
-        census.note_fired(1, true, 0);
-        census.note_fired(3, true, 1);
-        census.note_fired(5, true, 1);
+        census.note_fired(3, 1, true, 0);
+        census.note_fired(3, 3, true, 1);
+        census.note_fired(3, 5, true, 1);
         assert_eq!(
-            census.first_incremental_fired,
+            census.first_incremental_fired[bucket(3)],
             Some(3),
             "the lead belongs to the first incremental stream that moved bytes"
         );
@@ -1289,82 +1405,64 @@ mod tests {
     #[test]
     fn a_pass_with_no_incremental_progress_leaves_the_cursor_alone() {
         let mut scheduler = scheduler_with(&[(1, 3, true), (3, 3, true)]);
-        let leaders = drive_leaders(&mut scheduler, &[1, 3], 1);
+        let leaders = drive_leaders(&mut scheduler, &[1, 3], 1, 3);
         assert_eq!(leaders, vec![Some(1)]);
         // A second pass where nothing fires.
         let (order, census) = scheduler.begin_pass([1u32, 3], |_| true);
         assert_eq!(order, vec![3, 1], "pass two starts after the pass-one lead");
-        assert_eq!(census.first_incremental_fired, None);
+        assert_eq!(census.first_incremental_fired[bucket(3)], None);
         scheduler.end_pass(order, census);
         assert_eq!(
-            scheduler.prioriser.incremental_cursor, 1,
+            scheduler.prioriser.incremental_cursor[bucket(3)],
+            1,
             "a pass with no incremental progress must not move the cursor"
         );
     }
 
-    /// The RFC 9218 §4 round-robin cursor is ONE connection-global stream id,
-    /// so only the urgency bucket that supplies the pass's leader rotates.
-    /// Every other bucket is rotated by a cursor drawn from a foreign id
-    /// range and can be permanently static.
+    /// LIFECYCLE.md invariant 26's multi-bucket half: EVERY urgency bucket
+    /// rotates its own incremental tail, not only the one that supplied the
+    /// pass's leader.
     ///
-    /// **This test pins observed behaviour, not a desired property.** It is
-    /// the counter-example that scopes LIFECYCLE.md invariant 26 to the
-    /// leading bucket: u=0 alternates `1, 3, 1, 3, …` as invariant 26
-    /// promises, while u=3 is `5, 7` in every pass and stream 7 never leads
-    /// it. `partition_point(|id| *id <= cursor)` over `[5, 7]` with a cursor
-    /// of 1 or 3 is 0 in every pass, so `rotate_left(0)` is a no-op forever.
+    /// Two buckets, each holding two ready incremental peers, all consuming
+    /// — the shape `fairness_property` structurally cannot generate on its
+    /// own main bucket, because its distractors are deliberately placed in
+    /// strictly lower-priority buckets. The u=3 tail must alternate
+    /// `5, 7 / 7, 5` exactly as the u=0 tail alternates `1, 3 / 3, 1`.
     ///
-    /// It is positional starvation here because every stream still gets its
-    /// DATA frame; it becomes byte starvation as soon as a pass is cut short,
-    /// since a stalled flush at stream 5 (`H2WritePass::stalled`, which ends
-    /// the pass) leaves 7 unwritten, pass after pass.
+    /// TO SEE THIS RED: restore the pre-#1456 connection-global cursor by
+    /// replacing the zip in [`Prioriser::advance_incremental_cursor`] with
+    /// `if let Some(id) = first_incremental_fired.iter().flatten().next() {`
+    /// `self.incremental_cursor = [*id; URGENCY_LEVELS]; }` — the lowest
+    /// urgency's leader written to every bucket, which is exactly what one
+    /// connection-global id did. It fails with
+    /// `left: [[1, 3, 5, 7], [3, 1, 5, 7], [1, 3, 5, 7], [3, 1, 5, 7], [1, 3, 5, 7], [3, 1, 5, 7]]`
+    /// — the u=0 tail alternating while the u=3 tail is frozen at `5, 7`,
+    /// because a cursor of 1 or 3 sits entirely below `[5, 7]` and
+    /// `partition_point` returns 0 forever. Measured, that mutation reds
+    /// exactly three tests — this one,
+    /// `test_advance_incremental_cursor_is_per_bucket`, and
+    /// `fairness_property::qc_incremental_leadership_visits_every_peer_once_per_cycle`
+    /// (`pass 1: urgency 3 expected leader Some(23), got Some(15)`) — and
+    /// leaves the other 1090 green, which is the evidence that per-bucket
+    /// rotation adds a scope rather than changing the leading bucket's
+    /// semantics.
     ///
-    /// This is NOT a regression: `Prioriser` is byte-identical to its parent
-    /// commit and the field's own doc has always scoped the cursor to "the
-    /// lowest-urgency bucket that contained at least one incremental
-    /// stream". Fixing it means `incremental_cursor: [StreamId;
-    /// URGENCY_LEVELS]`, which changes wire ordering on multi-bucket
-    /// connections and needs its own changeset and its own e2e evidence.
-    ///
-    /// DO NOT "fix" this test by changing its expectation. If per-bucket
-    /// rotation lands, delete it and move its scenario into
-    /// `fairness_property`, whose `RotationPlan` deliberately keeps every
-    /// distractor in a strictly lower-priority bucket so its main bucket is
-    /// always the leader — the exact scope invariant 26 claims.
-    ///
-    /// TO SEE THIS RED: this test asserts the LEADING bucket too, so it reds
-    /// under the same two mutations invariant 26's other tests do — changing
-    /// `partition_point(|id| *id <= self.incremental_cursor)` to `*id <` in
-    /// [`Prioriser::apply_incremental_rotation`], or deleting the
-    /// `advance_incremental_cursor` statement from
-    /// [`H2Scheduler::end_pass`]. Either freezes the leading bucket and the
-    /// assertion fails with
+    /// The two mutations that break the rotate-and-commit pair itself —
+    /// deleting the `advance_incremental_cursor` statement from
+    /// [`H2Scheduler::end_pass`], or changing this rotation's
+    /// `partition_point(|id| *id <= cursor)` to `*id < cursor` — freeze BOTH
+    /// tails instead, and it fails with
     /// `left: [[1, 3, 5, 7], [1, 3, 5, 7], [1, 3, 5, 7], [1, 3, 5, 7], [1, 3, 5, 7], [1, 3, 5, 7]]`.
-    ///
-    /// Its DISTINCTIVE half — the frozen TRAILING bucket — has no one-line
-    /// red, and that is the point: it asserts what the code already does.
-    /// Note that both mutations above leave columns 2-3 reading `5, 7`
-    /// throughout, exactly as the green run does; nothing short of the
-    /// design change moves them. The change that
-    /// invalidates it is a design change — `incremental_cursor:
-    /// [StreamId; URGENCY_LEVELS]`, a per-bucket leader in
-    /// [`ReadyIncrementalCensus`] (`note_fired` would need the urgency it is
-    /// not given today), and an [`H2Scheduler::end_pass`] that commits one
-    /// per bucket. `end_pass` cannot do it with what it holds now, because
-    /// `first_incremental_fired` is a single id. After that change the
-    /// trailing bucket alternates `5, 7 / 7, 5 / …` like the leading one and
-    /// the expectation below is simply wrong. Delete the test then; do not
-    /// edit its expectation to match.
     #[test]
-    fn the_round_robin_cursor_is_connection_global_so_only_the_leading_bucket_rotates() {
+    fn every_urgency_bucket_rotates_its_own_incremental_tail() {
         let mut scheduler =
             scheduler_with(&[(1, 0, true), (3, 0, true), (5, 3, true), (7, 3, true)]);
         let mut orders = Vec::new();
         for _ in 0..6 {
             let (order, mut census) = scheduler.begin_pass([1u32, 3, 5, 7], |_| true);
             for &stream_id in &order {
-                let (_, is_incremental) = scheduler.priority(&stream_id);
-                census.note_fired(stream_id, is_incremental, 1);
+                let (urgency, is_incremental) = scheduler.priority(&stream_id);
+                census.note_fired(urgency, stream_id, is_incremental, 1);
             }
             orders.push(order.clone());
             scheduler.end_pass(order, census);
@@ -1373,15 +1471,14 @@ mod tests {
             orders,
             vec![
                 vec![1, 3, 5, 7],
-                vec![3, 1, 5, 7],
+                vec![3, 1, 7, 5],
                 vec![1, 3, 5, 7],
-                vec![3, 1, 5, 7],
+                vec![3, 1, 7, 5],
                 vec![1, 3, 5, 7],
-                vec![3, 1, 5, 7],
+                vec![3, 1, 7, 5],
             ],
-            "the leading bucket (u=0) alternates; the trailing bucket (u=3) \
-             is frozen at `5, 7` because the single connection-global cursor \
-             only ever holds an id from the leading bucket"
+            "every urgency bucket rotates its own incremental tail: u=0 \
+             alternates `1, 3` / `3, 1` and u=3 alternates `5, 7` / `7, 5`"
         );
     }
 
@@ -1482,7 +1579,7 @@ mod tests {
         let mut census = ReadyIncrementalCensus {
             ready: [0, 3, 0, 2, 0, 0, 0, 0],
             incremental_count: 5,
-            first_incremental_fired: None,
+            first_incremental_fired: [None; URGENCY_LEVELS],
         };
         census.note_ineligible(1, true);
         assert_eq!(census.incremental_peer_count(1), 2, "urgency-1 drops to 2");
@@ -1495,7 +1592,7 @@ mod tests {
         let mut census = ReadyIncrementalCensus {
             ready: [0; URGENCY_LEVELS],
             incremental_count: 0,
-            first_incremental_fired: None,
+            first_incremental_fired: [None; URGENCY_LEVELS],
         };
         census.note_ineligible(0, true);
         assert_eq!(
@@ -1510,7 +1607,7 @@ mod tests {
         let mut census = ReadyIncrementalCensus {
             ready: [0, 3, 0, 0, 0, 0, 0, 0],
             incremental_count: 3,
-            first_incremental_fired: None,
+            first_incremental_fired: [None; URGENCY_LEVELS],
         };
         census.note_ineligible(1, false);
         assert_eq!(
@@ -1561,13 +1658,26 @@ mod tests {
 
     // ── Property coverage: RFC 9218 §4 leadership fairness ──────────────
     //
-    // The deterministic tests above fix two shapes: four same-urgency
-    // incremental peers over eight passes, and five over ten. This property
-    // generalises the peer count (2..=8), the stream ids and their gaps, the
-    // urgency bucket they share, the number of cycles, and — the part no
-    // deterministic case covers — a set of DISTRACTORS that must not perturb
-    // the rotation: non-incremental streams in the same bucket, and
-    // incremental streams in a strictly lower-priority bucket.
+    // The deterministic tests above fix three shapes: four same-urgency
+    // incremental peers over eight passes, five over ten, and two buckets of
+    // two over six. This property generalises the peer count (2..=8), the
+    // stream ids and their gaps, the urgency bucket they share, the number of
+    // cycles, a SECOND multi-peer incremental bucket at strictly lower
+    // priority, and a set of DISTRACTORS that must not perturb the rotation:
+    // non-incremental streams in the same bucket, and lone incremental
+    // streams in strictly lower-priority buckets.
+    //
+    // The oracle is per urgency bucket, and that is the corrected half. The
+    // scenario that
+    // `the_round_robin_cursor_is_connection_global_so_only_the_leading_bucket_rotates`
+    // pinned before it was deleted lives here now: before sozu-proxy/sozu#1456 the generator
+    // placed every distractor in a strictly lower-priority bucket precisely
+    // so the main bucket always supplied the pass's leader — the only scope
+    // a connection-global cursor could serve — and the property could not
+    // see a frozen trailing bucket at all. It now asserts the cyclic
+    // successor for EVERY generated bucket, so a cursor that rotates one
+    // bucket at another's expense fails here as well as in the
+    // deterministic case.
     //
     // It is a sibling of `h2.rs`'s `write_pass_property` and
     // `reassembly_property` rather than a case inside either. Those two
@@ -1593,9 +1703,18 @@ mod tests {
             incremental: Vec<StreamId>,
             /// The urgency bucket they share.
             urgency: u8,
-            /// Streams that must never lead: non-incremental peers in the
-            /// same bucket, and incremental streams in a numerically higher
-            /// (lower-priority) bucket that therefore sort after them.
+            /// A SECOND multi-peer incremental bucket, 2..=4 ascending ids
+            /// at a strictly lower priority than `urgency`. This is the
+            /// shape sozu-proxy/sozu#1456 was about: a connection-global
+            /// cursor can only ever hold an id from the bucket that supplies
+            /// the pass's leader, so this one never rotated. `None` when
+            /// `urgency` is already `MAX_URGENCY` and no lower-priority
+            /// bucket exists.
+            trailing: Option<(u8, Vec<StreamId>)>,
+            /// Streams that must never lead their OWN bucket out of turn:
+            /// non-incremental peers in the main bucket, and lone
+            /// incremental streams in numerically higher (lower-priority)
+            /// buckets that therefore sort after them.
             distractors: Vec<(StreamId, u8, bool)>,
             /// Full cycles to drive, 1..=4.
             cycles: u8,
@@ -1615,6 +1734,21 @@ mod tests {
                     incremental.push(next);
                     next += 2 * (1 + u32::from(u8::arbitrary(g) % 4));
                 }
+                // The second rotating bucket, whenever the main one leaves
+                // room below it.
+                let trailing = if urgency < MAX_URGENCY {
+                    let spread = MAX_URGENCY - urgency;
+                    let trailing_urgency = urgency + 1 + (u8::arbitrary(g) % spread);
+                    let peers = *g.choose(&[2u8, 3, 4]).expect("non-empty slice");
+                    let mut ids = Vec::with_capacity(usize::from(peers));
+                    for _ in 0..peers {
+                        ids.push(next);
+                        next += 2 * (1 + u32::from(u8::arbitrary(g) % 4));
+                    }
+                    Some((trailing_urgency, ids))
+                } else {
+                    None
+                };
                 let mut distractors = Vec::new();
                 for _ in 0..(u8::arbitrary(g) % 4) {
                     let id = next;
@@ -1630,6 +1764,7 @@ mod tests {
                 RotationPlan {
                     incremental,
                     urgency,
+                    trailing,
                     distractors,
                     cycles: 1 + u8::arbitrary(g) % 4,
                 }
@@ -1643,12 +1778,34 @@ mod tests {
                 .iter()
                 .map(|&id| (id, plan.urgency, true))
                 .collect();
+            if let Some((trailing_urgency, ids)) = &plan.trailing {
+                entries.extend(ids.iter().map(|&id| (id, *trailing_urgency, true)));
+            }
             entries.extend(plan.distractors.iter().copied());
             let all_ids: Vec<StreamId> = entries.iter().map(|&(id, _, _)| id).collect();
+
+            // The oracle's own model of the connection, built from the plan
+            // rather than from anything the scheduler returned: every
+            // incremental stream grouped by its urgency, ascending. A
+            // distractor that happens to share a bucket is grouped here too,
+            // so no generated shape falls outside the oracle.
+            let mut buckets: [Vec<StreamId>; URGENCY_LEVELS] = Default::default();
+            for &(id, urgency, incremental) in &entries {
+                if incremental {
+                    buckets[bucket(urgency)].push(id);
+                }
+            }
+            for ids in buckets.iter_mut() {
+                ids.sort_unstable();
+            }
 
             let mut scheduler = scheduler_with(&entries);
             let passes = peers * usize::from(plan.cycles);
             let mut leaders = Vec::with_capacity(passes);
+            // The trailing bucket's OBSERVED leader per pass, kept beside the
+            // main bucket's so its starvation bound is measured rather than
+            // derived from the oracle that already checked it.
+            let mut trailing_leaders: Vec<Option<StreamId>> = Vec::with_capacity(passes);
             for pass in 0..passes {
                 let (order, mut census) = scheduler.begin_pass(all_ids.iter().copied(), |_| true);
                 if order.len() != all_ids.len() {
@@ -1669,11 +1826,33 @@ mod tests {
                     ));
                 }
                 for &stream_id in &order {
-                    let (_, is_incremental) = scheduler.priority(&stream_id);
-                    census.note_fired(stream_id, is_incremental, 1);
+                    let (urgency, is_incremental) = scheduler.priority(&stream_id);
+                    census.note_fired(urgency, stream_id, is_incremental, 1);
                 }
-                leaders.push(census.first_incremental_fired);
+                let pass_leaders = census.first_incremental_fired;
                 scheduler.end_pass(order, census);
+
+                // Per-bucket oracle: pass n is led by the n-th stream of
+                // THAT bucket, cycling. A solo incremental stream is the
+                // same rule with a cycle of one, so no bucket is special.
+                for (index, ids) in buckets.iter().enumerate() {
+                    if ids.is_empty() {
+                        continue;
+                    }
+                    let expected = Some(ids[pass % ids.len()]);
+                    if pass_leaders[index] != expected {
+                        return TestResult::error(format!(
+                            "pass {pass}: urgency {index} expected leader \
+                             {expected:?}, got {:?} (bucket {ids:?}, main \
+                             bucket u={} {:?})",
+                            pass_leaders[index], plan.urgency, plan.incremental
+                        ));
+                    }
+                }
+                leaders.push(pass_leaders[bucket(plan.urgency)]);
+                if let Some((trailing_urgency, _)) = &plan.trailing {
+                    trailing_leaders.push(pass_leaders[bucket(*trailing_urgency)]);
+                }
             }
 
             // Oracle: built from the plan's own ascending id list, never
@@ -1698,6 +1877,28 @@ mod tests {
                         "stream {id} led {led} of {passes} passes, expected {} \
                          — a starved peer",
                         plan.cycles
+                    ));
+                }
+            }
+            // And the same bound for the trailing bucket, where the pass
+            // count need not be a whole number of ITS cycles: a perfect
+            // round-robin over `passes` passes leaves every peer's lead
+            // count within one of every other's. Zero leads for one peer
+            // while its bucket-mate leads every pass — the pre-#1456
+            // trailing bucket — is a spread of `passes`.
+            if let Some((trailing_urgency, ids)) = &plan.trailing {
+                let counts: Vec<usize> = ids
+                    .iter()
+                    .map(|&id| trailing_leaders.iter().filter(|l| **l == Some(id)).count())
+                    .collect();
+                let spread = counts.iter().max().copied().unwrap_or(0)
+                    - counts.iter().min().copied().unwrap_or(0);
+                if spread > 1 {
+                    return TestResult::error(format!(
+                        "trailing bucket u={trailing_urgency} {ids:?} led \
+                         {counts:?} over {passes} passes — spread {spread}, \
+                         so a peer waited while another led repeatedly \
+                         (leaders {trailing_leaders:?})"
                     ));
                 }
             }

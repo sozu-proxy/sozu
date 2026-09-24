@@ -59,7 +59,7 @@ ConnectionH2<Front>
  |-- scheduler: H2Scheduler                 // Closed API (h2_scheduler.rs, private
  |                                         // fields): prioriser (priorities:
  |                                         // HashMap<StreamId, (u8, bool)> urgency +
- |                                         // incremental, incremental_cursor) and the
+ |                                         // incremental, per-bucket incremental_cursor) and the
  |                                         // reusable write-pass order buffer
  |
  |-- hpack: HpackState                      // Closed API (hpack_state.rs, private fields):
@@ -149,7 +149,7 @@ and reaches everything below through the methods listed here.
 
 `Prioriser` manages per-stream scheduling priorities per RFC 9218. It wraps a
 `HashMap<StreamId, (u8, bool)>` where the tuple is `(urgency, incremental)`,
-plus the round-robin `incremental_cursor`.
+plus the per-urgency-bucket round-robin `incremental_cursor`.
 
 **`Prioriser` methods:**
 
@@ -159,8 +159,8 @@ plus the round-robin `incremental_cursor`.
 | `push_priority_guarded` | `(&mut self, StreamId, PriorityPart, StreamId, &HashMap<StreamId, GlobalStreamId>) -> bool` | Same, behind the open-stream / idle-look-ahead filter that bounds a PRIORITY flood. |
 | `get` | `(&self, &StreamId) -> (u8, bool)` | Returns `(urgency, incremental)`. Defaults to `(3, false)` if absent. |
 | `remove` | `(&mut self, &StreamId)` | Removes entry at stream cleanup. |
-| `apply_incremental_rotation` | `(&self, &mut [StreamId]) -> usize` | Inside each urgency bucket, moves incremental streams to the tail and rotates that tail past `incremental_cursor`. Returns the incremental count. |
-| `advance_incremental_cursor` | `(&mut self, Option<StreamId>)` | Commits the pass's leader as the next pass's cursor. `None` is a no-op. |
+| `apply_incremental_rotation` | `(&self, &mut [StreamId]) -> usize` | Inside each urgency bucket, moves incremental streams to the tail and rotates that tail past **that bucket's own** entry in `incremental_cursor`. Returns the incremental count. |
+| `advance_incremental_cursor` | `(&mut self, &[Option<StreamId>; 8])` | Commits each bucket's own pass leader as that bucket's next cursor. A `None` entry leaves its bucket's cursor alone, so an all-`None` census is a whole no-op. |
 
 **`H2Scheduler` methods** — `priority`, `push_priority`,
 `push_priority_guarded`, `remove_stream` and `prioriser_mut` delegate to the
@@ -169,15 +169,19 @@ plus the round-robin `incremental_cursor`.
 | Method | Signature | Behavior |
 |--------|-----------|----------|
 | `begin_pass` | `(&mut self, impl IntoIterator<Item = StreamId>, impl FnMut(StreamId) -> bool) -> (Vec<StreamId>, ReadyIncrementalCensus)` | Orders one write pass and takes its same-urgency ready-incremental census. The closure is the caller's readiness projection — the one fact the scheduler does not own — and is called for incremental streams only. |
-| `end_pass` | `(&mut self, Vec<StreamId>, ReadyIncrementalCensus)` | Takes the order buffer back and commits the round-robin cursor. |
+| `end_pass` | `(&mut self, Vec<StreamId>, ReadyIncrementalCensus)` | Takes the order buffer back and commits every urgency bucket's round-robin cursor. |
 | `reclaim_idle_buffer` | `(&mut self, usize)` | Quiet-time shrink of the order buffer, beside `HpackState::reclaim_idle_buffers`. |
 
 `ReadyIncrementalCensus` is a fixed `[usize; 8]` (RFC 9218 §4.1 urgency is
-`[0, 7]`) plus the pass leader. `write_streams` reads
-`incremental_peer_count(urgency)` per stream, calls `note_ineligible` at the
-three mid-pass transitions of LIFECYCLE.md invariant 17, `note_fired` when a
-stream consumes window, and `ready_total` for the
-`h2.streams.ready_incremental.by_urgency` gauge.
+`[0, 7]`) plus a matching `[Option<StreamId>; 8]` of per-bucket pass leaders.
+`write_streams` reads `incremental_peer_count(urgency)` per stream, calls
+`note_ineligible` at the three mid-pass transitions of LIFECYCLE.md invariant
+17, `note_fired(urgency, ...)` when a stream consumes window, and
+`ready_total` for the `h2.streams.ready_incremental.by_urgency` gauge.
+`note_fired` takes the urgency because that is what attributes the firing
+stream to a bucket: without it the census can name one leader for the whole
+connection, and only the bucket that supplied it ever rotates
+(sozu-proxy/sozu#1456).
 
 ### parse_rfc9218_priority()
 
@@ -217,9 +221,10 @@ let (order, mut census) = self.scheduler.begin_pass(
 `Prioriser::apply_incremental_rotation`. Lower urgency values are served first
 (urgency 0 = highest priority). Among streams with equal urgency, lower stream
 IDs go first for stability, non-incremental streams drain before incremental
-ones, and the incremental tail is rotated past `incremental_cursor` so
-same-urgency incremental downloads take the lead in turn — one position per
-pass, which is LIFECYCLE.md invariant 26's starvation bound.
+ones, and each bucket's incremental tail is rotated past that bucket's own
+entry in `incremental_cursor` so same-urgency incremental downloads take the
+lead in turn — one position per pass, in every populated bucket, which is
+LIFECYCLE.md invariant 26's starvation bound.
 
 ### Priority cleanup
 
@@ -847,7 +852,7 @@ what makes a re-entry after a transmit different from a first entry:
    order (urgency, then stream_id, then the rotated incremental tail) and its
    ready-incremental census.
 4. `Prepare { cursor }` — ONCE per stream: the eligibility gate,
-   `kawa.prepare`, the window debit and `census.note_fired`.
+   `kawa.prepare`, the window debit and `census.note_fired(urgency, ...)`.
 5. `Flush { cursor, .. }` — yields one `Transmit` per round until the queue
    drains or the socket stalls, then recycles the stream if it completed and
    advances the cursor back to `Prepare`.
@@ -855,7 +860,7 @@ what makes a re-entry after a transmit different from a first entry:
    converter buffers if they grew beyond 16KB
    (`HpackState::shrink_converter_buffers`), accounts the deferred RSTs, ends
    the pass with `H2Scheduler::end_pass` (which takes the order buffer back
-   and commits the RFC 9218 §4 round-robin cursor), then cleans up
+   and commits every bucket's RFC 9218 §4 round-robin cursor), then cleans up
    `dead_streams` via `remove_dead_stream` (evicting the `H2StreamTable` wire
    mapping, `rst_sent`, and the activity/fc-stall caches together, plus the
    scheduler's priority entry via `H2Scheduler::remove_stream`), distributes

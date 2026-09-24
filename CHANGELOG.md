@@ -1196,6 +1196,84 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux-h2)`: the RFC 9218 §4 round-robin cursor is per urgency bucket, so every incremental
+  bucket rotates instead of only the one that leads the pass.** `Prioriser` held ONE
+  connection-global `incremental_cursor`. `apply_incremental_rotation` applied it to every urgency
+  bucket's incremental tail, but `H2Scheduler::end_pass` could only ever commit an id drawn from
+  the lowest-numbered urgency bucket that had a ready incremental stream fire — the pass order is
+  ascending by urgency, so the first stream to consume send window always came from there. Every
+  other bucket was then rotated by a cursor from a foreign id range, and a cursor sitting entirely
+  below (or entirely above) a bucket's own ids makes `partition_point` return a constant, so
+  `rotate_left(0)` was a no-op **forever** (sozu-proxy/sozu#1456). Measured, u=0 incremental
+  `{1, 3}` beside u=3 incremental `{5, 7}`, all ready and all consuming, six passes:
+  `[[1,3,5,7], [3,1,5,7], [1,3,5,7], [3,1,5,7], [1,3,5,7], [3,1,5,7]]` — the u=0 tail alternates as
+  invariant 26 promised, the u=3 tail is `5, 7` in every pass, and stream 7 never leads its bucket.
+  It now reads `[[1,3,5,7], [3,1,7,5], [1,3,5,7], [3,1,7,5], [1,3,5,7], [3,1,7,5]]`.
+
+  Not a regression and not a rounding error: `Prioriser` was byte-identical to its pre-extraction
+  form and the field's own doc always scoped the cursor honestly to "the incremental tail of the
+  lowest-urgency bucket that contained at least one incremental stream". What it was is **partial
+  RFC 9218 §4**, which describes round-robin within an urgency level without qualification. Today
+  it is *positional* starvation — every stream still gets its frame, just never the lead position
+  in its bucket — and it becomes *byte* starvation the moment a pass is cut short: a stalled flush
+  partway through the order leaves the trailing streams unwritten, pass after pass, always the same
+  ones, because the order never rotates.
+
+  Three changes carry it, and the third is the one that is not obvious.
+  `incremental_cursor: [StreamId; 8]` — exact rather than a cap, because RFC 9218 §4.1 urgency is
+  `[0, 7]` and `Prioriser::push_priority` already clamps into it, so no out-of-range fallback is
+  reachable. A per-bucket `first_incremental_fired: [Option<StreamId>; 8]` in
+  `ReadyIncrementalCensus`, with `end_pass` committing each bucket's own leader.
+  And **`ReadyIncrementalCensus::note_fired` now takes the urgency** —
+  `note_fired(urgency, stream_id, is_incremental, consumed)`, matching `note_ineligible`'s existing
+  shape — without which the census cannot attribute the firing stream to a bucket at all and can
+  only ever name one leader per connection. The leading bucket's semantics are untouched: each
+  bucket still commits the FIRST stream of that bucket which consumed window, never the last, and
+  `consumed > 0` remains load-bearing so a permanently window-blocked stream cannot take a lead it
+  does not use.
+
+  **This changes bytes on the wire**, which is why it carries e2e evidence rather than an argument.
+  On a connection with two populated incremental buckets the trailing bucket's DATA frame order was
+  stable and now rotates. It is not marked breaking: `mod h2_scheduler` is private, so `Prioriser`
+  and its `pub fn advance_incremental_cursor` are unreachable outside `sozu-lib` and no published
+  API signature moves; no configuration key, CLI flag, protobuf message or metric name changes; and
+  HTTP/2 offers no cross-stream ordering guarantee a peer could have depended on — the new order is
+  more conformant to RFC 9218 §4, not a different contract. The four e2e tests that place
+  incremental streams under an explicit urgency are unaffected by construction, two of them holding
+  exactly one incremental stream per bucket (`try_h2_mixed_urgency_incremental_solo_drains`,
+  `try_h2_customer_har_shape_drains`) and two holding a single bucket
+  (`try_h2_rfc9218_incremental_round_robin`, `try_h2_mid_pass_rst_does_not_force_yield`): one peer
+  in a bucket leaves nothing to rotate, and a lone bucket was always the one that led.
+
+  `e2e/src/tests/h2_correctness_tests.rs`'s new `test_h2_per_bucket_incremental_rotation` is the
+  wire evidence. Four streams, `u=0, i` on 1 and 3 beside `u=3, i` on 5 and 7, 96 KiB bodies, the
+  same `INITIAL_WINDOW_SIZE=0` window-starving handshake `try_h2_rfc9218_incremental_round_robin`
+  uses so one bulk `WINDOW_UPDATE` write releases a fully-populated four-stream pass. It reads the
+  trailing bucket's leader out of the DATA trace by splitting it into passes on the leading bucket.
+  Before: `u=3 bucket leader per pass: [5, 5, 5, 5, 5, 5, 5]` over seven passes, `trailing_rotates=false`.
+  After: `[5, 7, 5, 7, 5, 7, 5]`, `trailing_rotates=true`.
+
+  `the_round_robin_cursor_is_connection_global_so_only_the_leading_bucket_rotates` is **deleted**
+  rather than re-expected. It existed to record observed behaviour and its own doc comment said so;
+  editing its expectation in place would have converted a deliberate record into a silent rewrite.
+  Its scenario is now `every_urgency_bucket_rotates_its_own_incremental_tail` — the same four
+  streams and six passes with the corrected oracle — and `fairness_property`'s generator gained a
+  second multi-peer incremental bucket at strictly lower priority while its oracle moved to the
+  cyclic successor of **every** bucket it generates, rather than the main one alone. That widening
+  is what the old generator structurally could not do: it placed every distractor in a strictly
+  lower-priority bucket precisely so the main bucket always supplied the leader, which was the only
+  scope a connection-global cursor could serve. Restoring that global commit — the lowest urgency's
+  leader written to every bucket — reds exactly three of `sozu-lib`'s 1093 tests, all three of them
+  this changeset's new coverage (`every_urgency_bucket_rotates_its_own_incremental_tail`,
+  `test_advance_incremental_cursor_is_per_bucket`, and
+  `fairness_property::qc_incremental_leadership_visits_every_peer_once_per_cycle` with
+  `pass 1: urgency 3 expected leader Some(23), got Some(15)`), and leaves the other 1090 green —
+  which is the measurement that the leading bucket's behaviour is unchanged. `lib/benches/h2_scheduling.rs`
+  carries its own mirror of the algorithm and was moved in step; its simulation populates one
+  bucket, so the shape is what is mirrored rather than the numbers. LIFECYCLE.md invariant 26,
+  `doc/h2_mux_internals.md` and `doc/testing.md` are rewritten to the per-bucket scope in the same
+  changeset.
+
 - **`fix(mux-h2)`: a peer that sends nothing but PINGs no longer holds a stuck HTTP/2 session
   open indefinitely.** `ConnectionH2::poll_read_target` carries the rule in prose — PING,
   WINDOW_UPDATE and SETTINGS must not reset the frontend timeout, "otherwise a peer sending

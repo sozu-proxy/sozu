@@ -206,21 +206,25 @@ Notes:
   from anything the scheduler returned. One `quickcheck` verdict over three
   unrelated state machines would say nothing about any of them. It generates
   2..=8 same-urgency incremental peers with arbitrary ids and gaps, an
-  arbitrary urgency bucket, 1..=4 full cycles, and a distractor set
-  (non-incremental peers in the same bucket, incremental streams in a
-  lower-priority bucket) that must not perturb the rotation, then asserts both
-  the exact leader sequence and the starvation bound: every peer leads exactly
-  once per cycle. Of the deterministic pair, one fixes four peers over eight
-  passes and the other deliberately goes to five rather than stopping at two,
-  because a rotation bug that swaps a pair still looks fair on two streams and
-  starves the fifth. All of it is scoped to the urgency bucket that supplies
-  the pass leader: the round-robin cursor is one connection-global stream id,
-  so a trailing bucket can be permanently static, which
-  `the_round_robin_cursor_is_connection_global_so_only_the_leading_bucket_rotates`
-  pins as observed behaviour. See LIFECYCLE.md invariant 26. Each test carries
-  a `TO SEE THIS RED` recipe naming the statement to delete and the panic it
-  produces — except that last one, which asserts what the code already does
-  and says so.
+  arbitrary urgency bucket, 1..=4 full cycles, a SECOND multi-peer incremental
+  bucket at strictly lower priority, and a distractor set (non-incremental
+  peers in the same bucket, lone incremental streams in lower-priority
+  buckets) that must not perturb the rotation, then asserts both the exact
+  leader sequence — for EVERY bucket it generated, not the main one alone —
+  and the starvation bound: every peer leads exactly once per cycle. Of the
+  deterministic trio, one fixes four peers over eight passes, one deliberately
+  goes to five rather than stopping at two because a rotation bug that swaps a
+  pair still looks fair on two streams and starves the fifth, and
+  `every_urgency_bucket_rotates_its_own_incremental_tail` drives two buckets of
+  two over six passes. That last one is the deterministic half of
+  sozu-proxy/sozu#1456: before it, the cursor was one connection-global stream
+  id, a trailing bucket was rotated by an id from a foreign range and could be
+  permanently static, and the property's generator placed every distractor in a
+  strictly lower-priority bucket precisely so its main bucket always led — so
+  nothing here could see the frozen bucket. Its wire half is
+  `h2_correctness_tests.rs`'s `test_h2_per_bucket_incremental_rotation`. See
+  LIFECYCLE.md invariant 26. Each test carries a `TO SEE THIS RED` recipe
+  naming the statement to mutate and the panic it produces.
 - `e2e/src/tests/fuzz_tests.rs` is a thin integration wrapper that shells out to
   the four fuzz targets for 10 s each. It *skips gracefully* (prints a notice,
   returns clean) when the nightly toolchain or `cargo-fuzz` is missing, so the

@@ -16,12 +16,22 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 type StreamId = u32;
 
+/// Number of distinct RFC 9218 §4.1 urgency buckets. Mirrors
+/// `sozu_lib::protocol::mux::h2_scheduler::URGENCY_LEVELS`.
+const URGENCY_LEVELS: usize = 8;
+
+/// Highest RFC 9218 §4.1 urgency, and so the last valid cursor index.
+const MAX_URGENCY: u8 = 7;
+
 /// Simulates the `Prioriser::get()` method.
 struct MockPrioriser {
     priorities: HashMap<StreamId, (u8, bool)>,
-    /// RFC 9218 §4 round-robin cursor. Mirrors
-    /// `sozu_lib::protocol::mux::h2_scheduler::Prioriser::incremental_cursor`.
-    incremental_cursor: StreamId,
+    /// RFC 9218 §4 round-robin cursors, one per urgency bucket. Mirrors
+    /// `sozu_lib::protocol::mux::h2_scheduler::Prioriser::incremental_cursor`,
+    /// which is per-bucket since sozu-proxy/sozu#1456 — a single
+    /// connection-global cursor rotated only the bucket that supplied the
+    /// pass's leader and left every other bucket frozen.
+    incremental_cursor: [StreamId; URGENCY_LEVELS],
 }
 
 impl MockPrioriser {
@@ -51,8 +61,8 @@ impl MockPrioriser {
                 let split = bucket.partition_point(|id| !self.get(id).1);
                 let incremental_tail = &mut bucket[split..];
                 if incremental_tail.len() > 1 {
-                    let start =
-                        incremental_tail.partition_point(|id| *id <= self.incremental_cursor);
+                    let cursor = self.incremental_cursor[usize::from(urgency_i.min(MAX_URGENCY))];
+                    let start = incremental_tail.partition_point(|id| *id <= cursor);
                     incremental_tail.rotate_left(start);
                 }
                 total_incremental += incremental_tail.len();
@@ -95,7 +105,7 @@ fn build_scenario(n: usize, distribution: &str) -> (Vec<StreamId>, MockPrioriser
         stream_ids,
         MockPrioriser {
             priorities,
-            incremental_cursor: 0,
+            incremental_cursor: [0; URGENCY_LEVELS],
         },
     )
 }
@@ -183,7 +193,7 @@ fn simulate_incremental_rr(streams_per_bucket: usize, frames_per_stream: usize) 
     }
     let mut prioriser = MockPrioriser {
         priorities,
-        incremental_cursor: 0,
+        incremental_cursor: [0; URGENCY_LEVELS],
     };
     // Remaining frames to send per stream, keyed by stream id.
     let mut remaining: HashMap<StreamId, usize> = stream_ids
@@ -203,12 +213,15 @@ fn simulate_incremental_rr(streams_per_bucket: usize, frames_per_stream: usize) 
         prioriser.apply_incremental_rotation(&mut buf);
 
         // RFC 9218 round-robin: one DATA frame per stream per pass, in the
-        // rotated order. Track the first-fired ID so we can advance the
-        // cursor afterwards.
-        let mut first_fired: Option<StreamId> = None;
+        // rotated order. Track the first-fired ID PER URGENCY BUCKET so each
+        // bucket's own cursor advances afterwards. This simulation populates
+        // one bucket, so the shape is what is being mirrored rather than the
+        // numbers — a mirror that drifts stops measuring the scheduler.
+        let mut first_fired: [Option<StreamId>; URGENCY_LEVELS] = [None; URGENCY_LEVELS];
         for id in buf {
-            if first_fired.is_none() {
-                first_fired = Some(id);
+            let slot = &mut first_fired[usize::from(prioriser.get(&id).0.min(MAX_URGENCY))];
+            if slot.is_none() {
+                *slot = Some(id);
             }
             let slot = remaining.get_mut(&id).expect("id present by construction");
             *slot -= 1;
@@ -217,7 +230,15 @@ fn simulate_incremental_rr(streams_per_bucket: usize, frames_per_stream: usize) 
                 remaining.remove(&id);
             }
         }
-        prioriser.incremental_cursor = first_fired.unwrap_or(0);
+        for (cursor, leader) in prioriser
+            .incremental_cursor
+            .iter_mut()
+            .zip(first_fired.iter())
+        {
+            if let Some(id) = leader {
+                *cursor = *id;
+            }
+        }
     }
 
     let mut out: Vec<usize> = stream_ids.iter().map(|id| completion[id]).collect();
