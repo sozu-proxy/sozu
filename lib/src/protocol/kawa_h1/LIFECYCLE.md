@@ -21,7 +21,7 @@ declared at `lib/src/protocol/mod.rs:25-27`). An unconditional
 `save_http_status_metric` fired 0 times across four real proxied e2e sessions,
 while the same binary panicked immediately under the function's own unit test.
 `TimeoutStatus`, `ResponseStream`, `save_http_status_metric`, **this module's**
-`handle_connection_result` (`lib/src/tcp.rs:2426` keeps its own separate copy,
+`handle_connection_result` (`lib/src/tcp.rs` keeps its own separate copy,
 which is live), this module's `log_context!` macro (and with it the `KAWA-H1`
 log tag) and the whole `diagnostics.rs` module went with it, because nothing
 else reached them. sozu#1347 — a frontend timeout consumed without

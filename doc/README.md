@@ -334,6 +334,65 @@ half is asserted the same way and in both directions: `testdata/citations/` carr
 every citation resolves to a non-blank line at **both** revisions, so the same tree must exit `0`
 without `--base` and `1` with it, and an unreachable base must be refused rather than skipped.
 
+### Auditing citations that never change
+
+Everything above, the drift rule included, is a *change* detector, and a change detector cannot find
+a defect that predates its first observation. Rule 2 compares a citation's text between two
+revisions, so a citation that was already wrong the first time it was seen is exempt **forever** —
+"unchanged" is exactly the condition for being exempt. [sozu-proxy/sozu#1466][audit] measured four
+of them in the mux `LIFECYCLE.md`, byte-identical across the whole series and wrong in every one:
+three landed on comment lines under prose naming an insert or a push, and the fourth cited
+`self.stream_table.rst_sent_contains(sid)` against a line reading `let total_before = *total;`.
+[sozu-proxy/sozu#1493][comment] closed that hole for Rust comments by forbidding the form outright,
+which needs no heuristic. These documents keep their line numbers, because here a number is
+sometimes the only way to name a span with no symbol — so this surface gets an audit instead.
+
+```
+python3 .github/scripts/check_doc_citations.py --audit --root .
+```
+
+It reads every citation's *prose* against its cited *line* and reports what does not plainly match,
+on two heuristics. **The target is a comment** while the citing prose names a statement, a call, an
+insert or a push — single-line citations only, because a range that starts on a comment is the
+normal way to cover a branch together with the sentence introducing it, and reading ranges too
+doubles the output with citations that are all correct. **The prose names a symbol that is not
+there** — neither within a few lines of the cited span nor as an item enclosing it — which is what
+reaches a wrong citation that lands on ordinary code and looks healthy to everything else.
+
+**It is advisory and it is not in CI.** It always exits `0`, it never edits a citation, and the
+`Doc citations` job does not run it. A heuristic that fails a build is a heuristic people learn to
+silence, and the silencing outlives the reason. What it produces is a list to disposition — `wrong`,
+`correct`, or `false positive` **with the reason** — and the disposition is the deliverable. A false
+positive is information about the heuristic, not noise: either the heuristic is wrong about a shape
+and should be narrowed, or it cannot tell and the limitation gets written down.
+
+**Expect roughly half of it to be wrong, and do not tune that away.** Its own first run examined 108
+of the guarded surface's 221 cited spans and reported 13; hand-audited, six were wrong citations and
+seven were false positives. A mode that found nothing on a tree known to contain wrong citations
+would be worse than no mode, so the ratio is printed in its own output rather than engineered down.
+The six repaired: two in `doc/testing.md` pointing at a comment line rather than the check or the
+byte it describes, one in the `kawa_h1` `LIFECYCLE.md` pointing at a bare `}` where the function it
+names is fifty lines below (repaired by dropping the number — the prose already names the symbol),
+and three in the mux `LIFECYCLE.md` naming `Mux::shutting_down` while pointing into
+`Mux::shutting_down_inner`, the body that the four-line `SessionState` wrapper drives.
+
+**Every run prints what it declined to check.** The largest class is prose that names nothing the
+heuristics can test — 111 citations on that same run, more than half the surface — a sentence
+carrying no backticked symbol and none of the statement nouns, inside which a wrong citation is
+invisible here. A prose-to-prose citation is declined too, having no code shape to read, as is any
+span rule 1 already rejects. Silence about skipped work is the defect behind
+[sozu-proxy/sozu#1457][ident] and [sozu-proxy/sozu#1447][reuse], so the counts print whether or not
+anything was found.
+
+And it misses things while looking straight at them. The mux `LIFECYCLE.md`'s `Mux::timeout`
+citation carried the same defect as the three `shutting_down` ones above — its number pointed into
+`Mux::timeout_inner` — and the audit did not report it, because the word `timeout` appears in a
+`trace!` and a comment near the cited line. It was found by hand while dispositioning the finding
+on the bullet directly below it, and repaired with them. Proximity cannot tell "the name is nearby"
+from "the item is here". Treat a clean audit as "nothing
+obvious", never as "the citations are right"; the remedy that actually ends the class is to cite a
+**symbol**, which has no number to audit.
+
 ### Citing a test by name
 
 The same command carries a second, independent rule, for the citation form that has no path at all:
@@ -501,6 +560,8 @@ every rule here, unchanged.
 [reuse]: https://github.com/sozu-proxy/sozu/issues/1447
 [cit]: https://github.com/sozu-proxy/sozu/issues/1335
 [drift]: https://github.com/sozu-proxy/sozu/issues/1389
+[audit]: https://github.com/sozu-proxy/sozu/issues/1466
+[comment]: https://github.com/sozu-proxy/sozu/pull/1493
 
 ## Release Notes
 

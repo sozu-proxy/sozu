@@ -26,6 +26,12 @@
 #      it asks that there be no number. See "LINE NUMBERS CITED FROM A RUST
 #      COMMENT" further down.
 #
+# Plus one MODE that is not a rule: `--audit` reads a citation's prose against
+# its cited line and reports what does not plainly match. It resolves nothing,
+# forbids nothing and always exits 0, because its answer is a heuristic. See
+# "AUDITING A CITATION THAT NEVER CHANGED" below for the two signals, the
+# measured false-positive rate, and why it is not in `ci.yml`.
+#
 # Why this exists: a line number carries no anchor, so a citation rots the
 # moment anyone edits the file it points into — and the edit usually lands in a
 # *different* pull request than the one holding the citation, so no reviewer is
@@ -525,11 +531,105 @@
 #   tree points at a line number, so no comment in this tree can rot by an edit
 #   made somewhere above it.
 #
+# AUDITING A CITATION THAT NEVER CHANGED — `--audit`, AND WHY IT IS NOT A RULE
+#   Rules 1 to 4 resolve a citation and rule 5 forbids a form. None of the five
+#   can find a citation that was ALREADY WRONG the first time it was seen, and
+#   rule 2 cannot by construction: it compares a citation's text between two
+#   revisions, so "unchanged" is exactly the condition for being exempt. A
+#   change detector cannot find a defect that predates its first observation —
+#   sozu-proxy/sozu#1466, which measured four citations in
+#   `lib/src/protocol/mux/LIFECYCLE.md` at `5d5191e8` that were byte-identical
+#   across the whole series and wrong in every one of them. Three landed on
+#   comment lines under prose naming an insert or a push; the fourth,
+#   `h2.rs:710`, cited `self.stream_table.rst_sent_contains(sid)` and resolved
+#   to `let total_before = *total;`.
+#
+#   sozu-proxy/sozu#1493 closed that hole for RUST COMMENTS by forbidding the
+#   form there outright, which is a complete remedy and needs no heuristic.
+#   `doc/**` and `**/LIFECYCLE.md` deliberately keep line numbers, because
+#   there a number is sometimes the only way to name a span with no symbol, so
+#   that surface needs an audit instead of a prohibition.
+#
+#   `--audit` is that audit. It reads every citation's PROSE against its cited
+#   LINE and reports what does not plainly match, on TWO heuristics:
+#
+#     * THE TARGET IS A COMMENT while the citing prose names a statement, a
+#       call, an insert or a push. Single-line citations only — a RANGE that
+#       starts on a comment is this tree's normal way of covering a branch
+#       together with the sentence introducing it, and reading ranges too took
+#       the mode from 13 findings to 26 at `6172929e`, all 13 additions
+#       hand-audited and all 13 correct.
+#     * THE PROSE NAMES A SYMBOL THAT IS NOT THERE — not within
+#       AUDIT_WINDOW lines of the cited span, and not as an item enclosing it.
+#       That is the one that reaches #1466's fourth citation, which lands on
+#       ordinary code and looks healthy to everything else here.
+#
+#   IT IS ADVISORY, DELIBERATELY, AND IT IS NOT IN `ci.yml`. It always exits 0
+#   and it never edits a citation. A heuristic that fails a build is a
+#   heuristic people learn to silence, and the silencing outlives the reason;
+#   every rule above earns its exit code by resolving something, and none of
+#   these two resolves anything. What this produces is a LIST A HUMAN
+#   DISPOSITIONS — `wrong`, `correct`, or `false positive` with the reason —
+#   and the disposition is the deliverable, not the list.
+#
+#   WHAT ITS FIRST RUN COST AND BOUGHT, so nobody has to guess at the rate.
+#   At main `6172929e` it examined 108 of the surface's 221 cited spans and
+#   reported 13. Hand-audited, SIX were wrong citations and SEVEN were false
+#   positives — a little under half. That ratio is the honest price of the
+#   mode and it is printed in its own output. The six:
+#     * `doc/testing.md`'s `redirect_rewrite_auth_tests.rs:264`, the middle
+#       line of a three-line comment whose check is two lines below it;
+#     * `doc/testing.md`'s `h2_security_tests.rs:2440`, a comment four lines
+#       above the `0x20` byte the prose says is sent;
+#     * `kawa_h1/LIFECYCLE.md`'s `lib/src/tcp.rs:2426`, a bare `}`, where
+#       `fn handle_connection_result` is at 2479 — repaired by dropping the
+#       number, since the prose already names the symbol;
+#     * three in `mux/LIFECYCLE.md` naming `Mux::shutting_down` while pointing
+#       into `shutting_down_inner`, the body that the four-line `SessionState`
+#       wrapper drives.
+#
+#   THE FALSE POSITIVES ARE DOCUMENTED, NOT TUNED AWAY. Two classes were
+#   tightened because the heuristic was simply wrong — a range that starts on a
+#   comment, and a symbol read across a bare-path citation belonging to another
+#   clause. The rest are left reporting, with the reason, because narrowing
+#   further would start costing real findings:
+#     * A SYMBOL THE PROSE NAMES AS A QUALIFIER, not as the cited construct —
+#       "Index of 232 with the parser still `Incomplete` (`expect.rs:249-259`)".
+#       The citation is right and the name belongs to the sentence, not the
+#       line.
+#     * A NAME THAT IS ONLY A COMPONENT of the identifier carrying it:
+#       `ClusterConfiguration` is present at `request_builder.rs:391-397` only
+#       inside `find_cluster_configuration`, which a whole-word search cannot
+#       see.
+#     * A NAME THE CITED LINE IS ABOUT BY ABSENCE: "remove `READABLE` interest
+#       (`h2.rs:4561`)" points at the mask that leaves `READABLE` out.
+#     * A DECLARATION FURTHER THAN AUDIT_WINDOW inside the construct the prose
+#       names — `h2.rs:2901`'s loop header is 16 lines above it.
+#
+#   AND WHAT IT CANNOT SEE AT ALL, counted in its own output beside what it
+#   checked, because silence about skipped work is the defect behind
+#   sozu-proxy/sozu#1457 and sozu-proxy/sozu#1447. The largest by far is PROSE
+#   THAT NAMES NOTHING TESTABLE — 111 citations at `6172929e`, more than half
+#   the surface — a sentence with no backticked symbol and none of the
+#   statement nouns, inside which a wrong citation is invisible here. Two more
+#   it declines by design: a prose-to-prose citation, which has no code shape
+#   to read, and any span rule 1 already rejects. And one it MISSED while
+#   looking straight at it: `mux/LIFECYCLE.md`'s `Mux::timeout` citation carried
+#   the same defect as the three `shutting_down` ones above — its number pointed
+#   into `timeout_inner` — and the audit did not report it, because the word
+#   `timeout` appears in a `trace!` and a comment within the window. It was
+#   found by hand while dispositioning the finding on the bullet directly below
+#   it, and repaired in the same changeset. Proximity cannot tell "the name is
+#   nearby" from "the item is here".
+#
 # Usage:
 #   python3 .github/scripts/check_doc_citations.py            # check the tree
 #   python3 .github/scripts/check_doc_citations.py --show     # + print every
 #                                                             #   resolved citation
 #   python3 .github/scripts/check_doc_citations.py --self-test # prove it fails
+#   python3 .github/scripts/check_doc_citations.py --audit     # advisory: read
+#                                                              #   every citation
+#                                                              #   against its prose
 #
 # Standard library only, on purpose: this is tooling, and sozu's production
 # dependency set does not grow for tooling.
@@ -1652,6 +1752,451 @@ def check_rust_comment_citations(root, historical=None, show=False, out=sys.stdo
     return examined, external, exempt, failures
 
 
+# ── The audit mode: a citation that was ALREADY wrong ────────────────────
+#
+# See "AUDITING A CITATION THAT NEVER CHANGED" in the header for what this
+# mode is for and why it never gates. Everything below is heuristic: it reads
+# the citing PROSE and the cited LINE and asks whether they plausibly describe
+# the same thing. That question has no mechanical answer, so this mode reports
+# and never fails, and every constant here carries the measurement that chose
+# it. Two trees are measured throughout — `6172929e`, the revision this mode
+# landed on, and `5d5191e8`, the revision sozu-proxy/sozu#1466 filed its four
+# wrong citations against, which is the only tree where the answers are known.
+
+# The statement nouns sozu-proxy/sozu#1466's own heuristic names, and no
+# others. Each says the prose is talking about a thing that EXECUTES — an
+# insert, a push, a call — which is what makes a comment line the wrong target
+# for it.
+#
+# "branch", "path" and "loop" are deliberately NOT here although they read as
+# belonging: this file's own convention text says "keep a line or a range only
+# where the prose means a specific branch", and `doc/**` uses "path" for a code
+# path and a filesystem path interchangeably. Measured: adding those three
+# moves the number of citations this mode EXAMINES from 108 to 118 at
+# `6172929e` and from 113 to 130 at `5d5191e8`, and moves the number it REPORTS
+# not at all — 13 and 15 either way. Nothing in either tree argues for them,
+# and a noun list is a false-positive multiplier the day one does.
+AUDIT_STATEMENT_NOUN = re.compile(
+    r"\b(?:statement|statements|call|calls|insert|inserts|push|pushes"
+    r"|arm|arms|field|fields|assignment|assignments)\b",
+    re.IGNORECASE,
+)
+
+# A code span in the prose. The audit reads only BACKTICKED text, never bare
+# prose words: these documents write every symbol in backticks, and reading
+# unbacked words turns `Resume` the English verb into `H2WritePhase::Resume`.
+BACKTICKED = re.compile(r"`([^`\n]+)`")
+
+# What a backticked span has to look like to be read as a SYMBOL: identifier
+# segments joined by `::` or `.`, with an optional call suffix.
+# `saturating_sub(1)` and `self.stream_table.rst_sent_contains(sid)` both
+# match; `gauge_add!`, a metric name with a hyphen and a markdown table row do
+# not.
+AUDIT_SYMBOL = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:\s*(?:::|\.)\s*[A-Za-z_][A-Za-z0-9_]*)*(?:\(.*\))?$"
+)
+
+# A name shorter than this is not looked for in the target file. The signal is
+# "the prose names something that is not there", and a short segment is not a
+# name — `get`, `now`, `push` and `close` each occur dozens of times in one
+# `h2.rs`, so searching for them answers "present" everywhere, which is the
+# same as not running. Measured at `6172929e`: 4 reports 19 findings, 6 reports
+# 16, 8 reports 13, 12 reports 9. 8 is where the generic names stop entering
+# and `rst_sent` — sozu-proxy/sozu#1466's own prose — is still readable.
+AUDIT_MIN_SEGMENT = 8
+
+# How far from the cited line the named symbol may sit and still count as
+# present. Measured at `6172929e`: 3 reports 14 findings, 8 reports 13, 16
+# reports 8, 32 reports 6. Widening it past 8 is pure suppression: the five
+# findings that disappear between 8 and 16 were hand-audited, and two of them —
+# `mux/LIFECYCLE.md`'s `mod.rs:2382-2383` and `mod.rs:2383`, both naming
+# `Mux::shutting_down` while pointing into `shutting_down_inner` — are wrong
+# citations repaired by this changeset. Nor is the window what makes the signal
+# work, which is the other half of the argument: #1466's `h2.rs:710`
+# names `rst_sent_contains`, whose nearest occurrence is over 1800 lines away.
+# The window exists to forgive a citation pointing a few lines inside what the
+# prose names, and 8 is enough for that.
+AUDIT_WINDOW = 8
+
+# A path written in backticks (`mod.rs`) matches AUDIT_SYMBOL — a `.` joins two
+# identifier segments — and is not a symbol. Tested on the SEGMENT so that
+# `doc/README.md` and a bare `h2.rs` are both caught.
+AUDIT_PATH_SEGMENTS = {"rs", "md"}
+
+# The item declarations a cited line can sit INSIDE. Kept to what a single line
+# states, because this file parses no Rust and is not going to start.
+ENCLOSING_FN = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)")
+ENCLOSING_TYPE = re.compile(
+    r"\b(?:struct|enum|trait|union)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    r"|\bimpl\b.*?\bfor\s+([A-Za-z_][A-Za-z0-9_]*)"
+    r"|\bimpl(?:\s*<[^>]*>)?\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+# The prose fragment is quoted whole up to this width. Wider than QUOTE_WIDTH's
+# 72 on purpose: rule 2 quotes ONE line of code to show what moved, while a
+# finding here has to carry enough of a sentence for a human to decide whether
+# it is about the line it cites.
+AUDIT_PROSE_WIDTH = 140
+
+
+def audit_fragment(body, doc_line, offset, line_starts):
+    """The prose a citation is embedded in, and where in it the citation sits.
+
+    Returns `(fragment, offset_into_fragment)`: the citation's own document
+    line, plus the line ABOVE it when the citation is the first thing on its
+    own line. A citation in that position is a wrapped continuation of the
+    sentence above, and reading its own line alone reads nothing.
+
+    That is not an edge case, it is the difference between catching
+    sozu-proxy/sozu#1466's fourth citation and not: at `5d5191e8`,
+    `lib/src/protocol/mux/LIFECYCLE.md` put `h2.rs:2775` alone on its line
+    under the prose naming `completed_streams.push`. Measured on that tree,
+    own-line-only reads 85 citations instead of 113, reports 11 findings
+    instead of 15, and reports THREE of #1466's four instead of four.
+
+    "First thing on its line" is decided on ALPHANUMERICS, not on whitespace: a
+    wrapped citation is routinely preceded by `(`, `- ` or a list marker, and a
+    whitespace-only test would take the line above for none of them.
+    """
+    line = doc_line(offset)
+    start = line_starts[line - 1]
+    before = body[start:offset]
+    text = body[start:line_starts[line]] if line < len(line_starts) else body[start:]
+    own = text.strip()
+    here = len(" ".join(before.split()))
+    if any(ch.isalnum() for ch in before) or line < 2:
+        return own, here
+    above = " ".join(body[line_starts[line - 2]:start].split())
+    if not above:
+        return own, here
+    return (above + " " + own).strip(), len(above) + 1 + here
+
+
+def audit_symbol(fragment, here):
+    """The one symbol THIS citation is attached to, or None.
+
+    THE NEAREST ONE BEFORE IT, not every symbol in the fragment. A document
+    line routinely carries two citations and three symbols, and reading them
+    all asks a citation to account for a name belonging to the clause beside
+    it. Measured at `6172929e`: reading the first symbol anywhere on the
+    fragment reports 24 findings, reading the attached one reports 13, and all
+    eleven that disappear were hand-audited and are correct citations. Every
+    one of them is this shape —
+
+        Successful parse (`expect.rs:219-236`) stores the `ProxyAddr` into
+        `self.addresses` …
+
+    where the symbol is the sentence's object, further down the span, and the
+    citation lands exactly where it says it does. The narrower reading still
+    reports all four of sozu-proxy/sozu#1466's citations, so it costs nothing
+    that is known to be a defect.
+
+    THE LAST SEGMENT of that symbol, and only when it is at least
+    AUDIT_MIN_SEGMENT long. Not the longest segment, which reads as the safer
+    choice and is the opposite: a citation almost always points INSIDE the item
+    it names, and a type name does not occur inside its own impl body, so
+    keyed on the longest segment `ConnectionH2::reset_stream` looks for
+    `ConnectionH2` at a line in the middle of `reset_stream` and reports a
+    correct citation. Measured at `6172929e`: longest-segment reports 16,
+    last-segment reports 13.
+
+    A token whose last segment is SHORTER than that — `HttpAnswers::get`,
+    `ParsingPhase::Error`, `completed_streams.push` — yields nothing rather
+    than being walked back to its type: the prose named a member, so the type
+    is the wrong thing to look for. That cost is paid on #1466's own fourth
+    citation, whose prose is `completed_streams.push` exactly; this signal
+    cannot test it and the comment signal is what catches it.
+
+    A citation's own text is skipped, and a backticked bare PATH ends the
+    search rather than being stepped over: `unlink_stream` (`mod.rs`) is this
+    repository's symbol-citation form, so a path in backticks is another
+    citation, and walking past one reads ITS symbol against this one's line.
+    """
+    for match in reversed(list(BACKTICKED.finditer(fragment))):
+        if match.end() > here:
+            continue
+        token = match.group(1).strip()
+        if CITATION.search(token) or not AUDIT_SYMBOL.match(token):
+            continue
+        segments = [s.strip() for s in re.split(r"::|\.", token.split("(", 1)[0]) if s.strip()]
+        if any(s in AUDIT_PATH_SEGMENTS for s in segments):
+            return None
+        last = segments[-1]
+        if last == "self" or len(last) < AUDIT_MIN_SEGMENT:
+            return None
+        return last
+    return None
+
+
+def audit_names_construct(fragment):
+    """Does this prose name something that EXECUTES, rather than an item?
+
+    Two ways, both narrow. A statement noun from AUDIT_STATEMENT_NOUN, or a
+    backticked symbol carrying a call, a field access or a path separator —
+    `completed_streams.push`, `saturating_sub(1)`, `Type::method`. A bare
+    `Prioriser` names an item and is not a construct: a citation pointing at
+    the doc comment ABOVE an item is what a reader wants, so naming one must
+    not arm the comment signal.
+    """
+    if AUDIT_STATEMENT_NOUN.search(fragment):
+        return True
+    for text in BACKTICKED.findall(fragment):
+        token = text.strip()
+        if CITATION.search(token) or not AUDIT_SYMBOL.match(token):
+            continue
+        segments = [s.strip() for s in re.split(r"::|\.", token.split("(", 1)[0]) if s.strip()]
+        if any(s in AUDIT_PATH_SEGMENTS for s in segments):
+            continue
+        if len(segments) > 1 or "(" in token:
+            return True
+    return False
+
+
+def comment_kind(line):
+    """`//!`, `///` or `//` for a comment line; None for anything else.
+
+    The three are reported separately because they are not the same claim. A
+    `//!` is a module preamble and a `///` documents the item below it, so a
+    citation landing on one may well be pointing at exactly what the prose
+    means; a plain `//` is a remark about the code beside it.
+    """
+    stripped = line.lstrip()
+    for marker in ("//!", "///", "//"):
+        if stripped.startswith(marker):
+            return marker
+    return None
+
+
+def enclosing_names(lines, start):
+    """The nearest `fn` and the nearest type-ish item declared above `start`.
+
+    This is the difference between a signal and a noise generator. The standing
+    form in this tree is prose that names the ENCLOSING function and cites one
+    statement inside it — `lib/src/protocol/mux/LIFECYCLE.md`'s list of
+    `remove_dead_stream` call sites labels each entry with the function that
+    holds it. The function name is nowhere near the cited line, because it is
+    at the top of the function, so a pure proximity search calls every entry in
+    that list wrong. Measured at `6172929e`: proximity alone reports 29
+    findings, proximity plus this reports 13, and all 16 that disappear are
+    prose naming the item its citation points inside.
+
+    NEAREST PRECEDING, not "the item this line is really in" — nothing here
+    parses Rust, so a line between two functions takes the name of the one
+    above it. That direction is deliberate: it can only SILENCE a finding,
+    never invent one, and this mode reports to a human.
+    """
+    names = set()
+    seen_fn = False
+    seen_type = False
+    for number in range(min(start, len(lines)) - 1, -1, -1):
+        line = lines[number]
+        if not seen_fn:
+            match = ENCLOSING_FN.search(line)
+            if match:
+                names.add(match.group(1))
+                seen_fn = True
+        if not seen_type:
+            match = ENCLOSING_TYPE.search(line)
+            if match:
+                names.add(next(group for group in match.groups() if group))
+                seen_type = True
+        if seen_fn and seen_type:
+            break
+    return names
+
+
+def _symbol_present(lines, start, end, symbol):
+    """Is `symbol` near the cited span, or does it name an item enclosing it?"""
+    if symbol in enclosing_names(lines, start):
+        return True
+    lo = max(0, start - 1 - AUDIT_WINDOW)
+    hi = min(len(lines), end + AUDIT_WINDOW)
+    # CASE-INSENSITIVELY, which is not laxity: this tree names a metric in
+    # prose by its emitted string (`accept_queue.backpressure`) and in code by
+    # the SCREAMING_CASE constant carrying it (`names::accept_queue::BACKPRESSURE`).
+    # Measured: a case-sensitive search moves `6172929e` from 13 findings to 15
+    # and `5d5191e8` from 15 to 17, and the additions are that one pair of
+    # citations, each landing exactly on the line it names.
+    pattern = re.compile(r"\b%s\b" % re.escape(symbol), re.IGNORECASE)
+    return any(pattern.search(line) for line in lines[lo:hi])
+
+
+def _clip_audit(text, width=QUOTE_WIDTH):
+    """One line, whitespace collapsed, clipped with an ellipsis."""
+    flat = " ".join(text.split())
+    return flat if len(flat) <= width else flat[: width - 1] + "…"
+
+
+def audit(root, show=False, out=sys.stdout):
+    """Read every citation's PROSE against its cited LINE. Advisory, never a gate.
+
+    Returns `(examined, declined, findings)`: how many cited spans were put to
+    the heuristics at all, a sorted `(reason, count)` list of everything it
+    declined to check, and the findings.
+
+    Rule 2 compares a citation between two revisions, so a citation that was
+    already wrong the first time it was seen is exempt forever — "unchanged" is
+    exactly the condition for being exempt. This mode asks a different
+    question, of one revision, and therefore has no such blind spot. What it
+    has instead is a heuristic answer, which is why it reports and never fails.
+
+    TWO SIGNALS, both measured against sozu-proxy/sozu#1466's four known-wrong
+    citations at `5d5191e8`, which is the only tree where the answers are known:
+
+      * THE TARGET IS A COMMENT while the prose names a construct that
+        executes. Three of the four — `h2.rs:2567`, `:2668`, `:2775` — land on
+        comment lines under prose naming an insert and a push.
+      * THE PROSE NAMES A SYMBOL THAT IS NOT THERE, neither within
+        AUDIT_WINDOW lines of the cited span nor as an item enclosing it. The
+        fourth, `h2.rs:710`, cited as `self.stream_table.rst_sent_contains(sid)`,
+        lands on `let total_before = *total;` — ordinary code, invisible to the
+        first signal, with the nearest `rst_sent_contains` over 1800 lines away.
+
+    A span that arms both is ONE finding carrying both signals, never two.
+
+    THE COMMENT SIGNAL READS A SINGLE-LINE CITATION ONLY. A RANGE that starts
+    on a comment is this tree's normal way of covering a branch together with
+    the comment introducing it — `manager.rs:248-252` is the over-size check
+    and the sentence above it — and treating a range like a single line turns
+    that convention into a report. Measured at `6172929e`: reading ranges too
+    takes this mode from 13 findings to 26, of which 15 are comment findings
+    and 13 of those 15 are ranges; all 13 were hand-audited and all 13 are
+    correct citations. All three of #1466's comment-line citations are single
+    lines, so the restriction costs nothing that is known to be a defect.
+    """
+    by_suffix = target_files(root)
+    cache = {}
+    findings = []
+    examined = 0
+    declined = {}
+
+    def decline(reason):
+        declined[reason] = declined.get(reason, 0) + 1
+
+    for doc in doc_files(root):
+        doc_dir = os.path.dirname(doc)
+        with open(os.path.join(root, doc), encoding="utf-8") as handle:
+            body = handle.read()
+        doc_line = doc_line_finder(body)
+        line_starts = [0]
+        for text in body.splitlines(keepends=True):
+            line_starts.append(line_starts[-1] + len(text))
+
+        for cited, spans_text, spans, offset in citations(body):
+            where = "%s:%d" % (doc, doc_line(offset))
+            if cited is None:
+                decline("a bare continuation binding to no path (rule 1 reports it)")
+                continue
+            target, _ = resolve_path(cited, by_suffix, root, doc_dir)
+            if target is None:
+                decline("a cited path that does not resolve (rule 1 reports it)")
+                continue
+            if not target.endswith(".rs"):
+                decline("a prose-to-prose citation, which has no code shape to read")
+                continue
+            if target not in cache:
+                with open(os.path.join(root, target), encoding="utf-8") as handle:
+                    cache[target] = handle.read().splitlines()
+            lines = cache[target]
+
+            fragment, here = audit_fragment(body, doc_line, offset, line_starts)
+            names_construct = audit_names_construct(fragment)
+            symbol = audit_symbol(fragment, here)
+
+            for start, end in spans:
+                span = str(start) if start == end else "%d-%d" % (start, end)
+                if start < 1 or start > end or end > len(lines) or not lines[start - 1].strip():
+                    decline("a span rule 1 already rejects (out of range, inverted or blank)")
+                    continue
+                if not names_construct and symbol is None:
+                    decline("prose naming nothing this heuristic can test")
+                    continue
+                examined += 1
+
+                signals = []
+                kind = comment_kind(lines[start - 1]) if start == end else None
+                if kind is not None and names_construct:
+                    signals.append(
+                        "the target is a `%s` comment while the prose names a statement or "
+                        "call — %s:%d is `%s`"
+                        % (kind, target, start, _clip_audit(lines[start - 1]))
+                    )
+                if symbol is not None and not _symbol_present(lines, start, end, symbol):
+                    signals.append(
+                        "the prose names `%s`, which occurs nowhere within %d lines of %s:%s "
+                        "and names no item enclosing it — %s:%d is `%s`"
+                        % (symbol, AUDIT_WINDOW, target, span, target, start,
+                           _clip_audit(lines[start - 1]))
+                    )
+                if not signals:
+                    if show:
+                        out.write(
+                            "%s  %s:%s  |plausible: %s\n"
+                            % (where, target, span, _clip_audit(lines[start - 1]))
+                        )
+                    continue
+                findings.append(
+                    "%s: `%s:%s`\n      prose: %s\n      %s"
+                    % (where, cited, span, _clip_audit(fragment, AUDIT_PROSE_WIDTH),
+                       "\n      ".join(signals))
+                )
+
+    return examined, sorted(declined.items()), findings
+
+
+def audit_report(root, show=False):
+    """Print the audit and ALWAYS return 0. See `audit` for the heuristics.
+
+    Separate from `main`'s five-rule run rather than appended to it, and
+    exiting 0 whatever it finds. A heuristic that fails a build is a heuristic
+    people learn to silence, and the silencing outlives the reason — which is
+    how a rule ends up with an exemption table nobody reads. This one produces
+    a list a human dispositions, and the disposition is the deliverable.
+    """
+    examined, declined, findings = audit(root, show=show)
+    print("ADVISORY: the citation audit is not a gate. It always exits 0, it never edits a")
+    print("citation, and it is deliberately absent from the `Doc citations` CI job. Every")
+    print("finding below is a GUESS that a human has to disposition against the code.")
+    print("Measured on its own first run, at main `6172929e`: 13 findings, 6 of them wrong")
+    print("citations and 7 false positives. Expect roughly half of what you read here to be")
+    print("a citation that is doing its job.")
+    print("")
+    if findings:
+        print(
+            "%d of %d examined citations do not plainly match the prose citing them:"
+            % (len(findings), examined)
+        )
+        for line in findings:
+            print("  " + line)
+            print("")
+    else:
+        print("No finding: all %d examined citations plainly match the prose citing them." % examined)
+        print("That is not a proof. Both heuristics are crude, and a tree with no finding is")
+        print("more likely to mean the prose says nothing testable than that every citation is")
+        print("right — read the declined counts below before reading this as clean.")
+        print("")
+
+    print("What it DECLINED to check, beside what it checked:")
+    if declined:
+        for reason, count in sorted(declined, key=lambda pair: -pair[1]):
+            print("  %5d  %s" % (count, reason))
+    else:
+        print("      0  nothing was declined")
+    print("")
+    print("Silence about skipped work is the defect that produced sozu-proxy/sozu#1457 and")
+    print("sozu-proxy/sozu#1447, so the declined counts are printed whether or not anything")
+    print("was found. The largest is prose that names nothing this heuristic can test: a")
+    print("sentence with no backticked symbol and none of the statement nouns is read by")
+    print("neither signal, and a wrong citation inside one is invisible here.")
+    print("")
+    print("Disposition each finding as `wrong`, `correct`, or `false positive` WITH the")
+    print("reason — a false positive is information about the heuristic, not noise to")
+    print("ignore. Where a finding is wrong and the prose names an item, cite the SYMBOL")
+    print("and drop the number: a symbol cannot drift and needs no audit.")
+    print("Convention and local usage: doc/README.md#auditing-citations-that-never-change")
+    return 0
+
+
 FIXTURE_EXPECTED = [
     "doc/bad.md:3: `sample.rs:99` — past end of sample.rs (10 lines)",
     "doc/bad.md:5: `sample.rs:4` — sample.rs:4 is blank",
@@ -1770,7 +2315,7 @@ FIXTURE_BARE_GROUP_EXPECTED = "doc/bad.md:24: `sample.rs:3/3` — line 3 repeate
 # that pin the scope. `doc/good.md` contributes nine; `doc/reference.md`,
 # `doc/wide.md` and `keyed.rs` none —
 # each is a citation TARGET, and carries no citation of its own.
-FIXTURE_TOTAL = 44
+FIXTURE_TOTAL = 48
 
 # Rule 2's half of the fixtures is a PAIR of revisions, so every file that
 # drifts carries its base revision beside it as `<name>.base`. That suffix is
@@ -1885,7 +2430,7 @@ REPORTED_PAIR = re.compile(r": was `(.*)`, now `(.*)`$")
 # half-applied renumbering used to exempt, and the reused number. Both are
 # spans the WHOLE-TUPLE key skipped or kept by accident rather than by rule,
 # so this counter moving from 32 to 34 is the coverage the per-span key buys.
-FIXTURE_DRIFT_COMPARED = 34
+FIXTURE_DRIFT_COMPARED = 39
 
 
 # The exact number of cited line ENDS the rule declined to compare because this
@@ -2028,6 +2573,48 @@ FIXTURE_COMMENT_EXTERNAL = 2
 FIXTURE_HISTORICAL = {
     ("comments_bad.rs", "drift.rs:4"): "fixture allowlist witness",
 }
+
+# The audit mode's half of the fixtures. `doc/audit.md` and `audit.rs` carry
+# FOUR citations: two that must be flagged, one per signal, and two that must
+# NOT be. The pair that must stay silent is the point — a heuristic is only as
+# good as what it declines to report, and both of these are shapes an earlier
+# build of this mode reported by the dozen on the real tree.
+#
+# `doc/audit.md` is NOT in BROKEN_FIXTURES: every one of its four citations
+# resolves to a non-blank line, so rules 1 to 5 must stay silent on it and the
+# clean-tree run must still exit 0. The audit is the only thing that reads it.
+FIXTURE_AUDIT_EXPECTED = [
+    "doc/audit.md:3: `audit.rs:10`",
+    "doc/audit.md:7: `audit.rs:11`",
+]
+
+# The two signals, asserted by the text that DISCRIMINATES them rather than by
+# list position. Both findings would still be two findings if the comment
+# signal fired on the symbol case and vice versa, and that swap is exactly what
+# a rewrite gets wrong.
+FIXTURE_AUDIT_COMMENT = "the target is a `//` comment while the prose names a statement or call"
+FIXTURE_AUDIT_SYMBOL = "the prose names `settle_fee`"
+
+# The two that must stay silent, named by their citation text.
+#
+#   * `audit.rs:10-13` is a RANGE starting on the same comment line the flagged
+#     single-line citation names. Delete the `start == end` guard and this
+#     becomes a finding — and with it the 13 correct range citations measured
+#     on the real tree at `6172929e`.
+#   * `audit.rs:30` sits 14 lines below its own `fn`, so only `enclosing_names`
+#     answers for it. Delete that and this becomes a finding — and with it the
+#     16 correct ones measured on the same tree.
+FIXTURE_AUDIT_QUIET = ("audit.rs:10-13", "audit.rs:30")
+
+# What the audit looked at, and the largest thing it declined to look at. The
+# second is asserted for rule 2's own reason: a mode that reports what it
+# checked and stays quiet about what it skipped reads as complete coverage, and
+# 26 of the fixture tree's citations are prose this heuristic cannot test at
+# all. That number is the honest half of a clean audit.
+FIXTURE_AUDIT_EXAMINED = 11
+FIXTURE_AUDIT_UNTESTABLE = 26
+FIXTURE_AUDIT_UNTESTABLE_REASON = "prose naming nothing this heuristic can test"
+
 
 # Every fixture document that is MEANT to fail, removed for the clean-tree run.
 BROKEN_FIXTURES = (
@@ -2471,6 +3058,90 @@ def self_test():
             "and a key that does not match exempts nothing while looking like it does."
         )
 
+    # ── The audit mode ────────────────────────────────────────────────────
+    # Not a rule: it reports and never gates, so the assertions are about WHAT
+    # it says, not about an exit code. Two findings, one per signal, and two
+    # citations it must leave alone.
+    audit_examined, audit_declined, audit_findings = audit(fixtures)
+    audit_findings = sorted(audit_findings)
+    if len(audit_findings) != len(FIXTURE_AUDIT_EXPECTED):
+        ok = False
+        print(
+            "FAIL self-test: expected %d audit findings from the fixtures, got %d:"
+            % (len(FIXTURE_AUDIT_EXPECTED), len(audit_findings))
+        )
+        for line in audit_findings:
+            print("  " + line)
+    else:
+        for expected, actual in zip(FIXTURE_AUDIT_EXPECTED, audit_findings):
+            if not actual.startswith(expected):
+                ok = False
+                print("FAIL self-test: expected an audit finding starting %r, got %r"
+                      % (expected, actual.splitlines()[0]))
+
+    # Each signal fires on ITS OWN case. Asserted separately because the counts
+    # above cannot tell one signal from the other, and a build where the
+    # comment signal answered for the symbol case would pass every count here.
+    for expected, reason, what in (
+        (FIXTURE_AUDIT_EXPECTED[0], FIXTURE_AUDIT_COMMENT,
+         "`audit.rs:10` is a `//` comment cited by prose naming a call — the signal "
+         "sozu-proxy/sozu#1466 named, and the one that catches three of its four"),
+        (FIXTURE_AUDIT_EXPECTED[1], FIXTURE_AUDIT_SYMBOL,
+         "`audit.rs:11` is ordinary code whose only tell is that `settle_fee` is not "
+         "there — the signal that catches #1466's FOURTH citation, which lands on "
+         "`let total_before = *total;` and looks perfectly healthy"),
+    ):
+        if not any(line.startswith(expected) and reason in line for line in audit_findings):
+            ok = False
+            print(
+                "FAIL self-test: expected the audit finding %s to carry %r — %s."
+                % (expected, reason, what)
+            )
+
+    # The two it must leave alone. This is the half that keeps the mode usable:
+    # a heuristic tuned until it reports everything is the same as one tuned
+    # until it reports nothing.
+    for quiet in FIXTURE_AUDIT_QUIET:
+        if any(quiet in line for line in audit_findings):
+            ok = False
+            print(
+                "FAIL self-test: the audit reported `%s`, which must stay silent. See "
+                "FIXTURE_AUDIT_QUIET for what each of the two pins and how many correct "
+                "citations on the real tree go with it." % quiet
+            )
+
+    declined_counts = dict(audit_declined)
+    if audit_examined != FIXTURE_AUDIT_EXAMINED:
+        ok = False
+        print(
+            "FAIL self-test: the audit examined %d fixture citations, expected exactly %d — "
+            "the scanned surface or one of the two prose gates has moved"
+            % (audit_examined, FIXTURE_AUDIT_EXAMINED)
+        )
+    if declined_counts.get(FIXTURE_AUDIT_UNTESTABLE_REASON) != FIXTURE_AUDIT_UNTESTABLE:
+        ok = False
+        print(
+            "FAIL self-test: the audit declined %r for %r citations, expected exactly %d. "
+            "An audit that counts what it checked and not what it skipped reads as complete "
+            "coverage — sozu-proxy/sozu#1457, sozu-proxy/sozu#1447."
+            % (FIXTURE_AUDIT_UNTESTABLE_REASON,
+               declined_counts.get(FIXTURE_AUDIT_UNTESTABLE_REASON), FIXTURE_AUDIT_UNTESTABLE)
+        )
+
+    # And the command line, because `--audit` must NOT act on what it finds.
+    # This is the inverse of every other CLI assertion here: the broken tree
+    # exits 1 for the five rules and the audit over the same tree exits 0.
+    code, out = _run_cli(["--audit", "--root", fixtures])
+    if (code != 0 or "ADVISORY" not in out
+            or FIXTURE_AUDIT_COMMENT not in out or FIXTURE_AUDIT_SYMBOL not in out):
+        ok = False
+        print(
+            "FAIL self-test: `--audit` over the fixture tree exited %d, expected 0 with an "
+            "advisory banner and both findings — a heuristic that fails a build is one "
+            "people learn to silence" % code
+        )
+        print("".join("    " + line + "\n" for line in out.splitlines()))
+
     # `check()` classifying correctly is NOT the same as the command acting on
     # it. A build of this script that reports every failure and still exits 0
     # is green in CI and guards nothing, and nothing above this point executes
@@ -2506,11 +3177,14 @@ def self_test():
             "seen in Rust comments (%d naming no file in the fixture tree); %d + %d + %d "
             "+ %d + %d expected failures reported, the fixture exemption table moving one "
             "verdict, exit 1 on the broken tree and 0 on the clean one, and an unreachable "
-            "base refused instead of skipped."
+            "base refused instead of skipped. The audit examined %d of them and reported "
+            "%d, one per signal, leaving a comment-started RANGE and a line answered only "
+            "by its enclosing item alone, and exiting 0 on a tree it found things in."
             % (
                 total, compared, exempt, examined, checked, pinned, unpinned,
                 seen, external,
                 len(bad), len(drifted), len(dead), len(mismatched), len(cited_lines),
+                audit_examined, len(audit_findings),
             )
         )
     return 0 if ok else 1
@@ -2537,10 +3211,20 @@ def main():
     )
     parser.add_argument("--show", action="store_true", help="print every resolved citation")
     parser.add_argument("--self-test", action="store_true", help="run the fixture self-test and exit")
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="read every citation's prose against its cited line and report what does not "
+        "plainly match, then exit 0. ADVISORY and standalone: it runs none of the five "
+        "rules, never fails a build, and is deliberately not in the CI job.",
+    )
     args = parser.parse_args()
 
     if args.self_test:
         return self_test()
+
+    if args.audit:
+        return audit_report(os.path.abspath(args.root), show=args.show)
 
     root = os.path.abspath(args.root)
     status = 0

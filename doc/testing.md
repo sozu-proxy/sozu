@@ -718,7 +718,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   `test_h2_default_answer_terminates_stream` passes on the decoded `:status`
   alone. The H1 form of the rule is a
   status-line prefix check rather than `response.contains("302")`
-  (`e2e/src/tests/redirect_rewrite_auth_tests.rs:264`). Nineteen indexed-status
+  (`e2e/src/tests/redirect_rewrite_auth_tests.rs:266-267`). Nineteen indexed-status
   byte probes survive in `h2_security_tests.rs` and
   `h2_security_header_injection.rs`, inventoried in
   `e2e/COVERAGE.md > Status assertions`, together with the `0x8D` / `:status 404`
@@ -736,7 +736,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   (`lib/src/protocol/mux/converter.rs:112`, armed at
   `lib/src/protocol/mux/h2.rs:5768`) prepends a `001xxxxx` HPACK dynamic table
   size update when a peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e
-  call sites send one: `h2_security_tests.rs:2440` (value 0) and
+  call sites send one: `h2_security_tests.rs:2444` (value 0) and
   `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
   `try_h2_large_gzipped_chunked_drains_fully` and
   `try_h2_large_chunked_7mb_drains_fully`
