@@ -149,7 +149,7 @@ mod h2_flow_control;
 mod h2_header_reassembly;
 mod h2_scheduler;
 mod h2_stream_table;
-mod h2_transmit;
+pub mod h2_transmit;
 mod h2_write_pass;
 mod hpack_state;
 pub mod parser;
@@ -188,7 +188,9 @@ pub use crate::protocol::mux::{
     h2::ConnectionH2,
     h2::H2ByteAccounting,
     h2::H2ConnectionConfig,
+    h2::{H2ReadOutcome, H2ReadTarget, H2StreamId, H2WriteTarget},
     h2_flood_detector::H2FloodConfig,
+    h2_write_pass::H2WritePass,
     parser::H2Error,
     router::Router,
     stream::{Stream, StreamParts, StreamState},

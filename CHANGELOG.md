@@ -240,6 +240,86 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: lift the two H2 byte movers out of the core, widen the poll/handle seam to
+  `pub`, and export `h2_transmit` with `gather` as a `pub unsafe fn`
+  ([#1339](https://github.com/sozu-proxy/sozu/issues/1339), Q10).**
+  `ConnectionH2::readable` and `ConnectionH2::write_streams` — the only production code on the H2
+  stream read and write paths that touches `self.socket` — move into a dedicated
+  `impl<Front: SocketHandler> ConnectionH2<Front>` block, the last one in `h2.rs` before
+  `#[cfg(test)] mod tests`, which holds those two functions and nothing else. Both bodies move
+  statement for statement and an inherent impl is order-independent, so this is
+  behaviour-preserving: no condition, ordering, counter or readiness decision changed, and
+  `h2.rs`'s production `self.socket` expressions are unchanged in number. What moved is where two
+  of them sit, so the socket coupling still owed on this path is countable by reading one region
+  instead of grepping the file, and that region is where the socket goes on living when
+  `ConnectionH2` stops carrying one. The query / flush / query triple the entry above moved out of
+  `finalize_write` travels with `write_streams` into the same block: that step is a socket touch
+  too, and it belongs on the same side of the split as the vectored write.
+
+  `ConnectionH2::poll_read_target`, `ConnectionH2::handle_read`,
+  `ConnectionH2::poll_write_target` and `ConnectionH2::handle_write` become `pub`, so a driver
+  outside this crate can eventually stand where those two functions stand. Four types follow them
+  because `private_interfaces` makes them follow, not because this step chose to widen them:
+  `H2ReadTarget`, `H2ReadOutcome` and `H2WriteTarget` in `h2.rs`, and `H2WritePass` in
+  `h2_write_pass.rs`, all appear in those four signatures, and a `pub` method of a re-exported
+  type may not name a `pub(super)` one — `cargo clippy … -D warnings` reports exactly those five
+  errors against the four `pub` markers alone. All four are re-exported from `protocol::mux`
+  beside `H2StreamId`, because a `pub` method whose argument type cannot be NAMED out of crate is
+  not callable out of crate either. `H2FinalizeTarget` and `H2ControlFlushTarget` stay
+  `pub(super)`: they appear only in the signatures of private functions.
+
+  **`h2_transmit` is exported, asymmetrically and on purpose.** `mod h2_transmit` becomes
+  `pub mod`, `gather` becomes a **`pub unsafe fn`** and `confirm` a plain `pub fn`. `gather` could
+  not be a plain `pub fn`: it PUSHES `IoSlice<'static>` borrowed out of its `&Kawa<T>` argument, so
+  three lines of safe out-of-crate code — call `gather`, drop the `Kawa`, read the first
+  descriptor — would be undefined behaviour with no `unsafe` written anywhere in them, and `kawa`
+  is a published crate, so not one Sōzu internal is needed to reach it. A `'static` in a safe
+  signature does not merely fail to state the obligation, it denies there is one. `unsafe` in the
+  signature puts the lifetime obligation on the caller, where it belongs once the caller can live
+  outside this crate, and a `# Safety` section names both halves of it: `kawa` must not be dropped
+  or mutated while a descriptor is readable, and `io_slices` must be emptied before that first
+  mutation.
+
+  `confirm` is deliberately NOT `unsafe`. It produces no descriptor; it only destroys them, and
+  destroying them is well defined even when they already dangle — `Vec::clear` drops `IoSlice`
+  values, and an `IoSlice` is a pointer and a length with no `Drop` that dereferences. Everything
+  after the clear is `Kawa::consume`, a safe `kawa` API where too large a `size` is a truncation
+  bug rather than undefined behaviour. So it leaves its caller no obligation, and `unsafe` on it
+  would be decoration that blunts what `unsafe` means at the one call site where it means "a
+  lifetime is being asserted here".
+
+  **The `unsafe` windows, now two blocks rather than one.** The inner block is unchanged:
+  `gather`'s `slice::from_raw_parts`, opening and closing inside that function. The outer one is
+  the `unsafe { … }` the `pub unsafe fn` forces into `ConnectionH2::write_streams`, and it wraps
+  the `gather` CALL and nothing else — not the vectored write, not the `confirm`. It is the only
+  `unsafe` keyword in `h2.rs` production code. The window those blocks guard is the same one and
+  did not widen: it opens at that `gather` call and closes at the `confirm` three statements
+  later, where `io_slices.clear()` runs before the consume that may relocate `kawa.storage`, with
+  nothing entered in between but the `SocketHandler::socket_write_vectored` that reborrows the
+  descriptors and cannot retain them. No `IoSlice<'static>` survives one loop iteration. The
+  bracket still does not span the poll/handle seam, which matters more now that the seam is `pub`;
+  `write_streams` stays private for that reason, and an out-of-crate caller now owns the identical
+  argument about its own bracket instead of the argument dissolving.
+
+  **Out-of-crate driving is still not possible, and nothing here claims it is.** Two things stand
+  in the way, neither in this step's scope: the buffers both protocols name are reached through
+  the private `read_space` / `write_buffer` over the private `ConnectionH2::zero`, and
+  `H2WritePass` has no reachable constructor — the byte totals `H2WritePass::new` takes come from
+  the private `ConnectionH2::compute_stream_byte_totals`. `sim/tests/h2_simulation.rs` therefore
+  keeps driving `ConnectionH2::readable` / `ConnectionH2::writable` over its own in-memory
+  `SocketHandler`, and its header now names those two gaps.
+
+  Intra-doc links inside the newly-public documentation are demoted to plain backticks, because
+  `private_intra_doc_links` under `RUSTDOCFLAGS="-D warnings"` rejects a link from public
+  documentation to a private item — `read_space`, `h2_transmit`'s own reference to
+  `H2Scheduler::begin_pass`, three `H2WritePhase` variants, `hpack_state::HpackState`,
+  `ConnectionH2::finalize_write`, `flush_zero_to_socket`, `write_streams` and
+  `H2WritePass::stalled` / `resume_bytes` among them. Every one still names its symbol, so no
+  citation became a line. The `h2.rs` and `mod.rs` line citations in `doc/h2_mux_internals.md`,
+  `doc/testing.md` and `lib/src/protocol/mux/LIFECYCLE.md` were re-anchored onto the text they
+  already named, and every re-anchored line end was checked to name byte-identical text inside an
+  identically-named enclosing `fn` at the base revision.
+
 - **`refactor(mux-h2)`: the two remaining query / flush / query triples move out of the H2 core
   (issue [#1339](https://github.com/sozu-proxy/sozu/issues/1339), Q10).**
   `ConnectionH2::finalize_write` and `ConnectionH2::flush_pending_control_frames` were the last

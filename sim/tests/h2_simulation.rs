@@ -15,7 +15,15 @@
 //!
 //! The byte-in / byte-out split is half-landed: [`ConnectionH2`] already has
 //! `poll_read_target` / `handle_read` and the `h2_transmit::gather` /
-//! `h2_transmit::confirm` write pair, but they are `pub(super)` and
+//! `h2_transmit::confirm` write pair, and those four poll/handle entry points
+//! are now `pub` and re-exported with `H2ReadTarget`, `H2ReadOutcome`,
+//! `H2WriteTarget` and `H2WritePass`. Driving them from HERE is still not
+//! possible, for two remaining reasons: the buffers they name are reached
+//! through the private `read_space` / `write_buffer` over the private
+//! `ConnectionH2::zero`, and `H2WritePass` has no reachable constructor. The
+//! `h2_transmit` pair is no longer one of them — `gather` is exported as a
+//! `pub unsafe fn`, carrying in its signature the lifetime obligation that a
+//! safe `pub` would have hidden, and `confirm` as a plain `pub fn`. And
 //! `ConnectionH2` is still generic over `Front: SocketHandler` with a `socket`
 //! field. So this harness takes the option this issue's Q10 discussion called
 //! **(a)**: it supplies its OWN in-memory [`SocketHandler`] ([`SimSocket`]) and
@@ -23,8 +31,8 @@
 //! points. Nothing here reaches into the core — every assertion is on bytes the
 //! core emitted, on `Connection::poll_timeout`, or on `ConnectionH2::stream_count`.
 //!
-//! When the remaining `Front` touch points go and the read/write pair becomes
-//! public, this harness **simplifies rather than breaks**: [`SimSocket`] and the
+//! When the remaining `Front` touch points go and those two reachability gaps
+//! close, this harness **simplifies rather than breaks**: [`SimSocket`] and the
 //! `mio` dev-dependency it exists to satisfy both disappear, the scenario grammar
 //! and every assertion below stay exactly as they are, and only [`H2Harness::pump`]
 //! is rewritten. That is the same "swap the driver, keep the scenarios" promise

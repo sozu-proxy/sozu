@@ -137,16 +137,17 @@ pub(super) enum H2WritePhase {
     /// takes the converter, order and census out of the pass as its FIRST
     /// statement, so re-entering it would `expect` on three empty `Option`s.
     /// `ConnectionH2::write_streams` never re-polls — it returns on `Done` and
-    /// on `Finalize` — but `poll_write_target` is `pub(super)`, and the read
-    /// side's `poll_read_target` already has direct unit tests, so a future
-    /// caller driving this core by hand is the likely one to find out.
+    /// on `Finalize` — but `poll_write_target` is `pub`, so its callers are no
+    /// longer enumerable by reading this crate, and the read side's
+    /// `poll_read_target` already has direct unit tests, so a future caller
+    /// driving this core by hand is the likely one to find out.
     Ended,
 }
 
 /// The `let` bindings of one `write_streams` pass, in the order the pre-image
 /// declared them, plus the phase and the three late-initialised values the
 /// inversion has to carry across the poll/handle boundary.
-pub(super) struct H2WritePass {
+pub struct H2WritePass {
     /// Where the drive loop is. Every transition is made by
     /// `ConnectionH2::poll_write_target` and by nothing else.
     pub(super) phase: H2WritePhase,
@@ -226,16 +227,17 @@ pub(super) struct H2WritePass {
 ///
 /// The guarantee that the converter's three pooled buffers reach
 /// `HpackState` again is structural: between
-/// [`Self::adopt_scheduler_pass`] and the first statement of
+/// `Self::adopt_scheduler_pass` and the first statement of
 /// `H2WritePhase::End`, `ConnectionH2::poll_write_target` has exactly ONE
 /// `return` — the `Transmit` yield — and `ConnectionH2::write_streams`' drive
 /// loop answers every `Transmit` and leaves only on `Done` or `Finalize`. So
-/// no pass can end while [`Self::converter`] is `Some`.
+/// no pass can end while `Self::converter` is `Some`.
 ///
 /// This catches the one way that could stop being true: a future caller of the
-/// `pub(super)` `poll_write_target` that stops driving after a `Transmit`. The
+/// now-`pub` `poll_write_target` that stops driving after a `Transmit` — a
+/// caller this crate no longer enumerates by reading its own call sites. The
 /// other way — a caller that polls once MORE after the pass answered — is
-/// closed by [`H2WritePhase::Ended`] instead, and needs no tripwire because
+/// closed by `H2WritePhase::Ended` instead, and needs no tripwire because
 /// the converter is already `None` by then.
 /// Dropping the converter there loses the buffers permanently and silently —
 /// `HpackState` simply re-grows three `Vec`s on every pass from then on, with

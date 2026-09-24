@@ -582,7 +582,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4069-4082
+```rust lib/src/protocol/mux/h2.rs:3910-3923
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -606,7 +606,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4115-4121
+```rust lib/src/protocol/mux/h2.rs:3956-3962
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -623,9 +623,9 @@ The other three sites take the `&mut self` wrapper
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5941`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5782`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6668`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6509`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -635,10 +635,10 @@ for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
 taken at the top of `H2WritePhase::Flush`'s post-flush tail
-(`lib/src/protocol/mux/h2.rs:2911`) and passes `stream.linked_token()` straight
+(`lib/src/protocol/mux/h2.rs:2752`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:2970-2971
+```rust lib/src/protocol/mux/h2.rs:2811-2812
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -765,7 +765,7 @@ not reasoned about, and it belongs to its own changeset.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:2295-2299
+```rust lib/src/protocol/mux/h2.rs:6853-6857
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -777,7 +777,11 @@ The read path is a **two-call protocol**, the read-side mirror of
 `h2_transmit::gather` / `h2_transmit::confirm` on the write side. `readable()`
 itself is only the caller that sits between the two halves, and its
 `self.socket.socket_read` is the single socket touch on the whole H2 read
-path:
+path. It lives in the SHELL impl block — the last
+`impl<Front: SocketHandler> ConnectionH2<Front>` in `h2.rs`, which holds
+`readable` and `write_streams` and nothing else — while `poll_read_target` and
+`handle_read` stay among the core impls. Those two are `pub` and re-exported
+from `protocol::mux` together with `H2ReadTarget` and `H2ReadOutcome`:
 
 1. `poll_read_target(context, endpoint)` runs the pass prelude — the
    `context.now` mirror, `prune_inactive_streams_while_closing`,
@@ -852,7 +856,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:3808-3812
+```rust lib/src/protocol/mux/h2.rs:3649-3653
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -977,7 +981,14 @@ control-frame path, not a TLS seam.
 ### write_streams(), poll_write_target() and handle_write()
 
 The main data-plane write path is a **drive loop**, the write-side mirror of
-`poll_read_target` / `handle_read`. `write_streams` is the shell: it owns the
+`poll_read_target` / `handle_read`. It sits beside `readable` in the shell
+impl block — the last `impl<Front: SocketHandler> ConnectionH2<Front>` in
+`h2.rs` — and it is the one member of this quartet that stays PRIVATE.
+`poll_write_target` and `handle_write` are `pub`, re-exported with
+`H2WriteTarget` and `H2WritePass`; `write_streams` is not, because the
+`Vec<IoSlice<'static>>` bracket must not become splittable by a caller this
+crate cannot enumerate — see the gather/confirm section below.
+`write_streams` is the shell: it owns the
 `Vec<IoSlice<'static>>` and the only `socket_write_vectored` call on the
 stream-write path, and it does nothing else but answer what the core asks for —
 including the TLS flush triple the pass ends on.
@@ -1040,7 +1051,8 @@ what makes a re-entry after a transmit different from a first entry:
 7. `Ended` — terminal. `End` releases the three scheduler-pass values as its
    FIRST statement, so re-entering it would `expect` on three empty `Option`s;
    `Ended` answers `H2WriteTarget::Done` instead. `write_streams` never
-   re-polls, but `poll_write_target` is `pub(super)`.
+   re-polls, but `poll_write_target` is `pub`, so its callers are no longer
+   enumerable by reading this crate.
 
 `handle_write` is the second half of the protocol and the pre-image flush
 loop's body: it logs the socket I/O, counts the bytes into the phase's own
@@ -1166,6 +1178,29 @@ because a QUIC datagram is all-or-nothing; there is no `poll_transmit` in this
 repository at all, and the sibling UDP core's coarser `UdpManager::poll_output`
 drains a manager-wide queue rather than one stream's `Kawa`.
 
+**Why the pair is exported asymmetrically.** `poll_read_target`,
+`handle_read`, `poll_write_target` and `handle_write` were widened so a driver
+outside this crate can eventually stand where `readable` and `write_streams`
+stand, and `h2_transmit` is `pub mod` so that driver can perform the write. But
+`gather` could not follow them as a plain `pub fn`: it PUSHES `IoSlice<'static>`
+borrowed out of its `&Kawa<T>` argument, so three lines of safe out-of-crate
+code — call `gather`, drop the `Kawa`, read the first descriptor — would be
+undefined behaviour with no `unsafe` written anywhere in them, and `kawa` is a
+published crate, so not one Sōzu internal is needed to reach it. A `'static` in
+a safe signature does not merely fail to state the obligation; it denies there
+is one.
+
+It is therefore `pub unsafe fn gather`, with a `# Safety` section naming both
+halves of the obligation: `kawa` must not be dropped or mutated while a
+descriptor is readable, and `io_slices` must be emptied before that first
+mutation. `confirm` is a plain `pub fn` and deliberately not `unsafe`: it
+produces no descriptor, and everything it does — `Vec::clear`, which drops
+`IoSlice` values without dereferencing them, then the safe `Kawa::consume` —
+is well defined even on descriptors that already dangle. Handing `consume` too
+large a `size` is a truncation bug, not undefined behaviour. Marking it
+`unsafe` would be decoration and would blunt what `unsafe` means at the one
+call site where it means "a lifetime is being asserted here".
+
 **The round-again, and the trap in it.** A partial write is ordinary: `size`
 may be the whole offer, less than it, or zero. `update_readiness_after_write`
 classifies a pass as stalled **iff `size == 0`** — the `status` only clears the
@@ -1181,7 +1216,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4983
+```rust lib/src/protocol/mux/h2.rs:4824
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -1334,7 +1369,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5984-5986
+```rust lib/src/protocol/mux/h2.rs:5825-5827
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1342,7 +1377,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5998-6004
+```rust lib/src/protocol/mux/h2.rs:5839-5845
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
