@@ -954,7 +954,7 @@ pub enum H2StreamId {
 /// empty SETTINGS, an empty DATA, a SETTINGS ACK) would stop being parsed at
 /// all. The variant is what stops a caller from having to know that.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum H2ReadTarget {
+pub enum H2ReadTarget {
     /// The core ended the pass by itself: a SETTINGS-ACK timeout, nothing owed
     /// by the peer, or no room left for what is owed. No read, and no
     /// [`ConnectionH2::handle_read`] — this is the pass's result.
@@ -963,7 +963,7 @@ pub(super) enum H2ReadTarget {
     /// buffer, because the frame in flight carries a zero-length payload.
     /// Perform no read and answer with [`H2ReadOutcome::Skipped`].
     Skip(H2StreamId),
-    /// Read into the space [`read_space`] returns for `stream_id`, which is
+    /// Read into the space `read_space` returns for `stream_id`, which is
     /// exactly `amount` bytes and never less than one, then answer with
     /// [`H2ReadOutcome::Filled`].
     Fill {
@@ -976,7 +976,7 @@ pub(super) enum H2ReadTarget {
 /// back to [`ConnectionH2::handle_read`]. Each variant answers the
 /// [`H2ReadTarget`] of the same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum H2ReadOutcome {
+pub enum H2ReadOutcome {
     /// Answers [`H2ReadTarget::Skip`]: no read was performed.
     Skipped,
     /// Answers [`H2ReadTarget::Fill`]: `amount` bytes of space were offered,
@@ -1030,10 +1030,10 @@ fn read_buffer<'a>(
 /// `while !kawa.out.is_empty()` inside a loop over the scheduler's order — so
 /// the write side is a DRIVE LOOP. [`ConnectionH2::handle_write`] settles one
 /// transmit and answers nothing; the pass's result comes from [`Self::Done`]
-/// or from the [`ConnectionH2::finalize_write`] the caller runs for
+/// or from the `ConnectionH2::finalize_write` the caller runs for
 /// [`Self::Finalize`].
 #[derive(Debug, Clone, Copy)]
-pub(super) enum H2WriteTarget {
+pub enum H2WriteTarget {
     /// The core ended the pass by itself. No write, no
     /// [`ConnectionH2::handle_write`], and no finalize — this is the pass's
     /// result.
@@ -1052,13 +1052,13 @@ pub(super) enum H2WriteTarget {
     /// `stream_id` is never [`H2StreamId::Zero`]. Several sites park `Zero` in
     /// `expect_write`, but the resume phase matches [`H2StreamId::Other`]
     /// only and the scheduler loop walks real stream ids; `self.zero` is
-    /// flushed by [`ConnectionH2::flush_zero_to_socket`], outside this pass
+    /// flushed by `ConnectionH2::flush_zero_to_socket`, outside this pass
     /// entirely.
     Transmit { stream_id: H2StreamId },
     /// The pass is over and owes the readiness decision of LIFECYCLE §9
-    /// invariant 16. Read [`ConnectionH2::tls_wants_write`], hand it to
+    /// invariant 16. Read `ConnectionH2::tls_wants_write`, hand it to
     /// `ConnectionH2::finalize_write` alongside `socket_write` and
-    /// `bytes_written`, and drive the [`H2FinalizeTarget`] that answers; the
+    /// `bytes_written`, and drive the `H2FinalizeTarget` that answers; the
     /// end of that protocol is the pass's result.
     ///
     /// `bytes_written` rides along with `socket_write` because
@@ -1953,7 +1953,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// three answers are produced by that prelude: a SETTINGS-ACK timeout and
     /// an idle `expect_read` both end the pass with no read at all. A poll
     /// that could not say "nothing" would not be the core's answer.
-    pub(super) fn poll_read_target<E, L>(
+    pub fn poll_read_target<E, L>(
         &mut self,
         context: &mut Context<L>,
         endpoint: &mut E,
@@ -2043,7 +2043,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// caller's read would pin `context.debug` and `Self::handle_frame`'s whole
     /// `&mut Context` with it. Re-deriving it from a `Copy` [`H2StreamId`] is
     /// a match and a field projection.
-    fn handle_read<E, L>(
+    pub fn handle_read<E, L>(
         &mut self,
         context: &mut Context<L>,
         endpoint: E,
@@ -2283,48 +2283,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         MuxResult::Continue
     }
 
-    /// Drive one frontend read pass.
-    ///
-    /// The core lives in `Self::poll_read_target` and `Self::handle_read`;
-    /// this function is the caller that sits between them, and its
-    /// `self.socket.socket_read` is the only socket touch on the whole H2 read
-    /// path. Keeping it *here* rather than inside the core is the point of the
-    /// split: a later change can move this body next to the socket without
-    /// reopening the frame state machine, exactly as
-    /// `h2_transmit::gather`/`confirm` already bracket the vectored write.
-    pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
-    where
-        E: Endpoint,
-        L: ListenerHandler + L7ListenerHandler,
-    {
-        match self.poll_read_target(context, &mut endpoint) {
-            H2ReadTarget::Done(result) => result,
-            H2ReadTarget::Skip(stream_id) => {
-                self.handle_read(context, endpoint, stream_id, H2ReadOutcome::Skipped)
-            }
-            H2ReadTarget::Fill { stream_id, amount } => {
-                let space = read_space(
-                    &mut self.zero,
-                    &mut context.streams,
-                    &self.position,
-                    stream_id,
-                    amount,
-                );
-                let (size, status) = self.socket.socket_read(space);
-                self.handle_read(
-                    context,
-                    endpoint,
-                    stream_id,
-                    H2ReadOutcome::Filled {
-                        amount,
-                        size,
-                        status,
-                    },
-                )
-            }
-        }
-    }
-
     /// Update the H2 connection-level *aggregate* gauges with this connection's
     /// current contribution, expressed as a signed delta against the last
     /// snapshot we emitted.
@@ -2405,123 +2363,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    /// Write application data (request/response bodies, headers) across all
-    /// active streams, respecting priority ordering and flow control.
-    ///
-    /// This is the main data-plane write path: it resumes any partially-written
-    /// stream, prepares new frames via the H2 block converter, flushes them to
-    /// the socket, and recycles completed streams.
-    ///
-    /// The core lives in [`Self::poll_write_target`] and [`Self::handle_write`];
-    /// this function is the caller that sits between them, and its
-    /// `self.socket.socket_write_vectored` is the only place a stream's bytes
-    /// reach the socket. Keeping it *here* rather than inside the core is the
-    /// point of the split, exactly as `readable()` keeps `socket_read` outside
-    /// [`Self::poll_read_target`].
-    ///
-    /// The pass's last step is a socket touch too, and for the same reason it
-    /// sits here: [`H2WriteTarget::Finalize`] is answered by reading
-    /// [`Self::tls_wants_write`], driving the [`H2FinalizeTarget`]
-    /// [`Self::finalize_write`] answers — performing
-    /// [`Self::flush_tls_records`] for [`H2FinalizeTarget::Flush`] and not for
-    /// [`H2FinalizeTarget::SkipFlush`] — and reading the query again for
-    /// [`Self::finalize_write_after_flush`]. That is the query / flush / query
-    /// triple `h2_close::TlsFlushPhase` names, and the three TLS seams it
-    /// reaches are what a byte-in / byte-out core receives as inputs instead
-    /// of asking for.
-    ///
-    /// Unlike `readable()` this is a LOOP and not a match: one read pass
-    /// performs one `socket_read`, while one write pass performs an unbounded
-    /// number of vectored writes — the pre-image's `while !kawa.out.is_empty()`
-    /// nested inside its walk of the scheduler's order. Every iteration here is
-    /// one of those rounds.
-    ///
-    /// The `Vec<IoSlice<'static>>` stays on this side of the split on purpose.
-    /// [`h2_transmit::gather`] hands back descriptors carrying a lifetime they
-    /// do not have, and [`h2_transmit::confirm`] must discharge them before the
-    /// consume that may relocate `kawa.storage`; bracketing the two around the
-    /// write in three adjacent statements keeps that `unsafe` window exactly as
-    /// wide as the pre-image's loop body kept it, and stops it from spanning a
-    /// `pub(super)` poll/handle boundary a future caller could interleave
-    /// `context` mutations into.
-    ///
-    /// The [`converter::H2BlockConverter`] is scoped to a single
-    /// `kawa.prepare` call rather than to the whole per-stream loop, so the
-    /// `&mut self.hpack` borrow it takes for the connection's HPACK encoder
-    /// never spans the loop. Every `&self` / `&mut self` method is therefore
-    /// callable inside the loop body; what remains deferred to after it —
-    /// RST accounting and stream retirement — is deferred for its own
-    /// ordering reasons, documented at each site.
-    /// [`converter::H2ConverterPass`] carries the scratch buffers and the
-    /// RFC 7541 §6.3 size-update signal from one stream's `prepare` to the
-    /// next by moving them, so the narrower scope costs no copy.
-    fn write_streams<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
-    where
-        E: Endpoint,
-        L: ListenerHandler + L7ListenerHandler,
-    {
-        // No `arm_timeout()` here. `writable()` reaches this function on every
-        // proxying-state pass, including one whose only output was the PING or
-        // SETTINGS acknowledgement `flush_pending_control_frames` drained a few
-        // statements earlier, so arming at pass entry renewed the session for a
-        // peer that had sent nothing but keepalives. The write side's share of
-        // LIFECYCLE §9 invariant 9 now lives in `ConnectionH2::handle_write`,
-        // where the pass knows a real stream's bytes reached the socket.
-        // Pre-compute byte totals for proportional overhead distribution.
-        let mut pass = H2WritePass::new(self.compute_stream_byte_totals(context));
-        let mut io_slices: Vec<IoSlice<'static>> = Vec::new();
-
-        loop {
-            match self.poll_write_target(context, &mut endpoint, &mut pass) {
-                H2WriteTarget::Done(result) => return result,
-                H2WriteTarget::Finalize {
-                    socket_write,
-                    bytes_written,
-                } => {
-                    let tls_wants_write = self.tls_wants_write();
-                    match self.finalize_write(tls_wants_write, socket_write, bytes_written, context)
-                    {
-                        H2FinalizeTarget::Done(result) => return result,
-                        // The only *action* of the three TLS seams, and the
-                        // one step the core cannot take for itself.
-                        H2FinalizeTarget::Flush => {
-                            self.flush_tls_records();
-                        }
-                        // The vectored writes above already attempted this
-                        // pass's flush; a second empty-buffer write would be a
-                        // syscall for nothing.
-                        H2FinalizeTarget::SkipFlush => {}
-                    }
-                    // A fresh query, not the binding above: this one asks
-                    // whether the step between them landed.
-                    let tls_wants_write = self.tls_wants_write();
-                    return self.finalize_write_after_flush(tls_wants_write);
-                }
-                H2WriteTarget::Transmit { stream_id } => {
-                    // Gather / write / confirm. The gather borrows
-                    // `kawa.storage` and hands back descriptors with an
-                    // extended lifetime; `confirm` discharges that obligation
-                    // before the consume. Both halves and the `unsafe` between
-                    // them live in `h2_transmit`.
-                    let kawa = write_buffer(
-                        &mut self.zero,
-                        &mut context.streams,
-                        &self.position,
-                        stream_id,
-                    );
-                    let offered = h2_transmit::gather(kawa, &mut io_slices);
-                    let (size, status) = self.socket.socket_write_vectored(&io_slices);
-                    debug_assert!(
-                        size <= offered,
-                        "the socket reported {size} bytes written for an offer of {offered}"
-                    );
-                    h2_transmit::confirm(kawa, &mut io_slices, size);
-                    self.handle_write(context, stream_id, size, status, &mut pass);
-                }
-            }
-        }
-    }
-
     /// Ask the core what it wants written to the socket, so the caller can
     /// perform that write and report it back through [`Self::handle_write`].
     ///
@@ -2533,22 +2374,22 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// stash because `expect_read` already lived on `stream_table`, whereas one
     /// write pass builds a dozen values that have to survive the round trip.
     ///
-    /// It is a `&mut` local of [`Self::write_streams`] and not an
+    /// It is a `&mut` local of `Self::write_streams` and not an
     /// `Option<H2WritePass>` field on `self`: every exit ends the pass, so it
     /// never outlives one call, and resumption ACROSS calls is already
     /// `H2StreamTable::expect_write`.
     ///
     /// **A caller that stops driving after an [`H2WriteTarget::Transmit`]
     /// strands the pass's converter**, and with it the three HPACK scratch
-    /// buffers it took out of [`hpack_state::HpackState`] — silently, and for
+    /// buffers it took out of `hpack_state::HpackState` — silently, and for
     /// the life of the connection. Between the transition into
-    /// [`H2WritePhase::Prepare`] and the first statement of
-    /// [`H2WritePhase::End`] this function has exactly one `return`, the
+    /// `H2WritePhase::Prepare` and the first statement of
+    /// `H2WritePhase::End` this function has exactly one `return`, the
     /// `Transmit` yield, so the drive loop is the whole guarantee;
     /// `H2WritePass`'s [`Drop`] carries the matching `debug_assert!`. A
     /// re-entry AFTER the pass answered is the other half of that argument and
     /// is handled separately: `End` moves the pass to
-    /// [`H2WritePhase::Ended`], whose arm answers `Done` rather than
+    /// `H2WritePhase::Ended`, whose arm answers `Done` rather than
     /// re-entering an arm whose first statement takes three `Option`s it has
     /// already emptied.
     ///
@@ -2559,7 +2400,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// status would truncate every response a TLS frontend accepts in two
     /// rounds, which is why adding that parameter here has to be a visible
     /// signature change rather than a one-token edit.
-    pub(super) fn poll_write_target<E, L>(
+    pub fn poll_write_target<E, L>(
         &mut self,
         context: &mut Context<L>,
         endpoint: &mut E,
@@ -2998,7 +2839,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 H2WritePhase::Ended => {
                     // The pass already answered. `write_streams` never gets
                     // here — it returns on `Done` and on `Finalize` — but this
-                    // function is `pub(super)`, and `End` below takes the
+                    // function is `pub`, and `End` below takes the
                     // scheduler-pass values out as its first statement, so a
                     // second poll re-entering that arm would `expect` on three
                     // empty `Option`s. Answering `Done` keeps a hand-driven
@@ -3205,7 +3046,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///
     /// It answers nothing, because nothing in this body can end a pass: the
     /// pass continues after a transmit, and the decision to stop is taken by
-    /// [`Self::poll_write_target`] reading [`H2WritePass::stalled`].
+    /// [`Self::poll_write_target`] reading `H2WritePass::stalled`.
     ///
     /// **This is the only place on the write core that sees a
     /// [`SocketResult`]**, and the only place that writes `pass.stalled` — in
@@ -3219,8 +3060,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// under, are decided by the PASS PHASE and not by the stream: the resume
     /// path's bytes are socket catch-up rather than the voluntary scheduler
     /// yield LIFECYCLE §9 invariant 16 retains `Ready::WRITABLE` for, so
-    /// [`H2WritePass::resume_bytes`] must never reach `finalize_write`.
-    fn handle_write<L>(
+    /// `H2WritePass::resume_bytes` must never reach `finalize_write`.
+    pub fn handle_write<L>(
         &mut self,
         context: &mut Context<L>,
         stream_id: H2StreamId,
@@ -6941,6 +6782,230 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.stream_table.register(stream_id, stream, self.now);
         self.readiness.arm_writable();
         true
+    }
+}
+
+/// The socket shell of the H2 stream data path: the two byte movers.
+///
+/// [`ConnectionH2::readable`] and `ConnectionH2::write_streams` are the only
+/// production code on the H2 stream read and write paths that touches
+/// `self.socket`. Each is the caller that sits between one of the core's two
+/// poll/handle pairs — [`ConnectionH2::poll_read_target`] with
+/// [`ConnectionH2::handle_read`], and [`ConnectionH2::poll_write_target`] with
+/// [`ConnectionH2::handle_write`]. All four are `pub`, so a driver outside this
+/// crate can stand where these two functions stand once the buffers they name
+/// are reachable too.
+///
+/// They are lifted out of the core impls rather than merely annotated, because
+/// the remaining `Front` coupling on this path is meant to be countable by
+/// reading one region instead of grepping the file, and this is the region the
+/// socket goes on living in when `ConnectionH2` stops carrying one. Nothing
+/// moved with them: both bodies are statement-for-statement what they were, an
+/// inherent impl is order-independent, and this block therefore changes no
+/// behaviour. `ConnectionH2::write_streams` keeps the query / flush / query
+/// triple it performs around `ConnectionH2::finalize_write` — that step is a
+/// socket touch too, and it belongs on this side of the split for the same
+/// reason the vectored write does.
+///
+/// # Why `write_streams` stays private, and where the `unsafe` windows are
+///
+/// `ConnectionH2::write_streams` keeps the `Vec<IoSlice<'static>>` that
+/// brackets `h2_transmit::gather` and `h2_transmit::confirm`, and it keeps it
+/// because the loop that opens and closes that bracket came here with it.
+/// There are now TWO `unsafe` blocks on this path rather than one, and they
+/// nest:
+///
+/// - the INNER one is `gather`'s `slice::from_raw_parts`, which re-labels
+///   borrows of `kawa.storage` as `'static`. It opens and closes inside that
+///   function, exactly as it always did.
+/// - the OUTER one is the `unsafe { … }` around the `gather` CALL below, which
+///   exists because `gather` is `pub unsafe fn`: the lifetime obligation is
+///   stated in its signature and discharged by the caller. It wraps the call
+///   and nothing else — not the vectored write, not the `confirm`.
+///
+/// The window those blocks guard is the same one, and it did not widen: it
+/// opens at that `gather` call and closes at the `confirm` three statements
+/// later, where `io_slices.clear()` runs before the consume which may relocate
+/// the storage. The only thing entered while the descriptors are live is
+/// `SocketHandler::socket_write_vectored`, which reborrows them for the
+/// duration of the call and cannot retain them. No `IoSlice<'static>` survives
+/// one iteration of the loop.
+///
+/// That the bracket does not span the poll/handle seam matters MORE now than
+/// it did before those four functions were widened, not less: the seam is
+/// `pub` rather than `pub(super)`, so halves on opposite sides of it could be
+/// separated by a caller this crate cannot see. `write_streams` stays private
+/// for that reason. `h2_transmit`'s pair is now exported — `gather` as
+/// `pub unsafe fn`, `confirm` as a plain `pub fn` that produces no descriptor
+/// and so leaves no obligation — which moves the same argument onto any
+/// out-of-crate caller's own bracket rather than dissolving it.
+impl<Front: SocketHandler> ConnectionH2<Front> {
+    /// Drive one frontend read pass.
+    ///
+    /// The core lives in `Self::poll_read_target` and `Self::handle_read`,
+    /// both `pub`; this function is the caller that sits between them, and its
+    /// `self.socket.socket_read` is the only socket touch on the whole H2 read
+    /// path. It lives in the shell impl rather than among the core impls for
+    /// the reason stated there: the socket touch sits where the socket does,
+    /// and the frame state machine between the two calls is drivable without
+    /// one, exactly as `h2_transmit::gather`/`confirm` already bracket the
+    /// vectored write.
+    pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        match self.poll_read_target(context, &mut endpoint) {
+            H2ReadTarget::Done(result) => result,
+            H2ReadTarget::Skip(stream_id) => {
+                self.handle_read(context, endpoint, stream_id, H2ReadOutcome::Skipped)
+            }
+            H2ReadTarget::Fill { stream_id, amount } => {
+                let space = read_space(
+                    &mut self.zero,
+                    &mut context.streams,
+                    &self.position,
+                    stream_id,
+                    amount,
+                );
+                let (size, status) = self.socket.socket_read(space);
+                self.handle_read(
+                    context,
+                    endpoint,
+                    stream_id,
+                    H2ReadOutcome::Filled {
+                        amount,
+                        size,
+                        status,
+                    },
+                )
+            }
+        }
+    }
+
+    /// Write application data (request/response bodies, headers) across all
+    /// active streams, respecting priority ordering and flow control.
+    ///
+    /// This is the main data-plane write path: it resumes any partially-written
+    /// stream, prepares new frames via the H2 block converter, flushes them to
+    /// the socket, and recycles completed streams.
+    ///
+    /// The core lives in [`Self::poll_write_target`] and [`Self::handle_write`],
+    /// both `pub`; this function is the caller that sits between them, and its
+    /// `self.socket.socket_write_vectored` is the only place a stream's bytes
+    /// reach the socket. It lives in the shell impl rather than among the core
+    /// impls for the reason stated there, exactly as `readable()` keeps
+    /// `socket_read` outside [`Self::poll_read_target`].
+    ///
+    /// The pass's last step is a socket touch too, and for the same reason it
+    /// sits here: [`H2WriteTarget::Finalize`] is answered by reading
+    /// [`Self::tls_wants_write`], driving the [`H2FinalizeTarget`]
+    /// [`Self::finalize_write`] answers — performing
+    /// [`Self::flush_tls_records`] for [`H2FinalizeTarget::Flush`] and not for
+    /// [`H2FinalizeTarget::SkipFlush`] — and reading the query again for
+    /// [`Self::finalize_write_after_flush`]. That is the query / flush / query
+    /// triple `h2_close::TlsFlushPhase` names, and the three TLS seams it
+    /// reaches are what a byte-in / byte-out core receives as inputs instead
+    /// of asking for.
+    ///
+    /// Unlike `readable()` this is a LOOP and not a match: one read pass
+    /// performs one `socket_read`, while one write pass performs an unbounded
+    /// number of vectored writes — the pre-image's `while !kawa.out.is_empty()`
+    /// nested inside its walk of the scheduler's order. Every iteration here is
+    /// one of those rounds.
+    ///
+    /// The `Vec<IoSlice<'static>>` came here WITH the loop, and stays inside
+    /// this one private function on purpose. [`h2_transmit::gather`] is a
+    /// `pub unsafe fn` that hands back descriptors carrying a lifetime they do
+    /// not have, and [`h2_transmit::confirm`] must discharge them before the
+    /// consume that may relocate `kawa.storage`; bracketing the two around the
+    /// write in three adjacent statements keeps that window exactly as wide as
+    /// the pre-image's loop body kept it, and stops it from spanning the
+    /// poll/handle boundary — now a `pub` one, which is why the bracket's
+    /// locality is load-bearing rather than tidy. The `unsafe { … }` below
+    /// wraps the `gather` call alone; see the shell impl's own note.
+    ///
+    /// The [`converter::H2BlockConverter`] is scoped to a single
+    /// `kawa.prepare` call rather than to the whole per-stream loop, so the
+    /// `&mut self.hpack` borrow it takes for the connection's HPACK encoder
+    /// never spans the loop. Every `&self` / `&mut self` method is therefore
+    /// callable inside the loop body; what remains deferred to after it —
+    /// RST accounting and stream retirement — is deferred for its own
+    /// ordering reasons, documented at each site.
+    /// [`converter::H2ConverterPass`] carries the scratch buffers and the
+    /// RFC 7541 §6.3 size-update signal from one stream's `prepare` to the
+    /// next by moving them, so the narrower scope costs no copy.
+    fn write_streams<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        // No `arm_timeout()` here. `writable()` reaches this function on every
+        // proxying-state pass, including one whose only output was the PING or
+        // SETTINGS acknowledgement `flush_pending_control_frames` drained a few
+        // statements earlier, so arming at pass entry renewed the session for a
+        // peer that had sent nothing but keepalives. The write side's share of
+        // LIFECYCLE §9 invariant 9 now lives in `ConnectionH2::handle_write`,
+        // where the pass knows a real stream's bytes reached the socket.
+        // Pre-compute byte totals for proportional overhead distribution.
+        let mut pass = H2WritePass::new(self.compute_stream_byte_totals(context));
+        let mut io_slices: Vec<IoSlice<'static>> = Vec::new();
+
+        loop {
+            match self.poll_write_target(context, &mut endpoint, &mut pass) {
+                H2WriteTarget::Done(result) => return result,
+                H2WriteTarget::Finalize {
+                    socket_write,
+                    bytes_written,
+                } => {
+                    let tls_wants_write = self.tls_wants_write();
+                    match self.finalize_write(tls_wants_write, socket_write, bytes_written, context)
+                    {
+                        H2FinalizeTarget::Done(result) => return result,
+                        // The only *action* of the three TLS seams, and the
+                        // one step the core cannot take for itself.
+                        H2FinalizeTarget::Flush => {
+                            self.flush_tls_records();
+                        }
+                        // The vectored writes above already attempted this
+                        // pass's flush; a second empty-buffer write would be a
+                        // syscall for nothing.
+                        H2FinalizeTarget::SkipFlush => {}
+                    }
+                    // A fresh query, not the binding above: this one asks
+                    // whether the step between them landed.
+                    let tls_wants_write = self.tls_wants_write();
+                    return self.finalize_write_after_flush(tls_wants_write);
+                }
+                H2WriteTarget::Transmit { stream_id } => {
+                    // Gather / write / confirm. The gather borrows
+                    // `kawa.storage` and hands back descriptors with an
+                    // extended lifetime; `confirm` discharges that obligation
+                    // before the consume.
+                    let kawa = write_buffer(
+                        &mut self.zero,
+                        &mut context.streams,
+                        &self.position,
+                        stream_id,
+                    );
+                    // SAFETY: `kawa` is neither dropped nor mutated between
+                    // this call and the `confirm` three statements below, and
+                    // that `confirm` clears `io_slices` before the
+                    // `Kawa::consume` which may relocate `kawa.storage`. The
+                    // only thing entered while the descriptors are live is the
+                    // vectored write, which reborrows them for the duration of
+                    // the call and cannot retain them.
+                    let offered = unsafe { h2_transmit::gather(kawa, &mut io_slices) };
+                    let (size, status) = self.socket.socket_write_vectored(&io_slices);
+                    debug_assert!(
+                        size <= offered,
+                        "the socket reported {size} bytes written for an offer of {offered}"
+                    );
+                    h2_transmit::confirm(kawa, &mut io_slices, size);
+                    self.handle_write(context, stream_id, size, status, &mut pass);
+                }
+            }
+        }
     }
 }
 

@@ -66,7 +66,7 @@
 //!   counters stay on `Position`. Splitting a counter across two owners is how
 //!   a gauge starts drifting.
 //! - **Which stream goes next.** Ordering is
-//!   [`super::h2_scheduler::H2Scheduler::begin_pass`]'s decision. This module
+//!   `super::h2_scheduler::H2Scheduler::begin_pass`'s decision. This module
 //!   sees one stream at a time and imposes no order of its own.
 //!
 //! # Fairness: a stalled pass is not fair to the streams it did not reach
@@ -113,20 +113,36 @@ use kawa::{AsBuffer, Kawa};
 /// hoisted once per write pass rather than per stream, so a pass over N
 /// streams performs no additional allocation.
 ///
-/// # Safety obligation taken on here, discharged in [`confirm`]
+/// # Safety
 ///
-/// The returned descriptors carry a `'static` lifetime they do not truly
-/// have: they point into `kawa.storage`, which [`Kawa::consume`] may relocate
-/// via `ptr::copy`. They are valid only until the next mutation of `kawa`.
-/// **Every gather must be followed by a [`confirm`] on the same `io_slices`
-/// before anything else touches `kawa`** — `confirm` clears the vector before
-/// it consumes, so no extended reference is live across the relocation.
+/// The descriptors this pushes into `io_slices` are labelled `'static` and are
+/// not. Each one points straight into `kawa.storage`, which [`Kawa::consume`]
+/// may relocate with a `ptr::copy` and which the `Kawa` frees when it is
+/// dropped. The lifetime is a deliberate lie, told so that ONE scratch vector
+/// can be reused across a whole write pass: a `Vec<IoSlice<'a>>` would bind to
+/// the first stream's borrow and could not then be handed the next stream's,
+/// which is an allocation per stream this path does not make.
 ///
-/// Pairing the two in one module is the point of this split: before it, the
-/// `unsafe` and the `io_slices.clear()` that discharges it sat eleven lines
-/// apart inside a loop body that also did metrics, readiness and stall
-/// classification.
-pub(super) fn gather<T: AsBuffer>(kawa: &Kawa<T>, io_slices: &mut Vec<IoSlice<'static>>) -> usize {
+/// The caller must guarantee, for every call:
+///
+/// 1. `kawa` is neither dropped nor mutated while any descriptor this call
+///    pushed is still readable, and
+/// 2. `io_slices` is emptied before that first mutation. [`confirm`] is the
+///    intended way and is what this module is shaped around: it clears the
+///    vector BEFORE the [`Kawa::consume`] that may relocate the storage.
+///
+/// Reading a descriptor once either is violated is a use-after-free. Nothing
+/// in the type system enforces the pairing, and a `'static` in a safe
+/// signature actively denies that there is one — which is why this function
+/// carries the obligation in `unsafe` rather than in prose alone. The
+/// obligation is the caller's, and a caller outside this crate has no other
+/// way to be told.
+///
+/// The only production caller is `super::h2::ConnectionH2::write_streams`,
+/// which opens the window here and closes it at the [`confirm`] three
+/// statements later, entering nothing in between but the vectored socket
+/// write that reborrows the descriptors and cannot retain them.
+pub unsafe fn gather<T: AsBuffer>(kawa: &Kawa<T>, io_slices: &mut Vec<IoSlice<'static>>) -> usize {
     io_slices.clear();
     let buffer = kawa.storage.buffer();
     let mut bytes_offered = 0usize;
@@ -176,7 +192,24 @@ pub(super) fn gather<T: AsBuffer>(kawa: &Kawa<T>, io_slices: &mut Vec<IoSlice<'s
 ///
 /// The clear happens BEFORE the consume, and that ordering is the whole
 /// safety argument — see [`gather`].
-pub(super) fn confirm<T: AsBuffer>(
+///
+/// # Why this half is NOT `unsafe`, although its sibling is
+///
+/// [`gather`] is `unsafe` because it PRODUCES the mislabelled descriptors;
+/// this one only destroys them, and destroying them is well defined even when
+/// they already dangle. `Vec::clear` drops `IoSlice` values, and dropping an
+/// `IoSlice` reads no byte of what it points at — it is a `libc::iovec`, a
+/// pointer and a length, with no `Drop` that dereferences. Everything after
+/// the clear is [`Kawa::consume`], a safe API of the `kawa` crate: handing it
+/// a `size` larger than the write really accepted advances the stream past
+/// bytes that never reached the peer, which is a truncation BUG and not
+/// undefined behaviour.
+///
+/// So this function leaves its caller no obligation to uphold, and `unsafe`
+/// on it would be decoration. Worse than decoration: it would stop `unsafe`
+/// meaning "a lifetime is being asserted here" at the one call site in this
+/// module where that is exactly what it means.
+pub fn confirm<T: AsBuffer>(
     kawa: &mut Kawa<T>,
     io_slices: &mut Vec<IoSlice<'static>>,
     size: usize,
@@ -242,7 +275,9 @@ mod tests {
         let mut kawa = kawa_with_out(&mut buf, payload, &[4, 9]);
         let mut slices: Vec<IoSlice<'static>> = Vec::new();
 
-        let offered = gather(&kawa, &mut slices);
+        // SAFETY: `kawa` outlives `slices` and is untouched until the
+        // `confirm` below clears them.
+        let offered = unsafe { gather(&kawa, &mut slices) };
 
         assert_eq!(offered, payload.len());
         assert_eq!(slices.len(), 3, "three blocks, three descriptors");
@@ -256,7 +291,8 @@ mod tests {
         let mut kawa = Kawa::new(Kind::Response, Buffer::new(SliceBuffer(&mut buf)));
         let mut slices: Vec<IoSlice<'static>> = Vec::new();
 
-        assert_eq!(gather(&kawa, &mut slices), 0);
+        // SAFETY: as above — no mutation of `kawa` before `confirm`.
+        assert_eq!(unsafe { gather(&kawa, &mut slices) }, 0);
         assert!(slices.is_empty());
         confirm(&mut kawa, &mut slices, 0);
     }
@@ -281,7 +317,8 @@ mod tests {
             })));
         let mut slices: Vec<IoSlice<'static>> = Vec::new();
 
-        let offered = gather(&kawa, &mut slices);
+        // SAFETY: as above — no mutation of `kawa` before `confirm`.
+        let offered = unsafe { gather(&kawa, &mut slices) };
 
         assert_eq!(offered, 4, "the delimiter bounds the offer");
         assert_eq!(gathered_bytes(&slices), b"abcd".to_vec());
@@ -320,7 +357,8 @@ mod tests {
         let mut kawa = kawa_with_out(&mut buf, payload, &[4]);
         let mut slices: Vec<IoSlice<'static>> = Vec::new();
 
-        gather(&kawa, &mut slices);
+        // SAFETY: as above — no mutation of `kawa` before `confirm`.
+        unsafe { gather(&kawa, &mut slices) };
         assert!(!slices.is_empty(), "premise: the gather produced something");
 
         confirm(&mut kawa, &mut slices, 4);
@@ -452,7 +490,9 @@ mod tests {
                     rounds <= MAX_ROUNDS,
                     "drive must terminate within its bound"
                 );
-                let offered = gather(&kawa, &mut slices);
+                // SAFETY: one round reads `slices` and then clears them
+                // through `confirm`; `kawa` is mutated nowhere in between.
+                let offered = unsafe { gather(&kawa, &mut slices) };
                 let accept = plan.chunk_sizes[tick % plan.chunk_sizes.len()].min(offered);
                 tick += 1;
                 let mut taken = 0usize;
