@@ -240,7 +240,7 @@ Run this before pushing — it mirrors what CI gates on:
 ```bash
 cargo build --all-features --locked
 cargo +nightly fmt --all -- --check        # nightly REQUIRED (rustfmt.toml uses `ignore = [...]`)
-cargo doc --no-deps --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --workspace --locked            # unit + simulation + regression guards + e2e
 ```
