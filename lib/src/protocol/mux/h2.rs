@@ -1341,6 +1341,68 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         })
     }
 
+    /// The TLS layer is holding encrypted records — handshake, alert, session
+    /// ticket or already-accepted application data — that it must push before
+    /// this connection can call a pass finished.
+    ///
+    /// **Not "the socket is writable".** The name of the underlying
+    /// [`SocketHandler`] method says socket, and that is what made this look
+    /// like an I/O question for as long as it was spelled out at every site.
+    /// It is a question about a buffer that happens to live behind the socket:
+    /// `FrontRustls` is the only production handler that overrides it, the
+    /// trait's default answer is `false`, and `Router::backends` is declared
+    /// `Connection<SessionTcpStream>` whatever the frontend is — so every
+    /// backend H2 connection already resolves every one of these queries
+    /// statically to `false`. The same core is monomorphised twice today, once
+    /// with TLS and once without, which is the evidence that the coupling is
+    /// incidental rather than structural.
+    ///
+    /// This is a seam, not an abbreviation. It is the single reach where
+    /// `ConnectionH2` asks that question, and the whole of what a byte-in /
+    /// byte-out core has to receive as an input instead of querying: the shell
+    /// that owns the socket is the only layer that can answer it, and it is
+    /// the layer this method's body moves to. Until then the body is the
+    /// delegation it always was and the answer is bit-identical.
+    ///
+    /// The query is free of side effects, so a caller that needs it twice
+    /// around a [`Self::flush_tls_records`] is asking two genuinely different
+    /// questions — "does rustls hold records" and "did the kernel take them" —
+    /// and a caller that needs it twice with nothing in between should bind it
+    /// once instead. [`h2_close::TlsFlushPhase`] names the first case;
+    /// [`Self::force_disconnect`] is the second.
+    fn tls_wants_write(&self) -> bool {
+        self.socket.socket_wants_write()
+    }
+
+    /// Ask the TLS layer to push whatever it has buffered towards the kernel,
+    /// offering it no new application bytes.
+    ///
+    /// The empty slice is the whole point: this is a flush, not a write. It is
+    /// the only *action* among the three TLS seams, which is why the four call
+    /// sites are the four places where a byte-in / byte-out core must hand
+    /// control back to its shell rather than take an input — the answer to
+    /// [`Self::tls_wants_write`] changes across this call, so no value captured
+    /// before it can stand in for the query after it.
+    ///
+    /// Returns the handler's `(size, SocketResult)` unchanged. Three of the
+    /// four callers discard both and re-query [`Self::tls_wants_write`]
+    /// instead — deliberately, since a flush that moved bytes may still leave
+    /// records behind — and only [`Self::flush_zero_buffer`] consumes the
+    /// status, through `update_readiness_after_write`.
+    fn flush_tls_records(&mut self) -> (usize, SocketResult) {
+        self.socket.socket_write(&[])
+    }
+
+    /// Start the TLS `close_notify` handshake, generating the records that
+    /// [`Self::tls_wants_write`] will then report as pending.
+    ///
+    /// Idempotence is the caller's business, not this seam's:
+    /// [`Self::initiate_close_notify`] gates it on `close_notify_sent` so a
+    /// second call cannot queue a second alert.
+    fn begin_tls_close(&mut self) {
+        self.socket.socket_close()
+    }
+
     /// Start TLS close_notify on the frontend and keep the session alive until
     /// rustls has flushed the generated records.
     pub fn initiate_close_notify(&mut self) -> bool {
@@ -1354,10 +1416,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         if !self.close_notify_sent {
             trace!("{} H2 initiating CLOSE_NOTIFY", log_context!(self));
-            self.socket.socket_close();
+            self.begin_tls_close();
             self.close_notify_sent = true;
         }
-        if self.socket.socket_wants_write() {
+        if self.tls_wants_write() {
             self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
             self.ensure_tls_flushed();
             true
@@ -3144,7 +3206,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     /// Re-arm edge-triggered WRITABLE event if rustls still has buffered TLS data.
     fn ensure_tls_flushed(&mut self) {
-        if self.socket.socket_wants_write() {
+        if self.tls_wants_write() {
             self.readiness.signal_pending_write();
         }
     }
@@ -3257,7 +3319,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // the arms that need `&mut self.readiness` and `&mut context.debug`.
         let action = h2_close::finalize_action(
             TlsFlushPhase::BeforeFlush,
-            self.socket.socket_wants_write(),
+            self.tls_wants_write(),
             socket_write,
             self.stream_table.expect_write().is_some(),
             bytes_written_this_pass > 0,
@@ -3310,7 +3372,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // The two TLS answers differ only in the step performed here, and
             // both fall through to the single post-flush query below.
             FinalizeAction::Flush => {
-                self.socket.socket_write(&[]);
+                self.flush_tls_records();
             }
             FinalizeAction::SkipFlush => {}
             // Named rather than `other =>`: a wildcard arm would turn a new
@@ -3332,7 +3394,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // are not re-read.
         let action = h2_close::finalize_action(
             TlsFlushPhase::AfterFlush,
-            self.socket.socket_wants_write(),
+            self.tls_wants_write(),
             false,
             false,
             false,
@@ -3518,7 +3580,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 if self.flush_zero_to_socket() {
                     self.stream_table.set_expect_write(Some(H2StreamId::Zero));
                     // Edge-triggered epoll: ensure pending TLS data gets flushed
-                    if self.socket.socket_wants_write() {
+                    if self.tls_wants_write() {
                         self.readiness.signal_pending_write();
                     }
                     return Some(MuxResult::Continue);
@@ -3567,7 +3629,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 if self.flush_zero_to_socket() {
                     self.stream_table.set_expect_write(Some(H2StreamId::Zero));
                     // Edge-triggered epoll: ensure pending TLS data gets flushed
-                    if self.socket.socket_wants_write() {
+                    if self.tls_wants_write() {
                         self.readiness.signal_pending_write();
                     }
                     return Some(MuxResult::Continue);
@@ -3597,8 +3659,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // TCP socket even when the connection is in GoAway or Error state.
         // Without this, the state-specific handlers may call force_disconnect()
         // before the response data reaches the kernel's TCP send buffer.
-        if self.socket.socket_wants_write() {
-            self.socket.socket_write(&[]);
+        if self.tls_wants_write() {
+            self.flush_tls_records();
         }
 
         match (&self.state, &self.position) {
@@ -3606,7 +3668,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // The preamble above already attempted this pass's flush, so
                 // this arm reads the post-flush answer and has no `Flush` of
                 // its own — see `h2_close`'s module doc.
-                match h2_close::error_close_action(self.socket.socket_wants_write()) {
+                match h2_close::error_close_action(self.tls_wants_write()) {
                     CloseAction::ReArmAndContinue => {
                         self.ensure_tls_flushed();
                         MuxResult::Continue
@@ -3649,15 +3711,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 match h2_close::goaway_close_action(
                     TlsFlushPhase::BeforeFlush,
                     self.peer_gone_after_final_goaway(),
-                    self.socket.socket_wants_write(),
+                    self.tls_wants_write(),
                 ) {
                     CloseAction::CloseSession => return MuxResult::CloseSession,
                     CloseAction::Flush => {
-                        self.socket.socket_write(&[]);
+                        self.flush_tls_records();
                         match h2_close::goaway_close_action(
                             TlsFlushPhase::AfterFlush,
                             false,
-                            self.socket.socket_wants_write(),
+                            self.tls_wants_write(),
                         ) {
                             CloseAction::ReArmAndContinue => {
                                 self.ensure_tls_flushed();
@@ -4709,7 +4771,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
         self.stream_table.expect_write().is_some()
             || !self.zero.storage.is_empty()
-            || self.socket.socket_wants_write()
+            || self.tls_wants_write()
     }
 
     /// True when the reaper has queued control frames (`RST_STREAM`) into
@@ -4750,7 +4812,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 log_context!(self),
                 size,
                 status,
-                self.socket.socket_wants_write()
+                self.tls_wants_write()
             );
             self.zero.storage.consume(size);
             self.position.count_bytes_out_counter(size);
@@ -4787,8 +4849,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return;
         }
         self.stream_table.set_expect_write(None);
-        if self.socket.socket_wants_write() {
-            let (_size, status) = self.socket.socket_write(&[]);
+        if self.tls_wants_write() {
+            let (_size, status) = self.flush_tls_records();
             let _ = update_readiness_after_write(0, status, &mut self.readiness);
         }
     }
@@ -6170,6 +6232,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     pub fn force_disconnect(&mut self) -> MuxResult {
         self.state = H2State::Error;
+        // Read ONCE for the whole function, above the `match`, because
+        // `Self::tls_wants_write` borrows all of `self` while the client arm
+        // holds `&mut self.position` for its `status` binding. Hoisting is
+        // behaviour-neutral: the query has no side effect, `self.state` is the
+        // only thing assigned between the old read points and this one, and
+        // both arms already wanted the same answer — the server arm says so in
+        // its own comment below.
+        let tls_wants_write = self.tls_wants_write();
         match &mut self.position {
             Position::Client(_, _, status) => {
                 *status = BackendStatus::Disconnecting;
@@ -6180,7 +6250,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.state,
                     self.stream_table.streams().len(),
                     self.stream_table.expect_write(),
-                    self.socket.socket_wants_write(),
+                    tls_wants_write,
                     self.readiness
                 );
                 MuxResult::Continue
@@ -6195,13 +6265,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // The decision itself is `h2_close::force_disconnect_action`,
                 // exhaustively unit-tested there.
                 //
-                // The answer is read ONCE and reported by both log lines. A
-                // literal `wants_write=` in either arm is a second copy of a
-                // fact the socket already owns, and the closing arm is reached
-                // with records still pending whenever the peer is gone — an
-                // operator diagnosing a truncation under HAProxy chaining would
-                // read the opposite of the socket's state.
-                let tls_wants_write = self.socket.socket_wants_write();
+                // The answer is read ONCE, above the `match`, and reported by
+                // every log line in this function. A literal `wants_write=` in
+                // any arm is a second copy of a fact the socket already owns,
+                // and the closing arm is reached with records still pending
+                // whenever the peer is gone — an operator diagnosing a
+                // truncation under HAProxy chaining would read the opposite of
+                // the socket's state.
                 if h2_close::force_disconnect_action(
                     self.peer_gone_after_final_goaway(),
                     tls_wants_write,
@@ -6250,7 +6320,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             }
             Position::Client(..) => {}
             Position::Server => {
-                let tls_pending_before = self.socket.socket_wants_write();
+                let tls_pending_before = self.tls_wants_write();
                 if !self.stream_table.streams().is_empty()
                     || tls_pending_before
                     || self.stream_table.expect_write().is_some()
@@ -9292,14 +9362,16 @@ mod tests {
     //
     // `h2_close::force_disconnect_action` is exhaustively tabled over its two
     // booleans in that module. Nothing called `ConnectionH2::force_disconnect`
-    // itself, so the CALLER half — the `socket_wants_write()` query that feeds
-    // the table and the wiring of `ReArmAndContinue` to interest, flush and
-    // return value — had no coverage. #1454 asks for this site by name.
+    // itself, so the CALLER half — the `ConnectionH2::tls_wants_write` query
+    // that feeds the table and the wiring of `ReArmAndContinue` to interest,
+    // flush and return value — had no coverage. #1454 asks for this site by
+    // name.
     //
     // Shape targeted: a SINGLE query, not a triple. `force_disconnect` reads
-    // the answer once into `tls_wants_write`, feeds the table and reports the
-    // same value from both debug arms; there is no `socket_write(&[])` here
-    // and so no second question to reconstruct.
+    // the answer once into `tls_wants_write`, above its `match` and therefore
+    // for both position arms, feeds the table and reports the same value from
+    // every debug line; there is no `ConnectionH2::flush_tls_records` here and
+    // so no second question to reconstruct.
 
     /// A server connection whose TLS records are still buffered re-arms
     /// instead of closing the session.
@@ -12929,8 +13001,8 @@ mod tests {
     /// exhaustively; what has never been proved is that this caller reads a
     /// real handler's answer at all.
     ///
-    /// TO SEE THIS RED: in `ConnectionH2::force_disconnect`'s server arm,
-    /// replace `let tls_wants_write = self.socket.socket_wants_write();` with
+    /// TO SEE THIS RED: in `ConnectionH2::force_disconnect`, replace
+    /// `let tls_wants_write = self.tls_wants_write();` with
     /// `let tls_wants_write = false;` — the decision stops reading the socket,
     /// and the call closes the session while records are pending, which sends
     /// FIN and destroys them. This test fails on `a disconnect with records

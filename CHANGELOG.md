@@ -210,6 +210,45 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: `ConnectionH2` asks the TLS layer through three named seams instead of
+  twenty-one raw socket calls — step 1 of the byte-in / byte-out extraction
+  ([#1339](https://github.com/sozu-proxy/sozu/issues/1339)).** **No behaviour change**: the three
+  new private methods are delegations, every answer is bit-identical, and `sozu-lib` is unmoved at
+  1107 tests.
+
+  `ConnectionH2::tls_wants_write` replaces sixteen `self.socket.socket_wants_write()` reaches with
+  fifteen calls — `ConnectionH2::force_disconnect`'s two collapse into one binding, see below —
+  `ConnectionH2::flush_tls_records` replaces the four empty-buffer `self.socket.socket_write(&[])`
+  flushes, and `ConnectionH2::begin_tls_close` replaces the one `self.socket.socket_close()`.
+  `self.socket` in `h2.rs` production code goes **26 occurrences to 8**: the three seam bodies, the
+  single `socket_read` of the read path, the single `socket_write_vectored` of the stream-write
+  path, `flush_zero_to_socket`'s real write, and the two `socket_ref()` reaches that Q11 and the
+  `Debug` impl still own.
+
+  The name of the trait method says *socket*, which is what made this read as an I/O question for
+  as long as it was written out at every site. It is a question about a buffer that happens to live
+  behind the socket: `FrontRustls` is the only production `SocketHandler` that overrides it, the
+  trait default is `false`, and `Router::backends` is declared `Connection<SessionTcpStream>`
+  whatever the frontend is — so every backend H2 connection already answers `false` at all fifteen,
+  statically. The seams are the three inputs and actions the I/O shell will own; their bodies move
+  there, their call sites do not.
+
+  One local change that is not a substitution: `ConnectionH2::force_disconnect` now reads the
+  answer once **above** its `match` rather than inside the `Position::Server` arm. A method taking
+  `&self` cannot coexist with the `&mut self.position` the client arm holds for its `status`
+  binding, and the server arm's own comment already required a single read — the hoist extends that
+  to both arms and to every `wants_write=` a debug line renders.
+
+  Coverage of the new seams was measured rather than assumed, by mutating each body and counting:
+  `tls_wants_write() -> false` gives `1097 passed; 10 failed`, `flush_tls_records()` returning
+  `(0, Continue)` without flushing gives `1103 passed; 4 failed`. `begin_tls_close() -> {}` leaves
+  the suite **fully green at 1107**, and `sozu-e2e` green too at **447 passed** under the same
+  mutation — so nothing in the tree detects it, not only nothing in the unit suite.
+  `ConnectionH2::initiate_close_notify` is reached only from `Mux::shutting_down`, and neither
+  layer drives that path. That is a pre-existing gap this changeset records rather than creates
+  (sozu-proxy/sozu#1484 already reported the same site as uncovered); closing it needs a driven
+  `close_notify` and belongs to its own changeset with its own test.
+
 - **`refactor(mux-h2)`: the two control-frame drains re-arm `Ready::WRITABLE` through
   `Readiness::signal_pending_write`, not a hand-rolled `event.insert` (issue #1462).**
   `ConnectionH2::flush_pending_control_frames`'s WINDOW_UPDATE-drain and RST_STREAM-drain stages
