@@ -103,30 +103,48 @@ The same three forms govern prose inside Rust source, with one narrowing: **in a
 names that branch in words — the `H2WritePhase::Flush` arm of `ConnectionH2::poll_write_target` —
 rather than reaching for the second form.
 
-The narrowing is not stylistic either. The resolver scans `doc/**` and every `**/LIFECYCLE.md`; a
-citation inside a comment is outside its scope entirely, so the second form there is a line number
-with no checker behind it, and the pull request that breaks it is still never the one that contains
-it. Measured at main `19fd5d8c`, before this convention reached the source: the tree carried 90
+The narrowing is not stylistic either, and it is now enforced: a `path.rs:NNN` written in a `//`,
+`///` or `//!` comment **fails CI**. Until [sozu-proxy/sozu#1473][cmt] it failed nothing at all —
+the resolver read `doc/**` and every `**/LIFECYCLE.md`, a citation inside a comment was outside its
+scope entirely, and the second form there was a line number with no checker behind it while the
+pull request that broke it was never the one that contained it. Measured at main `19fd5d8c`, before
+this convention reached the source: the tree carried 90
 `path.rs:NNN` citation tokens in Rust comments across 25 files, holding 113 line targets between
 them. **Sixty-eight of the 90 had drifted** since the commit that last wrote or re-anchored them.
 Forty-three of those 68 broke on the very NEXT commit that touched the file they point into; the
 median citation survived **one** such commit and zero days, and 65 of 68 were wrong within a week.
 A pointer with that half-life is not a maintenance problem to be tightened — it is a form that does
 not work. The worked case is the one that reaches furthest: `h2.rs:NNN` written for
-`ConnectionH2::write_streams` now lands on an unrelated `H2State::ClientPreface` match arm, which
-resolves cleanly, is not blank, and reads like a real place in the file.
+`ConnectionH2::write_streams` landed, at that revision, on an unrelated `H2State::ClientPreface`
+match arm — resolving cleanly, not blank, and reading like a real place in the file. The tense is
+the revision's, not today's: [sozu-proxy/sozu#1479][inv] has since inverted that write path into
+`poll_write_target`/`handle_write`, which is the point rather than a caveat — the number moved
+again, and the symbols it should have named did not.
 
-Extending the resolver over `**/*.rs` was the alternative, and it was measured rather than argued.
-Switched on at that revision it would have had to reject those 68 drifted citations, plus 14 naming
-a basename that is ambiguous in this tree — four files here are called `h2.rs` and nineteen
-`mod.rs` — plus two pointing into the `kawa` dependency, which is not in this repository at all. A
-gate that fails on most of the population it guards is a gate that gets bypassed rather than
-satisfied, which is the argument `check_doc_citations.py`'s own header makes about `--all-features`.
-The symbol form costs a reader one `git grep` and cannot drift at all.
+Extending the *resolver* over `**/*.rs` was the alternative, and it was measured rather than
+argued. Switched on at that revision it would have had to reject those 68 drifted citations, plus
+14 naming a basename that is ambiguous in this tree — four files here are called `h2.rs` and
+nineteen `mod.rs` — plus two pointing into the `kawa` dependency, which is not in this repository
+at all. A gate that fails on most of the population it guards is a gate that gets bypassed rather
+than satisfied, which is the argument `check_doc_citations.py`'s own header makes about
+`--all-features`. It would also have widened the drift rule across a codebase where line shifts are
+constant and legitimate, making a correct edit report a failure.
 
-Nothing mechanical enforces this in Rust source yet: the resolver's scope is unchanged, so this is
-a review convention there until a rule rejects the `path.rs:NNN` form inside a comment. The
-population it was applied to was converted whole, so such a rule would start green.
+So what shipped is the cheaper and stricter rule: **forbid the form**, do not resolve it. The
+population had already been converted whole, so the rule started green and stays green by conversion
+rather than by renumbering. It scans every `*.rs` in the tree, and a cited path binds to the citing
+file's own directory first — which is how it reaches a bare `h1.rs:NNN` written from `mux/h2.rs`,
+the shape a grep keyed on a `lib/src/`-style prefix walks straight past. A citation naming no file
+in this repository is left alone: the two `kawa` ones are a pinned dependency this tree does not
+edit, so nothing here can move them. The symbol form costs a reader one `git grep` and cannot drift
+at all.
+
+One escape hatch exists, and it is not for a citation that is merely awkward to convert. A comment
+that records a position **at a revision that no longer exists** — `h2.rs:NNN` for call sites a later
+extraction deleted — cannot be converted to a symbol and must not be renumbered onto today's tree,
+because renumbering falsifies a record instead of repairing it. Such a citation is declared in
+`HISTORICAL_CITATIONS`, keyed on its citing file and its exact text, with the reason it is there.
+An entry without a reason is an unreviewed silencing of the rule, exactly as for `NOT_A_TEST`.
 
 ### Continuing a citation without repeating the path
 
@@ -225,6 +243,12 @@ below 1 or past end-of-file, either end of a range is blank, a range is inverted
 continuation has no citation earlier on its own line to inherit from, or the same line
 repeats inside one citation group — `file.rs:NNN/NNN`, which is what a `/` or `,` continuation
 renumbered on one half only looks like, and which would otherwise resolve perfectly.
+
+The same run additionally **forbids** a `file.rs:NNN` written inside a `//`, `///` or `//!` comment
+in any `*.rs`. That rule resolves nothing and renumbers nothing: it reports the citing site, the
+citation text and the file it names, and asks for the symbol instead. A citation naming no file in
+this repository is counted and skipped, and both counts are printed beside each other so a green
+run cannot hide how much it declined to look at.
 
 A cited path is resolved against the citing document's own directory first, then repo-root-relative,
 then as a unique tree-wide suffix. So `configure.md:NNN` in `doc/configure_admin_ops.md` binds to
@@ -453,13 +477,23 @@ was left behind". It does not mean the citations are right, and it is not a lice
 the code when you touch one. Where the prose names an item, cite the symbol and the question does
 not arise.
 
-One surface gap is known and left open on purpose. The line-citation rules read `doc/**` and every
-`**/LIFECYCLE.md`; the test-name rule additionally reads every `*.rs` comment and `CHANGELOG.md`.
-Aligning them was measured on `265d895d`: it adds 195 citations across 190 files and **50**
-pre-existing failures, 27 of them in `CHANGELOG.md`, which is an append-only record of the tree as
-it stood at each release and must not be renumbered to satisfy a guard. That repair is its own
-changeset, and it would not reach `e2e/COVERAGE.md` either — no rule reads that file today.
+One surface gap is known and left open on purpose. The line-citation rules RESOLVE citations in
+`doc/**` and every `**/LIFECYCLE.md`; the test-name rule additionally reads every `*.rs` comment and
+`CHANGELOG.md`. Aligning the resolver with them was measured on `265d895d`: it adds 195 citations
+across 190 files and **50** pre-existing failures, 27 of them in `CHANGELOG.md`, which is an
+append-only record of the tree as it stood at each release and must not be renumbered to satisfy a
+guard. That repair is its own changeset, and it would not reach `e2e/COVERAGE.md` either — no rule
+reads that file today.
 
+The comment rule does not close that gap and does not try to. It reads every `*.rs` and **forbids**
+rather than resolves, so it imports none of those 50: it asks for no number to be correct, only for
+no number to be there. `CHANGELOG.md` stays outside it for the reason above — a quoted tool
+transcript in a release entry is a record of what a command printed on the day it ran, and a rule
+that made it fail would be asking for the record to be rewritten. `e2e/COVERAGE.md` stays outside
+every rule here, unchanged.
+
+[cmt]: https://github.com/sozu-proxy/sozu/issues/1473
+[inv]: https://github.com/sozu-proxy/sozu/pull/1479
 [md-cit]: https://github.com/sozu-proxy/sozu/issues/1444
 [bare]: https://github.com/sozu-proxy/sozu/issues/1459
 [bare-eg]: https://github.com/sozu-proxy/sozu/pull/1465

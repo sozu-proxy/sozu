@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Resolve every citation in this repository's prose against the tree it ships
 # with, and fail when one of them cannot be resolved. Three citation forms are
-# checked, by four independent rules:
+# checked, by five independent rules — four that RESOLVE a citation, and one
+# that FORBIDS a form outright:
 #
 #   1. `file.rs:NNN(-MMM)?` and `file.md:NNN(-MMM)?` in `doc/**` and
 #      `**/LIFECYCLE.md` — a path and a line number — plus the bare `` `:NNN` ``
@@ -19,6 +20,11 @@
 #   4. a fenced code block whose INFO STRING names the lines it quotes —
 #      ```rust path/to/file.rs:NNN-MMM — must quote them literally. See "STALE
 #      CODE QUOTED IN PROSE" further down.
+#   5. a `file.rs:NNN` citation written inside a `//`, `///` or `//!` COMMENT,
+#      in any `*.rs` in the tree — forbidden outright rather than resolved.
+#      This is the one rule here that does not ask whether a number is right;
+#      it asks that there be no number. See "LINE NUMBERS CITED FROM A RUST
+#      COMMENT" further down.
 #
 # Why this exists: a line number carries no anchor, so a citation rots the
 # moment anyone edits the file it points into — and the edit usually lands in a
@@ -428,6 +434,96 @@
 #   What it does is make the repair durable. `doc/h2_mux_internals.md` now pins
 #   every block it can, so the next extraction step moves those lines and this
 #   rule reports it instead of a reviewer finding it two refactors later.
+#
+# LINE NUMBERS CITED FROM A RUST COMMENT
+#   Rules 1 to 4 read `doc/**` and every `**/LIFECYCLE.md`. A `file.rs:NNN`
+#   written in a `//`, `///` or `//!` comment is outside all four, so it was
+#   never extracted, never resolved, never drift-compared and never reported as
+#   unresolvable either — the same total blindness `BARE CONTINUATIONS`
+#   describes, over a much larger surface.
+#
+#   sozu-proxy/sozu#1473 is the worked case and it is the dangerous shape: two
+#   `SAFETY:` comments justifying `from_utf8_unchecked` cited a line that was a
+#   `Method` match arm rather than the `hostname_and_port` they named. The
+#   claim was TRUE — every byte that function accepts is ASCII — and only the
+#   proof path was broken, so a reader auditing the unsafe block followed the
+#   pointer, landed somewhere unrelated, and lost confidence the comment was
+#   there to give. sozu-proxy/sozu#1466 is the same defect from a third
+#   direction: four `h2.rs` citations that were wrong when the drift rule first
+#   saw them, and therefore frozen wrong forever, because "unchanged" is
+#   exactly the condition for being exempt from rule 2.
+#
+#   WHY FORBID RATHER THAN RESOLVE. Extending rules 1 and 2 over `**/*.rs` was
+#   the obvious alternative and it was measured, not argued. At main `19fd5d8c`
+#   the tree carried 90 such citation tokens across 25 files holding 113 line
+#   targets, and SIXTY-EIGHT of the 90 had already drifted since the commit
+#   that last wrote them; 43 of those 68 broke on the very next commit touching
+#   the file they point into, and the median citation survived ONE such commit.
+#   Switched on, the resolver would have had to reject all 68, plus 14 naming a
+#   basename that is ambiguous here — four files are called `h2.rs`, nineteen
+#   `mod.rs` — plus two pointing into the `kawa` dependency. A gate that fails
+#   on most of the population it guards gets bypassed rather than satisfied.
+#   Worse, it would have widened the DRIFT rule across a codebase where line
+#   shifts are constant and legitimate, so an ordinary correct edit would
+#   report a failure and the exemption machinery of "A NUMBER REUSED FOR
+#   DIFFERENT CODE" would have to carry the whole tree instead of one document
+#   set.
+#
+#   Forbidding costs none of that. The rule asks for no number to be right,
+#   only for there to be no number, so it imports not one pre-existing failure
+#   and there is nothing for it to renumber. sozu-proxy/sozu#1480 converted the
+#   population whole before this rule landed, so it started green — and it
+#   stays green by conversion, never by renumbering.
+#
+#   SCOPE, stated rather than implied, because a rule narrowed until it matches
+#   nothing reads exactly like a rule that passes:
+#     * EVERY `*.rs` IN THE TREE, not `lib|command|bin|e2e/src` alone. The
+#       defect is a property of the form, not of the directory the comment sits
+#       in, and a directory list would leave `sim/`, `fuzz/`, `lib/benches`,
+#       `lib/examples`, the integration tests and every `build.rs` free to
+#       reintroduce it while the rule still read as covering Rust comments.
+#     * RESOLVED SIBLING-FIRST, through rule 1's own `resolve_path`, so this
+#       rule and the resolver can never disagree about which file a citation
+#       names. That is load-bearing and not a detail: `mux/h2.rs` cited its own
+#       sibling as a bare `h1.rs:361-368`, and #1473's own finder grep — keyed
+#       on a `(lib|command|bin|e2e)/src/` prefix — walked straight past it. A
+#       rule built on that same prefix would have shipped green over a live
+#       instance of the exact defect it was written for. An AMBIGUOUS basename
+#       fails too: it still names lines this tree's own edits move.
+#     * A CITATION NAMING NO FILE HERE IS SKIPPED AND COUNTED. `stream.rs`
+#       cites `kawa/src/protocol/h1/parser/primitives.rs:194-203` into a
+#       dependency pinned at a version; nothing in this repository can move
+#       those lines, so this rule is not their owner. `doc/README.md` reached
+#       the same verdict on the same two when the convention landed.
+#     * `CHANGELOG.md` IS NOT READ, and that is deliberate rather than
+#       incidental — it is `*.md`, and the rule reads `*.rs`. It is an
+#       append-only record of the tree as it stood at each release, carrying
+#       quoted tool transcripts of what a command printed on the day it ran. 27
+#       of its citations would fail a resolver (measured on `265d895d`), and a
+#       rule that made them fail would be asking for a record to be rewritten.
+#     * A TRAILING COMMENT ON A CODE LINE IS NOT READ. See `RUST_COMMENT_LINE`
+#       for the measurement: all eight tokens in the tree sat on a
+#       comment-leading line, and reading "everything after the first `//`"
+#       would have bought zero sites and cost the `//` inside a string literal.
+#
+#   THE ONE EXEMPTION, and what it is not for. A comment that records a
+#   position AT A REVISION THAT NO LONGER EXISTS cannot be converted — the
+#   construct it names was deleted, so there is no symbol — and must not be
+#   renumbered onto today's tree, because that falsifies a record instead of
+#   repairing it. `HISTORICAL_CITATIONS` declares such a site, keyed on its
+#   citing file AND its exact citation text, with the reason, exactly as
+#   `NOT_A_TEST` does. An entry without a reason is an unreviewed silencing of
+#   this rule. A live pointer into a file this repository still edits does not
+#   belong there: it has a symbol to name, and naming it is the whole remedy.
+#
+#   WHAT THIS DOES NOT CATCH. It is not a floor in rules 1 to 4's sense — there
+#   is no number left to be subtly wrong — but it says nothing about whether
+#   the SYMBOL a comment names is the right one, or still exists. Rule 3 covers
+#   that for a cited test name and nothing covers it for an arbitrary symbol; a
+#   comment naming a function that was renamed away still passes here. What the
+#   rule guarantees is narrower and worth having on its own: no comment in this
+#   tree points at a line number, so no comment in this tree can rot by an edit
+#   made somewhere above it.
 #
 # Usage:
 #   python3 .github/scripts/check_doc_citations.py            # check the tree
@@ -1426,6 +1522,136 @@ def check_pinned_snippets(root, show=False, out=sys.stdout):
     return pinned, unpinned, failures
 
 
+# ── Rule 5: line numbers cited from a Rust comment ──────────────────────
+#
+# See "LINE NUMBERS CITED FROM A RUST COMMENT" in the header for the
+# measurements that shaped this rule, and for why it FORBIDS the form instead
+# of resolving it the way rules 1 and 2 do for the documents.
+
+# A citation is read from a line whose first non-blank characters are `//`.
+# That is `prose_blocks`'s own definition of a Rust comment, kept identical on
+# purpose: rules 3 and 5 must never disagree about what a comment is. `///` and
+# `//!` begin with `//` and are therefore included, which matters — two of the
+# sites this rule was written for are `//!` module preambles.
+#
+# THE GAP THIS LEAVES, named rather than implied: a TRAILING comment on a code
+# line — `let n = 1; // see h2.rs:12` — is not read. Measured on the tree this
+# rule landed in: all EIGHT `path.rs:NNN` tokens in Rust comments sat on a
+# comment-leading line and none on a trailing one, so reading "everything after
+# the first `//`" would have bought zero sites and cost the `//` inside a string
+# literal, which is a match to this pattern and not a comment to the compiler
+# (`"https://example.invalid/x.rs:1"`). Narrow and measured, like
+# `BARE_CITATION`'s two discriminators. No site in the tree takes that branch
+# today, and a citation moved onto one would be reported by nothing — which is
+# the honest cost of the choice, not a reason to widen it blind.
+RUST_COMMENT_LINE = "//"
+
+# A citation a Rust comment may keep, with the reason it keeps it. The shape is
+# NOT_A_TEST's, for NOT_A_TEST's reason: every entry carries the reason it is
+# here, and an entry without one is an unreviewed silencing of this rule. The
+# key is the citing FILE and the exact citation text, so an entry exempts one
+# written site and never a form.
+#
+# The class is a citation that records a position at a revision that is GONE.
+# Renumbering one onto today's tree does not repair it, it falsifies a record;
+# converting it to a symbol cannot be done either, because the construct it
+# names was deleted. So such a citation is neither converted nor renumbered —
+# it is declared here and left exactly as its author wrote it.
+#
+# This table is NOT the place for a citation that is merely inconvenient to
+# convert. A live pointer into a file this repository still edits has a symbol
+# to name, and naming it is the whole remedy this rule exists to force.
+HISTORICAL_CITATIONS = {
+    ("lib/src/protocol/mux/h2_flood_detector.rs", "h2.rs:6946"):
+        "a position AT THE PRE-EXTRACTION REVISION, which the citing sentence "
+        "says out loud. It records where `H2FloodDetector::default()`'s test "
+        "call sites were before this module took them — not where anything is "
+        "now. That extraction deleted the `impl Default` the number describes, "
+        "so there is no symbol to cite instead and no line to renumber onto",
+}
+
+
+def rust_files(root):
+    """Every `*.rs` in the tree, repo-root-relative, `SKIP_DIRS` excluded.
+
+    THE WHOLE TREE, not `lib|command|bin|e2e/src` alone. The defect is a
+    property of the form, not of the directory the comment happens to sit in,
+    and scoping by the citing path would leave `sim/`, `fuzz/`, `lib/benches`,
+    `lib/examples`, the integration tests and every `build.rs` free to
+    reintroduce it — while reading as a rule that covers Rust comments.
+    """
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            if name.endswith(".rs"):
+                found.append(
+                    os.path.relpath(os.path.join(dirpath, name), root).replace(os.sep, "/")
+                )
+    return sorted(found)
+
+
+def check_rust_comment_citations(root, historical=None, show=False, out=sys.stdout):
+    """No `//`, `///` or `//!` comment may cite a line number in this tree.
+
+    Returns `(examined, external, exempt, failures)`: how many citations were
+    found on comment lines at all, how many named no file in this tree, how
+    many `historical` declares, and the failures among the rest.
+
+    WHAT DECIDES A HIT is `resolve_path` — rule 1's own resolver, so this rule
+    and the resolver can never disagree about which file a citation names. A
+    citation that resolves, and one whose basename is AMBIGUOUS in this tree,
+    both fail: each names a line this repository's own edits move. A citation
+    that resolves to nothing here is skipped and counted, because a pinned
+    reference into an external dependency is not moved by anything in this
+    repository and this rule is not its owner — `doc/README.md` reached the
+    same verdict on the two `kawa` citations when the convention landed.
+
+    Resolution is sibling-first, exactly as for a module `LIFECYCLE.md`, which
+    is what brings a bare `h1.rs:361-368` written from `mux/h2.rs` inside the
+    rule. A finder grep keyed on a `lib/src/`-style prefix walks past that
+    form, and a rule built on the same prefix would have shipped green over it.
+    """
+    historical = HISTORICAL_CITATIONS if historical is None else historical
+    by_suffix = target_files(root)
+    examined = 0
+    external = 0
+    exempt = 0
+    failures = []
+
+    for rel in rust_files(root):
+        own_dir = os.path.dirname(rel)
+        with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as handle:
+            body = handle.read()
+        for number, line in enumerate(body.splitlines(), 1):
+            if not line.lstrip().startswith(RUST_COMMENT_LINE):
+                continue
+            for match in CITATION.finditer(line):
+                examined += 1
+                cited = match.group("path")
+                text = "%s:%s" % (cited, " ".join(match.group("spans").split()))
+                where = "%s:%d" % (rel, number)
+                target, why = resolve_path(cited, by_suffix, root, own_dir)
+                if target is None and why == "no such file in the tree":
+                    external += 1
+                    if show:
+                        out.write("%s  `%s`  |external: names no file in this tree\n" % (where, text))
+                    continue
+                reason = historical.get((rel, text))
+                if reason is not None:
+                    exempt += 1
+                    if show:
+                        out.write("%s  `%s`  |historical: %s\n" % (where, text, reason))
+                    continue
+                failures.append(
+                    "%s: `%s` — a line number cited from a Rust comment, naming %s; cite the "
+                    "SYMBOL instead (`Type::method`), with the path and no line number"
+                    % (where, text, target if target else "several files by that basename")
+                )
+
+    return examined, external, exempt, failures
+
+
 FIXTURE_EXPECTED = [
     "doc/bad.md:3: `sample.rs:99` — past end of sample.rs (10 lines)",
     "doc/bad.md:5: `sample.rs:4` — sample.rs:4 is blank",
@@ -1747,8 +1973,71 @@ FIXTURE_PINNED_EXPECTED = [
 FIXTURE_PINNED = 3
 FIXTURE_UNPINNED = 1
 
+# The invariant half of rule 5's failure message, shared by every expectation
+# below so that a reworded report is ONE edit here rather than six, and so
+# that the expectations stay readable as what they actually discriminate:
+# the citing site, the citation text, and the file it resolved to.
+FIXTURE_COMMENT_MESSAGE = "— a line number cited from a Rust comment, naming"
+
+# Rule 5's half of the fixtures. `comments_bad.rs` writes the forbidden form in
+# each span shape `CITATION` carries — a single line, a range, and a `/` group
+# — so a narrowed pattern loses a fixture instead of losing the tree quietly;
+# `mod/comments_sibling_bad.rs` writes the BARE-SIBLING shape;
+# `comments_good.rs` is the clean one and carries the two that must be left
+# alone. The listed order is `sorted()`'s, which is lexicographic on the
+# message and therefore on `file:line` as TEXT — `:11` before `:6`.
+FIXTURE_COMMENT_EXPECTED = [
+    "comments_bad.rs:11: `sample.rs:6-8` %s sample.rs" % FIXTURE_COMMENT_MESSAGE,
+    "comments_bad.rs:12: `sample.rs:7/8` %s sample.rs" % FIXTURE_COMMENT_MESSAGE,
+    "comments_bad.rs:16: `drift.rs:4` %s drift.rs" % FIXTURE_COMMENT_MESSAGE,
+    "comments_bad.rs:6: `sample.rs:3` %s sample.rs" % FIXTURE_COMMENT_MESSAGE,
+    "mod/comments_sibling_bad.rs:5: `h2.rs:2` %s mod/h2.rs" % FIXTURE_COMMENT_MESSAGE,
+]
+
+# THE SIBLING CITATION, asserted by name rather than only as a list entry.
+# `h2.rs:2` written from `mod/` carries no directory, so the finder grep in
+# sozu-proxy/sozu#1473 — keyed on a `lib/src/`-style prefix — walks past it,
+# and a rule built on that same prefix would ship green over the live instance
+# of exactly this shape: `mux/h2.rs`'s `h1.rs:361-368`, naming its own sibling.
+# Only `resolve_path`'s directory-first binding reaches it. The assertion is on
+# the RESOLVED TARGET, because that is the single character of the report that
+# separates a correct binding from a plausible wrong one: root `h2.rs` is a
+# real 3-line file and reports just as confidently.
+FIXTURE_COMMENT_SIBLING_EXPECTED = (
+    "mod/comments_sibling_bad.rs:5: `h2.rs:2` %s mod/h2.rs" % FIXTURE_COMMENT_MESSAGE
+)
+
+# Both totals asserted, not floors, for the reason every other total here is:
+#   * dropping `*.rs` from rust_files(), or narrowing it to a directory list,
+#     loses the sibling fixture and then the whole rule reports on less than it
+#     claims to cover;
+#   * requiring the citing line to start with `///` rather than `//` loses the
+#     three plain-`//` header citations;
+#   * dropping the external SKIP makes `external` 0 and turns `comments_good.rs`
+#     into two failures, which is the rule claiming ownership of a dependency
+#     this repository does not edit.
+FIXTURE_COMMENT_EXAMINED = 7
+FIXTURE_COMMENT_EXTERNAL = 2
+
+# The fixture-local exemption table, used to exercise the disposition on a tree
+# where the real HISTORICAL_CITATIONS entry names nothing. `comments_bad.rs`'s
+# `drift.rs:4` is reported with the default table and silent with this one, so
+# deleting this entry — or keying the table on anything but (file, citation) —
+# moves a verdict and turns `--self-test` red. A table no fixture can move is
+# not a guard; see TARGET_SUFFIXES for the same lesson learned the hard way.
+FIXTURE_HISTORICAL = {
+    ("comments_bad.rs", "drift.rs:4"): "fixture allowlist witness",
+}
+
 # Every fixture document that is MEANT to fail, removed for the clean-tree run.
-BROKEN_FIXTURES = ("doc/bad.md", "tests_bad.rs", "CHANGELOG.md", "doc/pinned_bad.md")
+BROKEN_FIXTURES = (
+    "doc/bad.md",
+    "tests_bad.rs",
+    "CHANGELOG.md",
+    "doc/pinned_bad.md",
+    "comments_bad.rs",
+    "mod/comments_sibling_bad.rs",
+)
 
 
 def _run_cli(args):
@@ -2109,6 +2398,79 @@ def self_test():
             % (pinned, unpinned, FIXTURE_PINNED, FIXTURE_UNPINNED)
         )
 
+    # ── Rule 5 ──────────────────────────────────────────────────────
+    # Default table first: its one entry names a file in the REAL tree and
+    # nothing in the fixtures, so the historical witness must report as plainly
+    # forbidden here alongside the rest. Every citation in `comments_good.rs`
+    # must stay silent, and it is not named by exclusion the way rule 1's clean
+    # set is — `external` carries that, as a counted total rather than an
+    # absence.
+    seen, external, comment_exempt, cited_lines = check_rust_comment_citations(fixtures)
+    cited_lines = sorted(cited_lines)
+    if len(cited_lines) != len(FIXTURE_COMMENT_EXPECTED):
+        ok = False
+        print(
+            "FAIL self-test: expected %d line-number citations from the Rust fixtures, got %d:"
+            % (len(FIXTURE_COMMENT_EXPECTED), len(cited_lines))
+        )
+        for line in cited_lines:
+            print("  " + line)
+    else:
+        for expected, actual in zip(FIXTURE_COMMENT_EXPECTED, cited_lines):
+            if not actual.startswith(expected):
+                ok = False
+                print("FAIL self-test: expected a failure starting %r, got %r" % (expected, actual))
+
+    # The bare SIBLING citation, asserted by name. The list above cannot stand
+    # in for it: bind `h2.rs:2` to the repository root instead of the citing
+    # file's directory and it is still reported, still one entry, still a real
+    # non-blank line — only the resolved target in the text changes, from
+    # `mod/h2.rs` to `h2.rs`. That is the same failure shape as a citation that
+    # resolves onto unrelated code: plausible, confident, and wrong.
+    if not any(line.startswith(FIXTURE_COMMENT_SIBLING_EXPECTED) for line in cited_lines):
+        ok = False
+        print(
+            "FAIL self-test: the bare sibling citation `h2.rs:2` on "
+            "mod/comments_sibling_bad.rs:5 was not reported against mod/h2.rs. A cited path "
+            "binds to the citing file's own directory first, which is what brings a bare "
+            "`h1.rs:NNN` written from `mux/h2.rs` inside this rule; a prefix-keyed rule walks "
+            "past that whole shape. Expected a failure starting %r."
+            % FIXTURE_COMMENT_SIBLING_EXPECTED
+        )
+
+    if (seen, external, comment_exempt) != (FIXTURE_COMMENT_EXAMINED, FIXTURE_COMMENT_EXTERNAL, 0):
+        ok = False
+        print(
+            "FAIL self-test: examined %d / %d external / %d exempt Rust-comment citations, "
+            "expected %d / %d / 0 — the scanned surface, the comment-line test or the "
+            "external skip has moved"
+            % (seen, external, comment_exempt, FIXTURE_COMMENT_EXAMINED, FIXTURE_COMMENT_EXTERNAL)
+        )
+
+    # Now the disposition. With the fixture table the historical witness must
+    # disappear from the failures AND appear in `exempt`; a table that silenced
+    # an entry without counting it would pass the first half of that and put
+    # this rule's coverage somewhere no report can read it.
+    _, _, table_exempt, disposed = check_rust_comment_citations(
+        fixtures, historical=FIXTURE_HISTORICAL
+    )
+    if len(disposed) != len(FIXTURE_COMMENT_EXPECTED) - 1 or table_exempt != 1:
+        ok = False
+        print(
+            "FAIL self-test: with the fixture table, expected exactly %d failures and 1 exempt, "
+            "got %d and %d:"
+            % (len(FIXTURE_COMMENT_EXPECTED) - 1, len(disposed), table_exempt)
+        )
+        for line in sorted(disposed):
+            print("  " + line)
+    elif any("drift.rs:4" in line for line in disposed):
+        ok = False
+        print(
+            "FAIL self-test: the fixture table declares `drift.rs:4` historical and it was "
+            "still reported — HISTORICAL_CITATIONS is keyed on (citing file, citation text), "
+            "and a key that does not match exempts nothing while looking like it does."
+        )
+
     # `check()` classifying correctly is NOT the same as the command acting on
     # it. A build of this script that reports every failure and still exits 0
     # is green in CI and guards nothing, and nothing above this point executes
@@ -2140,12 +2502,15 @@ def self_test():
         print(
             "OK self-test: %d fixture line citations, %d of them compared against a base "
             "revision (%d more exempt as re-anchored), %d examined test names (%d checked), "
-            "and %d pinned blocks compared (%d unpinned Rust blocks left alone); %d + %d + %d "
-            "+ %d expected failures reported, exit 1 on the broken tree and 0 on the clean "
-            "one, and an unreachable base refused instead of skipped."
+            "%d pinned blocks compared (%d unpinned Rust blocks left alone), and %d citations "
+            "seen in Rust comments (%d naming no file in the fixture tree); %d + %d + %d "
+            "+ %d + %d expected failures reported, the fixture exemption table moving one "
+            "verdict, exit 1 on the broken tree and 0 on the clean one, and an unreachable "
+            "base refused instead of skipped."
             % (
                 total, compared, exempt, examined, checked, pinned, unpinned,
-                len(bad), len(drifted), len(dead), len(mismatched),
+                seen, external,
+                len(bad), len(drifted), len(dead), len(mismatched), len(cited_lines),
             )
         )
     return 0 if ok else 1
@@ -2281,6 +2646,41 @@ def main():
         )
         print("This is a floor too, and an opt-in one: a block that carries no `path:NNN-MMM` in its")
         print("fence is never compared, so a quote is only guarded once its author pins it.")
+
+    print("")
+    seen, external, exempt, cited_lines = check_rust_comment_citations(root, show=args.show)
+    if cited_lines:
+        status = 1
+        print(
+            "::error::%d of %d `file.rs:NNN` citations written in a Rust comment name a line in "
+            "this tree:" % (len(cited_lines), seen)
+        )
+        for line in cited_lines:
+            print("  " + line)
+        print("")
+        print("This rule FORBIDS the form rather than resolving it. A line number in a comment is a")
+        print("pointer with no owner: the resolver above reads `doc/**` and every `**/LIFECYCLE.md`")
+        print("and never a Rust comment, so until this rule the form was checked by nothing at all")
+        print("(sozu-proxy/sozu#1466, sozu-proxy/sozu#1473). Measured at main `19fd5d8c`, 68 of the")
+        print("tree's 90 such citations had already drifted and the median one survived ONE commit")
+        print("into the file it points at.")
+        print("Cite the SYMBOL — `Type::method`, with the path and no line number. Where the prose")
+        print("means one branch inside an item, name that branch in words. A citation that records a")
+        print("position at a revision which no longer exists belongs in HISTORICAL_CITATIONS, keyed")
+        print("on its citing file and its exact text, with the reason — never renumbered onto")
+        print("today's tree, which falsifies the record instead of repairing it.")
+        print("Convention and worked example: doc/README.md#citing-code-from-a-rust-comment")
+    else:
+        print(
+            "OK: no `file.rs:NNN` citation in a Rust comment names a line in this tree "
+            "(%d seen; %d name no file here, %d exempt as historical)." % (seen, external, exempt)
+        )
+        print("Every `*.rs` in the tree is scanned, not `lib|command|bin|e2e/src` alone, and a cited")
+        print("path binds to the citing file's own directory first — so a bare `h1.rs:NNN` written")
+        print("from `mux/h2.rs` is inside this rule, although a prefix-keyed grep walks past it.")
+        print("What it declines to look at is counted beside what it checked, never silent: a")
+        print("citation naming no file here is a pinned external dependency this repository does not")
+        print("edit, and a TRAILING comment on a code line is not read at all.")
 
     return status
 

@@ -381,7 +381,9 @@ jobs:
   # │   still name the same TEXT at the merge base; and a fenced    │
   # │   block that names the lines it quotes must quote them        │
   # │   literally. One more rule reads those plus every `*.rs` and  │
-  # │   CHANGELOG.md: a cited test name must name a `fn`.           │
+  # │   CHANGELOG.md: a cited test name must name a `fn`. A fifth   │
+  # │   reads every `*.rs` alone and FORBIDS rather than resolves:  │
+  # │   no `file.rs:NNN` in a `//`, `///` or `//!` comment.         │
   # │                                                               │
   # │   .github/scripts/check_doc_citations.py IS the authority.    │
   # │   Its header carries every rule, the measurement behind it    │
