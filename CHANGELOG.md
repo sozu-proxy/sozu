@@ -4,6 +4,35 @@
 
 ### ✨ Added
 
+- **`test(mux-h2)`: a driven TLS `close_notify` over a real `FrontRustls`
+  ([#1498](https://github.com/sozu-proxy/sozu/issues/1498)).**
+  `ConnectionH2::begin_tls_close` — the seam that reaches `FrontRustls::socket_close`, which is
+  `rustls::ServerConnection::send_close_notify` — had no coverage at all. Measured at `0dddedf2`:
+  replacing its body with `{}` left `cargo test -p sozu-lib` at `1114 passed; 0 failed`, and
+  reddened no `sozu-e2e` test either, while the same mutation on either of its two siblings from
+  the same extraction reddens at once — measured against this changeset's own `1115 passed`
+  baseline, `tls_wants_write() -> false` gives `1104 passed; 11 failed` and a no-op
+  `flush_tls_records()` gives `1110 passed; 5 failed`, ten and four of those respectively being
+  tests other than the one added here. The hole was structural rather than an oversight — every handler
+  the suite drove a close over (`mio::net::TcpStream` and the `BackpressuredTlsSocket` fixture)
+  inherits `SocketHandler::socket_close`'s EMPTY trait default, so the real seam and a no-op are
+  the same thing to all of them, and `FrontRustls` is the only implementation in the tree that
+  overrides it. #1484's coverage audit had reached the same conclusion from the other direction,
+  listing `initiate_close_notify` among the `socket_wants_write` branches its six
+  `ConnectionH2<FrontRustls>` tests could not reach, for want of a driven close_notify.
+  `a_frontend_timeout_makes_the_peer_receive_a_tls_close_notify` drives the whole production route
+  — `Mux::timeout` → `Mux::delay_close_for_frontend_flush` → `Connection::initiate_close_notify` →
+  `ConnectionH2::initiate_close_notify` → `begin_tls_close` → `send_close_notify` — over the existing
+  `rustls_h2_connection` fixture, flushes with the same `Connection::flush_zero_buffer` that
+  `Mux::shutting_down_inner` calls for this purpose, and asserts on what the peer's real
+  `rustls::ClientConnection` DECRYPTS: `IoState::peer_has_closed()`, plus `Reader::read` answering
+  `Ok(0)` rather than `UnexpectedEof`. That second witness is the whole point — rustls answers
+  `Ok(0)` only for a stream closed WITH a `close_notify` and
+  `UnexpectedEof("peer closed connection without sending TLS close_notify")` for a bare FIN, so an
+  assertion that a FIN had arrived would have passed against the mutant. Seen red before it was
+  trusted: `1114 passed; 1 failed`, this test and nothing else. Test-only — no production code
+  changes, so `sozu-lib` as a dependency build is byte-identical to `0dddedf2`.
+
 - **`test(sim)`: deterministic simulation of the H2 core — step C4 of the `poll_timeout` series
   ([#1359](https://github.com/sozu-proxy/sozu/issues/1359)).** `sim/tests/h2_simulation.rs` drives
   `ConnectionH2::readable` / `ConnectionH2::writable` under a moonpool-sim seeded workload on the

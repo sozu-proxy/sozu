@@ -13333,6 +13333,176 @@ mod tests {
         );
     }
 
+    // ── #1498: a DRIVEN TLS close_notify over a real `FrontRustls` ─────
+    //
+    // `ConnectionH2::begin_tls_close` is the seam that reaches
+    // `FrontRustls::socket_close`, which is
+    // `rustls::ServerConnection::send_close_notify`. Replacing its body with
+    // `{}` at 0dddedf2 left the WHOLE suite green — `sozu-lib` `1114 passed;
+    // 0 failed`, and no `sozu-e2e` test reddened on the mutation either —
+    // while the same mutation on either of its two siblings from the same
+    // extraction reddens at once. Measured against this branch's own `1115
+    // passed` baseline: `tls_wants_write() -> false` gives `1104 passed; 11
+    // failed` and a no-op `flush_tls_records()` gives `1110 passed; 5
+    // failed`, ten and four of those respectively being tests OTHER than this
+    // one — which is the asymmetry the whole file turns on. #1484's
+    // coverage audit reached the same conclusion from the other direction,
+    // listing `initiate_close_notify` among the `socket_wants_write` branches
+    // its six `ConnectionH2<FrontRustls>` tests could not reach, for want of a
+    // driven close_notify.
+    //
+    // The hole is structural rather than an oversight. Every handler the suite
+    // drives a close over — `mio::net::TcpStream` and
+    // `BackpressuredTlsSocket` — inherits `SocketHandler::socket_close`'s EMPTY
+    // trait default, so to all of them the real seam and a no-op are the same
+    // thing. `FrontRustls` is the only implementation in the tree that
+    // overrides it, which is why the test below has to build one.
+    //
+    // And the assertion has to be on the ALERT, not on a FIN. That distinction
+    // is the whole point of the alert: rustls answers `Ok(0)` from its reader
+    // for a stream closed WITH a close_notify and
+    // `UnexpectedEof("peer closed connection without sending TLS
+    // close_notify")` for one closed without, so only the alert lets a peer
+    // tell a complete response from a connection cut mid-stream. A test that
+    // asserted a FIN had arrived would pass against the no-op mutant, which
+    // still closes the socket.
+
+    /// The frontend idle timeout on a server H2 connection makes the peer
+    /// receive a TLS close_notify alert.
+    ///
+    /// The route is the production one and the whole of it:
+    /// `Mux::timeout` -> `Mux::delay_close_for_frontend_flush` ->
+    /// `Connection::initiate_close_notify` ->
+    /// `ConnectionH2::initiate_close_notify` -> `begin_tls_close` ->
+    /// `FrontRustls::socket_close` -> `send_close_notify`.
+    ///
+    /// `Mux::delay_close_for_frontend_flush` is the SOLE caller of
+    /// `Connection::initiate_close_notify`, and it is itself called from four
+    /// sites in `Mux::ready_inner` and this one in `Mux::timeout_inner`.
+    /// `Mux::shutting_down` is not among them: it drives frontend I/O and can
+    /// flush records the alert has already generated, but it never asks for
+    /// one. The timeout is chosen over the four `ready_inner` sites only
+    /// because they need a `dyn ProxySession` and a `dyn L7Proxy`; the seam
+    /// under test is the same on all five.
+    ///
+    /// The flush is `Connection::flush_zero_buffer` — the same call
+    /// `Mux::shutting_down_inner` makes for exactly this purpose, on a
+    /// connection whose zero buffer is empty so nothing but the alert reaches
+    /// the wire. `FrontRustls::socket_write(&[])` takes its "flush pending TLS
+    /// records even if no application data was written" block, which is what
+    /// hands the record to `write_tls`.
+    ///
+    /// TO SEE THIS RED: replace the body of `ConnectionH2::begin_tls_close`
+    /// with `{}`. rustls is then never asked for the alert, `tls_wants_write()`
+    /// answers false, `initiate_close_notify` returns false and the flush has
+    /// nothing to push, so this test fails on `the peer must decrypt a TLS
+    /// close_notify alert`. Measured: `1114 passed; 1 failed` — this test and
+    /// nothing else, which is what a hole this complete looks like once it has
+    /// exactly one witness. Note `close_notify_sent` is still set by the
+    /// mutant, so no assertion on that flag could discriminate — only the
+    /// bytes the peer receives can.
+    #[test]
+    fn a_frontend_timeout_makes_the_peer_receive_a_tls_close_notify() {
+        use std::io::Read as _;
+
+        use crate::{StateResult, protocol::SessionState};
+
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, mut peer, mut client) = rustls_h2_connection(&pool, H2State::Header);
+        // `Mux::consume_timer_entry` re-validates the wheel entry against the
+        // core's own deadline and returns `Continue` having done NOTHING when
+        // that deadline is still in the future. `ConnectionH2::new` arms one a
+        // full `timeout_duration` out, so move it into the past: this is the
+        // idle deadline genuinely elapsing, which is what the event loop would
+        // be reacting to.
+        connection.timeout_deadline = Some(Instant::now() - Duration::from_secs(60));
+
+        let frontend_token = mio::Token(0);
+        let mut mux = crate::protocol::mux::Mux {
+            configured_frontend_timeout: Duration::from_secs(30),
+            frontend_token,
+            frontend: crate::protocol::mux::Connection::H2(connection),
+            router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
+            // No streams at all, so the per-stream loop leaves `should_close`
+            // true and `should_write` false, which is the only combination
+            // that reaches `delay_close_for_frontend_flush`.
+            context: test_context(&pool),
+            session_ulid: Ulid::generate(),
+            timeouts: HashMap::new(),
+        };
+        let mut metrics = SessionMetrics::new(None);
+
+        {
+            let crate::protocol::mux::Connection::H2(h2) = &mux.frontend else {
+                unreachable!("the frontend was built as H2")
+            };
+            assert!(
+                !h2.socket.socket_wants_write(),
+                "premise: the fixture must start with rustls holding nothing, \
+                 or the records this test attributes to the alert could be the \
+                 handshake's"
+            );
+        }
+        assert!(
+            !client
+                .process_new_packets()
+                .expect("the peer must decrypt what the frontend wrote")
+                .peer_has_closed(),
+            "premise: the peer must not have seen a close before the timeout \
+             runs, or the closing assertion is reading a state it inherited"
+        );
+
+        let result = mux.timeout(frontend_token, &mut metrics);
+
+        let mut received = Vec::new();
+        let mut peer_saw_close_notify = false;
+        for _ in 0..MAX_DRIVE_TICKS {
+            mux.frontend.flush_zero_buffer();
+            // Loopback delivery is softirq-driven, not synchronous with
+            // `write_tls`: give it a slot rather than spinning the CPU.
+            std::thread::yield_now();
+            drain_peer(&mut client, &mut peer, &mut received);
+            peer_saw_close_notify = client
+                .process_new_packets()
+                .expect("the peer must decrypt what the frontend wrote")
+                .peer_has_closed();
+            if peer_saw_close_notify {
+                break;
+            }
+        }
+
+        assert!(
+            peer_saw_close_notify,
+            "the peer must decrypt a TLS close_notify alert: without it a \
+             client cannot tell this orderly shutdown from a stream truncated \
+             mid-response, and reports a protocol error instead of a clean end"
+        );
+        let mut sentinel = [0u8; 1];
+        assert!(
+            matches!(client.reader().read(&mut sentinel), Ok(0)),
+            "the alert must be what ended the peer's stream, stated in \
+             rustls's own vocabulary: its reader answers Ok(0) only for a \
+             stream closed with a close_notify, UnexpectedEof for a bare FIN \
+             and WouldBlock for neither — so this is the assertion a FIN \
+             cannot satisfy"
+        );
+        assert!(
+            received.is_empty(),
+            "nothing but the alert may reach the peer on this path: decrypted \
+             plaintext here would mean the connection also wrote a frame after \
+             asking rustls to close, which RFC 8446 §6.1 has the peer discard \
+             ({} bytes)",
+            received.len()
+        );
+        assert_eq!(
+            result,
+            StateResult::Continue,
+            "a timeout that queued an alert must keep the session alive until \
+             the records drain: closing here sends FIN over the very bytes the \
+             close_notify was generated to deliver"
+        );
+    }
+
     // ── Connection-level idle deadline: what counts as liveness ────────
     //
     // LIFECYCLE §9 invariant 9 says the connection timer resets only on
