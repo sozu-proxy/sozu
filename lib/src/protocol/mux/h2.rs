@@ -874,6 +874,20 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// call sites stay as they were.
     pub(super) now: Instant,
 }
+/// Renders the peer address this connection snapshotted at construction,
+/// where it used to render the socket behind it.
+///
+/// `socket_ref()` handed `mio::net::TcpStream`'s own `Debug` a concrete OS
+/// handle — local address, peer address and file descriptor — which is more
+/// than a reader of this struct needs and is a value a byte-in / byte-out core
+/// cannot produce. `peer_address` is what every `log_context!` line already
+/// renders, it survives the peer's reset where a live `getpeername(2)` answers
+/// `ENOTCONN`, and it carries no descriptor. In the H2 simulator it is a fixed
+/// address by construction, so no ephemeral port reaches a trace through here
+/// any more.
+///
+/// `ConnectionH2::snapshot_rtts` is the one reach into
+/// `SocketHandler::socket_ref` left in this file; `socket_mut` has none.
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionH2")
@@ -883,7 +897,7 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
             .field("readiness", &self.readiness)
             .field("local_settings", &self.local_settings)
             .field("peer_settings", &self.peer_settings)
-            .field("socket", &self.socket.socket_ref())
+            .field("peer_address", &self.peer_address)
             .field("streams", self.stream_table.streams())
             .field("zero", &self.zero.storage.meter(20))
             .field(
@@ -3579,10 +3593,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.storage.fill(offset);
                 if self.flush_zero_to_socket() {
                     self.stream_table.set_expect_write(Some(H2StreamId::Zero));
-                    // Edge-triggered epoll: ensure pending TLS data gets flushed
-                    if self.tls_wants_write() {
-                        self.readiness.signal_pending_write();
-                    }
+                    self.ensure_tls_flushed();
                     return Some(MuxResult::Continue);
                 }
             }
@@ -3628,10 +3639,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 kawa.storage.fill(offset);
                 if self.flush_zero_to_socket() {
                     self.stream_table.set_expect_write(Some(H2StreamId::Zero));
-                    // Edge-triggered epoll: ensure pending TLS data gets flushed
-                    if self.tls_wants_write() {
-                        self.readiness.signal_pending_write();
-                    }
+                    self.ensure_tls_flushed();
                     return Some(MuxResult::Continue);
                 }
             }

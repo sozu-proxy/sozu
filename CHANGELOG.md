@@ -210,6 +210,49 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: `ConnectionH2`'s `Debug` renders the peer address instead of the socket —
+  step 2a of the byte-in / byte-out extraction
+  ([#1339](https://github.com/sozu-proxy/sozu/issues/1339)).** **No behaviour change** outside one
+  rendered `Debug` line: `sozu-lib` is unmoved at 1113 tests, `sozu` at 113 and `sozu-e2e` at 447.
+
+  `.field("socket", &self.socket.socket_ref())` becomes `.field("peer_address",
+  &self.peer_address)`. The old field handed `mio::net::TcpStream`'s own `Debug` a local address,
+  a peer address and a file descriptor. `peer_address` is the address the connection snapshots once
+  at construction and that every `log_context!` line already renders; it carries no descriptor, and
+  it survives the peer's reset, where a live `getpeername(2)` answers `ENOTCONN` — which is exactly
+  when an operator reads the line. It is also a value a byte-in / byte-out core can produce at all:
+  `socket_ref` returns a concrete OS type no in-memory transport can synthesise, which is why the
+  H2 simulator's in-memory `SocketHandler` carries a connected loopback stream it never reads or
+  writes, and why that simulator's `peer_addr` answers a fixed address. No ephemeral port reaches a
+  trace through this impl any more.
+
+  `socket_ref()` reaches in `h2.rs`'s production range go **2 to 1**, and `socket_mut()` stays at
+  0. The survivor is `ConnectionH2::snapshot_rtts`, and Q11's local half is deliberately **not**
+  taken here. Injecting `client_rtt` means refreshing it once per pass — the shape the rest of the
+  extraction implies, mirroring how `ConnectionH2.now` is mirrored from `Context::now` — where
+  today it costs one `getsockopt(TCP_INFO)` per stream recycle, and `Endpoint` cannot supply it
+  lazily because it is the other side of the connection. That trade is measured, not reasoned
+  about, and it belongs to its own changeset.
+
+  Two verbatim copies of `ConnectionH2::ensure_tls_flushed`'s body — the stalled WINDOW_UPDATE and
+  RST_STREAM drain tails of `ConnectionH2::flush_pending_control_frames` — become calls to it.
+  Step 1 gave that body a name; a character-identical copy of a named method is the same fact
+  written twice. Seen red first: deleting both calls gives `1111 passed; 2 failed`, one test per
+  collapsed site — `a_stalled_window_update_drain_re_signals_the_writable_event` and
+  `a_stalled_rst_stream_drain_re_signals_the_writable_event` — and restoring them returns the suite
+  to 1113.
+
+  sozu-proxy/sozu#1484's six `ConnectionH2<FrontRustls>` tests, which cover the
+  `size > 0 && WouldBlock` truncation vector, keep their shape: 0 diff hits, all six green. The TLS
+  `close_notify` path this changeset does not touch remains uncovered (sozu-proxy/sozu#1498).
+  `doc/h2_mux_internals.md` gains the `Debug` contract, names `ensure_tls_flushed` as the one
+  composite built on the TLS query, and records that `ConnectionH2::close` hands `&mut self.socket`
+  whole to `shared::drain_tls_close_notify` — a reach that asks no question and is shared
+  byte-for-byte with `ConnectionH1::close`; 46 line citations across it, `doc/testing.md` and
+  `LIFECYCLE.md` are re-anchored for the line shift. The drifted-citation gate exempts 64
+  re-anchored spans from its comparison, and all 64 were audited against the base blob as
+  byte-identical.
+
 - **`refactor(mux-h2)`: the mux core takes its buffers from a caller-implemented `BufferSource`,
   and the HPACK state comes under that same contract
   ([#1336](https://github.com/sozu-proxy/sozu/issues/1336), Q1 option (c) and Q14).** Every buffer
