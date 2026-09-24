@@ -93,7 +93,8 @@ MuxState
     │   ├── [1] Stream { state: Linked(Token(12)), front: Kawa, back: Kawa, ... }
     │   ├── [2] Stream { state: Recycle, ... }
     │   └── ...
-    ├── pool: Weak<RefCell<Pool>>         ◄── buffer allocator
+    ├── buffers: Box<dyn BufferSource>    ◄── caller-supplied buffer source
+    │                                         (PoolBufferSource over the worker Pool)
     └── listener: Rc<RefCell<L>>
 ```
 

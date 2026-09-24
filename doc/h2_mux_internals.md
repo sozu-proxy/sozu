@@ -65,7 +65,9 @@ ConnectionH2<Front>
  |-- hpack: HpackState                      // Closed API (hpack_state.rs, private fields):
  |                                         // decoder, encoder, and the reusable
  |                                         // converter_buf / lowercase_buf / cookie_buf
- |                                         // scratch buffers
+ |                                         // scratch buffers. All three buffers come from
+ |                                         // the connection's BufferSource, so HpackState::new
+ |                                         // is fallible (buffer_source.rs)
  |-- local_settings: H2Settings             // Settings we advertise
  |-- peer_settings: H2Settings              // Settings the peer advertised
  |-- stream_table: H2StreamTable             // Closed API (h2_stream_table.rs, private fields):
@@ -718,7 +720,12 @@ transitions to `H2State::Frame(header)` for payload reading.
 Key decisions in this method:
 - MAX_CONCURRENT_STREAMS enforcement: queues RST_STREAM(REFUSED_STREAM) and
   transitions to `Discard` state to skip the HEADERS payload
-- Buffer pool exhaustion: same treatment as MAX_CONCURRENT_STREAMS
+- Buffer exhaustion: same treatment as MAX_CONCURRENT_STREAMS. The core asks
+  its `BufferSource` (`buffer_source.rs`) rather than a pool directly, and a
+  source that answers `None` is reporting a transient shortage — so the answer
+  is a refusal of that one stream, never a connection error. See
+  `BufferSource`'s own documentation for why that distinction is the contract
+  rather than a convention
 - Closed vs idle stream detection: frames on closed streams get RST_STREAM or
   GOAWAY depending on frame type; frames on idle streams get GOAWAY(PROTOCOL_ERROR)
 
@@ -1125,7 +1132,7 @@ and `tracestate` headers are extracted from inbound requests:
 At access log emission time (`Stream::generate_access_log`, in
 `lib/src/protocol/mux/stream.rs`):
 
-```rust lib/src/protocol/mux/stream.rs:776-779
+```rust lib/src/protocol/mux/stream.rs:782-785
 #[cfg(feature = "opentelemetry")]
 otel: context.otel.as_ref(),
 #[cfg(not(feature = "opentelemetry"))]
@@ -1233,14 +1240,17 @@ header block this connection emits.
 
 ### Buffer shrinking after large headers
 
-`converter_buf`, `lowercase_buf` and `cookie_buf` live in `HpackState`. A
+`converter_buf`, `lowercase_buf` and `cookie_buf` live in `HpackState`, which
+acquires all three from the connection's `BufferSource` at construction
+(`buffer_source.rs`) rather than allocating them itself — which is why
+`HpackState::new` returns an `Option`. A
 write pass takes all three out by value, hands them to `H2ConverterPass`, and
 `H2ConverterPass::converter` / `::reclaim` move them into and out of each
 per-`prepare` `H2BlockConverter` — a `Vec` move, never a copy of the bytes.
 The pass gives them back at the end, and `HpackState::shrink_converter_buffers`
 then caps each one:
 
-```rust lib/src/protocol/mux/hpack_state.rs:106-116
+```rust lib/src/protocol/mux/hpack_state.rs:128-138
 pub(super) fn shrink_converter_buffers(&mut self) {
     if self.converter_buf.capacity() > 16_384 {
         self.converter_buf.shrink_to(4096);

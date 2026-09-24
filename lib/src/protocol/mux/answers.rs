@@ -352,7 +352,11 @@ mod tests {
     use sozu_command::proto::command::SocketAddress;
 
     use super::*;
-    use crate::{Protocol, pool::Pool, protocol::kawa_h1::editor::HttpContext};
+    use crate::{
+        Protocol,
+        pool::Pool,
+        protocol::{kawa_h1::editor::HttpContext, mux::buffer_source::PoolBufferSource},
+    };
 
     fn make_stream() -> (Rc<RefCell<Pool>>, Stream) {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
@@ -401,8 +405,12 @@ mod tests {
             tags: None,
             access_log_message: None,
         };
-        let stream =
-            Stream::new(Rc::downgrade(&pool), http_ctx, 65_535).expect("pool checkout failed");
+        let stream = Stream::new(
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+            http_ctx,
+            65_535,
+        )
+        .expect("pool checkout failed");
         (pool, stream)
     }
 

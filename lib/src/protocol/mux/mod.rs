@@ -134,6 +134,7 @@ macro_rules! log_module_context {
 
 pub mod answers;
 pub mod auth;
+pub mod buffer_source;
 pub mod connection;
 mod converter;
 pub mod debug;
@@ -179,6 +180,7 @@ pub(crate) use crate::protocol::mux::answers::{
 use crate::protocol::mux::connection::{EndpointClient, EndpointServer};
 pub use crate::protocol::mux::{
     answers::terminate_default_answer,
+    buffer_source::{BufferSource, PoolBufferSource},
     connection::Connection,
     debug::{DebugEvent, DebugHistory},
     h1::ConnectionH1,
@@ -441,7 +443,14 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// `StreamState::Linked(token)`. Eliminates O(n) scans of `streams`
     /// when handling backend connect/disconnect/timeout/close events.
     pub backend_streams: HashMap<Token, Vec<GlobalStreamId>>,
-    pub pool: Weak<RefCell<Pool>>,
+    /// Where every buffer this session's streams and connections need comes
+    /// from, and the only thing allowed to refuse one.
+    ///
+    /// Boxed rather than concrete so the core names the contract rather than
+    /// the worker's [`Pool`]: a refusal is the same event whatever stands
+    /// behind it, and the `REFUSED_STREAM` answer to one is the same answer.
+    /// [`Context::new`] installs the [`PoolBufferSource`] the proxy runs on.
+    pub buffers: Box<dyn BufferSource>,
     pub listener: Rc<RefCell<L>>,
     /// Connection/session ULID — mirrors `Mux.session_ulid`. Stored here so
     /// per-stream `HttpContext` construction in [`Self::create_stream`] can
@@ -561,7 +570,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             streams: Vec::new(),
             pending_links: VecDeque::new(),
             backend_streams: HashMap::new(),
-            pool,
+            buffers: Box::new(PoolBufferSource::new(pool)),
             listener,
             session_ulid,
             session_address,
@@ -695,8 +704,8 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             }
             return Some(stream_id);
         }
-        self.streams
-            .push(Stream::new(self.pool.clone(), http_context, window)?);
+        let stream = Stream::new(&mut *self.buffers, http_context, window)?;
+        self.streams.push(stream);
         Some(self.streams.len() - 1)
     }
 
@@ -2648,7 +2657,7 @@ mod tests {
             Ulid::generate(),
             socket,
             Position::Server,
-            Rc::downgrade(&pool),
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
             H2FloodConfig::default(),
             H2ConnectionConfig::default(),
             Duration::from_secs(30),

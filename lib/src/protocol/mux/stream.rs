@@ -9,7 +9,7 @@ use std::{
     cell::{Cell, RefCell},
     fmt::Debug,
     ops::{Deref, DerefMut},
-    rc::{Rc, Weak},
+    rc::Rc,
     time::Duration,
 };
 
@@ -20,7 +20,6 @@ use super::{GenericHttpStream, Position};
 use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Protocol, SessionMetrics,
-    pool::Pool,
     protocol::http::{editor::HttpContext, parser::Method},
 };
 
@@ -58,10 +57,12 @@ impl StreamState {
 /// Ceiling on the request captures one worker may hold armed at once
 /// (sozu-proxy/sozu#1450).
 ///
-/// Captures live on the global allocator, outside the buffer [`Pool`], so no
+/// Captures live on the global allocator, outside the buffer
+/// [`Pool`](crate::pool::Pool), so no
 /// `max_buffers` accounting sees them. Before this ceiling their only bound
 /// was transitive: a capture can exist only on a live [`Stream`], and
-/// [`Stream::new`] takes exactly two `pool.checkout()` calls, so at most
+/// [`Stream::new`] takes exactly two [`BufferSource::checkout`](super::buffer_source::BufferSource::checkout)
+/// calls, each served by that same [`Pool`](crate::pool::Pool), so at most
 /// `max_buffers / 2` captures can be armed at once. At the defaults
 /// (`max_buffers` 1000, `buffer_size` 16393) that is 500 captures of at most
 /// 16400 bytes each, about 8.2 MB — and it scales with `max_buffers`, so
@@ -103,7 +104,7 @@ thread_local! {
     ///
     /// Thread-local rather than a process-wide static because that is the
     /// scope of everything it is reconciled against: a Sōzu worker is one
-    /// event-loop thread, its [`Pool`] is an `Rc<RefCell<Pool>>` that cannot
+    /// event-loop thread, its [`Pool`](crate::pool::Pool) is an `Rc<RefCell<Pool>>` that cannot
     /// leave it, and the `backend.retry.captures_armed` gauge this counter
     /// feeds lives in the `thread_local!` `crate::metrics::METRICS`. A shared
     /// static would let one worker thread in a multi-worker test process
@@ -302,14 +303,19 @@ pub struct StreamParts<'a> {
 }
 
 impl Stream {
-    pub fn new(pool: Weak<RefCell<Pool>>, context: HttpContext, window: u32) -> Option<Self> {
-        let (front_buffer, back_buffer) = {
-            let pool = pool.upgrade()?;
-            let mut pool = pool.borrow_mut();
-            match (pool.checkout(), pool.checkout()) {
-                (Some(front_buffer), Some(back_buffer)) => (front_buffer, back_buffer),
-                _ => return None,
-            }
+    /// `None` when `buffers` cannot supply the pair. Both halves are asked
+    /// for together and neither is kept without the other, so a stream that
+    /// cannot be served leaves the source exactly as it found it — which is
+    /// what makes the caller's `RST_STREAM(REFUSED_STREAM)` a refusal of one
+    /// stream rather than a leak charged to the next.
+    pub fn new(
+        buffers: &mut dyn super::buffer_source::BufferSource,
+        context: HttpContext,
+        window: u32,
+    ) -> Option<Self> {
+        let (front_buffer, back_buffer) = match (buffers.checkout(), buffers.checkout()) {
+            (Some(front_buffer), Some(back_buffer)) => (front_buffer, back_buffer),
+            _ => return None,
         };
         let stream = Self {
             state: StreamState::Idle,
@@ -792,7 +798,9 @@ mod tests {
     use super::*;
     use crate::{
         metrics::METRICS,
+        pool::Pool,
         protocol::mux::{
+            buffer_source::PoolBufferSource,
             shared::{self, EndStreamAction},
             test_support::TestListener,
         },
@@ -821,7 +829,12 @@ mod tests {
             false,
             false,
         );
-        Stream::new(Rc::downgrade(pool), context, 65535).expect("test stream checkout")
+        Stream::new(
+            &mut PoolBufferSource::new(Rc::downgrade(pool)),
+            context,
+            65535,
+        )
+        .expect("test stream checkout")
     }
 
     /// The current value of one proxy-level metric for this test thread.
@@ -1206,8 +1219,12 @@ mod tests {
             false,
             false,
         );
-        let mut stream =
-            Stream::new(Rc::downgrade(&pool), context, 65535).expect("test stream checkout");
+        let mut stream = Stream::new(
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+            context,
+            65535,
+        )
+        .expect("test stream checkout");
 
         let space = stream.back.storage.space();
         space[..RESPONSE.len()].copy_from_slice(RESPONSE);

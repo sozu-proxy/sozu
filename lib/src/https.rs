@@ -702,7 +702,7 @@ impl HttpsSession {
                 mux::Connection::new_h2_server(
                     session_ulid,
                     front_stream,
-                    self.pool.clone(),
+                    &mut *context.buffers,
                     handshake.container_frontend_timeout.duration(),
                     flood_config,
                     connection_config,

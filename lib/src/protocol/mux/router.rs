@@ -588,7 +588,7 @@ impl Router {
                     socket,
                     cluster_id.to_owned(),
                     backend,
-                    context.pool.clone(),
+                    &mut *context.buffers,
                     self.configured_connect_timeout,
                     flood_config,
                     connection_config,
@@ -1486,7 +1486,7 @@ mod tests {
         http::HttpProxy,
         protocol::{
             http::{editor::HttpContext, parser::Method},
-            mux::stream::Stream,
+            mux::{buffer_source::PoolBufferSource, stream::Stream},
         },
     };
 
@@ -1579,8 +1579,12 @@ mod tests {
             context.path = Some("/".to_owned());
             context.method = Some(Method::Get);
 
-            let mut stream = Stream::new(Rc::downgrade(&pool), context, 65_535)
-                .expect("test stream must check out its buffers");
+            let mut stream = Stream::new(
+                &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+                context,
+                65_535,
+            )
+            .expect("test stream must check out its buffers");
             let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
             let (front, stream_context) = {
                 let split = &mut stream;
@@ -1901,7 +1905,8 @@ mod backend_selection_order_tests {
         protocol::{
             http::parser::Method,
             mux::{
-                BackendStatus, Connection, Context, Position, StreamState, h2::H2ConnectionConfig,
+                BackendStatus, Connection, Context, Position, StreamState,
+                buffer_source::PoolBufferSource, h2::H2ConnectionConfig,
                 h2_flood_detector::H2FloodConfig,
             },
         },
@@ -2038,7 +2043,7 @@ mod backend_selection_order_tests {
                 socket,
                 staged.cluster().to_owned(),
                 backend,
-                Rc::downgrade(pool),
+                &mut PoolBufferSource::new(Rc::downgrade(pool)),
                 Duration::from_secs(30),
                 H2FloodConfig::default(),
                 H2ConnectionConfig::default(),

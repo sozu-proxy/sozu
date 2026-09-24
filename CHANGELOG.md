@@ -210,6 +210,54 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the mux core takes its buffers from a caller-implemented `BufferSource`,
+  and the HPACK state comes under that same contract
+  ([#1336](https://github.com/sozu-proxy/sozu/issues/1336), Q1 option (c) and Q14).** Every buffer
+  the core needs used to come from a concrete `Weak<RefCell<Pool>>` it held directly, except the
+  HPACK scratch, which came from nothing at all — `HpackState::new` built three `Vec`s and a
+  `loona_hpack` codec pair on the global allocator. A core that borrows its wire buffers while
+  allocating its header state bounds nothing, which is why the two were answered together. There
+  is now one trait, `sozu_lib::protocol::mux::BufferSource`, with two calls — `checkout` for wire
+  octets and `scratch` for a reusable connection-lifetime buffer — and one implementation,
+  `PoolBufferSource`, whose bodies are the expressions that used to sit at the call sites.
+  `Context` holds a `Box<dyn BufferSource>` in place of its `pool` field; `Stream::new`,
+  `ConnectionH2::new`, `Connection::new_h2_server` / `new_h2_client` and `HpackState::new` each
+  take `&mut dyn BufferSource`. `HpackState::new` became fallible as a result, so a refused
+  scratch buffer refuses the connection on the path a refused stream-0 buffer already took.
+
+  **No behaviour changes.** `PoolBufferSource::checkout` is the same upgrade-then-checkout, and
+  `PoolBufferSource::scratch` is the same `Vec::new()`, so every allocation happens where and when
+  it did. What changes is who can be asked: a caller may now supply a source of its own, which is
+  what makes memory pressure reachable from a test without arranging it through the global
+  allocator.
+
+  The behaviour this had to preserve — **buffer exhaustion mid-request produces
+  `RST_STREAM(REFUSED_STREAM)`, never a connection error** — had no coverage anywhere in the tree.
+  It does now, before the ownership moved: `sim/tests/h2_simulation.rs`'s
+  `h2_pool_exhaustion_mid_request_refuses_the_stream_not_the_connection` sizes the pool to three
+  buffers, so the connection's own takes one, the first stream takes the pair, and the second
+  stream finds nothing; it requires exactly one `RST_STREAM(REFUSED_STREAM)` on the stream that
+  could not be served, no GOAWAY, the admitted stream still live, and that stream still drivable
+  to completion afterwards. Replacing the refusal with `goaway(InternalError)` reddens it. The
+  harness gained one knob for it, `H2Harness::with_pool_maximum`; `H2Harness::new` delegates with
+  the 512 it always used.
+
+  Two more guards pin the contract itself: `PoolBufferSource` refuses rather than panicking when
+  its pool is exhausted or dropped, and answers again once a buffer comes back; and a source that
+  grants `checkout` while refusing `scratch` refuses the connection, which is the half of the
+  contract only a caller-implemented source can reach.
+
+  **Left for its own changeset, deliberately.** `loona_hpack` exposes no capacity-supplied
+  constructor, so its dynamic tables are under the contract at acquisition and bounded by the
+  RFC 7541 §4.2 table-size settings, not routed through the source. Growth of a scratch buffer
+  after it has been handed over still reaches the global allocator; pre-sizing one needs an answer
+  for an over-sized header block that this does not invent. `H2Scheduler`'s pass-order buffer —
+  the fourth scratch `Vec` the issue counted, before the scheduler extraction moved it out of
+  `HpackState` — holds stream ids rather than octets and is already bounded by the
+  concurrent-stream admission gate. And `h2_header_reassembly`'s accumulator, which the issue
+  tracks separately, still has no bound. `doc/architecture.md`, `doc/configure.md`,
+  `doc/h2_mux_internals.md` and `LIFECYCLE.md` follow the rename.
+
 - **`refactor(mux-h2)`: `Router::backends` becomes a `BTreeMap<Token, _>`, so a tie between backend
   connections no longer resolves by hash order
   ([#1338](https://github.com/sozu-proxy/sozu/issues/1338)).** Three lines of production code: the

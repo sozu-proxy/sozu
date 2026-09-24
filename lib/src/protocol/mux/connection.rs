@@ -18,7 +18,7 @@
 use std::{
     cell::RefCell,
     fmt::Debug,
-    rc::{Rc, Weak},
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -36,7 +36,6 @@ use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Readiness,
     backends::Backend,
-    pool::Pool,
     socket::{SocketHandler, stats::socket_rtt},
 };
 
@@ -140,7 +139,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub fn new_h2_server(
         session_ulid: Ulid,
         front_stream: Front,
-        pool: Weak<RefCell<Pool>>,
+        buffers: &mut dyn super::buffer_source::BufferSource,
         timeout_duration: Duration,
         flood_config: h2_flood_detector::H2FloodConfig,
         connection_config: h2::H2ConnectionConfig,
@@ -151,7 +150,7 @@ impl<Front: SocketHandler> Connection<Front> {
             session_ulid,
             front_stream,
             Position::Server,
-            pool,
+            buffers,
             flood_config,
             connection_config,
             stream_idle_timeout,
@@ -168,7 +167,7 @@ impl<Front: SocketHandler> Connection<Front> {
         front_stream: Front,
         cluster_id: String,
         backend: Rc<RefCell<Backend>>,
-        pool: Weak<RefCell<Pool>>,
+        buffers: &mut dyn super::buffer_source::BufferSource,
         timeout_duration: Duration,
         flood_config: h2_flood_detector::H2FloodConfig,
         connection_config: h2::H2ConnectionConfig,
@@ -194,7 +193,7 @@ impl<Front: SocketHandler> Connection<Front> {
                 backend,
                 BackendStatus::Connecting(Instant::now()),
             ),
-            pool,
+            buffers,
             flood_config,
             connection_config,
             stream_idle_timeout,

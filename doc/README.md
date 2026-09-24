@@ -436,7 +436,7 @@ as authoritative — a reader who copies it assumes the compile error is theirs.
 A fenced block closes that by naming the lines it quotes, in the info string, after the language:
 
 ````markdown
-```rust lib/src/protocol/mux/hpack_state.rs:106-116
+```rust lib/src/protocol/mux/hpack_state.rs:128-138
 pub(super) fn shrink_converter_buffers(&mut self) {
     if self.converter_buf.capacity() > 16_384 {
         self.converter_buf.shrink_to(4096);
@@ -449,7 +449,7 @@ pub(super) fn shrink_converter_buffers(&mut self) {
 The checker reads those lines and compares them to the block, line by line. Comparison is on the
 **stripped** line, matching the drift rule, so the indentation a quote loses when it leaves an `impl`
 block is not a mismatch — every other character is. A citation may carry several spans
-(`lib/src/protocol/mux/hpack_state.rs:106-116, 124`), and the block must then be their concatenation
+(`lib/src/protocol/mux/hpack_state.rs:128-138, 146`), and the block must then be their concatenation
 in order. There is no elision
 syntax, on purpose.
 
