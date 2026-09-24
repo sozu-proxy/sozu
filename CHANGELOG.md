@@ -1089,6 +1089,44 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux-h2)`: a short read of 25..=32 octets no longer disconnects a valid HTTP/2 client.**
+  `ConnectionH2::readable` arms `expect_read` with `CLIENT_PREFACE_SIZE` — the 24-octet magic
+  string plus a 9-octet SETTINGS frame header, 33 in all — and its short-read branch runs an early
+  guard so a client that is plainly not speaking H2 is dropped without waiting for the rest of the
+  window. The guard tested the WHOLE accumulated buffer with
+  `b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".starts_with(i)`, which asks whether `i` is a prefix **of the
+  24-octet constant**: once the buffer passed 24 octets that is false for every possible input,
+  a byte-perfect preface followed by a byte-perfect SETTINGS header included. The guard was
+  therefore correct only while the client had sent 24 octets or fewer, and between 25 and 32 it
+  refused unconditionally — `MuxResult::CloseSession`, no GOAWAY, and an `EARLY INVALID PREFACE`
+  debug line naming the client as the offender. Nothing about a TCP segment or a TLS record makes a
+  read land on the 24-octet boundary: a small segment, a split TLS record, or one client `write()`
+  the kernel delivers in two pieces all produce it, so this closed conforming connections at a rate
+  set by the network rather than by anything the peer did wrong. It now compares only the part the
+  constant can cover, deriving the width from `serializer::H2_PRI` (the existing preface constant,
+  already used by the client-position arm and by `health_check.rs`) rather than from a second
+  hard-coded 24, so the two cannot drift apart. A genuinely wrong octet anywhere in the first 24 is
+  still refused on the same short read, which is the only moment the early guard can act at all —
+  `parser::preface` in the `H2State::ClientPreface` arm is reached only once the whole window has
+  arrived. Regression coverage sweeps the axis rather than one split, because the defect is
+  invisible at exactly 24 (the buffer never grows past the magic string) and at exactly 33 (the
+  request is filled, so the short-read branch is never entered) — the two sizes a hand-written test
+  is most likely to pick: `a_byte_perfect_client_preface_survives_every_read_fragmentation` drives
+  a server-position `ConnectionH2` over every chunk size in `1..=40`, consuming each piece before
+  writing the next so two loopback writes cannot coalesce into a non-short read, and collects every
+  failing size instead of asserting inside the loop (asserting inside stops at 1 and hides the
+  band). Against the old comparison it reports
+  `[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15, 16, 25, 26, 27, 28, 29, 30, 31, 32]` — every chunk
+  size whose partial sums land in the 25..=32 window. That is a wider set than the nine sizes the
+  original report sampled, and consistent with every one of them: the report did not measure the
+  intermediate sizes, not that they behaved differently there.
+  `an_invalid_client_preface_is_still_refused_before_the_window_is_filled` holds the other side,
+  corrupting the first and the last octet of the magic string across that same band; clipping to
+  one octet less than the constant makes it report
+  `[(23, 24), (23, 25), (23, 26), (23, 27), (23, 28), (23, 29), (23, 30), (23, 31), (23, 32)]`.
+  Found by the H2 deterministic simulator while building its read-fragmentation axis; the guard
+  dates to `de87c9450` (sozu-proxy/sozu#1487).
+
 - **`fix(ci)`: the drifted-citation rule keys its exemption per span, so correcting one number in a
   citation group no longer exempts the siblings left behind.** `check_doc_citations.py` built its
   base-revision set from the whole parsed span tuple, so a group written `file.rs:NNN/MMM/PPP/QQQ`

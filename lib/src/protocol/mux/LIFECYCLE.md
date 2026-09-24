@@ -137,6 +137,19 @@ SNI. Coalesced acceptances (matched SAN != initial SNI) bump
    - `readiness.interest = READABLE | HUP | ERROR`.
 3. The event loop fires `ready()` which dispatches to `Connection::readable`
    (`connection.rs`) → `ConnectionH2::readable` (`h2.rs`).
+4. A read that comes back SHORT of that request re-arms `expect_read` with the
+   remainder and runs an early guard, so a client that is plainly not speaking
+   H2 is dropped (`ConnectionH2::force_disconnect`, logged as `EARLY INVALID
+   PREFACE`) without waiting for the whole window. The guard compares only the
+   octets the magic string can cover — `serializer::H2_PRI` is 24 octets while
+   the request is `CLIENT_PREFACE_SIZE`, so between the two lies a window the
+   guard must accept rather than refuse. Nothing about a TCP segment or a TLS
+   record makes a read land on the 24-octet boundary, and a byte-perfect
+   preface split anywhere inside the request is a conforming client:
+   `a_byte_perfect_client_preface_survives_every_read_fragmentation` sweeps
+   every fixed chunk size in `1..=40` (not every partition of the window),
+   `an_invalid_client_preface_is_still_refused_before_the_window_is_filled`
+   holds the other side.
 
 ### 2.2 Connection state machine (`H2State`)
 

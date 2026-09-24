@@ -1945,8 +1945,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     if let (H2State::ClientPreface, Position::Server) =
                         (&self.state, &self.position)
                     {
-                        let i = kawa.storage.data();
-                        if !b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".starts_with(i) {
+                        let (pri, i) = (serializer::H2_PRI.as_bytes(), kawa.storage.data());
+                        if !pri.starts_with(&i[..i.len().min(pri.len())]) {
                             debug!("{} EARLY INVALID PREFACE: {:?}", log_context!(self), i);
                             return self.force_disconnect();
                         }
@@ -11493,6 +11493,177 @@ mod tests {
             "the second block must depend on the dynamic table the first one \
              built — a decoder that never saw the first block must fail on \
              it, otherwise the two blocks came from two encoders"
+        );
+    }
+
+    // ── RFC 9113 §3.4 client connection preface, read-fragmentation axis ──
+    //
+    // `Connection::new_h2_server` arms `expect_read` with
+    // `CLIENT_PREFACE_SIZE` (the 24-octet magic string plus a 9-octet
+    // SETTINGS frame header). When a read comes back SHORT of that request,
+    // the short-read branch of `ConnectionH2::readable` runs an early guard
+    // so a client that is plainly not speaking H2 is dropped without waiting
+    // for the rest of the window.
+    //
+    // Nothing about a TCP segment or a TLS record guarantees it lands on the
+    // 24-octet boundary, so that guard has to tolerate EVERY split of a
+    // byte-perfect preface while still refusing a wrong one.
+
+    /// The whole accumulated window, at every chunk size, is the axis that
+    /// matters here — not one hand-picked split. The failure this pins is
+    /// invisible at exactly 24 (the window never grows past the magic
+    /// string, so a prefix test against it still answers correctly) and at
+    /// exactly 33 (the request is filled, so the short-read branch is never
+    /// entered at all) — the two sizes a hand-written test is most likely to
+    /// pick. So the sweep collects every failing size instead of asserting
+    /// inside the loop, which would stop at the first one and hide the band.
+    ///
+    /// To SEE THIS RED: in the `H2State::ClientPreface` arm of
+    /// `ConnectionH2::readable`'s short-read branch, compare the whole
+    /// accumulated window instead of the part the constant can cover —
+    /// `if !pri.starts_with(i)` in place of
+    /// `if !pri.starts_with(&i[..i.len().min(pri.len())])`. `starts_with`
+    /// asks whether the window is a prefix OF the 24-octet constant, so it
+    /// answers false for every window longer than 24 whatever the window
+    /// holds, and this reports `[1, 25, 26, 27, 28, 29, 30, 31, 32]`.
+    #[test]
+    fn a_byte_perfect_client_preface_survives_every_read_fragmentation() {
+        use std::io::Write;
+
+        // Built from the wire bytes, not from `serializer::H2_PRI`, so this
+        // also pins the constant's value rather than agreeing with whatever
+        // it happens to hold.
+        let mut wire = Vec::with_capacity(CLIENT_PREFACE_SIZE);
+        wire.extend_from_slice(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        // SETTINGS, empty payload, no flags, stream 0 — RFC 9113 §6.5.
+        wire.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            wire.len(),
+            CLIENT_PREFACE_SIZE,
+            "the probe must be exactly the window the server asks for"
+        );
+
+        let mut disconnected = Vec::new();
+
+        for chunk in 1..=40usize {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16_384)));
+            let (mut connection, mut peer) = test_h2_connection(&pool, None);
+            let mut context = test_context(&pool);
+            let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+            let mut delivered = 0usize;
+            let mut closed = false;
+
+            'delivery: for piece in wire.chunks(chunk) {
+                peer.write_all(piece).expect("loopback write must complete");
+                peer.flush().expect("loopback flush must complete");
+                delivered += piece.len();
+
+                // Drive until THIS piece has been consumed before writing the
+                // next one. Two loopback writes the connection has not read
+                // between coalesce in the kernel receive queue, which would
+                // hand `socket_read` a full 33-octet window, take the
+                // not-short path, and never reach the guard under test.
+                for _ in 0..64 {
+                    if !matches!(connection.state, H2State::ClientPreface) {
+                        break 'delivery;
+                    }
+                    if matches!(
+                        connection.readable(&mut context, EndpointClient(&mut router)),
+                        MuxResult::CloseSession
+                    ) {
+                        closed = true;
+                        break 'delivery;
+                    }
+                    if connection.stream_table.expect_read()
+                        == Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE - delivered))
+                    {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+
+            if closed
+                || matches!(
+                    connection.state,
+                    H2State::ClientPreface | H2State::Error | H2State::GoAway
+                )
+            {
+                disconnected.push(chunk);
+            }
+        }
+
+        assert!(
+            disconnected.is_empty(),
+            "a byte-perfect client preface must be accepted however the \
+             reads are fragmented; these chunk sizes were disconnected \
+             instead: {disconnected:?}"
+        );
+    }
+
+    /// The other half of the same guard: clipping the comparison to the part
+    /// the magic string can cover must not blunt it. A window that is wrong
+    /// INSIDE the first 24 octets is still refused while the request is
+    /// unfilled — which is the only moment the early guard can act, since
+    /// `parser::preface` in the `H2State::ClientPreface` arm is reached only
+    /// once the whole `CLIENT_PREFACE_SIZE` window has been read.
+    ///
+    /// Corrupting the FIRST and the LAST octet of the magic string proves
+    /// the comparison still spans all 24, and sweeping the window across the
+    /// 25..=32 band proves the fix did not turn the band into a hole that
+    /// lets a non-H2 client linger.
+    ///
+    /// To SEE THIS RED: drop the guard's `!`, or clip the comparison to
+    /// fewer octets than the magic string holds — e.g.
+    /// `&i[..i.len().min(pri.len() - 1)]`, which stops refusing the
+    /// `corrupt_at = 23` cases.
+    #[test]
+    fn an_invalid_client_preface_is_still_refused_before_the_window_is_filled() {
+        use std::io::Write;
+
+        let mut survivors = Vec::new();
+
+        for corrupt_at in [0usize, 23] {
+            for window in (corrupt_at + 1)..CLIENT_PREFACE_SIZE {
+                let mut wire = Vec::with_capacity(CLIENT_PREFACE_SIZE);
+                wire.extend_from_slice(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+                wire.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+                wire[corrupt_at] ^= 0xff;
+                wire.truncate(window);
+
+                let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16_384)));
+                let (mut connection, mut peer) = test_h2_connection(&pool, None);
+                let mut context = test_context(&pool);
+                let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+                peer.write_all(&wire).expect("loopback write must complete");
+                peer.flush().expect("loopback flush must complete");
+
+                // The window is short of `CLIENT_PREFACE_SIZE`, so the
+                // connection never leaves `H2State::ClientPreface` on its
+                // own: whatever refuses it here is the early guard.
+                for _ in 0..64 {
+                    if matches!(
+                        connection.readable(&mut context, EndpointClient(&mut router)),
+                        MuxResult::CloseSession
+                    ) {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+
+                if !matches!(connection.state, H2State::Error) {
+                    survivors.push((corrupt_at, window));
+                }
+            }
+        }
+
+        assert!(
+            survivors.is_empty(),
+            "a preface wrong inside its first 24 octets must be refused \
+             before the request is filled; these (corrupt_at, window) pairs \
+             survived: {survivors:?}"
         );
     }
 
