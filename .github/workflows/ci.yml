@@ -510,6 +510,9 @@ jobs:
       - name: TCP preread simulation sweep (debug, asserts live)
         run: cargo test -p sozu-sim --locked --test tcp_preread_sim -- --nocapture
 
+      - name: H2 core simulation sweep (debug, asserts live)
+        run: cargo test -p sozu-sim --locked --test h2_simulation -- --nocapture
+
   # ┌──────────────────────────────────────────────────────────────┐
   # │ Group D — Bombardier load benches (folded from benchmark.yml) │
   # └──────────────────────────────────────────────────────────────┘
