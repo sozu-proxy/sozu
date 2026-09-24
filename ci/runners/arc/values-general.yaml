@@ -67,6 +67,90 @@
 # near-whole-node methodology `bench` already used, now shared by both pools since both are 1:1
 # node:pod.
 #
+# ephemeral-storage request/limit, and two corrections to the paragraphs above (2026-09-24, after
+# the 1:1 redesign shipped and jobs STILL died — see values-bench.yaml for the full event chain
+# that named the cause: node disk pressure recycling the node under a running job, with no
+# `Evicted` event anywhere to attribute it).
+#
+# Correction 1 — "a single job's ~5-8Gi footprint fits comfortably in a node's real ~15Gi free
+# disk" (two paragraphs up) is wrong, and it is wrong in the direction that matters. The ~15Gi is
+# real, but a job never gets to spend it: kubelet starts evicting well before the disk is full.
+# Measured on the live S nodes (`kubectl --raw /api/v1/nodes/<node>/proxy/configz` and
+# `.../stats/summary`, identical on both nodegroups):
+#
+#   device capacity                       41.95 GB   (40971488Ki)
+#   used at IDLE, no job running          23.8  GB   (17.4 OS+containerd, 6.4 image layers)
+#   available at IDLE                     16.0  GB   (the rest is ext4 reserved blocks)
+#   running system pods' ephemeral         0.03 GB   (negligible — the baseline is OS + images)
+#   evictionHard imagefs.available          15%   -> 6.3 GB floor on a 42.0GB device
+#   evictionHard nodefs.available           10%   -> 4.2 GB floor
+#
+# nodefs and imagefs are the SAME device here (identical capacity and identical available in
+# stats/summary), so both thresholds are evaluated against one filesystem and the BINDING one is
+# the higher floor: imagefs at 15% = 6.3GB. Usable headroom for a job is therefore
+# 16.0 - 6.3 = ~9.7GB, not ~15Gi and emphatically not the 37.8GB kubelet advertises as
+# ephemeral-storage allocatable. Measured live per-pod usage across 11 concurrent jobs on
+# 2026-09-24: 2.1GB to 7.0GB, peak 7.0GB on a general cell. A 7.0GB job against a 9.7GB ceiling
+# is a ~2.7GB margin — which is why this fails intermittently rather than always, and why it
+# correlates with nothing in the job's own code.
+#
+# Correction 2 — "an ephemeral-storage request/limit can't reliably fix this" (the SUPERSEDED
+# paragraph) was right about the REQUEST and is left standing for it: a request is checked against
+# that same fictional 37.8GB allocatable, so it still cannot guard scheduling. But it does not
+# apply to the LIMIT, which is a different mechanism: kubelet measures the pod's actual writable-
+# layer usage and kills that pod, with no reference to allocatable at all. The original sentence
+# was written while arguing about 2-pods-per-node packing, where only the request was in play.
+#
+# Sizing: limit 8Gi (8.59GB). Above the measured 7.0GB peak with ~1.6GB of slack, so legitimate
+# jobs are not killed; and a pod sitting at its limit still leaves 16.0 - 8.59 = 7.4GB available,
+# ~1.1GB clear of the 6.3GB eviction floor, so the POD hits its own limit before the NODE ever
+# reaches DiskPressure. That ordering is the whole point: node-level pressure kills an arbitrary
+# victim and reports a bare exit 130, whereas a pod-level limit kills the offender and says
+# "exceeded ephemeral-storage limit" with its name on it. This change is worth shipping mostly
+# because it makes the next failure legible, not because it creates space.
+#
+# Two things to know before anyone "fixes" a kill this limit produces. First, the 7.0GB peak above
+# is a MID-RUN sample of jobs that happened to be running when it was taken, not a measured
+# end-of-job maximum, so the real ceiling of the heaviest cell may be higher. If a legitimate job
+# starts dying with "exceeded ephemeral-storage limit", that is this limit working exactly as
+# designed and having found the true footprint: raise the limit toward the ~9.7GB ceiling, or
+# resize the node disk (below). Do NOT delete the limit — removing it restores the silent,
+# unattributable node-level eviction this whole block exists to explain. Second, the ~1.1GB margin
+# between an 8Gi pod and the eviction floor is not a stable quantity: imagefs was measured between
+# 6.06GB and 6.38GB across nodes, and `imageGCHighThresholdPercent` is 85, which is the SAME point
+# as `imagefs.available: 15%` — so image garbage collection buys no cushion ahead of eviction, and
+# a newly rolled runner image digest sitting beside one not yet collected can consume that margin
+# on its own. That is the second reason the node-disk resize below is the durable fix rather than
+# an optional improvement.
+#
+# It does NOT create space, and the durable fix is a bigger node disk — an operator action
+# (`clever k8s nodegroups`), not a repository change, so it is recorded here rather than faked in
+# YAML. The structural problem is that 23.8GB of a 42.0GB device is consumed before any job
+# starts, and the 15% imagefs reserve takes a further 6.3GB, leaving 9.7GB for a workload already
+# measured at 7.0GB. The baseline is OS + image layers and does not shrink when the disk grows,
+# while the 15% reserve does scale, so on an 80GB device the same nodes would have roughly
+# 0.95*80 - 23.8 = ~52GB available against a 12GB floor: ~40GB usable, about four times today's
+# headroom, and enough that the 8Gi limit becomes a genuine guard rail rather than a near-miss.
+# Whether the S flavor's disk can be sized independently of its CPU/memory on CKE is the thing to
+# check before choosing a target flavor.
+#
+# Also reconciled against the live release 2026-09-24: `helm get values sozu-general -n
+# arc-runners` matches this file byte-for-byte (maxRunners 23, cpu 7, memory 10Gi) — the only
+# drift across both pools was `bench`'s maxRunners, fixed in values-bench.yaml. The `default`
+# nodegroup was observed at 33 nodes rather than the 23 computed above; it has autoscaling enabled
+# (min/max set via `clever k8s nodegroups`, not a chart value), so that is the autoscaler at work
+# and the 23-node arithmetic above is kept as the sizing rationale it was.
+#
+# Not changed, deliberately: ci.yml's `cache-all-crates: true`. It was measured before being left
+# alone. The five `pipeline` cells build `--locked`, so every crate in the registry is already a
+# lockfile crate and `cache-all-crates: false` would prune nothing there — zero disk saved in
+# exactly the jobs that die. The two jobs where the flag does retain extra crates are the ones
+# that `cargo install` a tool (`ci-fuzz`, `ci-audit`), and their cache blobs are the smallest in
+# the repository at 0.16GB and 0.22GB compressed (`gh api /repos/sozu-proxy/sozu/actions/caches`,
+# 20 entries, 10.56GB total, largest `ci-fips-pipeline` at 1.30GB). Dropping caching to save disk
+# would trade an intermittent reliability problem for a permanently slower pipeline, and the
+# measurement says it would not even buy the disk.
+#
 # hostAliases (root-caused 2026-09-22): sozu's e2e suite resolves three fixed test hostnames
 # (cluster-a.localhost, cluster-b.localhost, other.localhost — grepped from e2e/src/, no dynamic
 # variants exist) via real getaddrinfo() calls (hyper's default HttpConnector, not a hardcoded
@@ -118,3 +202,12 @@ template:
           requests:
             cpu: "7"
             memory: "10Gi"
+            # 8Gi against ~9.7GB of real usable headroom, measured peak 7.0GB — arithmetic in the
+            # block above. Mirrors the limit for visibility only: a request is checked against
+            # kubelet's fictional 37.8GB allocatable, so it guards nothing. CPU is what enforces
+            # 1 pod = 1 node (7 + 0.28 system = 7.28 of 8), so this costs no concurrency.
+            ephemeral-storage: "8Gi"
+          limits:
+            # The half that makes a failure attributable: the pod is killed naming its own limit
+            # instead of the node going into DiskPressure and taking an unnamed victim.
+            ephemeral-storage: "8Gi"

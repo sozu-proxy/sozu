@@ -5027,6 +5027,50 @@
 
 ### 🤖 CI
 
+- **`ci(runners)`: give both self-hosted runner pools an `ephemeral-storage` request and limit, so
+  a job that fills the node disk is killed by name instead of vanishing into an exit code 130.**
+  Jobs on the ARC pools were dying roughly five minutes into a sixty-minute budget with
+  "Process completed with exit code 130" and "The operation was canceled", or "The self-hosted
+  runner lost communication with the server", while sibling matrix cells in the same run carried on
+  (`fail-fast` is `false`). The cause is node disk pressure, and the reason it went undiagnosed is
+  that nothing reports it: the runner pods declared no `ephemeral-storage` request or limit at all,
+  so when a build filled the node's root filesystem kubelet reclaimed at the NODE level and the
+  node itself was recycled underneath the running job — no `Evicted` event on the pod, nothing on
+  the GitHub side naming disk, just a runner that stopped answering. One full chain, correlated
+  between `kubectl get events` and the failed job's own runner name: pod
+  `sozu-bench-jzs82-runner-5v2hr` started on `bench-node28` at 10:13:34Z, `EvictionThresholdMet`
+  ("Attempting to reclaim ephemeral-storage") at 10:16:40Z, `NodeHasDiskPressure` at 10:16:41Z,
+  the pod killed at 10:18:33Z and the node removed at 10:18:43Z; GitHub recorded that run's
+  `crypto-openssl` cell as a failure from 10:13:38Z to 10:18:37Z on precisely that runner.
+  The numbers behind the values chosen, measured on the live S-flavor nodes through kubelet's own
+  `stats/summary` and `configz`: the 42.0 GB device is already at 23.8 GB used / 16.0 GB available
+  with no job running (17.4 GB OS and containerd, 6.4 GB image layers), and `evictionHard` sets
+  `imagefs.available` to 15% — 6.3 GB on that device, and the binding floor, since nodefs and
+  imagefs are the same filesystem here. A job therefore has about 9.7 GB of usable headroom, not
+  the 37.8 GB kubelet advertises as `ephemeral-storage` allocatable. Live per-pod usage across
+  eleven concurrent jobs measured 2.1 GB to 7.0 GB. The limit is set to 8 Gi: above the measured
+  peak with roughly 1.6 GB of slack, and low enough that a pod sitting at its limit still leaves
+  the node about 1.1 GB clear of the eviction floor, so the pod trips its own limit before the node
+  ever reaches DiskPressure. That ordering is the point of the change — a node-level eviction
+  kills an arbitrary victim and reports nothing, whereas a pod-level limit kills the offender with
+  "exceeded ephemeral-storage limit" and its name attached. The matching request mirrors the limit
+  for visibility only and guards nothing, because a request is checked against that same
+  inaccurate allocatable figure; what actually holds these pools at one job per node is CPU, 7
+  requested plus 0.28 for the node's system pods against 8 allocatable. Concurrency is unchanged.
+  This makes the failure legible; it does not create disk. The durable fix is a larger node disk,
+  an operator action rather than a repository one, and the arithmetic for it is recorded in
+  `ci/runners/arc/values-general.yaml` alongside the measurements above.
+  Two things are deliberately left alone. `ci.yml`'s `cache-all-crates: true` was measured before
+  being kept: the pipeline cells build `--locked`, so every registry crate is already a lockfile
+  crate and disabling the flag would prune nothing in the jobs that actually die, while the two
+  jobs where it does retain extra crates own the two smallest caches in the repository (0.16 GB and
+  0.22 GB compressed, against 1.30 GB for the largest). Dropping caching to reclaim disk would buy
+  a permanently slower pipeline and, by that measurement, not even the disk. The stale
+  `resources.requests` this changeset was expected to correct had already been corrected upstream;
+  the one real divergence found against the deployed release was `sozu-bench`'s `maxRunners`, live
+  at 18 against 12 in the tracked file, which is reconciled here so the next deployment does not
+  silently cut the bench pool by a third.
+
 - **`ci(doc)`: add an advisory `--audit` mode that reads a citation's prose against its cited line,
   and repair the six citations its first run found.**
   Every rule in `check_doc_citations.py` either resolves a citation or forbids a form, and none of
