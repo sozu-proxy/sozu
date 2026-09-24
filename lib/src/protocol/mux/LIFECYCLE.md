@@ -775,8 +775,8 @@ Every deadline above is evaluated against a snapshot, not against a fresh
   count and bounds iterations, not wall clock, and `counter` (`mod.rs:1355`)
   sits above both loops, so one `ready()` call can spend the whole budget
   under a single snapshot;
-- at the top of `Mux::timeout` (`mod.rs:2001`);
-- at the top of `Mux::shutting_down` (`mod.rs:2376`), which runs outside
+- at the top of `Mux::timeout_inner` (`mod.rs:2001`);
+- at the top of `Mux::shutting_down_inner` (`mod.rs:2376`), which runs outside
   `ready()` entirely. That line is load-bearing, not belt-and-braces:
   `drive_frontend_shutdown_io` (`mod.rs`) always reaches `readable()` for
   an H2 frontend — `force_h2_read` is unconditionally true, so the early
@@ -989,7 +989,7 @@ Two GOAWAY frames in `ConnectionH2::graceful_goaway` (`h2.rs`):
 
 1. **Initial GOAWAY** — send GOAWAY with `last_stream_id = 0x7FFFFFFF`
    (`STREAM_ID_MAX`, `h2.rs`); keep `READABLE` so in-flight request bodies
-   can still arrive. Called first time from `Mux::shutting_down` at
+   can still arrive. Called first time from `Mux::shutting_down_inner` at
    `mod.rs:2383`. Draining flag set.
 2. **Final GOAWAY** — on the second invocation (draining already true), call
    `goaway(NoError)` (`h2.rs:4605`) with the actual `highest_peer_stream_id`,
@@ -1369,7 +1369,7 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
    that never arms is the opposite defect — an unconditional session cap — and
    a "the deadline did not move" assertion alone cannot tell the two apart.
 10. **Single `graceful_goaway` per session outside the final GOAWAY.**
-    `Mux::shutting_down` (`mod.rs:2382-2383`) only calls it if
+    `Mux::shutting_down_inner` (`mod.rs:2382-2383`) only calls it if
     `!self.frontend.is_draining()`; a second unconditional call would
     collapse the initial GOAWAY into the final one and disconnect
     in-flight streams.

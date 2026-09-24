@@ -4861,6 +4861,56 @@
 
 ### 🤖 CI
 
+- **`ci(doc)`: add an advisory `--audit` mode that reads a citation's prose against its cited line,
+  and repair the six citations its first run found.**
+  Every rule in `check_doc_citations.py` either resolves a citation or forbids a form, and none of
+  them can see a citation that was already wrong the first time it was seen. The drift rule cannot
+  by construction: it compares a citation's text between two revisions, so "unchanged" is exactly
+  the condition for being exempt, and a change detector cannot find a defect that predates its first
+  observation. sozu#1466 measured four such citations in the mux `LIFECYCLE.md`, byte-identical
+  across the whole series and wrong in every one — three landing on comment lines under prose naming
+  an insert or a push, and one citing `self.stream_table.rst_sent_contains(sid)` against a line
+  reading `let total_before = *total;`. sozu#1493 closed that hole for Rust comments by forbidding
+  the form; `doc/**` and `**/LIFECYCLE.md` keep their line numbers, because there a number is
+  sometimes the only way to name a span with no symbol, so that surface needed an audit instead.
+  `--audit` reads every citation's prose against its cited line on two heuristics: the target is a
+  **comment** while the prose names a statement, a call, an insert or a push, or the prose names a
+  **symbol that is not there** — neither within eight lines of the span nor as an item enclosing it.
+  Measured against sozu#1466's own four at `5d5191e8`, the comment signal reports three and the
+  symbol signal reports the fourth, which lands on ordinary code and is invisible to everything else
+  here. The comment signal reads single-line citations only: a range that starts on a comment is how
+  this tree covers a branch together with the sentence introducing it, and reading ranges too took
+  the mode from 13 findings to 26, all 13 additions hand-audited and all 13 correct.
+  **It is advisory and it is not in `ci.yml`.** It always exits 0 and it never edits a citation. A
+  heuristic that fails a build is a heuristic people learn to silence, and the silencing outlives
+  the reason. What it produces is a list to disposition, and the disposition is the deliverable.
+  Its own first run at `6172929e` examined 108 of the surface's 221 cited spans and reported 13:
+  hand-audited, **six wrong citations and seven false positives**, a ratio printed in its own output
+  rather than engineered down — a mode that found nothing on a tree known to contain wrong citations
+  would be worse than no mode. The six are repaired here. `doc/testing.md` cited the middle line of
+  a three-line comment for a status-line prefix check whose code is two lines below it, and a
+  comment four lines above the `0x20` byte it says three call sites send. The `kawa_h1`
+  `LIFECYCLE.md` cited a bare `}` for `handle_connection_result`, whose `fn` is fifty lines below —
+  repaired by dropping the number, since the prose already names the symbol. And three citations in
+  the mux `LIFECYCLE.md` named `Mux::shutting_down` while pointing into `Mux::shutting_down_inner`,
+  the body that the four-line `SessionState` wrapper drives; `Mux::timeout` had the same defect on
+  the bullet directly above one of them and is repaired with them, although the audit does **not**
+  report it —
+  the word `timeout` appears in a `trace!` within the window, and proximity cannot tell "the name is
+  nearby" from "the item is here".
+  Two false-positive classes were narrowed because the heuristic was wrong about a shape — a
+  comment-started range, and a symbol read across a bare-path citation belonging to another clause —
+  and the rest are left reporting with their reason written down, because narrowing further starts
+  costing real findings. **Every run prints what it declined to check**, in the style the other
+  rules use: 111 of that run's citations name nothing either heuristic can test, which is more than
+  half the surface and the honest half of a clean audit. Silence about skipped work is the defect
+  behind sozu#1457 and sozu#1447.
+  `--self-test` gains four fixture citations: one the comment signal must flag, one only the symbol
+  signal can, and two that must stay **silent** — a comment-started range, and a line answered only
+  by its enclosing item — each pinning a narrowing that a rewrite would lose. The command line is
+  asserted too, and in the inverse direction from every other rule here: the same broken fixture
+  tree that exits 1 for the five rules must exit 0 under `--audit`.
+
 - **`ci(doc)`: reject a `file.rs:NNN` citation written inside a Rust comment, and convert the five
   left in the tree.**
   `check_doc_citations.py` resolved citations in `doc/**` and every `**/LIFECYCLE.md` only, so the
