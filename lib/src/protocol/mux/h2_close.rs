@@ -23,14 +23,16 @@
 //! **It deliberately does NOT own, and why**:
 //!
 //! - **The flush.** A core cannot attempt I/O. [`CloseAction::Flush`] is an
-//!   instruction to the caller, which performs `socket_write(&[])` and then
-//!   asks again with [`TlsFlushPhase::AfterFlush`].
+//!   instruction to the caller, which performs
+//!   `ConnectionH2::flush_tls_records` and then asks again with
+//!   [`TlsFlushPhase::AfterFlush`].
 //! - **`Readiness`.** [`CloseAction::ReArmAndContinue`] says to re-arm;
 //!   the caller owns the bits.
-//! - **Reading `socket_wants_write()`.** That is a live-socket query and the
-//!   caller makes it. This module receives the answer as a `bool` — a one-bit
-//!   projection, the same shape `H2Scheduler::begin_pass` takes its readiness
-//!   predicate in.
+//! - **Reading whether TLS still holds records.** That is a live-socket query
+//!   and the caller makes it, through its own `ConnectionH2::tls_wants_write`
+//!   seam. This module receives the answer as a `bool` — a one-bit projection,
+//!   the same shape `H2Scheduler::begin_pass` takes its readiness predicate
+//!   in.
 //!
 //! # Why the two queries are a phase and not a loop
 //!
@@ -43,8 +45,8 @@
 //! ```
 //!
 //! Query (2) is not a repeat of query (1). It is the only way the code learns
-//! whether the flush succeeded — **`socket_write(&[])`'s returned `size` and
-//! `SocketResult` are both discarded at that site**, so "did the kernel accept
+//! whether the flush succeeded — **the empty-buffer flush's returned `size`
+//! and `SocketResult` are both discarded at that site**, so "did the kernel accept
 //! the flush" is inferred purely from the handler's internal state changing
 //! between the two calls. A caller that collapses the two into one query, or
 //! that reuses the first answer for the second, silently reintroduces the
@@ -74,8 +76,9 @@
 //! # The fourth site: finalizing a write pass is not a close
 //!
 //! `ConnectionH2::finalize_write` runs the same triple —
-//! `socket_wants_write()`, a flush, `socket_wants_write()` again — and it is
-//! the last of them left inline in `h2.rs`, so its decision belongs here too.
+//! `ConnectionH2::tls_wants_write`, a flush, `ConnectionH2::tls_wants_write`
+//! again — and it is the last of them left inline in `h2.rs`, so its decision
+//! belongs here too.
 //! It gets [`FinalizeAction`], a SIBLING of [`CloseAction`], and the
 //! separation is the point rather than a filing preference.
 //!
@@ -98,9 +101,9 @@
 //! analogue for. Its middle step is CONDITIONAL:
 //!
 //! ```ignore
-//! if self.socket.socket_wants_write() {
+//! if self.tls_wants_write() {
 //!     if !socket_write {                 // <- the third input
-//!         self.socket.socket_write(&[]);
+//!         self.flush_tls_records();
 //!     }
 //!     self.ensure_tls_flushed();
 //! }
@@ -118,9 +121,9 @@
 //!
 //! ## What this site does NOT consume
 //!
-//! `socket_write(&[])`'s `(size, status)` return. `finalize_write` discards it
-//! — the post-flush `socket_wants_write()` query is how it learns whether the
-//! flush landed — so no `SocketResult` reaches [`finalize_action`]. That
+//! The empty-buffer flush's `(size, status)` return. `finalize_write` discards
+//! it — the post-flush `ConnectionH2::tls_wants_write` query is how it learns
+//! whether the flush landed — so no `SocketResult` reaches [`finalize_action`]. That
 //! matters because `super::update_readiness` treats `size > 0` with a
 //! `WouldBlock` status as NOT stalled (it clears the WRITABLE event bit and
 //! returns `false`, so `poll_write_target` yields another
@@ -271,8 +274,8 @@ pub(super) enum FinalizeAction {
 /// pass whose records are still in rustls leaves every bit alone and lets the
 /// flush decide. A parked `expect_write` then suppresses the rest of it.
 ///
-/// - `tls_wants_write` — `socket_wants_write()`, the live-socket query the
-///   caller makes. This module receives the one-bit projection.
+/// - `tls_wants_write` — `ConnectionH2::tls_wants_write`, the live-socket
+///   query the caller makes. This module receives the one-bit projection.
 /// - `socket_write` — did this pass already push bytes through
 ///   `socket_write_vectored`? See "the conditional middle flush".
 /// - `expect_write_parked` — `stream_table.expect_write().is_some()`.
