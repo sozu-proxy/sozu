@@ -76,6 +76,10 @@ harness = false
 name = "crypto_provider"
 harness = false
 
+[[bench]]
+name = "h2_stream_table"
+harness = false
+
 [features]
 # `crypto-ring` is enabled by default so `cargo {build,test} -p sozu-lib`
 # (no explicit features) compiles out of the box. Downstream binaries
