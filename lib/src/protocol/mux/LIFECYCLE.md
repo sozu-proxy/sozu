@@ -537,18 +537,24 @@ every caller still goes through — it delegates the bookkeeping above to
 `H2StreamTable::remove` and additionally evicts the RFC 9218 `prioriser` entry
 (out of `h2_stream_table.rs`'s scope; see that module's doc). Call sites
 (non-exhaustive — new ones may be added without updating this list, but the
-routing discipline is compiler-enforced, not just documented):
+routing discipline is compiler-enforced, not just documented). An entry whose
+method holds exactly one `remove_dead_stream` call is cited by symbol — the
+method name is the whole address there, and a line only rots; do not convert
+those back. The entries that keep a line mean one specific branch inside a
+method that calls it more than once, or — for the `close` exception below —
+one block inside a method that does several unrelated things:
 
 - `poll_write_target` after end-of-stream — the `H2WritePhase::Resume` retirement
   at `h2.rs:2579` and `H2WritePhase::End`'s deferred `completed_streams` loop at
   `h2.rs:2977`.
-- `prune_inactive_streams_while_closing` — `h2.rs:3286`.
+- `ConnectionH2::prune_inactive_streams_while_closing` (`h2.rs`).
 - `handle_window_update_frame` zero-increment path — `h2.rs:6085`.
-- `cancel_timed_out_streams` slow-multiplex guard — `h2.rs:4252`.
-- `handle_continuation_header_state` CONTINUATION oversize — `h2.rs:1799`.
-- `handle_rst_stream_frame` peer RST — `h2.rs:5789`.
-- `handle_goaway_frame` retry loop — `h2.rs:6035`.
-- `end_stream` client-side retirement — `h2.rs:6577`.
+- `ConnectionH2::cancel_timed_out_streams` slow-multiplex guard (`h2.rs`).
+- `ConnectionH2::handle_continuation_header_state` CONTINUATION oversize
+  (`h2.rs`).
+- `ConnectionH2::handle_rst_stream_frame` peer RST (`h2.rs`).
+- `ConnectionH2::handle_goaway_frame` retry loop (`h2.rs`).
+- `ConnectionH2::end_stream` client-side retirement (`h2.rs`).
 
 No call site in this file performs `self.streams.remove(...)` inline: it
 cannot — `streams` is a private field of `h2_stream_table.rs`, so that
@@ -592,7 +598,7 @@ if total > 1 && active > 0 && total > active * self.h2_stream_shrink_ratio {
 
 The default ratio is 2 (`h2.rs`, `DEFAULT_STREAM_SHRINK_RATIO`),
 overrideable per listener via `H2ConnectionConfig::stream_shrink_ratio`
-(`h2.rs:307`). In short: if more than `2×active` slots are held, trim trailing
+(`h2.rs`). In short: if more than `2×active` slots are held, trim trailing
 `Recycle` entries.
 
 ### 6.2 What it pops
@@ -786,7 +792,7 @@ Every deadline above is evaluated against a snapshot, not against a fresh
   silent draining session propagates its last `ready()` snapshot forever.
   Pinned by `shutting_down_refreshes_the_snapshot_so_the_drain_budget_expires`.
 
-The H2 core reads `ConnectionH2.now` (`h2.rs:875`), a mirror assigned from
+The H2 core reads `ConnectionH2.now` (`h2.rs`), a mirror assigned from
 `context.now` once per pass — `writable`, `cancel_timed_out_streams` and
 `start_stream` carry `self.now = context.now;` at their top, and the read pass
 carries it at the top of `poll_read_target`, which `readable` calls first, not
@@ -1339,9 +1345,20 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
    `HashSet::insert` whose surrounding statements are generic, so a line
    number here would anchor on text that says nothing about the rule. Do not
    convert it back.
-8. **No new streams during drain.** `create_stream` and `start_stream` both
-   short-circuit when `self.drain.draining()` (`h2.rs:4882-4889`,
-   `h2.rs:6710-6717`).
+8. **No new streams during drain.** `ConnectionH2::create_stream` and
+   `ConnectionH2::start_stream` both short-circuit when `self.drain.draining()`
+   (`h2.rs`).
+   Cited by symbol rather than by line on purpose — in each method the guard
+   precedes every stream allocation and is the only `drain.draining()` test in
+   the body, so the method name locates it as precisely as a range did while
+   surviving every insertion above it. Measured: a 21-line insertion into
+   `ConnectionH2::initiate_close_notify` moved the two ranges this replaces onto
+   `self.flush_tls_records()` and a bare `context` argument, and both still
+   RESOLVED — `--root` flagged neither. Only the drifted-citation rule, which
+   `ci.yml` supplies a `--base` for on a pull request, would have caught them,
+   and what it then asks for is a re-anchor: exactly what sozu-proxy/sozu#1501
+   and #1497 each performed faithfully on this file's HEADERS citation and each
+   landed on the wrong statement. Do not convert it back.
 9. **Connection-level timer resets only on application activity.** H2 control
    frames (PING / WINDOW_UPDATE / SETTINGS) do **not** push
    `ConnectionH2.timeout_deadline` out. `arm_timeout()` has exactly three call
@@ -1513,7 +1530,7 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     outside any pass — it seeds `now`, `refuse_window_start` and the flood
     detector's `window_start` from that one value. The reviewer check is
     `grep -nE 'Instant::now|SystemTime::now|\.elapsed\(\)' lib/src/protocol/mux/h2.rs`.
-    Every hit must be inside `#[cfg(test)] mod tests` (`h2.rs:6778` onward) or
+    Every hit must be inside `#[cfg(test)] mod tests` (`h2.rs`) or
     that one constructor — there is no third carve-out any more.
     `h2_flood_detector.rs` (extracted from `h2.rs`; not covered by the
     `h2.rs`-scoped grep above) used to hold exactly that third exception —

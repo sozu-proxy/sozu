@@ -211,6 +211,45 @@
 
 ### 🔄 Changed
 
+- **`docs(mux-h2)`: `LIFECYCLE.md` anchors eleven `h2.rs` citations to symbols instead of lines.**
+  Checklist invariant 8 read "`create_stream` and `start_stream` both short-circuit when
+  `self.drain.draining()` (`h2.rs:4882-4889`, `h2.rs:6710-6717`)". Both ranges were correct at
+  `342397dd` — this is hardening, not a repair — and both were still the wrong form:
+  `doc/README.md`'s first of three says that prose naming an item cites the symbol, and the prose
+  names two methods. Invariant 7 immediately above already says so about itself ("Cited by symbol
+  rather than by line on purpose … Do not convert it back"), so invariant 8 contradicted its own
+  neighbour.
+
+  Measured here rather than argued. A 21-line insertion into
+  `ConnectionH2::initiate_close_notify` — the shape sozu-proxy/sozu#1498's H1-mirroring
+  `debug_assert!`s take — moved invariant 8's two ranges onto `self.flush_tls_records()` and a
+  bare `context` argument, and **both still resolved**: `check_doc_citations.py --root .` flagged
+  neither. What does catch them is the drifted-citation rule, which `ci.yml` supplies a `--base`
+  for on every pull request — and what it asks for is a re-anchor, which is the cost rather than
+  the cure. The same insertion after the conversion leaves `LIFECYCLE.md` with zero resolver
+  failures instead of one, and its drifted-citation entries fall 42 → 32 (61 → 51 tree-wide). Two commits have already renumbered a neighbouring
+  `h2.rs` anchor in this file faithfully and landed it on the wrong statement — #1501 to
+  `h2.rs:5384`, #1497 to `h2.rs:5387`, both a `log_context!` argument rather than the HEADERS
+  liveness refresh — which is what a re-anchor preserves: the pointer, not the claim.
+
+  Ten further anchors convert on the same test, each one where the prose already names the item
+  and the item resolves to a single site: the six `remove_dead_stream` call sites in §5.4 whose
+  method holds exactly one such call, `H2ConnectionConfig::stream_shrink_ratio`,
+  `ConnectionH2.now`, and invariant 20's `#[cfg(test)] mod tests` boundary. Four anchors
+  deliberately keep a line, because there the prose means one branch inside a method that calls
+  `remove_dead_stream` more than once — `ConnectionH2::poll_write_target`'s `H2WritePhase::Resume`
+  and `H2WritePhase::End` arms, `ConnectionH2::handle_window_update_frame`'s zero-increment path —
+  or one block inside `close`, which does several unrelated things. That is `doc/README.md`'s
+  second form doing its job; converting them would trade a rotting pointer for a vague one. Both
+  the invariant-8 site and the §5.4 list now carry a "do not convert it back" note in invariant
+  7's style, so the next renumbering sweep leaves them alone.
+
+  Document only: no behaviour, no public API, no test expectation, and `h2.rs` is byte-identical
+  to `342397dd`. `doc/h2_mux_internals.md`'s pinned code blocks are untouched — those are fenced
+  verbatim quotes compared by content, a different mechanism. This continues into
+  `lib/src/protocol/mux/` the convention sozu-proxy/sozu#1473 applied to the 82 Rust-comment
+  citations "outside `lib/src/protocol/mux/`".
+
 - **`refactor(mux-h2)`: the H2 request ULID is built from two injected sources instead of
   `Ulid::generate()` (issue [#1338](https://github.com/sozu-proxy/sozu/issues/1338), Q8).**
   `ConnectionH2::create_stream` was the mux's single production `Ulid::generate()` site, and
