@@ -1893,6 +1893,182 @@ fn test_h2_rfc9218_incremental_round_robin() {
     );
 }
 
+/// Split a DATA stream-id trace into per-write-pass segments, keyed on the
+/// leading urgency bucket as a pass marker.
+///
+/// RFC 9218 §4 orders every pass ascending by urgency, so a pass reads
+/// `[<leading bucket>.., <trailing bucket>..]`. A frame from `leading` that
+/// follows a frame from `trailing` is therefore the first frame of the next
+/// pass, and that transition is the only pass boundary observable from the
+/// wire alone.
+fn split_passes_on_leading_bucket(order: &[u32], leading: &[u32]) -> Vec<Vec<u32>> {
+    let mut passes: Vec<Vec<u32>> = Vec::new();
+    let mut previous_was_trailing = false;
+    for &sid in order {
+        let is_leading = leading.contains(&sid);
+        if passes.is_empty() || (is_leading && previous_was_trailing) {
+            passes.push(Vec::new());
+        }
+        passes
+            .last_mut()
+            .expect("a segment was just opened")
+            .push(sid);
+        previous_was_trailing = !is_leading;
+    }
+    passes
+}
+
+/// Which of `a` / `b` appears FIRST in each pass that carries both — used
+/// for the leading and the trailing bucket alike, so it is named for the
+/// question rather than for either one.
+///
+/// A pass carrying only one of them is dropped rather than counted: it is
+/// the start-up window before both backends have answered, or the drain tail
+/// after the shorter stream ended, and neither says anything about the
+/// rotation. Taking the FIRST occurrence rather than the only one keeps the
+/// reading honest when two passes fuse because the leading bucket had
+/// nothing ready between them.
+fn first_of_pair_per_pass(passes: &[Vec<u32>], a: u32, b: u32) -> Vec<u32> {
+    passes
+        .iter()
+        .filter_map(|pass| {
+            let first_a = pass.iter().position(|&sid| sid == a);
+            let first_b = pass.iter().position(|&sid| sid == b);
+            match (first_a, first_b) {
+                (Some(ia), Some(ib)) => Some(if ia < ib { a } else { b }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// RFC 9218 §4, the wire evidence for per-bucket incremental rotation
+/// (sozu-proxy/sozu#1456): on a connection carrying TWO urgency buckets that
+/// each hold two ready incremental peers, BOTH buckets rotate their tail.
+///
+/// This is the e2e half of `h2_scheduler.rs`'s
+/// `every_urgency_bucket_rotates_its_own_incremental_tail`, and it exists
+/// because the change it guards is a change to the bytes on the wire rather
+/// than to an internal data structure. Four streams, `u=0, i` on 1 and 3 and
+/// `u=3, i` on 5 and 7, all with bodies several DATA frames long. The
+/// converter's yield-after-one-DATA (invariant 15) gives each stream one
+/// frame per pass, so the DATA trace is the pass order repeated.
+///
+/// The oracle is the TRAILING bucket's leader per pass. Before the fix a
+/// single connection-global cursor could only ever hold an id from the
+/// leading bucket, `partition_point(|id| *id <= cursor)` over `[5, 7]` with a
+/// cursor of 1 or 3 returned 0 in every pass, and the trace read
+/// `5, 7 / 5, 7 / 5, 7 …` — stream 7 never once led its own bucket, which is
+/// positional starvation that becomes byte starvation as soon as a pass is
+/// cut short. After it, 5 and 7 alternate the lead and BOTH appear in the
+/// per-pass leader list below.
+///
+/// Asserting that both ids lead at least one steady-state pass, rather than
+/// pinning an exact alternating sequence, is deliberate: the backends are
+/// real threads and a stream whose kawa is momentarily empty drops out of a
+/// pass, so an exact sequence would be a timing assertion rather than a
+/// scheduling one. Zero versus non-zero leads for stream 7 is the
+/// discriminator, and it is a hard zero on the pre-fix code.
+///
+/// The window-starving handshake is the same one
+/// `try_h2_rfc9218_incremental_round_robin` uses and for the same reason:
+/// `INITIAL_WINDOW_SIZE=0` holds every response in sozu's kawa buffers until
+/// one bulk `WINDOW_UPDATE` write lifts all five windows together, so the
+/// scheduler sees a fully-populated four-stream pass order instead of
+/// emitting stream 1 alone while the other windows are still closed.
+fn try_h2_per_bucket_incremental_rotation() -> State {
+    // Four backends so each stream is served by its own thread — a shared
+    // backend would serialize the responses and decide the wire order for
+    // reasons that have nothing to do with the scheduler.
+    let (worker, backends, front_port) = setup_h2_test_with_large_bodies(
+        "H2-COR-RFC9218-PERBUCKET",
+        4,
+        // 6 x max_frame_size (16384): six DATA frames per stream, so the
+        // trace carries enough passes for the rotation to show.
+        96 * 1024,
+    );
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake_with_initial_window(&mut tls, 0);
+
+    // Leading bucket: u=0 incremental. Trailing bucket: u=3 incremental.
+    // Two ready incremental peers in EACH — the shape a single
+    // connection-global cursor cannot serve.
+    const LEADING: [u32; 2] = [1, 3];
+    const TRAILING: [u32; 2] = [5, 7];
+    for (sid, urgency) in [(1u32, 0u8), (3, 0), (5, 3), (7, 3)] {
+        let block = build_get_headers_with_priority(urgency, "i");
+        let headers = H2Frame::headers(sid, block, true, true);
+        tls.write_all(&headers.encode()).unwrap();
+    }
+    tls.flush().unwrap();
+
+    // Let all four backends reply into sozu's kawa buffers. No DATA can
+    // egress yet: every stream window is 0.
+    thread::sleep(Duration::from_millis(500));
+
+    // One TCP write for all five WINDOW_UPDATEs — see the round-robin test
+    // for why splitting them perturbs the pass order.
+    let mut bulk = Vec::new();
+    for sid in LEADING.iter().chain(TRAILING.iter()) {
+        bulk.extend_from_slice(&H2Frame::window_update(*sid, 1_000_000).encode());
+    }
+    bulk.extend_from_slice(&H2Frame::window_update(0, 4_000_000).encode());
+    tls.write_all(&bulk).unwrap();
+    tls.flush().unwrap();
+
+    let frames = collect_response_frames(&mut tls, 300, 10, 400);
+    log_frames("RFC 9218 per-bucket rotation", &frames);
+
+    let order = data_frame_stream_order(&frames);
+    let passes = split_passes_on_leading_bucket(&order, &LEADING);
+    let leading_leaders = first_of_pair_per_pass(&passes, LEADING[0], LEADING[1]);
+    let trailing_leaders = first_of_pair_per_pass(&passes, TRAILING[0], TRAILING[1]);
+
+    println!("DATA stream-ID order: {order:?}");
+    println!("passes: {passes:?}");
+    println!("u=0 bucket leader per pass: {leading_leaders:?}");
+    println!("u=3 bucket leader per pass: {trailing_leaders:?}");
+
+    let leading_rotates = LEADING.iter().all(|sid| leading_leaders.contains(sid));
+    let trailing_rotates = TRAILING.iter().all(|sid| trailing_leaders.contains(sid));
+    // Enough passes carrying both trailing peers for "7 never leads" to be a
+    // measurement rather than a small sample.
+    let enough_passes = trailing_leaders.len() >= 3;
+    let every_stream_fired = LEADING
+        .iter()
+        .chain(TRAILING.iter())
+        .all(|sid| order.contains(sid));
+
+    println!(
+        "leading_rotates={leading_rotates} trailing_rotates={trailing_rotates} \
+         enough_passes={enough_passes} every_stream_fired={every_stream_fired} \
+         trailing_passes={} total_data_frames={}",
+        trailing_leaders.len(),
+        order.len()
+    );
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && every_stream_fired && enough_passes && leading_rotates && trailing_rotates {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_per_bucket_incremental_rotation() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 RFC 9218 §4: every urgency bucket rotates its own incremental tail",
+            try_h2_per_bucket_incremental_rotation
+        ),
+        State::Success
+    );
+}
+
 /// RFC 9218 §4: three same-urgency streams with `priority: u=3, i=?0` must
 /// drain **sequentially** — the pre-existing behaviour. Uses the same
 /// window-starving handshake as the round-robin test so the scheduler sees

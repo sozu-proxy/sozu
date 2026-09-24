@@ -1852,18 +1852,20 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `write_pass_property::qc_one_write_pass_prefixes_its_first_header_block_only`
     (`h2.rs`).
 
-26. **RFC 9218 §4 incremental leadership rotates inside the bucket that
-    leads the pass — rotate AND commit, or a stream starves — and no
-    further.** Scheduler fairness has two halves and neither is sufficient
-    alone. `Prioriser::apply_incremental_rotation` (`h2_scheduler.rs`),
-    called from `H2Scheduler::begin_pass`, rotates each urgency bucket's
-    incremental tail to start at the first stream id *strictly greater* than
-    `Prioriser::incremental_cursor`, wrapping; `H2Scheduler::end_pass` then
-    commits that cursor to `ReadyIncrementalCensus::first_incremental_fired`
-    — the first incremental stream of the pass that actually **consumed send
-    window**. Together they advance leadership exactly one position per pass,
-    so K ready incremental peers sharing the leading bucket each lead once
-    every K passes and none waits longer than K-1.
+26. **RFC 9218 §4 incremental leadership rotates inside EVERY urgency
+    bucket — rotate AND commit, per bucket, or a stream starves.** Scheduler
+    fairness has two halves and neither is sufficient alone.
+    `Prioriser::apply_incremental_rotation` (`h2_scheduler.rs`), called from
+    `H2Scheduler::begin_pass`, rotates each urgency bucket's incremental tail
+    to start at the first stream id *strictly greater* than **that bucket's
+    own entry** in `Prioriser::incremental_cursor`, wrapping;
+    `H2Scheduler::end_pass` then commits each of those cursors to the
+    matching entry of `ReadyIncrementalCensus::first_incremental_fired` — the
+    first incremental stream **of that bucket** which actually **consumed
+    send window**. Together they advance leadership exactly one position per
+    pass in every populated bucket, so K ready incremental peers sharing a
+    bucket each lead once every K passes and none waits longer than K-1,
+    whatever the bucket's urgency and whatever the other buckets are doing.
 
     Each half fails differently and both failures are starvation, not a
     slowdown. Rotating without committing re-reads the same cursor forever
@@ -1873,32 +1875,32 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     window-blocked stream that "led" without sending would hand the cursor
     onward every pass while its peers never actually got a turn either.
 
-    **The bound covers ONE bucket per connection, and the limitation is
-    real.** `incremental_cursor` is a single connection-global stream id.
-    `apply_incremental_rotation` applies it to every bucket's tail, but
-    `end_pass` can only ever commit an id drawn from the lowest-numbered
-    urgency bucket that had a ready incremental stream fire — the pass order
-    is ascending by urgency, so the first stream to consume window comes from
-    there. Any other bucket is rotated by a cursor from a foreign id range,
-    and when that cursor sits entirely below or entirely above the bucket's
-    own ids `partition_point` returns a constant and the bucket never rotates
-    at all. Measured: u=0 incremental `{1, 3}` beside u=3 incremental
-    `{5, 7}`, all ready and all consuming, six passes — u=0 alternates
-    `1, 3, 1, 3, …` while u=3 is `5, 7` in every pass and stream 7 never
-    leads. That is positional starvation, and a stalled flush at stream 5
-    (`H2WritePass::stalled`, which ends the pass) turns it into byte
-    starvation for 7, pass after pass.
+    **Per bucket is the scope, and the connection-global shape it replaced is
+    named here so no later change restores it** (sozu-proxy/sozu#1456). With
+    one cursor for the whole connection, `end_pass` could only ever commit an
+    id drawn from the lowest-numbered urgency bucket that had a ready
+    incremental stream fire — the pass order is ascending by urgency, so the
+    first stream to consume window came from there. Every other bucket was
+    rotated by a cursor from a foreign id range, and when that cursor sat
+    entirely below or entirely above the bucket's own ids `partition_point`
+    returned a constant and the bucket never rotated at all. Measured on that
+    shape: u=0 incremental `{1, 3}` beside u=3 incremental `{5, 7}`, all
+    ready and all consuming, six passes — u=0 alternated `1, 3, 1, 3, …`
+    while u=3 was `5, 7` in every pass and stream 7 never led. That was
+    positional starvation, and a stalled flush at stream 5
+    (`H2WritePass::stalled`, which ends the pass) turned it into byte
+    starvation for 7, pass after pass. The same six passes now read
+    `[1,3,5,7]` / `[3,1,7,5]` alternating, and the change is visible on the
+    wire: on a connection with two populated incremental buckets the trailing
+    bucket's frame order was stable and now rotates.
 
-    This is **not a regression**: `Prioriser` is byte-identical to the commit
-    that extracted it, and the field's own doc has always scoped the cursor
-    to "the incremental tail of the lowest-urgency bucket that contained at
-    least one incremental stream". What this invariant adds is the name and
-    the boundary, so no later change inherits the wider reading. Per-bucket
-    rotation means `incremental_cursor: [StreamId; 8]`, a per-bucket leader
-    in `ReadyIncrementalCensus` (`note_fired` is not given the urgency
-    today), and a matching `end_pass`; it changes wire ordering on
-    multi-bucket connections and needs its own changeset with its own e2e
-    evidence.
+    Three things carry the scope, and the third is the one that was missing:
+    `incremental_cursor: [StreamId; 8]` — exact rather than a cap, because
+    RFC 9218 §4.1 urgency is `[0, 7]` and `Prioriser::push_priority` clamps
+    into it; a per-bucket `first_incremental_fired` in
+    `ReadyIncrementalCensus`; and `ReadyIncrementalCensus::note_fired` taking
+    the **urgency**, without which the census cannot attribute the firing
+    stream to a bucket at all and can only name one leader per connection.
 
     The census of invariant 17 must stay bucket-scoped for an unrelated
     reason: a connection-global peer count starves nothing, but it makes a
@@ -1910,25 +1912,31 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `no_incremental_peer_is_starved_over_a_full_cycle` (five peers, ten
     passes, each leading exactly twice — deliberately five rather than two,
     because a rotation bug that swaps a pair still looks fair on two streams
-    and starves the fifth), `a_window_blocked_stream_does_not_take_the_lead`
-    and `a_pass_with_no_incremental_progress_leaves_the_cursor_alone`; and
-    generalised over 2..=8 peers, their ids and gaps, the shared urgency
-    bucket, 1..=4 full cycles and a distractor set by
+    and starves the fifth), `a_window_blocked_stream_does_not_take_the_lead`,
+    `a_pass_with_no_incremental_progress_leaves_the_cursor_alone`,
+    `test_advance_incremental_cursor_is_per_bucket` (one bucket's committed
+    leader moves no other bucket's cursor) and
+    `every_urgency_bucket_rotates_its_own_incremental_tail` (two buckets of
+    two, six passes, both tails alternating); and generalised over 2..=8
+    peers, their ids and gaps, the shared urgency bucket, 1..=4 full cycles,
+    a second multi-peer incremental bucket at strictly lower priority and a
+    distractor set by
     `fairness_property::qc_incremental_leadership_visits_every_peer_once_per_cycle`,
-    whose distractors sit in strictly lower-priority buckets precisely so its
-    main bucket is always the leader — the scope this invariant claims. The
-    boundary itself is pinned by
-    `the_round_robin_cursor_is_connection_global_so_only_the_leading_bucket_rotates`,
-    which asserts the frozen trailing bucket as observed behaviour. All of
-    them are in `h2_scheduler.rs`; each carries a `TO SEE THIS RED` recipe
-    naming the exact statement to delete and the panic it produces, except
-    the last, which has no one-line red and says so.
+    whose oracle now checks the cyclic successor for **every** bucket it
+    generated rather than the main one alone. All of them are in
+    `h2_scheduler.rs`; each carries a `TO SEE THIS RED` recipe naming the
+    exact statement to mutate and the panic it produces. The wire half is
+    `h2_correctness_tests.rs`'s `test_h2_per_bucket_incremental_rotation`,
+    which reads the trailing bucket's leader out of the DATA frame trace.
 
-    The composition is what this step's tests add. At the parent commit,
-    deleting the `advance_incremental_cursor` call site from
-    `ConnectionH2::write_streams` leaves the entire `protocol::mux` suite
-    green — 402 passed, 0 failed. The rotation primitive was pinned; the
-    rotate-and-commit pair was not.
+    The composition is what pins the pair. At the commit that extracted the
+    scheduler, deleting the `advance_incremental_cursor` call site from
+    `ConnectionH2::write_streams` left the entire `protocol::mux` suite green
+    — 402 passed, 0 failed. The rotation primitive was pinned; the
+    rotate-and-commit pair was not. And restoring the connection-global
+    commit — the lowest urgency's leader written to every bucket — reds
+    exactly three of the 1093 `sozu-lib` tests today, all three of them the
+    coverage this invariant's per-bucket scope added.
 
 27. **A close under TLS backpressure asks TWO questions, not one, and asks
     the second after a flush it performed itself.** Three sites decide

@@ -73,26 +73,29 @@
 //!
 //! Worth stating here because this is where the two halves meet. The pass
 //! order comes from the scheduler. `Prioriser::apply_incremental_rotation`
-//! does rotate *every* same-urgency run's incremental tail — what LIFECYCLE
-//! invariant 26 scopes to the leading bucket is the **commit**, and hence the
-//! fairness bound. `Prioriser` holds one connection-global
-//! `incremental_cursor` and `end_pass` commits only the first incremental
-//! stream that fired, which is always in the lowest-numbered ready bucket. In
-//! any other bucket that cursor is a foreign id range, so `partition_point`
-//! returns a constant and the rotation, though it runs, is a no-op: that
-//! bucket's tail is frozen. While every stream still gets its frame on a pass
-//! that runs to completion, that is *positional* unfairness only.
+//! rotates *every* same-urgency run's incremental tail, and since
+//! sozu-proxy/sozu#1456 `end_pass` **commits** a leader for every bucket too,
+//! so LIFECYCLE invariant 26's fairness bound now covers all of them. Before
+//! it, `Prioriser` held one connection-global `incremental_cursor` and
+//! `end_pass` committed only the first incremental stream that fired, which
+//! is always in the lowest-numbered ready bucket. In any other bucket that
+//! cursor was a foreign id range, so `partition_point` returned a constant
+//! and the rotation, though it ran, was a no-op: that bucket's tail was
+//! frozen. Every stream still got its frame on a pass that ran to
+//! completion, so it read as *positional* unfairness only.
 //!
-//! It becomes **byte** starvation the moment a pass is cut short. When
-//! [`confirm`]'s caller sees a stalled socket and stops the pass at stream 5,
-//! stream 7 is simply not written — and if the next pass presents the same
-//! frozen order, it is not written again, pass after pass. The stall is where
-//! a positional freeze turns into a stream that never sends. Do not read a
+//! That is why it mattered here: it became **byte** starvation the moment a
+//! pass was cut short. When [`confirm`]'s caller sees a stalled socket and
+//! stops the pass at stream 5, stream 7 is simply not written — and if the
+//! next pass presents the same frozen order, it is not written again, pass
+//! after pass. The stall is where a positional freeze turns into a stream
+//! that never sends, and it is why a per-bucket commit is a correctness fix
+//! rather than a tidier arrangement. Do not read a
 //! completed-pass fairness argument as covering a stalled one; it does not.
 //!
-//! This module cannot fix that — it sees one stream and has no order to
-//! change — and it deliberately makes no claim to. The fix, if one is wanted,
-//! is a per-bucket cursor in the scheduler.
+//! This module could never have fixed it — it sees one stream and has no
+//! order to change — and it deliberately makes no claim to. The fix lives in
+//! the scheduler, and it is the per-bucket cursor described above.
 
 use std::io::IoSlice;
 

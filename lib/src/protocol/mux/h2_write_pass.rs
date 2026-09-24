@@ -105,7 +105,7 @@ pub(super) enum H2WritePhase {
         stream_state: StreamState,
     },
     /// About to run the eligibility gate, `kawa.prepare`, the window debit and
-    /// `census.note_fired` for `order[cursor]`. Entered ONCE per stream: the
+    /// `census.note_fired(urgency, ...)` for `order[cursor]`. Entered ONCE per stream: the
     /// round-again after a partial write re-enters [`Self::Flush`], never
     /// this, which is what keeps one pass to one prepare per stream.
     Prepare { cursor: usize },
@@ -336,7 +336,8 @@ impl H2WritePass {
 
     /// The pass's same-urgency ready-peer census, read for
     /// `incremental_peer_count` and written by `note_fired` /
-    /// `note_ineligible`.
+    /// `note_ineligible` — both of which take the urgency, so every count
+    /// and every RFC 9218 §4 leader it holds is per bucket.
     pub(super) fn census_mut(&mut self) -> &mut ReadyIncrementalCensus {
         self.census.as_mut().expect(SCHEDULER_PASS_EXPECT)
     }

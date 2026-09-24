@@ -1155,6 +1155,16 @@ RENAMED_TESTS = {
     # impossible rather than merely untested.
     "remove_udp_frontend_spares_same_address_siblings":
         "remove_udp_frontend_drops_exactly_the_frontend_its_tags_name",
+    # sozu#1456, the same shape as the two regex entries above: this test
+    # pinned the connection-global round-robin cursor as OBSERVED behaviour,
+    # and its own doc comment asked for it to be deleted rather than
+    # re-expected when per-bucket rotation landed. It was. The CHANGELOG
+    # entries that describe the commits before it cite the old name on
+    # purpose, to record that the deletion is the fix; the scenario — the
+    # same four streams over the same six passes — is now this test, with the
+    # corrected oracle.
+    "the_round_robin_cursor_is_connection_global_so_only_the_leading_bucket_rotates":
+        "every_urgency_bucket_rotates_its_own_incremental_tail",
 }
 
 # Sentence-shaped identifiers that survive both filters and are not test names.
