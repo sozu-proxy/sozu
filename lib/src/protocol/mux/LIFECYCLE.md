@@ -332,7 +332,7 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   request/response bytes flow both ways. Set by `Context::link_stream`
   (`mod.rs`), cleared by `Context::unlink_stream` (`mod.rs`).
 - `Unlinked` — backend finished or was reset; response may still need to drain
-  to the client. Transitions: `answers.rs:326/342`, `h1.rs:995-1052`, and in
+  to the client. Transitions: `answers.rs:326/342`, `h1.rs:1042-1099`, and in
   `h2.rs` the `StreamState::Unlinked` assignments of `ConnectionH2::reset_stream`
   and `ConnectionH2::end_stream` (the client-side retirement plus the
   `ForwardTerminated` and `CloseDelimited` arms of the server side). By symbol,
@@ -420,7 +420,7 @@ runs — see §6.
   **every** backend `ConnectionH2` attached to this session indexes into it.
 - Index: `GlobalStreamId = usize` (`mod.rs`).
 - Mutated by:
-  - push — `create_stream` when no `Recycle` slot is available (`mod.rs:713-714`).
+  - push — `create_stream` when no `Recycle` slot is available (`mod.rs:773`).
   - pop — `shrink_trailing_recycle` (`mod.rs`).
   - in-place state edits — everywhere.
 
@@ -673,16 +673,16 @@ Two independent per-stream deadlines, both bounded by
 (deduped) via the unit-testable free function `collect_timed_out_streams`. Both
 deadlines are compared against `ConnectionH2.now` (§7.5):
 
-- **Bidirectional-silence guard** — `ConnectionH2.stream_last_activity_at:
-  HashMap<StreamId, Instant>`. Refreshed on every non-empty inbound DATA frame,
+- **Bidirectional-silence guard** — `H2StreamTable.stream_last_activity_at:
+  BTreeMap<StreamId, Instant>`. Refreshed on every non-empty inbound DATA frame,
   on HEADERS for an existing stream (trailers), and on outbound bytes written.
   Catches a stream making no forward progress in either direction
   (slow-multiplex Slowloris: the connection-level timer resets on every frame,
   so without this per-stream guard a peer could hold `max_concurrent_streams`
   slots for the full session timeout).
-- **Outbound-flow-control-stall guard** — `ConnectionH2.stream_fc_stalled_since:
-  HashMap<StreamId, Instant>`, paired with
-  `ConnectionH2.stream_fc_stalled_progress: HashMap<StreamId, usize>` (the
+- **Outbound-flow-control-stall guard** — `H2StreamTable.stream_fc_stalled_since:
+  BTreeMap<StreamId, Instant>`, paired with
+  `H2StreamTable.stream_fc_stalled_progress: BTreeMap<StreamId, usize>` (the
   cumulative-stall budget). Armed (in `ConnectionH2::poll_write_target`) whenever a stream holds
   sendable buffered data it cannot send because its effective send window
   `min(stream.window, connection.window)` is exhausted. This is
@@ -807,7 +807,7 @@ asymmetry that produces it is architectural:
 - An **arm** site runs at an arbitrary depth into its pass — the liveness
   refreshes in the DATA-payload arm of `ConnectionH2::poll_read_target` (`h2.rs`, by
   symbol for the collision the liveness `Reset:` bullet above records — do not
-  convert it back) and at `h2.rs:5387` (HEADERS), the
+  convert it back) and at `h2.rs:5421` (HEADERS), the
   outbound-byte refreshes at `h2.rs:2536` (`H2WritePhase::Resume`) and
   `h2.rs:2815-2817` (`H2WritePhase::Flush`), the `FcStallAction::Arm` branch of
   `ConnectionH2::poll_write_target` (`h2.rs`) — and stamps the

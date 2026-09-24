@@ -134,7 +134,8 @@
   `flush_pending_control_frames`'s two queries — that function is entered 43 times in one
   byte-conservation run, but both queries sit behind stages needing queued control frames or a
   parked zero-buffer write, and this fixture opens neither. `shared.rs`'s two in
-  `drain_tls_close_notify` are uncovered because nothing calls that function at all. Test-only: no
+  `drain_tls_close_notify` are uncovered because this fixture never reaches it —
+  `ConnectionH1::close` and `ConnectionH2::close` both call it in production. Test-only: no
   production code, no dependency and no `Cargo.lock` entry changes.
 
 - **`test(fuzz)`: cargo-fuzz target for the command channel's length-delimited IPC framing.**
@@ -1448,6 +1449,75 @@
   decision.
 
 ### 🐛 Fixed
+
+- **`docs(mux)`: three citations that resolved onto real but unrelated lines, three field
+  declarations that named the wrong container and the wrong owner, and one CHANGELOG claim that
+  named the wrong reason.** `lib/src/protocol/mux/LIFECYCLE.md` §4.2 put the
+  `Context.streams` push at `mod.rs:713-714`. Those two lines are
+  `listener.get_sticky_name().to_string()` and `listener.get_sozu_id_header().to_string()`,
+  arguments of the `HttpContext::new(...)` call that opens `Context::create_stream`. The push is
+  `self.streams.push(stream)` at `mod.rs:773`, past the `Recycle`-reuse early return the bullet's
+  own text names as its precondition.
+
+  §3.1's `Unlinked` bullet cited `h1.rs:995-1052` for the H1 transitions. `995` is a format string
+  inside `ConnectionH1::end_stream`'s wrong-stream `error!` guard and `1052` is a `debug_assert!`
+  argument; the four `StreamState::Unlinked` assignments the range is meant to bracket are at
+  `h1.rs:1042`, `1061`, `1091` and `1099`. It was exact when written — `fbc83edf` carried
+  `h1.rs:737-772` against assignments at 737, 745, 767 and 772 — and successive renumberings walked
+  it off them while keeping it plausible.
+
+  §7.5's arm-site list put the HEADERS liveness refresh at `h2.rs:5387`, which is
+  `log_context!(self)` inside `error!("… header_block_fragment out of bounds of zero.storage")`.
+  The refresh is `self.stream_table.touch_activity(stream_id, self.now)` at `h2.rs:5421`, under the
+  comment that names it; the citation misses it by thirty-four lines. The two commits directly
+  below this one each renumbered it and neither noticed: sozu-proxy/sozu#1501 moved it from
+  `h2.rs:5376` to `h2.rs:5384`, and sozu-proxy/sozu#1497 from `h2.rs:5384` to `h2.rs:5387`. Both
+  moves were faithful and both landed on `log_context!(self)` — a re-anchor preserves the pointer,
+  not the claim.
+
+  §7.2 declared all three per-stream reap caches as `ConnectionH2` fields holding a `HashMap`:
+  `stream_last_activity_at: HashMap<StreamId, Instant>`, `stream_fc_stalled_since:
+  HashMap<StreamId, Instant>` and `stream_fc_stalled_progress: HashMap<StreamId, usize>`. Both
+  halves are wrong, and have been since sozu-proxy/sozu#1415's stream-slot-bookkeeping extraction:
+  the three are private fields of `H2StreamTable` (`h2_stream_table.rs`), each built by
+  `BTreeMap::new()` in `H2StreamTable::new`, and `ConnectionH2` declares no field of any of those
+  names — cited by symbol here because that module is being edited under sozu-proxy/sozu#1338 and a
+  line number would not survive it. #1415 converted them to `BTreeMap` for the determinism reason
+  its own entry in this file records — `collect_timed_out`'s union decided which of several
+  simultaneously-timed-out streams was `RST_STREAM`'d first, and a `HashMap` made that order vary
+  across restarts — and that entry was written correctly. §7.2 simply kept the pre-extraction
+  shape, which is what §4.1's wire-map bullet was updated away from in the same changeset. Reading
+  the container name in §7.2 as a determinism claim now inverts the guarantee the code provides.
+
+  And sozu-proxy/sozu#1484's entry in this file said `shared::drain_tls_close_notify`'s two
+  uncovered lines were uncovered "because nothing calls that function at all". It has two
+  production callers — the `Position::Server` arms of `ConnectionH1::close` and
+  `ConnectionH2::close`, each importing it from `shared.rs`. What #1484 measured is that its own
+  six-test fixture never reaches them. Only that causal clause is rewritten: every count, probe
+  tally and mutation result in that entry was true as measured and is left as written.
+
+  **Why no rule caught them.** `.github/scripts/check_doc_citations.py`'s drift rule keys its
+  exemption on the citation tuple as it stood in the BASE revision of the citing document, so a
+  span the changeset re-anchored is counted as exempt and never compared — and a renumbering is
+  exactly a re-anchor. All three citations sat in that blind spot, each one landing on a line that
+  is real and non-blank, which is all the resolver rules ask. The three §7.2 field declarations
+  never entered any rule at all: every rule in that file resolves a `path:NNN` or a fenced quote,
+  and a sentence naming a type and a container carries neither, so nothing has ever read one.
+  Measured at `42ed6bac` over the window the three citations were renumbered in,
+  `--base f2082b6e --show` reported 133 exempt cited ends across 91 doc
+  sites; 11 of those sites are fenced blocks the pinned-quote rule already compares verbatim, and
+  reading the remaining 80 against the code they name found 77 correct and these three wrong.
+  `--base 42ed6bac --show` on this tree exempts 109 more, the spans sozu-proxy/sozu#1501's and
+  sozu-proxy/sozu#1497's renumberings re-anchored: 15 are pinned fences the verbatim rule compares,
+  4 are the citations repaired here, and the other 90 anchor on byte-identical text before and
+  after those renumberings, so both moved every pointer they touched faithfully — including the one
+  that was already wrong, which each of them moved in turn.
+  `--audit` reports 7 findings on this tree and all 7 are the heuristic pairing a prose symbol with
+  a line eight or more away from it, not a wrong target. Those ratios are the point of printing the
+  exempt count beside the compared one: a run can say "none of the 212 cited lines changed their
+  text" and be telling the truth about the 212 while saying nothing at all about the 109 it declined
+  to read.
+  Documentation only: no production code, no test, no dependency and no `Cargo.lock` entry changes.
 
 - **`fix(mux-h2)`: the RFC 9218 §4 round-robin cursor is per urgency bucket, so every incremental
   bucket rotates instead of only the one that leads the pass.** `Prioriser` held ONE
