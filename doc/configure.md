@@ -3297,24 +3297,58 @@ tables — no per-request allocation.
 #### Round-trip-time fields on access logs
 
 `client_rtt` and `server_rtt` carry the kernel-measured TCP round-trip time on
-each side of the proxy at the moment the access log is emitted. Source:
-`getsockopt(TCP_INFO)` (Linux `SOL_TCP`, BSD `IPPROTO_TCP`, Darwin `IPPROTO_TCP`
-opt `0x106`) wrapped in `lib/src/socket.rs::stats::socket_rtt`. Unit on the
-wire: microseconds (`uint64`); on Darwin the kernel reports `tcpi_srtt` in
-milliseconds and the helper multiplies by 1000 before exposing the same
-`Duration`.
+each side of the proxy. Source: `getsockopt(TCP_INFO)` (Linux `SOL_TCP`, BSD
+`IPPROTO_TCP`, Darwin `IPPROTO_TCP` opt `0x106`) wrapped in
+`lib/src/socket.rs::stats::socket_rtt`. Unit on the wire: microseconds
+(`uint64`); on Darwin the kernel reports `tcpi_srtt` in milliseconds and the
+helper multiplies by 1000 before exposing the same `Duration`.
 
 | Access-log field | Wire tag                                               | Populated on                                                                             |
 | ---------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
 | `client_rtt`     | `ProtobufAccessLog.client_rtt` #9 (`optional uint64`)  | every protocol path: H1 and H2 (`mux`), Pipe (TCP/WS), TCP frontend                      |
 | `server_rtt`     | `ProtobufAccessLog.server_rtt` #10 (`optional uint64`) | every protocol path that has a backend socket; `None` for the TCP frontend (no upstream) |
 
-Capture is at access-log emission time and is cheap (one `getsockopt(TCP_INFO)`
-syscall per side), so the cell reflects the most recent kernel SRTT estimate
-rather than a session-wide average. `None` on AF_UNIX or any FSM state where
-`TCP_INFO` is not usable (pre-handshake, dead socket). Real implementations
-exist for Linux, FreeBSD, NetBSD, OpenBSD, DragonFly, macOS and iOS; non-Unix
-stub builds short-circuit to `None`.
+`None` on AF_UNIX or any FSM state where `TCP_INFO` is not usable
+(pre-handshake, dead socket). Real implementations exist for Linux, FreeBSD,
+NetBSD, OpenBSD, DragonFly, macOS and iOS; non-Unix stub builds short-circuit
+to `None`.
+
+##### When each cell is measured
+
+On every path except HTTP/2, both cells are read at access-log emission time
+and cost one `getsockopt(TCP_INFO)` syscall per side, so each one is the
+kernel's SRTT estimate for that socket at the moment that request finished.
+
+**On HTTP/2, `client_rtt` is no longer measured per request.** It is sampled
+once per readiness sweep of the connection — at most one `getsockopt(TCP_INFO)`
+per `Mux::ready`, `Mux::timeout` and `Mux::shutting_down` pass, taken before
+anything in that pass can emit an access log — and every stream that finishes
+during that pass reports that one value. `server_rtt` is unchanged: it is still
+read per request, through `Endpoint::peer_rtt`, because the backend socket is
+the other side of the connection.
+
+Two consequences for anyone trending the field:
+
+- **`client_rtt` means "the frontend SRTT at the last readiness sweep", not
+  "the frontend SRTT when this stream finished".** Several H2 access logs
+  emitted from one sweep carry an identical `client_rtt`, so repeated values
+  across concurrent streams are expected and are not a sign of a stuck
+  measurement. A percentile computed over H2 access logs is now weighted by
+  how many streams happened to complete together, and the value can be up to
+  one sweep old.
+- **The two cells on one H2 log line no longer share a sampling instant.**
+  `client_rtt` may predate `server_rtt` by the duration of the pass. Do not
+  subtract one from the other on an H2 line and read the difference as a
+  network asymmetry.
+
+This changed in issue #1339 (question 11). The frontend RTT was the last thing
+the H2 core read from an operating-system socket handle, and moving that read
+out to the connection's owner is what lets the core be driven by something
+other than a real TCP socket. Sampling it per readiness sweep instead of at
+every entry point was the cheaper of the two ways to do that — see
+`doc/h2_mux_internals.md` for the measurements behind the choice, including
+the case where the per-sweep sample costs *more* syscalls than the per-request
+read it replaced.
 
 #### HTTP/2 flood mitigations
 

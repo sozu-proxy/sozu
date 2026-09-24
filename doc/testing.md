@@ -777,7 +777,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **`decode_status` returns `None` on a size-update-prefixed block, and whether
   that is fail-closed depends on the call site.** `H2BlockConverter::emit_pending_size_update_if_new_block`
   (`lib/src/protocol/mux/converter.rs:112`, armed at
-  `lib/src/protocol/mux/h2.rs:5911`) prepends a `001xxxxx` HPACK dynamic table
+  `lib/src/protocol/mux/h2.rs:5943`) prepends a `001xxxxx` HPACK dynamic table
   size update when a peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e
   call sites send one: `h2_security_tests.rs:2444` (value 0) and
   `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
@@ -799,7 +799,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **A test that only reddens under CI load is not automatically a flake — find
   the production site first.** Before retrying or quarantining, ask whether the
   symptom is reachable at all. #1353's 421 has exactly one emission site
-  (`lib/src/protocol/mux/mod.rs:1962`), reachable only through
+  (`lib/src/protocol/mux/mod.rs:2004`), reachable only through
   `RetrieveClusterError::SniAuthorityMismatch`, which is constructed at exactly
   one site (`lib/src/protocol/mux/router.rs:797`) immediately after
   `incr!(names::http::SNI_AUTHORITY_MISMATCH)` — and the failing run reported
