@@ -8,7 +8,7 @@
 //! the canonical home for the edge-trigger discipline — paths that queue
 //! bytes for a later event-loop pass must arm writable / signal pending
 //! write (cf. `arm_writable()` at the deferred-control-frame sites and
-//! `lib/src/lib.rs:1006`-`1010`).
+//! `Readiness::arm_writable` / `Readiness::signal_pending_write` in `lib/src/lib.rs`).
 
 use std::{
     cmp::min,
@@ -5256,10 +5256,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.mark_end_of_stream(stream);
             }
             if let StreamState::Linked(token) = stream_state {
-                // Mirror of h1.rs:361-368 for the H2-backend → H2-frontend
-                // path: edge-triggered epoll will NOT re-fire for bytes we
-                // just pushed into stream.back; the synthetic event is the
-                // only wake path. LIFECYCLE invariant 15.
+                // Mirror of `ConnectionH1::readable`'s close-delimited EOF branch
+                // for the H2-backend → H2-frontend path: edge-triggered epoll will
+                // NOT re-fire for bytes we just pushed into stream.back; the
+                // synthetic event is the only wake path. LIFECYCLE invariant 15.
                 endpoint.readiness_mut(token).arm_writable();
                 incr!(names::h2::SIGNAL_WRITABLE_REARMED_PEER_DATA);
             }

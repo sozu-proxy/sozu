@@ -4783,6 +4783,53 @@
 
 ### 🤖 CI
 
+- **`ci(doc)`: reject a `file.rs:NNN` citation written inside a Rust comment, and convert the five
+  left in the tree.**
+  `check_doc_citations.py` resolved citations in `doc/**` and every `**/LIFECYCLE.md` only, so the
+  same citation written in a `//`, `///` or `//!` comment was outside all four of its rules: never
+  extracted, never resolved, never drift-compared, and never reported as unresolvable either.
+  sozu#1473 measured what that costs on the worst shape — two `SAFETY:` comments justifying
+  `from_utf8_unchecked`, whose claim was true and whose proof path pointed at a `Method` match arm
+  instead of the function they named. sozu#1466 found the same defect frozen: a citation already
+  wrong when the drift rule first saw it is exempt forever, because "unchanged" is the condition
+  for being exempt.
+  A fifth rule now **forbids** the form rather than resolving it. Extending the resolver over
+  `**/*.rs` was measured and rejected: at `19fd5d8c` the tree held 90 such tokens and 68 had already
+  drifted, so the resolver would have failed on most of the population it guarded, and it would have
+  widened the drift rule across a codebase where line shifts are constant and legitimate. Forbidding
+  imports no pre-existing failure and has nothing to renumber. It reads every `*.rs` — not
+  `lib|command|bin|e2e/src` alone — and resolves sibling-first through the resolver's own
+  `resolve_path`, which is what reaches a bare `h1.rs:361-368` written from `mux/h2.rs`; the finder
+  grep in #1473, keyed on a `lib/src/`-style prefix, walks past that shape, and a rule built on the
+  same prefix would have shipped green over it. A citation naming no file here — the two into the
+  pinned `kawa` dependency — is skipped and counted beside what was checked. `CHANGELOG.md` is not
+  read: it is an append-only record carrying quoted tool transcripts, and a rule that failed on one
+  would be asking for the record to be rewritten.
+  Five citations converted, every one re-derived against the tree rather than renumbered. Three were
+  wrong. `mux/h2.rs`'s module preamble cited `lib/src/lib.rs:1006`-`1010` for "arm writable / signal
+  pending write" and landed on `pub enum RequiredEvents`, ~220 lines from `Readiness::arm_writable`
+  and `Readiness::signal_pending_write`. Both `mux/mod.rs` shutdown sites cited
+  `lib/src/https.rs:650-655` for a write-up about `SHUT_RD` and TCP RST and landed on an
+  `Arc::new(snapshot)` block, ~370 lines from the comment inside `HttpsSession::close`. The fourth,
+  `mux/stream.rs`'s `lib/src/metrics/mod.rs:44`, was correct and still converts — it keeps its claim
+  and loses the number. The fifth is the one no prefix-keyed grep reports: `mux/h2.rs:5233`'s bare
+  `h1.rs:361-368`, now `ConnectionH1::readable`'s close-delimited EOF branch. All five edits are
+  line-count neutral, so no citation in `doc/**` or any `LIFECYCLE.md` moved.
+  One citation is declared historical rather than converted: `h2_flood_detector.rs` cites
+  `h2.rs:6946` for `H2FloodDetector::default()`'s test call sites **at the pre-extraction revision**,
+  which the same sentence says out loud. The extraction deleted the `impl Default` it describes, so
+  there is no symbol to cite and no line to renumber onto — renumbering it would falsify a record.
+  `HISTORICAL_CITATIONS` holds it, keyed on the citing file and the exact citation text, with the
+  reason; an entry without a reason is an unreviewed silencing of the rule, as for `NOT_A_TEST`.
+  Seen red: planting one `lib/src/metrics/mod.rs:44` in a comment in `lib/src/metrics/mod.rs` takes
+  the run to exit 1 naming that file, that text and the file it resolves to; removing it restores
+  exit 0 with the file byte-identical. The self-test gains a fixture per shape — single line, range,
+  `/` group, bare sibling binding to `mod/h2.rs` rather than the root `h2.rs`, and an external
+  citation that must stay silent — with both totals asserted, and a fixture exemption table whose
+  one entry moves a verdict, so deleting it turns `--self-test` red. `doc/README.md` records the
+  convention, the rejected alternative and the escape hatch; its worked example is re-tensed to the
+  revision it was measured at, since sozu#1479 has inverted that write path since.
+
 - **`ci(doc)`: fail the run on a rustdoc warning instead of printing it and discarding it.**
   The `Build documentation` step on the `msrv-full` cell ran `cargo doc --no-deps --all-features
   --locked` with no `RUSTDOCFLAGS`, so every rustdoc diagnostic was written to a log nobody reads

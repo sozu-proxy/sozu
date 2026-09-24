@@ -661,7 +661,7 @@ impl Stream {
             // `names::http::ERRORS` emission site in the crate, so the labels
             // written here are the whole cardinality contract for `http.errors`;
             // the backend label is dropped centrally, by detail level, in
-            // `metrics::filter_labels_for_detail` (`lib/src/metrics/mod.rs:44`).
+            // `metrics::filter_labels_for_detail` (`lib/src/metrics/mod.rs`).
             // `pipe::log_request_error` is a different metric
             // (`names::pipe::ERRORS`) and is not a second source of this one.
             incr!(

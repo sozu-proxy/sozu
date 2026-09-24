@@ -1264,8 +1264,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             }
             // invariant: write-only shutdown — Shutdown::Both on a TLS frontend
             // discards the receive buffer and elicits TCP RST, truncating the
-            // already-queued response. Canonical write-up: `lib/src/https.rs:650-655`.
-            // Backend sockets follow the same discipline for symmetry.
+            // already-queued response. Canonical write-up: `HttpsSession::close`
+            // (`lib/src/https.rs`). Backend sockets follow the same discipline for symmetry.
             if let Err(e) = socket.shutdown(Shutdown::Write)
                 && e.kind() != ErrorKind::NotConnected
             {
@@ -1687,8 +1687,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             }
                             // invariant: write-only shutdown — Shutdown::Both on a TLS frontend
                             // discards the receive buffer and elicits TCP RST, truncating the
-                            // already-queued response. Canonical write-up: `lib/src/https.rs:650-655`.
-                            // Backend sockets follow the same discipline for symmetry.
+                            // already-queued response. Canonical write-up: `HttpsSession::close`
+                            // (`lib/src/https.rs`). Backend sockets follow the same discipline for symmetry.
                             if let Err(e) = socket.shutdown(Shutdown::Write)
                                 && e.kind() != ErrorKind::NotConnected
                             {
