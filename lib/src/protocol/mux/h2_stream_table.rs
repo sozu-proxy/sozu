@@ -72,48 +72,48 @@
 //! reaping without a fairness cursor, unlike the caveat
 //! `H2FlowControl`'s own module doc carries for its pending map.
 //!
-//! `streams` itself (the wire `StreamId -> GlobalStreamId` map) stays a
-//! `HashMap` — it is NOT a determinism leak. Every iteration site was
-//! enumerated by reading (not just grepping for `.iter()/.keys()/.values()/
-//! .drain()`, which misses the `for (&k, &v) in &map` shape):
+//! `streams` itself (the wire `StreamId -> GlobalStreamId` map) is now a
+//! `BTreeMap` too — issue #1338's last open question. The justification this
+//! doc used to give for keeping it a `HashMap` was wrong, and the shape of
+//! the error is worth recording: it enumerated every iteration site and
+//! argued each loop BODY was order-independent, but per-element
+//! commutativity does not cover EARLY TERMINATION.
 //!
-//! - `write_streams` hands `self.streams.keys().copied()` to
-//!   `H2Scheduler::begin_pass`, which `extend`s its order buffer with them
-//!   and then immediately sorts by `(urgency, *id)` — a total order, because
-//!   `*id` is a unique tiebreaker. The `HashMap` order the `extend` produced
-//!   is discarded by the sort; wire HEADERS/DATA order is the sorted order,
-//!   not the map order.
-//! - `compute_stream_byte_totals`'s `for &gid in self.streams.values()` only
-//!   accumulates two `usize` sums — addition is commutative, so map order
-//!   cannot change the result.
-//! - `update_initial_window_size`'s `for &gid in self.streams.values()`
-//!   applies an additive delta to each stream's own `window` field
-//!   independently and OR-combines a `bool` — both order-independent.
-//! - `handle_goaway_frame`'s retry loop
-//!   (`for (&stream_id, &global_stream_id) in &self.streams`) and `close`'s
-//!   backend-teardown loop (`for global_stream_id in self.streams.values()`)
-//!   both affect *scheduling* order (which stream gets pushed to
-//!   `pending_links` / notified via `endpoint.end_stream` first) — not the
-//!   literal bytes emitted for a fixed frame set. Every actual DATA/HEADERS/
-//!   RST_STREAM frame byte these streams eventually produce is still
-//!   ordered later by `H2Scheduler::begin_pass`'s deterministic sort.
-//!   Reconnection/dial order to a *new* backend is already subject to real
-//!   network-timing nondeterminism, unlike a single synchronous
-//!   `drain_*_into` pass — the class of leak issue #1338 and step 2's
-//!   `pending_window_updates` fix targeted.
-//! - `close`'s debug-log loop
-//!   (`for (stream_id, global_stream_id) in &self.streams`) only orders log
-//!   lines, never wire bytes.
-//! - `GOAWAY`'s own `last_stream_id` is `highest_peer_stream_id`, a scalar
-//!   updated incrementally (`if stream_id > highest { highest = stream_id
-//!   }`) as frames arrive — never derived by iterating `streams`.
+//! `update_initial_window_size` is the counter-example. Its body does read
+//! as commutative — an additive delta to each stream's own `window`, a
+//! `bool` OR-combined — but the loop also carries the `None => return true`
+//! arm RFC 9113 §6.9.2 requires on `checked_add`, and it returns from
+//! INSIDE the loop. So when a SETTINGS_INITIAL_WINDOW_SIZE change overflows
+//! one stream, which PREFIX of the others was already mutated before the
+//! abort is precisely the iteration order. `handle_settings_frame` turns
+//! that `true` into a GOAWAY, and the half-updated window set stays in
+//! `context.streams` for `close`'s teardown walk and any pass still to run.
+//!
+//! Two further sites order observable work rather than arithmetic.
+//! `handle_goaway_frame` walks the map into `retry_streams` and pushes each
+//! retryable stream onto `context.pending_links`, so relink — and therefore
+//! reconnect — order was hash order. `ConnectionH2::close` notifies each
+//! linked stream through `endpoint.end_stream`, so teardown order was hash
+//! order. Neither reorders the bytes of a fixed frame set, which is what
+//! the old text meant by "scheduling only"; both are still the
+//! restart-to-restart irreproducibility issue #1338 is about.
+//!
+//! The rest are genuinely order-free and were correct under either
+//! container: `write_streams` hands the keys to `H2Scheduler::begin_pass`,
+//! which sorts by `(urgency, id)` and discards the order it was given;
+//! `compute_stream_byte_totals` sums two `usize`s; `close`'s debug-log loop
+//! orders only log lines; and `GOAWAY`'s `last_stream_id` comes from the
+//! scalar `highest_peer_stream_id`, never from iterating `streams`.
+//!
+//! `streams` is read on the per-frame path, so the container was measured,
+//! not assumed: see `H2StreamTable::new` and `lib/benches/h2_stream_table.rs`.
 //!
 //! `rst_sent` is only ever queried by `.contains()` / mutated by
 //! `.insert()`/`.remove()` — never iterated — so it carries no ordering
 //! concern either.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -122,7 +122,7 @@ use super::{GlobalStreamId, StreamId, h2::H2StreamId};
 /// H2 wire-level stream-slot bookkeeping: see the module doc.
 pub(super) struct H2StreamTable {
     /// Wire `StreamId -> GlobalStreamId` map.
-    streams: HashMap<StreamId, GlobalStreamId>,
+    streams: BTreeMap<StreamId, GlobalStreamId>,
     /// Highest stream ID accepted from the peer (used for GoAway last_stream_id).
     highest_peer_stream_id: StreamId,
     /// See `LIFECYCLE.md` §5.1 — `(id, remaining bytes)` of a parked partial read.
@@ -167,9 +167,22 @@ impl H2StreamTable {
     /// `expect_read` seeds the initial parked read — `ConnectionH2::new`'s
     /// caller differs it for a frontend (client preface) vs. a backend
     /// (nothing yet expected) connection.
+    ///
+    /// `streams` is built with `BTreeMap::new()` and carries NO capacity
+    /// hint. `BTreeMap` has no `with_capacity`: it allocates one node at a
+    /// time instead of one contiguous bucket array, so there is nothing to
+    /// size up front. The `HashMap::with_capacity(8)` this replaced is
+    /// dropped outright rather than translated — do not reintroduce the 8
+    /// as a comment claiming a reservation that no longer happens. The
+    /// number itself is not lost: it is the expected steady-state occupancy
+    /// `lib/benches/h2_stream_table.rs` measures as its smallest `n`, and
+    /// the size at which the tree wins hardest — a tree of 11 keys or fewer
+    /// is one node, while hashing a `u32` with SipHash-1-3 costs about 9 ns
+    /// whatever `n` is. See the module doc's Determinism section for why
+    /// the container changed at all.
     pub(super) fn new(expect_read: Option<(H2StreamId, usize)>) -> Self {
         let table = H2StreamTable {
-            streams: HashMap::with_capacity(8),
+            streams: BTreeMap::new(),
             highest_peer_stream_id: 0,
             expect_read,
             expect_write: None,
@@ -187,10 +200,15 @@ impl H2StreamTable {
     /// Read-only borrow of the wire map, for the several distinct read-only
     /// iteration/query shapes call sites in `h2.rs` need (`.len()`,
     /// `.is_empty()`, `.contains_key()`, `.keys()`, `.values()`, `.iter()`).
+    /// Every iteration shape among those walks ascending `StreamId`. That is
+    /// load-bearing, not incidental: three call sites turn this order into
+    /// observable behaviour, and the module doc's Determinism section names
+    /// them. Do not swap the container back without reading it.
+    ///
     /// No `&mut` accessor is exposed: mutation only happens through
     /// [`Self::register`] and [`Self::remove`], which keep the associated
     /// caches and `expect_read`/`expect_write` invalidation in lockstep.
-    pub(super) fn streams(&self) -> &HashMap<StreamId, GlobalStreamId> {
+    pub(super) fn streams(&self) -> &BTreeMap<StreamId, GlobalStreamId> {
         &self.streams
     }
 
@@ -662,5 +680,87 @@ mod tests {
         table.register(1, 0, now);
         table.arm_fc_stall(1, now, 0);
         assert!(table.collect_timed_out(now, deadline).is_empty());
+    }
+
+    /// The wire map's iteration order is an observable, and three production
+    /// sites consume it. `ConnectionH2::handle_goaway_frame` walks the map
+    /// into `retry_streams` and pushes each retryable stream onto
+    /// `context.pending_links`, so relink — and therefore reconnect — order
+    /// is this order. `ConnectionH2::update_initial_window_size` walks the
+    /// values and can `return` from INSIDE its loop when `checked_add`
+    /// overflows, so the set of streams whose `window` it already rewrote
+    /// when it aborts is a PREFIX of this order. `ConnectionH2::close`
+    /// walks the same values calling `endpoint.end_stream`, so teardown
+    /// notification order is this order.
+    ///
+    /// None of those three is reachable from inside this module, so the
+    /// guard sits on the single property all three inherit: the map
+    /// iterates in ascending wire `StreamId` whatever order `register` was
+    /// called in. Keys, values and pairs are all asserted, because the
+    /// three sites between them read all three shapes.
+    ///
+    /// TO SEE THIS RED: restore `streams` to
+    /// `HashMap<StreamId, GlobalStreamId>` and `new`'s
+    /// `HashMap::with_capacity(8)`. Measured on that revert, this test
+    /// fails on its first assertion. No permutation below is the EXPECTED
+    /// failure: `RandomState` is seeded per process, so the left-hand value
+    /// differs between runs by construction and none of them is a fact to
+    /// assert on. What reproduces is the failure and its shape — a
+    /// permutation of `expected_ids` that is not `expected_ids`. Four runs
+    /// of that revert gave four different permutations, every one red. One,
+    /// as a labelled sample only: `left: [501, 901, 1, 17, 45, 3, 19, 5,
+    /// 777]`.
+    #[test]
+    fn streams_iterates_in_ascending_stream_id_order_whatever_the_insertion_order() {
+        let mut table = H2StreamTable::new(None);
+        let now = Instant::now();
+        // Scrambled, and deliberately NOT the id set
+        // `collect_timed_out_is_ascending_stream_id_order_deterministically`
+        // uses, so neither test can quietly come to rest on the other's
+        // fixture.
+        let insertion_order: [StreamId; 9] = [901, 5, 17, 45, 1, 777, 19, 3, 501];
+        for (slot, &stream_id) in insertion_order.iter().enumerate() {
+            table.register(stream_id, slot as GlobalStreamId, now);
+        }
+
+        // The slot handed to `register` is the INSERTION index, so sorting
+        // the pairs by wire id scrambles the slots — which is what makes the
+        // values assertion below independent of the keys assertion instead
+        // of a restatement of it.
+        let mut expected_pairs: Vec<(StreamId, GlobalStreamId)> = insertion_order
+            .iter()
+            .enumerate()
+            .map(|(slot, &stream_id)| (stream_id, slot as GlobalStreamId))
+            .collect();
+        expected_pairs.sort_unstable();
+        let expected_ids: Vec<StreamId> = expected_pairs.iter().map(|&(id, _)| id).collect();
+        let expected_slots: Vec<GlobalStreamId> =
+            expected_pairs.iter().map(|&(_, slot)| slot).collect();
+
+        let observed_ids: Vec<StreamId> = table.streams().keys().copied().collect();
+        assert_eq!(
+            observed_ids, expected_ids,
+            "streams() must walk ascending wire StreamId: begin_scheduler_pass \
+             seeds the whole write-pass order buffer from exactly these keys"
+        );
+
+        let observed_slots: Vec<GlobalStreamId> = table.streams().values().copied().collect();
+        assert_eq!(
+            observed_slots, expected_slots,
+            "streams().values() must follow that same ascending key order: it is \
+             the prefix update_initial_window_size has already mutated when a \
+             checked_add overflow aborts it, and the order close tears down in"
+        );
+
+        let observed_pairs: Vec<(StreamId, GlobalStreamId)> = table
+            .streams()
+            .iter()
+            .map(|(&stream_id, &slot)| (stream_id, slot))
+            .collect();
+        assert_eq!(
+            observed_pairs, expected_pairs,
+            "streams() pairs must agree with its own keys and values: \
+             handle_goaway_frame reads both halves of this iterator together"
+        );
     }
 }

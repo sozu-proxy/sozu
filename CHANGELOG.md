@@ -337,6 +337,56 @@
   re-anchored spans from its comparison, and all 64 were audited against the base blob as
   byte-identical.
 
+- **`refactor(mux-h2)`: the H2 wire stream map is a `BTreeMap`, closing the last open question in
+  [#1338](https://github.com/sozu-proxy/sozu/issues/1338).** `H2StreamTable::streams` — the
+  `StreamId -> GlobalStreamId` map every inbound frame is looked up in — was the one map of the five
+  in the H2 core still walked in `RandomState` order. Its module doc argued that this was not a
+  determinism leak, enumerating each iteration site and showing each loop BODY to be
+  order-independent. That argument is wrong, and the rewritten doc records *how* it is wrong,
+  because the shape generalises: per-element commutativity does not cover EARLY TERMINATION.
+  `update_initial_window_size` is the counter-example. Its body is commutative — an additive delta
+  to each stream's own `window`, a `bool` OR-combined — but the loop also carries the
+  `None => return true` arm RFC 9113 §6.9.2 requires on `checked_add`, and it returns from INSIDE
+  the loop, so on a SETTINGS_INITIAL_WINDOW_SIZE that overflows one stream, *which prefix of the
+  others was already mutated* is exactly the iteration order. Two further sites order observable
+  work rather than arithmetic: `handle_goaway_frame` walks the map into `retry_streams` and pushes
+  each retryable stream onto `context.pending_links`, so relink — and therefore reconnect — order
+  was hash order; and `ConnectionH2::close` notifies each linked stream through
+  `endpoint.end_stream`, so teardown order was hash order. None of the three reorders the bytes of
+  a fixed frame set, which is what the old text meant by "scheduling only"; all three are
+  restart-to-restart irreproducibility of the kind #1338 is about.
+
+  Measured, not assumed. `streams` is the only one of the five on the per-frame path, so
+  `lib/benches/h2_stream_table.rs` (sozu-proxy/sozu#1502) was written before the decision. At the
+  two sizes this map actually reaches, `BTreeMap` is *faster*: 1.7-2.3x at `n = 8` (the occupancy
+  `H2StreamTable::new` used to declare) and equal-or-faster at `n = 100`
+  (`DEFAULT_MAX_CONCURRENT_STREAMS`), because SipHash-1-3 over a `u32` costs ~9 ns whatever `n` is
+  while a tree of eleven keys or fewer is one cache line. It loses past a crossover between 100 and
+  1000, reaching ~+50 ns per frame at `n = 10000`, an operator-raised cap. A fixed-seed hasher
+  measured below the noise floor against `RandomState` in all twenty cells of that table, so it had
+  no performance case either way and is not adopted; the bench keeps all three containers so the
+  crossover can be re-measured rather than re-argued.
+
+  `HashMap::with_capacity(8)` is dropped rather than translated — `BTreeMap` has no
+  `with_capacity`, because it allocates a node at a time instead of one contiguous bucket array —
+  and `H2StreamTable::new`'s doc now says so, so the 8 is not re-added as a comment claiming a
+  reservation that no longer happens. Every signature that carried the container type moves with
+  it: `any_stream_has_pending_back`, `any_stream_id_matches`, `Prioriser::push_priority_guarded`
+  and its `is_acceptable`, and `H2Scheduler::push_priority_guarded` now take
+  `&BTreeMap<StreamId, GlobalStreamId>`. The regression test is
+  `streams_iterates_in_ascending_stream_id_order_whatever_the_insertion_order`: it registers nine
+  scrambled ids and pins the keys, the values and the pairs — the three iterator shapes those
+  sites read between them — to ascending wire `StreamId`. It was seen red on the pre-conversion
+  tree, failing on its first assertion in four runs out of four with four *different* permutations.
+  No permutation is quoted as the expected failure, in the test or here — `RandomState` is seeded
+  per process, so the failing value is unreproducible by construction and only the failure and its
+  shape are facts; the test records one as a labelled sample. `doc/architecture.md`,
+  `doc/h2_mux_internals.md` and `lib/src/protocol/mux/LIFECYCLE.md` (§1.2 prose and diagram, §4.1,
+  and checklist invariant 1) are updated in the same changeset. The two §4.1 / invariant-1
+  `h2_stream_table.rs:125` line citations are replaced by the symbol the prose already names rather
+  than renumbered: the field did not move — the module-doc rewrite is line-count neutral — and a
+  symbol cannot drift, which is what `check_doc_citations.py` itself recommends.
+
 - **`refactor(mux-h2)`: the mux core takes its buffers from a caller-implemented `BufferSource`,
   and the HPACK state comes under that same contract
   ([#1336](https://github.com/sozu-proxy/sozu/issues/1336), Q1 option (c) and Q14).** Every buffer

@@ -329,7 +329,7 @@ with `file.rs:LINE` citations against current HEAD.
   connections from interfering with each other's stream state.
 - **Shared-nothing stream pool**: Streams are stored in `Vec<Stream>` indexed by
   `GlobalStreamId`. Each `ConnectionH2` maps its H2 stream IDs to global IDs via
-  `HashMap<StreamId, GlobalStreamId>`. This allows H2 frontend and H2 backend to reference
+  `BTreeMap<StreamId, GlobalStreamId>`. This allows H2 frontend and H2 backend to reference
   the same stream without shared ownership.
 - **HPACK safety**: Decode callbacks (`pkawa.rs`) use fallible `write_all()` calls and
   validate headers per RFC 9113 §8.2 (no uppercase, no connection-specific headers,

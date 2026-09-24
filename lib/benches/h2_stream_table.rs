@@ -1,22 +1,25 @@
 //! Benchmarks for the H2 wire stream-table container choice (issue #1338).
 //!
 //! Context: `sozu_lib::protocol::mux::h2_stream_table::H2StreamTable::streams`
-//! is the wire `StreamId -> GlobalStreamId` map. Issue #1338 asks whether it
+//! is the wire `StreamId -> GlobalStreamId` map. Issue #1338 asked whether it
 //! should become a `BTreeMap` — the container four sibling maps already use on
 //! determinism grounds (`H2FlowControl::pending_window_updates` and
 //! `H2StreamTable`'s `stream_last_activity_at`, `stream_fc_stalled_since` and
 //! `stream_fc_stalled_progress`) — or stay a `HashMap` with a seeded hasher.
+//! It IS one now: this bench is the measurement that closed that question, and
+//! it is kept so the crossover below can be re-measured rather than re-argued.
 //!
 //! Unlike those four, `streams` is read on the **per-frame** path, so the
-//! determinism argument alone does not settle it. This bench measures the
-//! access pattern that path actually produces. It decides nothing: it reports
-//! the cost of each container under that mix.
+//! determinism argument alone did not settle it. This bench measures the
+//! access pattern that path actually produces. It decides nothing itself: it
+//! reports the cost of each container under that mix.
 //!
 //! ## Containers compared
 //!
 //! 1. `hashmap_random_state` — `HashMap` with the std default `RandomState`.
-//!    What `H2StreamTable::new` builds today.
-//! 2. `btreemap` — the issue #1338 proposal. Total order, no seed.
+//!    What `H2StreamTable::new` built before issue #1338 was closed.
+//! 2. `btreemap` — what `H2StreamTable::new` builds today. Total order, no
+//!    seed.
 //! 3. `hashmap_fixed_seed` — `HashMap` with
 //!    `BuildHasherDefault<DefaultHasher>`: the same SipHash-1-3 as the std
 //!    default but with fixed keys, so iteration order is reproducible across
@@ -76,9 +79,9 @@
 //!
 //! ## Why these `n`
 //!
-//! - `n = 8` — `H2StreamTable::new` sizes the map with
-//!   `HashMap::with_capacity(8)`. That is the code's own statement of the
-//!   expected steady-state occupancy.
+//! - `n = 8` — the expected steady-state occupancy, which `H2StreamTable::new`
+//!   used to state as `HashMap::with_capacity(8)`. `BTreeMap` takes no
+//!   capacity hint, so that statement now lives here instead of there.
 //! - `n = 100` — `DEFAULT_MAX_CONCURRENT_STREAMS`, the advertised default cap.
 //! - `n = 1000` — an operator-raised cap, an order of magnitude over default.
 //! - `n = 10000` — `MAX_SAFE_CONCURRENT_STREAMS`, the value
@@ -111,8 +114,9 @@ const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 100;
 /// `H2ConnectionConfig::new` clamps `h2_max_concurrent_streams` to.
 const MAX_SAFE_CONCURRENT_STREAMS: usize = 10_000;
 
-/// Mirrors the `HashMap::with_capacity(8)` that `H2StreamTable::new` uses for
-/// the wire map — the expected steady-state stream count.
+/// The expected steady-state stream count for the wire map.
+/// `H2StreamTable::new` used to state it as `HashMap::with_capacity(8)`;
+/// `BTreeMap` takes no capacity hint, so this constant carries it now.
 const TYPICAL_CONCURRENT_STREAMS: usize = 8;
 
 /// Number of distinct RFC 9218 §4.1 urgency buckets. Mirrors

@@ -137,7 +137,7 @@
 //! borrow reason: the per-stream loop re-borrows `self.hpack`'s encoder for
 //! every eligible stream, so no borrow of a connection field may span it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use sozu_command::logging::ansi_palette;
 
@@ -287,7 +287,7 @@ impl Prioriser {
         stream_id: StreamId,
         priority: parser::PriorityPart,
         last_stream_id: StreamId,
-        open_streams: &HashMap<StreamId, GlobalStreamId>,
+        open_streams: &BTreeMap<StreamId, GlobalStreamId>,
     ) -> bool {
         if !self.is_acceptable(stream_id, last_stream_id, open_streams) {
             trace!(
@@ -305,7 +305,7 @@ impl Prioriser {
         &self,
         stream_id: StreamId,
         last_stream_id: StreamId,
-        open_streams: &HashMap<StreamId, GlobalStreamId>,
+        open_streams: &BTreeMap<StreamId, GlobalStreamId>,
     ) -> bool {
         if open_streams.contains_key(&stream_id) {
             return true;
@@ -630,7 +630,7 @@ impl H2Scheduler {
         stream_id: StreamId,
         priority: parser::PriorityPart,
         last_stream_id: StreamId,
-        open_streams: &HashMap<StreamId, GlobalStreamId>,
+        open_streams: &BTreeMap<StreamId, GlobalStreamId>,
     ) -> bool {
         self.prioriser
             .push_priority_guarded(stream_id, priority, last_stream_id, open_streams)
@@ -940,7 +940,7 @@ mod tests {
     #[test]
     fn test_prioriser_guarded_accepts_open_stream() {
         let mut p = Prioriser::default();
-        let mut open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let mut open: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         open.insert(3, 0);
         let invalid = p.push_priority_guarded(
             3,
@@ -958,7 +958,7 @@ mod tests {
     #[test]
     fn test_prioriser_guarded_accepts_idle_lookahead() {
         let mut p = Prioriser::default();
-        let open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let open: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         // Just ahead of last_stream_id, within PRIORITY_IDLE_LOOKAHEAD.
         let invalid = p.push_priority_guarded(
             105,
@@ -976,7 +976,7 @@ mod tests {
     #[test]
     fn test_prioriser_guarded_drops_far_future_stream() {
         let mut p = Prioriser::default();
-        let open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let open: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         // Beyond the 64-slot lookahead window.
         let invalid = p.push_priority_guarded(
             1_000_001,
@@ -995,7 +995,7 @@ mod tests {
     #[test]
     fn test_prioriser_guarded_drops_closed_past_stream() {
         let mut p = Prioriser::default();
-        let open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let open: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         // Past the counter and not open = already closed. Drop.
         let invalid = p.push_priority_guarded(
             3,
@@ -1015,7 +1015,7 @@ mod tests {
         // Previously an attacker could pack MAX_PRIORITIES entries by picking
         // far-future stream IDs. The guard rejects them before the cap helps.
         let mut p = Prioriser::default();
-        let open: HashMap<StreamId, GlobalStreamId> = HashMap::new();
+        let open: BTreeMap<StreamId, GlobalStreamId> = BTreeMap::new();
         for delta in 10_000..(10_000 + MAX_PRIORITIES as u32) {
             p.push_priority_guarded(
                 delta,
