@@ -574,9 +574,9 @@ The other three sites take the `&mut self` wrapper
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5769`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5772`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6496`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6499`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -1259,7 +1259,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5812-5814
+```rust lib/src/protocol/mux/h2.rs:5815-5817
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1267,7 +1267,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5826-5832
+```rust lib/src/protocol/mux/h2.rs:5829-5835
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

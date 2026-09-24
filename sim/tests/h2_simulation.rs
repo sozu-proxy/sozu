@@ -55,13 +55,25 @@
 //!
 //! # What this simulator establishes that a unit test cannot
 //!
-//! Three named properties, each with its own `#[test]` on top of the sweep:
+//! Four named properties, each with its own `#[test]` on top of the sweep:
 //!
 //! 1. **Determinism** ([`h2_simulation_is_deterministic`]) — one seed replayed
 //!    twice yields a byte-identical trace, and distinct seeds explore distinct
 //!    interleavings. The trace is the *observable* history: frames out, stream
 //!    count, published deadline, `MuxResult`. Nothing wall-clock, nothing
 //!    address-shaped, nothing `Ulid`-shaped enters it.
+//!
+//! 1b. **The request id is a pure function of the seed**
+//!    ([`h2_request_ids_are_a_pure_function_of_the_seed`]) — the ULID
+//!    `ConnectionH2::create_stream` mints per stream. It is a SEPARATE guard
+//!    precisely because property 1's trace excludes `Ulid`-shaped values by
+//!    contract: that exclusion is what let `Ulid::generate()` survive here
+//!    green, and a trace that omits a value cannot testify about it. The ULID
+//!    is built from `Context::now_wall_ms` and `Context::request_id_rng`, both
+//!    supplied by [`H2Harness`]; before that it came from `rusty_ulid`'s own
+//!    `unix_epoch_ms()` and `rand::rng()`, two host reaches no sweep of
+//!    `lib/src/protocol/mux/` for `Instant::now` / `SystemTime::now` / `rand`
+//!    could see (issue #1338, Q8).
 //!
 //! 2. **The wheel's earliness window is not an expiry**
 //!    ([`h2_stream_idle_deadline_survives_the_wheel_earliness_window`]) —
@@ -216,6 +228,8 @@ use moonpool_sim::{
     RandomProvider, SimContext, SimulationBuilder, SimulationReport, SimulationResult, Workload,
     buggify_with_prob, current_sim_seed,
 };
+use rand::{SeedableRng, rngs::StdRng};
+use rusty_ulid::Ulid;
 use sozu_command_lib::{logging::CachedTags, ready::Ready};
 use sozu_lib::{
     FrontendFromRequestError, L7ListenerHandler, ListenerHandler, Protocol, Readiness,
@@ -762,9 +776,43 @@ struct H2Harness {
     /// Every frame the core has emitted, in order.
     emitted: Vec<WireFrame>,
     trace: Vec<String>,
+    /// Every request ULID the core has minted, in first-observed order.
+    ///
+    /// Kept OUT of [`H2Harness::trace`] on purpose: that trace's contract
+    /// (see its `record`) is that nothing `Ulid`-shaped enters it, and
+    /// [`h2_simulation_is_deterministic`] rests on it. The request id is a
+    /// separate observable with its own guard
+    /// ([`h2_request_ids_are_a_pure_function_of_the_seed`]).
+    request_ids: Vec<Ulid>,
+    /// Dedupe key for [`Self::request_ids`]: `(slot index, id)`.
+    ///
+    /// A slot is re-read on every pass, so without a dedupe each id would be
+    /// appended once per pass it survives. Keyed on the PAIR rather than on
+    /// the id alone so [`Self::request_ids`] holds one entry per slot
+    /// occupancy: a stuck RNG then shows up as many occupancies collapsing
+    /// onto few distinct ids, which
+    /// [`h2_request_ids_are_a_pure_function_of_the_seed`] asserts against.
+    /// Keying on the id alone would hide exactly that failure.
+    request_ids_seen: BTreeSet<(usize, Ulid)>,
+    /// Wall-clock instant the simulated connection is anchored at, in Unix
+    /// milliseconds. Fixed, not read from the host: it is the base
+    /// [`Self::pump`] adds the virtual elapsed time to when it refreshes
+    /// `Context::now_wall_ms`, and it becomes the 48-bit timestamp prefix of
+    /// every request ULID the core mints. 2023-11-14T22:13:20Z, chosen only
+    /// to be a plausible present-day value rather than 0.
+    wall_base_ms: u64,
     _pool: Rc<RefCell<Pool>>,
     _placeholder_peer: PlaceholderPeer,
 }
+
+/// See [`H2Harness::wall_base_ms`].
+const SIM_WALL_BASE_MS: u64 = 1_700_000_000_000;
+
+/// Request-id seed for the standalone property tests, which drive the harness
+/// directly instead of through a moonpool campaign and so have no campaign
+/// seed to derive one from. None of them asserts on a request id; the constant
+/// exists so their ids are reproducible rather than drawn from the host RNG.
+const PINNED_REQUEST_ID_SEED: u64 = 0x5E_ED_1D;
 
 impl H2Harness {
     /// `clock_base` is the instant the simulated connection is considered to
@@ -777,15 +825,29 @@ impl H2Harness {
     /// public `Connection::set_timeout_duration` at `clock_base` replaces that
     /// anchor with one the harness owns, which is what makes the determinism
     /// guard a real check rather than a coin toss.
+    /// `request_id_seed` seeds `Context::request_id_rng`, the entropy half of
+    /// the request ULID. `Context::new` seeds that field from the host RNG,
+    /// which is the right default for a proxy and the wrong one for a
+    /// simulator; replacing it here is what makes the minted ids a pure
+    /// function of the campaign seed. The timestamp half comes from
+    /// `Context::now_wall_ms`, refreshed by [`Self::pump`] from
+    /// [`SIM_WALL_BASE_MS`] plus the virtual elapsed time.
     fn new(
         connection_config: H2ConnectionConfig,
         timeouts: HarnessTimeouts,
         clock_base: Instant,
+        request_id_seed: u64,
     ) -> Self {
         // Two checkouts per stream plus the H2 connection's own `zero` buffer.
         // 512 is "effectively unbounded" for every scenario that is not about
         // exhaustion; the one that is passes its own ceiling.
-        Self::with_pool_maximum(connection_config, timeouts, clock_base, 512)
+        Self::with_pool_maximum(
+            connection_config,
+            timeouts,
+            clock_base,
+            512,
+            request_id_seed,
+        )
     }
 
     /// [`Self::new`] with an explicit buffer-pool ceiling.
@@ -802,6 +864,7 @@ impl H2Harness {
         timeouts: HarnessTimeouts,
         clock_base: Instant,
         pool_maximum: usize,
+        request_id_seed: u64,
     ) -> Self {
         // 16393 is the documented floor for an H2-enabled buffer pool — the
         // 16384-octet maximum frame payload plus its 9-octet header — and a
@@ -825,6 +888,11 @@ impl H2Harness {
             Some(SIM_PEER_ADDRESS.parse().expect("peer address parses")),
             SIM_PUBLIC_ADDRESS.parse().expect("public address parses"),
         );
+        // Replace the two host reaches `Context::new` makes for the request
+        // ULID with sources this harness owns. Both are refreshed per pass by
+        // `pump`; these are the pre-first-pass values.
+        context.request_id_rng = StdRng::seed_from_u64(request_id_seed);
+        context.now_wall_ms = SIM_WALL_BASE_MS;
         let connection = Connection::new_h2_server(
             0u128.into(),
             socket,
@@ -856,6 +924,9 @@ impl H2Harness {
             pending_out: Vec::new(),
             emitted: Vec::new(),
             trace: Vec::new(),
+            request_ids: Vec::new(),
+            request_ids_seen: BTreeSet::new(),
+            wall_base_ms: SIM_WALL_BASE_MS,
             _pool: pool,
             _placeholder_peer: placeholder_peer,
         }
@@ -962,6 +1033,15 @@ impl H2Harness {
         let mut idle_rounds = 0usize;
         loop {
             self.context.now = now;
+            // `now_wall_ms` is the wall-clock sibling of `now` and `Mux`
+            // refreshes the two together; this harness stands in for `Mux`, so
+            // it must too. Derived from the SAME virtual instant rather than
+            // from the host, so the ULID timestamp prefix stays a pure
+            // function of the seed.
+            self.context.now_wall_ms =
+                self.wall_base_ms.saturating_add(
+                    now.saturating_duration_since(self.clock_base()).as_millis() as u64,
+                );
             // Re-arm the writable event while the core still holds queued bytes.
             //
             // This is what the event loop does for real: `socket_write`
@@ -1098,6 +1178,7 @@ impl H2Harness {
     /// Nothing reads a private field, so the trace survives the byte-in /
     /// byte-out extraction unchanged.
     fn record(&mut self, now: Instant, result: MuxResult) {
+        self.collect_request_ids();
         let already = self
             .trace
             .iter()
@@ -1146,6 +1227,43 @@ impl H2Harness {
 
     fn fingerprint(&self) -> u64 {
         fnv1a(self.trace.join("\n").as_bytes())
+    }
+
+    /// Append every request ULID visible in a stream slot that this harness
+    /// has not recorded yet, in slot order.
+    ///
+    /// Called at the top of [`Self::record`], i.e. once per pass, because a
+    /// recycled slot overwrites its `HttpContext::id` when the next stream
+    /// takes it: reading only at the end of a run would see the last
+    /// occupant of each slot and miss every earlier one. Slot order is a
+    /// `Vec` index order, so the sequence is deterministic given the ids.
+    ///
+    /// The set is a dedupe, not an assertion — a slot is re-read on every
+    /// pass it survives, so without it each id would land in the vector once
+    /// per pass. `h2_request_ids_are_a_pure_function_of_the_seed` checks
+    /// uniqueness separately, on the vector.
+    fn collect_request_ids(&mut self) {
+        for (slot, stream) in self.context.streams.iter().enumerate() {
+            let id = stream.context.id;
+            if self.request_ids_seen.insert((slot, id)) {
+                self.request_ids.push(id);
+            }
+        }
+    }
+
+    /// How many of [`Self::request_ids`] are distinct values.
+    ///
+    /// Equal to its length exactly when every slot occupancy minted its own
+    /// id — the statement that the entropy source is advancing rather than
+    /// returning a constant.
+    fn distinct_request_ids(&self) -> usize {
+        self.request_ids.iter().collect::<BTreeSet<_>>().len()
+    }
+
+    /// A stable digest of every request ULID this run minted, in order.
+    fn request_id_fingerprint(&self) -> u64 {
+        let rendered: Vec<String> = self.request_ids.iter().map(|id| id.to_string()).collect();
+        fnv1a(rendered.join(",").as_bytes())
     }
 
     fn emitted_of(&self, ty: u8) -> impl Iterator<Item = &WireFrame> {
@@ -1386,6 +1504,14 @@ impl Model {
 
 type FingerprintSink = Arc<Mutex<Vec<(u64, usize, usize)>>>;
 type ConfigSink = Arc<Mutex<Vec<SwarmConfig>>>;
+/// `(digest of every request ULID in order, slot occupancies observed,
+/// distinct ids among them)`.
+///
+/// Deliberately a SEPARATE sink from [`FingerprintSink`]: the observable
+/// trace behind that one excludes `Ulid`-shaped values by contract, and
+/// folding the request ids into it would silently widen
+/// [`h2_simulation_is_deterministic`]'s claim.
+type RequestIdSink = Arc<Mutex<Vec<(u64, usize, usize)>>>;
 
 struct H2SimWorkload {
     steps: usize,
@@ -1393,6 +1519,7 @@ struct H2SimWorkload {
     sink: Option<FingerprintSink>,
     swarm: bool,
     config_sink: Option<ConfigSink>,
+    request_id_sink: Option<RequestIdSink>,
 }
 
 #[async_trait]
@@ -1440,7 +1567,7 @@ impl Workload for H2SimWorkload {
         let max_concurrent = 1 + ctx.random().random_range(0..8u32);
         let connection_window = 65_535 + 1024 * ctx.random().random_range(0..16u32);
         let config = H2ConnectionConfig::new(connection_window, max_concurrent, 2);
-        let mut harness = H2Harness::new(config, HarnessTimeouts::default(), base);
+        let mut harness = H2Harness::new(config, HarnessTimeouts::default(), base, seed);
         let mut model = Model {
             next_stream_id: 1,
             ..Model::default()
@@ -1575,6 +1702,13 @@ impl Workload for H2SimWorkload {
                 harness.fingerprint(),
                 model.opened.len(),
                 harness.emitted.len(),
+            ));
+        }
+        if let Some(sink) = &self.request_id_sink {
+            sink.lock().expect("request id sink").push((
+                harness.request_id_fingerprint(),
+                harness.request_ids.len(),
+                harness.distinct_request_ids(),
             ));
         }
 
@@ -1751,6 +1885,7 @@ fn workload(steps: usize, verbose: bool, swarm: bool) -> H2SimWorkload {
         sink: None,
         swarm,
         config_sink: None,
+        request_id_sink: None,
     }
 }
 
@@ -1827,6 +1962,7 @@ fn h2_simulation_is_deterministic() {
                 // nondeterministic draw would fork the trace.
                 swarm: true,
                 config_sink: None,
+                request_id_sink: None,
             })
             .set_debug_seeds(vec![seed])
             .set_iterations(1)
@@ -1854,6 +1990,100 @@ fn h2_simulation_is_deterministic() {
     assert!(
         explored.len() >= 2,
         "distinct seeds collapsed onto {} trajectory/ies — the sweep explores nothing",
+        explored.len(),
+    );
+}
+
+/// **Property 1b — the request id is a pure function of the seed.**
+///
+/// [`h2_simulation_is_deterministic`] deliberately excludes `Ulid`-shaped
+/// values from its trace, so it says nothing about the one identifier the core
+/// mints per stream. This is that claim, and the two must stay separate: the
+/// request id is a wall-clock-plus-entropy value, and folding it into the
+/// frame/deadline trace would conflate a leak in the core's framing with a
+/// leak in its id source.
+///
+/// # What used to make this fail
+///
+/// `ConnectionH2::create_stream` called `Ulid::generate()`, which
+/// `rusty_ulid` defines as
+/// `Ulid::from_timestamp_with_rng(unix_epoch_ms(), &mut rand::rng())` — the
+/// host wall clock and a thread-local OS-seeded RNG, both reached from inside
+/// the dependency. Neither is visible to a sweep of this module for
+/// `Instant::now` / `SystemTime::now` / `rand`, which is why the reach
+/// survived the clock-hygiene passes: you can only find it by reading what
+/// the external call does, not by searching for what it looks like.
+/// `Context::next_request_id` now composes the same ULID from
+/// `Context::now_wall_ms` and `Context::request_id_rng`, and this harness
+/// owns both.
+///
+/// # Three separable claims
+///
+/// 1. **Reproducible** — one seed replayed twice mints the same ids in the
+///    same order. This is the half that was red.
+/// 2. **Not constant** — distinct seeds mint distinct id sequences, so a core
+///    that returned a fixed ULID could not pass claim 1 vacuously.
+/// 3. **Advancing** — every stream slot occupancy observed got its own id.
+///    An RNG seeded once and never stepped satisfies claims 1 and 2 (the
+///    timestamp half still varies) while handing every request the same id,
+///    which is the failure this one names.
+#[test]
+fn h2_request_ids_are_a_pure_function_of_the_seed() {
+    /// `(digest of the minted ids in order, slot occupancies observed,
+    /// distinct ids among them)`.
+    fn request_ids(seed: u64) -> (u64, usize, usize) {
+        let steps = 300;
+        let sink: RequestIdSink = Arc::new(Mutex::new(Vec::new()));
+        let report = SimulationBuilder::new()
+            .workload(H2SimWorkload {
+                steps,
+                verbose: false,
+                sink: None,
+                // Swarm ON for the same reason the trace guard keeps it on:
+                // the per-seed configuration draw is itself part of what must
+                // reproduce.
+                swarm: true,
+                config_sink: None,
+                request_id_sink: Some(sink.clone()),
+            })
+            .set_debug_seeds(vec![seed])
+            .set_iterations(1)
+            .run_time_budget(run_budget(steps))
+            .run();
+        assert_no_failures(&report);
+        let recorded = sink.lock().expect("request id sink");
+        *recorded.first().expect("workload recorded request ids")
+    }
+
+    let a = request_ids(0x00AB_CDEF);
+    let b = request_ids(0x00AB_CDEF);
+    assert_eq!(
+        a, b,
+        "same seed must mint the same request ids in the same order",
+    );
+
+    // An empty run would satisfy every equality below without exercising the
+    // id source at all.
+    assert!(
+        a.1 >= 2,
+        "the scenario must open at least two streams for this to mean anything, observed {}",
+        a.1,
+    );
+    assert_eq!(
+        a.1, a.2,
+        "every stream slot occupancy must mint its own request id — {} occupancies \
+         collapsed onto {} distinct ids, so the entropy source is not advancing",
+        a.1, a.2,
+    );
+
+    let explored: std::collections::BTreeSet<u64> = [0x11u64, 0x12, 0x13, 0x14]
+        .into_iter()
+        .map(|seed| request_ids(seed).0)
+        .collect();
+    assert!(
+        explored.len() >= 2,
+        "distinct seeds minted {} distinct id sequence(s) — a constant id would pass the \
+         equality above and prove nothing",
         explored.len(),
     );
 }
@@ -1927,7 +2157,12 @@ fn h2_stream_idle_deadline_survives_the_wheel_earliness_window() {
 
     for early_ms in probes {
         let base = Instant::now();
-        let mut harness = H2Harness::new(H2ConnectionConfig::default(), timeouts, base);
+        let mut harness = H2Harness::new(
+            H2ConnectionConfig::default(),
+            timeouts,
+            base,
+            PINNED_REQUEST_ID_SEED,
+        );
 
         harness.bootstrap(base, 65_535);
         harness.feed(&settings_ack());
@@ -2009,7 +2244,12 @@ fn h2_concurrent_stream_ceiling_holds_under_adversarial_interleaving() {
         ("one-octet-at-a-time", 1usize, 1usize),
     ] {
         let base = Instant::now();
-        let mut harness = H2Harness::new(config, HarnessTimeouts::default(), base);
+        let mut harness = H2Harness::new(
+            config,
+            HarnessTimeouts::default(),
+            base,
+            PINNED_REQUEST_ID_SEED,
+        );
         harness.bootstrap(base, 65_535);
         harness.feed(&settings_ack());
 
@@ -2079,7 +2319,13 @@ fn h2_pool_exhaustion_mid_request_refuses_the_stream_not_the_connection() {
     let config = H2ConnectionConfig::new(65_535, 64, 2);
     let base = Instant::now();
     // 1 (`zero`) + 2 (stream 1) = 3. Stream 3 then finds nothing.
-    let mut harness = H2Harness::with_pool_maximum(config, HarnessTimeouts::default(), base, 3);
+    let mut harness = H2Harness::with_pool_maximum(
+        config,
+        HarnessTimeouts::default(),
+        base,
+        3,
+        PINNED_REQUEST_ID_SEED,
+    );
 
     harness.bootstrap(base, 65_535);
     harness.feed(&settings_ack());
@@ -2168,7 +2414,12 @@ fn h2_pool_exhaustion_mid_request_refuses_the_stream_not_the_connection() {
 fn h2_inbound_credit_is_attributed_to_the_stream_that_spent_it() {
     let config = H2ConnectionConfig::new(65_535, 8, 2);
     let base = Instant::now();
-    let mut harness = H2Harness::new(config, HarnessTimeouts::default(), base);
+    let mut harness = H2Harness::new(
+        config,
+        HarnessTimeouts::default(),
+        base,
+        PINNED_REQUEST_ID_SEED,
+    );
 
     harness.bootstrap(base, 65_535);
     harness.feed(&settings_ack());
@@ -2259,6 +2510,7 @@ fn h2_swarm_config_is_stable_across_draws() {
                 sink: None,
                 swarm: true,
                 config_sink: Some(sink.clone()),
+                request_id_sink: None,
             })
             .set_debug_seeds(vec![seed])
             .set_iterations(1)

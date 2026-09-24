@@ -335,14 +335,26 @@ RUSTFLAGS="--cfg tokio_unstable" SOZU_H2_SIM_SEED=0xdeadbeef \
   cargo test -p sozu-sim --test h2_simulation
 ```
 
-Beyond the seed sweep it carries four named properties that a unit test cannot
+Beyond the seed sweep it carries five named properties that a unit test cannot
 state: byte-identical replay of one seed plus divergence across seeds; the
+request ULID the core mints being a pure function of the seed; the
 stream-idle deadline holding through every millisecond of `crate::timer`'s
 documented `(delay_ms + tick_ms/2) mod tick_ms` earliness window (see
 `duration_to_tick` in `lib/src/timer.rs`) and retiring the stream only strictly
 past it; the concurrent-stream ceiling under one-octet reads and one-octet
 writes; and per-stream inbound flow-control credit matching, exactly, the octets
-the peer spent on that stream while frame headers straddle reads. Its module doc records
+the peer spent on that stream while frame headers straddle reads.
+
+The request-id property is deliberately a SECOND test rather than a widening of
+the replay one, and the split is the lesson worth carrying to a fifth simulator.
+The replay trace excludes `Ulid`-shaped values by contract, so it stayed green
+while `ConnectionH2::create_stream` still called `Ulid::generate()` — a wall-clock
+read and a random draw that `rusty_ulid` performs inside its own crate, invisible
+to every `Instant::now` / `SystemTime::now` / `rand` sweep of `lib/src/protocol/mux/`.
+A trace that omits a value cannot testify about it. When a core's observable
+surface is split into more than one digest, each one needs its own guard, and a
+digest's exclusions are part of its contract rather than an implementation detail
+(issue [#1338](https://github.com/sozu-proxy/sozu/issues/1338), Q8). Its module doc records
 three behaviours measured while it was written that it records rather than
 asserts, each with the reproduction: two are open
 ([sozu-proxy/sozu#1488](https://github.com/sozu-proxy/sozu/issues/1488),
@@ -738,7 +750,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **`decode_status` returns `None` on a size-update-prefixed block, and whether
   that is fail-closed depends on the call site.** `H2BlockConverter::emit_pending_size_update_if_new_block`
   (`lib/src/protocol/mux/converter.rs:112`, armed at
-  `lib/src/protocol/mux/h2.rs:5838`) prepends a `001xxxxx` HPACK dynamic table
+  `lib/src/protocol/mux/h2.rs:5841`) prepends a `001xxxxx` HPACK dynamic table
   size update when a peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e
   call sites send one: `h2_security_tests.rs:2444` (value 0) and
   `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
@@ -760,7 +772,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **A test that only reddens under CI load is not automatically a flake — find
   the production site first.** Before retrying or quarantining, ask whether the
   symptom is reachable at all. #1353's 421 has exactly one emission site
-  (`lib/src/protocol/mux/mod.rs:1880`), reachable only through
+  (`lib/src/protocol/mux/mod.rs:1946`), reachable only through
   `RetrieveClusterError::SniAuthorityMismatch`, which is constructed at exactly
   one site (`lib/src/protocol/mux/router.rs:798`) immediately after
   `incr!(names::http::SNI_AUTHORITY_MISMATCH)` — and the failing run reported

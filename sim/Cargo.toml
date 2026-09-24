@@ -30,6 +30,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 #   RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test udp_simulation
 [target.'cfg(tokio_unstable)'.dev-dependencies]
 async-trait = { workspace = true }
+# The two sources a request ULID is built from. `tests/h2_simulation.rs`
+# supplies both so the ids the core mints are a pure function of the campaign
+# seed: `StdRng::seed_from_u64` replaces the OS-seeded `Context::request_id_rng`,
+# and `Ulid` types the collected ids. Neither is a new crate in the graph —
+# `sozu-lib` already depends on both, and this crate is `publish = false`.
+rand = { workspace = true }
+rusty_ulid = { workspace = true }
 # moonpool-sim drives the seeded runtime / virtual clock / RNG / fault injection.
 moonpool-sim = { workspace = true }
 # crypto-ring so sozu-lib resolves a rustls provider and compiles; the UDP core
