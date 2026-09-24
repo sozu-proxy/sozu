@@ -77,6 +77,87 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the H2 stream-write path becomes a `poll_write_target` / `handle_write`
+  drive loop, and `flush_stream_out` is deleted.** The write half of the inversion
+  `poll_read_target` / `handle_read` already landed for the read half, with one forced divergence:
+  a read pass performs exactly one `socket_read`, so `readable()` is a two-call protocol, while a
+  write pass performs an unbounded number of vectored writes — the pre-image's
+  `while !kawa.out.is_empty()` nested inside its walk of the scheduler's order. `write_streams` is
+  therefore a LOOP, and it is now nothing but the shell: it owns the `Vec<IoSlice<'static>>`, it
+  brackets `h2_transmit::gather` / `socket_write_vectored` / `h2_transmit::confirm` in three
+  adjacent statements, and it answers whatever the core asks for. `write_buffer` is added as the
+  exact mirror of `read_buffer`, taking `zero` and `streams` apart rather than `&mut ConnectionH2`
+  and `&mut Context` so `ConnectionH2::socket` stays borrowable while the gathered descriptors are
+  live. No condition, counter boundary or readiness decision moves, and the ONE ordering question
+  the split raises is answered by preserving the pre-image: `Stream::state` is read BEFORE the
+  flush, in `H2WritePhase::Start` and in `H2WritePhase::Prepare`, and carried through the transmits
+  on the phase rather than re-read after them. Its consumer is `handle_1xx_reset`, which decides
+  whether to re-arm `Ready::READABLE` on the linked token, so a stream retired mid-flush must not
+  change which state that check sees. `H2Scheduler::priority` is likewise read once per stream per
+  pass, in `Prepare`, and carried — not re-read in `Flush`, which would be a second `HashMap`
+  lookup on the write hot path.
+
+  `H2WriteTarget` has three variants and the two that end a pass are NOT interchangeable.
+  `Finalize { socket_write, bytes_written }` carries the byte total as well as the flag because
+  `finalize_write` reads it as `made_progress`, and that alone selects
+  `FinalizeAction::RetainPendingBack` over `Quiesce` (LIFECYCLE §9 invariant 16); it is accumulated
+  stream by stream inside the loop, so only the pass knows it. Three sites end a pass WITHOUT
+  finalizing and are `Done(MuxResult)` — the resume path's stall, the MadeYouReset emitted-RST cap
+  trip, and the close-frontend GOAWAY — because folding any of them into `Finalize` would run
+  invariant 16's readiness policy over a pass that must not reach it.
+
+  **`SocketResult` is confined to two places on the write core, and that is a structural guard
+  rather than a tidiness.** `update_readiness` (`mux/mod.rs`) returns stalled **iff `size == 0`**;
+  the `status` only clears the WRITABLE event bit. So `(size > 0, WouldBlock)` — which `FrontRustls`
+  returns structurally whenever rustls accepted plaintext while the kernel was full — is NOT a
+  stall, and the flush must go round again or the response is truncated on the hot path. The
+  pass terminator is `H2WritePass::stalled`, written by the single statement
+  `pass.stalled = update_readiness_after_write(size, status, &mut self.readiness);` in
+  `handle_write`, whose parameter is the type's only other appearance.
+  `poll_write_target` never sees a `SocketResult`, so keying the terminator on the status there
+  cannot be a one-token edit — it needs a visible signature change first. Verified with
+  `git grep -n "SocketResult" -- lib/src/protocol/mux/h2.rs`: no hit falls inside that function's
+  span.
+
+  `H2WritePass` gains a phase and three late-initialised `Option` fields. `H2WritePhase` is
+  `Start` / `Resume { .. }` / `Prepare { cursor }` / `Flush { cursor, .. }` / `End` / `Ended`, and
+  the `Prepare`/`Flush` split is load-bearing: the round-again after a partial write re-enters `Flush`
+  and never `Prepare`, which is what keeps one pass to one `kawa.prepare` per stream. The
+  `H2ConverterPass`, the scheduler's loaned `order` buffer and its `ReadyIncrementalCensus` cannot
+  be built when the pass is — `H2Scheduler::begin_pass` enumerates a map the resume path may have
+  removed from, and the converter's constructor `mem::take`s three scratch buffers out of
+  `HpackState` that a stalled resume would then drop — so they are adopted at the transition into
+  `Prepare` and released as the FIRST statement of `End`. Six `expect` sites share one message
+  naming the invariant — three in `release_scheduler_pass`, one in each of the three accessors —
+  beside two `debug_assert!`, one against opening the scheduler pass twice and one in `Drop`.
+  What guarantees the converter's buffers reach `HpackState` again is that
+  `poll_write_target` has exactly one `return` between those two points, the `Transmit` yield,
+  which the shell's loop always answers; `H2WritePass`'s `Drop` carries the matching
+  `debug_assert!` for a future caller that stops driving. A caller that polls once MORE after the
+  pass answered is the other half of that argument, and is closed by the terminal `Ended` phase:
+  `End` releases the three values as its first statement, so re-entering that arm would `expect` on
+  three empty `Option`s — `Ended` answers `Done(MuxResult::Continue)` instead. `write_streams`
+  never re-polls, but `poll_write_target` is `pub(super)` and `poll_read_target` already has direct
+  unit tests. The MadeYouReset cap trip still drops the
+  three buffers, because it returns between `into_buffers` and the `put_*` calls exactly as the
+  pre-image did.
+
+  `flush_stream_out` and `FlushOutcome` are deleted outright rather than left as a single-shot
+  helper: a vestigial one would keep its fixture tests green against a function production no
+  longer calls. No test changed, was added, removed or ignored; the suite holds at the same count.
+  The three tests that drove the deleted associated function now drive `write_streams` directly
+  over the same scripted socket, through the test-module-local `FlushOutcome` their assertions
+  read, derived from `kawa.out` being empty — the pre-image's own loop-exit condition — rather than
+  from the `expect_write` park, which has its own tests. All six reddening recipes recorded on this
+  region still redden the same tests with the same `left:` / `right:` values; all six are
+  re-expressed against the inverted form, so each `TO SEE THIS RED` is applicable verbatim and
+  none names a binding the inversion deleted. The double-visit recipe moves from
+  `'outer: for &stream_id in order.iter().chain(order.iter())` to the same `chain` over the order
+  vector in `begin_scheduler_pass`; the resume-fold and accumulation recipes move from
+  `write_pass.` locals in `write_streams` to `pass.` fields in `begin_scheduler_pass` and in
+  `poll_write_target`'s `H2WritePhase::Flush` arm. `doc/h2_mux_internals.md`, `doc/architecture.md`,
+  `doc/configure.md` and `LIFECYCLE.md` follow the two deleted symbols and the moved sites.
+
 - **`refactor(mux-h2)`: the locals of one `write_streams` pass become the fields of an
   `H2WritePass` struct in a new `h2_write_pass.rs`.** Pure state extraction, ahead of the
   control-flow inversion that turns the write path into a `poll` / write / `handle` drive loop the
@@ -212,8 +293,8 @@
   (`h2_close.rs`); every other `BeforeFlush` answer returns early in `h2.rs`, so an uncongested
   pass still asks exactly once, as the pre-image did — its `ensure_tls_flushed()` also sat inside
   the `if self.socket.socket_wants_write()` branch. The third query is `FinalizeAction::ReArm`
-  (`h2.rs:2985`) calling `ensure_tls_flushed()`, whose own `socket_wants_write()` (`h2.rs:2784`)
-  re-asks what the `AfterFlush` decision (`h2.rs:2972`) already knows. It is redundant — nothing
+  (`h2.rs:3326`) calling `ensure_tls_flushed()`, whose own `socket_wants_write()` (`h2.rs:3125`)
+  re-asks what the `AfterFlush` decision (`h2.rs:3313`) already knows. It is redundant — nothing
   mutates the socket between them — and deliberate: it keeps every post-decision TLS re-arm in this
   file spelled the same way, as the GoAway and Error arms of `writable` already do, and keeps this
   commit free of an unrelated change. It is also cheap: `FrontRustls::socket_wants_write` is
@@ -1096,7 +1177,7 @@
   (`lib/src/protocol/mux/stream.rs:721`); a client sending `get` is now logged as `get` instead of
   `GET`, which is what it actually sent. *Response framing*: `Method::Head` is what terminates the
   response parse after the headers (`lib/src/protocol/kawa_h1/editor.rs:1117`,
-  `lib/src/protocol/mux/h2.rs:4674`), and a client sending `head` no longer reaches that arm, so the
+  `lib/src/protocol/mux/h2.rs:5013`), and a client sending `head` no longer reaches that arm, so the
   response is framed by `Content-Length` like any other. This is a net improvement, and the trade
   runs in the direction worth having: **before**, `head` was treated as `Method::Head` and the parse
   was terminated after the headers, so an RFC-conforming origin — which sees an unrecognised
@@ -1317,8 +1398,10 @@
   number. `e2e/src/tests/h2_utils.rs`'s `decode_status` doc comment carries a near-duplicate of that
   paragraph, outside the guarded surface where no rule reaches it, and it had drifted further: its
   own bare continuation read `:3663` (a bare `}`), its written-out half `:3559` (a `use` list), and
-  its arming site `lib/src/protocol/mux/h2.rs:5838` (a bare `}`) against a real site at `:5254`
-  (`self.pending_table_size_update = Some(capped);`). All three repaired by grep; `converter.rs:112`
+  its arming site `lib/src/protocol/mux/h2.rs:5838` — a bare `}` at the revision that wrote this
+  entry, so that number records the stale citation and must not be renumbered — against a real
+  site at `h2.rs:5742` (`self.pending_table_size_update = Some(capped);`, in
+  `handle_settings_frame`). All three repaired by grep; `converter.rs:112`
   and `h2_security_tests.rs:2440` were verified correct and left alone. Repairing one copy of a fact
   and knowingly leaving the other is the defect this changeset is about. The remaining two
   continuations are exact and stay as written, both verified by grep rather than by trusting the
@@ -1634,12 +1717,12 @@
 
 - **`docs(testing)`: re-anchor the `pending_table_size_update` arming citation, and record a full
   read of every line citation in `doc/testing.md`.** The `decode_status` note cited
-  `lib/src/protocol/mux/h2.rs:5349` as the site where
+  `lib/src/protocol/mux/h2.rs:5690` as the site where
   `H2BlockConverter::emit_pending_size_update_if_new_block` is armed. That line is
   `if !settings.settings.is_empty() {`, the RFC 9113 §6.5 SETTINGS-ACK empty-payload check — a real
   line inside the same `handle_settings_frame`, but a different statement in a different part of it,
   with nothing to do with the HPACK table-size update. The arming site is
-  `self.pending_table_size_update = Some(capped);` at `lib/src/protocol/mux/h2.rs:5384`, in that
+  `self.pending_table_size_update = Some(capped);` at `lib/src/protocol/mux/h2.rs:5725`, in that
   function's `parser::SETTINGS_HEADER_TABLE_SIZE` arm; the citation now points there. It was
   re-derived from the construct the prose names
   (`grep -n 'pending_table_size_update = Some' lib/src/protocol/mux/h2.rs`) and read back, never
@@ -2308,7 +2391,7 @@
   `0`/`None` (indefinite wait explicitly opted in)". `Mux::shutting_down_inner` (`mod.rs`) checks that
   deadline first and force-closes when it elapses; with it disabled, that branch never fires and the
   function falls through to `if self.frontend.has_pending_write() { return false; }` (`mod.rs:2426`).
-  `ConnectionH2::has_pending_write` (`h2.rs:4400-4407`) includes `!self.zero.storage.is_empty()`, and
+  `ConnectionH2::has_pending_write` (`h2.rs:4741-4748`) includes `!self.zero.storage.is_empty()`, and
   this guard is precisely what keeps `zero.storage` non-empty — on purpose — while a CONTINUATION
   frame's bytes are still partially read at the moment the peer's FIN lands. Those bytes can now never
   arrive (the peer is gone), so `zero.storage` never re-empties on its own, `has_pending_write` never
@@ -3392,7 +3475,7 @@
   **This changes rendered log content.** If you alert, dashboard or grep on the `peer=` slot of a
   `MUX-H2` line, read the operator note at the end of this entry before upgrading. It is a fix, not
   a regression, but it is a visible one.
-  Both `log_context!` (`lib/src/protocol/mux/h2.rs:73`) and its per-stream variant
+  Both `log_context!` (`lib/src/protocol/mux/h2.rs:74`) and its per-stream variant
   `log_context_stream!` (`:104`) built their `peer=` slot from
   `$self.socket.socket_ref().peer_addr().ok()` — a live `getpeername(2)` on every expansion, on two
   separate lines. The kernel answers `ENOTCONN` from the moment the peer sends a RST, so the slot
@@ -4217,7 +4300,7 @@
   `Mux` is the only clock sampler in the multiplexer. It writes `Context.now`
   (`lib/src/protocol/mux/mod.rs:450`) once per **outer** `Mux::ready` pass (`mod.rs:821`) and at the
   top of `Mux::timeout` (`mod.rs:1406`) and `Mux::shutting_down` (`mod.rs:1904`); the H2 core reads
-  the mirror `ConnectionH2.now` (`lib/src/protocol/mux/h2.rs:1867`), assigned at each public entry
+  the mirror `ConnectionH2.now` (`lib/src/protocol/mux/h2.rs:1933`), assigned at each public entry
   point. `H2FloodDetector::check_flood` and `::new` take `now` as a parameter and
   `H2FloodDetector::window_start` is now private, so nothing can advance the rate window against a
   clock the connection is not reading. `Instant` stays the type — there is no clock trait and no
@@ -4229,23 +4312,23 @@
   the whole budget under a single snapshot.
   **Behaviour change: every deadline armed or evaluated inside a pass is now accurate to within that
   pass, in EITHER direction.** The error is not one-sided:
-  - An **arm** site runs at arbitrary depth into its pass (`h2.rs:5302` DATA, `h2.rs:5440` HEADERS,
-    `h2.rs:2852` / `h2.rs:3205` outbound bytes, `h2.rs:3240` fc-stall) and stamps the snapshot taken
+  - An **arm** site runs at arbitrary depth into its pass (`h2.rs:5643` DATA, `h2.rs:5781` HEADERS,
+    `h2.rs:3193` / `h2.rs:3546` outbound bytes, `h2.rs:3581` fc-stall) and stamps the snapshot taken
     at the START of that pass, so the stored instant is older than the event it records. An **eval**
     site runs near the top of a pass — `cancel_timed_out_streams` is the first thing `readable` does,
-    and the SETTINGS-ACK check (`h2.rs:2483`, mirrored at `h2.rs:3665`) is next. The measured age is
+    and the SETTINGS-ACK check (`h2.rs:1823`, mirrored at `h2.rs:3418`) is next. The measured age is
     inflated by the arm site's depth, so a deadline can fire up to one pass **early** as well as one
     pass late. Worked against the strict `>` predicate in `collect_timed_out_streams`: pass P has
     snapshot `T`; at real `T+Δ` a DATA frame stores `T`; pass Q has snapshot `T+deadline+δ` and
     computes `deadline+δ > deadline`, so it reaps, while true elapsed is `deadline+δ−Δ < deadline`
     whenever `Δ > δ`. At base both ends read the real clock and the comparison was exact; this is
     the cost of the snapshot, and it is bounded by one pass.
-  - The flood window (`h2.rs:1157`) and the RFC 9113 §5.1.2 back-pressure window (`h2.rs:4517`) are
+  - The flood window (`h2.rs:1223`) and the RFC 9113 §5.1.2 back-pressure window (`h2.rs:4858`) are
     the one asymmetric case, and they **fail closed**: `now` is constant for the whole pass, so a
     window cannot decay part-way through one. A burst arriving during a pass is weighed in full
     against the window that was open when the pass started, where before a long pass could halve the
     counters under the burst. The window boundary still carries the same one-pass error either way.
-  `graceful_goaway` (`h2.rs:4740`) takes `now` as its one new parameter, because its caller
+  `graceful_goaway` (`h2.rs:5081`) takes `now` as its one new parameter, because its caller
   `Mux::shutting_down` runs outside `ready()`. That handler also takes its own sample
   (`mod.rs:1929`), which is load-bearing rather than belt-and-braces: `drive_frontend_shutdown_io`
   (`mod.rs:722`) always reaches `readable()` for an H2 frontend, and `readable` mirrors
@@ -5326,8 +5409,8 @@ Other workspace deps were already pinned to the latest crates.io patch.
 - Lockfile refreshed via `cargo update`: 32 transitive packages bumped, 2 new transitive version slots (`itertools 0.13.0`, `wit-bindgen 0.57.1`), plus criterion 0.8 dep fan-out.
 No MSRV impact — all movers declare MSRV ≤ 1.88.0.
 - **Docs and comments consolidation**: refreshed code comments, rustdoc, and `lib/src/protocol/mux/LIFECYCLE.md` / `doc/h2_mux_internals.md` so they describe behavior directly instead of citing now-retired plan labels (router "Wave 1c/2b/3a", security-audit "Phase 1D", Codex review markers "G5/G7/G10/G11/G12", h2-priority-rearm "Fix A/B/C/D", "B3-h/B3-p/B3-z" test plan entries, and the "Phase 1/2/3" stage labels inside `flush_pending_control_frames` and `graceful_goaway`).
-One operator-visible side effect — the `h2.rs:4089` debug log `GOAWAY (graceful, phase 1)` now reads `GOAWAY (graceful, initial)`.
-The final GOAWAY continues to log via the generic `GOAWAY: {error}` line at `h2.rs:4032` (unchanged), so only the initial-GOAWAY substring shifts.
+One operator-visible side effect — the `h2.rs:4430` debug log `GOAWAY (graceful, phase 1)` now reads `GOAWAY (graceful, initial)`.
+The final GOAWAY continues to log via the generic `GOAWAY: {error}` line at `h2.rs:4373` (unchanged), so only the initial-GOAWAY substring shifts.
 Deployments running with `--features logs-debug` that scrape sozu logs for the literal `phase 1` substring need to update their filters.
 The RFC 9113 §6.8 double-GOAWAY behavior itself is unchanged.
 No other metrics, config keys, or wire behavior change.
@@ -5801,7 +5884,7 @@ Run with `cargo test -p sozu-e2e -- --ignored fuzz` (requires nightly + cargo-fu
 
 - **Customer H2 truncation regression guards** (cleverapps.io 2026-04 ticket): two e2e tests lock in the multi-fix chain that closed a report of ~7.4 MB gzipped chunked JSON responses truncating at ~3 MB across an H1-backend → H2-frontend path. `test_h2_large_gzipped_chunked_drains_fully` serves a deterministic XorShift-seeded 7.76 MB payload gzipped through `ChunkedFlushH1Backend` + `Content-Encoding: gzip` and asserts sha256 byte-identity of the wire body within 8 s using a Chromium-146 request profile (H2 preface + SETTINGS with `INITIAL_WINDOW_SIZE=6_291_456`, one-shot `WINDOW_UPDATE(0, 15_663_105)`, per-stream `WINDOW_UPDATE(sid, 32 KiB)` cadence, `priority: u=3, i`). `test_h2_large_chunked_7mb_drains_fully` is the scale-only smoke (same total bytes, `b'Z'` fill, no gzip).
 New helpers in `e2e/src/tests/h2_utils.rs` — `h2_handshake_chromium_146`, `build_chrome146_get_headers`, `drain_h2_stream_streaming`, `advance_one_frame` — plus three additive `ChunkedFlushConfig` knobs (`body`, `extra_response_headers`, `content_type`).
-Stream-0 `WINDOW_UPDATE` is issued once at handshake only so the drain stays below `DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW=100` (`lib/src/protocol/mux/h2.rs:259`).
+Stream-0 `WINDOW_UPDATE` is issued once at handshake only so the drain stays below `DEFAULT_MAX_WINDOW_UPDATE_STREAM0_PER_WINDOW=100` (`lib/src/protocol/mux/h2.rs:250`).
 Adds `flate2` as a workspace dependency and wires `sha2` into the `sozu-e2e` crate.
 
 #### Telemetry & observability
@@ -5889,7 +5972,7 @@ Operators can grep new tags `HTTP`, `HTTPS`, `TLS-RESOLVER`, `PROXY-EXPECT`, `PR
 Three previously-untagged `trace!` sites in `lib/src/protocol/pipe.rs` (`Pipe::new`, `Pipe::readable`, `Pipe::backend_writable`) are now wrapped in the `PIPE` envelope.
 Format strings include the literal substring of the previous body verbatim, so existing grep predicates continue to match.
 
-- **H2 close-drain log severity tiered by stream-count and close-state**: The `TLS buffer NOT fully drained on close` line at `lib/src/protocol/mux/h2.rs:5141` now downgrades from `error!` to `warn!` when stream count is zero AND the connection was already in a `GoAway` or `Error` state.
+- **H2 close-drain log severity tiered by stream-count and close-state**: The `TLS buffer NOT fully drained on close` line at `lib/src/protocol/mux/h2.rs:5482` now downgrades from `error!` to `warn!` when stream count is zero AND the connection was already in a `GoAway` or `Error` state.
 This covers the operator-noisy "peer-initiated `GOAWAY(PROTOCOL_ERROR)` followed by TCP RST" path (no application data was queued to lose) without dropping the alarm on truly loss-bearing closes. `streams != 0` (live streams at close) and `streams == 0` from any other state stay at `error!`.
 Composes orthogonally with the send-side `H2Error`-variant tier added by `649af790`.
 See `lib/src/protocol/mux/LIFECYCLE.md` §11 for the tier table.
@@ -5924,7 +6007,7 @@ CWE-770 hardening.
 The gauge now skips the emit entirely when the cert set is empty so dashboards keep the last known good value (typically the previous worker's reading across a hot upgrade).
 Companion items — labelling per listener, refresh on remove_listener / soft_stop / hard_stop — are tracked as a follow-up resolver-lifecycle refactor.
 
-- **`cancel_timed_out_streams` now routes through the `enqueue_rst` chokepoint**: the slow-multiplex idle-cancel guard at `lib/src/protocol/mux/h2.rs:3415-3475` previously pushed RST tuples directly into `self.pending_rst_streams` and inserted into `self.rst_sent` inline, bypassing the canonical `enqueue_rst` / `enqueue_rst_into` helpers.
+- **`cancel_timed_out_streams` now routes through the `enqueue_rst` chokepoint**: the slow-multiplex idle-cancel guard at `lib/src/protocol/mux/h2.rs:3756-3816` previously pushed RST tuples directly into `self.pending_rst_streams` and inserted into `self.rst_sent` inline, bypassing the canonical `enqueue_rst` / `enqueue_rst_into` helpers.
 Three silent divergences: (a) `MAX_PENDING_RST_STREAMS = 200` queued cap and `total_rst_streams_queued` were not updated, so a peer that opens 200 idle streams could push past the cap silently — no GOAWAY(ENHANCE_YOUR_CALM) escalation; (b) double-cancel grew `pending_rst_streams` instead of short-circuiting on `rst_sent` membership; (c) invariant 15 `Readiness::arm_writable` was hand-rolled.
 Routing through `enqueue_rst` fixes all three.
 Behaviour change: 200 cumulative idle-cancel RSTs from one peer now triggers GOAWAY(ENHANCE_YOUR_CALM); deliberate, since opening 200 streams that never make progress IS abusive (pinning MAX_CONCURRENT_STREAMS slots).
@@ -5938,7 +6021,7 @@ RFC 9218 §7.1 priority field values are SF-Items (RFC 8941) — ASCII-only, typ
 The new cap mirrors `nghttp2`'s `NGHTTP2_MAX_PRIORITY_VALUE_LEN` and the `h2` Rust crate's upper bound; overflow returns `H2Error::ProtocolError`.
 Two new unit tests cover the cap and the boundary.
 
-- **H2 overlong DATA + Content-Length violation no longer starves connection-level flow control**: when a peer sent DATA frames whose cumulative payload exceeded the response's declared `Content-Length` (RFC 9113 §8.1.1), `handle_data_frame` reset and removed the offending stream **before** crediting the connection-level `WINDOW_UPDATE` for the wire payload bytes (`lib/src/protocol/mux/h2.rs:4064-4124`).
+- **H2 overlong DATA + Content-Length violation no longer starves connection-level flow control**: when a peer sent DATA frames whose cumulative payload exceeded the response's declared `Content-Length` (RFC 9113 §8.1.1), `handle_data_frame` reset and removed the offending stream **before** crediting the connection-level `WINDOW_UPDATE` for the wire payload bytes (`lib/src/protocol/mux/h2.rs:4405-4465`).
 Because RFC 9113 §6.9 + §5.2 measure flow control against the full wire payload (pad-length + padding included), the bad bytes consumed the peer's send window without it being credited back; repeated bad streams could permanently shrink the connection window and stall **unrelated** streams sharing the same H2 connection.
 The connection-level credit + arming of pending `WINDOW_UPDATE`s is now done **before** the Content-Length early-return; per-stream credit remains below the gate (the violating stream is being RST'd, so its window is moot per §6.9).
 
@@ -5948,7 +6031,7 @@ Under EMFILE/ENFILE bursts this poisoned capacity dashboards until the connect t
 The failure path now decrements all three gauges, calls `proxy.borrow().remove_session(token)` so the regular session-drop path releases `active_requests`, and returns `BackendConnectionError::MaxSessionsMemory`.
 CWE-400 hardening.
 
-- **H2 close-drain log missing `MUX-H2` envelope**: The TLS-drain warning at `lib/src/protocol/mux/h2.rs:5141` (`Position::Server` arm of `ConnectionH2::close`) emitted as a raw `error!` without the canonical `MUX-H2 Session(...)` envelope, so operators could not grep-correlate this line against the preceding `WARN MUX-H2` GOAWAY-receipt line for the same session.
+- **H2 close-drain log missing `MUX-H2` envelope**: The TLS-drain warning at `lib/src/protocol/mux/h2.rs:5482` (`Position::Server` arm of `ConnectionH2::close`) emitted as a raw `error!` without the canonical `MUX-H2 Session(...)` envelope, so operators could not grep-correlate this line against the preceding `WARN MUX-H2` GOAWAY-receipt line for the same session.
 The format string is now prefixed with `"{}"` and `log_context!(self)` is the first interpolation argument, matching the H1 sibling at `mux/h1.rs:669-678` and the rest of `ConnectionH2`'s log surface.
 Regression coverage in `e2e/src/tests/h2_correctness_tests.rs` (`test_h2_peer_goaway_protocol_error_then_rst_clean_drain`, `test_h2_peer_goaway_no_error_clean_close`, `test_h2_peer_goaway_during_response_body`) plus a static `lib/tests/log_layout.rs` walker (echoed at compile time as `cargo:warning=` lines via `lib/build.rs`) keeps the rule honest going forward.
 

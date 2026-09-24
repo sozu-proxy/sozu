@@ -3005,7 +3005,7 @@ Intentionally **not** emitted in this slice (no corresponding lifecycle exists):
   unrelated to pool sizing.
 - `backend.flow_control.resumed` — the converter has no "resumed" boundary; the
   next writable cycle just succeeds when the backend ACKs window updates.
-  Plumbing an explicit marker through `flush_stream_out` was deferred.
+  Plumbing an explicit marker through the write pass's flush was deferred.
 
 #### Backend metrics (per cluster/backend)
 

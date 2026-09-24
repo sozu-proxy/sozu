@@ -100,7 +100,7 @@ that drifts 46 lines does not mislead slightly — it lands the reader in a diff
 
 The same three forms govern prose inside Rust source, with one narrowing: **in a `//`, `///` or
 `//!` comment, cite the symbol and never a line number.** A comment that means one specific branch
-names that branch in words — the `FlushOutcome::Stalled` arm of `ConnectionH2::write_streams` —
+names that branch in words — the `H2WritePhase::Flush` arm of `ConnectionH2::poll_write_target` —
 rather than reaching for the second form.
 
 The narrowing is not stylistic either. The resolver scans `doc/**` and every `**/LIFECYCLE.md`; a

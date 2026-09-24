@@ -36,11 +36,15 @@
 //! `debug_assert!`; the `unsafe` and that clear were six lines apart, not
 //! eleven, with a push, three braces and the vectored write between them —
 //! the debug event, byte counters and READABLE re-arm all came *after* the
-//! clear. One of those moved: the caller now pushes its `DebugEvent::SocketIO`
-//! *before* calling `confirm`, so the clear follows the debug event instead of
-//! preceding it. That is inert — `debug.push` does not touch `kawa` — and the
-//! obligation this module states is "clear before the consume", which still
-//! holds because both now happen inside `confirm`, in that order.
+//! clear. They still do. The extraction briefly moved the caller's
+//! `DebugEvent::SocketIO` push ahead of `confirm`; the write-path inversion
+//! that followed put it back behind, because the push now lives in
+//! `ConnectionH2::handle_write`, which the shell calls only once `confirm`
+//! has returned. Either way it is inert — `debug.push` does not touch `kawa`,
+//! and no production code in this module constructs a `DebugEvent` — and the
+//! obligation this module states is "clear before the consume", which holds
+//! because both happen inside `confirm`, in that order, whatever the caller
+//! does around it.
 //! So this is not a correctness fix and it does not make anything
 //! type-level: two free functions each taking an independent `&mut Vec` is
 //! co-location, not enforcement, and a caller can still call `Kawa::consume`
@@ -342,9 +346,10 @@ mod tests {
     // stall was structurally ungenerable and the header described a path no
     // test could enter.
     //
-    // `drive` mirrors `flush_stream_out`'s loop rather than approximating it:
-    // it stops on a zero accept against a non-zero offer, which is exactly
-    // what `update_readiness_after_write` reports as `FlushOutcome::Stalled`.
+    // `drive` mirrors the write pass's round-again loop rather than
+    // approximating it: it stops on a zero accept against a non-zero offer,
+    // which is exactly what `update_readiness_after_write` reports, and what
+    // `ConnectionH2::poll_write_target` reads back as `H2WritePass::stalled`.
     // An earlier version broke on `offered == 0` instead, which production
     // never does — that reading would skip a leading `Delimiter` rather than
     // consuming it.
@@ -430,7 +435,7 @@ mod tests {
 
         /// Returns the bytes handed to the shell, and whether the queue
         /// drained (false means the pass stalled, production's
-        /// `FlushOutcome::Stalled`).
+        /// `H2WritePass::stalled`).
         fn drive(plan: &WritePlan) -> (Vec<u8>, bool) {
             let mut buf = vec![0u8; plan.payload.len() * 4 + 64];
             let mut kawa = kawa_for(&mut buf, plan);
