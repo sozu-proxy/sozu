@@ -1263,7 +1263,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         session_ulid: Ulid,
         socket: Front,
         position: super::Position,
-        pool: std::rc::Weak<std::cell::RefCell<crate::pool::Pool>>,
+        buffers: &mut dyn super::buffer_source::BufferSource,
         flood_config: H2FloodConfig,
         connection_config: H2ConnectionConfig,
         stream_idle_timeout: std::time::Duration,
@@ -1272,9 +1272,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         expect_read: Option<(H2StreamId, usize)>,
         readiness_interest: sozu_command::ready::Ready,
     ) -> Option<Self> {
-        let buffer = pool
-            .upgrade()
-            .and_then(|pool| pool.borrow_mut().checkout())?;
+        let buffer = buffers.checkout()?;
         // The one clock sample this module takes outside `Mux`'s sampling
         // points. A connection is constructed at accept / backend-connect
         // time, outside any `ready()` pass, so there is no snapshot to
@@ -1287,8 +1285,10 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         };
         // RFC 7541 §4.2: enforce SETTINGS_HEADER_TABLE_SIZE as the upper bound
         // for dynamic table size updates from the peer
-        let hpack =
-            hpack_state::HpackState::new(local_settings.settings_header_table_size as usize);
+        let hpack = hpack_state::HpackState::new(
+            buffers,
+            local_settings.settings_header_table_size as usize,
+        )?;
         Some(ConnectionH2 {
             session_ulid,
             hpack,
@@ -6774,6 +6774,7 @@ mod tests {
         protocol::{
             kawa_h1::editor::HttpContext,
             mux::{
+                buffer_source::PoolBufferSource,
                 connection::EndpointClient,
                 router::Router,
                 test_support::{TestListener, connected_socket, test_context},
@@ -7508,8 +7509,12 @@ mod tests {
             tags: None,
             access_log_message: None,
         };
-        Stream::new(Rc::downgrade(pool), http_ctx, 65_535)
-            .expect("pool should have capacity for two buffers")
+        Stream::new(
+            &mut PoolBufferSource::new(Rc::downgrade(pool)),
+            http_ctx,
+            65_535,
+        )
+        .expect("pool should have capacity for two buffers")
     }
 
     fn make_pool_for_invariant_16() -> Rc<RefCell<Pool>> {
@@ -7637,6 +7642,82 @@ mod tests {
     /// arm from [`ConnectionH2::release_connection_gauges`]. The live-delta
     /// assertion still passes; the post-drop one fails with `left: 3, right: 0`
     /// — the connection's contribution outliving the connection, which is the
+    /// A [`BufferSource`] that hands over pooled wire buffers exactly as the
+    /// real one does but refuses every scratch request.
+    ///
+    /// It exists to separate the two halves of the contract. Refusing
+    /// `checkout` is already reachable by sizing a pool, and the H2
+    /// simulator's exhaustion scenario does exactly that. Refusing `scratch`
+    /// is reachable ONLY through a caller-supplied source: the proxy's own
+    /// [`PoolBufferSource`] hands out a fresh `Vec` and never says no. That
+    /// asymmetry is the point of the trait being caller-implemented rather
+    /// than a method on `Pool`, so it needs a test that could not be written
+    /// without it.
+    struct ScratchStarvedSource(PoolBufferSource);
+
+    impl super::super::buffer_source::BufferSource for ScratchStarvedSource {
+        fn checkout(&mut self) -> Option<crate::pool::Checkout> {
+            self.0.checkout()
+        }
+
+        fn scratch(&mut self) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    fn loopback_socket_handle() -> mio::net::TcpStream {
+        mio::net::TcpStream::connect(
+            format!("127.0.0.1:{}", crate::testing::provide_port())
+                .parse()
+                .expect("loopback address must parse"),
+        )
+        .expect("mio connect must return a socket handle")
+    }
+
+    fn connection_from_source(
+        buffers: &mut dyn super::super::buffer_source::BufferSource,
+    ) -> Option<ConnectionH2<mio::net::TcpStream>> {
+        ConnectionH2::new(
+            Ulid::generate(),
+            loopback_socket_handle(),
+            Position::Server,
+            buffers,
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )
+    }
+
+    /// The HPACK half of the ownership contract is real, not decorative: the
+    /// codec pair and its scratch buffers are acquired from the connection's
+    /// buffer source, and a source that refuses one refuses the connection.
+    ///
+    /// Both arms run against the SAME pool, with enough buffers for the
+    /// connection's stream-0 checkout. So the only difference between the two
+    /// outcomes is the source's answer to `scratch`, which is what stops this
+    /// from passing for the unrelated reason that the pool ran dry.
+    #[test]
+    fn a_source_that_refuses_scratch_refuses_the_connection() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+
+        assert!(
+            connection_from_source(&mut PoolBufferSource::new(Rc::downgrade(&pool))).is_some(),
+            "the pool has free buffers, so a source that grants scratch must build a connection",
+        );
+        assert!(
+            connection_from_source(&mut ScratchStarvedSource(PoolBufferSource::new(
+                Rc::downgrade(&pool)
+            )))
+            .is_none(),
+            "a source that refuses the HPACK scratch must refuse the connection: the codec pair \
+             is under the same ownership contract as the wire buffers, not allocated behind it",
+        );
+    }
+
     /// aggregate drifting upward by 3 for the rest of the worker's life.
     #[test]
     fn dropping_a_connection_releases_its_ready_incremental_contribution() {
@@ -7658,7 +7739,7 @@ mod tests {
             Ulid::generate(),
             socket,
             Position::Server,
-            Rc::downgrade(&pool),
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
             H2FloodConfig::default(),
             H2ConnectionConfig::default(),
             Duration::from_secs(30),
@@ -7864,7 +7945,7 @@ mod tests {
             Ulid::generate(),
             BackpressuredTlsSocket::new(socket, pending, drain_per_flush),
             Position::Server,
-            Rc::downgrade(pool),
+            &mut PoolBufferSource::new(Rc::downgrade(pool)),
             H2FloodConfig::default(),
             H2ConnectionConfig::default(),
             Duration::from_secs(30),
@@ -9518,7 +9599,7 @@ mod tests {
             Ulid::generate(),
             socket,
             Position::Server,
-            Rc::downgrade(pool),
+            &mut PoolBufferSource::new(Rc::downgrade(pool)),
             H2FloodConfig::default(),
             H2ConnectionConfig::default(),
             Duration::from_secs(30),
@@ -9902,7 +9983,7 @@ mod tests {
             session_ulid,
             socket,
             Position::Server,
-            Rc::downgrade(pool),
+            &mut PoolBufferSource::new(Rc::downgrade(pool)),
             H2FloodConfig::default(),
             H2ConnectionConfig::default(),
             Duration::from_secs(30),
@@ -10069,7 +10150,7 @@ mod tests {
             session_ulid,
             socket,
             Position::Server,
-            Rc::downgrade(&pool),
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
             H2FloodConfig::default(),
             H2ConnectionConfig::default(),
             Duration::from_secs(30),
@@ -12660,7 +12741,7 @@ mod tests {
             Ulid::generate(),
             socket,
             Position::Server,
-            Rc::downgrade(pool),
+            &mut PoolBufferSource::new(Rc::downgrade(pool)),
             H2FloodConfig::default(),
             H2ConnectionConfig::default(),
             Duration::from_secs(30),

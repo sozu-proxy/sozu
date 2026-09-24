@@ -15,6 +15,16 @@
 //! `write_streams` converter borrow, and the scratch-buffer reclaim logic)
 //! for how they're used.
 //!
+//! The three scratch buffers and the codec pair are acquired from the
+//! connection's [`super::buffer_source::BufferSource`] rather than allocated
+//! here, which is what puts this module's state under the same ownership
+//! contract as the wire buffers instead of leaving it to the global
+//! allocator. [`HpackState::new`] is fallible for that reason: a source that
+//! refuses refuses the whole connection, on the same path as a refused
+//! stream-0 buffer. What the source does *not* reach is documented on the
+//! trait — `loona_hpack`'s own tables, and growth of a buffer already handed
+//! over.
+//!
 //! The pass-ordering buffer `priorities_buf` arrived here with that
 //! relocation and left again with the scheduler extraction: it holds
 //! priority-sorted stream ids, never HPACK bytes, and now lives on
@@ -34,22 +44,34 @@ pub(super) struct HpackState {
 }
 
 impl HpackState {
-    /// Builds the decoder/encoder pair and empty scratch buffers for a new
-    /// connection.
+    /// Builds the decoder/encoder pair and the scratch buffers for a new
+    /// connection, drawing all three buffers from `buffers`.
     ///
     /// `header_table_size` is `local_settings.settings_header_table_size` —
     /// RFC 7541 §4.2 requires the decoder enforce it as the upper bound for
     /// dynamic table size updates from the peer.
-    pub(super) fn new(header_table_size: usize) -> Self {
+    ///
+    /// Returns `None` when the source refuses a scratch buffer. The codec
+    /// pair is built only once all three have been granted, so a refusal
+    /// costs no `loona_hpack` allocation either — which is the sense in which
+    /// the codecs are under the contract, given the crate offers no
+    /// capacity-supplied constructor to route their tables through.
+    pub(super) fn new(
+        buffers: &mut dyn super::buffer_source::BufferSource,
+        header_table_size: usize,
+    ) -> Option<Self> {
+        let converter_buf = buffers.scratch()?;
+        let lowercase_buf = buffers.scratch()?;
+        let cookie_buf = buffers.scratch()?;
         let mut decoder = loona_hpack::Decoder::new();
         decoder.set_max_allowed_table_size(header_table_size);
-        HpackState {
+        Some(HpackState {
             decoder,
             encoder: loona_hpack::Encoder::new(),
-            converter_buf: Vec::new(),
-            lowercase_buf: Vec::new(),
-            cookie_buf: Vec::new(),
-        }
+            converter_buf,
+            lowercase_buf,
+            cookie_buf,
+        })
     }
 
     pub(super) fn decoder_mut(&mut self) -> &mut loona_hpack::Decoder<'static> {

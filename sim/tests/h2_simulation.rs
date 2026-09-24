@@ -109,8 +109,9 @@
 //! the same seeded RNG instead, and its `Workload::run` contains no `.await` at
 //! all. That is forced, not preferred: `moonpool_sim::Workload` is declared
 //! `#[async_trait]` without `?Send`, so its future must be `Send`, while the H2
-//! core is `Rc`-based by design (`Context` owns `Rc<RefCell<Pool>>` and
-//! `Rc<RefCell<L>>`; the worker runtime is single-threaded per worker and
+//! core is `Rc`-based by design (`Context` owns a `Box<dyn BufferSource>` over
+//! a `Weak<RefCell<Pool>>`, and an `Rc<RefCell<L>>`; the worker runtime is
+//! single-threaded per worker and
 //! deliberately carries no `Arc<Mutex>` inside the event loop). Holding the
 //! harness across a yield point therefore does not compile, and the only honest
 //! alternatives are an `unsafe impl Send` lie or this.
@@ -782,7 +783,26 @@ impl H2Harness {
         clock_base: Instant,
     ) -> Self {
         // Two checkouts per stream plus the H2 connection's own `zero` buffer.
-        //
+        // 512 is "effectively unbounded" for every scenario that is not about
+        // exhaustion; the one that is passes its own ceiling.
+        Self::with_pool_maximum(connection_config, timeouts, clock_base, 512)
+    }
+
+    /// [`Self::new`] with an explicit buffer-pool ceiling.
+    ///
+    /// The pool maximum is the *only* knob that makes checkout failure
+    /// reachable from outside the core: both H2 checkout sites —
+    /// `ConnectionH2::new` for `zero`, and `Stream::new` for a stream's
+    /// request/response pair — go through `Pool::checkout`, which answers
+    /// `None` once `used` has reached `maximum_capacity`. Sizing the pool is
+    /// therefore how this harness forces exhaustion deterministically today,
+    /// without an injected allocator and without a timing race.
+    fn with_pool_maximum(
+        connection_config: H2ConnectionConfig,
+        timeouts: HarnessTimeouts,
+        clock_base: Instant,
+        pool_maximum: usize,
+    ) -> Self {
         // 16393 is the documented floor for an H2-enabled buffer pool — the
         // 16384-octet maximum frame payload plus its 9-octet header — and a
         // smaller one deadlocks the mux on a full-size frame. Nothing here
@@ -791,12 +811,12 @@ impl H2Harness {
         const H2_MIN_BUFFER_SIZE: usize = 16_384 + FRAME_HEADER_LEN;
         let pool = Rc::new(RefCell::new(Pool::with_capacity(
             1,
-            512,
+            pool_maximum,
             H2_MIN_BUFFER_SIZE,
         )));
         let (socket, placeholder_peer) = SimSocket::new();
         let listener = Rc::new(RefCell::new(SimListener::new(connection_config)));
-        let context = Context::new(
+        let mut context = Context::new(
             // `Ulid: From<u128>` in argument position — never `Ulid::generate()`,
             // which reads the wall clock and a random source.
             0u128.into(),
@@ -808,7 +828,10 @@ impl H2Harness {
         let connection = Connection::new_h2_server(
             0u128.into(),
             socket,
-            Rc::downgrade(&pool),
+            // The same source the session's streams draw from, so a pool
+            // ceiling bounds the connection and its streams together — which
+            // is what makes exhaustion reachable by sizing one number.
+            &mut *context.buffers,
             timeouts.connection,
             H2FloodConfig::default(),
             connection_config,
@@ -2023,6 +2046,104 @@ fn h2_concurrent_stream_ceiling_holds_under_adversarial_interleaving() {
             opens - CEILING,
         );
     }
+}
+
+/// **Property 3c — buffer-pool exhaustion mid-request refuses the stream and
+/// keeps the connection.**
+///
+/// The concurrent-stream ceiling above is an admission decision the core makes
+/// from its own bookkeeping. This one is the other refusal path, and it is the
+/// one that constrains buffer ownership: a stream needs a request/response
+/// buffer pair the core does not own and cannot conjure, the supply is
+/// exhausted *while the connection is healthy and mid-request*, and the answer
+/// must still be `RST_STREAM(REFUSED_STREAM)` on that one stream — never
+/// GOAWAY, never a dropped frame, never a stalled connection. Exhaustion is
+/// transient by nature: the streams already running will hand their buffers
+/// back, so tearing the connection down over it converts a momentary shortage
+/// into every in-flight request on that connection being lost.
+///
+/// The pool is sized so the shortage is arithmetic rather than incidental:
+/// three buffers total, one consumed by the connection's own `zero` buffer at
+/// construction and two by the first stream, leaving the second stream's pair
+/// unsatisfiable. `max_concurrent_streams` is set far above the two streams
+/// opened, and the assertions below require the *admitted* stream to still be
+/// live, so a run in which the ceiling refused instead would fail rather than
+/// pass for the wrong reason.
+///
+/// Nothing here reads a log line or any other core-internal literal: the
+/// oracle is the wire, decoded by this file's own decoder.
+#[test]
+fn h2_pool_exhaustion_mid_request_refuses_the_stream_not_the_connection() {
+    // Far above the two streams opened below: the pool, not the ceiling, must
+    // be what refuses.
+    let config = H2ConnectionConfig::new(65_535, 64, 2);
+    let base = Instant::now();
+    // 1 (`zero`) + 2 (stream 1) = 3. Stream 3 then finds nothing.
+    let mut harness = H2Harness::with_pool_maximum(config, HarnessTimeouts::default(), base, 3);
+
+    harness.bootstrap(base, 65_535);
+    harness.feed(&settings_ack());
+
+    harness.feed(&headers(1, "sim.invalid", false));
+    harness.pump(base + Duration::from_millis(10), usize::MAX, usize::MAX);
+    assert_eq!(
+        harness.h2().stream_count(),
+        1,
+        "the first stream must be admitted — the pool still had its pair",
+    );
+    assert_eq!(
+        harness.emitted_of(T_RST_STREAM).count(),
+        0,
+        "nothing was refused before the pool ran out",
+    );
+
+    // The pool is now empty. This is the mid-request exhaustion.
+    harness.feed(&headers(3, "sim.invalid", false));
+    harness.pump(base + Duration::from_millis(20), usize::MAX, usize::MAX);
+
+    let refusals: Vec<&WireFrame> = harness
+        .emitted_of(T_RST_STREAM)
+        .filter(|f| f.rst_error() == Some(E_REFUSED_STREAM))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "exhaustion must refuse exactly the one stream it could not serve, saw {} RST_STREAM \
+         frames in total",
+        harness.emitted_of(T_RST_STREAM).count(),
+    );
+    assert_eq!(
+        refusals[0].stream_id, 3,
+        "the refusal must name the stream that could not be served",
+    );
+    assert!(
+        !harness.goaway_seen(),
+        "buffer-pool exhaustion is transient and MUST NOT be escalated to a connection error",
+    );
+    assert_eq!(
+        harness.h2().stream_count(),
+        1,
+        "the stream that was already admitted must survive the refusal of another",
+    );
+
+    // And the connection is still usable: the admitted stream can still be
+    // driven to completion, which is the whole point of refusing rather than
+    // GOAWAYing. A core that had torn the connection down would emit nothing
+    // more and leave the stream parked.
+    harness.feed(&data(1, 64, true));
+    harness.pump(base + Duration::from_millis(30), usize::MAX, usize::MAX);
+    assert!(
+        !harness.goaway_seen(),
+        "the connection must still be alive after the refused stream",
+    );
+    assert_eq!(
+        harness
+            .emitted_of(T_RST_STREAM)
+            .filter(|f| f.stream_id == 1)
+            .count(),
+        0,
+        "the surviving stream must not have been reset by another stream's refusal",
+    );
 }
 
 /// **Property 3b — inbound flow-control credit is attributed to the stream
