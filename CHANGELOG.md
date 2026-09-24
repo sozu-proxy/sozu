@@ -240,6 +240,87 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the two remaining query / flush / query triples move out of the H2 core
+  (issue [#1339](https://github.com/sozu-proxy/sozu/issues/1339), Q10).**
+  `ConnectionH2::finalize_write` and `ConnectionH2::flush_pending_control_frames` were the last
+  two core functions that read `ConnectionH2::tls_wants_write`, acted on the answer, and read it
+  again. Both now answer a step and let the shell that owns the socket perform it, on the
+  `ConnectionH2::poll_read_target` / `ConnectionH2::handle_read` protocol this module already
+  uses for the read half and `h2_transmit::gather` / `h2_transmit::confirm` for the vectored
+  write.
+
+  **`finalize_write` takes the pre-flush answer and hands back the middle step.** Its signature
+  gains a leading `tls_wants_write: bool` and its return becomes `H2FinalizeTarget`, a sibling of
+  `H2WriteTarget` with three variants: `Done(MuxResult)` for the RFC 9113 §6.8 graceful GOAWAY and
+  the four readiness answers of LIFECYCLE §9 invariant 16, and `Flush` / `SkipFlush` for the two
+  answers that need the TLS step. `ConnectionH2::write_streams` — already the only site that
+  touches the socket on the stream-write path — reads the query, performs
+  `ConnectionH2::flush_tls_records` for `Flush` and not for `SkipFlush`, reads the query again, and
+  hands that second answer to the new `ConnectionH2::finalize_write_after_flush`. The two answers
+  stay two variants rather than one boolean because `h2_close::finalize_action` already
+  distinguishes them, and the post-flush query stays a second call rather than a reused binding
+  because it asks a different question: not "does rustls hold records" but "did the step between
+  them land" — `socket_write(&[])`'s `(size, status)` is discarded, so nothing else on this path
+  can tell.
+
+  **`flush_pending_control_frames` answers `H2ControlFlushTarget` instead of `Option<MuxResult>`.**
+  `Proceed` is the former `None`, `Done(MuxResult)` the former `Some`, and `Stalled` is new: the
+  three stalled-drain tails — the zero-buffer resume, the WINDOW_UPDATE drain and the RST_STREAM
+  drain — used to read `tls_wants_write` and call `ConnectionH2::ensure_tls_flushed` themselves,
+  and now return `Stalled` for `ConnectionH2::writable` to do it once for all three. That query
+  could not become an input: it has to be read AFTER the `ConnectionH2::flush_zero_to_socket`
+  whose stall produced it, because that write is what changes the answer.
+  `ConnectionH2::ensure_tls_flushed`'s production call sites fall from eight to six.
+  `flush_zero_to_socket` itself stays inside the function — it is a byte mover on the
+  control-frame path, not a TLS seam, and lifting it is a different step.
+
+  **Behaviour-preserving**, and nothing on the wire, in a route, a metric, a configuration key or
+  a CLI flag moves. `cargo test -p sozu-lib` reads `1115 passed; 0 failed` at `84d979f8` and
+  `1115 passed; 0 failed` here. One ordering detail is worth stating because it is real and
+  unobservable rather than absent: `write_streams` reads `tls_wants_write` BEFORE `finalize_write`
+  runs the graceful-GOAWAY check that used to precede the query, so on that one path the query now
+  happens and its value is discarded. `SocketHandler::socket_wants_write` is free of side effects
+  and no test fixture counts it — `BackpressuredTlsSocket` deliberately models the record state
+  rather than scripting an answer sequence, and counts flushes only — so no observation moves.
+  The count of `self.socket` reaches in `h2.rs` above `mod tests` is unchanged at eleven, which
+  is the honest measure of this step: neither function ever held one. Both reached the socket only
+  through the three named seams of sozu-proxy/sozu#1499, and what moved is which layer calls them.
+
+  **Six `TO SEE THIS RED` recipes repaired, each re-measured against the tree it now names.** Four
+  named `self.socket.socket_wants_write()` at sites where sozu-proxy/sozu#1499 and
+  sozu-proxy/sozu#1507 had already replaced it, so they were unfollowable before this changeset
+  touched anything — the WINDOW_UPDATE-drain and RST_STREAM-drain stages of
+  `flush_pending_control_frames`, and the `h2_close::error_close_action` and
+  `h2_close::goaway_close_action` call sites in `writable`. A fifth named
+  `self.socket.socket_write(&[])` in the `H2State::GoAway` arm's `CloseAction::Flush` body, which
+  is `self.flush_tls_records()`. The sixth, on
+  `a_finalized_write_pass_flushes_once_and_re_arms_while_records_survive`, this changeset itself
+  made wrong by moving the `Flush` arm's action to `write_streams` and the `ReArm` arm to
+  `finalize_write_after_flush`. Every repaired recipe was applied as written and the resulting
+  failure recorded: the two drain recipes and both halves of the finalize recipe give
+  `1114 passed; 1 failed` naming only their own test, `error_close_action(false)` gives
+  `1114 passed; 1 failed` (the stale text said `1097`), and both the `goaway_close_action`
+  post-flush constant and the deferred-GOAWAY-flush recipe give `1113 passed; 2 failed` (the stale
+  text said `1096`), the second failure being
+  `a_flush_that_does_not_drain_keeps_the_connection_open` in each case. A recipe nobody can follow
+  is the durable form of "this test was seen red", so a stale one converts proven evidence into an
+  unverifiable claim; the three `log_context!` recipes that name `self.socket` deliberately were
+  read and left alone, because they ask a reader to PUT BACK a removed form and the form they
+  replace is still there.
+
+  Docs move in the same changeset: `doc/h2_mux_internals.md`'s `ensure_tls_flushed`,
+  `flush_pending_control_frames()`, `write_streams()` and `finalize_write()` sections,
+  `h2_close.rs`'s module header, and `LIFECYCLE.md` §9's fourth-site paragraph. `LIFECYCLE.md`'s
+  `h2.rs:3336` pin drops to a bare `h2.rs`, since the sentence holding it already names
+  `finalize_write` — sozu-proxy/sozu#1509's form, and no line pin is reintroduced. The remaining
+  35 `h2.rs` line citations across `LIFECYCLE.md`, `doc/h2_mux_internals.md` and `doc/testing.md`
+  are renumbered, and every one of them lands on the byte-identical line text — and inside the
+  same enclosing item — that it named at `84d979f8`. The numbering was derived against
+  `68523ccd` and holds unchanged at `84d979f8` because sozu-proxy/sozu#1510 replaced exactly one
+  `h2.rs` line and added none: `git diff --numstat` over that range reads `1 1`, and the line it
+  replaced (`H2ConnectionConfig::h2_initial_connection_window`'s doc comment) is named by no
+  citation in the tree.
+
 - **`docs(mux-h2)`: the advertised connection-level receive window is not enforced, and the tree
   now says so instead of implying the opposite
   ([#1488](https://github.com/sozu-proxy/sozu/issues/1488)).** Sōzu advertises a connection-level

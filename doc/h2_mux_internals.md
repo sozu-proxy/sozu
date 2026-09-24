@@ -582,7 +582,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:3923-3936
+```rust lib/src/protocol/mux/h2.rs:4069-4082
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -606,7 +606,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:3969-3975
+```rust lib/src/protocol/mux/h2.rs:4115-4121
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -623,9 +623,9 @@ The other three sites take the `&mut self` wrapper
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5795`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5941`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6522`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6668`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -635,10 +635,10 @@ for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
 taken at the top of `H2WritePhase::Flush`'s post-flush tail
-(`lib/src/protocol/mux/h2.rs:2808`) and passes `stream.linked_token()` straight
+(`lib/src/protocol/mux/h2.rs:2911`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:2867-2868
+```rust lib/src/protocol/mux/h2.rs:2970-2971
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -704,13 +704,15 @@ than pass a value in.
 One composite is built on the query and has a name of its own:
 `ConnectionH2::ensure_tls_flushed` is "re-arm the edge-triggered WRITABLE event
 if the answer is yes". It takes that answer as a `tls_wants_write` parameter and
-does not ask: the query belongs to the caller. Five call sites already hold the
-answer — four from the `h2_close` decision just taken on it, and
+does not ask: the query belongs to the caller. Five of the six call sites already
+hold the answer — four from the `h2_close` decision just taken on it, and
 `initiate_close_notify` from its own branch condition — and pass that binding,
-since nothing mutates the socket in between; the three stalled-drain tails of
-`flush_pending_control_frames` have no such binding and read it after the
-`flush_zero_to_socket` whose stall brought them there, because that write is what
-changes the answer. Under edge-triggered epoll a connection whose bytes are stuck
+since nothing mutates the socket in between; the sixth, `writable`'s
+`H2ControlFlushTarget::Stalled` arm, has no such binding and reads it after the
+`flush_zero_to_socket` whose stall brought it there, because that write is what
+changes the answer. The three stalled-drain tails of
+`flush_pending_control_frames` used to read it and re-arm individually; they now
+answer `H2ControlFlushTarget::Stalled` and that one arm re-arms for all three. Under edge-triggered epoll a connection whose bytes are stuck
 in rustls rather than in the kernel has no other wake-up, so every site that parks
 output must end with it. It is called, never spelled out: a site that writes the
 body again is the same fact written twice.
@@ -763,7 +765,7 @@ not reasoned about, and it belongs to its own changeset.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:2222-2226
+```rust lib/src/protocol/mux/h2.rs:2295-2299
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -850,7 +852,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:3672-3676
+```rust lib/src/protocol/mux/h2.rs:3808-3812
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -962,21 +964,38 @@ separate pending-GOAWAY queue to fall back on, so the
 `initial_goaway_pending` flag itself is what guarantees the advisory GOAWAY
 is still sent once reassembly completes rather than silently dropped.
 
-Returns `Some(MuxResult)` if the caller should return early, `None` to proceed.
+Answers `H2ControlFlushTarget`: `Done(MuxResult)` when a GOAWAY already ended
+the pass, `Proceed` when `writable()` should carry on into its state dispatch,
+and `Stalled` when one of the three `flush_zero_to_socket` calls stalled — in
+which case `writable` reads `tls_wants_write` and hands it to
+`ensure_tls_flushed`, which is the re-arm the three tails used to perform
+themselves. The query has to happen AFTER the write that stalled, so it cannot
+be an input, and the shell that owns the socket is the layer that makes it.
+`flush_zero_to_socket` itself stays inside: it is a byte mover on the
+control-frame path, not a TLS seam.
 
 ### write_streams(), poll_write_target() and handle_write()
 
 The main data-plane write path is a **drive loop**, the write-side mirror of
 `poll_read_target` / `handle_read`. `write_streams` is the shell: it owns the
 `Vec<IoSlice<'static>>` and the only `socket_write_vectored` call on the
-stream-write path, and it does nothing else but answer what the core asks for.
+stream-write path, and it does nothing else but answer what the core asks for —
+including the TLS flush triple the pass ends on.
 
 ```rust
 loop {
     match self.poll_write_target(context, &mut endpoint, &mut pass) {
         H2WriteTarget::Done(result) => return result,
-        H2WriteTarget::Finalize { socket_write, bytes_written } =>
-            return self.finalize_write(socket_write, bytes_written, context),
+        H2WriteTarget::Finalize { socket_write, bytes_written } => {
+            let tls_wants_write = self.tls_wants_write();
+            match self.finalize_write(tls_wants_write, socket_write, bytes_written, context) {
+                H2FinalizeTarget::Done(result) => return result,
+                H2FinalizeTarget::Flush => { self.flush_tls_records(); }
+                H2FinalizeTarget::SkipFlush => {}
+            }
+            let tls_wants_write = self.tls_wants_write();
+            return self.finalize_write_after_flush(tls_wants_write);
+        }
         H2WriteTarget::Transmit { stream_id } => { /* gather, write, confirm */ }
     }
 }
@@ -1095,14 +1114,16 @@ live.
 ### finalize_write()
 
 `write_streams` ends by asking `finalize_write` what the pass owes the next
-tick. After the RFC 9113 §6.8 graceful-GOAWAY check (draining with every stream
-gone), the rest is one decision taken in `h2_close::finalize_action` and
-performed here:
+tick, handing it the `tls_wants_write` answer it read itself. After the RFC 9113
+§6.8 graceful-GOAWAY check (draining with every stream gone), the rest is one
+decision taken in `h2_close::finalize_action`; the four readiness answers are
+performed here and the two TLS answers are handed back to `write_streams` as an
+`H2FinalizeTarget`, whose second call is `finalize_write_after_flush`:
 
-| answer | what `finalize_write` does |
+| answer | what it means |
 |---|---|
-| `Flush` | rustls holds records and the pass wrote nothing: `ConnectionH2::flush_tls_records`, then re-ask with `TlsFlushPhase::AfterFlush` |
-| `SkipFlush` | rustls holds records but `socket_write_vectored` already attempted this pass's flush: go straight to the post-flush query |
+| `Flush` | rustls holds records and the pass wrote nothing: the caller performs `ConnectionH2::flush_tls_records`, re-reads `tls_wants_write`, and re-asks with `TlsFlushPhase::AfterFlush` |
+| `SkipFlush` | rustls holds records but `socket_write_vectored` already attempted this pass's flush: the caller re-reads `tls_wants_write` without a second empty-buffer write |
 | `Parked` | a partial write set `expect_write`: it owns the next tick, no bit moves |
 | `RetainPendingBack` | LIFECYCLE §9 invariant 16: progress plus queued response bytes, so `Ready::WRITABLE` survives (the absence of the withdrawal below) |
 | `ArmControlQueue` | a deferred RST_STREAM / WINDOW_UPDATE is still queued: `Readiness::arm_writable` |
@@ -1111,13 +1132,13 @@ performed here:
 | `Settled` | post-flush: the kernel took everything |
 
 Two things about that list are worth knowing before changing it. The pre-flush
-answers and the post-flush answers are disjoint, and the caller matches both
-sets exhaustively with named-impossible arms rather than a wildcard — a `_` arm
-would turn a new variant into a release-mode panic on the write path instead of
-a compile error. And `ConnectionH2::flush_tls_records`' `(size, status)` is
-discarded here, as it is at the close sites: the post-flush
-`ConnectionH2::tls_wants_write` query is how this path learns whether the flush
-landed, so no `SocketResult` reaches the decision. `flush_zero_buffer()` is the one site on the write path that does
+answers and the post-flush answers are disjoint, and the two halves match their
+own set exhaustively with named-impossible arms rather than a wildcard — a `_`
+arm would turn a new variant into a release-mode panic on the write path instead
+of a compile error. And `ConnectionH2::flush_tls_records`' `(size, status)` is
+discarded at its `write_streams` call site, as it is at the close sites: the
+post-flush `ConnectionH2::tls_wants_write` query is how this path learns whether
+the flush landed, so no `SocketResult` reaches the decision. `flush_zero_buffer()` is the one site on the write path that does
 consume a status, through `update_readiness_after_write`.
 
 
@@ -1160,7 +1181,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4837
+```rust lib/src/protocol/mux/h2.rs:4983
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -1313,7 +1334,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5838-5840
+```rust lib/src/protocol/mux/h2.rs:5984-5986
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1321,7 +1342,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5852-5858
+```rust lib/src/protocol/mux/h2.rs:5998-6004
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
