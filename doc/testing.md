@@ -85,6 +85,7 @@ catching.
 | **Unit** | `#[cfg(test)] mod tests` beside each module in `lib/src/**`, `command/src/**` | nothing beyond `protoc` + toolchain | run by `cargo test -p sozu-lib` | yes |
 | **Integration / e2e** | `e2e/src/tests/*` (registered in `e2e/src/tests/mod.rs`), mocks in `e2e/src/mock/*` | spawns real workers + mock clients/backends; `h2spec` for one conformance test | `cargo test -p sozu-e2e` | yes |
 | **Fuzz** | `fuzz/fuzz_targets/*` (out-of-workspace `sozu-fuzz` crate) | nightly toolchain + `cargo-fuzz` | `fuzz` CI job (nightly toolchain, 300 s/target on every push/PR); `#[ignore]`-style runtime skip when prereqs absent | yes (300 s/target); daily 900 s sweep in `simulation-sweep.yml` |
+| **Deterministic simulation** | `sim/tests/h2_simulation.rs` (`sozu-sim`, moonpool-sim) — the H2 core (`ConnectionH2::readable`/`writable`) driven through an in-memory `SocketHandler`, [#1359](https://github.com/sozu-proxy/sozu/issues/1359) C4 | same `--cfg tokio_unstable` gating as below | per-PR `udp-simulation` job (same job, added step, modest sweep); widened via `SOZU_H2_SIM_*` env knobs | yes |
 | **Deterministic simulation** | `sim/tests/udp_simulation.rs` (`sozu-sim`, moonpool-sim) | `RUSTFLAGS="--cfg tokio_unstable"` (scoped to the sim — cfg-gated, off by default) | per-PR `udp-simulation` job (modest sweep) + nightly deep swarm; widened via env knobs | yes |
 | **Deterministic simulation** | `sim/tests/tcp_preread_sim.rs` (`sozu-sim`, moonpool-sim) — TCP SNI-preread core, [#1279](https://github.com/sozu-proxy/sozu/issues/1279) | same `--cfg tokio_unstable` gating as above | per-PR `udp-simulation` job (same job, added step, modest sweep) + nightly `tcp-preread-simulation-sweep` job in `simulation-sweep.yml` (deep swarm); widened via `SOZU_TCP_PREREAD_SIM_*` env knobs | yes |
 | **Deterministic simulation** | `sim/tests/metrics_lease_sim.rs` (`sozu-sim`, moonpool-sim) — metrics cardinality-lease core (`Aggregator::lease_apply`/`lease_clear`/`lease_tick` plus the `remove_cluster`/`add_cluster`/`remove_backend` tombstone) | same `--cfg tokio_unstable` gating as above | no CI job yet — run manually with the command below; widened via `SOZU_METRICS_LEASE_SIM_*` env knobs | no (not yet wired into CI — see this section's closing note) |
@@ -102,6 +103,11 @@ Notes:
   a `decided`/`deadline` latch, a `check_invariants()` sweep run at both ends of
   `handle_input`, and one unit test per reachable `RejectReason` variant. See
   `lib/src/protocol/tcp_preread/LIFECYCLE.md` for the full lifecycle.
+- `sim/tests/h2_simulation.rs` runs per-PR as a step of the `udp-simulation`
+  job, beside the UDP and TCP-preread sweeps. No deep nightly job exists for it
+  yet: an `h2-simulation-sweep` job in `simulation-sweep.yml` analogous to
+  `tcp-preread-simulation-sweep` is proposed but intentionally not added by the
+  change that introduced this simulator.
 - `sim/tests/metrics_lease_sim.rs` has no CI job. A `metrics-lease-simulation`
   job analogous to `udp-simulation` (a modest per-PR sweep) plus a
   `metrics-lease-simulation-sweep` job in `simulation-sweep.yml` (deep nightly
@@ -267,6 +273,9 @@ RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test tcp_preread_sim
 
 # Deterministic metrics cardinality-lease simulation (same crate, same cfg gating):
 RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test metrics_lease_sim
+
+# Deterministic H2-core simulation (same crate, same cfg gating):
+RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test h2_simulation
 ```
 
 ### Simulation sweep + single-seed replay
@@ -311,6 +320,32 @@ the same contract under `SOZU_METRICS_LEASE_SIM_SEED` / `_SEEDS` / `_STEPS`
 RUSTFLAGS="--cfg tokio_unstable" SOZU_METRICS_LEASE_SIM_SEED=0xdeadbeef \
   cargo test -p sozu-sim --test metrics_lease_sim
 ```
+
+The H2-core simulator (`sim/tests/h2_simulation.rs`, `ConnectionH2::readable` /
+`ConnectionH2::writable` driven through an in-memory `SocketHandler`) mirrors the
+same contract under `SOZU_H2_SIM_SEED` / `_SEEDS` / `_STEPS` (default 256 seeds ×
+400 client actions):
+
+```bash
+RUSTFLAGS="--cfg tokio_unstable" SOZU_H2_SIM_SEED=0xdeadbeef \
+  cargo test -p sozu-sim --test h2_simulation
+```
+
+Beyond the seed sweep it carries four named properties that a unit test cannot
+state: byte-identical replay of one seed plus divergence across seeds; the
+stream-idle deadline holding through every millisecond of `crate::timer`'s
+documented `(delay_ms + tick_ms/2) mod tick_ms` earliness window (see
+`duration_to_tick` in `lib/src/timer.rs`) and retiring the stream only strictly
+past it; the concurrent-stream ceiling under one-octet reads and one-octet
+writes; and per-stream inbound flow-control credit matching, exactly, the octets
+the peer spent on that stream while frame headers straddle reads. Its module doc records
+three behaviours measured while it was written that it records rather than
+asserts, each with the reproduction: two are open
+([sozu-proxy/sozu#1488](https://github.com/sozu-proxy/sozu/issues/1488),
+[#1489](https://github.com/sozu-proxy/sozu/issues/1489)) and the third — a short
+read past the 24-octet preface closing a conforming connection — was fixed in
+`fa0b93a4` ([#1487](https://github.com/sozu-proxy/sozu/issues/1487)). Read it
+before extending the file.
 
 ### Fuzzing
 
@@ -547,9 +582,14 @@ that silently keeps drawing fresh ones, a shadow model that never inspects
 the core's actual output, and chaos that is on by default but rarely fires —
 read it before adding a fifth simulator.
 
-The H2 mux (`lib/src/protocol/mux/`) is the obvious next candidate — its stream
-slot lifecycle, flow-control accounting, and GOAWAY/RST_STREAM semantics are a
-state machine of the same shape. This is a stated direction, not a commitment.
+The H2 mux (`lib/src/protocol/mux/`) is no longer a stated direction:
+`sim/tests/h2_simulation.rs` drives `ConnectionH2` under the same recipe. It is
+the first simulator here whose core is not yet byte-in / byte-out — the type is
+still generic over `Front: SocketHandler` — so step 1 of the recipe was met by
+supplying an in-memory `SocketHandler` rather than by extracting one. When the
+remaining `Front` touch points go, that harness half disappears and the scenario
+and assertion layer is untouched, which is the same "swap the driver, keep the
+scenarios" promise each sub-machine extraction makes.
 
 ---
 

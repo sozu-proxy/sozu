@@ -4,6 +4,67 @@
 
 ### ✨ Added
 
+- **`test(sim)`: deterministic simulation of the H2 core — step C4 of the `poll_timeout` series
+  ([#1359](https://github.com/sozu-proxy/sozu/issues/1359)).** `sim/tests/h2_simulation.rs` drives
+  `ConnectionH2::readable` / `ConnectionH2::writable` under a moonpool-sim seeded workload on the
+  same pattern as `udp_simulation.rs`, `tcp_preread_sim.rs` and `metrics_lease_sim.rs`
+  (`doc/testing.md`'s "Recipe: adding a simulator over another sans-io core"). It is the first
+  simulator here whose core is not yet byte-in / byte-out: `ConnectionH2` is still generic over
+  `Front: SocketHandler`, so the harness supplies an in-memory `SocketHandler` and drives the public
+  entry points, and the clock the core reads is whatever the harness assigns to `Context::now`. Four
+  named properties, each seen red before it was trusted. **Determinism** — one seed replayed twice
+  yields a byte-identical trace of frames out, live stream count, published deadline and
+  `MuxResult`, and four other seeds produce more than one trajectory; removing the harness's
+  re-anchor of the connection deadline onto the injected clock reddens it in 3 runs out of 3, which
+  is how the real leak it guards (the one wall-clock `Instant::now()` `ConnectionH2::new` still
+  takes) was found. **Tick-boundary timing** — `crate::timer`'s `duration_to_tick` rounds to the
+  NEAREST tick, so an entry armed for `D` is delivered from `D - tick/2` and the total earliness is
+  `(delay_ms + tick_ms/2) mod tick_ms`, `[0, 99]` ms at the default tick; driven at every
+  millisecond of that window the core leaves the stream alone and moves nothing, and retires it
+  exactly once strictly past the deadline (`H2StreamTable::collect_timed_out` compares with a strict
+  `>`). Shortening the core's idle deadline by one tick reddens it at the very first probe.
+  **Concurrent-stream ceiling** — opening twelve streams against a configured ceiling of three
+  refuses exactly nine, under whole-frame delivery and again under one octet per `socket_read` and
+  one per `socket_write`; relaxing the admission gate from `>=` to `>` reddens it at the fourth
+  open. **Per-stream inbound credit** — with four streams fed uneven DATA volumes round-robin while
+  every read caps at 17 octets and every write at 257, the per-stream WINDOW_UPDATE credit returned
+  equals, exactly, the octets spent on that stream; attributing every credit to stream 1 reddens it.
+  Runs with `RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim --test h2_simulation`
+  (`SOZU_H2_SIM_SEED` / `_SEEDS` / `_STEPS` replay knobs, same contract as the other three
+  simulators; default 256 seeds × 400 client actions, ~5 s), wired into the existing per-PR
+  `udp-simulation` CI job as one added step. No deep nightly job is added (proposed, not added — see
+  `doc/testing.md`). The one manifest change is a `mio` entry in `sozu-sim`'s cfg-gated
+  `[target.'cfg(tokio_unstable)'.dev-dependencies]`: `SocketHandler::socket_ref`/`socket_mut` still
+  return `&mio::net::TcpStream` and `sozu_lib::testing` re-exports `mio::net::UnixStream` but not
+  `TcpStream`, so the in-memory socket's signature cannot be written without naming it. Test-only,
+  cfg-gated, already resolved by `sozu-lib` at the same workspace pin; no production dependency
+  grows, and the line disappears with the remaining `Front` touch points.
+
+  Three behaviours measured while writing it are recorded in the file's module doc rather than
+  asserted, because an assertion loose enough to pass would certify them. (1)
+  `ConnectionH2::handle_read`'s early-preface guard compared the whole accumulated window against
+  the 24-octet preface with `starts_with`, while the window it is offered is `CLIENT_PREFACE_SIZE` =
+  24 + 9 octets, so any short read settling past 24 accumulated octets force-disconnected a valid
+  client. Measured here at fixed `socket_read` chunk sizes: 1, 25, 26 and 32 ended the connection
+  with zero frames emitted, while 12, 23, 24, 33 and 64 completed the handshake. **Since fixed** —
+  sozu-proxy/sozu#1487, `fa0b93a4`, whose own regression sweep walks the chunk size instead of
+  sampling it and pins a wider failing band (1..=10, 13..=16, 25..=32) than the sampling above
+  found. `H2Harness::bootstrap` still feeds the handshake whole, now as a scoping choice rather than
+  a workaround: extending the fragmentation axis over it is left to its own changeset. (2) No
+  connection-level inbound receive window is enforced — `H2FlowControl::window` is the send-side
+  window and `H2FlowControl::account_received_bytes` only decides when to hand credit back — so a
+  peer can push past what Sōzu advertised without a `FLOW_CONTROL_ERROR`; back-pressure comes from
+  the buffer pool instead. Measured: 106496 DATA octets accepted against an advertised 98303 with no
+  GOAWAY (sozu-proxy/sozu#1488). (3) `ConnectionH2::poll_read_target` documents that
+  PING/WINDOW_UPDATE/SETTINGS must not
+  reset the connection idle timer, but `ConnectionH2::write_streams` opens with an unconditional
+  `ConnectionH2::arm_timeout`, so any pass with something to send reaches it. Measured with a 600 s
+  timeout and one stream opened at t=10 ms: a PING at t=10 s moves the deadline to t=10 s, an empty
+  pass at t=20 s and a client WINDOW_UPDATE at t=30 s leave it, a client SETTINGS at t=40 s moves it
+  to t=40 s, and a PING at t=500 s moves it to t=500 s — a PING-only peer holds a stuck session open
+  indefinitely, which is the scenario that policy comment names (sozu-proxy/sozu#1489). The
+  per-stream deadline is immune. Reported, not fixed: this changeset adds no `lib/` change.
+
 - **`test(mux-h2)`: the first `ConnectionH2<FrontRustls>` in the tree — the H2 write path under TLS
   backpressure now has coverage against the production handler instead of a modelled one.**
   `git grep -cE 'ConnectionH2<FrontRustls>' -- '*.rs'` answers 0 at `c0f01021` and on every commit
