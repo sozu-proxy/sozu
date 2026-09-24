@@ -4,8 +4,82 @@
 //! the logic for picking (or opening) the right backend for an incoming
 //! request. The H2 reuse strategy prefers the least-loaded non-draining
 //! connection of the target cluster; H1 falls back to keep-alive reuse.
+//!
+//! ## Determinism (nothing mandates a tie-break order; issue #1338 does)
+//!
+//! [`Router::backends`] used to be a `HashMap<Token, _>`, and
+//! `Router::connect` scans it with a plain `for (token, backend) in
+//! &self.backends` loop, in the map's iteration order — seeded per-`HashMap`
+//! (`RandomState`), so **which backend served a request was non-deterministic
+//! across process restarts**, for the identical set of backend connections and
+//! the identical request. That is a strictly wider leak than the wire-order
+//! ones `h2_flow_control` and `h2_stream_table` closed: it
+//! does not reorder bytes on one connection, it sends them to a different
+//! machine.
+//!
+//! Three separate decisions inside that one loop read the order, and they do
+//! not read it the same way:
+//!
+//! - the H2 least-loaded arm compares with a strict `<`, so the FIRST
+//!   connection at the minimum stream count wins — on a tie, map order alone
+//!   picks the backend;
+//! - the H2 `BackendStatus::Connecting` fallback assigns with neither a
+//!   `break` nor an "already chosen" guard, so the LAST matching connecting
+//!   connection wins;
+//! - the H1 `BackendStatus::KeepAlive` arm assigns and breaks, so the FIRST
+//!   matching keep-alive socket wins.
+//!
+//! The map is now a `BTreeMap`, so the scan is the total order on `Token` —
+//! fixed, reproducible, and free (`BTreeMap` iteration is already sorted; no
+//! extra sort step, no injected seed to thread through construction and
+//! tests). The three decisions above resolve to the lowest `Token`, the
+//! highest `Token` and the lowest `Token` respectively. Pinning is all this
+//! does: the last-wins shape of the connecting fallback is preserved, not
+//! corrected, because changing which backend is preferred is a routing change
+//! and not a determinism one.
+//!
+//! A `Token` is the slab index the proxy's session manager handed the backend
+//! socket at dial time, and the slab hands out its lowest free index, so the
+//! order carries no fairness meaning of its own. It does not need one for the
+//! least-loaded arm, and for the reason `h2_stream_table`'s doc had
+//! to spell out and `h2_flow_control`'s could not: a tie there does
+//! not persist across requests. Attaching the stream increments the winner's
+//! `ConnectionH2::stream_count`, so the next request sees it above the minimum
+//! and takes the next token — the load counter is itself the fairness cursor
+//! `pending_window_updates` had to note the absence of. The connecting
+//! fallback has no such counter, but every candidate it ranks is a connection
+//! that cannot serve anything yet, and it concentrated every waiting stream on
+//! one of them before this change too; the total order fixes WHICH one, it
+//! does not change how many.
+//!
+//! ## Complexity — UNMEASURED beyond the default configuration
+//!
+//! `n` here is the number of live backend connections on ONE frontend session,
+//! not a worker-wide or cluster-wide count. An H2 frontend reaching an H2
+//! cluster holds roughly one multiplex slot per cluster it touches. An H2
+//! frontend reaching an H1 cluster cannot bundle streams, so it holds up to
+//! one socket per concurrent stream — bounded by the `max_concurrent_streams`
+//! this proxy advertises, `DEFAULT_MAX_CONCURRENT_STREAMS` (100) by default
+//! and clamped by `H2ConnectionConfig::new` to `MAX_SAFE_CONCURRENT_STREAMS`
+//! (10_000).
+//!
+//! What changes complexity class is the point lookup: `get` / `get_mut` /
+//! `insert` / `remove` / `contains_key` go from `HashMap`'s amortized `O(1)`
+//! to `BTreeMap`'s `O(log n)`, and `Mux::ready` does one `get_mut`
+//! per backend event through `EndpointClient`. Every iteration site —
+//! `Router::connect`'s scan, `Mux::reschedule`, the two
+//! `Mux::ready` sweeps — already walks all `n` and keeps its `O(n)`. At the
+//! default ceiling (`n <= 100`) a lookup is ~7 `usize` comparisons against one
+//! SipHash-1-3 of a `usize` plus a bucket probe, which is not expected to be
+//! measurable; at a listener configured near `MAX_SAFE_CONCURRENT_STREAMS`
+//! (`n` up to 10_000, ~14 comparisons) it stops being self-evidently
+//! negligible. That expectation has **not been benchmarked**, neither before
+//! nor after this change. Closing it requires a before/after run of this
+//! repository's `Bombardier bench` CI job (or an equivalent local
+//! `bombardier` run) against an H1 cluster behind an H2 frontend at or near
+//! that ceiling; no such run has been produced.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Duration};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, time::Duration};
 
 use mio::{Interest, Token, net::TcpStream};
 use sozu_command::{
@@ -107,7 +181,7 @@ fn log_sni_authority_mismatch(
 
 #[derive(Debug)]
 pub struct Router {
-    pub backends: HashMap<Token, Connection<SessionTcpStream>>,
+    pub backends: BTreeMap<Token, Connection<SessionTcpStream>>,
     pub configured_backend_timeout: Duration,
     pub configured_connect_timeout: Duration,
     /// Fallback readiness used when a backend token is missing from the map.
@@ -118,7 +192,7 @@ pub struct Router {
 impl Router {
     pub fn new(configured_backend_timeout: Duration, configured_connect_timeout: Duration) -> Self {
         Self {
-            backends: HashMap::new(),
+            backends: BTreeMap::new(),
             configured_backend_timeout,
             configured_connect_timeout,
             fallback_readiness: Readiness::new(),
@@ -1773,5 +1847,324 @@ mod authority_matched_cert_name_tests {
         // `[::1]` compares equal to `[::1]`.
         let names = vec!["[::1]".to_owned()];
         assert!(authority_matched_cert_name("[::1]:8443", &names).is_some());
+    }
+}
+
+/// Backend-selection order: `Router::connect` must resolve a tie the same way
+/// on every process, for the identical set of backend connections and the
+/// identical request (issue #1338).
+///
+/// **Why these assert a SPECIFIC token rather than "the same one twice".**
+/// `RandomState` is seeded per `HashMap`, not per iteration: two walks of one
+/// live `HashMap` agree, so a test that runs the selection twice inside one
+/// process and compares passes against a `HashMap` by construction. What does
+/// NOT agree is two SEPARATELY CONSTRUCTED maps — `RandomState::default()`
+/// bumps a thread-local key on every instantiation — so each round below
+/// builds a fresh [`Router`], and therefore a fresh hasher, and asserts the
+/// token the total order on `Token` picks. Measured against the pre-image at
+/// four keys: the minimum came first in 8, 5 and 7 of 24 rounds over three
+/// runs, never in all 24.
+///
+/// That makes the red statistical rather than structural, and the bound is
+/// stated so it can be checked rather than trusted: with `n` staged backends
+/// and `r` rounds a `HashMap` survives with probability `n.pow(-r)`, which is
+/// `4^-24` here — about one run in 2.8e14. A `BTreeMap` survives with
+/// probability 1.
+///
+/// **To SEE THESE RED:** in this module, put `Router::backends` back to
+/// `HashMap<Token, Connection<SessionTcpStream>>`, `Router::new`'s initialiser
+/// back to `HashMap::new()` and the import back to `collections::HashMap`.
+/// Reverting the file wholesale deletes these tests instead of reddening them.
+#[cfg(test)]
+mod backend_selection_order_tests {
+    use std::{cell::RefCell, net::SocketAddr, rc::Rc, time::Duration};
+
+    use mio::Token;
+    use rusty_ulid::Ulid;
+    use sozu_command::{
+        config::ListenerBuilder,
+        proto::command::{Cluster, PathRule, RequestHttpFrontend, RulePosition, SocketAddress},
+    };
+
+    use super::Router;
+    use crate::{
+        L7Proxy, ProxySession,
+        backends::Backend,
+        http::{HttpListener, HttpProxy},
+        pool::Pool,
+        protocol::{
+            http::parser::Method,
+            mux::{
+                BackendStatus, Connection, Context, Position, StreamState, h2::H2ConnectionConfig,
+                h2_flood_detector::H2FloodConfig,
+            },
+        },
+        server::ListenSession,
+        socket::SessionTcpStream,
+    };
+
+    /// Staged deliberately out of order and non-contiguous, so a green run
+    /// cannot be an artefact of insertion order or of a dense key space.
+    const STAGED_TOKENS: [usize; 4] = [23, 7, 41, 13];
+    const LOWEST_TOKEN: usize = 7;
+    const HIGHEST_TOKEN: usize = 41;
+    /// See the module-level note for the `n.pow(-r)` bound this feeds.
+    const ROUNDS: usize = 24;
+
+    const H2_CLUSTER: &str = "cluster-1338-h2";
+    const H1_CLUSTER: &str = "cluster-1338-h1";
+    const H2_AUTHORITY: &str = "h2.backend-order.example.com";
+    const H1_AUTHORITY: &str = "h1.backend-order.example.com";
+
+    /// Which arm of `Router::connect`'s scan the staged backends land in.
+    enum Staged {
+        /// `Position::Client(_, _, BackendStatus::Connected)` on an H2
+        /// connection — the least-loaded arm, strict `<`, first-at-minimum.
+        ConnectedH2,
+        /// `BackendStatus::Connecting` on an H2 connection — the fallback
+        /// arm, assigned with no `break` and no "already chosen" guard.
+        ConnectingH2,
+        /// `BackendStatus::KeepAlive` on an H1 connection — assigned with a
+        /// `break`, so first-seen.
+        KeepAliveH1,
+    }
+
+    impl Staged {
+        fn cluster(&self) -> &'static str {
+            match self {
+                Staged::ConnectedH2 | Staged::ConnectingH2 => H2_CLUSTER,
+                Staged::KeepAliveH1 => H1_CLUSTER,
+            }
+        }
+
+        fn authority(&self) -> &'static str {
+            match self {
+                Staged::ConnectedH2 | Staged::ConnectingH2 => H2_AUTHORITY,
+                Staged::KeepAliveH1 => H1_AUTHORITY,
+            }
+        }
+    }
+
+    /// The proxy, listener, clusters, frontends and buffer pool the routing
+    /// half of `Router::connect` needs. Built once and shared by every round:
+    /// the order under test belongs to `Router::backends`, which each round
+    /// rebuilds from scratch.
+    struct RoutingFixture {
+        proxy: Rc<RefCell<dyn L7Proxy>>,
+        listener: Rc<RefCell<HttpListener>>,
+        pool: Rc<RefCell<Pool>>,
+        /// `Router::connect` touches `session` only on the new-dial path
+        /// (`L7Proxy::add_session`); every round here returns through the
+        /// reuse path, which never reads it.
+        session: Rc<RefCell<dyn ProxySession>>,
+    }
+
+    fn routing_fixture() -> RoutingFixture {
+        let port = crate::testing::provide_port();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, port);
+        let config = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("test http listener config must build");
+        let parts =
+            crate::testing::prebuild_server(32, 65_536, false).expect("test server must build");
+        let pool = parts.pool.clone();
+        let mut proxy = HttpProxy::new(parts.registry, parts.sessions, parts.pool, parts.backends);
+        let listener_token = Token(0);
+        proxy
+            .add_listener(config, listener_token)
+            .expect("test listener must register");
+        for (cluster_id, authority, http2) in [
+            (H2_CLUSTER, H2_AUTHORITY, Some(true)),
+            (H1_CLUSTER, H1_AUTHORITY, None),
+        ] {
+            proxy
+                .add_cluster(Cluster {
+                    cluster_id: cluster_id.to_owned(),
+                    http2,
+                    ..Default::default()
+                })
+                .expect("the test cluster must register");
+            proxy
+                .add_http_frontend(RequestHttpFrontend {
+                    cluster_id: Some(cluster_id.to_owned()),
+                    address,
+                    hostname: authority.to_owned(),
+                    path: PathRule::prefix("/".to_owned()),
+                    position: RulePosition::Tree.into(),
+                    ..Default::default()
+                })
+                .expect("the test frontend must register");
+        }
+        let listener = proxy
+            .get_listener(&listener_token)
+            .expect("the registered listener must be reachable");
+        RoutingFixture {
+            proxy: Rc::new(RefCell::new(proxy)),
+            listener,
+            pool,
+            session: Rc::new(RefCell::new(ListenSession {
+                protocol: crate::Protocol::HTTP,
+            })),
+        }
+    }
+
+    /// One backend connection in the requested arm, plus the accepted peer the
+    /// caller must keep alive for the length of the round.
+    fn staged_backend(
+        pool: &Rc<RefCell<Pool>>,
+        staged: &Staged,
+    ) -> (Connection<SessionTcpStream>, std::net::TcpStream) {
+        let (socket, peer) = super::super::test_support::connected_socket();
+        let backend_address: SocketAddr =
+            "127.0.0.1:2".parse().expect("backend address must parse");
+        let backend = Rc::new(RefCell::new(Backend::new(
+            "test-backend",
+            backend_address,
+            None,
+            None,
+            None,
+        )));
+        let session_ulid = Ulid::generate();
+        let socket = SessionTcpStream::new(socket, session_ulid, Some(backend_address));
+        let mut connection = match staged {
+            Staged::ConnectedH2 | Staged::ConnectingH2 => Connection::new_h2_client(
+                session_ulid,
+                socket,
+                staged.cluster().to_owned(),
+                backend,
+                Rc::downgrade(pool),
+                Duration::from_secs(30),
+                H2FloodConfig::default(),
+                H2ConnectionConfig::default(),
+                Duration::from_secs(30),
+                None,
+            )
+            .expect("the test pool must hand out a buffer for the H2 backend"),
+            Staged::KeepAliveH1 => Connection::new_h1_client(
+                session_ulid,
+                socket,
+                staged.cluster().to_owned(),
+                backend,
+                Duration::from_secs(30),
+            ),
+        };
+        // `new_h*_client` opens in `Connecting`; the other two arms are
+        // reached by moving the status the way a completed dial does.
+        if let Position::Client(_, _, status) = connection.position_mut() {
+            match staged {
+                Staged::ConnectedH2 => *status = BackendStatus::Connected,
+                Staged::ConnectingH2 => {}
+                Staged::KeepAliveH1 => *status = BackendStatus::KeepAlive,
+            }
+        }
+        (connection, peer)
+    }
+
+    /// Stage [`STAGED_TOKENS`] into a FRESH [`Router`] — a fresh `RandomState`
+    /// in the pre-image — drive one `Router::connect`, and report the token it
+    /// attached the stream to.
+    fn selected_backend_token(fixture: &RoutingFixture, staged: &Staged) -> Token {
+        let pool = &fixture.pool;
+        let mut context = Context::new(
+            Ulid::generate(),
+            Rc::downgrade(pool),
+            fixture.listener.clone(),
+            // No session address: the per-(cluster, source-IP) gate is
+            // skipped, so this never reaches the proxy's session manager.
+            None,
+            "127.0.0.1:80"
+                .parse()
+                .expect("test public address must parse"),
+        );
+        let stream_id = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out a stream");
+        {
+            let stream = &mut context.streams[stream_id];
+            stream.state = StreamState::Link;
+            stream.context.authority = Some(staged.authority().to_owned());
+            stream.context.path = Some("/".to_owned());
+            stream.context.method = Some(Method::Get);
+        }
+
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let mut peers = Vec::with_capacity(STAGED_TOKENS.len());
+        for token in STAGED_TOKENS {
+            let (connection, peer) = staged_backend(pool, staged);
+            peers.push(peer);
+            router.backends.insert(Token(token), connection);
+        }
+
+        router
+            .connect(
+                stream_id,
+                &mut context,
+                fixture.session.clone(),
+                fixture.proxy.clone(),
+                Token(0),
+            )
+            .expect("the router must reuse one of the staged backends");
+
+        match context.streams[stream_id].state {
+            StreamState::Linked(token) => token,
+            other => panic!("connect must link the stream to a backend, got {other:?}"),
+        }
+    }
+
+    /// The leak with the most user-visible consequence: the H2 least-loaded
+    /// arm compares stream counts with a strict `<`, so every staged backend
+    /// sitting at the same count leaves the choice entirely to iteration
+    /// order — hash order decided which machine served the request.
+    #[test]
+    fn an_h2_stream_count_tie_always_picks_the_lowest_backend_token() {
+        let fixture = routing_fixture();
+        for round in 0..ROUNDS {
+            let chosen = selected_backend_token(&fixture, &Staged::ConnectedH2);
+            assert_eq!(
+                chosen,
+                Token(LOWEST_TOKEN),
+                "round {round}: a stream-count tie must resolve to the lowest token, \
+                 not to whatever the map iterated first"
+            );
+        }
+    }
+
+    /// The same scan's fallback arm, and it does NOT bias the same way:
+    /// it assigns with neither a `break` nor an "already chosen" guard, so
+    /// the LAST matching connecting backend wins. The total order pins that
+    /// to the highest token — asserting the lowest here would be red against
+    /// both containers.
+    #[test]
+    fn an_all_connecting_h2_fallback_always_picks_the_highest_backend_token() {
+        let fixture = routing_fixture();
+        for round in 0..ROUNDS {
+            let chosen = selected_backend_token(&fixture, &Staged::ConnectingH2);
+            assert_eq!(
+                chosen,
+                Token(HIGHEST_TOKEN),
+                "round {round}: the connecting-backend fallback assigns last-wins, \
+                 so the total order must land on the highest token"
+            );
+        }
+    }
+
+    /// The H1 keep-alive arm carries the same first-seen bias as the H2
+    /// least-loaded one — `reuse_token = Some(*token); break;` — and it is
+    /// live wherever an H2 frontend fans several concurrent streams onto an
+    /// H1 cluster: each stream dials its own socket, every socket parks
+    /// `KeepAlive` for the same cluster, and the next request picks among
+    /// them by map order.
+    #[test]
+    fn an_h1_keep_alive_reuse_always_picks_the_lowest_backend_token() {
+        let fixture = routing_fixture();
+        for round in 0..ROUNDS {
+            let chosen = selected_backend_token(&fixture, &Staged::KeepAliveH1);
+            assert_eq!(
+                chosen,
+                Token(LOWEST_TOKEN),
+                "round {round}: the first matching keep-alive socket wins, so the total \
+                 order must land on the lowest token"
+            );
+        }
     }
 }

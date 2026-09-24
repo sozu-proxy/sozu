@@ -360,7 +360,7 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   own line, `self.stream_table`, is one of thirteen identical lines in `h2.rs`.
 - **Backend attach.** `Router::connect` (called from `mod.rs:1814` during the
   `pending_links` drain) eventually calls `Context::link_stream`
-  (`router.rs:442/622`) which sets `Linked(token)` and pushes to
+  (`router.rs:516/696`) which sets `Linked(token)` and pushes to
   `context.backend_streams`.
 - **Backend detach.** `Context::unlink_stream` (`mod.rs`) — called from the four
   timeout arms of `Mux::timeout_inner` (`mod.rs`), from H1 EOF (`h1.rs:1009`),

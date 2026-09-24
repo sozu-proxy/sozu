@@ -2982,11 +2982,25 @@ pool footprint is `N * max_buffers * buffer_size`.
 #### Backend pool
 
 H2 mux reuses backend connections via
-`Router::backends: HashMap<Token, Connection>`
+`Router::backends: BTreeMap<Token, Connection>`
 (`lib/src/protocol/mux/router.rs`). There is no separate pool abstraction: the
 map is the pool. Reuse picks an existing non-draining H2 multiplex slot (below
 `SETTINGS_MAX_CONCURRENT_STREAMS`) or an H1 keep-alive socket; misses dial a
 fresh backend socket.
+
+The map is ordered rather than hashed so that reuse is reproducible. Three of
+`Router::connect`'s decisions read the scan order directly: the H2 least-loaded
+arm compares stream counts with a strict `<` (first-at-minimum wins), the
+connecting-backend fallback assigns last-wins, and the H1 keep-alive arm
+assigns and breaks. While the map was a `HashMap` its per-process `RandomState`
+seed therefore decided **which backend served a request** whenever two
+candidates tied — sozu-proxy/sozu#1338's widest order leak, and the only one
+that reaches a different machine rather than reordering bytes on one
+connection. The total order on `Token` resolves those three to the lowest,
+highest and lowest token respectively. This pins the choice; it does not
+rebalance anything, and `LEAST_LOADED` and the other `load_balancing`
+algorithms above are untouched — they choose which backend server to DIAL,
+while this chooses among sockets this session already holds.
 
 | Metric                        | Type    | Scope | Description                                                                                                                                                                                                                                                                                                                       |
 | ----------------------------- | ------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

@@ -210,6 +210,79 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: `Router::backends` becomes a `BTreeMap<Token, _>`, so a tie between backend
+  connections no longer resolves by hash order
+  ([#1338](https://github.com/sozu-proxy/sozu/issues/1338)).** Three lines of production code: the
+  field type, `Router::new`'s initialiser and the `std::collections` import. `Token` is `Ord` over a
+  `usize`, `BTreeMap` is std, and no production dependency grows.
+
+  **This is the widest of the issue's order leaks, not another wire-order one.** The two already
+  closed on `main` (`H2FlowControl::pending_window_updates`, `H2StreamTable`'s three `stream_*`
+  maps) decide which bytes leave one connection first. This one decides **which machine serves the
+  request**, and it is three separate decisions inside `Router::connect`'s single scan, which do not
+  even bias the same way:
+
+  - the H2 least-loaded arm compares stream counts with a strict `<`, so the FIRST connection at
+    the minimum wins — on a tie, iteration order alone picks the backend;
+  - the H2 `BackendStatus::Connecting` fallback assigns with neither a `break` nor an
+    "already chosen" guard, so the LAST matching connecting connection wins. Previous write-ups of
+    this leak called it first-seen; it is not, and a test asserting the lowest token here would be
+    red against both containers;
+  - the H1 `BackendStatus::KeepAlive` arm assigns and breaks, so the FIRST matching keep-alive
+    socket wins. No prior enumeration of the issue named this one at all, and it is live wherever an
+    H2 frontend fans concurrent streams onto an H1 cluster: streams cannot be bundled, so each dials
+    its own socket, every socket parks `KeepAlive` for the same cluster, and the next request picks
+    among them by map order.
+
+  The total order on `Token` resolves those three to the lowest, the highest and the lowest token
+  respectively — fixed, reproducible, and free (`BTreeMap` iteration is already sorted; no extra
+  sort step, no injected seed to thread through construction and tests), which is the same argument
+  `h2_flow_control.rs` and `h2_stream_table.rs` already carry in their own module docs. Pinning is
+  all it does: the fallback's last-wins shape is preserved rather than corrected, because changing
+  which backend is preferred is a routing change and not a determinism one. The `load_balancing`
+  algorithms are untouched — they pick which backend server to DIAL, this picks among sockets the
+  session already holds.
+
+  **Re-derived count: this one container closes 8 of the sites the issue's leak table holds, and
+  adds a ninth the table did not have.** Behind `router.backends`, by reading every use and not
+  just grepping for `.iter()/.values()/.keys()`: `Router::connect`'s scan (the three decisions
+  above), `Mux::reschedule`'s wheel-insertion order, `Mux::ready`'s `backends.iter_mut()` sweep
+  whose `break` on `MuxResult::CloseSession` lets the first dead backend in map order decide the
+  pass, `Mux::ready`'s `try_resume_reading` sweep, and `Mux::close`'s `deregister_socket` +
+  `shutdown(Write)` + `remove_session` loop, which is the order each backend peer observes FIN.
+  Three diagnostic sites go with them: `Mux::print_state`'s per-backend loop and the two
+  `BACKENDS: {:#?}` traces in `Mux::ready` and `Mux::close` — `HashMap`'s own `Debug` walks
+  `self.iter()`, so a `{:#?}` dump leaked the seed as surely as a `for` loop did. Eight named sites,
+  ten order-dependent decisions. Two uses were refuted rather than converted: `Mux::cancel_timeouts`
+  clears each backend's deadline independently of every other, and `Mux::reschedule`'s `retain`
+  walks `Mux::timeouts` — a different map — behind a pure `contains_key` predicate.
+
+  **The tie-break guard is red against a `HashMap` by construction, not by luck.** `RandomState` is
+  seeded per `HashMap`, not per iteration, so two walks of one live map agree and a guard that runs
+  the selection twice inside one process and compares passes against the pre-image trivially. What
+  does not agree is two separately constructed maps, because `RandomState::default()` bumps a
+  thread-local key on every instantiation. Each round of
+  `an_h2_stream_count_tie_always_picks_the_lowest_backend_token`,
+  `an_all_connecting_h2_fallback_always_picks_the_highest_backend_token` and
+  `an_h1_keep_alive_reuse_always_picks_the_lowest_backend_token` therefore builds a fresh `Router`,
+  stages four backends under deliberately unordered non-contiguous tokens, drives a real
+  `Router::connect` through real routing, and asserts the token the total order picks. With `n`
+  staged backends and `r` rounds the pre-image survives with probability `n.pow(-r)` — `4^-24`, one
+  run in 2.8e14. Measured on the pre-image, the minimum token came first in 8, 5 and 7 rounds of 24
+  over three runs, never in all 24; all three guards failed at round 0 or 1 in three consecutive
+  reverted runs and pass in the converted tree. The production diff adds **zero** numeric and
+  **zero** string literals, so it cannot be shaped to the test.
+
+  **Complexity is unmeasured beyond the default configuration**, and the module doc says so in the
+  shape `h2_flow_control.rs` established. `n` is the backend connections of ONE frontend session,
+  bounded by the advertised `max_concurrent_streams` — 100 by default, clamped at 10_000. Point
+  lookups (`get`/`get_mut`/`insert`/`remove`) move from amortized `O(1)` to `O(log n)`; every
+  iteration site already walks all `n` and keeps its `O(n)`. No `bombardier` run was produced.
+
+  `H2StreamTable::streams` is deliberately **left** as a `HashMap`: it is the one container the
+  seeded-hasher-versus-`BTreeMap` decision still governs, and none of its uses is behind
+  `router.backends`.
+
 - **`refactor(mux-h2)`: `ConnectionH2` asks the TLS layer through three named seams instead of
   twenty-one raw socket calls — step 1 of the byte-in / byte-out extraction
   ([#1339](https://github.com/sozu-proxy/sozu/issues/1339)).** **No behaviour change**: the three
