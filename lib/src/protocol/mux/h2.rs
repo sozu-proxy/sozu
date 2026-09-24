@@ -4894,10 +4894,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // stream. `observe_peer_stream_id` asserts the monotonic-non-decreasing
         // property itself.
         self.stream_table.observe_peer_stream_id(stream_id);
-        let global_stream_id = context.create_stream(
-            Ulid::generate(),
-            self.peer_settings.settings_initial_window_size,
-        )?;
+        // `Ulid::generate()` would read the wall clock and a thread-local RNG
+        // from inside `rusty_ulid` — two host reaches no grep over this module
+        // can see. `Context::next_request_id` composes the same ULID from the
+        // two sources the embedder owns instead.
+        let request_id = context.next_request_id();
+        let global_stream_id =
+            context.create_stream(request_id, self.peer_settings.settings_initial_window_size)?;
         self.last_stream_id = (stream_id + 2) & !1;
         self.stream_table
             .register(stream_id, global_stream_id, self.now);

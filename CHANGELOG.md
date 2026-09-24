@@ -210,6 +210,50 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the H2 request ULID is built from two injected sources instead of
+  `Ulid::generate()` (issue [#1338](https://github.com/sozu-proxy/sozu/issues/1338), Q8).**
+  `ConnectionH2::create_stream` was the mux's single production `Ulid::generate()` site, and
+  `rusty_ulid` 2.0.1 defines that call as
+  `Ulid::from_timestamp_with_rng(unix_epoch_ms(), &mut rand::rng())` — the host wall clock and a
+  thread-local OS-seeded RNG, both reached from inside the dependency. It now calls
+  `Context::next_request_id`, which composes the same ULID from `Context::now_wall_ms` and
+  `Context::request_id_rng`. **No behaviour changes in production**: `now_wall_ms` is refreshed by
+  `Mux` at exactly the three sites that already refresh `Context::now` (`Mux::ready`,
+  `Mux::timeout`, `Mux::shutting_down`), and `request_id_rng` is seeded once per session in
+  `Context::new` from `rand::rng()` — the same OS-backed reseeding CSPRNG `Ulid::generate()` draws
+  from, so a request id is no more predictable than before. The ULID layout, the 48-bit
+  Unix-millisecond prefix and the 80-bit random suffix are unchanged.
+
+  This is the reach a reference sweep structurally cannot find. `Instant::now()`,
+  `SystemTime::now()` and `rand` all return zero hits for `ConnectionH2::create_stream`, because
+  the read happens one crate away; LIFECYCLE.md's §9 invariant 20 grep is written over exactly
+  those three spellings and reported the module clean throughout. It is found by enumerating what
+  each external call *does*, not by searching for what it looks like, and invariant 20 now says so.
+
+  Two `Context` fields and one method are added; both fields are `pub` like every other one, so an
+  out-of-crate struct literal still compiles but must now supply them. `Context::new` is unchanged
+  and remains the constructor.
+  `Context::now_wall_ms` is a per-pass snapshot rather than a provider closure, for the same reason
+  `Context::now` is: the mux's discipline is one clock sample per pass, read by the core from a
+  field, and a boxed provider would let the core reach the host at an arbitrary depth into a pass.
+
+  Guarded by `h2_request_ids_are_a_pure_function_of_the_seed` in `sim/tests/h2_simulation.rs`,
+  which asserts three separable claims — one seed replayed twice mints the same ids in the same
+  order, four seeds mint more than one sequence, and every stream slot occupancy observed gets its
+  own id (an RNG seeded once and never stepped would satisfy the first two). Restoring
+  `Ulid::generate()` at the one call site reddens the first claim immediately: the same seed
+  replayed twice yields two different digests over the same 4 ids — `13223333605012924217` and
+  `1129667692384430182` on one run, and a fresh pair on every run, which is the property under
+  test. The pre-existing `h2_simulation_is_deterministic` stays green across that revert, and
+  deliberately so — its trace excludes `Ulid`-shaped values by contract, which is why the leak
+  survived it and why the new guard is a separate test rather than a widening of the old one.
+
+  `sozu-sim` gains `rand` and `rusty_ulid` in its cfg-gated
+  `[target.'cfg(tokio_unstable)'.dev-dependencies]` so the harness can supply both sources. Neither
+  is a new package in the graph — `sozu-lib` already depends on both at the same workspace pin, and
+  `sozu-sim` is `publish = false`; the lockfile change is two lines under `sozu-sim`'s own
+  dependency list. No production dependency grows.
+
 - **`refactor(mux-h2)`: `ConnectionH2`'s `Debug` renders the peer address instead of the socket —
   step 2a of the byte-in / byte-out extraction
   ([#1339](https://github.com/sozu-proxy/sozu/issues/1339)).** **No behaviour change** outside one

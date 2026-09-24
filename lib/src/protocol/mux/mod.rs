@@ -23,10 +23,11 @@ use std::{
     net::{Shutdown, SocketAddr},
     rc::{Rc, Weak},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use mio::{Token, net::TcpStream};
+use rand::{SeedableRng, rngs::StdRng};
 use rusty_ulid::Ulid;
 use sozu_command::{
     logging::ansi_palette,
@@ -549,6 +550,52 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// adapter in [`Mux::timeouts`] and never touched by a core — which
     /// publishes a deadline stamped from this snapshot instead.
     pub now: Instant,
+    /// Wall-clock sibling of [`Self::now`]: Unix milliseconds for the pass
+    /// currently executing.
+    ///
+    /// [`Self::now`] is an [`Instant`] — an opaque monotonic point with no
+    /// epoch and no defined conversion to civil time — so it cannot supply
+    /// the 48-bit Unix-millisecond prefix a ULID carries in its high bits
+    /// (see [`Self::next_request_id`]). This field is that value, and it is
+    /// refreshed by [`Mux`] at exactly the three sites that refresh
+    /// [`Self::now`], from the same pass. The two are siblings: a site that
+    /// sets one and not the other lets a request id carry the timestamp of
+    /// an older pass.
+    ///
+    /// It is a snapshot rather than a provider closure for the same reason
+    /// [`Self::now`] is: the mux's discipline is one clock sample per pass,
+    /// read by the core from a field, and a boxed provider would let the
+    /// core reach the host at an arbitrary depth into a pass instead.
+    pub now_wall_ms: u64,
+    /// Entropy source for the 80-bit random suffix of a request ULID.
+    ///
+    /// `Ulid::generate()` is exactly
+    /// `Ulid::from_timestamp_with_rng(unix_epoch_ms(), &mut rand::rng())` —
+    /// two ambient reaches (the wall clock and a thread-local RNG) hidden
+    /// inside a dependency, invisible to any grep over this module for
+    /// `Instant::now` / `SystemTime::now` / `rand`. Holding the RNG here
+    /// replaces the second with a field the embedder owns, exactly as
+    /// [`Self::now_wall_ms`] replaces the first.
+    ///
+    /// Seeded once per session in [`Self::new`] from `rand::rng()` — the
+    /// same OS-backed reseeding CSPRNG `Ulid::generate()` draws from, so the
+    /// unpredictability of a request id is unchanged. A request id that
+    /// repeats across sessions would be a regression, so nothing in the mux
+    /// re-seeds it; a deterministic simulator assigns this field directly
+    /// after construction instead.
+    pub request_id_rng: StdRng,
+}
+
+/// Unix milliseconds for the wall clock, saturating to 0 before the epoch.
+///
+/// The single host wall-clock reach behind [`Context::now_wall_ms`]. Kept as
+/// one function so the three [`Mux`] refresh sites and [`Context::new`] cannot
+/// drift apart on the unit or on the pre-epoch case.
+fn unix_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
@@ -586,7 +633,25 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             tls_cipher: None,
             tls_alpn: None,
             now: Instant::now(),
+            now_wall_ms: unix_epoch_ms(),
+            request_id_rng: StdRng::from_rng(&mut rand::rng()),
         }
+    }
+
+    /// Mint the request ULID for a stream this session is about to open.
+    ///
+    /// Replaces `Ulid::generate()` at the mux's single production ULID site.
+    /// `generate()` composes two ambient reaches — the wall clock and a
+    /// thread-local RNG — inside `rusty_ulid`; this composes the same ULID
+    /// from [`Self::now_wall_ms`] and [`Self::request_id_rng`], the two
+    /// sources the embedder owns. Same bytes, same layout, no host reach
+    /// from inside the core.
+    ///
+    /// `Ulid::from_timestamp_with_rng` panics above `0xFFFF_FFFF_FFFF` ms
+    /// (year 10889); [`Self::now_wall_ms`] is a Unix-millisecond count, so
+    /// reaching it requires a host clock set eight millennia ahead.
+    pub fn next_request_id(&mut self) -> Ulid {
+        Ulid::from_timestamp_with_rng(self.now_wall_ms, &mut self.request_id_rng)
     }
 
     pub fn active_len(&self) -> usize {
@@ -1410,6 +1475,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             // `start` above stays a separate sample so the trace reports the
             // true entry instant.
             self.context.now = Instant::now();
+            self.context.now_wall_ms = unix_epoch_ms();
             self.context.debug.push(DebugEvent::LoopStart);
             loop {
                 self.context.debug.push(DebugEvent::LoopIteration(counter));
@@ -2008,6 +2074,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // `timeout` runs outside `ready()`, so it is its own sampling point.
         // `cancel_timed_out_streams` below reaps on this snapshot.
         self.context.now = Instant::now();
+        self.context.now_wall_ms = unix_epoch_ms();
         // Consume the wheel entry and re-validate it BEFORE the per-token
         // branches, so both of them share one gate. See
         // `Mux::consume_timer_entry`.
@@ -2383,6 +2450,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // `shutting_down_refreshes_the_snapshot_so_the_drain_budget_expires`.
         let now = Instant::now();
         self.context.now = now;
+        self.context.now_wall_ms = unix_epoch_ms();
         // RFC 9113 §6.8: initiate graceful shutdown with double-GOAWAY pattern.
         // Only send the initial GOAWAY once. The final GOAWAY (with the real
         // last_stream_id) is handled by finalize_write() when all streams drain.

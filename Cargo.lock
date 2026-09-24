@@ -3408,6 +3408,8 @@ dependencies = [
  "async-trait",
  "mio",
  "moonpool-sim",
+ "rand 0.10.2",
+ "rusty_ulid",
  "sozu-command-lib",
  "sozu-lib",
 ]
