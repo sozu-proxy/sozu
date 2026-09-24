@@ -2961,6 +2961,34 @@
   otherwise has to delete the test and argue the memory.
   Closes [#1430](https://github.com/sozu-proxy/sozu/issues/1430).
 
+### ➖ Removed
+
+- **`refactor(mux-h2)`: five redundant `socket_wants_write()` re-queries on the H2 TLS re-arm path
+  ([#1339](https://github.com/sozu-proxy/sozu/issues/1339)).**
+  `ConnectionH2::ensure_tls_flushed` now takes the TLS answer as a `tls_wants_write: bool`
+  parameter instead of asking for it, so the five call sites that already hold that answer stop
+  asking a second time. Each of the five reaches the re-arm through a decision taken on the very
+  same value — `finalize_action`'s `AfterFlush` phase, `error_close_action`,
+  `goaway_close_action`'s `AfterFlush` phase, `force_disconnect`'s binding above its `match`, and
+  `initiate_close_notify`'s own branch condition — and nothing mutates the socket between the
+  decision and the re-arm, so the second query could only repeat the first. The three stalled-drain
+  tails of `flush_pending_control_frames` keep a query, now spelled at the call site rather than
+  borrowed from the helper, because they run after the `flush_zero_to_socket` whose stall brought
+  them there and that write is exactly what changes the answer; the helper's doc says which callers
+  are in which group and why, so the asymmetry is stated where it is read rather than inferred.
+  No behaviour change, and both counts say so: `cargo test -p sozu-lib` is unmoved at `1113 passed;
+  0 failed`, and the coverage guard is unmoved too — replacing `ConnectionH2::tls_wants_write`'s
+  body with `false` yields `1103 passed; 10 failed` on the tree before this change and the same
+  `1103 passed; 10 failed`, over an identical set of ten test names, on the tree after it. Two of
+  those ten are `a_stalled_window_update_drain_re_signals_the_writable_event` and
+  `a_stalled_rst_stream_drain_re_signals_the_writable_event`, the stages whose query moved out to
+  the caller, which is what proves the seam is still wired to its callers rather than quietly
+  decoupled from them. `ConnectionH2::has_pending_write` and `ConnectionH2::flush_zero_to_socket`
+  deliberately keep their own query: the first is `pub` and dispatched through `Connection`'s
+  `forward!`, whose H1 arm *is* `socket_wants_write()`, and the second reads it only inside a
+  per-iteration `#[cfg(debug_assertions)]` trace taken after each write, where a caller-supplied
+  value would log the pre-flush answer.
+
 ### 🔐 Security
 
 - **`fix(mux-h2)`: bound `pending_rst_streams` at the insert, so one mass idle-timeout reap cannot
