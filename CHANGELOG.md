@@ -240,6 +240,88 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the `writable()` close arms stop touching the socket, and `writable` joins
+  the shell ([#1339](https://github.com/sozu-proxy/sozu/issues/1339), Q10).**
+  `ConnectionH2::writable` held the last two query / flush / query triples inside the H2 core: an
+  unconditional preamble flush whose post-flush answer the `(H2State::Error, Position::Server)` arm
+  read, and a second, complete triple inside the `H2State::GoAway` arm. Both now follow the
+  protocol sozu-proxy/sozu#1512 established for `ConnectionH2::finalize_write` — the core answers a
+  step, the shell performs it, and the core is told what the socket then said.
+
+  **The dispatch becomes a core function that takes no socket, no `Context` and no `Endpoint`.**
+  `ConnectionH2::dispatch_writable_state(tls_wants_write: bool)` is `writable`'s
+  `(H2State, Position)` match, and it answers `H2WritableStateTarget`: `Done(MuxResult)` for every
+  arm that ends the pass, `Flush` for the one flush the `H2State::GoAway` arm needs, and
+  `WriteStreams` for the four proxying states, which the caller turns into
+  `ConnectionH2::write_streams`. The post-flush answer reaches the core only through
+  `ConnectionH2::dispatch_writable_state_after_flush`'s own parameter.
+
+  **The two fused questions are two parameters of two functions.** The `H2State::GoAway` arm's
+  nested `if` asked "does rustls hold buffered records" and "did the kernel accept the flush" off
+  two calls to the same query, and its own comment calls conflating them the primary truncation
+  vector under HAProxy chaining: a proxy that closes a TLS connection with records pending sends
+  FIN, destroys them, and the peer reads a truncated response it cannot distinguish from an attack.
+  `H2WritableStateTarget::Flush` therefore carries NO `bool` with it. The pre-flush answer is
+  `dispatch_writable_state`'s parameter, the post-flush answer is
+  `dispatch_writable_state_after_flush`'s, and in the shell each read is its own `let` — the third
+  shadows the second inside the `Flush` arm alone. `H2FinalizeTarget` is deliberately not reused:
+  its `SkipFlush` answers a question no close arm asks, since nothing writes to the socket between
+  the dispatch and its flush, and sharing the enum would force a named-impossible arm into the
+  shell's match — the argument `h2_close` already makes against widening `CloseAction`.
+
+  **`ConnectionH2::writable` moves into the shell impl block**, which now holds `readable`,
+  `writable` and `write_streams`. It performs every TLS seam call its own body used to make
+  inline: the preamble flush and the two queries around it, the stalled-drain re-arm query, and
+  the `H2State::GoAway` arm's flush and post-flush query. Two seam reads reached on the same pass
+  stay outside it and are worth naming so the claim is exact — the one inside
+  `ConnectionH2::flush_zero_to_socket`, which `ConnectionH2::flush_pending_control_frames` still
+  performs, and the one inside `ConnectionH2::force_disconnect`, `h2_close`'s third close site.
+  `tls_wants_write`'s
+  production call sites fall from thirteen to twelve, six of them now in that block;
+  `flush_tls_records` stays at four and `ConnectionH2::ensure_tls_flushed` at six.
+  `ConnectionH2::flush_pending_control_frames` keeps its `ConnectionH2::flush_zero_to_socket`: that
+  is a byte mover on the control-frame path, not a TLS seam, and lifting it is a different step.
+
+  **Behaviour-preserving**, and nothing on the wire, in a route, a metric, a configuration key or a
+  CLI flag moves. `cargo test -p sozu-lib` reads `1117 passed; 0 failed` at `c5c80909` and
+  `1117 passed; 0 failed` here. One ordering detail is real and unobservable rather than absent:
+  the `(H2State::Error, Position::Server)` and `H2State::GoAway` arms used to read
+  `tls_wants_write` once each, and the shell now reads it ONCE before the dispatch — so the query
+  happens for the arms that never consulted it, and its value is discarded there.
+  `SocketHandler::socket_wants_write` is free of side effects (`FrontRustls` answers
+  `!self.peer_reset && self.session.wants_write()`, every other handler takes the trait's `false`
+  default) and no fixture counts it: `BackpressuredTlsSocket` deliberately models the record state
+  rather than scripting an answer sequence, "so a positional script would pin the query COUNT
+  instead of the behaviour", and counts flushes only. The flush count per pass is unchanged — at
+  most one in the preamble, at most one for the GOAWAY arm — which is what the two
+  `flushes.get() >= 2` assertions read.
+
+  **The net was run unchanged and proved live.** The seven `FrontRustls` tests of
+  sozu-proxy/sozu#1454 and sozu-proxy/sozu#1498 — five of which build a real
+  `ConnectionH2<FrontRustls>` over a handshaken TLS 1.3 session on a loopback socket with pinned
+  kernel queues — pass without an edit. Four `TO SEE THIS RED` recipes were repaired to name the
+  functions the arms now live in, then applied as written and re-measured: deleting
+  `ensure_tls_flushed` from `dispatch_writable_state_after_flush`'s
+  `CloseAction::ReArmAndContinue` arm gives `1116 passed; 1 failed`
+  (`a_flush_that_does_not_drain_keeps_the_connection_open`); returning `Continue` right after the
+  `flush_tls_records()` in `writable`'s `H2WritableStateTarget::Flush` arm gives
+  `1115 passed; 2 failed`; `error_close_action(false)` gives `1116 passed; 1 failed`
+  (`a_rustls_frontend_in_error_state_re_arms_until_its_records_drain`); and pinning
+  `goaway_close_action(AfterFlush, false, …)`'s third argument to `false` gives
+  `1115 passed; 2 failed`. Each failed on the assertion message its recipe names. The three stale
+  `1113`/`1114` counts they carried were measured against a 1115-test suite and are corrected.
+
+  Docs move in the same changeset: `doc/h2_mux_internals.md`'s three-seams table, its
+  `writable() entry point` section and both of its shell-impl-block claims, `h2_close.rs`'s module
+  header and the docs on `h2_close::goaway_close_action` and `h2_close::error_close_action`, and
+  `LIFECYCLE.md` §9 invariant 27. The seams table said `15` call sites for `tls_wants_write`: that
+  was right at sozu-proxy/sozu#1499, sozu-proxy/sozu#1512 folded two away without correcting the
+  line, and it now reads `12`. One comment in `h2.rs` said the
+  `(H2State::Error, Position::Server)` arm's post-flush query was **Uncovered**; that was already
+  wrong before this changeset renamed what it points at —
+  `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain` has driven it since
+  sozu-proxy/sozu#1454 — and it is corrected in place.
+
 - **`refactor(mux-h2)`: lift the two H2 byte movers out of the core, widen the poll/handle seam to
   `pub`, and export `h2_transmit` with `gather` as a `pub unsafe fn`
   ([#1339](https://github.com/sozu-proxy/sozu/issues/1339), Q10).**

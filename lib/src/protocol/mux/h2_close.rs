@@ -1,7 +1,8 @@
 //! Close decisions taken under TLS backpressure, for [`super::h2::ConnectionH2`].
 //!
 //! Three sites in `h2.rs` decide whether a connection may close or must keep
-//! draining: the `H2State::GoAway` arm of `writable`, the
+//! draining: the `H2State::GoAway` arm of
+//! `ConnectionH2::dispatch_writable_state`, the
 //! `(H2State::Error, Position::Server)` arm beside it, and
 //! `force_disconnect`'s server arm. All three ask the same question — does
 //! rustls still hold encrypted records that have not reached the kernel? —
@@ -57,11 +58,15 @@
 //! # The flush the GoAway arm does not perform
 //!
 //! `ConnectionH2::writable` already attempts an unconditional flush in its
-//! preamble, before the state match runs. So by the time the GoAway arm asks
-//! its first question, one flush has been attempted this pass already, and
-//! the arm's own flush is the SECOND attempt. Both are deliberate: the
-//! preamble pushes bytes for every state, and the GoAway arm re-checks
-//! because a close is about to be decided on the answer.
+//! preamble, before it calls `ConnectionH2::dispatch_writable_state`. So by
+//! the time the GoAway arm asks its first question, one flush has been
+//! attempted this pass already, and the one that arm asks for through
+//! `H2WritableStateTarget::Flush` is the SECOND attempt. Both are deliberate:
+//! the preamble pushes bytes for every state, and the GoAway arm re-checks
+//! because a close is about to be decided on the answer. Neither is performed
+//! by this module or by the arm itself — [`CloseAction::Flush`] is an
+//! instruction, and `ConnectionH2::writable` is the layer that carries it
+//! out.
 //!
 //! # Tick count
 //!
@@ -92,8 +97,8 @@
 //! which is LIFECYCLE §9 invariant 16's readiness policy and decides nothing
 //! about closing. Widening [`CloseAction`] with `RetainPendingBack` or
 //! `Quiesce` would force a named-impossible arm into every exhaustive `match`
-//! `ConnectionH2::writable` already writes over it, for variants that can
-//! never reach those arms.
+//! `ConnectionH2::dispatch_writable_state` already writes over it, for
+//! variants that can never reach those arms.
 //!
 //! [`TlsFlushPhase`] is shared rather than duplicated, because the two-query
 //! distinction is the identical one: the first query asks whether rustls holds
@@ -161,7 +166,8 @@ pub(super) enum CloseAction {
     Disconnect,
 }
 
-/// The `H2State::GoAway` arm of `ConnectionH2::writable`.
+/// The `H2State::GoAway` arm of `ConnectionH2::dispatch_writable_state`, and
+/// the `ConnectionH2::dispatch_writable_state_after_flush` that settles it.
 ///
 /// `peer_gone` is `peer_gone_after_final_goaway()`: the peer hung up after we
 /// sent our final GOAWAY, so there is nobody left to deliver to and buffered
@@ -195,10 +201,12 @@ pub(super) fn goaway_close_action(
     }
 }
 
-/// The `(H2State::Error, Position::Server)` arm of `ConnectionH2::writable`.
+/// The `(H2State::Error, Position::Server)` arm of
+/// `ConnectionH2::dispatch_writable_state`.
 ///
-/// No `Flush` variant is reachable: `writable`'s preamble already attempted
-/// one this pass, and this arm's answer is read after it. Unlike the GoAway
+/// No `Flush` variant is reachable: `ConnectionH2::writable`'s preamble
+/// already attempted one this pass, and the `tls_wants_write` this arm is
+/// handed is the read after it. Unlike the GoAway
 /// arm, an error connection has no graceful disconnect to fall through to —
 /// it closes.
 pub(super) fn error_close_action(tls_wants_write: bool) -> CloseAction {
