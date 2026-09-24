@@ -5070,6 +5070,53 @@
 
 ### 🤖 CI
 
+- **`ci(profile)`: cap CI debug info at `line-tables-only` for the dev and the release profile,
+  cutting the measured per-job `target/` by up to 1.70GB against an 8Gi `ephemeral-storage` limit
+  the peak job came within 67MB of.**
+  Runner pods now declare an 8Gi `ephemeral-storage` request and limit, which makes a job that
+  fills the node disk fail by name instead of recycling the node underneath itself. That does not
+  make the job fit. Sampling every runner pod through kubelet's `stats/summary` every 50s measured
+  a `sozu-bench` cell sustaining 7.90GB and touching 8.523GB in a single sample -- 67MB, 0.8%,
+  below the 8.590GB limit. The spike is real disk rather than a stats artefact: the node's own
+  `available` fell 1.00GB over the same interval and recovered with it. A `sozu-general` cell
+  reached 8.299GB, `msrv-full` 7.247GB, and the remaining `crypto-*` cells sat between 6.0GB and
+  7.9GB. The limit is enforced on the instantaneous figure, so a 1GB transient is what decides
+  whether a job survives.
+  Rust debug info is the largest reducible term in that footprint, and it is capped in workflow
+  environment rather than in `Cargo.toml`. `[profile.release] debug = true` is a deliberate choice
+  for profiling and flamegraph work on a production proxy and is left exactly as it is, so local
+  builds and every artefact `release.yml` publishes are unaffected. Inside `ci.yml` the dev/test
+  profile is built by all nine `pipeline` cells and by `udp-simulation`, and the release profile by
+  the four `bench: true` cells, the four `build-sozu` provider cells, `build-lagging_server`,
+  `build-bench-logger` and the two `cargo install` steps.
+  Measured on 1.93.1 with `CARGO_INCREMENTAL=0` (`rust-cache` exports it unconditionally, so
+  incremental output was never part of the footprint), a scratch `CARGO_TARGET_DIR`, and `du -sb`.
+  With the `crypto-ring` cell's flags the dev/test profile goes from 4.275GB to 2.836GB
+  (-1.439GB, -34%) and the bench profile from 1.208GB to 0.944GB (-264MB, -22%); `build-sozu` with
+  `jemallocator,crypto-ring` goes from 1.493GB to 1.276GB (-217MB, -15%), and the binary it hands
+  to the bombardier benches from 162MB to 65MB. A `bench: true` cell builds both profiles and so
+  sheds 1.70GB of the 8.523GB peak. The release-profile lever the investigation started from is
+  the smaller of the two per cell by 5.5x; the dev lever is what moves the peak.
+  `line-tables-only` and not `false`, which would have taken the bench profile to 0.624GB. On the
+  `sozu-lib` test binary `.debug_line` falls only from 14.24MB to 13.44MB while `.debug_info`
+  falls from 45.64MB to 6.94MB, so panic frames keep function, file and line, and `debug = false`
+  emits no `.debug_*` section at all. It is also the exact value `cargo-fuzz` pins for its own
+  builds (`--config profile.release.debug="line-tables-only"`), which both leaves the `fuzz` job's
+  `cargo fuzz run` independent of this setting -- `fuzz/` is its own workspace and never inherited
+  the root profile anyway -- and records upstream's judgement on the floor that keeps libFuzzer
+  crash frames readable.
+  Deliberately not changed. `cache-all-crates` stays `true` at all eleven sites: the failing cells
+  build `--locked`, so pruning it removes nothing they fetch. `cargo doc --no-deps --all-features`
+  is the single largest step in `msrv-full`, adding 1.213GB -- 1.161GB of it a second,
+  all-features dependency graph (`tui` plus all four crypto providers, resolved differently from
+  the build and test steps so nothing is reused) and 52MB of HTML -- but `--all-features` is
+  precisely what makes that step a gate, and narrowing it to shrink a disk figure would silently
+  stop gating the features it drops. And the node's own floor is untouchable from this repository:
+  across 44 live nodes the non-container base measures 17.33GB of a 42.0GB device (range
+  17.313-17.456GB, flat against node age at -0.05GB/h, so nothing accumulates there for a longer
+  node lifetime or image GC to reclaim), leaving ~10.1GB usable under kubelet's
+  `imagefs.available: 15%` eviction threshold.
+
 - **`ci(runners)`: give both self-hosted runner pools an `ephemeral-storage` request and limit, so
   a job that fills the node disk is killed by name instead of vanishing into an exit code 130.**
   Jobs on the ARC pools were dying roughly five minutes into a sixty-minute budget with

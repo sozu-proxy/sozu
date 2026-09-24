@@ -9,6 +9,44 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Debug-info budget, CI-only. Runner pods carry an 8Gi (8.590GB)
+  # `ephemeral-storage` limit, and sampling every runner pod through kubelet's
+  # `stats/summary` every 50s measured a `sozu-bench` cell sustaining 7.90GB
+  # and touching 8.523GB in a single sample -- 67MB, 0.8%, below the limit.
+  # The spike is real disk and not a stats artefact: the node's own
+  # `available` fell 1.00GB over the same interval and recovered with it. A
+  # node offers ~10.1GB before kubelet's `imagefs.available: 15%` eviction
+  # floor, and the limit is enforced on the instantaneous figure, so a 1GB
+  # transient is what decides whether a job survives.
+  #
+  # Rust debug info is the largest reducible term in `target/`, and it is
+  # capped here in workflow environment rather than in `Cargo.toml`:
+  # `[profile.release] debug = true` stays exactly as it is for local
+  # profiling and flamegraph work, and `release.yml` publishes its artefacts
+  # unchanged. The dev/test profile is built by all nine `pipeline` cells and
+  # by `udp-simulation`; the release profile by the four `bench: true` cells,
+  # the four `build-sozu` cells, `build-lagging_server`, `build-bench-logger`
+  # and the two `cargo install` steps. `cargo fuzz run` is unaffected either
+  # way -- see the note on `line-tables-only` below.
+  #
+  # Measured on 1.93.1 with CARGO_INCREMENTAL=0 (rust-cache exports it
+  # unconditionally), a scratch CARGO_TARGET_DIR and `du -sb`:
+  #   dev/test, crypto-ring cell flags:  4.275GB -> 2.836GB  (-1.439GB, -34%)
+  #   bench,    crypto-ring cell flags:  1.208GB -> 0.944GB  (-264MB,   -22%)
+  #   build-sozu, jemallocator+crypto-ring:
+  #                                      1.493GB -> 1.276GB  (-217MB,   -15%)
+  #                       and the binary it uploads, 162MB -> 65MB
+  #
+  # `line-tables-only` and not `false`: it keeps `.debug_line` nearly whole
+  # (14.24MB -> 13.44MB on the sozu-lib test binary) while dropping most of
+  # `.debug_info` (45.64MB -> 6.94MB), so panic frames keep function, file and
+  # line. It is also the exact value cargo-fuzz pins for its own builds --
+  # `--config profile.release.debug="line-tables-only"`, which both makes the
+  # `fuzz` job's `cargo fuzz run` independent of this setting and records
+  # upstream's judgement on the floor that keeps libFuzzer crash frames
+  # readable. `debug = false` emits no `.debug_*` section at all.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
 
 # Cancel superseded PR runs only. `main` pushes and tag pushes are
 # preserved so artefacts produced under one SHA aren't lost when a
