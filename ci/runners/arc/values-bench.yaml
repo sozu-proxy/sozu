@@ -20,6 +20,18 @@
 # crypto-ring/aws-lc-rs/openssl/fips) = 4 x 1.5 = 6 nodes, then doubled to 12 the same day once
 # real usage showed 6 was too slow — jobs were queueing behind the fixed pool while `general`
 # kept pace, confirming demand exceeded the 1.5x estimate. maxRunners capped at 12 to match 1:1.
+#
+# Reconciled against the live release 2026-09-24: `helm get values sozu-bench -n arc-runners`
+# reports maxRunners 18, and the `bench` nodegroup carries 28 nodes — both raised outside git
+# after the paragraph above was written, so the tracked 12 would have SHRUNK the pool by a third
+# on the next `helm upgrade`. maxRunners below now states the deployed 18. Every other deployed
+# value already matched this file byte-for-byte. The nodegroup node count is not a chart value
+# (it is managed with `clever k8s nodegroups`), so the 6 -> 12 prose above is kept as the
+# historical record and 28 is the count observed live on 2026-09-24. Note that 18 runners against
+# 28 nodes is no longer the strict 1:1 the sentence above describes: the pool cannot fill its own
+# nodegroup, and 10 bench nodes can never receive a runner. Whether that is deliberate headroom or
+# a second, opposite drift is an operator call, so it is recorded here rather than guessed at —
+# raising maxRunners to 28 would be a capacity decision, not part of this disk fix.
 # The resources.requests
 # below reserve nearly the entire S node (7 vCPU / 10Gi, ~1 vCPU / ~1.2Gi headroom for daemonsets —
 # same sizing as values-general.yaml, since both pools now share the same near-whole-node
@@ -41,11 +53,49 @@
 # hostAliases, sozu.io block (2026-09-23, bench-bombardier migration): replaces that job's former
 # "Host mapping sozu.io domains" step, which did `sudo tee -a /etc/hosts` — same 0.0.0.0 target,
 # same NSS "files" mechanism, just applied at the pod level instead of at runtime with root.
+#
+# ephemeral-storage request/limit (2026-09-24) — THE INCIDENT THIS POOL PRODUCED. Jobs were dying
+# roughly five minutes in with "Process completed with exit code 130" and "The operation was
+# canceled", or "The self-hosted runner lost communication with the server", while sibling matrix
+# cells kept running (`fail-fast: false`) and `timeout-minutes: 60` was never approached. The full
+# chain, reconstructed from `kubectl get events` correlated with the failed job's own runner name:
+#
+#   10:13:33Z  Scheduled  pod sozu-bench-jzs82-runner-5v2hr -> bench-node28
+#   10:13:34Z  Started    container runner
+#   10:13:38Z  (GitHub)   crypto-openssl begins on runner sozu-bench-jzs82-runner-5v2hr
+#   10:16:40Z  EvictionThresholdMet  bench-node28  "Attempting to reclaim ephemeral-storage"
+#   10:16:41Z  NodeHasDiskPressure   bench-node28
+#   10:18:33Z  Killing    pod sozu-bench-jzs82-runner-5v2hr  "Stopping container runner"
+#   10:18:34Z  NodeNotSchedulable    bench-node28
+#   10:18:37Z  (GitHub)   crypto-openssl recorded `failure` — 4m59s of a 60m budget
+#   10:18:43Z  RemovingNode          bench-node28   (node recycled, kubelet restarts 10:23:09Z)
+#
+# (run 35985966643 attempt 1, PR #1502.) Note what is ABSENT from that chain: there is no
+# `Evicted` event on the pod. Under node-level disk pressure the node itself is reclaimed and
+# recycled, so the runner simply stops talking to GitHub and the job is reported as a generic
+# cancellation — nothing on either side names ephemeral-storage as the cause. That silence is why
+# this kept being read as a flaky test rather than a disk problem.
+#
+# Why a LIMIT and not just a request: without a limit, one overrunning job takes the whole node
+# into DiskPressure and kubelet reclaims *something* — producing exactly the unattributable exit
+# 130 above, on whichever pod happens to lose. With a limit, kubelet kills the one offending pod
+# with an explicit "exceeded ephemeral-storage limit" naming the culprit, and nothing else on the
+# node is disturbed. Converting a mysterious cancellation into a named, attributable failure is
+# most of what this change buys; it does not manufacture disk that is not there — see the sizing
+# arithmetic and the node-resize recommendation in values-general.yaml, which apply unchanged to
+# this pool since both nodegroups run the identical S flavor (verified: same 8 vCPU, same
+# 11283432Ki memory, same 37759323279 ephemeral-storage allocatable on a 42.0GB device).
+#
+# The request is NOT a scheduling guard (values-general.yaml explains why kubelet's advertised
+# allocatable makes it useless as one); it is set equal to the limit only so the declared intent
+# shows up in `kubectl describe node`. It costs no concurrency here: cpu 7 + 0.28 for the node's
+# system pods = 7.28 of 8 allocatable already makes a second runner unschedulable, verified
+# against the live distribution of 11 running runners across 11 distinct nodes.
 githubConfigUrl: "https://github.com/sozu-proxy/sozu"
 githubConfigSecret: sozu-runner-github-app
 
 minRunners: 0
-maxRunners: 12
+maxRunners: 18
 
 template:
   spec:
@@ -81,3 +131,11 @@ template:
           requests:
             cpu: "7"
             memory: "10Gi"
+            # 8Gi against ~9.7GB of real usable headroom, measured peak 7.0GB — see the block
+            # above and the arithmetic in values-general.yaml. Request mirrors the limit for
+            # visibility only; CPU is what enforces 1 pod = 1 node.
+            ephemeral-storage: "8Gi"
+          limits:
+            # The half that makes a failure attributable: the pod is killed naming its own limit
+            # instead of the node going into DiskPressure and taking an unnamed victim.
+            ephemeral-storage: "8Gi"
