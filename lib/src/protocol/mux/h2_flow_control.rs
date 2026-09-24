@@ -31,6 +31,59 @@
 //! `ConnectionH2` / `Stream` — they need the stream table and endpoint this
 //! module deliberately does not have.
 //!
+//! ## The advertised connection-level receive window is not enforced
+//!
+//! A peer derives its connection-level send allowance from RFC 9113 §6.9.2's
+//! fixed 65535-octet initial value — no SETTINGS parameter can change the
+//! connection-level window, only `WINDOW_UPDATE` on stream 0 can — plus every
+//! stream-0 `WINDOW_UPDATE` Sōzu sends it: the one-shot enlargement to
+//! `H2ConnectionConfig::initial_connection_window`, queued by
+//! `ConnectionH2::writable`'s `(H2State::ServerSettings, Position::Server)`
+//! arm on a frontend connection and by `ConnectionH2::handle_settings_frame`
+//! on a backend one, and then the periodic grants back. On this side that
+//! configured number governs exactly two things: how large that one-shot
+//! enlargement is, and how often credit is returned —
+//! `ConnectionH2::handle_data_frame` passes `initial_connection_window / 2`
+//! as the threshold to [`H2FlowControl::account_received_bytes`]. It is an
+//! invitation to send. It is not a ceiling anything checks.
+//!
+//! Nothing here bounds inbound DATA. [`H2FlowControl::window`] is the SEND
+//! window — peer-granted credit for our own writes — and
+//! [`H2FlowControl::account_received_bytes`] only accumulates. No state in
+//! this module is decremented by an inbound DATA frame, so none can go
+//! negative, and no connection-level `FLOW_CONTROL_ERROR` is raised: the only
+//! `H2Error::FlowControlError` this connection emits at all comes from
+//! `ConnectionH2::handle_window_update_frame`, when an increment would grow a
+//! SEND window past 2^31-1 — GOAWAY for the connection window, RST_STREAM for
+//! a stream's. Every other flow-control-shaped rejection there is a
+//! `ProtocolError` (a zero increment; a `SETTINGS_INITIAL_WINDOW_SIZE` above
+//! 2^31-1, which `ConnectionH2::update_initial_window_size` reports to
+//! `ConnectionH2::handle_settings_frame`). Measured on
+//! sozu-proxy/sozu#1488: against 98303 octets advertised — the 65535 default
+//! plus one 32768 grant — **106496 octets of DATA were accepted, with no
+//! GOAWAY and no `FLOW_CONTROL_ERROR`**.
+//!
+//! The real boundary is memory, and it is the buffer pool. Every buffer a
+//! stream needs comes from the caller-supplied `BufferSource`
+//! (`buffer_source.rs`), which may refuse, and a refusal degrades one stream
+//! with `RST_STREAM(REFUSED_STREAM)` and never the connection. That module's
+//! doc is the contract and states the rule in full; read it there rather than
+//! trusting a restatement here. The pool bounds memory, which is the thing
+//! flow control exists to protect, and it does so without per-connection
+//! credit bookkeeping.
+//!
+//! The consequence, unsoftened: a peer that trusts the advertisement has no
+//! way to discover the real limit — nothing on the wire reports the pool's
+//! remaining capacity — and RFC 9113 §6.9.1 makes enforcement a MUST, so a
+//! conformance suite will flag this as a §6.9.1 violation. sozu-proxy/sozu#1488
+//! offered two defensible resolutions and the decision was to document the
+//! gap, not to close it. Closing it means tracking outstanding inbound credit
+//! and emitting `FLOW_CONTROL_ERROR`, which changes observable behaviour and
+//! belongs to its own changeset; until then, do not describe this window as
+//! enforced anywhere, and do not assert the connection window is never
+//! overcommitted in a test — see `doc/testing.md` for why the H2 simulator
+//! deliberately carries no such property.
+//!
 //! ## Determinism (RFC 9113 doesn't mandate an order; issue #1338 does)
 //!
 //! `pending_window_updates` used to be a `HashMap`, and

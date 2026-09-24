@@ -114,13 +114,35 @@ SNI. Coalesced acceptances (matched SAN != initial SNI) bump
 | `H2StreamId`                         | `h2.rs`                         | `Zero` or `Other { id, gid }` — used by `expect_read`/`expect_write` |
 | `StreamId` (alias for `u32`)         | `mod.rs`                        | On-the-wire H2 stream identifier                                     |
 | `GlobalStreamId` (alias for `usize`) | `mod.rs`                        | Index into `context.streams`                                         |
-| `H2FlowControl`                      | `h2_flow_control.rs`            | Connection-level send/recv window                                    |
+| `H2FlowControl`                      | `h2_flow_control.rs`            | Connection-level send window + receive-side byte accounting          |
 | `H2DrainState`                       | `h2_drain.rs`                   | Graceful-shutdown bookkeeping                                        |
 | `H2ByteAccounting`                   | `h2.rs`                         | Overhead byte attribution                                            |
 | `H2ConnectionConfig`                 | `h2.rs`                         | Per-listener tuning                                                  |
 | `H2FloodConfig`                      | `h2_flood_detector.rs`          | CVE-mitigation thresholds                                            |
 | `H2FloodViolation`                   | `h2_flood_detector.rs`          | A tripped threshold's (reason, count, threshold)                     |
 | `H2FloodDetector`                    | `h2_flood_detector.rs`          | CVE-mitigation rate/lifetime counters                                |
+
+`H2FlowControl`'s row says "receive-side byte accounting" and not "receive
+window" on purpose. Sōzu advertises a connection-level receive window — RFC
+9113 §6.9.2's fixed 65535 octets plus every stream-0 `WINDOW_UPDATE` it sends,
+which is how `H2ConnectionConfig::initial_connection_window` reaches the peer —
+and then enforces nothing against it. `H2FlowControl::window` is the SEND
+window, peer-granted credit for our own writes, and
+`H2FlowControl::account_received_bytes` is a counter whose only job is deciding
+when to hand credit back: no state is decremented by an inbound DATA frame, so
+none can go negative and no connection-level `FLOW_CONTROL_ERROR` is raised.
+Measured: 106496 octets of DATA accepted against an advertised 98303, with no
+GOAWAY (sozu-proxy/sozu#1488). The real boundary is memory, bounded by the
+buffer pool: a `BufferSource` refusal degrades one stream with
+`RST_STREAM(REFUSED_STREAM)` and never the connection — `buffer_source.rs`'s
+module doc is that contract, and §8.2's `refuse_stream_and_discard` is where
+the H2 core spends it. Unsoftened: a peer that trusts the advertisement has no
+way to discover the real limit, and RFC 9113 §6.9.1 makes enforcement a MUST,
+so a conformance suite will flag this as a §6.9.1 violation. The decision was
+to document the gap rather than close it, so do not describe this window as
+enforced. The full statement lives in `h2_flow_control.rs`'s module doc and in
+doc/h2_mux_internals.md's "The advertised connection-level receive window is
+not enforced".
 
 ---
 

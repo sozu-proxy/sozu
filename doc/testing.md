@@ -345,6 +345,33 @@ past it; the concurrent-stream ceiling under one-octet reads and one-octet
 writes; and per-stream inbound flow-control credit matching, exactly, the octets
 the peer spent on that stream while frame headers straddle reads.
 
+A **sixth property is deliberately absent, and its absence is the record.** The
+connection-level one — that the receive window Sōzu advertised is never
+overcommitted — was carried first and is **false against today's code**. Sōzu
+advertises a connection-level receive window (RFC 9113 §6.9.2's fixed 65535
+octets, plus every stream-0 `WINDOW_UPDATE` it sends, which is how
+`h2_initial_connection_window` reaches the peer) and enforces nothing against
+it: `H2FlowControl::window` is the **send** window, peer-granted credit for our
+own writes, and `H2FlowControl::account_received_bytes` is a counter whose only
+job is deciding when to hand credit back, so nothing can go negative and no
+connection-level `FLOW_CONTROL_ERROR` is ever raised. Measured while this
+harness was written: **106496 octets of DATA accepted against an advertised
+98303**, with no GOAWAY
+([sozu-proxy/sozu#1488](https://github.com/sozu-proxy/sozu/issues/1488)).
+Back-pressure comes from the buffer pool instead, which refuses one stream with
+`RST_STREAM(REFUSED_STREAM)` rather than failing the connection. The property
+was **rewritten** into the per-stream credit attribution above
+(`h2_inbound_credit_is_attributed_to_the_stream_that_spent_it`) rather than
+loosened until it passed, because an assertion weak enough to go green would
+certify the gap as intended behaviour — the same reasoning §8's regression
+guards apply to a test that is relaxed instead of fixed. **So do not add a
+connection-level flow-control property asserting what the code does today.** The
+original goes back in, in its original form, once enforcement lands: #1488's
+decision was to document the gap rather than close it, and the full statement of
+what the advertised value does and does not mean lives in
+`lib/src/protocol/mux/h2_flow_control.rs`'s module doc and in
+`doc/h2_mux_internals.md`.
+
 The request-id property is deliberately a SECOND test rather than a widening of
 the replay one, and the split is the lesson worth carrying to a fifth simulator.
 The replay trace excludes `Ulid`-shaped values by contract, so it stayed green
