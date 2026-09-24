@@ -149,8 +149,43 @@ jobs:
         if: matrix.cell == 'msrv-full'
         run: cargo +nightly fmt --all -- --check
 
+      # `RUSTDOCFLAGS: -D warnings` is what makes this step a gate instead
+      # of a report. Without it rustdoc's diagnostics are emitted and then
+      # discarded by a green run: sozu#1482 took this exact command from 76
+      # warnings to 0, and every one of those 76 had been printed by a run
+      # that passed.
+      #
+      # What it guards: broken and private intra-doc links, bare URLs,
+      # redundant explicit links and invalid HTML in doc comments. The
+      # dominant form here is a `pub fn` whose docs link a target the reader
+      # cannot reach — `ConnectionH2` is publicly re-exported out of the
+      # private `mux::h2` module, so documentation on its public methods
+      # (`readable`) that links `Self::handle_read`, a private `fn`, is a
+      # `private_intra_doc_links` warning.
+      #
+      # Why a CLEAN merge reintroduces them: those fixes are doc-comment
+      # rewrites, so a branch forked before #1482 still carries the old
+      # text. On a hunk the other side never touched, git keeps the
+      # rewriting side — so the old links come back with ZERO conflicts and
+      # nothing for a reviewer to look at. Four branches forked before
+      # #1482 and touching `mux::h2` were each found to revert its fixes
+      # that way. Measured on one of them with `git merge-tree`, 13 links
+      # come back, naming `Self::handle_read`,
+      # `Self::flush_pending_control_frames`, `Self::poll_read_target`,
+      # `Self::enqueue_rst`, `Mux`, `h2_control_tx::H2ControlTx` and
+      # `h2_stream_table::H2StreamTable::collect_timed_out`. Every job on
+      # every one of them was green, because a warning is not a failure.
+      #
+      # Scope is deliberate on two axes. The `env:` is step-level, not
+      # job-wide: `cargo test` runs doctests through rustdoc, so a job-wide
+      # value would also gate the four test steps below. And the command is
+      # left byte-identical to what CI already ran:
+      # `--document-private-items` documents a far larger population and is
+      # NOT gated here.
       - name: Build documentation
         if: matrix.cell == 'msrv-full'
+        env:
+          RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --all-features --locked
 
       # Lint runs on the 1.93.1 MSRV cell so feature-specific lints

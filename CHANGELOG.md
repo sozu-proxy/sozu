@@ -4638,6 +4638,31 @@
 
 ### 🤖 CI
 
+- **`ci(doc)`: fail the run on a rustdoc warning instead of printing it and discarding it.**
+  The `Build documentation` step on the `msrv-full` cell ran `cargo doc --no-deps --all-features
+  --locked` with no `RUSTDOCFLAGS`, so every rustdoc diagnostic was written to a log nobody reads
+  and the job passed regardless. sozu#1482 took that exact command from 76 warnings to 0, and every
+  one of those 76 had been emitted by a run that passed. The step now carries a step-level `env:`
+  setting `RUSTDOCFLAGS: -D warnings`.
+  What this closes is a CLEAN merge, not a careless one. The #1482 repairs are doc-comment
+  rewrites, so a branch forked before it still carries the old text; on a hunk the other side never
+  touched, git keeps the rewriting side, and the old links come back with zero conflicts and
+  nothing for a reviewer to see. Four branches forked before #1482 and touching `mux::h2` were each
+  found to revert its fixes exactly that way. Measured on one of them with `git merge-tree`, 13
+  intra-doc links come back, naming `Self::handle_read`, `Self::flush_pending_control_frames`,
+  `Self::poll_read_target`, `Self::enqueue_rst`, `Mux`, `h2_control_tx::H2ControlTx` and
+  `h2_stream_table::H2StreamTable::collect_timed_out`. Every job on every one of them was green,
+  because a warning is not a failure.
+  Seen red before landing: turning the `Self::handle_read` code span in the documentation of
+  `ConnectionH2::readable` back into a link fails the step with `private_intra_doc_links`
+  (`ConnectionH2` is re-exported publicly out of the private `mux::h2` module, while the link
+  target is a private `fn`), and reverting that one span restores exit 0 with zero warnings. No
+  suppression was added anywhere: #1482 added none, and neither does this.
+  Scope: the `env:` is step-level, so it reaches no other step of the cell — not `Build`, not
+  `Format check`, not `Lint (clippy)`, and in particular none of the four `cargo test` steps, whose
+  doctests also run through rustdoc. Only the `msrv-full` cell runs the step at all. The `run:`
+  line is byte-identical, so `--document-private-items`, a much larger population, stays ungated.
+
 - **`ci(bench)`: build each provider's release `sozu` once, off the critical path, and share it
   as an artifact.**
   `Bombardier bench (<provider>)` ran `cargo build --release -p sozu --no-default-features
