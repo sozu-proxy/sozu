@@ -210,6 +210,52 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: the two control-frame drains re-arm `Ready::WRITABLE` through
+  `Readiness::signal_pending_write`, not a hand-rolled `event.insert` (issue #1462).**
+  `ConnectionH2::flush_pending_control_frames`'s WINDOW_UPDATE-drain and RST_STREAM-drain stages
+  each ended their stalled branch with `self.readiness.event.insert(Ready::WRITABLE)`. **No
+  behaviour changes**: `Ready::insert` cannot clear a neighbouring bit, so the two spellings are
+  the same state transition, and this is a missing guard rather than a live defect.
+
+  Both sites mean "pending write" in the helper's own sense, on three independent readings. They
+  sit under `if self.socket.socket_wants_write()`, which is `signal_pending_write`'s documented
+  precondition verbatim — buffered data that will not generate a new epoll WRITABLE event. They run
+  immediately after `flush_zero_to_socket` returned stalled, which means
+  `update_readiness_after_write` (`mux/mod.rs`) has just REMOVED the WRITABLE event bit, so the
+  insert is a re-signal after a stall cleared it, not an epoll edge being recorded. And
+  `ConnectionH2::ensure_tls_flushed` — called by the zero-buffer-resume stage a few lines above in
+  the same function — is the identical gate and body, already spelled with the helper.
+
+  What the hand-rolled spelling opted out of is the only mechanical statement of the
+  `event`/`interest` rule: `signal_pending_write`'s two `debug_assert!`s, which prove it set
+  WRITABLE and disturbed no other bit. It also opted out invisibly — `grep signal_pending_write`
+  did not find these two, so an audit of "every place we signal a pending write" missed them.
+  Production call sites go 13 → 15.
+
+  **The assertions were inert here until this changeset, and that is measured, not assumed.**
+  Replacing each re-arm with a `panic!` and running the whole `sozu-lib` suite against the
+  pre-image reports 1100 passed, 0 failed, neither panic observed: no test reached either stalled
+  branch, so neither `debug_assert!` could ever execute on these paths.
+  `a_stalled_window_update_drain_re_signals_the_writable_event` and
+  `a_stalled_rst_stream_drain_re_signals_the_writable_event` (`h2.rs`) now walk them. Neither test
+  can see WHICH spelling a stage uses — by construction, the two are indistinguishable from
+  outside — so neither is offered as a regression test for the swap; what each detects is the
+  re-arm going missing, which strands the serialized frame in `expect_write` with no further epoll
+  edge coming, and each fails on its own assertion when its block is deleted. Reaching the stalled
+  branch needs a non-empty `socket_write` that answers `(0, WouldBlock)`, which a loopback socket
+  with default buffers never does for 13 bytes of WINDOW_UPDATE, so the `BackpressuredTlsSocket`
+  harness gains a `write_script` mirroring its existing `vectored_script`; an empty script — the
+  default — still delegates to the real socket, leaving every earlier test byte-for-byte unaffected.
+
+  The three remaining hand-rolled `backend_readiness.event.insert(Ready::WRITABLE)` sites in
+  `proxy_protocol::relay` are deliberately left alone: all three are inside `relay_test`, pairing
+  an interest insert with an event insert to model "the event loop observed a WRITABLE edge on the
+  backend" before calling `back_writable`. That is a fixture recording an epoll edge, not a session
+  signalling buffered bytes, so the helper would state the wrong thing there. Production
+  `RelayProxyProtocol` hand-rolls none. `git grep -n 'event.insert(Ready::WRITABLE)' -- lib/`
+  finds two further hits and no more: the insert inside `signal_pending_write` itself, and the
+  comment heading the two new tests, which names both spellings on purpose.
+
 - **`refactor(mux-h2)`: the H2 stream-write path becomes a `poll_write_target` / `handle_write`
   drive loop, and `flush_stream_out` is deleted.** The write half of the inversion
   `poll_read_target` / `handle_read` already landed for the read half, with one forced divergence:

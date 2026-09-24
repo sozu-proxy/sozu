@@ -3497,7 +3497,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.stream_table.set_expect_write(Some(H2StreamId::Zero));
                     // Edge-triggered epoll: ensure pending TLS data gets flushed
                     if self.socket.socket_wants_write() {
-                        self.readiness.event.insert(Ready::WRITABLE);
+                        self.readiness.signal_pending_write();
                     }
                     return Some(MuxResult::Continue);
                 }
@@ -3546,7 +3546,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.stream_table.set_expect_write(Some(H2StreamId::Zero));
                     // Edge-triggered epoll: ensure pending TLS data gets flushed
                     if self.socket.socket_wants_write() {
-                        self.readiness.event.insert(Ready::WRITABLE);
+                        self.readiness.signal_pending_write();
                     }
                     return Some(MuxResult::Continue);
                 }
@@ -7655,6 +7655,23 @@ mod tests {
         /// `debug_assert!(size <= offered)`, and reddening through a
         /// production assertion is the tree noticing rather than the test.
         vectored_script: std::collections::VecDeque<(usize, SocketResult)>,
+        /// Scripted `(size, status)` answers for a NON-EMPTY `socket_write`,
+        /// consumed front to back exactly like `vectored_script`. An empty
+        /// script — the default — delegates to the real loopback socket, so
+        /// every test written before this field is byte-for-byte unaffected.
+        ///
+        /// The record model cannot express this either. `pending` /
+        /// `drain_per_flush` answer "does rustls still hold records?", which
+        /// is the EMPTY-buffer flush question; this one is "did the kernel
+        /// take the bytes `flush_zero_to_socket` handed it?". A loopback
+        /// socket with default buffers always takes 13 bytes of
+        /// WINDOW_UPDATE, so the stalled branch of the control-frame drains
+        /// is unreachable without scripting the answer.
+        ///
+        /// Each `size` is a CAP, clamped to what the caller actually offered:
+        /// `flush_zero_to_socket` feeds the answer straight to
+        /// `kawa::Buffer::consume`, which panics past the filled length.
+        write_script: std::collections::VecDeque<(usize, SocketResult)>,
         /// How many times `socket_write_vectored` was called, whether the
         /// answer came from the script or from the delegated loopback socket.
         ///
@@ -7675,6 +7692,7 @@ mod tests {
                 drain_per_flush,
                 flushes: std::cell::Cell::new(0),
                 vectored_script: std::collections::VecDeque::new(),
+                write_script: std::collections::VecDeque::new(),
                 vectored_calls: 0,
             }
         }
@@ -7692,7 +7710,10 @@ mod tests {
                 self.pending.set(self.pending.get() - drained);
                 return (0, SocketResult::Continue);
             }
-            self.stream.socket_write(buf)
+            match self.write_script.pop_front() {
+                Some((cap, status)) => (cap.min(buf.len()), status),
+                None => self.stream.socket_write(buf),
+            }
         }
 
         fn socket_write_vectored(&mut self, bufs: &[IoSlice]) -> (usize, SocketResult) {
@@ -7996,6 +8017,157 @@ mod tests {
         assert!(
             !connection.readiness.interest.is_writable(),
             "a pass that owes nothing must relinquish WRITABLE interest, got              {:?}",
+            connection.readiness
+        );
+    }
+
+    // ── The control-frame drains' own edge-triggered re-arm ─────────────
+    //
+    // `ConnectionH2::flush_pending_control_frames`'s WINDOW_UPDATE-drain
+    // and RST_STREAM-drain stages end the same way: the zero-buffer flush
+    // stalled, so `update_readiness_after_write` (`mux/mod.rs`) has just
+    // REMOVED the WRITABLE event bit, and the stage puts it back when the
+    // socket still holds records it could not hand to the kernel.
+    //
+    // Until the two tests below existed, nothing in the suite reached either
+    // stalled branch. Measured by replacing each re-arm with a `panic!` and
+    // running the whole `sozu-lib` suite against `98745bba`: 1092 passed, 0
+    // failed, neither panic observed. That is what these tests are for —
+    // `Readiness::signal_pending_write`'s two `debug_assert!`s only guard a
+    // path some test actually walks, and a stage that spells the re-arm by
+    // hand carries no assertion at all.
+    //
+    // Neither test can see WHICH spelling a stage uses:
+    // `readiness.event.insert(Ready::WRITABLE)` and `signal_pending_write()`
+    // are indistinguishable from outside, by construction — `insert` cannot
+    // clear a neighbouring bit, so the two are the same state transition.
+    // What they detect is the re-arm going missing, which strands the
+    // connection: the serialized frame is parked in `expect_write` and no
+    // further epoll edge is coming for it.
+
+    /// The WINDOW_UPDATE drain re-signals WRITABLE when its flush stalls.
+    ///
+    /// TO SEE THIS RED: delete the
+    /// `if self.socket.socket_wants_write() { .. }` block from the
+    /// WINDOW_UPDATE-drain stage of
+    /// `ConnectionH2::flush_pending_control_frames`. The last assertion
+    /// fails with `the stalled WINDOW_UPDATE drain must re-signal the
+    /// WRITABLE event`: `flush_zero_to_socket` cleared the bit on the way in
+    /// and nothing else on this path sets it. Deleting the whole
+    /// `if self.flush_zero_to_socket() { .. }` branch instead reddens the
+    /// `expect_write` premise first, measured as `left: None, right:
+    /// Some(Zero)` — the pass still returns `Continue`, so the assertion above
+    /// it does not discriminate.
+    #[test]
+    fn a_stalled_window_update_drain_re_signals_the_writable_event() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        // One record rustls still holds and a kernel that accepts nothing, so
+        // `socket_wants_write()` answers true for the whole test.
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 1, 0, H2State::Header);
+        // The zero-buffer flush stalls on its first round. `(0, WouldBlock)`
+        // is what `update_readiness_after_write` reads as a stall, and it
+        // removes the WRITABLE event bit before the drain stage can re-arm.
+        connection
+            .socket
+            .write_script
+            .push_back((0, SocketResult::WouldBlock));
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: this harness must report buffered TLS records, or the \
+             re-arm is gated off and the assertion below could not fail"
+        );
+        // Connection-level replenishment: ordinary housekeeping, queued the
+        // way `handle_frame` queues it.
+        connection.queue_window_update(0, 65_535);
+        assert!(
+            connection.stream_table.expect_write().is_none(),
+            "premise: no parked partial write, or the drain stage is skipped"
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a stalled control-frame flush parks the pass and continues, got \
+             {result:?}"
+        );
+        assert_eq!(
+            connection.stream_table.expect_write(),
+            Some(H2StreamId::Zero),
+            "premise: the pass must have taken the STALLED branch of the \
+             WINDOW_UPDATE drain, the only site that parks the zero buffer here"
+        );
+        assert!(
+            connection.readiness.event.is_writable(),
+            "the stalled WINDOW_UPDATE drain must re-signal the WRITABLE \
+             event: under edge-triggered epoll the parked frame has no other \
+             wake-up, got {:?}",
+            connection.readiness
+        );
+    }
+
+    /// The RST_STREAM drain re-signals WRITABLE when its flush stalls.
+    ///
+    /// The sibling of the WINDOW_UPDATE test above, on the stage beneath it.
+    /// No WINDOW_UPDATE is queued on purpose: that stage returns early, so
+    /// queueing one would make this test exercise the wrong drain.
+    ///
+    /// TO SEE THIS RED: delete the
+    /// `if self.socket.socket_wants_write() { .. }` block from the
+    /// RST_STREAM-drain stage of
+    /// `ConnectionH2::flush_pending_control_frames`. The last assertion
+    /// fails with `the stalled RST_STREAM drain must re-signal the WRITABLE
+    /// event`.
+    #[test]
+    fn a_stalled_rst_stream_drain_re_signals_the_writable_event() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = connection_with_backpressure(&pool, 1, 0, H2State::Header);
+        connection
+            .socket
+            .write_script
+            .push_back((0, SocketResult::WouldBlock));
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: this harness must report buffered TLS records, or the \
+             re-arm is gated off and the assertion below could not fail"
+        );
+        // One RST, well under `h2_control_tx::MAX_PENDING_RST_STREAMS`, so
+        // the lifetime cap check above this stage does not escalate to
+        // GOAWAY(ENHANCE_YOUR_CALM) and swallow the drain.
+        assert!(
+            connection.enqueue_rst(1, H2Error::Cancel).is_none(),
+            "premise: a single RST must not trip the flood detector"
+        );
+        assert!(
+            connection.flow_control.pending_window_updates_is_empty(),
+            "premise: no queued WINDOW_UPDATE, or the stage above returns \
+             first and this test exercises the wrong drain"
+        );
+
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a stalled control-frame flush parks the pass and continues, got \
+             {result:?}"
+        );
+        assert_eq!(
+            connection.stream_table.expect_write(),
+            Some(H2StreamId::Zero),
+            "premise: the pass must have taken the STALLED branch of the \
+             RST_STREAM drain, the only site that parks the zero buffer here"
+        );
+        assert!(
+            connection.readiness.event.is_writable(),
+            "the stalled RST_STREAM drain must re-signal the WRITABLE event: \
+             under edge-triggered epoll the parked frame has no other wake-up, \
+             got {:?}",
             connection.readiness
         );
     }
