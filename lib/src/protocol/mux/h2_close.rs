@@ -9,10 +9,11 @@
 //! **the peer sees a truncated response.** That is data loss, not style,
 //! which is why the decision is separated from the I/O that feeds it.
 //!
-//! A fourth site, `ConnectionH2::finalize_write`, ends every write pass with
-//! the same three-step shape without deciding a close at all; see
-//! [`finalize_action`] and the section below for why it is a sibling enum
-//! rather than four more [`CloseAction`] variants.
+//! A fourth site, the end of every `ConnectionH2::write_streams` pass, runs
+//! the same three-step shape without deciding a close at all, and
+//! `ConnectionH2::finalize_write` takes its decision; see [`finalize_action`]
+//! and the section below for why it is a sibling enum rather than four more
+//! [`CloseAction`] variants.
 //!
 //! **This module owns**: the mapping from `(has the peer gone, does rustls
 //! still hold records, have we flushed yet)` to a close action, and the
@@ -75,10 +76,13 @@
 
 //! # The fourth site: finalizing a write pass is not a close
 //!
-//! `ConnectionH2::finalize_write` runs the same triple —
+//! `ConnectionH2::finalize_write` answers the same triple —
 //! `ConnectionH2::tls_wants_write`, a flush, `ConnectionH2::tls_wants_write`
-//! again — and it is the last of them left inline in `h2.rs`, so its decision
-//! belongs here too.
+//! again — so its decision belongs here too. The triple itself is performed
+//! by `ConnectionH2::write_streams`, the shell that already owns the pass's
+//! `socket_write_vectored`: `finalize_write` takes the first answer as an
+//! input and hands back the middle step, and
+//! `ConnectionH2::finalize_write_after_flush` is told the second answer.
 //! It gets [`FinalizeAction`], a SIBLING of [`CloseAction`], and the
 //! separation is the point rather than a filing preference.
 //!
