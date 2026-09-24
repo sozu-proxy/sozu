@@ -147,7 +147,8 @@ SNI. Coalesced acceptances (matched SAN != initial SNI) bump
    record makes a read land on the 24-octet boundary, and a byte-perfect
    preface split anywhere inside the request is a conforming client:
    `a_byte_perfect_client_preface_survives_every_read_fragmentation` sweeps
-   every split, `an_invalid_client_preface_is_still_refused_before_the_window_is_filled`
+   every fixed chunk size in `1..=40` (not every partition of the window),
+   `an_invalid_client_preface_is_still_refused_before_the_window_is_filled`
    holds the other side.
 
 ### 2.2 Connection state machine (`H2State`)

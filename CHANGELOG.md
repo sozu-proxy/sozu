@@ -964,8 +964,9 @@
   failing size instead of asserting inside the loop (asserting inside stops at 1 and hides the
   band). Against the old comparison it reports
   `[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15, 16, 25, 26, 27, 28, 29, 30, 31, 32]` — every chunk
-  size whose partial sums land in the 25..=32 window, a wider set than the original report's
-  measurement, which let consecutive writes coalesce.
+  size whose partial sums land in the 25..=32 window. That is a wider set than the nine sizes the
+  original report sampled, and consistent with every one of them: the report did not measure the
+  intermediate sizes, not that they behaved differently there.
   `an_invalid_client_preface_is_still_refused_before_the_window_is_filled` holds the other side,
   corrupting the first and the last octet of the magic string across that same band; clipping to
   one octet less than the constant makes it report
