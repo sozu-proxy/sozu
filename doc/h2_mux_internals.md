@@ -533,7 +533,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:3892-3905
+```rust lib/src/protocol/mux/h2.rs:3900-3913
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -557,7 +557,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:3938-3944
+```rust lib/src/protocol/mux/h2.rs:3946-3952
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -574,9 +574,9 @@ The other three sites take the `&mut self` wrapper
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5761`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5769`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6488`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6496`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -586,10 +586,10 @@ for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
 taken at the top of `H2WritePhase::Flush`'s post-flush tail
-(`lib/src/protocol/mux/h2.rs:2793`) and passes `stream.linked_token()` straight
+(`lib/src/protocol/mux/h2.rs:2807`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:2852-2853
+```rust lib/src/protocol/mux/h2.rs:2866-2867
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -652,9 +652,64 @@ instead (`ConnectionH2::force_disconnect` does, above its `match`). And
 are exactly the four places where the extraction must invert control rather
 than pass a value in.
 
+One composite is built on the query and has a name of its own:
+`ConnectionH2::ensure_tls_flushed` is "ask, and re-arm the edge-triggered
+WRITABLE event if the answer is yes". Under edge-triggered epoll a connection
+whose bytes are stuck in rustls rather than in the kernel has no other wake-up,
+so every site that parks output must end with it. It is called, never spelled
+out: a site that writes the two-line body again is the same fact written twice,
+and the two stalled-drain tails of `flush_pending_control_frames` were exactly
+that until they became calls.
+
+### What the `Debug` impl renders
+
+`ConnectionH2`'s `Debug` does not name the socket. It renders `peer_address`,
+the address the connection snapshots once at construction and that every
+`log_context!` line already carries, where it used to hand
+`mio::net::TcpStream`'s own `Debug` a `socket` field through
+`SocketHandler::socket_ref` — a local address, a peer address and a file
+descriptor.
+
+Three consequences, in the order they matter:
+
+- It keeps the address a reader of a `Debug` line wants and drops the
+  descriptor, which named nothing outside this process.
+- It survives the peer's reset. A live `getpeername(2)` answers `ENOTCONN`
+  there, which is exactly when an operator reads the line; the snapshot does
+  not.
+- It is a value a byte-in / byte-out core can produce at all. `socket_ref`
+  returns a concrete OS type no in-memory transport can synthesise, which is
+  why the H2 simulator's in-memory `SocketHandler` carries a connected loopback
+  stream it never reads or writes. That simulator's `peer_addr` already answers
+  a fixed address by construction, so no ephemeral port reaches a trace through
+  this impl any more.
+
+`ConnectionH2::snapshot_rtts` is the one `socket_ref` reach left in the file and
+`socket_mut` has none. What the core still requires of `SocketHandler` is
+therefore `socket_read`, `socket_write`, `socket_write_vectored`, `peer_addr`,
+the three seams above, and that one RTT read.
+
+One of those reaches is a hand-off rather than a call, and counting `self.socket`
+misses what it implies: `ConnectionH2::close` passes `&mut self.socket` whole to
+`shared::drain_tls_close_notify`, which runs its own `socket_close` /
+`socket_wants_write` / `socket_write_vectored` drain loop on the far side. It
+adds no trait method to the list — those are the three seams' own underlying
+calls plus the vectored write — but it is a place the socket crosses a function
+boundary rather than being asked a question, it is shared byte-for-byte with
+`ConnectionH1::close`, and it has to move at the step that gives the socket to
+the shell. An H2-motivated change to it moves H1 in the same commit.
+
+The RTT read is Q11's local half and is deliberately **not** taken here. The
+injection shape the rest of the extraction implies — mirror the value in at
+every public entry point, the way `ConnectionH2.now` is mirrored from
+`Context::now` — refreshes it once per pass, where today it costs one
+`getsockopt(TCP_INFO)` per stream recycle, and `Endpoint` cannot supply it
+lazily because it is the other side of the connection. That trade is measured,
+not reasoned about, and it belongs to its own changeset.
+
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:2207-2211
+```rust lib/src/protocol/mux/h2.rs:2221-2225
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -741,7 +796,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:3643-3647
+```rust lib/src/protocol/mux/h2.rs:3651-3655
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1051,7 +1106,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4806
+```rust lib/src/protocol/mux/h2.rs:4814
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -1204,7 +1259,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5804-5806
+```rust lib/src/protocol/mux/h2.rs:5812-5814
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1212,7 +1267,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5818-5824
+```rust lib/src/protocol/mux/h2.rs:5826-5832
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
