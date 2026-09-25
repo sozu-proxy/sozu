@@ -168,6 +168,9 @@
 # for a platform DNS reliability issue, not a code fix — the underlying CoreDNS capacity limit
 # should still be reported to the CKE platform team since it could affect any workload with
 # bursty DNS resolution, and is unrelated to this project's scope to fix.
+# No nodeSelector (2026-09-25): general pods are no longer pinned to the `default` nodegroup and
+# may land on any node of the cluster, `bench` included. 1 job = 1 pod = 1 node still holds through
+# the cpu request below, independently of the selector; both nodegroups run the same S flavor.
 githubConfigUrl: "https://github.com/sozu-proxy/sozu"
 githubConfigSecret: sozu-runner-github-app
 
@@ -182,8 +185,6 @@ template:
           - "cluster-a.localhost"
           - "cluster-b.localhost"
           - "other.localhost"
-    nodeSelector:
-      clever-cloud.com/nodegroup: default
     securityContext:
       runAsNonRoot: true
       runAsUser: 1001
