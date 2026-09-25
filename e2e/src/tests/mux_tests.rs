@@ -9,12 +9,15 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sozu_command_lib::{
     config::{FileConfig, ListenerBuilder},
-    proto::command::{ActivateListener, Cluster, ListenerType, Request, request::RequestType},
+    proto::command::{
+        ActivateListener, Cluster, ListenerType, QueryMetricsOptions, Request, filtered_metrics,
+        request::RequestType, response_content::ContentType,
+    },
 };
 
 use crate::{
@@ -2368,6 +2371,166 @@ fn test_h1_chunked_trailer_forwarded() {
             5,
             "H1 chunked trailers forwarded through sozu (issue #899)",
             try_h1_chunked_trailer_forwarded,
+        ),
+        State::Success,
+    );
+}
+
+// =========================================================================
+// `http.active_requests` balances over one complete H1 request
+//
+// Companion to `test_h2_active_requests_balances_over_one_request`
+// (`h2_tests.rs`). Both are needed, and not out of symmetry: the `+1` sites
+// are per-protocol, but the `-1` is NOT — it lives once in
+// `Stream::generate_access_log`, shared by H1, H2 and `Mux::close`. Anything
+// that moves that decrement moves it for both protocols at once, so a test
+// on one path alone would leave the other half of the moved symbol unguarded.
+//
+// **Which half of the H1 path this covers.** H1 increments the gauge at two
+// sites: `ConnectionH1::readable`, for the first request on a connection, and
+// `ConnectionH1::writable`, for a pipelined request whose headers were parsed
+// while the previous response was still being written. This test sends ONE
+// request and closes, so it exercises the **`readable`** site only. The
+// pipelined site is NOT covered here — do not read this test as covering it.
+//
+// Sampling happens **in flight**, with the response withheld at the backend,
+// because `AggregatedMetric::update` saturates a gauge at zero: a test that
+// only checked the value returned to its starting point could not see a
+// missing increment, since the unpaired decrement would take 0 to 0 and read
+// exactly like a balanced request.
+//
+//   correct            0 -> 1 -> 0
+//   `+1` missing       0 -> 0 -> 0   (the in-flight assertion fails)
+//   `-1` missing       0 -> 1 -> 1   (the post-completion assertion fails)
+//
+// **What these two tests do NOT cover.** `Stream::generate_access_log` has
+// eight production callers — three in `h1.rs`, four in `h2.rs`, one in
+// `mod.rs` — and these tests exercise one H1 caller and one H2 caller. The
+// other six are not covered by a test, and they do not need to be: they have
+// no step of their own to forget. `#[must_use]` on the return obliges every
+// caller to handle it, and on the core side the events are drained at a
+// single point rather than recorded per caller. Do not read these tests as
+// covering the other six.
+// =========================================================================
+
+/// Read one proxy gauge by name. `None` is "not readable this sample" and is
+/// deliberately not folded into a value: before the first request the key may
+/// be absent entirely, which is not the same observation as a zero.
+fn query_proxy_gauge(worker: &mut Worker, metric_name: &str) -> Option<u64> {
+    if worker.server_job.is_finished() {
+        return None;
+    }
+    worker.send_proxy_request_type(RequestType::QueryMetrics(QueryMetricsOptions {
+        list: false,
+        cluster_ids: vec![],
+        backend_ids: vec![],
+        metric_names: vec![metric_name.to_owned()],
+        no_clusters: true,
+        workers: false,
+    }));
+    let response = worker.read_proxy_response()?;
+    let content = response.content.and_then(|content| content.content_type)?;
+    let ContentType::WorkerMetrics(metrics) = content else {
+        return None;
+    };
+    match metrics
+        .proxy
+        .get(metric_name)
+        .and_then(|metric| metric.inner.clone())
+    {
+        Some(filtered_metrics::Inner::Gauge(value)) => Some(value),
+        _ => None,
+    }
+}
+
+/// Poll `http.active_requests` until it reads `want`, or report the last
+/// sample. Bounded by a deadline rather than a sleep, so a slow machine costs
+/// iterations instead of turning a correct run into a failure.
+fn await_active_requests_h1(
+    worker: &mut Worker,
+    want: u64,
+    deadline: Duration,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        let last = query_proxy_gauge(worker, sozu_lib::metrics::names::http::ACTIVE_REQUESTS);
+        if last == Some(want) {
+            return Ok(());
+        }
+        if started.elapsed() > deadline {
+            return Err(format!("wanted {want}, last sample {last:?}"));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn try_h1_active_requests_balances_over_one_request() -> State {
+    let front_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_config();
+    let (mut worker, mut backends) = setup_sync_test(
+        "H1-ACTIVE-REQ-BALANCE",
+        config,
+        listeners,
+        state,
+        front_address,
+        1,
+        false,
+    );
+    let mut backend = backends.pop().expect("one backend was requested");
+    backend.connect();
+
+    let mut client = Client::new(
+        "balance-client",
+        front_address,
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client.connect();
+    client.send();
+
+    // The backend having the request is what proves sozu parsed the headers,
+    // so the increment — if it happens at all — has happened. The response is
+    // withheld: `backend.send` is not called until the in-flight sample is
+    // taken, which makes this an ordering guarantee rather than a race.
+    backend.accept(0);
+    backend.receive(0);
+
+    if let Err(diag) = await_active_requests_h1(&mut worker, 1, Duration::from_secs(10)) {
+        println!("H1 active-requests balance - in flight: {diag}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    backend.send(0);
+    let response = client.receive();
+    if !response.as_deref().is_some_and(|r| r.contains("200")) {
+        println!("H1 active-requests balance - unexpected response: {response:?}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    if let Err(diag) = await_active_requests_h1(&mut worker, 0, Duration::from_secs(10)) {
+        println!("H1 active-requests balance - after completion: {diag}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_h1_active_requests_balances_over_one_request() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H1: http.active_requests rises to exactly one while a request is \
+             held at the backend and returns to zero once it completes",
+            try_h1_active_requests_balances_over_one_request,
         ),
         State::Success,
     );

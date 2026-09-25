@@ -133,6 +133,8 @@ macro_rules! log_module_context {
     }};
 }
 
+use self::h2::MetricEvent;
+
 pub mod answers;
 pub mod auth;
 pub mod buffer_source;
@@ -515,19 +517,31 @@ impl Position {
         !self.is_server()
     }
 
-    /// Increment the global `count!()` counter for bytes read on this side.
-    pub fn count_bytes_in_counter(&self, size: usize) {
+    /// The bytes-read event for this side.
+    ///
+    /// Returns exactly one event — never zero, never two — because both arms
+    /// of the match below emit one, so the caller needs no container to carry
+    /// it. A caller that is its own shell records it at once; a caller inside
+    /// the H2 core queues it. `#[must_use]` is what makes that a compiler
+    /// obligation rather than a convention: this leaf is reached from a core
+    /// AND from shells, and an event silently dropped here is an upward
+    /// drift that never underflows, so nothing would log and nothing would
+    /// saturate.
+    #[must_use]
+    fn bytes_in_event(&self, size: usize) -> MetricEvent {
         match self {
-            Position::Client(..) => count!(names::backend::BACK_BYTES_IN, size as i64),
-            Position::Server => count!(names::backend::BYTES_IN, size as i64),
+            Position::Client(..) => MetricEvent::BackendBytesIn(size as i64),
+            Position::Server => MetricEvent::FrontendBytesIn(size as i64),
         }
     }
 
-    /// Increment the global `count!()` counter for bytes written on this side.
-    pub fn count_bytes_out_counter(&self, size: usize) {
+    /// The bytes-written event for this side. Same one-event guarantee and
+    /// same reason for `#[must_use]` as [`Self::bytes_in_event`].
+    #[must_use]
+    fn bytes_out_event(&self, size: usize) -> MetricEvent {
         match self {
-            Position::Client(..) => count!(names::backend::BACK_BYTES_OUT, size as i64),
-            Position::Server => count!(names::backend::BYTES_OUT, size as i64),
+            Position::Client(..) => MetricEvent::BackendBytesOut(size as i64),
+            Position::Server => MetricEvent::FrontendBytesOut(size as i64),
         }
     }
 
@@ -1008,6 +1022,19 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             stream.back_received_end_of_stream = false;
             stream.front_data_received = 0;
             stream.back_data_received = 0;
+            // The ONE place `request_counted` is cleared without emitting the
+            // paired `http.active_requests` decrement, and it must stay the
+            // only one. A slot reaches `StreamState::Recycle` only through
+            // `Stream::generate_access_log`, which already emitted the `-1`
+            // and cleared the flag, so this is re-initialisation of an
+            // already-false field rather than a decrement that went missing.
+            // `Stream::new` asserts the same invariant for a fresh slot
+            // ("new stream must not have a counted request"); this is its
+            // reuse-path counterpart. A future site that clears this flag
+            // without accounting for the gauge is a silent upward leak: the
+            // `+1` stays in the aggregate with nothing left to pair it, and
+            // an aggregate that only drifts up never underflows, so nothing
+            // logs and nothing saturates.
             stream.request_counted = false;
             stream.window = i32::try_from(window).unwrap_or(i32::MAX);
             stream.context = http_context;
@@ -1693,13 +1720,19 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         .get(&token)
                         .and_then(|c| socket_rtt(c.socket()))
                 });
-                stream.generate_access_log(
-                    is_error,
-                    Some("session close"),
-                    self.context.listener.clone(),
-                    client_rtt,
-                    server_rtt,
-                );
+                for event in stream
+                    .generate_access_log(
+                        is_error,
+                        Some("session close"),
+                        self.context.listener.clone(),
+                        client_rtt,
+                        server_rtt,
+                    )
+                    .into_iter()
+                    .flatten()
+                {
+                    crate::protocol::mux::h2::record_metric(event);
+                }
                 stream.state = StreamState::Recycle;
             }
         }

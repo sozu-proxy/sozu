@@ -2247,6 +2247,48 @@
   trade. The core ends at one macro site, not zero, and that is the better outcome: a contorted zero
   would cost more than the documented one.
 
+- **`refactor(mux-h2)`: the shared leaves the H2 core reaches through return their metrics, and the
+  core ends at one macro site ([#1341](https://github.com/sozu-proxy/sozu/issues/1341), Q4 — the
+  shared leaves).** `Position::count_bytes_{in,out}_counter` and `Stream::generate_access_log` are
+  leaf helpers reached from the split H2 core **and** from `ConnectionH1`, `Mux` and `Router`, which
+  are shells by construction. Both now **return** their events; each caller handles them — a core
+  caller queues them, a shell records them at once, because `METRICS` is legitimately a shell's.
+  **`impl ConnectionH2` holds one metric-macro site**, down from 41 at the start of this series, and
+  `impl Position` holds none.
+  **The return is bounded and lives on the stack, with no container at all.** `bytes_in_event` and
+  `bytes_out_event` return exactly one `MetricEvent` — both arms of their match emit one, never
+  zero, never two — and `generate_access_log` returns `[Option<MetricEvent>; 2]`. That matters
+  because `generate_access_log` is **allocation-free today**, measured: zero `to_owned`, `to_string`,
+  `format!`, `String::`, `Vec::`, `vec!`, `collect`, `clone` or `Box::` across its 164-line body. A
+  `Vec` return would not have added an allocation to a hot path that already had some, it would have
+  introduced the **first**, per request. A fixed array also needs no queue on the caller, which
+  matters because four of the eight callers are shells and have none.
+  Slots are filled **by explicit index, never through a `push` helper**: a `push` overflowing a fixed
+  array would silently drop an event, and a dropped `-1` drifts the aggregate upward forever —
+  and an aggregate that only drifts up never underflows, so nothing logs and nothing saturates. The
+  bound is documented at the site with the two events that saturate it; a third is a compile error at
+  every call site rather than a truncation.
+  **`#[must_use]` on both returns is what makes the eight callers a compiler obligation** rather than
+  a convention, and it found all ten call sites (8 production, 2 tests) at once. This is the first
+  `#[must_use]` under `lib/src/protocol/mux/`, and it is deliberately not applied retroactively to
+  the `MetricEvent` returns of #1530, #1532 or #1534.
+  `ConnectionH2::complete_server_stream` is static — its `stream` borrows `context.streams`, so it
+  can hold neither `&mut self` nor a queue — and therefore propagates through its return, which
+  becomes `(Option<mio::Token>, [Option<MetricEvent>; 2])`.
+  **Three sites in `generate_access_log` stay `incr!` macros on purpose**, documented at the site:
+  `names::http::ERRORS` and the two computed status-bucket keys carry `cluster_id`/`backend_id`
+  labels, and carrying those in an event means owned `Option<String>`s — measured,
+  `size_of::<MetricEvent>()` goes **24 → 48 bytes** for every queued event, and the enum loses
+  `Copy`. Same trade as `names::backend::RETRY_STALE_UPSTREAM`, and worse: that one fires on a
+  stale-upstream retry, these fire on every access log. Eight sites moved, three documented.
+  `names::http::REQUESTS` folds into `MetricEvent::RequestStarted` with the in-flight gauge's `+1`
+  because the two are adjacent and unconditional in the same `if`, with nothing fallible between
+  them — the criterion that allowed `RstStreamSent` to fold and forbade folding the GOAWAY pair.
+  **`http.active_requests` is now deliberately split across two mechanisms**, and that is safe
+  because each *path* balances, not because the pair travels together: H2's `+1` is an event, H1's
+  two `+1` stay macros where they already correctly sit, and the single `-1` is an event both record.
+  Two e2e tests pin it per path, and both were seen red — see `doc/testing.md`.
+
 ### 🐛 Fixed
 
 - **`fix(mux)`: the `peer=` slot of every `MUX` log line is read from the snapshot the frontend
@@ -4006,6 +4048,33 @@
   `forward!`, whose H1 arm *is* `socket_wants_write()`, and the second reads it only inside a
   per-iteration `#[cfg(debug_assertions)]` trace taken after each write, where a caller-supplied
   value would log the pre-flush answer.
+
+- **BREAKING (library API) — `refactor(mux-h2)`: three publicly reachable items change or leave the
+  public surface ([#1341](https://github.com/sozu-proxy/sozu/issues/1341), Q4).** `lib.rs` declares
+  `pub mod protocol`, `protocol/mod.rs` declares `pub mod mux`, `mux/mod.rs` declares
+  `pub mod stream`, and `Position` is a `pub enum` — so all three were reachable from outside the
+  crate.
+
+  **Removed from `sozu_lib::protocol::mux`:** `Position::count_bytes_in_counter` and
+  `Position::count_bytes_out_counter`. They emitted `count!` directly; the replacements
+  `Position::bytes_in_event` / `bytes_out_event` **return** a `MetricEvent` for the caller to record
+  and are module-private, because `MetricEvent` is itself `pub(super)` and a return type more private
+  than its item does not compile. `Position::count_bytes_in` and `count_bytes_out` — different
+  methods, which take a `&mut SessionMetrics` — are untouched and stay public.
+
+  **No longer public in `sozu_lib::protocol::mux::stream`:** `Stream::generate_access_log` becomes
+  `pub(super)`, and its signature changes from `-> ()` to `-> [Option<MetricEvent>; 2]` carrying
+  `#[must_use]`. A downstream crate calling it was recording nothing; there is no replacement on the
+  public surface, because the type it now returns is not public either.
+
+  **Additive, and called out separately so it is not read as a third removal:**
+  `protocol::mux::h2::record_metric` widens from module-private to `pub(super)`, because the shells
+  outside `h2.rs` now record events themselves. Nothing that compiled before stops compiling on its
+  account.
+
+  Nothing on the wire, no metric key, no log line, no configuration key and no CLI flag changes. The
+  precedent for accepting a public-surface break in a minor is #1529, which removed five items from
+  `sozu_lib::protocol::udp`.
 
 ### 🔐 Security
 
