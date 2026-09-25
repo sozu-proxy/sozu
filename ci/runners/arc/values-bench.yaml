@@ -2,9 +2,9 @@
 # Pinned version: 0.14.2
 # Helm release name "sozu-bench" IS the runs-on label: runs-on: sozu-bench
 #
-# Isolation mechanism (per design, refined during planning): the `bench` NodeGroup gives every
-# bench job its own dedicated node — no other pod is ever co-scheduled — which is what actually
-# buys bench reproducibility (Heracles ISCA 2015: cgroup/QoS isolation alone is insufficient
+# Isolation mechanism (per design, refined during planning): every bench job gets its own
+# dedicated node through the resources.requests below (see "No nodeSelector") — no other pod is
+# ever co-scheduled — which is what actually buys bench reproducibility (Heracles ISCA 2015: cgroup/QoS isolation alone is insufficient
 # against LLC/DRAM-bandwidth interference; only physical node exclusivity holds). Autoscaling is
 # explicitly disabled (clever k8s nodegroups create silently inherits the cluster's autoscaling
 # setting — a nodegroups update --disable-autoscaling was required after creation, see
@@ -91,6 +91,12 @@
 # shows up in `kubectl describe node`. It costs no concurrency here: cpu 7 + 0.28 for the node's
 # system pods = 7.28 of 8 allocatable already makes a second runner unschedulable, verified
 # against the live distribution of 11 running runners across 11 distinct nodes.
+# No nodeSelector (2026-09-25): bench pods are no longer pinned to the `bench` nodegroup and may
+# land on any node of the cluster, `default` included. Whole-node exclusivity is unaffected: it
+# never came from the selector but from the resources.requests below (cpu 7 + 0.28 system = 7.28
+# of 8), and both nodegroups run the identical S flavor, so a bench job still gets a fully
+# dedicated node of the same shape. What is lost is only the separation between the two pools'
+# capacity: general and bench runners now draw from the same set of nodes.
 githubConfigUrl: "https://github.com/sozu-proxy/sozu"
 githubConfigSecret: sozu-runner-github-app
 
@@ -111,8 +117,6 @@ template:
           - "rsa-2048.sozu.io"
           - "rsa-4096.sozu.io"
           - "ecdsa.sozu.io"
-    nodeSelector:
-      clever-cloud.com/nodegroup: bench
     securityContext:
       runAsNonRoot: true
       runAsUser: 1001
