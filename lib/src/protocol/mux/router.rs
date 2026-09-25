@@ -86,6 +86,7 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
+    net::IpAddr,
     rc::Rc,
     time::Duration,
 };
@@ -245,6 +246,82 @@ impl<'a> RoutingView<'a> {
     }
 }
 
+/// What [`Router::plan_connect`] answers: either a finished decision, or a
+/// step it needs the embedder to perform before it can finish.
+///
+/// The per-`(cluster, source-IP)` limit gate is the reason this exists. It is
+/// not a read — it consults `SessionManager::cluster_ip_at_limit` **and**
+/// calls `SessionManager::track_cluster_ip`, which mutates
+/// `connections_per_cluster_ip`, worker-global state keyed on
+/// `(cluster, ip)` across every session and read again by `lib/src/tcp.rs`'s
+/// own gate. A read-only view cannot carry a mutation, so the gate becomes a
+/// returned step instead: the core resolves the cluster, hands the embedder
+/// what to ask, and the embedder answers.
+#[derive(Debug)]
+pub(super) enum ConnectStep {
+    /// No gate consultation was needed — the stream carries no source IP —
+    /// so this is already the decision.
+    Decided(ConnectPlan),
+    /// The core resolved a cluster and needs the limit consulted, and
+    /// updated, before it can go on. Answer with
+    /// [`Router::plan_connect_resume`].
+    CheckIpLimit(ConnectResume),
+}
+
+/// The phase-one results the core needs handed back to finish deciding, plus
+/// what the embedder needs to consult the gate.
+///
+/// Opaque on purpose: the embedder reads the four gate inputs through
+/// accessors and cannot reach — or forge — the routing results the core
+/// parked here. [`Router::plan_connect_resume`] takes it **by value**, so a
+/// resume cannot be replayed; that is `H2Shell::settled` taking its parked
+/// target, applied to this seam.
+#[derive(Debug)]
+pub(super) struct ConnectResume {
+    cluster_id: String,
+    h2: bool,
+    frontend_should_stick: bool,
+    ip: IpAddr,
+    max_connections_per_ip: Option<u64>,
+    cluster_retry_after: Option<u32>,
+}
+
+impl ConnectResume {
+    /// The cluster routing resolved, which the gate is keyed on.
+    pub(super) fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+    /// The source IP the gate is keyed on — proxy-protocol-aware when
+    /// present, falling back to `peer_addr`.
+    pub(super) fn ip(&self) -> IpAddr {
+        self.ip
+    }
+    /// The cluster's per-IP connection limit override, if it set one.
+    pub(super) fn max_connections_per_ip(&self) -> Option<u64> {
+        self.max_connections_per_ip
+    }
+    /// The cluster's `Retry-After` override, if it set one.
+    pub(super) fn cluster_retry_after(&self) -> Option<u32> {
+        self.cluster_retry_after
+    }
+}
+
+/// The embedder's answer to [`ConnectStep::CheckIpLimit`].
+///
+/// `Admitted` carries no payload on purpose: it means the embedder has
+/// already *performed* the track, so there is nothing left for the core to
+/// decide about it and no binding a later edit could reuse to ask a question
+/// this variant has answered — the discipline
+/// `H2WritableStateTarget::Flush` set by carrying no `bool`.
+#[derive(Debug)]
+pub(super) enum IpGateVerdict {
+    /// Under the limit, and the embedder has tracked this `(cluster, ip)`.
+    Admitted,
+    /// At the limit. Carries the resolved `Retry-After` the core stashes on
+    /// the stream for the 429 mapping to render or elide.
+    AtLimit { retry_after: u32 },
+}
+
 /// What [`Router::plan_connect`] decided, for the embedder to fulfil.
 ///
 /// Question 6 of [#1340](https://github.com/sozu-proxy/sozu/issues/1340): the
@@ -316,17 +393,7 @@ impl Router {
         // The cluster-side configuration this decision reads, borrowed from
         // the embedder for the length of the call.
         view: &RoutingView<'_>,
-        // Still here for ONE thing: the per-(cluster, source-IP) limit gate,
-        // which is a read AND a `SessionManager::track_cluster_ip` mutation
-        // and therefore cannot become part of a read-only view. It leaves in
-        // the step that follows this one.
-        proxy: Rc<RefCell<dyn L7Proxy>>,
-        // Frontend session token, threaded in from `Mux::ready` so the
-        // per-(cluster, source-IP) accounting can key on it without
-        // re-borrowing the session cell — the outer event-loop call chain
-        // already holds a mutable borrow of it.
-        frontend_token: Token,
-    ) -> Result<ConnectPlan, BackendConnectionError> {
+    ) -> Result<ConnectStep, BackendConnectionError> {
         let stream = &mut context.streams[stream_id];
         // when reused, a stream should be detached from its old connection, if not we could end
         // with concurrent connections on a single endpoint
@@ -468,39 +535,76 @@ impl Router {
         // limit governs distinct **frontend connections** per
         // `(cluster, ip)`: an H2 session multiplexing N streams to the same
         // cluster from the same IP still consumes a single slot.
-        let session_ip = stream_context.session_address.map(|sa| sa.ip());
-        if let Some(ip) = session_ip {
-            // The frontend session is mutably borrowed up the call stack
-            // (`HttpSession::ready` -> `state.ready` -> `Mux::ready` ->
-            // here), so we cannot reach `session.borrow().frontend_token()`.
-            // The token is threaded in by the caller instead.
-            let sessions_rc = proxy.borrow().sessions();
-            let at_limit = sessions_rc.borrow().cluster_ip_at_limit(
-                frontend_token,
-                &cluster_id,
-                &ip,
-                cluster_max_connections_per_ip,
-            );
-            if at_limit {
-                let retry_after = sessions_rc
-                    .borrow()
-                    .effective_retry_after(cluster_retry_after);
-                // Stash the resolved retry value on the stream so the
-                // mux's BackendConnectionError → 429 mapping can render
-                // (or elide) the `Retry-After` header without
-                // re-deriving the override chain.
-                stream_context.retry_after_seconds = Some(retry_after).filter(|v| *v > 0);
-                return Err(BackendConnectionError::TooManyConnectionsPerIp {
-                    cluster_id: cluster_id.to_owned(),
-                });
-            }
-            // Idempotent track — H2 streams to the same `(cluster, ip)`
-            // share a single slot in the per-token set. Decrement happens
-            // wholesale on session close via `untrack_all_cluster_ip`.
-            sessions_rc
-                .borrow_mut()
-                .track_cluster_ip(frontend_token, cluster_id.clone(), ip);
+        // This is where phase one ends. The gate needs `SessionManager`, which
+        // the core does not hold and cannot be handed as a read-only view
+        // because consulting it is only half of what happens here — the other
+        // half is `track_cluster_ip`, a mutation of worker-global state. So
+        // the core stops, says what to ask, and resumes on the answer.
+        //
+        // A stream with no source address skips the gate entirely, exactly as
+        // before, and is decided outright.
+        let Some(ip) = stream_context.session_address.map(|sa| sa.ip()) else {
+            return self
+                .decide_after_gate(stream_id, context, &cluster_id, h2, frontend_should_stick)
+                .map(ConnectStep::Decided);
+        };
+        Ok(ConnectStep::CheckIpLimit(ConnectResume {
+            cluster_id,
+            h2,
+            frontend_should_stick,
+            ip,
+            max_connections_per_ip: cluster_max_connections_per_ip,
+            cluster_retry_after,
+        }))
+    }
+
+    /// Finish a decision the embedder paused at
+    /// [`ConnectStep::CheckIpLimit`].
+    ///
+    /// Takes `resume` **by value**, so a parked decision cannot be resumed
+    /// twice. The return type is [`ConnectPlan`], not [`ConnectStep`], so a
+    /// second gate consultation is not merely wrong but unrepresentable.
+    pub(super) fn plan_connect_resume<L: ListenerHandler + L7ListenerHandler>(
+        &mut self,
+        stream_id: GlobalStreamId,
+        context: &mut Context<L>,
+        resume: ConnectResume,
+        verdict: IpGateVerdict,
+    ) -> Result<ConnectPlan, BackendConnectionError> {
+        if let IpGateVerdict::AtLimit { retry_after } = verdict {
+            // Stash the resolved retry value on the stream so the mux's
+            // `BackendConnectionError` -> 429 mapping can render (or elide)
+            // the `Retry-After` header without re-deriving the override
+            // chain. The embedder resolved it; the core only records it.
+            context.streams[stream_id].context.retry_after_seconds =
+                Some(retry_after).filter(|v| *v > 0);
+            return Err(BackendConnectionError::TooManyConnectionsPerIp {
+                cluster_id: resume.cluster_id,
+            });
         }
+        self.decide_after_gate(
+            stream_id,
+            context,
+            &resume.cluster_id,
+            resume.h2,
+            resume.frontend_should_stick,
+        )
+    }
+
+    /// Everything the decision does once the gate has answered: the pool
+    /// reuse scan, and the dial request when nothing is reusable.
+    ///
+    /// One body shared by both the gated and the ungated entry, so the two
+    /// cannot drift — the thing a split like this most easily gets wrong.
+    fn decide_after_gate<L: ListenerHandler + L7ListenerHandler>(
+        &mut self,
+        stream_id: GlobalStreamId,
+        context: &mut Context<L>,
+        cluster_id: &str,
+        h2: bool,
+        frontend_should_stick: bool,
+    ) -> Result<ConnectPlan, BackendConnectionError> {
+        let stream_context = &mut context.streams[stream_id].context;
 
         /*
         H2 connecting strategy (least-loaded):
@@ -652,7 +756,7 @@ impl Router {
         // `Mux::ready_inner` performs it in the same order and calls back
         // into `Router::commit_dialed`.
         Ok(ConnectPlan::Dial {
-            cluster_id,
+            cluster_id: cluster_id.to_owned(),
             h2,
             frontend_should_stick,
         })
@@ -1900,7 +2004,7 @@ mod backend_selection_order_tests {
 
     use super::Router;
     use crate::{
-        L7Proxy,
+        BackendConnectionError, L7Proxy,
         backends::Backend,
         http::{HttpListener, HttpProxy},
         pool::Pool,
@@ -1911,11 +2015,27 @@ mod backend_selection_order_tests {
                 buffer_source::PoolBufferSource,
                 h2::H2ConnectionConfig,
                 h2_flood_detector::H2FloodConfig,
-                router::{ConnectPlan, RoutingView},
+                router::{ConnectPlan, ConnectStep, IpGateVerdict, RoutingView},
             },
         },
         socket::SessionTcpStream,
     };
+
+    /// Unwrap a step these fixtures can only produce one way.
+    ///
+    /// Every `Context` here is built with `session_address: None`, so the
+    /// per-(cluster, source-IP) gate is skipped and `Router::plan_connect`
+    /// must decide outright. A `CheckIpLimit` would mean the gate fired
+    /// without a source IP, which is its own bug.
+    fn decided(step: ConnectStep) -> ConnectPlan {
+        match step {
+            ConnectStep::Decided(plan) => plan,
+            ConnectStep::CheckIpLimit(_) => panic!(
+                "a stream with no session address must not reach the \
+                 per-(cluster, source-IP) gate"
+            ),
+        }
+    }
 
     /// Staged deliberately out of order and non-contiguous, so a green run
     /// cannot be an artefact of insertion order or of a dense key space.
@@ -2114,13 +2234,8 @@ mod backend_selection_order_tests {
         let proxy_ref = fixture.proxy.borrow();
         let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
         let plan = router
-            .plan_connect(
-                stream_id,
-                &mut context,
-                &view,
-                fixture.proxy.clone(),
-                Token(0),
-            )
+            .plan_connect(stream_id, &mut context, &view)
+            .map(decided)
             .expect("the router must reuse one of the staged backends");
         assert!(
             matches!(plan, ConnectPlan::Attached),
@@ -2131,6 +2246,115 @@ mod backend_selection_order_tests {
             StreamState::Linked(token) => token,
             other => panic!("connect must link the stream to a backend, got {other:?}"),
         }
+    }
+
+    /// An admitted stream must have been **counted** before the decision
+    /// resumes — the ordering the gate-as-a-step split has to preserve.
+    ///
+    /// `SessionManager::track_cluster_ip` mutates
+    /// `connections_per_cluster_ip`, which is keyed on `(cluster, ip)`
+    /// **across every session on the worker** and read again by
+    /// `lib/src/tcp.rs`'s own gate. So an `IpGateVerdict::Admitted` is an
+    /// assertion that the slot has already been taken. Resume as `Admitted`
+    /// without having tracked and the stream goes through uncounted, and the
+    /// next session from the same IP finds a slot that should be gone.
+    ///
+    /// The test drives the real production sequence — `Router::plan_connect`
+    /// → `super::consult_ip_gate` → `Router::plan_connect_resume` — for two
+    /// DIFFERENT frontend tokens from the SAME source IP, against a limit of
+    /// one. Two tokens, not one: the gate is deliberately idempotent within a
+    /// token (an H2 session multiplexing many streams to one cluster holds a
+    /// single slot), so a second stream on the same token could never trip
+    /// the limit and would prove nothing.
+    ///
+    /// To SEE THIS RED: delete the `track_cluster_ip` call from
+    /// `super::consult_ip_gate`, leaving it to return
+    /// `IpGateVerdict::Admitted` without counting. The second token is then
+    /// admitted too and the `AtLimit` assertion below fires.
+    #[test]
+    fn an_admitted_stream_is_counted_before_the_decision_resumes() {
+        let fixture = routing_fixture();
+        let sessions = fixture.proxy.borrow().sessions();
+        let source: SocketAddr = "203.0.113.7:51000"
+            .parse()
+            .expect("test source address must parse");
+
+        // One connection per (cluster, ip).
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            H2_CLUSTER.to_owned(),
+            Cluster {
+                cluster_id: H2_CLUSTER.to_owned(),
+                max_connections_per_ip: Some(1),
+                ..Default::default()
+            },
+        );
+        let view = RoutingView::new(&clusters, ListenerType::Http);
+
+        // Drive one stream all the way through the three-step sequence and
+        // report what the gate said and what the decision became.
+        let run = |token: Token| {
+            let mut context = Context::new(
+                Ulid::generate(),
+                Rc::downgrade(&fixture.pool),
+                fixture.listener.clone(),
+                Some(source),
+                "127.0.0.1:80"
+                    .parse()
+                    .expect("test public address must parse"),
+            );
+            let stream_id = context
+                .create_stream(Ulid::generate(), 65_535)
+                .expect("the test pool must hand out a stream");
+            {
+                let stream = &mut context.streams[stream_id];
+                stream.state = StreamState::Link;
+                stream.context.authority = Some(H2_AUTHORITY.to_owned());
+                stream.context.path = Some("/".to_owned());
+                stream.context.method = Some(Method::Get);
+            }
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            let step = router
+                .plan_connect(stream_id, &mut context, &view)
+                .expect("routing must resolve the staged cluster");
+            let ConnectStep::CheckIpLimit(resume) = step else {
+                panic!("a stream WITH a session address must reach the per-IP gate")
+            };
+            let verdict = super::super::consult_ip_gate(&sessions, token, &resume);
+            let admitted = matches!(verdict, IpGateVerdict::Admitted);
+            let outcome = router.plan_connect_resume(stream_id, &mut context, resume, verdict);
+            let retry_after = context.streams[stream_id].context.retry_after_seconds;
+            (admitted, outcome, retry_after)
+        };
+
+        let (admitted, outcome, _) = run(Token(1));
+        assert!(
+            admitted,
+            "premise: the first token must be under the limit, or the second proves nothing"
+        );
+        assert!(
+            matches!(outcome, Ok(ConnectPlan::Dial { .. })),
+            "an admitted stream must go on to request a dial, got {outcome:?}"
+        );
+
+        let (admitted, outcome, retry_after) = run(Token(2));
+        assert!(
+            !admitted,
+            "a SECOND token from the same source IP must find the slot already counted — \
+             an Admitted verdict here means the first stream resumed without being tracked"
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(BackendConnectionError::TooManyConnectionsPerIp { .. })
+            ),
+            "the refused stream must surface TooManyConnectionsPerIp, got {outcome:?}"
+        );
+        assert_eq!(
+            retry_after, None,
+            "with no cluster or global override the resolved Retry-After is 0, which is \
+             stashed as None so the 429 mapping elides the header rather than sending 0"
+        );
     }
 
     /// The routing decision reads cluster configuration from the view it was
@@ -2204,13 +2428,8 @@ mod backend_selection_order_tests {
 
         let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
         let plan = router
-            .plan_connect(
-                stream_id,
-                &mut context,
-                &view,
-                fixture.proxy.clone(),
-                Token(0),
-            )
+            .plan_connect(stream_id, &mut context, &view)
+            .map(decided)
             .expect("routing must resolve the staged cluster");
 
         match plan {
@@ -2296,13 +2515,8 @@ mod backend_selection_order_tests {
         let proxy_ref = fixture.proxy.borrow();
         let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
         let plan = router
-            .plan_connect(
-                stream_id,
-                &mut context,
-                &view,
-                fixture.proxy.clone(),
-                Token(0),
-            )
+            .plan_connect(stream_id, &mut context, &view)
+            .map(decided)
             .expect("routing must resolve the staged cluster");
 
         match &plan {

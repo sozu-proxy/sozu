@@ -2362,6 +2362,39 @@
   `track_cluster_ip`, a mutation of worker-global state, so it cannot become a read-only view. It
   becomes a returned step of its own.
 
+- **`refactor(mux)`: the per-(cluster, source-IP) limit gate becomes a returned step
+  ([#1340](https://github.com/sozu-proxy/sozu/issues/1340), Q6).** It was the last thing
+  `Router::plan_connect` reached `Rc<RefCell<dyn L7Proxy>>` for, and it could not follow
+  `clusters()` and `kind()` into the borrowed view, because it is not a read: it calls
+  `SessionManager::cluster_ip_at_limit` **and** `SessionManager::track_cluster_ip`, which mutates
+  `connections_per_cluster_ip` — worker-global state keyed on `(cluster, ip)` across every
+  session, read again by `lib/src/tcp.rs`'s own gate for the TCP proxy.
+
+  So it is a step: `Router::plan_connect` answers `ConnectStep::CheckIpLimit(ConnectResume)`,
+  `consult_ip_gate` performs the consult and the track, and `Router::plan_connect_resume`
+  finishes on the verdict. `plan_connect` now takes no `L7Proxy` handle at all.
+
+  Two properties are enforced by types rather than by comment. `ConnectResume` is taken **by
+  value**, so a parked decision cannot be resumed twice. The resumed call returns `ConnectPlan`,
+  not `ConnectStep`, so a second gate consultation is unrepresentable. Both entries share one
+  `Router::decide_after_gate` body so the gated and ungated paths cannot drift.
+
+  **`Rc<RefCell<dyn L7Proxy>>` production code references in `lib/src/protocol/mux/router.rs` go
+  4 → 3** (comment lines filtered). **That 3 is the floor for this stage, and it is not a miss:**
+  the remaining three are the import plus `Router::backend_from_request` and
+  `Router::get_backend_for_sticky_session`, which reach `L7Proxy::backends` for selection.
+  Reaching zero means giving *selection* a borrowed view of backend load state, which is Question
+  12's second part — a further stage, not a failure of this one.
+
+  No behaviour change. `an_admitted_stream_is_counted_before_the_decision_resumes` drives the real
+  three-step sequence — `plan_connect` → `consult_ip_gate` → `plan_connect_resume` — for two
+  different frontend tokens from one source IP against a limit of one, and pins that the track
+  lands before the decision resumes. Two tokens rather than two streams on one token, because the
+  gate is deliberately idempotent within a token and a same-token retry could never trip the
+  limit. Seen red by deleting the `track_cluster_ip` call so the gate returns `Admitted` without
+  counting: the second token is then admitted too. The production diff and the test share no
+  string literal. `cargo test -p sozu-lib` goes **1128 → 1129 passed**.
+
 - **`fix(mux-h2)`: the RFC 9218 §4 round-robin cursor is per urgency bucket, so every incremental
   bucket rotates instead of only the one that leads the pass.** `Prioriser` held ONE
   connection-global `incremental_cursor`. `apply_incremental_rotation` applied it to every urgency
