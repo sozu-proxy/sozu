@@ -14,12 +14,11 @@ use kawa::{
 };
 use sozu_command::logging::ansi_palette;
 
-use crate::metrics::names;
 use crate::protocol::{
     http::parser::compare_no_case,
     mux::{
         StreamId,
-        h2::MAX_HEADER_LIST_SIZE,
+        h2::{MAX_HEADER_LIST_SIZE, MetricEvent},
         parser::{self, FrameHeader, FrameType, H2Error},
         pkawa::is_connection_specific_header,
         serializer::{gen_frame_header, gen_rst_stream},
@@ -43,6 +42,12 @@ pub struct H2BlockConverter<'a> {
     pub stream_id: StreamId,
     pub encoder: &'a mut loona_hpack::Encoder<'static>,
     pub out: Vec<u8>,
+    /// Metric events this converter produced, for the connection to hand its
+    /// shell. Reused across streams exactly as `out`, `lowercase_buf` and
+    /// `cookie_buf` are: the pass moves its `Vec` in here and
+    /// [`H2ConverterPass::reclaim`] takes the allocation back, so a stream
+    /// that emits costs no allocation after the first.
+    pub metric_events: Vec<MetricEvent>,
     pub scheme: &'static [u8],
     /// Reusable buffer for lowercasing header keys, avoiding per-header allocation.
     pub lowercase_buf: Vec<u8>,
@@ -206,6 +211,9 @@ pub struct H2ConverterPass {
     cookie_buf: Vec<u8>,
     pending_table_size_update: Option<u32>,
     size_update_emitted: bool,
+    /// The reusable event buffer [`Self::converter`] lends out and
+    /// [`Self::reclaim`] takes back. Always empty between streams.
+    metric_events: Vec<MetricEvent>,
 }
 
 impl H2ConverterPass {
@@ -230,6 +238,7 @@ impl H2ConverterPass {
             cookie_buf,
             pending_table_size_update,
             size_update_emitted: false,
+            metric_events: Vec::new(),
         }
     }
 
@@ -250,6 +259,7 @@ impl H2ConverterPass {
             stream_id,
             encoder,
             out: std::mem::take(&mut self.out),
+            metric_events: std::mem::take(&mut self.metric_events),
             scheme: self.scheme,
             lowercase_buf: std::mem::take(&mut self.lowercase_buf),
             cookie_buf: std::mem::take(&mut self.cookie_buf),
@@ -269,7 +279,16 @@ impl H2ConverterPass {
     /// the window the converter has left. The caller's
     /// `consumed = window - remaining` is the flow-control debit for the
     /// stream it just prepared.
-    pub fn reclaim(&mut self, mut converter: H2BlockConverter<'_>) -> i32 {
+    pub fn reclaim(
+        &mut self,
+        mut converter: H2BlockConverter<'_>,
+        events: &mut Vec<MetricEvent>,
+    ) -> i32 {
+        // Move the elements out, keep the allocation: `append` drains the
+        // source and leaves its capacity, which the `mem::take` below then
+        // returns to the pass for the next stream.
+        events.append(&mut converter.metric_events);
+        self.metric_events = std::mem::take(&mut converter.metric_events);
         self.out = std::mem::take(&mut converter.out);
         self.lowercase_buf = std::mem::take(&mut converter.lowercase_buf);
         self.cookie_buf = std::mem::take(&mut converter.cookie_buf);
@@ -574,7 +593,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         self.window,
                         data.len()
                     );
-                    incr!(names::h2::FLOW_CONTROL_STALL);
+                    self.metric_events.push(MetricEvent::FlowControlStall);
                     if self.position_is_client {
                         // Direction-scoped counterpart: the proxy → backend
                         // write was paused because the backend's HTTP/2
@@ -584,7 +603,8 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         // updates, so the stall metric is the only signal
                         // available without plumbing an explicit boundary
                         // through the write pass's flush.
-                        incr!(names::backend::FLOW_CONTROL_PAUSED);
+                        self.metric_events
+                            .push(MetricEvent::BackendFlowControlPaused);
                     }
                     kawa.blocks.push_front(Block::Chunk(Chunk { data }));
                     return false;
@@ -608,7 +628,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 }
                 kawa.push_out(Store::from_slice(&header));
                 kawa.push_out(data);
-                incr!(names::h2::FRAMES_TX_DATA);
+                self.metric_events.push(MetricEvent::DataFrameSent);
                 // kawa.push_delimiter();
                 // RFC 9218 §4: incremental streams yield to the scheduler
                 // after every DATA frame so same-urgency incremental peers
@@ -678,7 +698,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         }
                         kawa.push_out(Store::from_slice(&header));
                         kawa.push_out(Store::from_vec(payload));
-                        incr!(names::h2::FRAMES_TX_HEADERS);
+                        self.metric_events.push(MetricEvent::HeadersFrameSent);
                         true
                     } else {
                         let chunks = payload.chunks(self.max_frame_size);
@@ -708,7 +728,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                     );
                                     return false;
                                 }
-                                incr!(names::h2::FRAMES_TX_HEADERS);
+                                self.metric_events.push(MetricEvent::HeadersFrameSent);
                             } else if let Err(e) = gen_frame_header(
                                 &mut header,
                                 &FrameHeader {
@@ -725,7 +745,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                 );
                                 return false;
                             } else {
-                                incr!(names::h2::FRAMES_TX_CONTINUATION);
+                                self.metric_events.push(MetricEvent::ContinuationFrameSent);
                             }
                             kawa.push_out(Store::from_slice(&header));
                             kawa.push_out(Store::from_slice(chunk));
@@ -754,7 +774,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         return false;
                     }
                     kawa.push_out(Store::from_slice(&header));
-                    incr!(names::h2::FRAMES_TX_DATA);
+                    self.metric_events.push(MetricEvent::DataFrameSent);
                 }
             }
         }
@@ -802,7 +822,8 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
             // path) would still try to encode headers/data after our RST.
             kawa.blocks.clear();
             self.out.clear();
-            incr!(names::h2::HEADERS_REJECTED_BUDGET_OVERRUN);
+            self.metric_events
+                .push(MetricEvent::HeadersRejectedBudgetOverrun);
             return;
         }
         if !self.out.is_empty() {
@@ -821,9 +842,61 @@ mod tests {
     use super::*;
     use kawa::{Buffer, Kind, SliceBuffer};
 
+    /// [`H2ConverterPass::reclaim`] hands the converter's metric events to the
+    /// caller's outbox, and hands the emptied allocation back to the pass.
+    ///
+    /// Both halves matter and they fail differently. Losing the first loses
+    /// every `h2.frames.tx.*` a write pass produced — silently, because a
+    /// converter that emitted nothing and a drain that dropped everything are
+    /// indistinguishable downstream. Losing the second turns a reusable buffer
+    /// into a per-stream allocation on the write hot path, which nothing would
+    /// report at all. The three scratch buffers beside it are reclaimed for
+    /// exactly that reason; the events follow the same contract.
+    ///
+    /// To SEE THIS RED: delete `events.append(&mut converter.metric_events);`
+    /// from [`H2ConverterPass::reclaim`]. The first assertion fails with
+    /// `left: 0, right: 2` — the pass swallowing what the converter produced.
+    #[test]
+    fn reclaim_hands_the_converter_events_out_and_the_allocation_back() {
+        let mut encoder = loona_hpack::Encoder::new();
+        let mut pass = H2ConverterPass::new(
+            16384,
+            b"https",
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+
+        let mut converter = pass.converter(&mut encoder, 1, 65535, false, 0);
+        converter.metric_events.push(MetricEvent::DataFrameSent);
+        converter.metric_events.push(MetricEvent::HeadersFrameSent);
+
+        let mut events = Vec::new();
+        pass.reclaim(converter, &mut events);
+
+        assert_eq!(
+            events.len(),
+            2,
+            "reclaim must move the converter's events into the caller's outbox"
+        );
+        assert_eq!(
+            events,
+            vec![MetricEvent::DataFrameSent, MetricEvent::HeadersFrameSent],
+            "in order, and unchanged"
+        );
+        assert!(
+            pass.metric_events.is_empty(),
+            "the pass keeps the buffer empty between streams, exactly as it \
+             keeps `out`, `lowercase_buf` and `cookie_buf`"
+        );
+    }
+
     /// Create a fresh H2BlockConverter with default settings for testing.
     fn test_converter<'a>(encoder: &'a mut loona_hpack::Encoder<'static>) -> H2BlockConverter<'a> {
         H2BlockConverter {
+            metric_events: Vec::new(),
             max_frame_size: 16384,
             window: 65535,
             stream_id: 1,

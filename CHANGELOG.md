@@ -2214,6 +2214,39 @@
   making `MetricEvent` non-`Copy` and allocating on the retry path, which is a datapath trade and
   not a mechanical substitution.
 
+- **`refactor(mux-h2)`: the two H2-only helpers the core reaches through return their metrics too
+  ([#1341](https://github.com/sozu-proxy/sozu/issues/1341), Q4 — the H2-only helpers).**
+  `converter::H2BlockConverter` and `pkawa` are reached, in production, only from
+  `ConnectionH2`, so their metric sites were core-side even though neither type is the core.
+  Both now return `MetricEvent`s. **`converter.rs` and `pkawa.rs` hold zero metric-macro sites**,
+  and `impl ConnectionH2` holds three — down from 41 before this series.
+  Each needed a different mechanism, and neither is new.
+  `H2BlockConverter` implements kawa's `BlockConverter<T>`, whose signature this repository does not
+  own, so its events accumulate on the converter and `H2ConverterPass::reclaim` hands them out —
+  the same `mem::take` that already reclaims `out`, `lowercase_buf` and `cookie_buf`, so a stream
+  that emits costs no allocation after the first pass.
+  `pkawa::handle_header` instead carries them on its **return**. It already takes ten parameters and
+  an `#[allow(clippy::too_many_arguments)]`, and #1341 rejected a twelfth parameter for Q5 on
+  exactly that ground; the return type already crosses the boundary, so the events travel on
+  something that was already there and the count stays at ten. An empty `Vec` does not allocate, so
+  the path that rejects nothing costs nothing.
+  The issue's inventory says pkawa has four metric sites. That counts the two `incr!` **inside**
+  `metric_reject`, and will mislead the next reader: there are **23 production rejection call sites**
+  funnelling through that one emission point, across four functions. Only `metric_reject` writes,
+  which is why one outbox reaches all 23 — and why `a_header_rejection_is_returned_not_recorded`
+  tests that single point rather than the sites.
+  `reclaim_hands_the_converter_events_out_and_the_allocation_back` pins both halves of the
+  converter's contract: losing the drain loses every `h2.frames.tx.*` a pass produced, silently,
+  and losing the reclaim turns a reusable buffer into a per-stream allocation on the write hot path
+  that nothing would report at all. Both tests were seen red before they were trusted.
+  `names::backend::RETRY_STALE_UPSTREAM` stays a metric macro, now with the reason on the line
+  rather than in a changelog. It is the only **labelled** site, and carrying its cluster and backend
+  labels in an event means owned `Option<String>`s: measured, `size_of::<MetricEvent>()` goes
+  **24 → 48 bytes**, paid by every queued event on behalf of a site that fires only on a
+  stale-upstream retry, and the enum loses `Copy`. Recording it in place is the cheaper half of that
+  trade. The core ends at one macro site, not zero, and that is the better outcome: a contorted zero
+  would cost more than the documented one.
+
 ### 🐛 Fixed
 
 - **`fix(mux-h1)`: the `peer=` slot of every `MUX-H1` log line is read from a snapshot

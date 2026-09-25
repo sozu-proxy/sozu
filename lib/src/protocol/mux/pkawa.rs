@@ -14,13 +14,13 @@ use kawa::{
 };
 use sozu_command::logging::ansi_palette;
 
-use crate::metrics::names;
 use crate::{
     pool::Checkout,
     protocol::{
         http::parser::compare_no_case,
         mux::{
             GenericHttpStream, StreamId,
+            h2::MetricEvent,
             h2_scheduler::Prioriser,
             parser::{H2Error, PriorityPart},
         },
@@ -46,11 +46,11 @@ macro_rules! log_module_context {
 /// so a future fifth pseudo-header inherits both the reject metric and
 /// the invalid-flag plumbing automatically.
 macro_rules! store_or_reject {
-    ($field:expr, $regular:expr, $kawa:expr, $value:expr, $invalid:expr) => {
+    ($field:expr, $regular:expr, $kawa:expr, $value:expr, $invalid:expr, $events:expr) => {
         match store_pseudo_header(&$field, $regular, $kawa, &$value) {
             Ok(s) => $field = s,
             Err(reason) => {
-                metric_reject(reason);
+                metric_reject(reason, $events);
                 *$invalid = true;
             }
         }
@@ -352,9 +352,10 @@ macro_rules! reject_metric_key {
 /// SOC uses to triage. Emitting both per call (rather than total once per
 /// request) keeps the totals in lockstep with the breakdown — easier to
 /// reconcile when a single request piles up several rejections.
-fn metric_reject(reason: RejectReason) {
-    incr!(names::h2::HEADERS_REJECTED_TOTAL);
-    incr!(reject_metric_key!("h2.headers.rejected", reason));
+fn metric_reject(reason: RejectReason, events: &mut Vec<MetricEvent>) {
+    events.push(MetricEvent::HeaderRejected {
+        reason_key: reject_metric_key!("h2.headers.rejected", reason),
+    });
 }
 
 /// Classify a header rejected by `is_invalid_h2_header`. Splits the original
@@ -671,10 +672,11 @@ fn decode_headers_with_budget<F>(
     input: &[u8],
     max_decoded_bytes: usize,
     max_header_fields: u32,
+    events: &mut Vec<MetricEvent>,
     mut per_header: F,
 ) -> Result<bool, (H2Error, bool)>
 where
-    F: FnMut(Cow<[u8]>, Cow<[u8]>, &mut bool, &mut usize),
+    F: FnMut(Cow<[u8]>, Cow<[u8]>, &mut bool, &mut usize, &mut Vec<MetricEvent>),
 {
     let max_header_fields = max_header_fields as usize;
     let mut invalid_headers = false;
@@ -721,11 +723,11 @@ where
             return;
         }
         if let Some(reason) = classify_invalid_h2_header(&k, &v) {
-            metric_reject(reason);
+            metric_reject(reason, events);
             invalid_headers = true;
             return;
         }
-        per_header(k, v, &mut invalid_headers, &mut field_count);
+        per_header(k, v, &mut invalid_headers, &mut field_count, events);
         // The cookie branch (RFC 9113 §8.2.3) expands one HPACK field into many
         // jar crumbs and bumps `field_count` for each crumb beyond the first
         // (the first crumb is already counted by the `field_count += 1` above,
@@ -746,7 +748,7 @@ where
         "a non-overflowing decode must end at or below the budget"
     );
     if budget_exceeded {
-        metric_reject(RejectReason::HeaderListOverBudget);
+        metric_reject(RejectReason::HeaderListOverBudget, events);
         error!(
             "{} HPACK decoded header size {} exceeds MAX_HEADER_LIST_SIZE {}",
             log_module_context!(),
@@ -756,7 +758,7 @@ where
         return Err((H2Error::EnhanceYourCalm, false));
     }
     if field_limit_exceeded {
-        metric_reject(RejectReason::TooManyHeaderFields);
+        metric_reject(RejectReason::TooManyHeaderFields, events);
         error!(
             "{} HPACK header field count {} exceeds max_header_fields {}",
             log_module_context!(),
@@ -786,12 +788,20 @@ pub fn handle_header<C>(
     max_header_list_size: u32,
     max_header_fields: u32,
     elide_x_real_ip: bool,
-) -> Result<(), (H2Error, bool)>
+) -> (Vec<MetricEvent>, Result<(), (H2Error, bool)>)
 where
     C: ParserCallbacks<Checkout>,
 {
+    // Owned here and returned, rather than taken as an eleventh parameter:
+    // this function already carries ten and an
+    // `#[allow(clippy::too_many_arguments)]`, and #1341 rejected a twelfth
+    // parameter for exactly that reason. The return type already crosses the
+    // boundary, so the events travel on something that was already there. An
+    // empty `Vec` does not allocate, so the path that rejects nothing — the
+    // common one — costs nothing.
+    let mut events: Vec<MetricEvent> = Vec::new();
     if !kawa.is_initial() {
-        return handle_trailer(
+        let status = handle_trailer(
             kawa,
             input,
             end_stream,
@@ -799,7 +809,9 @@ where
             max_header_list_size,
             max_header_fields,
             elide_x_real_ip,
+            &mut events,
         );
+        return (events, status);
     }
     kawa.push_block(Block::StatusLine);
     let max_decoded_bytes = max_header_list_size as usize;
@@ -823,41 +835,49 @@ where
                 input,
                 max_decoded_bytes,
                 max_header_fields,
-                |k, v, invalid_headers, field_count| {
+                &mut events,
+                |k, v, invalid_headers, field_count, events| {
                     if compare_no_case(&k, b":method") {
                         // RFC 9110 §9: method = token. Validate every byte is
                         // a tchar — spaces, delimiters, and CTLs in the method
                         // reach the H1 request line and can smuggle extra path
                         // segments or headers to backends.
                         if !v.iter().all(|&b| is_tchar(b)) {
-                            metric_reject(RejectReason::InvalidMethod);
+                            metric_reject(RejectReason::InvalidMethod, events);
                             *invalid_headers = true;
                             return;
                         }
-                        store_or_reject!(method, regular_headers, kawa, v, invalid_headers);
+                        store_or_reject!(method, regular_headers, kawa, v, invalid_headers, events);
                     } else if compare_no_case(&k, b":scheme") {
                         // RFC 9113 §8.3.1: the HPACK lowercase rule means a
                         // valid :scheme arrives exactly as "http" or "https".
                         // Anything else is a smuggling / SSRF vector.
                         if v.as_ref() != b"http" && v.as_ref() != b"https" {
-                            metric_reject(RejectReason::InvalidScheme);
+                            metric_reject(RejectReason::InvalidScheme, events);
                             *invalid_headers = true;
                             return;
                         }
-                        store_or_reject!(scheme, regular_headers, kawa, v, invalid_headers);
+                        store_or_reject!(scheme, regular_headers, kawa, v, invalid_headers, events);
                     } else if compare_no_case(&k, b":path") {
                         // RFC 9112 §3.2: fragment identifiers (`#`) are
                         // prohibited in request-targets.
                         if v.contains(&b'#') {
-                            metric_reject(RejectReason::InvalidPath);
+                            metric_reject(RejectReason::InvalidPath, events);
                             *invalid_headers = true;
                             return;
                         }
-                        store_or_reject!(path, regular_headers, kawa, v, invalid_headers);
+                        store_or_reject!(path, regular_headers, kawa, v, invalid_headers, events);
                     } else if compare_no_case(&k, b":authority") {
-                        store_or_reject!(authority, regular_headers, kawa, v, invalid_headers);
+                        store_or_reject!(
+                            authority,
+                            regular_headers,
+                            kawa,
+                            v,
+                            invalid_headers,
+                            events
+                        );
                     } else if k.starts_with(b":") {
-                        metric_reject(RejectReason::UnknownPseudo);
+                        metric_reject(RejectReason::UnknownPseudo, events);
                         *invalid_headers = true;
                     } else if compare_no_case(&k, b"cookie") {
                         regular_headers = true;
@@ -890,7 +910,7 @@ where
                             if let Some(reason) = classify_invalid_value_byte(cookie_key)
                                 .or_else(|| classify_invalid_value_byte(cookie_val))
                             {
-                                metric_reject(reason);
+                                metric_reject(reason, events);
                                 *invalid_headers = true;
                                 return;
                             }
@@ -915,14 +935,14 @@ where
                             }
                             let key_start = kawa.storage.end as u32;
                             if kawa.storage.write_all(cookie_key).is_err() {
-                                metric_reject(RejectReason::OversizedPseudoValue);
+                                metric_reject(RejectReason::OversizedPseudoValue, events);
                                 *invalid_headers = true;
                                 return;
                             }
                             let key_len = cookie_key.len() as u32;
                             let val_start = kawa.storage.end as u32;
                             if kawa.storage.write_all(cookie_val).is_err() {
-                                metric_reject(RejectReason::OversizedPseudoValue);
+                                metric_reject(RejectReason::OversizedPseudoValue, events);
                                 *invalid_headers = true;
                                 return;
                             }
@@ -949,7 +969,7 @@ where
                         // which point authority is known regardless of order.
                         regular_headers = true;
                         if let Some(reason) = classify_invalid_value_byte(&v) {
-                            metric_reject(reason);
+                            metric_reject(reason, events);
                             *invalid_headers = true;
                             return;
                         }
@@ -983,7 +1003,7 @@ where
                     } else {
                         regular_headers = true;
                         if let Err(reason) = write_regular_header(kawa, &k, &v) {
-                            metric_reject(reason);
+                            metric_reject(reason, events);
                             *invalid_headers = true;
                             return;
                         }
@@ -999,7 +1019,14 @@ where
                         }
                     }
                 },
-            )?;
+            );
+            // `?` cannot early-return the tuple this function now answers
+            // with, so the exit is explicit and carries the events
+            // accumulated so far.
+            let invalid_headers = match invalid_headers {
+                Ok(invalid) => invalid,
+                Err(error) => return (events, Err(error)),
+            };
             // Post-decode :path form validation (deferred because :method may
             // arrive after :path in HPACK — RFC 9113 does not mandate ordering).
             // RFC 9112 §3.2 / RFC 9113 §8.3.1: for http/https URIs we accept
@@ -1012,7 +1039,7 @@ where
                     .data_opt(kawa.storage.buffer())
                     .is_some_and(|m| m == b"OPTIONS");
                 if !(starts_with_slash || (is_asterisk && method_is_options)) {
-                    return Err((H2Error::ProtocolError, false));
+                    return (events, Err((H2Error::ProtocolError, false)));
                 }
             }
             // RFC 9113 §8.3.1 requires all four pseudo-headers to be present and non-empty.
@@ -1030,7 +1057,7 @@ where
                 || scheme.is_empty()
             {
                 error!("{} INVALID HEADERS", log_module_context!());
-                return Err((H2Error::ProtocolError, false));
+                return (events, Err((H2Error::ProtocolError, false)));
             }
             // RFC 9113 §8.3.1: if a literal ``host`` header appears, it must
             // match ``:authority`` (modulo optional port) and be deduplicated
@@ -1041,7 +1068,7 @@ where
                     "{} H2 host header: multiple disagreeing values",
                     log_module_context!()
                 );
-                return Err((H2Error::ProtocolError, false));
+                return (events, Err((H2Error::ProtocolError, false)));
             }
             if let Some(ref host) = host_value {
                 let authority_bytes = authority.data_opt(kawa.storage.buffer()).unwrap_or(&[]);
@@ -1050,7 +1077,7 @@ where
                         "{} H2 host header does not match :authority",
                         log_module_context!()
                     );
-                    return Err((H2Error::ProtocolError, false));
+                    return (events, Err((H2Error::ProtocolError, false)));
                 }
                 // Match — drop it. kawa's H1 serializer emits Host: from
                 // :authority on its own.
@@ -1084,14 +1111,15 @@ where
                 input,
                 max_decoded_bytes,
                 max_header_fields,
-                |k, v, invalid_headers, _field_count| {
+                &mut events,
+                |k, v, invalid_headers, _field_count, events| {
                     if compare_no_case(&k, b":status") {
                         // RFC 9113 §8.3.2 / RFC 9110 §15: :status is exactly
                         // three ASCII digits. `u16::from_str` would accept
                         // `+200`, ` 200`, `00200` etc., all of which diverge
                         // from the backend's H1 parser.
                         if v.len() != 3 || !v.iter().all(|b| b.is_ascii_digit()) {
-                            metric_reject(RejectReason::InvalidStatus);
+                            metric_reject(RejectReason::InvalidStatus, events);
                             *invalid_headers = true;
                             return;
                         }
@@ -1115,25 +1143,29 @@ where
                                 );
                             }
                             Err(reason) => {
-                                metric_reject(reason);
+                                metric_reject(reason, events);
                                 *invalid_headers = true;
                             }
                         }
                     } else if k.starts_with(b":") {
-                        metric_reject(RejectReason::UnknownPseudo);
+                        metric_reject(RejectReason::UnknownPseudo, events);
                         *invalid_headers = true;
                     } else {
                         regular_headers = true;
                         if let Err(reason) = write_regular_header(kawa, &k, &v) {
-                            metric_reject(reason);
+                            metric_reject(reason, events);
                             *invalid_headers = true;
                         }
                     }
                 },
-            )?;
+            );
+            let invalid_headers = match invalid_headers {
+                Ok(invalid) => invalid,
+                Err(error) => return (events, Err(error)),
+            };
             if invalid_headers || status.is_empty() {
                 error!("{} INVALID HEADERS", log_module_context!());
-                return Err((H2Error::ProtocolError, false));
+                return (events, Err((H2Error::ProtocolError, false)));
             }
             // Past the validity gate, :status was exactly three ASCII digits
             // (the in-loop guard rejected anything else), so the decimal `code`
@@ -1184,7 +1216,7 @@ where
                     log_module_context!(),
                     n
                 );
-                return Err((H2Error::ProtocolError, false));
+                return (events, Err((H2Error::ProtocolError, false)));
             }
         }
         if let BodySize::Empty = kawa.body_size {
@@ -1236,7 +1268,7 @@ where
     }));
 
     if kawa.parsing_phase == ParsingPhase::Terminated {
-        return Ok(());
+        return (events, Ok(()));
     }
 
     // A stream that still expects a body (`!end_stream`) must have had its
@@ -1260,7 +1292,7 @@ where
             || kawa.parsing_phase == ParsingPhase::Body,
         "a non-empty Content-Length body must transition to ParsingPhase::Body"
     );
-    Ok(())
+    (events, Ok(()))
 }
 
 /// Decode an H2 trailer HEADERS frame and append the validated trailer
@@ -1299,6 +1331,7 @@ where
 /// elision of `x-real-ip` no longer depends on it — the listener flag
 /// only governs whether sōzu *injects* an `X-Real-IP` header on the
 /// forward, never whether it filters one off the wire.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_trailer(
     kawa: &mut GenericHttpStream,
     input: &[u8],
@@ -1307,6 +1340,7 @@ pub fn handle_trailer(
     max_header_list_size: u32,
     max_header_fields: u32,
     elide_x_real_ip: bool,
+    events: &mut Vec<MetricEvent>,
 ) -> Result<(), (H2Error, bool)> {
     // Acknowledge the parameter; dropping it would force a callsite
     // change. The elision below covers x-real-ip unconditionally so
@@ -1368,7 +1402,7 @@ pub fn handle_trailer(
         }
         // RFC 9113 §8.1: Trailers MUST NOT contain pseudo-header fields.
         if k.starts_with(b":") {
-            metric_reject(RejectReason::UnknownPseudo);
+            metric_reject(RejectReason::UnknownPseudo, events);
             invalid_trailers = true;
             return;
         }
@@ -1378,7 +1412,7 @@ pub fn handle_trailer(
         // bytes (RFC 9110 §5.5). Without this, crafted trailer names can
         // smuggle H1 lines through kawa's serializer.
         if let Some(reason) = classify_invalid_h2_header(&k, &v) {
-            metric_reject(reason);
+            metric_reject(reason, events);
             invalid_trailers = true;
             return;
         }
@@ -1398,13 +1432,13 @@ pub fn handle_trailer(
             k.as_ref(),
             b"x-real-ip" | b"x-forwarded-for" | b"forwarded" | b"x-request-id"
         ) {
-            incr!(names::h2::TRAILER_SPOOF_VECTOR_ELIDED);
+            events.push(MetricEvent::TrailerSpoofVectorElided);
             return;
         }
         let start = kawa.storage.end as u32;
         let end_before = kawa.storage.end;
         if kawa.storage.write_all(&k).is_err() || kawa.storage.write_all(&v).is_err() {
-            metric_reject(RejectReason::OversizedPseudoValue);
+            metric_reject(RejectReason::OversizedPseudoValue, events);
             invalid_trailers = true;
             return;
         }
@@ -1438,7 +1472,7 @@ pub fn handle_trailer(
         return Err((H2Error::CompressionError, true));
     }
     if budget_exceeded {
-        metric_reject(RejectReason::HeaderListOverBudget);
+        metric_reject(RejectReason::HeaderListOverBudget, events);
         error!(
             "{} HPACK decoded trailer size {} exceeds MAX_HEADER_LIST_SIZE {}",
             log_module_context!(),
@@ -1448,7 +1482,7 @@ pub fn handle_trailer(
         return Err((H2Error::EnhanceYourCalm, false));
     }
     if field_limit_exceeded {
-        metric_reject(RejectReason::TooManyHeaderFields);
+        metric_reject(RejectReason::TooManyHeaderFields, events);
         error!(
             "{} HPACK trailer field count {} exceeds max_header_fields {}",
             log_module_context!(),
@@ -1485,7 +1519,7 @@ pub fn handle_trailer(
              delivery to upgrade framing to chunked.",
             log_module_context!()
         );
-        incr!(names::h2::TRAILERS_DROPPED_CONTENT_LENGTH);
+        events.push(MetricEvent::TrailersDroppedContentLength);
     }
 
     kawa.push_block(Block::Flags(Flags {
@@ -1501,6 +1535,57 @@ pub fn handle_trailer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Read a process-local counter by raw key, treating an absent key as 0.
+    fn proxy_counter(key: &str) -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(key)
+                .and_then(|fm| fm.inner.as_ref())
+                .and_then(|inner| match inner {
+                    Inner::Count(v) => Some(*v),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// A header rejection is RETURNED, not recorded.
+    ///
+    /// `metric_reject` is the single emission point for all 23 rejection call
+    /// sites in this module, so it is the one place where pkawa could reach
+    /// the worker-local `METRICS` aggregator behind its caller's back. It is
+    /// also invisible from the outside: a rejection that both emits directly
+    /// AND returns an event double-counts, and one that emits directly and
+    /// returns nothing looks identical to a correct one on the dashboard.
+    ///
+    /// To SEE THIS RED: put `incr!(names::h2::HEADERS_REJECTED_TOTAL);` back
+    /// at the top of `metric_reject` (with `use crate::metrics::names;`). The
+    /// first assertion fails with `left: <before + 1>, right: <before>` —
+    /// pkawa writing the registry its caller is supposed to own.
+    #[test]
+    fn a_header_rejection_is_returned_not_recorded() {
+        let before = proxy_counter(crate::metrics::names::h2::HEADERS_REJECTED_TOTAL);
+
+        let mut events = Vec::new();
+        metric_reject(RejectReason::InvalidMethod, &mut events);
+
+        assert_eq!(
+            proxy_counter(crate::metrics::names::h2::HEADERS_REJECTED_TOTAL),
+            before,
+            "pkawa must not write METRICS: the rejection travels back to \
+             `ConnectionH2` as a MetricEvent and its shell records it"
+        );
+        assert_eq!(events.len(), 1, "exactly one event per rejection");
+        assert!(
+            matches!(events[0], MetricEvent::HeaderRejected { .. }),
+            "and it carries the per-reason key alongside the roll-up, got {:?}",
+            events[0]
+        );
+    }
 
     // ── parse_rfc9218_priority ────────────────────────────────────────────
 
@@ -1807,7 +1892,7 @@ mod tests {
         }
         let mut callbacks = NoOpCallbacks;
 
-        let result = handle_header(
+        let (_events, result) = handle_header(
             &mut decoder,
             &mut prioriser,
             1,
@@ -1869,6 +1954,7 @@ mod tests {
             max_header_fields,
             false,
         )
+        .1
         .map(|()| kawa)
     }
 
@@ -2211,6 +2297,7 @@ mod tests {
             u32::MAX,
             false,
         )
+        .1
     }
 
     fn try_decode_response_headers(
@@ -2245,6 +2332,7 @@ mod tests {
             u32::MAX,
             false,
         )
+        .1
     }
 
     #[test]
@@ -2578,6 +2666,7 @@ mod tests {
             crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
             u32::MAX,
             false,
+            &mut Vec::new(),
         );
         assert!(err.is_err(), "LF in trailer value must be rejected");
     }
@@ -2807,6 +2896,7 @@ mod tests {
             crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
             u32::MAX,
             false, // elide_x_real_ip — listener flag, not the trailer-side gate
+            &mut Vec::new(),
         );
         assert!(result.is_ok(), "handle_trailer failed: {:?}", result.err());
         kawa
