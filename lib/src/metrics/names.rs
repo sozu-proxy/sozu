@@ -205,9 +205,10 @@ pub mod h2 {
 
     /// Streams that were ready to emit AND marked incremental (RFC 9218 §4),
     /// summed over the urgency buckets of one write pass and aggregated across
-    /// every live H2 connection. Emitted as a signed `gauge_add!` delta from
-    /// `ConnectionH2::gauge_connection_state` with the matching teardown in
-    /// `impl Drop`, exactly like the `CONNECTION_*` trio below it.
+    /// every live H2 connection. Emitted as a signed delta that
+    /// `ConnectionH2::gauge_connection_state` returns as a `MetricEvent`, with
+    /// the matching teardown in `impl Drop for H2Shell`, exactly like the
+    /// `CONNECTION_*` trio below it.
     pub const STREAMS_READY_INCREMENTAL_BY_URGENCY: &str =
         "h2.streams.ready_incremental.by_urgency";
 

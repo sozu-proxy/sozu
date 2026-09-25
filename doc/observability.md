@@ -99,9 +99,11 @@ offending key. Two patterns prevent this class of bug:
    that closes it.
 2. **Move teardown into `impl Drop`** when the close paths are scattered
    across the codebase (graceful shutdown, force-disconnect, panic-unwind).
-   `impl Drop for ConnectionH2` is the canonical example: it subtracts
-   whatever `gauge_add!(+N)` the connection ever emitted, regardless of which
-   close path runs.
+   `impl Drop for H2Shell` is the canonical example: it subtracts whatever
+   positive contribution the connection ever made, regardless of which close
+   path runs. It sits on the shell rather than on `ConnectionH2` because the
+   core returns its metrics as `MetricEvent`s instead of writing `METRICS`
+   itself; the shell owns the core, so the RAII guarantee is unchanged.
 
 ### Cardinality budgets
 

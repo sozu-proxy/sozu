@@ -2133,6 +2133,43 @@
   consecutive runs is the right number for a deterministic handshake is a separate maintainer
   decision.
 
+- **`refactor(mux-h2)`: the H2 core's four connection-level gauges leave it as returned
+  `MetricEvent`s, and the `Drop` that rebalances them moves to the shell
+  ([#1341](https://github.com/sozu-proxy/sozu/issues/1341), Q4 — the gauges and their
+  teardown).** `ConnectionH2::gauge_connection_state` and
+  `ConnectionH2::release_connection_gauges` no longer call `gauge_add!`. They push a signed-delta
+  `MetricEvent` onto the core, and `H2Shell` drains it into the worker-local `METRICS` aggregator
+  through the new `record_metric`. The keys, the deltas and the aggregate a
+  dashboard reads are unchanged; what changed is which layer writes them. The metric macros borrow
+  a `thread_local!` aggregator, which is exactly the ambient process reach a byte-in / byte-out
+  core gave up — and which a deterministic simulator has no way to observe, so a core that wrote
+  there could not be driven by one. The binding precedent is in-repo: `protocol/udp/`'s core has
+  zero metric-macro sites and emits `Output::Metric(MetricEvent)`, which `crate::udp` folds into
+  `METRICS` and `sim/tests/udp_simulation.rs` folds into a shadow model instead.
+  `impl Drop` moves from `ConnectionH2` to `H2Shell` with it, one layer up where `METRICS`
+  legitimately lives. RAII is not given up: the shell owns the core, so the core cannot outlive
+  the release, and because `H2Shell` now implements `Drop` the compiler additionally refuses to
+  move `core` out of it. Losing that impl is the one failure with no symptom — every live
+  connection's contribution would leak upward permanently, with no resync and no underflow to
+  notice — so `dropping_a_connection_releases_its_ready_incremental_contribution` pins the round
+  trip and its "To SEE THIS RED" recipe now names the new site; deleting
+  `self.core.release_connection_gauges();` from `impl Drop for H2Shell` fails it with
+  `left: 3, right: 0`. A second test,
+  `the_core_queues_gauge_deltas_instead_of_writing_the_metrics_registry`, pins *who writes*, which
+  no assertion on the aggregate's value can distinguish: a core that emitted directly and a shell
+  that records what the core queued leave the aggregate identical. Measured over
+  `lib/src/protocol/mux/` at `6d6640bf`, counting code references rather than grep lines: 102
+  production metric-macro sites across the seven macros `lib/src/metrics/mod.rs` declares
+  (`incr!` 57, `gauge_add!` 26, `count!` 17, `gauge!` 2; `decr!`, `time!` and
+  `record_backend_metrics!` have none), zero of them inside a `#[cfg(test)]` span, and 41 inside
+  `impl ConnectionH2`. This changeset moves the eight in `gauge_connection_state` and
+  `release_connection_gauges`; the rest of the core's sites keep calling the macros and both
+  mechanisms end in the same aggregator, so a half-migrated counter is not a wrong counter.
+  Recording moves from the emit site to the end of the shell's step — `H2Shell::settled`, so
+  after every `readable`, `writable`, `start_stream` and `cancel_timed_out_streams` — or to
+  `Drop`. The queue is FIFO and its values are signed deltas, so a step that reaches neither
+  records the same sum at the next drain rather than losing it.
+
 ### 🐛 Fixed
 
 - **`fix(mux-h1)`: the `peer=` slot of every `MUX-H1` log line is read from a snapshot
