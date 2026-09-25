@@ -235,6 +235,39 @@ jobs:
         if: matrix.toolchain == '1.93.1'
         run: cargo clippy --all-targets --locked ${{ matrix.flags }} -- -D warnings
 
+      # `sozu-command-lib` was named in no workflow at all until this step:
+      # CI tested `sozu-lib`, `sozu`, `sozu-e2e` and `sozu-sim`, and there is
+      # no `cargo test --workspace` anywhere, so `command/`'s 170 `#[test]`
+      # functions across 13 files never ran (sozu#1539). They pass — this was
+      # never a quarantine anyone chose, the package was simply never added,
+      # and nothing reported its absence. The same gap was closed twice before,
+      # package by package, for the crates the fix at hand was about (the
+      # `Test sozu` and process-level e2e comments below record both); the
+      # command lib was in scope neither time.
+      #
+      # It guards the configuration parser and validator, the protobuf
+      # request/response types, `Channel` and the state model that `sozu-lib`
+      # and `sozu` are both built on, plus `tests/state_compat_v1_1_1.rs` —
+      # a forward-compat regression pinning the `SaveState` / `LoadState` JSON
+      # contract that `proxy-manager` and other tools pinned to
+      # `sozu-command-lib = "1.1.1"` still write. A break there reaches CI today
+      # only if some other package's test happens to exercise it sideways.
+      #
+      # Gated to one cell rather than run per crypto provider, and carrying no
+      # `${{ matrix.flags }}`. Both follow from the same measurement:
+      # `command/src/` contains ZERO `cfg(feature)` — its only features
+      # (`unstable`, `logs-debug`, `logs-trace`) are empty markers and it has no
+      # crypto-provider feature at all, so nothing in it varies by matrix cell
+      # and four cells would re-run one identical result four times. The flags
+      # are not merely redundant but rejected: `cargo test -p sozu-command-lib
+      # --no-default-features --features crypto-ring,opentelemetry,splice,simd`
+      # fails with "the package 'sozu-command-lib' does not contain these
+      # features". `--locked` and `--verbose` match the neighbouring test steps
+      # so a dependency drift fails here exactly as it fails there.
+      - name: Test sozu-command-lib
+        if: matrix.cell == 'msrv-full'
+        run: cargo test -p sozu-command-lib --locked --verbose
+
       - name: Test sozu-lib
         run: cargo test -p sozu-lib --locked ${{ matrix.flags }} --verbose
 
