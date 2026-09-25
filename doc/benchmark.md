@@ -290,9 +290,10 @@ connect(12, {sa_family=AF_INET, sin_port=htons(1052), sin_addr=inet_addr("127.0.
 > `get_backend_for_sticky_session` methods — no longer exist: that session
 > state machine became unreachable once `HttpStateMachine` gained its `Mux`
 > variant, and it was removed on 2026-09-20 (sozu#1346). On a current build the
-> same `connect` syscall is reached through
-> `sozu_lib::protocol::mux::router::Router::connect`
-> (`lib/src/protocol/mux/router.rs`), which calls `Router::backend_from_request`
+> same `connect` syscall is reached through `Mux::dial_backend`
+> (`lib/src/protocol/mux/mod.rs`), which calls `Router::backend_from_request`
 > (`lib/src/protocol/mux/router.rs`) — its only call site — and connects the
-> socket it returns, all under the mux `ready` pass. The
+> socket it returns, all under the mux `ready` pass. Routing itself decides one
+> step earlier, in `Router::plan_connect`
+> (`lib/src/protocol/mux/router.rs`), which performs no syscall at all. The
 > technique this section teaches is unchanged.

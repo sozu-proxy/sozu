@@ -66,7 +66,7 @@ pub mod backend {
     /// with the cluster and the STALE backend — the one that did not answer.
     ///
     /// One request can increment this more than once: the replay goes back
-    /// through `Router::connect`, so `CONN_RETRIES` bounds the total, not
+    /// through `Router::plan_connect`, so `CONN_RETRIES` bounds the total, not
     /// this counter.
     ///
     /// Read it as "an upstream went away before answering", NOT as "the pool

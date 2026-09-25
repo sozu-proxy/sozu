@@ -315,7 +315,7 @@ constructed it. Conceptually the lifecycle is:
 2. **Route the request** to a cluster via `Router::route_from_request`
    (`lib/src/protocol/mux/router.rs`).
 3. **Pick a backend** via `Router::backend_from_request` and **connect to
-   it** via `Router::connect` (same file). A previously-opened keep-alive
+   it** via `Router::plan_connect` (same file). A previously-opened keep-alive
    socket may be reused after a liveness probe.
 4. **Forward bytes** in both directions through the per-`Stream`
    front/back Kawa buffer pair (`lib/src/protocol/mux/stream.rs`),
@@ -523,7 +523,7 @@ from the slab under both front and back tokens, mio deregisters the
 sockets, and the slab entries return to the free list. Half-closed
 H2 streams unwind the same way — per-stream cleanup in `mux::mod` and
 `mux::router` decrements `backend.pool.size`
-(`Mux::close` in `lib/src/protocol/mux/mod.rs`, `Router::connect` in
+(`Mux::close` in `lib/src/protocol/mux/mod.rs`, `Router::plan_connect` in
 `lib/src/protocol/mux/router.rs`).
 
 ## 10. Hot reconfig and upgrades
@@ -591,7 +591,7 @@ set to read a session's life from a dashboard:
   binary backpressure + time-integrated saturation
   (`lib/src/server.rs:518, 534, 594, 1199-1205`).
 - `backend.pool.size` — long-lived gauge mirroring open backend
-  connections (`Router::connect` in `lib/src/protocol/mux/router.rs`,
+  connections (`Router::plan_connect` in `lib/src/protocol/mux/router.rs`,
   `Mux::close` in `lib/src/protocol/mux/mod.rs`,
   `Connection::pre_close_client_bookkeeping` in
   `lib/src/protocol/mux/connection.rs`).

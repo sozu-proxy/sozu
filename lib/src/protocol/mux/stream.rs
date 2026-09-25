@@ -483,7 +483,7 @@ impl Stream {
     /// calls this on every `KeepAlive -> Connected` transition and
     /// `reused_from_pool` is never cleared, so a replay that lands on
     /// another pooled connection re-arms a fresh capture and may itself be
-    /// replayed. `Router::connect`'s `stream.attempts >= CONN_RETRIES` gate
+    /// replayed. `Router::plan_connect`'s `stream.attempts >= CONN_RETRIES` gate
     /// is the only bound on how many times one request is re-issued.
     ///
     /// Arming is BEST EFFORT. Past [`MAX_ARMED_REPLAY_CAPTURES`] no buffer is
@@ -506,7 +506,7 @@ impl Stream {
     ///
     /// The method is known here. `crate::protocol::http::editor::HttpContext`
     /// sets it in `on_request_headers` during the frontend parse, and
-    /// `super::router::Router::connect` routes on it — `route_from_request`,
+    /// `super::router::Router::plan_connect` routes on it — `route_from_request`,
     /// which fails with `RetrieveClusterError::NoMethod` without it — before
     /// it reaches `super::h1::ConnectionH1::start_stream`, the sole caller of
     /// this function.

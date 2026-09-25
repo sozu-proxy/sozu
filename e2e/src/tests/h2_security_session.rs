@@ -4,7 +4,7 @@
 //! Recipes landing in this module follow (one per commit):
 //!
 //! * FIX-18 (`ba0f177c`) — [`e2e_session_router_connect_failure_no_leak`]:
-//!   arm the `new_h2_client` failure-injection hook so `Router::connect`
+//!   arm the `new_h2_client` failure-injection hook so `Mux::dial_backend`
 //!   bails out, and assert sozu returns a non-success status, the backend
 //!   is never invoked, and the worker still performs a clean soft-stop.
 //! * FIX-19 (`1f84f86e`) — [`e2e_socket_bad_tls_peer_does_not_starve_others`]:
@@ -120,7 +120,7 @@ fn minimal_get_headers(authority: &str) -> Vec<u8> {
 }
 
 // ============================================================================
-// FIX-18 — Router::connect rollback on backend failure
+// FIX-18 — Mux::dial_backend rollback on backend failure
 // ============================================================================
 
 /// Setup a cluster whose backend speaks H2 so that the
@@ -182,7 +182,7 @@ fn try_e2e_session_router_connect_failure_no_leak() -> State {
     let (mut worker, mut backend, front_port) = setup_h2_backend_cluster("E2E-SESSION-FIX18");
 
     // Arm the injection: the NEXT call to Connection::new_h2_client inside
-    // the worker will return None, driving Router::connect into its
+    // the worker will return None, driving Mux::dial_backend into its
     // MaxBuffers error path.
     let _prev = __test_force_h2_client_failure(true);
 
@@ -212,9 +212,9 @@ fn try_e2e_session_router_connect_failure_no_leak() -> State {
     // Acceptance:
     // 1. The forced failure produced a non-success status (503 is typical)
     //    OR the hyper call errored out entirely (also acceptable — both
-    //    mean Router::connect rejected the stream).
+    //    mean Mux::dial_backend rejected the stream).
     // 2. The backend was never asked to serve the forced-fail request
-    //    (`resp_sent == 0` — Router::connect aborted before committing any
+    //    (`resp_sent == 0` — Mux::dial_backend aborted before committing any
     //    backend state).
     // 3. Sozu is still reachable on the front listener and performs a
     //    clean soft-stop — the hallmark of "no resource leak".
@@ -241,7 +241,7 @@ fn e2e_session_router_connect_failure_no_leak() {
     assert_eq!(
         repeat_until_error_or(
             3,
-            "FIX-18: Router::connect rollback on forced backend failure",
+            "FIX-18: Mux::dial_backend rollback on forced backend failure",
             try_e2e_session_router_connect_failure_no_leak,
         ),
         State::Success,

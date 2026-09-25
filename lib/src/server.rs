@@ -243,14 +243,14 @@ pub struct SessionManager {
     /// multiplexes to that cluster (an H2 connection serving 100
     /// streams to cluster X from IP 1.2.3.4 still counts as 1). The
     /// counter is incremented the first time a session's
-    /// `Router::connect` resolves to a fresh `(cluster, ip)` pair, and
+    /// `Router::plan_connect` resolves to a fresh `(cluster, ip)` pair, and
     /// decremented when the session closes. Empty when the feature is
     /// unused.
     ///
     /// ── Why nested maps instead of `HashMap<(String, IpAddr), usize>` ──
     ///
     /// The per-request hot path (`cluster_ip_at_limit`, called from
-    /// `mux/router::connect` for every cluster-resolving request) used
+    /// `mux/router::plan_connect` for every cluster-resolving request) used
     /// to allocate a `String` to build the compound key on every
     /// lookup. Splitting the storage so the outer key is `String`
     /// lets the lookup take `&str` — `HashMap::get(cluster_id)` on a
@@ -312,7 +312,7 @@ impl SessionManager {
     /// the limit governs distinct frontend connections, not streams.
     ///
     /// Hot-path: called for every cluster-resolving request from
-    /// `mux/router::connect`. The nested-map storage lets both lookups
+    /// `mux/router::plan_connect`. The nested-map storage lets both lookups
     /// borrow `cluster_id` and `ip`; no per-call allocation runs here
     /// in steady state.
     pub fn cluster_ip_at_limit(

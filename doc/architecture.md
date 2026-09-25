@@ -299,7 +299,7 @@ inline at the start of `writable()`, avoiding extra event loop iterations.
 ```
 lib/src/protocol/mux/
 ├── mod.rs                   Mux session state (SessionState impl), shared Context,
-│                            ready() loop
+│                            ready() loop, backend dial and registration
 ├── h1.rs                    ConnectionH1: the one active H1 stream, wired into Context
 ├── h2.rs                    ConnectionH2: RFC 9113 frame dispatch, settings and
 │                            connection state, edge-trigger discipline
@@ -332,7 +332,7 @@ lib/src/protocol/mux/
 ├── connection.rs            Connection enum dispatching H1/H2, plus the two
 │                            Endpoint adaptors
 ├── router.rs                Backend connection map, reuse strategy, and
-│                            Router::connect orchestration
+│                            Router::plan_connect's routing decision
 ├── stream.rs                Stream / StreamState / StreamParts, the front/back kawa
 │                            pair, bidirectional end-of-stream flags, replay capture
 ├── buffer_source.rs         BufferSource trait and PoolBufferSource: where the core

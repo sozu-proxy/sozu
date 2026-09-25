@@ -270,7 +270,7 @@
 
   No behaviour changes. `Router::backend_from_request`'s load balancer is the only reader of the
   counters involved, and it sees the same values it saw before: application is FIFO and the queue
-  is drained immediately before each `Router::connect` as well as on the way out of `Mux::ready`,
+  is drained immediately before each `Router::plan_connect` as well as on the way out of `Mux::ready`,
   `Mux::timeout`, `Mux::close` and `Mux::shutting_down`, so every read point observes exactly what
   mutating in place left there, saturation included. A `BackendId` names a slot rather than the
   backend's name, so a reload that replaces a registry entry mid-session leaves connections
@@ -2239,6 +2239,53 @@
   request stops depending on per-`HashMap` `RandomState` seeding, so naming a `HashMap` there
   contradicted the guarantee that change exists to provide. Documentation only; no production code
   changes.
+
+- **`refactor(mux)`: `Router::connect` splits into a decision and an effect the embedder performs
+  ([#1340](https://github.com/sozu-proxy/sozu/issues/1340), Q6, first half).** `Router::connect`
+  routed, gated, scanned the pool, dialled a backend, set `TCP_NODELAY`, built the `Connection`,
+  inserted a slab session, registered an epoll interest and rolled all of that back on failure —
+  511 lines, 309 of them code, holding `Rc<RefCell<dyn ProxySession>>` and
+  `Rc<RefCell<dyn L7Proxy>>` to do it.
+
+  It is now `Router::plan_connect`, which decides and returns a `ConnectPlan`: `Attached` when it
+  completed the attach from the pool, `Dial { cluster_id, h2, frontend_should_stick }` when it
+  needs a backend opened. `Mux::dial_backend` performs the dial, the `setsockopt`, the
+  `Connection` construction, `L7Proxy::add_session`, `L7Proxy::register_socket` and the gauge
+  block — in the order `Router::connect` used, unchanged — and hands the result to
+  `Router::commit_dialed`. Same protocol the socket-boundary extraction used four times: the core
+  answers a step, the caller performs the effect, the caller calls back with the answer.
+
+  **`Rc<RefCell<dyn ProxySession>>` code references in `lib/src/protocol/mux/router.rs` go from 4
+  to 0** (comment lines filtered). Its single use was `add_session`, which is the embedder's.
+  `Rc<RefCell<dyn L7Proxy>>` is unchanged at 5 production code references there — the three reads
+  `plan_connect` still makes (`clusters`, `kind`, `sessions`) plus selection — and the borrowed
+  view takes those next. `lib/src/protocol/mux/mod.rs` gains one of each, which is the embedder
+  absorbing what the core put down.
+
+  `ConnectPlan::Attached` deliberately carries no token: the attach is complete, so there is no
+  binding a later edit could reuse to ask a question the variant has already answered — the
+  discipline `H2WritableStateTarget::Flush` set by carrying no `bool`.
+
+  **A wrong comment is fixed rather than moved.** The `register_socket` rollback claimed dropping
+  the connection released the `active_requests` charge "via the regular session drop path
+  (`pre_close_client_bookkeeping`)". `Connection` has no `impl Drop`, so dropping it ran no
+  bookkeeping at all; the claim was harmless only because the charge is guarded on
+  `BackendStatus::Connected` and a freshly-dialled connection is `Connecting`, so there was never
+  anything to release. The rollback now calls `Connection::release_start_stream_charge`
+  explicitly, under the same guard the charge uses, so the pair holds however the status is
+  reached instead of by accident.
+
+  No behaviour change. `a_dial_plan_performs_no_effect_of_its_own` pins the property the split is
+  actually about — a `Dial` that had already dialled would still be a `Dial`, so it asserts on the
+  state the router, the stream, the reverse index and the accounting ledger are left in, not on
+  the returned value. Seen red by performing one effect in `plan_connect`:
+  `left: Linked(Token(4242)), right: Link`. `cargo test -p sozu-lib` goes `1126 → 1127 passed`.
+
+  `Router::connect` is named in 48 places outside `CHANGELOG.md`; all 48 were repointed at
+  `Router::plan_connect` or, where the prose meant the dial or its rollback, at
+  `Mux::dial_backend`. CHANGELOG entries were deliberately left alone: this repository keeps them
+  as a historical record and already names `SimSocket` and `PlaceholderPeer`, neither of which
+  exists in the tree.
 
 - **`fix(mux-h2)`: the RFC 9218 §4 round-robin cursor is per urgency bucket, so every incremental
   bucket rotates instead of only the one that leads the pass.** `Prioriser` held ONE
