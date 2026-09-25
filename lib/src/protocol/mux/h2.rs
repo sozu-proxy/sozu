@@ -47,7 +47,7 @@ use crate::{
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
         update_readiness_after_read, update_readiness_after_write,
     },
-    socket::{SocketHandler, SocketResult, stats::socket_rtt},
+    socket::{SocketHandler, SocketResult},
 };
 
 /// Protocol label + session descriptor used as a prefix on every
@@ -873,6 +873,22 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// across six frame handlers. The macro reads `$self.now`, so those ten
     /// call sites stay as they were.
     pub(super) now: Instant,
+    /// The frontend's kernel-measured TCP round-trip time, sampled by
+    /// [`super::Mux`] once per pass and read by [`Self::snapshot_rtts`] for
+    /// the access log's `client_rtt` cell. `None` until the first sample, and
+    /// on any connection whose kernel refuses `getsockopt(TCP_INFO)`.
+    ///
+    /// The value belongs to the frontend socket, so it is meaningful only
+    /// while `position` is [`Position::Server`]; a backend H2 connection
+    /// carries whatever `Mux` never wrote, which stays `None`.
+    ///
+    /// A carried sample rather than a live read, for the same reason
+    /// [`Self::now`] is one: the read is an ambient host reach a byte-in /
+    /// byte-out core cannot perform. `now` is a clock read and free, so `Mux`
+    /// refreshes it per outer loop iteration; this one is a syscall, so `Mux`
+    /// refreshes it once per pass — see `Mux::refresh_client_rtt`. Issue
+    /// #1339 Q11 decided that trade on measurement.
+    pub(super) client_rtt: Option<Duration>,
 }
 /// Renders the peer address this connection snapshotted at construction,
 /// where it used to render the socket behind it.
@@ -886,8 +902,10 @@ pub struct ConnectionH2<Front: SocketHandler> {
 /// address by construction, so no ephemeral port reaches a trace through here
 /// any more.
 ///
-/// `ConnectionH2::snapshot_rtts` is the one reach into
-/// `SocketHandler::socket_ref` left in this file; `socket_mut` has none.
+/// No production body in this file reaches `SocketHandler::socket_ref` any
+/// more, and `socket_mut` never had one. `ConnectionH2::snapshot_rtts` held
+/// the last of them until issue #1339 Q11 moved the frontend RTT read out to
+/// `Mux::refresh_client_rtt`; the remaining spellings are all in `mod tests`.
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionH2")
@@ -1459,6 +1477,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             refuse_window_start: now,
             mcs_backpressure_applied: false,
             now,
+            client_rtt: None,
         })
     }
 
@@ -3890,15 +3909,28 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         }
     }
 
-    /// Snapshot the access-log RTTs for the local frontend and the linked backend.
+    /// Report the access-log RTTs for the local frontend and the linked backend.
+    ///
+    /// **The two cells no longer share a sampling instant.** `client_rtt` is
+    /// [`Self::client_rtt`], the value `Mux::refresh_client_rtt` sampled once
+    /// at the top of this pass, so every stream finishing in one pass reports
+    /// the same number. `server_rtt` is still read here, through
+    /// [`Endpoint::peer_rtt`], because the backend socket is the other side of
+    /// the connection and this core cannot hold a sample for it. Issue #1339
+    /// Q11 decided that asymmetry on measurement; `doc/configure.md` states it
+    /// for operators reading the log.
+    ///
+    /// Nothing in this method reaches a socket any more, which is the point:
+    /// the local RTT was the last `SocketHandler::socket_ref` read in this
+    /// file.
     ///
     /// `Position::Server`-only. On a backend H2 connection (`Position::Client`)
-    /// the snapshot would write swapped values onto the shared `Stream.metrics`:
-    /// the connection's `socket` is the upstream and the corresponding
-    /// `EndpointServer::socket` returns the frontend, so the per-stream
-    /// `client_rtt`/`server_rtt` cells would be populated with mislabelled
-    /// values. Gating keeps backend H2 from poisoning the access-log metric
-    /// for the matching frontend stream.
+    /// the report would write swapped values onto the shared `Stream.metrics`:
+    /// `Mux` samples the frontend into the frontend connection alone, and the
+    /// corresponding `EndpointServer::peer_rtt` returns that same frontend, so
+    /// the per-stream `client_rtt`/`server_rtt` cells would be populated with
+    /// mislabelled values. Gating keeps backend H2 from poisoning the
+    /// access-log metric for the matching frontend stream.
     ///
     /// Callers must invoke this BEFORE `endpoint.end_stream(...)` on reset
     /// paths so the backend lookup does not depend on
@@ -3913,7 +3945,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return (None, None);
         }
         (
-            socket_rtt(self.socket.socket_ref()),
+            self.client_rtt,
             linked_token.and_then(|t| endpoint.peer_rtt(t)),
         )
     }
@@ -10050,6 +10082,77 @@ mod tests {
         )
         .expect("a pool with free buffers must yield an H2 connection");
         (connection, peer)
+    }
+
+    /// `snapshot_rtts` reports the sample `Mux` took for the whole pass, not a
+    /// fresh `getsockopt(TCP_INFO)` per finishing stream.
+    ///
+    /// This is the observable change of issue #1339 Q11. The access log's
+    /// `client_rtt` used to mean "the frontend RTT when THIS stream finished"
+    /// and now means "the frontend RTT at the last `Mux` pass", so several
+    /// streams completing in one pass report one identical value. The two
+    /// calls below stand for two streams recycling inside one pass: all five
+    /// production callers of this method sit on a recycle or reset path, and
+    /// more than one of them can run in a single `write_streams` sweep.
+    ///
+    /// The premise is asserted first, and it is what makes the test
+    /// discriminating: the connection sits on a live loopback socket, so
+    /// `TCP_INFO` really does answer, and it answers a sub-millisecond SRTT
+    /// that can never equal the carried sentinel. Without that half, a
+    /// `snapshot_rtts` that had merely lost the ability to read the socket
+    /// would pass this test while reporting nothing at all.
+    ///
+    /// `server_rtt` is deliberately NOT carried: it is the other side of the
+    /// connection, `Endpoint::peer_rtt` still reads it per call, and
+    /// `endpoint_client_peer_rtt_is_keyed_by_token` (`mod.rs`) pins that half.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::snapshot_rtts`], put
+    /// `socket_rtt(self.socket.socket_ref())` back in place of
+    /// `self.client_rtt`. Both reports then carry the live loopback SRTT and
+    /// the first assertion fails with ``assertion `left == right` failed: the
+    /// first stream to finish in the pass must report the sample Mux carried
+    /// in, not a fresh TCP_INFO read``, `left: Some(72µs)` against
+    /// `right: Some(4321s)`.
+    #[test]
+    fn snapshot_rtts_reports_the_carried_pass_sample_to_every_stream() {
+        use crate::socket::stats::socket_rtt;
+
+        /// A value no loopback SRTT can take, so the assertions below can only
+        /// be satisfied by the carried field.
+        const PASS_SAMPLE: Duration = Duration::from_secs(4321);
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let live = socket_rtt(connection.socket.socket_ref());
+        assert!(
+            live.is_some_and(|rtt| rtt != PASS_SAMPLE),
+            "premise: TCP_INFO must answer on a live loopback frontend, and \
+             never with the sentinel — otherwise a snapshot_rtts that still \
+             read the socket would be indistinguishable from one that carries \
+             the pass sample, got {live:?}"
+        );
+
+        connection.client_rtt = Some(PASS_SAMPLE);
+
+        let endpoint = EndpointClient(&mut router);
+        let first = connection.snapshot_rtts(&endpoint, Some(mio::Token(1)));
+        let second = connection.snapshot_rtts(&endpoint, Some(mio::Token(2)));
+
+        assert_eq!(
+            first.0,
+            Some(PASS_SAMPLE),
+            "the first stream to finish in the pass must report the sample Mux \
+             carried in, not a fresh TCP_INFO read"
+        );
+        assert_eq!(
+            second.0, first.0,
+            "a second stream finishing in the SAME pass must report the same \
+             client_rtt — that identity is what #1339 Q11 traded the \
+             per-recycle syscall for, and it is what an operator trending the \
+             field will see"
+        );
     }
 
     /// The graceful-shutdown budget is armed from the `now` handed to

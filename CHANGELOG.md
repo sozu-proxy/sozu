@@ -240,6 +240,44 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: sample the frontend RTT once per `Mux` pass, so the H2 core no longer reads
+  a socket for the access log ([#1339](https://github.com/sozu-proxy/sozu/issues/1339), Q11).**
+  **Operator-visible:** on HTTP/2 the access log's `client_rtt` no longer means "the frontend SRTT
+  when this stream finished". It means "the frontend SRTT at the last readiness sweep", and every
+  stream completing during one sweep reports the same value. Repeated `client_rtt` across
+  concurrent H2 streams is now expected rather than a stuck measurement, a percentile over H2
+  access logs is weighted by how many streams happened to finish together, and the value can be up
+  to one sweep old. `server_rtt` is unchanged — it is still read per access log through
+  `Endpoint::peer_rtt` — so **the two cells on one H2 log line no longer share a sampling
+  instant** and their difference is not a network asymmetry. H1, Pipe (TCP/WS) and the TCP
+  frontend are untouched and still measure per access log. `doc/configure.md`'s "When each cell is
+  measured" states all of this for operators.
+  Mechanically: `ConnectionH2::client_rtt` is a carried field written only by
+  `Mux::refresh_client_rtt` and read only by `ConnectionH2::snapshot_rtts`, which stops calling
+  `stats::socket_rtt` and so removes the **last `SocketHandler::socket_ref` reach in production
+  `h2.rs`** — the point of the change, since a concrete `mio::net::TcpStream` is what no in-memory
+  transport can synthesise. `Mux` samples at all three of its entry points that can emit an access
+  log — `SessionState::ready` (once per call, above `ready_inner`'s outer loop, because a clock
+  read is free and a `getsockopt(TCP_INFO)` is not), `Mux::timeout_inner` and
+  `Mux::shutting_down_inner`. The last two are load-bearing, not symmetry: both reach
+  `ConnectionH2::cancel_timed_out_streams`, which reaps and logs a silent peer's streams precisely
+  when the previous sweep's sample is oldest.
+  **This costs syscalls rather than saving them, at e2e concurrency.** A sample per sweep beats a
+  sample per stream only above one recycle per sweep. Counted three times per workload at a
+  1-minute load average of 3.5, `getsockopt(TCP_INFO)` for `client_rtt` went 50 → 140 (2.80×) on
+  `test_h2_concurrent_streams` and 250 → 483 (1.93×) on
+  `test_h2_50_concurrent_streams_no_crosstalk`; all `TCP_INFO` went 110 → 200 (1.82×) and
+  505 → 738 (1.46×). The before-counts are exactly the stream-recycle counts and are identical
+  across runs; the after-counts vary a few percent because the rate now tracks event-loop
+  wake-ups rather than work completed. The rejected alternative — mirroring the value in at every
+  `ConnectionH2` entry point, the way `ConnectionH2::now` is mirrored from `Context::now` —
+  measured 7.8–9.7× with +6.5% / +5.3% CPU, so this is the cheaper of the two extraction shapes
+  and not a free one. Emitting the access log as an output the shell fills in removes the cost
+  entirely, is a larger change, and can supersede this step without rework;
+  `doc/h2_mux_internals.md` records the table and the reasoning.
+  Pinned by `snapshot_rtts_reports_the_carried_pass_sample_to_every_stream` (`h2.rs`) and
+  `a_mux_pass_refreshes_the_carried_client_rtt` (`mod.rs`), both seen red first.
+
 - **`refactor(mux-h2)`: the `writable()` close arms stop touching the socket, and `writable` joins
   the shell ([#1339](https://github.com/sozu-proxy/sozu/issues/1339), Q10).**
   `ConnectionH2::writable` held the last two query / flush / query triples inside the H2 core: an

@@ -1132,21 +1132,63 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         }
         false
     }
+
+    /// Sample the frontend's TCP round-trip time for this pass and hand it to
+    /// the H2 core.
+    ///
+    /// The counterpart of `unix_epoch_ms` for a value that costs a syscall
+    /// instead of a clock read, and kept as one function for the same reason:
+    /// the three entry points below cannot drift apart on the gate or on
+    /// which socket is read.
+    ///
+    /// Called from [`SessionState::ready`], [`Mux::timeout_inner`] and
+    /// [`Mux::shutting_down_inner`] — every `Mux` entry point that can reach
+    /// `ConnectionH2::snapshot_rtts` and therefore emit an access log. The
+    /// last two matter as much as the first: `timeout_inner` runs
+    /// `ConnectionH2::cancel_timed_out_streams` precisely when the peer has
+    /// gone silent and no `ready()` has run for a while, which is when the
+    /// previous pass's sample is oldest. `Mux::close` is deliberately NOT on
+    /// the list: it already takes its own sample for its own teardown loop,
+    /// and `ConnectionH2::close` emits no access log.
+    ///
+    /// H1 is not gated out by accident. `ConnectionH1` reads its own socket at
+    /// each access log, one stream at a time, and an H1 connection carries one
+    /// request at a time, so there is nothing for a per-pass sample to
+    /// amortise there — taking one would add a syscall per pass and change
+    /// nothing a reader of the log can see.
+    ///
+    /// Issue #1339 Q11. The rejected alternative was to refresh the value at
+    /// every `ConnectionH2` entry point the way `Context::now` is refreshed;
+    /// it measured 7.8–9.7× the syscall rate for +6.5% / +5.3% CPU.
+    fn refresh_client_rtt(&mut self) {
+        if let Connection::H2(connection) = &mut self.frontend {
+            connection.client_rtt = socket_rtt(connection.socket.socket_ref());
+        }
+    }
 }
 
 impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> SessionState
     for Mux<Front, L>
 {
     /// Thin wrapper over `Mux::ready_inner` whose only job is to run
-    /// `Mux::reschedule` on the way out. `ready_inner` has a dozen `return`
+    /// `Mux::reschedule` on the way out, and to take this pass's single
+    /// frontend-RTT sample on the way in. `ready_inner` has a dozen `return`
     /// sites; arming the wheel at each of them by hand is precisely the
     /// discipline this refactor exists to remove.
+    ///
+    /// The sample is taken HERE and not inside `ready_inner`'s outer loop,
+    /// where `Context::now` is refreshed. The clock is free, so sharing one
+    /// instant per outer iteration costs nothing; the RTT is a
+    /// `getsockopt(TCP_INFO)` syscall, and an outer loop that goes round
+    /// several times would pay it several times per readiness sweep. One
+    /// sweep, one syscall — see `Mux::refresh_client_rtt`.
     fn ready(
         &mut self,
         session: Rc<RefCell<dyn ProxySession>>,
         proxy: Rc<RefCell<dyn L7Proxy>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
+        self.refresh_client_rtt();
         let result = self.ready_inner(session, proxy, metrics);
         self.reschedule();
         result
@@ -2102,6 +2144,18 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             );
             return StateResult::Continue;
         }
+        // Deliberately BELOW the early-delivery gate, unlike the clock above
+        // it: `consume_timer_entry` reads `context.now` to decide, so the
+        // clock has to be fresh before it, while the RTT is only wanted by
+        // the access logs `cancel_timed_out_streams` emits further down. The
+        // wheel rounds to the nearest tick and re-validates, so a firing that
+        // turns out to be early is common (§7.6 of `LIFECYCLE.md`) — sampling
+        // above the gate would spend a `getsockopt(TCP_INFO)` on every one of
+        // those do-nothing passes, which is the cost this whole change is
+        // accounted in. A silent peer is what brings us here and is exactly
+        // when the last `ready()` sample is oldest, so the sample itself is
+        // load-bearing; its position is not symmetry with the clock.
+        self.refresh_client_rtt();
         let front_is_h2 = match self.frontend {
             Connection::H1(_) => false,
             Connection::H2(_) => true,
@@ -2473,6 +2527,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         let now = Instant::now();
         self.context.now = now;
         self.context.now_wall_ms = unix_epoch_ms();
+        // Same reasoning for the frontend RTT: `drive_frontend_shutdown_io`
+        // below reaches `readable()` and `writable()`, so every
+        // `ConnectionH2::snapshot_rtts` site is live on this path and a
+        // draining session would otherwise log the sample of its last
+        // `ready()` pass for the whole drain.
+        self.refresh_client_rtt();
         // RFC 9113 §6.8: initiate graceful shutdown with double-GOAWAY pattern.
         // Only send the initial GOAWAY once. The final GOAWAY (with the real
         // last_stream_id) is handled by finalize_write() when all streams drain.
@@ -3575,6 +3635,96 @@ mod tests {
                 "EndpointServer must report its single frontend's RTT for any token"
             );
         }
+    }
+
+    /// A `Mux` pass replaces the carried frontend-RTT sample, so a stream
+    /// finishing in a LATER pass reports a freshly measured value.
+    ///
+    /// The other half of `snapshot_rtts_reports_the_carried_pass_sample_to_every_stream`
+    /// (`h2.rs`). That one pins "one value for every stream in a pass"; this
+    /// one pins "a new value on the next pass". Neither is the contract
+    /// alone — a value that was carried but never refreshed would satisfy the
+    /// first while freezing the access log's `client_rtt` at the connection's
+    /// very first sample forever.
+    ///
+    /// Entered through [`SessionState::timeout`] rather than
+    /// [`SessionState::ready`]. Both call the same
+    /// [`Mux::refresh_client_rtt`], which exists as one function so the three
+    /// entry points cannot drift apart, but `ready` takes
+    /// `Rc<RefCell<dyn ProxySession>>` and `Rc<RefCell<dyn L7Proxy>>` and this
+    /// crate has no test implementation of either — `L7Proxy::sessions` alone
+    /// would require a live `SessionManager`. `timeout` needs no mock and is
+    /// not a lesser path: it is where `cancel_timed_out_streams` reaps a
+    /// silent peer's streams and emits their access logs, which is exactly
+    /// when the previous pass's sample is oldest.
+    ///
+    /// TO SEE THIS RED: delete the `self.refresh_client_rtt();` line from
+    /// [`Mux::timeout_inner`]. The frontend then still carries the sentinel
+    /// and the final assertion fails with `a Mux pass must replace the
+    /// carried frontend RTT with a fresh sample, got Some(4321s)`.
+    #[test]
+    fn a_mux_pass_refreshes_the_carried_client_rtt() {
+        /// A value no loopback SRTT can take, standing for the sample an
+        /// earlier pass left behind.
+        const STALE_SAMPLE: Duration = Duration::from_secs(4321);
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (socket, _peer) = connected_socket();
+        let h2 = ConnectionH2::new(
+            Ulid::generate(),
+            socket,
+            Position::Server,
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            None,
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+
+        let mut frontend = Connection::H2(h2);
+        let Connection::H2(h2) = &mut frontend else {
+            unreachable!("frontend was built as H2")
+        };
+        h2.client_rtt = Some(STALE_SAMPLE);
+        // A deadline already in the past, so `Mux::consume_timer_entry`
+        // accepts the firing as a real expiry and the body below it runs.
+        // Without this the connection carries the 30 s deadline it armed at
+        // construction, the firing re-validates as an early wheel delivery,
+        // and `timeout_inner` returns before reaching anything this test is
+        // about.
+        h2.timeout_deadline = Some(Instant::now() - Duration::from_secs(1));
+
+        let mut mux = Mux {
+            configured_frontend_timeout: Duration::from_secs(30),
+            frontend_token: Token(0),
+            frontend,
+            router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
+            context: test_context(&pool),
+            session_ulid: Ulid::generate(),
+            timeouts: HashMap::new(),
+        };
+
+        let mut metrics = SessionMetrics::new(None);
+        let _ = mux.timeout(Token(0), &mut metrics);
+
+        let Connection::H2(h2) = &mux.frontend else {
+            unreachable!("frontend was built as H2")
+        };
+        assert!(
+            h2.client_rtt.is_some(),
+            "premise: TCP_INFO must answer on a live loopback frontend, \
+             otherwise this test cannot tell a refresh from a failed read"
+        );
+        assert!(
+            h2.client_rtt.is_some_and(|rtt| rtt != STALE_SAMPLE),
+            "a Mux pass must replace the carried frontend RTT with a fresh \
+             sample, got {:?}",
+            h2.client_rtt
+        );
     }
 
     /// An H1 backend connection on a live loopback socket, plus the peer the
