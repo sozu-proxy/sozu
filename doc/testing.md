@@ -911,11 +911,50 @@ decrement missing  0 -> 1 -> 1   (the post-completion assertion fails)
 ```
 
 Two consequences worth carrying to the next gauge test. **Read the gauge, do not
-infer it** — three e2e tests in `mux_tests.rs` are named after
-`http.active_requests` and none of them reads it, which is [#1535]. And **do not
+infer it** — three e2e tests in `mux_tests.rs` were named after
+`http.active_requests` and none of them read it, which was [#1535]. And **do not
 fold an absent key into zero**: the poller returns `Option<u64>`, so "the key
 does not exist" and "the gauge is zero" stay distinguishable, which is what made
 a missing increment report `last sample None` instead of a plausible `Some(0)`.
+
+### When the scenario under test has no increment of its own
+
+Holding the operation open works when the operation *should* raise the gauge.
+The three tests [#1535] was about assert the opposite: an idle timeout, a
+malformed request and an interim `100 Continue` must leave the gauge alone. From
+a zero baseline that is unobservable — the correct proxy reads `0` and the
+leaking one reads `0`, because the clamp swallows the difference. It is not that
+those tests were thin; the property they were named for is one their shape could
+not express.
+
+Move the baseline instead. `http.active_requests` is per worker process, not per
+connection, so `hold_one_request_in_flight` (`mux_tests.rs`) puts ONE legitimate
+request in flight on its own connection and proves the gauge reads `1`. The
+scenario under test then runs on other connections, and the assertion is that
+the gauge still reads exactly `1`; a parasitic decrement takes it to `0`, which
+is observable. Releasing the held request afterwards takes it back to `0` and
+pins the decrement a charged stream does owe.
+
+```
+correct            1 -> 1 -> 0
+parasitic `-1`     1 -> 0        (the unchanged-gauge assertion fails)
+```
+
+Two rules travel with the technique. **The held request has to outlive the
+scenario**, so shorten only the timeout the scenario actually needs:
+`setup_short_timeout_test` shortens `request_timeout` — the timeout a frontend is
+armed with before its first request links, and therefore the one that decides
+how fast a silent connection collects its 408 — and leaves `front_timeout` and
+`back_timeout` at their defaults, because either at two seconds would answer the
+held request 504 and emit a perfectly legitimate `-1`, zeroing the gauge for a
+correct proxy. And **sample once, after a barrier, rather than polling**: a poll
+for a value the gauge already holds returns on its first iteration without ever
+observing the scenario, so `expect_active_requests_h1` takes a single sample and
+its callers earn it by first reading the scenario's connection to EOF
+(`raw_read_until_eof`, which reports a deadline as an error rather than folding
+it into the bytes read) or by reading the interim response. The three
+replacements keep `await_active_requests_h1` for the edges where the gauge IS
+expected to move, and nothing else.
 
 [#1535]: https://github.com/sozu-proxy/sozu/issues/1535
 
