@@ -16,7 +16,7 @@ use std::{
 use mio::Token;
 use sozu_command::logging::ansi_palette;
 
-use super::{GenericHttpStream, Position};
+use super::{GenericHttpStream, Position, h2::MetricEvent};
 use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Protocol, SessionMetrics,
@@ -641,16 +641,41 @@ impl Stream {
     /// `getsockopt(TCP_INFO)` values from the sockets it can reach, mirroring
     /// the inline pattern used by the `pipe` and TCP-frontend access-log
     /// sites.
-    pub fn generate_access_log<L>(
+    /// Generate the access log, and return the metric events the caller must
+    /// record.
+    ///
+    /// **The bound is two, and it is saturated by exactly these two events**:
+    /// [`MetricEvent::ActiveRequestFinished`], emitted when `request_counted`
+    /// was set, and [`MetricEvent::AccessLogUnsent`], emitted when the logger
+    /// refused the record. A fixed array rather than a `Vec` because the
+    /// count is known: this function is allocation-free and must stay so, and
+    /// a caller that is its own shell has no queue to lend. Slots are filled
+    /// by explicit index, never through a `push` helper — a `push` that
+    /// overflowed a fixed array would silently drop an event, and a dropped
+    /// `-1` is an upward drift that never underflows, so nothing logs and
+    /// nothing saturates. A third event means changing this type, which is a
+    /// compile error at every call site rather than a truncation.
+    ///
+    /// The three remaining metric sites in this body stay `incr!` macros on
+    /// purpose: they carry `cluster_id`/`backend_id` labels, and carrying
+    /// those in a `MetricEvent` means owned `Option<String>`s, which measures
+    /// at `size_of::<MetricEvent>()` 24 -> 48 bytes for every queued event
+    /// and costs the enum its `Copy` — for sites that fire on every access
+    /// log. Same trade as `names::backend::RETRY_STALE_UPSTREAM`, and worse,
+    /// because that one fires only on a stale-upstream retry.
+    #[must_use]
+    pub(super) fn generate_access_log<L>(
         &mut self,
         error: bool,
         message: Option<&str>,
         listener: Rc<RefCell<L>>,
         client_rtt: Option<Duration>,
         server_rtt: Option<Duration>,
-    ) where
+    ) -> [Option<MetricEvent>; 2]
+    where
         L: ListenerHandler + L7ListenerHandler,
     {
+        let mut events: [Option<MetricEvent>; 2] = [None, None];
         let context = &self.context;
         // Fall back to the per-stream timeout discriminator
         // (`access_log_message`) when the caller did not supply an explicit
@@ -667,7 +692,7 @@ impl Stream {
         // true at the matching `gauge_add!(.., 1)` in the H1/H2 readable paths.
         let was_counted = self.request_counted;
         if self.request_counted {
-            gauge_add!(names::http::ACTIVE_REQUESTS, -1);
+            events[0] = Some(MetricEvent::ActiveRequestFinished);
             self.request_counted = false;
         }
         debug_assert!(
@@ -775,7 +800,7 @@ impl Stream {
 
         log_access! {
             error,
-            on_failure: { incr!(names::access_logs::UNSENT) },
+            on_failure: { events[1] = Some(MetricEvent::AccessLogUnsent) },
             message,
             context: context.log_context(),
             session_address: context.session_address,
@@ -804,6 +829,8 @@ impl Stream {
             otel: None,
         };
         self.metrics.register_end_of_session(&context.log_context());
+
+        events
     }
 }
 
@@ -1263,7 +1290,8 @@ mod tests {
 
         // The call itself is the assertion: with a range precondition in place
         // this panics instead of incrementing `http.status.other`.
-        stream.generate_access_log(
+        // This test asserts on the access log, not on metrics.
+        let _ = stream.generate_access_log(
             false,
             None,
             Rc::new(RefCell::new(TestListener::new())),

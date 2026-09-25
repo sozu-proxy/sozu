@@ -386,7 +386,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             space_before - size,
             "fill must consume exactly `size` bytes of free space"
         );
-        self.position.count_bytes_in_counter(size);
+        crate::protocol::mux::h2::record_metric(self.position.bytes_in_event(size));
         self.position.count_bytes_in(parts.metrics, size);
         if update_readiness_after_read(size, status, &mut self.readiness) {
             // size=0: the socket returned EOF (Closed) or WouldBlock.
@@ -706,7 +706,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         }
         context.debug.push(DebugEvent::StreamEvent(1, size));
         kawa.consume(size);
-        self.position.count_bytes_out_counter(size);
+        crate::protocol::mux::h2::record_metric(self.position.bytes_out_event(size));
         self.position.count_bytes_out(parts.metrics, size);
         let should_yield = update_readiness_after_write(size, status, &mut self.readiness);
         if self.socket.socket_wants_write() {
@@ -739,13 +739,19 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             let client_rtt = socket_rtt(self.socket.socket_ref());
                             let server_rtt =
                                 stream.linked_token().and_then(|t| endpoint.peer_rtt(t));
-                            stream.generate_access_log(
-                                false,
-                                Some("H1::Upgrade"),
-                                context.listener.clone(),
-                                client_rtt,
-                                server_rtt,
-                            );
+                            for event in stream
+                                .generate_access_log(
+                                    false,
+                                    Some("H1::Upgrade"),
+                                    context.listener.clone(),
+                                    client_rtt,
+                                    server_rtt,
+                                )
+                                .into_iter()
+                                .flatten()
+                            {
+                                crate::protocol::mux::h2::record_metric(event);
+                            }
                             return MuxResult::Upgrade;
                         }
                         kawa::StatusLine::Response { code: 100, .. } => {
@@ -785,13 +791,19 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                 let client_rtt = socket_rtt(self.socket.socket_ref());
                                 let server_rtt =
                                     stream.linked_token().and_then(|t| endpoint.peer_rtt(t));
-                                stream.generate_access_log(
-                                    false,
-                                    Some("H1::EarlyHint"),
-                                    context.listener.clone(),
-                                    client_rtt,
-                                    server_rtt,
-                                );
+                                for event in stream
+                                    .generate_access_log(
+                                        false,
+                                        Some("H1::EarlyHint"),
+                                        context.listener.clone(),
+                                        client_rtt,
+                                        server_rtt,
+                                    )
+                                    .into_iter()
+                                    .flatten()
+                                {
+                                    crate::protocol::mux::h2::record_metric(event);
+                                }
                                 return self.defer_close_for_tls_flush("early-hint");
                             }
                         }
@@ -801,13 +813,19 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     stream.metrics.backend_stop();
                     let client_rtt = socket_rtt(self.socket.socket_ref());
                     let server_rtt = stream.linked_token().and_then(|t| endpoint.peer_rtt(t));
-                    stream.generate_access_log(
-                        false,
-                        Some("H1::Complete"),
-                        context.listener.clone(),
-                        client_rtt,
-                        server_rtt,
-                    );
+                    for event in stream
+                        .generate_access_log(
+                            false,
+                            Some("H1::Complete"),
+                            context.listener.clone(),
+                            client_rtt,
+                            server_rtt,
+                        )
+                        .into_iter()
+                        .flatten()
+                    {
+                        crate::protocol::mux::h2::record_metric(event);
+                    }
                     stream.metrics.reset();
                     let old_state = std::mem::replace(&mut stream.state, StreamState::Unlinked);
                     if let StreamState::Linked(token) = old_state {

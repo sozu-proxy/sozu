@@ -1072,12 +1072,12 @@ fn try_h2_continuation_survives_a_graceful_drain_mid_reassembly() -> State {
     let (first_chunk, second_chunk) = continuation.split_at(first_chunk_len);
 
     // Baseline for the mid-frame gate below. `ConnectionH2::handle_read`
-    // counts every frontend socket read through
-    // `Position::count_bytes_in_counter` — PARTIAL reads included, which is
-    // what makes this counter able to witness a frame that has not finished
-    // arriving, unlike `h2.frames.rx.headers` which ticks only on a frame
-    // completed. This raw TLS connection is the only frontend session on this
-    // worker, and the backend side counts under a different key
+    // counts every frontend socket read through `Position::bytes_in_event`,
+    // queued on the core and recorded by the shell — PARTIAL reads included,
+    // which is what makes this counter able to witness a frame that has not
+    // finished arriving, unlike `h2.frames.rx.headers` which ticks only on a
+    // frame completed. This raw TLS connection is the only frontend session on
+    // this worker, and the backend side counts under a different key
     // (`back_bytes_in`, `Position::Client`), so from here on `bytes_in` moves
     // by exactly what this test writes and by nothing else.
     let bytes_in_before_first_chunk =
@@ -9734,6 +9734,174 @@ fn test_h2_dual_backend_failure_no_gauge_underflow() {
             10,
             "H2: dual backend failure must not double-decrement gauges",
             try_h2_dual_backend_failure_no_gauge_underflow
+        ),
+        State::Success
+    );
+}
+
+// =========================================================================
+// `http.active_requests` balances over one complete H2 request
+//
+// The gauge is shared: H1 increments it at two sites and H2 at one, while a
+// single `Stream::generate_access_log` decrements it for all three. A test
+// that only checked "the gauge returns to where it started" would be unable
+// to see a MISSING increment, because `AggregatedMetric::update` saturates a
+// gauge at zero — the unpaired decrement would take 0 to 0 and read exactly
+// like a balanced request. So this samples the gauge **in flight**, with the
+// request held open at the backend, and again after it completes:
+//
+//   correct            0 -> 1 -> 0
+//   `+1` missing       0 -> 0 -> 0   (the in-flight assertion fails)
+//   `-1` missing       0 -> 1 -> 1   (the post-completion assertion fails)
+//
+// Each half of the H2 path therefore fails a different assertion, and neither
+// depends on the H1 path being correct.
+//
+// **What these two tests do NOT cover.** `Stream::generate_access_log` has
+// eight production callers — three in `h1.rs`, four in `h2.rs`, one in
+// `mod.rs` — and these tests exercise one H1 caller and one H2 caller. The
+// other six are not covered by a test, and they do not need to be: they have
+// no step of their own to forget. `#[must_use]` on the return obliges every
+// caller to handle it, and on the core side the events are drained at a
+// single point rather than recorded per caller. Do not read these tests as
+// covering the other six.
+// =========================================================================
+
+/// Poll `http.active_requests` until it reads `want`, or fail with the last
+/// sample. `None` is "not readable this sample" and is not folded into a
+/// value: before the first request the key may be absent entirely, which is
+/// not the same observation as a zero.
+fn await_active_requests(worker: &mut Worker, want: u64, deadline: Duration) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        let last = query_proxy_gauge(worker, sozu_lib::metrics::names::http::ACTIVE_REQUESTS);
+        if last == Some(want) {
+            return Ok(());
+        }
+        if started.elapsed() > deadline {
+            return Err(format!("wanted {want}, last sample {last:?}"));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn try_h2_active_requests_balances_over_one_request() -> State {
+    let front_port = provide_port();
+    let front_address = SocketAddress::new_v4(127, 0, 0, 1, front_port);
+    let back_address = create_local_address();
+
+    let (config, listeners, state) = Worker::empty_https_config(front_address.clone().into());
+    let mut worker =
+        Worker::start_new_worker_owned("H2-ACTIVE-REQ-BALANCE", config, listeners, state);
+
+    worker.send_proxy_request_type(RequestType::AddHttpsListener(
+        ListenerBuilder::new_https(front_address.clone())
+            .to_tls(None)
+            .unwrap(),
+    ));
+    worker.send_proxy_request_type(RequestType::ActivateListener(ActivateListener {
+        address: front_address.clone(),
+        proxy: ListenerType::Https.into(),
+        from_scm: false,
+    }));
+    worker.send_proxy_request_type(RequestType::AddCluster(Worker::default_cluster(
+        "cluster_0",
+    )));
+    worker.send_proxy_request_type(RequestType::AddHttpsFrontend(RequestHttpFrontend {
+        hostname: String::from("localhost"),
+        ..Worker::default_http_frontend("cluster_0", front_address.clone().into())
+    }));
+    let certificate_and_key = CertificateAndKey {
+        certificate: String::from(include_str!("../../../lib/assets/local-certificate.pem")),
+        key: String::from(include_str!("../../../lib/assets/local-key.pem")),
+        certificate_chain: vec![],
+        versions: vec![],
+        names: vec![],
+    };
+    worker.send_proxy_request_type(RequestType::AddCertificate(AddCertificate {
+        address: front_address,
+        certificate: certificate_and_key,
+        expired_at: None,
+    }));
+    worker.send_proxy_request_type(RequestType::AddBackend(Worker::default_backend(
+        "cluster_0",
+        "cluster_0-0",
+        back_address.into(),
+        None,
+    )));
+    worker.read_to_last();
+
+    // Held rather than slow: the in-flight sample below is an ordering
+    // requirement, not a duration, and any fixed delay is a bet this test
+    // loses exactly when the machine is busy.
+    let mut delayed_backend = DelayedH2Backend::start_held(back_address, "balance-body");
+
+    let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
+    let mut tls = raw_h2_connection(front_addr);
+    h2_handshake(&mut tls);
+
+    let block = super::h2_utils::build_chrome146_get_headers("localhost", "/api/balance", None);
+    let frame = H2Frame::headers(1, block, true, true);
+    if tls.write_all(&frame.encode()).is_err() || tls.flush().is_err() {
+        println!("H2 active-requests balance - HEADERS write failed");
+        delayed_backend.release();
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        delayed_backend.stop();
+        return State::Fail;
+    }
+
+    // The request reaching the backend is what proves sozu has processed the
+    // HEADERS frame, so the increment — if it happens at all — has happened.
+    let wait_start = Instant::now();
+    while delayed_backend.get_requests_received() == 0 {
+        if wait_start.elapsed() > Duration::from_secs(10) {
+            println!("H2 active-requests balance - request never reached the backend");
+            delayed_backend.release();
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            delayed_backend.stop();
+            return State::Fail;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // IN FLIGHT: exactly one request is outstanding.
+    if let Err(diag) = await_active_requests(&mut worker, 1, Duration::from_secs(10)) {
+        println!("H2 active-requests balance - in flight: {diag}");
+        delayed_backend.release();
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        delayed_backend.stop();
+        return State::Fail;
+    }
+
+    delayed_backend.release();
+    let _ = collect_response_frames(&mut tls, 500, 2, 500);
+
+    // AFTER: the stream completed, so the gauge is back to zero.
+    let settled = await_active_requests(&mut worker, 0, Duration::from_secs(10));
+    delayed_backend.stop();
+    if let Err(diag) = settled {
+        println!("H2 active-requests balance - after completion: {diag}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    worker.soft_stop();
+    let _ = worker.wait_for_server_stop();
+    State::Success
+}
+
+#[test]
+fn test_h2_active_requests_balances_over_one_request() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2 edge: http.active_requests rises to exactly one while a request \
+             is held at the backend and returns to zero once it completes",
+            try_h2_active_requests_balances_over_one_request
         ),
         State::Success
     );

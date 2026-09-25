@@ -786,7 +786,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **`decode_status` returns `None` on a size-update-prefixed block, and whether
   that is fail-closed depends on the call site.** `H2BlockConverter::emit_pending_size_update_if_new_block`
   (`lib/src/protocol/mux/converter.rs:117`, armed at
-  `lib/src/protocol/mux/h2.rs:6348`) prepends a `001xxxxx` HPACK dynamic table
+  `lib/src/protocol/mux/h2.rs:6395`) prepends a `001xxxxx` HPACK dynamic table
   size update when a peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e
   call sites send one: `h2_security_tests.rs:2444` (value 0) and
   `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
@@ -808,7 +808,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **A test that only reddens under CI load is not automatically a flake — find
   the production site first.** Before retrying or quarantining, ask whether the
   symptom is reachable at all. #1353's 421 has exactly one emission site
-  (`lib/src/protocol/mux/mod.rs:2646`), reachable only through
+  (`lib/src/protocol/mux/mod.rs:2679`), reachable only through
   `RetrieveClusterError::SniAuthorityMismatch`, which is constructed at exactly
   one site (`lib/src/protocol/mux/router.rs:888`) immediately after
   `incr!(names::http::SNI_AUTHORITY_MISMATCH)` — and the failing run reported
@@ -888,6 +888,37 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   binary; CI installs it. It skips cleanly when `h2spec` is absent from `PATH`.
 
 ---
+
+### Asserting on a gauge: sample in flight, not only at the end
+
+A gauge that must balance over an operation cannot be checked by asserting it
+returns to its starting value. `AggregatedMetric::update` **saturates a gauge at
+zero**, so a missing increment is invisible: the unpaired decrement takes 0 to 0
+and reads exactly like a balanced operation. The test has to observe the raised
+state, which means holding the operation open.
+
+`test_h1_active_requests_balances_over_one_request` (`mux_tests.rs`) and
+`test_h2_active_requests_balances_over_one_request` (`h2_tests.rs`) are the
+worked examples. Each holds the response at the backend — `backend.receive(0)`
+before `backend.send(0)` on H1, `DelayedH2Backend::start_held` on H2 — so the
+sample is taken by ordering rather than by racing a delay, then releases and
+samples again:
+
+```
+correct            0 -> 1 -> 0
+increment missing  0 -> 0 -> 0   (the in-flight assertion fails)
+decrement missing  0 -> 1 -> 1   (the post-completion assertion fails)
+```
+
+Two consequences worth carrying to the next gauge test. **Read the gauge, do not
+infer it** — three e2e tests in `mux_tests.rs` are named after
+`http.active_requests` and none of them reads it, which is [#1535]. And **do not
+fold an absent key into zero**: the poller returns `Option<u64>`, so "the key
+does not exist" and "the gauge is zero" stay distinguishable, which is what made
+a missing increment report `last sample None` instead of a plausible `Some(0)`.
+
+[#1535]: https://github.com/sozu-proxy/sozu/issues/1535
+
 
 ## 8. Regression guards
 

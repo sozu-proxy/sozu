@@ -1125,6 +1125,31 @@ pub(super) enum MetricEvent {
     TrailerSpoofVectorElided,
     /// Trailers were dropped because the message carried a Content-Length.
     TrailersDroppedContentLength,
+
+    // ── Shared leaves reached from the core ─────────────────────────────
+    /// Bytes read on a frontend connection.
+    FrontendBytesIn(i64),
+    /// Bytes read on a backend connection.
+    BackendBytesIn(i64),
+    /// Bytes written on a frontend connection.
+    FrontendBytesOut(i64),
+    /// Bytes written on a backend connection.
+    BackendBytesOut(i64),
+    /// A request started being served. Records the lifetime counter and the
+    /// in-flight gauge's `+1` together: `ConnectionH2::handle_headers_frame`
+    /// emits them on consecutive unconditional lines, which is the same
+    /// criterion that allowed [`Self::RstStreamSent`] to fold its pair and
+    /// that forbade folding the GOAWAY one.
+    RequestStarted,
+    /// A request finished being served — the in-flight gauge's `-1`. Its
+    /// `+1` counterpart is [`Self::RequestStarted`] on the H2 path and a
+    /// `gauge_add!` macro on the H1 path, because `ConnectionH1` is its own
+    /// shell and `METRICS` is legitimately its own. The pair is therefore
+    /// deliberately split across two mechanisms; what makes that safe is that
+    /// each PATH balances, not that the pair travels together.
+    ActiveRequestFinished,
+    /// An access log could not be written.
+    AccessLogUnsent,
 }
 
 /// Fold one core-returned [`MetricEvent`] into the worker-local `METRICS`
@@ -1135,7 +1160,7 @@ pub(super) enum MetricEvent {
 /// calls it: it queues events and lets the layer that owns the socket decide
 /// when they are recorded. A second translation site would be a second place
 /// for the gauge arithmetic to drift.
-fn record_metric(event: MetricEvent) {
+pub(super) fn record_metric(event: MetricEvent) {
     match event {
         MetricEvent::ConnectionWindowBytes(delta) => {
             gauge_add!(names::h2::CONNECTION_WINDOW_BYTES, delta)
@@ -1228,6 +1253,21 @@ fn record_metric(event: MetricEvent) {
         MetricEvent::TrailersDroppedContentLength => {
             incr!(names::h2::TRAILERS_DROPPED_CONTENT_LENGTH)
         }
+
+        MetricEvent::FrontendBytesIn(bytes) => count!(names::backend::BYTES_IN, bytes),
+        MetricEvent::BackendBytesIn(bytes) => count!(names::backend::BACK_BYTES_IN, bytes),
+        MetricEvent::FrontendBytesOut(bytes) => count!(names::backend::BYTES_OUT, bytes),
+        MetricEvent::BackendBytesOut(bytes) => {
+            count!(names::backend::BACK_BYTES_OUT, bytes)
+        }
+        MetricEvent::RequestStarted => {
+            incr!(names::http::REQUESTS);
+            gauge_add!(names::http::ACTIVE_REQUESTS, 1);
+        }
+        MetricEvent::ActiveRequestFinished => {
+            gauge_add!(names::http::ACTIVE_REQUESTS, -1)
+        }
+        MetricEvent::AccessLogUnsent => incr!(names::access_logs::UNSENT),
     }
 }
 
@@ -2427,7 +2467,8 @@ impl ConnectionH2 {
                 };
                 context.debug.push(DebugEvent::SocketIO(0, did, size));
                 kawa.storage.fill(size);
-                self.position.count_bytes_in_counter(size);
+                let event = self.position.bytes_in_event(size);
+                self.metric_events.push(event);
                 self.bytes.zero_bytes_read += size;
                 if update_readiness_after_read(size, status, &mut self.readiness) {
                     if matches!(self.position, Position::Server)
@@ -3471,7 +3512,8 @@ impl ConnectionH2 {
         context
             .debug
             .push(DebugEvent::SocketIO(debug_site, global_stream_id, size));
-        self.position.count_bytes_out_counter(size);
+        let event = self.position.bytes_out_event(size);
+        self.metric_events.push(event);
         if let H2StreamId::Other {
             gid: global_stream_id,
             ..
@@ -4398,7 +4440,9 @@ impl ConnectionH2 {
                     global_stream_id
                 );
                 self.metric_events.push(MetricEvent::EndToEndH2Request);
-                let token = Self::complete_server_stream(stream, listener, client_rtt, server_rtt);
+                let (token, events) =
+                    Self::complete_server_stream(stream, listener, client_rtt, server_rtt);
+                self.metric_events.extend(events.into_iter().flatten());
                 Some((stream_id, token))
             }
         }
@@ -4418,12 +4462,12 @@ impl ConnectionH2 {
         listener: std::rc::Rc<std::cell::RefCell<L>>,
         client_rtt: Option<Duration>,
         server_rtt: Option<Duration>,
-    ) -> Option<mio::Token>
+    ) -> (Option<mio::Token>, [Option<MetricEvent>; 2])
     where
         L: ListenerHandler + L7ListenerHandler,
     {
         stream.metrics.backend_stop();
-        stream.generate_access_log(
+        let events = stream.generate_access_log(
             false,
             Some("H2::Complete"),
             listener,
@@ -4432,11 +4476,12 @@ impl ConnectionH2 {
         );
         stream.metrics.reset();
         let state = std::mem::replace(&mut stream.state, StreamState::Recycle);
-        if let StreamState::Linked(token) = state {
+        let token = if let StreamState::Linked(token) = state {
             Some(token)
         } else {
             None
-        }
+        };
+        (token, events)
     }
 
     /// Compute the total bytes transferred across all active streams.
@@ -4719,13 +4764,14 @@ impl ConnectionH2 {
                     Position::Server => {
                         self.distribute_overhead(&mut stream.metrics, byte_totals);
                         stream.metrics.backend_stop();
-                        stream.generate_access_log(
+                        let events = stream.generate_access_log(
                             true,
                             Some(reason),
                             context.listener.clone(),
                             client_rtt,
                             server_rtt,
                         );
+                        self.metric_events.extend(events.into_iter().flatten());
                         stream.state = StreamState::Recycle;
                     }
                 }
@@ -5330,7 +5376,8 @@ impl ConnectionH2 {
     /// [`Self::finish_zero_flush`].
     pub fn consume_zero_flush(&mut self, size: usize, status: SocketResult) -> bool {
         self.zero.storage.consume(size);
-        self.position.count_bytes_out_counter(size);
+        let event = self.position.bytes_out_event(size);
+        self.metric_events.push(event);
         self.bytes.overhead_bout += size;
         update_readiness_after_write(size, status, &mut self.readiness)
     }
@@ -6051,8 +6098,7 @@ impl ConnectionH2 {
         }
         // was_initial prevents trailers from triggering connection
         if was_initial && self.position.is_server() {
-            incr!(names::http::REQUESTS);
-            gauge_add!(names::http::ACTIVE_REQUESTS, 1);
+            self.metric_events.push(MetricEvent::RequestStarted);
             stream.metrics.service_start();
             stream.request_counted = true;
             stream.state = StreamState::Link;
@@ -6281,13 +6327,14 @@ impl ConnectionH2 {
                     // when the last byte of the response is written. Here, the reset is requested
                     // on the server endpoint and immediately terminates, shortcutting the other path
                     stream.metrics.backend_stop();
-                    stream.generate_access_log(
+                    let events = stream.generate_access_log(
                         true,
                         Some("H2::ResetFrame"),
                         context.listener.clone(),
                         client_rtt,
                         server_rtt,
                     );
+                    self.metric_events.extend(events.into_iter().flatten());
                     stream.state = StreamState::Recycle;
                 }
             }
@@ -6955,13 +7002,14 @@ impl ConnectionH2 {
             let stream = &mut context.streams[stream_id];
             self.distribute_overhead(&mut stream.metrics, reset_byte_totals);
             stream.metrics.backend_stop();
-            stream.generate_access_log(
+            let events = stream.generate_access_log(
                 true,
                 Some("H2::Reset"),
                 context.listener.clone(),
                 client_rtt,
                 server_rtt,
             );
+            self.metric_events.extend(events.into_iter().flatten());
             stream.metrics.reset();
         }
         // Queue the RST for wire emission. Independent of the owning stream

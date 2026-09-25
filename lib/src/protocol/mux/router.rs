@@ -1698,7 +1698,8 @@ mod tests {
                 .expect("the wildcard frontend must route foo.example.com");
             drop(proxy_ref);
 
-            stream.generate_access_log(false, None, listener, None, None);
+            // This test asserts on the access log, not on metrics.
+            let _ = stream.generate_access_log(false, None, listener, None, None);
         });
 
         assert!(
