@@ -54,8 +54,57 @@ message Cluster {
   // elides the header — `Retry-After: 0` invites an immediate retry
   // that defeats the cap.
   optional uint32 retry_after            = 14;
+  // Per-cluster override of the SUBNET cap. Same three-state
+  // semantics. Independent of tag 13: both must admit.
+  optional uint64 max_connections_per_subnet = 17;
 }
 ```
+
+#### The second, independent cap: per-(cluster, source-SUBNET)
+
+The per-IP cap above has no concept of a subnet, and that is a hole
+rather than a simplification. Someone on an IPv6 `/64` — the standard
+residential allocation — bypasses it **entirely** by taking a fresh
+address for every connection: the per-address counter never reaches 2.
+[#1270](https://github.com/sozu-proxy/sozu/issues/1270) reported it.
+
+The answer is a SECOND counter, not a change to the first. The two
+serve different cases, and both need to be expressible at once:
+
+- **per-IP** — the API-gateway case. One client, one address, holding
+  too many connections.
+- **per-subnet** — the denial-of-service case. One actor, a routed
+  prefix, spreading across it.
+
+So `max_connections_per_ip = 10` and `max_connections_per_subnet = 100`
+together mean "10 per IP **and** 100 per subnet". Both gates are
+consulted on every admission and **both must admit**.
+
+```protobuf
+message Config {
+  // Global default for the subnet cap. 0 = disabled, and it IS the
+  // default: the per-IP behaviour is strictly unchanged out of the box.
+  optional uint64 max_connections_per_subnet = 26 [default = 0];
+  // Prefix lengths, in bits, defining "subnet". Rejected at
+  // config-load time outside 0-32 / 0-128, never clamped. The defaults
+  // mask nothing. /24 and /56 are the recommended starting points.
+  optional uint32 subnet_ipv4_prefix         = 27 [default = 32];
+  optional uint32 subnet_ipv6_prefix         = 28 [default = 128];
+}
+```
+
+The prefixes are **boot-time only**. Changing a mask would re-key every
+live counter, so there is no runtime setter for them; only the limit
+itself can be patched at runtime.
+
+**IPv4-mapped IPv6 sources are canonicalised first.** A dual-stack
+`[::]` listener reports an IPv4 client as `::ffff:a.b.c.d`. Masking
+that with an IPv6 prefix would collapse the entire IPv4 internet into
+the single `::/56` bucket, so `SessionManager::subnet_key`
+(`lib/src/server.rs`) converts the mapped form to IPv4 and charges it
+to `subnet_ipv4_prefix` instead. The per-IP counter is deliberately
+**not** canonicalised — it keeps charging the address exactly as it
+arrived, which is part of what leaves its behaviour untouched.
 
 Cluster-level override takes precedence; `None` falls back to the
 global default. `Some(0)` is an explicit "unlimited" sentinel — the
@@ -77,6 +126,22 @@ source_ip)` pairs. On session accept + cluster resolution:
 3. Compare against `cluster.max_connections_per_ip.unwrap_or(global)`.
 4. If `count >= cap`, reject; else increment and proceed.
 5. On session close, decrement. Empty entries are dropped.
+
+The subnet counter is an exact mirror of this discipline on a second
+pair of maps (`connections_per_cluster_subnet` /
+`cluster_subnet_tracks`), keyed on the masked address instead of the
+raw one, with one deliberate difference: **it is not written at all
+while the cap is `0`**. The per-IP index is populated unconditionally,
+so mirroring that would make every deployment which never enables the
+subnet cap pay a second hash, a second allocation and a second
+per-session entry forever. The cost of the difference is that enabling
+the cap at runtime does not retroactively count sessions already in
+flight; the counter converges as those sessions close.
+
+Both counters are released from the single existing teardown call,
+`SessionManager::untrack_all_cluster_ip` — a second release entry point
+would be one more thing each of the three protocol close paths could
+forget, and a missed release leaks a slot until worker restart.
 
 The counter lives on the SessionManager rather than a global hashmap
 because of H2 multiplexing: H2 sessions multiplex many streams over
@@ -164,9 +229,12 @@ this is its own decision, not part of a refactor
 
 ### 3.3 Enforcement points
 
-The cap is checked **after cluster resolution and before backend
+Both caps are checked **after cluster resolution and before backend
 connect**, so a 401 / 421 / redirect / answer-template frontend is
-never gated. Two enforcement points:
+never gated. The conjunction lives in exactly one place —
+`SessionManager::cluster_connection_at_limit` (`lib/src/server.rs`) —
+so the two enforcement points below cannot drift on what "admitted"
+means. Two enforcement points:
 
 - **Unified H1+H2 mux** (`lib/src/protocol/mux/router.rs`) — HTTP and
   HTTPS clients hitting the cap receive `429 Too Many Requests` with
@@ -226,7 +294,7 @@ against the socket peer:
   preread outcome directly, folds the raw socket peer over them with
   `.or(self.frontend_address)` (`lib/src/tcp.rs:385`; `frontend_address =
   socket.peer_addr().ok()`, `lib/src/tcp.rs:183` and `:305`), and is called from
-  the per-(cluster, source-IP) gate at `lib/src/tcp.rs:1671`.
+  the per-(cluster, source-IP) gate at `lib/src/tcp.rs:1672`.
 - `ExpectProxyProtocol::into_pipe`
   (`lib/src/protocol/proxy_protocol/expect.rs`) and
   `RelayProxyProtocol::into_pipe`
@@ -277,6 +345,22 @@ retry_after = 5
 max_connections_per_ip = 0
 ```
 
+Both caps together, which is the shape [#1270](https://github.com/sozu-proxy/sozu/issues/1270)
+asks for:
+
+```toml
+# "10 per IP AND 100 per /24 (IPv4) or /56 (IPv6)".
+max_connections_per_ip     = 10
+max_connections_per_subnet = 100
+subnet_ipv4_prefix         = 24
+subnet_ipv6_prefix         = 56
+
+[clusters."api-internal"]
+# Independent opt-outs: this cluster keeps the per-IP cap but drops
+# the subnet one.
+max_connections_per_subnet = 0
+```
+
 ### 3.8 CLI / runtime API
 
 Three verbs on `sozu connection-limit`:
@@ -286,6 +370,18 @@ Three verbs on `sozu connection-limit`:
 | `set`    | `SetMaxConnectionsPerIp` (50)    | —                               |
 | `show`   | `QueryMaxConnectionsPerIp` (51)  | `MaxConnectionsPerIpLimit` (14) |
 | `remove` | `SetMaxConnectionsPerIp(0)` (50) | —                               |
+
+Three mirrored verbs on `sozu subnet-connection-limit`:
+
+| Verb     | Proto request                        | Proto response                      |
+| -------- | ------------------------------------ | ----------------------------------- |
+| `set`    | `SetMaxConnectionsPerSubnet` (60)    | —                                   |
+| `show`   | `QueryMaxConnectionsPerSubnet` (61)  | `MaxConnectionsPerSubnetLimit` (18) |
+| `remove` | `SetMaxConnectionsPerSubnet(0)` (60) | —                                   |
+
+`show` reports the two prefix lengths alongside the limit. They are
+boot-time only, so this reply is the only runtime surface that can tell
+an operator what the live cap is a cap *on*; a bare number would not.
 
 The setter is **non-sticky** — it patches the worker's runtime value
 but does not write through to TOML. Operators must mirror the change
@@ -419,6 +515,47 @@ A source IP can hold up to 100 concurrent connections per cluster,
 but the listener as a whole admits up to 10 000 — so a single
 attacker saturates one cluster but does not starve other clusters
 served by the same listener.
+
+### 7.1.1 Choosing the subnet prefixes
+
+**Recommended starting point: `/24` for IPv4 and `/56` for IPv6.**
+
+```toml
+max_connections            = 10_000
+max_connections_per_ip     = 10
+max_connections_per_subnet = 100
+subnet_ipv4_prefix         = 24
+subnet_ipv6_prefix         = 56
+```
+
+These are recommendations, **not defaults**. The shipped defaults are
+`/32` and `/128`, which mask nothing, and `max_connections_per_subnet =
+0`, which disables the cap outright — so an upgrade changes no
+behaviour until an operator opts in. That follows what the reporter of
+[#1270](https://github.com/sozu-proxy/sozu/issues/1270) did in the
+equivalent Caddy module: leave the default at single IPs, and recommend
+`/24` and `/56` in the documentation.
+
+Why these two:
+
+- **`/24` (IPv4)** — the smallest block routinely allocated to a single
+  organisation, and the granularity most operators already reason about.
+  Shorter (say `/16`) starts merging unrelated networks.
+- **`/56` (IPv6)** — a residential subscriber is typically handed a
+  `/56`, from which they may carve `/64`s at will. Capping at `/64`
+  would still let a `/56` holder mint 256 uncapped buckets; capping at
+  `/48` or shorter would merge unrelated subscribers behind one ISP
+  allocation. `/56` is the level at which one subscriber maps to one
+  counter.
+
+Set the per-subnet cap well above the per-IP cap — a `/24` legitimately
+holds many distinct clients. A ratio of roughly 10:1 over
+`max_connections_per_ip` is a reasonable place to start; a NAT'd office
+or a mobile carrier's CGNAT range can sit far above that (see §7.3).
+
+Changing a prefix requires a **restart**: the mask is part of the
+counter key, so patching it at runtime would re-key every live counter.
+Only `max_connections_per_subnet` itself has a runtime setter.
 
 ### 7.2 Per-cluster overrides
 

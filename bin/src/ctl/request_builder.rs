@@ -15,12 +15,13 @@ use sozu_command_lib::{
         CustomHttpAnswers, DeactivateListener, FrontendFilters, HardStop, HealthCheckConfig,
         ListListeners, ListedFrontends, ListenerType, LoadBalancingParams, MetricsConfiguration,
         PathRule, ProxyProtocolConfig, QueryCertificatesFilters, QueryClusterByDomain,
-        QueryClustersHashes, QueryHealthChecks, QueryMaxConnectionsPerIp, RemoveBackend,
-        RemoveCertificate, RemoveListener, ReplaceCertificate, RequestHttpFrontend,
-        RequestTcpFrontend, RequestUdpFrontend, ResponseContent, RulePosition, SetHealthCheck,
-        SocketAddress, SoftStop, Status, SubscribeEvents, TlsVersion, UpdateHttpListenerConfig,
-        UpdateHttpsListenerConfig, UpdateTcpListenerConfig, UpdateUdpListenerConfig,
-        request::RequestType, response_content::ContentType,
+        QueryClustersHashes, QueryHealthChecks, QueryMaxConnectionsPerIp,
+        QueryMaxConnectionsPerSubnet, RemoveBackend, RemoveCertificate, RemoveListener,
+        ReplaceCertificate, RequestHttpFrontend, RequestTcpFrontend, RequestUdpFrontend,
+        ResponseContent, RulePosition, SetHealthCheck, SocketAddress, SoftStop, Status,
+        SubscribeEvents, TlsVersion, UpdateHttpListenerConfig, UpdateHttpsListenerConfig,
+        UpdateTcpListenerConfig, UpdateUdpListenerConfig, request::RequestType,
+        response_content::ContentType,
     },
     proto::display::print_json_response,
 };
@@ -29,8 +30,8 @@ use super::CtlError;
 use crate::{
     cli::{
         BackendCmd, ClusterCmd, ClusterH2Cmd, ConnectionLimitCmd, HealthCheckCmd, HttpFrontendCmd,
-        HttpListenerCmd, HttpsListenerCmd, MetricsCmd, TcpFrontendCmd, TcpListenerCmd,
-        UdpFrontendCmd, UdpListenerCmd,
+        HttpListenerCmd, HttpsListenerCmd, MetricsCmd, SubnetConnectionLimitCmd, TcpFrontendCmd,
+        TcpListenerCmd, UdpFrontendCmd, UdpListenerCmd,
     },
     ctl::CommandManager,
 };
@@ -1430,6 +1431,30 @@ impl CommandManager {
             }
             ConnectionLimitCmd::Show => self.send_request(
                 RequestType::QueryMaxConnectionsPerIp(QueryMaxConnectionsPerIp {}).into(),
+            ),
+        }
+    }
+
+    /// Drives `sozu subnet-connection-limit {set|remove|show}` — the twin
+    /// of `connection_limit_command`, on the independent per-subnet
+    /// counter. Non-sticky in exactly the same way: workers reset to the
+    /// TOML-configured value on restart, so operators must mirror the
+    /// change in the config to make it durable. Only the limit is
+    /// settable; the subnet prefixes are boot-time TOML keys and `show`
+    /// reports them read-only.
+    pub fn subnet_connection_limit_command(
+        &mut self,
+        cmd: SubnetConnectionLimitCmd,
+    ) -> Result<(), CtlError> {
+        match cmd {
+            SubnetConnectionLimitCmd::Set { limit } => {
+                self.send_request(RequestType::SetMaxConnectionsPerSubnet(limit).into())
+            }
+            SubnetConnectionLimitCmd::Remove => {
+                self.send_request(RequestType::SetMaxConnectionsPerSubnet(0).into())
+            }
+            SubnetConnectionLimitCmd::Show => self.send_request(
+                RequestType::QueryMaxConnectionsPerSubnet(QueryMaxConnectionsPerSubnet {}).into(),
             ),
         }
     }

@@ -238,6 +238,14 @@ pub enum SubCmd {
         #[clap(subcommand)]
         cmd: ConnectionLimitCmd,
     },
+    #[clap(
+        name = "subnet-connection-limit",
+        about = "manage the per-(cluster, source-subnet) connection limit at runtime"
+    )]
+    SubnetConnectionLimit {
+        #[clap(subcommand)]
+        cmd: SubnetConnectionLimitCmd,
+    },
     /// Live operator TUI: btop/htop-style overview of clusters, backends,
     /// listeners, and H2 health. Built behind the `tui` Cargo feature so
     /// production binaries stay lean. v1 is read-only; the cardinality lease
@@ -331,6 +339,38 @@ pub enum ConnectionLimitCmd {
     #[clap(
         name = "show",
         about = "show the current global per-(cluster, source-IP) connection limit"
+    )]
+    Show,
+}
+
+/// Runtime surface for the per-(cluster, source-SUBNET) connection
+/// limit — the twin of [`ConnectionLimitCmd`].
+///
+/// Only the limit is settable. The subnet prefix lengths
+/// (`subnet_ipv4_prefix` / `subnet_ipv6_prefix`) are boot-time TOML keys:
+/// changing a mask would re-key every live counter, so it takes a
+/// restart. `show` reports them alongside the limit so an operator can
+/// see what the live cap is a cap on.
+#[derive(Subcommand, PartialEq, Eq, Clone, Debug)]
+pub enum SubnetConnectionLimitCmd {
+    #[clap(
+        name = "set",
+        about = "set the global per-(cluster, source-subnet) connection limit. `0` disables the feature."
+    )]
+    Set {
+        #[clap(
+            help = "maximum simultaneous connections per (cluster, source-subnet) pair (0 = unlimited)"
+        )]
+        limit: u64,
+    },
+    #[clap(
+        name = "remove",
+        about = "disable the global per-(cluster, source-subnet) limit (equivalent to `set 0`)"
+    )]
+    Remove,
+    #[clap(
+        name = "show",
+        about = "show the current global per-(cluster, source-subnet) connection limit and the subnet prefixes in force"
     )]
     Show,
 }

@@ -151,6 +151,20 @@ message Request {
     RequestUdpFrontend add_udp_frontend = 58;
     // remove a UDP frontend
     RequestUdpFrontend remove_udp_frontend = 59;
+    // set the global per-(cluster, source-SUBNET) connection limit at
+    // runtime. `0` is "unlimited" and is the default, which is why the
+    // subnet limiter is inert until an operator turns it on. This is a
+    // SECOND, independent counter: it does not replace, relax or
+    // tighten `set_max_connections_per_ip`, and both gates must admit a
+    // connection for it to proceed. Per-cluster overrides set on the
+    // `Cluster` message take precedence at admit time. The prefix
+    // lengths themselves are boot-time only (`ServerConfig`), because
+    // changing a mask would re-key every live counter.
+    uint64 set_max_connections_per_subnet = 60;
+    // query the current global per-(cluster, source-SUBNET) connection
+    // limit AND the two prefix lengths in force. Workers reply with
+    // `MaxConnectionsPerSubnetLimit`.
+    QueryMaxConnectionsPerSubnet query_max_connections_per_subnet = 61;
   }
 }
 
@@ -174,6 +188,7 @@ message HardStop {}
 message ReturnListenSockets {}
 message CountRequests {}
 message QueryMaxConnectionsPerIp {}
+message QueryMaxConnectionsPerSubnet {}
 
 // Wrapper message to distinguish "absent" (preserve) from "present but empty"
 // (reset to default) for ALPN protocols. A bare `repeated string` cannot make
@@ -1169,6 +1184,18 @@ message Cluster {
     // Optional UDP-specific cluster configuration. Present only for clusters
     // that front UDP backends; absent for HTTP/HTTPS/TCP clusters.
     optional UdpClusterConfig udp = 16;
+    // Per-cluster override for the global `max_connections_per_subnet`.
+    // Same three-state semantics as `max_connections_per_ip` above:
+    // `None` (field absent) inherits the global default, `Some(0)` is
+    // explicit "unlimited for this cluster", `Some(n > 0)` overrides.
+    // This is an INDEPENDENT counter from tag 13, not a replacement:
+    // a connection must satisfy BOTH the per-IP and the per-subnet cap
+    // to be admitted, which is what lets an operator express "10 per IP
+    // AND 100 per /64". Counts are kept per `(cluster_id, masked_ip)`,
+    // so two clusters never share a counter. The mask itself comes from
+    // the boot-time `ServerConfig.subnet_ipv4_prefix` /
+    // `subnet_ipv6_prefix` and is NOT overridable per cluster.
+    optional uint64 max_connections_per_subnet = 17;
 }
 
 message HealthCheckConfig {
@@ -1330,6 +1357,12 @@ message ResponseContent {
         // previous_effective}` because each worker holds its own
         // `Aggregator` with an independent lease table.
         WorkerMetricDetailStatus worker_metric_detail_status = 17;
+        // current global per-(cluster, source-SUBNET) connection limit,
+        // together with the two prefix lengths that define "subnet".
+        // The prefixes travel with the limit because they are boot-time
+        // only: without them in the reply an operator could read the
+        // live cap but had no way to learn what it is a cap ON.
+        MaxConnectionsPerSubnetLimit max_connections_per_subnet_limit = 18;
     }
 }
 
@@ -1621,6 +1654,22 @@ message MaxConnectionsPerIpLimit {
     required uint64 limit = 1;
 }
 
+// `0` means unlimited (the subnet limiter is disabled), which is the
+// default. Returned by workers in response to
+// `Request.query_max_connections_per_subnet`. Carries the two prefix
+// lengths alongside the cap: they are set once at worker boot from
+// `ServerConfig`, so this reply is the only runtime surface that can
+// tell an operator which mask the live counters are keyed on.
+message MaxConnectionsPerSubnetLimit {
+    required uint64 limit = 1;
+    // IPv4 prefix length in bits, 0-32. 32 (the default) makes an IPv4
+    // "subnet" the single address, i.e. inert.
+    required uint32 ipv4_prefix = 2;
+    // IPv6 prefix length in bits, 0-128. 128 (the default) makes an
+    // IPv6 "subnet" the single address, i.e. inert.
+    required uint32 ipv6_prefix = 3;
+}
+
 // matches std::net::SocketAddr in the Rust library
 // beware that the ports are expressed with uint32 here,
 // but they should NOT exceed uint16 value
@@ -1865,6 +1914,37 @@ message ServerConfig {
     // this value (no HTTP envelope), but it is still accepted in the
     // proto/config shape for symmetry.
     optional uint32 retry_after = 24 [default = 60];
+    // Default per-(cluster, source-SUBNET) connection limit. `0` means
+    // unlimited and IS THE DEFAULT, so this limiter is inert until an
+    // operator turns it on and the pre-existing per-IP behaviour is
+    // strictly unchanged out of the box.
+    //
+    // This is a SECOND, independent counter standing beside
+    // `max_connections_per_ip` (tag 23), not a replacement for it. The
+    // per-IP cap serves the API-gateway case (a single abusive client);
+    // the per-subnet cap serves the denial-of-service case, where an
+    // attacker holding a routed prefix — an ordinary residential IPv6
+    // `/64` — defeats a per-address counter entirely by taking a fresh
+    // address per connection (sozu-proxy/sozu#1270). Both gates are
+    // consulted and BOTH must admit, so "10 per IP AND 100 per /64" is
+    // expressible.
+    optional uint64 max_connections_per_subnet = 26 [default = 0];
+    // IPv4 prefix length, in bits, used to derive the subnet key from an
+    // IPv4 source address. Valid range 0-32; rejected at config-load
+    // time outside it. The default of 32 masks nothing, so an operator
+    // who sets only `max_connections_per_subnet` gets a per-address
+    // counter rather than a surprising aggregation. `/24` is the
+    // recommended starting point (see doc/configure.md).
+    optional uint32 subnet_ipv4_prefix = 27 [default = 32];
+    // IPv6 prefix length, in bits, used to derive the subnet key from an
+    // IPv6 source address. Valid range 0-128; rejected at config-load
+    // time outside it. The default of 128 masks nothing. `/56` is the
+    // recommended starting point (see doc/configure.md). An
+    // IPv4-mapped IPv6 source (`::ffff:a.b.c.d`, what a dual-stack
+    // `[::]` listener hands back for a v4 client) is canonicalised to
+    // its IPv4 form FIRST and then masked with `subnet_ipv4_prefix`, so
+    // v4 clients are not all collapsed into a single `::/56` bucket.
+    optional uint32 subnet_ipv6_prefix = 28 [default = 128];
     // Requested kernel-pipe capacity, in bytes, for each `splice(2)`
     // zero-copy direction in the `Pipe` protocol. Applied via
     // `fcntl(F_SETPIPE_SZ)` per pipe at `SplicePipe::new`; the kernel

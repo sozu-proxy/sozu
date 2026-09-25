@@ -640,6 +640,7 @@ fn response_content_kind(content: Option<&command::ResponseContent>) -> Option<&
             ContentType::CertificatesWithFingerprints(_) => "certificates_with_fingerprints",
             ContentType::RequestCounts(_) => "request_counts",
             ContentType::MaxConnectionsPerIpLimit(_) => "max_connections_per_ip_limit",
+            ContentType::MaxConnectionsPerSubnetLimit(_) => "max_connections_per_subnet_limit",
             ContentType::HealthChecksList(_) => "health_checks_list",
             ContentType::MetricDetailStatus(_) => "metric_detail_status",
             ContentType::WorkerMetricDetailStatus(_) => "worker_metric_detail_status",

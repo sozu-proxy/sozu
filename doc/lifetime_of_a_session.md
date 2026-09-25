@@ -168,7 +168,7 @@ the kernel's listen backlog absorbs the surplus. The
 worker spent backpressured (`lib/src/server.rs:110-114`, and the
 `ACCEPT_SATURATION_TICK` block of `Server::run` in `lib/src/server.rs`). The
 system unwinds at 90% of `max_connections` to avoid flapping
-(`lib/src/server.rs:657-665`).
+(`lib/src/server.rs:1056-1064`).
 
 ### 3.4 Zombie detection
 
@@ -231,7 +231,7 @@ cause:
   the listener has `disable_http11 = true`
   (`lib/src/https.rs:466, 496`).
 
-The startup-time validator at `command/src/config.rs:1233-1237, 1255-1261`
+The startup-time validator at `command/src/config.rs:1279-1283, 1301-1307`
 catches the obvious operator mistake of pairing `disable_http11 = true` with
 `alpn_protocols` that still contains `"http/1.1"`.
 
@@ -515,7 +515,7 @@ Linux the subsequent `close()` then sends a TCP RST instead of a FIN,
 destroying any data still in the send buffer — including the TLS
 records the drain loop just flushed. `Shutdown::Write` sends FIN only
 after the send buffer drains, preserving the response. The plaintext
-TCP path (`lib/src/tcp.rs:1563-1567, 1830-1835`) keeps `Shutdown::Both`
+TCP path (`lib/src/tcp.rs:1563-1567, 1838-1843`) keeps `Shutdown::Both`
 because it has no encrypted send-buffer to truncate; the comment
 flags that a future TLS upgrade on TCP would need to switch modes.
 

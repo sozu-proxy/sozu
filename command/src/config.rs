@@ -256,6 +256,37 @@ pub const DEFAULT_MAX_CONNECTIONS_PER_IP: u64 = 0;
 /// envelope), but the field is accepted for symmetry.
 pub const DEFAULT_RETRY_AFTER: u32 = 60;
 
+/// Default per-(cluster, source-SUBNET) connection limit. `0` means
+/// unlimited, which disables the subnet limiter entirely and leaves the
+/// pre-existing per-IP behaviour strictly unchanged. This is a SECOND,
+/// independent counter beside [`DEFAULT_MAX_CONNECTIONS_PER_IP`], not a
+/// replacement: the per-IP cap serves the API-gateway case, the
+/// per-subnet cap the denial-of-service case where an attacker holding a
+/// routed prefix takes a fresh address per connection
+/// (sozu-proxy/sozu#1270). Both gates are consulted and both must admit.
+pub const DEFAULT_MAX_CONNECTIONS_PER_SUBNET: u64 = 0;
+
+/// Default IPv4 prefix length (bits) used to derive the subnet key. 32
+/// masks nothing, so enabling only `max_connections_per_subnet` yields a
+/// per-address counter rather than a surprising aggregation. `/24` is the
+/// recommended starting point; see `doc/configure.md`.
+pub const DEFAULT_SUBNET_IPV4_PREFIX: u32 = 32;
+
+/// Default IPv6 prefix length (bits) used to derive the subnet key. 128
+/// masks nothing. `/56` is the recommended starting point; see
+/// `doc/configure.md`.
+pub const DEFAULT_SUBNET_IPV6_PREFIX: u32 = 128;
+
+/// Inclusive upper bound for [`DEFAULT_SUBNET_IPV4_PREFIX`] and the
+/// `subnet_ipv4_prefix` config key. A value above this is a config error,
+/// never silently clamped.
+pub const MAX_SUBNET_IPV4_PREFIX: u32 = 32;
+
+/// Inclusive upper bound for [`DEFAULT_SUBNET_IPV6_PREFIX`] and the
+/// `subnet_ipv6_prefix` config key. A value above this is a config error,
+/// never silently clamped.
+pub const MAX_SUBNET_IPV6_PREFIX: u32 = 128;
+
 #[derive(Debug)]
 pub enum IncompatibilityKind {
     PublicAddress,
@@ -316,6 +347,21 @@ pub enum ConfigError {
     },
     #[error("Invalid ALPN protocol '{0}'. Valid values: \"h2\", \"http/1.1\"")]
     InvalidAlpnProtocol(String),
+    /// `subnet_ipv4_prefix` / `subnet_ipv6_prefix` is outside the bit
+    /// width of its address family. Rejected rather than clamped: a
+    /// silently narrowed mask would enforce a different policy than the
+    /// one written in the file, and the operator would have no way to
+    /// tell from the config which one is in force.
+    #[error(
+        "{key} = {value} is out of range: a {family} prefix length must be between 0 and \
+         {maximum} bits inclusive."
+    )]
+    InvalidSubnetPrefix {
+        key: &'static str,
+        family: &'static str,
+        value: u32,
+        maximum: u32,
+    },
     /// `disable_http11 = true` and `alpn_protocols` containing `"http/1.1"`
     /// are mutually exclusive: the proxy advertises `http/1.1` to peers,
     /// then refuses every connection that negotiates
@@ -2454,6 +2500,14 @@ pub struct FileClusterConfig {
     /// limit. The source IP is taken from the parsed proxy-protocol
     /// header when present, else `peer_addr`.
     pub max_connections_per_ip: Option<u64>,
+    /// Override the global per-(cluster, source-SUBNET) connection limit
+    /// for this cluster. Same three-state semantics as
+    /// [`FileClusterConfig::max_connections_per_ip`]: `None` inherits,
+    /// `Some(0)` is explicit unlimited, `Some(n > 0)` overrides. This is
+    /// an independent counter — a connection must satisfy BOTH caps.
+    /// The mask itself is global and boot-time only (`subnet_ipv4_prefix`
+    /// / `subnet_ipv6_prefix`), not overridable per cluster.
+    pub max_connections_per_subnet: Option<u64>,
     /// Override the global `Retry-After` header value (seconds) emitted
     /// on HTTP 429 responses for this cluster. `None` inherits the global
     /// default. `Some(0)` omits the header. TCP clusters carry this
@@ -2642,6 +2696,7 @@ impl FileClusterConfig {
                     authorized_hashes: self.authorized_hashes.unwrap_or_default(),
                     www_authenticate: self.www_authenticate,
                     max_connections_per_ip: self.max_connections_per_ip,
+                    max_connections_per_subnet: self.max_connections_per_subnet,
                     retry_after: self.retry_after,
                     health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
                     udp,
@@ -2692,6 +2747,7 @@ impl FileClusterConfig {
                     authorized_hashes: self.authorized_hashes.unwrap_or_default(),
                     www_authenticate: self.www_authenticate,
                     max_connections_per_ip: self.max_connections_per_ip,
+                    max_connections_per_subnet: self.max_connections_per_subnet,
                     retry_after: self.retry_after,
                     health_check: self.health_check.as_ref().map(|hc| hc.to_proto()),
                     udp,
@@ -2895,6 +2951,12 @@ pub struct HttpClusterConfig {
     /// [`FileClusterConfig::max_connections_per_ip`] for semantics.
     #[serde(default)]
     pub max_connections_per_ip: Option<u64>,
+    /// Per-cluster override of the global `max_connections_per_subnet`.
+    /// See [`FileClusterConfig::max_connections_per_subnet`] for
+    /// semantics: an independent second cap, not a replacement for the
+    /// per-IP one.
+    #[serde(default)]
+    pub max_connections_per_subnet: Option<u64>,
     /// Per-cluster override of the global `retry_after` HTTP-429 header
     /// value (seconds). See [`FileClusterConfig::retry_after`].
     #[serde(default)]
@@ -2927,6 +2989,7 @@ impl HttpClusterConfig {
                 authorized_hashes: self.authorized_hashes.clone(),
                 www_authenticate: self.www_authenticate.clone(),
                 max_connections_per_ip: self.max_connections_per_ip,
+                max_connections_per_subnet: self.max_connections_per_subnet,
                 retry_after: self.retry_after,
                 health_check: self.health_check.clone(),
                 udp: self.udp.clone(),
@@ -3028,6 +3091,12 @@ pub struct TcpClusterConfig {
     /// [`FileClusterConfig::max_connections_per_ip`] for semantics.
     #[serde(default)]
     pub max_connections_per_ip: Option<u64>,
+    /// Per-cluster override of the global `max_connections_per_subnet`.
+    /// See [`FileClusterConfig::max_connections_per_subnet`] for
+    /// semantics: an independent second cap, not a replacement for the
+    /// per-IP one.
+    #[serde(default)]
+    pub max_connections_per_subnet: Option<u64>,
     /// Per-cluster override of the global `retry_after`. TCP listeners
     /// never emit `Retry-After`; the field is carried for shape
     /// uniformity with [`HttpClusterConfig`].
@@ -3061,6 +3130,7 @@ impl TcpClusterConfig {
                 authorized_hashes: self.authorized_hashes.clone(),
                 www_authenticate: self.www_authenticate.clone(),
                 max_connections_per_ip: self.max_connections_per_ip,
+                max_connections_per_subnet: self.max_connections_per_subnet,
                 retry_after: self.retry_after,
                 health_check: self.health_check.clone(),
                 udp: self.udp.clone(),
@@ -3197,6 +3267,30 @@ pub struct FileConfig {
     /// closed gracefully without dialing the backend.
     #[serde(default)]
     pub max_connections_per_ip: Option<u64>,
+    /// Default per-(cluster, source-SUBNET) connection limit. `None`
+    /// keeps `0` (unlimited), which leaves this limiter inert and the
+    /// per-IP behaviour strictly unchanged. It is a SECOND, independent
+    /// counter beside `max_connections_per_ip`: the per-IP cap serves
+    /// the API-gateway case, the per-subnet cap the denial-of-service
+    /// case where an attacker holding a routed prefix takes a fresh
+    /// address per connection (sozu-proxy/sozu#1270). Both gates are
+    /// consulted and both must admit, so "10 per IP AND 100 per /64" is
+    /// expressible. Each cluster may override via its own
+    /// `max_connections_per_subnet`.
+    #[serde(default)]
+    pub max_connections_per_subnet: Option<u64>,
+    /// IPv4 prefix length (bits, 0-32) used to derive the subnet key.
+    /// `None` keeps 32, which masks nothing. `/24` is the recommended
+    /// starting point. Out-of-range values are rejected at config-load
+    /// time rather than clamped.
+    #[serde(default)]
+    pub subnet_ipv4_prefix: Option<u32>,
+    /// IPv6 prefix length (bits, 0-128) used to derive the subnet key.
+    /// `None` keeps 128, which masks nothing. `/56` is the recommended
+    /// starting point. An IPv4-mapped IPv6 source is canonicalised to
+    /// IPv4 first and masked with `subnet_ipv4_prefix` instead.
+    #[serde(default)]
+    pub subnet_ipv6_prefix: Option<u32>,
     /// Default `Retry-After` header value (seconds) sent on HTTP 429
     /// responses. `Some(0)` or `None` keeping the default `0` omits the
     /// header (rendering `Retry-After: 0` invites an immediate retry that
@@ -3418,6 +3512,15 @@ impl ConfigBuilder {
             max_connections_per_ip: file_config
                 .max_connections_per_ip
                 .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_IP),
+            max_connections_per_subnet: file_config
+                .max_connections_per_subnet
+                .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_SUBNET),
+            subnet_ipv4_prefix: file_config
+                .subnet_ipv4_prefix
+                .unwrap_or(DEFAULT_SUBNET_IPV4_PREFIX),
+            subnet_ipv6_prefix: file_config
+                .subnet_ipv6_prefix
+                .unwrap_or(DEFAULT_SUBNET_IPV6_PREFIX),
             retry_after: file_config.retry_after.unwrap_or(DEFAULT_RETRY_AFTER),
             splice_pipe_capacity_bytes: file_config.splice_pipe_capacity_bytes,
             ..Default::default()
@@ -3622,6 +3725,27 @@ impl ConfigBuilder {
 
     /// Builds a [`Config`], populated with listeners and clusters
     pub fn into_config(&mut self) -> Result<Config, ConfigError> {
+        // Subnet prefix lengths must fit their address family. Checked
+        // here rather than clamped in `ConfigBuilder::new` (which cannot
+        // fail) so a typo such as `subnet_ipv4_prefix = 64` stops the
+        // load instead of quietly enforcing /32.
+        if self.built.subnet_ipv4_prefix > MAX_SUBNET_IPV4_PREFIX {
+            return Err(ConfigError::InvalidSubnetPrefix {
+                key: "subnet_ipv4_prefix",
+                family: "IPv4",
+                value: self.built.subnet_ipv4_prefix,
+                maximum: MAX_SUBNET_IPV4_PREFIX,
+            });
+        }
+        if self.built.subnet_ipv6_prefix > MAX_SUBNET_IPV6_PREFIX {
+            return Err(ConfigError::InvalidSubnetPrefix {
+                key: "subnet_ipv6_prefix",
+                family: "IPv6",
+                value: self.built.subnet_ipv6_prefix,
+                maximum: MAX_SUBNET_IPV6_PREFIX,
+            });
+        }
+
         if let Some(listeners) = &self.file.listeners {
             self.populate_listeners(listeners.clone())?;
         }
@@ -3956,6 +4080,21 @@ pub struct Config {
     /// proxy-protocol header when present.
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: u64,
+    /// Default per-(cluster, source-SUBNET) connection limit. `0` means
+    /// unlimited and is the default, so the subnet limiter is inert
+    /// until an operator turns it on. An independent second counter
+    /// beside `max_connections_per_ip`, not a replacement: both gates
+    /// must admit. Each cluster may override.
+    #[serde(default = "default_max_connections_per_subnet")]
+    pub max_connections_per_subnet: u64,
+    /// IPv4 prefix length (bits, 0-32) defining the subnet key. 32
+    /// (default) masks nothing.
+    #[serde(default = "default_subnet_ipv4_prefix")]
+    pub subnet_ipv4_prefix: u32,
+    /// IPv6 prefix length (bits, 0-128) defining the subnet key. 128
+    /// (default) masks nothing.
+    #[serde(default = "default_subnet_ipv6_prefix")]
+    pub subnet_ipv6_prefix: u32,
     /// Default `Retry-After` header value (seconds) emitted on HTTP 429
     /// responses. `0` omits the header.
     #[serde(default = "default_retry_after")]
@@ -4008,6 +4147,18 @@ fn default_worker_timeout() -> u32 {
 
 fn default_max_connections_per_ip() -> u64 {
     DEFAULT_MAX_CONNECTIONS_PER_IP
+}
+
+fn default_max_connections_per_subnet() -> u64 {
+    DEFAULT_MAX_CONNECTIONS_PER_SUBNET
+}
+
+fn default_subnet_ipv4_prefix() -> u32 {
+    DEFAULT_SUBNET_IPV4_PREFIX
+}
+
+fn default_subnet_ipv6_prefix() -> u32 {
+    DEFAULT_SUBNET_IPV6_PREFIX
 }
 
 fn default_retry_after() -> u32 {
@@ -4406,6 +4557,9 @@ impl From<&Config> for ServerConfig {
             basic_auth_max_credential_bytes: config.basic_auth_max_credential_bytes,
             evict_on_queue_full: Some(config.evict_on_queue_full),
             max_connections_per_ip: Some(config.max_connections_per_ip),
+            max_connections_per_subnet: Some(config.max_connections_per_subnet),
+            subnet_ipv4_prefix: Some(config.subnet_ipv4_prefix),
+            subnet_ipv6_prefix: Some(config.subnet_ipv6_prefix),
             retry_after: Some(config.retry_after),
             splice_pipe_capacity_bytes: config.splice_pipe_capacity_bytes,
         };
@@ -6173,6 +6327,127 @@ mod tests {
         assert_eq!(
             add_udp_frontend_count, 2,
             "both cluster frontends on the udp listener must emit AddUdpFrontend"
+        );
+    }
+
+    /// The three subnet keys must travel from TOML through `Config`,
+    /// and the per-cluster override with them. Nothing else asserts this
+    /// plumbing: a swapped or dropped key would only surface as a cap
+    /// that silently never fires.
+    #[test]
+    fn subnet_connection_limit_keys_round_trip_from_toml() {
+        let toml_content = r#"
+            command_socket   = "/tmp/sozu.sock"
+            saved_state      = "./state.json"
+            worker_count     = 1
+
+            max_connections_per_ip     = 10
+            max_connections_per_subnet = 100
+            subnet_ipv4_prefix         = 24
+            subnet_ipv6_prefix         = 56
+
+            [[listeners]]
+            protocol = "http"
+            address  = "127.0.0.1:8080"
+
+            [clusters.api]
+            protocol       = "http"
+            load_balancing = "ROUND_ROBIN"
+            max_connections_per_subnet = 7
+            frontends = [
+              { address = "127.0.0.1:8080", hostname = "example.com" }
+            ]
+            backends = [ { address = "10.0.0.1:8080" } ]
+        "#;
+        let file_config: FileConfig =
+            toml::from_str(toml_content).expect("Could not parse TOML config");
+        let config = ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+            .into_config()
+            .expect("a config with valid subnet prefixes must load");
+
+        assert_eq!(
+            config.max_connections_per_subnet, 100,
+            "the global subnet cap must survive the TOML round trip"
+        );
+        assert_eq!(
+            config.subnet_ipv4_prefix, 24,
+            "subnet_ipv4_prefix must survive the TOML round trip"
+        );
+        assert_eq!(
+            config.subnet_ipv6_prefix, 56,
+            "subnet_ipv6_prefix must survive the TOML round trip — a swap with the IPv6 \
+             key would leave a cap that silently never fires"
+        );
+        assert_eq!(
+            config.max_connections_per_ip, 10,
+            "the pre-existing per-IP cap must be unaffected: the two are independent"
+        );
+
+        let cluster = config
+            .clusters
+            .get("api")
+            .expect("the staged cluster must be present");
+        let override_value = match cluster {
+            ClusterConfig::Http(http) => http.max_connections_per_subnet,
+            other => panic!("expected an HTTP cluster, got {other:?}"),
+        };
+        assert_eq!(
+            override_value,
+            Some(7),
+            "the per-cluster subnet override must reach the cluster config"
+        );
+    }
+
+    /// An out-of-range prefix is REJECTED, never silently clamped. A
+    /// narrowed mask would enforce a policy other than the one written
+    /// in the file, and nothing in the config would say so.
+    #[test]
+    fn an_out_of_range_subnet_prefix_is_rejected_not_clamped() {
+        let with_prefixes = |v4: &str, v6: &str| -> String {
+            format!(
+                r#"
+            command_socket = "/tmp/sozu.sock"
+            saved_state    = "./state.json"
+            worker_count   = 1
+
+            max_connections_per_subnet = 100
+            subnet_ipv4_prefix         = {v4}
+            subnet_ipv6_prefix         = {v6}
+
+            [[listeners]]
+            protocol = "http"
+            address  = "127.0.0.1:8080"
+        "#
+            )
+        };
+
+        for (v4, v6, key) in [
+            ("33", "56", "subnet_ipv4_prefix"),
+            ("24", "129", "subnet_ipv6_prefix"),
+        ] {
+            let file_config: FileConfig =
+                toml::from_str(&with_prefixes(v4, v6)).expect("Could not parse TOML config");
+            let result = ConfigBuilder::new(file_config, "/tmp/test_config.toml").into_config();
+            match result {
+                Err(ConfigError::InvalidSubnetPrefix { key: reported, .. }) => {
+                    assert_eq!(
+                        reported, key,
+                        "the rejection must name the key that is out of range"
+                    );
+                }
+                other => panic!("{key} out of range must be rejected, got {other:?}"),
+            }
+        }
+
+        // Positive space: both bounds are INCLUSIVE, so the widest legal
+        // pair must still load.
+        let file_config: FileConfig =
+            toml::from_str(&with_prefixes("32", "128")).expect("Could not parse TOML config");
+        assert!(
+            ConfigBuilder::new(file_config, "/tmp/test_config.toml")
+                .into_config()
+                .is_ok(),
+            "the full-width prefixes are legal and are the defaults — they must load"
         );
     }
 }

@@ -275,6 +275,7 @@ fn is_mutating_verb(req: &RequestType) -> bool {
             | RequestType::HardStop(_)
             | RequestType::Logging(_)
             | RequestType::SetMaxConnectionsPerIp(_)
+            | RequestType::SetMaxConnectionsPerSubnet(_)
     )
 }
 
@@ -367,6 +368,7 @@ impl Server {
                         | RequestType::CountRequests(_)
                         | RequestType::SubscribeEvents(_)
                         | RequestType::QueryMaxConnectionsPerIp(_)
+                        | RequestType::QueryMaxConnectionsPerSubnet(_)
                         | RequestType::SetMetricDetail(_)
                 ),
             "read-only / non-transition verbs must not open the systemd reload window"
@@ -442,7 +444,13 @@ impl Server {
             // (the live counter lives in `SessionManager`, not in the
             // master's `ConfigState`), so we hand them off to the
             // generic worker fan-out path.
-            RequestType::SetMaxConnectionsPerIp(_) | RequestType::QueryMaxConnectionsPerIp(_) => {
+            RequestType::SetMaxConnectionsPerIp(_)
+            | RequestType::QueryMaxConnectionsPerIp(_)
+            // The per-(cluster, source-SUBNET) twin. Same reasoning: the
+            // live counter and the prefixes both live in `SessionManager`,
+            // not in the master's `ConfigState`.
+            | RequestType::SetMaxConnectionsPerSubnet(_)
+            | RequestType::QueryMaxConnectionsPerSubnet(_) => {
                 worker_request(self, client, request_type);
             }
             // `sozu top`'s runtime cardinality lease verb. Each worker maintains

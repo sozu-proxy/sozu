@@ -1662,32 +1662,40 @@ impl TcpSession {
         // `BackendConnectionError::TooManyConnectionsPerIp` →
         // `handle_connection_result` → `SessionResult::Close` — TCP has
         // no HTTP envelope to carry a 429 / `Retry-After`.
-        let cluster_max_connections_per_ip = self
+        let (cluster_max_connections_per_ip, cluster_max_connections_per_subnet) = self
             .proxy
             .borrow()
             .configs
             .get(&cluster_id)
-            .and_then(|c| c.max_connections_per_ip);
+            .map(|c| (c.max_connections_per_ip, c.max_connections_per_subnet))
+            .unwrap_or((None, None));
         if let Some(ip) = self.effective_session_address().map(|sa| sa.ip()) {
             let sessions_rc = self.proxy.borrow().sessions.clone();
-            let at_limit = sessions_rc.borrow().cluster_ip_at_limit(
+            // Both caps, through the one combined gate the mux uses too,
+            // so raw TCP and HTTP/HTTPS can never disagree about what
+            // "admitted" means.
+            let at_limit = sessions_rc.borrow().cluster_connection_at_limit(
                 self.frontend_token,
                 &cluster_id,
                 &ip,
                 cluster_max_connections_per_ip,
+                cluster_max_connections_per_subnet,
             );
             if at_limit {
                 debug!(
-                    "{} per-(cluster, source-IP) limit hit for cluster {} from {}",
+                    "{} per-(cluster, source-IP/subnet) limit hit for cluster {} from {}",
                     log_context!(self),
                     cluster_id,
                     ip
                 );
                 return Err(BackendConnectionError::TooManyConnectionsPerIp { cluster_id });
             }
-            sessions_rc
-                .borrow_mut()
-                .track_cluster_ip(self.frontend_token, cluster_id.clone(), ip);
+            sessions_rc.borrow_mut().track_cluster_connection(
+                self.frontend_token,
+                cluster_id.clone(),
+                ip,
+                cluster_max_connections_per_subnet,
+            );
             self.cluster_ip_tracked = true;
         }
 
@@ -2672,6 +2680,12 @@ pub struct ClusterConfiguration {
     /// Resolved against `SessionManager::effective_max_connections_per_ip`
     /// at admit time in `connect_to_backend`.
     pub max_connections_per_ip: Option<u64>,
+    /// Per-cluster override of the global per-(cluster, source-SUBNET)
+    /// connection limit. Same three-state semantics as
+    /// `max_connections_per_ip` above, resolved against
+    /// `SessionManager::effective_max_connections_per_subnet` at admit
+    /// time. An independent second cap: both must admit.
+    pub max_connections_per_subnet: Option<u64>,
 }
 
 pub struct TcpProxy {
@@ -2972,6 +2986,7 @@ impl ProxyConfiguration for TcpProxy {
                         .and_then(|n| ProxyProtocolConfig::try_from(n).ok()),
                     //load_balancing: cluster.load_balancing,
                     max_connections_per_ip: cluster.max_connections_per_ip,
+                    max_connections_per_subnet: cluster.max_connections_per_subnet,
                 };
                 self.configs.insert(cluster.cluster_id, config);
                 WorkerResponse::ok(message.id)
