@@ -412,6 +412,27 @@ from "the item is here". Treat a clean audit as "nothing
 obvious", never as "the citations are right"; the remedy that actually ends the class is to cite a
 **symbol**, which has no number to audit.
 
+**Widening its prose window was measured and rejected.** [sozu-proxy/sozu#1531][widen] filed a
+citation in `doc/lifetime_of_a_session.md` naming `accept_queue.saturated_seconds` while pointing at
+a buffer-pool gauge block fifteen lines above the ticker, and asked whether this mode could reach
+it. The signal it needs already exists — *the prose names a symbol that is not there* — but the
+citation sits mid-line under the sentence naming the metric, so the fragment read is its own line
+alone, and both of that document's spans were *declined* rather than examined. Reading one line
+further up takes the mode from 7 findings to 13, of which one addition is a real defect; taking
+every symbol the surrounding prose names, which is the literal rule that issue proposed, takes it to
+17, of which two are real and three correct citations it reports today go quiet. Against the six in
+thirteen this mode measured for itself and prints in its own banner, one in six is the rate at which
+a reviewer stops reading — so the item was closed rather than shipped.
+
+Worse, the variants that do fire on it fire by a one-line margin. The wrong span ends seven lines
+above the ticker's own comment, and that comment names the metric, so a window of eight excludes it
+by exactly one line; at nine every variant goes quiet while the citation stays just as wrong. The
+correct companion span in the same sentence is silent for the same reason in reverse — it opens on
+the constant's doc comment, which names the metric. Same mechanism, opposite verdicts, one line
+apart. What repaired that document was the remedy above: its five misaligned spans became symbols,
+and the declined count fell from 95 to 90, because every one of them had been in the bucket this
+mode cannot read.
+
 ### Citing a test by name
 
 The same command carries a second, independent rule, for the citation form that has no path at all:
@@ -580,6 +601,7 @@ every rule here, unchanged.
 [cit]: https://github.com/sozu-proxy/sozu/issues/1335
 [drift]: https://github.com/sozu-proxy/sozu/issues/1389
 [audit]: https://github.com/sozu-proxy/sozu/issues/1466
+[widen]: https://github.com/sozu-proxy/sozu/issues/1531
 [comment]: https://github.com/sozu-proxy/sozu/pull/1493
 
 ## Release Notes

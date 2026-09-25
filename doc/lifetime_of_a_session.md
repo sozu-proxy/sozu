@@ -165,7 +165,8 @@ the kernel's listen backlog absorbs the surplus. The
 `accept_queue.backpressure` gauge flips to 1 in that state
 (`SessionManager::check_limits`, `lib/src/server.rs`); a 1 Hz ticker also bumps
 `accept_queue.saturated_seconds` so dashboards can plot how long the
-worker spent backpressured (`lib/src/server.rs:110-114, 1268-1274`). The
+worker spent backpressured (`lib/src/server.rs:110-114`, and the
+`ACCEPT_SATURATION_TICK` block of `Server::run` in `lib/src/server.rs`). The
 system unwinds at 90% of `max_connections` to avoid flapping
 (`lib/src/server.rs:657-665`).
 
@@ -499,8 +500,9 @@ A session ends when:
 
 For TLS frontends specifically, the close path uses **write-only
 shutdown** on the front socket
-(`lib/src/https.rs:1022-1029`, mirrored in
-`lib/src/http.rs:617-622`):
+(the `Shutdown::Write` block of `HttpsSession::close` in
+`lib/src/https.rs`, mirrored in `HttpSession::close` in
+`lib/src/http.rs`):
 
 ```rust
 front_socket.shutdown(Shutdown::Write)
@@ -539,8 +541,9 @@ the master with the listener file descriptors handed off across
 `execve` (`bin/src/upgrade.rs`), so a new binary takes over the same
 listening sockets without dropping accepted connections.
 
-Detailed master/worker lifecycle, the SoftStop / HardStop verbs
-(`lib/src/server.rs:1368-1383`), and the audit-log envelope live in
+Detailed master/worker lifecycle, the `HardStop` / `SoftStop` arms of
+`Server::read_channel_messages_and_notify` (`lib/src/server.rs`), and
+the audit-log envelope live in
 [`bin/src/command/LIFECYCLE.md`](../bin/src/command/LIFECYCLE.md).
 
 **Scope clarification.** Data-plane sessions never emit audit-log
@@ -590,7 +593,8 @@ set to read a session's life from a dashboard:
 - `accept_queue.backpressure`, `accept_queue.saturated_seconds` —
   binary backpressure + time-integrated saturation
   (`SessionManager::check_limits` and `SessionManager::decr` in
-  `lib/src/server.rs`, plus `lib/src/server.rs:1268-1274`).
+  `lib/src/server.rs`, plus the `ACCEPT_SATURATION_TICK` block of
+  `Server::run` in the same file).
 - `backend.pool.size` — long-lived gauge mirroring open backend
   connections (`Router::plan_connect` in `lib/src/protocol/mux/router.rs`,
   `Mux::close` in `lib/src/protocol/mux/mod.rs`,

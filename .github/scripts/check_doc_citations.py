@@ -658,6 +658,59 @@
 #   it, and repaired in the same changeset. Proximity cannot tell "the name is
 #   nearby" from "the item is here".
 #
+#   WIDENING THE PROSE WINDOW WAS MEASURED AND REJECTED — sozu-proxy/sozu#1531.
+#   That issue filed a citation in `doc/lifetime_of_a_session.md` that named
+#   `accept_queue.saturated_seconds` while pointing at a buffer-pool gauge
+#   block fifteen lines above the ticker, and asked whether this mode could be
+#   made to catch it. It cannot usefully, and the reason is worth keeping.
+#
+#   The signal it needs already exists — "the prose names a symbol that is not
+#   there". What silenced it is `audit_fragment`: the citation sits mid-line
+#   under the sentence naming the metric, so the fragment is its own line
+#   alone, which carries no symbol, and BOTH of that document's spans were
+#   DECLINED as "prose naming nothing this heuristic can test" rather than
+#   examined. So the candidate is not a new rule, it is a wider prose window.
+#   Measured at `00118f77`, against this mode's own 7 findings / 81 examined:
+#
+#     * ALWAYS READ ONE LINE ABOVE (keeping the nearest-symbol picker): 13
+#       findings, +6 and -0. ONE of the six is a real defect. It also reaches
+#       only ONE of the issue's two citations: at the metric-inventory one,
+#       `audit_symbol` walks back onto `SessionManager::decr`, whose last
+#       segment is four characters, and RETURNS None instead of continuing to
+#       `check_limits` — a second silencer, unrelated to the window.
+#     * THE ISSUE'S LITERAL RULE — any identifier the surrounding prose names,
+#       flagging only when NONE is present: 17 findings, +13 and -3. TWO of the
+#       thirteen are real, both of them the filed defect. The three it loses
+#       are correct citations this mode reports today.
+#     * BOTH, over a whole blank-line-delimited block: 26 findings, +23 and -4,
+#       with no further real defect than those two.
+#
+#   So the honest rate on the additions is 1 in 6, or 2 in 13, against the 6 in
+#   13 this mode measured for itself and PRINTS in its own banner. It would
+#   also re-import false-positive classes already measured out above: reading
+#   every symbol in the fragment reinstates `expect.rs:219-236` / `ProxyAddr`,
+#   quoted verbatim in `audit_symbol` as the reason the nearest one is read,
+#   and a block-wide window merges adjacent markdown table rows and reads a
+#   fenced block's `rust` info string as a prose symbol. A mode whose banner
+#   has to promise one finding in six is a mode reviewers stop reading, so the
+#   item was closed rather than shipped.
+#
+#   AND THE VARIANTS THAT DO FIRE ON IT FIRE BY A ONE-LINE MARGIN, which is
+#   the real reason to stop. The wrong span ends seven lines above the ticker's
+#   own comment, and that comment names the metric; AUDIT_WINDOW is 8, so the
+#   name falls outside by exactly one line. At 9 it is inside and every variant
+#   above goes quiet while the citation stays just as wrong. The correct
+#   companion span in the same sentence is silent for the very same reason in
+#   reverse — its first line is the constant's doc comment, which names the
+#   metric. Same mechanism, opposite verdicts, one line apart: this is
+#   `Mux::timeout` again, and proximity still cannot tell "the name is nearby"
+#   from "the item is here".
+#
+#   WHAT DID FIX IT is the convention this file already states: the five spans
+#   that issue's changeset repaired were replaced by symbols, and the declined
+#   count fell from 95 to 90 — every one of them had been in the bucket this
+#   mode cannot read. A symbol needs no window.
+#
 # Usage:
 #   python3 .github/scripts/check_doc_citations.py            # check the tree
 #   python3 .github/scripts/check_doc_citations.py --show     # + print every
