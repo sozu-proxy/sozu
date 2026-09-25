@@ -270,8 +270,224 @@ type GlobalStreamId = usize;
 pub type MuxClear = Mux<SessionTcpStream, HttpListener>;
 pub type MuxTls = Mux<FrontRustls, HttpsListener>;
 
+/// An opaque, session-scoped name for one entry of the worker's backend
+/// registry.
+///
+/// It is an index into `Mux::backend_registry` and nothing else: the core
+/// can carry it, compare it and hand it back, and cannot turn it into a
+/// `Backend`. Only the embedder resolves it, which is what keeps
+/// `Rc<RefCell<Backend>>` out of the core (#1340, Question 12).
+///
+/// Session-scoped rather than derived from `(cluster_id, backend_id)` on
+/// purpose. A reload that replaces a registry entry mid-session builds a NEW
+/// `Rc`, which takes a NEW slot, so connections opened before it keep charging
+/// the handle they were dialled against — exactly what holding the `Rc`
+/// inside `Position::Client` used to do. Keying on the backend's name instead
+/// would split a balanced start/end pair across two `Backend` values: the
+/// superseded one would keep a charge forever and the fresh one would
+/// saturate at zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BackendSlot(usize);
+
+/// A backend as the core sees it: the opaque slot, plus the two identity
+/// fields the datapath renders.
+///
+/// `backend_id` and `address` are copied once, when the backend is dialled.
+/// Both are immutable for the life of a registry entry, so carrying them is
+/// not a cached view of mutable state — no load state crosses this boundary.
+/// The mutable half (`active_connections`, `active_requests`, `failures`,
+/// `connection_time`, `health`, `status`) stays behind the slot, and the core
+/// reaches it only by emitting a [`BackendDelta`].
+///
+/// `backend_id` is an `Rc<str>` because the `BackendStatus::Connecting` ->
+/// `BackendStatus::Connected` transition rebuilds the `Position::Client`
+/// variant once per dial. That reconstruction cost one `Rc` bump when the
+/// field was an `Rc<RefCell<Backend>>`; a `String` would make it a heap copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackendId {
+    /// Private to this module: [`Mux::backend`] is the only way out.
+    slot: BackendSlot,
+    /// `Backend::backend_id`, for log lines and per-backend metric labels.
+    pub backend_id: Rc<str>,
+    /// `Backend::address`, for log lines and `push_event` payloads.
+    pub address: SocketAddr,
+}
+
+impl BackendId {
+    /// The slot this id names. Module-private on purpose — see [`Mux::backend`]
+    /// for the crate-visible resolution path.
+    fn slot(&self) -> BackendSlot {
+        self.slot
+    }
+}
+
+/// One accounting change the core decided and the embedder performs.
+///
+/// LIFECYCLE §9 invariant 14 is a balance, and this is the ledger it balances:
+/// every [`BackendChange::StreamsStarted`] unit the mux emits is covered by
+/// exactly one [`BackendChange::StreamsEnded`] unit against the same slot.
+/// Because every write to `Backend::active_requests` and
+/// `Backend::active_connections` on the mux path now goes through
+/// `Mux::apply_backend_deltas`, reconciling the emitted stream to zero is a
+/// direct test of the invariant rather than a proxy for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackendDelta {
+    /// The registry entry to charge.
+    pub slot: BackendSlot,
+    /// What to charge it.
+    pub change: BackendChange,
+}
+
+/// The accounting operations [`BackendDelta`] can carry.
+///
+/// Deliberately only the two counters invariant 14 is about. The health and
+/// latency writes the mux also makes (`failures`, `retry_policy`,
+/// `connection_time`) are NOT here: they are not part of the balance, and the
+/// load balancer reads `retry_policy`, so they stay immediate at their
+/// existing embedder-side call sites rather than being deferred to a drain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendChange {
+    /// `Backend::active_requests += n` — `n` streams started on this backend.
+    StreamsStarted(usize),
+    /// `Backend::active_requests -= n`, saturating — `n` streams left it.
+    StreamsEnded(usize),
+    /// `Backend::dec_connections()` — the connection to this backend closed.
+    ConnectionClosed,
+}
+
+/// The embedder's table of registry handles, indexed by [`BackendSlot`].
+///
+/// A newtype rather than a bare `Vec` so the two operations that may cross
+/// Question 12's perimeter — minting a slot for a freshly dialled backend,
+/// and performing a [`BackendDelta`] against one — are the only ones there
+/// are. Nothing hands a `&Rc<RefCell<Backend>>` out of here except
+/// [`Mux::backend`], whose one caller is the WebSocket upgrade.
+#[derive(Debug, Default)]
+pub(crate) struct BackendRegistry(Vec<Rc<RefCell<Backend>>>);
+
+impl BackendRegistry {
+    /// Name `backend` with a slot, reusing the one it already has.
+    ///
+    /// Identity is `Rc::ptr_eq`, not the backend's id or address: two dials
+    /// separated by a reload that replaced the registry entry are two
+    /// different `Backend` values, and each must keep its own accounting.
+    /// The scan is linear over the backends ONE session has dialled, which
+    /// is the cluster's backend count at worst — the same order as the
+    /// `Router::backends` walk the caller has just done.
+    fn intern(&mut self, backend: &Rc<RefCell<Backend>>) -> BackendSlot {
+        match self.0.iter().position(|known| Rc::ptr_eq(known, backend)) {
+            Some(slot) => BackendSlot(slot),
+            None => {
+                self.0.push(backend.clone());
+                BackendSlot(self.0.len() - 1)
+            }
+        }
+    }
+
+    /// Build the core's view of a backend it is about to be handed.
+    fn id_for(&mut self, backend: &Rc<RefCell<Backend>>) -> BackendId {
+        let slot = self.intern(backend);
+        let borrow = backend.borrow();
+        BackendId {
+            slot,
+            backend_id: Rc::from(borrow.backend_id.as_str()),
+            address: borrow.address,
+        }
+    }
+
+    fn get(&self, slot: BackendSlot) -> Option<&Rc<RefCell<Backend>>> {
+        self.0.get(slot.0)
+    }
+
+    /// Resolve one of the core's opaque [`BackendId`]s to the registry handle
+    /// it names.
+    ///
+    /// The single crate-visible way back from an id to an
+    /// `Rc<RefCell<Backend>>`, so the perimeter Question 12 draws has one
+    /// door rather than a `pub` slot every caller can walk through. Its only
+    /// callers are `upgrade_mux` in `lib/src/http.rs` and `lib/src/https.rs`,
+    /// which hand the live handle to the WebSocket `Pipe` that takes the
+    /// backend over.
+    ///
+    /// It sits here rather than on [`Mux`] because those callers have already
+    /// moved `Mux::frontend` out by the time they need it; a field access
+    /// borrows disjointly where a `&self` method on `Mux` could not.
+    ///
+    /// `None` cannot happen for an id this session minted — the table never
+    /// shrinks — so a caller treats it as the desync it would be.
+    pub(crate) fn handle(&self, backend: &BackendId) -> Option<&Rc<RefCell<Backend>>> {
+        self.get(backend.slot())
+    }
+
+    /// Perform one accounting change the core decided.
+    ///
+    /// The before/after pair-assertions that used to sit at each emitting
+    /// site live here now: this is where both halves are observable, and one
+    /// copy covers every emitter instead of each carrying its own.
+    fn apply(&self, delta: BackendDelta) {
+        let Some(backend) = self.get(delta.slot) else {
+            // Unreachable while the vector only grows, which it does. Report
+            // rather than panic: losing one charge is a drifting gauge, and
+            // dropping a session over it would be worse.
+            error!(
+                "{} backend accounting delta {:?} names a slot this session never minted",
+                log_module_context!(),
+                delta
+            );
+            return;
+        };
+        let mut backend = backend.borrow_mut();
+        match delta.change {
+            BackendChange::StreamsStarted(count) => {
+                let before = backend.active_requests;
+                backend.active_requests += count;
+                debug_assert_eq!(
+                    backend.active_requests,
+                    before + count,
+                    "a StreamsStarted delta must raise active_requests by exactly its count"
+                );
+            }
+            BackendChange::StreamsEnded(count) => {
+                // `saturating_sub` is the network-safe floor a desynced peer
+                // needs, so the post-relation is all that can be asserted —
+                // not that `before >= count`.
+                let before = backend.active_requests;
+                backend.active_requests = backend.active_requests.saturating_sub(count);
+                debug_assert_eq!(
+                    backend.active_requests,
+                    before.saturating_sub(count),
+                    "a StreamsEnded delta must lower active_requests by its count (saturating)"
+                );
+                debug_assert!(
+                    backend.active_requests <= before,
+                    "active_requests must not grow on a StreamsEnded delta"
+                );
+            }
+            BackendChange::ConnectionClosed => {
+                // `dec_connections` floors at 0 (a double close from a
+                // desynced peer must not panic), so the post-relation is
+                // "decreased by one, unless already at zero".
+                let before = backend.active_connections;
+                backend.dec_connections();
+                debug_assert_eq!(
+                    backend.active_connections,
+                    before.saturating_sub(1),
+                    "a ConnectionClosed delta must release exactly one backend connection \
+                     (saturating at 0)"
+                );
+            }
+        }
+        trace!(
+            "{} backend accounting {:?} applied: {:#?}",
+            log_module_context!(),
+            delta.change,
+            backend
+        );
+    }
+}
+
 pub enum Position {
-    Client(String, Rc<RefCell<Backend>>, BackendStatus),
+    Client(String, BackendId, BackendStatus),
     Server,
 }
 
@@ -582,6 +798,22 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// re-seeds it; a deterministic simulator assigns this field directly
     /// after construction instead.
     pub request_id_rng: StdRng,
+    /// Backend accounting the core decided and the embedder has not performed
+    /// yet (#1340, Question 12).
+    ///
+    /// The core's outbound channel for registry writes, in the same place
+    /// `udp`'s `Output` queue sits: a site that used to reach a
+    /// `Rc<RefCell<Backend>>` through `Position::Client` and mutate it pushes
+    /// a [`BackendDelta`] here instead. `Mux::apply_backend_deltas` is the
+    /// only drain, and the only writer of `Backend::active_requests` /
+    /// `Backend::active_connections` on the mux path.
+    ///
+    /// Entries are applied in the order they were pushed, and the drain runs
+    /// before anything reads backend load state — in practice, before each
+    /// `Router::connect`, whose load balancer is that sole reader. FIFO plus
+    /// drain-before-read leaves the counters at every read point exactly
+    /// where mutating in place left them, saturation included.
+    pub backend_deltas: Vec<BackendDelta>,
 }
 
 /// Unix milliseconds for the wall clock, saturating to 0 before the epoch.
@@ -629,7 +861,19 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
             now: Instant::now(),
             now_wall_ms: unix_epoch_ms(),
             request_id_rng: StdRng::from_rng(&mut rand::rng()),
+            backend_deltas: Vec::new(),
         }
+    }
+
+    /// Record one backend accounting change for the embedder to perform.
+    ///
+    /// The single push site, so every emitter reads the same way and a
+    /// `grep` for `record_backend_delta` enumerates the ledger's inputs.
+    pub(super) fn record_backend_delta(&mut self, backend: &BackendId, change: BackendChange) {
+        self.backend_deltas.push(BackendDelta {
+            slot: backend.slot(),
+            change,
+        });
     }
 
     /// Mint the request ULID for a stream this session is about to open.
@@ -842,6 +1086,20 @@ pub struct Mux<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     /// `reschedule`'s `retain`, and `TimeoutContainer::drop` cancels its entry
     /// — which is why no backend-removal site has to remember to cancel.
     pub timeouts: HashMap<Token, TimeoutContainer>,
+    /// The registry handles the core's [`BackendSlot`]s stand for.
+    ///
+    /// The embedder's half of Question 12's perimeter: the core carries an
+    /// opaque slot, this resolves it, and `Mux::apply_backend_deltas` is
+    /// what turns the core's [`BackendDelta`]s into writes on the worker's
+    /// `Backend` values. Indexed by slot.
+    ///
+    /// A dial reuses an existing slot when `Rc::ptr_eq` matches, so the
+    /// vector is bounded by the number of DISTINCT backends a session dials
+    /// rather than by its request count. Entries are never removed while the
+    /// session lives: a delta pushed before a backend connection closed must
+    /// still resolve when the drain reaches it, and an index that moved would
+    /// silently mis-charge it.
+    pub(crate) backend_registry: BackendRegistry,
     /// Per-session correlation ID generated at construction time. Included in
     /// every log line emitted from this module so all events for a single
     /// frontend connection can be reassembled (independent of the ephemeral
@@ -852,6 +1110,25 @@ pub struct Mux<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L> {
     pub fn front_socket(&self) -> &TcpStream {
         self.frontend.socket()
+    }
+
+    /// Perform every backend accounting change the core has decided since the
+    /// last drain, in the order it decided them.
+    ///
+    /// The ONLY writer of `Backend::active_requests` and
+    /// `Backend::active_connections` on the mux path. `mem::take` empties the
+    /// queue before the first change is applied, so running this twice in a
+    /// row is idempotent — the second call finds nothing and performs
+    /// nothing.
+    ///
+    /// Called from the four `Mux` wrappers that already owe the timer wheel a
+    /// `reschedule` on every exit, and once more immediately before each
+    /// `Router::connect`, because that call's load balancer is the only
+    /// reader of the counters this drains.
+    pub(crate) fn apply_backend_deltas(&mut self) {
+        for delta in std::mem::take(&mut self.context.backend_deltas) {
+            self.backend_registry.apply(delta);
+        }
     }
 }
 
@@ -1194,6 +1471,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     ) -> SessionResult {
         self.refresh_client_rtt();
         let result = self.ready_inner(session, proxy, metrics);
+        self.apply_backend_deltas();
         self.reschedule();
         result
     }
@@ -1212,6 +1490,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// then check the two properties carried over from `UdpManager`.
     fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> StateResult {
         let result = self.timeout_inner(token, metrics);
+        self.apply_backend_deltas();
         self.reschedule();
 
         // Strict-advance guard, carried over from `UdpManager::handle_timeout`
@@ -1420,8 +1699,26 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
             match client.position() {
                 Position::Client(cluster_id, backend, _) => {
-                    let mut backend_borrow = backend.borrow_mut();
-                    backend_borrow.dec_connections();
+                    // Session teardown iterates the backends map directly
+                    // instead of routing through `Connection::close`, so it
+                    // emits the same two accounting changes that path emits.
+                    // Going through the ledger rather than mutating here is
+                    // what lets the invariant-14 balance be read off one
+                    // stream of deltas — see `Mux::apply_backend_deltas`.
+                    let count = self
+                        .context
+                        .backend_streams
+                        .get(token)
+                        .map_or(0, |ids| ids.len());
+                    let (slot, backend_id) = (backend.slot(), backend.backend_id.clone());
+                    self.context.backend_deltas.push(BackendDelta {
+                        slot,
+                        change: BackendChange::StreamsEnded(count),
+                    });
+                    self.context.backend_deltas.push(BackendDelta {
+                        slot,
+                        change: BackendChange::ConnectionClosed,
+                    });
                     gauge_add!(names::backend::CONNECTIONS, -1);
                     // Second `-1` site for `backend.pool.size` (the first is
                     // in `connection.rs::pre_close_client_bookkeeping`). This
@@ -1437,19 +1734,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         names::backend::CONNECTIONS_PER_BACKEND,
                         -1,
                         Some(cluster_id),
-                        Some(&backend_borrow.backend_id)
+                        Some(&backend_id)
                     );
-                    let count = self
-                        .context
-                        .backend_streams
-                        .get(token)
-                        .map_or(0, |ids| ids.len());
-                    backend_borrow.active_requests =
-                        backend_borrow.active_requests.saturating_sub(count);
                     trace!(
-                        "{} connection (session) closed: {:#?}",
+                        "{} connection (session) closed: {:?}",
                         log_context_lite!(self),
-                        backend_borrow
+                        backend
                     );
                 }
                 Position::Server => {
@@ -1460,9 +1750,14 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 }
             }
         }
-        // Clear the reverse index after all backends have decremented their
-        // active_requests counters (which depend on the index for stream counts).
+        // Clear the reverse index after all backends have charged their
+        // `StreamsEnded` deltas (whose counts come from that index).
         self.context.backend_streams.clear();
+
+        // The session is going away, so this is the last chance to settle the
+        // ledger against the worker's registry. Everything the frontend close
+        // and the loop above decided is performed here.
+        self.apply_backend_deltas();
     }
 
     /// Thin wrapper over `Mux::shutting_down_inner`: it drives frontend I/O
@@ -1470,6 +1765,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// every exit.
     fn shutting_down(&mut self) -> SessionIsToBeClosed {
         let result = self.shutting_down_inner();
+        self.apply_backend_deltas();
         self.reschedule();
         result
     }
@@ -1603,29 +1899,42 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                     .debug
                                     .push(DebugEvent::CCS(*token, cluster_id.clone()));
 
-                                let mut backend_borrow = backend.borrow_mut();
+                                // Health and latency are not invariant 14 and
+                                // the load balancer READS `retry_policy`, so
+                                // these three writes stay immediate, against
+                                // the handle the slot resolves to. Only the
+                                // `active_requests` charge below is a delta.
+                                let Some(handle) = self.backend_registry.get(backend.slot()) else {
+                                    error!(
+                                        "{} connected backend names a slot this session never                                          minted: {:?}",
+                                        log_context_lite!(self),
+                                        backend
+                                    );
+                                    continue;
+                                };
+                                let mut backend_borrow = handle.borrow_mut();
                                 if backend_borrow.retry_policy.is_down() {
                                     info!(
                                         "{} backend server {} at {} is up",
                                         log_context_lite!(self),
-                                        backend_borrow.backend_id,
-                                        backend_borrow.address
+                                        backend.backend_id,
+                                        backend.address
                                     );
                                     incr!(
                                         names::backend::UP,
                                         Some(cluster_id),
-                                        Some(&backend_borrow.backend_id)
+                                        Some(&backend.backend_id)
                                     );
                                     gauge!(
                                         names::backend::AVAILABLE,
                                         1,
                                         Some(cluster_id),
-                                        Some(&backend_borrow.backend_id)
+                                        Some(&backend.backend_id)
                                     );
                                     push_event(Event {
                                         kind: EventKind::BackendUp as i32,
-                                        backend_id: Some(backend_borrow.backend_id.to_owned()),
-                                        address: Some(backend_borrow.address.into()),
+                                        backend_id: Some(backend.backend_id.to_string()),
+                                        address: Some(backend.address.into()),
                                         cluster_id: Some(cluster_id.to_owned()),
                                         metric_detail: None,
                                     });
@@ -1635,19 +1944,34 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 backend_borrow.failures = 0;
                                 backend_borrow.set_connection_time(start.elapsed());
                                 backend_borrow.retry_policy.succeed();
+                                drop(backend_borrow);
 
+                                // These streams linked while the connection
+                                // was still `Connecting`, so
+                                // `Connection::start_stream`'s `Connected`
+                                // guard skipped their charge. This is where
+                                // every first stream of a fresh dial is
+                                // charged — which is why the ledger cannot be
+                                // core-only and still balance.
+                                let mut started = 0;
                                 if let Some(ids) = self.context.backend_streams.get(token) {
+                                    started = ids.len();
                                     for &stream_id in ids {
                                         self.context.streams[stream_id].metrics.backend_connected();
-                                        backend_borrow.active_requests += 1;
                                     }
                                 }
+                                if started > 0 {
+                                    let slot = backend.slot();
+                                    self.context.backend_deltas.push(BackendDelta {
+                                        slot,
+                                        change: BackendChange::StreamsStarted(started),
+                                    });
+                                }
                                 trace!(
-                                    "{} connection success: {:#?}",
+                                    "{} connection success: {:?}",
                                     log_context_lite!(self),
-                                    backend_borrow
+                                    backend
                                 );
-                                drop(backend_borrow);
                                 *position = Position::Client(
                                     std::mem::take(cluster_id),
                                     backend.clone(),
@@ -1730,7 +2054,18 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         trace!("{} Closing {:#?}", log_context_lite!(self), client);
                         match client.position() {
                             Position::Client(cluster_id, backend, BackendStatus::Connecting(_)) => {
-                                let mut backend_borrow = backend.borrow_mut();
+                                // A dial that never completed charged nothing
+                                // to `active_requests`, so this arm touches
+                                // only the health counters — not the ledger.
+                                let Some(handle) = self.backend_registry.get(backend.slot()) else {
+                                    error!(
+                                        "{} failed backend names a slot this session never                                          minted: {:?}",
+                                        log_context_lite!(self),
+                                        backend
+                                    );
+                                    continue;
+                                };
+                                let mut backend_borrow = handle.borrow_mut();
                                 backend_borrow.failures += 1;
 
                                 let already_unavailable = backend_borrow.retry_policy.is_down();
@@ -1738,49 +2073,55 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 incr!(
                                     names::backend::CONNECTIONS_ERROR,
                                     Some(cluster_id),
-                                    Some(&backend_borrow.backend_id)
+                                    Some(&backend.backend_id)
                                 );
                                 if !already_unavailable && backend_borrow.retry_policy.is_down() {
                                     error!(
                                         "{} backend server {} at {} is down",
                                         log_context_lite!(self),
-                                        backend_borrow.backend_id,
-                                        backend_borrow.address
+                                        backend.backend_id,
+                                        backend.address
                                     );
                                     incr!(
                                         names::backend::DOWN,
                                         Some(cluster_id),
-                                        Some(&backend_borrow.backend_id)
+                                        Some(&backend.backend_id)
                                     );
                                     gauge!(
                                         names::backend::AVAILABLE,
                                         0,
                                         Some(cluster_id),
-                                        Some(&backend_borrow.backend_id)
+                                        Some(&backend.backend_id)
                                     );
                                     push_event(Event {
                                         kind: EventKind::BackendDown as i32,
-                                        backend_id: Some(backend_borrow.backend_id.to_owned()),
-                                        address: Some(backend_borrow.address.into()),
+                                        backend_id: Some(backend.backend_id.to_string()),
+                                        address: Some(backend.address.into()),
                                         cluster_id: Some(cluster_id.to_owned()),
                                         metric_detail: None,
                                     });
                                 }
+                                drop(backend_borrow);
                                 trace!(
-                                    "{} connection fail: {:#?}",
+                                    "{} connection fail: {:?}",
                                     log_context_lite!(self),
-                                    backend_borrow
+                                    backend
                                 );
                             }
                             Position::Client(_, backend, _) => {
-                                let mut backend_borrow = backend.borrow_mut();
+                                // A backend that dies past `Connecting` still
+                                // owes the charge every stream it carries
+                                // took — the same `StreamsEnded(count)` the
+                                // teardown path emits.
                                 let count = self
                                     .context
                                     .backend_streams
                                     .get(token)
                                     .map_or(0, |ids| ids.len());
-                                backend_borrow.active_requests =
-                                    backend_borrow.active_requests.saturating_sub(count);
+                                self.context.backend_deltas.push(BackendDelta {
+                                    slot: backend.slot(),
+                                    change: BackendChange::StreamsEnded(count),
+                                });
                             }
                             Position::Server => {
                                 error!(
@@ -1945,12 +2286,22 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     .set_timeout_duration(self.configured_frontend_timeout, context.now);
                 let front_readiness = self.frontend.readiness_mut();
                 dirty = true;
+                // Settle the ledger before the ONLY reader of backend load
+                // state on this path runs: `Router::connect`'s load balancer
+                // weighs `active_requests` and `connection_time`. Draining
+                // here is what keeps a second stream linking in the same pass
+                // seeing the first stream's charge, exactly as it did when
+                // the charge was applied in place.
+                for delta in std::mem::take(&mut context.backend_deltas) {
+                    self.backend_registry.apply(delta);
+                }
                 match self.router.connect(
                     stream_id,
                     context,
                     session.clone(),
                     proxy.clone(),
                     self.frontend_token,
+                    &mut self.backend_registry,
                 ) {
                     Ok(_) => {
                         let state = context.streams[stream_id].state;
@@ -2894,6 +3245,7 @@ mod tests {
             context,
             session_ulid: Ulid::generate(),
             timeouts: HashMap::new(),
+            backend_registry: BackendRegistry::default(),
         };
 
         assert!(
@@ -2955,6 +3307,7 @@ mod tests {
             context,
             session_ulid: Ulid::generate(),
             timeouts: HashMap::new(),
+            backend_registry: BackendRegistry::default(),
         };
         (mux, peer)
     }
@@ -3507,7 +3860,7 @@ mod tests {
         let backend_token = Token(1);
 
         let (mut connection, _backend_peer) =
-            test_backend_connection(&mux, Duration::from_secs(30));
+            test_backend_connection(&mut mux, Duration::from_secs(30));
         let Connection::H1(h1) = &mut connection else {
             unreachable!("new_h1_client builds an H1 connection")
         };
@@ -3559,7 +3912,8 @@ mod tests {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
         let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
         let backend_token = Token(1);
-        let (connection, _backend_peer) = test_backend_connection(&mux, Duration::from_secs(30));
+        let (connection, _backend_peer) =
+            test_backend_connection(&mut mux, Duration::from_secs(30));
         mux.router.backends.insert(backend_token, connection);
 
         mux.reschedule();
@@ -3602,7 +3956,8 @@ mod tests {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
         let (mut mux, _frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(30));
         let backend_token = Token(1);
-        let (connection, _backend_peer) = test_backend_connection(&mux, Duration::from_secs(30));
+        let (connection, _backend_peer) =
+            test_backend_connection(&mut mux, Duration::from_secs(30));
         mux.router.backends.insert(backend_token, connection);
 
         let endpoint = EndpointClient(&mut mux.router);
@@ -3710,6 +4065,7 @@ mod tests {
             context: test_context(&pool),
             session_ulid: Ulid::generate(),
             timeouts: HashMap::new(),
+            backend_registry: BackendRegistry::default(),
         };
 
         let mut metrics = SessionMetrics::new(None);
@@ -3734,7 +4090,7 @@ mod tests {
     /// An H1 backend connection on a live loopback socket, plus the peer the
     /// caller must keep alive.
     fn test_backend_connection(
-        mux: &Mux<mio::net::TcpStream, test_support::TestListener>,
+        mux: &mut Mux<mio::net::TcpStream, test_support::TestListener>,
         duration: Duration,
     ) -> (Connection<SessionTcpStream>, std::net::TcpStream) {
         let (backend_socket, backend_peer) = connected_socket();
@@ -3746,6 +4102,9 @@ mod tests {
             None,
             None,
         )));
+        // Through the embedder's table, exactly as a real dial does: the
+        // handle stops here and the connection carries the opaque id.
+        let backend = mux.backend_registry.id_for(&backend);
         let connection = Connection::new_h1_client(
             Ulid::generate(),
             SessionTcpStream::new(backend_socket, mux.session_ulid, Some(backend_address)),
@@ -3794,7 +4153,7 @@ mod tests {
         let backend_token = Token(1);
 
         let (mut connection, _backend_peer) =
-            test_backend_connection(&mux, Duration::from_secs(30));
+            test_backend_connection(&mut mux, Duration::from_secs(30));
         let Connection::H1(h1) = &mut connection else {
             unreachable!("new_h1_client builds an H1 connection")
         };
@@ -3857,7 +4216,7 @@ mod tests {
         let backend_token = Token(1);
 
         let (mut connection, _backend_peer) =
-            test_backend_connection(&mux, Duration::from_secs(30));
+            test_backend_connection(&mut mux, Duration::from_secs(30));
         let Connection::H1(h1) = &mut connection else {
             unreachable!("new_h1_client builds an H1 connection")
         };

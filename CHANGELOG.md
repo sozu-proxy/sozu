@@ -240,6 +240,74 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux)`: `Position::Client` holds an opaque backend id, and backend accounting leaves
+  the core as deltas ([#1340](https://github.com/sozu-proxy/sozu/issues/1340), Q12).** The core no
+  longer holds `Rc<RefCell<Backend>>` anywhere. `Position::Client` carried one so that six
+  datapath sites could reach the worker's backend registry and mutate its load counters in place;
+  it now carries a `BackendId`, an opaque session-scoped slot plus the two identity fields the
+  datapath actually reads (`backend_id`, `address`), both immutable for the life of a registry
+  entry.
+
+  The measurement, comment lines filtered: `Rc<RefCell<Backend>>` code references under
+  `lib/src/protocol/mux/` went from **5 to 7**, and that number is the wrong one to read — the
+  five were `Position::Client`, both `Connection::new_h*_client` signatures and the two
+  `pre_*_client_bookkeeping` reads, all inside the core. `connection.rs` is now at **0**, and none
+  of the seven is reachable from `Position`, `Connection`, `ConnectionH1`, `ConnectionH2` or
+  `Context`. Five belong to the embedder's new `BackendRegistry` on `Mux`, and two are
+  `Router::backend_from_request` and `Router::get_backend_for_sticky_session`, which hold a handle
+  transiently at the dial and store none — the dial itself is Q6's to move out.
+
+  Each of those six sites — `Connection::close`, `Connection::end_stream`,
+  `Connection::start_stream`, `ConnectionH2::cancel_timed_out_streams`,
+  `ConnectionH2::handle_rst_stream_frame` and `ConnectionH2::handle_goaway_frame` — now records a
+  `BackendChange` on `Context::backend_deltas`, and `Mux::apply_backend_deltas` is the single
+  writer that performs them against `Mux::backend_registry`. The three embedder-side accounting
+  sites in `Mux` emit onto the same list, because a fresh dial's first streams are charged at the
+  `Connecting` -> `Connected` transition rather than by `Connection::start_stream`, whose
+  `Connected` guard skips them — a core-only ledger could not balance. The health and latency
+  writes (`Backend::failures`, `retry_policy`, `set_connection_time`) are not part of that balance
+  and stay immediate, because the load balancer reads `retry_policy`.
+
+  No behaviour changes. `Router::backend_from_request`'s load balancer is the only reader of the
+  counters involved, and it sees the same values it saw before: application is FIFO and the queue
+  is drained immediately before each `Router::connect` as well as on the way out of `Mux::ready`,
+  `Mux::timeout`, `Mux::close` and `Mux::shutting_down`, so every read point observes exactly what
+  mutating in place left there, saturation included. A `BackendId` names a slot rather than the
+  backend's name, so a reload that replaces a registry entry mid-session leaves connections
+  dialled before it charging the handle they were dialled against — what holding the `Rc` used to
+  give; keying on the name would strand a charge on the superseded `Backend` and saturate the
+  fresh one at zero.
+
+  `Connection::start_stream` also stops charging a stream it has not started. The previous shape
+  charged first and undid the charge when the inner start refused; the charge is now recorded only
+  after the start returns true, so there is no rollback to get wrong and no binding in scope a
+  later edit could reuse for the wrong question.
+
+  **That reordering fixes a standing invariant-14 violation on the H1 keep-alive path, and is the
+  one behaviour change in this entry.** The charge is guarded on `BackendStatus::Connected`, and an
+  H1 connection taken back out of the pool is `BackendStatus::KeepAlive` until
+  `ConnectionH1::start_stream` flips it — so charging beforehand skipped the reuse entirely, while
+  the matching `Connection::end_stream` still released one. Every keep-alive reuse cycle net `-1`d
+  the backend, `saturating_sub` floored it at zero, and a reused H1 connection reported no
+  in-flight request while it served one, biasing least-loaded and PeakEWMA balancing toward
+  backends that are already busy. Seen red at
+  `invariant_14_an_h1_keep_alive_reuse_is_charged`: `left: (0, 0), right: (1, 0)` under the old
+  ordering. The two before/after pair-assertions move to
+  `BackendRegistry::apply`, where both halves are observable and one copy covers every emitter;
+  the refusal-path assertion and the `#[cfg(debug_assertions)] fn backend_active_requests` helper
+  it needed are removed because the path they guarded no longer exists.
+
+  LIFECYCLE §9 invariant 14 is a balance, and it is now a property of one observable list rather
+  than of six scattered mutations. Five tests in `h2.rs` reconcile that list across the nominal,
+  refused-start, `RST_STREAM`, `GOAWAY` and idle-reap paths and then apply it and assert the
+  counter returns to zero, plus a sixth on the H1 keep-alive path above. Each was seen red:
+  removing the `GOAWAY` arm's emit gives
+  `left: (3, 0), right: (0, 0)` on
+  `invariant_14_an_inbound_goaway_releases_every_retired_charge`, and restoring the
+  charge-then-undo shape reddens `invariant_14_a_refused_start_stream_charges_nothing` with the
+  `+1`/`-1` pair printed in the assertion message. `cargo test -p sozu-lib` goes from
+  `1120 passed` to `1126 passed`, the six new tests and nothing else.
+
 - **`refactor(mux-h2)`: `ConnectionH2` drops its `Front` parameter — the H2 core is byte-in /
   byte-out ([#1339](https://github.com/sozu-proxy/sozu/issues/1339), Q10).** The milestone the
   socket-boundary series was built for. `Connection::H2` now holds

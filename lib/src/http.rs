@@ -178,6 +178,7 @@ impl HttpSession {
                 // rather than dropping it and arming a fresh one: the session's
                 // request timeout started when the socket was accepted.
                 timeouts: HashMap::from([(token, container_frontend_timeout)]),
+                backend_registry: mux::BackendRegistry::default(),
             })
         };
 
@@ -370,6 +371,7 @@ impl HttpSession {
                         self.frontend_token,
                         expect.container_frontend_timeout,
                     )]),
+                    backend_registry: mux::BackendRegistry::default(),
                 };
                 mux.frontend.readiness_mut().event = expect.frontend_readiness.event;
 
@@ -468,7 +470,7 @@ impl HttpSession {
             .timeouts
             .remove(&back_token)
             .unwrap_or_else(|| TimeoutContainer::new_empty(mux.router.configured_backend_timeout));
-        let (cluster_id, backend, backend_readiness, backend_socket) = match backend {
+        let (cluster_id, backend_id, backend_readiness, backend_socket) = match backend {
             mux::Connection::H1(mux::ConnectionH1 {
                 position: mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
                 readiness,
@@ -491,6 +493,20 @@ impl HttpSession {
             }
         };
 
+        // The mux core carries an opaque `BackendId` (#1340, Q12); the
+        // WebSocket `Pipe` that takes this backend over still owns the
+        // registry handle, so resolve it here, on the embedder's side of that
+        // perimeter, through the one accessor there is.
+        let Some(backend) = mux.backend_registry.handle(&backend_id).cloned() else {
+            error!(
+                "{} upgrade_mux: backend {:?} names a slot this session never minted, closing",
+                log_context!(self),
+                backend_id.backend_id
+            );
+            return None;
+        };
+        let backend_id = backend_id.backend_id.to_string();
+
         // Post-removal book-keeping: the backend is gone from the map and the
         // count dropped by exactly one (the `remove` matched a present key).
         debug_assert!(
@@ -508,7 +524,6 @@ impl HttpSession {
         container_frontend_timeout.reset();
         container_backend_timeout.reset();
 
-        let backend_id = backend.borrow().backend_id.clone();
         // `Pipe::backend_socket` is typed `Option<TcpStream>` (raw, pre-mux).
         // The mux wraps every backend TCP socket in `SessionTcpStream` so
         // SOCKET-layer errors carry the session ULID; unwrap back to the
