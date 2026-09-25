@@ -499,8 +499,8 @@ A session ends when:
 
 For TLS frontends specifically, the close path uses **write-only
 shutdown** on the front socket
-(`lib/src/https.rs:1008-1015`, mirrored in
-`lib/src/http.rs:602-607`):
+(`lib/src/https.rs:1022-1029`, mirrored in
+`lib/src/http.rs:617-622`):
 
 ```rust
 front_socket.shutdown(Shutdown::Write)

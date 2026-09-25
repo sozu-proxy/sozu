@@ -635,9 +635,9 @@ The other three sites take the `&mut self` wrapper
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5967`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5963`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6644`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6639`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -906,7 +906,7 @@ supersede this step without rework.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:7517-7521
+```rust lib/src/protocol/mux/h2.rs:7512-7516
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -996,7 +996,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:7589-7593
+```rust lib/src/protocol/mux/h2.rs:7584-7588
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1406,7 +1406,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:7091
+```rust lib/src/protocol/mux/h2.rs:7086
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -1559,7 +1559,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6010-6012
+```rust lib/src/protocol/mux/h2.rs:6006-6008
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1567,7 +1567,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6024-6030
+```rust lib/src/protocol/mux/h2.rs:6020-6026
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

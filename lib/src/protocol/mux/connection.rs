@@ -16,9 +16,7 @@
 //! protocol-specific writers.
 
 use std::{
-    cell::RefCell,
     fmt::Debug,
-    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -27,14 +25,14 @@ use rusty_ulid::Ulid;
 use sozu_command::{logging::ansi_palette, ready::Ready};
 
 use super::{
-    BackendStatus, ConnectionH1, Context, Endpoint, GlobalStreamId, MuxResult, Position, Router,
+    BackendChange, BackendId, BackendStatus, ConnectionH1, Context, Endpoint, GlobalStreamId,
+    MuxResult, Position, Router,
     h2::{self, H2Shell, H2StreamId},
     h2_flood_detector,
 };
 use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Readiness,
-    backends::Backend,
     socket::{SocketHandler, stats::socket_rtt},
 };
 
@@ -114,7 +112,7 @@ impl<Front: SocketHandler> Connection<Front> {
         session_ulid: Ulid,
         front_stream: Front,
         cluster_id: String,
-        backend: Rc<RefCell<Backend>>,
+        backend: BackendId,
         timeout_duration: Duration,
     ) -> Connection<Front> {
         Connection::H1(ConnectionH1 {
@@ -170,7 +168,7 @@ impl<Front: SocketHandler> Connection<Front> {
         session_ulid: Ulid,
         front_stream: Front,
         cluster_id: String,
-        backend: Rc<RefCell<Backend>>,
+        backend: BackendId,
         buffers: &mut dyn super::buffer_source::BufferSource,
         timeout_duration: Duration,
         flood_config: h2_flood_detector::H2FloodConfig,
@@ -446,20 +444,15 @@ impl<Front: SocketHandler> Connection<Front> {
         }
     }
 
-    fn pre_close_client_bookkeeping(&self) {
+    fn pre_close_client_bookkeeping<L>(&self, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         if let Position::Client(cluster_id, backend, _) = self.position() {
-            let mut backend_borrow = backend.borrow_mut();
-            // Pair the `dec_connections` with its prior value: the close path
-            // releases exactly one slot. `dec_connections` floors at 0 (a
-            // double-close from a desynced peer must not panic), so the
-            // post-relation is "decreased by one, unless already at zero".
-            let before = backend_borrow.active_connections;
-            backend_borrow.dec_connections();
-            debug_assert_eq!(
-                backend_borrow.active_connections,
-                before.saturating_sub(1),
-                "close must release exactly one backend connection (saturating at 0)"
-            );
+            // The close path releases exactly one slot. The embedder performs
+            // it and holds the "decreased by one, unless already at zero"
+            // relation — see `BackendRegistry::apply`.
+            context.record_backend_delta(backend, BackendChange::ConnectionClosed);
             gauge_add!(names::backend::CONNECTIONS, -1);
             // Pair with the `+1` at `router.rs::connect` (new-dial path).
             // This is the graceful-close decrement, used both by the dead
@@ -470,58 +463,39 @@ impl<Front: SocketHandler> Connection<Front> {
                 names::backend::CONNECTIONS_PER_BACKEND,
                 -1,
                 Some(cluster_id),
-                Some(&backend_borrow.backend_id)
+                Some(&backend.backend_id)
             );
+            trace!("{} connection close: {:?}", log_module_context!(), backend);
+        }
+    }
+
+    fn pre_end_stream_client_bookkeeping<L>(&self, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
+            // Pairs with the `StreamsStarted(1)` in
+            // `post_start_stream_client_bookkeeping`.
+            context.record_backend_delta(backend, BackendChange::StreamsEnded(1));
             trace!(
-                "{} connection close: {:#?}",
+                "{} connection end stream: {:?}",
                 log_module_context!(),
-                backend_borrow
+                backend
             );
         }
     }
 
-    fn pre_end_stream_client_bookkeeping(&self) {
+    fn post_start_stream_client_bookkeeping<L>(&self, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
         if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
-            let mut backend_borrow = backend.borrow_mut();
-            // Pairs with the `+1` in `pre_start_stream_client_bookkeeping`.
-            // `saturating_sub` is the network-safe floor (a desync from the
-            // peer must not panic), so we can only assert the post-relation,
-            // not that `before > 0`.
-            let before = backend_borrow.active_requests;
-            backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
-            debug_assert_eq!(
-                backend_borrow.active_requests,
-                before.saturating_sub(1),
-                "end_stream bookkeeping must decrement active_requests by one (saturating)"
-            );
-            debug_assert!(
-                backend_borrow.active_requests <= before,
-                "active_requests must not grow on stream end"
-            );
+            // Pairs with the `StreamsEnded(1)` in the end path.
+            context.record_backend_delta(backend, BackendChange::StreamsStarted(1));
             trace!(
-                "{} connection end stream: {:#?}",
+                "{} connection start stream: {:?}",
                 log_module_context!(),
-                backend_borrow
-            );
-        }
-    }
-
-    fn pre_start_stream_client_bookkeeping(&self) {
-        if let Position::Client(_, backend, BackendStatus::Connected) = self.position() {
-            let mut backend_borrow = backend.borrow_mut();
-            // Pairs with the `saturating_sub(1)` in the end path. Snapshot the
-            // counter so we can assert it advanced by exactly one.
-            let before = backend_borrow.active_requests;
-            backend_borrow.active_requests += 1;
-            debug_assert_eq!(
-                backend_borrow.active_requests,
-                before + 1,
-                "start_stream bookkeeping must increment active_requests by exactly one"
-            );
-            trace!(
-                "{} connection start stream: {:#?}",
-                log_module_context!(),
-                backend_borrow
+                backend
             );
         }
     }
@@ -531,7 +505,7 @@ impl<Front: SocketHandler> Connection<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        self.pre_close_client_bookkeeping();
+        self.pre_close_client_bookkeeping(context);
         forward!(self, close(context, endpoint))
     }
 
@@ -539,7 +513,7 @@ impl<Front: SocketHandler> Connection<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        self.pre_end_stream_client_bookkeeping();
+        self.pre_end_stream_client_bookkeeping(context);
         forward!(self, end_stream(stream, context))
     }
 
@@ -551,42 +525,19 @@ impl<Front: SocketHandler> Connection<Front> {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        // Snapshot the backend's in-flight counter so we can assert the
-        // increment/rollback is net-zero on the failure path: a refused
-        // `start_stream` must NOT leak an `active_requests` charge onto the
-        // backend (it would skew least-loaded balancing forever). The snapshot
-        // and its assert are both cfg'd so the `RefCell` borrow never exists in
-        // release (the helper is `#[cfg(debug_assertions)]` too).
-        #[cfg(debug_assertions)]
-        let before = self.backend_active_requests();
-        self.pre_start_stream_client_bookkeeping();
+        // The charge is emitted AFTER the start is known to have succeeded,
+        // never before with a rollback behind it. A refused `start_stream`
+        // must not leak an `active_requests` charge onto the backend — it
+        // would skew least-loaded balancing forever — and the way to hold
+        // that is for the refusal path to have no charge to undo rather than
+        // to undo one correctly. Ordering the emit this way is free: neither
+        // `ConnectionH1::start_stream` nor `ConnectionH2::start_stream` reads
+        // backend load state, so nothing about the decision changes.
         let started = forward!(self, start_stream(stream, context));
-        if !started {
-            // Undo active_requests increment on failure
-            self.pre_end_stream_client_bookkeeping();
-            #[cfg(debug_assertions)]
-            debug_assert_eq!(
-                self.backend_active_requests(),
-                before,
-                "a refused start_stream must roll active_requests back to its prior value"
-            );
+        if started {
+            self.post_start_stream_client_bookkeeping(context);
         }
         started
-    }
-
-    /// Snapshot the backend's in-flight request counter, or `None` when this
-    /// connection has no `Connected` backend (server position, or a client
-    /// that is still connecting / already keep-alive). Used by `start_stream`
-    /// to pair-assert the increment/rollback is net-zero on refusal. Cheap
-    /// `RefCell` borrow, compiled only with `debug_assertions`.
-    #[cfg(debug_assertions)]
-    fn backend_active_requests(&self) -> Option<usize> {
-        match self.position() {
-            Position::Client(_, backend, BackendStatus::Connected) => {
-                Some(backend.borrow().active_requests)
-            }
-            _ => None,
-        }
     }
 }
 

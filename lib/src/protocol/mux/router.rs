@@ -93,7 +93,9 @@ use sozu_command::{
 
 #[cfg(debug_assertions)]
 use super::DebugEvent;
-use super::{BackendStatus, Connection, Context, GlobalStreamId, Position, StreamState};
+use super::{
+    BackendRegistry, BackendStatus, Connection, Context, GlobalStreamId, Position, StreamState,
+};
 use crate::{
     BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, ProxySession, Readiness,
     RetrieveClusterError,
@@ -214,6 +216,10 @@ impl Router {
         // re-borrowing `session` — the outer event-loop call chain
         // already holds a mutable borrow of that cell.
         frontend_token: Token,
+        // The embedder's slot table. The dial is the one moment a registry
+        // handle exists on this path, and this is what turns it into the
+        // opaque `BackendId` the core carries from here on (#1340, Q12).
+        backend_registry: &mut BackendRegistry,
     ) -> Result<(), BackendConnectionError> {
         let stream = &mut context.streams[stream_id];
         // when reused, a stream should be detached from its old connection, if not we could end
@@ -505,15 +511,18 @@ impl Router {
                 );
                 return Err(BackendConnectionError::MaxSessionsMemory);
             }
-            // For reused backends: set context fields and metrics lifecycle
+            // For reused backends: set context fields and metrics lifecycle.
+            // Both values are read off the connection's own `BackendId`, which
+            // copied them at dial. They are identity, immutable for the life
+            // of the registry entry, so this is the same answer the registry
+            // borrow used to give — without the core holding the handle.
             if let Some(backend_conn) = self.backends.get(&token)
-                && let Position::Client(_, backend_ref, _) = backend_conn.position()
+                && let Position::Client(_, backend, _) = backend_conn.position()
             {
-                let backend = backend_ref.borrow();
                 let stream = &mut context.streams[stream_id];
-                stream.context.backend_id = Some(backend.backend_id.to_owned());
+                stream.context.backend_id = Some(backend.backend_id.to_string());
                 stream.context.backend_address = Some(backend.address);
-                stream.metrics.backend_id = Some(backend.backend_id.to_owned());
+                stream.metrics.backend_id = Some(backend.backend_id.to_string());
                 stream.metrics.backend_start();
                 stream.metrics.backend_connected();
             }
@@ -565,12 +574,19 @@ impl Router {
                 );
             }
 
+            // The one place a registry handle becomes an opaque id: the
+            // embedder's table names it, copies the two identity fields the
+            // datapath renders, and the `Rc` goes no further. Everything
+            // below this line — and every `Position::Client` built from it —
+            // holds `backend`, never the handle.
+            let backend = backend_registry.id_for(&backend);
+
             // Cache the backend's configured address so SOCKET log lines
             // fired on ECONNREFUSED (or any failed async `connect()`) can
             // still render `peer=<backend>` — `getpeername(2)` returns
             // ENOTCONN in that state, so the live lookup path would show
             // `peer=None` exactly when the operator needs the backend id.
-            let backend_peer = Some(backend.borrow().address);
+            let backend_peer = Some(backend.address);
             let socket = SessionTcpStream::new(socket, context.session_ulid, backend_peer);
 
             let flood_config = context.listener.borrow().get_h2_flood_config();
@@ -580,7 +596,7 @@ impl Router {
                 .listener
                 .borrow()
                 .get_h2_graceful_shutdown_deadline();
-            let backend_id_for_gauge = backend.borrow().backend_id.to_owned();
+            let backend_id_for_gauge = backend.backend_id.to_string();
             let mut connection = if h2 {
                 match Connection::new_h2_client(
                     context.session_ulid,
@@ -1916,7 +1932,7 @@ mod backend_selection_order_tests {
         protocol::{
             http::parser::Method,
             mux::{
-                BackendStatus, Connection, Context, Position, StreamState,
+                BackendRegistry, BackendStatus, Connection, Context, Position, StreamState,
                 buffer_source::PoolBufferSource, h2::H2ConnectionConfig,
                 h2_flood_detector::H2FloodConfig,
             },
@@ -2035,6 +2051,7 @@ mod backend_selection_order_tests {
     fn staged_backend(
         pool: &Rc<RefCell<Pool>>,
         staged: &Staged,
+        backend_registry: &mut BackendRegistry,
     ) -> (Connection<SessionTcpStream>, std::net::TcpStream) {
         let (socket, peer) = super::super::test_support::connected_socket();
         let backend_address: SocketAddr =
@@ -2046,6 +2063,9 @@ mod backend_selection_order_tests {
             None,
             None,
         )));
+        // Through the embedder's table, exactly as a real dial does: the
+        // handle stops here and the connection carries the opaque id.
+        let backend = backend_registry.id_for(&backend);
         let session_ulid = Ulid::generate();
         let socket = SessionTcpStream::new(socket, session_ulid, Some(backend_address));
         let mut connection = match staged {
@@ -2110,9 +2130,10 @@ mod backend_selection_order_tests {
         }
 
         let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let mut backend_registry = BackendRegistry::default();
         let mut peers = Vec::with_capacity(STAGED_TOKENS.len());
         for token in STAGED_TOKENS {
-            let (connection, peer) = staged_backend(pool, staged);
+            let (connection, peer) = staged_backend(pool, staged, &mut backend_registry);
             peers.push(peer);
             router.backends.insert(Token(token), connection);
         }
@@ -2124,6 +2145,7 @@ mod backend_selection_order_tests {
                 fixture.session.clone(),
                 fixture.proxy.clone(),
                 Token(0),
+                &mut backend_registry,
             )
             .expect("the router must reuse one of the staged backends");
 

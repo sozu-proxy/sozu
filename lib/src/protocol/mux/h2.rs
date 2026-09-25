@@ -32,9 +32,9 @@ use crate::metrics::names;
 use crate::{
     L7ListenerHandler, ListenerHandler, Protocol, Readiness, SessionMetrics,
     protocol::mux::{
-        BackendStatus, Context, DebugEvent, DebugHistory, Endpoint, GenericHttpStream,
-        GlobalStreamId, MuxResult, Position, Stream, StreamId, StreamState, converter,
-        forcefully_terminate_answer,
+        BackendChange, BackendStatus, Context, DebugEvent, DebugHistory, Endpoint,
+        GenericHttpStream, GlobalStreamId, MuxResult, Position, Stream, StreamId, StreamState,
+        converter, forcefully_terminate_answer,
         h2_close::{self, CloseAction, FinalizeAction, TlsFlushPhase},
         h2_control_tx,
         h2_drain::{self, GracefulDrainDecision},
@@ -4410,9 +4410,7 @@ impl ConnectionH2 {
                 let stream = &mut context.streams[global_stream_id];
                 match &self.position {
                     Position::Client(_, backend, BackendStatus::Connected) => {
-                        let mut backend_borrow = backend.borrow_mut();
-                        backend_borrow.active_requests =
-                            backend_borrow.active_requests.saturating_sub(1);
+                        context.record_backend_delta(backend, BackendChange::StreamsEnded(1));
                     }
                     Position::Client(..) => {}
                     Position::Server => {
@@ -5958,9 +5956,7 @@ impl ConnectionH2 {
                 // place where Backend.active_requests is decremented), so do the
                 // bookkeeping explicitly here to avoid leaking load counters.
                 Position::Client(_, backend, BackendStatus::Connected) => {
-                    let mut backend_borrow = backend.borrow_mut();
-                    backend_borrow.active_requests =
-                        backend_borrow.active_requests.saturating_sub(1);
+                    context.record_backend_delta(backend, BackendChange::StreamsEnded(1));
                 }
                 Position::Client(..) => {}
                 Position::Server => {
@@ -6222,8 +6218,7 @@ impl ConnectionH2 {
             // stream from self.streams without going through Connection::end_stream,
             // so decrement Backend.active_requests here to keep load metrics honest.
             if let Position::Client(_, backend, BackendStatus::Connected) = &self.position {
-                let mut backend_borrow = backend.borrow_mut();
-                backend_borrow.active_requests = backend_borrow.active_requests.saturating_sub(1);
+                context.record_backend_delta(backend, BackendChange::StreamsEnded(1));
             }
             // Retire from streams/prioriser/stream_last_activity_at and
             // invalidate expect_write/expect_read if they reference this gid.
@@ -6896,7 +6891,7 @@ impl ConnectionH2 {
             let context = log_context!(self);
             match &mut self.position {
                 Position::Client(cluster_id, backend, status) => {
-                    let backend_addr = backend.borrow().address;
+                    let backend_addr = backend.address;
                     let cluster = cluster_id.clone();
                     info!(
                         "{} H2 backend stream IDs exhausted (cluster={}, backend={:?}) — draining",
@@ -7791,12 +7786,14 @@ mod tests {
         protocol::{
             kawa_h1::editor::HttpContext,
             mux::{
+                BackendChange, BackendDelta, Connection,
                 buffer_source::PoolBufferSource,
                 connection::EndpointClient,
                 router::Router,
                 test_support::{TestListener, connected_socket, test_context},
             },
         },
+        socket::SessionTcpStream,
     };
 
     // ── H2FloodDetector / H2FloodViolation ─────────────────────────────
@@ -14707,6 +14704,7 @@ mod tests {
             context: test_context(&pool),
             session_ulid: Ulid::generate(),
             timeouts: HashMap::new(),
+            backend_registry: crate::protocol::mux::BackendRegistry::default(),
         };
         let mut metrics = SessionMetrics::new(None);
 
@@ -15355,6 +15353,384 @@ mod tests {
             "a draining pass that flushed a stream's bytes must arm the \
              deadline: the drain has to be able to finish delivering a \
              response the peer is still reading"
+        );
+    }
+    // ── LIFECYCLE §9 invariant 14 — the backend accounting ledger ────────
+    //
+    // Invariant 14 is a balance: every stream removed outside
+    // `Connection::end_stream` must release the `active_requests` charge its
+    // creation took. Before #1340's Question 12 that balance was spread over
+    // six sites, each reaching a `Rc<RefCell<Backend>>` through
+    // `Position::Client` and mutating it in place, and nothing could observe
+    // the pair — a missed decrement showed up as load-balancing drift in
+    // production, days later.
+    //
+    // The core now emits `BackendDelta`s and the embedder performs them, so
+    // the balance is a property of one observable list. These tests read that
+    // list directly, and then apply it to a real `Backend` and assert the
+    // counter returns to where it started, which is the invariant itself
+    // rather than a proxy for it.
+
+    /// Sum a ledger into the net `active_requests` change it describes, and
+    /// the number of connection releases it carries.
+    fn reconcile(deltas: &[BackendDelta]) -> (i64, usize) {
+        let mut net = 0i64;
+        let mut closed = 0usize;
+        for delta in deltas {
+            match delta.change {
+                BackendChange::StreamsStarted(count) => net += count as i64,
+                BackendChange::StreamsEnded(count) => net -= count as i64,
+                BackendChange::ConnectionClosed => closed += 1,
+            }
+        }
+        (net, closed)
+    }
+
+    /// Everything one of these scenarios needs: a live backend connection in
+    /// `Connected`, the registry entry behind it, and the peer that keeps the
+    /// loopback socket open.
+    struct LedgerFixture {
+        connection: Connection<SessionTcpStream>,
+        registry: crate::protocol::mux::BackendRegistry,
+        backend: Rc<RefCell<crate::backends::Backend>>,
+        _peer: std::net::TcpStream,
+    }
+
+    fn ledger_fixture(pool: &Rc<RefCell<Pool>>) -> LedgerFixture {
+        let (socket, peer) = connected_socket();
+        let address: std::net::SocketAddr =
+            "127.0.0.1:2".parse().expect("backend address must parse");
+        let backend = Rc::new(RefCell::new(crate::backends::Backend::new(
+            "ledger-backend",
+            address,
+            None,
+            None,
+            None,
+        )));
+        let mut registry = crate::protocol::mux::BackendRegistry::default();
+        let backend_id = registry.id_for(&backend);
+        let session_ulid = Ulid::generate();
+        let mut connection = Connection::new_h2_client(
+            session_ulid,
+            SessionTcpStream::new(socket, session_ulid, Some(address)),
+            "ledger-cluster".to_owned(),
+            backend_id,
+            &mut PoolBufferSource::new(Rc::downgrade(pool)),
+            Duration::from_secs(30),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+        )
+        .expect("the test pool must hand out a buffer for the H2 backend");
+        // `new_h2_client` opens in `Connecting`, where the charge is taken by
+        // the embedder at the transition rather than by `start_stream`. Move
+        // it the way a completed dial does, so these scenarios exercise the
+        // `Connected` guard the three reset paths read.
+        if let Position::Client(_, _, status) = connection.position_mut() {
+            *status = BackendStatus::Connected;
+        }
+        LedgerFixture {
+            connection,
+            registry,
+            backend,
+            _peer: peer,
+        }
+    }
+
+    /// Open `count` streams on the backend through the production path, and
+    /// return their global ids.
+    fn open_streams(
+        fixture: &mut LedgerFixture,
+        context: &mut Context<TestListener>,
+        count: usize,
+    ) -> Vec<GlobalStreamId> {
+        (0..count)
+            .map(|_| {
+                let gid = context
+                    .create_stream(Ulid::generate(), 65_535)
+                    .expect("the test pool must hand out stream buffers");
+                assert!(
+                    fixture.connection.start_stream(gid, context),
+                    "the backend must accept the stream this scenario opens"
+                );
+                gid
+            })
+            .collect()
+    }
+
+    /// Apply a ledger and read the counter it leaves behind.
+    fn settle(fixture: &mut LedgerFixture, context: &mut Context<TestListener>) -> usize {
+        for delta in std::mem::take(&mut context.backend_deltas) {
+            fixture.registry.apply(delta);
+        }
+        fixture.backend.borrow().active_requests
+    }
+
+    /// The nominal path: what `Connection::start_stream` charges,
+    /// `Connection::end_stream` releases, and the close releases the
+    /// connection slot exactly once.
+    #[test]
+    fn invariant_14_start_and_end_stream_balance() {
+        let pool = make_pool_for_invariant_16();
+        let mut context = test_context(&pool);
+        let mut fixture = ledger_fixture(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let gids = open_streams(&mut fixture, &mut context, 3);
+        assert_eq!(
+            reconcile(&context.backend_deltas),
+            (3, 0),
+            "three started streams must charge exactly three"
+        );
+
+        for gid in gids {
+            fixture.connection.end_stream(gid, &mut context);
+        }
+        fixture
+            .connection
+            .close(&mut context, EndpointClient(&mut router));
+
+        assert_eq!(
+            reconcile(&context.backend_deltas),
+            (0, 1),
+            "every charge must be released, and the connection released once"
+        );
+        assert_eq!(
+            settle(&mut fixture, &mut context),
+            0,
+            "applying the ledger must return active_requests to zero"
+        );
+    }
+
+    /// A refused `start_stream` must charge nothing at all — not charge and
+    /// then correctly undo. The rollback that used to sit here is the shape
+    /// this asserts is gone: a ledger with a `+1` and a `-1` in it would also
+    /// reconcile to zero, so the assertion is on the list being EMPTY.
+    #[test]
+    fn invariant_14_a_refused_start_stream_charges_nothing() {
+        let pool = make_pool_for_invariant_16();
+        let mut context = test_context(&pool);
+        let mut fixture = ledger_fixture(&pool);
+
+        // Drive the peer's MAX_CONCURRENT_STREAMS to zero so the very next
+        // `start_stream` is refused by RFC 9113 §5.1.2's check.
+        let Connection::H2(shell) = &mut fixture.connection else {
+            unreachable!("the fixture was built as H2");
+        };
+        shell.core.peer_settings.settings_max_concurrent_streams = 0;
+
+        let gid = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out stream buffers");
+        assert!(
+            !fixture.connection.start_stream(gid, &mut context),
+            "premise: the backend must refuse this stream"
+        );
+
+        assert!(
+            context.backend_deltas.is_empty(),
+            "a refused start_stream must leave no entry in the ledger at all, \
+             not a charge and a compensating release: got {:?}",
+            context.backend_deltas
+        );
+        assert_eq!(
+            settle(&mut fixture, &mut context),
+            0,
+            "a refused start_stream must leave active_requests untouched"
+        );
+    }
+
+    /// An inbound `RST_STREAM` removes the stream without going through
+    /// `Connection::end_stream`, so it owes the release itself.
+    #[test]
+    fn invariant_14_an_inbound_rst_stream_releases_its_charge() {
+        let pool = make_pool_for_invariant_16();
+        let mut context = test_context(&pool);
+        let mut fixture = ledger_fixture(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let _gids = open_streams(&mut fixture, &mut context, 2);
+        let Connection::H2(shell) = &mut fixture.connection else {
+            unreachable!("the fixture was built as H2");
+        };
+        let reset_id = *shell
+            .core
+            .stream_table
+            .streams()
+            .keys()
+            .next()
+            .expect("the scenario opened two streams");
+        shell.core.handle_rst_stream_frame(
+            parser::RstStream {
+                stream_id: reset_id,
+                error_code: H2Error::Cancel as u32,
+            },
+            &mut context,
+            EndpointClient(&mut router),
+        );
+
+        assert_eq!(
+            reconcile(&context.backend_deltas),
+            (1, 0),
+            "the reset stream must release its charge, and only its own"
+        );
+        assert_eq!(
+            settle(&mut fixture, &mut context),
+            1,
+            "one of the two streams is gone, so exactly one charge remains"
+        );
+    }
+
+    /// An inbound `GOAWAY` retires every stream above `last_stream_id`
+    /// without `Connection::end_stream`, so it owes each of their releases.
+    #[test]
+    fn invariant_14_an_inbound_goaway_releases_every_retired_charge() {
+        let pool = make_pool_for_invariant_16();
+        let mut context = test_context(&pool);
+        let mut fixture = ledger_fixture(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let _gids = open_streams(&mut fixture, &mut context, 3);
+        let Connection::H2(shell) = &mut fixture.connection else {
+            unreachable!("the fixture was built as H2");
+        };
+        // `last_stream_id = 0` retires all three: the peer says it processed
+        // none of them.
+        shell.core.handle_goaway_frame(
+            parser::GoAway {
+                last_stream_id: 0,
+                error_code: H2Error::NoError as u32,
+                // Empty debug data: `Slice` is an offset/length pair into
+                // a buffer this scenario does not carry.
+                additional_debug_data: kawa::repr::Slice::new(b"", b""),
+            },
+            &mut context,
+            EndpointClient(&mut router),
+        );
+
+        assert_eq!(
+            reconcile(&context.backend_deltas),
+            (0, 0),
+            "every retired stream must release the charge it took"
+        );
+        assert_eq!(
+            settle(&mut fixture, &mut context),
+            0,
+            "a GOAWAY that retires every stream must leave no charge behind"
+        );
+    }
+
+    /// An H1 backend taken back out of the keep-alive pool must be charged
+    /// for the request it is being reused for.
+    ///
+    /// This one records a BEHAVIOUR CHANGE, not just a refactor. Before
+    /// #1340's Question 12 the charge was taken *before* the inner
+    /// `start_stream`, under a `BackendStatus::Connected` guard — and an H1
+    /// connection coming out of the pool is `BackendStatus::KeepAlive` at
+    /// that moment, because `ConnectionH1::start_stream` is what flips it to
+    /// `Connected`. So the reuse took no charge, while the matching
+    /// `Connection::end_stream` released one (it runs before
+    /// `ConnectionH1::end_stream` flips the status back, so its own
+    /// `Connected` guard passes). Every keep-alive reuse cycle therefore net
+    /// `-1`d the backend, `saturating_sub` floored it at zero, and a reused
+    /// H1 connection reported no in-flight request while it served one —
+    /// exactly the monotonic drift invariant 14 names, biasing least-loaded
+    /// and PeakEWMA balancing toward backends that are already busy.
+    ///
+    /// Recording the charge after the inner call fixes it, because the flip
+    /// has happened by then. Taking it afterwards is also what removes the
+    /// rollback, so the two properties are one edit.
+    #[test]
+    fn invariant_14_an_h1_keep_alive_reuse_is_charged() {
+        let pool = make_pool_for_invariant_16();
+        let mut context = test_context(&pool);
+        let (socket, _peer) = connected_socket();
+        let address: std::net::SocketAddr =
+            "127.0.0.1:2".parse().expect("backend address must parse");
+        let backend = Rc::new(RefCell::new(crate::backends::Backend::new(
+            "h1-keepalive-backend",
+            address,
+            None,
+            None,
+            None,
+        )));
+        let mut registry = crate::protocol::mux::BackendRegistry::default();
+        let backend_id = registry.id_for(&backend);
+        let session_ulid = Ulid::generate();
+        let mut connection = Connection::new_h1_client(
+            session_ulid,
+            SessionTcpStream::new(socket, session_ulid, Some(address)),
+            "h1-keepalive-cluster".to_owned(),
+            backend_id,
+            Duration::from_secs(30),
+        );
+        // Park it in the pool, the state `Router::connect`'s H1 reuse arm
+        // picks a backend up from.
+        if let Position::Client(_, _, status) = connection.position_mut() {
+            *status = BackendStatus::KeepAlive;
+        }
+
+        let gid = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out stream buffers");
+        assert!(
+            connection.start_stream(gid, &mut context),
+            "premise: a keep-alive H1 backend must accept the reused stream"
+        );
+        assert_eq!(
+            reconcile(&context.backend_deltas),
+            (1, 0),
+            "a keep-alive reuse must charge the request it is being reused for"
+        );
+
+        connection.end_stream(gid, &mut context);
+        assert_eq!(
+            reconcile(&context.backend_deltas),
+            (0, 0),
+            "and the charge must be released when that request ends"
+        );
+        for delta in std::mem::take(&mut context.backend_deltas) {
+            registry.apply(delta);
+        }
+        assert_eq!(
+            backend.borrow().active_requests,
+            0,
+            "a full reuse cycle must leave active_requests where it found it"
+        );
+    }
+
+    /// `cancel_timed_out_streams` reaps an idle stream on the same terms:
+    /// removed outside `Connection::end_stream`, so it releases its own
+    /// charge.
+    #[test]
+    fn invariant_14_a_timed_out_stream_releases_its_charge() {
+        let pool = make_pool_for_invariant_16();
+        let mut context = test_context(&pool);
+        let mut fixture = ledger_fixture(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let _gids = open_streams(&mut fixture, &mut context, 1);
+        // Push the mux's clock far past the stream idle timeout the fixture
+        // configured, so the reaper finds the stream expired.
+        context.now += Duration::from_secs(120);
+        let Connection::H2(shell) = &mut fixture.connection else {
+            unreachable!("the fixture was built as H2");
+        };
+        let mut endpoint = EndpointClient(&mut router);
+        shell
+            .core
+            .cancel_timed_out_streams(&mut context, &mut endpoint);
+
+        assert_eq!(
+            reconcile(&context.backend_deltas),
+            (0, 0),
+            "a reaped stream must release the charge it took"
+        );
+        assert_eq!(
+            settle(&mut fixture, &mut context),
+            0,
+            "reaping the only stream must leave no charge behind"
         );
     }
 }

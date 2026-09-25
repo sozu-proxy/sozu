@@ -752,6 +752,7 @@ impl HttpsSession {
             // than dropping it and arming a fresh one: the session's request
             // timeout started when the socket was accepted.
             timeouts: HashMap::from([(self.frontend_token, handshake.container_frontend_timeout)]),
+            backend_registry: mux::BackendRegistry::default(),
         }))
     }
 
@@ -807,7 +808,7 @@ impl HttpsSession {
             .timeouts
             .remove(&back_token)
             .unwrap_or_else(|| TimeoutContainer::new_empty(mux.router.configured_backend_timeout));
-        let (cluster_id, backend, backend_readiness, backend_socket) = match backend {
+        let (cluster_id, backend_id, backend_readiness, backend_socket) = match backend {
             mux::Connection::H1(mux::ConnectionH1 {
                 position: mux::Position::Client(cluster_id, backend, mux::BackendStatus::Connected),
                 readiness,
@@ -830,12 +831,25 @@ impl HttpsSession {
             }
         };
 
+        // The mux core carries an opaque `BackendId` (#1340, Q12); the
+        // WebSocket `Pipe` that takes this backend over still owns the
+        // registry handle, so resolve it here, on the embedder's side of that
+        // perimeter, through the one accessor there is.
+        let Some(backend) = mux.backend_registry.handle(&backend_id).cloned() else {
+            error!(
+                "{} upgrade_mux: backend {:?} names a slot this session never minted, closing",
+                log_context!(self),
+                backend_id.backend_id
+            );
+            return None;
+        };
+        let backend_id = backend_id.backend_id.to_string();
+
         let ws_context = stream.context.websocket_context();
 
         container_frontend_timeout.reset();
         container_backend_timeout.reset();
 
-        let backend_id = backend.borrow().backend_id.clone();
         // Unwrap the `SessionTcpStream` that the mux put around every backend
         // TCP socket — `Pipe::backend_socket` is typed `Option<TcpStream>`.
         let backend_socket = backend_socket.stream;
