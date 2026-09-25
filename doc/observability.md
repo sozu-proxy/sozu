@@ -178,7 +178,7 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
 |---|---|---|
 | `MUX` | `protocol/mux/mod.rs` | session ULID, peer/local, frontend, backend list |
 | `MUX-H2` | `protocol/mux/h2.rs` | …plus position, state, total RST counts, draining. `peer` is a snapshot (see below), not a live lookup |
-| `MUX-H1` | `protocol/mux/h1.rs` | …plus stream id, parked, close_notify |
+| `MUX-H1` | `protocol/mux/h1.rs` | …plus stream id, parked, close_notify. `peer` is a snapshot (see below), not a live lookup |
 | `MUX-ROUTER` | `protocol/mux/router.rs` | renders `[session req cluster backend]` via `HttpContext::log_context()` |
 | `MUX-CONN` / `MUX-CONV` / `MUX-PARSER` / `MUX-PKAWA` / `MUX-STREAM` | corresponding files | module-level only (no per-session context) |
 | `RUSTLS` | `protocol/rustls.rs` | SNI/ALPN byte lengths, version, source, frontend |
@@ -191,25 +191,32 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
 - Use the macro defined in the file. Do not call `log::info!`/`log::error!`
   directly from protocol code — the prefix tag is load-bearing for
   log-search.
-- The `peer` slot of a `MUX-H2` line is a snapshot, not a live
-  `getpeername(2)`. It is captured once when `ConnectionH2` is constructed
-  (`ConnectionH2::peer_address`, `lib/src/protocol/mux/h2.rs`), reading the
+- The `peer` slot of a `MUX-H1` or `MUX-H2` line is a snapshot, not a live
+  `getpeername(2)`. It is captured once when the connection is constructed
+  (`ConnectionH1::peer_address` and `ConnectionH2::peer_address`), reading the
   snapshot the socket handler itself took when it was built
   (`SocketHandler::peer_addr`, `lib/src/socket.rs`). The two agree for every
   production handler, which is why rendering the line costs no socket access
-  at all. Two consequences an operator should expect.
+  at all. Three consequences an operator should expect.
   First, it stays populated after the peer resets — `getpeername(2)`
   answers `ENOTCONN` there, so a live lookup renders `peer=None` on exactly
   the error lines being read during an incident. Do not match `peer=None`
-  on a `MUX-H2` line to detect a reset. Second, on a PROXY-protocol TLS
-  frontend it is the source the PROXY header advertised, so it names the
-  client and agrees with the `HTTPS` line for the same request id rather
-  than naming the load balancer. (A `MUX-H2` frontend line only ever
-  exists on a TLS frontend: `Connection::new_h2_server` is called once,
-  from the ALPN branch of `https.rs`, and h2c is unimplemented on the
-  cleartext listener.)
-  `MUX` (`protocol/mux/mod.rs`) and `MUX-H1` (`protocol/mux/h1.rs`) still
-  render a live `getpeername(2)` and are unchanged.
+  on a `MUX-H1` or `MUX-H2` line to detect a reset. Second, on a
+  PROXY-protocol frontend it is the source the PROXY header advertised, so it
+  names the client and agrees with the `HTTP`/`HTTPS` line for the same
+  request id rather than naming the load balancer. (A `MUX-H2` frontend line
+  only ever exists on a TLS frontend: `Connection::new_h2_server` is called
+  once, from the ALPN branch of `https.rs`, and h2c is unimplemented on the
+  cleartext listener. A `MUX-H1` frontend line exists on both listeners.)
+  Third — and with no `MUX-H2` counterpart, because only `ConnectionH1` is
+  built by both `Connection::new_h1_server` and `Connection::new_h1_client` —
+  a backend `MUX-H1` line names the cluster-configured backend address. The
+  dial path caches it for exactly this reason: a nonblocking `connect()` still
+  in flight makes `getpeername(2)` refuse, so the live lookup rendered
+  `peer=None` for the whole window in which an ECONNREFUSED line is emitted.
+  `MUX` (`protocol/mux/mod.rs`) still renders a live `getpeername(2)` and is
+  unchanged — it reaches the raw stream through `Connection::socket()` rather
+  than through the handler's accessor.
 - The `peer` slot of a `SOCKET` line is the same snapshot, through the
   same accessor, for every handler. Both of the layer's two renderers now
   read `configured_peer` first and fall back to `getpeername(2)` only

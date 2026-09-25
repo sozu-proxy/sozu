@@ -456,7 +456,7 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   request/response bytes flow both ways. Set by `Context::link_stream`
   (`mod.rs`), cleared by `Context::unlink_stream` (`mod.rs`).
 - `Unlinked` — backend finished or was reset; response may still need to drain
-  to the client. Transitions: `answers.rs:326/342`, `h1.rs:1044-1101`, and in
+  to the client. Transitions: `answers.rs:326/342`, `h1.rs:1080-1137`, and in
   `h2.rs` the `StreamState::Unlinked` assignments of `ConnectionH2::reset_stream`
   and `ConnectionH2::end_stream` (the client-side retirement plus the
   `ForwardTerminated` and `CloseDelimited` arms of the server side). By symbol,
@@ -488,7 +488,7 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   the pool-reuse return and once at the end of the new-dial path — which sets
   `Linked(token)` and pushes to `context.backend_streams`.
 - **Backend detach.** `Context::unlink_stream` (`mod.rs`) — called from the four
-  timeout arms of `Mux::timeout_inner` (`mod.rs`), from H1 EOF (`h1.rs:1011`),
+  timeout arms of `Mux::timeout_inner` (`mod.rs`), from H1 EOF (`h1.rs:1047`),
   and from `ConnectionH2::reset_stream` and `ConnectionH2::end_stream`
   (`h2.rs`), each of which opens with it. By symbol, not line, for the same
   reason as the `Unlinked` bullet above. Do not convert it back.
