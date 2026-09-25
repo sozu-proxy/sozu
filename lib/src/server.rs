@@ -365,6 +365,75 @@ impl SessionManager {
     /// first observation — `entry(cluster_id.clone())` materialises a
     /// new outer-map slot. Subsequent IPs under the same `(token,
     /// cluster)` reuse the existing slot.
+    ///
+    /// ── A FAILED backend dial keeps the slot, and that is deliberate ──
+    ///
+    /// `Router::plan_connect` (`lib/src/protocol/mux/router.rs`) claims
+    /// here, after the `Self::cluster_ip_at_limit` gate but BEFORE
+    /// backend selection and the dial. Six fallible exits follow the
+    /// claim and none of them releases. Since sozu-proxy/sozu#1519 they
+    /// sit in two functions rather than one: `Router::plan_connect`
+    /// keeps the two pool-reuse refusals, and `Mux::dial_backend`
+    /// (`lib/src/protocol/mux/mod.rs`) owns the four on the fresh-dial
+    /// path — backend selection, buffer-pool exhaustion, the new
+    /// connection refusing the stream, and the `L7Proxy::register_socket`
+    /// rollback, which restores its gauges and slab entry but not the
+    /// slot. The split moved no ordering: the claim still precedes all
+    /// six. `Self::untrack_all_cluster_ip` is the only release, and
+    /// session teardown is its only caller — the
+    /// `L7Proxy::remove_session` impls on `HttpProxy` / `HttpsProxy` for
+    /// the mux, `TcpSession::close` for raw TCP.
+    /// An unpaired claim reads like an oversight; it is not one, and
+    /// sozu-proxy/sozu#1521 is where the reasoning was measured rather
+    /// than assumed. Do not pair a release with those exits as part of a
+    /// refactor — it would LOOSEN a connection limit under exactly the
+    /// conditions a client can induce.
+    ///
+    /// What makes the unpaired claim cheap is that a failed dial ENDS
+    /// the frontend connection, so the slot returns with it:
+    ///
+    /// - `Mux::ready_inner` joins the plan and the dial into a single
+    ///   `Result` with `and_then`, so every post-claim exit from either
+    ///   function reaches the same `BackendConnectionError` arm of its
+    ///   pending-link loop, which answers the stream from the template
+    ///   registry instead of retrying. No arm there returns
+    ///   `SessionResult::Close` of its own.
+    /// - Every built-in template in
+    ///   `lib/src/protocol/kawa_h1/answers.rs` carries
+    ///   `Connection: close`, so `set_default_answer_with_retry_after`
+    ///   (`lib/src/protocol/mux/answers.rs`) clears
+    ///   `HttpContext::keep_alive_frontend`. That one bit is what closes
+    ///   the connection.
+    /// - H1: once the answer flushes, the response-complete branch of
+    ///   `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) takes
+    ///   `ConnectionH1::defer_close_for_tls_flush` instead of the
+    ///   keep-alive reset, so the session closes after that one flush.
+    /// - H2: the write pass raises its `close_frontend` flag when the
+    ///   answered stream retires, and `ConnectionH2::poll_write_target`
+    ///   (`lib/src/protocol/mux/h2.rs`) then sends `ConnectionH2::goaway`
+    ///   when that stream was the only one, or
+    ///   `ConnectionH2::graceful_goaway` when others are still in flight.
+    ///   A draining connection REFUSES new peer streams, so the window is
+    ///   bounded by the streams already open, not by the client.
+    /// - TCP never reaches an answer at all: any error out of
+    ///   `TcpSession::connect_to_backend` (`lib/src/tcp.rs`) becomes
+    ///   `SessionResult::Close` in the same event-loop pass.
+    /// - A registered, `Normal` backend that is down may not fail on the
+    ///   dial at all. `Backend::try_connect` (`lib/src/backends.rs`) is
+    ///   non-blocking: a refusal the kernel reports synchronously —
+    ///   the common case for a closed port on loopback — surfaces as
+    ///   `BackendError::ConnectionFailures` and takes the answer path
+    ///   above, while an `EINPROGRESS` connect returns `Ok` and its
+    ///   refusal arrives later as a backend HUP, so the stream retries
+    ///   through `EndStreamAction::Reconnect` instead. The re-track is
+    ///   the no-op above, so one slot — not one per attempt — is held
+    ///   for at most `CONN_RETRIES` attempts.
+    ///
+    /// The one configuration where the window IS the connection's whole
+    /// lifetime is an operator answer template that omits
+    /// `Connection: close`, the opt-out `doc/rate-limit-design.md`
+    /// already records for the 429 template. An operator who takes it
+    /// holds one slot per failed dial until the client goes away.
     pub fn track_cluster_ip(&mut self, token: Token, cluster_id: String, ip: IpAddr) {
         // Snapshot the forward count for this (cluster, ip) before the insert
         // so we can pair-assert the delta. Ungated `let`: read only inside the

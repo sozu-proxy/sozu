@@ -85,6 +85,83 @@ to the same cluster from the same source consuming a **single**
 connection slot. This matches the per-connection semantics operators
 expect when they set `max_connections_per_ip = 1`.
 
+Step 4 increments **before** backend selection and before the dial, and
+step 5 is the only decrement: a backend dial that fails does **not**
+give the slot back. That is deliberate, not a missing pairing — see
+§3.2.1.
+
+#### 3.2.1 A failed backend dial keeps the slot
+
+`Router::plan_connect` (`lib/src/protocol/mux/router.rs`) increments
+after the gate check and before it decides anything about a backend.
+Six failures can follow that increment, and every one of them returns a
+`BackendConnectionError` without decrementing. Since
+[#1519](https://github.com/sozu-proxy/sozu/pull/1519) split the connect
+path they live in two functions:
+
+- **`Router::plan_connect`** keeps the two pool-reuse refusals — a
+  reused connection that vanished from the router's backend map, and a
+  reused backend that refuses one more stream.
+- **`Mux::dial_backend`** (`lib/src/protocol/mux/mod.rs`) owns the four
+  on the fresh-dial path — backend selection with nothing available, a
+  buffer pool with nothing left, the freshly-built connection refusing
+  the stream, and a `L7Proxy::register_socket` that fails. The last one
+  rolls back its own gauges, slab entry and epoll registration; it does
+  not roll back the slot.
+
+The split changed no ordering — the increment still precedes all six —
+and it does not fork the error path either: `Mux::ready_inner` joins the
+plan and the dial into a single `Result` with `and_then`, so both halves
+land in one error arm. The decrement happens once, on session teardown.
+
+The claim is cheap because a failed dial **ends the frontend
+connection**, so the slot comes back with it:
+
+- That error arm, in `Mux::ready_inner`'s pending-link loop, answers the
+  stream from the template registry rather than retrying, and no arm of
+  it returns a session close of its own. Every built-in template in
+  `lib/src/protocol/kawa_h1/answers.rs` carries `Connection: close`,
+  which clears `HttpContext::keep_alive_frontend`.
+- **HTTP/1.1** — once the answer flushes, the response-complete branch
+  of `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`) closes the
+  session instead of taking the keep-alive reset. One flush.
+- **HTTP/2, the failed stream was the only one** — the write pass sends
+  a final `GOAWAY(NO_ERROR)` as that stream retires.
+- **HTTP/2, other streams still in flight** — the write pass sends the
+  advisory `GOAWAY` of a graceful drain instead, and a draining
+  connection **refuses** new peer streams. The window is therefore the
+  remaining lifetime of the streams already open, and the client cannot
+  extend it. The `h2_graceful_shutdown_deadline_seconds` forced close
+  does not apply here: it is armed only by the worker's soft-stop path.
+- **Raw TCP** — never reaches an answer. Any error out of
+  `TcpSession::connect_to_backend` (`lib/src/tcp.rs`) becomes a session
+  close in the same event-loop pass.
+
+A registered, healthy-status backend that is down may not fail on the
+dial at all. `Backend::try_connect` (`lib/src/backends.rs`) is
+non-blocking: a refusal the kernel reports synchronously — the common
+case for a closed port on loopback — surfaces as
+`BackendError::ConnectionFailures` and takes the answer path above,
+while an `EINPROGRESS` connect returns `Ok` and its refusal, or a
+blackholed SYN, arrives later as a backend HUP and the stream retries
+instead. The re-increment is idempotent within the session, so **one**
+slot — not one per attempt — is held for at most `CONN_RETRIES`
+attempts, each bounded by `connect_timeout`.
+
+The one configuration in which the slot is held for the connection's
+whole lifetime is a custom answer template that omits
+`Connection: close` — the same keep-alive opt-in §3.4 records for the
+429 template. An operator who takes it holds one slot per failed dial
+until the client goes away, and should size
+`max_connections_per_ip` for that.
+
+Releasing the slot on a dial failure would **loosen** the cap under
+precisely the conditions a client can induce, and would buy very
+little: the connection that provoked the failure is closed by the
+answer it provoked, so it cannot accumulate slots either way. Changing
+this is its own decision, not part of a refactor
+(sozu-proxy/sozu#1521).
+
 ### 3.3 Enforcement points
 
 The cap is checked **after cluster resolution and before backend
