@@ -860,6 +860,19 @@ rather than derived for exactly the reason this section gives: a derive would
 render `socket` through `Front`'s `Debug` and hand the descriptor straight back
 through the wrapper.
 
+`ConnectionH1`'s `Debug` renders the same slot, for the first two of those
+reasons. It was the last `Debug` in `protocol/mux/` still handing
+`socket_ref`'s `mio::net::TcpStream` to that type's own `Debug`, so one
+connection rendered two different peers depending on which struct a trace
+carried: the H2 one the snapshot, the H1 one a live `getpeername(2)` taken at
+format time — which answers `ENOTCONN` once the peer has reset — alongside a
+file descriptor. The third reason does not transfer. `ConnectionH1` is still
+generic over `Front: SocketHandler`, and the three `stats::socket_rtt` samples
+in `ConnectionH1::writable` still reach `socket_ref`; those read a round-trip
+time rather than an address, and they stay. Pinned by
+`debug_renders_the_proxy_advertised_peer_not_the_transport_socket`
+(`lib/src/protocol/mux/h1.rs`).
+
 ### What the RTT read cost to remove
 
 Q11's local half is the step that removed it. `ConnectionH2::client_rtt` is now
