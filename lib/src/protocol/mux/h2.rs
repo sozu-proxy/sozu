@@ -818,13 +818,30 @@ pub struct ConnectionH2 {
     /// ready_incremental_streams)` snapshot emitted by
     /// [`Self::gauge_connection_state`]. The snapshot represents this
     /// connection's *contribution* to the four aggregate gauges; each call
-    /// emits the signed delta against this snapshot via [`gauge_add!`] so the
-    /// gauges sum across connections.
+    /// pushes the signed delta against this snapshot onto
+    /// [`Self::metric_events`] so the gauges sum across connections.
     ///
-    /// Stays `None` until the first emission. [`Drop`] applies the negative of
-    /// this snapshot so the connection's contribution is always rebalanced to
-    /// zero on teardown — independent of which close path runs.
+    /// Stays `None` until the first emission.
+    /// [`Self::release_connection_gauges`] applies the negative of this
+    /// snapshot so the connection's contribution is always rebalanced to zero
+    /// on teardown — independent of which close path runs. `H2Shell`'s
+    /// [`Drop`] is what calls it.
     last_gauge_snapshot: Option<(usize, usize, usize, usize)>,
+    /// Metric events this core produced and has not yet handed to its shell.
+    ///
+    /// The core owns the *arithmetic* — which metric, and by how much — and
+    /// nothing else: writing to the worker-local `METRICS` aggregator is a
+    /// reach for ambient process state that a byte-in / byte-out core cannot
+    /// make, and that a deterministic simulator cannot observe. So the events
+    /// queue here and [`H2Shell`] drains them through
+    /// [`Self::drain_metric_events`], exactly as `protocol/udp/`'s core
+    /// queues `Output::Metric` for `crate::udp` to drain.
+    ///
+    /// Nothing is lost if a pass forgets to drain: the queue is FIFO and the
+    /// values are signed deltas, so a later drain records the same sum, and
+    /// `H2Shell`'s [`Drop`] drains whatever is left. See
+    /// [`H2Shell::record_pending_metrics`].
+    metric_events: Vec<MetricEvent>,
     /// Per-stream idle cap. Streams with no activity for longer than this are
     /// RST_STREAM(CANCEL)'d by [`Self::cancel_timed_out_streams`]. Compared
     /// against `stream_table`'s per-stream activity/flow-control-stall
@@ -941,26 +958,77 @@ impl std::fmt::Debug for ConnectionH2 {
     }
 }
 
-/// Symmetric tear-down for the four aggregate gauges
-/// `ConnectionH2::gauge_connection_state` feeds — the three
-/// `h2.connection.*` metrics and `h2.streams.ready_incremental.by_urgency`:
-/// whatever positive contribution this connection made is subtracted back out
-/// when the connection is dropped.
+/// One metric the H2 core asks its shell to record.
 ///
-/// Using `Drop` (rather than wiring decrements into every close path —
-/// `graceful_goaway`, `force_disconnect`, `handle_goaway_frame`, `Mux::close`,
-/// stream-id exhaustion, panic-unwind) is what guarantees the gauge is
-/// arithmetically symmetric regardless of which path teardown took. Past
-/// underflow incidents (commits ff401b54, aadb3fa4) were increment/decrement
-/// asymmetries. `ff401b54` carried both shapes at once: a `-1` for streams that
-/// never ran the `+1`, AND a `-1` that ran twice on one stream (100-Continue,
-/// and an H2 reset followed by close). `aadb3fa4` was the doubled `-1` alone,
-/// let through by an early return. `Drop` closes both shapes — it is the sole
-/// decrement site, and taking `last_gauge_snapshot` makes a second call a
-/// no-op.
-impl Drop for ConnectionH2 {
-    fn drop(&mut self) {
-        self.release_connection_gauges();
+/// The metric macros of [`crate::metrics`] borrow the worker-local `METRICS`
+/// aggregator through a `thread_local!`, which is exactly the ambient process
+/// reach a byte-in / byte-out core gave up — and which a deterministic
+/// simulator has no way to observe, so a core that wrote there could not be
+/// driven by one. [`ConnectionH2`] therefore returns the metric instead of
+/// emitting it, and [`H2Shell`] — the layer that already owns the socket, and
+/// the layer `METRICS` legitimately belongs to — records it through
+/// [`record_metric`].
+///
+/// The precedent is in-repo and predates this type: `protocol/udp/`'s core has
+/// zero metric-macro sites and emits `Output::Metric(MetricEvent)`, which
+/// `crate::udp`'s `Udp::record_metric` folds into the aggregator and
+/// `sim/tests/udp_simulation.rs` folds into a shadow model instead.
+///
+/// Variants name what happened in the core's own terms; mapping them onto
+/// metric keys is [`record_metric`]'s job and happens shell-side. The four
+/// below are the H2 connection-level aggregate gauges, each carrying the
+/// *signed delta* this connection contributes — never an absolute value. The
+/// delta is what makes them summable across every live H2 connection; an
+/// absolute `gauge!` would have each connection overwrite the last one's
+/// value, which is the defect [`ConnectionH2::gauge_connection_state`]'s
+/// snapshot arithmetic was introduced to fix.
+///
+/// The migration is incremental: a site that still calls a metric macro from
+/// the core has not moved yet, and the two mechanisms compose — both end in
+/// the same aggregator, so a half-migrated counter is not a wrong counter.
+/// The type lives here rather than in a `protocol/mux/` module of its own
+/// because every variant is H2-connection state; the first non-H2 core type
+/// that needs one is what should promote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MetricEvent {
+    /// Signed delta on [`names::h2::CONNECTION_WINDOW_BYTES`] — this
+    /// connection's available connection-level send window, clamped at 0 so
+    /// the aggregate represents capacity rather than deficit.
+    ConnectionWindowBytes(i64),
+    /// Signed delta on [`names::h2::CONNECTION_ACTIVE_STREAMS`] — this
+    /// connection's in-flight stream count.
+    ConnectionActiveStreams(i64),
+    /// Signed delta on [`names::h2::CONNECTION_PENDING_WINDOW_UPDATES`] —
+    /// this connection's queued, un-flushed per-stream WINDOW_UPDATE entries.
+    ConnectionPendingWindowUpdates(i64),
+    /// Signed delta on [`names::h2::STREAMS_READY_INCREMENTAL_BY_URGENCY`] —
+    /// this connection's streams that were ready to emit AND marked
+    /// incremental (RFC 9218 §4) on its last completed write pass.
+    StreamsReadyIncrementalByUrgency(i64),
+}
+
+/// Fold one core-returned [`MetricEvent`] into the worker-local `METRICS`
+/// aggregator.
+///
+/// Shell-side by construction, and deliberately the only place in this module
+/// that turns a [`MetricEvent`] into a metric macro. [`ConnectionH2`] never
+/// calls it: it queues events and lets the layer that owns the socket decide
+/// when they are recorded. A second translation site would be a second place
+/// for the gauge arithmetic to drift.
+fn record_metric(event: MetricEvent) {
+    match event {
+        MetricEvent::ConnectionWindowBytes(delta) => {
+            gauge_add!(names::h2::CONNECTION_WINDOW_BYTES, delta)
+        }
+        MetricEvent::ConnectionActiveStreams(delta) => {
+            gauge_add!(names::h2::CONNECTION_ACTIVE_STREAMS, delta)
+        }
+        MetricEvent::ConnectionPendingWindowUpdates(delta) => {
+            gauge_add!(names::h2::CONNECTION_PENDING_WINDOW_UPDATES, delta)
+        }
+        MetricEvent::StreamsReadyIncrementalByUrgency(delta) => {
+            gauge_add!(names::h2::STREAMS_READY_INCREMENTAL_BY_URGENCY, delta)
+        }
     }
 }
 
@@ -1589,6 +1657,7 @@ impl ConnectionH2 {
             connection_config,
             ready_incremental_streams: 0,
             last_gauge_snapshot: None,
+            metric_events: Vec::new(),
             stream_idle_timeout,
             refuse_count_window: 0,
             refuse_window_start: now,
@@ -2370,8 +2439,9 @@ impl ConnectionH2 {
     /// current contribution, expressed as a signed delta against the last
     /// snapshot we emitted.
     ///
-    /// The four metrics are emitted via [`gauge_add!`] (lifecycle deltas) so
-    /// that the dashboard sees the **sum across all live H2 connections**:
+    /// The four metrics are returned as [`MetricEvent`] signed deltas (rather
+    /// than absolute values) so that the dashboard sees the **sum across all
+    /// live H2 connections**:
     ///
     /// - `h2.connection.window_bytes` — sum of available connection-level
     ///   send-window bytes. Negative per-connection windows clamp to 0 so the
@@ -2385,11 +2455,12 @@ impl ConnectionH2 {
     ///
     /// Called from the write hot path; emits nothing when the snapshot is
     /// unchanged so the steady state stays cheap. The paired decrement for
-    /// every increment is provided by [`Drop`], which subtracts the final
-    /// snapshot when the connection is dropped — keeping the aggregate
-    /// arithmetically symmetric independent of which close path runs
-    /// (`graceful_goaway`, `force_disconnect`, `handle_goaway_frame`,
-    /// `Mux::close`, panic-unwind, …).
+    /// every increment is provided by [`Self::release_connection_gauges`],
+    /// which subtracts the final snapshot when the connection is dropped —
+    /// keeping the aggregate arithmetically symmetric independent of which
+    /// close path runs (`graceful_goaway`, `force_disconnect`,
+    /// `handle_goaway_frame`, `Mux::close`, panic-unwind, …).
+    /// [`H2Shell`]'s [`Drop`] is the single site that calls it.
     fn gauge_connection_state(&mut self) {
         let snapshot = (
             self.flow_control.window().max(0) as usize,
@@ -2407,43 +2478,68 @@ impl ConnectionH2 {
         let du = snapshot.2 as i64 - prev.2 as i64;
         let dr = snapshot.3 as i64 - prev.3 as i64;
         if dw != 0 {
-            gauge_add!(names::h2::CONNECTION_WINDOW_BYTES, dw);
+            self.metric_events
+                .push(MetricEvent::ConnectionWindowBytes(dw));
         }
         if ds != 0 {
-            gauge_add!(names::h2::CONNECTION_ACTIVE_STREAMS, ds);
+            self.metric_events
+                .push(MetricEvent::ConnectionActiveStreams(ds));
         }
         if du != 0 {
-            gauge_add!(names::h2::CONNECTION_PENDING_WINDOW_UPDATES, du);
+            self.metric_events
+                .push(MetricEvent::ConnectionPendingWindowUpdates(du));
         }
         if dr != 0 {
-            gauge_add!(names::h2::STREAMS_READY_INCREMENTAL_BY_URGENCY, dr);
+            self.metric_events
+                .push(MetricEvent::StreamsReadyIncrementalByUrgency(dr));
         }
         self.last_gauge_snapshot = Some(snapshot);
     }
 
     /// Subtract this connection's contribution from the four aggregate gauges
     /// [`Self::gauge_connection_state`] feeds. Idempotent: clears
-    /// `last_gauge_snapshot` so a second call (or a [`Drop`] on top of an
+    /// `last_gauge_snapshot` so a second call (or a `Drop` on top of an
     /// explicit reset) is a no-op.
     ///
-    /// Pairs with every prior call to [`Self::gauge_connection_state`]; called
-    /// from [`Drop`] so the symmetry is guaranteed regardless of the close
-    /// path.
+    /// Pairs with every prior call to [`Self::gauge_connection_state`]. Queues
+    /// the negatives onto [`Self::metric_events`] like every other core-side
+    /// metric; the caller is [`H2Shell`]'s [`Drop`], which calls this and then
+    /// drains, so the symmetry is guaranteed regardless of the close path.
+    ///
+    /// Stays module-private: the release has to run exactly once per
+    /// connection, at teardown, and that single caller is in this module
+    /// alongside it.
     fn release_connection_gauges(&mut self) {
         if let Some((w, s, u, r)) = self.last_gauge_snapshot.take() {
             if w != 0 {
-                gauge_add!(names::h2::CONNECTION_WINDOW_BYTES, -(w as i64));
+                self.metric_events
+                    .push(MetricEvent::ConnectionWindowBytes(-(w as i64)));
             }
             if s != 0 {
-                gauge_add!(names::h2::CONNECTION_ACTIVE_STREAMS, -(s as i64));
+                self.metric_events
+                    .push(MetricEvent::ConnectionActiveStreams(-(s as i64)));
             }
             if u != 0 {
-                gauge_add!(names::h2::CONNECTION_PENDING_WINDOW_UPDATES, -(u as i64));
+                self.metric_events
+                    .push(MetricEvent::ConnectionPendingWindowUpdates(-(u as i64)));
             }
             if r != 0 {
-                gauge_add!(names::h2::STREAMS_READY_INCREMENTAL_BY_URGENCY, -(r as i64));
+                self.metric_events
+                    .push(MetricEvent::StreamsReadyIncrementalByUrgency(-(r as i64)));
             }
         }
+    }
+
+    /// Take every [`MetricEvent`] this core has queued since the last drain.
+    ///
+    /// The core's half of the boundary: it states what happened and by how
+    /// much, and stops there. Recording is [`record_metric`]'s job, and
+    /// [`H2Shell::record_pending_metrics`] is the production caller. Reading
+    /// the queue instead is what will let a driver with no `METRICS` registry
+    /// — `sim/tests/h2_simulation.rs`, once the slice needing it exports the
+    /// type — fold the events into a shadow model, as `udp_simulation.rs` does.
+    pub(super) fn drain_metric_events(&mut self) -> std::vec::Drain<'_, MetricEvent> {
+        self.metric_events.drain(..)
     }
 
     /// Ask the core what it wants written to the socket, so the caller can
@@ -6951,6 +7047,41 @@ impl<Front: SocketHandler> std::fmt::Debug for H2Shell<Front> {
     }
 }
 
+/// Symmetric tear-down for the four aggregate gauges
+/// `ConnectionH2::gauge_connection_state` feeds — the three
+/// `h2.connection.*` metrics and `h2.streams.ready_incremental.by_urgency`:
+/// whatever positive contribution this connection made is subtracted back out
+/// when the connection is dropped, and the whole event queue is flushed with
+/// it.
+///
+/// Using `Drop` (rather than wiring decrements into every close path —
+/// `graceful_goaway`, `force_disconnect`, `handle_goaway_frame`, `Mux::close`,
+/// stream-id exhaustion, panic-unwind) is what guarantees the gauge is
+/// arithmetically symmetric regardless of which path teardown took. Past
+/// underflow incidents (commits ff401b54, aadb3fa4) were increment/decrement
+/// asymmetries. `ff401b54` carried both shapes at once: a `-1` for streams that
+/// never ran the `+1`, AND a `-1` that ran twice on one stream (100-Continue,
+/// and an H2 reset followed by close). `aadb3fa4` was the doubled `-1` alone,
+/// let through by an early return. `Drop` closes both shapes — it is the sole
+/// decrement site, and taking `last_gauge_snapshot` makes a second call a
+/// no-op.
+///
+/// It sits on the **shell** rather than on [`ConnectionH2`] because
+/// `record_metric` writes the worker-local `METRICS` aggregator, which is
+/// exactly the ambient reach the core gave up. RAII is not given up with it:
+/// the shell owns the core, so the core cannot outlive this, and because
+/// `H2Shell` now implements `Drop` the compiler additionally refuses to move
+/// `core` out of it. If this impl were lost, every live connection's
+/// contribution would leak upward permanently, with no resync and no
+/// underflow to notice — which is what
+/// `dropping_a_connection_releases_its_ready_incremental_contribution` pins.
+impl<Front: SocketHandler> Drop for H2Shell<Front> {
+    fn drop(&mut self) {
+        self.core.release_connection_gauges();
+        self.record_pending_metrics();
+    }
+}
+
 impl<Front: SocketHandler> H2Shell<Front> {
     /// The TLS layer is holding encrypted records — handshake, alert, session
     /// ticket or already-accepted application data — that it must push before
@@ -7475,12 +7606,35 @@ impl<Front: SocketHandler> H2Shell<Front> {
     }
 
     fn settled(&mut self, result: MuxResult) -> MuxResult {
-        let Some(target) = self.core.poll_force_disconnect() else {
-            return result;
+        let settled = match self.core.poll_force_disconnect() {
+            None => result,
+            Some(target) => {
+                let tls_wants_write = self.tls_wants_write();
+                self.core
+                    .force_disconnect_after_query(target, tls_wants_write)
+            }
         };
-        let tls_wants_write = self.tls_wants_write();
-        self.core
-            .force_disconnect_after_query(target, tls_wants_write)
+        self.record_pending_metrics();
+        settled
+    }
+
+    /// Record every [`MetricEvent`] the core queued during the step that just
+    /// ended.
+    ///
+    /// The shell half of the boundary: the core states the arithmetic, this
+    /// writes it into the worker-local `METRICS` aggregator. It runs at the
+    /// end of [`Self::settled`] — so after every `readable`, `writable`,
+    /// `start_stream` and `cancel_timed_out_streams` — and in [`Drop`].
+    ///
+    /// A step that reaches neither is not a lost event: the queue is FIFO and
+    /// its values are signed deltas, so the next drain records the same sum,
+    /// and `Drop` drains whatever is left. That is what bounds the queue, and
+    /// what makes "drain here" a scheduling choice rather than a correctness
+    /// one.
+    fn record_pending_metrics(&mut self) {
+        for event in self.core.drain_metric_events() {
+            record_metric(event);
+        }
     }
 
     /// [`ConnectionH2::settled`] for a core step whose own answer is not a
@@ -8639,24 +8793,6 @@ mod tests {
         })
     }
 
-    /// `h2.streams.ready_incremental.by_urgency` is an aggregate across every
-    /// live H2 connection, so a connection must hand back exactly what it
-    /// contributed, on every close path. [`Drop`] is the single decrement
-    /// site; this pins the round trip.
-    ///
-    /// Before this was folded into `last_gauge_snapshot`, the metric was an
-    /// absolute `gauge!` set from inside `write_streams`: connection B
-    /// overwrote connection A's value, nothing was ever released, and the
-    /// dashboard read "whatever the last writer wrote" instead of a sum.
-    ///
-    /// `METRICS` is a thread-local, so this asserts the DELTA around one
-    /// connection's lifetime — robust to any starting value.
-    ///
-    /// To SEE THIS RED: delete the
-    /// `if r != 0 { gauge_add!(names::h2::STREAMS_READY_INCREMENTAL_BY_URGENCY, -(r as i64)); }`
-    /// arm from [`ConnectionH2::release_connection_gauges`]. The live-delta
-    /// assertion still passes; the post-drop one fails with `left: 3, right: 0`
-    /// — the connection's contribution outliving the connection, which is the
     /// A [`BufferSource`] that hands over pooled wire buffers exactly as the
     /// real one does but refuses every scratch request.
     ///
@@ -8733,6 +8869,25 @@ mod tests {
         );
     }
 
+    /// `h2.streams.ready_incremental.by_urgency` is an aggregate across every
+    /// live H2 connection, so a connection must hand back exactly what it
+    /// contributed, on every close path. `H2Shell`'s [`Drop`] is the single
+    /// decrement site; this pins the round trip.
+    ///
+    /// Before this was folded into `last_gauge_snapshot`, the metric was an
+    /// absolute `gauge!` set from inside `write_streams`: connection B
+    /// overwrote connection A's value, nothing was ever released, and the
+    /// dashboard read "whatever the last writer wrote" instead of a sum.
+    ///
+    /// `METRICS` is a thread-local, so this asserts the DELTA around one
+    /// connection's lifetime — robust to any starting value.
+    ///
+    /// To SEE THIS RED: delete `self.core.release_connection_gauges();`
+    /// from `impl Drop for H2Shell`, leaving the
+    /// `self.record_pending_metrics();` below it. The live-delta assertion
+    /// still passes — the shell still records what the core queued — and the
+    /// post-drop one fails with `left: 3, right: 0`: the connection's
+    /// contribution outliving the connection, which is the
     /// aggregate drifting upward by 3 for the rest of the worker's life.
     #[test]
     fn dropping_a_connection_releases_its_ready_incremental_contribution() {
@@ -8767,9 +8922,11 @@ mod tests {
 
         // What the tail of `write_streams` writes once the pass's bucket map
         // is final, published by the `gauge_connection_state` call that
-        // follows it.
+        // follows it — then handed to the aggregator by the shell, which is
+        // what `H2Shell::settled` does at the end of every real pass.
         connection.core.ready_incremental_streams = 3;
         connection.core.gauge_connection_state();
+        connection.record_pending_metrics();
 
         assert_eq!(
             ready_incremental_gauge() - before,
@@ -8785,6 +8942,81 @@ mod tests {
             before,
             "Drop must subtract exactly the contribution the connection made, \
              returning the aggregate to its prior value"
+        );
+    }
+
+    /// The core computes the gauge arithmetic and stops there: writing the
+    /// worker-local `METRICS` aggregator is the shell's step, through
+    /// [`H2Shell::record_pending_metrics`].
+    ///
+    /// This is the property that makes the H2 core drivable by a deterministic
+    /// simulator, which is the whole point of returning the metric rather than
+    /// emitting it: a driver with no aggregator sees the same
+    /// [`MetricEvent`]s that production folds into `METRICS`, and can fold
+    /// them into a shadow model instead. `protocol/udp/`'s core already works
+    /// this way and `sim/tests/udp_simulation.rs` already reads it that way.
+    ///
+    /// The sibling test above pins the arithmetic; this one pins *who writes*,
+    /// which no assertion on the aggregate's value can distinguish — a core
+    /// that emitted directly and a shell that records what the core queued
+    /// leave the aggregate identical.
+    ///
+    /// To SEE THIS RED: in [`ConnectionH2::gauge_connection_state`], put
+    /// `gauge_add!(names::h2::STREAMS_READY_INCREMENTAL_BY_URGENCY, dr);`
+    /// back in place of the
+    /// `self.metric_events.push(MetricEvent::StreamsReadyIncrementalByUrgency(dr));`
+    /// push. The first assertion then fails with `left: <before + 5>, right:
+    /// <before>` — the core reaching the aggregator behind the shell's back.
+    #[test]
+    fn the_core_queues_gauge_deltas_instead_of_writing_the_metrics_registry() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let before = ready_incremental_gauge();
+
+        let mut connection =
+            connection_from_source(&mut PoolBufferSource::new(Rc::downgrade(&pool)))
+                .expect("a pool with free buffers must yield an H2 connection");
+
+        connection.core.ready_incremental_streams = 5;
+        connection.core.gauge_connection_state();
+
+        assert_eq!(
+            ready_incremental_gauge(),
+            before,
+            "the core must not write METRICS: `gauge_connection_state` queues \
+             a MetricEvent and the shell decides when it is recorded"
+        );
+
+        let queued: Vec<MetricEvent> = connection.core.drain_metric_events().collect();
+        assert!(
+            queued.contains(&MetricEvent::StreamsReadyIncrementalByUrgency(5)),
+            "the queued events must carry the signed delta the core computed, \
+             got {queued:?}"
+        );
+        assert_eq!(
+            ready_incremental_gauge(),
+            before,
+            "draining is not recording: taking the events out of the core must \
+             not move the aggregate either"
+        );
+
+        for event in queued {
+            record_metric(event);
+        }
+
+        assert_eq!(
+            ready_incremental_gauge() - before,
+            5,
+            "recording the drained events must produce exactly the aggregate \
+             the old in-core `gauge_add!` produced"
+        );
+
+        drop(connection);
+
+        assert_eq!(
+            ready_incremental_gauge(),
+            before,
+            "the released snapshot must travel the same queue and rebalance to \
+             the prior value"
         );
     }
 

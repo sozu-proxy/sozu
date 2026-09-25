@@ -228,7 +228,7 @@ fn rust_sources(root: &Path) -> Vec<PathBuf> {
 }
 
 /// To SEE THIS RED: in `lib/src/protocol/mux/h2.rs`, replace
-/// `names::h2::STREAMS_READY_INCREMENTAL_BY_URGENCY` in `gauge_connection_state`
+/// `names::h2::STREAMS_READY_INCREMENTAL_BY_URGENCY` in `record_metric`
 /// with the literal `"h2.streams.ready_incremental.by_urgency"`. The scan then
 /// reports that one site, byte-identical emission and all.
 ///
