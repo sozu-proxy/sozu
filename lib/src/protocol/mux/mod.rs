@@ -2489,9 +2489,24 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 for delta in std::mem::take(&mut context.backend_deltas) {
                     self.backend_registry.apply(delta);
                 }
+                // Build the routing view once for this decision, from a single
+                // `proxy.borrow()`. Holding one `Ref` for the call is what
+                // gives every read inside it the same cluster map; the two
+                // sites used to take separate borrows. A second immutable
+                // borrow inside (`plan_connect`'s limit gate, and
+                // `dial_backend`'s `add_session` / `register_socket`) is fine
+                // — nothing on this path borrows the proxy mutably.
+                let proxy_ref = proxy.borrow();
+                let view = router::RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
                 match self
                     .router
-                    .plan_connect(stream_id, context, proxy.clone(), self.frontend_token)
+                    .plan_connect(
+                        stream_id,
+                        context,
+                        &view,
+                        proxy.clone(),
+                        self.frontend_token,
+                    )
                     .and_then(|plan| match plan {
                         router::ConnectPlan::Attached => Ok(()),
                         router::ConnectPlan::Dial {

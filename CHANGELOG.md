@@ -2330,6 +2330,38 @@
   as a historical record and already names `SimSocket` and `PlaceholderPeer`, neither of which
   exists in the tree.
 
+- **`refactor(mux)`: the routing decision reads cluster configuration from a borrowed view
+  ([#1340](https://github.com/sozu-proxy/sozu/issues/1340), Q6).** `Router::plan_connect` made
+  three reads through `Rc<RefCell<dyn L7Proxy>>`. Two of them — `L7Proxy::clusters` and
+  `L7Proxy::kind` — are pure, and now arrive as `RoutingView`, built once per decision by
+  `Mux::ready_inner` from a single `proxy.borrow()`. `Router::route_from_request` no longer takes
+  the handle at all.
+
+  Same mechanism as Q12's backend view, applied a second time rather than reinvented: a view in
+  with a defined staleness, a result out. The staleness is **one routing decision** — every read
+  inside a `plan_connect` call sees the same cluster map. That is marginally stronger than what it
+  replaces, and deliberately: the two sites used to take separate `proxy.borrow()`s, so a cluster
+  update landing between them would have been half-observed. None can interleave (`clusters()` is
+  owned by the worker's command loop and a stream is drained from `pending_links` inside the very
+  `ready()` pass that queued it), so this closes a window that was never open rather than changing
+  a behaviour that was.
+
+  Measured, comment lines filtered: `proxy.borrow()` reads inside `Router::plan_connect` go
+  **3 → 1**, and `Rc<RefCell<dyn L7Proxy>>` production code references in
+  `lib/src/protocol/mux/router.rs` go **5 → 4**. The four that remain are the import, the
+  `plan_connect` parameter, and `Router::backend_from_request` /
+  `Router::get_backend_for_sticky_session`.
+
+  No behaviour change. `the_routing_decision_reads_cluster_config_from_the_view` hands the decision
+  a view that disagrees with the proxy about `cluster.http2` and asserts the plan follows the view;
+  seen red by restoring the read to the handle, which reports `h2: true`. The production diff and
+  the test share no string literal. `cargo test -p sozu-lib` goes **1127 → 1128 passed**.
+
+  The one read still taken through the handle in `plan_connect` is the per-(cluster, source-IP)
+  limit gate, and it is deliberately not in this change: it calls `cluster_ip_at_limit` **and**
+  `track_cluster_ip`, a mutation of worker-global state, so it cannot become a read-only view. It
+  becomes a returned step of its own.
+
 - **`fix(mux-h2)`: the RFC 9218 §4 round-robin cursor is per urgency bucket, so every incremental
   bucket rotates instead of only the one that leads the pass.** `Prioriser` held ONE
   connection-global `incremental_cursor`. `apply_incremental_rotation` applied it to every urgency

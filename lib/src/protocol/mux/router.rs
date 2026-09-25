@@ -83,12 +83,18 @@
 //! `bombardier` run) against an H1 cluster behind an H2 frontend at or near
 //! that ceiling; no such run has been produced.
 
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    rc::Rc,
+    time::Duration,
+};
 
 use mio::{Token, net::TcpStream};
 use sozu_command::{
     logging::ansi_palette,
-    proto::command::{ListenerType, RedirectPolicy, RedirectScheme},
+    proto::command::{Cluster, ListenerType, RedirectPolicy, RedirectScheme},
+    state::ClusterId,
 };
 
 #[cfg(debug_assertions)]
@@ -183,6 +189,62 @@ fn log_sni_authority_mismatch(
     );
 }
 
+/// The cluster-side configuration the routing decision reads, borrowed from
+/// the embedder for the length of one decision.
+///
+/// Question 6 of [#1340](https://github.com/sozu-proxy/sozu/issues/1340) puts
+/// routing inside the core; this is how the data that routing needs gets
+/// there without the core holding the handle it used to reach through.
+/// `L7Proxy::clusters` and `L7Proxy::kind` were two of the three reads
+/// `Router::plan_connect` made against `Rc<RefCell<dyn L7Proxy>>`, and both
+/// are pure. They arrive as this instead.
+///
+/// The mechanism is Question 12's, applied a second time rather than
+/// reinvented: a view in with a defined staleness, a result out. The
+/// staleness here is **one routing decision** — the view is built once per
+/// `Router::plan_connect` call and every read inside that call sees the same
+/// cluster map.
+///
+/// That is marginally *stronger* than what it replaces, and deliberately so:
+/// the two sites used to take separate `proxy.borrow()`s, one in
+/// `Router::plan_connect` and one in `Router::route_from_request`, so a
+/// cluster update landing between them would have been half-observed. No
+/// such update can interleave — `clusters()` is owned by the worker's
+/// command loop and a stream is drained from `pending_links` inside the very
+/// `ready()` pass that queued it — so this closes a window that was never
+/// open rather than changing a behaviour that was.
+///
+/// A simulator can build one of these from whatever cluster map it likes,
+/// which is what Q6's determinism argument wants and what an
+/// `Rc<RefCell<dyn L7Proxy>>` could never give it.
+pub(super) struct RoutingView<'a> {
+    clusters: &'a HashMap<ClusterId, Cluster>,
+    listener_kind: ListenerType,
+}
+
+impl<'a> RoutingView<'a> {
+    pub(super) fn new(
+        clusters: &'a HashMap<ClusterId, Cluster>,
+        listener_kind: ListenerType,
+    ) -> Self {
+        Self {
+            clusters,
+            listener_kind,
+        }
+    }
+
+    /// The cluster `cluster_id` names, if the worker still holds one.
+    fn cluster(&self, cluster_id: &str) -> Option<&Cluster> {
+        self.clusters.get(cluster_id)
+    }
+
+    /// Whether this listener is plaintext HTTP, which is what both legacy
+    /// `https_redirect` sites gate on.
+    fn is_http_listener(&self) -> bool {
+        matches!(self.listener_kind, ListenerType::Http)
+    }
+}
+
 /// What [`Router::plan_connect`] decided, for the embedder to fulfil.
 ///
 /// Question 6 of [#1340](https://github.com/sozu-proxy/sozu/issues/1340): the
@@ -251,6 +313,13 @@ impl Router {
         &mut self,
         stream_id: GlobalStreamId,
         context: &mut Context<L>,
+        // The cluster-side configuration this decision reads, borrowed from
+        // the embedder for the length of the call.
+        view: &RoutingView<'_>,
+        // Still here for ONE thing: the per-(cluster, source-IP) limit gate,
+        // which is a read AND a `SessionManager::track_cluster_ip` mutation
+        // and therefore cannot become part of a read-only view. It leaves in
+        // the step that follows this one.
         proxy: Rc<RefCell<dyn L7Proxy>>,
         // Frontend session token, threaded in from `Mux::ready` so the
         // per-(cluster, source-IP) accounting can key on it without
@@ -328,7 +397,7 @@ impl Router {
                 let stream_split = &mut *stream;
                 (&mut stream_split.front, &mut stream_split.context)
             };
-            self.route_from_request(stream_context_ref, front_ref, &context.listener, &proxy)
+            self.route_from_request(stream_context_ref, front_ref, &context.listener, view)
                 .map_err(BackendConnectionError::RetrieveClusterError)?
         };
         let stream_context = &mut stream.context;
@@ -340,10 +409,8 @@ impl Router {
             h2,
             cluster_max_connections_per_ip,
             cluster_retry_after,
-        ) = proxy
-            .borrow()
-            .clusters()
-            .get(&cluster_id)
+        ) = view
+            .cluster(&cluster_id)
             .map(|cluster| {
                 (
                     cluster.sticky_session,
@@ -385,7 +452,7 @@ impl Router {
         // from `route_from_request` with the same error, so this only
         // handles the legacy cluster-level path that doesn't surface
         // from `route_from_request`.
-        if frontend_should_redirect_https && matches!(proxy.borrow().kind(), ListenerType::Http) {
+        if frontend_should_redirect_https && view.is_http_listener() {
             return Err(BackendConnectionError::RetrieveClusterError(
                 RetrieveClusterError::HttpsRedirect,
             ));
@@ -625,7 +692,7 @@ impl Router {
         context: &mut HttpContext,
         front: &mut super::GenericHttpStream,
         listener: &Rc<RefCell<L>>,
-        proxy: &Rc<RefCell<dyn L7Proxy>>,
+        view: &RoutingView<'_>,
     ) -> Result<String, RetrieveClusterError> {
         let (host, uri, method) = match context.extract_route() {
             Ok(tuple) => tuple,
@@ -805,10 +872,8 @@ impl Router {
         //  - `authorized_hashes` and `www_authenticate` for the 401 path
         let (legacy_https_redirect, https_redirect_port, authorized_hashes, www_authenticate) =
             match cluster_id.as_deref() {
-                Some(id) => proxy
-                    .borrow()
-                    .clusters()
-                    .get(id)
+                Some(id) => view
+                    .cluster(id)
                     .map(|c| {
                         (
                             c.https_redirect,
@@ -905,7 +970,7 @@ impl Router {
         // `ListenerType::Http`; gate the URL stash on the same predicate
         // so an HTTPS listener never carries a stale `redirect_location`
         // into a downstream default-answer path.
-        if legacy_https_redirect && matches!(proxy.borrow().kind(), ListenerType::Http) {
+        if legacy_https_redirect && view.is_http_listener() {
             let port = https_redirect_port;
             context.redirect_location =
                 Some(build_redirect_location("https", context, port, None, None));
@@ -1409,7 +1474,8 @@ mod tests {
     };
 
     use super::{
-        Router, authority_matches_sni, log_coalescing_accepted, log_sni_authority_mismatch,
+        Router, RoutingView, authority_matches_sni, log_coalescing_accepted,
+        log_sni_authority_mismatch,
     };
     use crate::{
         L7Proxy,
@@ -1521,9 +1587,12 @@ mod tests {
                 let split = &mut stream;
                 (&mut split.front, &mut split.context)
             };
+            let proxy_ref = proxy.borrow();
+            let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
             router
-                .route_from_request(stream_context, front, &listener, &proxy)
+                .route_from_request(stream_context, front, &listener, &view)
                 .expect("the wildcard frontend must route foo.example.com");
+            drop(proxy_ref);
 
             stream.generate_access_log(false, None, listener, None, None);
         });
@@ -1818,13 +1887,15 @@ mod authority_matched_cert_name_tests {
 /// Reverting the file wholesale deletes these tests instead of reddening them.
 #[cfg(test)]
 mod backend_selection_order_tests {
-    use std::{cell::RefCell, net::SocketAddr, rc::Rc, time::Duration};
+    use std::{cell::RefCell, collections::HashMap, net::SocketAddr, rc::Rc, time::Duration};
 
     use mio::Token;
     use rusty_ulid::Ulid;
     use sozu_command::{
         config::ListenerBuilder,
-        proto::command::{Cluster, PathRule, RequestHttpFrontend, RulePosition, SocketAddress},
+        proto::command::{
+            Cluster, ListenerType, PathRule, RequestHttpFrontend, RulePosition, SocketAddress,
+        },
     };
 
     use super::Router;
@@ -1837,8 +1908,10 @@ mod backend_selection_order_tests {
             http::parser::Method,
             mux::{
                 BackendRegistry, BackendStatus, Connection, Context, Position, StreamState,
-                buffer_source::PoolBufferSource, h2::H2ConnectionConfig,
-                h2_flood_detector::H2FloodConfig, router::ConnectPlan,
+                buffer_source::PoolBufferSource,
+                h2::H2ConnectionConfig,
+                h2_flood_detector::H2FloodConfig,
+                router::{ConnectPlan, RoutingView},
             },
         },
         socket::SessionTcpStream,
@@ -2038,8 +2111,16 @@ mod backend_selection_order_tests {
         // the router completed the attach itself and asked the embedder for
         // nothing. A `Dial` here would mean the reuse scan missed, which is
         // the failure this harness exists to catch.
+        let proxy_ref = fixture.proxy.borrow();
+        let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
         let plan = router
-            .plan_connect(stream_id, &mut context, fixture.proxy.clone(), Token(0))
+            .plan_connect(
+                stream_id,
+                &mut context,
+                &view,
+                fixture.proxy.clone(),
+                Token(0),
+            )
             .expect("the router must reuse one of the staged backends");
         assert!(
             matches!(plan, ConnectPlan::Attached),
@@ -2049,6 +2130,106 @@ mod backend_selection_order_tests {
         match context.streams[stream_id].state {
             StreamState::Linked(token) => token,
             other => panic!("connect must link the stream to a backend, got {other:?}"),
+        }
+    }
+
+    /// The routing decision reads cluster configuration from the view it was
+    /// handed, not from the `L7Proxy` handle it still carries.
+    ///
+    /// Question 6 of [#1340](https://github.com/sozu-proxy/sozu/issues/1340)
+    /// puts routing inside the core, and the only thing that makes that worth
+    /// anything is that the data routing reads is supplied rather than
+    /// fetched — otherwise a simulator still cannot drive the decision. This
+    /// hands `Router::plan_connect` a view that DISAGREES with the proxy
+    /// about the one cluster knob the plan surfaces, and asserts the plan
+    /// follows the view.
+    ///
+    /// The fixture registers `H2_CLUSTER` with `http2: Some(true)`. The view
+    /// below says `Some(false)` for the same cluster id. A `Dial { h2: true }`
+    /// would mean the decision went back to `L7Proxy::clusters` behind the
+    /// view's back.
+    ///
+    /// To SEE THIS RED: restore either cluster read to the handle — in
+    /// `Router::plan_connect` write `proxy.borrow().clusters().get(&cluster_id)`
+    /// in place of `view.cluster(&cluster_id)` — and the assertion below
+    /// reports `h2: true`.
+    #[test]
+    fn the_routing_decision_reads_cluster_config_from_the_view() {
+        let fixture = routing_fixture();
+        let pool = &fixture.pool;
+        let mut context = Context::new(
+            Ulid::generate(),
+            Rc::downgrade(pool),
+            fixture.listener.clone(),
+            // No session address: the per-(cluster, source-IP) gate — the one
+            // read still taken through the handle — is skipped, so this test
+            // isolates the reads that moved.
+            None,
+            "127.0.0.1:80"
+                .parse()
+                .expect("test public address must parse"),
+        );
+        let stream_id = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out a stream");
+        {
+            let stream = &mut context.streams[stream_id];
+            stream.state = StreamState::Link;
+            stream.context.authority = Some(H2_AUTHORITY.to_owned());
+            stream.context.path = Some("/".to_owned());
+            stream.context.method = Some(Method::Get);
+        }
+
+        // A cluster map that is NOT the proxy's, disagreeing on `http2`.
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            H2_CLUSTER.to_owned(),
+            Cluster {
+                cluster_id: H2_CLUSTER.to_owned(),
+                http2: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            fixture
+                .proxy
+                .borrow()
+                .clusters()
+                .get(H2_CLUSTER)
+                .and_then(|c| c.http2),
+            Some(true),
+            "premise: the proxy and the view must disagree, or this proves nothing"
+        );
+        let view = RoutingView::new(&clusters, ListenerType::Http);
+
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let plan = router
+            .plan_connect(
+                stream_id,
+                &mut context,
+                &view,
+                fixture.proxy.clone(),
+                Token(0),
+            )
+            .expect("routing must resolve the staged cluster");
+
+        match plan {
+            ConnectPlan::Dial {
+                ref cluster_id, h2, ..
+            } => {
+                assert_eq!(
+                    cluster_id, H2_CLUSTER,
+                    "premise: routing resolved a cluster"
+                );
+                assert!(
+                    !h2,
+                    "the plan must carry the view's `http2`, not the proxy's — \
+                     `h2: true` means the decision read `L7Proxy::clusters` behind the view"
+                );
+            }
+            ConnectPlan::Attached => {
+                panic!("premise: an empty router has nothing to reuse, so it must ask for a dial")
+            }
         }
     }
 
@@ -2112,8 +2293,16 @@ mod backend_selection_order_tests {
         // An EMPTY router: nothing to reuse, so routing must fall through to
         // the new-backend path and ask the embedder for a dial.
         let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let proxy_ref = fixture.proxy.borrow();
+        let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
         let plan = router
-            .plan_connect(stream_id, &mut context, fixture.proxy.clone(), Token(0))
+            .plan_connect(
+                stream_id,
+                &mut context,
+                &view,
+                fixture.proxy.clone(),
+                Token(0),
+            )
             .expect("routing must resolve the staged cluster");
 
         match &plan {
