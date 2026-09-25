@@ -2170,6 +2170,50 @@
   `Drop`. The queue is FIFO and its values are signed deltas, so a step that reaches neither
   records the same sum at the next drain rather than losing it.
 
+- **`refactor(mux-h2)`: the H2 core's counters follow its gauges out as `MetricEvent`s
+  ([#1341](https://github.com/sozu-proxy/sozu/issues/1341), Q4 — the counters).** Thirty more
+  metric-macro sites inside `impl ConnectionH2` become `MetricEvent` pushes that `H2Shell` records
+  through `record_metric`, leaving **three** macro sites in the H2 core where there were 41.
+  Same keys, same counts, same aggregate. Twenty-three variants are added, named for what happened
+  rather than for the key they map to — `RstStreamSent(H2Error)`, `FrameReceived(FrameType)`,
+  `StreamReapedIdleTimeout` — so the mapping onto `h2.*` lives shell-side with the aggregator.
+  `metric_for_goaway_sent`, `metric_for_rst_stream_sent`, `metric_for_goaway_received`,
+  `metric_for_rst_stream_received` and `h2_frame_rx_metric_key` are unchanged as helpers; they are
+  simply called one layer out now.
+  **Two adjacent macro lines were folded into one event only where both were unconditional**:
+  `RstStreamSent` carries the frame-type total and the per-code breakdown together, because
+  `ConnectionH2::account_emitted_rst` and `ConnectionH2::end_stream` emit them on consecutive
+  unconditional lines. The GOAWAY pair was deliberately NOT folded —
+  `count!(metric_for_goaway_sent(error), 1)` fires before `serializer::gen_goaway` runs while
+  `incr!(names::h2::FRAMES_TX_GOAWAY)` fires inside its `Ok` arm, so one event would record a frame
+  on the wire that a serialisation failure never wrote. `MetricEvent::GoAwaySent` and
+  `MetricEvent::GoAwayFrameSent` stay separate for that reason.
+  **The drain widened, because a late counter is a wrong counter in a way a late gauge is not.** A
+  gauge delta recorded at teardown still sums correctly; a counter recorded there is attributed
+  past however many scrapes the connection outlived, `LocalDrain` being cumulative and scraped
+  periodically. `H2Shell::end_stream` — the one public entry point that reaches a producer and
+  settles through neither `H2Shell::settled` nor `H2Shell::settle` — now drains, and
+  `H2Shell::record_pending_metrics` documents the three drain sites and names the entry points that
+  reach no producer at all. `Drop` remains the backstop, so the worst case stays deferral rather
+  than loss. `a_queued_counter_is_recorded_when_its_entry_point_returns` pins it, and
+  `one_rst_stream_sent_event_records_both_of_its_counters` pins that the folded pair did not become
+  half a merge; both were seen red before they were trusted.
+  `parser::FrameType` gains `Copy` and `parser::Frame` gains a `frame_type()` accessor, so the core
+  can name a parsed frame's type without re-deriving it: `FrameHeader` already carried a
+  `frame_type` field, and the twelve-arm match callers wrote instead was the workaround for the
+  missing accessor. The derive is free rather than merely safe — `FrameType::Unknown(u8)` is its
+  only payload-carrying variant and `u8` is `Copy`, and no `.clone()` on a `FrameType` value exists
+  anywhere in the tree, so `clippy::clone_on_copy` has nothing to fire on under `-D warnings`.
+  `MetricEvent` drops `Eq` (keeping `PartialEq`) because `H2Error` and `FrameType` derive only the
+  latter; it is `pub(super)` and has no consumer outside `protocol::mux`.
+  Still deliberately left behind, with the reason in each case: `names::http::REQUESTS` and
+  `names::http::ACTIVE_REQUESTS` in `ConnectionH2::handle_headers_frame`, because the gauge's
+  paired `-1` is in `Stream::generate_access_log` and a gauge moves with its pair; and
+  `names::backend::RETRY_STALE_UPSTREAM` in `ConnectionH2::end_stream`, the only labelled site,
+  whose `Option<&str>` cluster and backend labels would have to become owned `Option<String>` —
+  making `MetricEvent` non-`Copy` and allocating on the retry path, which is a datapath trade and
+  not a mechanical substitution.
+
 ### 🐛 Fixed
 
 - **`fix(mux-h1)`: the `peer=` slot of every `MUX-H1` log line is read from a snapshot

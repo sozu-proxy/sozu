@@ -238,7 +238,7 @@ A flow is reaped on the **first** of these (`CloseReason`, `flow.rs`):
 
 | Knob | Config | Semantics | Check |
 |------|--------|-----------|-------|
-| **idle** | `front_timeout` / `back_timeout` (default 30 s, `mod.rs:272-273`) | no datagram in that direction within the window | `UdpManager::handle_timeout` (`manager.rs`) |
+| **idle** | `front_timeout` / `back_timeout` (default 30 s, `mod.rs:279-280`) | no datagram in that direction within the window | `UdpManager::handle_timeout` (`manager.rs`) |
 | **responses** | `responses` (`0` = unlimited) | close after N backend replies — **DNS uses 1** | `UdpFlow::responses_exhausted` (`flow.rs`) |
 | **requests** | `requests` (`0` = unlimited) | close after N client forwards | `UdpFlow::requests_exhausted` (`flow.rs`) |
 | drain / admin | — | listener drain, remove, soft/hard-stop, abort | `UdpManager::close_all` (`manager.rs`), `UdpManager::abort_flow` (`manager.rs`) |

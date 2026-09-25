@@ -218,6 +218,13 @@ pub enum DropReason {
 
 /// Metric events the core asks the shell to record. The shell owns the
 /// `incr!`/`count!`/`gauge!`/`time!` macros (`lib/src/metrics/`).
+///
+/// `protocol::mux::h2`'s `MetricEvent` is a different type with the same name,
+/// and deliberately so: it carries the H2 core's own vocabulary and shares no
+/// variant with this one. Converging them would put H2 connection gauges
+/// inside [`Output::Metric`], which every consumer of this enum would then
+/// have to match on. The shared name is the same idiom
+/// [`crate::protocol::tcp_preread::Output`] and [`Output`] already use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MetricEvent {
     /// A new flow was admitted (`udp.flows.created`, `udp.active_flows += 1`).
