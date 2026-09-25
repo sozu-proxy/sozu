@@ -319,8 +319,8 @@ from `Mux::ready`. Termination may be triggered by:
 - Frontend HUP — detected by the `readiness().event.is_hup()` branch of
   `Mux::ready` (`lib/src/protocol/mux/mod.rs`), subject to
   `delay_close_for_frontend_flush` (`mod.rs`) to avoid truncating TLS.
-- `MuxResult::CloseSession` from any readable/writable path (`mod.rs:2042`,
-  `mod.rs:2414`, etc.).
+- `MuxResult::CloseSession` from any readable/writable path (`mod.rs:2091`,
+  `mod.rs:2463`, etc.).
 - A loop-iteration budget overrun (`MAX_LOOP_ITERATIONS = 10_000`, `mod.rs`,
   checked in the inner loop of `Mux::ready_inner`).
 - Timeout (`Mux::timeout`, `mod.rs`).
@@ -514,15 +514,38 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   (`router.rs`) pins it by handing the decision a view that disagrees with the
   proxy and asserting the plan follows the view.
 
-  One read is left, and it is not a read: the per-(cluster, source-IP) limit
-  gate calls `SessionManager::cluster_ip_at_limit` **and**
+  The per-(cluster, source-IP) limit gate could not follow them, because it is
+  not a read: it calls `SessionManager::cluster_ip_at_limit` **and**
   `SessionManager::track_cluster_ip`, a mutation of worker-global state
   (`connections_per_cluster_ip`, keyed on `(cluster, ip)` across every session
-  and read again by `lib/src/tcp.rs`'s own gate). It cannot become part of a
-  read-only view, so it becomes a returned step in its own right. Backend
-  selection likewise still reaches the handle, from `Mux::dial_backend`
-  through `Router::backend_from_request`; giving it a borrowed view of backend
-  load state is Question 12's second part.
+  and read again by `lib/src/tcp.rs`'s own gate). A read-only view cannot carry
+  a mutation, so the gate is a **returned step** instead:
+  `Router::plan_connect` answers `ConnectStep::CheckIpLimit(ConnectResume)`,
+  `consult_ip_gate` (`mod.rs`) performs the consult and the track, and
+  `Router::plan_connect_resume` finishes on the verdict. `plan_connect` now
+  takes no `Rc<RefCell<dyn L7Proxy>>` at all.
+
+  Two things make the split hard to get wrong rather than merely documented.
+  `ConnectResume` is taken **by value**, so a parked decision cannot be
+  resumed twice — `H2Shell::settled` taking its parked target, applied here.
+  And the resumed call returns `ConnectPlan`, not `ConnectStep`, so a second
+  gate consultation is unrepresentable rather than just incorrect. Both
+  entries share one `Router::decide_after_gate` body, so the gated and ungated
+  paths cannot drift.
+
+  **The track happens before the decision resumes, and that ordering is the
+  invariant.** An `IpGateVerdict::Admitted` asserts to the core that the slot
+  has been taken; resuming as `Admitted` without tracking would let the stream
+  through uncounted, and because the counter is worker-global the next session
+  from the same IP would find a slot that should already be gone.
+  `an_admitted_stream_is_counted_before_the_decision_resumes` (`router.rs`)
+  drives the real three-step sequence for two different frontend tokens from
+  one source IP against a limit of one — two tokens, because the gate is
+  deliberately idempotent within a token.
+
+  Backend selection still reaches the handle, from `Mux::dial_backend` through
+  `Router::backend_from_request`; giving it a borrowed view of backend load
+  state is Question 12's second part.
 - **Backend detach.** `Context::unlink_stream` (`mod.rs`) — called from the four
   timeout arms of `Mux::timeout_inner` (`mod.rs`), from H1 EOF (`h1.rs:1047`),
   and from `ConnectionH2::reset_stream` and `ConnectionH2::end_stream`
@@ -594,7 +617,7 @@ runs — see §6.
    wire-id entry (never a public surface).
 3. A `StreamState::Linked(token)` must have a matching entry in
    `context.backend_streams[token]`. This is asserted in debug builds at
-   `mod.rs:2672-2702` after every `ready()` pass.
+   `mod.rs:2737-2767` after every `ready()` pass.
 
 The H1 side keeps its single `stream: Option<GlobalStreamId>` in `ConnectionH1`
 — there is no hashmap because H1 multiplexing is limited to request pipelining
@@ -799,7 +822,7 @@ re-validates every delivery and puts an early one back — §7.6.
   frontend token — see §7.7.
 - Fired when: no traffic observed for `configured_frontend_timeout`
   (`mod.rs:1071`) while any stream is live, or the shorter `request_timeout`
-  until the first `Link` transition (`mod.rs:2473-2475`).
+  until the first `Link` transition (`mod.rs:2522-2524`).
 - Reset: on meaningful activity — HEADERS for an existing stream, DATA bytes
   read, and a write-pass transmit that moved a stream's bytes — see
   `ConnectionH2::handle_headers_frame` (`h2.rs`), the `arm_timeout()` call in
@@ -818,7 +841,7 @@ re-validates every delivery and puts an early one back — §7.6.
   flushed a PING ACK reset the deadline the read side had just refused to
   reset. The write site is now per transmit and gated on the bytes, so an
   acknowledgement-only pass arms nothing.
-- Handling: `Mux::timeout` inspects each stream's state (`mod.rs:2776`) and
+- Handling: `Mux::timeout` inspects each stream's state (`mod.rs:2841`) and
   either writes a default 408/503/504 answer, forcefully terminates, or keeps
   draining.
 - Access-log discriminator: before each `set_default_answer` or
@@ -902,8 +925,8 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
   (`Connection::set_timeout_duration`, called from `Mux::ready_inner`).
 - Fired by: timer wheel → `Mux::timeout` with the backend token.
 - Action: for each stream linked to that backend, either send 504, or forcefully
-  terminate, or keep draining — see `mod.rs:2877-2932`. The timeout is re-armed
-  if the session stays alive (`mod.rs:3007`) to avoid the "immortal zombie"
+  terminate, or keep draining — see `mod.rs:2942-2997`. The timeout is re-armed
+  if the session stays alive (`mod.rs:3072`) to avoid the "immortal zombie"
   state.
 - Access-log discriminator: the "response not started" arm sets
   `stream.context.access_log_message = Some("backend_timeout")`; the "response
@@ -937,14 +960,14 @@ Every deadline above is evaluated against a snapshot, not against a fresh
 `Instant::now()`. **`Mux` is the only clock sampler in the mux.** It writes
 `Context.now` (`mod.rs:766`) at three points:
 
-- once per **outer** `Mux::ready` pass (`mod.rs:2022`), so that the inner loop
+- once per **outer** `Mux::ready` pass (`mod.rs:2071`), so that the inner loop
   deliberately shares one instant — that is the property the snapshot exists
   for, not a claim about how long a sweep takes. `MAX_LOOP_ITERATIONS` is a
-  count and bounds iterations, not wall clock, and `counter` (`mod.rs:1974`)
+  count and bounds iterations, not wall clock, and `counter` (`mod.rs:2023`)
   sits above both loops, so one `ready()` call can spend the whole budget
   under a single snapshot;
-- at the top of `Mux::timeout_inner` (`mod.rs:2711`);
-- at the top of `Mux::shutting_down_inner` (`mod.rs:3105`), which runs outside
+- at the top of `Mux::timeout_inner` (`mod.rs`);
+- at the top of `Mux::shutting_down_inner` (`mod.rs:3170`), which runs outside
   `ready()` entirely. That line is load-bearing, not belt-and-braces:
   `drive_frontend_shutdown_io` (`mod.rs`) always reaches `readable()` for
   an H2 frontend — `force_h2_read` is unconditionally true, so the early
@@ -1194,7 +1217,7 @@ Two GOAWAY frames in `ConnectionH2::graceful_goaway` (`h2.rs`):
 1. **Initial GOAWAY** — send GOAWAY with `last_stream_id = 0x7FFFFFFF`
    (`STREAM_ID_MAX`, `h2.rs`); keep `READABLE` so in-flight request bodies
    can still arrive. Called first time from `Mux::shutting_down_inner` at
-   `mod.rs:3119`. Draining flag set.
+   `mod.rs:3184`. Draining flag set.
 2. **Final GOAWAY** — on the second invocation (draining already true), call
    `goaway(NoError)` (`h2.rs:4854`) with the actual `highest_peer_stream_id`,
    remove `READABLE` interest (`h2.rs:4810`), transition to `H2State::GoAway`.
@@ -1217,7 +1240,7 @@ Three directions:
   [`enqueue_rst`](#proxy-rst-emission-path), and counts against
   `record_rst_emitted` (CVE-2025-8671 MadeYouReset) unless `NoError`.
 - **Proxy-initiated, idle cancel** — `cancel_timed_out_streams` (§7.2); the
-  per-stream `forcefully_terminate_answer` call in the `mod.rs:2831` timeout
+  per-stream `forcefully_terminate_answer` call in the `mod.rs:2896` timeout
   path now arms `Ready::WRITABLE` via `arm_writable()` so the pair with
   `event::WRITABLE` actually schedules the next `writable()` tick under
   edge-triggered epoll.
@@ -1321,7 +1344,7 @@ RFC 9113 §§5.3, 6.9, 8.1.2.
 `Mux::shutting_down` (`mod.rs`) is called by the server loop during process
 shutdown or listener reload. It:
 
-1. Initiates the double-GOAWAY (`mod.rs:3119`).
+1. Initiates the double-GOAWAY (`mod.rs:3184`).
 2. Drives frontend I/O outside the epoll loop (`drive_frontend_shutdown_io`,
    `mod.rs`) — H2 needs extra passes for the peer's END_STREAM and final TLS
    flush.
@@ -1512,7 +1535,7 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
 2. **Backend index consistency.** If
    `context.streams[gid].state == StreamState::Linked(token)`, then
    `context.backend_streams[&token]` contains `gid`. Asserted under
-   `debug_assertions` in `Mux::ready` at `mod.rs:2672-2702`.
+   `debug_assertions` in `Mux::ready` at `mod.rs:2737-2767`.
 3. **`expect_write` validity.** If
    `expect_write == Some(H2StreamId::Other { gid, .. })`, then
    `gid < context.streams.len()` and the slot at `gid` is not `Recycle`. Every
@@ -1584,7 +1607,7 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
    that never arms is the opposite defect — an unconditional session cap — and
    a "the deadline did not move" assertion alone cannot tell the two apart.
 10. **Single `graceful_goaway` per session outside the final GOAWAY.**
-    `Mux::shutting_down_inner` (`mod.rs:3118-3119`) only calls it if
+    `Mux::shutting_down_inner` (`mod.rs:3183-3184`) only calls it if
     `!self.frontend.is_draining()`; a second unconditional call would
     collapse the initial GOAWAY into the final one and disconnect
     in-flight streams.

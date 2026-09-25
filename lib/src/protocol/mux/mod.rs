@@ -1107,6 +1107,55 @@ pub struct Mux<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     pub session_ulid: Ulid,
 }
 
+/// Answer the per-`(cluster, source-IP)` limit step the core paused at.
+///
+/// The embedder half of [`router::ConnectStep::CheckIpLimit`]. The core
+/// cannot do this itself: it is a consult of
+/// `SessionManager::cluster_ip_at_limit` **and**, on the admitting path, a
+/// call to `SessionManager::track_cluster_ip`, which mutates
+/// `connections_per_cluster_ip` — worker-global state keyed on
+/// `(cluster, ip)` across every session, and read again by
+/// `lib/src/tcp.rs`'s own gate for the TCP proxy.
+///
+/// **The track happens here, before the decision resumes, and that ordering
+/// is the point.** An `Admitted` verdict asserts to the core that the slot
+/// has been taken. Resuming as `Admitted` without having tracked would let
+/// the stream through uncounted, and because the counter is worker-global
+/// the next session from the same IP would find a slot that should already
+/// be gone. `an_admitted_stream_is_counted_before_the_decision_resumes`
+/// pins it.
+///
+/// A free function rather than a `Mux` method so it can be driven directly:
+/// the ordering above is the thing worth testing, and testing it through a
+/// copy of this logic would prove nothing about this logic.
+fn consult_ip_gate(
+    sessions: &Rc<RefCell<crate::server::SessionManager>>,
+    frontend_token: Token,
+    resume: &router::ConnectResume,
+) -> router::IpGateVerdict {
+    let at_limit = sessions.borrow().cluster_ip_at_limit(
+        frontend_token,
+        resume.cluster_id(),
+        &resume.ip(),
+        resume.max_connections_per_ip(),
+    );
+    if at_limit {
+        let retry_after = sessions
+            .borrow()
+            .effective_retry_after(resume.cluster_retry_after());
+        return router::IpGateVerdict::AtLimit { retry_after };
+    }
+    // Idempotent track — H2 streams to the same `(cluster, ip)` share a
+    // single slot in the per-token set. The decrement happens wholesale on
+    // session close, via `untrack_all_cluster_ip`.
+    sessions.borrow_mut().track_cluster_ip(
+        frontend_token,
+        resume.cluster_id().to_owned(),
+        resume.ip(),
+    );
+    router::IpGateVerdict::Admitted
+}
+
 impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L> {
     pub fn front_socket(&self) -> &TcpStream {
         self.frontend.socket()
@@ -2500,13 +2549,29 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 let view = router::RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
                 match self
                     .router
-                    .plan_connect(
-                        stream_id,
-                        context,
-                        &view,
-                        proxy.clone(),
-                        self.frontend_token,
-                    )
+                    .plan_connect(stream_id, context, &view)
+                    .and_then(|step| match step {
+                        router::ConnectStep::Decided(plan) => Ok(plan),
+                        // The core resolved a cluster and paused: the
+                        // per-(cluster, source-IP) gate is a consult AND a
+                        // mutation of worker-global session state, so the core
+                        // cannot perform it. Answer it here, then resume.
+                        //
+                        // The track must land BEFORE the decision resumes, not
+                        // after: `cluster_ip_at_limit` is read by every other
+                        // session on this worker and by `lib/src/tcp.rs`'s own
+                        // gate, so a stream admitted but not yet counted is a
+                        // slot a concurrent stream can take twice.
+                        router::ConnectStep::CheckIpLimit(resume) => {
+                            let verdict = consult_ip_gate(
+                                &proxy.borrow().sessions(),
+                                self.frontend_token,
+                                &resume,
+                            );
+                            self.router
+                                .plan_connect_resume(stream_id, context, resume, verdict)
+                        }
+                    })
                     .and_then(|plan| match plan {
                         router::ConnectPlan::Attached => Ok(()),
                         router::ConnectPlan::Dial {
