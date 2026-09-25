@@ -622,7 +622,7 @@ impl L7ListenerHandler for SimListener {
         _uri: &str,
         _method: &Method,
     ) -> Result<RouteResult, FrontendFromRequestError> {
-        // Routing lives in `Router::connect`, which only `Mux::ready_inner`
+        // Routing lives in `Router::plan_connect`, which only `Mux::ready_inner`
         // drives — never `ConnectionH2::readable`. Nothing in this harness can
         // reach this method; it answers an error so a future caller fails
         // loudly instead of silently routing somewhere.

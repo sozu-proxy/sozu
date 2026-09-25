@@ -1853,7 +1853,7 @@ impl L7Proxy for HttpProxy {
         // slot is freed — once the slot is reused for a new session the
         // token would otherwise alias an unrelated set of entries. No-op
         // when the session never tracked anything (feature disabled, or
-        // no request reached `Router::connect`).
+        // no request reached `Router::plan_connect`).
         sessions.untrack_all_cluster_ip(token);
         let removed = sessions.slab.try_remove(token.0).is_some();
         // Removal must report exactly whether the slot was occupied, and the

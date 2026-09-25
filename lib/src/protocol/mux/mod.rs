@@ -26,7 +26,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use mio::{Token, net::TcpStream};
+use mio::{Interest, Token, net::TcpStream};
 use rand::{SeedableRng, rngs::StdRng};
 use rusty_ulid::Ulid;
 use sozu_command::{
@@ -810,7 +810,7 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     ///
     /// Entries are applied in the order they were pushed, and the drain runs
     /// before anything reads backend load state — in practice, before each
-    /// `Router::connect`, whose load balancer is that sole reader. FIFO plus
+    /// `Router::plan_connect`, whose load balancer is that sole reader. FIFO plus
     /// drain-before-read leaves the counters at every read point exactly
     /// where mutating in place left them, saturation included.
     pub backend_deltas: Vec<BackendDelta>,
@@ -904,7 +904,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
     /// Prefer this over `&self.streams[stream_id].context` at call sites
     /// that only need read access — it keeps the `Stream`/`HttpContext`
     /// relationship encapsulated and reads the same regardless of whether
-    /// the caller is inside `Router::connect`, the H2 mux, or a free
+    /// the caller is inside `Router::plan_connect`, the H2 mux, or a free
     /// helper. Panics on an out-of-bounds `stream_id`, which is the same
     /// behaviour as the raw `streams[sid]` indexing it replaces.
     pub fn http_context(&self, stream_id: GlobalStreamId) -> &HttpContext {
@@ -913,7 +913,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
 
     /// Mutable sibling of [`Self::http_context`]. Use when routing
     /// decisions need to stamp `cluster_id` / `backend_id` on the stream's
-    /// [`HttpContext`] (e.g. `Router::connect` at the fill-cluster /
+    /// [`HttpContext`] (e.g. `Router::plan_connect` at the fill-cluster /
     /// fill-backend points).
     pub fn http_context_mut(&mut self, stream_id: GlobalStreamId) -> &mut HttpContext {
         &mut self.streams[stream_id].context
@@ -1123,7 +1123,7 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L>
     ///
     /// Called from the four `Mux` wrappers that already owe the timer wheel a
     /// `reschedule` on every exit, and once more immediately before each
-    /// `Router::connect`, because that call's load balancer is the only
+    /// `Router::plan_connect`, because that call's load balancer is the only
     /// reader of the counters this drains.
     pub(crate) fn apply_backend_deltas(&mut self) {
         for delta in std::mem::take(&mut self.context.backend_deltas) {
@@ -1776,6 +1776,195 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 /// every exit path needs: the [`Mux::reschedule`] that pushes the cores'
 /// deadlines onto the timer wheel.
 impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHandler> Mux<Front, L> {
+    /// Fulfil a [`router::ConnectPlan::Dial`]: select a backend, dial it,
+    /// build the connection, register it, and hand it to
+    /// `Router::commit_dialed`.
+    ///
+    /// This is the embedder half of Question 6's split
+    /// ([#1340](https://github.com/sozu-proxy/sozu/issues/1340)). Every step
+    /// here reaches something the core has no business holding — the
+    /// `BackendMap`, a `connect(2)`, `setsockopt`, the session slab, the mio
+    /// registry — and the order is the one `Router::plan_connect` used, unchanged.
+    ///
+    /// SECURITY (CWE-400): every stateful side-effect (the
+    /// `backend.connections` / `backend.pool.size` /
+    /// `connections_per_backend` gauges, the slab session, the mio
+    /// registration, the router-map entry, `stream.metrics.backend_start`) is
+    /// deferred until AFTER both the `Connection` constructor and
+    /// `start_stream` have succeeded. If either fails this returns `Err`
+    /// without leaking a slab entry, an epoll registration, a gauge counter
+    /// or a router-map entry. The `TcpStream` lives on the stack and is moved
+    /// into the `Connection`; on failure the `Connection` — or the raw
+    /// `TcpStream`, for the pool-exhaustion branch that drops inside
+    /// `Connection::new_h2_client` — is dropped, closing the fd. No token is
+    /// allocated before that point, so there is nothing to roll back.
+    ///
+    /// Taken as free functions over `&mut` fields rather than `&mut self` so
+    /// the caller can keep its `&mut self.context` binding across the call.
+    #[allow(clippy::too_many_arguments)]
+    fn dial_backend(
+        router: &mut Router,
+        backend_registry: &mut BackendRegistry,
+        stream_id: GlobalStreamId,
+        context: &mut Context<L>,
+        session: &Rc<RefCell<dyn ProxySession>>,
+        proxy: &Rc<RefCell<dyn L7Proxy>>,
+        cluster_id: &str,
+        h2: bool,
+        frontend_should_stick: bool,
+    ) -> Result<(), BackendConnectionError> {
+        let (socket, backend) = router.backend_from_request(
+            cluster_id,
+            frontend_should_stick,
+            &mut context.streams[stream_id].context,
+            proxy.clone(),
+        )?;
+
+        if let Err(e) = socket.set_nodelay(true) {
+            error!(
+                "{} error setting nodelay on back socket({:?}): {:?}",
+                log_module_context!(context.http_context(stream_id)),
+                socket,
+                e
+            );
+        }
+
+        // The one place a registry handle becomes an opaque id: the
+        // embedder's table names it, copies the two identity fields the
+        // datapath renders, and the `Rc` goes no further. Everything below
+        // this line — and every `Position::Client` built from it — holds
+        // `backend`, never the handle.
+        let backend = backend_registry.id_for(&backend);
+
+        // Cache the backend's configured address so SOCKET log lines fired on
+        // ECONNREFUSED (or any failed async `connect()`) can still render
+        // `peer=<backend>` — `getpeername(2)` returns ENOTCONN in that state,
+        // so the live lookup path would show `peer=None` exactly when the
+        // operator needs the backend id.
+        let backend_peer = Some(backend.address);
+        let socket = SessionTcpStream::new(socket, context.session_ulid, backend_peer);
+
+        let flood_config = context.listener.borrow().get_h2_flood_config();
+        let connection_config = context.listener.borrow().get_h2_connection_config();
+        let stream_idle_timeout = context.listener.borrow().get_h2_stream_idle_timeout();
+        let graceful_shutdown_deadline = context
+            .listener
+            .borrow()
+            .get_h2_graceful_shutdown_deadline();
+        let backend_id_for_gauge = backend.backend_id.to_string();
+        let mut connection = if h2 {
+            match Connection::new_h2_client(
+                context.session_ulid,
+                socket,
+                cluster_id.to_owned(),
+                backend,
+                &mut *context.buffers,
+                router.configured_connect_timeout,
+                flood_config,
+                connection_config,
+                stream_idle_timeout,
+                graceful_shutdown_deadline,
+            ) {
+                Some(connection) => connection,
+                // Pool exhaustion: the socket was already dropped by
+                // `new_h2_client` and no side-effect has been committed.
+                None => return Err(BackendConnectionError::MaxBuffers),
+            }
+        } else {
+            Connection::new_h1_client(
+                context.session_ulid,
+                socket,
+                cluster_id.to_owned(),
+                backend,
+                router.configured_connect_timeout,
+            )
+        };
+
+        // Check the backend can accept a new stream BEFORE committing any
+        // registry state. `start_stream` records its `StreamsStarted` delta
+        // only once the start has succeeded, so a refusal leaves the backend
+        // accounting untouched rather than needing a rollback.
+        if !connection.start_stream(stream_id, context) {
+            error!(
+                "{} Backend rejected stream start (max concurrent streams reached)",
+                log_module_context!(context.http_context(stream_id))
+            );
+            // `connection` (socket + pending timeout deadline) drops here; no
+            // wheel entry was ever armed for it.
+            return Err(BackendConnectionError::MaxSessionsMemory);
+        }
+
+        // --- Happy path: commit side-effects in one atomic-ish block ---
+        let stream = &mut context.streams[stream_id];
+        stream.metrics.backend_start();
+        stream.metrics.backend_id = stream.context.backend_id.to_owned();
+        gauge_add!(names::backend::CONNECTIONS, 1);
+        // `backend.pool.size` mirrors `backend.connections` exactly: one entry
+        // per `Router::backends` token. The `-1` partners live in
+        // `connection.rs::pre_close_client_bookkeeping` (graceful close) and
+        // in `Mux::close` (session teardown). Symmetric pairing with both
+        // decrement sites is the only defence against the gauge underflow
+        // class of bug fixed by ff401b54 / aadb3fa4.
+        gauge_add!(names::backend::POOL_SIZE, 1);
+        gauge_add!(
+            names::backend::CONNECTIONS_PER_BACKEND,
+            1,
+            Some(cluster_id),
+            Some(&backend_id_for_gauge)
+        );
+
+        let token = proxy.borrow().add_session(session.clone());
+
+        {
+            let socket_ref = connection.socket_mut();
+            if let Err(e) = proxy.borrow().register_socket(
+                socket_ref,
+                token,
+                Interest::READABLE | Interest::WRITABLE,
+            ) {
+                // SECURITY (CWE-400): treat mio registration failure as a hard
+                // connect failure. Without this rollback the gauges
+                // (`backend.connections`, `backend.pool.size`,
+                // `connections_per_backend`) and the slab session leak until
+                // the connect timeout fires. Under fd pressure
+                // (EMFILE/ENFILE) this can occur in tight bursts and poison
+                // capacity dashboards.
+                error!(
+                    "{} error registering back socket: {:?} — rolling back",
+                    log_module_context!(context.http_context(stream_id)),
+                    e
+                );
+                // Undo the gauge increments committed above.
+                gauge_add!(names::backend::CONNECTIONS, -1);
+                gauge_add!(names::backend::POOL_SIZE, -1);
+                gauge_add!(
+                    names::backend::CONNECTIONS_PER_BACKEND,
+                    -1,
+                    Some(cluster_id),
+                    Some(&backend_id_for_gauge)
+                );
+                // Release the `active_requests` charge `start_stream` took.
+                //
+                // The comment this replaces claimed the drop released it "via
+                // the regular session drop path
+                // (`pre_close_client_bookkeeping`)". That was never true:
+                // `Connection` has no `impl Drop`, so dropping it runs no
+                // bookkeeping at all. It was harmless only because the charge
+                // is guarded on `BackendStatus::Connected` and a
+                // freshly-dialled connection is `Connecting`, so there was
+                // nothing to release. Emitting the release explicitly, under
+                // the same guard the charge uses, makes the pair hold however
+                // the status is reached rather than by accident.
+                connection.release_start_stream_charge(context);
+                proxy.borrow().remove_session(token);
+                return Err(BackendConnectionError::MaxSessionsMemory);
+            }
+        }
+
+        router.commit_dialed(stream_id, context, token, connection);
+        Ok(())
+    }
+
     fn ready_inner(
         &mut self,
         session: Rc<RefCell<dyn ProxySession>>,
@@ -2287,22 +2476,40 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 let front_readiness = self.frontend.readiness_mut();
                 dirty = true;
                 // Settle the ledger before the ONLY reader of backend load
-                // state on this path runs: `Router::connect`'s load balancer
-                // weighs `active_requests` and `connection_time`. Draining
-                // here is what keeps a second stream linking in the same pass
-                // seeing the first stream's charge, exactly as it did when
-                // the charge was applied in place.
+                // state on this path runs: the load balancer reached from
+                // `Mux::dial_backend` below weighs `active_requests` and
+                // `connection_time`. Draining here is what keeps a second
+                // stream linking in the same pass seeing the first stream's
+                // charge, exactly as it did when the charge was applied in
+                // place. It is also what makes the view each selection reads
+                // current: `Backend::try_connect` increments
+                // `active_connections` synchronously at the dial, inside this
+                // same loop iteration, so the next iteration's selection sees
+                // it (#1340, Question 6's second wrinkle).
                 for delta in std::mem::take(&mut context.backend_deltas) {
                     self.backend_registry.apply(delta);
                 }
-                match self.router.connect(
-                    stream_id,
-                    context,
-                    session.clone(),
-                    proxy.clone(),
-                    self.frontend_token,
-                    &mut self.backend_registry,
-                ) {
+                match self
+                    .router
+                    .plan_connect(stream_id, context, proxy.clone(), self.frontend_token)
+                    .and_then(|plan| match plan {
+                        router::ConnectPlan::Attached => Ok(()),
+                        router::ConnectPlan::Dial {
+                            cluster_id,
+                            h2,
+                            frontend_should_stick,
+                        } => Self::dial_backend(
+                            &mut self.router,
+                            &mut self.backend_registry,
+                            stream_id,
+                            context,
+                            &session,
+                            &proxy,
+                            &cluster_id,
+                            h2,
+                            frontend_should_stick,
+                        ),
+                    }) {
                     Ok(_) => {
                         let state = context.streams[stream_id].state;
                         context.debug.push(DebugEvent::CC(stream_id, state));
@@ -2390,7 +2597,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             }
                             // Per-(cluster, source-IP) connection limit reached.
                             // Emit HTTP 429 with the resolved `Retry-After`. The
-                            // value is computed in `Router::connect` (where the
+                            // value is computed in `Router::plan_connect` (where the
                             // SessionManager + cluster override are reachable)
                             // and stashed on the stream context just before the
                             // error is returned, so the answer engine can render
@@ -2763,7 +2970,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             // deadline out on the first pass that moves a stream's bytes — not
             // on every pass, LIFECYCLE §9 invariant 9 — but nothing hangs on
             // it.) That is what covers the pool-reuse branch of
-            // `Router::connect` never arming a timeout, unlike the fresh-dial
+            // `Router::plan_connect` never arming a timeout, unlike the fresh-dial
             // branch.
             //
             // The assertion below is the cheap tripwire for link 3: if the

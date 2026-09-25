@@ -388,7 +388,7 @@ pub struct HttpContext {
     /// non-empty `val` set/replaces.
     pub headers_response: Vec<HeaderEditSnapshot>,
     /// Resolved `Retry-After` value (seconds) for an HTTP 429 default
-    /// answer. Computed in `Router::connect` when the per-(cluster,
+    /// answer. Computed in `Router::plan_connect` when the per-(cluster,
     /// source-IP) connection limit is hit, by folding the cluster's
     /// `retry_after` override over the global default. `None` (or
     /// `Some(0)`) tells the answer engine to omit the `Retry-After`

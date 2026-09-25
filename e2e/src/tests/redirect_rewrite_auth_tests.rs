@@ -1526,7 +1526,7 @@ pub fn try_redirect_permanent_uses_rewrite_host_and_template() -> State {
     // `%REDIRECT_LOCATION` is the canonical placeholder for the 301
     // Location URL — the same variable schema the listener default
     // uses, so the same `(REDIRECT_LOCATION, ROUTE, REQUEST_ID)`
-    // variable feed produced by `Router::connect` flows in cleanly.
+    // variable feed produced by `Router::plan_connect` flows in cleanly.
     let custom_template = "\
 HTTP/1.1 301 Moved Permanently\r\n\
 Location: %REDIRECT_LOCATION\r\n\

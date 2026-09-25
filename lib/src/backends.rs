@@ -393,7 +393,7 @@ pub struct BackendMap {
     pub health_check_configs: HashMap<ClusterId, HealthCheckConfig>,
     /// Whether the cluster's backends speak HTTP/2 (cluster.http2 = true).
     /// Mirrors the same backend-capability hint the mux router reads at
-    /// `protocol/mux/router.rs::Router::connect`. The health checker uses
+    /// `protocol/mux/router.rs::Router::plan_connect`. The health checker uses
     /// it to switch the probe wire format from HTTP/1.1 to h2c so an
     /// h2c-only backend is not probed with an HTTP/1.1 preface that
     /// would always fail.

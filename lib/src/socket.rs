@@ -469,7 +469,7 @@ pub struct SessionTcpStream {
     pub stream: TcpStream,
     pub session_ulid: Ulid,
     /// Peer address cached at construction. For backend-facing sockets
-    /// (created from a nonblocking `connect()` in `Router::connect`) this is
+    /// (created from a nonblocking `connect()` in `Mux::dial_backend`) this is
     /// the cluster-configured backend address — reliable across ENOTCONN
     /// after a failed handshake, which is the sharp case that motivates the
     /// cache. For frontend-facing sockets constructed from an accepted

@@ -8,7 +8,7 @@
 //! ## Determinism (nothing mandates a tie-break order; issue #1338 does)
 //!
 //! [`Router::backends`] used to be a `HashMap<Token, _>`, and
-//! `Router::connect` scans it with a plain `for (token, backend) in
+//! `Router::plan_connect` scans it with a plain `for (token, backend) in
 //! &self.backends` loop, in the map's iteration order — seeded per-`HashMap`
 //! (`RandomState`), so **which backend served a request was non-deterministic
 //! across process restarts**, for the identical set of backend connections and
@@ -71,7 +71,7 @@
 //! `insert` / `remove` / `contains_key` go from `HashMap`'s amortized `O(1)`
 //! to `BTreeMap`'s `O(log n)`, and `Mux::ready` does one `get_mut`
 //! per backend event through `EndpointClient`. Every iteration site —
-//! `Router::connect`'s scan, `Mux::reschedule`, the two
+//! `Router::plan_connect`'s scan, `Mux::reschedule`, the two
 //! `Mux::ready` sweeps — already walks all `n` and keeps its `O(n)`. At the
 //! default ceiling (`n <= 100`) a lookup is ~7 `usize` comparisons against one
 //! SipHash-1-3 of a `usize` plus a bucket probe, which is not expected to be
@@ -85,7 +85,7 @@
 
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc, time::Duration};
 
-use mio::{Interest, Token, net::TcpStream};
+use mio::{Token, net::TcpStream};
 use sozu_command::{
     logging::ansi_palette,
     proto::command::{ListenerType, RedirectPolicy, RedirectScheme},
@@ -93,11 +93,9 @@ use sozu_command::{
 
 #[cfg(debug_assertions)]
 use super::DebugEvent;
-use super::{
-    BackendRegistry, BackendStatus, Connection, Context, GlobalStreamId, Position, StreamState,
-};
+use super::{BackendStatus, Connection, Context, GlobalStreamId, Position, StreamState};
 use crate::{
-    BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, ProxySession, Readiness,
+    BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, Readiness,
     RetrieveClusterError,
     backends::{Backend, BackendError},
     protocol::http::editor::{HeaderEditMode, HeaderEditSnapshot, HttpContext},
@@ -185,6 +183,37 @@ fn log_sni_authority_mismatch(
     );
 }
 
+/// What [`Router::plan_connect`] decided, for the embedder to fulfil.
+///
+/// Question 6 of [#1340](https://github.com/sozu-proxy/sozu/issues/1340): the
+/// core decides and the embedder performs. This is the "returned request"
+/// half of that, in the shape the socket-boundary extraction used four times
+/// (`finalize_write` / `H2FinalizeTarget`, `flush_pending_control_frames` /
+/// `H2ControlFlushTarget`, `dispatch_writable_state` / `H2WritableStateTarget`,
+/// and `force_disconnect`'s inversion): the core answers a step, the caller
+/// performs the effect, the caller calls back with the answer —
+/// [`Router::commit_dialed`] here.
+#[derive(Debug)]
+pub(super) enum ConnectPlan {
+    /// The stream was attached to a backend connection the router already
+    /// held, and nothing is left to perform. Carries no token on purpose: the
+    /// attach is complete, so there is no binding a later edit could reuse to
+    /// ask a question this variant has already answered — the discipline
+    /// `H2WritableStateTarget::Flush` set by carrying no `bool`.
+    Attached,
+    /// No connection could be reused. The embedder must select a backend,
+    /// dial it, build the `Connection`, register it, and hand the result
+    /// back to [`Router::commit_dialed`].
+    Dial {
+        /// The cluster routing resolved for this stream.
+        cluster_id: String,
+        /// Whether that cluster's backends speak HTTP/2.
+        h2: bool,
+        /// Whether the frontend asked for sticky-session affinity.
+        frontend_should_stick: bool,
+    },
+}
+
 #[derive(Debug)]
 pub struct Router {
     pub backends: BTreeMap<Token, Connection<SessionTcpStream>>,
@@ -205,22 +234,30 @@ impl Router {
         }
     }
 
-    pub(super) fn connect<L: ListenerHandler + L7ListenerHandler>(
+    /// Decide what this stream needs, without performing any of it.
+    ///
+    /// Routing, the cluster gate, the per-(cluster, source-IP) limit and the
+    /// pool-reuse scan all happen here. Dialling, the slab session and the
+    /// epoll registration do not: those are the embedder's, and this answers
+    /// a [`ConnectPlan`] asking for them instead of reaching a
+    /// `Rc<RefCell<dyn ProxySession>>` to do them itself.
+    ///
+    /// `session` is gone from this signature entirely — its single use was
+    /// `L7Proxy::add_session`, which now happens in `Mux::ready_inner`.
+    /// `proxy` remains for the three reads this still makes (`clusters`,
+    /// `kind`, `sessions`) and for backend selection, both of which Question
+    /// 6's borrowed-view step takes next.
+    pub(super) fn plan_connect<L: ListenerHandler + L7ListenerHandler>(
         &mut self,
         stream_id: GlobalStreamId,
         context: &mut Context<L>,
-        session: Rc<RefCell<dyn ProxySession>>,
         proxy: Rc<RefCell<dyn L7Proxy>>,
         // Frontend session token, threaded in from `Mux::ready` so the
         // per-(cluster, source-IP) accounting can key on it without
-        // re-borrowing `session` — the outer event-loop call chain
-        // already holds a mutable borrow of that cell.
+        // re-borrowing the session cell — the outer event-loop call chain
+        // already holds a mutable borrow of it.
         frontend_token: Token,
-        // The embedder's slot table. The dial is the one moment a registry
-        // handle exists on this path, and this is what turns it into the
-        // opaque `BackendId` the core carries from here on (#1340, Q12).
-        backend_registry: &mut BackendRegistry,
-    ) -> Result<(), BackendConnectionError> {
+    ) -> Result<ConnectPlan, BackendConnectionError> {
         let stream = &mut context.streams[stream_id];
         // when reused, a stream should be detached from its old connection, if not we could end
         // with concurrent connections on a single endpoint
@@ -527,193 +564,60 @@ impl Router {
                 stream.metrics.backend_connected();
             }
             context.link_stream(stream_id, token);
-            return Ok(());
+            return Ok(ConnectPlan::Attached);
         }
 
-        // New-backend path: fall through.
+        // New-backend path: no reusable connection was found (no live H2
+        // multiplex slot for this cluster, no H1 keep-alive socket), so a
+        // fresh TCP dial and full backend handshake have to follow.
         //
-        // Pool miss: no reusable connection was found (no live H2 multiplex
-        // slot for this cluster, no H1 keep-alive socket). A fresh TCP dial
-        // and full backend handshake will follow. Pair with `backend.pool.hit`
-        // above. The metric is incremented BEFORE `backend_from_request` so
-        // the count includes attempts that fail at backend selection
-        // (BackendError::NoBackendForCluster, etc.) — every miss is a slot
-        // we did not save. The dial itself may still fail
-        // (BackendConnectionError::*), in which case `backend.pool.size` is
-        // never bumped (see the gauge below) but the miss is already counted.
+        // Pool miss, counted here rather than after the dial so the count
+        // includes attempts that fail at backend selection
+        // (`BackendError::NoBackendForCluster`, etc.) — every miss is a slot
+        // we did not save. Pair with `backend.pool.hit` above. The dial
+        // itself may still fail, in which case `backend.pool.size` is never
+        // bumped but the miss is already counted.
         incr!(names::backend::POOL_MISS);
-        let token = {
-            //
-            // SECURITY (CWE-400): defer every stateful side-effect
-            // (backend.connections / connections_per_backend gauges, slab
-            // add_session, mio register_socket, self.backends.insert,
-            // stream.metrics.backend_start) until AFTER `new_h2_client` AND
-            // `start_stream` have both succeeded. If either fails we must
-            // return Err without leaking a slab entry, an epoll registration,
-            // a gauge counter, or a router-map entry.
-            //
-            // The TcpStream lives on the stack here and is moved into the
-            // Connection by `new_h2_client`/`new_h1_client`; on failure the
-            // Connection (or the raw TcpStream, for the pool-exhaustion
-            // branch that drops inside `new_h2_client`) is dropped, closing
-            // the fd. No token is ever allocated, so there is nothing to
-            // roll back.
-            let (socket, backend) = self.backend_from_request(
-                &cluster_id,
-                frontend_should_stick,
-                stream_context,
-                proxy.clone(),
-            )?;
 
-            if let Err(e) = socket.set_nodelay(true) {
-                error!(
-                    "{} error setting nodelay on back socket({:?}): {:?}",
-                    log_module_context!(context.http_context(stream_id)),
-                    socket,
-                    e
-                );
-            }
+        // Everything past this point was the embedder's work all along: the
+        // selection, the `connect(2)`, `set_nodelay`, the slab session, the
+        // epoll registration and their rollback. It now reads that way.
+        // `Mux::ready_inner` performs it in the same order and calls back
+        // into `Router::commit_dialed`.
+        Ok(ConnectPlan::Dial {
+            cluster_id,
+            h2,
+            frontend_should_stick,
+        })
+    }
 
-            // The one place a registry handle becomes an opaque id: the
-            // embedder's table names it, copies the two identity fields the
-            // datapath renders, and the `Rc` goes no further. Everything
-            // below this line — and every `Position::Client` built from it —
-            // holds `backend`, never the handle.
-            let backend = backend_registry.id_for(&backend);
-
-            // Cache the backend's configured address so SOCKET log lines
-            // fired on ECONNREFUSED (or any failed async `connect()`) can
-            // still render `peer=<backend>` — `getpeername(2)` returns
-            // ENOTCONN in that state, so the live lookup path would show
-            // `peer=None` exactly when the operator needs the backend id.
-            let backend_peer = Some(backend.address);
-            let socket = SessionTcpStream::new(socket, context.session_ulid, backend_peer);
-
-            let flood_config = context.listener.borrow().get_h2_flood_config();
-            let connection_config = context.listener.borrow().get_h2_connection_config();
-            let stream_idle_timeout = context.listener.borrow().get_h2_stream_idle_timeout();
-            let graceful_shutdown_deadline = context
-                .listener
-                .borrow()
-                .get_h2_graceful_shutdown_deadline();
-            let backend_id_for_gauge = backend.backend_id.to_string();
-            let mut connection = if h2 {
-                match Connection::new_h2_client(
-                    context.session_ulid,
-                    socket,
-                    cluster_id.to_owned(),
-                    backend,
-                    &mut *context.buffers,
-                    self.configured_connect_timeout,
-                    flood_config,
-                    connection_config,
-                    stream_idle_timeout,
-                    graceful_shutdown_deadline,
-                ) {
-                    Some(connection) => connection,
-                    // pool exhaustion: socket already dropped by new_h2_client,
-                    // no side-effects were committed.
-                    None => return Err(BackendConnectionError::MaxBuffers),
-                }
-            } else {
-                Connection::new_h1_client(
-                    context.session_ulid,
-                    socket,
-                    cluster_id.to_owned(),
-                    backend,
-                    self.configured_connect_timeout,
-                )
-            };
-
-            // Check the backend can accept a new stream BEFORE committing any
-            // registry state. `start_stream` increments `active_requests` via
-            // `pre_start_stream_client_bookkeeping` and undoes it itself on
-            // failure (see `Connection::start_stream`), so dropping the
-            // connection on a false return leaves backend accounting clean.
-            if !connection.start_stream(stream_id, context) {
-                error!(
-                    "{} Backend rejected stream start (max concurrent streams reached)",
-                    log_module_context!(context.http_context(stream_id))
-                );
-                // `connection` (socket + pending timeout deadline) drops here; no
-                // wheel entry was ever armed for it.
-                return Err(BackendConnectionError::MaxSessionsMemory);
-            }
-
-            // --- Happy path: commit side-effects in one atomic-ish block ---
-            let stream = &mut context.streams[stream_id];
-            stream.metrics.backend_start();
-            stream.metrics.backend_id = stream.context.backend_id.to_owned();
-            gauge_add!(names::backend::CONNECTIONS, 1);
-            // `backend.pool.size` mirrors `backend.connections` exactly: one
-            // entry per `Router::backends` token. The `-1` partner lives in
-            // `connection.rs::pre_close_client_bookkeeping` (graceful close)
-            // and `mod.rs::close_backend` (session teardown). Symmetric
-            // pairing with both decrement sites is the only defence against
-            // the gauge underflow class of bug fixed by ff401b54 / aadb3fa4.
-            gauge_add!(names::backend::POOL_SIZE, 1);
-            gauge_add!(
-                names::backend::CONNECTIONS_PER_BACKEND,
-                1,
-                Some(&cluster_id),
-                Some(&backend_id_for_gauge)
-            );
-
-            let token = proxy.borrow().add_session(session);
-
-            {
-                let socket_ref = connection.socket_mut();
-                if let Err(e) = proxy.borrow().register_socket(
-                    socket_ref,
-                    token,
-                    Interest::READABLE | Interest::WRITABLE,
-                ) {
-                    // SECURITY (CWE-400): treat mio registration failure as a
-                    // hard connect failure. Without this rollback the gauges
-                    // (`backend.connections`, `backend.pool.size`,
-                    // `connections_per_backend`), the slab session, and the
-                    // already-incremented `Backend.active_requests` counter
-                    // (bumped in `Connection::start_stream` ->
-                    // `pre_start_stream_client_bookkeeping`) all leak until
-                    // the connect timeout fires. Under fd pressure
-                    // (EMFILE/ENFILE) this can occur in tight bursts and
-                    // poison capacity dashboards.
-                    error!(
-                        "{} error registering back socket: {:?} — rolling back",
-                        log_module_context!(context.http_context(stream_id)),
-                        e
-                    );
-                    // Undo the gauge increments committed above.
-                    gauge_add!(names::backend::CONNECTIONS, -1);
-                    gauge_add!(names::backend::POOL_SIZE, -1);
-                    gauge_add!(
-                        names::backend::CONNECTIONS_PER_BACKEND,
-                        -1,
-                        Some(&cluster_id),
-                        Some(&backend_id_for_gauge)
-                    );
-                    // Drop the slab session and the connection. The connection
-                    // is local to this scope; dropping it here also closes the
-                    // underlying TcpStream and releases the
-                    // `Backend.active_requests` increment via the regular
-                    // session drop path (`pre_close_client_bookkeeping`).
-                    proxy.borrow().remove_session(token);
-                    return Err(BackendConnectionError::MaxSessionsMemory);
-                }
-            }
-
-            // No `set(token)` here any more: the connection arms its own
-            // connect-timeout DEADLINE at construction and the `Mux` adapter
-            // reflects it onto the wheel when `ready()` reschedules, which is
-            // the same pass this runs in. Until that reschedule no wheel entry
-            // exists — which is what the rollback paths above want, since they
-            // drop `connection` without ever reaching here.
-            self.backends.insert(token, connection);
-            token
-        };
-
+    /// Take ownership of a backend connection the embedder dialled, built and
+    /// registered, and attach `stream_id` to it.
+    ///
+    /// The reply half of [`ConnectPlan::Dial`]. By the time this runs the
+    /// embedder has already proved the connection usable — `start_stream`
+    /// returned true and the epoll registration succeeded — so this performs
+    /// the two steps that are the router's own: taking the connection into
+    /// the backend map under its token, and linking the stream to it.
+    ///
+    /// Deliberately infallible. Every way the dial could fail is decided
+    /// before the caller reaches here, which is what keeps the CWE-400
+    /// rollback discipline in one place instead of split across the seam.
+    pub(super) fn commit_dialed<L: ListenerHandler + L7ListenerHandler>(
+        &mut self,
+        stream_id: GlobalStreamId,
+        context: &mut Context<L>,
+        token: Token,
+        connection: Connection<SessionTcpStream>,
+    ) {
+        // No timer arming here: the connection arms its own connect-timeout
+        // DEADLINE at construction and the `Mux` adapter reflects it onto the
+        // wheel when `ready()` reschedules, which is the same pass this runs
+        // in. Until that reschedule no wheel entry exists — which is what the
+        // caller's rollback paths want, since they drop the connection
+        // without ever reaching here.
+        self.backends.insert(token, connection);
         context.link_stream(stream_id, token);
-        Ok(())
     }
 
     fn route_from_request<L: ListenerHandler + L7ListenerHandler>(
@@ -997,7 +901,7 @@ impl Router {
         };
 
         // ── 3. Legacy `cluster.https_redirect` (HTTP-only listeners) ───────
-        // The caller (`Router::connect`) emits the actual 301 only on
+        // The caller (`Router::plan_connect`) emits the actual 301 only on
         // `ListenerType::Http`; gate the URL stash on the same predicate
         // so an HTTPS listener never carries a stale `redirect_location`
         // into a downstream default-answer path.
@@ -1885,7 +1789,7 @@ mod authority_matched_cert_name_tests {
     }
 }
 
-/// Backend-selection order: `Router::connect` must resolve a tie the same way
+/// Backend-selection order: `Router::plan_connect` must resolve a tie the same way
 /// on every process, for the identical set of backend connections and the
 /// identical request (issue #1338).
 ///
@@ -1925,7 +1829,7 @@ mod backend_selection_order_tests {
 
     use super::Router;
     use crate::{
-        L7Proxy, ProxySession,
+        L7Proxy,
         backends::Backend,
         http::{HttpListener, HttpProxy},
         pool::Pool,
@@ -1934,10 +1838,9 @@ mod backend_selection_order_tests {
             mux::{
                 BackendRegistry, BackendStatus, Connection, Context, Position, StreamState,
                 buffer_source::PoolBufferSource, h2::H2ConnectionConfig,
-                h2_flood_detector::H2FloodConfig,
+                h2_flood_detector::H2FloodConfig, router::ConnectPlan,
             },
         },
-        server::ListenSession,
         socket::SessionTcpStream,
     };
 
@@ -1954,7 +1857,7 @@ mod backend_selection_order_tests {
     const H2_AUTHORITY: &str = "h2.backend-order.example.com";
     const H1_AUTHORITY: &str = "h1.backend-order.example.com";
 
-    /// Which arm of `Router::connect`'s scan the staged backends land in.
+    /// Which arm of `Router::plan_connect`'s scan the staged backends land in.
     enum Staged {
         /// `Position::Client(_, _, BackendStatus::Connected)` on an H2
         /// connection — the least-loaded arm, strict `<`, first-at-minimum.
@@ -1983,18 +1886,14 @@ mod backend_selection_order_tests {
         }
     }
 
-    /// The proxy, listener, clusters, frontends and buffer pool the routing
-    /// half of `Router::connect` needs. Built once and shared by every round:
+    /// The proxy, listener, clusters, frontends and buffer pool
+    /// `Router::plan_connect` needs. Built once and shared by every round:
     /// the order under test belongs to `Router::backends`, which each round
     /// rebuilds from scratch.
     struct RoutingFixture {
         proxy: Rc<RefCell<dyn L7Proxy>>,
         listener: Rc<RefCell<HttpListener>>,
         pool: Rc<RefCell<Pool>>,
-        /// `Router::connect` touches `session` only on the new-dial path
-        /// (`L7Proxy::add_session`); every round here returns through the
-        /// reuse path, which never reads it.
-        session: Rc<RefCell<dyn ProxySession>>,
     }
 
     fn routing_fixture() -> RoutingFixture {
@@ -2040,9 +1939,6 @@ mod backend_selection_order_tests {
             proxy: Rc::new(RefCell::new(proxy)),
             listener,
             pool,
-            session: Rc::new(RefCell::new(ListenSession {
-                protocol: crate::Protocol::HTTP,
-            })),
         }
     }
 
@@ -2103,7 +1999,7 @@ mod backend_selection_order_tests {
     }
 
     /// Stage [`STAGED_TOKENS`] into a FRESH [`Router`] — a fresh `RandomState`
-    /// in the pre-image — drive one `Router::connect`, and report the token it
+    /// in the pre-image — drive one `Router::plan_connect`, and report the token it
     /// attached the stream to.
     fn selected_backend_token(fixture: &RoutingFixture, staged: &Staged) -> Token {
         let pool = &fixture.pool;
@@ -2138,21 +2034,117 @@ mod backend_selection_order_tests {
             router.backends.insert(Token(token), connection);
         }
 
-        router
-            .connect(
-                stream_id,
-                &mut context,
-                fixture.session.clone(),
-                fixture.proxy.clone(),
-                Token(0),
-                &mut backend_registry,
-            )
+        // Every staged backend is reusable, so the plan must be `Attached`:
+        // the router completed the attach itself and asked the embedder for
+        // nothing. A `Dial` here would mean the reuse scan missed, which is
+        // the failure this harness exists to catch.
+        let plan = router
+            .plan_connect(stream_id, &mut context, fixture.proxy.clone(), Token(0))
             .expect("the router must reuse one of the staged backends");
+        assert!(
+            matches!(plan, ConnectPlan::Attached),
+            "the staged backends are all reusable, so no dial may be requested: got {plan:?}"
+        );
 
         match context.streams[stream_id].state {
             StreamState::Linked(token) => token,
             other => panic!("connect must link the stream to a backend, got {other:?}"),
         }
+    }
+
+    /// A plan is a decision, not a deed: `ConnectPlan::Dial` must leave the
+    /// router and the stream exactly as it found them.
+    ///
+    /// This is the property Question 6 of
+    /// [#1340](https://github.com/sozu-proxy/sozu/issues/1340) is actually
+    /// about — the core decides and the embedder performs — and it is the one
+    /// a later edit is most likely to erode, by "just" doing one small effect
+    /// inline because the data is right there. Asserting on the return value
+    /// alone would not catch that: a `Dial` that had already dialled is still
+    /// a `Dial`. So this asserts on the state the router and the stream are
+    /// left in.
+    ///
+    /// To SEE THIS RED: perform any effect in `Router::plan_connect`'s
+    /// new-backend path before it returns — inserting into `self.backends`,
+    /// or calling `context.link_stream(stream_id, token)` — and the
+    /// corresponding assertion below fires.
+    ///
+    /// SCOPE, because the name would otherwise over-read.
+    /// `Router::plan_connect` is NOT pure yet. It still performs one registry
+    /// mutation: `SessionManager::track_cluster_ip`, reached through
+    /// `L7Proxy::sessions` in the per-(cluster, source-IP) limit gate. That is
+    /// the mutation sitting *between* cluster resolution and backend
+    /// selection that #1340 recorded as Question 6's first wrinkle, and it is
+    /// deliberately unchanged here — it moves when the borrowed view lands,
+    /// as either a second returned step or part of that view.
+    ///
+    /// This `Context` is therefore built with `session_address: None`, which
+    /// skips the gate entirely, and the assertions below cover the router's
+    /// backend map, the stream's link state, the backend-stream reverse index
+    /// and the accounting ledger — NOT the session manager. Read the
+    /// assertion list rather than the test name.
+    #[test]
+    fn a_dial_plan_performs_no_effect_of_its_own() {
+        let fixture = routing_fixture();
+        let pool = &fixture.pool;
+        let mut context = Context::new(
+            Ulid::generate(),
+            Rc::downgrade(pool),
+            fixture.listener.clone(),
+            // No session address, so the per-(cluster, source-IP) gate is
+            // skipped and this never reaches the proxy's session manager.
+            None,
+            "127.0.0.1:80"
+                .parse()
+                .expect("test public address must parse"),
+        );
+        let stream_id = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out a stream");
+        {
+            let stream = &mut context.streams[stream_id];
+            stream.state = StreamState::Link;
+            stream.context.authority = Some(H2_AUTHORITY.to_owned());
+            stream.context.path = Some("/".to_owned());
+            stream.context.method = Some(Method::Get);
+        }
+
+        // An EMPTY router: nothing to reuse, so routing must fall through to
+        // the new-backend path and ask the embedder for a dial.
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let plan = router
+            .plan_connect(stream_id, &mut context, fixture.proxy.clone(), Token(0))
+            .expect("routing must resolve the staged cluster");
+
+        match &plan {
+            ConnectPlan::Dial { cluster_id, .. } => assert_eq!(
+                cluster_id, H2_CLUSTER,
+                "the dial request must name the cluster routing resolved"
+            ),
+            ConnectPlan::Attached => {
+                panic!("premise: an empty router has nothing to reuse, so it must ask for a dial")
+            }
+        }
+
+        assert!(
+            router.backends.is_empty(),
+            "a plan must not have taken a backend connection into the router: {:?}",
+            router.backends.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            context.streams[stream_id].state,
+            StreamState::Link,
+            "a plan must not have linked the stream — the embedder has not dialled yet"
+        );
+        assert!(
+            context.backend_streams.is_empty(),
+            "a plan must not have touched the backend-stream reverse index"
+        );
+        assert!(
+            context.backend_deltas.is_empty(),
+            "a plan must not have charged any backend accounting: {:?}",
+            context.backend_deltas
+        );
     }
 
     /// The leak with the most user-visible consequence: the H2 least-loaded

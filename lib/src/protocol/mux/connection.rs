@@ -180,7 +180,7 @@ impl<Front: SocketHandler> Connection<Front> {
         // [`__test_force_h2_client_failure`], pretend the pool was exhausted
         // and return `None`. This mirrors the buffer-pool-exhaustion branch
         // inside [`ConnectionH2::new`] deterministically so E2E tests can
-        // exercise `Router::connect`'s rollback path (FIX-18) without having
+        // exercise `Mux::dial_backend`'s rollback path (FIX-18) without having
         // to starve the pool in-process.
         #[cfg(any(test, feature = "e2e-hooks"))]
         if test_hooks::FORCE_NEW_H2_CLIENT_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -515,6 +515,22 @@ impl<Front: SocketHandler> Connection<Front> {
     {
         self.pre_end_stream_client_bookkeeping(context);
         forward!(self, end_stream(stream, context))
+    }
+
+    /// Release the `active_requests` charge [`Self::start_stream`] took, for
+    /// a caller that has to abandon a connection it already started a stream
+    /// on.
+    ///
+    /// Its one caller is `Mux::dial_backend`'s `register_socket` rollback,
+    /// which drops a connection whose `start_stream` already succeeded. Same
+    /// guard as the charge, so the pair holds whatever status the connection
+    /// is in: a freshly-dialled one is `BackendStatus::Connecting` and was
+    /// never charged, so this correctly emits nothing for it.
+    pub(super) fn release_start_stream_charge<L>(&self, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        self.pre_end_stream_client_bookkeeping(context);
     }
 
     pub(super) fn start_stream<L>(

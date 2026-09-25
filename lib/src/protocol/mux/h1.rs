@@ -1132,7 +1132,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         );
                         stream.state = StreamState::Link;
                         context.pending_links.push_back(stream_id);
-                        // `Router::connect` still gates on `stream.attempts`
+                        // `Router::plan_connect` still gates on `stream.attempts`
                         // against `CONN_RETRIES`, so a cluster whose backends
                         // are all stale cannot loop: the budget runs out and
                         // the caller answers 503.

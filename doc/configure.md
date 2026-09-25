@@ -2879,7 +2879,7 @@ request that again lands on a pooled connection may be re-issued again, so
 `backend.retry.stale_upstream` can increment more than once for one client
 request, and the counter is not the number of replays that reached a backend.
 It is incremented in `ConnectionH1::end_stream` / `ConnectionH2::end_stream`
-*before* the stream is pushed back onto `pending_links`, so `Router::connect`
+*before* the stream is pushed back onto `pending_links`, so `Router::plan_connect`
 has not yet had the chance to refuse it. With `CONN_RETRIES = 3` that is at
 most three increments for one client request, of which at most two replays are
 actually written to a backend: the third increment is immediately followed by
@@ -2989,7 +2989,7 @@ map is the pool. Reuse picks an existing non-draining H2 multiplex slot (below
 fresh backend socket.
 
 The map is ordered rather than hashed so that reuse is reproducible. Three of
-`Router::connect`'s decisions read the scan order directly: the H2 least-loaded
+`Router::plan_connect`'s decisions read the scan order directly: the H2 least-loaded
 arm compares stream counts with a strict `<` (first-at-minimum wins), the
 connecting-backend fallback assigns last-wins, and the H1 keep-alive arm
 assigns and breaks. While the map was a `HashMap` its per-process `RandomState`

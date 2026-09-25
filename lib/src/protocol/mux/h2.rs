@@ -1566,7 +1566,7 @@ impl ConnectionH2 {
             timeout_duration,
             // Armed from construction, exactly as the old `TimeoutContainer`
             // was: the frontend arrived already armed from the handshake state,
-            // and `Router::connect` armed a fresh backend with the connect
+            // and `Router::plan_connect` armed a fresh backend with the connect
             // timeout right after registering its socket. The adapter reflects
             // this onto the wheel on its next reschedule.
             timeout_deadline: now.checked_add(timeout_duration),
@@ -15665,7 +15665,7 @@ mod tests {
             backend_id,
             Duration::from_secs(30),
         );
-        // Park it in the pool, the state `Router::connect`'s H1 reuse arm
+        // Park it in the pool, the state `Router::plan_connect`'s H1 reuse arm
         // picks a backend up from.
         if let Position::Client(_, _, status) = connection.position_mut() {
             *status = BackendStatus::KeepAlive;
