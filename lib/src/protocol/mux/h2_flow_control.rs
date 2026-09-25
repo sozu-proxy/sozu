@@ -38,7 +38,7 @@
 //! connection-level window, only `WINDOW_UPDATE` on stream 0 can — plus every
 //! stream-0 `WINDOW_UPDATE` Sōzu sends it: the one-shot enlargement to
 //! `H2ConnectionConfig::initial_connection_window`, queued by
-//! `ConnectionH2::writable`'s `(H2State::ServerSettings, Position::Server)`
+//! `H2Shell::writable`'s `(H2State::ServerSettings, Position::Server)`
 //! arm on a frontend connection and by `ConnectionH2::handle_settings_frame`
 //! on a backend one, and then the periodic grants back. On this side that
 //! configured number governs exactly two things: how large that one-shot

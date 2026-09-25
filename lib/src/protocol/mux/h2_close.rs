@@ -10,7 +10,7 @@
 //! **the peer sees a truncated response.** That is data loss, not style,
 //! which is why the decision is separated from the I/O that feeds it.
 //!
-//! A fourth site, the end of every `ConnectionH2::write_streams` pass, runs
+//! A fourth site, the end of every `H2Shell::write_streams` pass, runs
 //! the same three-step shape without deciding a close at all, and
 //! `ConnectionH2::finalize_write` takes its decision; see [`finalize_action`]
 //! and the section below for why it is a sibling enum rather than four more
@@ -26,12 +26,12 @@
 //!
 //! - **The flush.** A core cannot attempt I/O. [`CloseAction::Flush`] is an
 //!   instruction to the caller, which performs
-//!   `ConnectionH2::flush_tls_records` and then asks again with
+//!   `H2Shell::flush_tls_records` and then asks again with
 //!   [`TlsFlushPhase::AfterFlush`].
 //! - **`Readiness`.** [`CloseAction::ReArmAndContinue`] says to re-arm;
 //!   the caller owns the bits.
 //! - **Reading whether TLS still holds records.** That is a live-socket query
-//!   and the caller makes it, through its own `ConnectionH2::tls_wants_write`
+//!   and the caller makes it, through its own `H2Shell::tls_wants_write`
 //!   seam. This module receives the answer as a `bool` — a one-bit projection,
 //!   the same shape `H2Scheduler::begin_pass` takes its readiness predicate
 //!   in.
@@ -57,7 +57,7 @@
 //!
 //! # The flush the GoAway arm does not perform
 //!
-//! `ConnectionH2::writable` already attempts an unconditional flush in its
+//! `H2Shell::writable` already attempts an unconditional flush in its
 //! preamble, before it calls `ConnectionH2::dispatch_writable_state`. So by
 //! the time the GoAway arm asks its first question, one flush has been
 //! attempted this pass already, and the one that arm asks for through
@@ -65,7 +65,7 @@
 //! the preamble pushes bytes for every state, and the GoAway arm re-checks
 //! because a close is about to be decided on the answer. Neither is performed
 //! by this module or by the arm itself — [`CloseAction::Flush`] is an
-//! instruction, and `ConnectionH2::writable` is the layer that carries it
+//! instruction, and `H2Shell::writable` is the layer that carries it
 //! out.
 //!
 //! # Tick count
@@ -82,9 +82,9 @@
 //! # The fourth site: finalizing a write pass is not a close
 //!
 //! `ConnectionH2::finalize_write` answers the same triple —
-//! `ConnectionH2::tls_wants_write`, a flush, `ConnectionH2::tls_wants_write`
+//! `H2Shell::tls_wants_write`, a flush, `H2Shell::tls_wants_write`
 //! again — so its decision belongs here too. The triple itself is performed
-//! by `ConnectionH2::write_streams`, the shell that already owns the pass's
+//! by `H2Shell::write_streams`, the shell that already owns the pass's
 //! `socket_write_vectored`: `finalize_write` takes the first answer as an
 //! input and hands back the middle step, and
 //! `ConnectionH2::finalize_write_after_flush` is told the second answer.
@@ -131,7 +131,7 @@
 //! ## What this site does NOT consume
 //!
 //! The empty-buffer flush's `(size, status)` return. `finalize_write` discards
-//! it — the post-flush `ConnectionH2::tls_wants_write` query is how it learns
+//! it — the post-flush `H2Shell::tls_wants_write` query is how it learns
 //! whether the flush landed — so no `SocketResult` reaches [`finalize_action`]. That
 //! matters because `super::update_readiness` treats `size > 0` with a
 //! `WouldBlock` status as NOT stalled (it clears the WRITABLE event bit and
@@ -139,7 +139,7 @@
 //! `H2WriteTarget::Transmit` for the same stream), and any
 //! decision function that took a `SocketResult` and treated
 //! `status != Continue` as a terminator would silently drop that second
-//! attempt. `ConnectionH2::flush_zero_buffer` is the site that does consume a
+//! attempt. `H2Shell::flush_zero_buffer` is the site that does consume a
 //! status; it is a different symbol and stays inline.
 
 /// Which of the two `socket_wants_write()` questions the caller is answering.
@@ -204,7 +204,7 @@ pub(super) fn goaway_close_action(
 /// The `(H2State::Error, Position::Server)` arm of
 /// `ConnectionH2::dispatch_writable_state`.
 ///
-/// No `Flush` variant is reachable: `ConnectionH2::writable`'s preamble
+/// No `Flush` variant is reachable: `H2Shell::writable`'s preamble
 /// already attempted one this pass, and the `tls_wants_write` this arm is
 /// handed is the read after it. Unlike the GoAway
 /// arm, an error connection has no graceful disconnect to fall through to —
@@ -286,7 +286,7 @@ pub(super) enum FinalizeAction {
 /// pass whose records are still in rustls leaves every bit alone and lets the
 /// flush decide. A parked `expect_write` then suppresses the rest of it.
 ///
-/// - `tls_wants_write` — `ConnectionH2::tls_wants_write`, the live-socket
+/// - `tls_wants_write` — `H2Shell::tls_wants_write`, the live-socket
 ///   query the caller makes. This module receives the one-bit projection.
 /// - `socket_write` — did this pass already push bytes through
 ///   `socket_write_vectored`? See "the conditional middle flush".

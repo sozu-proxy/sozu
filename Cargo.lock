@@ -3406,7 +3406,6 @@ name = "sozu-sim"
 version = "2.2.1"
 dependencies = [
  "async-trait",
- "mio",
  "moonpool-sim",
  "rand 0.10.2",
  "rusty_ulid",

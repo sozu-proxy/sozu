@@ -246,7 +246,7 @@ pub(super) fn next_stream_id(
 const ENLARGED_CONNECTION_WINDOW: u32 = 1_048_576;
 
 /// H2 client connection preface size: 24-byte magic + 9-byte SETTINGS frame header
-pub(super) const CLIENT_PREFACE_SIZE: usize = 24 + parser::FRAME_HEADER_SIZE;
+pub const CLIENT_PREFACE_SIZE: usize = 24 + parser::FRAME_HEADER_SIZE;
 
 // ── Flood Detection Thresholds (CVE mitigations) ────────────────────────────
 //
@@ -658,7 +658,7 @@ pub struct H2ByteAccounting {
     pub overhead_bout: usize,
 }
 
-pub struct ConnectionH2<Front: SocketHandler> {
+pub struct ConnectionH2 {
     /// Connection/session ULID propagated from the parent [`super::Mux`]. Used to
     /// stamp the session slot of the `[session req cluster backend]` log
     /// prefix emitted by this module's `log_context!` / `log_context_stream!`
@@ -718,7 +718,6 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// proxy reads its peer through mio's inherent method; only tests call
     /// the trait method on a bare stream.
     peer_address: Option<std::net::SocketAddr>,
-    pub socket: Front,
     pub state: H2State,
     /// Wire `StreamId -> GlobalStreamId` map, `expect_read`/`expect_write`,
     /// `highest_peer_stream_id`, `rst_sent`, and the per-stream
@@ -860,7 +859,7 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// the system clock.
     ///
     /// Assigned from `context.now` at each public entry point
-    /// ([`Self::readable`], [`Self::writable`],
+    /// ([`H2Shell::readable`], [`H2Shell::writable`],
     /// [`Self::cancel_timed_out_streams`], [`Self::start_stream`]) and from
     /// the `now` parameter of [`Self::graceful_goaway`]. `Mux::shutting_down`
     /// reaches it indirectly: it refreshes `Context::now`, and the
@@ -883,12 +882,22 @@ pub struct ConnectionH2<Front: SocketHandler> {
     /// carries whatever `Mux` never wrote, which stays `None`.
     ///
     /// A carried sample rather than a live read, for the same reason
-    /// [`Self::now`] is one: the read is an ambient host reach a byte-in /
+    /// `Self::now` is one: the read is an ambient host reach a byte-in /
     /// byte-out core cannot perform. `now` is a clock read and free, so `Mux`
     /// refreshes it per outer loop iteration; this one is a syscall, so `Mux`
     /// refreshes it once per pass — see `Mux::refresh_client_rtt`. Issue
     /// #1339 Q11 decided that trade on measurement.
     pub(super) client_rtt: Option<Duration>,
+    /// A [`Self::force_disconnect`] raised at a site with no socket in reach,
+    /// waiting for the shell to read `tls_wants_write` and settle it through
+    /// [`Self::force_disconnect_after_query`].
+    ///
+    /// `None` is the resting state and the only state a connection is in
+    /// between passes: every entry point that can raise one settles before
+    /// returning, so this never survives a pass. See
+    /// [`H2ForceDisconnectTarget`] for why the target is parked here rather
+    /// than returned.
+    pending_force_disconnect: Option<H2ForceDisconnectTarget>,
 }
 /// Renders the peer address this connection snapshotted at construction,
 /// where it used to render the socket behind it.
@@ -906,7 +915,7 @@ pub struct ConnectionH2<Front: SocketHandler> {
 /// more, and `socket_mut` never had one. `ConnectionH2::snapshot_rtts` held
 /// the last of them until issue #1339 Q11 moved the frontend RTT read out to
 /// `Mux::refresh_client_rtt`; the remaining spellings are all in `mod tests`.
-impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
+impl std::fmt::Debug for ConnectionH2 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionH2")
             .field("position", &self.position)
@@ -949,7 +958,7 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH2<Front> {
 /// let through by an early return. `Drop` closes both shapes — it is the sole
 /// decrement site, and taking `last_gauge_snapshot` makes a second call a
 /// no-op.
-impl<Front: SocketHandler> Drop for ConnectionH2<Front> {
+impl Drop for ConnectionH2 {
     fn drop(&mut self) {
         self.release_connection_gauges();
     }
@@ -1070,11 +1079,11 @@ pub enum H2WriteTarget {
     /// `stream_id` is never [`H2StreamId::Zero`]. Several sites park `Zero` in
     /// `expect_write`, but the resume phase matches [`H2StreamId::Other`]
     /// only and the scheduler loop walks real stream ids; `self.zero` is
-    /// flushed by `ConnectionH2::flush_zero_to_socket`, outside this pass
+    /// flushed by `H2Shell::flush_zero_to_socket`, outside this pass
     /// entirely.
     Transmit { stream_id: H2StreamId },
     /// The pass is over and owes the readiness decision of LIFECYCLE §9
-    /// invariant 16. Read `ConnectionH2::tls_wants_write`, hand it to
+    /// invariant 16. Read `H2Shell::tls_wants_write`, hand it to
     /// `ConnectionH2::finalize_write` alongside `socket_write` and
     /// `bytes_written`, and drive the `H2FinalizeTarget` that answers; the
     /// end of that protocol is the pass's result.
@@ -1096,8 +1105,8 @@ pub enum H2WriteTarget {
 /// [`H2ReadTarget`] builds the read's: the core answers a step, the shell
 /// performs the socket work, and the core is told what the socket then said.
 /// The step here is the TLS flush triple — read
-/// [`ConnectionH2::tls_wants_write`], perform or skip
-/// [`ConnectionH2::flush_tls_records`], read it again — whose middle is the
+/// `H2Shell::tls_wants_write`, perform or skip
+/// `H2Shell::flush_tls_records`, read it again — whose middle is the
 /// only *action* of the three TLS seams and therefore the one place this pass
 /// has to invert control rather than take a value in.
 ///
@@ -1105,19 +1114,19 @@ pub enum H2WriteTarget {
 /// boolean because `h2_close::finalize_action` already distinguishes them:
 /// they differ only in the middle step and share the whole of what follows.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum H2FinalizeTarget {
+pub enum H2FinalizeTarget {
     /// The pre-flush decision ended the pass: the RFC 9113 §6.8 graceful
     /// GOAWAY, or one of the four readiness answers taken while rustls holds
     /// nothing. No flush and no [`ConnectionH2::finalize_write_after_flush`]
     /// — this is the pass's result.
     Done(MuxResult),
     /// rustls holds records and this pass wrote nothing: perform
-    /// [`ConnectionH2::flush_tls_records`], read
-    /// [`ConnectionH2::tls_wants_write`] again, and answer with
+    /// `H2Shell::flush_tls_records`, read
+    /// `H2Shell::tls_wants_write` again, and answer with
     /// [`ConnectionH2::finalize_write_after_flush`].
     Flush,
     /// rustls holds records but `socket_write_vectored` already attempted this
-    /// pass's flush as a side effect: read [`ConnectionH2::tls_wants_write`]
+    /// pass's flush as a side effect: read `H2Shell::tls_wants_write`
     /// again WITHOUT spending a second empty-buffer write on it, and answer
     /// with [`ConnectionH2::finalize_write_after_flush`].
     ///
@@ -1132,7 +1141,7 @@ pub(super) enum H2FinalizeTarget {
 ///
 /// [`Self::Stalled`] is what replaces the TLS re-arm the three stalled-drain
 /// tails used to perform inline. A zero-buffer flush that stalled has to be
-/// followed by a FRESH [`ConnectionH2::tls_wants_write`] — that write is what
+/// followed by a FRESH `H2Shell::tls_wants_write` — that write is what
 /// changes the answer, so no value read before it can stand in — and the
 /// shell that owns the socket is the layer that reads it.
 ///
@@ -1140,7 +1149,7 @@ pub(super) enum H2FinalizeTarget {
 /// the preamble did not end the pass, and `writable()` falls through to its
 /// `(H2State, Position)` dispatch.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum H2ControlFlushTarget {
+pub enum H2ControlFlushTarget {
     /// Nothing owed, nothing stalled: `writable()` proceeds into its state
     /// dispatch.
     Proceed,
@@ -1149,10 +1158,79 @@ pub(super) enum H2ControlFlushTarget {
     /// is the pass's result, and no TLS query follows it.
     Done(MuxResult),
     /// One of the three zero-buffer flushes stalled. Read
-    /// [`ConnectionH2::tls_wants_write`], hand it to
+    /// `tls_wants_write`, hand it to
     /// [`ConnectionH2::ensure_tls_flushed`], and answer the pass with
     /// [`MuxResult::Continue`].
     Stalled,
+    /// A stage has put bytes in the connection's `zero` buffer, or resumed a
+    /// partially written one, and cannot move them itself. Drain the buffer to
+    /// the socket and answer with
+    /// [`ConnectionH2::handle_control_flush`], naming the stage back.
+    FlushZero(H2ControlFlushStage),
+}
+
+/// Which of [`ConnectionH2::flush_pending_control_frames`]' three zero-buffer
+/// flushes an [`H2ControlFlushTarget::FlushZero`] is asking for.
+///
+/// It travels out with the request and back in with the answer, so
+/// [`ConnectionH2::handle_control_flush`] runs the continuation that belongs
+/// to the stage that asked rather than a shared one. The three differ: only
+/// `ResumeZero` re-enables READABLE interest on success, and only the two
+/// serialising stages re-arm `expect_write` on a stall.
+///
+/// Carrying the stage is what lets the `bool` stay a pure answer to "did that
+/// write stall". The alternative — a flag on the connection saying which stage
+/// is outstanding — would be a second place for the same fact to live, and
+/// `h2_close::TlsFlushPhase` documents what that costs on this very path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H2ControlFlushStage {
+    /// The partially written zero buffer a previous pass left behind.
+    ResumeZero,
+    /// A freshly serialised WINDOW_UPDATE batch.
+    WindowUpdates,
+    /// A freshly serialised RST_STREAM batch.
+    RstStreams,
+}
+
+/// Where [`ConnectionH2::control_flush_from`] re-enters the stage sequence.
+///
+/// Ordered, and compared with `<=`, because the stages are a sequence: a
+/// continuation resumes at its own point and runs everything below it. Not
+/// [`H2ControlFlushStage`] reused — that enum names the three stages that
+/// ASK for a flush, while this one names the three points the walk can be
+/// entered at, and they are not the same three. `DeferredGoaway` covers the
+/// initial-GOAWAY stage, which asks for no flush of its own and so has no
+/// `H2ControlFlushStage`, while `RstCap` covers the cap check that precedes
+/// the RST drain.
+/// What a control-flush walk answers once every
+/// [`H2ControlFlushTarget::FlushZero`] it raised has been performed.
+///
+/// [`H2ControlFlushTarget`] minus that variant. A separate enum rather than
+/// the same one, for the reason [`H2WritableStateTarget`] gives against
+/// reusing [`H2FinalizeTarget`]: `H2Shell::drive_control_flush` consumes every
+/// `FlushZero` itself, so sharing the enum would force a named-impossible arm
+/// into the write pass's match — a reader would have to work out that it
+/// cannot happen, and a later edit could make it happen without the match
+/// noticing.
+#[derive(Debug, Clone, Copy)]
+enum ControlFlushOutcome {
+    /// Nothing owed, nothing stalled: the pass proceeds into its state
+    /// dispatch.
+    Proceed,
+    /// The walk ended the pass by itself.
+    Done(MuxResult),
+    /// One of the flushes stalled.
+    Stalled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ControlFlushResume {
+    /// The whole sequence, from the zero-buffer resume onwards.
+    ResumeZero,
+    /// The deferred initial GOAWAY and everything below it.
+    DeferredGoaway,
+    /// The RST_STREAM lifetime-cap check and the drain below it.
+    RstCap,
 }
 
 /// What [`ConnectionH2::dispatch_writable_state`] wants its caller to do with
@@ -1165,7 +1243,7 @@ pub(super) enum H2ControlFlushTarget {
 /// can only enter the core through
 /// [`ConnectionH2::dispatch_writable_state_after_flush`]'s own parameter,
 /// which is what stops "does rustls hold records" and "did the kernel take
-/// them" from ever being read off one binding. [`h2_close::TlsFlushPhase`]
+/// them" from ever being read off one binding. `h2_close::TlsFlushPhase`
 /// states why those are two questions and what conflating them costs.
 ///
 /// Not [`H2FinalizeTarget`] reused. That enum's `SkipFlush` answers a question
@@ -1175,24 +1253,66 @@ pub(super) enum H2ControlFlushTarget {
 /// It is the argument `h2_close` already makes against widening `CloseAction`
 /// with `FinalizeAction`'s readiness answers, applied the other way round.
 #[derive(Debug, Clone, Copy)]
-pub(super) enum H2WritableStateTarget {
+pub enum H2WritableStateTarget {
     /// The arm ended the pass by itself: this is the pass's result. Every arm
     /// but the two below answers this, the `H2State::GoAway` arm's
     /// departed-peer and nothing-pending answers included.
     Done(MuxResult),
     /// The `H2State::GoAway` arm asks for the second flush of this pass:
-    /// perform [`ConnectionH2::flush_tls_records`], read
-    /// [`ConnectionH2::tls_wants_write`] again, and answer with
+    /// perform `H2Shell::flush_tls_records`, read
+    /// `H2Shell::tls_wants_write` again, and answer with
     /// [`ConnectionH2::dispatch_writable_state_after_flush`].
     ///
     /// The preamble already attempted one flush this pass; this one re-checks
     /// because a close is about to be decided on the answer. Both are
     /// deliberate — see `h2_close`'s module doc.
     Flush,
-    /// A proxying state: run `ConnectionH2::write_streams`, whose result is
+    /// A proxying state: run `H2Shell::write_streams`, whose result is
     /// the pass's. It is the caller's to run for the same reason the flush is,
     /// and it is why the dispatch takes neither `Context` nor `Endpoint`.
     WriteStreams,
+}
+
+/// The half of [`ConnectionH2::force_disconnect`] that still owes the socket a
+/// question, parked until the shell can ask it.
+///
+/// The fourth member of the poll/handle family, and the only one that cannot
+/// be *returned* by the function that raises it. [`H2FinalizeTarget`],
+/// [`H2ControlFlushTarget`] and [`H2WritableStateTarget`] are answers a core
+/// step hands straight back to its caller; this one is raised at seventeen
+/// sites, seven of them inside [`ConnectionH2::handle_read`], whose `pub`
+/// signature returns [`MuxResult`] and does not change. A target that cannot
+/// ride the return value has to be parked on the connection instead, which is
+/// why this is a field rather than a return type. The pairing is otherwise
+/// identical: [`ConnectionH2::poll_force_disconnect`] takes it, the shell
+/// reads [`SocketHandler::socket_wants_write`](crate::socket::SocketHandler::socket_wants_write),
+/// and [`ConnectionH2::force_disconnect_after_query`] receives that answer as
+/// its own parameter.
+///
+/// Both variants carry everything the settlement needs that the socket cannot
+/// supply, so nothing is re-derived after the fact. `peer_gone` in particular
+/// is computed at the raising site and carried: it reads `stream_table` and
+/// `zero.storage`, and `ConnectionH2::remove_dead_stream` runs between the
+/// raise and the settlement on the `ConnectionH2::reset_stream` paths, so a
+/// value re-read at settlement time would not be the one the decision was
+/// entitled to.
+///
+/// `Position::Client` is a variant rather than a settled answer because its
+/// arm's `debug!` renders `wants_write=` too, and that line must report what
+/// the socket says rather than a literal — see `ConnectionH2::peer_address`'s
+/// neighbouring note on the same rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H2ForceDisconnectTarget {
+    /// A `Position::Client` connection. The settlement logs and answers
+    /// [`MuxResult::Continue`]; the backend status and the `HUP` readiness
+    /// event were already written at the raising site, because neither needs
+    /// the socket.
+    Client,
+    /// A `Position::Server` connection, with `peer_gone_after_final_goaway()`
+    /// as the raising site read it. The settlement runs
+    /// `h2_close::force_disconnect_action` on the pair and performs the
+    /// `ReArmAndContinue` readiness write when that is the answer.
+    Server { peer_gone: bool },
 }
 
 /// The buffer an [`H2WriteTarget::Transmit`] names, resolved to the `Kawa`
@@ -1343,7 +1463,7 @@ fn decode_discarded_field_block(
     }
 }
 
-impl<Front: SocketHandler> ConnectionH2<Front> {
+impl ConnectionH2 {
     fn frontend_hung_up_while_draining(&self) -> bool {
         matches!(self.position, Position::Server)
             && self.drain.draining()
@@ -1365,7 +1485,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// The next instant this connection wants its embedder to call `timeout()`
     /// at, or `None` for "no timer". The adapter reflects this onto the real
     /// wheel; nothing in this module touches `crate::timer`.
-    pub(super) fn poll_timeout(&self) -> Option<Instant> {
+    pub fn poll_timeout(&self) -> Option<Instant> {
         self.timeout_deadline
     }
 
@@ -1373,7 +1493,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// connection's clock snapshot. Replaces the old
     /// `TimeoutContainer::reset()` at the same three call sites, and reads
     /// `self.now` rather than the real clock (invariant 20).
-    pub(super) fn arm_timeout(&mut self) {
+    pub fn arm_timeout(&mut self) {
         self.timeout_deadline = self.now.checked_add(self.timeout_duration);
     }
 
@@ -1388,7 +1508,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// re-armed rather than keeping the old deadline. `now` is the adapter's
     /// snapshot: this is called from `Mux::ready`, outside the entry points
     /// that mirror it into `self.now`.
-    pub(super) fn set_timeout_duration(&mut self, duration: Duration, now: Instant) {
+    pub fn set_timeout_duration(&mut self, duration: Duration, now: Instant) {
         self.timeout_duration = duration;
         self.timeout_deadline = now.checked_add(duration);
     }
@@ -1398,9 +1518,9 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// Differences between server and client are captured by the caller-provided
     /// `position`, `expect_read`, and `readiness_interest` parameters.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(
+    pub fn new(
         session_ulid: Ulid,
-        socket: Front,
+        peer_address: Option<std::net::SocketAddr>,
         position: super::Position,
         buffers: &mut dyn super::buffer_source::BufferSource,
         flood_config: H2FloodConfig,
@@ -1441,10 +1561,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 interest: readiness_interest,
                 event: Ready::EMPTY,
             },
-            // The one read of `peer_addr()` on this connection's whole
-            // lifetime. Taken before `socket` is moved into the struct.
-            peer_address: socket.peer_addr(),
-            socket,
+            peer_address,
             state: H2State::ClientPreface,
             timeout_duration,
             // Armed from construction, exactly as the old `TimeoutContainer`
@@ -1478,104 +1595,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             mcs_backpressure_applied: false,
             now,
             client_rtt: None,
+            pending_force_disconnect: None,
         })
-    }
-
-    /// The TLS layer is holding encrypted records — handshake, alert, session
-    /// ticket or already-accepted application data — that it must push before
-    /// this connection can call a pass finished.
-    ///
-    /// **Not "the socket is writable".** The name of the underlying
-    /// [`SocketHandler`] method says socket, and that is what made this look
-    /// like an I/O question for as long as it was spelled out at every site.
-    /// It is a question about a buffer that happens to live behind the socket:
-    /// `FrontRustls` is the only production handler that overrides it, the
-    /// trait's default answer is `false`, and `Router::backends` is declared
-    /// `Connection<SessionTcpStream>` whatever the frontend is — so every
-    /// backend H2 connection already resolves every one of these queries
-    /// statically to `false`. The same core is monomorphised twice today, once
-    /// with TLS and once without, which is the evidence that the coupling is
-    /// incidental rather than structural.
-    ///
-    /// This is a seam, not an abbreviation. It is the single reach where
-    /// `ConnectionH2` asks that question, and the whole of what a byte-in /
-    /// byte-out core has to receive as an input instead of querying: the shell
-    /// that owns the socket is the only layer that can answer it, and it is
-    /// the layer this method's body moves to. Until then the body is the
-    /// delegation it always was and the answer is bit-identical.
-    ///
-    /// The query is free of side effects, so a caller that needs it twice
-    /// around a [`Self::flush_tls_records`] is asking two genuinely different
-    /// questions — "does rustls hold records" and "did the kernel take them" —
-    /// and a caller that needs it twice with nothing in between should bind it
-    /// once instead. [`h2_close::TlsFlushPhase`] names the first case;
-    /// [`Self::force_disconnect`] is the second.
-    fn tls_wants_write(&self) -> bool {
-        self.socket.socket_wants_write()
-    }
-
-    /// Ask the TLS layer to push whatever it has buffered towards the kernel,
-    /// offering it no new application bytes.
-    ///
-    /// The empty slice is the whole point: this is a flush, not a write. It is
-    /// the only *action* among the three TLS seams, which is why the four call
-    /// sites are the four places where a byte-in / byte-out core must hand
-    /// control back to its shell rather than take an input — the answer to
-    /// [`Self::tls_wants_write`] changes across this call, so no value captured
-    /// before it can stand in for the query after it.
-    ///
-    /// Three of the four have made that move and all three are in the shell
-    /// impl: [`Self::write_streams`] performs it for
-    /// [`H2FinalizeTarget::Flush`], outside the [`Self::finalize_write`] that
-    /// used to run it inline, and [`Self::writable`] performs both of the
-    /// connection-level write pass's — its unconditional preamble, and the
-    /// second one [`H2WritableStateTarget::Flush`] asks for on behalf of the
-    /// `H2State::GoAway` arm now in [`Self::dispatch_writable_state`]. The
-    /// fourth is [`Self::flush_zero_buffer`].
-    ///
-    /// Returns the handler's `(size, SocketResult)` unchanged. Three of the
-    /// four callers discard both and re-query [`Self::tls_wants_write`]
-    /// instead — deliberately, since a flush that moved bytes may still leave
-    /// records behind — and only [`Self::flush_zero_buffer`] consumes the
-    /// status, through `update_readiness_after_write`.
-    fn flush_tls_records(&mut self) -> (usize, SocketResult) {
-        self.socket.socket_write(&[])
-    }
-
-    /// Start the TLS `close_notify` handshake, generating the records that
-    /// [`Self::tls_wants_write`] will then report as pending.
-    ///
-    /// Idempotence is the caller's business, not this seam's:
-    /// [`Self::initiate_close_notify`] gates it on `close_notify_sent` so a
-    /// second call cannot queue a second alert.
-    fn begin_tls_close(&mut self) {
-        self.socket.socket_close()
-    }
-
-    /// Start TLS close_notify on the frontend and keep the session alive until
-    /// rustls has flushed the generated records.
-    pub fn initiate_close_notify(&mut self) -> bool {
-        if !self.position.is_server()
-            || matches!(
-                self.state,
-                H2State::ClientPreface | H2State::ClientSettings | H2State::ServerSettings
-            )
-        {
-            return false;
-        }
-        if !self.close_notify_sent {
-            trace!("{} H2 initiating CLOSE_NOTIFY", log_context!(self));
-            self.begin_tls_close();
-            self.close_notify_sent = true;
-        }
-        let tls_wants_write = self.tls_wants_write();
-        if tls_wants_write {
-            self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
-            self.ensure_tls_flushed(tls_wants_write);
-            true
-        } else {
-            false
-        }
     }
 
     fn expect_header(&mut self) {
@@ -3164,7 +3185,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // LIFECYCLE §9 invariant 9, write side. Outbound APPLICATION data
             // is activity; an acknowledgement is not. Both halves of this
             // condition are load-bearing and neither is implied by reaching
-            // `ConnectionH2::write_streams`: an `H2StreamId::Other` id is what
+            // `H2Shell::write_streams`: an `H2StreamId::Other` id is what
             // makes these bytes a stream's rather than `self.zero`'s, and
             // `size > 0` is what makes them bytes the socket actually took.
             // `arm_timeout` reads `self.now`, the snapshot `writable()` adopted
@@ -3228,23 +3249,23 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// Re-arm edge-triggered WRITABLE event if rustls still has buffered TLS data.
     ///
     /// Takes the answer rather than asking for it: `tls_wants_write` is
-    /// [`Self::tls_wants_write`]'s result, read by the caller. That query was
+    /// `H2Shell::tls_wants_write`'s result, read by the caller. That query was
     /// this composite's whole remaining socket reach, and handing it in is
     /// what leaves a body a byte-in / byte-out core can keep.
     ///
     /// When the caller reads it is not uniform, and cannot be. Five of the six
     /// call sites already hold the answer — four from the `h2_close` decision
-    /// just taken on it, [`Self::initiate_close_notify`] from its own branch
+    /// just taken on it, [`H2Shell::initiate_close_notify`] from its own branch
     /// condition — and pass that binding: nothing mutates the socket in
     /// between, so a second query would answer the same. The sixth, the
-    /// [`H2ControlFlushTarget::Stalled`] arm of [`Self::writable`], has no
-    /// such binding and must read it AFTER the [`Self::flush_zero_to_socket`]
+    /// [`H2ControlFlushTarget::Stalled`] arm of [`H2Shell::writable`], has no
+    /// such binding and must read it AFTER the `H2Shell::flush_zero_to_socket`
     /// whose stall brought it there: that write is what changes the answer.
     /// The three stalled-drain tails of
     /// [`Self::flush_pending_control_frames`] used to read it and re-arm
     /// individually; they now answer [`H2ControlFlushTarget::Stalled`] and
     /// that one arm re-arms for all three.
-    fn ensure_tls_flushed(&mut self, tls_wants_write: bool) {
+    pub fn ensure_tls_flushed(&mut self, tls_wants_write: bool) {
         if tls_wants_write {
             self.readiness.signal_pending_write();
         }
@@ -3280,7 +3301,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// connection-level close. This happens on incomplete/oversized header
     /// blocks: the stream slot is created on the initial HEADERS frame, then a
     /// GOAWAY closes the connection before the request is fully materialized.
-    fn prune_inactive_streams_while_closing<L>(&mut self, context: &mut Context<L>)
+    pub fn prune_inactive_streams_while_closing<L>(&mut self, context: &mut Context<L>)
     where
         L: ListenerHandler + L7ListenerHandler,
     {
@@ -3335,7 +3356,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// caller must perform before [`Self::finalize_write_after_flush`] settles
     /// the pass.
     ///
-    /// `tls_wants_write` is [`Self::tls_wants_write`]'s answer, read by the
+    /// `tls_wants_write` is `H2Shell::tls_wants_write`'s answer, read by the
     /// caller. It is the pre-flush half of the query / flush / query triple
     /// this function used to run inline; the flush and the post-flush query
     /// are the caller's too, which is what leaves a body a byte-in /
@@ -3343,7 +3364,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// graceful-GOAWAY check below rather than after, which the query's
     /// freedom from side effects makes unobservable: on that path the value
     /// is discarded.
-    fn finalize_write<L>(
+    pub fn finalize_write<L>(
         &mut self,
         tls_wants_write: bool,
         socket_write: bool,
@@ -3436,7 +3457,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     }
 
     /// Settle a write pass whose [`H2FinalizeTarget`] asked for the TLS flush
-    /// step, given the answer [`Self::tls_wants_write`] gave AFTER it.
+    /// step, given the answer `H2Shell::tls_wants_write` gave AFTER it.
     ///
     /// The second half of [`Self::finalize_write`]'s protocol, and the reason
     /// the split is not a rename: `tls_wants_write` here is a DIFFERENT
@@ -3453,7 +3474,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// the next one, so the degenerate arguments below are the shape
     /// `h2_close::goaway_close_action`'s own post-flush call already uses —
     /// the inputs the flush could not change are not re-read.
-    fn finalize_write_after_flush(&mut self, tls_wants_write: bool) -> MuxResult {
+    pub fn finalize_write_after_flush(&mut self, tls_wants_write: bool) -> MuxResult {
         let action = h2_close::finalize_action(
             TlsFlushPhase::AfterFlush,
             tls_wants_write,
@@ -3508,7 +3529,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// draining, WINDOW_UPDATE-drain and RST_STREAM-drain stages and the
     /// deferred-initial-GOAWAY-readiness check, all four in
     /// [`Self::flush_pending_control_frames`]; plus [`Self::graceful_goaway`]'s
-    /// own defer-or-send decision and [`Self::flush_zero_buffer`]'s no-op
+    /// own defer-or-send decision and [`H2Shell::flush_zero_buffer`]'s no-op
     /// guard — six call sites in total. All six were already present
     /// except the frontend-hung-up-while-draining one, added in the review
     /// that found #1423's premise wrong: that stage used to assume
@@ -3535,19 +3556,29 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// Answers [`H2ControlFlushTarget`]: [`H2ControlFlushTarget::Proceed`]
     /// when `writable()` should carry on into its state dispatch,
     /// [`H2ControlFlushTarget::Done`] when a GOAWAY already ended the pass,
-    /// and [`H2ControlFlushTarget::Stalled`] when one of the three
-    /// [`Self::flush_zero_to_socket`] calls stalled — in which case the
-    /// caller reads [`Self::tls_wants_write`] and hands it to
-    /// [`Self::ensure_tls_flushed`]. The three tails used to do that
-    /// themselves, and they are the reason the answer is an enum rather than
-    /// the `Option<MuxResult>` it was: the query has to happen AFTER the write
-    /// that stalled, so it cannot be an input, and the shell that owns the
-    /// socket is the layer that makes it.
+    /// [`H2ControlFlushTarget::FlushZero`] when a stage has bytes in `zero`
+    /// for the caller to move, and [`H2ControlFlushTarget::Stalled`] when one
+    /// of those moves stalled — in which case the caller reads
+    /// `tls_wants_write` and hands it to [`Self::ensure_tls_flushed`].
     ///
-    /// [`Self::flush_zero_to_socket`] itself stays here. It is a byte mover on
-    /// the control-frame path, not a TLS seam, and lifting it is a separate
-    /// step from this one.
-    fn flush_pending_control_frames(&mut self) -> H2ControlFlushTarget {
+    /// `flush_zero_to_socket` no longer lives here, and could not: it writes
+    /// to a socket this type no longer owns. What is left in its place is the
+    /// same protocol the rest of this file's write path already speaks — the
+    /// core answers a step, the caller performs the socket work, and the core
+    /// is told what the socket said, through
+    /// [`Self::handle_control_flush`]. Three stages ask for it, so
+    /// [`H2ControlFlushStage`] names which one is asking and the answer comes
+    /// back to the continuation that belongs to it.
+    ///
+    /// The stages are a SEQUENCE, not a set, and each one's post-flush action
+    /// differs, which is why this is a resumable walk rather than three
+    /// independent calls. The walk cannot restart from the top after a flush:
+    /// the two stages above the preamble — the hung-up-while-draining cleanup
+    /// and the SETTINGS-ACK timeout — are not idempotent with respect to a
+    /// partly drained connection, and re-entering them mid-pass would let a
+    /// `frontend_hung_up_while_draining()` connection clear a buffer the
+    /// caller has just been told to send.
+    pub fn flush_pending_control_frames(&mut self) -> H2ControlFlushTarget {
         // CORRECTION (review of e1c3c2fb, B2): this stage used to clear
         // `zero.storage` unconditionally here, on the theory that
         // `frontend_hung_up_while_draining()` firing meant "no further
@@ -3589,74 +3620,125 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             return H2ControlFlushTarget::Done(self.goaway(H2Error::SettingsTimeout));
         }
 
-        // Stage — resume zero-buffer flush.
-        // If a previous write was partial, finish it before serialising any
-        // new control frames. Don't reset the timeout for control frame
-        // writes (SETTINGS ACK, PING response, WINDOW_UPDATE) — only
-        // application-data writes should reset it.
-        if let Some(H2StreamId::Zero) = self.stream_table.expect_write() {
-            if self.flush_zero_to_socket() {
-                return H2ControlFlushTarget::Stalled;
-            }
-            // When H2StreamId::Zero is used to write, READABLE is disabled —
-            // re-enable it now that the flush is complete.
-            self.readiness.interest.insert(Ready::READABLE);
-            self.stream_table.set_expect_write(None);
-        }
+        self.control_flush_from(ControlFlushResume::ResumeZero)
+    }
 
-        // Stage — send a deferred initial GOAWAY.
-        // `graceful_goaway` could not serialize into `self.zero.storage`
-        // while `header_block_reassembly_in_progress()` was true — see its
-        // comment and `send_initial_goaway`. Send it now that reassembly has
-        // completed; if it is still in progress this call, leave the flag
-        // set and retry on a later pass (nothing is lost: `graceful_goaway`
-        // already armed WRITABLE, and completing the reassembly re-enters
-        // this function via the next writable() call in the same
-        // readable()/writable() sweep). The readiness/reassembly check stays
-        // here, computed by this caller: `H2DrainState` has neither
-        // `self.stream_table` nor `self.state` to compute it itself — see
-        // `h2_drain`'s module doc.
-        let ready_to_flush_initial_goaway = self.stream_table.expect_write().is_none()
-            && !self.header_block_reassembly_in_progress();
-        if self
-            .drain
-            .take_deferred_initial_goaway(ready_to_flush_initial_goaway)
-        {
-            return H2ControlFlushTarget::Done(self.send_initial_goaway());
-        }
-
-        // Stage — drain pending WINDOW_UPDATE frames.
-        // Serialize and flush them inline to avoid extra event loop
-        // iterations that could cause response data to be sent before
-        // subsequent frames are validated.
-        //
-        // Deferred while a header block is being reassembled: this stage
-        // clears and reuses `self.zero.storage`, which right now holds the
-        // bytes accumulated from an earlier HEADERS/CONTINUATION frame on
-        // some (possibly different) stream, awaiting its own CONTINUATION.
-        // The queued WINDOW_UPDATEs stay queued — WRITABLE was already
-        // armed when they were enqueued (`Self::queue_window_update`), so
-        // the next `writable()` call after the block completes drains them
-        // normally; nothing is lost, only delayed.
-        if !self.flow_control.pending_window_updates_is_empty()
-            && self.stream_table.expect_write().is_none()
-            && !self.header_block_reassembly_in_progress()
-        {
-            let kawa = &mut self.zero;
-            kawa.storage.clear();
-            let buf = kawa.storage.space();
-            // Emission order is the deterministic ascending stream_id order
-            // `H2FlowControl` guarantees — see its module doc — not
-            // insertion/arrival order.
-            let (offset, frames_written) = self.flow_control.drain_window_updates_into(buf);
-            if frames_written > 0 {
-                count!(names::h2::FRAMES_TX_WINDOW_UPDATE, frames_written as i64);
+    /// Answer the [`H2ControlFlushTarget::FlushZero`] the caller just
+    /// performed, and carry the walk on from there.
+    ///
+    /// `stage` is the one the answer belongs to and `stalled` is what the
+    /// caller's write reported — two parameters of ONE function that the
+    /// raising side cannot have pre-bound, which is the discipline
+    /// [`H2WritableStateTarget::Flush`] keeps by carrying no `bool`. Each
+    /// stage's post-flush action is different and lives in its own arm:
+    /// only the zero-buffer resume re-enables READABLE, and only the two
+    /// serialising stages re-arm `expect_write` on a stall, because only they
+    /// put bytes in `zero` that nothing else would come back for.
+    pub fn handle_control_flush(
+        &mut self,
+        stage: H2ControlFlushStage,
+        stalled: bool,
+    ) -> H2ControlFlushTarget {
+        match stage {
+            H2ControlFlushStage::ResumeZero => {
+                if stalled {
+                    return H2ControlFlushTarget::Stalled;
+                }
+                // When H2StreamId::Zero is used to write, READABLE is disabled —
+                // re-enable it now that the flush is complete.
+                self.readiness.interest.insert(Ready::READABLE);
+                self.stream_table.set_expect_write(None);
+                self.control_flush_from(ControlFlushResume::DeferredGoaway)
             }
-            if offset > 0 {
-                kawa.storage.fill(offset);
-                if self.flush_zero_to_socket() {
+            H2ControlFlushStage::WindowUpdates => {
+                if stalled {
                     self.stream_table.set_expect_write(Some(H2StreamId::Zero));
                     return H2ControlFlushTarget::Stalled;
+                }
+                self.control_flush_from(ControlFlushResume::RstCap)
+            }
+            H2ControlFlushStage::RstStreams => {
+                if stalled {
+                    self.stream_table.set_expect_write(Some(H2StreamId::Zero));
+                    return H2ControlFlushTarget::Stalled;
+                }
+                H2ControlFlushTarget::Proceed
+            }
+        }
+    }
+
+    /// The stage sequence itself, entered at `resume`.
+    ///
+    /// Private, and deliberately not a public resumption surface: the only
+    /// legal entry points are the top of the walk
+    /// ([`Self::flush_pending_control_frames`]) and the three continuations
+    /// ([`Self::handle_control_flush`]). A caller able to name an arbitrary
+    /// resume point could skip the SETTINGS-ACK timeout or re-run a
+    /// serialisation into a buffer the socket is still draining.
+    fn control_flush_from(&mut self, resume: ControlFlushResume) -> H2ControlFlushTarget {
+        if resume <= ControlFlushResume::ResumeZero {
+            // Stage — resume zero-buffer flush.
+            // If a previous write was partial, finish it before serialising any
+            // new control frames. Don't reset the timeout for control frame
+            // writes (SETTINGS ACK, PING response, WINDOW_UPDATE) — only
+            // application-data writes should reset it.
+            if let Some(H2StreamId::Zero) = self.stream_table.expect_write() {
+                return H2ControlFlushTarget::FlushZero(H2ControlFlushStage::ResumeZero);
+            }
+        }
+
+        if resume <= ControlFlushResume::DeferredGoaway {
+            // Stage — send a deferred initial GOAWAY.
+            // `graceful_goaway` could not serialize into `self.zero.storage`
+            // while `header_block_reassembly_in_progress()` was true — see its
+            // comment and `send_initial_goaway`. Send it now that reassembly has
+            // completed; if it is still in progress this call, leave the flag
+            // set and retry on a later pass (nothing is lost: `graceful_goaway`
+            // already armed WRITABLE, and completing the reassembly re-enters
+            // this function via the next writable() call in the same
+            // readable()/writable() sweep). The readiness/reassembly check stays
+            // here, computed by this caller: `H2DrainState` has neither
+            // `self.stream_table` nor `self.state` to compute it itself — see
+            // `h2_drain`'s module doc.
+            let ready_to_flush_initial_goaway = self.stream_table.expect_write().is_none()
+                && !self.header_block_reassembly_in_progress();
+            if self
+                .drain
+                .take_deferred_initial_goaway(ready_to_flush_initial_goaway)
+            {
+                return H2ControlFlushTarget::Done(self.send_initial_goaway());
+            }
+
+            // Stage — drain pending WINDOW_UPDATE frames.
+            // Serialize and flush them inline to avoid extra event loop
+            // iterations that could cause response data to be sent before
+            // subsequent frames are validated.
+            //
+            // Deferred while a header block is being reassembled: this stage
+            // clears and reuses `self.zero.storage`, which right now holds the
+            // bytes accumulated from an earlier HEADERS/CONTINUATION frame on
+            // some (possibly different) stream, awaiting its own CONTINUATION.
+            // The queued WINDOW_UPDATEs stay queued — WRITABLE was already
+            // armed when they were enqueued (`Self::queue_window_update`), so
+            // the next `writable()` call after the block completes drains them
+            // normally; nothing is lost, only delayed.
+            if !self.flow_control.pending_window_updates_is_empty()
+                && self.stream_table.expect_write().is_none()
+                && !self.header_block_reassembly_in_progress()
+            {
+                let kawa = &mut self.zero;
+                kawa.storage.clear();
+                let buf = kawa.storage.space();
+                // Emission order is the deterministic ascending stream_id order
+                // `H2FlowControl` guarantees — see its module doc — not
+                // insertion/arrival order.
+                let (offset, frames_written) = self.flow_control.drain_window_updates_into(buf);
+                if frames_written > 0 {
+                    count!(names::h2::FRAMES_TX_WINDOW_UPDATE, frames_written as i64);
+                }
+                if offset > 0 {
+                    kawa.storage.fill(offset);
+                    return H2ControlFlushTarget::FlushZero(H2ControlFlushStage::WindowUpdates);
                 }
             }
         }
@@ -3699,10 +3781,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             let (offset, _frames_written) = self.control_tx.drain_rst_streams_into(buf);
             if offset > 0 {
                 kawa.storage.fill(offset);
-                if self.flush_zero_to_socket() {
-                    self.stream_table.set_expect_write(Some(H2StreamId::Zero));
-                    return H2ControlFlushTarget::Stalled;
-                }
+                return H2ControlFlushTarget::FlushZero(H2ControlFlushStage::RstStreams);
             }
         }
 
@@ -3710,7 +3789,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     }
 
     /// Take `writable()`'s `(H2State, Position)` decision, given the answer
-    /// [`Self::tls_wants_write`] gave AFTER the pass preamble's flush.
+    /// `H2Shell::tls_wants_write` gave AFTER the pass preamble's flush.
     ///
     /// `tls_wants_write` is that answer, read by the caller. It is the third
     /// step of the preamble's own query / flush / query triple and the
@@ -3720,19 +3799,19 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// flush through [`H2WritableStateTarget::Flush`]. ONE read serves
     /// whichever of the two runs — only one of them can — and nothing mutates
     /// the socket between the caller's read and this call. The arms that never
-    /// consult it discard it, exactly as [`Self::write_streams`] discards the
+    /// consult it discard it, exactly as `H2Shell::write_streams` discards the
     /// answer it reads before [`Self::finalize_write`]'s graceful-GOAWAY
-    /// check; [`Self::tls_wants_write`] is free of side effects, which is what
+    /// check; `H2Shell::tls_wants_write` is free of side effects, which is what
     /// makes both unobservable.
     ///
     /// Answers [`H2WritableStateTarget`]. Every arm but two ends the pass with
     /// [`H2WritableStateTarget::Done`]; the `H2State::GoAway` arm may ask for
     /// the TLS flush step, and the four proxying states name
     /// [`H2WritableStateTarget::WriteStreams`]. That last one is the caller's
-    /// to run for the same reason the flush is — [`Self::write_streams`] owns
+    /// to run for the same reason the flush is — `H2Shell::write_streams` owns
     /// the socket and this function does not — and it is why this function
     /// takes neither `Context` nor `Endpoint`: no other arm reads either.
-    fn dispatch_writable_state(&mut self, tls_wants_write: bool) -> H2WritableStateTarget {
+    pub fn dispatch_writable_state(&mut self, tls_wants_write: bool) -> H2WritableStateTarget {
         match (&self.state, &self.position) {
             (H2State::Error, Position::Server) => {
                 // The caller's preamble already attempted this pass's flush,
@@ -3875,7 +3954,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 
     /// Settle the `H2State::GoAway` arm whose [`H2WritableStateTarget::Flush`]
     /// asked for the TLS flush step, given the answer
-    /// [`Self::tls_wants_write`] gave AFTER it.
+    /// `H2Shell::tls_wants_write` gave AFTER it.
     ///
     /// The second half of [`Self::dispatch_writable_state`]'s protocol, built
     /// the way [`Self::finalize_write_after_flush`] is built and for the same
@@ -3893,7 +3972,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// the same reason [`Self::finalize_write_after_flush`] does not reopen
     /// the readiness policy: the flush cannot resurrect a departed peer, and
     /// the decision answers from the one input it could have changed.
-    fn dispatch_writable_state_after_flush(&mut self, tls_wants_write: bool) -> MuxResult {
+    pub fn dispatch_writable_state_after_flush(&mut self, tls_wants_write: bool) -> MuxResult {
         match h2_close::goaway_close_action(TlsFlushPhase::AfterFlush, false, tls_wants_write) {
             CloseAction::ReArmAndContinue => {
                 self.ensure_tls_flushed(tls_wants_write);
@@ -4065,7 +4144,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///
     /// Returns `(total_bytes_in, total_bytes_out)` where bytes_in = `bin + backend_bin`
     /// and bytes_out = `bout + backend_bout` for each stream.
-    fn compute_stream_byte_totals<L: ListenerHandler + L7ListenerHandler>(
+    pub fn compute_stream_byte_totals<L: ListenerHandler + L7ListenerHandler>(
         &self,
         context: &Context<L>,
     ) -> (usize, usize) {
@@ -4456,7 +4535,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// and the MadeYouReset emitted-RST lifetime cap.
     ///
     /// Two distinct emission paths feed this helper:
-    ///   * Queued frames — [`Self::enqueue_rst`] (and therefore every
+    ///   * Queued frames — `Self::enqueue_rst` (and therefore every
     ///     callable that funnels through it: `reset_stream`,
     ///     `refuse_stream_and_discard`, `cancel_timed_out_streams`,
     ///     DATA-on-closed-stream) calls this once at queue-time. The
@@ -4685,7 +4764,7 @@ fn h2_frame_rx_metric_key(frame: &Frame) -> &'static str {
     }
 }
 
-impl<Front: SocketHandler> ConnectionH2<Front> {
+impl ConnectionH2 {
     pub fn goaway(&mut self, error: H2Error) -> MuxResult {
         self.state = H2State::Error;
         // A final/error GOAWAY supersedes any advisory initial GOAWAY that
@@ -4863,106 +4942,120 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         self.drain.deadline_elapsed(self.now)
     }
 
-    /// Returns `true` if there is data queued waiting to be flushed:
-    /// - H2 control frames in the zero buffer (GOAWAY, SETTINGS ACK, etc.)
-    /// - A partially-written stream or control frame (`expect_write`)
-    /// - Encrypted TLS records in rustls's output buffer not yet flushed to TCP
+    /// True when the reaper has queued control frames (`RST_STREAM`) into
+    /// `h2_control_tx::H2ControlTx` that have not yet been serialized. Kept SEPARATE
+    /// from [`H2Shell::has_pending_write`] because that probe gates connection close
+    /// (the `mod.rs` close-gating sites) and must NOT treat a queued RST as a
+    /// reason to keep the connection open; this probe is consulted ONLY by the
+    /// `MuxState::timeout` flush gate to push a silent-peer `RST_STREAM(CANCEL)`
+    /// onto the wire before the connection closes.
+    /// Adopt the embedder's clock snapshot for this pass.
     ///
-    /// The TLS check is critical: `shutting_down()` uses this to prevent
-    /// premature session close while response DATA is still in rustls's
-    /// buffer (accepted by `socket_write_vectored` but not yet on the wire).
+    /// `Self::now` is mirrored from `Context::now` at each public entry
+    /// point rather than read from the host — invariant 20 — and a driver
+    /// standing where `H2Shell::writable` stands has to perform that mirror
+    /// itself. The other entry points that need it do it inside their own
+    /// bodies; the write pass is assembled by its caller, so its mirror is
+    /// exposed.
+    pub fn adopt_now(&mut self, now: Instant) {
+        self.now = now;
+    }
+
+    /// The landing zone an [`H2ReadTarget::Fill`] names.
     ///
-    /// Does NOT check per-stream `back.out`/`back.blocks`; use
-    /// [`Self::has_pending_write_full`] on paths that must honour
-    /// LIFECYCLE invariant 16 (e.g. shutdown-drain).
-    pub fn has_pending_write(&self) -> bool {
+    /// The read half of the byte-in / byte-out surface: a driver answers
+    /// `Fill` by filling this slice and reporting what it managed, and never
+    /// needs to know which buffer it belongs to. `H2Shell::readable` fills it
+    /// from a socket; `sim/tests/h2_simulation.rs` fills it from a
+    /// `VecDeque<u8>`, and that is the whole difference between them.
+    ///
+    /// Takes `context` apart from `self` rather than borrowing all of `*self`,
+    /// for the reason `read_space` gives: the caller must keep the rest of
+    /// the connection borrowable while the slice is live.
+    pub fn read_space<'a, L>(
+        &'a mut self,
+        context: &'a mut Context<L>,
+        stream_id: H2StreamId,
+        amount: usize,
+    ) -> &'a mut [u8]
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        read_space(
+            &mut self.zero,
+            &mut context.streams,
+            &self.position,
+            stream_id,
+            amount,
+        )
+    }
+
+    /// The buffer an [`H2WriteTarget::Transmit`] names.
+    ///
+    /// The write half of the same surface, and the one a driver brackets with
+    /// [`h2_transmit::gather`] and [`h2_transmit::confirm`] around its own
+    /// vectored write. See `write_buffer` for why it takes `context` apart
+    /// from `self`.
+    pub fn write_buffer<'a, L>(
+        &'a mut self,
+        context: &'a mut Context<L>,
+        stream_id: H2StreamId,
+    ) -> &'a mut GenericHttpStream
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        write_buffer(
+            &mut self.zero,
+            &mut context.streams,
+            &self.position,
+            stream_id,
+        )
+    }
+
+    /// The control-frame bytes an [`H2ControlFlushTarget::FlushZero`] is
+    /// asking the caller to move, or empty when there are none left.
+    pub fn zero_pending(&self) -> &[u8] {
+        self.zero.storage.data()
+    }
+
+    /// Account for one write of [`Self::zero_pending`], and answer whether the
+    /// caller should stop.
+    ///
+    /// `true` means the write stalled (WouldBlock or a zero-length write) and
+    /// the caller must wait for its next writable event; `false` means carry
+    /// on until [`Self::zero_pending`] is empty, then call
+    /// [`Self::finish_zero_flush`].
+    pub fn consume_zero_flush(&mut self, size: usize, status: SocketResult) -> bool {
+        self.zero.storage.consume(size);
+        self.position.count_bytes_out_counter(size);
+        self.bytes.overhead_bout += size;
+        update_readiness_after_write(size, status, &mut self.readiness)
+    }
+
+    /// Reset the zero buffer once a caller has drained it completely.
+    ///
+    /// `consume()` advances `start` but never resets it, so without this the
+    /// next fill would panic.
+    pub fn finish_zero_flush(&mut self) {
+        self.zero.storage.clear();
+    }
+
+    /// [`H2Shell::has_pending_write`] with the TLS answer supplied instead of
+    /// queried — the byte-in / byte-out spelling of the same probe.
+    ///
+    /// A driver with no TLS layer passes `false` and gets the connection's own
+    /// two conditions back.
+    pub fn has_pending_write_with(&self, tls_wants_write: bool) -> bool {
         if self.peer_gone_after_final_goaway() {
             return false;
         }
         self.stream_table.expect_write().is_some()
             || !self.zero.storage.is_empty()
-            || self.tls_wants_write()
+            || tls_wants_write
     }
 
-    /// True when the reaper has queued control frames (`RST_STREAM`) into
-    /// `h2_control_tx::H2ControlTx` that have not yet been serialized. Kept SEPARATE
-    /// from [`Self::has_pending_write`] because that probe gates connection close
-    /// (the `mod.rs` close-gating sites) and must NOT treat a queued RST as a
-    /// reason to keep the connection open; this probe is consulted ONLY by the
-    /// `MuxState::timeout` flush gate to push a silent-peer `RST_STREAM(CANCEL)`
-    /// onto the wire before the connection closes.
     pub fn has_pending_control_write(&self) -> bool {
         self.control_tx.has_pending()
-    }
-
-    /// Connection-level [`Self::has_pending_write`] extended with a per-stream
-    /// back-buffer probe (LIFECYCLE §9 invariant 16). Used by shutdown-drain
-    /// paths that must not close while any open stream still has outbound
-    /// kawa bytes queued — a voluntary scheduler yield can leave `back.out`
-    /// or `back.blocks` non-empty without `expect_write` being set.
-    pub fn has_pending_write_full<L>(&self, context: &Context<L>) -> bool
-    where
-        L: ListenerHandler + L7ListenerHandler,
-    {
-        self.has_pending_write()
-            || any_stream_has_pending_back(self.stream_table.streams(), &context.streams)
-    }
-
-    /// Flush the zero buffer to the socket, counting bytes as connection overhead.
-    ///
-    /// Returns `true` if the socket stalled (WouldBlock / zero-length write),
-    /// meaning the caller should stop writing and wait for the next writable event.
-    /// Returns `false` when the buffer has been fully drained.
-    fn flush_zero_to_socket(&mut self) -> bool {
-        while !self.zero.storage.is_empty() {
-            let (size, status) = self.socket.socket_write(self.zero.storage.data());
-            #[cfg(debug_assertions)]
-            trace!(
-                "{} flush_zero_to_socket: written={}, status={:?}, wants_write={}",
-                log_context!(self),
-                size,
-                status,
-                self.tls_wants_write()
-            );
-            self.zero.storage.consume(size);
-            self.position.count_bytes_out_counter(size);
-            self.bytes.overhead_bout += size;
-            if update_readiness_after_write(size, status, &mut self.readiness) {
-                return true;
-            }
-        }
-        // Reset buffer positions after draining. consume() advances start but
-        // never resets it, so without clear() the next fill would panic.
-        self.zero.storage.clear();
-        false
-    }
-
-    /// Directly flush the zero buffer to the socket without going through
-    /// the full writable() path. Used during shutdown when the event loop
-    /// won't deliver new epoll events for this session (edge-triggered).
-    ///
-    /// No-op while `header_block_reassembly_in_progress()`: `self.zero` is
-    /// also the read-side accumulation buffer for an in-flight
-    /// HEADERS/CONTINUATION field block, and `Mux::shutting_down` calls this
-    /// unconditionally right after `graceful_goaway` — including when
-    /// `graceful_goaway` deferred its GOAWAY for that exact reason and left
-    /// nothing queued. `expect_write == Some(H2StreamId::Zero)` (the only
-    /// case with legitimate bytes to flush here) already cannot coexist with
-    /// reassembly in progress — READABLE is disabled for the whole time a
-    /// zero-buffer write is stalled — so skipping is always safe and never
-    /// drops a real write.
-    pub fn flush_zero_buffer(&mut self) {
-        if self.header_block_reassembly_in_progress() {
-            return;
-        }
-        if self.flush_zero_to_socket() {
-            return;
-        }
-        self.stream_table.set_expect_write(None);
-        if self.tls_wants_write() {
-            let (_size, status) = self.flush_tls_records();
-            let _ = update_readiness_after_write(0, status, &mut self.readiness);
-        }
     }
 
     /// Number of streams currently tracked in the wire map. `stream_table` is
@@ -6343,20 +6436,103 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         false
     }
 
+    /// Take the force-disconnect decision as far as it goes without a socket,
+    /// and park the rest.
+    ///
+    /// Everything this function can settle by itself, it settles here:
+    /// `H2State::Error`, and on a `Position::Client` connection the backend
+    /// status and the `HUP` readiness event. What it cannot settle is the
+    /// `tls_wants_write` answer `h2_close::force_disconnect_action` decides
+    /// on, because the socket belongs to the shell — so it raises an
+    /// [`H2ForceDisconnectTarget`] and answers provisionally.
+    ///
+    /// The provisional answer is exact everywhere but one case.
+    /// `Position::Client` always continued. A `Position::Server` whose peer is
+    /// gone always closes, because `h2_close::force_disconnect_action`
+    /// answers `CloseSession` on `peer_gone` whatever the socket says. Only a
+    /// server connection with a live peer genuinely turns on the query, and it
+    /// answers [`MuxResult::Continue`] until the shell settles it — the
+    /// conservative direction of the two, since a session held one pass too
+    /// long is recoverable and a session closed with records still buffered is
+    /// the truncation `h2_close::force_disconnect_action` exists to prevent.
+    ///
+    /// Seventeen sites reach this function and every one returns its answer
+    /// immediately, so on the ordinary paths no core code runs between the
+    /// raise and the return of the entry point the shell called.
+    /// [`Self::goaway`] and `Self::send_initial_goaway` are the exception on
+    /// their GOAWAY-serialisation failure arms, which `Self::enqueue_rst`'s
+    /// flood escalation can reach from deep in a frame handler; what those
+    /// paths can observe in the gap is documented on
+    /// [`Self::force_disconnect_after_query`].
     pub fn force_disconnect(&mut self) -> MuxResult {
         self.state = H2State::Error;
-        // Read ONCE for the whole function, above the `match`, because
-        // `Self::tls_wants_write` borrows all of `self` while the client arm
-        // holds `&mut self.position` for its `status` binding. Hoisting is
-        // behaviour-neutral: the query has no side effect, `self.state` is the
-        // only thing assigned between the old read points and this one, and
-        // both arms already wanted the same answer — the server arm says so in
-        // its own comment below.
-        let tls_wants_write = self.tls_wants_write();
+        // Read ONCE above the `match`, for the borrow reason the
+        // `tls_wants_write` read that used to sit here had: the client arm
+        // holds `&mut self.position` for its `status` binding, while this
+        // query borrows all of `self`. Hoisting is behaviour-neutral — it has
+        // no side effect and the only field it reads that this function writes
+        // is `self.state`, assigned above — and it is what lets the raised
+        // target CARRY the answer instead of re-deriving it later. That
+        // matters: `peer_gone_after_final_goaway` reads `stream_table` and
+        // `zero.storage`, and `Self::remove_dead_stream` runs between the
+        // raise and the settlement on the `Self::reset_stream` paths.
+        let peer_gone = self.peer_gone_after_final_goaway();
         match &mut self.position {
             Position::Client(_, _, status) => {
                 *status = BackendStatus::Disconnecting;
                 self.readiness.event = Ready::HUP;
+                self.pending_force_disconnect = Some(H2ForceDisconnectTarget::Client);
+                MuxResult::Continue
+            }
+            Position::Server => {
+                self.pending_force_disconnect = Some(H2ForceDisconnectTarget::Server { peer_gone });
+                if peer_gone {
+                    MuxResult::CloseSession
+                } else {
+                    MuxResult::Continue
+                }
+            }
+        }
+    }
+
+    /// Take the [`H2ForceDisconnectTarget`] this connection parked, if it
+    /// parked one.
+    ///
+    /// Taking rather than reading is what makes a second settlement
+    /// impossible: the next call sees `None` and the shell's helper answers
+    /// with the result it was already holding.
+    pub fn poll_force_disconnect(&mut self) -> Option<H2ForceDisconnectTarget> {
+        self.pending_force_disconnect.take()
+    }
+
+    /// Settle a [`Self::force_disconnect`] with the `tls_wants_write` answer
+    /// the shell read on its behalf.
+    ///
+    /// `tls_wants_write` arrives as this function's own parameter and the
+    /// target as the other, which is the same discipline
+    /// [`H2WritableStateTarget::Flush`] keeps by carrying no `bool`: the
+    /// pre-raise state and the post-raise socket answer are parameters of one
+    /// function that never read each other's source, and no binding survives
+    /// in the raising scope for a later edit to point at the wrong question.
+    /// The query is read fresh here, exactly as [`Self::force_disconnect`]
+    /// used to read it fresh at all seventeen sites — including the four whose
+    /// caller already held an answer, which is why none of them passes its own.
+    ///
+    /// Between the raise and this call the core cannot change the answer: it
+    /// holds no socket, so nothing it runs can flush a record. What the gap
+    /// can change is what the log lines render. On the ordinary paths there is
+    /// no gap. On [`Self::goaway`]'s serialisation-failure arm, reachable from
+    /// `Self::enqueue_rst`, `ConnectionH2::remove_dead_stream` and the rest
+    /// of a frame handler may run first, so `streams=` and `expect_write=`
+    /// report the connection as the settlement finds it rather than as the
+    /// raise left it. `peer_gone` is not among them — it is carried.
+    pub fn force_disconnect_after_query(
+        &mut self,
+        target: H2ForceDisconnectTarget,
+        tls_wants_write: bool,
+    ) -> MuxResult {
+        match target {
+            H2ForceDisconnectTarget::Client => {
                 debug!(
                     "{} H2 force_disconnect client: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
                     log_context!(self),
@@ -6368,27 +6544,24 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 );
                 MuxResult::Continue
             }
-            Position::Server => {
-                // Don't disconnect immediately if rustls still has buffered TLS
-                // records. Returning CloseSession here triggers shutdown(Write)
-                // which sends FIN — but any TLS records still in rustls's buffer
-                // (not yet flushed to the TCP send buffer) are lost, causing the
-                // client to see "TLS decode error / unexpected eof".
-                // Instead, keep WRITABLE interest and let the writable path flush.
-                // The decision itself is `h2_close::force_disconnect_action`,
-                // exhaustively unit-tested there.
-                //
-                // The answer is read ONCE, above the `match`, and reported by
-                // every log line in this function. A literal `wants_write=` in
-                // any arm is a second copy of a fact the socket already owns,
-                // and the closing arm is reached with records still pending
-                // whenever the peer is gone — an operator diagnosing a
-                // truncation under HAProxy chaining would read the opposite of
-                // the socket's state.
-                if h2_close::force_disconnect_action(
-                    self.peer_gone_after_final_goaway(),
-                    tls_wants_write,
-                ) == CloseAction::ReArmAndContinue
+            // Don't disconnect immediately if rustls still has buffered TLS
+            // records. Returning CloseSession here triggers shutdown(Write)
+            // which sends FIN — but any TLS records still in rustls's buffer
+            // (not yet flushed to the TCP send buffer) are lost, causing the
+            // client to see "TLS decode error / unexpected eof".
+            // Instead, keep WRITABLE interest and let the writable path flush.
+            // The decision itself is `h2_close::force_disconnect_action`,
+            // exhaustively unit-tested there.
+            //
+            // The answer is this function's parameter, and reported by every
+            // log line here. A literal `wants_write=` in any arm is a second
+            // copy of a fact the socket already owns, and the closing arm is
+            // reached with records still pending whenever the peer is gone —
+            // an operator diagnosing a truncation under HAProxy chaining would
+            // read the opposite of the socket's state.
+            H2ForceDisconnectTarget::Server { peer_gone } => {
+                if h2_close::force_disconnect_action(peer_gone, tls_wants_write)
+                    == CloseAction::ReArmAndContinue
                 {
                     debug!(
                         "{} H2 force_disconnect delaying close: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
@@ -6414,136 +6587,6 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     );
                     MuxResult::CloseSession
                 }
-            }
-        }
-    }
-
-    pub fn close<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E)
-    where
-        E: Endpoint,
-        L: ListenerHandler + L7ListenerHandler,
-    {
-        match self.position {
-            Position::Client(_, _, BackendStatus::KeepAlive) => {
-                error!(
-                    "{} H2 connections do not use KeepAlive backend status",
-                    log_context!(self)
-                );
-                return;
-            }
-            Position::Client(..) => {}
-            Position::Server => {
-                let tls_pending_before = self.tls_wants_write();
-                if !self.stream_table.streams().is_empty()
-                    || tls_pending_before
-                    || self.stream_table.expect_write().is_some()
-                {
-                    debug!(
-                        "{} H2 close with active state: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
-                        log_context!(self),
-                        self.state,
-                        self.stream_table.streams().len(),
-                        self.stream_table.expect_write(),
-                        tls_pending_before,
-                        self.readiness
-                    );
-                    for (stream_id, global_stream_id) in self.stream_table.streams() {
-                        let stream = &context.streams[*global_stream_id];
-                        debug!(
-                            "{}   close stream id={} gid={}: state={:?}, front_eos={}, back_eos={}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
-                            log_context!(self),
-                            stream_id,
-                            global_stream_id,
-                            stream.state,
-                            stream.front_received_end_of_stream,
-                            stream.back_received_end_of_stream,
-                            stream.front.parsing_phase,
-                            stream.back.parsing_phase,
-                            stream.front.is_completed(),
-                            stream.back.is_completed()
-                        );
-                    }
-                }
-                if !self.close_notify_sent {
-                    trace!("{} H2 SENDING CLOSE NOTIFY", log_context!(self));
-                }
-                let (tls_pending_after, drain_rounds) =
-                    drain_tls_close_notify(&mut self.socket, &mut self.close_notify_sent);
-                if tls_pending_after {
-                    // Severity tiering: key on stream-count + close-state, not
-                    // peer-vs-operator. Composes with the send-side `H2Error`
-                    // variant tier in `goaway()` — both rules demote benign
-                    // paths and keep loss-bearing paths loud.
-                    //
-                    // - `streams != 0`           -> `error!`: live streams at
-                    //   close time, response-byte loss is possible.
-                    // - `streams == 0` AND state in {GoAway, Error}
-                    //                             -> `warn!`: idle close after
-                    //   a GOAWAY exchange (peer-initiated abort or our own
-                    //   graceful drain). What's stranded is best-effort
-                    //   GOAWAY/close_notify; no application data was queued.
-                    // - `streams == 0` from any other state
-                    //                             -> `error!`: unexpected
-                    //   teardown path (no GOAWAY exchange) — keep loud so
-                    //   unknown failure modes surface.
-                    if !self.stream_table.streams().is_empty() {
-                        error!(
-                            "{} TLS buffer NOT fully drained on close: \
-                             pending_before={}, pending_after={}, drain_rounds={}, \
-                             state={:?}, streams={}, expect_write={:?}, \
-                             close_notify_sent={}, readiness={:?}",
-                            log_context!(self),
-                            tls_pending_before,
-                            tls_pending_after,
-                            drain_rounds,
-                            self.state,
-                            self.stream_table.streams().len(),
-                            self.stream_table.expect_write(),
-                            self.close_notify_sent,
-                            self.readiness
-                        );
-                    } else if matches!(self.state, H2State::GoAway | H2State::Error) {
-                        warn!(
-                            "{} TLS buffer NOT fully drained on close: \
-                             pending_before={}, pending_after={}, drain_rounds={}, \
-                             state={:?}, streams={}, expect_write={:?}, \
-                             close_notify_sent={}, readiness={:?}",
-                            log_context!(self),
-                            tls_pending_before,
-                            tls_pending_after,
-                            drain_rounds,
-                            self.state,
-                            self.stream_table.streams().len(),
-                            self.stream_table.expect_write(),
-                            self.close_notify_sent,
-                            self.readiness
-                        );
-                    } else {
-                        error!(
-                            "{} TLS buffer NOT fully drained on close: \
-                             pending_before={}, pending_after={}, drain_rounds={}, \
-                             state={:?}, streams={}, expect_write={:?}, \
-                             close_notify_sent={}, readiness={:?}",
-                            log_context!(self),
-                            tls_pending_before,
-                            tls_pending_after,
-                            drain_rounds,
-                            self.state,
-                            self.stream_table.streams().len(),
-                            self.stream_table.expect_write(),
-                            self.close_notify_sent,
-                            self.readiness
-                        );
-                    }
-                }
-                return;
-            }
-        }
-        // reconnection is handled by the server for each stream separately
-        for global_stream_id in self.stream_table.streams().values() {
-            trace!("{} end stream: {}", log_context!(self), global_stream_id);
-            if let StreamState::Linked(token) = context.streams[*global_stream_id].state {
-                endpoint.end_stream(token, *global_stream_id, context);
             }
         }
     }
@@ -6877,59 +6920,432 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     }
 }
 
-/// The socket shell of the H2 data path: the two byte movers and the write
-/// pass's entry point.
+/// A [`ConnectionH2`] and the socket it speaks through.
 ///
-/// [`ConnectionH2::readable`] and `ConnectionH2::write_streams` are the only
-/// production code on the H2 stream read and write paths that touches
-/// `self.socket`. Each is the caller that sits between one of the core's two
-/// poll/handle pairs — [`ConnectionH2::poll_read_target`] with
-/// [`ConnectionH2::handle_read`], and [`ConnectionH2::poll_write_target`] with
-/// [`ConnectionH2::handle_write`]. All four are `pub`, so a driver outside this
-/// crate can stand where these two functions stand once the buffers they name
-/// are reachable too.
+/// The split issue #1339 Q10 decided, in the shape it decided: the core is
+/// byte-in / byte-out and knows nothing about sockets, while everything that
+/// reaches one lives here. `Connection::H2` holds this rather than the core,
+/// so `Connection<Front: SocketHandler>` keeps its bound and `Router::backends`
+/// keeps its declared type — the parameter did not leave the mux, it moved off
+/// the state machine.
 ///
-/// [`ConnectionH2::writable`] is the third member and the one that reaches the
-/// socket only through the three named TLS seams rather than through
-/// `self.socket` itself. It is the caller of a third poll/handle pair —
-/// `ConnectionH2::dispatch_writable_state` with
-/// `ConnectionH2::dispatch_writable_state_after_flush`, around
-/// `ConnectionH2::flush_pending_control_frames`'s own answer — and it performs
-/// every TLS seam call its own body used to make inline: the preamble flush
-/// and the two queries around it, the stalled-drain re-arm query, and the
-/// `H2State::GoAway` arm's flush and post-flush query. Two seam reads on this
-/// pass are NOT its own and are named here so the claim stays exact — the one
-/// inside `ConnectionH2::flush_zero_to_socket`, which
-/// `ConnectionH2::flush_pending_control_frames` still reaches and whose lift
-/// is a separate step, and the one inside `ConnectionH2::force_disconnect`,
-/// the third close site of `h2_close`. The pair it drives —
-/// `ConnectionH2::dispatch_writable_state` and
-/// `ConnectionH2::dispatch_writable_state_after_flush` — takes no `Front`, no
-/// `Context` and no `Endpoint`: the `(H2State, Position)` dispatch between the
-/// flushes is
-/// drivable without a socket, which is the whole claim this block is here to
-/// make countable.
+/// Both halves sit in this module, so this impl reaches the core's private
+/// fields exactly as the methods it inherited used to. Nothing was widened to
+/// `pub` to let the socket keep working; the `pub` surface that did grow
+/// exists for a driver OUTSIDE this crate — `sim/tests/h2_simulation.rs` is
+/// the first, and it builds its own shell over the same poll/handle pairs
+/// this one uses.
+pub struct H2Shell<Front: SocketHandler> {
+    /// The socket-free state machine.
+    pub core: ConnectionH2,
+    /// The only socket in the H2 frontend or backend path.
+    pub socket: Front,
+}
+
+/// Renders the core and nothing else.
 ///
-/// They are lifted out of the core impls rather than merely annotated, because
-/// the remaining `Front` coupling on this path is meant to be countable by
-/// reading one region instead of grepping the file, and this is the region the
-/// socket goes on living in when `ConnectionH2` stops carrying one. No body
-/// changed as it moved: `readable` and `write_streams` are
-/// statement-for-statement what they were, `writable`'s statements are the
-/// ones its own arms used to run in the order they used to run in, an inherent
-/// impl is order-independent, and this block therefore changes no behaviour.
-/// `ConnectionH2::write_streams` keeps the query / flush / query triple it
-/// performs around `ConnectionH2::finalize_write` — that step is a socket
-/// touch too, and it belongs on this side of the split for the same reason the
-/// vectored write does.
+/// Deliberately NOT derived. A derive would render `socket` through
+/// `Front`'s own `Debug`, which for a `mio::net::TcpStream` is a local
+/// address, a peer address and a file descriptor — precisely what
+/// [`ConnectionH2`]'s own `Debug` stopped rendering, and for the same reasons
+/// it gives. Wrapping the core in a new type must not hand that back through
+/// the wrapper.
+impl<Front: SocketHandler> std::fmt::Debug for H2Shell<Front> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.core.fmt(f)
+    }
+}
+
+impl<Front: SocketHandler> H2Shell<Front> {
+    /// The TLS layer is holding encrypted records — handshake, alert, session
+    /// ticket or already-accepted application data — that it must push before
+    /// this connection can call a pass finished.
+    ///
+    /// **Not "the socket is writable".** The name of the underlying
+    /// [`SocketHandler`] method says socket, and that is what made this look
+    /// like an I/O question for as long as it was spelled out at every site.
+    /// It is a question about a buffer that happens to live behind the socket:
+    /// `FrontRustls` is the only production handler that overrides it, the
+    /// trait's default answer is `false`, and `Router::backends` is declared
+    /// `Connection<SessionTcpStream>` whatever the frontend is — so every
+    /// backend H2 connection already resolves every one of these queries
+    /// statically to `false`. The same core is monomorphised twice today, once
+    /// with TLS and once without, which is the evidence that the coupling is
+    /// incidental rather than structural.
+    ///
+    /// This is a seam, not an abbreviation. It is the single reach where
+    /// `ConnectionH2` asks that question, and the whole of what a byte-in /
+    /// byte-out core has to receive as an input instead of querying: the shell
+    /// that owns the socket is the only layer that can answer it, and it is
+    /// the layer this method's body moves to. Until then the body is the
+    /// delegation it always was and the answer is bit-identical.
+    ///
+    /// The query is free of side effects, so a caller that needs it twice
+    /// around a [`Self::flush_tls_records`] is asking two genuinely different
+    /// questions — "does rustls hold records" and "did the kernel take them" —
+    /// and a caller that needs it twice with nothing in between should bind it
+    /// once instead. `h2_close::TlsFlushPhase` names the first case;
+    /// [`ConnectionH2::force_disconnect`] is the second.
+    fn tls_wants_write(&self) -> bool {
+        self.socket.socket_wants_write()
+    }
+
+    /// Ask the TLS layer to push whatever it has buffered towards the kernel,
+    /// offering it no new application bytes.
+    ///
+    /// The empty slice is the whole point: this is a flush, not a write. It is
+    /// the only *action* among the three TLS seams, which is why the four call
+    /// sites are the four places where a byte-in / byte-out core must hand
+    /// control back to its shell rather than take an input — the answer to
+    /// [`Self::tls_wants_write`] changes across this call, so no value captured
+    /// before it can stand in for the query after it.
+    ///
+    /// Three of the four have made that move and all three are in the shell
+    /// impl: [`Self::write_streams`] performs it for
+    /// [`H2FinalizeTarget::Flush`], outside the [`ConnectionH2::finalize_write`] that
+    /// used to run it inline, and [`Self::writable`] performs both of the
+    /// connection-level write pass's — its unconditional preamble, and the
+    /// second one [`H2WritableStateTarget::Flush`] asks for on behalf of the
+    /// `H2State::GoAway` arm now in [`ConnectionH2::dispatch_writable_state`]. The
+    /// fourth is [`Self::flush_zero_buffer`].
+    ///
+    /// Returns the handler's `(size, SocketResult)` unchanged. Three of the
+    /// four callers discard both and re-query [`Self::tls_wants_write`]
+    /// instead — deliberately, since a flush that moved bytes may still leave
+    /// records behind — and only [`Self::flush_zero_buffer`] consumes the
+    /// status, through `update_readiness_after_write`.
+    fn flush_tls_records(&mut self) -> (usize, SocketResult) {
+        self.socket.socket_write(&[])
+    }
+
+    /// Start the TLS `close_notify` handshake, generating the records that
+    /// [`Self::tls_wants_write`] will then report as pending.
+    ///
+    /// Idempotence is the caller's business, not this seam's:
+    /// [`Self::initiate_close_notify`] gates it on `close_notify_sent` so a
+    /// second call cannot queue a second alert.
+    fn begin_tls_close(&mut self) {
+        self.socket.socket_close()
+    }
+
+    /// Start TLS close_notify on the frontend and keep the session alive until
+    /// rustls has flushed the generated records.
+    pub fn initiate_close_notify(&mut self) -> bool {
+        if !self.core.position.is_server()
+            || matches!(
+                self.core.state,
+                H2State::ClientPreface | H2State::ClientSettings | H2State::ServerSettings
+            )
+        {
+            return false;
+        }
+        if !self.core.close_notify_sent {
+            trace!("{} H2 initiating CLOSE_NOTIFY", log_context!(self.core));
+            self.begin_tls_close();
+            self.core.close_notify_sent = true;
+        }
+        let tls_wants_write = self.tls_wants_write();
+        if tls_wants_write {
+            self.core.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
+            self.core.ensure_tls_flushed(tls_wants_write);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns `true` if there is data queued waiting to be flushed:
+    /// - H2 control frames in the zero buffer (GOAWAY, SETTINGS ACK, etc.)
+    /// - A partially-written stream or control frame (`expect_write`)
+    /// - Encrypted TLS records in rustls's output buffer not yet flushed to TCP
+    ///
+    /// The TLS check is critical: `shutting_down()` uses this to prevent
+    /// premature session close while response DATA is still in rustls's
+    /// buffer (accepted by `socket_write_vectored` but not yet on the wire).
+    ///
+    /// Does NOT check per-stream `back.out`/`back.blocks`; use
+    /// [`Self::has_pending_write_full`] on paths that must honour
+    /// LIFECYCLE invariant 16 (e.g. shutdown-drain).
+    pub fn has_pending_write(&self) -> bool {
+        self.core.has_pending_write_with(self.tls_wants_write())
+    }
+
+    /// Connection-level [`Self::has_pending_write`] extended with a per-stream
+    /// back-buffer probe (LIFECYCLE §9 invariant 16). Used by shutdown-drain
+    /// paths that must not close while any open stream still has outbound
+    /// kawa bytes queued — a voluntary scheduler yield can leave `back.out`
+    /// or `back.blocks` non-empty without `expect_write` being set.
+    pub fn has_pending_write_full<L>(&self, context: &Context<L>) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        self.has_pending_write()
+            || any_stream_has_pending_back(self.core.stream_table.streams(), &context.streams)
+    }
+
+    /// Flush the zero buffer to the socket, counting bytes as connection overhead.
+    ///
+    /// Returns `true` if the socket stalled (WouldBlock / zero-length write),
+    /// meaning the caller should stop writing and wait for the next writable event.
+    /// Returns `false` when the buffer has been fully drained.
+    fn flush_zero_to_socket(&mut self) -> bool {
+        while !self.core.zero_pending().is_empty() {
+            let (size, status) = self.socket.socket_write(self.core.zero_pending());
+            #[cfg(debug_assertions)]
+            trace!(
+                "{} flush_zero_to_socket: written={}, status={:?}, wants_write={}",
+                log_context!(self.core),
+                size,
+                status,
+                self.tls_wants_write()
+            );
+            if self.core.consume_zero_flush(size, status) {
+                return true;
+            }
+        }
+        // Reset buffer positions after draining. consume() advances start but
+        // never resets it, so without clear() the next fill would panic.
+        self.core.zero.storage.clear();
+        false
+    }
+
+    /// Directly flush the zero buffer to the socket without going through
+    /// the full writable() path. Used during shutdown when the event loop
+    /// won't deliver new epoll events for this session (edge-triggered).
+    ///
+    /// No-op while `header_block_reassembly_in_progress()`: `self.zero` is
+    /// also the read-side accumulation buffer for an in-flight
+    /// HEADERS/CONTINUATION field block, and `Mux::shutting_down` calls this
+    /// unconditionally right after `graceful_goaway` — including when
+    /// `graceful_goaway` deferred its GOAWAY for that exact reason and left
+    /// nothing queued. `expect_write == Some(H2StreamId::Zero)` (the only
+    /// case with legitimate bytes to flush here) already cannot coexist with
+    /// reassembly in progress — READABLE is disabled for the whole time a
+    /// zero-buffer write is stalled — so skipping is always safe and never
+    /// drops a real write.
+    pub fn flush_zero_buffer(&mut self) {
+        if self.core.header_block_reassembly_in_progress() {
+            return;
+        }
+        if self.flush_zero_to_socket() {
+            return;
+        }
+        self.core.stream_table.set_expect_write(None);
+        if self.tls_wants_write() {
+            let (_size, status) = self.flush_tls_records();
+            let _ = update_readiness_after_write(0, status, &mut self.core.readiness);
+        }
+    }
+
+    pub fn close<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E)
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        match self.core.position {
+            Position::Client(_, _, BackendStatus::KeepAlive) => {
+                error!(
+                    "{} H2 connections do not use KeepAlive backend status",
+                    log_context!(self.core)
+                );
+                return;
+            }
+            Position::Client(..) => {}
+            Position::Server => {
+                let tls_pending_before = self.tls_wants_write();
+                if !self.core.stream_table.streams().is_empty()
+                    || tls_pending_before
+                    || self.core.stream_table.expect_write().is_some()
+                {
+                    debug!(
+                        "{} H2 close with active state: state={:?}, streams={}, expect_write={:?}, wants_write={}, readiness={:?}",
+                        log_context!(self.core),
+                        self.core.state,
+                        self.core.stream_table.streams().len(),
+                        self.core.stream_table.expect_write(),
+                        tls_pending_before,
+                        self.core.readiness
+                    );
+                    for (stream_id, global_stream_id) in self.core.stream_table.streams() {
+                        let stream = &context.streams[*global_stream_id];
+                        debug!(
+                            "{}   close stream id={} gid={}: state={:?}, front_eos={}, back_eos={}, front_phase={:?}, back_phase={:?}, front_completed={}, back_completed={}",
+                            log_context!(self.core),
+                            stream_id,
+                            global_stream_id,
+                            stream.state,
+                            stream.front_received_end_of_stream,
+                            stream.back_received_end_of_stream,
+                            stream.front.parsing_phase,
+                            stream.back.parsing_phase,
+                            stream.front.is_completed(),
+                            stream.back.is_completed()
+                        );
+                    }
+                }
+                if !self.core.close_notify_sent {
+                    trace!("{} H2 SENDING CLOSE NOTIFY", log_context!(self.core));
+                }
+                let (tls_pending_after, drain_rounds) =
+                    drain_tls_close_notify(&mut self.socket, &mut self.core.close_notify_sent);
+                if tls_pending_after {
+                    // Severity tiering: key on stream-count + close-state, not
+                    // peer-vs-operator. Composes with the send-side `H2Error`
+                    // variant tier in `goaway()` — both rules demote benign
+                    // paths and keep loss-bearing paths loud.
+                    //
+                    // - `streams != 0`           -> `error!`: live streams at
+                    //   close time, response-byte loss is possible.
+                    // - `streams == 0` AND state in {GoAway, Error}
+                    //                             -> `warn!`: idle close after
+                    //   a GOAWAY exchange (peer-initiated abort or our own
+                    //   graceful drain). What's stranded is best-effort
+                    //   GOAWAY/close_notify; no application data was queued.
+                    // - `streams == 0` from any other state
+                    //                             -> `error!`: unexpected
+                    //   teardown path (no GOAWAY exchange) — keep loud so
+                    //   unknown failure modes surface.
+                    if !self.core.stream_table.streams().is_empty() {
+                        error!(
+                            "{} TLS buffer NOT fully drained on close: \
+                             pending_before={}, pending_after={}, drain_rounds={}, \
+                             state={:?}, streams={}, expect_write={:?}, \
+                             close_notify_sent={}, readiness={:?}",
+                            log_context!(self.core),
+                            tls_pending_before,
+                            tls_pending_after,
+                            drain_rounds,
+                            self.core.state,
+                            self.core.stream_table.streams().len(),
+                            self.core.stream_table.expect_write(),
+                            self.core.close_notify_sent,
+                            self.core.readiness
+                        );
+                    } else if matches!(self.core.state, H2State::GoAway | H2State::Error) {
+                        warn!(
+                            "{} TLS buffer NOT fully drained on close: \
+                             pending_before={}, pending_after={}, drain_rounds={}, \
+                             state={:?}, streams={}, expect_write={:?}, \
+                             close_notify_sent={}, readiness={:?}",
+                            log_context!(self.core),
+                            tls_pending_before,
+                            tls_pending_after,
+                            drain_rounds,
+                            self.core.state,
+                            self.core.stream_table.streams().len(),
+                            self.core.stream_table.expect_write(),
+                            self.core.close_notify_sent,
+                            self.core.readiness
+                        );
+                    } else {
+                        error!(
+                            "{} TLS buffer NOT fully drained on close: \
+                             pending_before={}, pending_after={}, drain_rounds={}, \
+                             state={:?}, streams={}, expect_write={:?}, \
+                             close_notify_sent={}, readiness={:?}",
+                            log_context!(self.core),
+                            tls_pending_before,
+                            tls_pending_after,
+                            drain_rounds,
+                            self.core.state,
+                            self.core.stream_table.streams().len(),
+                            self.core.stream_table.expect_write(),
+                            self.core.close_notify_sent,
+                            self.core.readiness
+                        );
+                    }
+                }
+                return;
+            }
+        }
+        // reconnection is handled by the server for each stream separately
+        for global_stream_id in self.core.stream_table.streams().values() {
+            trace!(
+                "{} end stream: {}",
+                log_context!(self.core),
+                global_stream_id
+            );
+            if let StreamState::Linked(token) = context.streams[*global_stream_id].state {
+                endpoint.end_stream(token, *global_stream_id, context);
+            }
+        }
+    }
+
+    /// Wrap a freshly built core around the socket it will speak through.
+    ///
+    /// The `peer_addr()` call is here because this is the layer that has a
+    /// socket to ask. It is still the one read of it on the connection's whole
+    /// lifetime — `ConnectionH2::peer_address` documents why the answer is
+    /// snapshotted rather than re-read — and it now happens one layer out,
+    /// before the core exists rather than inside its constructor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_ulid: Ulid,
+        socket: Front,
+        position: super::Position,
+        buffers: &mut dyn super::buffer_source::BufferSource,
+        flood_config: H2FloodConfig,
+        connection_config: H2ConnectionConfig,
+        stream_idle_timeout: std::time::Duration,
+        graceful_shutdown_deadline: Option<std::time::Duration>,
+        timeout_duration: std::time::Duration,
+        expect_read: Option<(H2StreamId, usize)>,
+        readiness_interest: sozu_command::ready::Ready,
+    ) -> Option<Self> {
+        let core = ConnectionH2::new(
+            session_ulid,
+            socket.peer_addr(),
+            position,
+            buffers,
+            flood_config,
+            connection_config,
+            stream_idle_timeout,
+            graceful_shutdown_deadline,
+            timeout_duration,
+            expect_read,
+            readiness_interest,
+        )?;
+        Some(H2Shell { core, socket })
+    }
+}
+
+/// The socket shell of the H2 data path.
+///
+/// Every production `self.socket` in this file is in this block and its
+/// sibling above it, and `ConnectionH2` has none. `H2Shell::readable` and
+/// `H2Shell::write_streams` are the two byte movers: each is the caller that
+/// sits between one of the core's two poll/handle pairs —
+/// [`ConnectionH2::poll_read_target`] with [`ConnectionH2::handle_read`], and
+/// [`ConnectionH2::poll_write_target`] with [`ConnectionH2::handle_write`].
+/// All four are `pub`, and so are the buffers they name
+/// ([`ConnectionH2::read_space`], [`ConnectionH2::write_buffer`]), so a driver
+/// outside this crate can stand exactly where these two functions stand.
+/// `sim/tests/h2_simulation.rs` is that driver, and it is what makes the claim
+/// measurable rather than asserted.
+///
+/// `H2Shell::writable` is the third member, and the only socket it touches it
+/// touches through the three TLS seams — `H2Shell::tls_wants_write`,
+/// `H2Shell::flush_tls_records` and `H2Shell::begin_tls_close` — whose bodies
+/// live here too. It drives two more poll/handle pairs:
+/// [`ConnectionH2::flush_pending_control_frames`] with
+/// [`ConnectionH2::handle_control_flush`], and
+/// [`ConnectionH2::dispatch_writable_state`] with
+/// [`ConnectionH2::dispatch_writable_state_after_flush`]. Neither takes a
+/// `Front`: the `(H2State, Position)` dispatch and the control-frame walk are
+/// both drivable without a socket, which is the whole claim.
+///
+/// The fourth pair is `ConnectionH2::force_disconnect` with
+/// [`ConnectionH2::force_disconnect_after_query`], and it is the one that
+/// cannot ride a return value — see [`H2ForceDisconnectTarget`]. `H2Shell::settled`
+/// is where it lands, and every `MuxResult` a core step hands this block goes
+/// through it.
 ///
 /// # Why `write_streams` stays private, and where the `unsafe` windows are
 ///
-/// `ConnectionH2::write_streams` keeps the `Vec<IoSlice<'static>>` that
-/// brackets `h2_transmit::gather` and `h2_transmit::confirm`, and it keeps it
-/// because the loop that opens and closes that bracket came here with it.
-/// There are now TWO `unsafe` blocks on this path rather than one, and they
-/// nest:
+/// `H2Shell::write_streams` keeps the `Vec<IoSlice<'static>>` that brackets
+/// `h2_transmit::gather` and `h2_transmit::confirm`, and it keeps it because
+/// the loop that opens and closes that bracket lives with it. There are TWO
+/// `unsafe` blocks on this path and they nest:
 ///
 /// - the INNER one is `gather`'s `slice::from_raw_parts`, which re-labels
 ///   borrows of `kawa.storage` as `'static`. It opens and closes inside that
@@ -6937,25 +7353,157 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 /// - the OUTER one is the `unsafe { … }` around the `gather` CALL below, which
 ///   exists because `gather` is `pub unsafe fn`: the lifetime obligation is
 ///   stated in its signature and discharged by the caller. It wraps the call
-///   and nothing else — not the vectored write, not the `confirm`.
+///   and nothing else — not the vectored write, not the `confirm`. It is the
+///   only `unsafe` block in production code in this file.
 ///
-/// The window those blocks guard is the same one, and it did not widen: it
-/// opens at that `gather` call and closes at the `confirm` three statements
-/// later, where `io_slices.clear()` runs before the consume which may relocate
-/// the storage. The only thing entered while the descriptors are live is
-/// `SocketHandler::socket_write_vectored`, which reborrows them for the
-/// duration of the call and cannot retain them. No `IoSlice<'static>` survives
-/// one iteration of the loop.
+/// **The window did not widen when `write_streams` moved onto `H2Shell`.** It
+/// still opens at that `gather` call and closes at the `confirm` three
+/// statements later, where `io_slices.clear()` runs before the consume which
+/// may relocate the storage; the `Vec` is still declared in the same function
+/// body, a few lines above the loop. The only thing entered while the
+/// descriptors are live is `SocketHandler::socket_write_vectored`, which
+/// reborrows them for the duration of the call and cannot retain them. No
+/// `IoSlice<'static>` survives one iteration of the loop. What changed is the
+/// receiver, from `&mut ConnectionH2<Front>` to `&mut H2Shell<Front>`, and the
+/// buffer now arrives through [`ConnectionH2::write_buffer`] instead of the
+/// free function — neither of which moves either end of the bracket.
 ///
-/// That the bracket does not span the poll/handle seam matters MORE now than
-/// it did before those four functions were widened, not less: the seam is
-/// `pub` rather than `pub(super)`, so halves on opposite sides of it could be
-/// separated by a caller this crate cannot see. `write_streams` stays private
-/// for that reason. `h2_transmit`'s pair is now exported — `gather` as
-/// `pub unsafe fn`, `confirm` as a plain `pub fn` that produces no descriptor
-/// and so leaves no obligation — which moves the same argument onto any
-/// out-of-crate caller's own bracket rather than dissolving it.
-impl<Front: SocketHandler> ConnectionH2<Front> {
+/// That the bracket does not span the poll/handle seam matters MORE now, not
+/// less: the seam is `pub`, the buffers it names are `pub`, and an
+/// out-of-crate driver really does exist, so halves on opposite sides of it
+/// could be separated by a caller this crate cannot see. `write_streams` stays
+/// private for that reason, on `H2Shell` exactly as it was on `ConnectionH2`.
+/// `h2_transmit`'s pair is exported — `gather` as `pub unsafe fn`, `confirm`
+/// as a plain `pub fn` that produces no descriptor and so leaves no
+/// obligation — which moves the same argument onto that driver's own bracket
+/// rather than dissolving it. `H2Harness::write_streams` in
+/// `sim/tests/h2_simulation.rs` opens and closes its own bracket inside its
+/// own single function, for the same reason and with the same shape.
+impl<Front: SocketHandler> H2Shell<Front> {
+    /// Answer a core step, settling any [`H2ForceDisconnectTarget`] it parked
+    /// on the way.
+    ///
+    /// The one place the socket answers a force-disconnect, and the reason
+    /// `ConnectionH2::force_disconnect` can be raised from seventeen sites
+    /// that hold no socket. Every `MuxResult` a core step hands this impl
+    /// block leaves through here, which is what makes the discipline
+    /// greppable rather than asserted: a core call in this block whose type is
+    /// [`MuxResult`] and which does not appear as this function's argument is
+    /// a missed settlement.
+    ///
+    /// `result` is the core's provisional answer and survives untouched when
+    /// nothing was parked — the overwhelmingly common case, since only a
+    /// force-disconnect parks anything.
+    /// [`ConnectionH2::force_disconnect`], settled.
+    ///
+    /// The public spelling of the decision: the core raises it and this reads
+    /// the query it could not. Every out-of-shell caller goes through here.
+    pub fn force_disconnect(&mut self) -> MuxResult {
+        let result = self.core.force_disconnect();
+        self.settled(result)
+    }
+
+    /// [`ConnectionH2::graceful_goaway`], settled.
+    ///
+    /// Reaches `ConnectionH2::force_disconnect` through
+    /// `ConnectionH2::send_initial_goaway`'s serialisation-failure arm.
+    pub fn graceful_goaway(&mut self, now: Instant) -> MuxResult {
+        let result = self.core.graceful_goaway(now);
+        self.settled(result)
+    }
+
+    /// [`ConnectionH2::start_stream`], settled.
+    ///
+    /// Answers the core's `bool` unchanged. The settlement is still required
+    /// and still belongs HERE: the core reaches
+    /// `ConnectionH2::graceful_goaway` from its stream-id-exhaustion arm, and
+    /// the readiness that settlement writes is read by `Mux` before it decides
+    /// whether this connection gets a `writable` at all.
+    pub fn start_stream<L>(&mut self, stream: GlobalStreamId, context: &mut Context<L>) -> bool
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        let started = self.core.start_stream(stream, context);
+        self.settle();
+        started
+    }
+
+    /// [`ConnectionH2::cancel_timed_out_streams`], settled.
+    ///
+    /// The core answers nothing and already discards the flood-violation
+    /// `MuxResult` its `ConnectionH2::enqueue_rst` sweep can raise — see its
+    /// own comment. That discard is preserved: what this adds is the readiness
+    /// half of a force-disconnect that discard used to leave completed.
+    pub fn cancel_timed_out_streams<E, L>(&mut self, context: &mut Context<L>, endpoint: &mut E)
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        self.core.cancel_timed_out_streams(context, endpoint);
+        self.settle();
+    }
+
+    /// [`ConnectionH2::end_stream`], forwarded.
+    ///
+    /// No settlement: `ConnectionH2::end_stream` cannot reach
+    /// `ConnectionH2::force_disconnect`. It is here only because
+    /// `Connection`'s `forward!` needs one name on both arms.
+    pub fn end_stream<L>(&mut self, stream_gid: GlobalStreamId, context: &mut Context<L>)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        self.core.end_stream(stream_gid, context)
+    }
+
+    /// Drive [`ConnectionH2::flush_pending_control_frames`] to a terminal
+    /// answer, performing each zero-buffer flush it asks for.
+    ///
+    /// The loop is the shell's because the socket is: the core walks its
+    /// stages, stops at each one that has bytes it cannot move, and is told
+    /// what the write reported. At most three iterations run — one per stage —
+    /// and a stall on any of them leaves the loop with
+    /// [`H2ControlFlushTarget::Stalled`], which is the caller's cue to read
+    /// the TLS query the stalled write just changed the answer to.
+    fn drive_control_flush(&mut self) -> ControlFlushOutcome {
+        let mut target = self.core.flush_pending_control_frames();
+        loop {
+            match target {
+                H2ControlFlushTarget::FlushZero(stage) => {
+                    let stalled = self.flush_zero_to_socket();
+                    target = self.core.handle_control_flush(stage, stalled);
+                }
+                H2ControlFlushTarget::Proceed => return ControlFlushOutcome::Proceed,
+                H2ControlFlushTarget::Done(result) => return ControlFlushOutcome::Done(result),
+                H2ControlFlushTarget::Stalled => return ControlFlushOutcome::Stalled,
+            }
+        }
+    }
+
+    fn settled(&mut self, result: MuxResult) -> MuxResult {
+        let Some(target) = self.core.poll_force_disconnect() else {
+            return result;
+        };
+        let tls_wants_write = self.tls_wants_write();
+        self.core
+            .force_disconnect_after_query(target, tls_wants_write)
+    }
+
+    /// [`ConnectionH2::settled`] for a core step whose own answer is not a
+    /// [`MuxResult`], or is one this layer has always dropped.
+    ///
+    /// `ConnectionH2::start_stream` answers a `bool` and
+    /// `ConnectionH2::cancel_timed_out_streams` answers nothing, yet both
+    /// reach `ConnectionH2::force_disconnect` — the first through
+    /// `ConnectionH2::graceful_goaway`, the second through
+    /// `ConnectionH2::enqueue_rst`'s flood escalation, which it already
+    /// discards with `let _ =`. The settlement still has to happen HERE rather
+    /// than at the next entry point, because it writes `readiness` and `Mux`
+    /// reads `Readiness::filter_interest` between entry points to decide
+    /// whether to call `readable`/`writable` at all.
+    fn settle(&mut self) {
+        let _ = self.settled(MuxResult::Continue);
+    }
+
     /// Drive one frontend read pass.
     ///
     /// The core lives in `Self::poll_read_target` and `Self::handle_read`,
@@ -6966,26 +7514,30 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// and the frame state machine between the two calls is drivable without
     /// one, exactly as `h2_transmit::gather`/`confirm` already bracket the
     /// vectored write.
-    pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
+    pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
     where
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        match self.poll_read_target(context, &mut endpoint) {
+        let result = self.readable_inner(context, endpoint);
+        self.settled(result)
+    }
+
+    fn readable_inner<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        match self.core.poll_read_target(context, &mut endpoint) {
             H2ReadTarget::Done(result) => result,
             H2ReadTarget::Skip(stream_id) => {
-                self.handle_read(context, endpoint, stream_id, H2ReadOutcome::Skipped)
+                self.core
+                    .handle_read(context, endpoint, stream_id, H2ReadOutcome::Skipped)
             }
             H2ReadTarget::Fill { stream_id, amount } => {
-                let space = read_space(
-                    &mut self.zero,
-                    &mut context.streams,
-                    &self.position,
-                    stream_id,
-                    amount,
-                );
+                let space = self.core.read_space(context, stream_id, amount);
                 let (size, status) = self.socket.socket_read(space);
-                self.handle_read(
+                self.core.handle_read(
                     context,
                     endpoint,
                     stream_id,
@@ -7039,22 +7591,31 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        // Entry point: adopt the mux's snapshot for this pass.
-        self.now = context.now;
-        self.prune_inactive_streams_while_closing(context);
+        let result = self.writable_inner(context, endpoint);
+        self.settled(result)
+    }
 
-        match self.flush_pending_control_frames() {
-            H2ControlFlushTarget::Done(result) => return result,
+    fn writable_inner<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        // Entry point: adopt the mux's snapshot for this pass.
+        self.core.adopt_now(context.now);
+        self.core.prune_inactive_streams_while_closing(context);
+
+        match self.drive_control_flush() {
+            ControlFlushOutcome::Done(result) => return result,
             // The stalled-drain tail the three stages used to run inline. The
             // query belongs here and not there: `flush_zero_to_socket` is what
             // changed the answer, so it has to be read after the stall, and
             // this is the layer that owns the socket.
-            H2ControlFlushTarget::Stalled => {
+            ControlFlushOutcome::Stalled => {
                 let tls_wants_write = self.tls_wants_write();
-                self.ensure_tls_flushed(tls_wants_write);
+                self.core.ensure_tls_flushed(tls_wants_write);
                 return MuxResult::Continue;
             }
-            H2ControlFlushTarget::Proceed => {}
+            ControlFlushOutcome::Proceed => {}
         }
 
         // Flush any pending TLS records before state-specific processing.
@@ -7072,7 +7633,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // two close arms that consult it because those arms no longer touch
         // the socket, and it is read ONCE because only one of them can run.
         let tls_wants_write = self.tls_wants_write();
-        match self.dispatch_writable_state(tls_wants_write) {
+        match self.core.dispatch_writable_state(tls_wants_write) {
             H2WritableStateTarget::Done(result) => result,
             // The `H2State::GoAway` arm's own flush, the second this pass
             // attempts, and the only *action* the close decision cannot take
@@ -7084,7 +7645,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // `(size, status)` is discarded, so this read is the only way
                 // the pass learns whether the records reached the kernel.
                 let tls_wants_write = self.tls_wants_write();
-                self.dispatch_writable_state_after_flush(tls_wants_write)
+                self.core
+                    .dispatch_writable_state_after_flush(tls_wants_write)
             }
             H2WritableStateTarget::WriteStreams => self.write_streams(context, endpoint),
         }
@@ -7097,20 +7659,20 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// stream, prepares new frames via the H2 block converter, flushes them to
     /// the socket, and recycles completed streams.
     ///
-    /// The core lives in [`Self::poll_write_target`] and [`Self::handle_write`],
+    /// The core lives in [`ConnectionH2::poll_write_target`] and [`ConnectionH2::handle_write`],
     /// both `pub`; this function is the caller that sits between them, and its
     /// `self.socket.socket_write_vectored` is the only place a stream's bytes
     /// reach the socket. It lives in the shell impl rather than among the core
     /// impls for the reason stated there, exactly as `readable()` keeps
-    /// `socket_read` outside [`Self::poll_read_target`].
+    /// `socket_read` outside [`ConnectionH2::poll_read_target`].
     ///
     /// The pass's last step is a socket touch too, and for the same reason it
     /// sits here: [`H2WriteTarget::Finalize`] is answered by reading
     /// [`Self::tls_wants_write`], driving the [`H2FinalizeTarget`]
-    /// [`Self::finalize_write`] answers — performing
+    /// [`ConnectionH2::finalize_write`] answers — performing
     /// [`Self::flush_tls_records`] for [`H2FinalizeTarget::Flush`] and not for
     /// [`H2FinalizeTarget::SkipFlush`] — and reading the query again for
-    /// [`Self::finalize_write_after_flush`]. That is the query / flush / query
+    /// [`ConnectionH2::finalize_write_after_flush`]. That is the query / flush / query
     /// triple `h2_close::TlsFlushPhase` names, and the three TLS seams it
     /// reaches are what a byte-in / byte-out core receives as inputs instead
     /// of asking for.
@@ -7134,7 +7696,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     ///
     /// The [`converter::H2BlockConverter`] is scoped to a single
     /// `kawa.prepare` call rather than to the whole per-stream loop, so the
-    /// `&mut self.hpack` borrow it takes for the connection's HPACK encoder
+    /// `&mut self.core.hpack` borrow it takes for the connection's HPACK encoder
     /// never spans the loop. Every `&self` / `&mut self` method is therefore
     /// callable inside the loop body; what remains deferred to after it —
     /// RST accounting and stream retirement — is deferred for its own
@@ -7155,19 +7717,26 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         // LIFECYCLE §9 invariant 9 now lives in `ConnectionH2::handle_write`,
         // where the pass knows a real stream's bytes reached the socket.
         // Pre-compute byte totals for proportional overhead distribution.
-        let mut pass = H2WritePass::new(self.compute_stream_byte_totals(context));
+        let mut pass = H2WritePass::new(self.core.compute_stream_byte_totals(context));
         let mut io_slices: Vec<IoSlice<'static>> = Vec::new();
 
         loop {
-            match self.poll_write_target(context, &mut endpoint, &mut pass) {
+            match self
+                .core
+                .poll_write_target(context, &mut endpoint, &mut pass)
+            {
                 H2WriteTarget::Done(result) => return result,
                 H2WriteTarget::Finalize {
                     socket_write,
                     bytes_written,
                 } => {
                     let tls_wants_write = self.tls_wants_write();
-                    match self.finalize_write(tls_wants_write, socket_write, bytes_written, context)
-                    {
+                    match self.core.finalize_write(
+                        tls_wants_write,
+                        socket_write,
+                        bytes_written,
+                        context,
+                    ) {
                         H2FinalizeTarget::Done(result) => return result,
                         // The only *action* of the three TLS seams, and the
                         // one step the core cannot take for itself.
@@ -7182,19 +7751,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     // A fresh query, not the binding above: this one asks
                     // whether the step between them landed.
                     let tls_wants_write = self.tls_wants_write();
-                    return self.finalize_write_after_flush(tls_wants_write);
+                    return self.core.finalize_write_after_flush(tls_wants_write);
                 }
                 H2WriteTarget::Transmit { stream_id } => {
                     // Gather / write / confirm. The gather borrows
                     // `kawa.storage` and hands back descriptors with an
                     // extended lifetime; `confirm` discharges that obligation
                     // before the consume.
-                    let kawa = write_buffer(
-                        &mut self.zero,
-                        &mut context.streams,
-                        &self.position,
-                        stream_id,
-                    );
+                    let kawa = self.core.write_buffer(context, stream_id);
                     // SAFETY: `kawa` is neither dropped nor mutated between
                     // this call and the `confirm` three statements below, and
                     // that `confirm` clears `io_slices` before the
@@ -7209,7 +7773,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                         "the socket reported {size} bytes written for an offer of {offered}"
                     );
                     h2_transmit::confirm(kawa, &mut io_slices, size);
-                    self.handle_write(context, stream_id, size, status, &mut pass);
+                    self.core
+                        .handle_write(context, stream_id, size, status, &mut pass);
                 }
             }
         }
@@ -8129,8 +8694,8 @@ mod tests {
 
     fn connection_from_source(
         buffers: &mut dyn super::super::buffer_source::BufferSource,
-    ) -> Option<ConnectionH2<mio::net::TcpStream>> {
-        ConnectionH2::new(
+    ) -> Option<H2Shell<mio::net::TcpStream>> {
+        H2Shell::new(
             Ulid::generate(),
             loopback_socket_handle(),
             Position::Server,
@@ -8188,7 +8753,7 @@ mod tests {
 
         let before = ready_incremental_gauge();
 
-        let mut connection = ConnectionH2::new(
+        let mut connection = H2Shell::new(
             Ulid::generate(),
             socket,
             Position::Server,
@@ -8206,8 +8771,8 @@ mod tests {
         // What the tail of `write_streams` writes once the pass's bucket map
         // is final, published by the `gauge_connection_state` call that
         // follows it.
-        connection.ready_incremental_streams = 3;
-        connection.gauge_connection_state();
+        connection.core.ready_incremental_streams = 3;
+        connection.core.gauge_connection_state();
 
         assert_eq!(
             ready_incremental_gauge() - before,
@@ -8392,9 +8957,9 @@ mod tests {
         pending: usize,
         drain_per_flush: usize,
         state: H2State,
-    ) -> (ConnectionH2<BackpressuredTlsSocket>, std::net::TcpStream) {
+    ) -> (H2Shell<BackpressuredTlsSocket>, std::net::TcpStream) {
         let (socket, peer) = connected_socket();
-        let mut connection = ConnectionH2::new(
+        let mut connection = H2Shell::new(
             Ulid::generate(),
             BackpressuredTlsSocket::new(socket, pending, drain_per_flush),
             Position::Server,
@@ -8408,7 +8973,7 @@ mod tests {
             Ready::WRITABLE | Ready::HUP | Ready::ERROR,
         )
         .expect("a pool with free buffers must yield an H2 connection");
-        connection.state = state;
+        connection.core.state = state;
         (connection, peer)
     }
 
@@ -8421,7 +8986,7 @@ mod tests {
     /// TO SEE THIS RED: delete the `self.ensure_tls_flushed(tls_wants_write);`
     /// call in the `CloseAction::ReArmAndContinue` arm of
     /// `ConnectionH2::dispatch_writable_state_after_flush`, which is where
-    /// `ConnectionH2::writable`'s `H2State::GoAway` branch settles. The WRITABLE
+    /// `H2Shell::writable`'s `H2State::GoAway` branch settles. The WRITABLE
     /// *event* bit is then never re-signalled and this test fails on its OWN
     /// assertion, `the WRITABLE event must be re-signalled so the event loop
     /// retries the flush`. The recipe deliberately does not swap
@@ -8456,20 +9021,20 @@ mod tests {
         // so the state is still `GoAway`; the fall-through would have gone
         // through `force_disconnect`, which sets `H2State::Error` first.
         assert!(
-            matches!(connection.state, H2State::GoAway),
+            matches!(connection.core.state, H2State::GoAway),
             "the GoAway arm must re-arm and return, not fall through to \
              force_disconnect, got {:?}",
-            connection.state
+            connection.core.state
         );
         // Not `readiness.interest`: that bit is this fixture's own argument to
         // `ConnectionH2::new` and nothing on this path clears it, so asserting
         // on it would assert on the harness. The edge-triggered re-arm is the
         // EVENT bit, set by `ensure_tls_flushed` -> `signal_pending_write`.
         assert!(
-            connection.readiness.event.is_writable(),
+            connection.core.readiness.event.is_writable(),
             "the WRITABLE event must be re-signalled so the event loop retries \
              the flush, got {:?}",
-            connection.readiness
+            connection.core.readiness
         );
         // Not `socket_wants_write()`: with `drain_per_flush = 0` that can never
         // change, so it is a tautology of the harness no production edit can
@@ -8490,7 +9055,7 @@ mod tests {
     /// but would double the latency of every close under backpressure and
     /// would strand the connection against a peer that never re-arms.
     ///
-    /// TO SEE THIS RED: in `ConnectionH2::writable`, add
+    /// TO SEE THIS RED: in `H2Shell::writable`, add
     /// `return MuxResult::Continue;` immediately after the
     /// `self.flush_tls_records();` inside the `H2WritableStateTarget::Flush`
     /// arm — the flush the `H2State::GoAway` branch asks for, performed and
@@ -8587,9 +9152,9 @@ mod tests {
         // reading the fixture's own argument back and could not see the
         // re-arm at all.
         assert!(
-            !connection.readiness.event.is_writable(),
+            !connection.core.readiness.event.is_writable(),
             "premise: the WRITABLE event must start clear so the re-arm below              is the only thing that can set it, got {:?}",
-            connection.readiness
+            connection.core.readiness
         );
 
         let result = connection.writable(&mut context, EndpointClient(&mut router));
@@ -8608,9 +9173,9 @@ mod tests {
             "premise: one record must survive both flushes, or the post-flush              query could only answer one way"
         );
         assert!(
-            connection.readiness.event.is_writable(),
+            connection.core.readiness.event.is_writable(),
             "the WRITABLE event must be re-signalled so the event loop retries              the flush, got {:?}",
-            connection.readiness
+            connection.core.readiness
         );
     }
 
@@ -8636,15 +9201,15 @@ mod tests {
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
-        connection.state = H2State::Header;
-        connection.readiness.interest.insert(Ready::WRITABLE);
+        connection.core.state = H2State::Header;
+        connection.core.readiness.interest.insert(Ready::WRITABLE);
 
         assert!(
             !connection.socket.socket_wants_write(),
             "premise: a plain TcpStream holds no TLS records, so the readiness              policy is reached at all"
         );
         assert!(
-            connection.stream_table.expect_write().is_none(),
+            connection.core.stream_table.expect_write().is_none(),
             "premise: no parked partial write, or the policy is suppressed"
         );
 
@@ -8655,9 +9220,9 @@ mod tests {
             "an empty write pass continues, got {result:?}"
         );
         assert!(
-            !connection.readiness.interest.is_writable(),
+            !connection.core.readiness.interest.is_writable(),
             "a pass that owes nothing must relinquish WRITABLE interest, got              {:?}",
-            connection.readiness
+            connection.core.readiness
         );
     }
 
@@ -8692,7 +9257,7 @@ mod tests {
     /// tail's `return H2ControlFlushTarget::Stalled;` with
     /// `return H2ControlFlushTarget::Done(MuxResult::Continue);` — the pass
     /// still ends on `Continue`, and the only thing lost is the TLS re-arm
-    /// `ConnectionH2::writable` performs for `Stalled`. The last assertion
+    /// `H2Shell::writable` performs for `Stalled`. The last assertion
     /// fails with `the stalled WINDOW_UPDATE drain must re-signal the
     /// WRITABLE event`: `flush_zero_to_socket` cleared the bit on the way in
     /// and nothing else on this path sets it. Measured: `1114 passed; 1
@@ -8725,9 +9290,9 @@ mod tests {
         );
         // Connection-level replenishment: ordinary housekeeping, queued the
         // way `handle_frame` queues it.
-        connection.queue_window_update(0, 65_535);
+        connection.core.queue_window_update(0, 65_535);
         assert!(
-            connection.stream_table.expect_write().is_none(),
+            connection.core.stream_table.expect_write().is_none(),
             "premise: no parked partial write, or the drain stage is skipped"
         );
 
@@ -8739,17 +9304,17 @@ mod tests {
              {result:?}"
         );
         assert_eq!(
-            connection.stream_table.expect_write(),
+            connection.core.stream_table.expect_write(),
             Some(H2StreamId::Zero),
             "premise: the pass must have taken the STALLED branch of the \
              WINDOW_UPDATE drain, the only site that parks the zero buffer here"
         );
         assert!(
-            connection.readiness.event.is_writable(),
+            connection.core.readiness.event.is_writable(),
             "the stalled WINDOW_UPDATE drain must re-signal the WRITABLE \
              event: under edge-triggered epoll the parked frame has no other \
              wake-up, got {:?}",
-            connection.readiness
+            connection.core.readiness
         );
     }
 
@@ -8786,11 +9351,14 @@ mod tests {
         // the lifetime cap check above this stage does not escalate to
         // GOAWAY(ENHANCE_YOUR_CALM) and swallow the drain.
         assert!(
-            connection.enqueue_rst(1, H2Error::Cancel).is_none(),
+            connection.core.enqueue_rst(1, H2Error::Cancel).is_none(),
             "premise: a single RST must not trip the flood detector"
         );
         assert!(
-            connection.flow_control.pending_window_updates_is_empty(),
+            connection
+                .core
+                .flow_control
+                .pending_window_updates_is_empty(),
             "premise: no queued WINDOW_UPDATE, or the stage above returns \
              first and this test exercises the wrong drain"
         );
@@ -8803,17 +9371,17 @@ mod tests {
              {result:?}"
         );
         assert_eq!(
-            connection.stream_table.expect_write(),
+            connection.core.stream_table.expect_write(),
             Some(H2StreamId::Zero),
             "premise: the pass must have taken the STALLED branch of the \
              RST_STREAM drain, the only site that parks the zero buffer here"
         );
         assert!(
-            connection.readiness.event.is_writable(),
+            connection.core.readiness.event.is_writable(),
             "the stalled RST_STREAM drain must re-signal the WRITABLE event: \
              under edge-triggered epoll the parked frame has no other wake-up, \
              got {:?}",
-            connection.readiness
+            connection.core.readiness
         );
     }
 
@@ -8941,7 +9509,7 @@ mod tests {
             context.streams[gid].metrics.bout,
             connection.socket.vectored_calls,
             out_is_empty,
-            connection.readiness.clone(),
+            connection.core.readiness.clone(),
         )
     }
 
@@ -9175,7 +9743,7 @@ mod tests {
         blocks: &[&'static [u8]],
         script: &[(usize, SocketResult)],
     ) -> (
-        ConnectionH2<BackpressuredTlsSocket>,
+        H2Shell<BackpressuredTlsSocket>,
         Context<TestListener>,
         GlobalStreamId,
         std::net::TcpStream,
@@ -9187,8 +9755,9 @@ mod tests {
             .create_stream(Ulid::generate(), 1 << 16)
             .expect("test context must create a stream");
         connection
+            .core
             .stream_table
-            .register(REGISTERED_STREAM_ID, gid, connection.now);
+            .register(REGISTERED_STREAM_ID, gid, connection.core.now);
         for block in blocks {
             context.streams[gid]
                 .back
@@ -9262,7 +9831,7 @@ mod tests {
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
         assert_eq!(
-            connection.stream_table.expect_write(),
+            connection.core.stream_table.expect_write(),
             None,
             "premise: no parked write, so the pass takes the main loop and not \
              the resume path"
@@ -9287,7 +9856,7 @@ mod tests {
             "every queued block must be consumed once the pass drains"
         );
         assert_eq!(
-            connection.stream_table.expect_write(),
+            connection.core.stream_table.expect_write(),
             None,
             "a pass that drained must not park expect_write: parking here \
              would defer a stream that owes nothing to the next writable tick"
@@ -9329,7 +9898,7 @@ mod tests {
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
         assert_eq!(
-            connection.stream_table.expect_write(),
+            connection.core.stream_table.expect_write(),
             None,
             "premise: nothing parked on entry, so any park below is this \
              pass's doing"
@@ -9339,7 +9908,7 @@ mod tests {
         let result = connection.writable(&mut context, EndpointClient(&mut router));
 
         assert_eq!(
-            connection.stream_table.expect_write(),
+            connection.core.stream_table.expect_write(),
             Some(H2StreamId::Other {
                 id: REGISTERED_STREAM_ID,
                 gid
@@ -9361,10 +9930,10 @@ mod tests {
             "a stalled write delivered nothing"
         );
         assert!(
-            connection.readiness.interest.is_writable(),
+            connection.core.readiness.interest.is_writable(),
             "a parked pass leaves every readiness bit alone — stripping \
              WRITABLE here would strand the parked stream, got {:?}",
-            connection.readiness
+            connection.core.readiness
         );
         assert!(
             matches!(result, MuxResult::Continue),
@@ -9411,13 +9980,13 @@ mod tests {
             id: REGISTERED_STREAM_ID,
             gid,
         };
-        connection.stream_table.set_expect_write(Some(parked));
+        connection.core.stream_table.set_expect_write(Some(parked));
         assert_prepare_gate_is_shut(&context, gid);
 
         let result = connection.writable(&mut context, EndpointClient(&mut router));
 
         assert_eq!(
-            connection.stream_table.expect_write(),
+            connection.core.stream_table.expect_write(),
             Some(parked),
             "a stalled resume must leave expect_write parked: clearing it \
              would hand a socket-blocked stream back to the scheduler"
@@ -9486,6 +10055,7 @@ mod tests {
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
         connection
+            .core
             .stream_table
             .set_expect_write(Some(H2StreamId::Other {
                 id: REGISTERED_STREAM_ID,
@@ -9502,16 +10072,16 @@ mod tests {
             .push_back(kawa::Block::StatusLine);
         assert_prepare_gate_is_shut(&context, gid);
         assert!(
-            connection.readiness.interest.is_writable(),
+            connection.core.readiness.interest.is_writable(),
             "premise: WRITABLE interest must start armed, or the withdrawal \
              below is unobservable, got {:?}",
-            connection.readiness
+            connection.core.readiness
         );
 
         let result = connection.writable(&mut context, EndpointClient(&mut router));
 
         assert_eq!(
-            connection.readiness.interest,
+            connection.core.readiness.interest,
             Ready::HUP | Ready::ERROR,
             "a pass whose scheduler loop wrote nothing must withdraw WRITABLE \
              interest: the resume path's drain is socket catch-up, not the \
@@ -9530,7 +10100,7 @@ mod tests {
              is unreachable whatever made_progress says"
         );
         assert_eq!(
-            connection.stream_table.expect_write(),
+            connection.core.stream_table.expect_write(),
             None,
             "a drained resume clears the park before the scheduler pass"
         );
@@ -9646,7 +10216,7 @@ mod tests {
         pool: &Rc<RefCell<Pool>>,
         script: &[(usize, SocketResult)],
     ) -> (
-        ConnectionH2<BackpressuredTlsSocket>,
+        H2Shell<BackpressuredTlsSocket>,
         Context<TestListener>,
         [GlobalStreamId; 2],
         std::net::TcpStream,
@@ -9661,14 +10231,15 @@ mod tests {
                 .expect("test context must create a stream");
             gids[slot] = gid;
             connection
+                .core
                 .stream_table
-                .register(stream_id, gid, connection.now);
+                .register(stream_id, gid, connection.core.now);
             // Same urgency for both, so they share one bucket and the pass
             // census answers `incremental_peer_count == 2`. At 1 the
             // converter's solo-bucket guard suppresses the yield and the
             // prepare drains to the window, which is the configuration this
             // test exists to avoid.
-            connection.scheduler.push_priority(
+            connection.core.scheduler.push_priority(
                 stream_id,
                 parser::PriorityPart::Rfc9218 {
                     urgency: 3,
@@ -9740,7 +10311,7 @@ mod tests {
         );
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
-        let window_before = connection.flow_control.window();
+        let window_before = connection.core.flow_control.window();
         assert_eq!(
             window_before, DEFAULT_INITIAL_WINDOW_SIZE as i32,
             "premise: the connection send window starts at the RFC 9113 \
@@ -9757,7 +10328,7 @@ mod tests {
         let result = connection.writable(&mut context, EndpointClient(&mut router));
 
         assert_eq!(
-            window_before - connection.flow_control.window(),
+            window_before - connection.core.flow_control.window(),
             2 * YIELDED_PAYLOAD,
             "one write pass must debit the connection send window once per \
              stream: a second prepare would spend credit for bytes this pass \
@@ -9849,8 +10420,9 @@ mod tests {
                 .expect("test context must create a stream");
             gids[slot] = gid;
             connection
+                .core
                 .stream_table
-                .register(stream_id, gid, connection.now);
+                .register(stream_id, gid, connection.core.now);
             let back = &mut context.streams[gid].back;
             back.parsing_phase = kawa::ParsingPhase::Body;
             back.blocks.push_back(kawa::Block::Chunk(kawa::Chunk {
@@ -9860,16 +10432,16 @@ mod tests {
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
         assert!(
-            connection.readiness.interest.is_writable(),
+            connection.core.readiness.interest.is_writable(),
             "premise: WRITABLE interest starts armed, so retaining it is not \
              vacuous, got {:?}",
-            connection.readiness
+            connection.core.readiness
         );
 
         let result = connection.writable(&mut context, EndpointClient(&mut router));
 
         assert_eq!(
-            connection.readiness.interest,
+            connection.core.readiness.interest,
             Ready::WRITABLE | Ready::HUP | Ready::ERROR,
             "a pass that delivered bytes and left blocks queued must RETAIN \
              WRITABLE interest (LIFECYCLE §9 invariant 16): stripping it \
@@ -9900,7 +10472,7 @@ mod tests {
             );
         }
         assert_eq!(
-            connection.stream_table.expect_write(),
+            connection.core.stream_table.expect_write(),
             None,
             "premise: nothing is parked, so `Parked` cannot decide this pass \
              ahead of the byte total"
@@ -9915,7 +10487,7 @@ mod tests {
     //
     // `h2_close::force_disconnect_action` is exhaustively tabled over its two
     // booleans in that module. Nothing called `ConnectionH2::force_disconnect`
-    // itself, so the CALLER half — the `ConnectionH2::tls_wants_write` query
+    // itself, so the CALLER half — the `H2Shell::tls_wants_write` query
     // that feeds the table and the wiring of `ReArmAndContinue` to interest,
     // flush and return value — had no coverage. #1454 asks for this site by
     // name.
@@ -9923,7 +10495,7 @@ mod tests {
     // Shape targeted: a SINGLE query, not a triple. `force_disconnect` reads
     // the answer once into `tls_wants_write`, above its `match` and therefore
     // for both position arms, feeds the table and reports the same value from
-    // every debug line; there is no `ConnectionH2::flush_tls_records` here and
+    // every debug line; there is no `H2Shell::flush_tls_records` here and
     // so no second question to reconstruct.
 
     /// A server connection whose TLS records are still buffered re-arms
@@ -9964,7 +10536,7 @@ mod tests {
             "premise: this harness must report buffered TLS records"
         );
         assert!(
-            !connection.peer_gone_after_final_goaway(),
+            !connection.core.peer_gone_after_final_goaway(),
             "premise: the peer must still be live, or the table short-circuits \
              to CloseSession on the first boolean and the record count is never \
              read"
@@ -9975,12 +10547,12 @@ mod tests {
         // this fixture's own argument back and would hold even if the re-arm
         // arm never assigned it. Starting from `HUP` alone makes the
         // assignment the only thing that can restore the bit.
-        connection.readiness.interest = Ready::HUP;
+        connection.core.readiness.interest = Ready::HUP;
         assert!(
-            !connection.readiness.event.is_writable(),
+            !connection.core.readiness.event.is_writable(),
             "premise: the WRITABLE event must start clear, so the signal below \
              is the only thing that can set it, got {:?}",
-            connection.readiness
+            connection.core.readiness
         );
 
         let result = connection.force_disconnect();
@@ -9991,17 +10563,17 @@ mod tests {
              sends FIN and destroys them, got {result:?}"
         );
         assert_eq!(
-            connection.readiness.interest,
+            connection.core.readiness.interest,
             Ready::WRITABLE | Ready::HUP | Ready::ERROR,
             "the re-arm must restore WRITABLE interest so the writable path is \
              called again to flush, got {:?}",
-            connection.readiness
+            connection.core.readiness
         );
         assert!(
-            connection.readiness.event.is_writable(),
+            connection.core.readiness.event.is_writable(),
             "the re-arm must signal the edge-triggered WRITABLE event, or the \
              event loop never revisits this connection, got {:?}",
-            connection.readiness
+            connection.core.readiness
         );
     }
 
@@ -10042,7 +10614,7 @@ mod tests {
              as false"
         );
         assert!(
-            !connection.peer_gone_after_final_goaway(),
+            !connection.core.peer_gone_after_final_goaway(),
             "premise: the peer must still be live, so the close comes from the \
              record count and not from the first boolean"
         );
@@ -10056,6 +10628,118 @@ mod tests {
         );
     }
 
+    /// A force-disconnect raised from the READ path still re-arms, because the
+    /// shell settles it before the pass returns.
+    ///
+    /// The sibling above calls `H2Shell::force_disconnect` directly, where the
+    /// raise and the settlement are two statements of one function. This one
+    /// enters through `H2Shell::readable`, which is the shape that made the
+    /// inversion necessary: `ConnectionH2::handle_read` force-disconnects at
+    /// seven sites, its `pub` signature returns `MuxResult` and cannot carry an
+    /// `H2ForceDisconnectTarget`, so the core parks one and answers
+    /// provisionally. Nothing the core does afterwards writes `readiness`; only
+    /// `H2Shell::settled` does, and only if the shell remembers to call it.
+    ///
+    /// `Mux` reads `Readiness::filter_interest` between entry points to decide
+    /// whether a connection gets a `writable` at all, so a settlement deferred
+    /// to the next entry point is not the same as one performed here: the
+    /// connection would be left with records in rustls and no WRITABLE
+    /// interest to come back on.
+    ///
+    /// TO SEE THIS RED: in `H2Shell::readable`, return `result` instead of
+    /// `self.settled(result)`. Measured: this test fails on its interest
+    /// assertion, `a force-disconnect raised inside handle_read must still
+    /// re-arm WRITABLE interest before the read pass returns`, `left: Hup`,
+    /// `right: Writable | Error | Hup`, while
+    /// `force_disconnect_re_arms_while_tls_records_are_pending` stays green —
+    /// the direct call is not the read path, which is why both exist.
+    #[test]
+    fn a_force_disconnect_raised_inside_handle_read_is_settled_before_the_pass_returns() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        // A kernel that accepts nothing, so the records outlive any flush and
+        // `force_disconnect_action` takes its `ReArmAndContinue` row.
+        let (mut connection, mut peer) =
+            connection_with_backpressure(&pool, 2, 0, H2State::ClientPreface);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        assert!(
+            connection.socket.socket_wants_write(),
+            "premise: this harness must report buffered TLS records, or the \
+             settlement takes the closing row and writes no interest at all"
+        );
+        assert!(
+            !connection.core.peer_gone_after_final_goaway(),
+            "premise: the peer must still be live, or the decision \
+             short-circuits to CloseSession on its first boolean and never \
+             reads the record count"
+        );
+
+        // A preface whose very first octet is wrong: `handle_read`'s early
+        // guard refuses it and reaches `force_disconnect` without the
+        // connection ever leaving `H2State::ClientPreface` on its own.
+        let mut wire = Vec::with_capacity(CLIENT_PREFACE_SIZE);
+        wire.extend_from_slice(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        wire.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        wire[0] ^= 0xff;
+        peer.write_all(&wire).expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        // Withdraw WRITABLE interest first. The fixture hands
+        // `WRITABLE | HUP | ERROR` to the constructor, so asserting on it
+        // untouched would read the fixture's own argument back and would hold
+        // even if nothing settled. Starting from `HUP` alone makes the
+        // settlement the only thing that can restore the bit.
+        connection.core.readiness.interest = Ready::HUP;
+        assert!(
+            !connection.core.readiness.event.is_writable(),
+            "premise: the WRITABLE event must start clear, so the signal below \
+             is the only thing that can set it, got {:?}",
+            connection.core.readiness
+        );
+
+        let mut result = MuxResult::Continue;
+        for _ in 0..64 {
+            result = connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(connection.core.state, H2State::Error) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        assert!(
+            matches!(connection.core.state, H2State::Error),
+            "premise: the read pass must have reached force_disconnect, which \
+             assigns H2State::Error, got {:?}",
+            connection.core.state
+        );
+        assert!(
+            matches!(result, MuxResult::Continue),
+            "a server still holding TLS records must not close: CloseSession \
+             sends FIN and destroys them, got {result:?}"
+        );
+        assert_eq!(
+            connection.core.readiness.interest,
+            Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+            "a force-disconnect raised inside handle_read must still re-arm \
+             WRITABLE interest before the read pass returns, got {:?}",
+            connection.core.readiness
+        );
+        assert!(
+            connection.core.readiness.event.is_writable(),
+            "the settlement must signal the edge-triggered WRITABLE event, or \
+             the event loop never revisits this connection, got {:?}",
+            connection.core.readiness
+        );
+        assert!(
+            connection.core.poll_force_disconnect().is_none(),
+            "the settlement must have TAKEN the parked target, so a second \
+             settlement cannot run"
+        );
+    }
+
     /// Build a bare server-side `ConnectionH2` for tests that only exercise
     /// connection-level bookkeeping. The socket is never read or written.
     ///
@@ -10065,9 +10749,9 @@ mod tests {
     fn test_h2_connection(
         pool: &Rc<RefCell<Pool>>,
         graceful_shutdown_deadline: Option<Duration>,
-    ) -> (ConnectionH2<mio::net::TcpStream>, std::net::TcpStream) {
+    ) -> (H2Shell<mio::net::TcpStream>, std::net::TcpStream) {
         let (socket, peer) = connected_socket();
-        let connection = ConnectionH2::new(
+        let connection = H2Shell::new(
             Ulid::generate(),
             socket,
             Position::Server,
@@ -10134,11 +10818,15 @@ mod tests {
              the pass sample, got {live:?}"
         );
 
-        connection.client_rtt = Some(PASS_SAMPLE);
+        connection.core.client_rtt = Some(PASS_SAMPLE);
 
         let endpoint = EndpointClient(&mut router);
-        let first = connection.snapshot_rtts(&endpoint, Some(mio::Token(1)));
-        let second = connection.snapshot_rtts(&endpoint, Some(mio::Token(2)));
+        let first = connection
+            .core
+            .snapshot_rtts(&endpoint, Some(mio::Token(1)));
+        let second = connection
+            .core
+            .snapshot_rtts(&endpoint, Some(mio::Token(2)));
 
         assert_eq!(
             first.0,
@@ -10187,30 +10875,30 @@ mod tests {
 
         // Nothing armed yet: `started_at` is None, so the budget cannot expire.
         assert!(
-            !connection.graceful_shutdown_deadline_elapsed(),
+            !connection.core.graceful_shutdown_deadline_elapsed(),
             "an unarmed drain must never report its budget as elapsed"
         );
 
-        let armed_at = connection.now + Duration::from_secs(100);
+        let armed_at = connection.core.now + Duration::from_secs(100);
         connection.graceful_goaway(armed_at);
         assert_eq!(
-            connection.drain.__test_started_at(),
+            connection.core.drain.__test_started_at(),
             Some(armed_at),
             "graceful_goaway must arm the budget from its `now` parameter"
         );
 
         // One millisecond short of the budget, measured on the connection's
         // clock. Real elapsed time here is microseconds.
-        connection.now = armed_at + deadline - Duration::from_millis(1);
+        connection.core.now = armed_at + deadline - Duration::from_millis(1);
         assert!(
-            !connection.graceful_shutdown_deadline_elapsed(),
+            !connection.core.graceful_shutdown_deadline_elapsed(),
             "the budget must not expire before `started_at + deadline` on the \
              connection's own clock"
         );
 
-        connection.now = armed_at + deadline;
+        connection.core.now = armed_at + deadline;
         assert!(
-            connection.graceful_shutdown_deadline_elapsed(),
+            connection.core.graceful_shutdown_deadline_elapsed(),
             "advancing only the connection snapshot past the budget must force close"
         );
     }
@@ -10233,35 +10921,42 @@ mod tests {
     fn backpressure_window_rolls_over_on_the_connection_snapshot() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
         let (mut connection, _peer) = test_h2_connection(&pool, None);
-        let advertised = connection.local_settings.settings_max_concurrent_streams;
+        let advertised = connection
+            .core
+            .local_settings
+            .settings_max_concurrent_streams;
 
         // One short of the burst threshold, all inside the first window.
         for _ in 0..BACKPRESSURE_REFUSAL_THRESHOLD - 1 {
-            connection.record_refusal_for_backpressure();
+            connection.core.record_refusal_for_backpressure();
         }
         assert_eq!(
-            connection.refuse_count_window,
+            connection.core.refuse_count_window,
             BACKPRESSURE_REFUSAL_THRESHOLD - 1
         );
         assert!(
-            !connection.mcs_backpressure_applied,
+            !connection.core.mcs_backpressure_applied,
             "back-pressure must not apply below the refusal threshold"
         );
 
         // Cross into the next window on the connection's clock alone.
-        connection.now += BACKPRESSURE_WINDOW_DURATION;
-        connection.record_refusal_for_backpressure();
+        connection.core.now += BACKPRESSURE_WINDOW_DURATION;
+        connection.core.record_refusal_for_backpressure();
 
         assert_eq!(
-            connection.refuse_count_window, 1,
+            connection.core.refuse_count_window, 1,
             "a refusal in a new window must restart the count, not top up the old one"
         );
         assert!(
-            !connection.mcs_backpressure_applied,
+            !connection.core.mcs_backpressure_applied,
             "two refusals spread across two windows are not a burst"
         );
         assert_eq!(
-            connection.local_settings.settings_max_concurrent_streams, advertised,
+            connection
+                .core
+                .local_settings
+                .settings_max_concurrent_streams,
+            advertised,
             "MAX_CONCURRENT_STREAMS must be untouched when no burst occurred"
         );
     }
@@ -10280,36 +10975,36 @@ mod tests {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
         let (mut connection, _peer) = test_h2_connection(&pool, None);
 
-        let sent_at = connection.now;
-        connection.settings_sent_at = Some(sent_at);
+        let sent_at = connection.core.now;
+        connection.core.settings_sent_at = Some(sent_at);
 
         // One millisecond short of the budget on the connection's clock.
-        connection.now = sent_at + SETTINGS_ACK_TIMEOUT - Duration::from_millis(1);
+        connection.core.now = sent_at + SETTINGS_ACK_TIMEOUT - Duration::from_millis(1);
         assert!(
             matches!(
-                connection.flush_pending_control_frames(),
+                connection.core.flush_pending_control_frames(),
                 H2ControlFlushTarget::Proceed
             ),
             "the SETTINGS-ACK deadline must not fire before SETTINGS_ACK_TIMEOUT \
              on the connection's own clock"
         );
         assert_eq!(
-            connection.settings_sent_at,
+            connection.core.settings_sent_at,
             Some(sent_at),
             "a deadline that has not fired must leave the ACK timer armed"
         );
 
         // At the budget: GOAWAY(SETTINGS_TIMEOUT).
-        connection.now = sent_at + SETTINGS_ACK_TIMEOUT;
+        connection.core.now = sent_at + SETTINGS_ACK_TIMEOUT;
         assert!(
             matches!(
-                connection.flush_pending_control_frames(),
+                connection.core.flush_pending_control_frames(),
                 H2ControlFlushTarget::Done(_)
             ),
             "advancing only the connection snapshot to the deadline must emit GOAWAY"
         );
         assert_eq!(
-            connection.settings_sent_at, None,
+            connection.core.settings_sent_at, None,
             "goaway must disarm the ACK timer so the timeout cannot re-fire"
         );
     }
@@ -10333,19 +11028,19 @@ mod tests {
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
-        let idle_timeout = connection.stream_idle_timeout;
-        let armed_at = connection.now;
+        let idle_timeout = connection.core.stream_idle_timeout;
+        let armed_at = connection.core.now;
         let gid = context
             .create_stream(Ulid::generate(), 1 << 16)
             .expect("test context must create a stream");
-        connection.stream_table.register(1, gid, armed_at);
+        connection.core.stream_table.register(1, gid, armed_at);
 
         // Exactly at the deadline: the predicate is a strict `>`, so the stream
         // survives.
         context.now = armed_at + idle_timeout;
         connection.cancel_timed_out_streams(&mut context, &mut EndpointClient(&mut router));
         assert!(
-            connection.control_tx.pending().is_empty(),
+            connection.core.control_tx.pending().is_empty(),
             "a stream exactly at its idle deadline must not be reaped"
         );
 
@@ -10353,11 +11048,11 @@ mod tests {
         context.now = armed_at + idle_timeout + Duration::from_millis(1);
         connection.cancel_timed_out_streams(&mut context, &mut EndpointClient(&mut router));
         assert!(
-            !connection.control_tx.pending().is_empty(),
+            !connection.core.control_tx.pending().is_empty(),
             "advancing only the mux snapshot past the idle deadline must reap the stream"
         );
         assert_eq!(
-            connection.control_tx.pending()[0],
+            connection.core.control_tx.pending()[0],
             (1, H2Error::Cancel),
             "the reaper must queue RST_STREAM(CANCEL) for the timed-out stream"
         );
@@ -10414,14 +11109,15 @@ mod tests {
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
-        let idle_timeout = connection.stream_idle_timeout;
-        let armed_at = connection.now;
+        let idle_timeout = connection.core.stream_idle_timeout;
+        let armed_at = connection.core.now;
         for i in 0..REAPED {
             let gid = context
                 .create_stream(Ulid::generate(), 1 << 16)
                 .expect("test context must create a stream");
             // RFC 9113 §5.1.1: client-initiated stream ids are odd.
             connection
+                .core
                 .stream_table
                 .register(2 * i as StreamId + 1, gid, armed_at);
         }
@@ -10432,11 +11128,11 @@ mod tests {
         connection.cancel_timed_out_streams(&mut context, &mut EndpointClient(&mut router));
 
         #[cfg(debug_assertions)]
-        connection.check_invariants(&context);
+        connection.core.check_invariants(&context);
         assert!(
-            connection.control_tx.pending().len() <= h2_control_tx::MAX_PENDING_RST_STREAMS,
+            connection.core.control_tx.pending().len() <= h2_control_tx::MAX_PENDING_RST_STREAMS,
             "a mass reap must stop queueing at the cap, got {} entries",
-            connection.control_tx.pending().len()
+            connection.core.control_tx.pending().len()
         );
     }
 
@@ -10517,7 +11213,7 @@ mod tests {
     fn connection_with_cached_peer(
         pool: &Rc<RefCell<Pool>>,
         stream: mio::net::TcpStream,
-    ) -> ConnectionH2<crate::socket::SessionTcpStream> {
+    ) -> H2Shell<crate::socket::SessionTcpStream> {
         let session_ulid = Ulid::generate();
         let socket = crate::socket::SessionTcpStream::new(
             stream,
@@ -10528,7 +11224,7 @@ mod tests {
                     .expect("the cached peer literal must parse"),
             ),
         );
-        ConnectionH2::new(
+        H2Shell::new(
             session_ulid,
             socket,
             Position::Server,
@@ -10572,7 +11268,7 @@ mod tests {
             "the test socket must be genuinely connected, so a live lookup succeeds"
         );
 
-        let rendered = log_context!(connection);
+        let rendered = log_context!(connection.core);
 
         assert!(
             rendered.contains(&format!("peer=Some({CACHED_PEER})")),
@@ -10595,7 +11291,7 @@ mod tests {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
         let (_listener, stream, live_peer) = connected_loopback_stream();
         let connection = connection_with_cached_peer(&pool, stream);
-        let mux_stream = make_stream_for_invariant_16(&pool, connection.session_ulid);
+        let mux_stream = make_stream_for_invariant_16(&pool, connection.core.session_ulid);
         let http_context = &mux_stream.context;
 
         assert_eq!(
@@ -10604,7 +11300,7 @@ mod tests {
             "the test socket must be genuinely connected, so a live lookup succeeds"
         );
 
-        let rendered = log_context_stream!(connection, http_context);
+        let rendered = log_context_stream!(connection.core, http_context);
 
         assert!(
             rendered.contains(&format!("peer=Some({CACHED_PEER})")),
@@ -10695,7 +11391,7 @@ mod tests {
                 .expect("the cached peer literal must parse"),
             calls: Rc::clone(&calls),
         };
-        let connection = ConnectionH2::new(
+        let connection = H2Shell::new(
             session_ulid,
             socket,
             Position::Server,
@@ -10720,7 +11416,7 @@ mod tests {
         // count below would mean the slot went missing rather than that it
         // became free.
         for _ in 0..3 {
-            let rendered = log_context!(connection);
+            let rendered = log_context!(connection.core);
             assert!(
                 rendered.contains(&format!("peer=Some({CACHED_PEER})")),
                 "each rendered line must still carry the peer: {rendered}"
@@ -10763,16 +11459,16 @@ mod tests {
         // so a pointer comparison below can tell them apart at all.
         let front = context.streams[gid].front.storage.space().as_ptr();
         let back = context.streams[gid].back.storage.space().as_ptr();
-        let zero = connection.zero.storage.space().as_ptr();
+        let zero = connection.core.zero.storage.space().as_ptr();
         assert_ne!(
             front, back,
             "a stream's request and response buffers must be distinct allocations"
         );
 
         let offered = read_space(
-            &mut connection.zero,
+            &mut connection.core.zero,
             &mut context.streams,
-            &connection.position,
+            &connection.core.position,
             H2StreamId::Zero,
             9,
         );
@@ -10788,9 +11484,9 @@ mod tests {
         );
 
         let offered = read_space(
-            &mut connection.zero,
+            &mut connection.core.zero,
             &mut context.streams,
-            &connection.position,
+            &connection.core.position,
             H2StreamId::Other { id: 1, gid },
             7,
         );
@@ -10833,18 +11529,21 @@ mod tests {
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
-        connection.state = H2State::Header;
+        connection.core.state = H2State::Header;
         connection
+            .core
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 0)));
 
-        let target = connection.poll_read_target(&mut context, &mut EndpointClient(&mut router));
+        let target = connection
+            .core
+            .poll_read_target(&mut context, &mut EndpointClient(&mut router));
         assert!(
             matches!(target, H2ReadTarget::Skip(H2StreamId::Zero)),
             "a zero-length payload must be a Skip, not a zero-length Fill: {target:?}"
         );
         assert!(
-            connection.stream_table.expect_read().is_none(),
+            connection.core.stream_table.expect_read().is_none(),
             "the settled byte debt must be cleared before the frame is dispatched"
         );
     }
@@ -10867,12 +11566,13 @@ mod tests {
 
         // Not ClientPreface: a short read there runs the early-preface check
         // instead, which is a different branch with its own coverage.
-        connection.state = H2State::Header;
+        connection.core.state = H2State::Header;
         connection
+            .core
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
 
-        let result = connection.handle_read(
+        let result = connection.core.handle_read(
             &mut context,
             EndpointClient(&mut router),
             H2StreamId::Zero,
@@ -10888,12 +11588,12 @@ mod tests {
             "a short read keeps the connection running: {result:?}"
         );
         assert_eq!(
-            connection.stream_table.expect_read(),
+            connection.core.stream_table.expect_read(),
             Some((H2StreamId::Zero, 6)),
             "a 3-byte answer to a 9-byte offer must leave 6 bytes owed"
         );
         assert_eq!(
-            connection.zero.storage.data().len(),
+            connection.core.zero.storage.data().len(),
             3,
             "the core must consume exactly the bytes the caller reported"
         );
@@ -10917,14 +11617,15 @@ mod tests {
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
-        connection.state = H2State::Header;
+        connection.core.state = H2State::Header;
         connection
+            .core
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
-        connection.readiness.event = Ready::READABLE;
-        connection.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        connection.core.readiness.event = Ready::READABLE;
+        connection.core.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
 
-        let result = connection.handle_read(
+        let result = connection.core.handle_read(
             &mut context,
             EndpointClient(&mut router),
             H2StreamId::Zero,
@@ -10940,15 +11641,15 @@ mod tests {
             "an empty read is not a close: {result:?}"
         );
         assert!(
-            !connection.readiness.event.is_readable(),
+            !connection.core.readiness.event.is_readable(),
             "an empty read must clear the READABLE event"
         );
         assert!(
-            connection.readiness.interest.is_readable(),
+            connection.core.readiness.interest.is_readable(),
             "an empty read must NOT drop the READABLE interest"
         );
         assert_eq!(
-            connection.stream_table.expect_read(),
+            connection.core.stream_table.expect_read(),
             Some((H2StreamId::Zero, 9)),
             "an empty read settles no part of the byte debt"
         );
@@ -10987,11 +11688,12 @@ mod tests {
         // than created. Drain is only the cheapest of the three refusal
         // triggers; MAX_CONCURRENT_STREAMS and pool exhaustion reach the same
         // `refuse_stream_and_discard` call.
-        connection.state = H2State::Header;
+        connection.core.state = H2State::Header;
         connection
+            .core
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
-        connection.drain.__test_set_draining();
+        connection.core.drain.__test_set_draining();
 
         // The peer's encoder. `loona_hpack` indexes a header whose *name* is in
         // neither table, so this block appends `x-sozu-probe: alpha` to the
@@ -11025,12 +11727,12 @@ mod tests {
         // instead of hanging.
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
-            if matches!(connection.state, H2State::Header)
+            if matches!(connection.core.state, H2State::Header)
                 && matches!(
-                    connection.stream_table.expect_read(),
+                    connection.core.stream_table.expect_read(),
                     Some((H2StreamId::Zero, 9))
                 )
-                && !connection.control_tx.pending().is_empty()
+                && !connection.core.control_tx.pending().is_empty()
             {
                 break;
             }
@@ -11040,18 +11742,18 @@ mod tests {
         // Premise of the test: we really went through the refusal path, the
         // stream was refused rather than created, and the connection survived.
         assert_eq!(
-            connection.control_tx.pending(),
+            connection.core.control_tx.pending(),
             vec![(1, H2Error::RefusedStream)],
             "the drain gate must refuse stream 1 with RST_STREAM(REFUSED_STREAM)"
         );
         assert!(
-            connection.stream_table.is_empty(),
+            connection.core.stream_table.is_empty(),
             "a refused stream must not be created"
         );
         assert!(
-            !matches!(connection.state, H2State::Error | H2State::GoAway),
+            !matches!(connection.core.state, H2State::Error | H2State::GoAway),
             "refusing one stream must leave the connection usable: {:?}",
-            connection.state
+            connection.core.state
         );
 
         // The peer's next block references the dynamic entry its encoder added
@@ -11065,6 +11767,7 @@ mod tests {
 
         let mut decoded = Vec::new();
         let status = connection
+            .core
             .hpack
             .decoder_mut()
             .decode_with_cb(&next_block, |k, v| {
@@ -11115,11 +11818,12 @@ mod tests {
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
-        connection.state = H2State::Header;
+        connection.core.state = H2State::Header;
         connection
+            .core
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
-        connection.drain.__test_set_draining();
+        connection.core.drain.__test_set_draining();
 
         // Same probe technique as the sibling test: this appends
         // `x-sozu-probe: alpha` to the peer's dynamic table at index 62.
@@ -11161,12 +11865,12 @@ mod tests {
 
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
-            if matches!(connection.state, H2State::Header)
+            if matches!(connection.core.state, H2State::Header)
                 && matches!(
-                    connection.stream_table.expect_read(),
+                    connection.core.stream_table.expect_read(),
                     Some((H2StreamId::Zero, 9))
                 )
-                && !connection.control_tx.pending().is_empty()
+                && !connection.core.control_tx.pending().is_empty()
             {
                 break;
             }
@@ -11174,19 +11878,19 @@ mod tests {
         }
 
         assert_eq!(
-            connection.control_tx.pending(),
+            connection.core.control_tx.pending(),
             vec![(1, H2Error::RefusedStream)],
             "the drain gate must refuse stream 1 with RST_STREAM(REFUSED_STREAM)"
         );
         assert!(
-            connection.stream_table.is_empty(),
+            connection.core.stream_table.is_empty(),
             "a refused stream must not be created"
         );
         assert!(
-            !matches!(connection.state, H2State::Error | H2State::GoAway),
+            !matches!(connection.core.state, H2State::Error | H2State::GoAway),
             "refusing a PADDED|PRIORITY HEADERS frame must leave the connection \
              usable: {:?}",
-            connection.state
+            connection.core.state
         );
 
         let next_block = peer_encoder.encode([(&b"x-sozu-probe"[..], &b"alpha"[..])]);
@@ -11198,6 +11902,7 @@ mod tests {
 
         let mut decoded = Vec::new();
         let status = connection
+            .core
             .hpack
             .decoder_mut()
             .decode_with_cb(&next_block, |k, v| {
@@ -11250,8 +11955,9 @@ mod tests {
         // Past the preface/SETTINGS handshake, waiting on a frame header.
         // `drain.draining` stays false: stream 1 must be genuinely accepted,
         // not refused — this is the ordinary, non-refusal path.
-        connection.state = H2State::Header;
+        connection.core.state = H2State::Header;
         connection
+            .core
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
 
@@ -11294,18 +12000,18 @@ mod tests {
         // CONTINUATION frame for stream 1 — accepted, not refused.
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
-            if matches!(connection.state, H2State::ContinuationHeader(_)) {
+            if matches!(connection.core.state, H2State::ContinuationHeader(_)) {
                 break;
             }
             std::thread::yield_now();
         }
         assert!(
-            matches!(connection.state, H2State::ContinuationHeader(_)),
+            matches!(connection.core.state, H2State::ContinuationHeader(_)),
             "stream 1's HEADERS frame must be accepted and await CONTINUATION: {:?}",
-            connection.state
+            connection.core.state
         );
         assert!(
-            !connection.stream_table.is_empty(),
+            !connection.core.stream_table.is_empty(),
             "a non-refused HEADERS frame must create stream 1"
         );
 
@@ -11314,7 +12020,7 @@ mod tests {
         // other stream. Nothing about it targets stream 1 or its
         // in-progress header block — this is the ordinary path, not an
         // attack.
-        connection.queue_window_update(0, 65_535);
+        connection.core.queue_window_update(0, 65_535);
         connection.writable(&mut context, EndpointClient(&mut router));
 
         // Now the CONTINUATION frame completing the block arrives.
@@ -11331,7 +12037,7 @@ mod tests {
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
             if !matches!(
-                connection.state,
+                connection.core.state,
                 H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
             ) {
                 break;
@@ -11340,10 +12046,10 @@ mod tests {
         }
 
         assert!(
-            !matches!(connection.state, H2State::Error | H2State::GoAway),
+            !matches!(connection.core.state, H2State::Error | H2State::GoAway),
             "an unrelated WINDOW_UPDATE flush must not corrupt a legitimate \
              in-progress header block into a connection error: {:?}",
-            connection.state
+            connection.core.state
         );
 
         // The peer's next block references the dynamic entry its encoder
@@ -11357,6 +12063,7 @@ mod tests {
 
         let mut decoded = Vec::new();
         let status = connection
+            .core
             .hpack
             .decoder_mut()
             .decode_with_cb(&next_block, |k, v| {
@@ -11403,8 +12110,9 @@ mod tests {
         // `drain.draining` stays false until `graceful_goaway` is called
         // below: stream 1 must be genuinely accepted, not refused — this is
         // the ordinary, non-refusal path.
-        connection.state = H2State::Header;
+        connection.core.state = H2State::Header;
         connection
+            .core
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
 
@@ -11454,25 +12162,25 @@ mod tests {
         // CONTINUATION frame for stream 1 — accepted, not refused.
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
-            if matches!(connection.state, H2State::ContinuationHeader(_)) {
+            if matches!(connection.core.state, H2State::ContinuationHeader(_)) {
                 break;
             }
             std::thread::yield_now();
         }
         assert!(
-            matches!(connection.state, H2State::ContinuationHeader(_)),
+            matches!(connection.core.state, H2State::ContinuationHeader(_)),
             "stream 1's HEADERS frame must be accepted and await CONTINUATION: {:?}",
-            connection.state
+            connection.core.state
         );
         assert!(
-            !connection.stream_table.is_empty(),
+            !connection.core.stream_table.is_empty(),
             "a non-refused HEADERS frame must create stream 1"
         );
 
         // The proxy decides to drain — a graceful shutdown or hot reload
         // landing mid-reassembly, exactly as issue #1398 describes. Nothing
         // about it targets stream 1 or its in-progress header block.
-        let drain_at = connection.now;
+        let drain_at = connection.core.now;
         let result = connection.graceful_goaway(drain_at);
         assert!(
             matches!(result, MuxResult::Continue),
@@ -11484,18 +12192,18 @@ mod tests {
         // out — `Mux::shutting_down` samples exactly this field against
         // `graceful_shutdown_deadline`.
         assert!(
-            connection.drain.draining(),
+            connection.core.drain.draining(),
             "graceful_goaway must mark the connection as draining immediately, \
              even when the GOAWAY itself is deferred"
         );
         assert_eq!(
-            connection.drain.__test_started_at(),
+            connection.core.drain.__test_started_at(),
             Some(drain_at),
             "the forced-close budget must arm from `graceful_goaway`'s `now` \
              parameter immediately, not once the deferred GOAWAY is sent"
         );
         assert!(
-            connection.drain.__test_initial_goaway_pending(),
+            connection.core.drain.__test_initial_goaway_pending(),
             "the advisory GOAWAY must be deferred while a header block is \
              reassembling, not sent (and clobber the reassembly) or dropped"
         );
@@ -11521,7 +12229,7 @@ mod tests {
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
             if !matches!(
-                connection.state,
+                connection.core.state,
                 H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
             ) {
                 break;
@@ -11530,10 +12238,10 @@ mod tests {
         }
 
         assert!(
-            !matches!(connection.state, H2State::Error | H2State::GoAway),
+            !matches!(connection.core.state, H2State::Error | H2State::GoAway),
             "a graceful_goaway landing mid-reassembly must not corrupt a \
              legitimate in-progress header block into a connection error: {:?}",
-            connection.state
+            connection.core.state
         );
 
         // The peer's next block references the dynamic entry its encoder
@@ -11547,6 +12255,7 @@ mod tests {
 
         let mut decoded = Vec::new();
         let status = connection
+            .core
             .hpack
             .decoder_mut()
             .decode_with_cb(&next_block, |k, v| {
@@ -11571,19 +12280,19 @@ mod tests {
         // serialization.
         for _ in 0..8 {
             connection.writable(&mut context, EndpointClient(&mut router));
-            if !connection.drain.__test_initial_goaway_pending()
-                && connection.stream_table.expect_write().is_none()
+            if !connection.core.drain.__test_initial_goaway_pending()
+                && connection.core.stream_table.expect_write().is_none()
             {
                 break;
             }
         }
         assert!(
-            !connection.drain.__test_initial_goaway_pending(),
+            !connection.core.drain.__test_initial_goaway_pending(),
             "the deferred advisory GOAWAY must be sent once reassembly completes, \
              not left pending forever"
         );
         assert!(
-            connection.stream_table.expect_write().is_none(),
+            connection.core.stream_table.expect_write().is_none(),
             "the advisory GOAWAY must have been fully flushed to the socket"
         );
 
@@ -11658,8 +12367,9 @@ mod tests {
         // `drain.draining` stays false until manually forced below: stream 1
         // must be genuinely accepted, not refused — this is the ordinary,
         // non-refusal path.
-        connection.state = H2State::Header;
+        connection.core.state = H2State::Header;
         connection
+            .core
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
 
@@ -11699,18 +12409,18 @@ mod tests {
         // CONTINUATION frame for stream 1 — accepted, not refused.
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
-            if matches!(connection.state, H2State::ContinuationHeader(_)) {
+            if matches!(connection.core.state, H2State::ContinuationHeader(_)) {
                 break;
             }
             std::thread::yield_now();
         }
         assert!(
-            matches!(connection.state, H2State::ContinuationHeader(_)),
+            matches!(connection.core.state, H2State::ContinuationHeader(_)),
             "stream 1's HEADERS frame must be accepted and await CONTINUATION: {:?}",
-            connection.state
+            connection.core.state
         );
         assert!(
-            !connection.stream_table.is_empty(),
+            !connection.core.stream_table.is_empty(),
             "a non-refused HEADERS frame must create stream 1"
         );
 
@@ -11719,8 +12429,8 @@ mod tests {
         // A peer can legitimately produce this by sending TCP FIN together
         // with (or shortly after) the last CONTINUATION frame it manages to
         // get out, observed by edge-triggered epoll as one combined event.
-        connection.drain.__test_set_draining();
-        connection.readiness.event.insert(Ready::HUP);
+        connection.core.drain.__test_set_draining();
+        connection.core.readiness.event.insert(Ready::HUP);
 
         // `flush_pending_control_frames`'s first, HUP-gated stage fires
         // here.
@@ -11729,7 +12439,7 @@ mod tests {
         // Real epoll delivers HUP once; un-signal it so the reads below
         // reflect the peer's normal traffic rather than a second synthetic
         // HUP this test injected by hand.
-        connection.readiness.event.remove(Ready::HUP);
+        connection.core.readiness.event.remove(Ready::HUP);
 
         // Now the CONTINUATION frame completing the block arrives — still
         // fully deliverable, exactly as it would be if the peer's FIN and
@@ -11748,7 +12458,7 @@ mod tests {
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
             if !matches!(
-                connection.state,
+                connection.core.state,
                 H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
             ) {
                 break;
@@ -11757,10 +12467,10 @@ mod tests {
         }
 
         assert!(
-            !matches!(connection.state, H2State::Error | H2State::GoAway),
+            !matches!(connection.core.state, H2State::Error | H2State::GoAway),
             "a HUP-while-draining event landing mid-reassembly must not corrupt \
              a legitimate in-progress header block into a connection error: {:?}",
-            connection.state
+            connection.core.state
         );
 
         // The peer's next block references the dynamic entry its encoder
@@ -11774,6 +12484,7 @@ mod tests {
 
         let mut decoded = Vec::new();
         let status = connection
+            .core
             .hpack
             .decoder_mut()
             .decode_with_cb(&next_block, |k, v| {
@@ -11826,8 +12537,9 @@ mod tests {
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
-        connection.state = H2State::Header;
+        connection.core.state = H2State::Header;
         connection
+            .core
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
 
@@ -11869,15 +12581,15 @@ mod tests {
 
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
-            if matches!(connection.state, H2State::ContinuationHeader(_)) {
+            if matches!(connection.core.state, H2State::ContinuationHeader(_)) {
                 break;
             }
             std::thread::yield_now();
         }
         assert!(
-            matches!(connection.state, H2State::ContinuationHeader(_)),
+            matches!(connection.core.state, H2State::ContinuationHeader(_)),
             "stream 1's HEADERS frame must be accepted and await CONTINUATION: {:?}",
-            connection.state
+            connection.core.state
         );
 
         // Complete the block — this re-enters `handle_headers_frame`, which
@@ -11894,7 +12606,7 @@ mod tests {
 
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
-            if connection.stream_table.get(1).is_none() {
+            if connection.core.stream_table.get(1).is_none() {
                 break;
             }
             std::thread::yield_now();
@@ -11902,7 +12614,7 @@ mod tests {
 
         // Premise: stream 1 really was torn down for self-dependency.
         assert!(
-            connection.stream_table.get(1).is_none(),
+            connection.core.stream_table.get(1).is_none(),
             "the self-dependent stream must have been torn down"
         );
 
@@ -11911,7 +12623,7 @@ mod tests {
         // own test module can reach the private field directly — no
         // test-only accessor needed.
         assert!(
-            !connection.header_reassembly.is_in_progress(),
+            !connection.core.header_reassembly.is_in_progress(),
             "aborting a self-dependent stream mid-reassembly must retire the \
              accumulator, not leave it `is_in_progress() == true` for the \
              next HEADERS frame on this connection"
@@ -11940,9 +12652,9 @@ mod tests {
         // HEADER is parsed, well before its payload is read and decoded.
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
-            if matches!(connection.state, H2State::Header)
+            if matches!(connection.core.state, H2State::Header)
                 && matches!(
-                    connection.stream_table.expect_read(),
+                    connection.core.stream_table.expect_read(),
                     Some((H2StreamId::Zero, 9))
                 )
             {
@@ -11952,6 +12664,7 @@ mod tests {
         }
 
         let stream3_gid = connection
+            .core
             .stream_table
             .get(3)
             .expect("stream 3's HEADERS frame must create a stream");
@@ -11992,8 +12705,9 @@ mod tests {
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
-        connection.state = H2State::Header;
+        connection.core.state = H2State::Header;
         connection
+            .core
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
 
@@ -12032,15 +12746,15 @@ mod tests {
 
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
-            if matches!(connection.state, H2State::ContinuationHeader(_)) {
+            if matches!(connection.core.state, H2State::ContinuationHeader(_)) {
                 break;
             }
             std::thread::yield_now();
         }
         assert!(
-            matches!(connection.state, H2State::ContinuationHeader(_)),
+            matches!(connection.core.state, H2State::ContinuationHeader(_)),
             "stream 1's HEADERS frame must be accepted and await CONTINUATION: {:?}",
-            connection.state
+            connection.core.state
         );
 
         // The CONTINUATION frame header, announcing the FULL payload
@@ -12062,9 +12776,9 @@ mod tests {
         // `expect_read` still wanting the remainder.
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
-            if matches!(connection.state, H2State::ContinuationFrame(_))
+            if matches!(connection.core.state, H2State::ContinuationFrame(_))
                 && matches!(
-                    connection.stream_table.expect_read(),
+                    connection.core.stream_table.expect_read(),
                     Some((H2StreamId::Zero, remaining)) if remaining == payload_segment_2.len()
                 )
             {
@@ -12073,13 +12787,13 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(
-            matches!(connection.state, H2State::ContinuationFrame(_)),
+            matches!(connection.core.state, H2State::ContinuationFrame(_)),
             "the CONTINUATION frame must be mid-payload, waiting on its \
              second TCP segment: {:?}",
-            connection.state
+            connection.core.state
         );
         assert_eq!(
-            connection.stream_table.expect_read(),
+            connection.core.stream_table.expect_read(),
             Some((H2StreamId::Zero, payload_segment_2.len())),
             "expect_read must want exactly the remaining bytes of this \
              frame's own payload — proof this is a genuine partial read, \
@@ -12090,10 +12804,10 @@ mod tests {
         // readiness reports HUP, landing squarely mid-payload-read — the
         // shape a TCP half-close produces (mio's `is_read_closed()` can be
         // true with data the peer already sent still unread).
-        connection.drain.__test_set_draining();
-        connection.readiness.event.insert(Ready::HUP);
+        connection.core.drain.__test_set_draining();
+        connection.core.readiness.event.insert(Ready::HUP);
         connection.writable(&mut context, EndpointClient(&mut router));
-        connection.readiness.event.remove(Ready::HUP);
+        connection.core.readiness.event.remove(Ready::HUP);
 
         // Now the second TCP segment, completing the CONTINUATION frame's
         // payload, arrives.
@@ -12104,7 +12818,7 @@ mod tests {
         for _ in 0..64 {
             connection.readable(&mut context, EndpointClient(&mut router));
             if !matches!(
-                connection.state,
+                connection.core.state,
                 H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
             ) {
                 break;
@@ -12113,11 +12827,11 @@ mod tests {
         }
 
         assert!(
-            !matches!(connection.state, H2State::Error | H2State::GoAway),
+            !matches!(connection.core.state, H2State::Error | H2State::GoAway),
             "a HUP-while-draining event landing mid-TCP-segment must not \
              corrupt a legitimate in-progress header block into a \
              connection error: {:?}",
-            connection.state
+            connection.core.state
         );
 
         let next_block = peer_encoder.encode([(&b"x-sozu-marker"[..], &b"legitimate-value"[..])]);
@@ -12129,6 +12843,7 @@ mod tests {
 
         let mut decoded = Vec::new();
         let status = connection
+            .core
             .hpack
             .decoder_mut()
             .decode_with_cb(&next_block, |k, v| {
@@ -12227,8 +12942,9 @@ mod tests {
         let mut context = test_context(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
-        connection.state = H2State::Header;
+        connection.core.state = H2State::Header;
         connection
+            .core
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
 
@@ -12251,19 +12967,29 @@ mod tests {
             peer.flush().expect("loopback flush must complete");
             for _ in 0..64 {
                 connection.readable(&mut context, EndpointClient(&mut router));
-                if connection.stream_table.streams().contains_key(&stream_id) {
+                if connection
+                    .core
+                    .stream_table
+                    .streams()
+                    .contains_key(&stream_id)
+                {
                     break;
                 }
                 std::thread::yield_now();
             }
             assert!(
-                connection.stream_table.streams().contains_key(&stream_id),
+                connection
+                    .core
+                    .stream_table
+                    .streams()
+                    .contains_key(&stream_id),
                 "stream {stream_id} must be accepted before the write pass"
             );
         }
 
         let answers = context.listener.borrow().get_answers().clone();
         let open: Vec<GlobalStreamId> = connection
+            .core
             .stream_table
             .streams()
             .values()
@@ -12272,7 +12998,7 @@ mod tests {
         for global_stream_id in open {
             crate::protocol::mux::answers::set_default_answer(
                 &mut context.streams[global_stream_id],
-                &mut connection.readiness,
+                &mut connection.core.readiness,
                 404,
                 &answers.borrow(),
             );
@@ -12284,14 +13010,20 @@ mod tests {
         let _ = peer.read_to_end(&mut discard);
 
         if let Some(size) = pending_table_size_update {
-            connection.hpack.set_encoder_max_table_size(size as usize);
+            connection
+                .core
+                .hpack
+                .set_encoder_max_table_size(size as usize);
         }
-        connection.pending_table_size_update = pending_table_size_update;
+        connection.core.pending_table_size_update = pending_table_size_update;
         connection.writable(&mut context, EndpointClient(&mut router));
 
         let mut wire = Vec::new();
         let _ = peer.read_to_end(&mut wire);
-        (headers_blocks(&wire), connection.pending_table_size_update)
+        (
+            headers_blocks(&wire),
+            connection.core.pending_table_size_update,
+        )
     }
 
     /// Two properties of a `write_streams` pass, both invisible to any
@@ -12401,7 +13133,7 @@ mod tests {
     // `Connection::new_h2_server` arms `expect_read` with
     // `CLIENT_PREFACE_SIZE` (the 24-octet magic string plus a 9-octet
     // SETTINGS frame header). When a read comes back SHORT of that request,
-    // the short-read branch of `ConnectionH2::readable` runs an early guard
+    // the short-read branch of `H2Shell::readable` runs an early guard
     // so a client that is plainly not speaking H2 is dropped without waiting
     // for the rest of the window.
     //
@@ -12419,7 +13151,7 @@ mod tests {
     /// inside the loop, which would stop at the first one and hide the band.
     ///
     /// To SEE THIS RED: in the `H2State::ClientPreface` arm of
-    /// `ConnectionH2::readable`'s short-read branch, compare the whole
+    /// `H2Shell::readable`'s short-read branch, compare the whole
     /// accumulated window instead of the part the constant can cover —
     /// `if !pri.starts_with(i)` in place of
     /// `if !pri.starts_with(&i[..i.len().min(pri.len())])`. `starts_with`
@@ -12465,7 +13197,7 @@ mod tests {
                 // hand `socket_read` a full 33-octet window, take the
                 // not-short path, and never reach the guard under test.
                 for _ in 0..64 {
-                    if !matches!(connection.state, H2State::ClientPreface) {
+                    if !matches!(connection.core.state, H2State::ClientPreface) {
                         break 'delivery;
                     }
                     if matches!(
@@ -12475,7 +13207,7 @@ mod tests {
                         closed = true;
                         break 'delivery;
                     }
-                    if connection.stream_table.expect_read()
+                    if connection.core.stream_table.expect_read()
                         == Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE - delivered))
                     {
                         break;
@@ -12486,7 +13218,7 @@ mod tests {
 
             if closed
                 || matches!(
-                    connection.state,
+                    connection.core.state,
                     H2State::ClientPreface | H2State::Error | H2State::GoAway
                 )
             {
@@ -12553,7 +13285,7 @@ mod tests {
                     std::thread::yield_now();
                 }
 
-                if !matches!(connection.state, H2State::Error) {
+                if !matches!(connection.core.state, H2State::Error) {
                     survivors.push((corrupt_at, window));
                 }
             }
@@ -12801,7 +13533,7 @@ mod tests {
         /// `HupWhileDraining` case and was exactly the bug `quickcheck`
         /// found while writing this property (review of `e1c3c2fb`, B3).
         fn apply_interleave<L>(
-            connection: &mut ConnectionH2<mio::net::TcpStream>,
+            connection: &mut H2Shell<mio::net::TcpStream>,
             context: &mut Context<L>,
             router: &mut Router,
             interleave: Interleave,
@@ -12811,18 +13543,18 @@ mod tests {
             match interleave {
                 Interleave::None => {}
                 Interleave::UnrelatedWindowUpdateFlush => {
-                    connection.queue_window_update(0, 65_535);
+                    connection.core.queue_window_update(0, 65_535);
                     connection.writable(context, EndpointClient(router));
                 }
                 Interleave::HupWhileDraining => {
-                    connection.drain.__test_set_draining();
-                    connection.readiness.event.insert(Ready::HUP);
+                    connection.core.drain.__test_set_draining();
+                    connection.core.readiness.event.insert(Ready::HUP);
                     connection.writable(context, EndpointClient(router));
-                    connection.readiness.event.remove(Ready::HUP);
+                    connection.core.readiness.event.remove(Ready::HUP);
                 }
                 Interleave::GracefulGoawayDefer => {
-                    if !connection.drain.draining() {
-                        let now = connection.now;
+                    if !connection.core.drain.draining() {
+                        let now = connection.core.now;
                         connection.graceful_goaway(now);
                     }
                 }
@@ -12845,8 +13577,9 @@ mod tests {
             let mut context = test_context(&pool);
             let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
-            connection.state = H2State::Header;
+            connection.core.state = H2State::Header;
             connection
+                .core
                 .stream_table
                 .set_expect_read(Some((H2StreamId::Zero, 9)));
 
@@ -12893,12 +13626,12 @@ mod tests {
 
             for _ in 0..64 {
                 connection.readable(&mut context, EndpointClient(&mut router));
-                if matches!(connection.state, H2State::ContinuationHeader(_)) {
+                if matches!(connection.core.state, H2State::ContinuationHeader(_)) {
                     break;
                 }
                 std::thread::yield_now();
             }
-            if !matches!(connection.state, H2State::ContinuationHeader(_)) {
+            if !matches!(connection.core.state, H2State::ContinuationHeader(_)) {
                 return TestResult::discard();
             }
 
@@ -12927,9 +13660,9 @@ mod tests {
 
                     for _ in 0..64 {
                         connection.readable(&mut context, EndpointClient(&mut router));
-                        if matches!(connection.state, H2State::ContinuationFrame(_))
+                        if matches!(connection.core.state, H2State::ContinuationFrame(_))
                             && matches!(
-                                connection.stream_table.expect_read(),
+                                connection.core.stream_table.expect_read(),
                                 Some((H2StreamId::Zero, remaining)) if remaining == segment_2.len()
                             )
                         {
@@ -12937,7 +13670,7 @@ mod tests {
                         }
                         std::thread::yield_now();
                     }
-                    if !matches!(connection.state, H2State::ContinuationFrame(_)) {
+                    if !matches!(connection.core.state, H2State::ContinuationFrame(_)) {
                         // The segment split did not land as a genuine
                         // partial read (e.g. too small to observe) — treat
                         // as a discard rather than a false failure.
@@ -12966,7 +13699,7 @@ mod tests {
                 for _ in 0..64 {
                     connection.readable(&mut context, EndpointClient(&mut router));
                     if !matches!(
-                        connection.state,
+                        connection.core.state,
                         H2State::ContinuationHeader(_) | H2State::ContinuationFrame(_)
                     ) {
                         break;
@@ -12975,16 +13708,17 @@ mod tests {
                 }
             }
 
-            if matches!(connection.state, H2State::Error | H2State::GoAway) {
+            if matches!(connection.core.state, H2State::Error | H2State::GoAway) {
                 return TestResult::error(format!(
                     "connection reached {:?} while reassembling under plan {plan:?}",
-                    connection.state
+                    connection.core.state
                 ));
             }
 
             let next_block = peer_encoder.encode([(&b"x-sozu-qc-marker"[..], &b"qc-value"[..])]);
             let mut decoded = Vec::new();
             let status = connection
+                .core
                 .hpack
                 .decoder_mut()
                 .decode_with_cb(&next_block, |k, v| {
@@ -13018,8 +13752,8 @@ mod tests {
     // answer. #1454 rules that shape out for closing it: `FrontRustls` is the
     // only production handler that can answer `true`, and a fixture that fakes
     // the answer on a TCP handler tests the fake. These are the first tests in
-    // the tree that build a `ConnectionH2<FrontRustls>`;
-    // `git grep -cE 'ConnectionH2<FrontRustls>' -- '*.rs'` answered 0 on every
+    // the tree that build a `H2Shell<FrontRustls>`;
+    // `git grep -cE 'H2Shell<FrontRustls>' -- '*.rs'` answered 0 on every
     // commit before this one, including on the `write_streams` inversion's head.
     //
     // What only the real handler can settle: `(size > 0, WouldBlock)` is not a
@@ -13281,12 +14015,12 @@ mod tests {
         pool: &Rc<RefCell<Pool>>,
         state: H2State,
     ) -> (
-        ConnectionH2<FrontRustls>,
+        H2Shell<FrontRustls>,
         std::net::TcpStream,
         rustls::ClientConnection,
     ) {
         let (socket, peer, client) = handshaken_front_rustls();
-        let mut connection = ConnectionH2::new(
+        let mut connection = H2Shell::new(
             Ulid::generate(),
             socket,
             Position::Server,
@@ -13300,7 +14034,7 @@ mod tests {
             Ready::WRITABLE | Ready::HUP | Ready::ERROR,
         )
         .expect("a pool with free buffers must yield an H2 connection");
-        connection.state = state;
+        connection.core.state = state;
         (connection, peer, client)
     }
 
@@ -13541,8 +14275,9 @@ mod tests {
             .create_stream(Ulid::generate(), 1 << 16)
             .expect("test context must create a stream");
         connection
+            .core
             .stream_table
-            .register(REGISTERED_STREAM_ID, gid, connection.now);
+            .register(REGISTERED_STREAM_ID, gid, connection.core.now);
         for chunk in body.chunks(QUEUED_RESPONSE_CHUNK_LEN) {
             context.streams[gid]
                 .back
@@ -13551,7 +14286,7 @@ mod tests {
         }
         assert_prepare_gate_is_shut(&context, gid);
         assert_eq!(
-            connection.stream_table.expect_write(),
+            connection.core.stream_table.expect_write(),
             None,
             "premise: no parked write, so the first pass takes the main loop"
         );
@@ -13563,7 +14298,7 @@ mod tests {
         loop {
             // What the event loop does: report the socket writable, run the
             // pass, and let the peer read whatever reached the kernel.
-            connection.readiness.event.insert(Ready::WRITABLE);
+            connection.core.readiness.event.insert(Ready::WRITABLE);
             connection.writable(&mut context, EndpointClient(&mut router));
             std::thread::yield_now();
             drain_peer(&mut client, &mut peer, &mut received);
@@ -13588,7 +14323,7 @@ mod tests {
             let still_owed =
                 !context.streams[gid].back.out.is_empty() || connection.socket.socket_wants_write();
             assert!(
-                !still_owed || connection.readiness.interest.is_writable(),
+                !still_owed || connection.core.readiness.interest.is_writable(),
                 "a pass that still owes bytes must keep WRITABLE interest, or \
                  no later event reaches this connection and the response is \
                  truncated at {} of {} bytes with {} blocks queued",
@@ -13656,7 +14391,7 @@ mod tests {
             "premise: the blocked kernel must leave real records pending"
         );
         assert!(
-            !connection.peer_gone_after_final_goaway(),
+            !connection.core.peer_gone_after_final_goaway(),
             "premise: the peer must still be live, or the decision \
              short-circuits on its first boolean and never reads the socket"
         );
@@ -13668,12 +14403,12 @@ mod tests {
              which the peer reads as a truncated response"
         );
         assert!(
-            connection.readiness.interest.is_writable(),
+            connection.core.readiness.interest.is_writable(),
             "the delayed close must keep WRITABLE interest so the write path \
              can still flush"
         );
         assert!(
-            connection.readiness.event.is_writable(),
+            connection.core.readiness.event.is_writable(),
             "ensure_tls_flushed must re-signal the WRITABLE event: nothing \
              else wakes an edge-triggered connection whose records are stuck \
              in rustls rather than in the kernel"
@@ -13703,7 +14438,7 @@ mod tests {
     /// POST-flush answer: it re-arms while rustls still holds records and
     /// closes only once they are gone.
     ///
-    /// That arm has no flush of its own — `ConnectionH2::writable`'s preamble
+    /// That arm has no flush of its own — `H2Shell::writable`'s preamble
     /// already issued this pass's `socket_write(&[])` and discarded both the
     /// size and the status it returned, and the `tls_wants_write` the arm is
     /// handed is the read after it, so that query is the only thing that can
@@ -13738,7 +14473,7 @@ mod tests {
              this arm reads its only input as false and the test proves nothing"
         );
 
-        connection.readiness.event.insert(Ready::WRITABLE);
+        connection.core.readiness.event.insert(Ready::WRITABLE);
         assert!(
             matches!(
                 connection.writable(&mut context, EndpointClient(&mut router)),
@@ -13749,7 +14484,7 @@ mod tests {
              not received and it reads the response as truncated"
         );
         assert!(
-            connection.readiness.event.is_writable(),
+            connection.core.readiness.event.is_writable(),
             "ensure_tls_flushed must re-signal the WRITABLE event, since \
              nothing else wakes a connection whose bytes are stuck in rustls \
              rather than in the kernel"
@@ -13767,7 +14502,7 @@ mod tests {
              the peer reads"
         );
 
-        connection.readiness.event.insert(Ready::WRITABLE);
+        connection.core.readiness.event.insert(Ready::WRITABLE);
         assert!(
             matches!(
                 connection.writable(&mut context, EndpointClient(&mut router)),
@@ -13803,7 +14538,7 @@ mod tests {
     /// TO SEE THIS RED: in `ConnectionH2::dispatch_writable_state_after_flush`,
     /// replace the `h2_close::goaway_close_action(TlsFlushPhase::AfterFlush,
     /// false, tls_wants_write)` third argument with `false`. The arm
-    /// stops reading whether the flush `ConnectionH2::writable` performed for
+    /// stops reading whether the flush `H2Shell::writable` performed for
     /// it landed, falls through to
     /// `force_disconnect`, and this test fails on `a GoAway pass whose flush
     /// did not land must stay in GoAway`. Measured: `1115 passed; 2 failed` —
@@ -13826,12 +14561,12 @@ mod tests {
             "premise: the blocked kernel must leave real records pending"
         );
         assert!(
-            !connection.peer_gone_after_final_goaway(),
+            !connection.core.peer_gone_after_final_goaway(),
             "premise: the peer must still be live, or the decision \
              short-circuits on its first boolean and never reads the socket"
         );
 
-        connection.readiness.event.insert(Ready::WRITABLE);
+        connection.core.readiness.event.insert(Ready::WRITABLE);
         assert!(
             matches!(
                 connection.writable(&mut context, EndpointClient(&mut router)),
@@ -13842,13 +14577,13 @@ mod tests {
              received"
         );
         assert!(
-            matches!(connection.state, H2State::GoAway),
+            matches!(connection.core.state, H2State::GoAway),
             "a GoAway pass whose flush did not land must stay in GoAway: \
              reaching Error means the arm fell through to force_disconnect \
              and its own record guard, not this one, kept the session alive"
         );
         assert!(
-            connection.readiness.event.is_writable(),
+            connection.core.readiness.event.is_writable(),
             "ensure_tls_flushed must re-signal the WRITABLE event so the loop \
              comes back and retries the flush"
         );
@@ -13865,7 +14600,7 @@ mod tests {
              the peer reads"
         );
 
-        connection.readiness.event.insert(Ready::WRITABLE);
+        connection.core.readiness.event.insert(Ready::WRITABLE);
         assert!(
             matches!(
                 connection.writable(&mut context, EndpointClient(&mut router)),
@@ -13878,7 +14613,7 @@ mod tests {
 
     // ── #1498: a DRIVEN TLS close_notify over a real `FrontRustls` ─────
     //
-    // `ConnectionH2::begin_tls_close` is the seam that reaches
+    // `H2Shell::begin_tls_close` is the seam that reaches
     // `FrontRustls::socket_close`, which is
     // `rustls::ServerConnection::send_close_notify`. Replacing its body with
     // `{}` at 0dddedf2 left the WHOLE suite green — `sozu-lib` `1114 passed;
@@ -13891,7 +14626,7 @@ mod tests {
     // one — which is the asymmetry the whole file turns on. #1484's
     // coverage audit reached the same conclusion from the other direction,
     // listing `initiate_close_notify` among the `socket_wants_write` branches
-    // its six `ConnectionH2<FrontRustls>` tests could not reach, for want of a
+    // its six `H2Shell<FrontRustls>` tests could not reach, for want of a
     // driven close_notify.
     //
     // The hole is structural rather than an oversight. Every handler the suite
@@ -13916,7 +14651,7 @@ mod tests {
     /// The route is the production one and the whole of it:
     /// `Mux::timeout` -> `Mux::delay_close_for_frontend_flush` ->
     /// `Connection::initiate_close_notify` ->
-    /// `ConnectionH2::initiate_close_notify` -> `begin_tls_close` ->
+    /// `H2Shell::initiate_close_notify` -> `begin_tls_close` ->
     /// `FrontRustls::socket_close` -> `send_close_notify`.
     ///
     /// `Mux::delay_close_for_frontend_flush` is the SOLE caller of
@@ -13935,7 +14670,7 @@ mod tests {
     /// records even if no application data was written" block, which is what
     /// hands the record to `write_tls`.
     ///
-    /// TO SEE THIS RED: replace the body of `ConnectionH2::begin_tls_close`
+    /// TO SEE THIS RED: replace the body of `H2Shell::begin_tls_close`
     /// with `{}`. rustls is then never asked for the alert, `tls_wants_write()`
     /// answers false, `initiate_close_notify` returns false and the flush has
     /// nothing to push, so this test fails on `the peer must decrypt a TLS
@@ -13958,7 +14693,7 @@ mod tests {
         // full `timeout_duration` out, so move it into the past: this is the
         // idle deadline genuinely elapsing, which is what the event loop would
         // be reacting to.
-        connection.timeout_deadline = Some(Instant::now() - Duration::from_secs(60));
+        connection.core.timeout_deadline = Some(Instant::now() - Duration::from_secs(60));
 
         let frontend_token = mio::Token(0);
         let mut mux = crate::protocol::mux::Mux {
@@ -14052,7 +14787,7 @@ mod tests {
     // application activity, and `ConnectionH2::poll_read_target` spells out
     // the reason in prose: a peer sending periodic PINGs must not prevent
     // timeout detection on a stuck session. The READ side honoured it. The
-    // WRITE side did not, because `ConnectionH2::write_streams` armed at pass
+    // WRITE side did not, because `H2Shell::write_streams` armed at pass
     // entry and `writable()` reaches that function on every proxying-state
     // pass — including the pass whose only output was the PING or SETTINGS
     // acknowledgement `flush_pending_control_frames` had just drained. So the
@@ -14083,18 +14818,19 @@ mod tests {
     fn liveness_fixture(
         pool: &Rc<RefCell<Pool>>,
     ) -> (
-        ConnectionH2<BackpressuredTlsSocket>,
+        H2Shell<BackpressuredTlsSocket>,
         Context<TestListener>,
         GlobalStreamId,
         Instant,
         std::net::TcpStream,
     ) {
         let (mut connection, peer) = connection_with_backpressure(pool, 0, 0, H2State::Header);
-        let t0 = connection.now;
-        connection.timeout_duration = LIVENESS_TIMEOUT;
-        connection.stream_idle_timeout = LIVENESS_TIMEOUT;
-        connection.timeout_deadline = t0.checked_add(LIVENESS_TIMEOUT);
+        let t0 = connection.core.now;
+        connection.core.timeout_duration = LIVENESS_TIMEOUT;
+        connection.core.stream_idle_timeout = LIVENESS_TIMEOUT;
+        connection.core.timeout_deadline = t0.checked_add(LIVENESS_TIMEOUT);
         connection
+            .core
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
         let mut context = test_context(pool);
@@ -14102,8 +14838,9 @@ mod tests {
             .create_stream(Ulid::generate(), 1 << 16)
             .expect("test context must create a stream");
         connection
+            .core
             .stream_table
-            .register(REGISTERED_STREAM_ID, gid, connection.now);
+            .register(REGISTERED_STREAM_ID, gid, connection.core.now);
         (connection, context, gid, t0, peer)
     }
 
@@ -14158,7 +14895,7 @@ mod tests {
     /// `WouldBlock` that only means "not yet", and every assertion downstream
     /// then measures a frame that was never delivered — which is a test that
     /// passes for the wrong reason, in the direction of the negative legs.
-    fn liveness_await_bytes(connection: &ConnectionH2<BackpressuredTlsSocket>, n: usize) {
+    fn liveness_await_bytes(connection: &H2Shell<BackpressuredTlsSocket>, n: usize) {
         let mut buf = vec![0u8; n];
         for _ in 0..1_000_000 {
             if let Ok(got) = connection.socket.socket_ref().peek(&mut buf)
@@ -14179,7 +14916,7 @@ mod tests {
     /// that the acknowledgement really was queued — instead of inferring it
     /// from the deadline it is about to measure.
     fn liveness_read(
-        connection: &mut ConnectionH2<BackpressuredTlsSocket>,
+        connection: &mut H2Shell<BackpressuredTlsSocket>,
         context: &mut Context<TestListener>,
         router: &mut Router,
         peer: &mut std::net::TcpStream,
@@ -14190,10 +14927,10 @@ mod tests {
         peer.write_all(frame).expect("loopback write must complete");
         peer.flush().expect("loopback flush must complete");
         liveness_await_bytes(connection, frame.len());
-        connection.readiness.interest.insert(Ready::READABLE);
-        connection.readiness.event.insert(Ready::READABLE);
+        connection.core.readiness.interest.insert(Ready::READABLE);
+        connection.core.readiness.event.insert(Ready::READABLE);
         for _ in 0..64 {
-            if !connection.readiness.filter_interest().is_readable() {
+            if !connection.core.readiness.filter_interest().is_readable() {
                 let mut leftover = [0u8; 1];
                 assert!(
                     !matches!(connection.socket.socket_ref().peek(&mut leftover), Ok(1)),
@@ -14204,31 +14941,37 @@ mod tests {
             }
             connection.readable(context, EndpointClient(&mut *router));
         }
-        panic!("the read half never settled: {:?}", connection.readiness);
+        panic!(
+            "the read half never settled: {:?}",
+            connection.core.readiness
+        );
     }
 
     /// Run the WRITE half at the clock the read half left: `writable()` while
     /// `filter_interest()` is writable. This is the pass that used to arm the
     /// frontend deadline unconditionally.
     fn liveness_write(
-        connection: &mut ConnectionH2<BackpressuredTlsSocket>,
+        connection: &mut H2Shell<BackpressuredTlsSocket>,
         context: &mut Context<TestListener>,
         router: &mut Router,
     ) {
         for _ in 0..64 {
-            if !connection.readiness.filter_interest().is_writable() {
+            if !connection.core.readiness.filter_interest().is_writable() {
                 return;
             }
             connection.writable(context, EndpointClient(&mut *router));
         }
-        panic!("the write half never settled: {:?}", connection.readiness);
+        panic!(
+            "the write half never settled: {:?}",
+            connection.core.readiness
+        );
     }
 
     /// Queue `blocks` as the registered stream's response and drive ONE
     /// `writable()` pass at `at`. Returns the bytes that reached the socket
     /// across the whole connection's lifetime so far.
     fn liveness_flush_stream(
-        connection: &mut ConnectionH2<BackpressuredTlsSocket>,
+        connection: &mut H2Shell<BackpressuredTlsSocket>,
         context: &mut Context<TestListener>,
         router: &mut Router,
         gid: GlobalStreamId,
@@ -14242,19 +14985,17 @@ mod tests {
                 .push_back(kawa::OutBlock::Store(kawa::Store::Static(block)));
         }
         context.now = at;
-        connection.readiness.interest.insert(Ready::WRITABLE);
-        connection.readiness.event.insert(Ready::WRITABLE);
+        connection.core.readiness.interest.insert(Ready::WRITABLE);
+        connection.core.readiness.event.insert(Ready::WRITABLE);
         connection.writable(context, EndpointClient(&mut *router));
         context.streams[gid].metrics.bout
     }
 
     /// The deadline a connection publishes, as an offset from pass zero, so a
     /// failure reads in the units the issue's table is written in.
-    fn liveness_deadline(
-        connection: &ConnectionH2<BackpressuredTlsSocket>,
-        t0: Instant,
-    ) -> Duration {
+    fn liveness_deadline(connection: &H2Shell<BackpressuredTlsSocket>, t0: Instant) -> Duration {
         connection
+            .core
             .poll_timeout()
             .expect("a live H2 connection must publish a deadline")
             .saturating_duration_since(t0)
@@ -14268,7 +15009,7 @@ mod tests {
     /// peer being alive on a stream: the ACK is the proxy talking to itself.
     ///
     /// TO SEE THIS RED: put `self.arm_timeout();` back as the first statement
-    /// of `ConnectionH2::write_streams`. Measured on that revert, this test
+    /// of `H2Shell::write_streams`. Measured on that revert, this test
     /// fails on `a PING is answered but is not stream activity`, with
     /// `left: 610s, right: 600.01s` — the deadline follows the PING instead of
     /// staying where the request left it. It is one of FOUR failures, the
@@ -14325,7 +15066,7 @@ mod tests {
                 &liveness_ping_frame(),
             );
             assert_eq!(
-                connection.stream_table.expect_write(),
+                connection.core.stream_table.expect_write(),
                 Some(H2StreamId::Zero),
                 "premise: the PING must really have been answered and parked, \
                  so the write pass below is the ACK-only pass this test is \
@@ -14335,7 +15076,7 @@ mod tests {
             liveness_write(&mut connection, &mut context, &mut router);
 
             assert_eq!(
-                connection.stream_table.expect_write(),
+                connection.core.stream_table.expect_write(),
                 None,
                 "premise: the ACK flush must have completed, which is what \
                  lets `flush_pending_control_frames` answer None and fall \
@@ -14404,7 +15145,7 @@ mod tests {
     /// both moving independently.
     ///
     /// TO SEE THIS RED: put `self.arm_timeout();` back as the first statement
-    /// of `ConnectionH2::write_streams`. Measured on that revert, this test
+    /// of `H2Shell::write_streams`. Measured on that revert, this test
     /// fails on `a SETTINGS ACK is not stream activity`, with
     /// `left: 640s, right: 600.01s`. Neutering the other half instead —
     /// `if size > 0` to `if false` in `ConnectionH2::handle_write` — reddens
@@ -14441,7 +15182,7 @@ mod tests {
             &liveness_settings_frame(),
         );
         assert_eq!(
-            connection.stream_table.expect_write(),
+            connection.core.stream_table.expect_write(),
             Some(H2StreamId::Zero),
             "premise: the SETTINGS must really have been acknowledged and \
              parked, so the write pass below is the ACK-only pass"
@@ -14450,7 +15191,7 @@ mod tests {
         liveness_write(&mut connection, &mut context, &mut router);
 
         assert_eq!(
-            connection.stream_table.expect_write(),
+            connection.core.stream_table.expect_write(),
             None,
             "premise: the ACK flush must have completed and fallen through \
              into the proxying-state write pass"
@@ -14499,7 +15240,7 @@ mod tests {
     /// still holds and this test then fails on `a write pass that moved a
     /// stream's bytes must arm the deadline`, with `left: 600s, right: 620s`.
     /// Restoring `self.arm_timeout()` to the top of
-    /// `ConnectionH2::write_streams` reddens the OTHER assertion instead, `a
+    /// `H2Shell::write_streams` reddens the OTHER assertion instead, `a
     /// write pass that emitted nothing is not liveness`, with
     /// `left: 610s, right: 600s`.
     #[test]
@@ -14553,7 +15294,7 @@ mod tests {
     ///
     /// `Mux::drive_frontend_shutdown_io` sets `force_h2_write` unconditionally
     /// for an H2 frontend, so a draining connection still in `H2State::Header`
-    /// reaches `ConnectionH2::write_streams` on every `shutting_down()` poll —
+    /// reaches `H2Shell::write_streams` on every `shutting_down()` poll —
     /// which is why arming at pass entry made a draining session immune to the
     /// frontend timeout for the whole drain, whether or not a byte moved. The
     /// drain keeps its deadline the same way every other pass does: by
@@ -14563,7 +15304,7 @@ mod tests {
     /// `ConnectionH2::handle_write` to `if false`. This test then fails on `a
     /// draining pass that flushed a stream's bytes must arm the deadline`,
     /// with `left: 600s, right: 620s`. Restoring `self.arm_timeout()` to the
-    /// top of `ConnectionH2::write_streams` reddens the other assertion, `a
+    /// top of `H2Shell::write_streams` reddens the other assertion, `a
     /// draining pass that emitted nothing is not liveness either`, with
     /// `left: 610s, right: 600s`.
     #[test]
@@ -14571,7 +15312,7 @@ mod tests {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
         let (mut connection, mut context, gid, t0, _peer) = liveness_fixture(&pool);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
-        connection.drain.__test_set_draining();
+        connection.core.drain.__test_set_draining();
 
         let empty_at = Duration::from_secs(10);
         let written = liveness_flush_stream(

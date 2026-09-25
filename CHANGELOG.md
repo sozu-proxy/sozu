@@ -240,6 +240,60 @@
 
 ### 🔄 Changed
 
+- **`refactor(mux-h2)`: `ConnectionH2` drops its `Front` parameter — the H2 core is byte-in /
+  byte-out ([#1339](https://github.com/sozu-proxy/sozu/issues/1339), Q10).** The milestone the
+  socket-boundary series was built for. `Connection::H2` now holds
+  `H2Shell<Front: SocketHandler> { core: ConnectionH2, socket: Front }`, and `ConnectionH2` names
+  no socket, no `SocketHandler` and no type parameter. `Connection<Front: SocketHandler>` and
+  `Router::backends`' declared type are unchanged: the parameter did not leave the mux, it moved
+  off the state machine. Production `self.socket` code references in `h2.rs` above `mod tests`
+  went from **7 to 0** — all seven now sit on `H2Shell` — and `ConnectionH2::poll_timeout`,
+  `arm_timeout` and `set_timeout_duration` widened from `pub(super)` to `pub` so an out-of-crate
+  driver can arm the connection deadline. Both halves live in `h2.rs`, so the shell reaches the
+  core's private fields exactly as the methods it inherited did; **nothing was widened to `pub` to
+  let the socket keep working.**
+  Three core steps changed shape rather than moving. `ConnectionH2::flush_pending_control_frames`
+  called `flush_zero_to_socket` at three points and is now a resumable walk answering
+  `H2ControlFlushTarget::FlushZero(H2ControlFlushStage)`, with
+  `ConnectionH2::handle_control_flush` running the continuation belonging to the stage that asked —
+  they differ, so the stage travels out with the request and back with the answer instead of a flag
+  living on the connection. `ConnectionH2::close` moved whole, taking its
+  `shared::drain_tls_close_notify` hand-off with it; `ConnectionH1::close` shares that helper
+  byte-for-byte and is untouched. And `ConnectionH2::force_disconnect` was **inverted**: it read
+  `tls_wants_write` itself from seventeen sites, seven of them inside the `pub`, socket-free
+  `ConnectionH2::handle_read`, so neither moving it nor threading a socket-derived `bool` through
+  `ConnectionH2::goaway`'s thirty-one call sites was available. It now settles everything that
+  needs no socket at the raising site, parks an `H2ForceDisconnectTarget` carrying
+  `peer_gone_after_final_goaway()` as it read it, and is settled by
+  `ConnectionH2::force_disconnect_after_query` with the answer `H2Shell::settled` read. That
+  helper *takes* the parked target, so a double settlement is impossible, and every `MuxResult` a
+  core step hands the shell passes through it.
+  **One behaviour change.** Two core sites discard a `MuxResult` that can carry a force-disconnect
+  — `ConnectionH2::cancel_timed_out_streams`' `let _ = self.enqueue_rst(..)` and
+  `ConnectionH2::start_stream`'s discarded `graceful_goaway`. A `CloseSession` raised there used to
+  be swallowed and the connection closed on a later pass through the `H2State::Error` arm; it now
+  propagates on this pass. Both are reachable only through a `gen_goaway` serialisation failure.
+  A carried `tls_wants_write` field refreshed by the shell after every socket call was considered
+  and rejected: less code, but it puts an ambient socket fact back in the core and rests on a
+  refresh discipline rather than a shape.
+  `doc/h2_mux_internals.md` (the three TLS seams, a new shell section, the inversion),
+  `doc/testing.md`, `doc/lifetime_of_a_session.md` and `LIFECYCLE.md` are updated in this
+  changeset.
+
+- **`build(sim)`: the `mio` dev-dependency is removed from `sozu-sim`
+  ([#1339](https://github.com/sozu-proxy/sozu/issues/1339), Q10).** A build-contract change, and
+  the measurable outcome of the line above. `sim/tests/h2_simulation.rs` used to hold a
+  `Connection<SimSocket>` and therefore had to make `SimSocket` a `SocketHandler`, whose
+  `socket_ref`/`socket_mut` return `&mio::net::TcpStream` — a concrete OS type no in-memory
+  transport can synthesise. That forced a connected loopback stream the harness never read or
+  wrote, a `PlaceholderPeer` to keep it connected, and the single `mio` line under
+  `[target.'cfg(tokio_unstable)'.dev-dependencies]`. The harness now builds `ConnectionH2`
+  directly and feeds it `&[u8]` in / `Vec<u8>` out over two byte queues, driving the same `pub`
+  poll/handle pairs `H2Shell` drives. **`SimSocket`, `PlaceholderPeer` and the `mio` dev-dependency
+  are all gone**, `H2Harness::pump` was rewritten, and **every scenario and assertion is unchanged**
+  — `RUSTFLAGS="--cfg tokio_unstable" cargo test -p sozu-sim` reports the same `12 passed` for
+  `h2_simulation` as before. `Cargo.lock` loses exactly one line. No production dependency changes.
+
 - **`refactor(mux-h2)`: sample the frontend RTT once per `Mux` pass, so the H2 core no longer reads
   a socket for the access log ([#1339](https://github.com/sozu-proxy/sozu/issues/1339), Q11).**
   **Operator-visible:** on HTTP/2 the access log's `client_rtt` no longer means "the frontend SRTT

@@ -185,10 +185,14 @@ pub use crate::protocol::mux::{
     connection::Connection,
     debug::{DebugEvent, DebugHistory},
     h1::ConnectionH1,
+    h2::CLIENT_PREFACE_SIZE,
     h2::ConnectionH2,
     h2::H2ByteAccounting,
     h2::H2ConnectionConfig,
-    h2::{H2ReadOutcome, H2ReadTarget, H2StreamId, H2WriteTarget},
+    h2::{
+        H2ControlFlushStage, H2ControlFlushTarget, H2FinalizeTarget, H2ForceDisconnectTarget,
+        H2ReadOutcome, H2ReadTarget, H2Shell, H2StreamId, H2WritableStateTarget, H2WriteTarget,
+    },
     h2_flood_detector::H2FloodConfig,
     h2_write_pass::H2WritePass,
     parser::H2Error,
@@ -231,7 +235,7 @@ const MAX_LOOP_ITERATIONS: i32 = 10_000;
 /// and the reason is scope, not risk. That function has around a dozen callers
 /// reaching it through `Connection::end_stream` and the two `Endpoint`
 /// adaptors, and the H2-driven ones are precisely the ones this proof never
-/// traced: `ConnectionH2::close` and `ConnectionH2::end_stream` iterate their
+/// traced: `H2Shell::close` and `ConnectionH2::end_stream` iterate their
 /// OWN wire map (`for global_stream_id in self.streams.values()`, `h2.rs`) and
 /// hand each `StreamState::Linked` gid to the peer, which on an H2-frontend /
 /// H1-backend session is a `ConnectionH1`. Add the reset and HUP paths and the
@@ -1149,7 +1153,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// gone silent and no `ready()` has run for a while, which is when the
     /// previous pass's sample is oldest. `Mux::close` is deliberately NOT on
     /// the list: it already takes its own sample for its own teardown loop,
-    /// and `ConnectionH2::close` emits no access log.
+    /// and `H2Shell::close` emits no access log.
     ///
     /// H1 is not gated out by accident. `ConnectionH1` reads its own socket at
     /// each access log, one stream at a time, and an H1 connection carries one
@@ -1162,7 +1166,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// it measured 7.8–9.7× the syscall rate for +6.5% / +5.3% CPU.
     fn refresh_client_rtt(&mut self) {
         if let Connection::H2(connection) = &mut self.frontend {
-            connection.client_rtt = socket_rtt(connection.socket.socket_ref());
+            connection.core.client_rtt = socket_rtt(connection.socket.socket_ref());
         }
     }
 }
@@ -2187,7 +2191,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     &mut self.context,
                     &mut EndpointClient(&mut self.router),
                 );
-                if h2.has_pending_control_write() {
+                if h2.core.has_pending_control_write() {
                     should_write = true;
                 }
             }
@@ -2804,7 +2808,7 @@ mod tests {
         pool::Pool,
         protocol::http::parser::Method,
         protocol::mux::{
-            h2::{ConnectionH2, H2ConnectionConfig, H2State},
+            h2::{H2ConnectionConfig, H2State},
             h2_flood_detector::H2FloodConfig,
         },
         timer::TimeoutContainer,
@@ -2838,7 +2842,7 @@ mod tests {
         let (socket, _peer) = connected_socket();
         let deadline = Duration::from_secs(5);
 
-        let mut h2 = ConnectionH2::new(
+        let mut h2 = h2::H2Shell::new(
             Ulid::generate(),
             socket,
             Position::Server,
@@ -2857,8 +2861,8 @@ mod tests {
         // budget well over the deadline ago. `shutting_down` takes the
         // already-draining branch, which never calls `graceful_goaway`.
         let armed_at = Instant::now() - Duration::from_secs(60);
-        h2.state = H2State::Header;
-        h2.drain.__test_arm_draining(armed_at);
+        h2.core.state = H2State::Header;
+        h2.core.drain.__test_arm_draining(armed_at);
         let mut frontend = Connection::H2(h2);
 
         let mut context = test_context(&pool);
@@ -2880,7 +2884,7 @@ mod tests {
         let Connection::H2(h2) = &mut frontend else {
             unreachable!("frontend was built as H2")
         };
-        h2.__test_insert_wire_mapping_only(1, stream_id);
+        h2.core.__test_insert_wire_mapping_only(1, stream_id);
 
         let mut mux = Mux {
             configured_frontend_timeout: Duration::from_secs(30),
@@ -3670,7 +3674,7 @@ mod tests {
 
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
         let (socket, _peer) = connected_socket();
-        let h2 = ConnectionH2::new(
+        let h2 = h2::H2Shell::new(
             Ulid::generate(),
             socket,
             Position::Server,
@@ -3689,14 +3693,14 @@ mod tests {
         let Connection::H2(h2) = &mut frontend else {
             unreachable!("frontend was built as H2")
         };
-        h2.client_rtt = Some(STALE_SAMPLE);
+        h2.core.client_rtt = Some(STALE_SAMPLE);
         // A deadline already in the past, so `Mux::consume_timer_entry`
         // accepts the firing as a real expiry and the body below it runs.
         // Without this the connection carries the 30 s deadline it armed at
         // construction, the firing re-validates as an early wheel delivery,
         // and `timeout_inner` returns before reaching anything this test is
         // about.
-        h2.timeout_deadline = Some(Instant::now() - Duration::from_secs(1));
+        h2.core.timeout_deadline = Some(Instant::now() - Duration::from_secs(1));
 
         let mut mux = Mux {
             configured_frontend_timeout: Duration::from_secs(30),
@@ -3715,15 +3719,15 @@ mod tests {
             unreachable!("frontend was built as H2")
         };
         assert!(
-            h2.client_rtt.is_some(),
+            h2.core.client_rtt.is_some(),
             "premise: TCP_INFO must answer on a live loopback frontend, \
              otherwise this test cannot tell a refresh from a failed read"
         );
         assert!(
-            h2.client_rtt.is_some_and(|rtt| rtt != STALE_SAMPLE),
+            h2.core.client_rtt.is_some_and(|rtt| rtt != STALE_SAMPLE),
             "a Mux pass must replace the carried frontend RTT with a fresh \
              sample, got {:?}",
-            h2.client_rtt
+            h2.core.client_rtt
         );
     }
 

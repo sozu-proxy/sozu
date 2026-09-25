@@ -138,7 +138,7 @@ use kawa::{AsBuffer, Kawa};
 /// obligation is the caller's, and a caller outside this crate has no other
 /// way to be told.
 ///
-/// The only production caller is `super::h2::ConnectionH2::write_streams`,
+/// The only production caller is `super::h2::H2Shell::write_streams`,
 /// which opens the window here and closes it at the [`confirm`] three
 /// statements later, entering nothing in between but the vectored socket
 /// write that reborrows the descriptors and cannot retain them.

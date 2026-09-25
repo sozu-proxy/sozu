@@ -21,13 +21,25 @@ Source files covered by this document:
 
 ## ConnectionH2 Sub-structures
 
-`ConnectionH2` is the central H2 connection type, generic over `Front: SocketHandler`.
-Its fields are decomposed into focused sub-structures to separate concerns:
+`ConnectionH2` is the central H2 connection type. It is **not** generic: it
+holds no socket and names no `SocketHandler`. The socket lives one layer out,
+in `H2Shell`, which is what `Connection::H2` holds:
 
 ```
-ConnectionH2<Front>
+H2Shell<Front: SocketHandler>
  |
  |-- socket: Front                          // TLS or TCP socket
+ |-- core: ConnectionH2                     // everything below
+```
+
+`Connection<Front: SocketHandler>` keeps its bound and `Router::backends` keeps
+its declared type: the parameter did not leave the mux, it moved off the state
+machine. `ConnectionH2`'s own fields are decomposed into focused
+sub-structures to separate concerns:
+
+```
+ConnectionH2
+ |
  |-- state: H2State                         // Frame-level state machine
  |-- position: Position                     // Server or Client(cluster, scheme)
  |-- readiness: Readiness                   // Edge-triggered interest tracking
@@ -582,7 +594,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4002-4015
+```rust lib/src/protocol/mux/h2.rs:4081-4094
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -606,7 +618,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4048-4054
+```rust lib/src/protocol/mux/h2.rs:4127-4133
 stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -623,9 +635,9 @@ The other three sites take the `&mut self` wrapper
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5874`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:5967`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6601`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:6644`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -635,10 +647,10 @@ for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
 taken at the top of `H2WritePhase::Flush`'s post-flush tail
-(`lib/src/protocol/mux/h2.rs:2814`) and passes `stream.linked_token()` straight
+(`lib/src/protocol/mux/h2.rs:2835`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:2873-2874
+```rust lib/src/protocol/mux/h2.rs:2894-2895
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -677,15 +689,23 @@ the complexity of the H2 state machine:
 
 ### The three TLS seams
 
-Everything `ConnectionH2` asks of the TLS layer goes through exactly three
+Everything the H2 connection asks of the TLS layer goes through exactly three
 private methods, and nothing else in the file spells the underlying
 `SocketHandler` call:
 
-| seam | question or action | call sites |
-|---|---|---|
-| `ConnectionH2::tls_wants_write` | does the TLS layer still hold encrypted records it must push? | 12 |
-| `ConnectionH2::flush_tls_records` | push whatever it holds, offering no new application bytes | 4 |
-| `ConnectionH2::begin_tls_close` | start the `close_notify` handshake | 1 |
+| seam | question or action |
+|---|---|
+| `H2Shell::tls_wants_write` | does the TLS layer still hold encrypted records it must push? |
+| `H2Shell::flush_tls_records` | push whatever it holds, offering no new application bytes |
+| `H2Shell::begin_tls_close` | start the `close_notify` handshake |
+
+**All three now live on `H2Shell`, and `ConnectionH2` calls none of them.**
+That is the whole of what the seams were for: they were the three inputs and
+actions a byte-in / byte-out core has to receive from, or hand back to, the
+I/O shell that owns the socket, and the shell is the layer their bodies have
+moved to. The call-site counts that used to sit in this table were the measure
+of an extraction still in progress; the extraction is done, so the measure is
+now simply that the core has none.
 
 The name of the underlying trait method says *socket*, and that is what made
 this read as an I/O question for as long as it was spelled out at every site.
@@ -693,49 +713,119 @@ It is a question about a buffer that happens to live behind the socket:
 `FrontRustls` is the only production `SocketHandler` that overrides it, the
 trait's default answer is `false`, and `Router::backends` is declared
 `Connection<SessionTcpStream>` whatever the frontend is — so every **backend**
-H2 connection already resolves all twelve queries statically to `false`. The
-same core is monomorphised twice today, once with TLS and once without.
-
-Six of the twelve are in the shell impl block: four in `ConnectionH2::writable`
-and two in `ConnectionH2::write_streams`. The count is the measure of the
-extraction rather than a tally, which is why it is worth keeping right: it
-read `15` from sozu-proxy/sozu#1499 until now, because sozu-proxy/sozu#1512
-folded two of them away without correcting the line, and lifting `writable`'s
-close arms folds a third — the `(H2State::Error, Position::Server)` and
-`H2State::GoAway` arms used to read the query once each, and one read now
-serves whichever of the two runs.
-
-The seams are not abbreviations. They are the three inputs and actions a
-byte-in / byte-out `ConnectionH2` has to receive from, or hand back to, the
-I/O shell that owns the socket — the shell is the layer these three bodies
-move to, and the call sites do not move with them. Issue #1339 decided that
-boundary; this is the first step of it, and it changes no behaviour.
+H2 connection resolves every one of these queries statically to `false`.
 
 Two properties of the set matter when changing it. `tls_wants_write` is free of
 side effects, so a caller that asks twice around a `flush_tls_records` is asking
 two genuinely different questions — "does rustls hold records" and "did the
 kernel take them" — which is what `h2_close::TlsFlushPhase` names, while a
 caller that asks twice with nothing in between should bind the answer once
-instead (`ConnectionH2::force_disconnect` does, above its `match`). And
-`flush_tls_records` is the only *action* of the three, so its four call sites
-are exactly the four places where the extraction must invert control rather
+instead. And `flush_tls_records` is the only *action* of the three, so its call
+sites are exactly the places where the extraction had to invert control rather
 than pass a value in.
 
 One composite is built on the query and has a name of its own:
 `ConnectionH2::ensure_tls_flushed` is "re-arm the edge-triggered WRITABLE event
 if the answer is yes". It takes that answer as a `tls_wants_write` parameter and
-does not ask: the query belongs to the caller. Five of the six call sites already
-hold the answer — four from the `h2_close` decision just taken on it, and
-`initiate_close_notify` from its own branch condition — and pass that binding,
-since nothing mutates the socket in between; the sixth, `writable`'s
-`H2ControlFlushTarget::Stalled` arm, has no such binding and reads it after the
-`flush_zero_to_socket` whose stall brought it there, because that write is what
-changes the answer. The three stalled-drain tails of
-`flush_pending_control_frames` used to read it and re-arm individually; they now
-answer `H2ControlFlushTarget::Stalled` and that one arm re-arms for all three. Under edge-triggered epoll a connection whose bytes are stuck
-in rustls rather than in the kernel has no other wake-up, so every site that parks
-output must end with it. It is called, never spelled out: a site that writes the
-body again is the same fact written twice.
+does not ask — the query belongs to the caller, which is why this one stayed in
+the core when the three seams left. Under edge-triggered epoll a connection
+whose bytes are stuck in rustls rather than in the kernel has no other wake-up,
+so every site that parks output must end with it. It is called, never spelled
+out: a site that writes the body again is the same fact written twice.
+
+### The shell, and what crosses it
+
+`H2Shell<Front: SocketHandler> { core: ConnectionH2, socket: Front }` is what
+`Connection::H2` holds. Both halves live in `h2.rs`, so the shell reaches the
+core's private fields exactly as the methods it inherited used to — **nothing
+was widened to `pub` to let the socket keep working**. The `pub` surface that
+did grow exists for a driver outside this crate.
+
+What moved to the shell is everything that touches `Front`: the three seams,
+`readable`, `writable`, `write_streams`, `flush_zero_to_socket`,
+`flush_zero_buffer`, `initiate_close_notify`, `has_pending_write`,
+`has_pending_write_full` and `close`. What stayed is the state machine.
+
+Three core steps had to change shape to stay in the core, because each one
+used to reach the socket from somewhere the shell cannot stand:
+
+- **`ConnectionH2::flush_pending_control_frames`** used to call
+  `flush_zero_to_socket` at three points. It is now a resumable walk: it
+  answers `H2ControlFlushTarget::FlushZero(H2ControlFlushStage)`, the caller
+  moves the bytes, and `ConnectionH2::handle_control_flush` runs the
+  continuation belonging to the stage that asked. The three continuations
+  differ — only the zero-buffer resume re-enables READABLE interest, and only
+  the two serialising stages re-arm `expect_write` on a stall — which is why
+  the stage travels out with the request and back with the answer instead of a
+  flag living on the connection.
+- **`ConnectionH2::close`** hands `&mut self.socket` whole to
+  `shared::drain_tls_close_notify`, which runs its own drain loop on the far
+  side. It moved to the shell entire; `ConnectionH1::close` shares that helper
+  byte-for-byte and is untouched.
+- **`ConnectionH2::force_disconnect`** is the one that could not simply move.
+  See below.
+
+### Inverting `force_disconnect`
+
+`force_disconnect` read `tls_wants_write` itself, and it is called from
+seventeen sites in the core — seven of them inside `ConnectionH2::handle_read`,
+whose `pub` signature is socket-free by construction and does not change. So
+neither moving it nor threading the answer through its callers was available:
+the first takes the socket to `handle_read`, the second takes a socket-derived
+`bool` into every frame handler by way of `ConnectionH2::goaway` and its
+thirty-one call sites.
+
+It is inverted instead, in the same poll/handle grammar as the rest of the
+write path, with one deliberate difference. `H2FinalizeTarget`,
+`H2ControlFlushTarget` and `H2WritableStateTarget` are all *returned* by the
+step that raises them. `H2ForceDisconnectTarget` cannot be: `handle_read`
+returns `MuxResult`. So it is parked on the connection, taken by
+`ConnectionH2::poll_force_disconnect`, and settled by
+`ConnectionH2::force_disconnect_after_query` with the answer the shell read.
+
+What the core settles at the raising site is everything that needs no socket:
+`H2State::Error`, and on a `Position::Client` connection the backend status and
+the `HUP` readiness event. What it defers is the `h2_close::force_disconnect_action`
+decision, the `ReArmAndContinue` readiness write, and the three `debug!` lines
+that render `wants_write=`. `peer_gone_after_final_goaway()` is computed at the
+raising site and **carried** in the target rather than re-read at settlement:
+it reads `stream_table` and `zero.storage`, and `ConnectionH2::remove_dead_stream`
+runs between raise and settlement on the `ConnectionH2::reset_stream` paths.
+
+The provisional answer is exact for every case but one. `Position::Client`
+always continued; a server whose peer is gone always closes, because the
+decision function answers `CloseSession` on `peer_gone` whatever the socket
+says. Only a server with a live peer turns on the query, and it answers
+`Continue` until settled — the conservative direction, since a session held one
+pass too long is recoverable and a session closed with records pending is the
+truncation that decision function exists to prevent.
+
+`H2Shell::settled` is the single settlement point, and it *takes* the parked
+target, so a double settlement is impossible. Every `MuxResult` a core step
+hands the shell passes through it, which makes a missed settlement greppable
+rather than asserted: a core call in the shell impl whose type is `MuxResult`
+and which is not an argument of `settled` is the bug. `H2Shell::settle` is the
+same for the steps whose own answer is not a `MuxResult` —
+`ConnectionH2::start_stream` answers a `bool` and
+`ConnectionH2::cancel_timed_out_streams` answers nothing, and both can reach
+`force_disconnect`. Those settle immediately rather than at the next entry
+point, because `Mux` reads `Readiness::filter_interest` between entry points to
+decide whether a connection gets a pass at all.
+
+**One behaviour change, named.** Two core sites discard the `MuxResult` that
+can carry a force-disconnect: `ConnectionH2::cancel_timed_out_streams` does
+`let _ = self.enqueue_rst(..)` and `ConnectionH2::start_stream` discards
+`graceful_goaway`'s. A `CloseSession` raised there used to be swallowed and the
+connection closed on a later pass through the `H2State::Error` arm; it now
+propagates on this pass. Both are reachable only through a `gen_goaway`
+serialisation failure — `ConnectionH2::goaway` and
+`ConnectionH2::send_initial_goaway` reach `force_disconnect` on that arm alone.
+
+A carried `tls_wants_write` field refreshed by the shell after every socket
+call was considered and rejected: it is less code, but it puts an ambient
+socket fact back inside the core, which is the thing this series exists to
+remove, and its correctness rests on a refresh discipline rather than on a
+shape.
 
 ### What the `Debug` impl renders
 
@@ -755,27 +845,18 @@ Three consequences, in the order they matter:
   not.
 - It is a value a byte-in / byte-out core can produce at all. `socket_ref`
   returns a concrete OS type no in-memory transport can synthesise, which is
-  why the H2 simulator's in-memory `SocketHandler` carries a connected loopback
-  stream it never reads or writes. That simulator's `peer_addr` already answers
-  a fixed address by construction, so no ephemeral port reaches a trace through
-  this impl any more.
+  why the H2 simulator used to carry a connected loopback stream it never read
+  or wrote. It no longer implements `SocketHandler` at all, so that placeholder
+  and the `mio` dev-dependency it forced are both gone.
 
-No production body in the file reaches `socket_ref` any more, and `socket_mut`
-never had one. `ConnectionH2::snapshot_rtts` held the last of them until Q11's
-local half landed; the remaining spellings are all in `mod tests`. What the
-core still requires of `SocketHandler` is therefore `socket_read`,
-`socket_write`, `socket_write_vectored`, `peer_addr` and the three seams
-above — and nothing that returns an OS handle.
-
-One of those reaches is a hand-off rather than a call, and counting `self.socket`
-misses what it implies: `ConnectionH2::close` passes `&mut self.socket` whole to
-`shared::drain_tls_close_notify`, which runs its own `socket_close` /
-`socket_wants_write` / `socket_write_vectored` drain loop on the far side. It
-adds no trait method to the list — those are the three seams' own underlying
-calls plus the vectored write — but it is a place the socket crosses a function
-boundary rather than being asked a question, it is shared byte-for-byte with
-`ConnectionH1::close`, and it has to move at the step that gives the socket to
-the shell. An H2-motivated change to it moves H1 in the same commit.
+`ConnectionH2` requires **nothing** of `SocketHandler`: it does not name the
+trait and has no `Front` parameter. `H2Shell` requires `socket_read`,
+`socket_write`, `socket_write_vectored`, `socket_wants_write`, `socket_close`
+and `peer_addr` — and `socket_ref` only through `Connection::socket`, which the
+event loop needs for registration. `H2Shell`'s own `Debug` is hand-written
+rather than derived for exactly the reason this section gives: a derive would
+render `socket` through `Front`'s `Debug` and hand the descriptor straight back
+through the wrapper.
 
 ### What the RTT read cost to remove
 
@@ -825,8 +906,8 @@ supersede this step without rework.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:6969-6973
-pub fn readable<E, L>(&mut self, context: &mut Context<L>, mut endpoint: E) -> MuxResult
+```rust lib/src/protocol/mux/h2.rs:7517-7521
+pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
     L: ListenerHandler + L7ListenerHandler,
@@ -837,9 +918,7 @@ The read path is a **two-call protocol**, the read-side mirror of
 `h2_transmit::gather` / `h2_transmit::confirm` on the write side. `readable()`
 itself is only the caller that sits between the two halves, and its
 `self.socket.socket_read` is the single socket touch on the whole H2 read
-path. It lives in the SHELL impl block — the last
-`impl<Front: SocketHandler> ConnectionH2<Front>` in `h2.rs`, which holds
-`readable`, `writable` and `write_streams` and nothing else — while
+path. It lives on `H2Shell`, the type that owns the socket, while
 `poll_read_target` and
 `handle_read` stay among the core impls. Those two are `pub` and re-exported
 from `protocol::mux` together with `H2ReadTarget` and `H2ReadOutcome`:
@@ -917,7 +996,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:7037-7041
+```rust lib/src/protocol/mux/h2.rs:7589-7593
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1087,8 +1166,8 @@ control-frame path, not a TLS seam.
 
 The main data-plane write path is a **drive loop**, the write-side mirror of
 `poll_read_target` / `handle_read`. It sits beside `readable` in the shell
-impl block — the last `impl<Front: SocketHandler> ConnectionH2<Front>` in
-`h2.rs` — and it is the one member of this quartet that stays PRIVATE.
+impl, on `H2Shell`, and it is the one member of this quartet that stays
+PRIVATE.
 `poll_write_target` and `handle_write` are `pub`, re-exported with
 `H2WriteTarget` and `H2WritePass`; `write_streams` is not, because the
 `Vec<IoSlice<'static>>` bracket must not become splittable by a caller this
@@ -1327,7 +1406,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:4916
+```rust lib/src/protocol/mux/h2.rs:7091
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -1480,7 +1559,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:5917-5919
+```rust lib/src/protocol/mux/h2.rs:6010-6012
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1488,7 +1567,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:5931-5937
+```rust lib/src/protocol/mux/h2.rs:6024-6030
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

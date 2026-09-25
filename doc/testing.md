@@ -85,7 +85,7 @@ catching.
 | **Unit** | `#[cfg(test)] mod tests` beside each module in `lib/src/**`, `command/src/**` | nothing beyond `protoc` + toolchain | run by `cargo test -p sozu-lib` | yes |
 | **Integration / e2e** | `e2e/src/tests/*` (registered in `e2e/src/tests/mod.rs`), mocks in `e2e/src/mock/*` | spawns real workers + mock clients/backends; `h2spec` for one conformance test | `cargo test -p sozu-e2e` | yes |
 | **Fuzz** | `fuzz/fuzz_targets/*` (out-of-workspace `sozu-fuzz` crate) | nightly toolchain + `cargo-fuzz` | `fuzz` CI job (nightly toolchain, 300 s/target on every push/PR); `#[ignore]`-style runtime skip when prereqs absent | yes (300 s/target); daily 900 s sweep in `simulation-sweep.yml` |
-| **Deterministic simulation** | `sim/tests/h2_simulation.rs` (`sozu-sim`, moonpool-sim) — the H2 core (`ConnectionH2::readable`/`writable`) driven through an in-memory `SocketHandler`, [#1359](https://github.com/sozu-proxy/sozu/issues/1359) C4 | same `--cfg tokio_unstable` gating as below | per-PR `udp-simulation` job (same job, added step, modest sweep); widened via `SOZU_H2_SIM_*` env knobs | yes |
+| **Deterministic simulation** | `sim/tests/h2_simulation.rs` (`sozu-sim`, moonpool-sim) — the byte-in / byte-out H2 core (`ConnectionH2`) driven over two in-memory byte queues, [#1359](https://github.com/sozu-proxy/sozu/issues/1359) C4 | same `--cfg tokio_unstable` gating as below | per-PR `udp-simulation` job (same job, added step, modest sweep); widened via `SOZU_H2_SIM_*` env knobs | yes |
 | **Deterministic simulation** | `sim/tests/udp_simulation.rs` (`sozu-sim`, moonpool-sim) | `RUSTFLAGS="--cfg tokio_unstable"` (scoped to the sim — cfg-gated, off by default) | per-PR `udp-simulation` job (modest sweep) + nightly deep swarm; widened via env knobs | yes |
 | **Deterministic simulation** | `sim/tests/tcp_preread_sim.rs` (`sozu-sim`, moonpool-sim) — TCP SNI-preread core, [#1279](https://github.com/sozu-proxy/sozu/issues/1279) | same `--cfg tokio_unstable` gating as above | per-PR `udp-simulation` job (same job, added step, modest sweep) + nightly `tcp-preread-simulation-sweep` job in `simulation-sweep.yml` (deep swarm); widened via `SOZU_TCP_PREREAD_SIM_*` env knobs | yes |
 | **Deterministic simulation** | `sim/tests/metrics_lease_sim.rs` (`sozu-sim`, moonpool-sim) — metrics cardinality-lease core (`Aggregator::lease_apply`/`lease_clear`/`lease_tick` plus the `remove_cluster`/`add_cluster`/`remove_backend` tombstone) | same `--cfg tokio_unstable` gating as above | no CI job yet — run manually with the command below; widened via `SOZU_METRICS_LEASE_SIM_*` env knobs | no (not yet wired into CI — see this section's closing note) |
@@ -325,9 +325,8 @@ RUSTFLAGS="--cfg tokio_unstable" SOZU_METRICS_LEASE_SIM_SEED=0xdeadbeef \
   cargo test -p sozu-sim --test metrics_lease_sim
 ```
 
-The H2-core simulator (`sim/tests/h2_simulation.rs`, `ConnectionH2::readable` /
-`ConnectionH2::writable` driven through an in-memory `SocketHandler`) mirrors the
-same contract under `SOZU_H2_SIM_SEED` / `_SEEDS` / `_STEPS` (default 256 seeds ×
+The H2-core simulator (`sim/tests/h2_simulation.rs`, `ConnectionH2` driven
+byte-in / byte-out over two in-memory queues) mirrors the same contract under `SOZU_H2_SIM_SEED` / `_SEEDS` / `_STEPS` (default 256 seeds ×
 400 client actions):
 
 ```bash
@@ -626,13 +625,17 @@ the core's actual output, and chaos that is on by default but rarely fires —
 read it before adding a fifth simulator.
 
 The H2 mux (`lib/src/protocol/mux/`) is no longer a stated direction:
-`sim/tests/h2_simulation.rs` drives `ConnectionH2` under the same recipe. It is
-the first simulator here whose core is not yet byte-in / byte-out — the type is
-still generic over `Front: SocketHandler` — so step 1 of the recipe was met by
-supplying an in-memory `SocketHandler` rather than by extracting one. When the
-remaining `Front` touch points go, that harness half disappears and the scenario
-and assertion layer is untouched, which is the same "swap the driver, keep the
-scenarios" promise each sub-machine extraction makes.
+`sim/tests/h2_simulation.rs` drives `ConnectionH2` under the same recipe, and it
+is now byte-in / byte-out like every other simulator here. It got there the hard
+way, and the transition is the recipe's own promise collected: the harness used
+to supply an in-memory `SocketHandler` carrying a connected loopback
+`mio::net::TcpStream` it never read or wrote, because
+`SocketHandler::socket_ref` returns that concrete OS type. `ConnectionH2` lost
+its `Front` parameter to `H2Shell` (issue #1339 Q10), and the placeholder, its
+peer and the `mio` dev-dependency all disappeared while **the scenario grammar
+and every assertion stayed exactly as written** — only the driver was rewritten.
+That is the "swap the driver, keep the scenarios" promise each sub-machine
+extraction makes, and this is the first time it has been collected in full.
 
 ---
 
@@ -777,7 +780,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **`decode_status` returns `None` on a size-update-prefixed block, and whether
   that is fail-closed depends on the call site.** `H2BlockConverter::emit_pending_size_update_if_new_block`
   (`lib/src/protocol/mux/converter.rs:112`, armed at
-  `lib/src/protocol/mux/h2.rs:5943`) prepends a `001xxxxx` HPACK dynamic table
+  `lib/src/protocol/mux/h2.rs:6036`) prepends a `001xxxxx` HPACK dynamic table
   size update when a peer changes `SETTINGS_HEADER_TABLE_SIZE`, and three e2e
   call sites send one: `h2_security_tests.rs:2444` (value 0) and
   `h2_handshake_chromium_146` (`h2_utils.rs:721`, value 65 536) from
@@ -799,7 +802,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **A test that only reddens under CI load is not automatically a flake — find
   the production site first.** Before retrying or quarantining, ask whether the
   symptom is reachable at all. #1353's 421 has exactly one emission site
-  (`lib/src/protocol/mux/mod.rs:2004`), reachable only through
+  (`lib/src/protocol/mux/mod.rs:2008`), reachable only through
   `RetrieveClusterError::SniAuthorityMismatch`, which is constructed at exactly
   one site (`lib/src/protocol/mux/router.rs:797`) immediately after
   `incr!(names::http::SNI_AUTHORITY_MISMATCH)` — and the failing run reported

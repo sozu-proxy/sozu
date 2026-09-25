@@ -92,7 +92,7 @@
 //! Two further sites order observable work rather than arithmetic.
 //! `handle_goaway_frame` walks the map into `retry_streams` and pushes each
 //! retryable stream onto `context.pending_links`, so relink — and therefore
-//! reconnect — order was hash order. `ConnectionH2::close` notifies each
+//! reconnect — order was hash order. `H2Shell::close` notifies each
 //! linked stream through `endpoint.end_stream`, so teardown order was hash
 //! order. Neither reorders the bytes of a fixed frame set, which is what
 //! the old text meant by "scheduling only"; both are still the
@@ -689,7 +689,7 @@ mod tests {
     /// is this order. `ConnectionH2::update_initial_window_size` walks the
     /// values and can `return` from INSIDE its loop when `checked_add`
     /// overflows, so the set of streams whose `window` it already rewrote
-    /// when it aborts is a PREFIX of this order. `ConnectionH2::close`
+    /// when it aborts is a PREFIX of this order. `H2Shell::close`
     /// walks the same values calling `endpoint.end_stream`, so teardown
     /// notification order is this order.
     ///

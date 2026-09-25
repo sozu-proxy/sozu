@@ -1,4 +1,4 @@
-//! Owned state of ONE [`super::h2::ConnectionH2::write_streams`] pass.
+//! Owned state of ONE [`super::h2::H2Shell::write_streams`] pass.
 //!
 //! Every value here used to be a `let` inside that function. They are grouped
 //! into one struct because the write path is being turned into a drive loop —
@@ -136,7 +136,7 @@ pub(super) enum H2WritePhase {
     /// A terminal phase rather than leaving [`Self::End`] in place: that arm
     /// takes the converter, order and census out of the pass as its FIRST
     /// statement, so re-entering it would `expect` on three empty `Option`s.
-    /// `ConnectionH2::write_streams` never re-polls — it returns on `Done` and
+    /// `H2Shell::write_streams` never re-polls — it returns on `Done` and
     /// on `Finalize` — but `poll_write_target` is `pub`, so its callers are no
     /// longer enumerable by reading this crate, and the read side's
     /// `poll_read_target` already has direct unit tests, so a future caller
@@ -229,7 +229,7 @@ pub struct H2WritePass {
 /// `HpackState` again is structural: between
 /// `Self::adopt_scheduler_pass` and the first statement of
 /// `H2WritePhase::End`, `ConnectionH2::poll_write_target` has exactly ONE
-/// `return` — the `Transmit` yield — and `ConnectionH2::write_streams`' drive
+/// `return` — the `Transmit` yield — and `H2Shell::write_streams`' drive
 /// loop answers every `Transmit` and leaves only on `Done` or `Finalize`. So
 /// no pass can end while `Self::converter` is `Some`.
 ///
@@ -264,7 +264,7 @@ impl H2WritePass {
     /// did. Hoisting those initialisations to pass start is inert: an empty
     /// `Vec` allocates nothing, and nothing reads any of them before the
     /// statement that used to declare them.
-    pub(super) fn new(byte_totals: (usize, usize)) -> Self {
+    pub fn new(byte_totals: (usize, usize)) -> Self {
         Self {
             phase: H2WritePhase::Start,
             byte_totals,

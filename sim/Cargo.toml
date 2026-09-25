@@ -46,12 +46,3 @@ sozu-lib = { workspace = true, features = ["crypto-ring"] }
 # MetricDetailLevel for tests/metrics_lease_sim.rs, which drives sozu-lib's
 # metrics::Aggregator directly and inspects its query() output.
 sozu-command-lib = { workspace = true }
-# `SocketHandler::socket_ref`/`socket_mut` still return `&mio::net::TcpStream`,
-# so tests/h2_simulation.rs cannot WRITE the signature of its in-memory socket
-# without naming that type, and sozu-lib re-exports `mio::{Poll, Registry, Token,
-# net::UnixStream}` but not `net::TcpStream` (`sozu_lib::testing`). Test-only,
-# cfg-gated, and the same workspace pin sozu-lib already resolves — no production
-# dependency grows. `Endpoint` no longer needs it (#1471 replaced
-# `Endpoint::socket` with `Endpoint::peer_rtt` for exactly this reason); this
-# line disappears with the remaining `Front` touch points.
-mio = { workspace = true }
