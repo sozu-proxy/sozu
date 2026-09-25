@@ -82,7 +82,7 @@ pub struct FrameHeader {
     pub stream_id: u32,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FrameType {
     Data,
     Headers,
@@ -398,6 +398,31 @@ pub enum Frame {
     /// Unknown frame type (RFC 9113 §5.5) — payload already consumed, the
     /// state machine MUST ignore it.
     Unknown(u8),
+}
+
+impl Frame {
+    /// The RFC 9113 §6 frame type of a parsed frame.
+    ///
+    /// [`FrameHeader`] carries a `frame_type` field, so a frame that has not
+    /// been parsed yet can name its type; a parsed [`Frame`] could not, and
+    /// callers that needed one re-derived it by matching all twelve variants
+    /// themselves. This is that match, written once.
+    pub fn frame_type(&self) -> FrameType {
+        match self {
+            Frame::Data(_) => FrameType::Data,
+            Frame::Headers(_) => FrameType::Headers,
+            Frame::Priority(_) => FrameType::Priority,
+            Frame::RstStream(_) => FrameType::RstStream,
+            Frame::Settings(_) => FrameType::Settings,
+            Frame::PushPromise(_) => FrameType::PushPromise,
+            Frame::Ping(_) => FrameType::Ping,
+            Frame::GoAway(_) => FrameType::GoAway,
+            Frame::WindowUpdate(_) => FrameType::WindowUpdate,
+            Frame::Continuation(_) => FrameType::Continuation,
+            Frame::PriorityUpdate(_) => FrameType::PriorityUpdate,
+            Frame::Unknown(raw) => FrameType::Unknown(*raw),
+        }
+    }
 }
 
 /// RFC 9218 §7.1 PRIORITY_UPDATE frame payload.

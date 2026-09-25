@@ -989,7 +989,19 @@ impl std::fmt::Debug for ConnectionH2 {
 /// The type lives here rather than in a `protocol/mux/` module of its own
 /// because every variant is H2-connection state; the first non-H2 core type
 /// that needs one is what should promote it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// **`protocol::udp::MetricEvent` is a different type with the same name, and
+/// deliberately so.** It is the UDP core's own vocabulary — flows admitted,
+/// datagrams forwarded — and shares no variant with this one, nor any prospect
+/// of sharing one. Converging them would force `crate::udp` and
+/// `sim/tests/udp_simulation.rs` to match on H2 connection gauges, because
+/// `protocol::udp::Output::Metric` embeds the type. The shared name is this
+/// tree's existing idiom for "same role at the same boundary, different
+/// protocol": `protocol::tcp_preread::Output` and `protocol::udp::Output`
+/// already do exactly this, and `RejectReason`, `BackendStatus`, `Router` and
+/// `SessionStatus` are each declared twice under `lib/src/` for the same
+/// reason.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum MetricEvent {
     /// Signed delta on [`names::h2::CONNECTION_WINDOW_BYTES`] — this
     /// connection's available connection-level send window, clamped at 0 so
@@ -1005,6 +1017,86 @@ pub(super) enum MetricEvent {
     /// this connection's streams that were ready to emit AND marked
     /// incremental (RFC 9218 §4) on its last completed write pass.
     StreamsReadyIncrementalByUrgency(i64),
+
+    // ── Frames written to the peer ──────────────────────────────────────
+    /// A SETTINGS frame was serialised into the connection's zero buffer.
+    SettingsFrameSent,
+    /// A PING ACK was serialised into the connection's zero buffer.
+    PingAckFrameSent,
+    /// A GOAWAY frame was serialised. Deliberately **not** folded into
+    /// [`Self::GoAwaySent`]: the decision to go away is unconditional, while
+    /// this fires only once `serializer::gen_goaway` succeeded, and a
+    /// serialisation failure must not be recorded as a frame on the wire.
+    GoAwayFrameSent,
+    /// The connection decided to send GOAWAY with this error code, whether or
+    /// not the frame then serialised.
+    GoAwaySent(H2Error),
+    /// A RST_STREAM was serialised with this error code. One event for two
+    /// counters — the frame-type total and the per-code breakdown — because
+    /// both macro lines it replaces were unconditional and adjacent.
+    RstStreamSent(H2Error),
+    /// `n` queued WINDOW_UPDATE frames were flushed in one control pass.
+    WindowUpdateFramesSent(i64),
+
+    // ── Frames read from the peer ───────────────────────────────────────
+    /// A frame arrived and parsed. The shell maps the type onto the
+    /// `h2.frames.rx.*` breakdown.
+    FrameReceived(FrameType),
+    /// A RST_STREAM arrived carrying this **raw wire** error code. Raw rather
+    /// than [`H2Error`] because a code outside RFC 9113 §7 has its own
+    /// `…unknown_error` bucket, and that mapping is the shell's.
+    RstStreamReceived(u32),
+    /// The peer reset a stream before the backend had begun answering it.
+    RstStreamReceivedBeforeResponse,
+    /// A GOAWAY arrived carrying this raw wire error code.
+    GoAwayReceived(u32),
+
+    // ── Control-queue back-pressure ─────────────────────────────────────
+    /// A WINDOW_UPDATE was dropped because the control queue was full.
+    WindowUpdateDropped,
+    /// A proxy-emitted RST_STREAM was dropped for the same reason.
+    RstStreamDropped,
+
+    // ── Stream lifecycle ────────────────────────────────────────────────
+    /// A request completed end to end over H2.
+    EndToEndH2Request,
+    /// A stream was reaped because its flow-control window had stalled.
+    StreamReapedWindowStall,
+    /// A reaped stalled stream had also consumed cumulative stall budget. A
+    /// strict subset of [`Self::StreamReapedWindowStall`], emitted alongside
+    /// it rather than instead of it.
+    StreamReapedStallBudget,
+    /// A stream was reaped for exceeding the per-stream idle cap.
+    StreamReapedIdleTimeout,
+    /// HEADERS arrived that no stream could be allocated for.
+    HeadersWithoutStream,
+    /// A header block failed to parse on a backend (client-position)
+    /// connection.
+    BackendHeaderParseError,
+    /// A header block failed to parse on a frontend (server-position)
+    /// connection.
+    FrontendHeaderParseError,
+
+    // ── Readiness re-arm sites ──────────────────────────────────────────
+    /// Writable readiness was re-armed because the control queue still owes
+    /// the peer bytes.
+    WritableRearmedControlQueue,
+    /// …because peer DATA has to be forwarded.
+    WritableRearmedPeerData,
+    /// …because peer HEADERS have to be forwarded.
+    WritableRearmedPeerHeaders,
+    /// …because a PRIORITY_UPDATE changed the scheduler's order.
+    WritableRearmedPriorityUpdate,
+
+    // ── Flood mitigation ────────────────────────────────────────────────
+    /// A flood threshold tripped. Carries the key rather than a semantic
+    /// discriminant because `H2FloodViolation` already holds `metric_key`
+    /// beside `reason` in one field, chosen at the construction site
+    /// precisely so the log line and the counter cannot drift apart. A
+    /// semantic variant here would duplicate that mapping and reintroduce the
+    /// drift the single field exists to prevent — the key is domain data the
+    /// core already receives, not something synthesised at the metric site.
+    FloodViolation { metric_key: &'static str },
 }
 
 /// Fold one core-returned [`MetricEvent`] into the worker-local `METRICS`
@@ -1029,6 +1121,63 @@ fn record_metric(event: MetricEvent) {
         MetricEvent::StreamsReadyIncrementalByUrgency(delta) => {
             gauge_add!(names::h2::STREAMS_READY_INCREMENTAL_BY_URGENCY, delta)
         }
+
+        MetricEvent::SettingsFrameSent => incr!(names::h2::FRAMES_TX_SETTINGS),
+        MetricEvent::PingAckFrameSent => incr!(names::h2::FRAMES_TX_PING_ACK),
+        MetricEvent::GoAwayFrameSent => incr!(names::h2::FRAMES_TX_GOAWAY),
+        MetricEvent::GoAwaySent(error) => count!(metric_for_goaway_sent(error), 1),
+        MetricEvent::RstStreamSent(error) => {
+            incr!(names::h2::FRAMES_TX_RST_STREAM);
+            count!(metric_for_rst_stream_sent(error), 1);
+        }
+        MetricEvent::WindowUpdateFramesSent(frames) => {
+            count!(names::h2::FRAMES_TX_WINDOW_UPDATE, frames)
+        }
+
+        MetricEvent::FrameReceived(frame_type) => {
+            count!(h2_frame_rx_metric_key(frame_type), 1)
+        }
+        MetricEvent::RstStreamReceived(error_code) => {
+            count!(metric_for_rst_stream_received(error_code), 1)
+        }
+        MetricEvent::RstStreamReceivedBeforeResponse => {
+            count!(names::h2::RST_STREAM_RECEIVED_PRE_RESPONSE_START, 1)
+        }
+        MetricEvent::GoAwayReceived(error_code) => {
+            count!(metric_for_goaway_received(error_code), 1)
+        }
+
+        MetricEvent::WindowUpdateDropped => incr!(names::h2::WINDOW_UPDATE_DROPPED),
+        MetricEvent::RstStreamDropped => incr!(names::h2::RST_STREAM_DROPPED),
+
+        MetricEvent::EndToEndH2Request => incr!(names::http::E2E_H2),
+        MetricEvent::StreamReapedWindowStall => {
+            count!(names::h2::STREAMS_REAPED_WINDOW_STALL, 1)
+        }
+        MetricEvent::StreamReapedStallBudget => {
+            count!(names::h2::STREAMS_REAPED_STALL_BUDGET, 1)
+        }
+        MetricEvent::StreamReapedIdleTimeout => {
+            count!(names::h2::STREAMS_REAPED_IDLE_TIMEOUT, 1)
+        }
+        MetricEvent::HeadersWithoutStream => incr!(names::h2::HEADERS_NO_STREAM_ERROR),
+        MetricEvent::BackendHeaderParseError => incr!(names::http::BACKEND_PARSE_ERRORS),
+        MetricEvent::FrontendHeaderParseError => incr!(names::http::FRONTEND_PARSE_ERRORS),
+
+        MetricEvent::WritableRearmedControlQueue => {
+            incr!(names::h2::SIGNAL_WRITABLE_REARMED_CONTROL_QUEUE)
+        }
+        MetricEvent::WritableRearmedPeerData => {
+            incr!(names::h2::SIGNAL_WRITABLE_REARMED_PEER_DATA)
+        }
+        MetricEvent::WritableRearmedPeerHeaders => {
+            incr!(names::h2::SIGNAL_WRITABLE_REARMED_PEER_HEADERS)
+        }
+        MetricEvent::WritableRearmedPriorityUpdate => {
+            incr!(names::h2::SIGNAL_WRITABLE_REARMED_PRIORITY_UPDATE)
+        }
+
+        MetricEvent::FloodViolation { metric_key } => count!(metric_key, 1),
     }
 }
 
@@ -2343,7 +2492,7 @@ impl ConnectionH2 {
                 match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
                     Ok((_, size)) => {
                         kawa.storage.fill(size);
-                        incr!(names::h2::FRAMES_TX_SETTINGS);
+                        self.metric_events.push(MetricEvent::SettingsFrameSent);
                         // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
                         self.settings_sent_at = Some(self.now);
                     }
@@ -3525,7 +3674,8 @@ impl ConnectionH2 {
                     "finalize_write: retained WRITABLE (control queue non-empty)".to_owned(),
                 ));
                 self.readiness.arm_writable();
-                incr!(names::h2::SIGNAL_WRITABLE_REARMED_CONTROL_QUEUE);
+                self.metric_events
+                    .push(MetricEvent::WritableRearmedControlQueue);
                 H2FinalizeTarget::Done(MuxResult::Continue)
             }
             // We wrote everything.
@@ -3830,7 +3980,8 @@ impl ConnectionH2 {
                 // insertion/arrival order.
                 let (offset, frames_written) = self.flow_control.drain_window_updates_into(buf);
                 if frames_written > 0 {
-                    count!(names::h2::FRAMES_TX_WINDOW_UPDATE, frames_written as i64);
+                    self.metric_events
+                        .push(MetricEvent::WindowUpdateFramesSent(frames_written as i64));
                 }
                 if offset > 0 {
                     kawa.storage.fill(offset);
@@ -3984,7 +4135,7 @@ impl ConnectionH2 {
                 match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
                     Ok((_, size)) => {
                         kawa.storage.fill(size);
-                        incr!(names::h2::FRAMES_TX_SETTINGS);
+                        self.metric_events.push(MetricEvent::SettingsFrameSent);
                         // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
                         self.settings_sent_at = Some(self.now);
                     }
@@ -4194,6 +4345,7 @@ impl ConnectionH2 {
                     log_module_context!(),
                     global_stream_id
                 );
+                self.metric_events.push(MetricEvent::EndToEndH2Request);
                 let token = Self::complete_server_stream(stream, listener, client_rtt, server_rtt);
                 Some((stream_id, token))
             }
@@ -4218,7 +4370,6 @@ impl ConnectionH2 {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        incr!(names::http::E2E_H2);
         stream.metrics.backend_stop();
         stream.generate_access_log(
             false,
@@ -4327,7 +4478,7 @@ impl ConnectionH2 {
                     stream_id,
                     increment
                 );
-                incr!(names::h2::WINDOW_UPDATE_DROPPED);
+                self.metric_events.push(MetricEvent::WindowUpdateDropped);
             }
             // Zero increment: nothing was queued, nothing to log.
             h2_flow_control::QueueWindowUpdateOutcome::Noop => {}
@@ -4454,12 +4605,16 @@ impl ConnectionH2 {
             // `remove_dead_stream` evicts it below.
             match reason {
                 "H2::WindowStall" => {
-                    count!(names::h2::STREAMS_REAPED_WINDOW_STALL, 1);
+                    self.metric_events
+                        .push(MetricEvent::StreamReapedWindowStall);
                     if matches!(self.stream_table.fc_stall_progress(sid), Some(acc) if acc > 0) {
-                        count!(names::h2::STREAMS_REAPED_STALL_BUDGET, 1);
+                        self.metric_events
+                            .push(MetricEvent::StreamReapedStallBudget);
                     }
                 }
-                "H2::IdleTimeout" => count!(names::h2::STREAMS_REAPED_IDLE_TIMEOUT, 1),
+                "H2::IdleTimeout" => self
+                    .metric_events
+                    .push(MetricEvent::StreamReapedIdleTimeout),
                 other => debug!("{} unexpected reap reason {}", log_context!(self), other),
             }
             // Route through the canonical chokepoint so dedupe (rst_sent),
@@ -4617,7 +4772,7 @@ impl ConnectionH2 {
                     wire_stream_id,
                     error
                 );
-                incr!(names::h2::RST_STREAM_DROPPED);
+                self.metric_events.push(MetricEvent::RstStreamDropped);
                 None
             }
         }
@@ -4647,8 +4802,7 @@ impl ConnectionH2 {
     /// with that result — the flood detector tripped its lifetime cap
     /// and converted to a connection-wide GOAWAY.
     fn account_emitted_rst(&mut self, error: H2Error) -> Option<MuxResult> {
-        incr!(names::h2::FRAMES_TX_RST_STREAM);
-        count!(metric_for_rst_stream_sent(error), 1);
+        self.metric_events.push(MetricEvent::RstStreamSent(error));
         if !matches!(error, H2Error::NoError)
             && let Some(violation) = self.flood_detector.record_rst_emitted()
         {
@@ -4749,7 +4903,9 @@ impl ConnectionH2 {
     /// (Rapid Reset, MadeYouReset, CONTINUATION/PING/SETTINGS floods, header
     /// overflow, glitch) funnels through this site.
     pub fn handle_flood_violation(&mut self, violation: H2FloodViolation) -> MuxResult {
-        count!(violation.metric_key, 1);
+        self.metric_events.push(MetricEvent::FloodViolation {
+            metric_key: violation.metric_key,
+        });
         warn!(
             "{} H2 flood detected: {} count {} exceeds threshold {}",
             log_context!(self),
@@ -4841,20 +4997,20 @@ fn metric_for_rst_stream_received(error_code: u32) -> &'static str {
 /// new H2 frame type must traverse, so adding a `Frame::*` variant fails
 /// the build here. Counts are per-frame, not per-byte; pair with
 /// `bytes_in` for traffic-mix dashboards.
-fn h2_frame_rx_metric_key(frame: &Frame) -> &'static str {
-    match frame {
-        Frame::Data(_) => "h2.frames.rx.data",
-        Frame::Headers(_) => "h2.frames.rx.headers",
-        Frame::PushPromise(_) => "h2.frames.rx.push_promise",
-        Frame::Priority(_) => "h2.frames.rx.priority",
-        Frame::RstStream(_) => "h2.frames.rx.rst_stream",
-        Frame::Settings(_) => "h2.frames.rx.settings",
-        Frame::Ping(_) => "h2.frames.rx.ping",
-        Frame::GoAway(_) => "h2.frames.rx.goaway",
-        Frame::WindowUpdate(_) => "h2.frames.rx.window_update",
-        Frame::Continuation(_) => "h2.frames.rx.continuation",
-        Frame::PriorityUpdate(_) => "h2.frames.rx.priority_update",
-        Frame::Unknown(_) => "h2.frames.rx.unknown",
+fn h2_frame_rx_metric_key(frame_type: FrameType) -> &'static str {
+    match frame_type {
+        FrameType::Data => "h2.frames.rx.data",
+        FrameType::Headers => "h2.frames.rx.headers",
+        FrameType::PushPromise => "h2.frames.rx.push_promise",
+        FrameType::Priority => "h2.frames.rx.priority",
+        FrameType::RstStream => "h2.frames.rx.rst_stream",
+        FrameType::Settings => "h2.frames.rx.settings",
+        FrameType::Ping => "h2.frames.rx.ping",
+        FrameType::GoAway => "h2.frames.rx.goaway",
+        FrameType::WindowUpdate => "h2.frames.rx.window_update",
+        FrameType::Continuation => "h2.frames.rx.continuation",
+        FrameType::PriorityUpdate => "h2.frames.rx.priority_update",
+        FrameType::Unknown(_) => "h2.frames.rx.unknown",
     }
 }
 
@@ -4890,7 +5046,7 @@ impl ConnectionH2 {
             H2Error::InternalError => error!("{} GOAWAY: {:?}", log_context!(self), error),
             _ => warn!("{} GOAWAY: {:?}", log_context!(self), error),
         }
-        count!(metric_for_goaway_sent(error), 1);
+        self.metric_events.push(MetricEvent::GoAwaySent(error));
 
         // RFC 9113 §6.8: last_stream_id is the highest peer-initiated stream we processed
         match serializer::gen_goaway(
@@ -4900,7 +5056,7 @@ impl ConnectionH2 {
         ) {
             Ok((_, size)) => {
                 kawa.storage.fill(size);
-                incr!(names::h2::FRAMES_TX_GOAWAY);
+                self.metric_events.push(MetricEvent::GoAwayFrameSent);
                 self.state = H2State::GoAway;
                 self.stream_table.set_expect_write(Some(H2StreamId::Zero));
                 self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
@@ -4995,12 +5151,13 @@ impl ConnectionH2 {
         // that wants to distinguish drain from termination compares
         // against the `h2.goaway.sent.no_error` rate (drain) vs the other
         // variants (termination on error).
-        count!(metric_for_goaway_sent(H2Error::NoError), 1);
+        self.metric_events
+            .push(MetricEvent::GoAwaySent(H2Error::NoError));
 
         match serializer::gen_goaway(kawa.storage.space(), STREAM_ID_MAX, H2Error::NoError) {
             Ok((_, size)) => {
                 kawa.storage.fill(size);
-                incr!(names::h2::FRAMES_TX_GOAWAY);
+                self.metric_events.push(MetricEvent::GoAwayFrameSent);
                 // Stay in the current state so the connection can continue processing
                 // existing streams. The final GOAWAY will transition to GoAway state.
                 // Keep READABLE so in-flight request bodies can still be received
@@ -5338,7 +5495,8 @@ impl ConnectionH2 {
         // Per-frame-type RX counter. Single chokepoint covers every H2 frame
         // type — adding a new `Frame::*` variant fails the build inside the
         // helper, keeping the metric breakdown in lock-step with RFC 9113 §6.
-        count!(h2_frame_rx_metric_key(&frame), 1);
+        self.metric_events
+            .push(MetricEvent::FrameReceived(frame.frame_type()));
         let result = match frame {
             Frame::Data(data) => self.handle_data_frame(data, wire_payload_len, context, endpoint),
             Frame::Headers(headers) => self.handle_headers_frame(headers, context, endpoint),
@@ -5623,7 +5781,8 @@ impl ConnectionH2 {
                 // NOT re-fire for bytes we just pushed into stream.back; the
                 // synthetic event is the only wake path. LIFECYCLE invariant 15.
                 endpoint.readiness_mut(token).arm_writable();
-                incr!(names::h2::SIGNAL_WRITABLE_REARMED_PEER_DATA);
+                self.metric_events
+                    .push(MetricEvent::WritableRearmedPeerData);
             }
         }
         MuxResult::Continue
@@ -5699,7 +5858,7 @@ impl ConnectionH2 {
                 log_context!(self),
                 self
             );
-            incr!(names::h2::HEADERS_NO_STREAM_ERROR);
+            self.metric_events.push(MetricEvent::HeadersWithoutStream);
             self.attribute_bytes_to_overhead();
             return self.force_disconnect();
         };
@@ -5783,8 +5942,12 @@ impl ConnectionH2 {
         self.zero.storage.clear();
         if let Err((error, global)) = status {
             match self.position {
-                Position::Client(..) => incr!(names::http::BACKEND_PARSE_ERRORS),
-                Position::Server => incr!(names::http::FRONTEND_PARSE_ERRORS),
+                Position::Client(..) => self
+                    .metric_events
+                    .push(MetricEvent::BackendHeaderParseError),
+                Position::Server => self
+                    .metric_events
+                    .push(MetricEvent::FrontendHeaderParseError),
             }
             if global {
                 error!(
@@ -5830,7 +5993,8 @@ impl ConnectionH2 {
         if let StreamState::Linked(token) = stream.state {
             // Mirror of handle_data_frame's rearm. LIFECYCLE invariant 15.
             endpoint.readiness_mut(token).arm_writable();
-            incr!(names::h2::SIGNAL_WRITABLE_REARMED_PEER_HEADERS);
+            self.metric_events
+                .push(MetricEvent::WritableRearmedPeerHeaders);
         }
         // was_initial prevents trailers from triggering connection
         if was_initial && self.position.is_server() {
@@ -5965,7 +6129,8 @@ impl ConnectionH2 {
         // stripped WRITABLE, the scheduler won't re-run without a synthetic
         // wake — pair the interest insert with signal_pending_write.
         self.readiness.arm_writable();
-        incr!(names::h2::SIGNAL_WRITABLE_REARMED_PRIORITY_UPDATE);
+        self.metric_events
+            .push(MetricEvent::WritableRearmedPriorityUpdate);
         MuxResult::Continue
     }
 
@@ -5984,7 +6149,8 @@ impl ConnectionH2 {
         // by `handle_flood_violation` shows up in the per-code breakdown
         // (the dedicated `h2.flood.violation.rst_stream_*` series tracks the
         // mitigation event itself).
-        count!(metric_for_rst_stream_received(rst_stream.error_code), 1);
+        self.metric_events
+            .push(MetricEvent::RstStreamReceived(rst_stream.error_code));
         // CVE-2023-44487 Rapid Reset + CVE-2019-9514: track RST_STREAM rate.
         self.flood_detector.record_rst_stream_window();
         check_flood_or_return!(self);
@@ -6021,7 +6187,8 @@ impl ConnectionH2 {
         // so the SOC can alert on the rate of pre-response RSTs without
         // having to differentiate by error code.
         if !response_started {
-            count!(names::h2::RST_STREAM_RECEIVED_PRE_RESPONSE_START, 1);
+            self.metric_events
+                .push(MetricEvent::RstStreamReceivedBeforeResponse);
         }
         debug!(
             "{} RstStream({} -> {})",
@@ -6209,7 +6376,7 @@ impl ConnectionH2 {
         match serializer::gen_ping_acknowledgement(kawa.storage.space(), &ping.payload) {
             Ok((_, size)) => {
                 kawa.storage.fill(size);
-                incr!(names::h2::FRAMES_TX_PING_ACK);
+                self.metric_events.push(MetricEvent::PingAckFrameSent);
             }
             Err(error) => {
                 error!(
@@ -6261,7 +6428,8 @@ impl ConnectionH2 {
                 goaway.additional_debug_data
             );
         }
-        count!(metric_for_goaway_received(goaway.error_code), 1);
+        self.metric_events
+            .push(MetricEvent::GoAwayReceived(goaway.error_code));
         // RFC 9113 §6.8: begin graceful drain.
         self.drain.observe_peer_goaway(goaway.last_stream_id);
         let peer_last_stream_id = self
@@ -6800,8 +6968,8 @@ impl ConnectionH2 {
                             if buf.len() >= frame.len() {
                                 buf[..frame.len()].copy_from_slice(&frame);
                                 kawa.storage.fill(frame.len());
-                                incr!(names::h2::FRAMES_TX_RST_STREAM);
-                                count!(metric_for_rst_stream_sent(H2Error::Cancel), 1);
+                                self.metric_events
+                                    .push(MetricEvent::RstStreamSent(H2Error::Cancel));
                                 self.readiness.arm_writable();
                                 self.stream_table.rst_sent_mut().insert(id);
                             }
@@ -7569,16 +7737,22 @@ impl<Front: SocketHandler> H2Shell<Front> {
         self.settle();
     }
 
-    /// [`ConnectionH2::end_stream`], forwarded.
+    /// [`ConnectionH2::end_stream`], forwarded and drained.
     ///
     /// No settlement: `ConnectionH2::end_stream` cannot reach
     /// `ConnectionH2::force_disconnect`. It is here only because
     /// `Connection`'s `forward!` needs one name on both arms.
+    ///
+    /// It still has to drain. The core's `end_stream` serialises a
+    /// RST_STREAM(CANCEL) for a stream the peer abandoned, and that is the one
+    /// producer this file reaches through a public entry point that settles
+    /// neither through `H2Shell::settled` nor through `H2Shell::settle`.
     pub fn end_stream<L>(&mut self, stream_gid: GlobalStreamId, context: &mut Context<L>)
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        self.core.end_stream(stream_gid, context)
+        self.core.end_stream(stream_gid, context);
+        self.record_pending_metrics();
     }
 
     /// Drive [`ConnectionH2::flush_pending_control_frames`] to a terminal
@@ -7622,15 +7796,29 @@ impl<Front: SocketHandler> H2Shell<Front> {
     /// ended.
     ///
     /// The shell half of the boundary: the core states the arithmetic, this
-    /// writes it into the worker-local `METRICS` aggregator. It runs at the
-    /// end of [`Self::settled`] — so after every `readable`, `writable`,
-    /// `start_stream` and `cancel_timed_out_streams` — and in [`Drop`].
+    /// writes it into the worker-local `METRICS` aggregator.
     ///
-    /// A step that reaches neither is not a lost event: the queue is FIFO and
-    /// its values are signed deltas, so the next drain records the same sum,
-    /// and `Drop` drains whatever is left. That is what bounds the queue, and
-    /// what makes "drain here" a scheduling choice rather than a correctness
-    /// one.
+    /// Three sites, and between them they cover every producer:
+    ///
+    /// - [`Self::settled`], so after every `readable`, `writable`,
+    ///   `start_stream`, `cancel_timed_out_streams`, `force_disconnect` and
+    ///   `graceful_goaway`, and after `writable_inner`'s
+    ///   [`Self::drive_control_flush`], whose only caller it is;
+    /// - [`Self::end_stream`], the one public entry point that reaches a
+    ///   producer and settles through neither;
+    /// - [`Drop`].
+    ///
+    /// The remaining public entry points — `close`, `initiate_close_notify`,
+    /// `flush_zero_buffer`, `has_pending_write`, `has_pending_write_full` —
+    /// reach no producer: they touch the TLS layer, the zero buffer and
+    /// readiness, and the core methods they call
+    /// (`consume_zero_flush`, `ensure_tls_flushed`, `has_pending_write_with`,
+    /// `zero_pending`) queue nothing.
+    ///
+    /// A step that reached none of the three would still not lose an event:
+    /// the queue is FIFO, so the next drain records the same values, and
+    /// `Drop` drains whatever is left. That is what bounds the queue, and what
+    /// keeps "drain here" a scheduling choice rather than a correctness one.
     fn record_pending_metrics(&mut self) {
         for event in self.core.drain_metric_events() {
             record_metric(event);
@@ -9017,6 +9205,107 @@ mod tests {
             before,
             "the released snapshot must travel the same queue and rebalance to \
              the prior value"
+        );
+    }
+
+    /// Read a process-local counter by its raw metric key, treating an absent
+    /// key as 0. Counter sibling of [`ready_incremental_gauge`], and
+    /// `dump_local_proxy_metrics` is non-draining here too, so repeated reads
+    /// are side-effect free.
+    fn proxy_counter(key: &str) -> i64 {
+        use sozu_command::proto::command::filtered_metrics::Inner;
+        crate::metrics::METRICS.with(|metrics| {
+            metrics
+                .borrow_mut()
+                .dump_local_proxy_metrics()
+                .get(key)
+                .and_then(|fm| fm.inner.as_ref())
+                .and_then(|inner| match inner {
+                    Inner::Count(v) => Some(*v),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+    }
+
+    /// A counter the core queues is recorded when the entry point that
+    /// produced it RETURNS — not whenever the connection is eventually
+    /// dropped.
+    ///
+    /// This is the property the gauges did not need. A gauge delta recorded
+    /// late still sums to the same value, so slice one could be correct with a
+    /// drain only in `settled` and `Drop`. A counter recorded late is a
+    /// counter attributed to the wrong minute: `LocalDrain` is cumulative and
+    /// scraped periodically, so deferring one to connection teardown moves it
+    /// past however many scrapes the connection outlives. `Drop` remains the
+    /// backstop that stops it being *lost*; this pins that the backstop is not
+    /// where it normally happens.
+    ///
+    /// `graceful_goaway` is the cheapest real producer to drive: one public
+    /// call on a fresh connection reaches `ConnectionH2::send_initial_goaway`,
+    /// which queues both `MetricEvent::GoAwaySent` and
+    /// `MetricEvent::GoAwayFrameSent`.
+    ///
+    /// To SEE THIS RED: delete `self.record_pending_metrics();` from
+    /// `H2Shell::settled`. Both assertions before `drop` fail with
+    /// `left: 0, right: 1` — the counters sitting in the core's queue,
+    /// arriving only when the connection is torn down.
+    #[test]
+    fn a_queued_counter_is_recorded_when_its_entry_point_returns() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let sent_before = proxy_counter("h2.goaway.sent.no_error");
+        let frames_before = proxy_counter(names::h2::FRAMES_TX_GOAWAY);
+
+        let mut connection =
+            connection_from_source(&mut PoolBufferSource::new(Rc::downgrade(&pool)))
+                .expect("a pool with free buffers must yield an H2 connection");
+
+        connection.graceful_goaway(Instant::now());
+
+        assert_eq!(
+            proxy_counter("h2.goaway.sent.no_error") - sent_before,
+            1,
+            "the GOAWAY decision must reach METRICS when `graceful_goaway` \
+             returns, not at teardown"
+        );
+        assert_eq!(
+            proxy_counter(names::h2::FRAMES_TX_GOAWAY) - frames_before,
+            1,
+            "so must the frame the serializer actually wrote"
+        );
+    }
+
+    /// One `MetricEvent::RstStreamSent` records BOTH counters its two macro
+    /// lines used to record: the frame-type total and the per-error-code
+    /// breakdown.
+    ///
+    /// Folding two macro lines into one event is only safe where both were
+    /// unconditional and adjacent, which is why the GOAWAY pair was NOT folded
+    /// — `h2.frames.tx.goaway` sits inside `serializer::gen_goaway`'s `Ok`
+    /// arm while `h2.goaway.sent.*` fires before it, so one event would record
+    /// a frame on the wire that a serialisation failure never wrote. The RST
+    /// pair has no such gap, and this pins that folding it kept both counters.
+    ///
+    /// To SEE THIS RED: delete either line from the
+    /// `MetricEvent::RstStreamSent` arm of `record_metric`. The surviving
+    /// assertion passes and the other fails with `left: 0, right: 1` — half a
+    /// merge, which is exactly what a merged pair can silently become.
+    #[test]
+    fn one_rst_stream_sent_event_records_both_of_its_counters() {
+        let frames_before = proxy_counter(names::h2::FRAMES_TX_RST_STREAM);
+        let by_code_before = proxy_counter(metric_for_rst_stream_sent(H2Error::Cancel));
+
+        record_metric(MetricEvent::RstStreamSent(H2Error::Cancel));
+
+        assert_eq!(
+            proxy_counter(names::h2::FRAMES_TX_RST_STREAM) - frames_before,
+            1,
+            "the frame-type total must still tick"
+        );
+        assert_eq!(
+            proxy_counter(metric_for_rst_stream_sent(H2Error::Cancel)) - by_code_before,
+            1,
+            "and so must the per-error-code breakdown"
         );
     }
 
