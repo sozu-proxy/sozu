@@ -3829,6 +3829,30 @@
   otherwise has to delete the test and argue the memory.
   Closes [#1430](https://github.com/sozu-proxy/sozu/issues/1430).
 
+- **`docs(observability)`: repoint five citations in `doc/lifetime_of_a_session.md` that were
+  stable, resolvable and wrong ([#1531](https://github.com/sozu-proxy/sozu/issues/1531)).**
+  The prose on accept-queue backpressure cited a buffer-pool gauge block as the evidence for the
+  1 Hz `accept_queue.saturated_seconds` ticker, in the narrative and again in the metric inventory.
+  The ticker is fifteen lines further down, in the `ACCEPT_SATURATION_TICK` block of `Server::run`,
+  and both sites now cite that symbol; the companion span covering the constant's own declaration
+  was already correct and is kept as a range. Every gate passed on the defect and each for a
+  defensible reason — the cited lines resolve and are not blank, so rule 1 is satisfied; the cited
+  text never changed, so rule 2 has nothing to compare, and #1528 re-anchored the number faithfully
+  while it was already wrong. A faithful re-anchor of a wrong citation is indistinguishable from a
+  faithful re-anchor of a right one, which is [#1447](https://github.com/sozu-proxy/sozu/issues/1447)
+  seen from the other side: that issue was a rule firing on a citation that was correct, this is
+  every rule staying silent on one that is not. Sweeping all eighteen cited spans in the document by
+  hand found three more of the same class, none of them in the metric inventory, which is clean: the
+  write-only-shutdown pair both landed in the failed-upgrade branch whose own comment says the front
+  socket is unreachable — the inverse of the claim they support — and now cite the `Shutdown::Write`
+  block of `HttpsSession::close` and its mirror in `HttpSession::close`; and the SoftStop / HardStop
+  citation straddled two functions while containing neither verb, and now cites
+  `Server::read_channel_messages_and_notify`. Documentation only: no `.rs` file changes.
+  Whether `--audit` could be made to catch the class was measured and the answer is no — the
+  reasoning, the numbers and the one-line window margin behind them are recorded in
+  `doc/README.md` and in the script's own header. `check_doc_citations.py` is unchanged apart from
+  that header.
+
 ### ➖ Removed
 
 - **BREAKING (library API) — `refactor(udp)`: backend selection moves into the UDP core, closing
