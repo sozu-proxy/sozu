@@ -843,6 +843,24 @@ impl BackendMap {
     }
 }
 
+/// The worker's backend registry, seen by the UDP core as a selection view.
+///
+/// `UdpManager` selects inside the core now (#1340, Question 6) and reaches
+/// the registry only through this, for the duration of one admission. It
+/// delegates to [`BackendMap::backend_from_cluster_id_with_key`], the
+/// connection-free selection entry point — the UDP datapath owns its own
+/// per-flow `UdpSocket`, so all the map has to surface is the chosen
+/// endpoint's identity.
+impl crate::protocol::udp::BackendSource for BackendMap {
+    fn select(
+        &mut self,
+        cluster: &str,
+        key: Option<u64>,
+    ) -> Option<(crate::protocol::udp::BackendId, SocketAddr)> {
+        self.backend_from_cluster_id_with_key(cluster, key).ok()
+    }
+}
+
 #[derive(Debug)]
 pub struct BackendList {
     pub backends: Vec<Rc<RefCell<Backend>>>,

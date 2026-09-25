@@ -1263,8 +1263,20 @@ impl UdpListenerSession {
                     // borrow checker is satisfied because `recv_buf` and
                     // `manager` are disjoint fields.
                     let mgr = self.manager.clone();
-                    mgr.borrow_mut()
-                        .handle_input(ManagerInput::ClientDatagram { src, payload }, now);
+                    // The backend set, borrowed for this admission only. The
+                    // manager selects from it; the shell no longer does
+                    // (#1340, Question 6).
+                    let backends = self.backends.clone();
+                    let mut backends = backends.borrow_mut();
+                    mgr.borrow_mut().handle_input(
+                        ManagerInput::ClientDatagram {
+                            src,
+                            payload,
+                            backends: &mut *backends,
+                        },
+                        now,
+                    );
+                    drop(backends);
                     // Drain outputs after each datagram to bound queue growth.
                     self.drain_outputs(now);
                     self.in_flight_client = None;
@@ -1326,9 +1338,6 @@ impl UdpListenerSession {
             let out = mgr.borrow_mut().poll_output();
             let Some(out) = out else { break };
             match out {
-                Output::SelectBackend { flow, cluster, key } => {
-                    self.on_select_backend(flow, &cluster, key, now)
-                }
                 Output::OpenUpstream { flow, backend } => self.on_open_upstream(flow, backend, now),
                 Output::SendToBackend(transmit) => self.on_send_to_backend(transmit),
                 Output::SendToClient(transmit) => self.on_send_to_client(transmit),
@@ -1336,45 +1345,6 @@ impl UdpListenerSession {
                 Output::Metric(ev) => Self::record_metric(ev),
                 Output::CloseFlow(flow) => self.on_close_flow(flow),
                 Output::Drop(reason) => Self::record_drop(reason),
-            }
-        }
-    }
-
-    fn on_select_backend(&mut self, flow: FlowId, cluster: &str, key: u64, now: Instant) {
-        let resolved = self
-            .backends
-            .borrow_mut()
-            .backend_from_cluster_id_with_key(cluster, Some(key));
-        match resolved {
-            Ok((backend, addr)) => {
-                self.manager.borrow_mut().handle_input(
-                    ManagerInput::BackendResolved {
-                        flow,
-                        backend,
-                        addr,
-                    },
-                    now,
-                );
-            }
-            Err(e) => {
-                debug!(
-                    "{} no backend for cluster {}: {}; aborting flow {}",
-                    log_context!(self),
-                    cluster,
-                    e,
-                    flow
-                );
-                incr!(names::udp::DROPPED_NO_BACKEND);
-                // Abort the flow instead of leaving it parked AwaitingBackend:
-                // the manager already counted it (FlowCreated, +1 gauge, slab +
-                // admission slot), so without this it would squat a `max_flows`
-                // slot for the full idle timeout while every later datagram is
-                // dropped. `abort_flow` enqueues FlowEvicted + CloseFlow, which
-                // the surrounding `drain_outputs` loop processes — freeing the
-                // slot immediately and balancing the gauge via FlowEvicted.
-                self.manager
-                    .borrow_mut()
-                    .abort_flow(flow, now, CloseReason::Aborted);
             }
         }
     }
@@ -2303,10 +2273,12 @@ mod tests {
                 })),
                 now,
             );
+            let mut backends = session.backends.borrow_mut();
             manager.handle_input(
                 ManagerInput::ClientDatagram {
                     src: SocketAddr::from(([127, 0, 0, 1], 41000)),
                     payload: b"query",
+                    backends: &mut *backends,
                 },
                 now,
             );

@@ -102,16 +102,19 @@ which also enforces "an empty datagram is not a valid flow trigger" (`manager.rs
 
 **Two-tier selection** on a client datagram (`UdpManager::on_client_datagram`, `manager.rs`):
 
-1. Oversize → `Drop(Truncated)` before any allocation (`manager.rs:248-252`).
-2. No cluster configured → `Drop(NoBackend)` (`manager.rs:253-257`).
-3. Extract the key; rejection → `Drop(Invalid)`, allocates nothing (`manager.rs:258-265`).
-4. **Key already in the table** → reuse its flow & backend (`manager.rs:267-271`,
+1. Oversize → `Drop(Truncated)` before any allocation (`manager.rs:251-255`).
+2. No cluster configured → `Drop(NoBackend)` (`manager.rs:256-260`).
+3. Extract the key; rejection → `Drop(Invalid)`, allocates nothing (`manager.rs:261-268`).
+4. **Key already in the table** → reuse its flow & backend (`manager.rs:270-274`,
    `forward_on_existing_flow`). This is what makes affinity sticky: the same
    client always reaches the same backend for the life of the flow.
-5. **New key**, draining or at cap → shed (`manager.rs:273-299`), allocate nothing.
-6. Otherwise **admit**: one slab slot + one payload copy, parked `AwaitingBackend`
-   with the first datagram buffered (`manager.rs:315-325`), then emit
-   `FlowCreated` + `SelectBackend` (`manager.rs:340-346`).
+5. **New key**, draining or at cap → shed (`manager.rs:276-302`), allocate nothing.
+6. Otherwise **select and admit**, in that order. `UdpManager` picks the
+   backend itself, from the `BackendSource` view the embedder handed in with
+   this datagram (`mod.rs`). No backend available → `Drop(NoBackend)`,
+   allocating nothing. Otherwise one slab slot, the flow born `Established` on
+   the chosen backend, then `FlowCreated` + `OpenUpstream`, and the admission
+   datagram is forwarded immediately.
 
 `FlowId` (`mod.rs`) is the slab index; it is stable for the flow's lifetime
 and reused after close. The shell additionally keeps `upstream_token -> FlowId`
@@ -122,25 +125,27 @@ and reused after close. The shell additionally keeps `upstream_token -> FlowId`
 
 ## 4. Flow Lifecycle State Machine
 
-Three phases (`FlowPhase`, `flow.rs`): `AwaitingBackend → Established → Closing`.
-The transition is strictly forward; `UdpFlow::set_phase` (`flow.rs`) `debug_assert!`s
-the legal edges (only `→ Closing` may be reached from either live phase — a flow
-can be aborted before it establishes).
+Two phases (`FlowPhase`, `flow.rs`): `Established → Closing`. A flow is
+admitted already `Established` — selection happens inside the admitting call,
+so a flow never exists without a backend — and `UdpFlow::set_phase` (`flow.rs`)
+`debug_assert!`s that the one remaining edge is the only one taken.
+
+There used to be a third phase, `AwaitingBackend`, for the window between
+asking the shell to choose a backend and being told which. Moving selection
+into the core closed that window, so the phase, its one-slot datagram buffer
+and the `BackendResolved` reply all went with it.
 
 ```
    client datagram, key unknown, room under cap
-                    │  admit: slab slot + buffer 1st datagram
+                    │  select a backend from the BackendSource view;
+                    │  none available → Drop(NoBackend), nothing allocated
+                    │  admit: slab slot, flow born on the chosen backend
                     ▼
-        ┌───────────────────────┐   FlowCreated + SelectBackend  (manager.rs:340-346)
-        │     AwaitingBackend     │   - extra client dgrams: newest-wins buffer,
-        │  (FlowPhase, flow.rs)   │     idle refresh only, NOT counted as request
-        └───────────┬───────────┘     (forward_on_existing_flow, manager.rs)
-                    │  BackendResolved (on_backend_resolved, manager.rs)
-                    │  → OpenUpstream + flush buffered dgram (counted now)
-                    ▼
-        ┌───────────────────────┐   client dgram  → SendToBackend (+PPv2 1st)
-        │      Established         │   backend dgram → SendToClient (NAT return)
-        │ (FlowPhase, flow.rs)    │   each touch() refreshes idle + bumps timer_gen
+        ┌───────────────────────┐   FlowCreated + OpenUpstream, and the
+        │      Established         │   admission datagram forwarded at once
+        │ (FlowPhase, flow.rs)    │   client dgram  → SendToBackend (+PPv2 1st)
+        │                         │   backend dgram → SendToClient (NAT return)
+        │                         │   each touch() refreshes idle + bumps timer_gen
         └───────────┬───────────┘
                     │  teardown trigger:
                     │   • idle deadline elapsed   (UdpManager::handle_timeout, manager.rs)
@@ -154,13 +159,14 @@ can be aborted before it establishes).
         └───────────────────────┘   racing client dgram here → Drop(Shed)
 ```
 
-Key subtlety — **`requests` counts real forwards, not buffered datagrams**. A
-datagram that arrives while `AwaitingBackend` is buffered (one slot, newest
-wins, `manager.rs:359-367`) and only counted toward `requests` when it is
-actually flushed in `on_backend_resolved` (`manager.rs:426-444`,
-`UdpFlow::on_client_datagram`, `flow.rs`). Otherwise a burst during the await window
-could trip the `requests` cap having delivered fewer than `requests` datagrams
-(`flow.rs:136-140`).
+Key subtlety — **`requests` counts real forwards, and every client datagram is
+now one**. There is no await window, so no datagram is buffered and none is
+discarded: an opening burst is delivered in full, where previously only the
+newest datagram of it survived the window. `UdpFlow::on_client_datagram`
+(`flow.rs`) is called once per forward, including for the admission datagram.
+This is a **behaviour change** — see the CHANGELOG entry — and it is asserted
+by `every_datagram_of_an_opening_burst_is_forwarded_and_counted_once`
+(`manager.rs`).
 
 ---
 
@@ -196,7 +202,7 @@ backend ──dgram──▶ connected upstream socket ──▶ ingest_upstream
                           ▼
               UdpManager::handle_input(BackendDatagram { flow })  (on_backend_datagram, manager.rs)
                           │  on_backend_datagram: count response, refresh idle
-                          ▼   Output::SendToClient (manager.rs:480)
+                          ▼   Output::SendToClient (manager.rs)
               on_send_to_client (udp.rs) ──dgram──▶ front socket ──▶ real client
 ```
 
@@ -232,7 +238,7 @@ A flow is reaped on the **first** of these (`CloseReason`, `flow.rs`):
 
 | Knob | Config | Semantics | Check |
 |------|--------|-----------|-------|
-| **idle** | `front_timeout` / `back_timeout` (default 30 s, `mod.rs:233-234`) | no datagram in that direction within the window | `UdpManager::handle_timeout` (`manager.rs`) |
+| **idle** | `front_timeout` / `back_timeout` (default 30 s, `mod.rs:272-273`) | no datagram in that direction within the window | `UdpManager::handle_timeout` (`manager.rs`) |
 | **responses** | `responses` (`0` = unlimited) | close after N backend replies — **DNS uses 1** | `UdpFlow::responses_exhausted` (`flow.rs`) |
 | **requests** | `requests` (`0` = unlimited) | close after N client forwards | `UdpFlow::requests_exhausted` (`flow.rs`) |
 | drain / admin | — | listener drain, remove, soft/hard-stop, abort | `UdpManager::close_all` (`manager.rs`), `UdpManager::abort_flow` (`manager.rs`) |
@@ -247,7 +253,7 @@ The manager only ever asks the shell to arm **one** deadline (`armed_deadline`,
 wheel (`arm_timer`, `udp.rs`; `server::TIMER`). Each flow carries a
 `timer_gen` token (`flow.rs`) bumped on every `UdpFlow::touch` (`flow.rs`).
 A wheel expiry only closes a flow whose deadline is still `<= now`
-(`UdpManager::handle_timeout`, `manager.rs:546-551`); a flow that saw traffic has been
+(`UdpManager::handle_timeout`, `manager.rs`); a flow that saw traffic has been
 rescheduled, so it survives the expiry. A debug **strict-advance guard**
 (at the end of `UdpManager::handle_timeout`) asserts the next armed deadline is strictly `> now` after
 a firing — this is the canonical sans-io busy-loop defence and the real reason
@@ -268,7 +274,7 @@ millisecond. Either figure is enough for what follows; the hazard is any
 earliness at all. `Timer::poll` then *removes* that entry from its slab. So on every expiry, whether or not a flow
 was due:
 
-- the manager clears `armed_deadline` (`manager.rs:535`) **before** any
+- the manager clears `armed_deadline` (`manager.rs:531`) **before** any
   `reschedule`, so a recomputed deadline equal to the old one is still emitted
   as a fresh `ArmTimer` instead of being memoized away — this is the
   load-bearing half;
@@ -456,14 +462,14 @@ model.
 1. **Silence is a virtue — drop before you allocate.** Unknown / empty /
    oversized / no-cluster / over-cap datagrams are dropped + metered **before**
    any flow, buffer, or socket is allocated (`UdpManager::on_client_datagram`,
-   `manager.rs:248-299`). Each early return pair-asserts `flows.len()` is
-   unchanged (`manager.rs:279-298`). `DropReason` (`mod.rs`) carries the
+   `manager.rs:251-302`). Each early return pair-asserts `flows.len()` is
+   unchanged (`manager.rs:282-301`). `DropReason` (`mod.rs`) carries the
    reason into `udp.datagrams.dropped`.
 2. **Bounded flow table = bounded fds.** `max_flows` (`UdpManager::max_flows`, `manager.rs`;
    `effective_max_flows` `udp.rs`) defaults to ~70 % of the soft
    `RLIMIT_NOFILE`, **clamped against shared-slab headroom** so a UDP listener
    cannot starve HTTP/TCP. Beyond the cap, new flows are **shed** (`FlowShed`,
-   `manager.rs:290-291`); existing flows are protected. This is the bounded
+   `manager.rs:293-294`); existing flows are protected. This is the bounded
    analog of kernel conntrack-table exhaustion.
 3. **Bounded rx.** `max_rx_datagram_size` is clamped to `buffer_size`
    (`clamp_max_rx`, `udp.rs`); the `recv_buf` is sized `max_rx + 1`
@@ -492,7 +498,7 @@ model.
    freeing the slab slot it would otherwise pin for the idle timeout.
 8. **Debug invariants everywhere.** `UdpManager::check_invariants` (`manager.rs`) runs
    as a post-condition after every public mutating method
-   (`handle_input`, `manager.rs:190`); the deterministic simulator
+   (`handle_input`, `manager.rs:187`); the deterministic simulator
    (`sim/tests/udp_simulation.rs`, the moonpool-driven `sozu-sim` crate) and the
    property tests (`prop_flow_invariants`, `manager.rs`) drive the core hard
    enough to trip any regression.

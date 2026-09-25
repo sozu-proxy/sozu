@@ -86,16 +86,57 @@ pub struct Transmit {
     pub payload: Vec<u8>,
 }
 
+/// The backend set the manager selects from, borrowed from the embedder at
+/// the one point selection happens.
+///
+/// Question 6 of [#1340](https://github.com/sozu-proxy/sozu/issues/1340) puts
+/// routing inside the core for H2, and leaving UDP doing it the other way
+/// would give the repository two architectures and no rule. So selection moves
+/// in here too, and this is how the backend set reaches it without the core
+/// holding a `BackendMap`.
+///
+/// The mechanism is Question 12's, applied again rather than reinvented: a
+/// view in with a defined staleness, a result out. The staleness is **one
+/// admission** — the view is borrowed for the `ManagerInput::ClientDatagram`
+/// that consumes it and not retained.
+///
+/// `&mut self` because selection advances load-balancer state: a round-robin
+/// cursor, an HRW/Maglev lookup, and the availability latch
+/// `BackendMap::record_cluster_availability` maintains. A simulator can
+/// implement this over any backend set it likes, which is what makes the
+/// selection reproducible and is the whole determinism argument for moving it
+/// in.
+pub trait BackendSource {
+    /// Pick a backend for `cluster`, optionally pinned by affinity `key` so a
+    /// client flow stays on one backend under HRW / Maglev. `None` means the
+    /// cluster has no backend that can serve, which is the caller's cue to
+    /// abort the flow rather than park it.
+    fn select(&mut self, cluster: &str, key: Option<u64>) -> Option<(BackendId, SocketAddr)>;
+}
+
 /// Inputs the shell feeds into the manager. Borrows the recv buffer; the core
 /// copies into an owned `Vec<u8>` only on admission.
-#[derive(Debug)]
+///
+/// `Debug` is hand-written rather than derived because
+/// [`ManagerInput::ClientDatagram`] carries a `&mut dyn BackendSource`, which
+/// has no `Debug` bound and should not gain one for a diagnostic. The mux's
+/// `Position` renders itself the same way and for the same reason: the handle
+/// is elided, everything else is shown.
 pub enum ManagerInput<'a> {
     /// A datagram from a client. Admitted into an existing/new flow or dropped.
+    ///
+    /// Carries the backend view because this is the **only** input that
+    /// selects: admission resolves a backend before the flow exists, so the
+    /// view arrives with the datagram that needs it rather than on every
+    /// entry point. Three of the four inputs cannot select, and a signature
+    /// that demanded a backend set from all of them would say otherwise.
     ClientDatagram {
         /// Real (pre-NAT) client source address.
         src: SocketAddr,
         /// Borrowed datagram bytes.
         payload: &'a [u8],
+        /// The backend set to select from, for this admission only.
+        backends: &'a mut dyn BackendSource,
     },
     /// A datagram from a backend, tagged by the shell with the owning flow
     /// (`upstream_token -> FlowId`). Drives the symmetric NAT return path.
@@ -108,32 +149,30 @@ pub enum ManagerInput<'a> {
     /// A control-plane / health event (add/remove backend, LB algo, timeouts,
     /// per-cluster knobs, drain). Never allocates a flow.
     Config(ConfigEvent),
-    /// Reply to an earlier [`Output::SelectBackend`]: the shell resolved the
-    /// backend via the `BackendMap` and is committing it to the flow.
-    BackendResolved {
-        /// Flow awaiting a backend.
-        flow: FlowId,
-        /// Resolved backend identifier.
-        backend: BackendId,
-        /// Resolved backend address for the connected upstream socket.
-        addr: SocketAddr,
-    },
+}
+
+impl std::fmt::Debug for ManagerInput<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClientDatagram { src, payload, .. } => f
+                .debug_struct("ClientDatagram")
+                .field("src", src)
+                .field("payload_len", &payload.len())
+                .finish_non_exhaustive(),
+            Self::BackendDatagram { flow, payload } => f
+                .debug_struct("BackendDatagram")
+                .field("flow", flow)
+                .field("payload_len", &payload.len())
+                .finish(),
+            Self::Config(event) => f.debug_tuple("Config").field(event).finish(),
+        }
+    }
 }
 
 /// Outputs the manager emits; the shell drains them via `poll_output` until
 /// `None`. The shell owns the actual syscalls and timer wheel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Output {
-    /// A new flow needs a backend. The shell consults the `BackendMap` with
-    /// `(cluster, key)` and replies with [`ManagerInput::BackendResolved`].
-    SelectBackend {
-        /// Flow awaiting a backend.
-        flow: FlowId,
-        /// Cluster the flow's listener routes to.
-        cluster: ClusterId,
-        /// Affinity hash for HRW / Maglev selection (`key % M`, `max hash`).
-        key: u64,
-    },
     /// The shell should `connect()` a fresh upstream socket for this flow and
     /// register `upstream_token -> flow` for NAT return demux.
     OpenUpstream {
