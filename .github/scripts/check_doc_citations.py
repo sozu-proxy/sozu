@@ -12,8 +12,10 @@
 #      CONTINUATIONS" for the form that no rule could see at all until
 #      sozu-proxy/sozu#1459.
 #   2. the same citations, read at TWO revisions: a citation this changeset did
-#      not touch must still name the same line TEXT it named at the base. See
-#      "DRIFTED CITATIONS" further down. Needs `--base <revision>`.
+#      not touch must still name the same line TEXT it named at the base. What
+#      counts as "did not touch" is the cited LINE and not its number — see
+#      "DRIFTED CITATIONS" and "A NUMBER REUSED FOR DIFFERENT CODE" further
+#      down. Needs `--base <revision>`.
 #   3. a backticked TEST NAME, in a Rust comment or a CHANGELOG/doc paragraph,
 #      that names no `fn` anywhere in the tree. See "DEAD TEST-NAME CITATIONS"
 #      further down.
@@ -123,11 +125,13 @@
 #
 #   An author who RE-ANCHORS a citation is not drifting it, so a SPAN is
 #   compared only when the identical `path` and that same line span are also
-#   present in the BASE revision of its own document. Identity is the citation,
-#   not its position in the file: moving a paragraph does not excuse a stale
-#   number, and repointing `editor.rs:1131` at `editor.rs:1152` is silently
-#   accepted. Comparison is on the STRIPPED line, so a pure re-indent is not
-#   drift.
+#   present in the BASE revision of its own document — and only when the base
+#   document's claim on that number has not demonstrably moved somewhere else,
+#   which is the second half of the identity and is in "A NUMBER REUSED FOR
+#   DIFFERENT CODE" below. Identity is the citation, not its position in the
+#   file: moving a paragraph does not excuse a stale number, and repointing
+#   `editor.rs:1131` at `editor.rs:1152` is silently accepted. Comparison is on
+#   the STRIPPED line, so a pure re-indent is not drift.
 #
 #   PER SPAN, not per group — sozu-proxy/sozu#1457. Keyed on the whole tuple,
 #   correcting ONE number in `h2.rs:5676/5860/5885/5903` changed the identity
@@ -148,7 +152,8 @@
 #   The seventh, `mod.rs:2152`, escapes the per-span key too, because the text
 #   at that line happens to equal the text at the line it used to name. A
 #   comparison of TEXT cannot see a number that moved between two identical
-#   lines, and nothing short of resolving the enclosing construct could.
+#   lines, and nothing short of resolving the enclosing construct could — the
+#   text-keyed identity below does not reach it either, for the same reason.
 #
 #   One residual inside a RANGE: `8-13` is one span, so fixing only its end to
 #   `8-14` re-anchors the start along with it. Both ends of a range describe
@@ -157,36 +162,67 @@
 #   against an old `x.rs:8-13`'s end — a new false positive for no coverage.
 #   Left as it is, deliberately.
 #
-# A NUMBER REUSED FOR DIFFERENT CODE — A LIMITATION, NOT A BUG
-#   The exemption keys on a NUMBER, and a number is not stable under the edits
-#   this rule exists to police. When a changeset renumbers a citation onto a
-#   line whose number the base revision spent on something else, the span is
-#   not new, the exemption does not apply, and a CORRECT citation is reported
-#   as drift. sozu-proxy/sozu#1447 found it in the H2 sans-io stack: at merge
-#   base `595920e9`, `lib/src/protocol/mux/LIFECYCLE.md:469` cited
-#   `h2.rs:6248` for the `handle_goaway_frame` retry loop; on a branch that
-#   renumbered citations after a large `h2.rs` edit, the `StreamState::Link`
-#   transition landed ON line 6248, and renumbering the Link citation to its
-#   true new line was reported as drift. No edit to the document fixes it.
+# A NUMBER REUSED FOR DIFFERENT CODE — KEYED ON THE TEXT, NOT ON THE NUMBER
+#   A NUMBER is not stable under the edits this rule exists to police, so an
+#   exemption keyed on one answers wrong in a way no edit to the document can
+#   repair. When a changeset renumbers a citation onto a line whose number the
+#   base revision spent on something else, the span is not new, a number-keyed
+#   exemption does not apply, and a CORRECT citation is reported as drift.
+#   sozu-proxy/sozu#1447 found it in the H2 sans-io stack: at merge base
+#   `595920e9`, `lib/src/protocol/mux/LIFECYCLE.md:469` cited `h2.rs:6248` for
+#   the `handle_goaway_frame` retry loop; on a branch that renumbered citations
+#   after a large `h2.rs` edit, the `StreamState::Link` transition landed ON
+#   line 6248, and renumbering the Link citation to its true new line was
+#   reported as drift.
 #
 #   This is not rare arithmetic. `doc/h2_mux_internals.md` alone carries 18
 #   pinned blocks into `h2.rs`, one branch renumbered 75 citations in a single
 #   pass, and number reuse across a document with ~100 citations into an
 #   8800-line file is a coincidence you buy once per citation.
 #
-#   NOTHING HERE GUESSES. The rule has a path, a number and two revisions of a
-#   line; it does not have the claim the number was attached to, and the
-#   honest re-anchor and the reused number are indistinguishable from that
-#   evidence — head text that existed elsewhere at the base fires on every
-#   insertion, genuine drift included. So this reports rather than suppresses,
-#   and says so in its own output. A rule that stopped comparing would be
-#   worse than one that occasionally over-reports, and a heuristic that
-#   guessed wrong QUIETLY would be worse than both. `doc/keyed.md`'s
-#   `keyed.rs:16` pins the over-report as an expected verdict, so widening the
-#   exemption to make it disappear turns the self-test red.
+#   THE IDENTITY IS THE CITED LINE, AND THE RULE CAN SEE IT MOVE. `check_drift`
+#   asks `reanchored_claims` for every cited line TEXT whose claim this
+#   changeset carried onto a new number, and declines a span whose base text is
+#   one of them: what the base document named at that number is alive
+#   elsewhere, so the span under test is a different citation that inherited
+#   the number rather than the base one left behind. Measured on
+#   `refactor/h2-goaway-drain` against `921c13673616`, which re-anchors 72
+#   spans: the number-keyed rule reported `h2.rs:5994` as drift because the
+#   base document had spent 5994 on `context.unlink_stream(stream_id);`, while
+#   that very line is cited — correctly, and by this changeset — at
+#   `h2.rs:5955`. The text-keyed rule declines the span and names both.
 #
-#   The remedy is the same one the rest of this file keeps naming: cite a
-#   SYMBOL wherever the prose names an item. A symbol has no number to reuse.
+#   NOTHING HERE GUESSES, and two counted conditions are what keep it that way.
+#   A RECEIVER is only a head-cited end whose number this document did not cite
+#   at the base at all, because a number the base already carried explains
+#   nothing — it is as likely to be a second stale citation, which is what two
+#   adjacent citations do when their file loses a line and each lands on its
+#   neighbour's old text. And the receivers for a text must be AT LEAST AS MANY
+#   as the base citations that named it: a document that named one line twice
+#   and re-anchored one of the two has left the other behind, which is
+#   sozu-proxy/sozu#1457's half-applied renumbering and must keep being
+#   reported. `doc/drift.md` is that fixture — its base cites `drift.rs:12`
+#   twice and this changeset re-anchors one to `:16` — so widening the
+#   exemption past its counting turns the self-test red instead of quietly
+#   turning the rule off.
+#
+#   TWO RESIDUALS, PRINTED RATHER THAN SILENT. A base citation this changeset
+#   DELETED instead of re-anchoring leaves no receiver, so a correct citation
+#   landing on the deleted one's line is still reported as drift, exactly as
+#   before. And a cited line carrying little text — a lone `}`, a bare `where`
+#   — can be matched by coincidence, in which case a real drift is declined.
+#   Neither is silent: every declined span is printed with the text that was
+#   matched and the number the claim moved to, so the evidence is on the
+#   reviewer's screen and a coincidence reads as one. A declined span is a
+#   comparison this rule did NOT perform, which is why it lowers the compared
+#   total and is listed rather than folded into the re-anchored count.
+#
+#   This rule also cannot say whether the number a changeset WROTE is a
+#   sensible place to point at — declining `h2.rs:5994` above says the base's
+#   claim moved, not that 5994 is a good citation. That question belongs to
+#   `--audit`, and to citing a SYMBOL wherever the prose names an item, which
+#   is the remedy the rest of this file keeps naming. A symbol has no number to
+#   reuse.
 #
 #   AND THE EXEMPTION IS COUNTED. A compared total reports what the rule
 #   looked at and never what it declined to look at, so this rule's coverage
@@ -1083,17 +1119,123 @@ def quote_pair(was, now):
     return _clip(was, start), _clip(now, start)
 
 
+def span_ends(start, end):
+    """The line numbers a span is CHECKED at: one, or the two ends of a range.
+
+    Rule 1 requires both ends of a range to be non-blank and leaves the
+    interior alone, and rule 2 compares exactly the same two lines so it stays
+    a strict superset of it. Every place here that walks a span walks this.
+    """
+    return (start,) if start == end else (start, end)
+
+
+def reanchored_claims(root, base, base_body, head_body, by_suffix, doc_dir, blobs, head):
+    """Every cited line TEXT this changeset carried from an old number onto a new one.
+
+    This is rule 2's identity for a citation, and it is the answer to
+    sozu-proxy/sozu#1447: a span NUMBER is not stable under the edits the rule
+    exists to police, so keying the exemption on the number alone reports a
+    CORRECT citation as drift whenever the changeset renumbers one onto a line
+    the base revision had spent on something else. The number is not the
+    citation. The line it names is.
+
+    Returns `{target: {text: number}}` — for each cited file, every line text
+    whose claim demonstrably MOVED, mapped to the new number that now carries
+    it. `check_drift` reads it in exactly one place: a span whose text changed
+    is declined instead of reported when the text it held at the BASE is in
+    this map, because the base document's claim on that text is alive at a
+    number this changeset introduced, and the span under test is therefore a
+    different citation that merely inherited the number.
+
+    NOTHING HERE GUESSES, and the two conditions are what keep it that way:
+
+      * a RECEIVER is a head-cited end whose number this document did not cite
+        at the base revision at all. A number the base already carried explains
+        nothing — it is as likely to be a second stale citation as a new one,
+        which is the two-adjacent-citations case where a file shrinks by a line
+        and each citation lands on its neighbour's old text.
+      * the receivers for a text must be AT LEAST AS MANY as the base
+        citations that named it. A document that named one line twice and
+        re-anchored one of the two has left the other behind, and that is
+        precisely the half-applied renumbering of sozu-proxy/sozu#1457, which
+        this rule must keep reporting. `doc/drift.md` is that fixture: its base
+        revision cites `drift.rs:12` twice, this changeset re-anchors one of
+        them to `:16` and leaves the other, so one claim is unaccounted for and
+        the stale span is compared as before.
+
+    Both are counted, not inferred, and a match is an exact text equality
+    between two revisions of the same file — never a similarity.
+    """
+    base_ends = {}
+    claims = {}
+    for cited, _text, spans, _offset in citations(base_body):
+        if cited is None:
+            continue  # rule 1 reports a continuation that binds to nothing
+        target, _ = resolve_path(cited, by_suffix, root, doc_dir)
+        if target is None:
+            continue  # rule 1 reports an unresolvable path
+        base_lines = blob(root, base, target, blobs)
+        if base_lines is None:
+            continue
+        base_lines = base_lines.splitlines()
+        for start, end in spans:
+            for number in span_ends(start, end):
+                base_ends.setdefault(target, set()).add(number)
+                if 1 <= number <= len(base_lines):
+                    text = base_lines[number - 1].strip()
+                    claims.setdefault(target, {})
+                    claims[target][text] = claims[target].get(text, 0) + 1
+
+    receivers = {}
+    for cited, _text, spans, _offset in citations(head_body):
+        if cited is None:
+            continue
+        target, _ = resolve_path(cited, by_suffix, root, doc_dir)
+        if target is None or target not in claims:
+            continue  # nothing at the base named a line in this file
+        if target not in head:
+            with open(os.path.join(root, target), encoding="utf-8") as handle:
+                head[target] = handle.read().splitlines()
+        head_lines = head[target]
+        for start, end in spans:
+            for number in span_ends(start, end):
+                if number in base_ends.get(target, ()):
+                    continue  # not a number this changeset introduced
+                if not 1 <= number <= len(head_lines):
+                    continue  # rule 1 owns out-of-range at HEAD
+                text = head_lines[number - 1].strip()
+                receivers.setdefault(target, {}).setdefault(text, []).append(number)
+
+    moved = {}
+    for target, texts in receivers.items():
+        for text, numbers in texts.items():
+            claimed = claims[target].get(text, 0)
+            if claimed and len(numbers) >= claimed:
+                # The lowest, so a document that re-anchored one text onto
+                # several numbers names the same one on every run.
+                moved.setdefault(target, {})[text] = min(numbers)
+    return moved
+
+
 def check_drift(root, base, show=False, out=sys.stdout):
     """A citation this changeset left alone must still name the same line TEXT.
 
-    Returns `(compared, exempt, failures)`: how many cited line ENDS were
-    resolvable at both revisions and therefore actually compared, how many were
-    resolvable and skipped because this changeset re-anchored them, and the
-    drifts among the compared ones. The two counts partition every cited end
-    that resolved and was in range at HEAD, which is what makes `exempt`
-    readable:
+    Returns `(compared, exempt, reused, failures)`: how many cited line ENDS
+    were resolvable at both revisions and therefore actually compared, how many
+    were resolvable and skipped because this changeset re-anchored their SPAN,
+    the ones it declined because this changeset re-anchored the CLAIM off their
+    number and spent the number on different code, and the drifts among the
+    compared ones. The three partition every cited end that resolved and was in
+    range at HEAD, which is what makes the second and third readable:
     "38 compared, 12 exempt" says there is something to disposition where
     "38 compared" reads as complete coverage.
+
+    `reused` is a list of report lines rather than a bare count because each
+    one is PRINTED, with the text that was matched and the number the claim
+    moved to. It is the one class here decided by comparing TEXT across
+    revisions rather than by a number's presence, so a reviewer has to be able
+    to read the evidence and disagree with it; a count alone would be a
+    heuristic with no audit trail.
 
     Resolution is rule 1's own `resolve_path` on the HEAD tree, so a bare
     `mod.rs` in `mux/LIFECYCLE.md` binds to that directory's sibling exactly as
@@ -1102,22 +1244,25 @@ def check_drift(root, base, show=False, out=sys.stdout):
     not drift. Both ENDS of a range are compared, and interior lines are not,
     matching the blank-line rule so this stays a strict superset of it.
 
-    Three things are deliberately not compared, each because rule 1 already
+    Four things are deliberately not compared, each because rule 1 already
     owns it or because there is nothing to compare against: a SPAN absent from
     the base revision of its own document (the author re-anchored that span), a
-    document or a cited file that the base tree did not carry (both are new
-    here), and a line number out of range at either revision. Only the first is
-    counted in `exempt`; the other two have their own owners.
+    span whose NUMBER the base revision spent on a claim this changeset carried
+    somewhere else (the author reused the number), a document or a cited file
+    that the base tree did not carry (both are new here), and a line number out
+    of range at either revision. The first two are counted and the second is
+    printed line by line; the other two have their own owners.
 
     The exemption is keyed per SPAN, so a group whose first number moved still
-    has its siblings compared (sozu-proxy/sozu#1457). It cannot be keyed on
-    anything better than a number, which is a real limitation and not a bug to
-    be heuristically papered over: see "A NUMBER REUSED FOR DIFFERENT CODE".
+    has its siblings compared (sozu-proxy/sozu#1457), and it is keyed on the
+    cited TEXT wherever a number alone answers wrong: see "A NUMBER REUSED FOR
+    DIFFERENT CODE".
     """
     by_suffix = target_files(root)
     blobs = {}
     head = {}
     failures = []
+    reused = []
     compared = 0
     exempt = 0
 
@@ -1149,6 +1294,17 @@ def check_drift(root, base, show=False, out=sys.stdout):
         with open(os.path.join(root, doc), encoding="utf-8") as handle:
             body = handle.read()
         doc_line = doc_line_finder(body)
+
+        # The other half of the identity, and the half a NUMBER cannot carry:
+        # every cited line text whose claim this changeset moved onto a number
+        # it introduced. A span whose text changed is DECLINED rather than
+        # reported when its base text is in here, because the claim the base
+        # document attached to that number is alive somewhere else and the span
+        # under test is a different citation that inherited the number
+        # (sozu-proxy/sozu#1447).
+        moved_claims = reanchored_claims(
+            root, base, base_body, body, by_suffix, doc_dir, blobs, head
+        )
 
         for cited, _spans_text, spans, offset in citations(body):
             if cited is None:
@@ -1189,9 +1345,29 @@ def check_drift(root, base, show=False, out=sys.stdout):
                         continue
                     if number > len(base_lines):
                         continue  # no line at the base revision to compare against
-                    compared += 1
                     was = base_lines[number - 1].strip()
                     now = head_lines[number - 1].strip()
+                    moved_to = moved_claims.get(target, {}).get(was)
+                    if was != now and moved_to is not None:
+                        # The number was REUSED. What the base document claimed
+                        # at this number is cited again at a number this
+                        # changeset introduced, so the span under test is not
+                        # the base citation left behind — it is a different one
+                        # that inherited the number, and comparing it reports a
+                        # citation no edit of the document can fix. Declined,
+                        # never silent: this is the one class here decided on
+                        # text rather than on a number's presence, so it is
+                        # printed with both.
+                        reused.append(
+                            "%s: `%s:%s` — %s:%d not compared: the base named `%s` there, "
+                            "and this changeset re-anchored that line to %s:%d"
+                            % (where, cited, span, target, number,
+                               _clip(was, 0), target, moved_to)
+                        )
+                        if show:
+                            out.write("%s  %s:%d  |reused-number\n" % (where, target, number))
+                        continue
+                    compared += 1
                     if was == now:
                         if show:
                             out.write("%s  %s:%d  |unmoved\n" % (where, target, number))
@@ -1202,7 +1378,7 @@ def check_drift(root, base, show=False, out=sys.stdout):
                         % (where, cited, span, target, number, edge, was_quoted, now_quoted)
                     )
 
-    return compared, exempt, failures
+    return compared, exempt, reused, failures
 
 
 # ── Rule 3: dead test-name citations ──────────────────────────────────────
@@ -2361,13 +2537,24 @@ DRIFT_BASE_SUFFIX = ".base"
 #     as maintained. Seen red: with the per-span key reverted to
 #     `tuple(spans)`, this entry disappears and the self-test prints
 #     "expected 5 drifted citations, got 4".
-#   * `keyed.rs:16` is sozu-proxy/sozu#1447's false POSITIVE, pinned here
-#     deliberately. The citation is CORRECT — the helper it names really is on
-#     line 16 at HEAD — but 16 named a different helper at the base revision,
-#     so the span is not new and the exemption does not apply. No edit to the
-#     document makes this report go away, and it is asserted so that a future
-#     attempt to silence it by widening the exemption goes red instead of
-#     quietly turning the rule off. See "A NUMBER REUSED FOR DIFFERENT CODE".
+#   * `keyed.rs:16` is sozu-proxy/sozu#1447's false positive, and it is NOT in
+#     this list — it is pinned in FIXTURE_DRIFT_REUSED_EXPECTED below as a
+#     declined comparison instead. The citation is CORRECT (the helper it names
+#     really is on line 16 at HEAD) and 16 named a different helper at the base
+#     revision, so a number-keyed exemption reported a citation no edit of the
+#     document could fix. The text-keyed identity sees that the base's claim on
+#     line 16 is cited again at `keyed.rs:20`, a number this changeset
+#     introduced, and declines the span.
+#
+# `drift.rs:12` is what holds that identity honest FROM THE OTHER SIDE, and it
+# is the reason this list must keep it. `doc/drift.md.base` cites `drift.rs:12`
+# TWICE — once for the stale reading and once for the re-anchored one — and the
+# head document re-anchors only one of the two, to `drift.rs:16`. One claim on
+# `pub fn moved(&self) -> u8 {` is therefore unaccounted for, the receiver
+# count does not reach the base claim count, and the span left behind is
+# compared exactly as before. Drop the counting from `reanchored_claims` and
+# this entry disappears: a reuse exemption widened until it swallowed the
+# half-applied renumbering of sozu-proxy/sozu#1457 turns the self-test red.
 FIXTURE_DRIFT_EXPECTED = [
     "doc/drift.md:11: `drift.rs:12` — drift.rs:12 moved: "
     "was `pub fn moved(&self) -> u8 {`, now `pub fn inserted(&self) -> u8 {`",
@@ -2375,10 +2562,27 @@ FIXTURE_DRIFT_EXPECTED = [
     "was `1`, now `0`",
     "doc/drift.md:15: `drift.rs:8-13` — drift.rs:13 moved (end of range): "
     "was `1`, now `0`",
-    "doc/keyed.md:16: `keyed.rs:16` — keyed.rs:16 moved: "
-    "was `pub fn tail(&self) -> u8 {`, now `pub fn reused(&self) -> u8 {`",
     "doc/keyed.md:7: `keyed.rs:17` — keyed.rs:17 moved: "
     "was `let far = 3;`, now `2`",
+]
+
+# The spans rule 2 DECLINED because this changeset reused their number, pinned
+# by their exact reported text for the same reason FIXTURE_DRIFT_EXPECTED is:
+# this is the one verdict here reached by comparing text across revisions
+# rather than by a number's presence, so what the report SAYS is half of it. A
+# reviewer disposition an exemption they cannot read, and a build that stopped
+# naming the matched text or the number the claim moved to would still emit the
+# same count.
+#
+# It is load-bearing in both directions. Revert `check_drift` to the
+# number-keyed exemption and this list goes empty while `keyed.rs:16` reappears
+# in FIXTURE_DRIFT_EXPECTED; widen `reanchored_claims` past its claim counting
+# and `drift.rs:12` moves here out of FIXTURE_DRIFT_EXPECTED. Neither can be
+# silenced without moving a fixture verdict.
+FIXTURE_DRIFT_REUSED_EXPECTED = [
+    "doc/keyed.md:16: `keyed.rs:16` — keyed.rs:16 not compared: the base named "
+    "`pub fn tail(&self) -> u8 {` there, and this changeset re-anchored that line "
+    "to keyed.rs:20",
 ]
 
 # The sixth citation's drift is held OUT of the list above deliberately.
@@ -2436,11 +2640,17 @@ REPORTED_PAIR = re.compile(r": was `(.*)`, now `(.*)`$")
 # the `>>>>>>>` a resolver reads. Two correct edits, silently composed into a
 # third value that is neither. When two branches move the same counter for
 # different reasons, the merge is a sum, and git cannot know that.
-# The thirty-third and thirty-fourth are `doc/keyed.md`'s: the sibling span a
-# half-applied renumbering used to exempt, and the reused number. Both are
-# spans the WHOLE-TUPLE key skipped or kept by accident rather than by rule,
-# so this counter moving from 32 to 34 is the coverage the per-span key buys.
-FIXTURE_DRIFT_COMPARED = 39
+# The thirty-third is `doc/keyed.md`'s sibling span, which a half-applied
+# renumbering used to exempt — a span the WHOLE-TUPLE key skipped rather than
+# decided, and the coverage the per-span key buys.
+#
+# `doc/keyed.md`'s reused number is deliberately NOT among these. It is
+# declined, counted in FIXTURE_DRIFT_REUSED_EXPECTED, and this counter dropped
+# by exactly one when the text-keyed identity landed. That direction matters:
+# a reuse exemption is a comparison this rule no longer performs, so it has to
+# show up as a smaller compared total and a non-empty declined list, never as a
+# compared total that stayed the same.
+FIXTURE_DRIFT_COMPARED = 38
 
 
 # The exact number of cited line ENDS the rule declined to compare because this
@@ -2804,7 +3014,7 @@ def self_test():
             ok = False
             print("FAIL self-test: the base revision did not resolve: %s" % why)
 
-        compared, exempt, drifted = check_drift(repo, base_sha)
+        compared, exempt, reused, drifted = check_drift(repo, base_sha)
         drifted = sorted(drifted)
 
         # The wide-line drift, separated before the exact comparison because
@@ -2887,6 +3097,28 @@ def self_test():
                 "what it declined to look at, so this rule can report a healthy count while "
                 "covering nothing — sozu-proxy/sozu#1447." % (exempt, FIXTURE_DRIFT_EXEMPT)
             )
+
+        # The second declined class, asserted by its exact REPORTED TEXT and
+        # not by a count. This is the only verdict rule 2 reaches by comparing
+        # text across revisions instead of by asking whether a number was
+        # present, so the evidence it prints is half the guarantee: an exemption
+        # a reviewer cannot read is a heuristic with no audit trail, which is
+        # the thing sozu-proxy/sozu#1447 refused. Asserting the string also
+        # keeps the report's SHAPE pinned — a build that stopped naming the
+        # matched text, or the number the claim moved to, emits the same count
+        # and fails here.
+        reused = sorted(reused)
+        if reused != FIXTURE_DRIFT_REUSED_EXPECTED:
+            ok = False
+            print(
+                "FAIL self-test: expected %d cited line(s) declined as a reused number, got %d:"
+                % (len(FIXTURE_DRIFT_REUSED_EXPECTED), len(reused))
+            )
+            for line in reused:
+                print("  " + line)
+            for expected in FIXTURE_DRIFT_REUSED_EXPECTED:
+                if expected not in reused:
+                    print("  MISSING: " + expected)
 
         # The same tree, without a base: every drift above is invisible to the
         # blank-line rule because every drifted line is non-blank at both
@@ -3182,7 +3414,8 @@ def self_test():
     if ok:
         print(
             "OK self-test: %d fixture line citations, %d of them compared against a base "
-            "revision (%d more exempt as re-anchored), %d examined test names (%d checked), "
+            "revision (%d more exempt as re-anchored, %d declined as a reused number), "
+            "%d examined test names (%d checked), "
             "%d pinned blocks compared (%d unpinned Rust blocks left alone), and %d citations "
             "seen in Rust comments (%d naming no file in the fixture tree); %d + %d + %d "
             "+ %d + %d expected failures reported, the fixture exemption table moving one "
@@ -3191,7 +3424,7 @@ def self_test():
             "%d, one per signal, leaving a comment-started RANGE and a line answered only "
             "by its enclosing item alone, and exiting 0 on a tree it found things in."
             % (
-                total, compared, exempt, examined, checked, pinned, unpinned,
+                total, compared, exempt, len(reused), examined, checked, pinned, unpinned,
                 seen, external,
                 len(bad), len(drifted), len(dead), len(mismatched), len(cited_lines),
                 audit_examined, len(audit_findings),
@@ -3268,7 +3501,7 @@ def main():
             print("with a clean run would be green forever while comparing nothing, which is the")
             print("shape of defect this file exists to close.")
             return 1
-        compared, exempt, drifted = check_drift(root, base, show=args.show)
+        compared, exempt, reused, drifted = check_drift(root, base, show=args.show)
         if drifted:
             status = 1
             print(
@@ -3282,10 +3515,8 @@ def main():
             print("replace it with the symbol the prose already names — a symbol cannot drift.")
             print("A span this changeset re-anchored is exempt and counted above, never silent; a")
             print("sibling it left behind in the same group is still compared.")
-            print("Read each against the claim before renumbering. A number this changeset REUSED")
-            print("for different code is compared against whatever the base revision put on it, so a")
-            print("citation that is ALREADY correct can appear here with no edit that removes it —")
-            print("sozu-proxy/sozu#1447. Citing a symbol leaves that class behind for good.")
+            print("Read each against the claim before renumbering. Citing a symbol wherever the prose")
+            print("names an item leaves this whole class behind for good.")
         else:
             print(
                 "OK: none of the %d cited lines compared against %s changed their text."
@@ -3297,6 +3528,28 @@ def main():
                 "%s exempt from the comparison and never checked at all; `--show` lists them, "
                 "and a compared total cannot report them." % _spans(exempt)
             )
+
+        if reused:
+            print("")
+            print(
+                "%d cited line%s NOT compared because this changeset reused the number for "
+                "different code (sozu-proxy/sozu#1447):"
+                % (len(reused), "" if len(reused) == 1 else "s")
+            )
+            for line in reused:
+                print("  " + line)
+            print("")
+            print("Each is declined on EVIDENCE, not on a guess: the text that number held at the base")
+            print("is cited again at a number this changeset introduced, at least as many times as the")
+            print("base document named it, so the claim moved and the number was spent on something")
+            print("else. Without this the correct citation is reported as drift and no edit to the")
+            print("document removes the report. Two residuals stay, and both are printed rather than")
+            print("silent. A base citation this changeset DELETED instead of re-anchoring leaves no")
+            print("such number, so a correct citation landing on the deleted one's line is still")
+            print("reported above. And a cited line carrying little text — a lone `}`, a bare `where`")
+            print("— can match by coincidence, and a real drift is declined; the matched text is")
+            print("quoted on each line so a reviewer can see what it was and disposition it.")
+            print("A symbol has no number to reuse, and none of this applies to one.")
 
     print("")
     examined, checked, dead = check_test_citations(root, show=args.show)

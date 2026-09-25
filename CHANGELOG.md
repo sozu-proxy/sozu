@@ -280,6 +280,58 @@
   `doc/testing.md`, `doc/lifetime_of_a_session.md` and `LIFECYCLE.md` are updated in this
   changeset.
 
+- **`fix(ci)`: the drifted-citation exemption is keyed on the cited line, not on its number
+  ([#1447](https://github.com/sozu-proxy/sozu/issues/1447)).** `check_doc_citations.py`'s rule 2
+  compares a citation this changeset did not touch against the text it named at the base revision,
+  and exempts one the changeset re-anchored. That exemption asked whether the SPAN was present at
+  the base, and a span number is not stable under the edits the rule exists to police: renumbering
+  a citation onto a line whose number the base revision spent on something else left the span
+  not-new, so a **correct** citation was reported as drift and no edit to the document removed the
+  report. #1447 found it at `595920e9`, where the mux `LIFECYCLE.md` cited an `h2.rs` line for the
+  `handle_goaway_frame` retry loop and a branch that renumbered after a large `h2.rs` edit landed
+  the `StreamState::Link` transition on that very line.
+
+  The rule now tracks the cited line's TEXT across the two revisions. A span is declined when the
+  line it named at the base is cited again at a number this changeset **introduced** — the base
+  document's claim is alive elsewhere, so the span under test is a different citation that
+  inherited the number rather than the base one left behind. Nothing guesses, and two counted
+  conditions keep it that way: a receiver is only a number this document did not cite at the base
+  at all (a number the base already carried is as likely to be a second stale citation, which is
+  what two adjacent citations do when their file loses a line), and the receivers for a line must
+  be at least as many as the base citations that named it, so a document that named one line twice
+  and re-anchored one of the two still has the other reported — which is what keeps
+  [#1457](https://github.com/sozu-proxy/sozu/issues/1457)'s half-applied renumbering visible.
+
+  Measured on `refactor/h2-goaway-drain` against `921c13673616`, a changeset that re-anchors 72
+  spans: the number-keyed rule reported one mux `h2.rs` citation as drift because the base had
+  spent that number on `context.unlink_stream(stream_id);`, while that line is cited — correctly,
+  by the same changeset — 39 lines earlier. On `06fc2708`, the 92-span re-anchoring #1457 was
+  measured on, the two rules report the identical six drifts and nothing is declined: the exemption
+  is inert where no number was reused.
+
+  Every declined span is **printed**, with the text that was matched and the number the claim moved
+  to, and `--show` tags it `|reused-number`. It is a comparison the rule did not perform, so it
+  lowers the compared total instead of hiding inside it, and it is listed separately from the
+  re-anchored exempt count that #1447's addendum asked for. Two residuals are stated in the report
+  rather than left silent: a base citation deleted instead of re-anchored leaves no receiver, so a
+  correct citation landing on its line is still reported; and a cited line carrying little text — a
+  lone `}`, a bare `where` — can match by coincidence, in which case a real drift is declined, with
+  the matched text on screen so a reviewer can see it for what it is. Declining a span says the
+  base's claim moved, never that the number the changeset wrote is a sensible place to point at;
+  that stays `--audit`'s question, and a symbol's.
+
+  `testdata/citations/doc/keyed.md`'s reused number moves out of `FIXTURE_DRIFT_EXPECTED` and into
+  the new `FIXTURE_DRIFT_REUSED_EXPECTED`, pinned by its exact reported text rather than by a
+  count, because an exemption a reviewer cannot read is a heuristic with no audit trail.
+  `FIXTURE_DRIFT_COMPARED` drops 39 -> 38 in the same direction. `doc/drift.md` is the guard from
+  the other side — its base cites `drift.rs:12` twice and the head re-anchors only one of them — so
+  widening the exemption past its claim counting moves that verdict and turns `--self-test` red.
+  Seen red four ways before it was trusted: the fixture verdict flipped against the unmodified
+  rule, the identity reverted, the claim counting dropped, and one word of the declined report's
+  wording changed.
+
+  Script, `doc/README.md` and this entry are the same changeset; no production code changes.
+
 - **`build(sim)`: the `mio` dev-dependency is removed from `sozu-sim`
   ([#1339](https://github.com/sozu-proxy/sozu/issues/1339), Q10).** A build-contract change, and
   the measurable outcome of the line above. `sim/tests/h2_simulation.rs` used to hold a
