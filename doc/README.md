@@ -270,8 +270,9 @@ the same way — the document's own directory first, so a module `LIFECYCLE.md` 
 siblings by bare name — and the *text* of the cited line is read at the merge base of `<revision>`
 and HEAD as well as at HEAD. Different text is reported, blank or not, at both ends of a range. A
 span this changeset **re-anchored** is not reported: only one that carries the same path and the
-same line span it carried at the base while the text underneath it changed. Comparison is on the
-stripped line, so a re-indent is not drift.
+same line span it carried at the base, whose claim this changeset did not carry to another number,
+while the text underneath it changed. Comparison is on the stripped line, so a re-indent is not
+drift.
 
 The exemption is keyed **per span, not per citation**. Keyed on the whole group, correcting one
 number in a four-span `file.rs:NNN/MMM/PPP/QQQ` changed the identity of the entire citation and
@@ -298,19 +299,37 @@ the rule did not run.
 It remains a floor in one direction: a citation into code that this changeset never touched is not
 compared. Cite a symbol wherever the prose names an item.
 
-**A number this changeset reused for different code is reported, and no edit fixes it.** The
-exemption keys on a number, and a number is not stable under the edits the rule exists to police, so
-renumbering a citation onto a line whose number the base revision spent on something else produces a
-report against a *correct* citation. [sozu-proxy/sozu#1447][reuse] found it in the H2 stack: at
-`595920e9` the mux `LIFECYCLE.md` cited one `h2.rs` line for the `handle_goaway_frame` retry loop,
-and on a branch that renumbered after a large `h2.rs` edit the `StreamState::Link` transition landed
-on that very line, so repointing the Link citation at its true new line was reported as drift with
-no edit available that would silence it. Nothing guesses here. The rule has a path,
-a number and two revisions of a line; it does not have the claim the number was attached to, and the
-honest re-anchor and the reused number are indistinguishable from that evidence. So it over-reports
-rather than suppress: a rule that stopped comparing would be worse than one that occasionally
-over-reports, and a heuristic that guessed wrong *quietly* would be worse than both. Read such a
-report against the claim before renumbering — and cite a symbol, which has no number to reuse.
+**The identity is the cited line, not its number.** A number is not stable under the edits the rule
+exists to police, so an exemption keyed on one answers wrong in a way no edit to the document can
+repair: renumbering a citation onto a line whose number the base revision spent on something else
+leaves the span not-new, and a *correct* citation is reported as drift. [sozu-proxy/sozu#1447][reuse]
+found it in the H2 stack: at `595920e9` the mux `LIFECYCLE.md` cited one `h2.rs` line for the
+`handle_goaway_frame` retry loop, and on a branch that renumbered after a large `h2.rs` edit the
+`StreamState::Link` transition landed on that very line, so repointing the Link citation at its true
+new line was reported as drift with no edit available that would silence it.
+
+So the rule tracks the **text** a citation named at the base and watches it move. A span is declined
+when the line it named at the base revision is cited again at a number this changeset *introduced* —
+the base document's claim is alive somewhere else, so the span under test is a different citation
+that inherited the number rather than the base one left behind. Nothing guesses: a receiver is only
+a number this document did not cite at the base at all, and the receivers for a line must be at
+least as many as the base citations that named it, so a document that named one line twice and
+re-anchored one of the two still has the other reported. That second condition is what keeps
+[#1457][ident]'s half-applied renumbering visible. Measured on a branch that re-anchors 72 spans:
+the number-keyed rule reported one mux `h2.rs` citation as drift because the base revision had spent
+that number on `context.unlink_stream(stream_id);`, while that very line is cited — correctly, and
+by the same changeset — 39 lines earlier. The text-keyed rule declines the span and names both.
+
+Two residuals stay, and both are **printed rather than silent**. A base citation this changeset
+deleted instead of re-anchoring leaves no receiver, so a correct citation landing on the deleted
+one's line is still reported. And a cited line carrying little text — a lone `}`, a bare `where` —
+can be matched by coincidence, in which case a real drift is declined. Every declined span is listed
+with the text that was matched and the number the claim moved to, so the evidence is on screen and a
+coincidence reads as one; `--show` tags them `|reused-number`. A declined span is a comparison the
+rule did **not** perform, so it lowers the compared total rather than hiding inside it. Note what
+this does not say: declining a span says the base's claim moved, never that the number the changeset
+wrote is a sensible place to point at. That question is `--audit`'s, and a symbol's — a symbol has no
+number to reuse.
 
 **Every run prints how many spans it did not look at.** A compared total reports what the rule
 examined and never what it declined to examine, so its coverage can fall to zero for a whole
@@ -319,9 +338,9 @@ six markdown citations: 370 cited ends compared with `.md` targets on, 370 with 
 of the six entered the rule — repairing a citation changes its span, which is exactly what the
 exemption covers. The run said "none of the 370 cited lines changed their text" and was telling the
 truth about the 370 while saying nothing about the six. `compared` and `exempt` now partition every
-cited end that resolved and was in range at HEAD, and `--show` lists each exempt span as
-`|re-anchored`. "38 compared, 12 exempt" says there is something to disposition where "38 compared"
-reads as complete coverage. A span renumbered into the **grown tail** of a file — past the end the
+cited end that resolved and was in range at HEAD — together with the spans declined as a reused
+number above — and `--show` lists each exempt span as `|re-anchored`. "38 compared, 12 exempt" says
+there is something to disposition where "38 compared" reads as complete coverage. A span renumbered into the **grown tail** of a file — past the end the
 base revision had — counts as exempt like any other, which matters because an insertion of any size
 pushes later citations past the old end by construction; binding the exempt count to the base range
 would have dropped exactly the changesets that re-anchor the most.

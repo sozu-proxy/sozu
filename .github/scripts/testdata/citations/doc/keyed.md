@@ -14,4 +14,4 @@ from the line it held at the base revision.
 
 Reused: the helper the tail one follows is documented here for the first time,
 and is declared at `keyed.rs:16` — the number that named the tail helper at the
-base revision. The citation is correct and the rule reports it anyway.
+base revision, whose line this changeset re-anchored to 20 instead.
