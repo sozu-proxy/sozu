@@ -1137,6 +1137,46 @@ pub(super) enum H2ControlFlushTarget {
     Stalled,
 }
 
+/// What [`ConnectionH2::dispatch_writable_state`] wants its caller to do with
+/// the `(H2State, Position)` arm it just took.
+///
+/// The connection-level write pass's own protocol, built the way
+/// [`H2FinalizeTarget`] builds the stream-level one: the core answers a step,
+/// the shell performs the socket work, and the core is told what the socket
+/// then said. [`Self::Flush`] carries NO answer with it — the post-flush query
+/// can only enter the core through
+/// [`ConnectionH2::dispatch_writable_state_after_flush`]'s own parameter,
+/// which is what stops "does rustls hold records" and "did the kernel take
+/// them" from ever being read off one binding. [`h2_close::TlsFlushPhase`]
+/// states why those are two questions and what conflating them costs.
+///
+/// Not [`H2FinalizeTarget`] reused. That enum's `SkipFlush` answers a question
+/// no close arm asks: nothing writes to the socket between this dispatch and
+/// its flush, so no vectored write can have attempted it as a side effect, and
+/// sharing the enum would force a named-impossible arm into the shell's match.
+/// It is the argument `h2_close` already makes against widening `CloseAction`
+/// with `FinalizeAction`'s readiness answers, applied the other way round.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum H2WritableStateTarget {
+    /// The arm ended the pass by itself: this is the pass's result. Every arm
+    /// but the two below answers this, the `H2State::GoAway` arm's
+    /// departed-peer and nothing-pending answers included.
+    Done(MuxResult),
+    /// The `H2State::GoAway` arm asks for the second flush of this pass:
+    /// perform [`ConnectionH2::flush_tls_records`], read
+    /// [`ConnectionH2::tls_wants_write`] again, and answer with
+    /// [`ConnectionH2::dispatch_writable_state_after_flush`].
+    ///
+    /// The preamble already attempted one flush this pass; this one re-checks
+    /// because a close is about to be decided on the answer. Both are
+    /// deliberate — see `h2_close`'s module doc.
+    Flush,
+    /// A proxying state: run `ConnectionH2::write_streams`, whose result is
+    /// the pass's. It is the caller's to run for the same reason the flush is,
+    /// and it is why the dispatch takes neither `Context` nor `Endpoint`.
+    WriteStreams,
+}
+
 /// The buffer an [`H2WriteTarget::Transmit`] names, resolved to the `Kawa`
 /// owning it — the exact mirror of [`read_buffer`], and taking `zero` and
 /// `streams` apart for the same reason: `ConnectionH2::socket` and
@@ -1465,11 +1505,14 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     /// [`Self::tls_wants_write`] changes across this call, so no value captured
     /// before it can stand in for the query after it.
     ///
-    /// One of the four has already made that move: [`Self::write_streams`]
-    /// performs it for [`H2FinalizeTarget::Flush`], outside the
-    /// [`Self::finalize_write`] that used to run it inline. The other three
-    /// are [`Self::writable`]'s preamble, its `H2State::GoAway` arm, and
-    /// [`Self::flush_zero_buffer`].
+    /// Three of the four have made that move and all three are in the shell
+    /// impl: [`Self::write_streams`] performs it for
+    /// [`H2FinalizeTarget::Flush`], outside the [`Self::finalize_write`] that
+    /// used to run it inline, and [`Self::writable`] performs both of the
+    /// connection-level write pass's — its unconditional preamble, and the
+    /// second one [`H2WritableStateTarget::Flush`] asks for on behalf of the
+    /// `H2State::GoAway` arm now in [`Self::dispatch_writable_state`]. The
+    /// fourth is [`Self::flush_zero_buffer`].
     ///
     /// Returns the handler's `(size, SocketResult)` unchanged. Three of the
     /// four callers discard both and re-query [`Self::tls_wants_write`]
@@ -3408,7 +3451,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             // re-arm still goes through `ensure_tls_flushed` rather than
             // touching `signal_pending_write` here, which keeps every
             // post-decision TLS re-arm in this file spelled the same way, as
-            // the GoAway and Error arms of `writable` already do.
+            // the GoAway and Error arms in `dispatch_writable_state` and
+            // `dispatch_writable_state_after_flush` already do.
             FinalizeAction::ReArm => self.ensure_tls_flushed(tls_wants_write),
             FinalizeAction::Settled => {}
             action @ (FinalizeAction::Flush
@@ -3646,51 +3690,43 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
         H2ControlFlushTarget::Proceed
     }
 
-    pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
-    where
-        E: Endpoint,
-        L: ListenerHandler + L7ListenerHandler,
-    {
-        // Entry point: adopt the mux's snapshot for this pass.
-        self.now = context.now;
-        self.prune_inactive_streams_while_closing(context);
-
-        match self.flush_pending_control_frames() {
-            H2ControlFlushTarget::Done(result) => return result,
-            // The stalled-drain tail the three stages used to run inline. The
-            // query belongs here and not there: `flush_zero_to_socket` is what
-            // changed the answer, so it has to be read after the stall, and
-            // this is the layer that owns the socket.
-            H2ControlFlushTarget::Stalled => {
-                let tls_wants_write = self.tls_wants_write();
-                self.ensure_tls_flushed(tls_wants_write);
-                return MuxResult::Continue;
-            }
-            H2ControlFlushTarget::Proceed => {}
-        }
-
-        // Flush any pending TLS records before state-specific processing.
-        // This ensures response DATA frames that were accepted by rustls
-        // (via socket_write_vectored in write_streams) are pushed to the
-        // TCP socket even when the connection is in GoAway or Error state.
-        // Without this, the state-specific handlers may call force_disconnect()
-        // before the response data reaches the kernel's TCP send buffer.
-        if self.tls_wants_write() {
-            self.flush_tls_records();
-        }
-
+    /// Take `writable()`'s `(H2State, Position)` decision, given the answer
+    /// [`Self::tls_wants_write`] gave AFTER the pass preamble's flush.
+    ///
+    /// `tls_wants_write` is that answer, read by the caller. It is the third
+    /// step of the preamble's own query / flush / query triple and the
+    /// pre-flush question both close arms decide on: the
+    /// `(H2State::Error, Position::Server)` arm has no flush of its own and
+    /// reads nothing else, while the `H2State::GoAway` arm asks for a second
+    /// flush through [`H2WritableStateTarget::Flush`]. ONE read serves
+    /// whichever of the two runs — only one of them can — and nothing mutates
+    /// the socket between the caller's read and this call. The arms that never
+    /// consult it discard it, exactly as [`Self::write_streams`] discards the
+    /// answer it reads before [`Self::finalize_write`]'s graceful-GOAWAY
+    /// check; [`Self::tls_wants_write`] is free of side effects, which is what
+    /// makes both unobservable.
+    ///
+    /// Answers [`H2WritableStateTarget`]. Every arm but two ends the pass with
+    /// [`H2WritableStateTarget::Done`]; the `H2State::GoAway` arm may ask for
+    /// the TLS flush step, and the four proxying states name
+    /// [`H2WritableStateTarget::WriteStreams`]. That last one is the caller's
+    /// to run for the same reason the flush is — [`Self::write_streams`] owns
+    /// the socket and this function does not — and it is why this function
+    /// takes neither `Context` nor `Endpoint`: no other arm reads either.
+    fn dispatch_writable_state(&mut self, tls_wants_write: bool) -> H2WritableStateTarget {
         match (&self.state, &self.position) {
             (H2State::Error, Position::Server) => {
-                // The preamble above already attempted this pass's flush, so
-                // this arm reads the post-flush answer and has no `Flush` of
-                // its own — see `h2_close`'s module doc.
-                let tls_wants_write = self.tls_wants_write();
+                // The caller's preamble already attempted this pass's flush,
+                // so this arm decides on the post-flush answer and has no
+                // `Flush` of its own — see `h2_close`'s module doc.
                 match h2_close::error_close_action(tls_wants_write) {
                     CloseAction::ReArmAndContinue => {
                         self.ensure_tls_flushed(tls_wants_write);
-                        MuxResult::Continue
+                        H2WritableStateTarget::Done(MuxResult::Continue)
                     }
-                    CloseAction::CloseSession => MuxResult::CloseSession,
+                    CloseAction::CloseSession => {
+                        H2WritableStateTarget::Done(MuxResult::CloseSession)
+                    }
                     // Named rather than `other =>`: a wildcard arm would turn a
                     // new `CloseAction` variant into a release-mode panic in the
                     // proxy write path instead of a compile error.
@@ -3708,13 +3744,15 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     self.state,
                     self.position
                 );
-                self.force_disconnect()
+                H2WritableStateTarget::Done(self.force_disconnect())
             }
-            (H2State::ClientPreface, Position::Server) => MuxResult::Continue,
+            (H2State::ClientPreface, Position::Server) => {
+                H2WritableStateTarget::Done(MuxResult::Continue)
+            }
             // Discard state: pending data (e.g. RST_STREAM) was already
-            // written in the preamble above; let the readable path consume
-            // the remaining frame payload.
-            (H2State::Discard, _) => MuxResult::Continue,
+            // written in the caller's control-frame preamble; let the readable
+            // path consume the remaining frame payload.
+            (H2State::Discard, _) => H2WritableStateTarget::Done(MuxResult::Continue),
             (H2State::GoAway, _) => {
                 // Response DATA frames may still sit in rustls's output
                 // buffer — accepted by socket_write_vectored during
@@ -3723,38 +3761,24 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // vector, so the decision lives in `h2_close`, exhaustively
                 // unit-tested there rather than inline here. Why the two
                 // `socket_wants_write()` queries are two DIFFERENT questions,
-                // and why the flush between them stays inside this call: see
-                // `h2_close::TlsFlushPhase`.
+                // and why the flush between them stays inside the same
+                // `writable()` call: see `h2_close::TlsFlushPhase`. The flush
+                // and the query after it belong to the caller, and
+                // `H2WritableStateTarget::Flush` is how this arm asks for them.
                 match h2_close::goaway_close_action(
                     TlsFlushPhase::BeforeFlush,
                     self.peer_gone_after_final_goaway(),
-                    self.tls_wants_write(),
+                    tls_wants_write,
                 ) {
-                    CloseAction::CloseSession => return MuxResult::CloseSession,
-                    CloseAction::Flush => {
-                        self.flush_tls_records();
-                        let tls_wants_write = self.tls_wants_write();
-                        match h2_close::goaway_close_action(
-                            TlsFlushPhase::AfterFlush,
-                            false,
-                            tls_wants_write,
-                        ) {
-                            CloseAction::ReArmAndContinue => {
-                                self.ensure_tls_flushed(tls_wants_write);
-                                return MuxResult::Continue;
-                            }
-                            CloseAction::Disconnect => {}
-                            action @ (CloseAction::CloseSession | CloseAction::Flush) => {
-                                unreachable!("AfterFlush yielded {action:?}")
-                            }
-                        }
+                    CloseAction::CloseSession => {
+                        H2WritableStateTarget::Done(MuxResult::CloseSession)
                     }
-                    CloseAction::Disconnect => {}
+                    CloseAction::Flush => H2WritableStateTarget::Flush,
+                    CloseAction::Disconnect => H2WritableStateTarget::Done(self.force_disconnect()),
                     action @ CloseAction::ReArmAndContinue => {
                         unreachable!("BeforeFlush yielded {action:?}")
                     }
                 }
-                self.force_disconnect()
             }
             (H2State::ClientPreface, Position::Client(..)) => {
                 trace!("{} Preparing preface and settings", log_context!(self));
@@ -3776,13 +3800,13 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                             log_context!(self),
                             error
                         );
-                        return self.force_disconnect();
+                        return H2WritableStateTarget::Done(self.force_disconnect());
                     }
                 };
 
                 self.state = H2State::ClientSettings;
                 self.stream_table.set_expect_write(Some(H2StreamId::Zero));
-                MuxResult::Continue
+                H2WritableStateTarget::Done(MuxResult::Continue)
             }
             (H2State::ClientSettings, Position::Client(..)) => {
                 trace!("{} Sent preface and settings", log_context!(self));
@@ -3790,7 +3814,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 self.stream_table
                     .set_expect_read(Some((H2StreamId::Zero, 9)));
                 self.readiness.interest.remove(Ready::WRITABLE);
-                MuxResult::Continue
+                H2WritableStateTarget::Done(MuxResult::Continue)
             }
             (H2State::ServerSettings, Position::Server) => {
                 // Enlarge the connection-level receive window beyond the RFC default
@@ -3814,7 +3838,7 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                 // from the peer (RFC 9113 §6.9).
                 self.expect_header();
                 // Keep WRITABLE so the queued WINDOW_UPDATE gets flushed.
-                MuxResult::Continue
+                H2WritableStateTarget::Done(MuxResult::Continue)
             }
             // Proxying states — writing application data (request/response).
             // These arms are NOT a filter on what the pass emits: a connection
@@ -3826,7 +3850,43 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
             (H2State::Header, _)
             | (H2State::Frame(_), _)
             | (H2State::ContinuationFrame(_), _)
-            | (H2State::ContinuationHeader(_), _) => self.write_streams(context, endpoint),
+            | (H2State::ContinuationHeader(_), _) => H2WritableStateTarget::WriteStreams,
+        }
+    }
+
+    /// Settle the `H2State::GoAway` arm whose [`H2WritableStateTarget::Flush`]
+    /// asked for the TLS flush step, given the answer
+    /// [`Self::tls_wants_write`] gave AFTER it.
+    ///
+    /// The second half of [`Self::dispatch_writable_state`]'s protocol, built
+    /// the way [`Self::finalize_write_after_flush`] is built and for the same
+    /// reason: `tls_wants_write` here is a DIFFERENT question from the one
+    /// that arm decided on. The first asks whether rustls holds records; this
+    /// one asks whether the flush between them landed —
+    /// `socket_write(&[])`'s `(size, status)` is discarded at the call site,
+    /// so nothing else on this path can tell. A caller that reused the first
+    /// answer here would close a TLS connection with records still pending,
+    /// and the peer would read a truncated response; that is the truncation
+    /// vector `h2_close`'s module doc names, not a style point.
+    ///
+    /// `peer_gone` is deliberately not re-read — the degenerate `false` below
+    /// is `h2_close::goaway_close_action`'s own post-flush convention — for
+    /// the same reason [`Self::finalize_write_after_flush`] does not reopen
+    /// the readiness policy: the flush cannot resurrect a departed peer, and
+    /// the decision answers from the one input it could have changed.
+    fn dispatch_writable_state_after_flush(&mut self, tls_wants_write: bool) -> MuxResult {
+        match h2_close::goaway_close_action(TlsFlushPhase::AfterFlush, false, tls_wants_write) {
+            CloseAction::ReArmAndContinue => {
+                self.ensure_tls_flushed(tls_wants_write);
+                MuxResult::Continue
+            }
+            CloseAction::Disconnect => self.force_disconnect(),
+            // Named rather than `other =>`: a wildcard arm would turn a new
+            // `CloseAction` variant into a release-mode panic in the proxy
+            // write path instead of a compile error.
+            action @ (CloseAction::CloseSession | CloseAction::Flush) => {
+                unreachable!("AfterFlush yielded {action:?}")
+            }
         }
     }
 
@@ -6785,7 +6845,8 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
     }
 }
 
-/// The socket shell of the H2 stream data path: the two byte movers.
+/// The socket shell of the H2 data path: the two byte movers and the write
+/// pass's entry point.
 ///
 /// [`ConnectionH2::readable`] and `ConnectionH2::write_streams` are the only
 /// production code on the H2 stream read and write paths that touches
@@ -6796,16 +6857,39 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
 /// crate can stand where these two functions stand once the buffers they name
 /// are reachable too.
 ///
+/// [`ConnectionH2::writable`] is the third member and the one that reaches the
+/// socket only through the three named TLS seams rather than through
+/// `self.socket` itself. It is the caller of a third poll/handle pair —
+/// `ConnectionH2::dispatch_writable_state` with
+/// `ConnectionH2::dispatch_writable_state_after_flush`, around
+/// `ConnectionH2::flush_pending_control_frames`'s own answer — and it performs
+/// every TLS seam call its own body used to make inline: the preamble flush
+/// and the two queries around it, the stalled-drain re-arm query, and the
+/// `H2State::GoAway` arm's flush and post-flush query. Two seam reads on this
+/// pass are NOT its own and are named here so the claim stays exact — the one
+/// inside `ConnectionH2::flush_zero_to_socket`, which
+/// `ConnectionH2::flush_pending_control_frames` still reaches and whose lift
+/// is a separate step, and the one inside `ConnectionH2::force_disconnect`,
+/// the third close site of `h2_close`. The pair it drives —
+/// `ConnectionH2::dispatch_writable_state` and
+/// `ConnectionH2::dispatch_writable_state_after_flush` — takes no `Front`, no
+/// `Context` and no `Endpoint`: the `(H2State, Position)` dispatch between the
+/// flushes is
+/// drivable without a socket, which is the whole claim this block is here to
+/// make countable.
+///
 /// They are lifted out of the core impls rather than merely annotated, because
 /// the remaining `Front` coupling on this path is meant to be countable by
 /// reading one region instead of grepping the file, and this is the region the
-/// socket goes on living in when `ConnectionH2` stops carrying one. Nothing
-/// moved with them: both bodies are statement-for-statement what they were, an
-/// inherent impl is order-independent, and this block therefore changes no
-/// behaviour. `ConnectionH2::write_streams` keeps the query / flush / query
-/// triple it performs around `ConnectionH2::finalize_write` — that step is a
-/// socket touch too, and it belongs on this side of the split for the same
-/// reason the vectored write does.
+/// socket goes on living in when `ConnectionH2` stops carrying one. No body
+/// changed as it moved: `readable` and `write_streams` are
+/// statement-for-statement what they were, `writable`'s statements are the
+/// ones its own arms used to run in the order they used to run in, an inherent
+/// impl is order-independent, and this block therefore changes no behaviour.
+/// `ConnectionH2::write_streams` keeps the query / flush / query triple it
+/// performs around `ConnectionH2::finalize_write` — that step is a socket
+/// touch too, and it belongs on this side of the split for the same reason the
+/// vectored write does.
 ///
 /// # Why `write_streams` stays private, and where the `unsafe` windows are
 ///
@@ -6880,6 +6964,97 @@ impl<Front: SocketHandler> ConnectionH2<Front> {
                     },
                 )
             }
+        }
+    }
+
+    /// Drive one frontend write pass.
+    ///
+    /// The core lives in `Self::flush_pending_control_frames`,
+    /// `Self::dispatch_writable_state` and
+    /// `Self::dispatch_writable_state_after_flush`; this function is the
+    /// caller that sits between them, and every TLS seam call this function's
+    /// own body used to make inline is here. It lives in the shell impl rather
+    /// than among the core impls for the reason stated there: the socket
+    /// touches sit where the socket does, and the `(H2State, Position)`
+    /// dispatch between them is drivable without one.
+    ///
+    /// The pass performs the query / flush / query triple `h2_close` names
+    /// TWICE, and the second time only for one arm:
+    ///
+    /// 1. the preamble — read `Self::tls_wants_write`, flush if it says yes.
+    ///    It pushes bytes for every state, which is why it is unconditional
+    ///    rather than owned by a close arm.
+    /// 2. a FRESH read of the same query, which is that preamble's post-flush
+    ///    answer and the pre-flush question both close arms decide on. It is
+    ///    handed to `Self::dispatch_writable_state` as an input.
+    /// 3. for `H2WritableStateTarget::Flush` alone — the `H2State::GoAway`
+    ///    arm — `Self::flush_tls_records` again, a third read, and
+    ///    `Self::dispatch_writable_state_after_flush`.
+    ///
+    /// Each read is a separate `let`, and the third shadows the second inside
+    /// the `Flush` arm only. That is the whole guard against the confusion
+    /// `h2_close::TlsFlushPhase` exists to prevent: "does rustls hold records"
+    /// and "did the kernel take them" are two questions, the second cannot be
+    /// read off the first, and a core that reused one answer for both would
+    /// close a connection with records pending.
+    ///
+    /// The tick count is load-bearing: the flush and the re-query happen
+    /// within THIS call and the pass does not return `Continue` to be called
+    /// again, which `a_flush_that_succeeds_closes_within_one_writable_call`
+    /// pins. See `h2_close`'s module doc for why.
+    pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
+    where
+        E: Endpoint,
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        // Entry point: adopt the mux's snapshot for this pass.
+        self.now = context.now;
+        self.prune_inactive_streams_while_closing(context);
+
+        match self.flush_pending_control_frames() {
+            H2ControlFlushTarget::Done(result) => return result,
+            // The stalled-drain tail the three stages used to run inline. The
+            // query belongs here and not there: `flush_zero_to_socket` is what
+            // changed the answer, so it has to be read after the stall, and
+            // this is the layer that owns the socket.
+            H2ControlFlushTarget::Stalled => {
+                let tls_wants_write = self.tls_wants_write();
+                self.ensure_tls_flushed(tls_wants_write);
+                return MuxResult::Continue;
+            }
+            H2ControlFlushTarget::Proceed => {}
+        }
+
+        // Flush any pending TLS records before state-specific processing.
+        // This ensures response DATA frames that were accepted by rustls
+        // (via socket_write_vectored in write_streams) are pushed to the
+        // TCP socket even when the connection is in GoAway or Error state.
+        // Without this, the state-specific handlers may call force_disconnect()
+        // before the response data reaches the kernel's TCP send buffer.
+        if self.tls_wants_write() {
+            self.flush_tls_records();
+        }
+
+        // A fresh query, not the binding above: this one asks whether the
+        // flush between them landed. It is read here rather than inside the
+        // two close arms that consult it because those arms no longer touch
+        // the socket, and it is read ONCE because only one of them can run.
+        let tls_wants_write = self.tls_wants_write();
+        match self.dispatch_writable_state(tls_wants_write) {
+            H2WritableStateTarget::Done(result) => result,
+            // The `H2State::GoAway` arm's own flush, the second this pass
+            // attempts, and the only *action* the close decision cannot take
+            // for itself.
+            H2WritableStateTarget::Flush => {
+                self.flush_tls_records();
+                // Again a fresh query, and again a different question from
+                // the one that produced `Flush`: `flush_tls_records`'s
+                // `(size, status)` is discarded, so this read is the only way
+                // the pass learns whether the records reached the kernel.
+                let tls_wants_write = self.tls_wants_write();
+                self.dispatch_writable_state_after_flush(tls_wants_write)
+            }
+            H2WritableStateTarget::WriteStreams => self.write_streams(context, endpoint),
         }
     }
 
@@ -8213,7 +8388,8 @@ mod tests {
     ///
     /// TO SEE THIS RED: delete the `self.ensure_tls_flushed(tls_wants_write);`
     /// call in the `CloseAction::ReArmAndContinue` arm of
-    /// `ConnectionH2::writable`'s `H2State::GoAway` branch. The WRITABLE
+    /// `ConnectionH2::dispatch_writable_state_after_flush`, which is where
+    /// `ConnectionH2::writable`'s `H2State::GoAway` branch settles. The WRITABLE
     /// *event* bit is then never re-signalled and this test fails on its OWN
     /// assertion, `the WRITABLE event must be re-signalled so the event loop
     /// retries the flush`. The recipe deliberately does not swap
@@ -8282,12 +8458,13 @@ mod tests {
     /// but would double the latency of every close under backpressure and
     /// would strand the connection against a peer that never re-arms.
     ///
-    /// TO SEE THIS RED: in the `H2State::GoAway` arm, add
+    /// TO SEE THIS RED: in `ConnectionH2::writable`, add
     /// `return MuxResult::Continue;` immediately after the
-    /// `self.flush_tls_records();` inside the `CloseAction::Flush` body —
-    /// the deferred shape, which still performs the flush. The first call then
+    /// `self.flush_tls_records();` inside the `H2WritableStateTarget::Flush`
+    /// arm — the flush the `H2State::GoAway` branch asks for, performed and
+    /// then deferred on. The first call then
     /// returns `Continue` and the final assertion fails with `a drained flush
-    /// must reach the disconnect in the SAME writable call`. Measured: `1113
+    /// must reach the disconnect in the SAME writable call`. Measured: `1115
     /// passed; 2 failed`, the sibling being
     /// `a_flush_that_does_not_drain_keeps_the_connection_open`, which never
     /// reaches its own post-flush answer under the deferral either. Dropping
@@ -8618,14 +8795,18 @@ mod tests {
     //
     //   - `finalize_write`, the BeforeFlush/AfterFlush pair — covered by
     //     `a_finalized_write_pass_flushes_once_and_re_arms_while_records_survive`.
-    //   - `writable`'s `H2State::GoAway` arm — covered by
+    //   - the `H2State::GoAway` arm of `dispatch_writable_state`, whose flush
+    //     `writable` performs for it — covered by
     //     `a_flush_that_does_not_drain_keeps_the_connection_open` and
     //     `a_flush_that_succeeds_closes_within_one_writable_call`.
-    //   - `writable`'s preamble paired with the `H2State::Error` arm's
-    //     `error_close_action` query. Only the preamble half is covered (the
-    //     two GoAway tests assert its flush); the second query is read solely
-    //     in the `(H2State::Error, Position::Server)` arm, which no fixture
-    //     enters. **Uncovered.**
+    //   - `writable`'s preamble paired with the `error_close_action` query of
+    //     `dispatch_writable_state`'s `(H2State::Error, Position::Server)`
+    //     arm. The preamble half is asserted by the two GoAway tests above,
+    //     and #1454's
+    //     `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain`
+    //     drives the second query over the production handler — this line
+    //     said **Uncovered** until that test existed, and it was already
+    //     wrong before this changeset renamed what it points at.
     //
     // The fourth, in `flush_zero_buffer`, is NOT a triple: it keeps the
     // `status` the flush returned instead of re-querying. Also uncovered.
@@ -13414,17 +13595,19 @@ mod tests {
         );
     }
 
-    /// `writable`'s `(H2State::Error, Position::Server)` arm reads the real
-    /// handler's POST-flush answer: it re-arms while rustls still holds
-    /// records and closes only once they are gone.
+    /// The `(H2State::Error, Position::Server)` arm of
+    /// `ConnectionH2::dispatch_writable_state` reads the real handler's
+    /// POST-flush answer: it re-arms while rustls still holds records and
+    /// closes only once they are gone.
     ///
-    /// That arm has no flush of its own — the preamble a few lines above it
+    /// That arm has no flush of its own — `ConnectionH2::writable`'s preamble
     /// already issued this pass's `socket_write(&[])` and discarded both the
-    /// size and the status it returned, so `socket_wants_write()` is the only
-    /// thing that can tell this site whether the flush landed. Until now the
-    /// arm was exercised only as `h2_close::error_close_action`'s pure table;
-    /// no test reached it through a connection whose handler could answer
-    /// `true`, because none existed.
+    /// size and the status it returned, and the `tls_wants_write` the arm is
+    /// handed is the read after it, so that query is the only thing that can
+    /// tell this site whether the flush landed. Until now the arm was
+    /// exercised only as `h2_close::error_close_action`'s pure table; no test
+    /// reached it through a connection whose handler could answer `true`,
+    /// because none existed.
     ///
     /// TO SEE THIS RED: in that arm, replace
     /// `h2_close::error_close_action(tls_wants_write)` with
@@ -13433,7 +13616,7 @@ mod tests {
     /// peer never received. Measured, this test fails on `a pass that finds
     /// records still pending after its own flush must not close the session:
     /// the close destroys plaintext the peer has not received and it reads the
-    /// response as truncated`. Measured: `1114 passed; 1 failed` — it is the
+    /// response as truncated`. Measured: `1116 passed; 1 failed` — it is the
     /// only test in the crate that moves.
     #[test]
     fn a_rustls_frontend_in_error_state_re_arms_until_its_records_drain() {
@@ -13492,14 +13675,16 @@ mod tests {
         );
     }
 
-    /// `writable`'s `H2State::GoAway` arm — the triple whose own comment calls
-    /// it the primary truncation vector under HAProxy chaining — over the
-    /// production TLS handler: it re-arms while rustls still holds records and
-    /// disconnects only once they are gone.
+    /// The `H2State::GoAway` arm of `ConnectionH2::dispatch_writable_state`
+    /// and the `ConnectionH2::dispatch_writable_state_after_flush` that
+    /// settles it — the triple whose own comment calls it the primary
+    /// truncation vector under HAProxy chaining — over the production TLS
+    /// handler: it re-arms while rustls still holds records and disconnects
+    /// only once they are gone.
     ///
     /// This is the triple #1454 names. Of the three, `finalize_write`'s is
     /// driven by `a_blocked_rustls_frontend_delivers_every_queued_byte_across_passes`
-    /// above and `writable`'s Error arm by
+    /// above and the Error arm by
     /// `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain`; this
     /// one completes the set. The fourth `socket_write(&[])` site,
     /// `flush_zero_buffer`, is deliberately not targeted here: it keeps the
@@ -13512,12 +13697,13 @@ mod tests {
     /// re-arm from a fall-through that only looks correct. `H2State::Error` is
     /// what the fall-through leaves behind, and nothing else sets it here.
     ///
-    /// TO SEE THIS RED: in that arm, replace the post-flush
-    /// `h2_close::goaway_close_action(TlsFlushPhase::AfterFlush, false,
-    /// tls_wants_write)` third argument with `false`. The arm
-    /// stops reading whether its own flush landed, falls through to
+    /// TO SEE THIS RED: in `ConnectionH2::dispatch_writable_state_after_flush`,
+    /// replace the `h2_close::goaway_close_action(TlsFlushPhase::AfterFlush,
+    /// false, tls_wants_write)` third argument with `false`. The arm
+    /// stops reading whether the flush `ConnectionH2::writable` performed for
+    /// it landed, falls through to
     /// `force_disconnect`, and this test fails on `a GoAway pass whose flush
-    /// did not land must stay in GoAway`. Measured: `1113 passed; 2 failed` —
+    /// did not land must stay in GoAway`. Measured: `1115 passed; 2 failed` —
     /// this test and `a_flush_that_does_not_drain_keeps_the_connection_open`,
     /// the same arm with one witness over a modelled handler and one over the
     /// production one.
