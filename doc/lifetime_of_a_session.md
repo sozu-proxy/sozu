@@ -336,7 +336,8 @@ now documents only the H1 vocabulary that module still provides
 The H2 multiplexer is the largest single piece of Sōzu and lives under
 `lib/src/protocol/mux/`. The high-level data model:
 
-- A single `ConnectionH2<Front>` per TCP connection
+- A single `ConnectionH2` per TCP connection, wrapped in an
+  `H2Shell<Front>` that holds the socket
   (`lib/src/protocol/mux/h2.rs`) owns the wire state: HPACK encoder
   and decoder, connection-level flow window, GOAWAY state, and the
   per-connection `H2FloodDetector`.

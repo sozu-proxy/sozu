@@ -2,7 +2,7 @@
 //!
 //! [`Connection`] is the H1/H2 dispatch enum used everywhere in the mux
 //! layer. Most of the methods are trivial pass-through forwarders to the
-//! underlying [`ConnectionH1`] or [`ConnectionH2`] implementation — the
+//! underlying [`ConnectionH1`] or [`h2::ConnectionH2`] implementation — the
 //! local `forward!` macro removes the boilerplate.
 //!
 //! The two `Endpoint` adaptors (`EndpointServer`, `EndpointClient`) are
@@ -27,9 +27,8 @@ use rusty_ulid::Ulid;
 use sozu_command::{logging::ansi_palette, ready::Ready};
 
 use super::{
-    BackendStatus, ConnectionH1, ConnectionH2, Context, Endpoint, GlobalStreamId, MuxResult,
-    Position, Router,
-    h2::{self, H2StreamId},
+    BackendStatus, ConnectionH1, Context, Endpoint, GlobalStreamId, MuxResult, Position, Router,
+    h2::{self, H2Shell, H2StreamId},
     h2_flood_detector,
 };
 use crate::metrics::names;
@@ -56,7 +55,7 @@ macro_rules! log_module_context {
 #[allow(clippy::large_enum_variant)]
 pub enum Connection<Front: SocketHandler> {
     H1(ConnectionH1<Front>),
-    H2(ConnectionH2<Front>),
+    H2(H2Shell<Front>),
 }
 
 // Dispatches a method call or field access to the inner H1/H2 connection.
@@ -69,16 +68,21 @@ macro_rules! forward {
             Connection::H2(c) => c.$method($($args)*),
         }
     };
+    // The H2 arm reaches one level further in. `Connection::H2` holds an
+    // `H2Shell`, whose state machine is `H2Shell::core`; `ConnectionH1` still
+    // carries its own fields directly. The asymmetry is the split, not an
+    // oversight, and it is confined to these two arms — every METHOD forwarded
+    // above is one `H2Shell` answers itself.
     (&$self:expr, $field:ident) => {
         match $self {
             Connection::H1(c) => &c.$field,
-            Connection::H2(c) => &c.$field,
+            Connection::H2(c) => &c.core.$field,
         }
     };
     (&mut $self:expr, $field:ident) => {
         match $self {
             Connection::H1(c) => &mut c.$field,
-            Connection::H2(c) => &mut c.$field,
+            Connection::H2(c) => &mut c.core.$field,
         }
     };
 }
@@ -146,7 +150,7 @@ impl<Front: SocketHandler> Connection<Front> {
         stream_idle_timeout: std::time::Duration,
         graceful_shutdown_deadline: Option<std::time::Duration>,
     ) -> Option<Connection<Front>> {
-        Some(Connection::H2(ConnectionH2::new(
+        Some(Connection::H2(H2Shell::new(
             session_ulid,
             front_stream,
             Position::Server,
@@ -185,7 +189,7 @@ impl<Front: SocketHandler> Connection<Front> {
         {
             return None;
         }
-        Some(Connection::H2(ConnectionH2::new(
+        Some(Connection::H2(H2Shell::new(
             session_ulid,
             front_stream,
             Position::Client(
@@ -239,7 +243,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub fn poll_timeout(&self) -> Option<Instant> {
         match self {
             Connection::H1(c) => c.poll_timeout(),
-            Connection::H2(c) => c.poll_timeout(),
+            Connection::H2(c) => c.core.poll_timeout(),
         }
     }
 
@@ -249,7 +253,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub fn timeout_duration(&self) -> Duration {
         match self {
             Connection::H1(c) => c.timeout_duration,
-            Connection::H2(c) => c.timeout_duration,
+            Connection::H2(c) => c.core.timeout_duration,
         }
     }
 
@@ -262,8 +266,8 @@ impl<Front: SocketHandler> Connection<Front> {
             // which the adapter has not necessarily mirrored yet at the sites
             // that call this; re-arm against the caller's `now` instead.
             Connection::H2(c) => {
-                let duration = c.timeout_duration;
-                c.set_timeout_duration(duration, now)
+                let duration = c.core.timeout_duration;
+                c.core.set_timeout_duration(duration, now)
             }
         }
     }
@@ -272,7 +276,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub fn clear_timeout(&mut self) {
         match self {
             Connection::H1(c) => c.clear_timeout(),
-            Connection::H2(c) => c.clear_timeout(),
+            Connection::H2(c) => c.core.clear_timeout(),
         }
     }
 
@@ -281,7 +285,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub fn set_timeout_duration(&mut self, duration: Duration, now: Instant) {
         match self {
             Connection::H1(c) => c.set_timeout_duration(duration, now),
-            Connection::H2(c) => c.set_timeout_duration(duration, now),
+            Connection::H2(c) => c.core.set_timeout_duration(duration, now),
         }
     }
 
@@ -289,7 +293,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub fn overhead_bytes(&self) -> (usize, usize) {
         match self {
             Connection::H1(_) => (0, 0),
-            Connection::H2(c) => (c.bytes.overhead_bin, c.bytes.overhead_bout),
+            Connection::H2(c) => (c.core.bytes.overhead_bin, c.core.bytes.overhead_bout),
         }
     }
 
@@ -382,7 +386,7 @@ impl<Front: SocketHandler> Connection<Front> {
                     false
                 }
             }
-            Connection::H2(c) => c.try_resume_reading(context),
+            Connection::H2(c) => c.core.try_resume_reading(context),
         }
     }
 
@@ -398,7 +402,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub(super) fn is_draining(&self) -> bool {
         match self {
             Connection::H1(_) => false,
-            Connection::H2(c) => c.drain.draining(),
+            Connection::H2(c) => c.core.drain.draining(),
         }
     }
 
@@ -410,7 +414,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub(super) fn graceful_shutdown_deadline_elapsed(&self) -> bool {
         match self {
             Connection::H1(_) => false,
-            Connection::H2(c) => c.graceful_shutdown_deadline_elapsed(),
+            Connection::H2(c) => c.core.graceful_shutdown_deadline_elapsed(),
         }
     }
 

@@ -421,9 +421,9 @@ impl Router {
                         let Connection::H2(h2c) = backend else {
                             continue;
                         };
-                        let stream_count = h2c.stream_count();
+                        let stream_count = h2c.core.stream_count();
                         if stream_count
-                            >= h2c.peer_settings.settings_max_concurrent_streams as usize
+                            >= h2c.core.peer_settings.settings_max_concurrent_streams as usize
                         {
                             continue;
                         }

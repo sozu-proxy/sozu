@@ -11,32 +11,40 @@
 //! sans-io core"). This is step C4 of the `poll_timeout` series
 //! ([#1359](https://github.com/sozu-proxy/sozu/issues/1359)).
 //!
-//! # How the core is driven, and why through a socket
+//! # How the core is driven
 //!
-//! The byte-in / byte-out split is half-landed: [`ConnectionH2`] already has
-//! `poll_read_target` / `handle_read` and the `h2_transmit::gather` /
-//! `h2_transmit::confirm` write pair, and those four poll/handle entry points
-//! are now `pub` and re-exported with `H2ReadTarget`, `H2ReadOutcome`,
-//! `H2WriteTarget` and `H2WritePass`. Driving them from HERE is still not
-//! possible, for two remaining reasons: the buffers they name are reached
-//! through the private `read_space` / `write_buffer` over the private
-//! `ConnectionH2::zero`, and `H2WritePass` has no reachable constructor. The
-//! `h2_transmit` pair is no longer one of them — `gather` is exported as a
-//! `pub unsafe fn`, carrying in its signature the lifetime obligation that a
-//! safe `pub` would have hidden, and `confirm` as a plain `pub fn`. And
-//! `ConnectionH2` is still generic over `Front: SocketHandler` with a `socket`
-//! field. So this harness takes the option this issue's Q10 discussion called
-//! **(a)**: it supplies its OWN in-memory [`SocketHandler`] ([`SimSocket`]) and
-//! drives the public `ConnectionH2::readable` / `ConnectionH2::writable` entry
-//! points. Nothing here reaches into the core — every assertion is on bytes the
-//! core emitted, on `Connection::poll_timeout`, or on `ConnectionH2::stream_count`.
+//! Byte-in / byte-out, with no socket anywhere in this file. [`ConnectionH2`]
+//! is not generic and holds no `Front`: the harness builds one directly, hands
+//! it `&[u8]` through `ConnectionH2::read_space` and collects `Vec<u8>` from
+//! `ConnectionH2::write_buffer` and `ConnectionH2::zero_pending`, and drives
+//! the same `pub` poll/handle pairs `H2Shell` drives — `poll_read_target` /
+//! `handle_read`, `poll_write_target` / `handle_write`,
+//! `flush_pending_control_frames` / `handle_control_flush`,
+//! `dispatch_writable_state` / `dispatch_writable_state_after_flush`,
+//! `finalize_write` / `finalize_write_after_flush`, and the
+//! `h2_transmit::gather` / `h2_transmit::confirm` bracket around its own
+//! vectored write.
 //!
-//! When the remaining `Front` touch points go and those two reachability gaps
-//! close, this harness **simplifies rather than breaks**: [`SimSocket`] and the
-//! `mio` dev-dependency it exists to satisfy both disappear, the scenario grammar
-//! and every assertion below stay exactly as they are, and only [`H2Harness::pump`]
-//! is rewritten. That is the same "swap the driver, keep the scenarios" promise
-//! `doc/testing.md` makes for each sub-machine extraction.
+//! That is what makes this harness the measurement rather than a test of one:
+//! `H2Shell` is the in-tree driver over a `SocketHandler`, this is an
+//! out-of-crate driver over two `VecDeque`/`Vec` byte queues, and they stand
+//! in the same places. [`H2Harness::read_pass`], [`H2Harness::write_pass`] and
+//! [`H2Harness::write_streams`] are deliberately shaped like their namesakes
+//! so the two can be read against each other.
+//!
+//! The previous revision of this file took the option Q10's discussion called
+//! **(a)**: it supplied its own in-memory `SocketHandler` with a connected
+//! loopback `mio::net::TcpStream` it never read or wrote, because
+//! `SocketHandler::socket_ref`/`socket_mut` return that concrete OS type and
+//! no in-memory transport can synthesise one. That placeholder, the peer that
+//! kept it connected, and the `mio` dev-dependency they forced are all gone;
+//! the scenario grammar and every assertion below are unchanged, and only the
+//! driver was rewritten. That is the "swap the driver, keep the scenarios"
+//! promise `doc/testing.md` makes for each sub-machine extraction, collected.
+//!
+//! Nothing here reaches into the core's private state — every assertion is on
+//! bytes the core emitted, on `ConnectionH2::poll_timeout`, or on
+//! `ConnectionH2::stream_count`.
 //!
 //! `lib/` stays async-free — this crate is the only async home for the
 //! simulation (moonpool/tokio are dev-dependencies, gated on `tokio_unstable`).
@@ -225,7 +233,7 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, VecDeque},
-    net::{SocketAddr, TcpListener as StdTcpListener},
+    net::SocketAddr,
     rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -245,12 +253,14 @@ use sozu_lib::{
     protocol::{
         http::{answers::HttpAnswers, parser::Method},
         mux::{
-            Connection, ConnectionH2, Context, Endpoint, H2ConnectionConfig, H2FloodConfig,
-            MuxResult, StreamState,
+            CLIENT_PREFACE_SIZE, ConnectionH2, Context, Endpoint, H2ConnectionConfig,
+            H2ControlFlushTarget, H2FinalizeTarget, H2FloodConfig, H2ReadOutcome, H2ReadTarget,
+            H2StreamId, H2WritableStateTarget, H2WritePass, H2WriteTarget, MuxResult, Position,
+            StreamState, h2_transmit,
         },
     },
     router::RouteResult,
-    socket::{SocketHandler, SocketResult, TransportProtocol},
+    socket::SocketResult,
     testing::Token,
 };
 
@@ -478,147 +488,81 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 // --------------------------------------------------------------------------
-// The in-memory socket. Q10 option (a): the core keeps its `Front` type
-// parameter, so the harness supplies the byte boundary itself.
+// The wire. Q10 landed on byte-in / byte-out, so there is no socket here at
+// all — the harness owns two byte queues and hands the core slices.
 // --------------------------------------------------------------------------
 
-/// A `SocketHandler` whose two directions are plain in-memory queues.
+/// Move queued peer bytes into the core's read landing zone.
 ///
-/// The `placeholder` field is dead weight the trait still demands:
-/// `SocketHandler::socket_ref`/`socket_mut` return `&mio::net::TcpStream`, a
-/// concrete OS type no in-memory transport can synthesise. It is a connected
-/// loopback stream that is never read, never written and never registered —
-/// exactly what `mux/mod.rs`'s own `test_support::connected_socket` keeps for
-/// the same reason. `peer_addr` deliberately answers a FIXED address rather
-/// than the placeholder's OS-assigned one, so no ephemeral port can reach the
-/// trace. Both disappear when `Front` does.
-struct SimSocket {
-    inbound: VecDeque<u8>,
-    outbound: Vec<u8>,
-    /// Peer sent its last byte; further reads report `Closed`, not `WouldBlock`.
+/// The whole of what used to be `SocketHandler::socket_read`. It is a free
+/// function rather than a method so the caller can hold `&mut` borrows of the
+/// connection and of the queue at the same time — the landing zone is a
+/// borrow OF the connection, which is exactly the shape
+/// `ConnectionH2::read_space` exists to allow.
+///
+/// `chunk` is the adversarial read-fragmentation axis: at most that many bytes
+/// per call, so frame headers straddle reads.
+fn wire_read(
+    inbound: &mut VecDeque<u8>,
     peer_shutdown: bool,
-    /// Adversarial read fragmentation: at most this many bytes per
-    /// `socket_read`, redrawn per pump so frame headers straddle reads.
-    read_chunk: usize,
-    /// Adversarial partial writes: at most this many bytes per `socket_write`,
-    /// after which the socket reports `WouldBlock`.
-    write_chunk: usize,
-    placeholder: mio::net::TcpStream,
-}
-
-/// The accepted peer of every [`SimSocket`] placeholder. Held for the harness's
-/// lifetime so the loopback stream stays connected, and never otherwise used —
-/// dropping it would close the peer end under a socket the core may still ask
-/// for a reference to.
-struct PlaceholderPeer {
-    _keepalive: std::net::TcpStream,
-}
-
-impl SimSocket {
-    fn new() -> (Self, PlaceholderPeer) {
-        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind placeholder listener");
-        let address = listener.local_addr().expect("placeholder local addr");
-        let placeholder = mio::net::TcpStream::connect(address).expect("connect placeholder");
-        let (peer, _) = listener.accept().expect("accept placeholder peer");
-        peer.set_nonblocking(true).expect("placeholder nonblocking");
-        (
-            SimSocket {
-                inbound: VecDeque::new(),
-                outbound: Vec::new(),
-                peer_shutdown: false,
-                read_chunk: usize::MAX,
-                write_chunk: usize::MAX,
-                placeholder,
-            },
-            PlaceholderPeer { _keepalive: peer },
-        )
+    chunk: usize,
+    buf: &mut [u8],
+) -> (usize, SocketResult) {
+    let want = buf.len().min(chunk);
+    let mut written = 0usize;
+    while written < want {
+        let Some(byte) = inbound.pop_front() else {
+            break;
+        };
+        buf[written] = byte;
+        written += 1;
+    }
+    if written > 0 {
+        return (written, SocketResult::Continue);
+    }
+    if peer_shutdown && inbound.is_empty() {
+        (0, SocketResult::Closed)
+    } else {
+        (0, SocketResult::WouldBlock)
     }
 }
 
-impl std::fmt::Debug for SimSocket {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Deliberately prints neither address nor buffer contents: this type's
-        // `Debug` reaches the core's own `Debug` impl and from there its log
-        // lines, and an ephemeral port there would be a nondeterminism leak.
-        f.debug_struct("SimSocket")
-            .field("inbound", &self.inbound.len())
-            .field("outbound", &self.outbound.len())
-            .field("peer_shutdown", &self.peer_shutdown)
-            .finish()
+/// Accept core bytes onto the wire. What `SocketHandler::socket_write` was.
+///
+/// `chunk` is the adversarial partial-write axis: at most that many bytes per
+/// call, after which the wire reports `WouldBlock`.
+fn wire_write(outbound: &mut Vec<u8>, chunk: usize, buf: &[u8]) -> (usize, SocketResult) {
+    let take = buf.len().min(chunk);
+    outbound.extend_from_slice(&buf[..take]);
+    if take == buf.len() {
+        (take, SocketResult::Continue)
+    } else {
+        (take, SocketResult::WouldBlock)
     }
 }
 
-impl SocketHandler for SimSocket {
-    fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
-        let want = buf.len().min(self.read_chunk);
-        let mut written = 0usize;
-        while written < want {
-            let Some(byte) = self.inbound.pop_front() else {
-                break;
-            };
-            buf[written] = byte;
-            written += 1;
+/// The vectored form. What `SocketHandler::socket_write_vectored` was, and the
+/// one the stream write path uses.
+fn wire_write_vectored(
+    outbound: &mut Vec<u8>,
+    chunk: usize,
+    slices: &[std::io::IoSlice],
+) -> (usize, SocketResult) {
+    let mut budget = chunk;
+    let mut written = 0usize;
+    for slice in slices {
+        if budget == 0 {
+            return (written, SocketResult::WouldBlock);
         }
-        if written > 0 {
-            return (written, SocketResult::Continue);
-        }
-        if self.peer_shutdown && self.inbound.is_empty() {
-            (0, SocketResult::Closed)
-        } else {
-            (0, SocketResult::WouldBlock)
-        }
-    }
-
-    fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
-        let take = buf.len().min(self.write_chunk);
-        self.outbound.extend_from_slice(&buf[..take]);
-        if take == buf.len() {
-            (take, SocketResult::Continue)
-        } else {
-            (take, SocketResult::WouldBlock)
+        let take = slice.len().min(budget);
+        outbound.extend_from_slice(&slice[..take]);
+        written += take;
+        budget -= take;
+        if take < slice.len() {
+            return (written, SocketResult::WouldBlock);
         }
     }
-
-    fn socket_write_vectored(&mut self, slices: &[std::io::IoSlice]) -> (usize, SocketResult) {
-        let mut budget = self.write_chunk;
-        let mut written = 0usize;
-        for slice in slices {
-            if budget == 0 {
-                return (written, SocketResult::WouldBlock);
-            }
-            let take = slice.len().min(budget);
-            self.outbound.extend_from_slice(&slice[..take]);
-            written += take;
-            budget -= take;
-            if take < slice.len() {
-                return (written, SocketResult::WouldBlock);
-            }
-        }
-        (written, SocketResult::Continue)
-    }
-
-    fn socket_close(&mut self) {}
-
-    fn socket_ref(&self) -> &mio::net::TcpStream {
-        &self.placeholder
-    }
-
-    fn socket_mut(&mut self) -> &mut mio::net::TcpStream {
-        &mut self.placeholder
-    }
-
-    fn peer_addr(&self) -> Option<SocketAddr> {
-        // Fixed, never the placeholder's OS-assigned port — see the type doc.
-        Some(SIM_PEER_ADDRESS.parse().expect("fixed peer address parses"))
-    }
-
-    fn protocol(&self) -> TransportProtocol {
-        TransportProtocol::Tcp
-    }
-
-    fn read_error(&self) {}
-
-    fn write_error(&self) {}
+    (written, SocketResult::Continue)
 }
 
 const SIM_PEER_ADDRESS: &str = "10.0.0.1:44444";
@@ -769,7 +713,19 @@ impl Endpoint for SimEndpoint<'_> {
 const MAX_PUMP_ITERATIONS: usize = 200_000;
 
 struct H2Harness {
-    connection: Connection<SimSocket>,
+    connection: ConnectionH2,
+    /// Bytes the peer has written and the core has not read yet.
+    inbound: VecDeque<u8>,
+    /// Bytes the core has written and [`H2Harness::harvest`] has not taken yet.
+    outbound: Vec<u8>,
+    /// Peer sent its last byte; further reads report `Closed`, not `WouldBlock`.
+    peer_shutdown: bool,
+    /// Adversarial read fragmentation: at most this many bytes per read pass,
+    /// redrawn per pump so frame headers straddle reads.
+    read_chunk: usize,
+    /// Adversarial partial writes: at most this many bytes per write, after
+    /// which the wire reports `WouldBlock`.
+    write_chunk: usize,
     context: Context<SimListener>,
     endpoint: SimEndpointState,
     /// Deadline published at construction, before any pass. Every deadline in
@@ -810,7 +766,6 @@ struct H2Harness {
     /// to be a plausible present-day value rather than 0.
     wall_base_ms: u64,
     _pool: Rc<RefCell<Pool>>,
-    _placeholder_peer: PlaceholderPeer,
 }
 
 /// See [`H2Harness::wall_base_ms`].
@@ -885,7 +840,6 @@ impl H2Harness {
             pool_maximum,
             H2_MIN_BUFFER_SIZE,
         )));
-        let (socket, placeholder_peer) = SimSocket::new();
         let listener = Rc::new(RefCell::new(SimListener::new(connection_config)));
         let mut context = Context::new(
             // `Ulid: From<u128>` in argument position — never `Ulid::generate()`,
@@ -901,21 +855,28 @@ impl H2Harness {
         // `pump`; these are the pre-first-pass values.
         context.request_id_rng = StdRng::seed_from_u64(request_id_seed);
         context.now_wall_ms = SIM_WALL_BASE_MS;
-        let connection = Connection::new_h2_server(
+        // The core, built directly. No socket, no `SocketHandler`, no
+        // `Connection` wrapper: `ConnectionH2` is not generic any more, and
+        // the peer address it used to take one `peer_addr()` call to learn is
+        // now a plain argument — a fixed one here, so no ephemeral port can
+        // reach a trace.
+        let mut connection = ConnectionH2::new(
             0u128.into(),
-            socket,
+            Some(SIM_PEER_ADDRESS.parse().expect("fixed peer address parses")),
+            Position::Server,
             // The same source the session's streams draw from, so a pool
             // ceiling bounds the connection and its streams together — which
             // is what makes exhaustion reachable by sizing one number.
             &mut *context.buffers,
-            timeouts.connection,
             H2FloodConfig::default(),
             connection_config,
             timeouts.stream_idle,
             None,
+            timeouts.connection,
+            Some((H2StreamId::Zero, CLIENT_PREFACE_SIZE)),
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
         )
         .expect("the buffer pool must yield the H2 connection buffer");
-        let mut connection = connection;
         connection.set_timeout_duration(timeouts.connection, clock_base);
         let deadline_base = connection.poll_timeout();
         debug_assert_eq!(
@@ -936,26 +897,272 @@ impl H2Harness {
             request_ids_seen: BTreeSet::new(),
             wall_base_ms: SIM_WALL_BASE_MS,
             _pool: pool,
-            _placeholder_peer: placeholder_peer,
+            inbound: VecDeque::new(),
+            outbound: Vec::new(),
+            peer_shutdown: false,
+            read_chunk: usize::MAX,
+            write_chunk: usize::MAX,
         }
     }
 
-    fn h2(&mut self) -> &mut ConnectionH2<SimSocket> {
-        match &mut self.connection {
-            Connection::H2(h2) => h2,
-            Connection::H1(_) => unreachable!("new_h2_server built an H2 connection"),
+    fn h2(&mut self) -> &mut ConnectionH2 {
+        &mut self.connection
+    }
+
+    /// The TLS query the shell would read from its socket.
+    ///
+    /// Always `false`: this wire is plain bytes with no TLS layer above it,
+    /// which is the same answer `SocketHandler`'s own default gives for every
+    /// non-`FrontRustls` handler — including the `mio::net::TcpStream` every
+    /// backend H2 connection uses. It is spelled as a function rather than
+    /// inlined so the driver below keeps the SHAPE of `H2Shell`'s passes: the
+    /// query is read where the shell reads it, and a reader can check the two
+    /// against each other.
+    fn tls_wants_write(&self) -> bool {
+        false
+    }
+
+    // ----------------------------------------------------------------------
+    // The driver. What `H2Shell` does over a `SocketHandler`, done here over
+    // two byte queues — the measurable point of the byte-in / byte-out split.
+    // Each function below stands where the shell's namesake stands and calls
+    // the same `pub` poll/handle pairs in the same order.
+    // ----------------------------------------------------------------------
+
+    /// Settle a parked [`H2ForceDisconnectTarget`], as `H2Shell` does.
+    ///
+    /// The core raises a force-disconnect at sites that hold no socket and
+    /// answers provisionally; whoever drives it owes it the `tls_wants_write`
+    /// answer before the result leaves the driver. Every `MuxResult` this
+    /// harness produces passes through here, which is the same discipline the
+    /// shell keeps and the reason a missed settlement is greppable rather than
+    /// asserted.
+    fn settled(&mut self, result: MuxResult) -> MuxResult {
+        let Some(target) = self.connection.poll_force_disconnect() else {
+            return result;
+        };
+        let tls_wants_write = self.tls_wants_write();
+        self.connection
+            .force_disconnect_after_query(target, tls_wants_write)
+    }
+
+    /// [`Self::settled`] where the step's own answer is not a `MuxResult`.
+    fn settle(&mut self) {
+        let _ = self.settled(MuxResult::Continue);
+    }
+
+    /// One frontend read pass. Mirrors `H2Shell::readable`.
+    fn read_pass(&mut self) -> MuxResult {
+        let result = {
+            let Self {
+                connection,
+                context,
+                endpoint,
+                inbound,
+                peer_shutdown,
+                read_chunk,
+                ..
+            } = self;
+            let mut endpoint = SimEndpoint(endpoint);
+            match connection.poll_read_target(context, &mut endpoint) {
+                H2ReadTarget::Done(result) => result,
+                H2ReadTarget::Skip(stream_id) => {
+                    connection.handle_read(context, endpoint, stream_id, H2ReadOutcome::Skipped)
+                }
+                H2ReadTarget::Fill { stream_id, amount } => {
+                    let space = connection.read_space(context, stream_id, amount);
+                    let (size, status) = wire_read(inbound, *peer_shutdown, *read_chunk, space);
+                    connection.handle_read(
+                        context,
+                        endpoint,
+                        stream_id,
+                        H2ReadOutcome::Filled {
+                            amount,
+                            size,
+                            status,
+                        },
+                    )
+                }
+            }
+        };
+        self.settled(result)
+    }
+
+    /// Drive the control-frame walk to a terminal answer, performing each
+    /// zero-buffer flush it asks for. Mirrors `H2Shell::drive_control_flush`.
+    ///
+    /// Returns `None` when the walk said `Proceed`, `Some(result)` when it
+    /// ended the pass by itself or stalled.
+    fn drive_control_flush(&mut self) -> Option<MuxResult> {
+        let mut target = self.connection.flush_pending_control_frames();
+        loop {
+            match target {
+                H2ControlFlushTarget::FlushZero(stage) => {
+                    let stalled = self.flush_zero_to_wire();
+                    target = self.connection.handle_control_flush(stage, stalled);
+                }
+                H2ControlFlushTarget::Proceed => return None,
+                H2ControlFlushTarget::Done(result) => return Some(result),
+                H2ControlFlushTarget::Stalled => {
+                    // The stalled write is what changed the answer, so the
+                    // query is read after it — here, where the wire is.
+                    let tls_wants_write = self.tls_wants_write();
+                    self.connection.ensure_tls_flushed(tls_wants_write);
+                    return Some(MuxResult::Continue);
+                }
+            }
         }
     }
 
-    fn socket_mut(&mut self) -> &mut SimSocket {
-        &mut self.h2().socket
+    /// Move the core's queued control bytes onto the wire.
+    /// Mirrors `H2Shell::flush_zero_to_socket`.
+    fn flush_zero_to_wire(&mut self) -> bool {
+        while !self.connection.zero_pending().is_empty() {
+            let (size, status) = {
+                let Self {
+                    connection,
+                    outbound,
+                    write_chunk,
+                    ..
+                } = self;
+                wire_write(outbound, *write_chunk, connection.zero_pending())
+            };
+            if self.connection.consume_zero_flush(size, status) {
+                return true;
+            }
+        }
+        self.connection.finish_zero_flush();
+        false
+    }
+
+    /// One frontend write pass. Mirrors `H2Shell::writable`.
+    fn write_pass(&mut self) -> MuxResult {
+        let result = self.write_pass_inner();
+        self.settled(result)
+    }
+
+    fn write_pass_inner(&mut self) -> MuxResult {
+        // Entry point: adopt this harness's snapshot for the pass, exactly as
+        // the shell adopts the mux's.
+        self.connection.adopt_now(self.context.now);
+        let Self {
+            connection,
+            context,
+            ..
+        } = self;
+        connection.prune_inactive_streams_while_closing(context);
+
+        if let Some(result) = self.drive_control_flush() {
+            return result;
+        }
+
+        // The shell flushes TLS records here when its query says so, then
+        // re-reads. With no TLS layer the query is `false` and the flush it
+        // guards is a write of nothing, so both collapse — but the second read
+        // stays a SEPARATE read, because it answers a different question and
+        // conflating the two is what `h2_close::TlsFlushPhase` exists to stop.
+        if self.tls_wants_write() {
+            self.flush_tls_records();
+        }
+        let tls_wants_write = self.tls_wants_write();
+        match self.connection.dispatch_writable_state(tls_wants_write) {
+            H2WritableStateTarget::Done(result) => result,
+            H2WritableStateTarget::Flush => {
+                self.flush_tls_records();
+                let tls_wants_write = self.tls_wants_write();
+                self.connection
+                    .dispatch_writable_state_after_flush(tls_wants_write)
+            }
+            H2WritableStateTarget::WriteStreams => self.write_streams(),
+        }
+    }
+
+    /// Push whatever the TLS layer is holding. There is none, so this offers
+    /// the wire an empty slice and it accepts nothing — the same no-op
+    /// `SocketHandler::socket_write(&[])` is for every non-TLS handler.
+    fn flush_tls_records(&mut self) {
+        let Self {
+            outbound,
+            write_chunk,
+            ..
+        } = self;
+        let _ = wire_write(outbound, *write_chunk, &[]);
+    }
+
+    /// The stream write pass. Mirrors `H2Shell::write_streams`.
+    ///
+    /// The `Vec<IoSlice<'static>>` bracket is this driver's own, and it opens
+    /// and closes inside this one function exactly as the shell's does.
+    fn write_streams(&mut self) -> MuxResult {
+        let byte_totals = {
+            let Self {
+                connection,
+                context,
+                ..
+            } = self;
+            connection.compute_stream_byte_totals(context)
+        };
+        let mut pass = H2WritePass::new(byte_totals);
+        let mut io_slices: Vec<std::io::IoSlice<'static>> = Vec::new();
+
+        loop {
+            let Self {
+                connection,
+                context,
+                endpoint,
+                outbound,
+                write_chunk,
+                ..
+            } = self;
+            let mut ep = SimEndpoint(endpoint);
+            match connection.poll_write_target(context, &mut ep, &mut pass) {
+                H2WriteTarget::Done(result) => return result,
+                H2WriteTarget::Finalize {
+                    socket_write,
+                    bytes_written,
+                } => {
+                    let tls_wants_write = false;
+                    match connection.finalize_write(
+                        tls_wants_write,
+                        socket_write,
+                        bytes_written,
+                        context,
+                    ) {
+                        H2FinalizeTarget::Done(result) => return result,
+                        // Both collapse to nothing without a TLS layer: the
+                        // flush would offer the wire an empty slice.
+                        H2FinalizeTarget::Flush | H2FinalizeTarget::SkipFlush => {}
+                    }
+                    let tls_wants_write = false;
+                    return connection.finalize_write_after_flush(tls_wants_write);
+                }
+                H2WriteTarget::Transmit { stream_id } => {
+                    let kawa = connection.write_buffer(context, stream_id);
+                    // SAFETY: `kawa` is neither dropped nor mutated between
+                    // this call and the `confirm` three statements below, and
+                    // that `confirm` clears `io_slices` before the
+                    // `Kawa::consume` which may relocate `kawa.storage`. The
+                    // only thing entered while the descriptors are live is
+                    // `wire_write_vectored`, which copies out of them and
+                    // cannot retain them.
+                    let offered = unsafe { h2_transmit::gather(kawa, &mut io_slices) };
+                    let (size, status) = wire_write_vectored(outbound, *write_chunk, &io_slices);
+                    debug_assert!(
+                        size <= offered,
+                        "the wire reported {size} bytes written for an offer of {offered}"
+                    );
+                    h2_transmit::confirm(kawa, &mut io_slices, size);
+                    connection.handle_write(context, stream_id, size, status, &mut pass);
+                }
+            }
+        }
     }
 
     /// Queue client bytes for the core to read, and arm the readable event the
     /// event loop would have delivered.
     fn feed(&mut self, bytes: &[u8]) {
-        self.socket_mut().inbound.extend(bytes.iter().copied());
-        self.connection.readiness_mut().event |= Ready::READABLE;
+        self.inbound.extend(bytes.iter().copied());
+        self.connection.readiness.event |= Ready::READABLE;
     }
 
     /// Feed the RFC 9113 §3.4 preface plus the client's SETTINGS and let the
@@ -1011,17 +1218,15 @@ impl H2Harness {
                 endpoint,
                 ..
             } = self;
-            let Connection::H2(h2) = connection else {
-                unreachable!("new_h2_server built an H2 connection")
-            };
-            h2.cancel_timed_out_streams(context, &mut SimEndpoint(endpoint));
+            connection.cancel_timed_out_streams(context, &mut SimEndpoint(endpoint));
         }
+        self.settle();
         self.pump(at, usize::MAX, usize::MAX)
     }
 
     fn shutdown_peer(&mut self) {
-        self.socket_mut().peer_shutdown = true;
-        self.connection.readiness_mut().event |= Ready::READABLE;
+        self.peer_shutdown = true;
+        self.connection.readiness.event |= Ready::READABLE;
     }
 
     /// Drive the core the way `Mux::ready_inner` does: refresh the clock
@@ -1031,11 +1236,8 @@ impl H2Harness {
     /// Returns the last `MuxResult`. `fragmentation` and `write_budget` are the
     /// two adversarial axes; `usize::MAX` on either disables it.
     fn pump(&mut self, now: Instant, fragmentation: usize, write_budget: usize) -> MuxResult {
-        {
-            let socket = self.socket_mut();
-            socket.read_chunk = fragmentation.max(1);
-            socket.write_chunk = write_budget.max(1);
-        }
+        self.read_chunk = fragmentation.max(1);
+        self.write_chunk = write_budget.max(1);
         let mut result = MuxResult::Continue;
         let mut iterations = 0usize;
         let mut idle_rounds = 0usize;
@@ -1059,7 +1261,7 @@ impl H2Harness {
             // from a peer that never reads — a scenario in which NOTHING is
             // observable, so every assertion below would pass vacuously.
             if self.has_pending_write() {
-                self.connection.readiness_mut().event |= Ready::WRITABLE;
+                self.connection.readiness.event |= Ready::WRITABLE;
             }
             // Re-arm the readable event while the peer's bytes are still queued.
             //
@@ -1077,47 +1279,25 @@ impl H2Harness {
             // so a core that answers a re-armed event by reading nothing leaves
             // `progressed` false and the loop exits on the very next check.
             if self.inbound_len() > 0 {
-                self.connection.readiness_mut().event |= Ready::READABLE;
+                self.connection.readiness.event |= Ready::READABLE;
             }
-            let interest = self.connection.readiness().filter_interest();
+            let interest = self.connection.readiness.filter_interest();
             let mut progressed = false;
 
             if interest.is_readable() {
                 let before = self.outbound_len();
                 let inbound_before = self.inbound_len();
-                result = {
-                    let Self {
-                        connection,
-                        context,
-                        endpoint,
-                        ..
-                    } = self;
-                    let Connection::H2(h2) = connection else {
-                        unreachable!("new_h2_server built an H2 connection")
-                    };
-                    h2.readable(context, SimEndpoint(endpoint))
-                };
+                result = self.read_pass();
                 progressed |= self.outbound_len() != before || self.inbound_len() != inbound_before;
                 if !matches!(result, MuxResult::Continue) {
                     break;
                 }
             }
 
-            let interest = self.connection.readiness().filter_interest();
+            let interest = self.connection.readiness.filter_interest();
             if interest.is_writable() {
                 let before = self.outbound_len();
-                result = {
-                    let Self {
-                        connection,
-                        context,
-                        endpoint,
-                        ..
-                    } = self;
-                    let Connection::H2(h2) = connection else {
-                        unreachable!("new_h2_server built an H2 connection")
-                    };
-                    h2.writable(context, SimEndpoint(endpoint))
-                };
+                result = self.write_pass();
                 progressed |= self.outbound_len() != before;
                 if !matches!(result, MuxResult::Continue) {
                     break;
@@ -1153,26 +1333,24 @@ impl H2Harness {
     }
 
     fn has_pending_write(&self) -> bool {
-        match &self.connection {
-            Connection::H2(h2) => h2.has_pending_write(),
-            Connection::H1(_) => unreachable!("new_h2_server built an H2 connection"),
-        }
+        self.connection
+            .has_pending_write_with(self.tls_wants_write())
     }
 
     fn outbound_len(&mut self) -> usize {
-        self.socket_mut().outbound.len()
+        self.outbound.len()
     }
 
     /// Octets the harness has queued that the core has not read yet. Zero is
     /// what makes a "the peer spent N octets" oracle a statement about what the
     /// core RECEIVED rather than about what the harness queued.
     fn inbound_len(&mut self) -> usize {
-        self.socket_mut().inbound.len()
+        self.inbound.len()
     }
 
     /// Move whatever the core wrote into the decoded frame history.
     fn harvest(&mut self) {
-        let written = std::mem::take(&mut self.socket_mut().outbound);
+        let written = std::mem::take(&mut self.outbound);
         self.pending_out.extend_from_slice(&written);
         let (frames, consumed) = decode_frames(&self.pending_out);
         self.pending_out.drain(..consumed);
@@ -1662,9 +1840,8 @@ impl Workload for H2SimWorkload {
             // a frame arrives incomplete and stays that way. The core must
             // answer with a GOAWAY or simply keep waiting — never panic.
             if buggify_with_prob!(0.01) {
-                let socket = harness.socket_mut();
-                let keep = socket.inbound.len().saturating_sub(3);
-                socket.inbound.truncate(keep);
+                let keep = harness.inbound.len().saturating_sub(3);
+                harness.inbound.truncate(keep);
             }
 
             let fragmentation = 1 + ctx.random().random_range(0..64usize);
@@ -1741,10 +1918,7 @@ fn check_invariants(
 ) {
     // Property 3a — the concurrent-stream ceiling. `max_concurrent_streams` is a
     // CONSTRUCTION input of this run; `stream_count` is the core's live count.
-    let live = match &harness.connection {
-        Connection::H2(h2) => h2.stream_count(),
-        Connection::H1(_) => unreachable!("new_h2_server built an H2 connection"),
-    };
+    let live = harness.connection.stream_count();
     // The comparison is against the CONFIGURED ceiling, not against the limit
     // the core advertises at any instant: `ConnectionH2::apply_mcs_backpressure`
     // lowers `local_settings.settings_max_concurrent_streams` below the
@@ -2270,10 +2444,7 @@ fn h2_concurrent_stream_ceiling_holds_under_adversarial_interleaving() {
                 fragmentation,
                 write_budget,
             );
-            let live = match &harness.connection {
-                Connection::H2(h2) => h2.stream_count(),
-                Connection::H1(_) => unreachable!(),
-            };
+            let live = harness.connection.stream_count();
             assert!(
                 live as u32 <= CEILING,
                 "schedule={schedule}: {live} live streams after opening {} exceeds the \
