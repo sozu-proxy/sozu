@@ -2084,6 +2084,42 @@
   to read.
   Documentation only: no production code, no test, no dependency and no `Cargo.lock` entry changes.
 
+- **`docs(mux)`: the mux module-layout block listed half the directory and stated thirteen line
+  counts, twelve of them wrong
+  ([#1520](https://github.com/sozu-proxy/sozu/issues/1520)).** `doc/architecture.md`'s "Module
+  layout" block is the only place under `doc/` that says what each file in `lib/src/protocol/mux/`
+  is for. Measured at `5355cec0` with `git show origin/main:<path> | wc -l`, it named 13 of the
+  directory's 26 modules and hardcoded a size beside each one. `debug.rs` at 80 was the only figure
+  still right, and only because that file has not changed since it was written down: `h2.rs` was
+  stated at 7562 against 15360, `router.rs` at 678 against 2192, `stream.rs` at 290 against 1274,
+  `shared.rs` at 93 against 646, and the closing "18 666 lines of Rust across 13 modules" against
+  43 092 across 26 — a total off by 24 426 lines. Two descriptions had gone stale the same way:
+  `mod.rs` was credited with `Router` and `Stream`, which have lived in `router.rs` and `stream.rs`
+  since they were split out, and `h2.rs` with flood detection and shutdown handling, which are
+  `h2_flood_detector.rs` and `h2_close.rs`/`h2_drain.rs`.
+
+  The block now lists all 26 modules — the thirteen it had plus `auth.rs`, `buffer_source.rs`,
+  `h2_close.rs`, `h2_control_tx.rs`, `h2_drain.rs`, `h2_flood_detector.rs`, `h2_flow_control.rs`,
+  `h2_header_reassembly.rs`, `h2_scheduler.rs`, `h2_stream_table.rs`, `h2_transmit.rs`,
+  `h2_write_pass.rs` and `hpack_state.rs`, each with a description read off the module itself —
+  and states no size at all. The sentence that already told the reader to run
+  `wc -l lib/src/protocol/mux/*.rs` becomes the whole answer instead of a footnote to a stale
+  snapshot: a size written in prose is a second copy of a number the tree already holds, and
+  nothing compares the two. Making the sizes checkable instead was the alternative, and was
+  rejected: such a gate fires on nearly every changeset that touches the directory, its fix is
+  always "re-run `wc -l` and paste", and it would not have caught the failure that actually
+  happened here, which is a module with no row at all. That residual obligation is now written
+  into the block — adding a module means adding its row, and no gate enforces that either.
+
+  One further correction in the same document, found while sweeping `doc/` for the same defect and
+  verified against `router.rs`'s `backends` declaration: the Mux session diagram declared
+  `backends: HashMap<Token, Connection<TcpStream>>`. The field is
+  `BTreeMap<Token, Connection<SessionTcpStream>>`; it became a `BTreeMap` in
+  [#1500](https://github.com/sozu-proxy/sozu/issues/1500) precisely so that which backend serves a
+  request stops depending on per-`HashMap` `RandomState` seeding, so naming a `HashMap` there
+  contradicted the guarantee that change exists to provide. Documentation only; no production code
+  changes.
+
 - **`fix(mux-h2)`: the RFC 9218 §4 round-robin cursor is per urgency bucket, so every incremental
   bucket rotates instead of only the one that leads the pass.** `Prioriser` held ONE
   connection-global `incremental_cursor`. `apply_incremental_rotation` applied it to every urgency
