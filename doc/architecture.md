@@ -82,7 +82,7 @@ MuxState
 │   └── H2(ConnectionH2)
 │
 ├── router: Router
-│   └── backends: HashMap<Token, Connection<TcpStream>>
+│   └── backends: BTreeMap<Token, Connection<SessionTcpStream>>
 │       ├── Token(7)  → H1(ConnectionH1)  ◄── backend to cluster "app-1"
 │       ├── Token(12) → H2(ConnectionH2)  ◄── backend to cluster "app-2" (h2c)
 │       └── ...
@@ -298,25 +298,62 @@ inline at the start of `writable()`, avoiding extra event loop iterations.
 
 ```
 lib/src/protocol/mux/
-├── mod.rs          Mux session, Stream, Router, ready() loop, stream lifecycle (1818 lines)
-├── h1.rs           HTTP/1.1 connection (ConnectionH1) (823 lines)
-├── h2.rs           HTTP/2 connection (ConnectionH2), state machine, flow control,
-│                   flood detection, RFC 9218 priorities, shutdown handling (7562 lines)
-├── parser.rs       H2 binary frame parser (nom), wire format constants (2246 lines)
-├── serializer.rs   H2 frame serializer (cookie-factory), SETTINGS/GOAWAY/RST_STREAM (557 lines)
-├── converter.rs    Kawa → H2 frame converter (H2BlockConverter), HPACK encoding (1410 lines)
-├── pkawa.rs        H2 → Kawa converter, HPACK decoding, pseudo-header validation,
-│                   RFC 9218 priority header parsing (2229 lines)
-├── connection.rs   Shared frontend/backend connection types and bookkeeping (578 lines)
-├── router.rs       Backend dial / pool / Router::connect orchestration (678 lines)
-├── stream.rs       Per-stream state, ownership, and bidirectional EOS tracking (290 lines)
-├── answers.rs      Mux-side default HTTP answers (302 lines)
-├── shared.rs       Cross-connection shared state (93 lines)
-└── debug.rs        Diagnostic helpers (80 lines)
+├── mod.rs                   Mux session state (SessionState impl), shared Context,
+│                            ready() loop
+├── h1.rs                    ConnectionH1: the one active H1 stream, wired into Context
+├── h2.rs                    ConnectionH2: RFC 9113 frame dispatch, settings and
+│                            connection state, edge-trigger discipline
+├── h2_close.rs              Whether a connection may close or must keep draining
+│                            under TLS backpressure
+├── h2_control_tx.rs         Proxy-emitted RST_STREAM queue and its lifetime cap
+├── h2_drain.rs              RFC 9113 §6.8 double-GOAWAY drain state and transitions
+├── h2_flood_detector.rs     Flood thresholds and counters: Rapid Reset, CONTINUATION
+│                            flood, MadeYouReset, PING/SETTINGS/empty-DATA rates
+├── h2_flow_control.rs       Connection-level (stream 0) send window, receive
+│                            accounting, queued WINDOW_UPDATEs
+├── h2_header_reassembly.rs  Owned accumulator for an in-progress HEADERS +
+│                            CONTINUATION field block
+├── h2_scheduler.rs          RFC 9218 priorities: which stream writes next, and
+│                            whether it may interleave
+├── h2_stream_table.rs       Wire StreamId → GlobalStreamId map, RST dedupe,
+│                            per-stream liveness and stall caches
+├── h2_transmit.rs           Vectored gather/confirm of one stream's pending output
+├── h2_write_pass.rs         Owned state and phase of one write_streams pass
+├── hpack_state.rs           Connection HPACK codec pair (RFC 7541) and its reusable
+│                            scratch buffers
+├── parser.rs                H2 binary frame parser (nom), wire format constants
+├── serializer.rs            H2 frame header and control-frame serializer
+│                            (cookie-factory): SETTINGS, PING, GOAWAY, RST_STREAM,
+│                            WINDOW_UPDATE
+├── converter.rs             Kawa → H2 frame converter (H2BlockConverter), HPACK
+│                            encoding, HEADERS/CONTINUATION split
+├── pkawa.rs                 H2 → Kawa converter, HPACK decoding, pseudo-header
+│                            validation, RFC 9218 priority header parsing
+├── connection.rs            Connection enum dispatching H1/H2, plus the two
+│                            Endpoint adaptors
+├── router.rs                Backend connection map, reuse strategy, and
+│                            Router::connect orchestration
+├── stream.rs                Stream / StreamState / StreamParts, the front/back kawa
+│                            pair, bidirectional end-of-stream flags, replay capture
+├── buffer_source.rs         BufferSource trait and PoolBufferSource: where the core
+│                            takes its buffers, and that a source may refuse
+├── answers.rs               Materialises a configured default answer into a stream's
+│                            kawa buffers
+├── auth.rs                  HTTP Basic auth: header extraction, SHA-256
+│                            canonicalisation, constant-time comparison
+├── shared.rs                Routines both write paths share, including the TLS
+│                            close_notify drain ordering
+└── debug.rs                 Bounded per-session event ring; a no-op without
+                             debug_assertions
 ```
 
-Total: 18 666 lines of Rust across 13 modules. Run
-`wc -l lib/src/protocol/mux/*.rs` to re-derive at any HEAD.
+The rows above carry no line count on purpose. A size written here is a second
+copy of a number the tree already holds, nothing compares the two, and the copy
+this block used to carry had drifted on twelve of its thirteen rows
+([#1520](https://github.com/sozu-proxy/sozu/issues/1520)). Run
+`wc -l lib/src/protocol/mux/*.rs` for the sizes at any HEAD. What that command
+cannot give you is the column to its right, so adding a module to this directory
+means adding its row here — an obligation no gate enforces either.
 
 #### Key design decisions
 
