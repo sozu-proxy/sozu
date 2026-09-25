@@ -238,6 +238,32 @@
   (`SOZU_METRICS_LEASE_SIM_SEED` / `_SEEDS` / `_STEPS` replay knobs, same contract as the other two
   simulators); no CI job is wired yet (see `doc/testing.md`).
 
+- **`ci(test)`: run `sozu-command-lib`'s tests, which no workflow had ever named
+  ([#1539](https://github.com/sozu-proxy/sozu/issues/1539)).**
+  `.github/workflows/ci.yml` tested exactly `sozu-lib`, `sozu`, `sozu-e2e` and `sozu-sim`, and
+  there is no `cargo test --workspace` anywhere in the workflows, so `command/`'s **170 `#[test]`
+  functions across 13 files never ran** — `sozu-command-lib` appeared in no workflow except a
+  licence line in `release.yml`. They pass: `cargo test -p sozu-command-lib --locked` is green on
+  `aaf2a6aa` (169 unit + 4 integration + 2 doctests; the 3 `ignored` are illustrative `proto` doc
+  blocks, not skipped tests). This was never a quarantine anyone chose — the package was simply
+  never added, and nothing reported its absence. A test that never runs is indistinguishable from
+  a test that always passes.
+  The same gap was closed twice before, each time for just the crate that fix was about
+  (sozu#1301/#1313/#1314's command-server tests, then the `#[ignore]`d process-level e2e); the
+  command lib was in scope neither time, and `ci.yml`'s own comments record both rounds.
+  What was unguarded: the configuration parser and validator, the protobuf request/response types,
+  `Channel`, the logging macros and the state model `sozu-lib` and `sozu` are both built on, plus
+  `command/tests/state_compat_v1_1_1.rs` — a forward-compat regression pinning the
+  `SaveState`/`LoadState` JSON contract that `proxy-manager` and other tools pinned to
+  `sozu-command-lib = "1.1.1"` still write.
+  The step is gated to the single `msrv-full` cell and carries no `${{ matrix.flags }}`, both
+  measured rather than assumed: `command/src/` contains **zero `cfg(feature)`** — its only
+  features (`unstable`, `logs-debug`, `logs-trace`) are empty markers and it has no
+  crypto-provider feature — so nothing in it varies by matrix cell and the four crypto cells would
+  re-run one identical result four times. The flags are not merely redundant but rejected: passing
+  them fails with `the package 'sozu-command-lib' does not contain these features`. `--locked` and
+  `--verbose` match the neighbouring test steps.
+
 ### 🔄 Changed
 
 - **`refactor(mux)`: `Position::Client` holds an opaque backend id, and backend accounting leaves
