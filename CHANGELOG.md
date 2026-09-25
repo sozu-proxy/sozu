@@ -2249,6 +2249,45 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux)`: the `peer=` slot of every `MUX` log line is read from the snapshot the frontend
+  connection captures at construction, not from a live `getpeername(2)` on every line.**
+  `log_context!` and `log_context_lite!` (`lib/src/protocol/mux/mod.rs`) built the slot from
+  `frontend.socket().peer_addr().ok()`. `Connection::socket()` hands back a
+  `&mio::net::TcpStream`, whose *inherent* `peer_addr` wins method resolution over
+  `SocketHandler::peer_addr`, so the slot was a live kernel lookup and never reached the trait at
+  all. The same defect class as `df52d83d` (`MUX-H2`), `504f0528` (`SOCKET`) and
+  [#1524](https://github.com/sozu-proxy/sozu/issues/1524) (`MUX-H1`);
+  `mod.rs` was the one envelope each of them left behind, because it holds a `Connection` rather
+  than a core and `Connection` exposed no route to the snapshot.
+
+  New `Connection::peer_address` (`lib/src/protocol/mux/connection.rs`), built on the existing
+  `forward!` macro like `readiness()` and `position()`, returning
+  `ConnectionH1::peer_address` / `ConnectionH2::peer_address`; both macros interpolate it. The
+  latter field widens from private to `pub(super)`, matching the visibility
+  `ConnectionH1::peer_address` already carried. All 52 expansions — 34 `log_context!`, 18
+  `log_context_lite!` — go through the two definitions, so no callsite changed.
+
+  **This changes rendered log content.** Two slots that used to render wrong now render right, and
+  a rule matching `peer=None` on a `MUX` line to detect a reset stops firing. After the peer resets,
+  `getpeername(2)` answers `ENOTCONN`, so the `error!` lines an operator reads during an incident
+  rendered `peer=None`; they now carry the address. On a PROXY-protocol frontend the raw lookup
+  reported the load balancer while the rest of the session was logged against the advertised client,
+  which may be a large cardinality increase on a dashboard grouping by `peer=`. The practical
+  symptom was that one session ULID rendered two different peers depending only on which envelope
+  emitted the line — `MUX` disagreeing with the `MUX-H1`, `MUX-H2`, `SOCKET` and `HTTPS` lines
+  beside it. No wire byte, metric, control-flow decision or log *layout* changes, and rendering a
+  `MUX` line now costs no socket access at all.
+
+  Two tests, each seen red under its own named substitution:
+  `log_context_renders_the_snapshotted_peer_not_a_live_lookup` and
+  `log_context_lite_renders_the_snapshotted_peer_not_a_live_lookup`
+  (`lib/src/protocol/mux/mod.rs`). Both assert the rendered VALUE, not a call count: before the
+  change the macros never reached `SocketHandler::peer_addr`, so a counting handler of the kind
+  `log_context_reads_the_peer_address_once_per_connection` uses reads zero on both sides of the
+  change and would stay green either way. The frontend handler snapshots `10.0.0.42:12345` while
+  its socket is genuinely connected to a live loopback listener, and each test asserts the healthy,
+  disagreeing live lookup as an explicit premise so it cannot pass for the wrong reason.
+
 - **`fix(mux-h1)`: the `peer=` slot of every `MUX-H1` log line is read from a snapshot
   `ConnectionH1` captures at construction, not from a live `getpeername(2)` on every line**
   ([#1524](https://github.com/sozu-proxy/sozu/issues/1524)). `log_context!` and

@@ -717,7 +717,7 @@ pub struct ConnectionH2 {
     /// instantiated in production (`TcpStateMachine`, `tcp.rs`), but the TCP
     /// proxy reads its peer through mio's inherent method; only tests call
     /// the trait method on a bare stream.
-    peer_address: Option<std::net::SocketAddr>,
+    pub(super) peer_address: Option<std::net::SocketAddr>,
     pub state: H2State,
     /// Wire `StreamId -> GlobalStreamId` map, `expect_read`/`expect_write`,
     /// `highest_peer_stream_id`, `rst_sent`, and the per-stream

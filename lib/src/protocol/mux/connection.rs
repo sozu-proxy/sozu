@@ -17,6 +17,7 @@
 
 use std::{
     fmt::Debug,
+    net::SocketAddr,
     time::{Duration, Instant},
 };
 
@@ -240,6 +241,32 @@ impl<Front: SocketHandler> Connection<Front> {
             Connection::H1(c) => c.socket.socket_mut(),
             Connection::H2(c) => c.socket.socket_mut(),
         }
+    }
+    /// The peer address this connection snapshotted at construction —
+    /// `ConnectionH1::peer_address` / `ConnectionH2::peer_address`, the single
+    /// [`SocketHandler::peer_addr`] read taken on its whole lifetime.
+    ///
+    /// The one accessor `Mux`'s own log macros were missing. Without it the
+    /// only route from a [`Connection`] to a peer address was [`socket`], which
+    /// hands back a concrete `&mio::net::TcpStream` whose *inherent*
+    /// `peer_addr` wins method resolution over the trait — a live
+    /// `getpeername(2)` that answers `ENOTCONN` once the peer resets and
+    /// reports the transport source rather than a PROXY-advertised client. So
+    /// a `MUX` line disagreed with the `MUX-H1` / `MUX-H2` / `SOCKET` / `HTTPS`
+    /// lines of the very same session.
+    ///
+    /// Reads the field rather than calling the trait again, so rendering a
+    /// `MUX` line costs no socket access at all and cannot drift from what the
+    /// per-protocol envelopes print for the same session.
+    ///
+    /// This is the sole reader of `ConnectionH2::peer_address` outside
+    /// `lib/src/protocol/mux/h2.rs`, and the only reason that field is
+    /// `pub(super)` rather than private — the visibility
+    /// `ConnectionH1::peer_address` already carried.
+    ///
+    /// [`socket`]: Connection::socket
+    pub fn peer_address(&self) -> Option<SocketAddr> {
+        *forward!(&self, peer_address)
     }
     /// The next instant this connection wants `timeout()` called at, or
     /// `None` for "no timer".

@@ -178,7 +178,7 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
 
 | Prefix | File | Carries |
 |---|---|---|
-| `MUX` | `protocol/mux/mod.rs` | session ULID, peer/local, frontend, backend list |
+| `MUX` | `protocol/mux/mod.rs` | session ULID, peer/local, frontend, backend list. `peer` is a snapshot (see below), not a live lookup |
 | `MUX-H2` | `protocol/mux/h2.rs` | …plus position, state, total RST counts, draining. `peer` is a snapshot (see below), not a live lookup |
 | `MUX-H1` | `protocol/mux/h1.rs` | …plus stream id, parked, close_notify. `peer` is a snapshot (see below), not a live lookup |
 | `MUX-ROUTER` | `protocol/mux/router.rs` | renders `[session req cluster backend]` via `HttpContext::log_context()` |
@@ -203,7 +203,7 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
   First, it stays populated after the peer resets — `getpeername(2)`
   answers `ENOTCONN` there, so a live lookup renders `peer=None` on exactly
   the error lines being read during an incident. Do not match `peer=None`
-  on a `MUX-H1` or `MUX-H2` line to detect a reset. Second, on a
+  on a `MUX`, `MUX-H1` or `MUX-H2` line to detect a reset. Second, on a
   PROXY-protocol frontend it is the source the PROXY header advertised, so it
   names the client and agrees with the `HTTP`/`HTTPS` line for the same
   request id rather than naming the load balancer. (A `MUX-H2` frontend line
@@ -216,9 +216,18 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
   dial path caches it for exactly this reason: a nonblocking `connect()` still
   in flight makes `getpeername(2)` refuse, so the live lookup rendered
   `peer=None` for the whole window in which an ECONNREFUSED line is emitted.
-  `MUX` (`protocol/mux/mod.rs`) still renders a live `getpeername(2)` and is
-  unchanged — it reaches the raw stream through `Connection::socket()` rather
-  than through the handler's accessor.
+  `MUX` (`protocol/mux/mod.rs`) renders the same snapshot, through
+  `Connection::peer_address` (`protocol/mux/connection.rs`), which forwards to
+  whichever of `ConnectionH1::peer_address` / `ConnectionH2::peer_address` the
+  session holds. Before that accessor existed it reached the raw stream through
+  `Connection::socket()`, whose `&mio::net::TcpStream` resolves `peer_addr` to
+  mio's *inherent* method, so the slot was a live `getpeername(2)` and one
+  session ULID rendered two different peers depending on which envelope the
+  line came from. Pinned by
+  `protocol::mux::tests::log_context_renders_the_snapshotted_peer_not_a_live_lookup`
+  and
+  `protocol::mux::tests::log_context_lite_renders_the_snapshotted_peer_not_a_live_lookup`
+  (`lib/src/protocol/mux/mod.rs`).
 - The `peer` slot of a `SOCKET` line is the same snapshot, through the
   same accessor, for every handler. Both of the layer's two renderers now
   read `configured_peer` first and fall back to `getpeername(2)` only
