@@ -35,7 +35,14 @@ use crate::{
 /// Fields included in the session block (chosen to surface the most common
 /// H1 troubleshooting axes — keep-alive churn, stream pinning, buffer-pressure
 /// stall and graceful TLS shutdown):
-/// - `peer` — peer address (or `None` if the socket is gone)
+/// - `peer` — peer address via [`SocketHandler::peer_addr`](crate::socket::SocketHandler::peer_addr),
+///   snapshotted once into `ConnectionH1::peer_address` at construction rather
+///   than looked up live on each expansion. It therefore survives the peer's
+///   RST (which is when these lines are read); on a PROXY-protocol frontend it
+///   names the advertised client rather than the load balancer, matching the
+///   `HTTPS`/`HTTP` line for the same request id; and on a backend connection
+///   it names the cluster-configured address even while the async `connect()`
+///   is still in flight and `getpeername(2)` would refuse
 /// - `position` — `Server` / `Client(...)` orientation
 /// - `stream` — currently active [`GlobalStreamId`] (or `none`)
 /// - `requests` — request count served on this connection (keep-alive)
@@ -53,7 +60,7 @@ macro_rules! log_context {
             gray = gray,
             white = white,
             ulid = $self.session_ulid,
-            peer = $self.socket.socket_ref().peer_addr().ok(),
+            peer = $self.peer_address,
             position = $self.position,
             stream = $self.stream,
             requests = $self.requests,
@@ -82,7 +89,7 @@ macro_rules! log_context_stream {
             req = $http_context.id,
             cluster = $http_context.cluster_id.as_deref().unwrap_or("-"),
             backend = $http_context.backend_id.as_deref().unwrap_or("-"),
-            peer = $self.socket.socket_ref().peer_addr().ok(),
+            peer = $self.peer_address,
             position = $self.position,
             stream = $self.stream,
             requests = $self.requests,
@@ -113,6 +120,35 @@ pub struct ConnectionH1<Front: SocketHandler> {
     pub readiness: Readiness,
     pub requests: usize,
     pub socket: Front,
+    /// Peer address of this connection, captured once at construction from
+    /// [`SocketHandler::peer_addr`](crate::socket::SocketHandler::peer_addr)
+    /// and never re-read.
+    ///
+    /// This is the `peer=` slot every `log_context!` line carries, and the one
+    /// its per-stream twin `log_context_stream!` fills. Both used to build it
+    /// from `socket.socket_ref().peer_addr().ok()` — a live `getpeername(2)`
+    /// that reached past the trait method added to stop exactly that.
+    ///
+    /// Both production handlers *prefer* a cached address and fall back to a
+    /// live lookup when they hold none: `SessionTcpStream` and `FrontRustls`
+    /// each answer `self.configured_peer.or_else(|| self.stream.peer_addr().ok())`
+    /// (`socket.rs`). **That fallback arm is reachable** — the direct routes
+    /// seed `configured_peer` from a best-effort `peer_addr().ok()` at accept,
+    /// an `Option` precisely because that lookup can fail — it is pinned by its
+    /// own tests, and nothing here licenses deleting it.
+    ///
+    /// The snapshot is at least as good on every path, which is the actual
+    /// argument. It is taken while the connection is established, so wherever
+    /// the fallback would have answered it answers here too; it then survives
+    /// the peer's reset, where a later live lookup returns `ENOTCONN` and
+    /// renders `peer=None` on exactly the error lines an operator reads during
+    /// an incident. The divergence is one-directional — `Some` where `None`
+    /// used to appear, never a different address.
+    ///
+    /// This is `ConnectionH2::peer_address`' shape, so an operator grepping a
+    /// single session ULID reads the same `peer=` on the `MUX-H1` and `MUX-H2`
+    /// lines of one connection.
+    pub(super) peer_address: Option<std::net::SocketAddr>,
     /// Active stream index, or `None` when the connection has no assigned stream
     /// (initial client state before `start_stream`, or after `end_stream` detaches).
     pub stream: Option<GlobalStreamId>,
@@ -1208,5 +1244,466 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use super::*;
+    use crate::{
+        Protocol as TransportKind,
+        protocol::{
+            kawa_h1::editor::HttpContext,
+            mux::{BackendId, BackendSlot, Connection},
+        },
+        socket::SessionTcpStream,
+    };
+
+    // ── The `peer=` slot of the MUX-H1 log prefix ───────────────────────
+    //
+    // These pin that the slot is the address the connection snapshotted at
+    // construction, not a live `getpeername(2)` taken per expansion. The
+    // difference is invisible while a connection is healthy and is the whole
+    // story once it is not: `getpeername(2)` answers ENOTCONN after the peer
+    // resets, and it reports the transport peer — the load balancer — on a
+    // PROXY-protocol frontend.
+
+    /// Address the handler caches. Deliberately non-loopback so it cannot
+    /// collide with whatever ephemeral port a live lookup would report.
+    const CACHED_PEER: &str = "10.0.0.42:12345";
+
+    fn cached_peer() -> std::net::SocketAddr {
+        CACHED_PEER
+            .parse()
+            .expect("the cached peer literal must parse")
+    }
+
+    /// A live, established loopback connection plus the address
+    /// `getpeername(2)` reports for it. The listener is returned so the
+    /// connection stays up for the whole test: these tests assert the snapshot
+    /// wins even while the live lookup is perfectly healthy, so a half-dead
+    /// socket would weaken them rather than strengthen them.
+    fn connected_loopback_stream() -> (
+        std::net::TcpListener,
+        mio::net::TcpStream,
+        std::net::SocketAddr,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let live_peer = listener
+            .local_addr()
+            .expect("test listener must report its local address");
+        let stream =
+            std::net::TcpStream::connect(live_peer).expect("loopback connect must complete");
+        stream
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        (listener, mio::net::TcpStream::from_std(stream), live_peer)
+    }
+
+    /// A socket that was never connected, and therefore one whose
+    /// `getpeername(2)` fails with `ENOTCONN` *deterministically*.
+    ///
+    /// This is the one reliable way to stage a failing live lookup. The
+    /// obvious alternative — connect to a closed port and wait for the RST —
+    /// is a race: whether the kernel has collected the RST yet, and so whether
+    /// `getpeername(2)` has started refusing, is not something a test may
+    /// assert on. An unconnected socket is in the refusing state from birth,
+    /// which is the state a reset peer leaves behind and the state these
+    /// tests are about.
+    fn unconnected_stream() -> mio::net::TcpStream {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .expect("a test socket must be creatable");
+        socket
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        mio::net::TcpStream::from_std(std::net::TcpStream::from(socket))
+    }
+
+    /// An opaque backend id for a `Position::Client` connection. The slot is
+    /// never resolved by anything under test — `log_context!` renders
+    /// `position` and nothing looks the backend up — so a standalone id is
+    /// enough and spares these tests a whole `Mux` and backend registry.
+    fn test_backend_id(address: std::net::SocketAddr) -> BackendId {
+        BackendId {
+            slot: BackendSlot(0),
+            backend_id: Rc::from("test-backend"),
+            address,
+        }
+    }
+
+    /// Unwrap the H1 arm of a freshly built connection.
+    fn h1_of<Front: SocketHandler>(connection: Connection<Front>) -> ConnectionH1<Front> {
+        match connection {
+            Connection::H1(connection) => connection,
+            Connection::H2(_) => unreachable!("new_h1_* builds an H1 connection"),
+        }
+    }
+
+    /// Symptom 1 — `getpeername(2)` answers `ENOTCONN` once the peer has
+    /// reset, so the pre-fix macro rendered `peer=None` on exactly the
+    /// `error!` lines an operator reads during an incident. The address was
+    /// least available precisely when it mattered most.
+    ///
+    /// Staged with a never-connected socket rather than a reset one, because
+    /// only the former refuses deterministically — see [`unconnected_stream`].
+    /// A peer reset is one way to reach that state; what this pins is the
+    /// rendering once the socket is in it, which is the part the macro owns.
+    ///
+    /// To SEE THIS RED: in `log_context!`, put
+    /// `peer = $self.socket.socket_ref().peer_addr().ok(),` back in place of
+    /// `peer = $self.peer_address,`. The slot collapses to `peer=None`.
+    #[test]
+    fn log_context_renders_the_peer_when_the_live_lookup_fails() {
+        let stream = unconnected_stream();
+        let cached = cached_peer();
+
+        // Premise: the live lookup really is refusing, so the assertion below
+        // cannot pass for the wrong reason.
+        assert_eq!(
+            stream.peer_addr().ok(),
+            None,
+            "an unconnected socket must refuse getpeername(2)"
+        );
+
+        let session_ulid = Ulid::generate();
+        let connection = h1_of(Connection::new_h1_server(
+            session_ulid,
+            SessionTcpStream::new(stream, session_ulid, Some(cached)),
+            Duration::from_secs(30),
+        ));
+
+        let rendered = log_context!(connection);
+
+        assert!(
+            rendered.contains(&format!("peer=Some({cached})")),
+            "the MUX-H1 peer= slot must survive a failed live lookup: {rendered}"
+        );
+        assert!(
+            !rendered.contains("peer=None"),
+            "the MUX-H1 peer= slot must not collapse to None while a snapshot \
+             exists: {rendered}"
+        );
+    }
+
+    /// Symptom 2 — a backend connection is built from a nonblocking
+    /// `connect()` that has not completed, so `getpeername(2)` refuses for the
+    /// whole window in which an ECONNREFUSED line is emitted. The dial path
+    /// caches the cluster-configured backend address into
+    /// `SessionTcpStream::configured_peer` for exactly that reason, and the H1
+    /// macro has to consult it rather than the raw stream.
+    ///
+    /// This is the `Position::Client` constructor, which `ConnectionH2` has no
+    /// counterpart for: `ConnectionH1` serves backend connections too.
+    ///
+    /// To SEE THIS RED: in `log_context!`, put
+    /// `peer = $self.socket.socket_ref().peer_addr().ok(),` back in place of
+    /// `peer = $self.peer_address,`. The backend id the operator needs is
+    /// replaced by `peer=None`.
+    #[test]
+    fn log_context_renders_the_backend_peer_while_the_connect_is_in_flight() {
+        let stream = unconnected_stream();
+        let backend_address = cached_peer();
+
+        // Premise: this is the state a dial in flight really leaves the socket
+        // in — the live lookup refuses.
+        assert_eq!(
+            stream.peer_addr().ok(),
+            None,
+            "a connect() still in flight must refuse getpeername(2)"
+        );
+
+        let session_ulid = Ulid::generate();
+        let connection = h1_of(Connection::new_h1_client(
+            session_ulid,
+            SessionTcpStream::new(stream, session_ulid, Some(backend_address)),
+            "test-cluster".to_owned(),
+            test_backend_id(backend_address),
+            Duration::from_secs(30),
+        ));
+
+        let rendered = log_context!(connection);
+
+        assert!(
+            rendered.contains(&format!("peer=Some({backend_address})")),
+            "a backend MUX-H1 line must name the configured backend: {rendered}"
+        );
+        assert!(
+            !rendered.contains("peer=None"),
+            "a backend MUX-H1 line must not collapse to None while the dial is \
+             in flight: {rendered}"
+        );
+    }
+
+    /// Symptom 3 — on a PROXY-protocol frontend the cached address is the
+    /// advertised client while the socket's own peer is the load balancer.
+    /// `upgrade_expect` adopts the advertised source into the handler's
+    /// `configured_peer`, and the pre-fix macro read straight past it: for one
+    /// request id the `HTTP` line named the client and the `MUX-H1` line named
+    /// the load balancer.
+    ///
+    /// The live lookup is deliberately HEALTHY here and disagrees with the
+    /// cache, which is what separates this from
+    /// [`log_context_renders_the_peer_when_the_live_lookup_fails`] — a single
+    /// test cannot be red for both reasons.
+    ///
+    /// This stages the cleartext expect-proxy route, whose handler really is a
+    /// `SessionTcpStream`. The TLS route composes the same macro with
+    /// `FrontRustls::peer_addr`, whose own PROXY seeding is pinned in
+    /// `https.rs` by `front_rustls_peer_snapshot_is_the_session_peer_not_the_accepted_socket`.
+    ///
+    /// To SEE THIS RED: in `log_context!`, put
+    /// `peer = $self.socket.socket_ref().peer_addr().ok(),` back in place of
+    /// `peer = $self.peer_address,`. The rendered line then carries the
+    /// loopback address the socket is really connected to — the load balancer
+    /// — so the first assertion fails on the missing advertised client.
+    #[test]
+    fn log_context_renders_the_proxy_advertised_peer_not_the_load_balancer() {
+        let (_listener, stream, live_peer) = connected_loopback_stream();
+        let advertised = cached_peer();
+
+        // Premise: the live lookup is healthy and disagrees with the cache, so
+        // the assertions below cannot pass for the wrong reason.
+        assert_eq!(
+            stream.peer_addr().ok(),
+            Some(live_peer),
+            "the test socket must be genuinely connected, so a live lookup succeeds"
+        );
+        assert_ne!(
+            advertised, live_peer,
+            "the advertised and transport addresses must differ for this test to discriminate"
+        );
+
+        let session_ulid = Ulid::generate();
+        let connection = h1_of(Connection::new_h1_server(
+            session_ulid,
+            SessionTcpStream::new(stream, session_ulid, Some(advertised)),
+            Duration::from_secs(30),
+        ));
+
+        let rendered = log_context!(connection);
+
+        assert!(
+            rendered.contains(&format!("peer=Some({advertised})")),
+            "MUX-H1 must render the PROXY-advertised client: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&live_peer.to_string()),
+            "MUX-H1 must not fall back to the transport peer, which is the load \
+             balancer on a PROXY frontend: {rendered}"
+        );
+    }
+
+    /// The per-stream twin fills the same slot from the same snapshot.
+    ///
+    /// `log_context_stream!` has no production expansion in this file today
+    /// and carries `#[allow(unused_macros)]`, so nothing else type-checks its
+    /// body at all. That is the reason to pin it rather than a reason to skip
+    /// it: leaving twin macros on different sources is how they drift apart,
+    /// and the divergence would be worse than either being wrong alone — the
+    /// same session would render two different peers depending on whether a
+    /// stream happened to be in scope at the callsite.
+    ///
+    /// To SEE THIS RED: in `log_context_stream!`, put
+    /// `peer = $self.socket.socket_ref().peer_addr().ok(),` back in place of
+    /// `peer = $self.peer_address,`. The per-stream envelope then carries the
+    /// loopback address while the connection envelope carries the cache.
+    #[test]
+    fn log_context_stream_renders_the_snapshot_not_a_live_lookup() {
+        let (_listener, stream, live_peer) = connected_loopback_stream();
+        let advertised = cached_peer();
+
+        assert_eq!(
+            stream.peer_addr().ok(),
+            Some(live_peer),
+            "the test socket must be genuinely connected, so a live lookup succeeds"
+        );
+
+        let session_ulid = Ulid::generate();
+        let connection = h1_of(Connection::new_h1_server(
+            session_ulid,
+            SessionTcpStream::new(stream, session_ulid, Some(advertised)),
+            Duration::from_secs(30),
+        ));
+        let http_context = test_http_context(session_ulid);
+
+        let rendered = log_context_stream!(connection, http_context);
+
+        assert!(
+            rendered.contains(&format!("peer=Some({advertised})")),
+            "the per-stream MUX-H1 envelope must render the snapshot: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&live_peer.to_string()),
+            "the per-stream MUX-H1 envelope must not fall back to the live \
+             getpeername(2) answer: {rendered}"
+        );
+    }
+
+    /// A [`SocketHandler`] that counts how often it is asked for the peer
+    /// address, delegating every other method to a real loopback stream.
+    ///
+    /// The tests above pin WHICH address the log prefix renders. None of them
+    /// can see how many times the connection reaches into the socket to get
+    /// it, because both production handlers answer from a cache and so give
+    /// the same answer however often they are asked. This handler makes the
+    /// count observable.
+    struct PeerAddrCountingSocket {
+        stream: mio::net::TcpStream,
+        peer: std::net::SocketAddr,
+        calls: Rc<Cell<usize>>,
+    }
+
+    impl SocketHandler for PeerAddrCountingSocket {
+        fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
+            self.stream.socket_read(buf)
+        }
+
+        fn socket_write(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+            self.stream.socket_write(buf)
+        }
+
+        fn socket_write_vectored(&mut self, bufs: &[IoSlice]) -> (usize, SocketResult) {
+            self.stream.socket_write_vectored(bufs)
+        }
+
+        fn socket_ref(&self) -> &mio::net::TcpStream {
+            &self.stream
+        }
+
+        fn socket_mut(&mut self) -> &mut mio::net::TcpStream {
+            &mut self.stream
+        }
+
+        fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+            self.calls.set(self.calls.get() + 1);
+            Some(self.peer)
+        }
+
+        fn protocol(&self) -> crate::socket::TransportProtocol {
+            crate::socket::TransportProtocol::Tcp
+        }
+
+        fn read_error(&self) {}
+
+        fn write_error(&self) {}
+    }
+
+    /// The `peer=` slot is read from the socket exactly ONCE per connection —
+    /// at construction — however many log lines the connection renders.
+    ///
+    /// This is the property that makes `peer_address` worth having, and it is
+    /// the only one that separates the snapshot from simply calling the trait
+    /// method in the macro. It is not about which address appears (the tests
+    /// above own that): for a handler that already caches, reading the cache
+    /// and reading a snapshot taken from that cache agree by construction, so
+    /// substituting `peer = $self.socket.peer_addr(),` leaves every one of
+    /// them green. What the snapshot changed is WHICH object a log line reads,
+    /// and only a call count can observe that.
+    ///
+    /// TO SEE THIS RED: in `log_context!`, put
+    /// `peer = $self.socket.peer_addr(),` — the call-the-trait-method shape —
+    /// in place of `peer = $self.peer_address,`. The count then rises by one
+    /// per rendered line and the final assertion fails with
+    /// `the peer address must be read once, at construction, not once per log line:
+    /// left: 4, right: 1`.
+    #[test]
+    fn log_context_reads_the_peer_address_once_per_connection() {
+        let (_listener, stream, _live_peer) = connected_loopback_stream();
+        let calls = Rc::new(Cell::new(0usize));
+        let peer = cached_peer();
+        let socket = PeerAddrCountingSocket {
+            stream,
+            peer,
+            calls: Rc::clone(&calls),
+        };
+
+        let connection = h1_of(Connection::new_h1_server(
+            Ulid::generate(),
+            socket,
+            Duration::from_secs(30),
+        ));
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "construction takes exactly one peer_addr() snapshot"
+        );
+
+        // Premise: the rendered lines really do carry the address, so a zero
+        // count below would mean the slot went missing rather than that it
+        // became free.
+        for _ in 0..3 {
+            let rendered = log_context!(connection);
+            assert!(
+                rendered.contains(&format!("peer=Some({peer})")),
+                "each rendered line must still carry the peer: {rendered}"
+            );
+        }
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the peer address must be read once, at construction, not once per log line"
+        );
+    }
+
+    /// The three fields `log_context_stream!` reads out of an `HttpContext`,
+    /// with every other field at an inert default. Built directly rather than
+    /// through a `Stream`, because the macro touches no buffer and a real
+    /// stream would drag a whole `Pool` in behind it.
+    fn test_http_context(session_ulid: Ulid) -> HttpContext {
+        HttpContext {
+            keep_alive_backend: true,
+            keep_alive_frontend: true,
+            sticky_session_found: None,
+            method: None,
+            authority: None,
+            path: None,
+            status: None,
+            reason: None,
+            user_agent: None,
+            x_request_id: None,
+            xff_chain: None,
+            #[cfg(feature = "opentelemetry")]
+            otel: None,
+            closing: false,
+            session_id: session_ulid,
+            id: Ulid::generate(),
+            backend_id: None,
+            cluster_id: None,
+            protocol: TransportKind::HTTP,
+            public_address: "127.0.0.1:0"
+                .parse()
+                .expect("the public address literal must parse"),
+            session_address: None,
+            sticky_name: String::new(),
+            sticky_session: None,
+            backend_address: None,
+            tls_server_name: None,
+            tls_cert_names: None,
+            strict_sni_binding: false,
+            elide_x_real_ip: false,
+            send_x_real_ip: false,
+            tls_version: None,
+            tls_cipher: None,
+            tls_alpn: None,
+            sozu_id_header: String::from("Sozu-Id"),
+            redirect_location: None,
+            www_authenticate: None,
+            original_authority: None,
+            headers_response: Vec::new(),
+            retry_after_seconds: None,
+            frontend_redirect_template: None,
+            redirect_status: None,
+            tags: None,
+            access_log_message: None,
+        }
     }
 }

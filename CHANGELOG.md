@@ -2135,6 +2135,49 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux-h1)`: the `peer=` slot of every `MUX-H1` log line is read from a snapshot
+  `ConnectionH1` captures at construction, not from a live `getpeername(2)` on every line**
+  ([#1524](https://github.com/sozu-proxy/sozu/issues/1524)). `log_context!` and
+  `log_context_stream!` built the slot from `socket.socket_ref().peer_addr().ok()`, reaching past
+  `SocketHandler::peer_addr` — the trait method added by `df52d83d` to stop exactly that. New
+  `ConnectionH1::peer_address: Option<SocketAddr>`, filled once in `Connection::new_h1_server` and
+  `Connection::new_h1_client` from `SocketHandler::peer_addr`; both macros interpolate the field.
+  This is the shape `ConnectionH2` already has, so an operator grepping a single session ULID now
+  reads the same `peer=` on the `MUX-H1` and `MUX-H2` lines of one connection instead of a correct
+  address on one and `peer=None` — or the load balancer — on the other.
+
+  **This changes rendered log content.** Three slots that used to render wrong now render right, and
+  a rule matching `peer=None` on a `MUX-H1` line to detect a reset stops firing. After the peer
+  resets, `getpeername(2)` answers `ENOTCONN`, so the `error!` lines an operator reads during an
+  incident rendered `peer=None`; they now carry the address. On a PROXY-protocol frontend the raw
+  lookup reported the load balancer while the rest of the session was logged against the advertised
+  client; the line now names the client, which may be a large cardinality increase on a dashboard
+  grouping by `peer=`. On a backend connection — `ConnectionH1` serves the backend side, which
+  `ConnectionH2` has no counterpart for — a nonblocking `connect()` still in flight makes
+  `getpeername(2)` refuse, so the slot rendered `peer=None` for the whole window in which an
+  ECONNREFUSED line is emitted; it now names the cluster-configured backend. No wire byte, metric,
+  control-flow decision or log *layout* changes.
+
+  The divergence from a live call is one-directional: `Some` where `None` used to appear, never a
+  different address. Both production handlers (`SessionTcpStream`, `FrontRustls`) *prefer* a cached
+  address but keep a reachable live-`getpeername(2)` fallback, pinned by its own tests; the snapshot
+  is taken while the connection is established, so it answers wherever that fallback would have
+  answered and additionally survives the reset. Nothing here licenses deleting those fallback arms.
+
+  The case is observability and consistency, not cost: #1341 examined the performance argument for
+  the H2 twin and retracted it, and the same reasoning applies here.
+
+  Five tests, each seen red under its own named substitution.
+  `log_context_renders_the_peer_when_the_live_lookup_fails`,
+  `log_context_renders_the_backend_peer_while_the_connect_is_in_flight` and
+  `log_context_renders_the_proxy_advertised_peer_not_the_load_balancer` cover the three symptoms;
+  `log_context_stream_renders_the_snapshot_not_a_live_lookup` pins the per-stream twin, which has no
+  production expansion and so was not type-checked at all before. `log_context_reads_the_peer_address_once_per_connection`
+  pins the count at exactly one per connection through a counting `SocketHandler` — the only
+  property that separates the snapshot from calling the trait method in the macro, since a caching
+  handler returns the same address however often it is asked, leaving the other four green under
+  that substitution.
+
 - **`docs(mux)`: three citations that resolved onto real but unrelated lines, three field
   declarations that named the wrong container and the wrong owner, and one CHANGELOG claim that
   named the wrong reason.** `lib/src/protocol/mux/LIFECYCLE.md` §4.2 put the

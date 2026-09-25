@@ -91,8 +91,13 @@ impl<Front: SocketHandler> Connection<Front> {
         front_stream: Front,
         timeout_duration: Duration,
     ) -> Connection<Front> {
+        // The one read of `peer_addr()` on this connection's whole lifetime,
+        // taken before `front_stream` is moved into `socket`. `ConnectionH1::
+        // peer_address` documents why the answer is snapshotted, not re-read.
+        let peer_address = front_stream.peer_addr();
         Connection::H1(ConnectionH1 {
             socket: front_stream,
+            peer_address,
             position: Position::Server,
             readiness: Readiness {
                 interest: Ready::READABLE | Ready::HUP | Ready::ERROR,
@@ -115,8 +120,14 @@ impl<Front: SocketHandler> Connection<Front> {
         backend: BackendId,
         timeout_duration: Duration,
     ) -> Connection<Front> {
+        // Same single read as the server constructor. On the dial path the
+        // handler already carries the cluster-configured backend address, so
+        // this answers it even while the async `connect()` is still in flight
+        // and `getpeername(2)` would refuse.
+        let peer_address = front_stream.peer_addr();
         Connection::H1(ConnectionH1 {
             socket: front_stream,
+            peer_address,
             position: Position::Client(
                 cluster_id,
                 backend,
