@@ -224,6 +224,116 @@ impl From<SessionToken> for usize {
     }
 }
 
+/// Mask `address` down to the network named by `prefix` bits.
+///
+/// `prefix` is validated at config-load time
+/// (`ConfigError::InvalidSubnetPrefix` in `command/src/config.rs`), but
+/// this runs on the per-request hot path and does not assume that
+/// happened: a prefix at or above the address width returns the address
+/// unmasked.
+///
+/// Both ends are handled by an explicit branch rather than by the shift.
+/// `u32::MAX << 32` is an overflowing shift — it panics under
+/// `debug_assertions` and silently wraps to a no-op shift in release —
+/// so a full-width prefix must never reach the shift. A zero prefix is
+/// branched from the other end for the same reason.
+fn mask_ipv4(address: Ipv4Addr, prefix: u32) -> Ipv4Addr {
+    if prefix >= u32::BITS {
+        return address;
+    }
+    if prefix == 0 {
+        return Ipv4Addr::UNSPECIFIED;
+    }
+    // Only a strictly-interior prefix reaches the shift, which is what
+    // makes `u32::BITS - prefix` a legal shift amount in 1..32.
+    debug_assert!(
+        prefix > 0 && prefix < u32::BITS,
+        "both shift-overflowing ends must have returned before the shift"
+    );
+    let mask = u32::MAX << (u32::BITS - prefix);
+    let masked = Ipv4Addr::from(u32::from(address) & mask);
+    // Pair assertion, positive then negative space: the result keeps
+    // every masked-in bit of the input, and holds none of the host bits
+    // the prefix is supposed to erase.
+    debug_assert_eq!(
+        u32::from(masked),
+        u32::from(address) & mask,
+        "masking must keep exactly the network bits of the source address"
+    );
+    debug_assert_eq!(
+        u32::from(masked) & !mask,
+        0,
+        "masking must clear every host bit below the prefix"
+    );
+    masked
+}
+
+/// IPv6 twin of [`mask_ipv4`]. The same two shift-overflowing ends are
+/// branched explicitly: `u128::MAX << 128` is as ill-defined as its
+/// 32-bit counterpart.
+fn mask_ipv6(address: Ipv6Addr, prefix: u32) -> Ipv6Addr {
+    if prefix >= u128::BITS {
+        return address;
+    }
+    if prefix == 0 {
+        return Ipv6Addr::UNSPECIFIED;
+    }
+    debug_assert!(
+        prefix > 0 && prefix < u128::BITS,
+        "both shift-overflowing ends must have returned before the shift"
+    );
+    let mask = u128::MAX << (u128::BITS - prefix);
+    let masked = Ipv6Addr::from(u128::from(address) & mask);
+    debug_assert_eq!(
+        u128::from(masked),
+        u128::from(address) & mask,
+        "masking must keep exactly the network bits of the source address"
+    );
+    debug_assert_eq!(
+        u128::from(masked) & !mask,
+        0,
+        "masking must clear every host bit below the prefix"
+    );
+    masked
+}
+
+/// Derive the per-(cluster, source-SUBNET) counter key for `address`.
+///
+/// An IPv4-mapped IPv6 address is canonicalised to its IPv4 form and
+/// charged to `ipv4_prefix`. This matters: a dual-stack `[::]` listener
+/// hands every IPv4 client back as `::ffff:a.b.c.d`, and masking those
+/// with an IPv6 prefix would collapse the entire IPv4 internet into the
+/// single `::/56` bucket — the subnet cap would then fire on unrelated
+/// clients the moment it was switched on. The per-IP counter is NOT
+/// canonicalised: it keeps charging the address exactly as it arrived,
+/// which is part of what leaves its behaviour untouched by this feature.
+pub fn subnet_key(address: &IpAddr, ipv4_prefix: u32, ipv6_prefix: u32) -> IpAddr {
+    let canonical_v4 = match address {
+        IpAddr::V4(v4) => Some(*v4),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+    };
+    let key = match (canonical_v4, address) {
+        (Some(v4), _) => IpAddr::V4(mask_ipv4(v4, ipv4_prefix)),
+        (None, IpAddr::V6(v6)) => IpAddr::V6(mask_ipv6(*v6, ipv6_prefix)),
+        // Unreachable: `canonical_v4` is `Some` for every `IpAddr::V4`.
+        (None, IpAddr::V4(v4)) => IpAddr::V4(mask_ipv4(*v4, ipv4_prefix)),
+    };
+    // Pair assertion: the key stays in the family it will be compared
+    // against — a mapped source yields a V4 key (positive space), and a
+    // genuine IPv6 source never yields one (negative space).
+    debug_assert_eq!(
+        key.is_ipv4(),
+        canonical_v4.is_some(),
+        "subnet key family must follow the canonicalised source family"
+    );
+    debug_assert_eq!(
+        key.is_ipv6(),
+        canonical_v4.is_none(),
+        "a genuine IPv6 source must never produce an IPv4 subnet key"
+    );
+    key
+}
+
 pub struct SessionManager {
     pub max_connections: usize,
     pub nb_connections: usize,
@@ -268,6 +378,43 @@ pub struct SessionManager {
     /// one slot in the limit) and to drain a session's contributions on
     /// close. Same nesting rationale as above.
     cluster_ip_tracks: HashMap<Token, HashMap<String, HashSet<IpAddr>>>,
+    /// Default per-(cluster, source-SUBNET) connection limit. `0`
+    /// disables the subnet limiter, which is the default; cluster-level
+    /// overrides take precedence at check time.
+    ///
+    /// This is a SECOND, INDEPENDENT counter standing beside
+    /// `max_connections_per_ip`, not a replacement for it. The per-IP
+    /// cap serves the API-gateway case — one abusive client, one
+    /// address. The per-subnet cap serves the denial-of-service case,
+    /// where an attacker holding a routed prefix (an ordinary
+    /// residential IPv6 `/64`) defeats a per-address counter outright
+    /// by taking a fresh address for every connection
+    /// (sozu-proxy/sozu#1270). Both gates are consulted and BOTH must
+    /// admit, so "10 per IP AND 100 per /64" is expressible.
+    pub max_connections_per_subnet: u64,
+    /// IPv4 prefix length, in bits, defining a "subnet" for the counter
+    /// above. Boot-time only: changing a mask would re-key every live
+    /// counter, so there is no runtime setter for it. 32 masks nothing.
+    pub subnet_ipv4_prefix: u32,
+    /// IPv6 prefix length, in bits. Boot-time only, as above. 128 masks
+    /// nothing.
+    pub subnet_ipv6_prefix: u32,
+    /// Active frontend connections per `(cluster_id, masked_source_ip)`.
+    /// Exact mirror of `connections_per_cluster_ip`, keyed on the subnet
+    /// key from `subnet_key` instead of the raw address; the same
+    /// nesting rationale applies verbatim.
+    ///
+    /// Stays EMPTY while the subnet limiter is disabled: unlike the
+    /// per-IP index, which is populated unconditionally, this one is
+    /// only written when a positive limit resolves for the cluster (see
+    /// `SessionManager::track_cluster_subnet`). That is what makes the
+    /// default genuinely free rather than merely inert — no second
+    /// allocation, no second hash, no second entry per session for an
+    /// operator who never turns the feature on.
+    connections_per_cluster_subnet: HashMap<String, HashMap<IpAddr, usize>>,
+    /// Reverse index for `connections_per_cluster_subnet`, mirroring
+    /// `cluster_ip_tracks`. Also empty while the limiter is disabled.
+    cluster_subnet_tracks: HashMap<Token, HashMap<String, HashSet<IpAddr>>>,
 }
 
 impl SessionManager {
@@ -276,6 +423,9 @@ impl SessionManager {
         max_connections: usize,
         max_connections_per_ip: u64,
         retry_after: u32,
+        max_connections_per_subnet: u64,
+        subnet_ipv4_prefix: u32,
+        subnet_ipv6_prefix: u32,
     ) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(SessionManager {
             max_connections,
@@ -286,6 +436,11 @@ impl SessionManager {
             retry_after,
             connections_per_cluster_ip: HashMap::new(),
             cluster_ip_tracks: HashMap::new(),
+            max_connections_per_subnet,
+            subnet_ipv4_prefix,
+            subnet_ipv6_prefix,
+            connections_per_cluster_subnet: HashMap::new(),
+            cluster_subnet_tracks: HashMap::new(),
         }))
     }
 
@@ -302,6 +457,88 @@ impl SessionManager {
     /// must skip emission rather than render `Retry-After: 0`.
     pub fn effective_retry_after(&self, override_value: Option<u32>) -> u32 {
         override_value.unwrap_or(self.retry_after)
+    }
+
+    /// Resolve the effective per-(cluster, source-SUBNET) limit. Same
+    /// three-state contract as `effective_max_connections_per_ip`:
+    /// `None` inherits the global default, `Some(0)` is explicit
+    /// "unlimited", `Some(n > 0)` overrides.
+    pub fn effective_max_connections_per_subnet(&self, override_value: Option<u64>) -> u64 {
+        override_value.unwrap_or(self.max_connections_per_subnet)
+    }
+
+    /// Derive the subnet counter key for `ip` under this manager's
+    /// configured prefixes. Allocation-free — `IpAddr` is `Copy`.
+    pub fn subnet_key(&self, ip: &IpAddr) -> IpAddr {
+        subnet_key(ip, self.subnet_ipv4_prefix, self.subnet_ipv6_prefix)
+    }
+
+    /// Returns `true` when admitting `token` to one more connection for
+    /// `(cluster, subnet_of(ip))` would exceed the resolved subnet
+    /// limit. Exact mirror of `cluster_ip_at_limit` on the subnet
+    /// counter: `0` is unlimited, and a token already holding a slot
+    /// for this `(cluster, subnet)` is never at the limit.
+    ///
+    /// The subnet key is derived only AFTER the `limit == 0` early
+    /// return, so a deployment that never enables this feature pays no
+    /// masking work on the hot path at all.
+    pub fn cluster_subnet_at_limit(
+        &self,
+        token: Token,
+        cluster_id: &str,
+        ip: &IpAddr,
+        override_value: Option<u64>,
+    ) -> bool {
+        let limit = self.effective_max_connections_per_subnet(override_value);
+        if limit == 0 {
+            return false;
+        }
+        debug_assert!(
+            limit > 0,
+            "limit==0 (unlimited) must have returned before reaching the bounded check"
+        );
+        let subnet = self.subnet_key(ip);
+        let already_tracked = self
+            .cluster_subnet_tracks
+            .get(&token)
+            .and_then(|by_cluster| by_cluster.get(cluster_id))
+            .is_some_and(|subnets| subnets.contains(&subnet));
+        if already_tracked {
+            debug_assert!(
+                self.connections_per_cluster_subnet
+                    .get(cluster_id)
+                    .and_then(|by_subnet| by_subnet.get(&subnet))
+                    .is_some_and(|c| *c > 0),
+                "a tracked (token, cluster, subnet) slot must have a positive forward count"
+            );
+            return false;
+        }
+        self.connections_per_cluster_subnet
+            .get(cluster_id)
+            .and_then(|by_subnet| by_subnet.get(&subnet))
+            .is_some_and(|c| (*c as u64) >= limit)
+    }
+
+    /// THE gate. Returns `true` when EITHER the per-IP cap or the
+    /// per-subnet cap would be exceeded by admitting `token` to one more
+    /// connection for `cluster_id` from `ip`.
+    ///
+    /// Both enforcement points — the H1+H2 mux router and raw TCP — call
+    /// this rather than the two halves, so the conjunction "admit only
+    /// if BOTH caps allow it" is stated once and cannot drift between
+    /// protocols. The per-IP half is evaluated first and is byte-for-byte
+    /// the pre-existing check; the subnet half is the single line this
+    /// feature adds to the admission path.
+    pub fn cluster_connection_at_limit(
+        &self,
+        token: Token,
+        cluster_id: &str,
+        ip: &IpAddr,
+        ip_override: Option<u64>,
+        subnet_override: Option<u64>,
+    ) -> bool {
+        self.cluster_ip_at_limit(token, cluster_id, ip, ip_override)
+            || self.cluster_subnet_at_limit(token, cluster_id, ip, subnet_override)
     }
 
     /// Returns `true` when admitting `token` to one more connection for
@@ -482,13 +719,112 @@ impl SessionManager {
         self.check_invariants();
     }
 
-    /// Drain every `(cluster, ip)` slot held by `token` and apply the
-    /// matching decrements. Called on session teardown only — there is
-    /// no per-stream untrack because the limit is per-connection, not
-    /// per-stream. Removes empty inner maps so the outer
-    /// `connections_per_cluster_ip` does not retain `(cluster_id,
-    /// empty_map)` orphans across cluster lifetimes.
+    /// Account `token`'s active connection against
+    /// `(cluster, subnet_of(ip))`. Mirror of `track_cluster_ip` on the
+    /// subnet counter, with one deliberate difference: it is a NO-OP
+    /// while the resolved subnet limit is `0`.
+    ///
+    /// That conditional is what keeps the default genuinely free. The
+    /// per-IP index is populated unconditionally, so an operator who
+    /// never enables the subnet cap would otherwise pay a second hash,
+    /// a second allocation and a second per-session entry forever for a
+    /// feature they do not use. The cost is that enabling the cap at
+    /// runtime does not retroactively count sessions already in flight;
+    /// the counter converges as those sessions close. The per-IP path
+    /// has the same shape of gap after `clear_cluster_ip_tracking`.
+    pub fn track_cluster_subnet(
+        &mut self,
+        token: Token,
+        cluster_id: String,
+        ip: IpAddr,
+        override_value: Option<u64>,
+    ) {
+        if self.effective_max_connections_per_subnet(override_value) == 0 {
+            // No assertion that nothing is recorded for this token: that
+            // is NOT an invariant. A cluster override can drop to
+            // `Some(0)` after a session was tracked under a positive
+            // limit — `AddCluster` is an upsert and clears no counters,
+            // and only the global `SetMaxConnectionsPerSubnet(0)` drains
+            // the bookkeeping. The stale slot is harmless (a `0` limit
+            // never refuses) and is released normally on session close.
+            return;
+        }
+        let subnet = self.subnet_key(&ip);
+        // Snapshot before the insert so the delta can be pair-asserted.
+        // Ungated `let`: read only inside the debug_assert! below, so it
+        // is optimised out in release (no E0425).
+        let count_before = self
+            .connections_per_cluster_subnet
+            .get(&cluster_id)
+            .and_then(|by_subnet| by_subnet.get(&subnet))
+            .copied()
+            .unwrap_or(0);
+        let inserted = self
+            .cluster_subnet_tracks
+            .entry(token)
+            .or_default()
+            .entry(cluster_id.clone())
+            .or_default()
+            .insert(subnet);
+        if inserted {
+            *self
+                .connections_per_cluster_subnet
+                .entry(cluster_id.clone())
+                .or_default()
+                .entry(subnet)
+                .or_insert(0) += 1;
+        }
+        debug_assert!(
+            self.cluster_subnet_tracks
+                .get(&token)
+                .and_then(|by_cluster| by_cluster.get(&cluster_id))
+                .is_some_and(|subnets| subnets.contains(&subnet)),
+            "track must leave the (token, cluster, subnet) recorded in the reverse index"
+        );
+        debug_assert_eq!(
+            self.connections_per_cluster_subnet
+                .get(&cluster_id)
+                .and_then(|by_subnet| by_subnet.get(&subnet))
+                .copied()
+                .unwrap_or(0),
+            count_before + inserted as usize,
+            "forward count must advance by exactly 1 on first track, 0 on a repeat"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+    }
+
+    /// Account `token`'s active connection against BOTH counters. The
+    /// companion of `cluster_connection_at_limit`: the two enforcement
+    /// points take the gate and the slot through one call each, so the
+    /// per-IP and per-subnet bookkeeping can never fall out of step
+    /// between the mux and raw TCP.
+    pub fn track_cluster_connection(
+        &mut self,
+        token: Token,
+        cluster_id: String,
+        ip: IpAddr,
+        subnet_override: Option<u64>,
+    ) {
+        self.track_cluster_ip(token, cluster_id.clone(), ip);
+        self.track_cluster_subnet(token, cluster_id, ip, subnet_override);
+    }
+
+    /// Drain every slot held by `token` — per-IP AND per-subnet — and
+    /// apply the matching decrements. Called on session teardown only —
+    /// there is no per-stream untrack because the limit is
+    /// per-connection, not per-stream. Removes empty inner maps so the
+    /// outer `connections_per_cluster_ip` does not retain
+    /// `(cluster_id, empty_map)` orphans across cluster lifetimes.
+    ///
+    /// The name is historical: this is the SINGLE release point every
+    /// protocol already calls on close (`HttpSession`, `HttpsSession`,
+    /// `TcpSession`), so the subnet counter is drained from here rather
+    /// than from a second call each of those three sites would have to
+    /// remember. A missed release leaks a slot until worker restart,
+    /// which is exactly the failure a second entry point would invite.
     pub fn untrack_all_cluster_ip(&mut self, token: Token) {
+        self.untrack_all_cluster_subnet(token);
         let Some(by_cluster) = self.cluster_ip_tracks.remove(&token) else {
             return;
         };
@@ -523,6 +859,69 @@ impl SessionManager {
                 .values()
                 .all(|by_ip| !by_ip.is_empty() && by_ip.values().all(|&c| c > 0)),
             "untrack_all must not leave empty inner maps or zero-count ips behind"
+        );
+        #[cfg(debug_assertions)]
+        self.check_invariants();
+    }
+
+    /// Drain every `(cluster, subnet)` slot held by `token`. Mirror of
+    /// the per-IP drain in `untrack_all_cluster_ip`, which is its only
+    /// caller. A no-op when the subnet limiter was never enabled, since
+    /// nothing was tracked in the first place.
+    fn untrack_all_cluster_subnet(&mut self, token: Token) {
+        let Some(by_cluster) = self.cluster_subnet_tracks.remove(&token) else {
+            return;
+        };
+        debug_assert!(
+            !self.cluster_subnet_tracks.contains_key(&token),
+            "untrack_all must evict the token from the subnet reverse index"
+        );
+        for (cluster_id, subnets) in by_cluster {
+            let Entry::Occupied(mut outer) = self.connections_per_cluster_subnet.entry(cluster_id)
+            else {
+                continue;
+            };
+            for subnet in subnets {
+                if let Entry::Occupied(mut inner) = outer.get_mut().entry(subnet) {
+                    let count = inner.get_mut();
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        inner.remove();
+                    }
+                }
+            }
+            if outer.get().is_empty() {
+                outer.remove();
+            }
+        }
+        debug_assert!(
+            self.connections_per_cluster_subnet
+                .values()
+                .all(|by_subnet| !by_subnet.is_empty() && by_subnet.values().all(|&c| c > 0)),
+            "untrack_all must not leave empty inner maps or zero-count subnets behind"
+        );
+    }
+
+    /// Whether both halves of the subnet accounting are empty.
+    ///
+    /// Exists so a test can assert that a DISABLED subnet limiter leaves
+    /// no bookkeeping behind at all — "inert" and "free" are different
+    /// claims, and only the second one is checkable from outside.
+    pub fn subnet_tracking_is_empty(&self) -> bool {
+        self.cluster_subnet_tracks.is_empty() && self.connections_per_cluster_subnet.is_empty()
+    }
+
+    /// Wipe every per-(cluster, source-SUBNET) accounting bucket.
+    /// Called by the runtime `SetMaxConnectionsPerSubnet(0)` path.
+    /// Deliberately does NOT touch the per-IP buckets: the two limiters
+    /// are independent, and disabling one must not silently reset the
+    /// other's live counters.
+    pub fn clear_cluster_subnet_tracking(&mut self) {
+        self.cluster_subnet_tracks.clear();
+        self.connections_per_cluster_subnet.clear();
+        debug_assert!(
+            self.cluster_subnet_tracks.is_empty() && self.connections_per_cluster_subnet.is_empty(),
+            "clear must wipe both the subnet reverse index and the subnet forward count map"
         );
         #[cfg(debug_assertions)]
         self.check_invariants();
@@ -710,6 +1109,32 @@ impl SessionManager {
             }),
             "cluster_ip_tracks retains an empty per-token or per-cluster entry"
         );
+        // 5-7. The same three structural clauses, on the subnet mirror.
+        debug_assert!(
+            self.connections_per_cluster_subnet
+                .values()
+                .all(|by_subnet| !by_subnet.is_empty() && by_subnet.values().all(|&c| c > 0)),
+            "connections_per_cluster_subnet holds an empty inner map or a zero count"
+        );
+        debug_assert!(
+            self.cluster_subnet_tracks.values().all(|by_cluster| {
+                by_cluster.iter().all(|(cluster_id, subnets)| {
+                    subnets.iter().all(|subnet| {
+                        self.connections_per_cluster_subnet
+                            .get(cluster_id)
+                            .and_then(|by_subnet| by_subnet.get(subnet))
+                            .is_some_and(|&c| c > 0)
+                    })
+                })
+            }),
+            "a tracked (token, cluster, subnet) slot has no positive forward count"
+        );
+        debug_assert!(
+            self.cluster_subnet_tracks.values().all(|by_cluster| {
+                !by_cluster.is_empty() && by_cluster.values().all(|subnets| !subnets.is_empty())
+            }),
+            "cluster_subnet_tracks retains an empty per-token or per-cluster entry"
+        );
     }
 }
 
@@ -852,6 +1277,15 @@ impl Server {
             config
                 .retry_after
                 .unwrap_or(sozu_command::config::DEFAULT_RETRY_AFTER),
+            config
+                .max_connections_per_subnet
+                .unwrap_or(sozu_command::config::DEFAULT_MAX_CONNECTIONS_PER_SUBNET),
+            config
+                .subnet_ipv4_prefix
+                .unwrap_or(sozu_command::config::DEFAULT_SUBNET_IPV4_PREFIX),
+            config
+                .subnet_ipv6_prefix
+                .unwrap_or(sozu_command::config::DEFAULT_SUBNET_IPV6_PREFIX),
         );
         {
             let mut s = sessions.borrow_mut();
@@ -2033,6 +2467,47 @@ impl Server {
                     message.id,
                     ContentType::MaxConnectionsPerIpLimit(
                         sozu_command::proto::command::MaxConnectionsPerIpLimit { limit },
+                    )
+                    .into(),
+                ));
+                return;
+            }
+            Some(RequestType::SetMaxConnectionsPerSubnet(limit)) => {
+                let mut sessions = self.sessions.borrow_mut();
+                let previous = sessions.max_connections_per_subnet;
+                sessions.max_connections_per_subnet = *limit;
+                // Disabling the subnet limiter on the fly should not
+                // leave stale `(cluster, subnet)` entries behind: drain
+                // its bookkeeping so a re-enable starts from a clean
+                // slate. The per-IP buckets are deliberately untouched —
+                // the two limiters are independent.
+                if *limit == 0 {
+                    sessions.clear_cluster_subnet_tracking();
+                }
+                info!(
+                    "{} updated global max_connections_per_subnet from {} to {}",
+                    message.id, previous, limit
+                );
+                push_queue(WorkerResponse::ok(message.id));
+                return;
+            }
+            Some(RequestType::QueryMaxConnectionsPerSubnet(_)) => {
+                let sessions = self.sessions.borrow();
+                let limit = sessions.max_connections_per_subnet;
+                // The prefixes ride along because they are boot-time
+                // only: this reply is the sole runtime surface that can
+                // tell an operator what the live cap is a cap ON.
+                let ipv4_prefix = sessions.subnet_ipv4_prefix;
+                let ipv6_prefix = sessions.subnet_ipv6_prefix;
+                drop(sessions);
+                push_queue(WorkerResponse::ok_with_content(
+                    message.id,
+                    ContentType::MaxConnectionsPerSubnetLimit(
+                        sozu_command::proto::command::MaxConnectionsPerSubnetLimit {
+                            limit,
+                            ipv4_prefix,
+                            ipv6_prefix,
+                        },
                     )
                     .into(),
                 ));
@@ -5603,6 +6078,172 @@ mod scm_listener_handoff_tests {
         assert!(
             descriptor_is_socket_on_port(udp_fd, udp_address.port as u16),
             "a failed UDP registration must not close the socket it was handed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionManager, mask_ipv4, mask_ipv6, subnet_key};
+    use mio::Token;
+    use slab::Slab;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// A cluster override can drop to `Some(0)` AFTER a session was
+    /// tracked under a positive limit: `AddCluster` is an upsert and
+    /// clears no counters, and only the GLOBAL `SetMaxConnectionsPerSubnet(0)`
+    /// drains the bookkeeping. The next track for that still-open session
+    /// then takes the disabled-limiter early return with its slot already
+    /// recorded, which must be an ordinary no-op rather than a panic.
+    #[test]
+    fn a_cluster_override_dropping_to_zero_after_a_track_is_a_no_op() {
+        let manager = SessionManager::new(Slab::with_capacity(8), 8, 0, 0, 0, 24, 56);
+        let token = Token(1);
+        let cluster = "api".to_owned();
+        let ip: IpAddr = "203.0.113.9".parse().expect("test address must parse");
+
+        // Tracked under a positive per-cluster override.
+        manager
+            .borrow_mut()
+            .track_cluster_subnet(token, cluster.clone(), ip, Some(5));
+        assert!(
+            !manager.borrow().subnet_tracking_is_empty(),
+            "premise: the positive override must have recorded a slot"
+        );
+
+        // The operator upserts the cluster with the cap disabled. The same
+        // session opens another stream: the early return must not trip on
+        // the slot it legitimately left behind.
+        manager
+            .borrow_mut()
+            .track_cluster_subnet(token, cluster.clone(), ip, Some(0));
+
+        // And the stale slot is still released normally on close.
+        manager.borrow_mut().untrack_all_cluster_ip(token);
+        assert!(
+            manager.borrow().subnet_tracking_is_empty(),
+            "teardown must drain the slot even though the cap was disabled in between"
+        );
+    }
+
+    /// The two ends of the prefix range are the ones that break: a
+    /// full-width prefix would shift by the whole word, and a zero prefix
+    /// would shift by it from the other side. Both are handled by an
+    /// explicit branch, and this pins that neither reaches the shift.
+    #[test]
+    fn masking_handles_both_shift_overflowing_prefix_bounds() {
+        let v4: Ipv4Addr = "203.0.113.45".parse().expect("test address must parse");
+        assert_eq!(
+            mask_ipv4(v4, 32),
+            v4,
+            "a /32 must be the address itself, not a wrapped-shift artefact"
+        );
+        assert_eq!(
+            mask_ipv4(v4, 0),
+            Ipv4Addr::UNSPECIFIED,
+            "a /0 must mask every bit away"
+        );
+
+        let v6: Ipv6Addr = "2001:db8:dead:beef::1"
+            .parse()
+            .expect("test address must parse");
+        assert_eq!(
+            mask_ipv6(v6, 128),
+            v6,
+            "a /128 must be the address itself, not a wrapped-shift artefact"
+        );
+        assert_eq!(
+            mask_ipv6(v6, 0),
+            Ipv6Addr::UNSPECIFIED,
+            "a /0 must mask every bit away"
+        );
+
+        // Out-of-range prefixes cannot reach the shift either. Config load
+        // rejects them, but the hot path does not rely on that having run.
+        assert_eq!(
+            mask_ipv4(v4, 33),
+            v4,
+            "an over-wide IPv4 prefix must clamp to the address, not panic or wrap"
+        );
+        assert_eq!(
+            mask_ipv6(v6, 129),
+            v6,
+            "an over-wide IPv6 prefix must clamp to the address, not panic or wrap"
+        );
+    }
+
+    /// The recommended prefixes from sozu-proxy/sozu#1270 — /24 and /56 —
+    /// must group the addresses an operator expects them to.
+    #[test]
+    fn masking_groups_addresses_at_the_recommended_prefixes() {
+        let parse_v4 = |s: &str| -> Ipv4Addr { s.parse().expect("test address must parse") };
+        assert_eq!(
+            mask_ipv4(parse_v4("203.0.113.1"), 24),
+            mask_ipv4(parse_v4("203.0.113.254"), 24),
+            "two hosts in one /24 must share a subnet key"
+        );
+        assert_ne!(
+            mask_ipv4(parse_v4("203.0.113.1"), 24),
+            mask_ipv4(parse_v4("203.0.114.1"), 24),
+            "hosts in different /24s must NOT share a subnet key"
+        );
+
+        let parse_v6 = |s: &str| -> Ipv6Addr { s.parse().expect("test address must parse") };
+        assert_eq!(
+            mask_ipv6(parse_v6("2001:db8:abcd:0000::1"), 56),
+            mask_ipv6(parse_v6("2001:db8:abcd:00ff::9999"), 56),
+            "two addresses in one /56 must share a subnet key"
+        );
+        assert_ne!(
+            mask_ipv6(parse_v6("2001:db8:abcd:0000::1"), 56),
+            mask_ipv6(parse_v6("2001:db8:abcd:0100::1"), 56),
+            "addresses in different /56s must NOT share a subnet key"
+        );
+
+        // The issue's own scenario: a /64 holder taking a fresh address
+        // per connection lands in one bucket at /56.
+        assert_eq!(
+            mask_ipv6(parse_v6("2001:db8:abcd:1234::1"), 56),
+            mask_ipv6(parse_v6("2001:db8:abcd:1234:ffff:ffff:ffff:ffff"), 56),
+            "every address a /64 holder can mint must collapse to one /56 key — that \
+             collapse IS the mitigation for sozu-proxy/sozu#1270"
+        );
+    }
+
+    /// A dual-stack `[::]` listener hands IPv4 clients back as
+    /// `::ffff:a.b.c.d`. Masking those with an IPv6 prefix would collapse
+    /// the entire IPv4 internet into one `::/56` bucket, so the mapped
+    /// form is canonicalised to IPv4 and charged to the IPv4 prefix.
+    #[test]
+    fn an_ipv4_mapped_source_is_charged_to_the_ipv4_prefix() {
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().expect("must parse");
+        let native: IpAddr = "203.0.113.7".parse().expect("must parse");
+        assert_eq!(
+            subnet_key(&mapped, 24, 56),
+            subnet_key(&native, 24, 56),
+            "a mapped IPv4 source must key identically to the same address arriving natively"
+        );
+        assert!(
+            subnet_key(&mapped, 24, 56).is_ipv4(),
+            "the key for a mapped source must be an IPv4 key"
+        );
+
+        // Negative space: two mapped addresses from DIFFERENT /24s must
+        // not collide. Under the bug this guards against, both would mask
+        // to `::/56` and share one counter.
+        let other: IpAddr = "::ffff:198.51.100.7".parse().expect("must parse");
+        assert_ne!(
+            subnet_key(&mapped, 24, 56),
+            subnet_key(&other, 24, 56),
+            "mapped sources from different IPv4 /24s must NOT share a subnet key — if they \
+             do, every IPv4 client on a dual-stack listener shares one bucket"
+        );
+
+        // A genuine IPv6 source is still keyed as IPv6.
+        let genuine: IpAddr = "2001:db8::1".parse().expect("must parse");
+        assert!(
+            subnet_key(&genuine, 24, 56).is_ipv6(),
+            "a genuine IPv6 source must keep an IPv6 subnet key"
         );
     }
 }

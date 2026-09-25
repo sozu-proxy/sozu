@@ -284,6 +284,7 @@ pub(super) struct ConnectResume {
     ip: IpAddr,
     max_connections_per_ip: Option<u64>,
     cluster_retry_after: Option<u32>,
+    max_connections_per_subnet: Option<u64>,
 }
 
 impl ConnectResume {
@@ -303,6 +304,12 @@ impl ConnectResume {
     /// The cluster's `Retry-After` override, if it set one.
     pub(super) fn cluster_retry_after(&self) -> Option<u32> {
         self.cluster_retry_after
+    }
+    /// The cluster's per-SUBNET connection limit override, if it set
+    /// one. Independent of `max_connections_per_ip`: the embedder
+    /// consults both caps and admits only when both allow it.
+    pub(super) fn max_connections_per_subnet(&self) -> Option<u64> {
+        self.max_connections_per_subnet
     }
 }
 
@@ -476,6 +483,7 @@ impl Router {
             h2,
             cluster_max_connections_per_ip,
             cluster_retry_after,
+            cluster_max_connections_per_subnet,
         ) = view
             .cluster(&cluster_id)
             .map(|cluster| {
@@ -485,9 +493,10 @@ impl Router {
                     cluster.http2.unwrap_or(false),
                     cluster.max_connections_per_ip,
                     cluster.retry_after,
+                    cluster.max_connections_per_subnet,
                 )
             })
-            .unwrap_or((false, false, false, None, None));
+            .unwrap_or((false, false, false, None, None, None));
 
         // A replay carries H1 wire bytes in `front.out` (the H1 write path is
         // the only one that captures), so its cluster must still resolve to
@@ -555,6 +564,7 @@ impl Router {
             ip,
             max_connections_per_ip: cluster_max_connections_per_ip,
             cluster_retry_after,
+            max_connections_per_subnet: cluster_max_connections_per_subnet,
         }))
     }
 
@@ -2355,6 +2365,245 @@ mod backend_selection_order_tests {
             retry_after, None,
             "with no cluster or global override the resolved Retry-After is 0, which is \
              stashed as None so the 429 mapping elides the header rather than sending 0"
+        );
+    }
+
+    /// A source holding a whole subnet defeats the per-(cluster, source-IP)
+    /// cap outright: it takes a fresh address for every connection, so the
+    /// per-address counter never reaches 2. The per-(cluster,
+    /// source-SUBNET) cap is the answer, and this pins that it fires on
+    /// DISTINCT addresses drawn from one masked network
+    /// (sozu-proxy/sozu#1270).
+    ///
+    /// Three tokens, three different `203.0.113.x` addresses — every one a
+    /// distinct `/32`, all inside `203.0.113.0/24`. The per-IP cap is set
+    /// to 10, comfortably above the 1 connection each address holds, so it
+    /// cannot be what refuses the fourth: only the subnet counter can.
+    /// That is the whole point of the two caps being independent.
+    ///
+    /// To SEE THIS RED: delete the `|| self.cluster_subnet_at_limit(...)`
+    /// disjunct from `SessionManager::cluster_connection_at_limit` in
+    /// `lib/src/server.rs`, leaving every other piece of the feature —
+    /// config keys, proto fields, masking, tracking — in place. The fourth
+    /// address is then admitted and the `AtLimit` assertion below fires.
+    #[test]
+    fn a_subnet_cap_refuses_a_fresh_address_from_an_already_counted_subnet() {
+        let fixture = routing_fixture();
+        let sessions = fixture.proxy.borrow().sessions();
+        {
+            let mut manager = sessions.borrow_mut();
+            // /24, so 203.0.113.* all mask to one key.
+            manager.subnet_ipv4_prefix = 24;
+            manager.max_connections_per_subnet = 3;
+            // Deliberately far above what any single address will hold.
+            manager.max_connections_per_ip = 10;
+        }
+
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            H2_CLUSTER.to_owned(),
+            Cluster {
+                cluster_id: H2_CLUSTER.to_owned(),
+                ..Default::default()
+            },
+        );
+        let view = RoutingView::new(&clusters, ListenerType::Http);
+
+        // Drive one stream, from its own source address on its own token,
+        // through the real three-step production sequence.
+        let run = |token: Token, source: SocketAddr| {
+            let mut context = Context::new(
+                Ulid::generate(),
+                Rc::downgrade(&fixture.pool),
+                fixture.listener.clone(),
+                Some(source),
+                "127.0.0.1:80"
+                    .parse()
+                    .expect("test public address must parse"),
+            );
+            let stream_id = context
+                .create_stream(Ulid::generate(), 65_535)
+                .expect("the test pool must hand out a stream");
+            {
+                let stream = &mut context.streams[stream_id];
+                stream.state = StreamState::Link;
+                stream.context.authority = Some(H2_AUTHORITY.to_owned());
+                stream.context.path = Some("/".to_owned());
+                stream.context.method = Some(Method::Get);
+            }
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            let step = router
+                .plan_connect(stream_id, &mut context, &view)
+                .expect("routing must resolve the staged cluster");
+            let ConnectStep::CheckIpLimit(resume) = step else {
+                panic!("a stream WITH a session address must reach the connection gate")
+            };
+            let verdict = super::super::consult_ip_gate(&sessions, token, &resume);
+            let admitted = matches!(verdict, IpGateVerdict::Admitted);
+            let outcome = router.plan_connect_resume(stream_id, &mut context, resume, verdict);
+            (admitted, outcome)
+        };
+
+        let address = |host: u8| -> SocketAddr {
+            format!("203.0.113.{host}:51000")
+                .parse()
+                .expect("test source address must parse")
+        };
+
+        // Premise: three DISTINCT addresses inside one /24 fill the cap.
+        for (index, host) in [1u8, 2, 3].into_iter().enumerate() {
+            let (admitted, outcome) = run(Token(index + 1), address(host));
+            assert!(
+                admitted,
+                "premise: 203.0.113.{host} is the {} of 3 allowed in the subnet and must be \
+                 admitted, or the refusal below proves nothing",
+                index + 1
+            );
+            assert!(
+                matches!(outcome, Ok(ConnectPlan::Dial { .. })),
+                "an admitted stream must go on to request a dial, got {outcome:?}"
+            );
+        }
+
+        // Premise: no single address is anywhere near the per-IP cap, so
+        // the per-IP counter cannot be what refuses the next one.
+        {
+            let manager = sessions.borrow();
+            for host in [1u8, 2, 3] {
+                let ip = address(host).ip();
+                assert!(
+                    !manager.cluster_ip_at_limit(Token(99), H2_CLUSTER, &ip, None),
+                    "premise: 203.0.113.{host} holds 1 of 10 per-IP slots and must be under \
+                     its own cap — otherwise the refusal below is the per-IP cap, not the subnet"
+                );
+            }
+        }
+
+        // A FOURTH, never-seen address in the same /24 is refused.
+        let (admitted, outcome) = run(Token(4), address(4));
+        assert!(
+            !admitted,
+            "a fresh address from an already-counted /24 must be refused — an Admitted \
+             verdict here is the #1270 bypass: a new address per connection defeats the cap"
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(BackendConnectionError::TooManyConnectionsPerIp { .. })
+            ),
+            "the refused stream must surface the too-many-connections error, got {outcome:?}"
+        );
+
+        // Negative space: the same fourth address in a DIFFERENT /24 is
+        // admitted, so the refusal above is the subnet key and not a
+        // blanket cap on new addresses.
+        let (admitted, _) = run(
+            Token(5),
+            "198.51.100.4:51000"
+                .parse()
+                .expect("test source address must parse"),
+        );
+        assert!(
+            admitted,
+            "an address in an UNCOUNTED subnet must still be admitted — otherwise the cap \
+             is refusing on something other than the subnet key"
+        );
+    }
+
+    /// The default must change nothing. With `max_connections_per_subnet`
+    /// left at its `0` default, the admission path must behave exactly as
+    /// it did before this feature existed — and, because the subnet
+    /// tracking is skipped outright rather than merely ignored, it must
+    /// also leave no bookkeeping behind.
+    ///
+    /// The same four addresses in one /24 that the test above refuses are
+    /// all admitted here, and the per-IP cap still fires on its own terms
+    /// when a single address exceeds it.
+    #[test]
+    fn an_unset_subnet_cap_leaves_the_admission_path_untouched() {
+        let fixture = routing_fixture();
+        let sessions = fixture.proxy.borrow().sessions();
+        {
+            let mut manager = sessions.borrow_mut();
+            // A /24 prefix is configured but the cap is OFF: the prefix
+            // alone must not gate anything.
+            manager.subnet_ipv4_prefix = 24;
+            manager.max_connections_per_subnet = 0;
+            manager.max_connections_per_ip = 1;
+        }
+
+        let mut clusters = HashMap::new();
+        clusters.insert(
+            H2_CLUSTER.to_owned(),
+            Cluster {
+                cluster_id: H2_CLUSTER.to_owned(),
+                ..Default::default()
+            },
+        );
+        let view = RoutingView::new(&clusters, ListenerType::Http);
+
+        let run = |token: Token, source: SocketAddr| {
+            let mut context = Context::new(
+                Ulid::generate(),
+                Rc::downgrade(&fixture.pool),
+                fixture.listener.clone(),
+                Some(source),
+                "127.0.0.1:80"
+                    .parse()
+                    .expect("test public address must parse"),
+            );
+            let stream_id = context
+                .create_stream(Ulid::generate(), 65_535)
+                .expect("the test pool must hand out a stream");
+            {
+                let stream = &mut context.streams[stream_id];
+                stream.state = StreamState::Link;
+                stream.context.authority = Some(H2_AUTHORITY.to_owned());
+                stream.context.path = Some("/".to_owned());
+                stream.context.method = Some(Method::Get);
+            }
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            let step = router
+                .plan_connect(stream_id, &mut context, &view)
+                .expect("routing must resolve the staged cluster");
+            let ConnectStep::CheckIpLimit(resume) = step else {
+                panic!("a stream WITH a session address must reach the connection gate")
+            };
+            let verdict = super::super::consult_ip_gate(&sessions, token, &resume);
+            matches!(verdict, IpGateVerdict::Admitted)
+        };
+
+        // Four distinct addresses in one /24 — the exact traffic the test
+        // above refuses — are all admitted while the cap is off.
+        for (index, host) in [1u8, 2, 3, 4].into_iter().enumerate() {
+            let source: SocketAddr = format!("203.0.113.{host}:51000")
+                .parse()
+                .expect("test source address must parse");
+            assert!(
+                run(Token(index + 1), source),
+                "with max_connections_per_subnet = 0, 203.0.113.{host} must be admitted — \
+                 the default must not gate traffic the previous release allowed"
+            );
+        }
+
+        // The subnet accounting must be genuinely untouched, not merely
+        // consulted-and-ignored: a disabled limiter allocates nothing.
+        assert!(
+            sessions.borrow().subnet_tracking_is_empty(),
+            "a disabled subnet limiter must leave both subnet maps empty — a populated one \
+             means every deployment that never enables this feature pays for it anyway"
+        );
+
+        // And the pre-existing per-IP cap still fires on its own terms:
+        // a SECOND token from an address already counted once is refused
+        // at a per-IP limit of 1.
+        let repeat: SocketAddr = "203.0.113.1:51000"
+            .parse()
+            .expect("test source address must parse");
+        assert!(
+            !run(Token(90), repeat),
+            "the per-IP cap must still refuse a second connection from the same address — \
+             this feature must not have relaxed the limiter that already existed"
         );
     }
 

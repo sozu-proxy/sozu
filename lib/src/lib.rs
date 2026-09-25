@@ -1695,8 +1695,10 @@ pub mod testing {
                 protocol: Protocol::Metrics,
             })));
         }
-        // Test fixture: feature disabled (max_connections_per_ip = 0).
-        let sessions = SessionManager::new(sessions, max_buffers, 0, 0);
+        // Test fixture: both limiters disabled (max_connections_per_ip
+        // = 0, max_connections_per_subnet = 0) and the subnet prefixes
+        // at their no-op widths.
+        let sessions = SessionManager::new(sessions, max_buffers, 0, 0, 0, 32, 128);
 
         let registry = event_loop
             .registry()

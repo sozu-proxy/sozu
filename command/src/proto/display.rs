@@ -122,6 +122,8 @@ pub fn format_request_type(request_type: &RequestType) -> &str {
         RequestType::UpdateTcpListener(_) => "UpdateTcpListener",
         RequestType::SetMaxConnectionsPerIp(_) => "SetMaxConnectionsPerIp",
         RequestType::QueryMaxConnectionsPerIp(_) => "QueryMaxConnectionsPerIp",
+        RequestType::SetMaxConnectionsPerSubnet(_) => "SetMaxConnectionsPerSubnet",
+        RequestType::QueryMaxConnectionsPerSubnet(_) => "QueryMaxConnectionsPerSubnet",
         RequestType::SetHealthCheck(_) => "SetHealthCheck",
         RequestType::RemoveHealthCheck(_) => "RemoveHealthCheck",
         RequestType::QueryHealthChecks(_) => "QueryHealthChecks",
@@ -213,6 +215,24 @@ impl ResponseContent {
                         limit_info.limit
                     );
                 }
+                Ok(())
+            }
+            ContentType::MaxConnectionsPerSubnetLimit(limit_info) => {
+                // The prefixes are boot-time only, so they are printed
+                // alongside the cap: "100" alone would not tell the
+                // operator what it is 100 connections PER.
+                if limit_info.limit == 0 {
+                    println!("Max connections per (cluster, source-subnet): unlimited (0)");
+                } else {
+                    println!(
+                        "Max connections per (cluster, source-subnet): {}",
+                        limit_info.limit
+                    );
+                }
+                println!(
+                    "Subnet prefixes: IPv4 /{}, IPv6 /{}",
+                    limit_info.ipv4_prefix, limit_info.ipv6_prefix
+                );
                 Ok(())
             }
             ContentType::HealthChecksList(list) => print_health_checks(list),

@@ -478,6 +478,7 @@ fn content_type_name(ct: Option<&ContentType>) -> &'static str {
         Some(ContentType::CertificatesWithFingerprints(_)) => "CertificatesWithFingerprints",
         Some(ContentType::RequestCounts(_)) => "RequestCounts",
         Some(ContentType::MaxConnectionsPerIpLimit(_)) => "MaxConnectionsPerIpLimit",
+        Some(ContentType::MaxConnectionsPerSubnetLimit(_)) => "MaxConnectionsPerSubnetLimit",
         Some(ContentType::HealthChecksList(_)) => "HealthChecksList",
         Some(ContentType::MetricDetailStatus(_)) => "MetricDetailStatus",
         Some(ContentType::WorkerMetricDetailStatus(_)) => "WorkerMetricDetailStatus",

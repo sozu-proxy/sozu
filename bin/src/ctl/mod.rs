@@ -225,6 +225,7 @@ impl CommandManager {
             SubCmd::Config { cmd: _ } => Ok(()), // noop, handled at the beginning of the method
             SubCmd::Events => self.events(),
             SubCmd::ConnectionLimit { cmd } => self.connection_limit_command(cmd),
+            SubCmd::SubnetConnectionLimit { cmd } => self.subnet_connection_limit_command(cmd),
             #[cfg(feature = "tui")]
             SubCmd::Top {
                 refresh_ms,

@@ -140,6 +140,38 @@ max_connections = 500
 # value (no HTTP envelope).
 # retry_after = 60
 
+# Default per-(cluster, source-SUBNET) connection limit. `0` disables the
+# feature (default), leaving the per-IP behaviour above strictly unchanged.
+#
+# This is a SECOND, INDEPENDENT counter beside `max_connections_per_ip`,
+# not a replacement for it. The per-IP cap serves the API-gateway case:
+# one abusive client on one address. The per-subnet cap serves the
+# denial-of-service case, where an attacker holding a routed prefix — an
+# ordinary residential IPv6 /64 — defeats a per-address counter outright
+# by taking a fresh address for every connection (issue #1270). Both
+# gates are consulted and BOTH must admit, so the two lines
+#   max_connections_per_ip     = 10
+#   max_connections_per_subnet = 100
+# together mean "10 per IP AND 100 per subnet".
+#
+# Each cluster may override via its own `max_connections_per_subnet`.
+# max_connections_per_subnet = 0
+
+# Prefix lengths, in bits, that define a "subnet" for the counter above.
+# Out-of-range values are rejected at config-load time, never clamped.
+# The defaults mask nothing (/32 and /128), so enabling only
+# `max_connections_per_subnet` gives a per-address counter rather than a
+# surprising aggregation.
+#
+# RECOMMENDED starting point for a public-facing listener: /24 and /56.
+# An IPv4-mapped IPv6 source (`::ffff:a.b.c.d`) is canonicalised to IPv4
+# and charged to `subnet_ipv4_prefix`.
+#
+# Boot-time only: changing a mask re-keys every live counter, so it takes
+# a restart. Only the limit itself has a runtime setter.
+# subnet_ipv4_prefix = 32
+# subnet_ipv6_prefix = 128
+
 # Upper bound, in bytes, on the **base64-decoded** `Authorization: Basic`
 # payload sōzu is willing to canonicalize per request. Set once at worker
 # boot from `ServerConfig::basic_auth_max_credential_bytes` and read on

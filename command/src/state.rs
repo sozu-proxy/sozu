@@ -264,6 +264,8 @@ impl ConfigState {
             | RequestType::ReturnListenSockets(_)
             | RequestType::SetMaxConnectionsPerIp(_)
             | RequestType::QueryMaxConnectionsPerIp(_)
+            | RequestType::SetMaxConnectionsPerSubnet(_)
+            | RequestType::QueryMaxConnectionsPerSubnet(_)
             | RequestType::HardStop(_) => Ok(()),
 
             _other_request => Err(StateError::UndispatchableRequest),

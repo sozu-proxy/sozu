@@ -1160,11 +1160,19 @@ fn consult_ip_gate(
     frontend_token: Token,
     resume: &router::ConnectResume,
 ) -> router::IpGateVerdict {
-    let at_limit = sessions.borrow().cluster_ip_at_limit(
+    // BOTH caps are consulted here, through the one combined gate:
+    // the pre-existing per-(cluster, source-IP) cap and the
+    // per-(cluster, source-SUBNET) cap that stands beside it. A
+    // connection is admitted only when both allow it, which is what
+    // makes "10 per IP AND 100 per /64" expressible. The subnet cap is
+    // `0` (disabled) by default, in which case this is byte-for-byte
+    // the previous per-IP consult.
+    let at_limit = sessions.borrow().cluster_connection_at_limit(
         frontend_token,
         resume.cluster_id(),
         &resume.ip(),
         resume.max_connections_per_ip(),
+        resume.max_connections_per_subnet(),
     );
     if at_limit {
         let retry_after = sessions
@@ -1175,10 +1183,11 @@ fn consult_ip_gate(
     // Idempotent track — H2 streams to the same `(cluster, ip)` share a
     // single slot in the per-token set. The decrement happens wholesale on
     // session close, via `untrack_all_cluster_ip`.
-    sessions.borrow_mut().track_cluster_ip(
+    sessions.borrow_mut().track_cluster_connection(
         frontend_token,
         resume.cluster_id().to_owned(),
         resume.ip(),
+        resume.max_connections_per_subnet(),
     );
     router::IpGateVerdict::Admitted
 }

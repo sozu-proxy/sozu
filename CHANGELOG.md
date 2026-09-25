@@ -4,6 +4,56 @@
 
 ### ✨ Added
 
+- **`feat(server)`: per-(cluster, source-subnet) connection limit, a second cap beside the
+  per-IP one ([#1270](https://github.com/sozu-proxy/sozu/issues/1270)).** The existing
+  `max_connections_per_ip` has no concept of a subnet, so anyone on an IPv6 `/64` — the
+  standard residential allocation — bypasses it *entirely* by taking a fresh address for
+  every connection: the per-address counter never reaches 2. This adds an independent
+  second counter rather than changing the first, because the two serve different cases and
+  both need to be expressible at once — the per-IP cap is the API-gateway case (one client,
+  one address), the per-subnet cap is the denial-of-service case (one actor, a routed
+  prefix). Both gates are consulted on every admission and **both must admit**, so
+  `max_connections_per_ip = 10` with `max_connections_per_subnet = 100` means "10 per IP
+  **and** 100 per subnet".
+  New global TOML keys `max_connections_per_subnet` (default `0` = disabled),
+  `subnet_ipv4_prefix` (default `32`) and `subnet_ipv6_prefix` (default `128`), plus a
+  per-cluster `max_connections_per_subnet` override with the same `None` inherits /
+  `Some(0)` explicit-unlimited / `Some(n)` overrides semantics as its per-IP twin.
+  **The defaults change no behaviour**: the cap is off and the prefixes mask nothing, so
+  an upgrade is inert until an operator opts in. `/24` and `/56` are documented
+  recommendations (`doc/configure.md`, `doc/rate-limit-design.md` §7.1.1), not defaults —
+  matching what the reporter did in the equivalent Caddy module. Out-of-range prefixes are
+  **rejected** at config-load time (`ConfigError::InvalidSubnetPrefix`), never silently
+  clamped.
+  New `command.proto` surface, mirroring the per-IP verbs: `Request.set_max_connections_per_subnet`
+  (tag 60), `Request.query_max_connections_per_subnet` (tag 61) with message
+  `QueryMaxConnectionsPerSubnet`, response `MaxConnectionsPerSubnetLimit` (`ResponseContent`
+  tag 18) carrying the limit **and** both prefixes, `Cluster.max_connections_per_subnet`
+  (tag 17), and `ServerConfig.{max_connections_per_subnet, subnet_ipv4_prefix,
+  subnet_ipv6_prefix}` (tags 26-28). New CLI `sozu subnet-connection-limit {set|remove|show}`;
+  `show` reports the prefixes alongside the limit because they are boot-time only and would
+  otherwise be unreadable at runtime. Like its per-IP twin the setter is non-sticky —
+  workers reset to the TOML value on restart.
+  Enforced for HTTP/HTTPS (`lib/src/protocol/mux/mod.rs`, 429 + optional `Retry-After`) and
+  raw TCP (`lib/src/tcp.rs`, graceful FIN) through a single combined gate,
+  `SessionManager::cluster_connection_at_limit`, so the two protocols cannot drift on what
+  "admitted" means. Masking is written here rather than taken from a crate — `Ipv4Addr` /
+  `Ipv6Addr` have no standard masking method — with both shift-overflowing prefix bounds
+  (`0` and the full address width) branched explicitly, since `u128::MAX << 128` panics
+  under `debug_assertions` and wraps silently in release. An IPv4-mapped IPv6 source
+  (`::ffff:a.b.c.d`, what a dual-stack `[::]` listener reports for an IPv4 client) is
+  canonicalised to IPv4 and charged to `subnet_ipv4_prefix`, so IPv4 clients are not all
+  collapsed into one `::/56` bucket; the per-IP counter is deliberately left
+  un-canonicalised. While the cap is `0` the subnet bookkeeping is not written at all, so
+  a deployment that never enables the feature allocates nothing for it —
+  `an_unset_subnet_cap_leaves_the_admission_path_untouched` asserts both maps stay empty.
+  Regression coverage: `a_subnet_cap_refuses_a_fresh_address_from_an_already_counted_subnet`
+  drives the real `plan_connect` → `consult_ip_gate` → `plan_connect_resume` sequence for
+  four distinct addresses in one `/24` under a per-IP cap of 10, so only the subnet counter
+  can refuse the fourth; plus `masking_handles_both_shift_overflowing_prefix_bounds`,
+  `masking_groups_addresses_at_the_recommended_prefixes` and
+  `an_ipv4_mapped_source_is_charged_to_the_ipv4_prefix`.
+
 - **`test(mux-h2)`: a driven TLS `close_notify` over a real `FrontRustls`
   ([#1498](https://github.com/sozu-proxy/sozu/issues/1498)).**
   `ConnectionH2::begin_tls_close` — the seam that reaches `FrontRustls::socket_close`, which is

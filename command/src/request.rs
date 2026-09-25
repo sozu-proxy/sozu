@@ -90,7 +90,9 @@ impl Request {
             | RequestType::QueryClusterById(_)
             | RequestType::QueryClustersByDomain(_)
             | RequestType::SetMaxConnectionsPerIp(_)
-            | RequestType::QueryMaxConnectionsPerIp(_) => {}
+            | RequestType::QueryMaxConnectionsPerIp(_)
+            | RequestType::SetMaxConnectionsPerSubnet(_)
+            | RequestType::QueryMaxConnectionsPerSubnet(_) => {}
 
             // the Add***Listener / Update***Listener and other Listener orders will be
             // handled separately by the notify_proxys function, so we don't give them
