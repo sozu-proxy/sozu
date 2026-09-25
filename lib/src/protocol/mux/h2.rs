@@ -1097,6 +1097,34 @@ pub(super) enum MetricEvent {
     /// drift the single field exists to prevent — the key is domain data the
     /// core already receives, not something synthesised at the metric site.
     FloodViolation { metric_key: &'static str },
+
+    // ── Wire conversion (`converter::H2BlockConverter`) ─────────────────
+    /// A DATA frame was written for a stream.
+    DataFrameSent,
+    /// A HEADERS frame was written for a stream.
+    HeadersFrameSent,
+    /// A CONTINUATION frame was written (RFC 9113 §6.10 header-block split).
+    ContinuationFrameSent,
+    /// A stream could not emit because its flow-control window was exhausted.
+    FlowControlStall,
+    /// The same stall, on a connection writing toward a backend. Scoped by
+    /// `H2BlockConverter::position_is_client`, captured at converter
+    /// construction so the stall sites do not each need the position.
+    BackendFlowControlPaused,
+    /// A header block was refused for exceeding the peer's declared budget.
+    HeadersRejectedBudgetOverrun,
+
+    // ── Header decoding (`pkawa`) ───────────────────────────────────────
+    /// A header was rejected by H2 header policy. Carries the per-reason key
+    /// alongside the roll-up, for the same reason [`Self::FloodViolation`]
+    /// does: `reject_metric_key!` derives it from the `RejectReason` variant
+    /// at the rejection site, and re-deriving it shell-side would duplicate a
+    /// mapping that exists once.
+    HeaderRejected { reason_key: &'static str },
+    /// A trailer field that could spoof a client-identity header was elided.
+    TrailerSpoofVectorElided,
+    /// Trailers were dropped because the message carried a Content-Length.
+    TrailersDroppedContentLength,
 }
 
 /// Fold one core-returned [`MetricEvent`] into the worker-local `METRICS`
@@ -1178,6 +1206,28 @@ fn record_metric(event: MetricEvent) {
         }
 
         MetricEvent::FloodViolation { metric_key } => count!(metric_key, 1),
+
+        MetricEvent::DataFrameSent => incr!(names::h2::FRAMES_TX_DATA),
+        MetricEvent::HeadersFrameSent => incr!(names::h2::FRAMES_TX_HEADERS),
+        MetricEvent::ContinuationFrameSent => incr!(names::h2::FRAMES_TX_CONTINUATION),
+        MetricEvent::FlowControlStall => incr!(names::h2::FLOW_CONTROL_STALL),
+        MetricEvent::BackendFlowControlPaused => {
+            incr!(names::backend::FLOW_CONTROL_PAUSED)
+        }
+        MetricEvent::HeadersRejectedBudgetOverrun => {
+            incr!(names::h2::HEADERS_REJECTED_BUDGET_OVERRUN)
+        }
+
+        MetricEvent::HeaderRejected { reason_key } => {
+            incr!(names::h2::HEADERS_REJECTED_TOTAL);
+            incr!(reason_key);
+        }
+        MetricEvent::TrailerSpoofVectorElided => {
+            incr!(names::h2::TRAILER_SPOOF_VECTOR_ELIDED)
+        }
+        MetricEvent::TrailersDroppedContentLength => {
+            incr!(names::h2::TRAILERS_DROPPED_CONTENT_LENGTH)
+        }
     }
 }
 
@@ -2986,7 +3036,9 @@ impl ConnectionH2 {
                             incremental_peer_count,
                         );
                         kawa.prepare(&mut converter);
-                        let remaining = pass.converter_mut().reclaim(converter);
+                        let remaining = pass
+                            .converter_mut()
+                            .reclaim(converter, &mut self.metric_events);
                         pass.consumed = window - remaining;
                         // The pre-prepare gate above only inserts into
                         // `rst_sent` when `kawa.is_error()` is already true on
@@ -5924,7 +5976,7 @@ impl ConnectionH2 {
         let parts = &mut stream.split(&self.position);
         let was_initial = parts.rbuffer.is_initial();
         let elide_x_real_ip = parts.context.elide_x_real_ip;
-        let status = pkawa::handle_header(
+        let (header_events, status) = pkawa::handle_header(
             self.hpack.decoder_mut(),
             self.scheduler.prioriser_mut(),
             stream_id,
@@ -5936,6 +5988,7 @@ impl ConnectionH2 {
             self.flood_detector.config().max_header_fields(),
             elide_x_real_ip,
         );
+        self.metric_events.extend(header_events);
         if self.header_reassembly.is_in_progress() {
             self.header_reassembly.finish();
         }
@@ -7069,6 +7122,17 @@ impl ConnectionH2 {
                                     log_context!(self),
                                     len
                                 );
+                                // Deliberately still a metric macro, and the
+                                // only one left in this core. It is the one
+                                // labelled site: carrying its cluster and
+                                // backend labels in a `MetricEvent` means
+                                // owned `Option<String>`s, which measures at
+                                // `size_of::<MetricEvent>()` 24 -> 48 bytes —
+                                // paid by every queued event, for a site that
+                                // fires only on a stale-upstream retry — and
+                                // costs the enum its `Copy`. Recording it here
+                                // is the cheaper half of that trade, not an
+                                // oversight.
                                 incr!(
                                     names::backend::RETRY_STALE_UPSTREAM,
                                     stream.context.cluster_id.as_deref(),
