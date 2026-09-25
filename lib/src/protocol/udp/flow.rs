@@ -12,7 +12,7 @@
 
 use std::{net::SocketAddr, time::Instant};
 
-use crate::protocol::udp::ClusterConfig;
+use crate::protocol::udp::{BackendId, ClusterConfig};
 
 /// Why a flow reached teardown. Surfaces in the access log on close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,17 +32,13 @@ pub enum CloseReason {
     Aborted,
 }
 
-/// The lifecycle of a flow w.r.t. its backend. A flow is admitted in
-/// [`AwaitingBackend`](FlowPhase::AwaitingBackend), transitions to
-/// [`Established`](FlowPhase::Established) once the shell resolves and opens an
-/// upstream, and is reaped on teardown.
+/// The lifecycle of a flow w.r.t. its backend. A flow is admitted already
+/// [`Established`](FlowPhase::Established) — selection happens inside the
+/// admitting call now, so there is no window in which a flow exists without a
+/// backend — and is reaped on teardown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlowPhase {
-    /// `SelectBackend` emitted; awaiting `BackendResolved`. Client datagrams
-    /// received in this window are buffered (one slot) so the first datagram is
-    /// not lost between admission and upstream open.
-    AwaitingBackend,
-    /// Backend resolved and upstream opened; datagrams flow both ways.
+    /// Backend selected and `OpenUpstream` requested; datagrams flow both ways.
     Established,
     /// Marked for teardown; the manager will emit `CloseFlow` and free the slot.
     Closing,
@@ -80,31 +76,33 @@ pub struct UdpFlow {
     /// True until the first upstream datagram is sent; gates PPv2 prefixing
     /// when `proxy_protocol_every_datagram` is false (first-datagram-only).
     pub first_upstream_pending: bool,
-
-    /// One-slot buffer for a client datagram that arrived while
-    /// [`AwaitingBackend`](FlowPhase::AwaitingBackend). Flushed on
-    /// `BackendResolved`. A second datagram in the window replaces it (newest
-    /// wins) rather than allocating an unbounded queue.
-    pub pending_payload: Option<Vec<u8>>,
 }
 
 impl UdpFlow {
-    /// Create a flow for `client`, awaiting a backend, with its idle deadline
-    /// armed `front_timeout` from `now`.
-    pub fn new(client: SocketAddr, config: ClusterConfig, now: Instant) -> Self {
+    /// Create a flow for `client` on the backend admission just selected, with
+    /// its idle deadline armed `front_timeout` from `now`.
+    ///
+    /// The backend arrives at construction because selection happens before
+    /// the flow exists: a flow is never without one.
+    pub fn new(
+        client: SocketAddr,
+        config: ClusterConfig,
+        backend_id: BackendId,
+        backend_addr: SocketAddr,
+        now: Instant,
+    ) -> Self {
         let idle_deadline = now + config.front_timeout;
         UdpFlow {
             client,
-            backend_id: None,
-            backend_addr: None,
-            phase: FlowPhase::AwaitingBackend,
+            backend_id: Some(backend_id),
+            backend_addr: Some(backend_addr),
+            phase: FlowPhase::Established,
             first_upstream_pending: config.send_proxy_protocol,
             config,
             requests_seen: 0,
             responses_seen: 0,
             idle_deadline,
             timer_gen: 0,
-            pending_payload: None,
         }
     }
 
@@ -133,16 +131,13 @@ impl UdpFlow {
 
     /// Record that one client datagram was actually *forwarded* upstream: bump
     /// the `requests` counter and refresh the front idle deadline. Returns the
-    /// new generation token. Call this only at a real forward site — a datagram
-    /// merely buffered while [`AwaitingBackend`](FlowPhase::AwaitingBackend) and
-    /// later overwritten (newest-wins) must NOT count, or a burst during await
-    /// could trip the `requests` cap having delivered fewer than `requests`
-    /// datagrams. Use [`touch`](Self::touch) for the buffer-only idle refresh.
+    /// new generation token. Call this only at a real forward site, so
+    /// `requests` measures datagrams that actually reached a backend. Use
+    /// [`touch`](Self::touch) for an idle refresh that is not a forward.
     pub fn on_client_datagram(&mut self, now: Instant) -> u64 {
-        // A real forward is only ever recorded on an Established flow (the buffer
-        // flush in `on_backend_resolved` transitions to Established first). A
-        // forward on an AwaitingBackend flow would mean we sent upstream before a
-        // backend was resolved — a routing bug.
+        // A real forward is only ever recorded on an Established flow. A flow
+        // is admitted Established, so the only way to fail this is a forward
+        // on a flow already torn down.
         debug_assert_eq!(
             self.phase,
             FlowPhase::Established,
@@ -165,9 +160,9 @@ impl UdpFlow {
     /// Record that one backend reply was returned; refresh the back idle
     /// deadline. Returns the new generation token.
     pub fn on_backend_datagram(&mut self, now: Instant) -> u64 {
-        // A backend reply can only arrive on an Established flow (the upstream
-        // socket is opened on establish). A reply for an AwaitingBackend flow
-        // would mean a datagram on a not-yet-connected upstream — impossible.
+        // A backend reply can only arrive on an Established flow: the upstream
+        // socket is opened from the admitting call, and a reply on a flow
+        // already torn down is the only way this can fail.
         debug_assert_eq!(
             self.phase,
             FlowPhase::Established,
@@ -185,28 +180,27 @@ impl UdpFlow {
         self.touch(self.config.back_timeout, now)
     }
 
-    /// Transition the flow to `next`, asserting the move is legal. The lifecycle
-    /// is strictly forward: `AwaitingBackend → Established → Closing`, with a
-    /// self-loop allowed only into `Closing` (idempotent close). A backward move
-    /// (`Established → AwaitingBackend`) or skipping straight from
-    /// `AwaitingBackend → Closing` is allowed *only* into `Closing` (a flow may
-    /// be aborted before it establishes); every other transition is a bug.
+    /// Transition the flow to `next`, asserting the move is legal. One edge
+    /// remains: `Established → Closing`, a live flow torn down. A flow is
+    /// admitted `Established`, so there is no forward edge left, and every
+    /// other transition — including a self-loop — is a bug.
+    ///
+    /// The idempotent-close case does not reach here: `UdpManager::close_flow`
+    /// returns early on a flow already `Closing` rather than re-setting it.
     ///
     /// Debug-only guard — the assignment itself is unconditional so release
     /// behavior is identical.
     pub fn set_phase(&mut self, next: FlowPhase) {
         #[cfg(debug_assertions)]
         {
-            let legal = match (self.phase, next) {
-                // Forward edges.
-                (FlowPhase::AwaitingBackend, FlowPhase::Established) => true,
-                // Either live phase may be torn down (normal close or abort).
-                (FlowPhase::AwaitingBackend, FlowPhase::Closing) => true,
-                (FlowPhase::Established, FlowPhase::Closing) => true,
-                // No legal backward or skipping edge, and no Awaiting/Established
-                // self-loop (callers set Established / Closing exactly once).
-                _ => false,
-            };
+            // One legal edge remains: a live flow is torn down exactly once.
+            // A flow is admitted Established, so there is no forward edge left
+            // to allow — anything else, including a self-loop, is a bug and
+            // falls through to `false` rather than being listed as permitted.
+            let legal = matches!(
+                (self.phase, next),
+                (FlowPhase::Established, FlowPhase::Closing)
+            );
             debug_assert!(
                 legal,
                 "illegal flow phase transition {:?} -> {next:?}",

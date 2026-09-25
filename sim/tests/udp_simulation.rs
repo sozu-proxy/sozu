@@ -77,7 +77,8 @@ use moonpool_sim::{
     TimeProvider, Workload, buggify_with_prob, current_sim_seed,
 };
 use sozu_lib::protocol::udp::{
-    CloseReason, ClusterConfig, ConfigEvent, FlowId, ManagerInput, MetricEvent, Output, UdpManager,
+    BackendSource, CloseReason, ClusterConfig, ConfigEvent, FlowId, ManagerInput, MetricEvent,
+    Output, UdpManager,
 };
 
 // --------------------------------------------------------------------------
@@ -96,13 +97,45 @@ fn pooled_source(ctx: &SimContext) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, ip)), port)
 }
 
-/// A small set of distinct backend addresses for resolution replies.
-fn pooled_backend(ctx: &SimContext) -> (String, SocketAddr) {
-    let n = ctx.random().random_range(0..4u8);
+/// One backend of the pool, by index.
+fn pooled_backend(n: u8) -> (String, SocketAddr) {
     (
         format!("b{n}"),
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5300 + n as u16),
     )
+}
+
+/// The backend set the manager selects from.
+///
+/// Selection is the core's now, so the harness supplies the set rather than
+/// answering a request for one. [`Action::ChangeBackendSet`] mutates it
+/// mid-run, which is the interleaving the retired `Output::SelectBackend` used to inject
+/// — a backend arriving late, or differing from what a flow expected —
+/// expressed in the inverted architecture.
+///
+/// `select` is a pure function of the affinity `key` and the current set, so
+/// a replayed seed picks the same backends: the determinism the inversion
+/// exists to buy.
+struct SimBackends {
+    backends: Vec<(String, SocketAddr)>,
+}
+
+impl SimBackends {
+    fn full() -> Self {
+        Self {
+            backends: (0..4u8).map(pooled_backend).collect(),
+        }
+    }
+}
+
+impl BackendSource for SimBackends {
+    fn select(&mut self, _cluster: &str, key: Option<u64>) -> Option<(String, SocketAddr)> {
+        if self.backends.is_empty() {
+            return None;
+        }
+        let i = key.unwrap_or(0) as usize % self.backends.len();
+        Some(self.backends[i].clone())
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -113,7 +146,6 @@ fn pooled_backend(ctx: &SimContext) -> (String, SocketAddr) {
 struct Model {
     created_seen: u64,
     evicted_seen: u64,
-    awaiting: Vec<FlowId>,
     established: Vec<FlowId>,
     cap_high_water: usize,
     shed_seen: u64,
@@ -125,7 +157,6 @@ impl Model {
         Model {
             created_seen: 0,
             evicted_seen: 0,
-            awaiting: Vec::new(),
             established: Vec::new(),
             cap_high_water: initial_cap,
             shed_seen: 0,
@@ -134,19 +165,27 @@ impl Model {
     }
 
     /// Fully drain the manager's output queue, folding each `Output` into the
-    /// shadow model. Returns the `SelectBackend` flow ids surfaced this drain.
-    fn drain(&mut self, mgr: &mut UdpManager) -> Vec<(FlowId, u64)> {
-        let mut selects = Vec::new();
+    /// shadow model.
+    ///
+    /// Records every flow whose upstream the manager asked to open. That used
+    /// to be a two-step — the core asked which backend, the harness answered
+    /// — and is one step now: a flow reaching `OpenUpstream` is already
+    /// established, so there is nothing to reply to and nothing to park.
+    fn drain(&mut self, mgr: &mut UdpManager) {
         while let Some(out) = mgr.poll_output() {
             match out {
                 Output::Metric(MetricEvent::FlowCreated) => self.created_seen += 1,
                 Output::Metric(MetricEvent::FlowEvicted) => self.evicted_seen += 1,
                 Output::Metric(MetricEvent::FlowShed) => self.shed_seen += 1,
-                Output::SelectBackend { flow, key, .. } => selects.push((flow, key)),
+                Output::OpenUpstream { flow, .. } => {
+                    self.established.push(flow);
+                    if self.established.len() > 256 {
+                        self.established.remove(0);
+                    }
+                }
                 _ => {}
             }
         }
-        selects
     }
 
     /// Harness-level invariants, checked after every fully-drained step. The
@@ -205,7 +244,7 @@ impl Model {
 enum Action {
     ClientDatagram,
     BackendDatagram,
-    BackendResolved,
+    ChangeBackendSet,
     ReconfigCluster,
     SetMaxFlows,
     SetMaxRx,
@@ -217,9 +256,22 @@ enum Action {
 
 /// The weighted action grammar (weights sum to 100), in the EXACT dispatch
 /// order of the pre-swarm `0..100` `match`: a cumulative walk over this table
-/// with every feature enabled maps each roll to the same action the
-/// historical grammar did, so an all-features configuration stays
-/// draw-identical to the pre-swarm harness.
+/// with every feature enabled maps each roll to one action, deterministically.
+///
+/// **What still holds:** the weights sum to 100, the dispatch order is this
+/// table's order, and a replayed seed produces a byte-identical trace to
+/// itself — the property [`udp_simulation_is_deterministic`] asserts.
+///
+/// **What no longer holds:** identity with runs of the same seed from before
+/// selection moved into the core. That claim used to be written here and is
+/// now false. Index 1 was `BackendResolved`, replaced by
+/// [`Action::ChangeBackendSet`] at the same weight so the distribution over
+/// *kinds* of interleaving does not shrink — but the actions differ, and more
+/// decisively, the retired `Output::SelectBackend` took a `random_bool(0.6)`
+/// draw per select out of the RNG stream. Preserving seed identity was
+/// therefore never achievable by re-weighting the table alone. A differing
+/// result for a given seed across that boundary is expected and is not a
+/// regression.
 ///
 /// Swarm classification (see `doc/testing.md`): index 0 (`ClientDatagram`) is
 /// MANDATORY — it is the sole flow creator, and without it every shadow-model
@@ -229,7 +281,7 @@ enum Action {
 /// a capacity bug needs. The rest are OPTIONAL grammar features.
 const ACTION_TABLE: [(Action, u32); 10] = [
     (Action::ClientDatagram, 34),
-    (Action::BackendResolved, 16),
+    (Action::ChangeBackendSet, 16),
     (Action::BackendDatagram, 14),
     (Action::AdvanceClock, 14),
     (Action::ReconfigCluster, 6),
@@ -462,6 +514,9 @@ impl Workload for UdpSimWorkload {
         let hash_seed: u64 = ctx.random().random();
         let mut mgr = UdpManager::new(cluster, initial_cap, initial_max_rx, hash_seed);
         let mut model = Model::new(initial_cap);
+        // The backend set the manager selects from. `Action::ChangeBackendSet`
+        // is what mutates it during the run.
+        let mut backends = SimBackends::full();
         let mut max_rx = initial_max_rx;
 
         let _ = model.drain(&mut mgr);
@@ -486,30 +541,20 @@ impl Workload for UdpSimWorkload {
                         ManagerInput::ClientDatagram {
                             src,
                             payload: &payload,
+                            backends: &mut backends,
                         },
                         now(ctx),
                     );
                 }
-                Action::BackendResolved => {
-                    let flow = if !model.awaiting.is_empty() && ctx.random().random_bool(0.7) {
-                        let i = ctx.random().random_range(0..model.awaiting.len());
-                        model.awaiting.swap_remove(i)
-                    } else {
-                        ctx.random().random_range(0..64usize)
-                    };
-                    let (backend, addr) = pooled_backend(ctx);
-                    mgr.handle_input(
-                        ManagerInput::BackendResolved {
-                            flow,
-                            backend,
-                            addr,
-                        },
-                        now(ctx),
-                    );
-                    model.established.push(flow);
-                    if model.established.len() > 256 {
-                        model.established.remove(0);
-                    }
+                Action::ChangeBackendSet => {
+                    // Mutate the set the manager selects from, between one
+                    // admission and the next. This is the interleaving the
+                    // retired `BackendResolved` used to inject, in the shape
+                    // the inverted architecture has for it. Drawing zero is
+                    // deliberate: an empty set is the cluster-has-nothing case
+                    // that makes the next admission fail outright.
+                    let n = ctx.random().random_range(0..5u8);
+                    backends.backends = (0..n).map(pooled_backend).collect();
                 }
                 Action::BackendDatagram => {
                     let flow = if !model.established.is_empty() && ctx.random().random_bool(0.7) {
@@ -558,6 +603,7 @@ impl Workload for UdpSimWorkload {
                             ManagerInput::ClientDatagram {
                                 src,
                                 payload: &payload,
+                                backends: &mut backends,
                             },
                             now(ctx),
                         );
@@ -565,9 +611,9 @@ impl Workload for UdpSimWorkload {
                     // Push the virtual clock past every idle deadline.
                     let _ = ctx.time().sleep(Duration::from_secs(30)).await;
                     mgr.handle_timeout(now(ctx));
-                    let _ = model.drain(&mut mgr);
+                    model.drain(&mut mgr);
                     mgr.close_all(now(ctx));
-                    let _ = model.drain(&mut mgr);
+                    model.drain(&mut mgr);
                     assert_eq!(
                         mgr.flow_count(),
                         0,
@@ -583,7 +629,6 @@ impl Workload for UdpSimWorkload {
                     max_rx = 1500;
                     mgr = UdpManager::new(cfg, cap, max_rx, hash_seed);
                     model.cap_high_water = model.cap_high_water.max(cap);
-                    model.awaiting.clear();
                     model.established.clear();
                 }
                 Action::AdvanceClock => {
@@ -601,35 +646,14 @@ impl Workload for UdpSimWorkload {
                 }
                 Action::CloseAll => {
                     mgr.close_all(now(ctx));
-                    model.awaiting.clear();
+                    model.established.clear();
                 }
             }
 
-            // Drain outputs, fold into the model, honour a subset of new
-            // SelectBackend requests so flows progress to Established.
-            let selects = model.drain(&mut mgr);
-            for (flow, _key) in selects {
-                if ctx.random().random_bool(0.6) {
-                    let (backend, addr) = pooled_backend(ctx);
-                    mgr.handle_input(
-                        ManagerInput::BackendResolved {
-                            flow,
-                            backend,
-                            addr,
-                        },
-                        now(ctx),
-                    );
-                    model.established.push(flow);
-                    let after = model.drain(&mut mgr);
-                    model.awaiting.extend(after.into_iter().map(|(f, _)| f));
-                } else {
-                    model.awaiting.push(flow);
-                }
-            }
-            if model.established.len() > 256 {
-                let overflow = model.established.len() - 256;
-                model.established.drain(0..overflow);
-            }
+            // Drain outputs and fold them into the model. There is no
+            // resolution round-trip to honour any more: a flow that reaches
+            // `OpenUpstream` is already established, and `drain` records it.
+            model.drain(&mut mgr);
 
             // Buggify: low-probability extra adversarial events, using
             // moonpool's fault-injection primitive. Each arm is gated by its
@@ -639,7 +663,7 @@ impl Workload for UdpSimWorkload {
             if buggify_with_prob!(0.02) {
                 let arm = ctx.random().random_range(0..4u8);
                 let arm_feature = match arm {
-                    0 => Action::BackendResolved,
+                    0 => Action::ChangeBackendSet,
                     1 => Action::ReconfigCluster,
                     2 => Action::SetMaxFlows,
                     _ => Action::AdvanceClock,
@@ -647,16 +671,12 @@ impl Workload for UdpSimWorkload {
                 if swarm_cfg.is_enabled(arm_feature) {
                     match arm {
                         0 => {
-                            let flow = ctx.random().random_range(0..128usize);
-                            let (backend, addr) = pooled_backend(ctx);
-                            mgr.handle_input(
-                                ManagerInput::BackendResolved {
-                                    flow,
-                                    backend,
-                                    addr,
-                                },
-                                now(ctx),
-                            );
+                            // Adversarial backend-set churn: empty the set,
+                            // then refill it, so an admission can land on
+                            // either side of the change.
+                            backends.backends.clear();
+                            let n = ctx.random().random_range(0..5u8);
+                            backends.backends = (0..n).map(pooled_backend).collect();
                         }
                         1 => {
                             for _ in 0..ctx.random().random_range(2..6u8) {
@@ -689,7 +709,7 @@ impl Workload for UdpSimWorkload {
                 }
             }
 
-            let _ = model.drain(&mut mgr);
+            model.drain(&mut mgr);
             model.check(&mut mgr, step, "step");
         }
 

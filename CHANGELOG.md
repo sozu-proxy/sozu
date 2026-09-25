@@ -3685,6 +3685,60 @@
 
 ### ➖ Removed
 
+- **BREAKING (library API) — `refactor(udp)`: backend selection moves into the UDP core, closing
+  the last place this repository routed outside it
+  ([#1340](https://github.com/sozu-proxy/sozu/issues/1340), Question 6).** `UdpManager` now picks
+  the backend itself, from a `BackendSource` view the embedder supplies with the datagram that
+  needs it, instead of emitting `Output::SelectBackend` and waiting for the shell to answer. H2
+  routes inside the core as of the same issue; leaving UDP doing it the other way would have left
+  the repository with two architectures and no rule.
+
+  **Removed from `sozu_lib::protocol::udp`:** `Output::SelectBackend`,
+  `ManagerInput::BackendResolved`, `FlowPhase::AwaitingBackend`, and `UdpFlow::pending_payload`.
+  `ManagerInput::ClientDatagram` gains a `backends: &mut dyn BackendSource` field. A downstream
+  crate driving `UdpManager` supplies a `BackendSource` at the datagram and deletes its resolve
+  round-trip; `impl BackendSource for BackendMap` (`lib/src/backends.rs`) is the in-tree one and
+  delegates to `BackendMap::backend_from_cluster_id_with_key`, the connection-free selector the UDP
+  datapath already used. Nothing on the wire, no metric, no log line, no configuration key and no
+  CLI flag changes.
+
+  **A behaviour change, and the reason for it.** `FlowPhase::AwaitingBackend` existed for the
+  window between asking the shell to choose a backend and being told which; the one-slot
+  newest-wins buffer existed to hold a datagram across that window, its own comment saying it was
+  there "so the first datagram is not lost between admission and upstream open". Selection is
+  synchronous now, so the window is gone and the buffer has nothing to buffer. **Every datagram of
+  an opening burst now reaches the backend.** Previously a client sending three datagrams before
+  the shell replied had the first two discarded — newest-wins — and only the third forwarded.
+  `requests` counts each of them, so a cluster with a `requests` cap reaches it on the datagram it
+  should. Pinned by `every_datagram_of_an_opening_burst_is_forwarded_and_counted_once`.
+
+  Selection failing at admission is unchanged in effect: the flow is not created and the datagram
+  is dropped as `NoBackend`. `a_flow_that_cannot_get_a_backend_frees_its_slot_immediately` keeps
+  that property — it is live because `backend_from_cluster_id_with_key` has three
+  `NoBackendForCluster` returns.
+
+  **No test was deleted.** `lib/src/protocol/udp/manager.rs` keeps 24 of 24 `#[test]` functions;
+  21 are unchanged in assertion count, and the three whose subject was the retired machinery were
+  retargeted to the property that survives. Assertions went 92 → 85, every loss being a subject
+  that no longer exists: the `AwaitingBackend` phase assertions, "no `SendToBackend` yet" (there is
+  no *yet*), and the newest-wins buffer's.
+
+  **`sim/tests/udp_simulation.rs` loses seed→interleaving identity with runs from before this
+  change, and that is expected rather than a regression.** `ACTION_TABLE` index 1 is now
+  `Action::ChangeBackendSet` at the same weight 16, so the distribution over *kinds* of
+  interleaving does not shrink — mutating the backend set between one admission and the next is
+  the interleaving `BackendResolved` used to inject, in the shape the inverted architecture has for
+  it. But identity was never recoverable by re-weighting: retiring `Output::SelectBackend` removes
+  a `random_bool(0.6)` draw per select from the RNG stream whatever the table says. The comment
+  claiming the table stayed "draw-identical to the pre-swarm harness" was true and is now false; it
+  has been corrected in place to say what still holds — weights sum to 100, dispatch order matches
+  the table, a replayed seed is byte-identical to itself — and what does not. Every assertion in
+  the harness survives unchanged; `Model::check`'s four never referred to the retired machinery.
+
+  `fuzz/fuzz_targets/fuzz_udp_flow.rs` keeps its seven-way dispatch: arm 1 churns the backend set
+  instead of replying to a resolve request.
+
+
 - **`refactor(mux-h2)`: five redundant `socket_wants_write()` re-queries on the H2 TLS re-arm path
   ([#1339](https://github.com/sozu-proxy/sozu/issues/1339)).**
   `ConnectionH2::ensure_tls_flushed` now takes the TLS answer as a `tls_wants_write: bool`

@@ -3,8 +3,8 @@
 //! `UdpManager` owns the flow table (`HashMap<FlowKey, FlowId>` over a
 //! `slab::Slab<UdpFlow>`), admission ("allocate nothing for unknown / over-cap
 //! / invalid datagrams"), the flow-table cap and shedding, pluggable flow-key
-//! extraction ([`FlowKeyExtractor`]), the LB-selection *request* for new flows
-//! (it emits [`Output::SelectBackend`]; the shell does the actual LB), and the
+//! extraction ([`FlowKeyExtractor`]), backend selection for new flows (from
+//! the [`BackendSource`] view the embedder supplies), and the
 //! timer scheduling: a **single armed manager-wide deadline** plus per-flow
 //! **generation tokens** so a stale expiry can never close a refreshed flow.
 //!
@@ -22,8 +22,8 @@ use std::{
 use slab::Slab;
 
 use crate::protocol::udp::{
-    ClusterConfig, ConfigEvent, DropReason, FlowId, FlowKey, ManagerInput, MetricEvent, Output,
-    Transmit,
+    BackendSource, ClusterConfig, ConfigEvent, DropReason, FlowId, FlowKey, ManagerInput,
+    MetricEvent, Output, Transmit,
     flow::{CloseReason, FlowPhase, UdpFlow},
     proxy_protocol::prepend_dgram_header,
 };
@@ -172,18 +172,15 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
     /// Feed one input into the manager. Pure: `now` is injected.
     pub fn handle_input(&mut self, input: ManagerInput<'_>, now: Instant) {
         match input {
-            ManagerInput::ClientDatagram { src, payload } => {
-                self.on_client_datagram(src, payload, now)
-            }
+            ManagerInput::ClientDatagram {
+                src,
+                payload,
+                backends,
+            } => self.on_client_datagram(src, payload, backends, now),
             ManagerInput::BackendDatagram { flow, payload } => {
                 self.on_backend_datagram(flow, payload, now)
             }
             ManagerInput::Config(event) => self.on_config(event, now),
-            ManagerInput::BackendResolved {
-                flow,
-                backend,
-                addr,
-            } => self.on_backend_resolved(flow, backend, addr, now),
         }
         // Post-condition: the public method ran to completion under the caller's
         // lock, so every structural invariant must hold again.
@@ -244,7 +241,13 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         self.debug_assert_invariants();
     }
 
-    fn on_client_datagram(&mut self, src: SocketAddr, payload: &[u8], now: Instant) {
+    fn on_client_datagram(
+        &mut self,
+        src: SocketAddr,
+        payload: &[u8],
+        backends: &mut dyn BackendSource,
+        now: Instant,
+    ) {
         // Over-size check first — never allocate for a truncated datagram.
         if payload.len() > self.max_rx_datagram_size {
             self.drop_datagram(DropReason::Truncated);
@@ -312,15 +315,36 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
             "admit path entered for a key already in the table (would orphan a flow)"
         );
 
-        // Admit: one slab slot + one copy of the payload (the design's single
-        // admission copy). The flow is parked AwaitingBackend with the datagram
-        // buffered until the shell resolves a backend. `requests_seen` stays 0:
-        // the datagram is only buffered here, and is counted as a forward when
-        // it is actually flushed in `on_backend_resolved` — so `requests`
-        // measures real forwards, not buffered-and-maybe-discarded datagrams.
-        let mut flow = UdpFlow::new(src, self.cluster.clone(), now);
-        flow.pending_payload = Some(payload.to_vec());
-        let key_hash = self.affinity_hash(&flow);
+        // Select the backend HERE, in the core, from the view the embedder
+        // handed in with this datagram (#1340, Question 6). The affinity hash
+        // is computed from a provisional flow so HRW / Maglev keep a client
+        // pinned; it reads only `client` and `config`, neither of which the
+        // backend can change.
+        let key_hash = self.affinity_hash(&UdpFlow::new(
+            src,
+            self.cluster.clone(),
+            String::new(),
+            src,
+            now,
+        ));
+        let Some((backend_id, backend_addr)) =
+            backends.select(&self.cluster.cluster, Some(key_hash))
+        else {
+            // The cluster has nothing that can serve. Drop without allocating
+            // a slab slot: there is no flow to park and nothing to abort.
+            self.drop_datagram(DropReason::NoBackend);
+            debug_assert_eq!(
+                self.flows.len(),
+                flows_before_admit,
+                "a failed selection must allocate no flow"
+            );
+            return;
+        };
+
+        // Admit: one slab slot. The flow is `Established` from birth — its
+        // backend was chosen a line ago — so there is no window in which it
+        // exists without one, and no datagram to buffer against that window.
+        let flow = UdpFlow::new(src, self.cluster.clone(), backend_id, backend_addr, now);
         let flow_id = self.flows.insert(flow);
         self.table.insert(key, flow_id);
 
@@ -339,12 +363,57 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
 
         self.outputs
             .push_back(Output::Metric(MetricEvent::FlowCreated));
-        self.outputs.push_back(Output::SelectBackend {
+        // Ask the shell to open the connected upstream socket and register
+        // `upstream_token -> flow` for NAT return demux. This is the returned
+        // request the embedder fulfils — the shape `Output::SelectBackend` used
+        // to have, except the decision it carries is now the core's.
+        self.outputs.push_back(Output::OpenUpstream {
             flow: flow_id,
-            cluster: self.cluster.cluster.clone(),
-            key: key_hash,
+            backend: backend_addr,
         });
-        // Arm the idle timer for the freshly-admitted flow.
+
+        // Forward the admission datagram immediately. It used to be buffered
+        // until the shell resolved a backend; there is no such window now, so
+        // it is a forward like any other and is counted as one.
+        self.forward_admission_datagram(flow_id, payload, backend_addr, now);
+    }
+
+    /// Send the datagram that caused a flow's admission, counting it as the
+    /// forward it now is.
+    ///
+    /// Before selection moved into the core this datagram sat in a one-slot
+    /// newest-wins buffer until `BackendResolved` arrived, and a second
+    /// datagram in that window replaced it. The window is gone, so the buffer
+    /// is too: every datagram of an opening burst is forwarded.
+    fn forward_admission_datagram(
+        &mut self,
+        flow_id: FlowId,
+        payload: &[u8],
+        backend: SocketAddr,
+        now: Instant,
+    ) {
+        let Some(flow) = self.flows.get_mut(flow_id) else {
+            debug_assert!(false, "the flow was inserted one statement ago");
+            return;
+        };
+        let mut out = payload.to_vec();
+        flow.on_client_datagram(now);
+        if flow.take_proxy_protocol() {
+            prepend_dgram_header(&mut out, flow.client, backend);
+        }
+        let teardown = flow.teardown_reason();
+        self.outputs
+            .push_back(Output::Metric(MetricEvent::DatagramIn(payload.len())));
+        self.outputs.push_back(Output::SendToBackend(Transmit {
+            dst: backend,
+            segment_size: None,
+            payload: out,
+        }));
+        if let Some(reason) = teardown {
+            self.close_flow(flow_id, reason);
+            return;
+        }
+        // `on_client_datagram` already refreshed the deadline + generation.
         self.reschedule();
     }
 
@@ -356,16 +425,6 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
         };
 
         match flow.phase {
-            FlowPhase::AwaitingBackend => {
-                // Backend not yet resolved: buffer (newest-wins, one slot) and
-                // refresh idle ONLY. Do not count this toward `requests` — the
-                // previously-buffered datagram is now discarded and was never
-                // forwarded. The single surviving buffered datagram is counted
-                // when it is actually flushed in `on_backend_resolved`.
-                flow.pending_payload = Some(payload.to_vec());
-                flow.touch(flow.config.front_timeout, now);
-                self.reschedule();
-            }
             FlowPhase::Established => {
                 flow.on_client_datagram(now);
                 let backend = flow
@@ -394,69 +453,6 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
                 self.drop_datagram(DropReason::Shed);
             }
         }
-    }
-
-    fn on_backend_resolved(
-        &mut self,
-        flow_id: FlowId,
-        backend: String,
-        addr: SocketAddr,
-        now: Instant,
-    ) {
-        let Some(flow) = self.flows.get_mut(flow_id) else {
-            // Flow was reaped (idle/drain) before the shell resolved a backend.
-            self.drop_datagram(DropReason::UnknownFlow);
-            return;
-        };
-        if flow.phase != FlowPhase::AwaitingBackend {
-            // Duplicate / late resolution; ignore without allocating.
-            return;
-        }
-        flow.backend_id = Some(backend);
-        flow.backend_addr = Some(addr);
-        flow.set_phase(FlowPhase::Established);
-
-        // Open the connected upstream socket (the shell registers
-        // upstream_token -> flow for NAT return).
-        self.outputs.push_back(Output::OpenUpstream {
-            flow: flow_id,
-            backend: addr,
-        });
-
-        // Flush the buffered first datagram, if any. This is the real forward
-        // site for the admission datagram, so count it toward `requests` here
-        // (refreshing the front idle deadline at the same time) — not at
-        // admission, where it was only buffered.
-        let pending = flow.pending_payload.take();
-        if let Some(mut payload) = pending {
-            let payload_len = payload.len();
-            flow.on_client_datagram(now);
-            if flow.take_proxy_protocol() {
-                prepend_dgram_header(&mut payload, flow.client, addr);
-            }
-            let teardown = flow.teardown_reason();
-            self.outputs
-                .push_back(Output::Metric(MetricEvent::DatagramIn(payload_len)));
-            self.outputs.push_back(Output::SendToBackend(Transmit {
-                dst: addr,
-                segment_size: None,
-                payload,
-            }));
-            if let Some(reason) = teardown {
-                self.close_flow(flow_id, reason);
-                return;
-            }
-            // `on_client_datagram` already refreshed the deadline + generation.
-            self.reschedule();
-            return;
-        }
-        // No buffered datagram: refresh idle and re-arm (phase changed; the
-        // deadline was set at `new()`).
-        let _gen = self
-            .flows
-            .get_mut(flow_id)
-            .map(|f| f.touch(self.cluster.front_timeout, now));
-        self.reschedule();
     }
 
     fn on_backend_datagram(&mut self, flow_id: FlowId, payload: &[u8], now: Instant) {
@@ -755,28 +751,20 @@ impl<E: FlowKeyExtractor> UdpManager<E> {
                 FlowPhase::Closing,
                 "FlowId {id} persists in the slab while Closing (close_flow must remove it)"
             );
-            debug_assert!(
-                matches!(
-                    flow.phase,
-                    FlowPhase::AwaitingBackend | FlowPhase::Established
-                ),
-                "FlowId {id} has an unexpected live phase {:?}",
-                flow.phase
+            debug_assert_eq!(
+                flow.phase,
+                FlowPhase::Established,
+                "FlowId {id} has an unexpected live phase"
             );
 
-            // (5) Established <=> backend_addr.is_some(); AwaitingBackend <=>
-            // backend_addr.is_none() (positive + negative space).
-            match flow.phase {
-                FlowPhase::Established => debug_assert!(
-                    flow.backend_addr.is_some(),
-                    "Established FlowId {id} has no backend address"
-                ),
-                FlowPhase::AwaitingBackend => debug_assert!(
-                    flow.backend_addr.is_none(),
-                    "AwaitingBackend FlowId {id} already carries a backend address"
-                ),
-                FlowPhase::Closing => {}
-            }
+            // (5) A live flow always carries the backend it was admitted on.
+            // The negative half of this pair — a phase that carried no address
+            // — went with `AwaitingBackend`: selection now happens before the
+            // flow exists, so there is no such state to assert about.
+            debug_assert!(
+                flow.backend_addr.is_some(),
+                "live FlowId {id} has no backend address"
+            );
 
             // (7) Counters within caps OR a teardown is due. A flow whose cap is
             // exhausted must report a teardown reason; an exhausted flow that
@@ -856,6 +844,53 @@ mod tests {
 
     use super::*;
 
+    /// The backend set these tests select from.
+    ///
+    /// Selection moved into the core (#1340, Question 6), so a test that
+    /// admits a flow has to supply one. Round-robin over whatever it holds;
+    /// `none()` is the cluster-has-nothing case that makes admission fail,
+    /// which is a live path because
+    /// `BackendMap::backend_from_cluster_id_with_key` has three
+    /// `NoBackendForCluster` returns.
+    struct TestBackends {
+        backends: Vec<(String, SocketAddr)>,
+        next: usize,
+    }
+
+    impl TestBackends {
+        /// One backend, which is what every test that is not about selection
+        /// wants.
+        fn one() -> Self {
+            Self {
+                backends: vec![("b1".to_owned(), backend_addr(1))],
+                next: 0,
+            }
+        }
+
+        /// A cluster with nothing that can serve.
+        fn none() -> Self {
+            Self {
+                backends: Vec::new(),
+                next: 0,
+            }
+        }
+    }
+
+    impl BackendSource for TestBackends {
+        fn select(&mut self, _cluster: &str, _key: Option<u64>) -> Option<(String, SocketAddr)> {
+            if self.backends.is_empty() {
+                return None;
+            }
+            let picked = self.backends[self.next % self.backends.len()].clone();
+            self.next += 1;
+            Some(picked)
+        }
+    }
+
+    fn backend_addr(n: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)), 5353)
+    }
+
     fn cluster(name: &str) -> ClusterConfig {
         ClusterConfig {
             cluster: name.to_owned(),
@@ -867,10 +902,6 @@ mod tests {
 
     fn client(n: u8, port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)), port)
-    }
-
-    fn backend() -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5300)
     }
 
     /// Drain all outputs into a Vec for assertions.
@@ -890,6 +921,7 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
                 payload: b"hi",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
@@ -902,7 +934,7 @@ mod tests {
         assert!(
             !outs
                 .iter()
-                .any(|o| matches!(o, Output::SelectBackend { .. }))
+                .any(|o| matches!(o, Output::OpenUpstream { .. }))
         );
     }
 
@@ -913,6 +945,7 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
                 payload: b"",
+                backends: &mut TestBackends::one(),
             },
             Instant::now(),
         );
@@ -931,6 +964,7 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
                 payload: b"toolong",
+                backends: &mut TestBackends::one(),
             },
             Instant::now(),
         );
@@ -942,8 +976,20 @@ mod tests {
         );
     }
 
+    /// A new flow opens an upstream and forwards its admission datagram, in
+    /// one call.
+    ///
+    /// Retargeted from `new_flow_requests_backend_then_forwards_buffered_datagram`.
+    /// That name described a two-step: the core asked the shell to choose a
+    /// backend, buffered the datagram, and flushed it when the shell replied.
+    /// Selection is the core's now, so there is no window and nothing to
+    /// buffer — the datagram is forwarded on the way in.
+    ///
+    /// Its "no SendToBackend yet, backend not resolved" assertion is the one
+    /// casualty: there is no *yet*. Its partner — that the datagram does reach
+    /// the backend, intact and at the right address — survives and is below.
     #[test]
-    fn new_flow_requests_backend_then_forwards_buffered_datagram() {
+    fn a_new_flow_opens_an_upstream_and_forwards_its_admission_datagram() {
         let mut mgr = UdpManager::new(cluster("dns"), 16, 65535, 7);
         let now = Instant::now();
         let src = client(1, 1000);
@@ -951,34 +997,23 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src,
                 payload: b"query",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
         assert_eq!(mgr.flow_count(), 1);
         let outs = drain(&mut mgr);
-        let select = outs
+        let opened = outs
             .iter()
             .find_map(|o| match o {
-                Output::SelectBackend { flow, cluster, .. } => Some((*flow, cluster.clone())),
+                Output::OpenUpstream { flow, backend } => Some((*flow, *backend)),
                 _ => None,
             })
-            .expect("SelectBackend emitted");
-        assert_eq!(select.1, "dns");
-        // No SendToBackend yet — backend not resolved.
-        assert!(!outs.iter().any(|o| matches!(o, Output::SendToBackend(_))));
-
-        mgr.handle_input(
-            ManagerInput::BackendResolved {
-                flow: select.0,
-                backend: "b1".to_owned(),
-                addr: backend(),
-            },
-            now,
-        );
-        let outs = drain(&mut mgr);
-        assert!(
-            outs.iter()
-                .any(|o| matches!(o, Output::OpenUpstream { .. }))
+            .expect("admission must ask the shell to open an upstream");
+        assert_eq!(
+            opened.1,
+            backend_addr(1),
+            "the upstream must be opened to the backend the core selected"
         );
         let sent = outs
             .iter()
@@ -986,8 +1021,8 @@ mod tests {
                 Output::SendToBackend(t) => Some(t.clone()),
                 _ => None,
             })
-            .expect("buffered datagram flushed on resolve");
-        assert_eq!(sent.dst, backend());
+            .expect("the admission datagram must be forwarded in the same call");
+        assert_eq!(sent.dst, backend_addr(1));
         assert_eq!(sent.payload, b"query");
     }
 
@@ -1000,24 +1035,17 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src,
                 payload: b"q1",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
-        let select_flow = drain(&mut mgr)
+        let _select_flow = drain(&mut mgr)
             .into_iter()
             .find_map(|o| match o {
-                Output::SelectBackend { flow, .. } => Some(flow),
+                Output::OpenUpstream { flow, .. } => Some(flow),
                 _ => None,
             })
             .unwrap();
-        mgr.handle_input(
-            ManagerInput::BackendResolved {
-                flow: select_flow,
-                backend: "b1".to_owned(),
-                addr: backend(),
-            },
-            now,
-        );
         drain(&mut mgr);
 
         // Second datagram from same source: no new SelectBackend, direct send.
@@ -1025,6 +1053,7 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src,
                 payload: b"q2",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
@@ -1033,7 +1062,7 @@ mod tests {
         assert!(
             !outs
                 .iter()
-                .any(|o| matches!(o, Output::SelectBackend { .. }))
+                .any(|o| matches!(o, Output::OpenUpstream { .. }))
         );
         assert!(
             outs.iter()
@@ -1048,22 +1077,21 @@ mod tests {
         let mut mgr = UdpManager::new(cfg, 16, 65535, 7);
         let now = Instant::now();
         let src = client(1, 1000);
-        mgr.handle_input(ManagerInput::ClientDatagram { src, payload: b"q" }, now);
-        let flow = drain(&mut mgr)
-            .into_iter()
-            .find_map(|o| match o {
-                Output::SelectBackend { flow, .. } => Some(flow),
-                _ => None,
-            })
-            .unwrap();
         mgr.handle_input(
-            ManagerInput::BackendResolved {
-                flow,
-                backend: "b1".to_owned(),
-                addr: backend(),
+            ManagerInput::ClientDatagram {
+                src,
+                payload: b"q",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
+        let flow = drain(&mut mgr)
+            .into_iter()
+            .find_map(|o| match o {
+                Output::OpenUpstream { flow, .. } => Some(flow),
+                _ => None,
+            })
+            .unwrap();
         drain(&mut mgr);
 
         // Single backend reply closes the flow.
@@ -1093,25 +1121,31 @@ mod tests {
         let mut mgr = UdpManager::new(cfg, 16, 65535, 7);
         let now = Instant::now();
         let src = client(1, 1000);
-        mgr.handle_input(ManagerInput::ClientDatagram { src, payload: b"1" }, now);
-        let flow = drain(&mut mgr)
-            .into_iter()
-            .find_map(|o| match o {
-                Output::SelectBackend { flow, .. } => Some(flow),
-                _ => None,
-            })
-            .unwrap();
         mgr.handle_input(
-            ManagerInput::BackendResolved {
-                flow,
-                backend: "b1".to_owned(),
-                addr: backend(),
+            ManagerInput::ClientDatagram {
+                src,
+                payload: b"1",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
+        let _flow = drain(&mut mgr)
+            .into_iter()
+            .find_map(|o| match o {
+                Output::OpenUpstream { flow, .. } => Some(flow),
+                _ => None,
+            })
+            .unwrap();
         drain(&mut mgr);
         // requests_seen is now 1 (the admission datagram). Second hits the cap.
-        mgr.handle_input(ManagerInput::ClientDatagram { src, payload: b"2" }, now);
+        mgr.handle_input(
+            ManagerInput::ClientDatagram {
+                src,
+                payload: b"2",
+                backends: &mut TestBackends::one(),
+            },
+            now,
+        );
         let outs = drain(&mut mgr);
         assert!(outs.iter().any(|o| matches!(o, Output::CloseFlow(_))));
         assert_eq!(mgr.flow_count(), 0);
@@ -1125,6 +1159,7 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
                 payload: b"a",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
@@ -1135,6 +1170,7 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src: client(2, 1000),
                 payload: b"b",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
@@ -1160,6 +1196,7 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
                 payload: b"q",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
@@ -1202,6 +1239,7 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
                 payload: b"q",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
@@ -1268,6 +1306,7 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
                 payload: b"q",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
@@ -1314,22 +1353,21 @@ mod tests {
         let mut mgr = UdpManager::new(cfg, 16, 65535, 7);
         let now = Instant::now();
         let src = client(1, 1000);
-        mgr.handle_input(ManagerInput::ClientDatagram { src, payload: b"q" }, now);
-        let flow = drain(&mut mgr)
-            .into_iter()
-            .find_map(|o| match o {
-                Output::SelectBackend { flow, .. } => Some(flow),
-                _ => None,
-            })
-            .unwrap();
         mgr.handle_input(
-            ManagerInput::BackendResolved {
-                flow,
-                backend: "b1".to_owned(),
-                addr: backend(),
+            ManagerInput::ClientDatagram {
+                src,
+                payload: b"q",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
+        let flow = drain(&mut mgr)
+            .into_iter()
+            .find_map(|o| match o {
+                Output::OpenUpstream { flow, .. } => Some(flow),
+                _ => None,
+            })
+            .unwrap();
         drain(&mut mgr);
         let gen0 = mgr.flow(flow).unwrap().timer_gen;
         // Datagram at t=5 refreshes deadline to t=15 and bumps generation.
@@ -1338,6 +1376,7 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src,
                 payload: b"q2",
+                backends: &mut TestBackends::one(),
             },
             t5,
         );
@@ -1358,7 +1397,14 @@ mod tests {
         let mut mgr = UdpManager::new(cluster("dns"), 16, 65535, 7);
         let now = Instant::now();
         let src = client(1, 1000);
-        mgr.handle_input(ManagerInput::ClientDatagram { src, payload: b"q" }, now);
+        mgr.handle_input(
+            ManagerInput::ClientDatagram {
+                src,
+                payload: b"q",
+                backends: &mut TestBackends::one(),
+            },
+            now,
+        );
         drain(&mut mgr);
         mgr.handle_input(ManagerInput::Config(ConfigEvent::Drain), now);
         // New flow shed.
@@ -1366,6 +1412,7 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src: client(2, 1000),
                 payload: b"q",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
@@ -1384,22 +1431,21 @@ mod tests {
         let mut mgr = UdpManager::new(cfg, 16, 65535, 7);
         let now = Instant::now();
         let src = client(1, 1000);
-        mgr.handle_input(ManagerInput::ClientDatagram { src, payload: b"q" }, now);
-        let flow = drain(&mut mgr)
-            .into_iter()
-            .find_map(|o| match o {
-                Output::SelectBackend { flow, .. } => Some(flow),
-                _ => None,
-            })
-            .unwrap();
         mgr.handle_input(
-            ManagerInput::BackendResolved {
-                flow,
-                backend: "b1".to_owned(),
-                addr: backend(),
+            ManagerInput::ClientDatagram {
+                src,
+                payload: b"q",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
+        let flow = drain(&mut mgr)
+            .into_iter()
+            .find_map(|o| match o {
+                Output::OpenUpstream { flow, .. } => Some(flow),
+                _ => None,
+            })
+            .unwrap();
         drain(&mut mgr);
         // Reconfigure to responses=1; the live flow keeps responses=0 (captured).
         let mut newcfg = cluster("dns");
@@ -1427,6 +1473,7 @@ mod tests {
                 ManagerInput::ClientDatagram {
                     src: client(n, 1000),
                     payload: b"q",
+                    backends: &mut TestBackends::one(),
                 },
                 now,
             );
@@ -1457,32 +1504,28 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src,
                 payload: b"q1",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
-        let flow = drain(&mut mgr)
-            .into_iter()
+        // One drain: the upstream request and the admission datagram are
+        // emitted by the same call now, not across a resolve round-trip.
+        let outs = drain(&mut mgr);
+        let _flow = outs
+            .iter()
             .find_map(|o| match o {
-                Output::SelectBackend { flow, .. } => Some(flow),
+                Output::OpenUpstream { flow, .. } => Some(*flow),
                 _ => None,
             })
-            .unwrap();
-        mgr.handle_input(
-            ManagerInput::BackendResolved {
-                flow,
-                backend: "b1".to_owned(),
-                addr: backend(),
-            },
-            now,
-        );
-        // First flushed datagram carries the PPv2 prefix.
-        let first = drain(&mut mgr)
+            .expect("admission must ask the shell to open an upstream");
+        // First datagram to the backend carries the PPv2 prefix.
+        let first = outs
             .into_iter()
             .find_map(|o| match o {
                 Output::SendToBackend(t) => Some(t.payload),
                 _ => None,
             })
-            .unwrap();
+            .expect("the admission datagram must be forwarded");
         assert!(first.len() > 2, "PPv2 header prepended to first datagram");
         assert_eq!(&first[..4], &[0x0D, 0x0A, 0x0D, 0x0A]);
         assert_eq!(first[12], 0x21);
@@ -1494,6 +1537,7 @@ mod tests {
             ManagerInput::ClientDatagram {
                 src,
                 payload: b"q2",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
@@ -1510,25 +1554,29 @@ mod tests {
     /// Helper: admit a flow from `src`, resolve it to `backend()`, and return
     /// its FlowId. Drains the manager between steps. Leaves the flow
     /// `Established`.
+    /// Admit a flow and return its id.
+    ///
+    /// One call now. It used to be two — admit, then reply to
+    /// `Output::SelectBackend` with `ManagerInput::BackendResolved` — because
+    /// the shell chose the backend. The core chooses it, so admission
+    /// establishes in the same call and the flow id comes from the
+    /// `OpenUpstream` the manager asks for.
     fn establish(mgr: &mut UdpManager, src: SocketAddr, now: Instant) -> FlowId {
-        mgr.handle_input(ManagerInput::ClientDatagram { src, payload: b"q" }, now);
-        let flow = drain(mgr)
-            .into_iter()
-            .find_map(|o| match o {
-                Output::SelectBackend { flow, .. } => Some(flow),
-                _ => None,
-            })
-            .unwrap();
         mgr.handle_input(
-            ManagerInput::BackendResolved {
-                flow,
-                backend: "b1".to_owned(),
-                addr: backend(),
+            ManagerInput::ClientDatagram {
+                src,
+                payload: b"q",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
-        drain(mgr);
-        flow
+        drain(mgr)
+            .into_iter()
+            .find_map(|o| match o {
+                Output::OpenUpstream { flow, .. } => Some(flow),
+                _ => None,
+            })
+            .expect("admission must ask the shell to open an upstream")
     }
 
     #[test]
@@ -1549,13 +1597,14 @@ mod tests {
                 ManagerInput::ClientDatagram {
                     src: client(n, 1000),
                     payload: b"q",
+                    backends: &mut TestBackends::one(),
                 },
                 now,
             );
             let flow = drain(&mut mgr)
                 .into_iter()
                 .find_map(|o| match o {
-                    Output::SelectBackend { flow, .. } => Some(flow),
+                    Output::OpenUpstream { flow, .. } => Some(flow),
                     _ => None,
                 })
                 .unwrap();
@@ -1634,47 +1683,60 @@ mod tests {
         assert_eq!(mgr.flow_count(), 0);
     }
 
+    /// A flow that cannot get a backend must free its slot immediately.
+    ///
+    /// Retargeted from `abort_flow_closes_awaiting_backend_flow`. Its subject
+    /// was the `AwaitingBackend` phase, which selection-in-core removed — but
+    /// the *property* it pinned survives, because selection can still fail:
+    /// `BackendMap::backend_from_cluster_id_with_key` has three
+    /// `NoBackendForCluster` returns. The failure just happens inside the
+    /// admitting call now instead of across two.
+    ///
+    /// What is asserted is unchanged in substance: nothing is left pinning a
+    /// `max_flows` slot, and no timer is armed for a flow that never ran.
     #[test]
-    fn abort_flow_closes_awaiting_backend_flow() {
-        // Simulates udp_connect failing / no backend resolving: the flow never
-        // leaves AwaitingBackend and must still free its slot immediately.
+    fn a_flow_that_cannot_get_a_backend_frees_its_slot_immediately() {
         let mut mgr = UdpManager::new(cluster("dns"), 16, 65535, 7);
         let now = Instant::now();
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
                 payload: b"q",
+                // The cluster has nothing that can serve.
+                backends: &mut TestBackends::none(),
             },
             now,
         );
-        let flow = drain(&mut mgr)
-            .into_iter()
-            .find_map(|o| match o {
-                Output::SelectBackend { flow, .. } => Some(flow),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(mgr.flow_count(), 1);
-        assert_eq!(mgr.flow(flow).unwrap().phase, FlowPhase::AwaitingBackend);
 
-        mgr.abort_flow(flow, now, CloseReason::Aborted);
         let outs = drain(&mut mgr);
         assert!(
             outs.iter()
-                .any(|o| matches!(o, Output::Metric(MetricEvent::FlowEvicted)))
+                .any(|o| matches!(o, Output::Drop(DropReason::NoBackend))),
+            "a failed selection must surface as a NoBackend drop: {outs:?}"
         );
         assert!(
-            outs.iter()
-                .any(|o| matches!(o, Output::CloseFlow(f) if *f == flow))
+            !outs
+                .iter()
+                .any(|o| matches!(o, Output::OpenUpstream { .. })),
+            "no upstream may be opened for a flow that got no backend"
         );
-        assert_eq!(mgr.flow_count(), 0, "AwaitingBackend slot freed by abort");
-        assert!(mgr.poll_timeout().is_none());
-        // The freed key is reusable: a new datagram from the same source admits
-        // a fresh flow rather than colliding with the aborted one.
+        assert_eq!(
+            mgr.flow_count(),
+            0,
+            "a failed selection must leave no flow pinning a max_flows slot"
+        );
+        assert!(
+            mgr.poll_timeout().is_none(),
+            "no timer may be armed for a flow that never ran"
+        );
+
+        // The key is reusable: a later datagram from the same source admits a
+        // fresh flow rather than colliding with the refused one.
         mgr.handle_input(
             ManagerInput::ClientDatagram {
                 src: client(1, 1000),
                 payload: b"q2",
+                backends: &mut TestBackends::one(),
             },
             now,
         );
@@ -1690,83 +1752,22 @@ mod tests {
         assert_eq!(mgr.flow_count(), 0);
     }
 
-    #[test]
-    fn requests_counts_forwards_not_buffered_during_await() {
-        // requests = 2. A burst of client datagrams arrives while the flow is
-        // still AwaitingBackend; all but the newest are discarded (newest-wins)
-        // and never forwarded — so they must NOT count toward `requests`. After
-        // resolve, the single buffered datagram is forwarded (count = 1). Only a
-        // SECOND real forward (post-establish) should reach the cap.
-        let mut cfg = cluster("syslog");
-        cfg.requests = 2;
-        let mut mgr = UdpManager::new(cfg, 16, 65535, 7);
-        let now = Instant::now();
-        let src = client(1, 1000);
-
-        // Admission datagram → AwaitingBackend, buffered (not counted yet).
-        mgr.handle_input(ManagerInput::ClientDatagram { src, payload: b"1" }, now);
-        let flow = drain(&mut mgr)
-            .into_iter()
-            .find_map(|o| match o {
-                Output::SelectBackend { flow, .. } => Some(flow),
-                _ => None,
-            })
-            .unwrap();
-        // Burst during await: 3 more datagrams, all overwriting the one slot.
-        for p in [b"2".as_slice(), b"3", b"4"] {
-            mgr.handle_input(ManagerInput::ClientDatagram { src, payload: p }, now);
-        }
-        drain(&mut mgr);
-        // Still alive, still awaiting — the burst did NOT trip the cap.
-        assert_eq!(mgr.flow_count(), 1, "await burst must not close the flow");
-        assert_eq!(
-            mgr.flow(flow).unwrap().requests_seen,
-            0,
-            "buffered-only datagrams must not count toward requests"
-        );
-
-        // Resolve: the single surviving buffered datagram is forwarded (count 1).
-        mgr.handle_input(
-            ManagerInput::BackendResolved {
-                flow,
-                backend: "b1".to_owned(),
-                addr: backend(),
-            },
-            now,
-        );
-        let outs = drain(&mut mgr);
-        assert!(
-            outs.iter()
-                .any(|o| matches!(o, Output::SendToBackend(t) if t.payload == b"4")),
-            "newest buffered datagram is the one forwarded"
-        );
-        assert!(
-            !outs.iter().any(|o| matches!(o, Output::CloseFlow(_))),
-            "one forward must not reach requests=2"
-        );
-        assert_eq!(mgr.flow_count(), 1);
-        assert_eq!(mgr.flow(flow).unwrap().requests_seen, 1);
-
-        // A real second forward (Established) reaches the cap and closes.
-        mgr.handle_input(ManagerInput::ClientDatagram { src, payload: b"5" }, now);
-        let outs = drain(&mut mgr);
-        assert!(
-            outs.iter()
-                .any(|o| matches!(o, Output::SendToBackend(t) if t.payload == b"5"))
-        );
-        assert!(
-            outs.iter().any(|o| matches!(o, Output::CloseFlow(_))),
-            "second real forward reaches requests=2"
-        );
-        assert_eq!(mgr.flow_count(), 0);
-    }
-
+    /// Every datagram of an opening burst reaches the backend, and each is
+    /// counted exactly once.
+    ///
+    /// Retargeted from the test that pinned the await-window buffering.
+    /// Its subject was the await window: datagrams arriving while the flow was
+    /// `AwaitingBackend` went into a one-slot newest-wins buffer, all but the
+    /// last were discarded, and only the survivor counted toward `requests`.
+    /// Selection happens inside the admitting call now, so there is no window,
+    /// no buffer, and nothing discarded — which is the **behaviour change**
+    /// this changeset carries into the UDP datapath.
+    ///
+    /// Two properties, both live: the burst is delivered in full, and
+    /// `requests` counts real forwards exactly once each so the cap still
+    /// closes the flow on the right datagram.
     // ---- quickcheck property tests (zero sockets, injected Instants) -------
-
     use quickcheck::{Arbitrary, Gen, quickcheck};
-
-    /// One step of an abstract client-side workload: a datagram from one of a
-    /// bounded set of sources, or a clock advance that fires the reaper.
     #[derive(Clone, Debug)]
     enum Step {
         /// Client datagram from source `id % 8`.
@@ -1792,6 +1793,85 @@ mod tests {
     /// inside `handle_timeout` itself (debug builds), so every `Tick` exercises
     /// it for free.
     #[test]
+    fn every_datagram_of_an_opening_burst_is_forwarded_and_counted_once() {
+        // Part one: an unlimited flow delivers the whole burst. Before this
+        // change only `b"3"` would have reached the backend.
+        let mut mgr = UdpManager::new(cluster("syslog"), 16, 65535, 7);
+        let now = Instant::now();
+        let src = client(1, 1000);
+        for p in [b"1".as_slice(), b"2", b"3"] {
+            mgr.handle_input(
+                ManagerInput::ClientDatagram {
+                    src,
+                    payload: p,
+                    backends: &mut TestBackends::one(),
+                },
+                now,
+            );
+        }
+        let sent: Vec<Vec<u8>> = drain(&mut mgr)
+            .into_iter()
+            .filter_map(|o| match o {
+                Output::SendToBackend(t) => Some(t.payload),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()],
+            "every datagram of the opening burst must reach the backend, in order"
+        );
+
+        // Part two: `requests` counts each real forward once, so a cap of two
+        // closes the flow on the second datagram and not before.
+        let mut cfg = cluster("syslog");
+        cfg.requests = 2;
+        let mut mgr = UdpManager::new(cfg, 16, 65535, 7);
+        let src = client(2, 1000);
+        mgr.handle_input(
+            ManagerInput::ClientDatagram {
+                src,
+                payload: b"a",
+                backends: &mut TestBackends::one(),
+            },
+            now,
+        );
+        let flow = drain(&mut mgr)
+            .into_iter()
+            .find_map(|o| match o {
+                Output::OpenUpstream { flow, .. } => Some(flow),
+                _ => None,
+            })
+            .expect("admission must ask the shell to open an upstream");
+        assert_eq!(
+            mgr.flow(flow).unwrap().requests_seen,
+            1,
+            "the admission datagram is a forward and is counted exactly once"
+        );
+        assert_eq!(mgr.flow_count(), 1, "one forward must not reach requests=2");
+
+        mgr.handle_input(
+            ManagerInput::ClientDatagram {
+                src,
+                payload: b"b",
+                backends: &mut TestBackends::one(),
+            },
+            now,
+        );
+        let outs = drain(&mut mgr);
+        assert!(
+            outs.iter()
+                .any(|o| matches!(o, Output::SendToBackend(t) if t.payload == b"b")),
+            "the second datagram must still be forwarded before the cap closes the flow"
+        );
+        assert!(
+            outs.iter().any(|o| matches!(o, Output::CloseFlow(_))),
+            "the second real forward reaches requests=2 and closes the flow"
+        );
+        assert_eq!(mgr.flow_count(), 0);
+    }
+
+    #[test]
     fn prop_flow_invariants() {
         fn prop(steps: Vec<Step>) -> bool {
             const MAX_FLOWS: usize = 4;
@@ -1807,7 +1887,14 @@ mod tests {
                 match step {
                     Step::Client(id) => {
                         let src = client(id % 8, 9000 + (id % 8) as u16);
-                        mgr.handle_input(ManagerInput::ClientDatagram { src, payload: b"q" }, now);
+                        mgr.handle_input(
+                            ManagerInput::ClientDatagram {
+                                src,
+                                payload: b"q",
+                                backends: &mut TestBackends::one(),
+                            },
+                            now,
+                        );
                     }
                     Step::Tick(secs) => {
                         now += Duration::from_secs(secs as u64);
@@ -1856,7 +1943,14 @@ mod tests {
             let mut mgr = UdpManager::new(cfg, 8, 65535, 1);
             let now = Instant::now();
             let src = client(1, 1000);
-            mgr.handle_input(ManagerInput::ClientDatagram { src, payload: b"q" }, now);
+            mgr.handle_input(
+                ManagerInput::ClientDatagram {
+                    src,
+                    payload: b"q",
+                    backends: &mut TestBackends::one(),
+                },
+                now,
+            );
             while mgr.poll_output().is_some() {}
 
             // Refresh inside the window: bumps the generation, pushes the
@@ -1866,6 +1960,7 @@ mod tests {
                 ManagerInput::ClientDatagram {
                     src,
                     payload: b"q2",
+                    backends: &mut TestBackends::one(),
                 },
                 refreshed_at,
             );

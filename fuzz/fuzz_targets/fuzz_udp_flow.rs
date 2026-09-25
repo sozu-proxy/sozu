@@ -32,10 +32,29 @@ use std::{
 
 use libfuzzer_sys::fuzz_target;
 use sozu_lib::protocol::udp::{
-    ClusterConfig, ConfigEvent, FlowId, FlowKey, FlowKeyExtractor, ManagerInput, MetricEvent,
-    Output, SourceTupleExtractor, UdpManager,
+    BackendSource, ClusterConfig, ConfigEvent, FlowId, FlowKey, FlowKeyExtractor, ManagerInput,
+    MetricEvent, Output, SourceTupleExtractor, UdpManager,
     proxy_protocol::{dgram_header, prepend_dgram_header},
 };
+
+/// The backend set the manager selects from, driven by the fuzz input.
+///
+/// Selection happens inside the core now, so the harness supplies a set
+/// instead of answering a request for one. An empty set is reachable and is
+/// the cluster-has-nothing path, which the fuzzer should explore.
+struct FuzzBackends {
+    backends: Vec<(String, SocketAddr)>,
+}
+
+impl BackendSource for FuzzBackends {
+    fn select(&mut self, _cluster: &str, key: Option<u64>) -> Option<(String, SocketAddr)> {
+        if self.backends.is_empty() {
+            return None;
+        }
+        let i = key.unwrap_or(0) as usize % self.backends.len();
+        Some(self.backends[i].clone())
+    }
+}
 
 /// A tiny big-endian byte reader over the fuzz input. Every getter returns a
 /// default (0 / empty) when the input is exhausted, so the grammar degrades
@@ -149,17 +168,11 @@ fn cluster_config(r: &mut Reader) -> ClusterConfig {
 /// Drain every queued output, threading the create/close tally and the running
 /// set of flows pending a backend so subsequent steps can resolve them. Returns
 /// nothing; mutates the bookkeeping in place.
-fn drain(
-    mgr: &mut UdpManager,
-    created: &mut u64,
-    closed: &mut u64,
-    awaiting: &mut Vec<FlowId>,
-) {
+fn drain(mgr: &mut UdpManager, created: &mut u64, closed: &mut u64) {
     while let Some(out) = mgr.poll_output() {
         match out {
             Output::Metric(MetricEvent::FlowCreated) => *created += 1,
             Output::CloseFlow(_) => *closed += 1,
-            Output::SelectBackend { flow, .. } => awaiting.push(flow),
             // Re-validate every owned datagram so a malformed PPv2 prefix or a
             // truncated copy would surface as a panic inside the harness rather
             // than silently passing.
@@ -202,8 +215,13 @@ fuzz_target!(|data: &[u8]| {
 
     let mut created = 0u64;
     let mut closed = 0u64;
-    // Flows that have emitted SelectBackend but not yet been resolved.
-    let mut awaiting: Vec<FlowId> = Vec::new();
+    // The backend set the manager selects from; arm 1 churns it.
+    let mut backends = FuzzBackends {
+        backends: vec![(
+            "fuzz-backend".to_owned(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 5300),
+        )],
+    };
 
     // Bound the step count so a pathological input can't run unboundedly; the
     // libFuzzer max input length already caps `data`, this is belt-and-braces.
@@ -215,28 +233,24 @@ fuzz_target!(|data: &[u8]| {
             0 => {
                 let src = r.client_addr();
                 let payload = r.bytes();
-                mgr.handle_input(ManagerInput::ClientDatagram { src, payload }, now);
+                mgr.handle_input(
+                    ManagerInput::ClientDatagram {
+                        src,
+                        payload,
+                        backends: &mut backends,
+                    },
+                    now,
+                );
             }
-            // Resolve the oldest pending flow (drives AwaitingBackend ->
-            // Established). Also occasionally resolve an arbitrary (possibly
-            // stale / reaped) flow id to hit the UnknownFlow path.
+            // Churn the backend set the core selects from. Replaces the
+            // resolve arm this target had before selection moved into the
+            // core, keeping the dispatch at seven. Drawing zero backends is
+            // deliberate: it is the cluster-has-nothing path.
             1 => {
-                let flow = if r.u8() & 1 == 0 {
-                    awaiting.pop()
-                } else {
-                    Some(r.u32() as FlowId)
-                };
-                if let Some(flow) = flow {
-                    let addr = r.addr();
-                    mgr.handle_input(
-                        ManagerInput::BackendResolved {
-                            flow,
-                            backend: "fuzz-backend".to_owned(),
-                            addr,
-                        },
-                        now,
-                    );
-                }
+                let n = r.u8() % 5;
+                backends.backends = (0..n)
+                    .map(|i| (format!("fuzz-backend-{i}"), r.addr()))
+                    .collect();
             }
             // Backend datagram for some flow id (valid or stale).
             2 => {
@@ -281,7 +295,7 @@ fuzz_target!(|data: &[u8]| {
             }
         }
 
-        drain(&mut mgr, &mut created, &mut closed, &mut awaiting);
+        drain(&mut mgr, &mut created, &mut closed);
 
         // Admission never grows the flow count past the largest cap ever in
         // effect (a later shrink may legitimately leave more live flows than
@@ -304,7 +318,7 @@ fuzz_target!(|data: &[u8]| {
     // balance, and no timer may stay armed (no leak).
     now += Duration::from_secs(10_000);
     mgr.handle_timeout(now);
-    drain(&mut mgr, &mut created, &mut closed, &mut awaiting);
+    drain(&mut mgr, &mut created, &mut closed);
     assert_eq!(mgr.flow_count(), 0, "reaper left {} flows", mgr.flow_count());
     assert!(
         mgr.poll_timeout().is_none(),

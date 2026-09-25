@@ -452,10 +452,14 @@ enforces (`lib/src/protocol/udp/manager.rs`):
 3. **`flow_count()` == slab population** — the public count never drifts from the
    real population.
 4. **No `Closing` flow persists** in the slab (`close_flow` sets `Closing` and
-   removes the slot in the same call). Pair: every live flow is `AwaitingBackend`
-   or `Established`.
-5. **Phase ↔ backend coherence** — `Established` ⇔ `backend_addr.is_some()`;
-   `AwaitingBackend` ⇔ `backend_addr.is_none()` (asserted both directions).
+   removes the slot in the same call). Pair: every live flow is `Established`.
+5. **Phase ↔ backend coherence** — a live flow always carries the backend it
+   was admitted on. This pair lost its negative half when selection moved into
+   the core: there used to be an `AwaitingBackend` phase that carried no
+   address, and with no window between admission and backend there is no such
+   state left to assert about. A worked example of an assertion whose *subject*
+   is deleted rather than weakened — the remaining half still fails if a live
+   flow loses its address.
 6. **Timer coherence** — `armed_deadline.is_some()` ⇔ at least one live flow
    exists, and when set equals the minimum idle deadline over live flows.
 7. **Cap / counter coherence** — a flow that exhausted a cap reports a teardown
@@ -465,8 +469,10 @@ enforces (`lib/src/protocol/udp/manager.rs`):
 
 Per-method, `flow.rs` adds the monotonic-counter guards (`requests_seen` /
 `responses_seen` saturate and never regress), the legal-transition guard in
-`set_phase` (strictly forward `AwaitingBackend → Established → Closing`, with the
-only skip being an abort into `Closing`), and the generation-token guard in
+`set_phase` (one edge remains, `Established → Closing`; the two edges out of
+the retired `AwaitingBackend` were deleted so they fall through to the guard's
+existing `false` rather than being listed as permitted — a dead allow turned
+into a live check), and the generation-token guard in
 `touch` (a touch *must* advance `timer_gen`, defeating the stale-close
 busy-loop).
 
