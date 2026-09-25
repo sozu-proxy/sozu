@@ -44,7 +44,7 @@ use sozu_command::{
 ///
 /// Fields included in the session block:
 /// - `frontend` — mio token of the frontend socket
-/// - `peer` — peer address (or `None` if the socket is gone)
+/// - `peer` — [`Connection::peer_address`]: a snapshot, not a live lookup
 /// - `streams` — number of streams currently held by the [`Context`]
 /// - `backends` — number of backend connections in the [`Router`]
 /// - `pending_links` — streams waiting to be linked to a backend
@@ -61,7 +61,7 @@ macro_rules! log_context {
             white = white,
             ulid = $self.session_ulid,
             frontend = $self.frontend_token.0,
-            peer = $self.frontend.socket().peer_addr().ok(),
+            peer = $self.frontend.peer_address(),
             streams = $self.context.streams.len(),
             backends = $self.router.backends.len(),
             pending_links = $self.context.pending_links.len(),
@@ -88,7 +88,7 @@ macro_rules! log_context_lite {
             white = white,
             ulid = $self.session_ulid,
             frontend = $self.frontend_token.0,
-            peer = $self.frontend.socket().peer_addr().ok(),
+            peer = $self.frontend.peer_address(),
             readiness = $self.frontend.readiness(),
         )
     }};
@@ -4627,6 +4627,170 @@ mod tests {
             "a request in flight keeps the answer registry it captured: a live \
              listener borrow on the write, reset or access-log path would hand \
              it a page installed after it started"
+        );
+    }
+
+    // ── peer-address snapshot in the MUX log envelope ────────────────────
+    //
+    // `log_context!` / `log_context_lite!` render `peer=` from
+    // `Connection::peer_address` (`lib/src/protocol/mux/connection.rs`), the
+    // snapshot the connection took at construction — not a live
+    // `getpeername(2)`. Both tests below make the two answers differ on
+    // purpose: the socket is genuinely connected to a loopback listener, so a
+    // live lookup succeeds and would print `127.0.0.1:<port>`; only a macro
+    // reading the snapshot can print `10.0.0.42:12345`.
+    //
+    // That gap is the PROXY-protocol symptom in miniature — the frontend's real
+    // peer is the load balancer while the snapshot holds the advertised client
+    // — and the same read is what keeps the slot populated after the peer's
+    // RST, when `getpeername(2)` answers ENOTCONN and a live lookup collapses
+    // to `None` on exactly the error lines an operator is reading. Until this
+    // change the `MUX` envelope printed one peer while the `MUX-H1`, `MUX-H2`,
+    // `SOCKET` and `HTTPS` lines of the same ULID printed another.
+    //
+    // Mirrors `h2::tests::log_context_renders_the_cached_peer_not_a_live_lookup`
+    // and `h1::tests::log_context_renders_the_proxy_advertised_peer_not_the_load_balancer`,
+    // which pin the same slot one layer down in the per-protocol envelopes.
+    //
+    // A counting test would not discriminate here, unlike
+    // `h1::tests::log_context_reads_the_peer_address_once_per_connection`:
+    // before this change the macros never reached `SocketHandler::peer_addr` at
+    // all — they went through `Connection::socket()` to mio's inherent method —
+    // so a trait-call counter reads zero on both sides. The assertions are
+    // therefore on the rendered VALUE.
+
+    /// A live, established loopback connection plus the address
+    /// `getpeername(2)` reports for it. The listener is returned so the
+    /// connection stays up for the whole test: these tests assert the snapshot
+    /// wins even while the live lookup is perfectly healthy, so a half-dead
+    /// socket would weaken them rather than strengthen them.
+    ///
+    /// Connects with a blocking `std` socket and converts afterwards rather
+    /// than reusing `connected_socket`, because `mio::net::TcpStream::connect`
+    /// returns before the handshake completes and the live lookup below is a
+    /// load-bearing premise, not a convenience.
+    fn connected_loopback_stream() -> (std::net::TcpListener, TcpStream, SocketAddr) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let live_peer = listener
+            .local_addr()
+            .expect("test listener must report its local address");
+        let stream =
+            std::net::TcpStream::connect(live_peer).expect("loopback connect must complete");
+        stream
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        (listener, TcpStream::from_std(stream), live_peer)
+    }
+
+    /// Address the frontend handler snapshots. Deliberately non-loopback so it
+    /// cannot collide with whatever ephemeral port the live lookup reports.
+    const SNAPSHOT_PEER: &str = "10.0.0.42:12345";
+
+    /// An H1 frontend `Mux` whose connection snapshotted [`SNAPSHOT_PEER`]
+    /// while its socket is really connected to `live_peer`.
+    /// `Connection::new_h1_server` takes that snapshot itself, from the
+    /// handler's `SocketHandler::peer_addr`, so nothing here writes the field
+    /// behind the production path's back.
+    ///
+    /// An H1 frontend only because it is the cheaper of the two to build: the
+    /// accessor under test resolves both `Connection` arms to the same
+    /// `peer_address` field through `forward!`, and the two macros are defined
+    /// once for every frontend.
+    fn mux_with_snapshotted_peer(
+        pool: &Rc<RefCell<Pool>>,
+        stream: TcpStream,
+    ) -> Mux<SessionTcpStream, test_support::TestListener> {
+        let session_ulid = Ulid::generate();
+        let socket = SessionTcpStream::new(
+            stream,
+            session_ulid,
+            Some(
+                SNAPSHOT_PEER
+                    .parse()
+                    .expect("the snapshotted peer literal must parse"),
+            ),
+        );
+        Mux {
+            configured_frontend_timeout: Duration::from_secs(60),
+            frontend_token: Token(0),
+            frontend: Connection::new_h1_server(session_ulid, socket, Duration::from_secs(60)),
+            router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
+            context: test_context(pool),
+            session_ulid,
+            timeouts: HashMap::new(),
+            backend_registry: BackendRegistry::default(),
+        }
+    }
+
+    /// To SEE THIS RED: in `log_context!` (mod.rs), put
+    /// `peer = $self.frontend.socket().peer_addr().ok(),` back in place of
+    /// `peer = $self.frontend.peer_address(),`. `Connection::socket()` hands
+    /// back a `&mio::net::TcpStream`, so the slot resolves to mio's *inherent*
+    /// `peer_addr` — a live `getpeername(2)` — and the rendered line carries
+    /// the loopback address the socket is really connected to.
+    #[test]
+    fn log_context_renders_the_snapshotted_peer_not_a_live_lookup() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (_listener, stream, live_peer) = connected_loopback_stream();
+        let mux = mux_with_snapshotted_peer(&pool, stream);
+
+        // Premise of the test: the live lookup is healthy and disagrees with the
+        // snapshot. Without it the assertions below could pass for the wrong
+        // reason (both answers happening to be the same address).
+        assert_eq!(
+            mux.frontend.socket().peer_addr().ok(),
+            Some(live_peer),
+            "the test socket must be genuinely connected, so a live lookup succeeds"
+        );
+        assert_ne!(
+            SNAPSHOT_PEER,
+            live_peer.to_string(),
+            "the snapshotted and live addresses must differ for this test to discriminate"
+        );
+
+        let rendered = log_context!(mux);
+
+        assert!(
+            rendered.contains(&format!("peer=Some({SNAPSHOT_PEER})")),
+            "the MUX peer= slot must render the snapshotted address; rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&live_peer.to_string()),
+            "the MUX peer= slot must not fall back to a live getpeername(2); rendered: {rendered}"
+        );
+    }
+
+    /// The lighter envelope reads the same slot. Separate from its full
+    /// sibling because the two macros carry their own copy of the `peer` line:
+    /// fixing one and not the other would render two different peers for one
+    /// session depending only on which borrow the callsite happened to hold.
+    ///
+    /// To SEE THIS RED: in `log_context_lite!` (mod.rs), put
+    /// `peer = $self.frontend.socket().peer_addr().ok(),` back in place of
+    /// `peer = $self.frontend.peer_address(),`.
+    #[test]
+    fn log_context_lite_renders_the_snapshotted_peer_not_a_live_lookup() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (_listener, stream, live_peer) = connected_loopback_stream();
+        let mux = mux_with_snapshotted_peer(&pool, stream);
+
+        assert_eq!(
+            mux.frontend.socket().peer_addr().ok(),
+            Some(live_peer),
+            "the test socket must be genuinely connected, so a live lookup succeeds"
+        );
+
+        let rendered = log_context_lite!(mux);
+
+        assert!(
+            rendered.contains(&format!("peer=Some({SNAPSHOT_PEER})")),
+            "the lite MUX peer= slot must render the snapshotted address; rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&live_peer.to_string()),
+            "the lite MUX peer= slot must not fall back to a live getpeername(2); \
+             rendered: {rendered}"
         );
     }
 }
