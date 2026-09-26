@@ -30,7 +30,7 @@
 //!   mid-flight does not corrupt the surviving `u=1, i` streams'
 //!   body delivery. The one-yield-saved delta from the mid-pass
 //!   bucket decrement is below CI timing noise and is not asserted
-//!   directly (see memory `project_sozu_h2_flood_family_flakes`).
+//!   directly: observing it would need an e2e-hooks timing probe.
 
 use std::{
     io::{Read, Write},
@@ -277,8 +277,8 @@ fn test_h2_backend_silent_triggers_504_within_back_timeout() {
 
 /// Two concurrent H2 streams on the same connection, both `u=3, i` at
 /// open time. The backend returns bodies just large enough to emit
-/// multiple DATA frames per stream (memory `feedback_h2_repro_multi_data_frames`
-/// — single-DATA responses pass by coincidence of natural writable).
+/// multiple DATA frames per stream — a single-DATA response passes by
+/// coincidence of the natural writable window and reproduces nothing.
 ///
 /// Setup pins the sozu scheduler in a state where `finalize_write`
 /// stripped `Ready::WRITABLE` on a voluntary incremental yield. At that
@@ -449,9 +449,8 @@ fn test_h2_priority_update_rearms_writable() {
 // ============================================================================
 
 /// An H2 backend that emits HEADERS → 50 ms pause → DATA (END_STREAM)
-/// with a ≥ 32 KiB body (two DATA frames — memory
-/// `feedback_h2_repro_multi_data_frames` notes that single-DATA
-/// responses pass by coincidence of the natural writable window).
+/// with a ≥ 32 KiB body (two DATA frames — a single-DATA response passes
+/// by coincidence of the natural writable window and reproduces nothing).
 ///
 /// Without the peer-side rearm in `handle_data_frame` /
 /// `handle_headers_frame`, the H2-backend → H2-frontend handoff inserts

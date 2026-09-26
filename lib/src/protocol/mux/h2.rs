@@ -4541,7 +4541,7 @@ impl ConnectionH2 {
     /// `h2_flow_control::H2FlowControl::queue_window_update`).
     ///
     /// Always signals pending write so callers don't have to remember the
-    /// edge-triggered epoll invariant (see memory feedback_epollet_signal_pending_write):
+    /// edge-triggered epoll invariant:
     /// under ET epoll a queued WINDOW_UPDATE without a live WRITABLE event bit
     /// is invisible to filter_interest() and will never get flushed.
     fn queue_window_update(&mut self, stream_id: u32, increment: u32) {

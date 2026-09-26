@@ -40,9 +40,12 @@ Three properties shape every extension:
 1. **Single-threaded per worker** — no `Arc<Mutex>` inside the loop. `METRICS`
    is `thread_local!` (`lib/src/metrics/mod.rs`).
 2. **Edge-triggered epoll via mio** — anything queued from the read path must
-   `signal_pending_write` on the readiness tracker (`feedback_epollet_signal_pending_write`
-   in agent memory). This affects metric flush timing only when the metrics
-   socket itself stalls — usually transparent to instrumentation authors.
+   `signal_pending_write` on the readiness tracker: under edge-triggered epoll
+   the WRITABLE event bit must be live for `filter_interest` to return
+   non-zero, so a queued write that never signalled is invisible to the event
+   loop and is never flushed. This affects metric flush timing only when the
+   metrics socket itself stalls — usually transparent to instrumentation
+   authors.
 3. **`&'static str` keys everywhere** — counters and gauges accept only
    `&'static str` keys (the type signature of `count_add` / `set_gauge`).
    Per-error / per-kind breakdowns must materialise the keys at compile time.
@@ -265,8 +268,7 @@ Structured prefixes via per-protocol `log_context!` / `log_module_context!` /
   `state` and `protocol` are untouched.
 - Tier severity by intent: `debug!`/`trace!` for expected idle closes,
   timeouts, noisy state. `warn!`/`error!` for real protocol errors or
-  invariant breaks. (See `feedback_log_context_before_theorising` for the
-  reasoning.)
+  invariant breaks.
 - When an `HttpContext` is in scope, prefer `$http_ctx.log_context()`
   (`HttpContext::log_context`, `lib/src/protocol/kawa_h1/editor.rs`) over
   hand-rolling a `LogContext { ... }` struct literal — the helper is the

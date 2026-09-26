@@ -2588,10 +2588,9 @@ fn build_get_headers_no_priority() -> Vec<u8> {
 /// expires. Returns `(body_bytes, end_stream_seen, got_rst_stream_on_sid,
 /// elapsed)`.
 ///
-/// Uses the END_STREAM-aware early-exit pattern documented in memory
-/// `feedback_collect_response_frames_quiet_time.md`: a `collect_response_frames`
-/// elapsed budget measures quiet time, not body delivery. The caller's
-/// deadline wall-clock is the source of truth.
+/// Uses an END_STREAM-aware early exit instead of a `collect_response_frames`
+/// elapsed budget, because that budget measures quiet time, not body
+/// delivery. The caller's deadline wall-clock is the source of truth.
 fn drain_h2_stream_until_end_stream(
     tls: &mut rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>,
     sid: u32,

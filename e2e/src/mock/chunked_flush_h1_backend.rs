@@ -4,8 +4,7 @@
 //! large-asset repro suite to characterise the cross-connection edge-triggered
 //! `WRITABLE` wake-gap (see the `StreamState::Linked` /
 //! `interest.insert(Ready::WRITABLE)` flip of `ConnectionH1::readable` in
-//! `lib/src/protocol/mux/h1.rs` and memory entry
-//! `project_sozu_h1_missing_signal_pending_write.md`).
+//! `lib/src/protocol/mux/h1.rs`).
 //!
 //! Divergence from [`CloseDelimitedBackend`] in `e2e/src/tests/h2_tests.rs`:
 //! that backend batches all writes (no `flush()` between chunks, no
