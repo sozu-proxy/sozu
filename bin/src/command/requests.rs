@@ -4172,7 +4172,8 @@ impl GatheringTask for StatusTask {
 
 #[derive(Debug)]
 struct StopTask {
-    pub client_token: Token,
+    /// `None` when the stop comes from `SIGTERM` rather than a client
+    pub client_token: Option<Token>,
     pub gatherer: DefaultGatherer,
     pub hardness: bool,
 }
@@ -4191,8 +4192,21 @@ fn stop(server: &mut Server, client: &mut ClientSession, hardness: bool) {
         AuditExtras::default(),
     );
 
+    if hardness {
+        client.return_processing("Performing hard stop...");
+    } else {
+        client.return_processing("Performing soft stop...");
+    }
+    begin_stop(server, Some(client.token), hardness);
+}
+
+/// Open the shutdown sequence: fan `SoftStop` or `HardStop` out to the workers,
+/// then stop the main process once they answered. Shared by the `SoftStop` /
+/// `HardStop` verbs and by `SIGTERM` (`CommandHub::on_sigterm`), which has no
+/// client to answer.
+pub(super) fn begin_stop(server: &mut Server, client_token: Option<Token>, hardness: bool) {
     let task = Box::new(StopTask {
-        client_token: client.token,
+        client_token,
         gatherer: DefaultGatherer::default(),
         hardness,
     });
@@ -4208,7 +4222,6 @@ fn stop(server: &mut Server, client: &mut ClientSession, hardness: bool) {
         "stop() must move the master into WorkersStopping before fan-out"
     );
     if hardness {
-        client.return_processing("Performing hard stop...");
         server.scatter(
             RequestType::HardStop(HardStop {}).into(),
             task,
@@ -4216,7 +4229,6 @@ fn stop(server: &mut Server, client: &mut ClientSession, hardness: bool) {
             None,
         );
     } else {
-        client.return_processing("Performing soft stop...");
         server.scatter(
             RequestType::SoftStop(SoftStop {}).into(),
             task,
@@ -4228,7 +4240,7 @@ fn stop(server: &mut Server, client: &mut ClientSession, hardness: bool) {
 
 impl GatheringTask for StopTask {
     fn client_token(&self) -> Option<Token> {
-        Some(self.client_token)
+        self.client_token
     }
 
     fn get_gatherer(&mut self) -> &mut dyn Gatherer {

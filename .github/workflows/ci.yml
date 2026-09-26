@@ -293,6 +293,7 @@ jobs:
           cargo test -p sozu --locked ${{ matrix.flags }} --test load_state_rollback_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test frontend_validate_before_commit_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test listener_validate_before_commit_e2e -- --ignored
+          cargo test -p sozu --locked ${{ matrix.flags }} --test sigterm_soft_stop_e2e -- --ignored
 
       # `tests::fuzz_tests::*` is `#[ignore]`d here and exercised in
       # the dedicated `fuzz` job below. Skipping it keeps the e2e

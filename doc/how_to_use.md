@@ -91,4 +91,11 @@ The repository provides a unit file [here][unit-file]. You can copy it to `/etc/
 
 This will make systemd take notice of it, and now you can start the service with `systemctl start sozu.service`. Furthermore, you can enable it, so that it is activated by default on future boots with `systemctl enable sozu.service`.
 
+`systemctl stop sozu.service` sends `SIGTERM` to every process of the unit, since the unit declares no
+`ExecStop=`. The workers ignore that signal; the main process turns it into a soft stop, the same as
+`sozu shutdown`: the workers stop accepting, finish their sessions, flush their logs and exit, then the
+main process exits. A second `SIGTERM` while the workers still drain turns it into a hard stop, the
+same as `sozu shutdown --hard`. A soft stop waits for sessions to end, and systemd bounds that wait:
+once `TimeoutStopSec` (90 s by default) expires, it sends `SIGKILL` to the whole unit.
+
 [unit-file]: ../os-build/systemd/sozu.service

@@ -80,6 +80,8 @@ pub enum UpgradeError {
     CreateHub(HubError),
     #[error("could not enable cloexec after upgrade: {0}")]
     EnableCloexec(ServerError),
+    #[error("could not handle SIGTERM: {0}")]
+    HandleSigterm(ServerError),
     #[error("could not setup the logger: {0}")]
     SetupLogging(LogError),
 }
@@ -356,6 +358,11 @@ pub fn begin_new_main_process(
 
     let mut command_hub =
         CommandHub::from_upgrade_data(upgrade_data).map_err(UpgradeError::CreateHub)?;
+
+    // `exec` reset the old main process's SIGTERM handler: install ours.
+    command_hub
+        .handle_sigterm()
+        .map_err(UpgradeError::HandleSigterm)?;
 
     command_hub
         .enable_cloexec_after_upgrade()

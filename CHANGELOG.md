@@ -4354,6 +4354,27 @@
   Seen red before green: `flushing_the_logger_writes_out_every_buffered_file_record` fails with 0 of
   8 lines on both files when `CompatLogger`'s `flush` is emptied back to a no-op, and passes restored.
 
+- **`fix(bin)`: `SIGTERM` now soft stops the workers instead of killing every process with its log
+  buffers unflushed ([#1555](https://github.com/sozu-proxy/sozu/issues/1555)).** The shipped units
+  declare no `ExecStop=`, so `systemctl stop` sends `SIGTERM` to the whole cgroup, and neither the
+  main process nor a worker handled it: a `file://` access log lost what it still buffered. The main
+  process now installs a `SIGTERM` handler (`CommandHub::handle_sigterm`) that writes one byte to a
+  socket pair polled by its event loop, which turns the signal into the `sozu shutdown` soft stop
+  (`requests.rs::begin_stop`, shared with the `SoftStop` / `HardStop` verbs); a second `SIGTERM`
+  while the workers still drain turns it into a hard stop. Workers set `SIGTERM` to `SIG_IGN` at the
+  start of `begin_worker_process` and leave through the soft stop, which flushes their logs; a
+  worker whose main process dies still leaves, since its channel closes. The drain is bounded by the
+  supervisor: systemd sends `SIGKILL` once `TimeoutStopSec` expires. Installed from both
+  `begin_main_process` and `begin_new_main_process`, because `exec` resets a handler across a main
+  upgrade. The proxying path is unchanged: the worker change runs once at startup. No dependency and
+  no `Cargo.lock` entry changes (`nix`, `libc` and `mio` were already there).
+  Measured on a one-worker proxy with `access_logs_target = "file://…"` and 27 requests per run,
+  `SIGTERM` to the main process then to the worker, five runs: 6 records lost on four runs and 8 on
+  one, main process killed by signal 15, before; none lost and a clean exit 0, after. Seen red before
+  green: `bin/tests/sigterm_soft_stop_e2e.rs` fails on the exit status (signal 15) without the main
+  process's handler and on 4 of 27 missing records without the worker's `SIG_IGN`, and passes with
+  both.
+
 ### ➖ Removed
 
 - **BREAKING (library API) — `refactor(udp)`: backend selection moves into the UDP core, closing

@@ -60,6 +60,8 @@ pub enum StartError {
     SetPermissions(IoError),
     #[error("could not launch new worker: {0}")]
     LaunchWorker(ServerError),
+    #[error("could not handle SIGTERM: {0}")]
+    HandleSigterm(ServerError),
     #[error("could not setup the logger: {0}")]
     SetupLogging(LogError),
 }
@@ -107,6 +109,11 @@ pub fn begin_main_process(args: &Args) -> Result<(), StartError> {
     info!("Creating command hub");
     let mut command_hub = CommandHub::new(unix_listener, config, executable_path)
         .map_err(StartError::CreateCommandHub)?;
+
+    // before any worker exists, so SIGTERM stops them from the first one on
+    command_hub
+        .handle_sigterm()
+        .map_err(StartError::HandleSigterm)?;
 
     info!("Launching workers");
     for _ in 0..worker_count {
