@@ -1,12 +1,23 @@
 /// Regression tests for mux layer fixes:
-/// - P0: close() stream cleanup (http.active_requests gauge leak)
+/// - `http.active_requests` accounting: a stream that was never charged emits
+///   no `-1` when its access log fires (H1 idle timeout, H1 malformed
+///   request), an H1 `100 Continue` does not release the charge early, and a
+///   complete H1 request charges and releases it exactly once.
 /// - P1: service_start/service_stop bracketing (service_time inflation)
 /// - P3: WebSocket upgrade gauge correctness
 ///
 /// Tests cover scenarios with and without proxy protocol, simulating
 /// HAProxy healthcheck patterns (connect + PP + disconnect every ~10ms).
+///
+/// The gauge tests READ the gauge. That is not a given: this header used to
+/// advertise "P0: close() stream cleanup (http.active_requests gauge leak)"
+/// over three tests that never sampled it and, in the shape they had, could
+/// not have. The block above [`await_active_requests_h1`] says why a gauge
+/// read from a zero baseline cannot witness an unbalanced decrement, and
+/// [`hold_one_request_in_flight`] says what a non-zero baseline buys instead
+/// (sozu#1535).
 use std::{
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{SocketAddr, TcpStream},
     thread,
     time::{Duration, Instant},
@@ -164,6 +175,43 @@ fn raw_read(stream: &mut TcpStream) -> Option<String> {
         None
     } else {
         Some(String::from_utf8_lossy(&data).to_string())
+    }
+}
+
+/// Read until the peer half-closes the connection, and report whether that
+/// close actually happened.
+///
+/// The EOF is an ordering barrier, not a convenience. A stream's access log —
+/// and with it the `http.active_requests` `-1`, when the stream carries a
+/// charge — is emitted before sozu shuts the frontend socket down, on the
+/// response-completion path (`ConnectionH1::writable`) as well as on the
+/// teardown path (`Mux::close`). A client that has read EOF has therefore
+/// already been passed by every decrement that connection can emit, which is
+/// what lets the gauge callers below sample once instead of racing.
+///
+/// `Err` is the deadline expiring with the connection still open: the barrier
+/// did not hold, so a sample taken after it would prove nothing. It is
+/// deliberately not folded into `Ok` with the bytes read so far.
+fn raw_read_until_eof(stream: &mut TcpStream, deadline: Duration) -> Result<String, String> {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .map_err(|error| format!("could not arm the read timeout: {error}"))?;
+    let started = Instant::now();
+    let mut data = Vec::new();
+    let mut buffer = [0u8; BUFFER_SIZE];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(String::from_utf8_lossy(&data).to_string()),
+            Ok(n) => data.extend_from_slice(&buffer[..n]),
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(error) => return Err(format!("read failed: {error}")),
+        }
+        if started.elapsed() >= deadline {
+            return Err(format!(
+                "still open after {deadline:?}, read so far: {:?}",
+                String::from_utf8_lossy(&data)
+            ));
+        }
     }
 }
 
@@ -1364,27 +1412,38 @@ fn test_proxy_protocol_mixed_traffic() {
 // =========================================================================
 // Regression tests for gauge underflow and error over-counting fixes
 //
-// These tests validate that:
-// - http.active_requests gauge is not decremented for streams that never
-//   had a request fully parsed (idle timeouts, malformed requests)
-// - Intermediate HTTP responses (100 Continue, 103 Early Hints) do not
-//   double-decrement the gauge
+// These tests validate that, measured against a baseline of one request held
+// in flight (see `hold_one_request_in_flight`):
+// - http.active_requests is not decremented for streams that never had a
+//   request fully parsed (idle timeouts, malformed requests)
+// - an intermediate HTTP response (100 Continue) does not release the charge
+//   early, leaving the final response to release it a second time
 // - Session close() does not unconditionally mark all in-flight streams
 //   as errors
 // =========================================================================
 
-/// Helper: set up a worker with short timeouts (2s front, 2s request)
-/// to avoid tests waiting 60+ seconds for idle timeout to fire.
+/// Helper: set up a worker whose pre-request timeout is 2s, so a silent
+/// connection collects its 408 instead of making the test wait out the
+/// 10-second default.
 fn setup_short_timeout_test(
     name: &str,
     front_address: SocketAddr,
     nb_backends: usize,
 ) -> (Worker, Vec<SyncBackend>) {
     let mut file_config = FileConfig::default();
-    file_config.front_timeout = Some(2);
+    // ONLY `request_timeout` is shortened, and which one is shortened is
+    // load-bearing. It is the timeout a frontend is armed with before its
+    // first request links — `HttpSession::new` builds the frontend's
+    // `TimeoutContainer` from `configured_request_timeout`, and `Mux` swaps in
+    // the nominal `front_timeout` only once a stream reaches
+    // `StreamState::Link` — so it alone decides how fast a silent connection
+    // collects its 408. `front_timeout` and `back_timeout` must stay at their
+    // defaults: the gauge test below holds one legitimate request in flight
+    // across the whole idle-timeout window, and a 2-second frontend or backend
+    // timeout would answer THAT request 504 and emit a perfectly LEGITIMATE
+    // `-1`. The gauge would read zero for a correct proxy, which is
+    // indistinguishable from the underflow the test exists to catch.
     file_config.request_timeout = Some(2);
-    file_config.back_timeout = Some(2);
-    file_config.connect_timeout = Some(2);
     let config = Worker::into_config(file_config);
     let mut listeners = sozu_command_lib::scm_socket::Listeners::default();
     attach_reserved_http_listener(&mut listeners, front_address);
@@ -1451,12 +1510,30 @@ fn raw_connect_with_timeout(addr: SocketAddr, timeout: Duration) -> TcpStream {
 }
 
 // =========================================================================
-// Test 15: H1 idle timeout does not underflow active_requests gauge
+// Test 15: an H1 idle timeout emits no `http.active_requests` decrement
 //
-// Connects to sozu, sends nothing, waits for the 408 timeout response.
-// Before the fix, each such connection would decrement http.active_requests
-// without ever incrementing it, causing gauge underflow.
-// Uses short timeouts (2s) to keep test fast.
+// A connection that sends nothing collects a 408 from `MuxState::timeout`'s
+// `StreamState::Idle` arm, then closes. That stream was never charged — the H1
+// `+1` sits past the header parse, in `ConnectionH1::readable` — so the access
+// log its 408 emits must not decrement the gauge.
+//
+// The assertion is made against a baseline of one request held in flight and
+// never against zero: `AggregatedMetric::update` saturates a gauge at zero, so
+// from a zero baseline a parasitic `-1` reads exactly like a balanced request.
+// See `hold_one_request_in_flight`.
+//
+// To SEE THIS RED: in `Stream::generate_access_log`
+// (`lib/src/protocol/mux/stream.rs`), drop the `if self.request_counted`
+// condition, leaving `events[0] = Some(MetricEvent::ActiveRequestFinished);`
+// and `self.request_counted = false;` unconditional. Every access log then
+// decrements, the five 408s take the gauge from 1 to 0, and this test reports
+// `idle-timeout: the 408s moved the gauge - wanted 1, sample Some(0)`.
+//
+// That substitution is SHARED with test 16, which goes red with it: the
+// malformed path reaches the same access log on the same never-charged
+// stream. There is no second guard between "no `+1`" and "no `-1`" to remove,
+// so these two tests are two scenarios through one guard, not two guards, and
+// no third distinct red was invented to disguise that.
 // =========================================================================
 
 fn try_idle_timeout_no_underflow() -> State {
@@ -1465,49 +1542,70 @@ fn try_idle_timeout_no_underflow() -> State {
     let mut backend = backends.pop().unwrap();
     backend.connect();
 
-    // Open 5 connections that send nothing and wait for timeout (408)
-    for i in 0..5 {
-        let mut stream = raw_connect_with_timeout(front_address, Duration::from_secs(5));
-        match raw_read(&mut stream) {
-            Some(response) if response.contains("408") => {
-                println!("idle-timeout {i}: got 408 as expected");
+    let mut held = match hold_one_request_in_flight(&mut worker, &mut backend, front_address, 0) {
+        Ok(held) => held,
+        Err(diag) => {
+            println!("idle-timeout: {diag}");
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    };
+
+    // Opened all at once rather than one at a time: each waits out the same
+    // 2-second `request_timeout`, and serialising them would hold the baseline
+    // request open five times longer for no added coverage.
+    let mut idle: Vec<TcpStream> = (0..5)
+        .map(|_| raw_connect_with_timeout(front_address, Duration::from_secs(5)))
+        .collect();
+    for (i, stream) in idle.iter_mut().enumerate() {
+        match raw_read_until_eof(stream, Duration::from_secs(20)) {
+            Ok(response) if response.contains("408") => {
+                println!("idle-timeout {i}: got 408 and EOF as expected");
             }
-            Some(response) => {
-                println!(
-                    "idle-timeout {i}: response: {}",
-                    &response[..response.len().min(60)]
-                );
+            Ok(response) => {
+                println!("idle-timeout {i}: expected a 408, got {response:?}");
+                worker.soft_stop();
+                let _ = worker.wait_for_server_stop();
+                return State::Fail;
             }
-            None => {
-                println!("idle-timeout {i}: connection closed");
+            Err(diag) => {
+                println!("idle-timeout {i}: {diag}");
+                worker.soft_stop();
+                let _ = worker.wait_for_server_stop();
+                return State::Fail;
             }
         }
     }
 
-    // Verify sozu is still functional after idle timeouts
-    let mut client = Client::new(
-        "verify-client",
-        front_address,
-        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-    );
-    client.connect();
-    client.send();
-    backend.accept(0);
-    backend.receive(0);
-    backend.send(0);
+    // THE assertion: five timed-out streams, none of them ever charged, and
+    // the gauge still holds exactly the one request in flight.
+    if let Err(diag) = expect_active_requests_h1(&mut worker, 1) {
+        println!("idle-timeout: the 408s moved the gauge - {diag}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
 
-    match client.receive() {
-        Some(response) if response.contains("200") => {}
-        other => {
-            println!("idle-timeout verify failed: {other:?}");
-            worker.soft_stop();
-            worker.wait_for_server_stop();
-            return State::Fail;
-        }
+    // Releasing the held request is what takes the gauge back to zero, which
+    // also pins the `-1` a charged stream DOES owe.
+    backend.send(0);
+    let response = held.receive();
+    if !response.as_deref().is_some_and(|r| r.contains("200")) {
+        println!("idle-timeout: the held request did not complete: {response:?}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    if let Err(diag) = await_active_requests_h1(&mut worker, 0, Duration::from_secs(10)) {
+        println!("idle-timeout: the held request never released its charge - {diag}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
     }
 
     worker.soft_stop();
-    worker.wait_for_server_stop();
+    let _ = worker.wait_for_server_stop();
     State::Success
 }
 
@@ -1516,7 +1614,8 @@ fn test_idle_timeout_no_underflow() {
     assert_eq!(
         repeat_until_error_or(
             3,
-            "H1 idle timeout does not underflow active_requests gauge",
+            "H1: five idle-timeout 408s leave http.active_requests at the one \
+             request held in flight",
             try_idle_timeout_no_underflow,
         ),
         State::Success,
@@ -1524,11 +1623,18 @@ fn test_idle_timeout_no_underflow() {
 }
 
 // =========================================================================
-// Test 16: H1 malformed request does not underflow active_requests gauge
+// Test 16: an H1 malformed request emits no `http.active_requests` decrement
 //
-// Sends garbage data that fails HTTP parsing, triggering a 400 response.
-// Before the fix, generate_access_log would decrement http.active_requests
-// for a stream that never had gauge_add!(+1) called.
+// A request that fails to parse is answered 400 by `ConnectionH1::readable`,
+// from a `return` placed BEFORE the `gauge_add!(ACTIVE_REQUESTS, 1)` a dozen
+// lines below it. The stream is therefore never charged, and the access log
+// its 400 emits must not decrement the gauge.
+//
+// To SEE THIS RED: the same substitution as test 15 — drop the
+// `if self.request_counted` condition in `Stream::generate_access_log`
+// (`lib/src/protocol/mux/stream.rs`). This test then reports
+// `malformed: the 400s moved the gauge - wanted 1, sample Some(0)`. The two
+// tests fall together deliberately; see test 15's note on why.
 // =========================================================================
 
 fn try_malformed_request_no_underflow() -> State {
@@ -1547,56 +1653,75 @@ fn try_malformed_request_no_underflow() -> State {
     let mut backend = backends.pop().unwrap();
     backend.connect();
 
-    // Send various malformed requests
+    let mut held = match hold_one_request_in_flight(&mut worker, &mut backend, front_address, 0) {
+        Ok(held) => held,
+        Err(diag) => {
+            println!("malformed: {diag}");
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    };
+
     let malformed_requests = [
         "GARBAGE DATA THAT IS NOT HTTP\r\n\r\n",
-        "\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost localhost\r\n\r\n",
         "GET\r\n\r\n",
     ];
 
     for (i, bad_request) in malformed_requests.iter().enumerate() {
         let mut stream = raw_connect_with_timeout(front_address, Duration::from_secs(5));
-        stream.write_all(bad_request.as_bytes()).unwrap();
-        match raw_read(&mut stream) {
-            Some(response) if response.contains("400") => {
-                println!("malformed {i}: got 400 as expected");
+        if let Err(error) = stream.write_all(bad_request.as_bytes()) {
+            println!("malformed {i}: could not send: {error}");
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            return State::Fail;
+        }
+        match raw_read_until_eof(&mut stream, Duration::from_secs(20)) {
+            Ok(response) if response.contains("400") => {
+                println!("malformed {i}: got 400 and EOF as expected");
             }
-            Some(response) => {
-                println!(
-                    "malformed {i}: got: {}",
-                    &response[..response.len().min(60)]
-                );
+            Ok(response) => {
+                println!("malformed {i}: expected a 400, got {response:?}");
+                worker.soft_stop();
+                let _ = worker.wait_for_server_stop();
+                return State::Fail;
             }
-            None => {
-                println!("malformed {i}: connection closed");
+            Err(diag) => {
+                println!("malformed {i}: {diag}");
+                worker.soft_stop();
+                let _ = worker.wait_for_server_stop();
+                return State::Fail;
             }
         }
     }
 
-    // Verify sozu is still functional
-    let mut client = Client::new(
-        "verify-client",
-        front_address,
-        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-    );
-    client.connect();
-    client.send();
-    backend.accept(0);
-    backend.receive(0);
-    backend.send(0);
+    // THE assertion: three rejected requests, none of them ever charged, and
+    // the gauge still holds exactly the one request in flight.
+    if let Err(diag) = expect_active_requests_h1(&mut worker, 1) {
+        println!("malformed: the 400s moved the gauge - {diag}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
 
-    match client.receive() {
-        Some(response) if response.contains("200") => {}
-        other => {
-            println!("malformed verify failed: {other:?}");
-            worker.soft_stop();
-            worker.wait_for_server_stop();
-            return State::Fail;
-        }
+    backend.send(0);
+    let response = held.receive();
+    if !response.as_deref().is_some_and(|r| r.contains("200")) {
+        println!("malformed: the held request did not complete: {response:?}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    if let Err(diag) = await_active_requests_h1(&mut worker, 0, Duration::from_secs(10)) {
+        println!("malformed: the held request never released its charge - {diag}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
     }
 
     worker.soft_stop();
-    worker.wait_for_server_stop();
+    let _ = worker.wait_for_server_stop();
     State::Success
 }
 
@@ -1605,7 +1730,8 @@ fn test_malformed_request_no_underflow() {
     assert_eq!(
         repeat_until_error_or(
             3,
-            "H1 malformed request does not underflow active_requests gauge",
+            "H1: three malformed-request 400s leave http.active_requests at \
+             the one request held in flight",
             try_malformed_request_no_underflow,
         ),
         State::Success,
@@ -1613,11 +1739,31 @@ fn test_malformed_request_no_underflow() {
 }
 
 // =========================================================================
-// Test 17: H1 100 Continue does not double-decrement active_requests gauge
+// Test 17: an H1 100 Continue does not release the active_requests charge
 //
-// Backend sends "100 Continue" then the final "200 OK" response.
-// Before the fix, generate_access_log was called for both the 100 and the
-// 200, causing two decrements for one increment.
+// `ConnectionH1::writable` matches `StatusLine::Response { code: 100, .. }`
+// and returns WITHOUT generating an access log, precisely so that the final
+// response stays the stream's only completion. The gauge is where that is
+// observable: while the client holds its 100 and the backend has not yet sent
+// the 200, the request is still in flight and must still be charged. With one
+// further request held in flight the reading is `2`, and an early release
+// shows up as `1`.
+//
+// What this covers, and what it does not. It covers the `code: 100` arm. It
+// does NOT cover `Stream::request_counted`'s idempotency, the second guard
+// against a double decrement, and no e2e test can: no production path calls
+// `generate_access_log` twice on one stream, because the completion path
+// clears `metrics.start` through `stream.metrics.reset()` and `Mux::close`
+// skips every stream whose `metrics.start` is `None`. Removing the flag clear
+// alone therefore changes no gauge value any client can observe. Do not read
+// the closing assertion below as covering it.
+//
+// To SEE THIS RED: in `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`),
+// delete the `kawa::StatusLine::Response { code: 100, .. }` match arm so that
+// a 100 falls through to the generic `_ => {}` completion path. The access log
+// then fires on the interim response, the charge is released one response too
+// early, and this test reports
+// `100-continue: the interim response released the charge - wanted 2, sample Some(1)`.
 // =========================================================================
 
 fn try_100_continue_no_double_decrement() -> State {
@@ -1636,75 +1782,111 @@ fn try_100_continue_no_double_decrement() -> State {
     let mut backend = backends.pop().unwrap();
     backend.connect();
 
-    // Send a request with Expect: 100-continue and the body in one go
-    let request = "POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\nhello";
-
-    let mut stream = raw_connect_with_timeout(front_address, Duration::from_secs(5));
-    stream.write_all(request.as_bytes()).unwrap();
-
-    backend.accept(0);
-    backend.receive(0);
-
-    // Backend sends 100 Continue first, then the real 200 OK
-    backend.set_response("HTTP/1.1 100 Continue\r\n\r\n");
-    backend.send(0);
-    thread::sleep(Duration::from_millis(300));
-
-    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-    backend.send(0);
-
-    // Client reads all available data. The 100 Continue may or may not be
-    // visible (sozu forwards it), then the 200 OK should follow.
-    let mut all_data = String::new();
-    for _ in 0..10 {
-        match raw_read(&mut stream) {
-            Some(data) => {
-                all_data.push_str(&data);
-                if all_data.contains("200 OK") {
-                    break;
-                }
-            }
-            None => break,
+    let mut held = match hold_one_request_in_flight(&mut worker, &mut backend, front_address, 0) {
+        Ok(held) => held,
+        Err(diag) => {
+            println!("100-continue: {diag}");
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            return State::Fail;
         }
-    }
+    };
 
-    if !all_data.contains("200") {
-        // 100-Continue forwarding is complex; as long as sozu doesn't crash
-        // and remains functional, the gauge fix is working.
-        println!(
-            "100-continue: did not get 200 in response, got: {}",
-            &all_data[..all_data.len().min(200)]
-        );
-        println!("100-continue: checking sozu is still alive...");
-    } else {
-        println!("100-continue: got 200 response as expected");
+    // The request under test, on its own frontend connection and its own
+    // backend slot, so the baseline above keeps its charge throughout.
+    let request = "POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\nhello";
+    let mut stream = raw_connect_with_timeout(front_address, Duration::from_secs(5));
+    if let Err(error) = stream.write_all(request.as_bytes()) {
+        println!("100-continue: could not send the request: {error}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
     }
-
-    // Verify sozu is still functional with a fresh request
-    let mut client = Client::new(
-        "verify-client",
-        front_address,
-        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-    );
-    client.connect();
-    client.send();
-    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong");
     backend.accept(1);
     backend.receive(1);
+
+    // Two requests in flight: the held baseline, and this one.
+    if let Err(diag) = await_active_requests_h1(&mut worker, 2, Duration::from_secs(10)) {
+        println!("100-continue: the request never charged the gauge - {diag}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    backend.set_response("HTTP/1.1 100 Continue\r\n\r\n");
     backend.send(1);
 
-    match client.receive() {
-        Some(response) if response.contains("200") => {}
-        other => {
-            println!("100-continue verify failed: {other:?}");
+    // Reading the interim response is the ordering barrier for the assertion
+    // that follows: sozu has handled the 100 and taken whatever branch it
+    // takes for it.
+    let mut interim = String::new();
+    let started = Instant::now();
+    while !interim.contains("100") && started.elapsed() < Duration::from_secs(10) {
+        if let Some(chunk) = raw_read(&mut stream) {
+            interim.push_str(&chunk);
+        }
+    }
+    if !interim.contains("100") {
+        println!("100-continue: the interim response never reached the client: {interim:?}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    // THE assertion: an interim response is not a completion, so the charge is
+    // still outstanding and the gauge still reads both requests.
+    if let Err(diag) = expect_active_requests_h1(&mut worker, 2) {
+        println!("100-continue: the interim response released the charge - {diag}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    backend.set_response("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    backend.send(1);
+    match raw_read_until_eof(&mut stream, Duration::from_secs(20)) {
+        Ok(rest) if rest.contains("200") => {}
+        Ok(rest) => {
+            println!("100-continue: expected a 200, got {rest:?} after {interim:?}");
             worker.soft_stop();
-            worker.wait_for_server_stop();
+            let _ = worker.wait_for_server_stop();
+            return State::Fail;
+        }
+        Err(diag) => {
+            println!("100-continue: {diag}");
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
             return State::Fail;
         }
     }
 
+    // The final response released the charge, once: the gauge is back to the
+    // held baseline and not below it.
+    if let Err(diag) = expect_active_requests_h1(&mut worker, 1) {
+        println!("100-continue: the completed request left the gauge wrong - {diag}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
+    backend.set_response(http_ok_response("pong0"));
+    backend.send(0);
+    let response = held.receive();
+    if !response.as_deref().is_some_and(|r| r.contains("200")) {
+        println!("100-continue: the held request did not complete: {response:?}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+    if let Err(diag) = await_active_requests_h1(&mut worker, 0, Duration::from_secs(10)) {
+        println!("100-continue: the held request never released its charge - {diag}");
+        worker.soft_stop();
+        let _ = worker.wait_for_server_stop();
+        return State::Fail;
+    }
+
     worker.soft_stop();
-    worker.wait_for_server_stop();
+    let _ = worker.wait_for_server_stop();
     State::Success
 }
 
@@ -1713,7 +1895,8 @@ fn test_100_continue_no_double_decrement() {
     assert_eq!(
         repeat_until_error_or(
             3,
-            "H1 100 Continue does not double-decrement active_requests gauge",
+            "H1: a 100 Continue leaves http.active_requests charged until the \
+             final response",
             try_100_continue_no_double_decrement,
         ),
         State::Success,
@@ -2462,6 +2645,74 @@ fn await_active_requests_h1(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Take ONE sample of `http.active_requests` and require it to read exactly
+/// `want`.
+///
+/// Deliberately not a poll, and not a thin wrapper over
+/// [`await_active_requests_h1`]. Its call sites assert that a scenario left
+/// the gauge UNCHANGED, and a poll for a value the gauge already holds returns
+/// on its first iteration, before the scenario it is meant to weigh has
+/// emitted anything at all — the vacuous shape sozu#1535 is about. The single
+/// sample is sound because every caller has already crossed an ordering
+/// barrier: the scenario's connection reached EOF, or its interim response
+/// reached the client.
+///
+/// `None` travels into the diagnostic as itself, exactly as it does in
+/// [`query_proxy_gauge`]: "no such key" and "the gauge reads zero" are two
+/// different observations.
+fn expect_active_requests_h1(worker: &mut Worker, want: u64) -> Result<(), String> {
+    let sample = query_proxy_gauge(worker, sozu_lib::metrics::names::http::ACTIVE_REQUESTS);
+    if sample == Some(want) {
+        Ok(())
+    } else {
+        Err(format!("wanted {want}, sample {sample:?}"))
+    }
+}
+
+/// Put one legitimate request in flight and leave it there, held at the
+/// backend between `receive` and `send`, with the gauge proved to read exactly
+/// one before returning.
+///
+/// This is the whole device the gauge tests turn on. `AggregatedMetric::update`
+/// saturates a `GaugeAdd` at zero — correctly, since a `clear()` during live
+/// traffic can drive a paired decrement below a fresh baseline — so measured
+/// from a zero baseline a parasitic `-1` reads 0, indistinguishable from a
+/// balanced request:
+///
+///   correct          0 -> 1 -> 0
+///   `-1` unpaired    0 -> 0        looks exactly like the line above
+///
+/// Measured from a baseline of one it reads 0 where 1 is required, and THAT is
+/// observable. What makes the baseline reachable is that `http.active_requests`
+/// is per worker process, not per connection: the scenario under test runs on
+/// its own connections while this one holds the gauge up.
+///
+/// The returned [`Client`] must outlive the assertions — dropping it closes the
+/// connection and lets sozu release the charge.
+fn hold_one_request_in_flight(
+    worker: &mut Worker,
+    backend: &mut SyncBackend,
+    front_address: SocketAddr,
+    client_id: usize,
+) -> Result<Client, String> {
+    let mut client = Client::new(
+        "gauge-baseline",
+        front_address,
+        "GET /api HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    client.connect();
+    client.send();
+    // The backend having the request is what proves sozu parsed the headers,
+    // so the `+1` — if it happens at all — has happened. The response is
+    // withheld: `backend.send` is the caller's to make, which makes this an
+    // ordering guarantee rather than a race.
+    backend.accept(client_id);
+    backend.receive(client_id);
+    await_active_requests_h1(worker, 1, Duration::from_secs(10))
+        .map(|()| client)
+        .map_err(|diag| format!("the held request never charged the gauge: {diag}"))
 }
 
 fn try_h1_active_requests_balances_over_one_request() -> State {

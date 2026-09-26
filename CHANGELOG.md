@@ -314,6 +314,34 @@
   them fails with `the package 'sozu-command-lib' does not contain these features`. `--locked` and
   `--verbose` match the neighbouring test steps.
 
+- **`test(mux)`: the three `http.active_requests` e2e tests read the gauge they are named after
+  ([#1535](https://github.com/sozu-proxy/sozu/issues/1535)).** `test_idle_timeout_no_underflow`,
+  `test_malformed_request_no_underflow` and `test_100_continue_no_double_decrement` were named for
+  the gauge and never sampled it: the first opened five connections, collected their 408s and then
+  asserted a LATER request answered 200 — an assertion that holds identically with or without the
+  underflow. They could not have been written in that shape, either. `AggregatedMetric::update`
+  clamps a negative `GaugeAdd` to zero, correctly, so measured from a zero baseline a parasitic
+  decrement reads 0 and so does a balanced request. The replacement moves the baseline instead:
+  `http.active_requests` is per worker process, so `hold_one_request_in_flight` puts ONE legitimate
+  request in flight on its own connection, proves the gauge reads `1`, and each scenario then runs
+  on other connections and must leave it at exactly `1` — a parasitic `-1` shows up as `0`.
+  Sampling is a single `expect_active_requests_h1` reading earned by an ordering barrier
+  (`raw_read_until_eof`, or the interim response reaching the client), never a poll for a value the
+  gauge already holds, which would return on its first iteration without observing the scenario at
+  all. `setup_short_timeout_test` now shortens `request_timeout` and nothing else, because a
+  2-second `front_timeout` or `back_timeout` would answer the held request 504 and emit a perfectly
+  legitimate `-1`. Seen red on otherwise unmodified production code, and the reds are two, not
+  three: dropping the `if self.request_counted` condition in `Stream::generate_access_log` reddens
+  the idle-timeout and malformed tests TOGETHER (`wanted 1, sample Some(0)`, `1 passed; 2 failed`)
+  because both scenarios reach the same access log on the same never-charged stream and there is no
+  second guard between "no `+1`" and "no `-1`"; deleting the
+  `kawa::StatusLine::Response { code: 100, .. }` arm in `ConnectionH1::writable` reddens the
+  100-Continue test alone (`wanted 2, sample Some(1)`, `2 passed; 1 failed`). Removing the
+  `self.request_counted = false;` clear reddens nothing by the gauge — it trips its own
+  `debug_assert!` first — and is recorded in the test's doc comment as a guard no e2e test can
+  reach, since no production path calls `generate_access_log` twice on one stream. Test-only; no
+  production file changed.
+
 ### 🔄 Changed
 
 - **`refactor(mux)`: `Position::Client` holds an opaque backend id, and backend accounting leaves
