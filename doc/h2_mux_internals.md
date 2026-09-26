@@ -1384,6 +1384,20 @@ because a QUIC datagram is all-or-nothing; there is no `poll_transmit` in this
 repository at all, and the sibling UDP core's coarser `UdpManager::poll_output`
 drains a manager-wide queue rather than one stream's `Kawa`.
 
+**A second caller: the H1 write pass.** `ConnectionH1::writable` walks the
+same `kawa.out` the same way for the one stream it carries, so it calls this
+pair instead of keeping its own loop. It keeps the `Vec<IoSlice<'static>>` as
+the connection's `io_slices` field, so only the vector's capacity survives a
+pass, never a descriptor, and a warm pass allocates nothing for it. As a
+per-pass local it cost one allocation plus one `realloc` per doubling, and an
+H1 header block is many `Store`s: `intentrace` shows 45 descriptors in the
+`writev(2)` of a `curl` request header and 32 in that of a
+`python3 -m http.server` response. Its window is wider than the shell's three
+statements: between the write and `confirm` it also copies the accepted bytes
+into the replay capture, which writes to the stream's `retry_buffer` and never
+to `kawa`, and its one early `return` inside the window is taken only when the
+vector is empty.
+
 **Why the pair is exported asymmetrically.** `poll_read_target`,
 `handle_read`, `poll_write_target` and `handle_write` were widened so a driver
 outside this crate can eventually stand where `readable` and `write_streams`

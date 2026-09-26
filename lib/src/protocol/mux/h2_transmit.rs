@@ -1,5 +1,6 @@
 //! Vectored transmit descriptor for one H2 stream's pending output, for
-//! [`super::h2::ConnectionH2`].
+//! [`super::h2::ConnectionH2`], also used by [`super::h1::ConnectionH1`]'s
+//! write pass for the one stream it carries.
 //!
 //! This is the sans-io output half of the write path, and it is deliberately
 //! NOT one function. A pure `poll_transmit(&mut self, buf: &mut [u8])` cannot
@@ -113,6 +114,8 @@ use kawa::{AsBuffer, Kawa};
 /// production caller keeps it for the connection's lifetime rather than per
 /// pass or per stream, so once its capacity has grown to the largest gather
 /// the connection has seen, a write pass performs no allocation here at all.
+/// `super::h1::ConnectionH1::writable`, the second production caller, does
+/// the same with its own `io_slices` field.
 ///
 /// # Safety
 ///
@@ -140,12 +143,17 @@ use kawa::{AsBuffer, Kawa};
 /// obligation is the caller's, and a caller outside this crate has no other
 /// way to be told.
 ///
-/// The only production caller is `super::h2::H2Shell::write_streams`,
-/// which opens the window here and closes it at the [`confirm`] three
-/// statements later, entering nothing in between but the vectored socket
-/// write that reborrows the descriptors and cannot retain them. The vector it
-/// passes is the shell's private `io_slices` field, which therefore holds
-/// capacity between two calls but never a descriptor.
+/// There are two production callers. `super::h2::H2Shell::write_streams`
+/// opens the window here and closes it at the [`confirm`] three statements
+/// later, entering nothing in between but the vectored socket write that
+/// reborrows the descriptors and cannot retain them. The vector it passes is
+/// the shell's private `io_slices` field, which therefore holds capacity
+/// between two calls but never a descriptor.
+/// `super::h1::ConnectionH1::writable` opens it the same way on its own
+/// `io_slices` field, and between the vectored write and [`confirm`] it also
+/// copies the accepted bytes out of the descriptors into the replay capture,
+/// which writes to the stream's `retry_buffer` and never to `kawa`. Its one
+/// early `return` inside the window is taken only when the vector is empty.
 pub unsafe fn gather<T: AsBuffer>(kawa: &Kawa<T>, io_slices: &mut Vec<IoSlice<'static>>) -> usize {
     io_slices.clear();
     let buffer = kawa.storage.buffer();
@@ -156,8 +164,9 @@ pub unsafe fn gather<T: AsBuffer>(kawa: &Kawa<T>, io_slices: &mut Vec<IoSlice<'s
             kawa::OutBlock::Store(store) => {
                 let data = store.data(buffer);
                 // SAFETY: the IoSlice references point into kawa's storage
-                // buffer. They are used only for the caller's vectored write
-                // and are cleared by `confirm` immediately after, before
+                // buffer. They are only read by the caller's vectored write
+                // (and, on H1, its replay capture) and are cleared by
+                // `confirm` after, before
                 // `kawa.consume()` which may relocate the buffer via
                 // `ptr::copy` (shift). No dangling 'static refs exist during
                 // consume().
