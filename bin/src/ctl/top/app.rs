@@ -456,6 +456,7 @@ const H2_TRACKED_KEYS: &[&str] = &[
     names::h2::FLOOD_VIOLATION_SETTINGS,
     names::h2::FLOOD_VIOLATION_PRIORITY,
     names::h2::WINDOW_UPDATE_DROPPED,
+    names::h2::RST_STREAM_DROPPED,
     names::h2::CLOSE_WITH_ACTIVE_STREAMS,
 ];
 

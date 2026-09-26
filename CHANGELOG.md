@@ -2709,6 +2709,17 @@
   viewport, since a pipe has no size to query. Frames go to stdout. Interactive mode is
   unchanged. `sozu_top_e2e` now passes without a pty and runs in CI on the `msrv-full` cell.
 
+- **`fix(top)`: the H2 pane's `rst_stream_dropped` row draws its 60 s trend, and the
+  `sozu top` unit tests run in CI ([#1576](https://github.com/sozu-proxy/sozu/issues/1576)).**
+  #1434 added the `h2.rst_stream_dropped` row to the flood table (`bin/src/ctl/top/panes/h2.rs`)
+  but not the key to `H2_TRACKED_KEYS` (`bin/src/ctl/top/app.rs`), the list
+  `App::fold_h2_trends` samples, so its trend cell always printed `—` where every sibling row
+  draws a sparkline. The key is now tracked beside `h2.window_update_dropped`, and the
+  `snapshot_h2_120x40` insta snapshot, which never received the new row and failed under
+  `cargo test -p sozu --features tui`, is updated to the corrected frame. Nothing caught the
+  drift because no CI cell enabled `tui`: a new `msrv-full` step now runs
+  `cargo test -p sozu --features tui --lib`.
+
 - **`fix(command)`: a channel socket error now leaves the channel marked for closing, so the
   master closes a worker session whose worker died with a message still unread
   ([#1560](https://github.com/sozu-proxy/sozu/issues/1560)).** `Channel::readable` and
