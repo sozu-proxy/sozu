@@ -2,9 +2,17 @@
 //!
 //! Both protocol state machines have converged on a handful of small
 //! routines that operate on SocketHandler and StreamState in the same way.
-//! Keeping them here prevents drift between the two write paths — which is
-//! load-bearing for TLS close_notify ordering (see agent memory
-//! `feedback_tls_write_symmetry`).
+//! Keeping them here prevents drift between the two write paths.
+//!
+//! That co-location is load-bearing for TLS close_notify ordering.
+//! `ConnectionH1::close` and `ConnectionH2::close` both reach
+//! `drain_tls_close_notify`, which emits close_notify once and then keeps
+//! flushing rustls until the socket stops wanting a write, before the
+//! underlying TCP socket is shut down. A per-protocol copy is how one of
+//! the two drifts back to a single write attempt, which leaves a partial
+//! TLS record in flight whenever the kernel send buffer is full — the
+//! client reports that as a TLS decode error or an unexpected eof. The
+//! drain loop and its round cap are documented on the helper itself.
 
 use kawa::AsBuffer;
 

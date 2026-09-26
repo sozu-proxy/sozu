@@ -4142,6 +4142,49 @@
   enforces that. Documentation only: no `.rs` file, no test, no dependency and no `Cargo.lock` entry
   changes.
 
+- **`docs(mux,e2e)`: nine comments asserted an invariant while pointing its proof at an
+  agent-private note that does not exist
+  ([#1544](https://github.com/sozu-proxy/sozu/issues/1544)).** Measured at `4cbad821`: nine comment
+  sites across six files deferred their reasoning to an agent-private memory file, named in prose as
+  a bare identifier. None of the seven distinct files named exists anywhere — not tracked here, not
+  in the agent homes, not in the knowledge vault they were said to live in, by filename or by
+  content. Two of the nine sites are in `doc/`, which ships. The defect is not the broken link but
+  what the link was carrying: a comment that states a load-bearing invariant and withholds its
+  proof is weaker than one that says nothing, because it reads as though it had been reasoned
+  through, and the invariant it guards is exactly the kind a later refactor removes.
+
+  The census in the issue named six rows over four files — already two locations short of the seven
+  its own table listed, since one row carried two. Sweeping for the reader-facing forms rather than
+  one filename prefix found two further sites, in `e2e/src/mock/chunked_flush_h1_backend.rs` and in
+  the preamble of `e2e/src/tests/h2_priority_rearm_tests.rs`, both using a second prefix the issue's
+  pattern could not see. Six of the nine already carried their substance in the surrounding clause
+  and lost only the pointer, one of them gaining a completing clause from its own commit history.
+  Two did not. The `shared.rs` preamble claimed that co-locating the H1
+  and H2 helpers is what keeps TLS `close_notify` ordering correct, and now says why: both
+  `ConnectionH1::close` and `ConnectionH2::close` reach `drain_tls_close_notify`, which emits
+  `close_notify` once and then keeps flushing rustls until the socket stops wanting a write, before
+  the TCP socket is shut down — a per-protocol copy is how one of the two drifts back to the single
+  write attempt that leaves a partial TLS record in flight when the kernel send buffer is full. That
+  reasoning was reconstructed from the helper's own doc comment and its two call sites, not invented.
+  The observability guide's edge-triggered epoll property gained the same treatment from the commit
+  that introduced the rule: the WRITABLE event bit must be live for `filter_interest` to return
+  non-zero, so a queued write that never signalled is never flushed. One pointer was dropped outright
+  with nothing put in its place — the severity-tiering bullet states a house convention, not an
+  invariant, and the note it deferred to was about gathering log context before forming a theory, a
+  subject the bullet never discusses. No pointer was replaced by another pointer.
+
+  `.github/scripts/check_doc_citations.py` loses three `NOT_A_TEST` entries whose recorded reason was
+  that the identifier named an agent-private note rather than a test — the leak had reached the tooling,
+  which had been taught to tolerate it. Removing them only tightens the rule, and it is what makes
+  the class machine-enforced from here: reintroducing one of these pointers now fails rule 3 instead
+  of being waived. Seen red before green, which is the only red this changeset admits: with the three
+  entries gone and the prose unrepaired, the run reports exactly four dead test-name citations and
+  exits 1; repaired, it exits 0. The `lib/src/protocol/mux/h2.rs` edit replaces one line with one
+  line, so none of the seventeen distinct line-numbered spans cited into that file past the edit
+  point drifted, no span needed re-anchoring, and the base comparison reports zero exempt spans
+  rather than a green that skipped them. Documentation only: no behaviour, no test, no dependency and no
+  `Cargo.lock` entry changes.
+
 ### ➖ Removed
 
 - **BREAKING (library API) — `refactor(udp)`: backend selection moves into the UDP core, closing
