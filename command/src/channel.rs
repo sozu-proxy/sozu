@@ -136,8 +136,9 @@ pub enum ChannelError {
 /// - `NoByteToRead` -- `read(2)` returned zero, the peer is gone.
 ///   `readable()` has already set `interest = Ready::EMPTY` and raised HUP;
 ///   re-arming would contradict the hangup it just recorded.
-/// - `Read` -- a hard socket read failure, where `readable()` has already
-///   cleared both `interest` and `readiness`.
+/// - `Read` -- a hard socket failure (`writable()` reports its write errors
+///   under this variant too), after which the failing call has already
+///   cleared `interest` and raised HUP and ERROR (sozu-proxy/sozu#1560).
 /// - `Connection` -- either a failed `connect(2)` or `readable()`/`writable()`
 ///   rejecting the call because the interest gate is shut. Restoring from here
 ///   the very bit that gate just refused is the loop this function exists to
@@ -502,8 +503,14 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                         break;
                     }
                     _ => {
+                        // Mark the channel for closing, as the `Ok(0)` arm
+                        // does: the owner closes on HUP or ERROR, and an
+                        // edge-triggered poller will not report them again
+                        // (sozu-proxy/sozu#1560). Assignment, not `insert`:
+                        // the socket has failed, so no other bit may stay
+                        // armed.
                         self.interest = Ready::EMPTY;
-                        self.readiness = Ready::EMPTY;
+                        self.readiness = Ready::HUP | Ready::ERROR;
                         return Err(ChannelError::Read(read_error));
                     }
                 },
@@ -581,8 +588,12 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                         break;
                     }
                     _ => {
+                        // Same as the read side: keep the channel marked for
+                        // closing instead of wiping HUP and ERROR. WRITABLE
+                        // must go: the worker's `Server::send_queue` keeps
+                        // looping while it is set and data is pending.
                         self.interest = Ready::EMPTY;
-                        self.readiness = Ready::EMPTY;
+                        self.readiness = Ready::HUP | Ready::ERROR;
                         return Err(ChannelError::Read(write_error));
                     }
                 },
@@ -2010,5 +2021,75 @@ mod tests {
             "an unsatisfiable declared length must still mark the channel for \
              closing, whatever the buffer layout it was parsed from"
         );
+    }
+
+    /// A peer that dies with bytes still queued towards it makes the next
+    /// `read(2)` fail with `ECONNRESET` rather than return EOF. That failure
+    /// must leave the channel marked for closing exactly as EOF does: the
+    /// supervisor's `WorkerSession::ready` closes a session on HUP or ERROR
+    /// only, and an edge-triggered poller reports the hangup once, so a read
+    /// error that wiped the readiness left a dead worker's session open for
+    /// good (sozu-proxy/sozu#1560).
+    #[test]
+    fn a_read_error_keeps_the_channel_marked_for_closing() {
+        for initial in [
+            Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+            Ready::READABLE | Ready::WRITABLE,
+        ] {
+            let (mut local, peer) =
+                Channel::<ProtobufMessage, ProtobufMessage>::generate_nonblocking(1000, 10000)
+                    .expect("could not generate nonblocking channels");
+            // Leave a byte unread in the peer's receive queue, then close the
+            // peer: the kernel resets the connection instead of sending EOF.
+            assert_eq!(local.sock.write(b"x").expect("write to the live peer"), 1);
+            drop(peer);
+
+            local.readiness = initial;
+            match local.readable() {
+                Err(ChannelError::Read(error)) => {
+                    assert_eq!(error.kind(), ErrorKind::ConnectionReset)
+                }
+                other => panic!("expected a connection reset, got {other:?}"),
+            }
+            assert!(
+                local.readiness.is_hup() && local.readiness.is_error(),
+                "a read error must leave HUP and ERROR set (from {initial:?}), got {:?}",
+                local.readiness
+            );
+            assert!(!local.readiness.is_readable() && !local.readiness.is_writable());
+            assert_eq!(local.interest, Ready::EMPTY);
+        }
+    }
+
+    /// Same contract on the write side: `EPIPE` towards a closed peer must
+    /// mark the channel for closing, as `Ok(0)` already does.
+    #[test]
+    fn a_write_error_keeps_the_channel_marked_for_closing() {
+        for initial in [
+            Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+            Ready::READABLE | Ready::WRITABLE,
+        ] {
+            let (mut local, peer) =
+                Channel::<ProtobufMessage, ProtobufMessage>::generate_nonblocking(1000, 10000)
+                    .expect("could not generate nonblocking channels");
+            drop(peer);
+
+            local
+                .write_delimited_message(&ProtobufMessage { inner: 7 })
+                .expect("queue a message in the back buffer");
+            local.interest.insert(Ready::WRITABLE);
+            local.readiness = initial;
+            match local.writable() {
+                Err(ChannelError::Read(error)) => assert_eq!(error.kind(), ErrorKind::BrokenPipe),
+                other => panic!("expected a broken pipe, got {other:?}"),
+            }
+            assert!(
+                local.readiness.is_hup() && local.readiness.is_error(),
+                "a write error must leave HUP and ERROR set (from {initial:?}), got {:?}",
+                local.readiness
+            );
+            assert!(!local.readiness.is_readable() && !local.readiness.is_writable());
+            assert_eq!(local.interest, Ready::EMPTY);
+        }
     }
 }

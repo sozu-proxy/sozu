@@ -2493,6 +2493,21 @@
 
 ### 🐛 Fixed
 
+- **`fix(command)`: a channel socket error now leaves the channel marked for closing, so the
+  master closes a worker session whose worker died with a message still unread
+  ([#1560](https://github.com/sozu-proxy/sozu/issues/1560)).** `Channel::readable` and
+  `Channel::writable` (`command/src/channel.rs`) answered any error other than `WouldBlock`
+  with `readiness = Ready::EMPTY`, which also erased the `HUP`/`ERROR` bits the event loop had
+  just recorded. `WorkerSession::ready` (`bin/src/command/sessions.rs`) closes a session on
+  those bits only, and the edge-triggered poller reports a hangup once, so the session stayed
+  open for good. The case is a worker that dies after the master wrote `SoftStop` but before
+  it read it: the kernel resets the connection, the next read fails with `ECONNRESET` instead
+  of returning EOF, and a soft stop (`sozu shutdown`) never finished. Both error arms now set
+  `readiness = HUP | ERROR`, like the `Ok(0)` arm that already raised `HUP`; `READABLE` and
+  `WRITABLE` stay cleared as before. Covered by
+  `a_read_error_keeps_the_channel_marked_for_closing` and
+  `a_write_error_keeps_the_channel_marked_for_closing`.
+
 - **`fix(mux)`: the `peer=` slot of every `MUX` log line is read from the snapshot the frontend
   connection captures at construction, not from a live `getpeername(2)` on every line.**
   `log_context!` and `log_context_lite!` (`lib/src/protocol/mux/mod.rs`) built the slot from
