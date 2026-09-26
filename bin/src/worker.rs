@@ -20,7 +20,7 @@ use nix::{
 use sozu_command_lib::{
     channel::{Channel, ChannelError},
     config::{Config, MetricDetailLevel},
-    logging::{AccessLogFormat, LogError, setup_logging},
+    logging::{AccessLogFormat, LOGGER, LogError, setup_logging},
     proto::command::{MetricDetail, ServerConfig, WorkerRequest, WorkerResponse},
     ready::Ready,
     request::{RequestError, read_initial_state_from_file},
@@ -237,6 +237,14 @@ pub fn begin_worker_process(
     info!("starting event loop");
     server.run();
     info!("ending event loop");
+    // Drain the log buffers while `server`, and with it the channel to the
+    // main process, is still alive. The main process answers that channel
+    // closing with `SIGKILL` (`Server::close_worker`), and the channel closes
+    // when `server` drops at the end of this function — before the
+    // thread-local `LOGGER` would drop and flush on its own. A `file://`
+    // target keeps up to a buffer's worth of records back, and they used to
+    // die with the worker on `SoftStop`, `HardStop` and worker upgrade.
+    LOGGER.with(|logger| logger.borrow_mut().flush());
     Ok(())
 }
 

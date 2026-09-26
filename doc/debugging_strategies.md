@@ -42,12 +42,17 @@ record is one `log_access` call, but not one syscall:
 | `tcp://`   | one                | same reused buffer, written with `write_all` because a stream may accept fewer bytes than offered. |
 
 `file://` trades durability for those syscalls: a record sits in the buffer until a later record
-fills it, and a worker that dies before the buffer drains loses whatever is still in it. Measured
-against a run emitting 27 records, 22 reached the file and 5 were lost. Nothing on the shutdown path
-recovers them — the `log::Log::flush` implementation is a no-op, a worker installs no signal handler,
-and `CommandServer::close_worker` terminates workers with `SIGKILL`, which no `Drop` can run after.
-Prefer `unix://` or `udp://` when no access log may be lost, and `file://` when syscall count matters
-more than the last records of a worker's life.
+fills it. A worker drains that buffer on its way out, before it closes its channel to the main
+process — the main process answers that channel closing with `SIGKILL` (`Server::close_worker`) —
+so no record is lost when a worker stops through `sozu shutdown`, `sozu shutdown --hard` or
+`sozu upgrade --worker`: measured over five runs of 27 records on each of the three, 6 records were
+missing on every run before that drain existed and none after. Records still buffered are lost when
+a worker does not reach that point: a crash, or a signal a worker does not handle, such as the
+`SIGTERM` that `systemctl stop` sends to every process of the unit when the unit declares no
+`ExecStop=` — tracked in [#1555](https://github.com/sozu-proxy/sozu/issues/1555) and
+[#1559](https://github.com/sozu-proxy/sozu/pull/1559). Stop through `sozu shutdown` when the last
+records of a `file://` access log matter, or use `unix://` or `udp://`, which send each record as it
+is logged.
 
 `log_level` follows [env_logger's level directives](https://docs.rs/env_logger/0.5.13/env_logger/).
 Moreover, the `RUST_LOG` environment variable can be used to override the log level.
