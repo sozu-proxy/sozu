@@ -472,9 +472,43 @@ The line is emitted by `Stream::generate_access_log`
 `H1::Complete` at `INFO` level: a parse rejection increments
 `http.frontend_parse_errors`, not `http.errors`. The request line is borrowed
 from the front buffer (`rejected_request_line` in the same file), so this adds
-no allocation to the access-log path. HTTP/2 is not covered: a request whose
-pseudo-headers are rejected is reset before it has a request line, and still
-logs `- - -`.
+no allocation to the access-log path. HTTP/2 has its own subsection below.
+
+### The request line of a rejected HTTP/2 request
+
+An HTTP/2 request whose field block is refused — a missing, repeated or empty
+pseudo-header, a connection-specific or uppercase field, a `host` field that
+disagrees with `:authority` — is reset with `RST_STREAM(PROTOCOL_ERROR)`. Its
+access-log line keeps the pseudo-headers decoded before the refusal:
+
+| Refused request | Logged `authority method path` |
+|---|---|
+| a `connection:` or an uppercase field after the four pseudo-headers | `example.com GET /diag` |
+| `:path` missing or empty | `example.com GET -` |
+| a second `:method` | `example.com GET /diag` (the first value) |
+| a second `:authority`, or a `host` field that disagrees with it | `- GET /diag` |
+| a control byte in `:path` | `example.com GET -` |
+
+The decode stops at the first refused field, so a pseudo-header sent after it
+is never stored and is logged `-`. `:authority` is logged only when it was
+validated: refused, repeated, or disputed by a `host` field, it is `-`, and a
+`host` field is never logged in its place, for the reason the HTTP/1.1 path
+never reads `Host`. No value can carry a control byte into the line, although
+the formatter escapes nothing: a pseudo value holding one (and a `:method` that
+is not a token) is refused before it is stored, so it is logged `-`.
+
+The values are the pseudo-header slices already written into the stream's
+front buffer, borrowed, so this adds no allocation either:
+`record_rejected_request` (`lib/src/protocol/mux/pkawa.rs`) keeps them as a
+`Version::V20` request line and marks the front in error, and
+`rejected_request_line` reads them back.
+
+The line is still emitted when the session closes, with message
+`session close` at `ERROR` level, not when the stream is reset:
+`ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs`) only logs a stream
+that reached routing, and a refused one never did. Its timings therefore run to
+the end of the connection. A refusal that closes the whole connection with
+`GOAWAY` (an HPACK decoding error) logs no line at all.
 
 ## Tracing — current state
 

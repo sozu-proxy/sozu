@@ -871,6 +871,8 @@ struct RejectedRequestLine<'a> {
 /// The request line of a request the parse rejected before [`HttpContext`]
 /// captured it, borrowed from the front buffer (sozu-proxy/sozu#1085).
 /// `None` unless `front` is in error and holds a parsed request line.
+/// HTTP/1.1 and HTTP/2 both reach here; the H2 case has its own section
+/// below.
 ///
 /// # Two paths fill the access log's request line, on purpose
 ///
@@ -906,24 +908,47 @@ struct RejectedRequestLine<'a> {
 /// line itself carries (absolute-form, `CONNECT`) is logged. Do not
 /// "complete" this with a `Host` lookup.
 ///
-/// H2 does not reach here with a request line: every rejection in
-/// `handle_header` (`lib/src/protocol/mux/pkawa.rs`) returns before the
-/// status line is assigned, so it stays `StatusLine::Unknown`.
+/// # HTTP/2
+///
+/// An H2 request `handle_header` (`lib/src/protocol/mux/pkawa.rs`) refused
+/// reaches here through `record_rejected_request` in the same file, which
+/// marks the front in error and keeps the pseudo-headers decoded before the
+/// refusal as a `Version::V20` line. Each is logged as stored, and a missing
+/// one as `-`: there is no request-target to split, and `:path` may be the
+/// very field that was missing. The authority is `:authority`, and only
+/// when it was validated — `record_rejected_request`'s caller empties it
+/// when it was refused, repeated, or disputed by a `host` field — never a
+/// `host` field. Borrowing is sound for the same reason as in H1: the
+/// stream is out of the connection's stream table once reset, so nothing
+/// writes its front again, and a slot is reused only through
+/// `Context::create_stream` (`lib/src/protocol/mux/mod.rs`), which clears
+/// `front` and `front.storage` together.
 fn rejected_request_line(front: &GenericHttpStream) -> Option<RejectedRequestLine<'_>> {
     if !front.is_error() {
         return None;
     }
     let kawa::StatusLine::Request {
+        version,
         method,
         uri,
         authority,
         path,
-        ..
     } = &front.detached.status_line
     else {
         return None;
     };
     let buf = front.storage.buffer();
+    if matches!(version, kawa::Version::V20) {
+        debug_assert!(
+            borrowed_bytes(uri, buf).is_none(),
+            "a rejected H2 request line carries no request-target"
+        );
+        return Some(RejectedRequestLine {
+            method: borrowed_str(method, buf),
+            authority: borrowed_str(authority, buf),
+            path: borrowed_str(path, buf),
+        });
+    }
     let method_bytes = borrowed_bytes(method, buf)?;
     let method = std::str::from_utf8(method_bytes).ok();
 
@@ -1431,5 +1456,192 @@ mod tests {
             None,
             None,
         );
+    }
+
+    // ── The access log of an H2 request whose field block was refused ──
+    // (sozu-proxy/sozu#1566, the HTTP/2 half of #1085)
+
+    /// HPACK-encode `headers`, hand the block to the real
+    /// `pkawa::handle_header` (`lib/src/protocol/mux/pkawa.rs`) on a real
+    /// `Stream`'s front, with the stream's own `HttpContext` as the
+    /// callbacks, exactly as `ConnectionH2` does for an initial HEADERS; then
+    /// emit the access log the way the session-close sweep in
+    /// `Mux::close` (`lib/src/protocol/mux/mod.rs`) does for the reset
+    /// stream. Returns every log line the run produced.
+    fn access_log_of_a_rejected_h2_request(
+        headers: &'static [(&'static [u8], &'static [u8])],
+    ) -> String {
+        crate::capture_test_logs(move || {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2, 16384)));
+            let mut stream = test_stream(&pool);
+            let mut encoder = loona_hpack::Encoder::new();
+            let mut block = Vec::new();
+            for &(name, value) in headers {
+                encoder
+                    .encode_header_into((name, value), &mut block)
+                    .expect("the test field block must encode");
+            }
+            let mut decoder = loona_hpack::Decoder::new();
+            let mut prioriser = crate::protocol::mux::h2_scheduler::Prioriser::default();
+            let (_events, status) = crate::protocol::mux::pkawa::handle_header(
+                &mut decoder,
+                &mut prioriser,
+                1,
+                &mut stream.front,
+                &block,
+                true,
+                &mut stream.context,
+                crate::protocol::mux::h2::MAX_HEADER_LIST_SIZE as u32,
+                u32::MAX,
+                false,
+            );
+            assert!(
+                matches!(status, Err((_, false))),
+                "premise: the staged field block must be refused as a stream \
+                 error, got {status:?}"
+            );
+            assert_eq!(
+                stream.context.method, None,
+                "premise: a refused block never reaches `HttpContext`'s capture"
+            );
+            let _ = stream.generate_access_log(
+                true,
+                Some("session close"),
+                Rc::new(RefCell::new(TestListener::new())),
+                None,
+                None,
+            );
+        })
+    }
+
+    /// The four pseudo-headers every H2 test below starts from.
+    const H2_BASE: [(&[u8], &[u8]); 4] = [
+        (b":method", b"GET"),
+        (b":scheme", b"https"),
+        (b":authority", b"lolcatho.st"),
+        (b":path", b"/ok"),
+    ];
+
+    fn assert_h2_line(output: &str, expected: &str, why: &str) {
+        assert!(
+            output.contains(&format!(" {expected} - | session close")),
+            "{why}: expected `{expected}`, got: {output}"
+        );
+    }
+
+    /// A header refused after every pseudo-header was stored: all three are
+    /// logged.
+    ///
+    /// To SEE THIS RED: in `record_rejected_request`
+    /// (`lib/src/protocol/mux/pkawa.rs`), delete the `status_line`
+    /// assignment. The line then renders `- - - -`, as it did before.
+    #[test]
+    fn a_refused_h2_header_keeps_the_pseudo_headers_in_the_access_log() {
+        static CONNECTION: [(&[u8], &[u8]); 5] = [
+            H2_BASE[0],
+            H2_BASE[1],
+            H2_BASE[2],
+            H2_BASE[3],
+            (b"connection", b"close"),
+        ];
+        let output = access_log_of_a_rejected_h2_request(&CONNECTION);
+        assert_h2_line(
+            &output,
+            "lolcatho.st GET /ok",
+            "a connection-specific header refused after the pseudo-headers",
+        );
+
+        static UPPERCASE: [(&[u8], &[u8]); 5] = [
+            H2_BASE[0],
+            H2_BASE[1],
+            H2_BASE[2],
+            H2_BASE[3],
+            (b"X-Upper", b"1"),
+        ];
+        let output = access_log_of_a_rejected_h2_request(&UPPERCASE);
+        assert_h2_line(
+            &output,
+            "lolcatho.st GET /ok",
+            "an uppercase field name refused after the pseudo-headers",
+        );
+    }
+
+    /// A missing or empty `:path` is logged `-`, and what was decoded around
+    /// it still is.
+    #[test]
+    fn a_missing_or_empty_h2_path_logs_the_rest_of_the_request_line() {
+        static MISSING: [(&[u8], &[u8]); 3] = [H2_BASE[0], H2_BASE[1], H2_BASE[2]];
+        let output = access_log_of_a_rejected_h2_request(&MISSING);
+        assert_h2_line(&output, "lolcatho.st GET -", "a missing :path");
+
+        static EMPTY: [(&[u8], &[u8]); 4] = [H2_BASE[0], H2_BASE[1], H2_BASE[2], (b":path", b"")];
+        let output = access_log_of_a_rejected_h2_request(&EMPTY);
+        assert_h2_line(&output, "lolcatho.st GET -", "an empty :path");
+    }
+
+    /// A repeated `:method` or `:path` keeps the first value, as the H1
+    /// rejection path logs what was parsed.
+    #[test]
+    fn a_repeated_h2_pseudo_header_logs_its_first_value() {
+        static METHOD: [(&[u8], &[u8]); 5] = [
+            H2_BASE[0],
+            H2_BASE[1],
+            H2_BASE[2],
+            H2_BASE[3],
+            (b":method", b"POST"),
+        ];
+        let output = access_log_of_a_rejected_h2_request(&METHOD);
+        assert_h2_line(&output, "lolcatho.st GET /ok", "a repeated :method");
+    }
+
+    /// The authority is logged only when it was validated. A second
+    /// `:authority`, and a `host` field that disagrees with it, leave the
+    /// first value stored in the buffer; it must still be logged `-`.
+    ///
+    /// To SEE THIS RED: in `handle_header` (`lib/src/protocol/mux/pkawa.rs`),
+    /// make `origin_disputed` `false`. Both lines then carry `lolcatho.st`.
+    #[test]
+    fn an_unvalidated_h2_authority_is_never_logged() {
+        static REPEATED: [(&[u8], &[u8]); 5] = [
+            H2_BASE[0],
+            H2_BASE[1],
+            H2_BASE[2],
+            H2_BASE[3],
+            (b":authority", b"other.example"),
+        ];
+        let output = access_log_of_a_rejected_h2_request(&REPEATED);
+        assert_h2_line(&output, "- GET /ok", "a repeated :authority");
+
+        static HOST: [(&[u8], &[u8]); 5] = [
+            H2_BASE[0],
+            H2_BASE[1],
+            H2_BASE[2],
+            H2_BASE[3],
+            (b"host", b"other.example"),
+        ];
+        let output = access_log_of_a_rejected_h2_request(&HOST);
+        assert_h2_line(&output, "- GET /ok", "a host field disputing :authority");
+    }
+
+    /// No control byte reaches the log line, whose formatter escapes
+    /// nothing: a pseudo value carrying one is refused before it is stored,
+    /// so it is logged `-`.
+    #[test]
+    fn an_h2_pseudo_header_with_a_control_byte_is_logged_as_absent() {
+        static PATH: [(&[u8], &[u8]); 4] =
+            [H2_BASE[0], H2_BASE[1], H2_BASE[2], (b":path", b"/a\r\nb")];
+        let output = access_log_of_a_rejected_h2_request(&PATH);
+        assert_h2_line(&output, "lolcatho.st GET -", "a CR LF in :path");
+        assert!(
+            !output.contains("/a"),
+            "no byte of a refused pseudo value may reach the log, got: {output}"
+        );
+
+        // Last, because the decode stops handing fields over at the first
+        // refusal: what follows a refused field is never stored.
+        static METHOD: [(&[u8], &[u8]); 4] =
+            [H2_BASE[1], H2_BASE[2], H2_BASE[3], (b":method", b"G\x01T")];
+        let output = access_log_of_a_rejected_h2_request(&METHOD);
+        assert_h2_line(&output, "lolcatho.st - /ok", "a control byte in :method");
     }
 }

@@ -201,7 +201,7 @@ connection, and only the bucket that supplied it ever rotates
 
 Located in `pkawa.rs`, this function parses the `priority` HTTP header value:
 
-```rust lib/src/protocol/mux/pkawa.rs:624
+```rust lib/src/protocol/mux/pkawa.rs:676
 pub(super) fn parse_rfc9218_priority(value: &[u8]) -> (u8, bool) {
 ```
 
@@ -1532,7 +1532,7 @@ All HPACK decode callbacks in `pkawa.rs` use fallible writes to kawa storage.
 The helper that stores one regular header returns a typed rejection instead of
 writing past the buffer:
 
-```rust lib/src/protocol/mux/pkawa.rs:541-543
+```rust lib/src/protocol/mux/pkawa.rs:593-595
 if kawa.storage.write_all(value).is_err() {
     return Err(RejectReason::OversizedPseudoValue);
 }

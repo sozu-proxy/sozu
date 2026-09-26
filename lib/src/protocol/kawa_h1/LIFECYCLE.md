@@ -226,7 +226,7 @@ rejected before it reaches routing. Note that `crate::protocol::http` is a
 consumers must search both spellings.
 
 Mirrors the equivalent HTTP/2 → H1 defense, `RejectReason::ClTeConflict`
-(`lib/src/protocol/mux/pkawa.rs:287`).
+(`lib/src/protocol/mux/pkawa.rs:289`).
 
 ---
 
