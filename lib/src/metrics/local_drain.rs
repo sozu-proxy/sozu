@@ -1750,52 +1750,6 @@ mod tests {
         }
     }
 
-    /// Heap allocations made by the current thread, counted by the
-    /// test binary's global allocator so a test can assert that a code path
-    /// allocates nothing. Per thread, so concurrently running tests do not
-    /// pollute one another's count.
-    mod allocation_counter {
-        use std::{
-            alloc::{GlobalAlloc, Layout, System},
-            cell::Cell,
-        };
-
-        thread_local! {
-            static THREAD_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
-        }
-
-        struct CountingAllocator;
-
-        fn count_one() {
-            let _ = THREAD_ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
-        }
-
-        unsafe impl GlobalAlloc for CountingAllocator {
-            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                count_one();
-                unsafe { System.alloc(layout) }
-            }
-            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-                count_one();
-                unsafe { System.alloc_zeroed(layout) }
-            }
-            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-                unsafe { System.dealloc(ptr, layout) }
-            }
-            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-                count_one();
-                unsafe { System.realloc(ptr, layout, new_size) }
-            }
-        }
-
-        #[global_allocator]
-        static COUNTING: CountingAllocator = CountingAllocator;
-
-        pub(super) fn thread_allocations() -> usize {
-            THREAD_ALLOCATIONS.with(Cell::get)
-        }
-    }
-
     /// Replays what `SessionMetrics::register_end_of_session` hands the
     /// drain for one request: cluster-labelled and proxy-wide times, the six
     /// `record_backend_metrics!` emissions and `access_logs.count`.
@@ -1840,6 +1794,8 @@ mod tests {
 
     #[test]
     fn steady_state_emission_does_not_allocate() {
+        use crate::test_allocations::allocations;
+
         // Once a cluster and its backends have been seen, recording a
         // request's metrics must not touch the heap: the owned copies of
         // `cluster_id`, `backend_id` and the metric name are made only on
@@ -1854,7 +1810,7 @@ mod tests {
         emit_end_of_session(&mut drain, "cluster-a", None);
         emit_end_of_session(&mut drain, "cluster-b", None);
 
-        let before = allocation_counter::thread_allocations();
+        let before = allocations();
         for _ in 0..100 {
             for backend in backends {
                 emit_end_of_session(&mut drain, "cluster-a", Some(backend));
@@ -1862,7 +1818,7 @@ mod tests {
             emit_end_of_session(&mut drain, "cluster-a", None);
             emit_end_of_session(&mut drain, "cluster-b", None);
         }
-        let allocations = allocation_counter::thread_allocations() - before;
+        let allocations = allocations() - before;
 
         assert_eq!(
             allocations, 0,
