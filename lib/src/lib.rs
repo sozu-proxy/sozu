@@ -963,10 +963,16 @@ pub enum ProxyError {
 use self::server::ListenToken;
 pub trait ProxyConfiguration {
     fn notify(&mut self, message: WorkerRequest) -> WorkerResponse;
-    fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
+    /// Accept one connection on the listener behind `token`, returning the
+    /// socket together with the peer address `accept(2)` reported for it.
+    fn accept(&mut self, token: ListenToken) -> Result<(TcpStream, SocketAddr), AcceptError>;
+    /// Build the session for a socket [`Self::accept`] returned. `peer` is the
+    /// address `accept(2)` returned with it, so the session never has to ask
+    /// the kernel again with `getpeername(2)`.
     fn create_session(
         &mut self,
         socket: TcpStream,
+        peer: SocketAddr,
         token: ListenToken,
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,

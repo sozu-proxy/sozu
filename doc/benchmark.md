@@ -207,17 +207,12 @@ accept4(9, {sa_family=AF_INET, sin_port=htons(46144), sin_addr=inet_addr("127.0.
 # Done! No more connections to accept
 accept4(9, 0x7ffe89e39b98, [128], SOCK_CLOEXEC|SOCK_NONBLOCK) = -1 EAGAIN (Resource temporarily unavailable)
 
-# The HTTP proxy sets NODELAY on the socket
-setsockopt(11, SOL_TCP, TCP_NODELAY, [1], 4) = 0
-
-# Sōzu registers the socket in the accept queue
+# Sōzu registers the socket in the accept queue, with the peer address
+# accept4 returned above
 # The accept queue is popped in another loop, to create sessions
 
 # When creating a session, the socket is registered in the event loop
 epoll_ctl(6, EPOLL_CTL_ADD, 11, {events=EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLET, data={u32=267, u64=267}}) = 0
-
-# Get the address of the socket (here, the host is the same, but the port is different)
-getpeername(11, {sa_family=AF_INET, sin_port=htons(46144), sin_addr=inet_addr("127.0.0.1")}, [128 => 16]) = 0
 
 # Return to the main event loop
 epoll_wait(3, [{events=EPOLLIN|EPOLLOUT, data={u32=267, u64=267}}], 1024, 1000) = 1
@@ -227,6 +222,11 @@ epoll_wait(3, [{events=EPOLLIN|EPOLLOUT, data={u32=267, u64=267}}], 1024, 1000) 
 # Here it comes!
 recvfrom(11, "GET /api HTTP/1.1\r\nHost: localho"..., 16400, 0, NULL, NULL) = 80
 ```
+
+There is no `setsockopt(TCP_NODELAY)` and no `getpeername` on the accepted
+socket. The listener got `TCP_NODELAY` when it was activated, and the kernel
+copies it to each socket it accepts; the peer address is the one `accept4`
+returned (sozu-proxy/sozu#1586).
 
 ### Find which parts of the code cause syscalls
 
