@@ -22,7 +22,7 @@ use sozu_command::{
 use crate::metrics::names;
 use crate::{
     protocol::{http::editor::HeaderEditMode, http::parser::Method},
-    router::pattern_trie::{InsertResult, TrieMatches, TrieNode, TrieSubMatch},
+    router::pattern_trie::{InlineTrieMatches, InsertResult, TrieNode, TrieSubMatch},
     sozu_command::logging::ansi_palette,
 };
 
@@ -162,13 +162,16 @@ impl Router {
         // order a search rather than a filter: a hostname whose rules all
         // reject this (path, method) hands the request to the next
         // candidate instead of ending the lookup (sozu#1351).
-        let trie_path: TrieMatches<'_, '_> = Vec::with_capacity(16);
-        if let Some(((_, path_rules), trie_matches)) =
-            self.tree
-                .lookup_with_path(hostname_b, true, trie_path, &mut |(_, path_rules)| {
-                    select_tree_rule(path_rules, path_b, method).is_some()
-                })
-            && let Some((path_rule, route)) = select_tree_rule(path_rules, path_b, method)
+        //
+        // The segments the walk matched are recorded on the stack, so a
+        // lookup allocates nothing of its own; see `InlineTrieMatches`.
+        let mut trie_matches = InlineTrieMatches::new();
+        if let Some((_, path_rules)) = self.tree.lookup_with_inline_path(
+            hostname_b,
+            true,
+            &mut trie_matches,
+            &mut |(_, path_rules)| select_tree_rule(path_rules, path_b, method).is_some(),
+        ) && let Some((path_rule, route)) = select_tree_rule(path_rules, path_b, method)
         {
             // The second call cannot disagree with the predicate: same
             // pure function, same leaf, same request. Re-running it is how
@@ -185,7 +188,7 @@ impl Router {
             // Revisit if a leaf ever holds enough rules to matter.
             return Ok(RouteResult::new_with_trie(
                 hostname_b,
-                trie_matches,
+                &trie_matches,
                 path_b,
                 path_rule,
                 route,
@@ -2422,10 +2425,10 @@ impl RouteResult {
     /// Build a `RouteResult` for a tree-match.
     ///
     /// Tree matches carry the captures collected by the trie traversal
-    /// (`TrieMatches`) alongside the matched leaf path rule.
+    /// (`InlineTrieMatches`) alongside the matched leaf path rule.
     fn new_with_trie<'a, 'b>(
         domain: &'a [u8],
-        domain_submatches: TrieMatches<'a, 'b>,
+        domain_submatches: &InlineTrieMatches<'a, 'b>,
         path: &'a [u8],
         path_rule: &PathRule,
         route: &Route,
@@ -2438,7 +2441,7 @@ impl RouteResult {
         let mut captures_host: Vec<&str> = Vec::with_capacity(frontend.capture_cap_host);
         if frontend.capture_cap_host > 0 {
             captures_host.push(from_utf8(domain).unwrap_or_default());
-            for submatch in &domain_submatches {
+            for submatch in domain_submatches.iter() {
                 match submatch {
                     TrieSubMatch::Wildcard(part) => {
                         captures_host.push(from_utf8(part).unwrap_or_default());
@@ -6270,6 +6273,124 @@ mod tests {
                 Err(RouterError::InvalidHostRewrite(_)),
             ),
             "a $HOST index past captures_len must be refused at registration",
+        );
+    }
+
+    /// A tree lookup allocates nothing of its own: whatever host shape
+    /// answers, the only heap work is building the [`RouteResult`], here the
+    /// cluster id cloned out of a legacy [`Route::ClusterId`] entry, which
+    /// the control reproduces.
+    ///
+    /// The three shapes cover every sink push the walk makes: a literal host
+    /// records no segment, a wildcard host records one on its leaf, a regex
+    /// host records one on the way down.
+    ///
+    /// TO SEE THIS RED: hand `lookup_with_path` a `Vec::with_capacity(16)`
+    /// again in `Router::lookup`, one allocation per lookup on every shape.
+    #[test]
+    fn a_tree_lookup_allocates_nothing_past_its_route_result() {
+        use std::hint::black_box;
+
+        use crate::test_allocations::allocations;
+
+        let mut router = Router::new();
+        for hostname in [
+            "literal.example.com",
+            "*.wildcard.example.com",
+            "/api[0-9]+/.regex.example.com",
+        ] {
+            let mut front = test_http_frontend();
+            front.hostname = hostname.to_owned();
+            router
+                .add_http_front(&front)
+                .unwrap_or_else(|error| panic!("{hostname} must register: {error}"));
+        }
+
+        let control = || {
+            let before = allocations();
+            let result = RouteResult::forward(black_box("cluster").to_owned());
+            let allocated = allocations() - before;
+            drop(black_box(result));
+            allocated
+        };
+        for host in [
+            "literal.example.com",
+            "foo.wildcard.example.com",
+            "api42.regex.example.com",
+        ] {
+            // Warm-up: a regex builds its per-thread search cache on its
+            // first match.
+            drop(router.lookup(host, "/", &Method::Get));
+            let before = allocations();
+            let result = router.lookup(black_box(host), black_box("/"), &Method::Get);
+            let allocated = allocations() - before;
+            assert_eq!(
+                result.ok().and_then(|result| result.cluster_id).as_deref(),
+                Some("cluster"),
+                "{host} must route to the test cluster",
+            );
+            assert_eq!(
+                allocated,
+                control(),
+                "{host}: a tree lookup must allocate only its RouteResult",
+            );
+        }
+    }
+
+    /// A trie walk records every non-literal segment it matched, in walk
+    /// order, and `RouteResult::new_with_trie` numbers the `$HOST[n]`
+    /// captures in that order. The record keeps its first 16 entries on the
+    /// stack; this hostname has 20 regex segments, so the last four spill
+    /// past them, and every one of the 20 must still reach the template in
+    /// the same position.
+    ///
+    /// The walk runs from the rightmost label, so a tree rule numbers its
+    /// segment captures right to left, where a pre/post rule reads the
+    /// whole-host regex left to right. This test pins the tree order as it
+    /// stands; it is not what the spill boundary is allowed to change.
+    #[test]
+    fn a_host_capture_past_sixteen_trie_segments_keeps_every_segment() {
+        const SEGMENTS: usize = 20;
+        let hostname = format!(
+            "{}.example.com",
+            (1..=SEGMENTS)
+                .map(|_| "/s([0-9]+)/")
+                .collect::<Vec<_>>()
+                .join(".")
+        );
+        let request = format!(
+            "{}.example.com",
+            (1..=SEGMENTS)
+                .map(|segment| format!("s{segment}"))
+                .collect::<Vec<_>>()
+                .join(".")
+        );
+        let template = (1..=SEGMENTS)
+            .map(|index| format!("$HOST[{index}]"))
+            .collect::<Vec<_>>()
+            .join("-");
+
+        let mut front = test_http_frontend();
+        front.hostname = hostname;
+        front.position = RulePosition::Tree;
+        front.rewrite_host = Some(template);
+        let mut router = Router::new();
+        router
+            .add_http_front(&front)
+            .unwrap_or_else(|error| panic!("the tree frontend must build: {error}"));
+
+        let walk_order = (1..=SEGMENTS)
+            .rev()
+            .map(|segment| segment.to_string())
+            .collect::<Vec<_>>()
+            .join("-");
+        assert_eq!(
+            router
+                .lookup(&request, "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.rewritten_host),
+            Some(walk_order),
+            "every trie segment, inline or spilled, must reach $HOST[n] in walk order",
         );
     }
 
