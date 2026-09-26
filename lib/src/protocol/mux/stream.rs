@@ -767,12 +767,38 @@ impl Stream {
             );
         }
 
-        let endpoint = sozu_command::logging::EndpointRecord::Http {
-            method: context.method.as_deref(),
-            authority: context.authority.as_deref(),
-            path: context.path.as_deref(),
-            reason: context.reason.as_deref(),
-            status: context.status,
+        // A request the parse rejected before `HttpContext` captured its
+        // request line (sozu-proxy/sozu#1085) is logged from the front
+        // buffer, borrowed: see `rejected_request_line` for why this is a
+        // second path and not a call to the nominal capture.
+        let rejected = if context.method.is_none() {
+            rejected_request_line(&self.front)
+        } else {
+            None
+        };
+        debug_assert!(
+            rejected.is_none() || self.front.is_error(),
+            "only a rejected request is logged from the front buffer"
+        );
+        debug_assert!(
+            rejected.is_none() || context.method.is_none(),
+            "a request line the context captured must never be overridden"
+        );
+        let endpoint = match &rejected {
+            Some(line) => sozu_command::logging::EndpointRecord::Http {
+                method: line.method,
+                authority: line.authority,
+                path: line.path,
+                reason: context.reason.as_deref(),
+                status: context.status,
+            },
+            None => sozu_command::logging::EndpointRecord::Http {
+                method: context.method.as_deref(),
+                authority: context.authority.as_deref(),
+                path: context.path.as_deref(),
+                reason: context.reason.as_deref(),
+                status: context.status,
+            },
         };
 
         let listener = listener.borrow();
@@ -832,6 +858,113 @@ impl Stream {
 
         events
     }
+}
+
+/// The request line of a rejected request, borrowed from the front buffer.
+/// See [`rejected_request_line`].
+struct RejectedRequestLine<'a> {
+    method: Option<&'a str>,
+    authority: Option<&'a str>,
+    path: Option<&'a str>,
+}
+
+/// The request line of a request the parse rejected before [`HttpContext`]
+/// captured it, borrowed from the front buffer (sozu-proxy/sozu#1085).
+/// `None` unless `front` is in error and holds a parsed request line.
+///
+/// # Two paths fill the access log's request line, on purpose
+///
+/// The nominal one is `HttpContext::on_request_headers`
+/// (`lib/src/protocol/kawa_h1/editor.rs`), which copies method, authority
+/// and path into owned `Option<String>`s: routing, redirects and header
+/// edits read them long after the parse. This one serves the access log
+/// alone, on the rejection path, and BORROWS: `EndpointRecord::Http` already
+/// takes `&str`, and the access-log path stays allocation-free. Do not
+/// replace it with a call to the nominal capture — that brings back two to
+/// three allocations per rejected request, a rate the client chooses.
+///
+/// Borrowing is sound because the bytes are still there: an H1 front is only
+/// ever reset through `kawa::Kawa::clear`, which returns
+/// `detached.status_line` to `StatusLine::Unknown` in the same call, so a
+/// `StatusLine::Request` here always points into the request it was parsed
+/// from.
+///
+/// # What is recovered, and what is refused
+///
+/// - kawa refused a header, or the framing in `process_headers`, after the
+///   request line. Its authority and path are still empty, so the
+///   request-target is split with `kawa::h1::parser::primitives::parse_url`,
+///   which answers `Store::Slice`/`Store::Static` and allocates nothing.
+/// - Sōzu's CL.TE guard in `HttpContext::on_request_headers` refused a
+///   request kawa had accepted, returning before the capture. kawa already
+///   resolved the authority and the path; they are logged as-is.
+///
+/// The authority of an origin-form request is NEVER read from a `Host`
+/// block. When kawa refuses a header, whether the `Host` line was reached is
+/// the client's choice — put the bad line first and no `Host` block exists —
+/// and a reached one was never validated. Only an authority the request
+/// line itself carries (absolute-form, `CONNECT`) is logged. Do not
+/// "complete" this with a `Host` lookup.
+///
+/// H2 does not reach here with a request line: every rejection in
+/// `handle_header` (`lib/src/protocol/mux/pkawa.rs`) returns before the
+/// status line is assigned, so it stays `StatusLine::Unknown`.
+fn rejected_request_line(front: &GenericHttpStream) -> Option<RejectedRequestLine<'_>> {
+    if !front.is_error() {
+        return None;
+    }
+    let kawa::StatusLine::Request {
+        method,
+        uri,
+        authority,
+        path,
+        ..
+    } = &front.detached.status_line
+    else {
+        return None;
+    };
+    let buf = front.storage.buffer();
+    let method_bytes = borrowed_bytes(method, buf)?;
+    let method = std::str::from_utf8(method_bytes).ok();
+
+    if let Some(path) = borrowed_str(path, buf) {
+        // `process_headers` ran, so the refusal is Sōzu's own.
+        return Some(RejectedRequestLine {
+            method,
+            authority: borrowed_str(authority, buf),
+            path: Some(path),
+        });
+    }
+    debug_assert!(
+        borrowed_bytes(authority, buf).is_none(),
+        "kawa resolves the authority and the path together"
+    );
+    let (authority, path) = borrowed_bytes(uri, buf)
+        .and_then(|uri| kawa::h1::parser::primitives::parse_url(buf, method_bytes, uri))
+        .map_or((None, None), |(authority, path)| {
+            (borrowed_str(&authority, buf), borrowed_str(&path, buf))
+        });
+    Some(RejectedRequestLine {
+        method,
+        authority,
+        path,
+    })
+}
+
+/// A `kawa::Store`'s bytes, borrowed from `buf` or from static data. `None`
+/// for every variant that owns its bytes, and for an empty store.
+fn borrowed_bytes<'a>(store: &kawa::Store, buf: &'a [u8]) -> Option<&'a [u8]> {
+    match store {
+        kawa::Store::Slice(slice) => slice.data_opt(buf),
+        kawa::Store::Static(bytes) => Some(bytes),
+        _ => None,
+    }
+}
+
+/// [`borrowed_bytes`], as UTF-8. Non-UTF-8 bytes are dropped, the way the
+/// nominal capture in `HttpContext::on_request_headers` drops them.
+fn borrowed_str<'a>(store: &kawa::Store, buf: &'a [u8]) -> Option<&'a str> {
+    borrowed_bytes(store, buf).and_then(|bytes| std::str::from_utf8(bytes).ok())
 }
 
 #[cfg(test)]
