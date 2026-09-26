@@ -4270,6 +4270,38 @@
   pseudo-headers `handle_header` (`lib/src/protocol/mux/pkawa.rs`) rejects never gets a request
   line. Documented in `doc/observability.md`.
 
+- **`perf(logging)`: the `tcp://` log backend sent one syscall per formatter fragment; it now sends
+  one per record.** `LoggerBackend::Tcp` was the only sink handed `Arguments` with no buffering of
+  its own. `Write::write_fmt` drives the formatter piece by piece and each piece reaches the socket
+  as its own `write_all`, so a single access-log record became a burst of tiny `send(2)` calls.
+  Measured on a loopback `tcp://` access-log sink with one worker and 20 sequential requests
+  (`access_logs_target = "tcp://127.0.0.1:…"`, `worker_count = 1`): **1634 `send(2)` for 20 records,
+  81.70 per record**, of which 822 carried a single byte — the timestamp alone was split into
+  `2026`, `-`, `0`, `9`, `-`, `26`, `T`, `0`, `8`, `:`, `38`, `:`, `44`, `.`, `531278`, `Z`. The
+  access log so dominated the worker that it was **77% of every syscall the request cost**: 106.25
+  syscalls per request in total against 2.05 `writev` for the actual data path.
+
+  The record is now rendered into the `LoggerBuffer` that `unix://` and `udp://` already use and
+  handed to the socket once: **1.00 `send(2)` per record, 25.35 syscalls per request**, each send
+  carrying one whole 355–359-byte record. Same figures over HTTP/2 (81.95 → 1.00 per record). The
+  buffer is reused across records and was already sized 4096, so the allocation cost is **amortised
+  zero**: the buffer grows at most once, to the largest record ever formatted, and never shrinks —
+  exactly the property the accepted `unix://` and `udp://` arms already have. It is the same
+  mechanism that removed the per-record `format(args)` `String` those arms used to build. `stdout` (1.00), `file://` (0.10, batching whole records into one
+  4 KB write) and `unix://` (1.00) are byte-for-byte unchanged; only the `Tcp` arm moved.
+
+  A stream may accept fewer bytes than offered, unlike the all-or-nothing datagram sinks whose
+  arms discard the returned count, so the record is written with `write_all`: a bare `write` here
+  would silently truncate a log line under send-buffer pressure. Four tests in
+  `command/src/logging/logs.rs` pin the one-call property, the buffer's constant capacity, the
+  short-write path and error propagation; the fixture builds its format arguments from runtime
+  fields rather than literals, because `format_args!` folds literal arguments into its template at
+  compile time and a literal fixture collapses to a single piece that measures nothing.
+
+  Neither `access_logs_format = "protobuf"` nor any other backend is affected, no configuration key
+  changes, and no production dependency is added.
+
+
 ### ➖ Removed
 
 - **BREAKING (library API) — `refactor(udp)`: backend selection moves into the UDP core, closing
