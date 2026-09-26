@@ -109,9 +109,10 @@ use kawa::{AsBuffer, Kawa};
 /// the inline loop this replaced did: a delimiter marks a boundary the stream
 /// must not write past in one go.
 ///
-/// `io_slices` is cleared first and is the caller's reusable scratch — it is
-/// hoisted once per write pass rather than per stream, so a pass over N
-/// streams performs no additional allocation.
+/// `io_slices` is cleared first and is the caller's reusable scratch. The
+/// production caller keeps it for the connection's lifetime rather than per
+/// pass or per stream, so once its capacity has grown to the largest gather
+/// the connection has seen, a write pass performs no allocation here at all.
 ///
 /// # Safety
 ///
@@ -119,9 +120,10 @@ use kawa::{AsBuffer, Kawa};
 /// not. Each one points straight into `kawa.storage`, which [`Kawa::consume`]
 /// may relocate with a `ptr::copy` and which the `Kawa` frees when it is
 /// dropped. The lifetime is a deliberate lie, told so that ONE scratch vector
-/// can be reused across a whole write pass: a `Vec<IoSlice<'a>>` would bind to
-/// the first stream's borrow and could not then be handed the next stream's,
-/// which is an allocation per stream this path does not make.
+/// can be reused across streams and across write passes: a
+/// `Vec<IoSlice<'a>>` would bind to the first stream's borrow and could not
+/// then be handed the next stream's, which is an allocation per stream this
+/// path does not make.
 ///
 /// The caller must guarantee, for every call:
 ///
@@ -141,7 +143,9 @@ use kawa::{AsBuffer, Kawa};
 /// The only production caller is `super::h2::H2Shell::write_streams`,
 /// which opens the window here and closes it at the [`confirm`] three
 /// statements later, entering nothing in between but the vectored socket
-/// write that reborrows the descriptors and cannot retain them.
+/// write that reborrows the descriptors and cannot retain them. The vector it
+/// passes is the shell's private `io_slices` field, which therefore holds
+/// capacity between two calls but never a descriptor.
 pub unsafe fn gather<T: AsBuffer>(kawa: &Kawa<T>, io_slices: &mut Vec<IoSlice<'static>>) -> usize {
     io_slices.clear();
     let buffer = kawa.storage.buffer();

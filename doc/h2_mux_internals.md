@@ -923,7 +923,7 @@ supersede this step without rework.
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:7996-8000
+```rust lib/src/protocol/mux/h2.rs:8012-8016
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1013,7 +1013,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8068-8072
+```rust lib/src/protocol/mux/h2.rs:8084-8088
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1189,10 +1189,15 @@ PRIVATE.
 `H2WriteTarget` and `H2WritePass`; `write_streams` is not, because the
 `Vec<IoSlice<'static>>` bracket must not become splittable by a caller this
 crate cannot enumerate — see the gather/confirm section below.
-`write_streams` is the shell: it owns the
+`write_streams` is the shell: it drives the
 `Vec<IoSlice<'static>>` and the only `socket_write_vectored` call on the
 stream-write path, and it does nothing else but answer what the core asks for —
-including the TLS flush triple the pass ends on.
+including the TLS flush triple the pass ends on. The vector is `H2Shell`'s
+private `io_slices` field, kept for the connection's lifetime: it is empty
+outside the gather/confirm bracket, and only its capacity survives from one
+pass to the next, so a warm transmitting pass allocates nothing for it. As a
+per-pass local it cost one heap allocation per transmitting pass, at least one
+per response.
 
 ```rust
 loop {
@@ -1423,7 +1428,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:7527
+```rust lib/src/protocol/mux/h2.rs:7533
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 

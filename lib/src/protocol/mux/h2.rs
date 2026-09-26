@@ -7341,6 +7341,12 @@ pub struct H2Shell<Front: SocketHandler> {
     pub core: ConnectionH2,
     /// The only socket in the H2 frontend or backend path.
     pub socket: Front,
+    /// `write_streams`' vectored-write scratch, kept for the connection's
+    /// lifetime so a transmitting pass reuses its capacity instead of
+    /// allocating it. Empty between two `h2_transmit::gather` /
+    /// `h2_transmit::confirm` brackets; private so that bracket cannot be
+    /// split from outside this module.
+    io_slices: Vec<IoSlice<'static>>,
 }
 
 /// Renders the core and nothing else.
@@ -7741,7 +7747,11 @@ impl<Front: SocketHandler> H2Shell<Front> {
             expect_read,
             readiness_interest,
         )?;
-        Some(H2Shell { core, socket })
+        Some(H2Shell {
+            core,
+            socket,
+            io_slices: Vec::new(),
+        })
     }
 }
 
@@ -7778,9 +7788,11 @@ impl<Front: SocketHandler> H2Shell<Front> {
 ///
 /// # Why `write_streams` stays private, and where the `unsafe` windows are
 ///
-/// `H2Shell::write_streams` keeps the `Vec<IoSlice<'static>>` that brackets
-/// `h2_transmit::gather` and `h2_transmit::confirm`, and it keeps it because
-/// the loop that opens and closes that bracket lives with it. There are TWO
+/// `H2Shell::write_streams` drives the `Vec<IoSlice<'static>>` that brackets
+/// `h2_transmit::gather` and `h2_transmit::confirm`, and it drives it because
+/// the loop that opens and closes that bracket lives with it. The vector
+/// itself is the shell's private `io_slices` field, so its capacity outlives
+/// the pass while no descriptor does. There are TWO
 /// `unsafe` blocks on this path and they nest:
 ///
 /// - the INNER one is `gather`'s `slice::from_raw_parts`, which re-labels
@@ -7792,14 +7804,18 @@ impl<Front: SocketHandler> H2Shell<Front> {
 ///   and nothing else — not the vectored write, not the `confirm`. It is the
 ///   only `unsafe` block in production code in this file.
 ///
-/// **The window did not widen when `write_streams` moved onto `H2Shell`.** It
-/// still opens at that `gather` call and closes at the `confirm` three
-/// statements later, where `io_slices.clear()` runs before the consume which
-/// may relocate the storage; the `Vec` is still declared in the same function
-/// body, a few lines above the loop. The only thing entered while the
-/// descriptors are live is `SocketHandler::socket_write_vectored`, which
-/// reborrows them for the duration of the call and cannot retain them. No
-/// `IoSlice<'static>` survives one iteration of the loop. What changed is the
+/// **The window did not widen when `write_streams` moved onto `H2Shell`, nor
+/// when the vector moved into a field of it.** It still opens at that `gather`
+/// call and closes at the `confirm` three statements later, where
+/// `io_slices.clear()` runs before the consume which may relocate the storage.
+/// The only thing entered while the descriptors are live is
+/// `SocketHandler::socket_write_vectored`, which reborrows them for the
+/// duration of the call and cannot retain them. No `IoSlice<'static>`
+/// survives one iteration of the loop: what the field keeps between passes is
+/// capacity, and the vector is empty whenever `write_streams` is not inside
+/// that bracket. `gather` clears it on entry as well, so even a descriptor
+/// stranded by a panic out of the vectored write is discarded before anything
+/// could read it. What changed is the
 /// receiver, from `&mut ConnectionH2<Front>` to `&mut H2Shell<Front>`, and the
 /// buffer now arrives through [`ConnectionH2::write_buffer`] instead of the
 /// free function — neither of which moves either end of the bracket.
@@ -8162,9 +8178,13 @@ impl<Front: SocketHandler> H2Shell<Front> {
     /// nested inside its walk of the scheduler's order. Every iteration here is
     /// one of those rounds.
     ///
-    /// The `Vec<IoSlice<'static>>` came here WITH the loop, and stays inside
-    /// this one private function on purpose. [`h2_transmit::gather`] is a
-    /// `pub unsafe fn` that hands back descriptors carrying a lifetime they do
+    /// The `Vec<IoSlice<'static>>` came here WITH the loop, and is only ever
+    /// filled inside this one private function, on purpose. It is the shell's
+    /// private `io_slices` field rather than a local so that a transmitting
+    /// pass reuses its capacity instead of allocating it: the local cost one
+    /// heap allocation per pass, at least one per response.
+    /// [`h2_transmit::gather`] is a `pub unsafe fn` that hands back
+    /// descriptors carrying a lifetime they do
     /// not have, and [`h2_transmit::confirm`] must discharge them before the
     /// consume that may relocate `kawa.storage`; bracketing the two around the
     /// write in three adjacent statements keeps that window exactly as wide as
@@ -8197,7 +8217,6 @@ impl<Front: SocketHandler> H2Shell<Front> {
         // where the pass knows a real stream's bytes reached the socket.
         // Pre-compute byte totals for proportional overhead distribution.
         let mut pass = H2WritePass::new(self.core.compute_stream_byte_totals(context));
-        let mut io_slices: Vec<IoSlice<'static>> = Vec::new();
 
         loop {
             match self
@@ -8240,18 +8259,18 @@ impl<Front: SocketHandler> H2Shell<Front> {
                     let kawa = self.core.write_buffer(context, stream_id);
                     // SAFETY: `kawa` is neither dropped nor mutated between
                     // this call and the `confirm` three statements below, and
-                    // that `confirm` clears `io_slices` before the
+                    // that `confirm` clears `self.io_slices` before the
                     // `Kawa::consume` which may relocate `kawa.storage`. The
                     // only thing entered while the descriptors are live is the
                     // vectored write, which reborrows them for the duration of
                     // the call and cannot retain them.
-                    let offered = unsafe { h2_transmit::gather(kawa, &mut io_slices) };
-                    let (size, status) = self.socket.socket_write_vectored(&io_slices);
+                    let offered = unsafe { h2_transmit::gather(kawa, &mut self.io_slices) };
+                    let (size, status) = self.socket.socket_write_vectored(&self.io_slices);
                     debug_assert!(
                         size <= offered,
                         "the socket reported {size} bytes written for an offer of {offered}"
                     );
-                    h2_transmit::confirm(kawa, &mut io_slices, size);
+                    h2_transmit::confirm(kawa, &mut self.io_slices, size);
                     self.core
                         .handle_write(context, stream_id, size, status, &mut pass);
                 }
@@ -10531,6 +10550,67 @@ mod tests {
         assert!(
             matches!(result, MuxResult::Continue),
             "a drained write pass continues, got {result:?}"
+        );
+    }
+
+    /// A write pass that transmits allocates nothing once the connection is
+    /// warm: the vectored descriptors live in `H2Shell::io_slices`, which
+    /// keeps its capacity from one pass to the next instead of being built
+    /// and freed by every `write_streams` call.
+    ///
+    /// The first pass is the warm-up and may grow the scratch; the second
+    /// queues the same two blocks again and is the measurement. Both go
+    /// through the loopback socket (empty script), so the write is a real
+    /// `writev(2)` and the count covers the whole gather / write / confirm
+    /// round trip plus `poll_write_target` and `handle_write` around it.
+    ///
+    /// TO SEE THIS RED: in `H2Shell::write_streams`, declare
+    /// `let mut io_slices: Vec<IoSlice<'static>> = Vec::new();` above the
+    /// loop and hand it to `gather`, the write and `confirm` in place of
+    /// `self.io_slices`. Measured: this test fails with
+    /// `left: 2, right: 1` under `cargo test`, and `left: 1, right: 0`
+    /// under `cargo test --release` — one allocation per transmitting pass.
+    #[test]
+    fn a_warm_write_pass_allocates_nothing() {
+        let pool = make_pool_for_invariant_16();
+        let (mut connection, mut context, gid, _peer) =
+            writable_fixture(&pool, &[FIRST_BLOCK, SECOND_BLOCK], &[]);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        assert_prepare_gate_is_shut(&context, gid);
+
+        connection.write_streams(&mut context, EndpointClient(&mut router));
+        assert!(
+            context.streams[gid].back.out.is_empty(),
+            "premise: the warm-up pass must drain, or the measured pass would \
+             start from a different state"
+        );
+        for block in [FIRST_BLOCK, SECOND_BLOCK] {
+            context.streams[gid]
+                .back
+                .out
+                .push_back(kawa::OutBlock::Store(kawa::Store::Static(block)));
+        }
+        let calls_before = connection.socket.vectored_calls;
+
+        let before = crate::test_allocations::allocations();
+        connection.write_streams(&mut context, EndpointClient(&mut router));
+        let allocations = crate::test_allocations::allocations() - before;
+
+        assert!(
+            connection.socket.vectored_calls > calls_before,
+            "premise: the measured pass must reach socket_write_vectored"
+        );
+        assert!(
+            context.streams[gid].back.out.is_empty(),
+            "premise: the measured pass must drain the stream"
+        );
+        // `finalize_write`'s `Quiesce` arm formats a `DebugEvent::Str` under
+        // `#[cfg(debug_assertions)]` only; a release build does not compile
+        // it. Everything else the pass does must be allocation-free.
+        let debug_instrumentation = usize::from(cfg!(debug_assertions));
+        assert_eq!(
+            allocations, debug_instrumentation,
+            "a warm transmitting write pass must not allocate"
         );
     }
 

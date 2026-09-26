@@ -445,6 +445,24 @@
   `random_weighted_pick_matches_weighted_index` compares the new draw with `WeightedIndex` over
   valid, zero, negative, overflowing, singleton and empty weight sets.
 
+- **`perf(mux-h2)`: a warm H2 write pass no longer allocates its `IoSlice` vector
+  ([#1571](https://github.com/sozu-proxy/sozu/issues/1571)).** `H2Shell::write_streams` built a
+  fresh `Vec<IoSlice<'static>>` on every pass, which allocated on the first descriptor
+  `h2_transmit::gather` pushed and was freed when the pass returned. Every transmitting pass
+  therefore cost one heap allocation, and every response at least one. The vector is now a
+  private `io_slices` field of `H2Shell`: it is cleared rather than freed, so only its capacity
+  survives between passes and never a descriptor. `gather` clears it on entry, `confirm` clears it
+  before `Kawa::consume`, and the `unsafe` window stays the three statements it was. The field is
+  private, so the bracket still cannot be split from outside the crate. No new dependency and no
+  new `unsafe`. `a_warm_write_pass_allocates_nothing` counts one warm pass through the shared
+  `test_allocations` counter: 1 → 0 allocations under `cargo test --release`. The debug build keeps one `format!` from
+  `finalize_write`'s `#[cfg(debug_assertions)]` instrumentation, which the test accounts for.
+  Measured on a release build with one worker, a `python3 -m http.server` backend and an
+  `LD_PRELOAD` allocation counter, 100 requests over one `curl --http2` connection: worker heap
+  allocations **6825–6906 → 6571–6636** (three runs each). `intentrace -p` shows the same
+  `writev(2)` count before and after: 600 for 100 sequential connections, and 204 for 100
+  requests on one connection.
+
 - **`perf(mux-h2)`: the frontend server preface leaves in one `writev(2)` instead of two.** The
   one-shot stream-0 `WINDOW_UPDATE` that enlarges the connection receive window to
   `h2_initial_connection_window` was queued by the `(ServerSettings, Server)` arm of the write
