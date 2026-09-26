@@ -2462,6 +2462,35 @@
   diff. `sozu-lib` goes 1147 to 1148 tests; `sozu`, `sozu-command-lib`, `sozu-e2e` and `sozu-sim`
   are unmoved.
 
+- **`refactor(mux)`: backend selection reaches the worker's backend set through a `BackendDialer`
+  lent for one call ([#1340](https://github.com/sozu-proxy/sozu/issues/1340), Q12, second
+  part).** `Router::backend_from_request` took `Rc<RefCell<dyn L7Proxy>>` to reach
+  `L7Proxy::backends`; it now takes `&mut dyn BackendDialer`, whose one method selects a backend
+  **and** dials it, and returns the opaque `BackendId` with its socket. `Mux::dial_backend`
+  implements it over the worker's `BackendMap` and the session's `BackendRegistry`, so the id is
+  minted on the embedder's side and `Router::get_backend_for_sticky_session`, which read no
+  `Router` state, is gone. In `lib/src/protocol/mux/router.rs`, production references to
+  `L7Proxy` go **3 → 0** and to `Rc<RefCell<Backend>>` **2 → 0**.
+
+  It is not the borrowed data view the issue first asked for, because that cannot be built here:
+  selection mutates (round-robin cursor, fail-open latch, `PeakEWMA`, Maglev table, availability
+  latch), and a snapshot of N backends each behind its own `RefCell` needs a container of `Ref`s.
+  It follows the UDP core's `BackendSource` instead. Selection and dial stay one call because
+  `Backend::try_connect` raises `active_connections` directly, outside the delta ledger: invariant
+  14's drain-before-read rule holds only while nothing separates reading the counters from the
+  dial. `Router` has no lifetime parameter, so it cannot keep the dialer it is lent. The sticky
+  cookie is resolved by the dialer rather than carried on `BackendId`, because
+  `BackendList::add_backend` rewrites `Backend::sticky_id` in place on a live entry.
+
+  No behaviour change, and no allocation added or removed: the per-selection candidate `Vec` in
+  `BackendList::available_backends` is untouched and out of scope. `L7Proxy::backends` now has no
+  caller; removing it from the trait is left for separate work. `backend_from_request` had no
+  test. `a_second_selection_observes_the_first_dials_connection` dials twice under `LeastLoaded`
+  on connections and requires two different backends — red, both on `backend-a`, when the
+  dial's increment is removed. `a_cookie_pins_only_a_frontend_that_sticks` pins that a frontend
+  which does not stick ignores the client's cookie — red when the caller maps every request to
+  the sticky arm. `sozu-lib` goes 1129 to 1131 tests.
+
 ### 🐛 Fixed
 
 - **`fix(mux)`: the `peer=` slot of every `MUX` log line is read from the snapshot the frontend

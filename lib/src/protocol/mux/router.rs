@@ -100,11 +100,10 @@ use sozu_command::{
 
 #[cfg(debug_assertions)]
 use super::DebugEvent;
-use super::{BackendStatus, Connection, Context, GlobalStreamId, Position, StreamState};
+use super::{BackendId, BackendStatus, Connection, Context, GlobalStreamId, Position, StreamState};
 use crate::{
-    BackendConnectionError, L7ListenerHandler, L7Proxy, ListenerHandler, Readiness,
-    RetrieveClusterError,
-    backends::{Backend, BackendError},
+    BackendConnectionError, L7ListenerHandler, ListenerHandler, Readiness, RetrieveClusterError,
+    backends::BackendError,
     protocol::http::editor::{HeaderEditMode, HeaderEditSnapshot, HttpContext},
     router::{HeaderEdit, RouteResult},
     server::CONN_RETRIES,
@@ -1141,68 +1140,137 @@ impl Router {
     /// `Context::create_stream` filled when the request arrived, and reading
     /// the listener again here would be exactly the mid-request reload leak
     /// `LIFECYCLE.md` §2.5 rules out.
+    ///
+    /// Takes no proxy handle either: the backend set arrives as `dialer`, a
+    /// capability borrowed for this one call (see [`BackendDialer`]).
     pub fn backend_from_request(
         &mut self,
         cluster_id: &str,
         frontend_should_stick: bool,
         context: &mut HttpContext,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
-    ) -> Result<(TcpStream, Rc<RefCell<Backend>>), BackendConnectionError> {
-        let (backend, conn) = self
-            .get_backend_for_sticky_session(
-                cluster_id,
-                frontend_should_stick,
-                context.sticky_session_found.as_deref(),
-                proxy,
-            )
+        dialer: &mut dyn BackendDialer,
+    ) -> Result<(TcpStream, BackendId), BackendConnectionError> {
+        // Spelled out rather than folded into the dialer's signature: a
+        // cookie the client sent to a frontend that does not stick is
+        // ignored, exactly as the `(false, Some(_))` arm of the match this
+        // replaced ignored it.
+        let affinity = if frontend_should_stick {
+            Affinity::Sticky(context.sticky_session_found.as_deref())
+        } else {
+            Affinity::Unpinned
+        };
+        let dialed = dialer
+            .select_and_dial(cluster_id, affinity)
             .map_err(|backend_error| {
                 trace!("{} {}", log_module_context!(context), backend_error);
                 BackendConnectionError::Backend(backend_error)
             })?;
+        debug_assert_eq!(
+            dialed.sticky_session.is_some(),
+            frontend_should_stick,
+            "a dialer resolves a sticky cookie exactly when the frontend sticks"
+        );
 
-        if frontend_should_stick {
-            // `context.sticky_name` is the name `Context::create_stream`
-            // captured when this request arrived, and it stays that name to
-            // the end of the request. Re-reading the listener here used to
-            // hand an in-flight request a cookie name an operator installed
-            // after it started — the request would then have been matched on
-            // the old name and answered with a `Set-Cookie` under the new one.
-            // A reload applies from the next request (`LIFECYCLE.md` §2.5).
-            context.sticky_session = Some(
-                backend
-                    .borrow()
-                    .sticky_id
-                    .clone()
-                    .unwrap_or_else(|| backend.borrow().backend_id.to_owned()),
-            );
+        // `context.sticky_name` is the name `Context::create_stream` captured
+        // when this request arrived, and it stays that name to the end of the
+        // request. Re-reading the listener here used to hand an in-flight
+        // request a cookie name an operator installed after it started — the
+        // request would then have been matched on the old name and answered
+        // with a `Set-Cookie` under the new one. A reload applies from the
+        // next request (`LIFECYCLE.md` §2.5).
+        if let Some(sticky_session) = dialed.sticky_session {
+            context.sticky_session = Some(sticky_session);
         }
 
-        context.backend_id = Some(backend.borrow().backend_id.to_owned());
-        context.backend_address = Some(backend.borrow().address);
+        context.backend_id = Some((*dialed.backend.backend_id).to_owned());
+        context.backend_address = Some(dialed.backend.address);
 
-        Ok((conn, backend))
+        Ok((dialed.socket, dialed.backend))
     }
+}
 
-    fn get_backend_for_sticky_session(
-        &self,
+/// The worker's backend set, as the one capability
+/// [`Router::backend_from_request`] needs from it: pick a backend and dial it.
+///
+/// Question 12 of [#1340](https://github.com/sozu-proxy/sozu/issues/1340)
+/// asked for a borrowed view of backend load state, "the same shape"
+/// `RoutingView` gave cluster configuration. That shape cannot select.
+/// `RoutingView` is an immutable borrow of immutable data, and selection
+/// mutates: the round-robin cursor, the fail-open latch, `PeakEWMA` under
+/// `LoadMetric::ConnectionTime`, the Maglev table and the cluster
+/// availability latch. A snapshot of the load counters cannot be taken
+/// without allocating either — each backend sits behind its own `RefCell`, so
+/// lending the core N of them at once needs a container of N `Ref`s. The shape
+/// that fits is the UDP core's `BackendSource` (`lib/src/protocol/udp/mod.rs`),
+/// a `&mut dyn` the core calls and the embedder implements.
+///
+/// # Why selecting and dialling are one call
+///
+/// There is no staleness to bound between reading the load counters and the
+/// dial, because nothing runs between them: `BackendMap::backend_from_cluster_id`
+/// (`lib/src/backends.rs`) selects and calls `Backend::try_connect` under one
+/// `borrow_mut`, the worker is single-threaded, and the connect is
+/// non-blocking. `Backend::try_connect` increments `active_connections`
+/// directly rather than through a [`super::BackendDelta`], so no drain point
+/// covers it; the second stream linking in the same pass sees the first one's
+/// connection only because the increment lands before the next selection.
+/// That is LIFECYCLE §9 invariant 14's "drain before any read" rule, and it
+/// holds as long as selection and dial are one synchronous step. A method that
+/// returned a chosen backend for the caller to dial later would open exactly
+/// the window it closes, so this one returns the backend and its socket
+/// together: a selection that has not been dialled is not a value that can
+/// exist.
+///
+/// # Why a trait and not `&mut BackendMap`
+///
+/// A bare `&mut BackendMap` would be smaller, and it would still leave
+/// [`Router::backend_from_request`] handing back an `Rc<RefCell<Backend>>`,
+/// because turning that handle into the opaque [`BackendId`] takes the
+/// session's `BackendRegistry` (`lib/src/protocol/mux/mod.rs`) as well. The
+/// embedder's implementation holds both, so no registry handle reaches this
+/// file at all. It is also what lets a simulator stand in for the backend set:
+/// `sim/tests/h2_simulation.rs` does not reach backend selection today, and
+/// this is the seam it would plug into.
+///
+/// `Router` has no lifetime parameter, so it cannot keep the `&mut` it is
+/// lent; the `Rc<RefCell<dyn L7Proxy>>` this replaced was `'static` and
+/// `Clone`, and nothing stopped it being stored.
+pub trait BackendDialer {
+    /// Select a backend of `cluster_id` and open a connection to it.
+    ///
+    /// Under [`Affinity::Sticky`] the result carries the cookie value to
+    /// answer with, read from the chosen backend under the same borrow as the
+    /// selection. It is resolved here rather than carried on [`BackendId`]
+    /// because `Backend::sticky_id` is not immutable: `BackendList::add_backend`
+    /// (`lib/src/backends.rs`) rewrites it in place on the live registry entry
+    /// when an existing backend is re-added, and `BackendId` carries only what
+    /// cannot change for the life of an entry.
+    fn select_and_dial(
+        &mut self,
         cluster_id: &str,
-        frontend_should_stick: bool,
-        sticky_session: Option<&str>,
-        proxy: Rc<RefCell<dyn L7Proxy>>,
-    ) -> Result<(Rc<RefCell<Backend>>, TcpStream), BackendError> {
-        match (frontend_should_stick, sticky_session) {
-            (true, Some(sticky_session)) => proxy
-                .borrow()
-                .backends()
-                .borrow_mut()
-                .backend_from_sticky_session(cluster_id, sticky_session),
-            _ => proxy
-                .borrow()
-                .backends()
-                .borrow_mut()
-                .backend_from_cluster_id(cluster_id),
-        }
-    }
+        affinity: Affinity<'_>,
+    ) -> Result<DialedBackend, BackendError>;
+}
+
+/// Whether a request is pinned to a backend by its sticky-session cookie.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Affinity<'a> {
+    /// The frontend does not stick: any cookie the client sent is ignored.
+    Unpinned,
+    /// The frontend sticks. `Some` is the cookie the request carried, tried
+    /// first; `None`, or a cookie naming no live backend, falls back to the
+    /// cluster's load balancer. Either way the answer carries a cookie.
+    Sticky(Option<&'a str>),
+}
+
+/// What [`BackendDialer::select_and_dial`] answers: the chosen backend, the
+/// socket already dialled to it, and — only under [`Affinity::Sticky`] — the
+/// cookie value that pins the client to it.
+#[derive(Debug)]
+pub struct DialedBackend {
+    pub backend: BackendId,
+    pub socket: TcpStream,
+    pub sticky_session: Option<String>,
 }
 
 /// Apply the frontend's request-side rewrite + header policy to the
@@ -2855,5 +2923,206 @@ mod backend_selection_order_tests {
                  order must land on the lowest token"
             );
         }
+    }
+}
+
+/// [`Router::backend_from_request`] against the embedder's real dialer.
+///
+/// Question 12 of [#1340](https://github.com/sozu-proxy/sozu/issues/1340)
+/// replaced the proxy handle this function took with a [`BackendDialer`]; it
+/// had no test before that change. Each fixture owns its own `BackendMap` and
+/// `BackendRegistry`, so nothing here depends on a proxy, a listener or a
+/// session.
+#[cfg(test)]
+mod backend_dialer_tests {
+    use std::{net::TcpListener, time::Duration};
+
+    use sozu_command::proto::command::{LoadBalancingAlgorithms, LoadMetric};
+
+    use super::Router;
+    use crate::{
+        backends::{Backend, BackendMap},
+        protocol::{
+            http::editor::HttpContext,
+            mux::{BackendId, BackendRegistry, RegistryDialer},
+        },
+    };
+
+    const CLUSTER: &str = "cluster-1340-q12";
+    const STICKY_B: &str = "sticky-b";
+
+    /// Two backends on two bound listeners, so both connects succeed, under
+    /// `LeastLoaded` on connections. The policy matters: round-robin would
+    /// alternate whatever the counters said, and a test that passes without
+    /// reading the load observes nothing.
+    struct Fixture {
+        backends: BackendMap,
+        registry: BackendRegistry,
+        router: Router,
+        // Held for the listening sockets' lifetime, never read.
+        _listeners: [TcpListener; 2],
+    }
+
+    fn fixture() -> Fixture {
+        let bind = || TcpListener::bind("127.0.0.1:0").expect("a loopback listener must bind");
+        let listeners = [bind(), bind()];
+        let address = |i: usize| {
+            listeners[i]
+                .local_addr()
+                .expect("a bound listener has an address")
+        };
+        let mut backends = BackendMap::new();
+        backends.set_load_balancing_policy_for_cluster(
+            CLUSTER,
+            LoadBalancingAlgorithms::LeastLoaded,
+            Some(LoadMetric::Connections),
+        );
+        backends.add_backend(
+            CLUSTER,
+            Backend::new("backend-a", address(0), None, None, None),
+        );
+        backends.add_backend(
+            CLUSTER,
+            Backend::new(
+                "backend-b",
+                address(1),
+                Some(STICKY_B.to_owned()),
+                None,
+                None,
+            ),
+        );
+        Fixture {
+            backends,
+            registry: BackendRegistry::default(),
+            router: Router::new(Duration::from_secs(10), Duration::from_secs(10)),
+            _listeners: listeners,
+        }
+    }
+
+    fn request(cookie: Option<&str>) -> HttpContext {
+        let mut context = HttpContext::new(
+            rusty_ulid::Ulid::generate(),
+            rusty_ulid::Ulid::generate(),
+            crate::Protocol::HTTP,
+            "127.0.0.1:80"
+                .parse()
+                .expect("test public address must parse"),
+            None,
+            "SOZUBALANCEID".to_owned(),
+            "Sozu-Id".to_owned(),
+            false,
+            false,
+        );
+        context.sticky_session_found = cookie.map(ToOwned::to_owned);
+        context
+    }
+
+    impl Fixture {
+        fn dial(&mut self, should_stick: bool, context: &mut HttpContext) -> BackendId {
+            let mut dialer = RegistryDialer {
+                backends: &mut self.backends,
+                registry: &mut self.registry,
+            };
+            let (_socket, backend) = self
+                .router
+                .backend_from_request(CLUSTER, should_stick, context, &mut dialer)
+                .expect("a cluster with two reachable backends must dial");
+            assert_eq!(
+                context.backend_id.as_deref(),
+                Some(&*backend.backend_id),
+                "the request must be stamped with the backend it was dialled to"
+            );
+            backend
+        }
+
+        fn active_connections(&self, backend: &BackendId) -> usize {
+            self.registry
+                .handle(backend)
+                .expect("an id this fixture minted must resolve")
+                .borrow()
+                .active_connections
+        }
+    }
+
+    /// Two streams linking in one pass must spread under `LeastLoaded`.
+    ///
+    /// The second selection reads `active_connections`, which only the first
+    /// dial can have raised: `Backend::try_connect` increments it at the dial,
+    /// and no delta drain covers that increment. So this holds only if
+    /// selection and dial are one step and the second selection reads live
+    /// counters. A view that froze the counters before the first selection
+    /// would send both streams to `backend-a`, and so would a dial that
+    /// stopped counting its connection.
+    #[test]
+    fn a_second_selection_observes_the_first_dials_connection() {
+        let mut fixture = fixture();
+
+        let first = fixture.dial(false, &mut request(None));
+        let second = fixture.dial(false, &mut request(None));
+
+        assert_eq!(
+            &*first.backend_id, "backend-a",
+            "with both backends idle the first minimum wins"
+        );
+        assert_ne!(
+            first.backend_id,
+            second.backend_id,
+            "the second selection landed on the first one's backend: either \
+             the selection read load counters taken before the first dial, or \
+             the first dial did not count its connection \
+             (first={} active={}, second={} active={})",
+            first.backend_id,
+            fixture.active_connections(&first),
+            second.backend_id,
+            fixture.active_connections(&second),
+        );
+        assert_eq!(
+            (
+                fixture.active_connections(&first),
+                fixture.active_connections(&second)
+            ),
+            (1, 1),
+            "each dial must count exactly one connection on the backend it chose"
+        );
+    }
+
+    /// A cookie pins the request only when its frontend sticks.
+    ///
+    /// The call this replaced matched on `(frontend_should_stick, cookie)`
+    /// and sent `(false, Some(_))` to the load balancer; the dialer now takes
+    /// an [`super::Affinity`] built by the caller, so that arm is the one a
+    /// signature change could flip without a compile error.
+    #[test]
+    fn a_cookie_pins_only_a_frontend_that_sticks() {
+        let mut unpinned = fixture();
+        let mut context = request(Some(STICKY_B));
+        let backend = unpinned.dial(false, &mut context);
+        assert_eq!(
+            &*backend.backend_id, "backend-a",
+            "a frontend that does not stick must ignore the client's cookie"
+        );
+        assert_eq!(
+            context.sticky_session, None,
+            "a frontend that does not stick must not answer with a cookie"
+        );
+
+        let mut pinned = fixture();
+        let mut context = request(Some(STICKY_B));
+        let backend = pinned.dial(true, &mut context);
+        assert_eq!(
+            &*backend.backend_id, "backend-b",
+            "a sticky frontend must follow the cookie to its backend"
+        );
+        assert_eq!(context.sticky_session.as_deref(), Some(STICKY_B));
+
+        let mut fallback = fixture();
+        let mut context = request(None);
+        let backend = fallback.dial(true, &mut context);
+        assert_eq!(
+            context.sticky_session.as_deref(),
+            Some(&*backend.backend_id),
+            "a sticky frontend with no cookie answers with the chosen \
+             backend's id when it has no sticky id of its own"
+        );
     }
 }
