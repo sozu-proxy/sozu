@@ -411,6 +411,45 @@ are sourced from the rustls handshake context in `lib/src/https.rs` and
 plumbed via `mux::Context` into `HttpContext`. The pipe path picks them up
 via `Pipe::set_tls_metadata` called from `https.rs::upgrade_mux`.
 
+### The cost of one access-log line
+
+An ASCII access-log line costs **no heap allocation in steady state**, on
+every target. Every `RequestRecord` field is a borrow, `file://` and `stdout`
+format straight into their own line buffer, and the socket targets format into
+the one `LoggerBuffer` the logger reuses for every record. What is left to keep
+free is the rendering of the fields themselves, and each one that used to
+build a `String` now writes into the formatter
+(`command/src/logging/display.rs`):
+
+| Field | Rendered by | Replaced |
+|---|---|---|
+| client and backend socket addresses | `LogAddress` | `AsString::as_string_or`, two allocations per address |
+| session and request ULIDs of the `[…]` context | `write_ulid`, a Crockford encoder on a 26-byte stack array | `rusty_ulid`'s `Display`, which is `f.write_str(&self.to_string())` |
+| user agent | `EscapedUserAgent`, which writes the spans between the replaced bytes | three chained `str::replace`, one `String` each |
+| HTTP status, colored or not | `write_status` | a `String` built by `display_status` |
+
+The output is unchanged byte for byte. The user agent still rewrites only a
+space to `_`, `[` to `{` and `]` to `}`; control bytes, quotes, other
+whitespace and non-ASCII pass through as before. Because `LogContext` renders
+through the same encoder, every main-log line that carries a
+`[session req cluster backend]` context saves its ULID allocations too.
+
+Two tests in `command/tests/access_log_allocations.rs` hold the contract under
+a counting global allocator: `a_file_access_log_line_does_not_allocate` and
+`a_udp_access_log_line_does_not_allocate` emit a record that exercises every
+field above and require 64 lines after warm-up to allocate nothing. The two
+targets are the two rendering paths, the `MultiLineWriter` and the reused
+buffer. Before this change each line allocated 10 times. On a release worker
+serving 20 sequential HTTP/1.1 requests to a `file://` target, the worker's
+`malloc` plus `realloc` count fell from 83.8 to 73.7 per request, and the
+backtraces of the remaining allocations no longer name the logging module.
+
+A new rendered field must follow the same rule: pass a value whose `Display`
+writes into the formatter, never `to_string()`, `format!` or
+`AsString::as_string_or` in the argument list of `InnerLogger::log_access`.
+The protobuf format (`access_logs_format = "protobuf"`) is a separate path,
+`RequestRecord::into_binary_access_log`, and these tests do not measure it.
+
 ### Where a frontend's `--tags` come from
 
 On HTTP and HTTPS listeners the access-log `tags` field is resolved **through
