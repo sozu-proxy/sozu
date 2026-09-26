@@ -37,6 +37,21 @@ implementation depending on what the frontend negotiated.
 | `parser.rs` / `serializer.rs` | idem                                 | RFC 9113 frame codec                              |
 | `converter.rs` / `pkawa.rs`   | idem                                 | HPACK ↔ kawa block conversion                     |
 | `h2_scheduler.rs`             | `lib/src/protocol/mux/h2_scheduler.rs` | RFC 9218 priorities + the write-pass order/yield decision |
+| `h2_close.rs`                 | `lib/src/protocol/mux/h2_close.rs` | Close and write-pass finalization decisions under TLS backpressure |
+| `h2_control_tx.rs`            | `lib/src/protocol/mux/h2_control_tx.rs` | Proxy-emitted `RST_STREAM` queue and its lifetime cap |
+| `h2_drain.rs`                 | `lib/src/protocol/mux/h2_drain.rs` | RFC 9113 §6.8 double-GOAWAY drain state and its transitions |
+| `h2_flood_detector.rs`        | `lib/src/protocol/mux/h2_flood_detector.rs` | CVE-2023-44487 / CVE-2024-27316 / CVE-2025-8671 mitigations, frame rate limits |
+| `h2_flow_control.rs`          | `lib/src/protocol/mux/h2_flow_control.rs` | Connection-level send window, queued `WINDOW_UPDATE`s; the advertised receive window is not enforced |
+| `h2_header_reassembly.rs`     | `lib/src/protocol/mux/h2_header_reassembly.rs` | Owned accumulator for an in-progress HEADERS + CONTINUATION block |
+| `h2_stream_table.rs`          | `lib/src/protocol/mux/h2_stream_table.rs` | Wire `StreamId` → `GlobalStreamId` map, RST dedupe, liveness and stall caches |
+| `h2_transmit.rs`              | `lib/src/protocol/mux/h2_transmit.rs` | Vectored `gather`/`confirm` of one stream's pending output |
+| `h2_write_pass.rs`            | `lib/src/protocol/mux/h2_write_pass.rs` | Owned state and phase of one `write_streams` pass |
+| `hpack_state.rs`              | `lib/src/protocol/mux/hpack_state.rs` | RFC 7541 codec pair and its reusable scratch buffers |
+| `buffer_source.rs`            | `lib/src/protocol/mux/buffer_source.rs` | Where the core takes every buffer; a refusal is not an error |
+| `answers.rs`                  | `lib/src/protocol/mux/answers.rs` | Materialises a configured default answer into a stream's kawa |
+| `auth.rs`                     | `lib/src/protocol/mux/auth.rs` | HTTP Basic extraction, SHA-256 canonicalisation, constant-time compare |
+| `shared.rs`                   | `lib/src/protocol/mux/shared.rs` | Routines H1 and H2 share, including TLS `close_notify` ordering |
+| `debug.rs`                    | `lib/src/protocol/mux/debug.rs` | Bounded per-session event ring; a no-op without `debug_assertions` |
 
 ### 1.2 The split between `ConnectionH2` and `Context`
 

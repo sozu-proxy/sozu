@@ -4108,6 +4108,40 @@
   `doc/README.md` and in the script's own header. `check_doc_citations.py` is unchanged apart from
   that header.
 
+- **`docs(mux)`: §1.1 of the mux LIFECYCLE document mapped 11 of the directory's 26 modules.** The
+  "Module layout" table is the maintainer's index into `lib/src/protocol/mux/`. Measured at
+  `4cbad821` by extracting every backticked `*.rs` name from the §1.1 block and comparing it against
+  `find lib/src/protocol/mux -maxdepth 1 -name '*.rs' -type f`, the table named 11 modules in 9 rows
+  while 26 exist. The fifteen with no row at all were `answers.rs`, `auth.rs`, `buffer_source.rs`,
+  `debug.rs`, `h2_close.rs`, `h2_control_tx.rs`, `h2_drain.rs`, `h2_flood_detector.rs`,
+  `h2_flow_control.rs`, `h2_header_reassembly.rs`, `h2_stream_table.rs`, `h2_transmit.rs`,
+  `h2_write_pass.rs`, `hpack_state.rs` and `shared.rs` — so the table named no owner for GOAWAY
+  draining, the CVE mitigations, the wire stream map, connection-level flow control, or either half
+  of the write path, and a maintainer using it as the directory's map got a map of 11 files.
+
+  Each of the fifteen descriptions is read off the module it names — its `//!` header and its
+  `pub`/`pub(super)` surface — rather than off its filename, because several of these names
+  understate what they hold. `h2_flood_detector.rs` carries the CVE-2023-44487 (Rapid Reset),
+  CVE-2024-27316 (CONTINUATION flood) and CVE-2025-8671 (MadeYouReset) mitigations, not a generic
+  rate limiter. `buffer_source.rs` carries the contract that a refusal is **not** an error condition
+  but a one-stream `RST_STREAM(REFUSED_STREAM)` degradation, which is the whole reason the trait is
+  fallible. And `h2_flow_control.rs` owns a *send* window plus receive accounting while the
+  connection-level receive window it advertises is not enforced at all — measured on
+  [#1488](https://github.com/sozu-proxy/sozu/issues/1488), which chose to document that gap rather
+  than close it, so a row reading "RFC 9113 §6.9 flow control" would have asserted a guarantee this
+  code does not provide.
+
+  No new row carries a `file.rs:LINE` anchor. The document's own header keeps a line number only for
+  a claim about a specific statement or branch inside an item, and "what is this module for" is not
+  one; the anchor is the item plus its file. Row order for the fifteen follows the order
+  `doc/architecture.md`'s own 26-row block already uses for the same modules, and the nine
+  pre-existing rows — the eleven modules they name — plus the header and the separator are unchanged
+  byte-for-byte. The same defect class was corrected in `doc/architecture.md` under
+  [#1520](https://github.com/sozu-proxy/sozu/issues/1520), which is also where the residual
+  obligation is written down: adding a module to this directory means adding its row, and no gate
+  enforces that. Documentation only: no `.rs` file, no test, no dependency and no `Cargo.lock` entry
+  changes.
+
 ### ➖ Removed
 
 - **BREAKING (library API) — `refactor(udp)`: backend selection moves into the UDP core, closing
