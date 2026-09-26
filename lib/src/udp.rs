@@ -461,11 +461,15 @@ impl UdpProxy {
 
     /// Drive the UDP health prober one event-loop step (server calls this once
     /// per iteration, mirroring `HealthChecker::poll`). Non-blocking.
+    ///
+    /// The prober borrows `self.registry` directly. It must not clone it:
+    /// `Registry::try_clone` is an `fcntl(F_DUPFD_CLOEXEC)` of the epoll
+    /// descriptor and dropping the clone is a `close`, so a clone here cost
+    /// two syscalls on **every** event-loop turn, with or without a UDP
+    /// cluster, and silently skipped health probing whenever the worker was
+    /// out of descriptors (`EMFILE`).
     pub fn health_poll(&mut self) {
-        let registry = self.registry.try_clone();
-        if let Ok(registry) = registry {
-            self.health.poll(&self.backends, &registry);
-        }
+        self.health.poll(&self.backends, &self.registry);
     }
 
     /// Record mio readiness for a UDP health-probe socket.
