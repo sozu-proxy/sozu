@@ -376,6 +376,41 @@
 
 ### 🔄 Changed
 
+- **`perf(mux)`: the close path no longer waits for an EOF it already read, nor shuts down a
+  socket whose peer has closed ([#1603](https://github.com/sozu-proxy/sozu/issues/1603)).** Up to two
+  syscalls per closed connection are gone. An H1 backend read that returns its last bytes together
+  with the EOF now records HUP on that read (`ConnectionH1::readable`), so the dead-backend check of
+  `Mux::ready_inner` closes the backend on the same pass, after those bytes are parsed, instead of on
+  the `EPOLLRDHUP` edge the kernel had already queued for the same FIN, which cost one more
+  `epoll_wait` that returned at once. That is the order the pass already followed when the
+  `EPOLLRDHUP` arrived together with the data. Frontend reads are unchanged: over TLS their `Closed`
+  can be a `close_notify` on a TCP stream that is still open, and a frontend HUP closes the whole
+  session. Every write-side `shutdown(SHUT_WR)` of the HTTP and HTTPS close paths — the frontend in
+  `HttpSession::close` and `HttpsSession::close`, the backends in `Mux::close` and the dead-backend
+  sweep — now goes through `protocol::mux::shutdown_write`, which skips it once the peer has closed:
+  the connection's readiness carries HUP (`Connection::peer_closed`), or, on a TLS frontend, a read
+  met the client's EOF or `close_notify` (`FrontRustls::peer_disconnected`). A backend sozu drops on
+  its own (`BackendStatus::Disconnecting`) keeps its shutdown. Nothing changes on the wire: the
+  `close(2)` that follows is the descriptor's last, and Linux sends the FIN after the queued bytes
+  (or a RST over unread data) with or without a prior `shutdown(SHUT_WR)`, so a peer that half-closed
+  and is still reading still gets its FIN. HAProxy skips the socket shutdown on the same condition
+  (`conn_sock_shutw`). The TLS `close_notify` is kept: RFC 8446 §6.1 requires it before the write
+  side closes whether or not the peer sent its own, and a reset peer already costs no write.
+  Measured on a release build, one worker, python backend, 20 sequential requests each on its own
+  connection, `LD_PRELOAD` fd tracer: H1 `shutdown` 2.00 → 0.05 per request, `epoll_wait` rounds
+  that only delivered an EOF already read 3 → 0 (12 of 20 in an earlier run of the same setup),
+  total 23.55 → 21.45; H2 `shutdown` 2.00 → 1.00 and `ENOTCONN` 15 → 1, the remaining frontend
+  shutdown being the connections sozu closed on the client's GOAWAY before its `close_notify`
+  arrived, a client it cannot yet know has closed. `intentrace -p`: H1 `shutdown` 2.00 → 0.00,
+  total 22.80 → 21.00; H2 `shutdown` 2.00 → 0.00, total 43.95 → 41.90. Pinned by
+  `an_h1_backend_eof_read_records_hup_and_a_frontend_one_does_not`,
+  `a_backend_eof_read_with_its_last_bytes_closes_the_backend_in_the_same_pass`,
+  `mux_close_skips_the_backend_shutdown_once_the_backend_closed` and
+  `mux_close_keeps_the_backend_shutdown_while_the_backend_is_there` (`mod.rs`), and
+  `https_close_skips_the_frontend_shutdown_once_the_client_closed` and
+  `https_close_keeps_the_frontend_shutdown_while_the_client_is_there` (`https.rs`), each seen red
+  first; the two "keeps" tests check that a peer still there receives the FIN.
+
 - **`perf(router)`: routing a request copies no authority and allocates no trie path
   ([#1589](https://github.com/sozu-proxy/sozu/issues/1589)).** Two of the three allocations #1583
   left per routed request inside `Router::route_from_request` are gone. The authority is no longer

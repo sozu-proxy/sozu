@@ -717,6 +717,53 @@ pub(super) fn tcp_info_reads() -> usize {
     TCP_INFO_READS.with(std::cell::Cell::get)
 }
 
+/// `shutdown(SHUT_WR)` on a socket whose descriptor is about to be closed,
+/// unless the peer has already closed its side.
+///
+/// Every write-side shutdown of the HTTP and HTTPS close paths goes through
+/// here: the frontend in `HttpSession::close` (`lib/src/http.rs`) and
+/// `HttpsSession::close` (`lib/src/https.rs`), the backends in `Mux::close`
+/// and in the dead-backend sweep of `Mux::ready_inner`. `peer_closed` comes
+/// from [`Connection::peer_closed`], which `HttpsSession::close` widens with
+/// `FrontRustls::peer_disconnected`.
+///
+/// Skipping it changes nothing on the wire. None of these descriptors is
+/// shared (no `dup`, `try_clone` or fork; see `doc/lifetime_of_a_session.md`
+/// §9), so the `close(2)` that follows is the last one, and Linux's
+/// `tcp_close` then sends the FIN after the queued bytes itself when the
+/// receive queue is empty, or a RST when it is not — whether or not a
+/// `shutdown(SHUT_WR)` came first. Once the peer has closed, the shutdown is
+/// therefore a syscall that only reports what the close would do, and on a
+/// peer that has also reset it fails with `ENOTCONN`. HAProxy draws the same
+/// line: `conn_sock_shutw` (`include/haproxy/connection.h`) skips the socket
+/// shutdown once `CO_FL_SOCK_RD_SH` records the read0. The TLS
+/// `close_notify` is not affected: it is written before this call, and RFC
+/// 8446 §6.1 requires it before the write side closes whether or not the
+/// peer sent its own.
+///
+/// Under `cfg(test)` each shutdown actually issued bumps a thread-local
+/// counter, read back by [`shutdown_writes`].
+pub(crate) fn shutdown_write(socket: &TcpStream, peer_closed: bool) -> std::io::Result<()> {
+    if peer_closed {
+        return Ok(());
+    }
+    #[cfg(test)]
+    SHUTDOWN_WRITES.with(|writes| writes.set(writes.get() + 1));
+    socket.shutdown(Shutdown::Write)
+}
+
+#[cfg(test)]
+thread_local! {
+    static SHUTDOWN_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `shutdown(SHUT_WR)` calls the calling thread has issued through
+/// [`shutdown_write`] so far.
+#[cfg(test)]
+pub(crate) fn shutdown_writes() -> usize {
+    SHUTDOWN_WRITES.with(std::cell::Cell::get)
+}
+
 /// Shared logic for half-close accounting: clear `bit` from `readiness.event` on
 /// socket errors/would-block, and return `true` (yield) when no bytes were
 /// transferred so the caller can park the half. Rationale for clearing only
@@ -1301,6 +1348,13 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L>
         self.frontend.socket()
     }
 
+    /// Whether the client has closed its side of the frontend connection, the
+    /// `peer_closed` argument the session's close path hands to
+    /// `shutdown_write`. See [`Connection::peer_closed`].
+    pub fn frontend_peer_closed(&self) -> bool {
+        self.frontend.peer_closed()
+    }
+
     /// Perform every backend accounting change the core has decided since the
     /// last drain, in the order it decided them.
     ///
@@ -1862,6 +1916,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
 
         for (token, client) in &mut self.router.backends {
             let proxy_borrow = proxy.borrow();
+            let peer_closed = client.peer_closed();
             let socket = client.socket_mut();
             // No `EPOLL_CTL_DEL`: the socket stays in `router.backends` until
             // this `Mux` drops with its session, before the event loop's next
@@ -1872,7 +1927,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             // discards the receive buffer and elicits TCP RST, truncating the
             // already-queued response. Canonical write-up: `HttpsSession::close`
             // (`lib/src/https.rs`). Backend sockets follow the same discipline for symmetry.
-            if let Err(e) = socket.shutdown(Shutdown::Write)
+            // Skipped once the backend has closed: see `shutdown_write`.
+            if let Err(e) = shutdown_write(socket, peer_closed)
                 && e.kind() != ErrorKind::NotConnected
             {
                 error!(
@@ -2560,12 +2616,14 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             // this block, and closing its socket removes it from
                             // the epoll set — see `HttpsSession::close`
                             // (`lib/src/https.rs`).
+                            let peer_closed = client.peer_closed();
                             let socket = client.socket_mut();
                             // invariant: write-only shutdown — Shutdown::Both on a TLS frontend
                             // discards the receive buffer and elicits TCP RST, truncating the
                             // already-queued response. Canonical write-up: `HttpsSession::close`
                             // (`lib/src/https.rs`). Backend sockets follow the same discipline for symmetry.
-                            if let Err(e) = socket.shutdown(Shutdown::Write)
+                            // Skipped once the backend has closed: see `shutdown_write`.
+                            if let Err(e) = shutdown_write(socket, peer_closed)
                                 && e.kind() != ErrorKind::NotConnected
                             {
                                 error!(
@@ -5261,5 +5319,335 @@ mod tests {
              which must take it out of the epoll set"
         );
         drop(parts.event_loop);
+    }
+
+    // ── a read that meets the EOF records HUP ──────────────────────────
+
+    /// An H1 backend read that meets the EOF records HUP; the same read on
+    /// the frontend leaves HUP to the event loop.
+    ///
+    /// Both peers write bytes and their FIN before the read, so the read
+    /// returns `(n > 0, Closed)`: the case whose HUP used to wait for the
+    /// `EPOLLRDHUP` edge.
+    ///
+    /// TO SEE THIS RED: delete the HUP insertion from `ConnectionH1::readable`
+    /// (`h1.rs`). The first assertion fails with `a backend read that met the
+    /// EOF must record HUP`.
+    #[test]
+    fn an_h1_backend_eof_read_records_hup_and_a_frontend_one_does_not() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, mut frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let (mut backend, mut backend_peer) =
+            test_backend_connection(&mut mux, Duration::from_secs(30));
+        let Connection::H1(h1) = &mut backend else {
+            unreachable!("new_h1_client builds an H1 connection")
+        };
+        h1.stream = Some(0);
+        mux.context.link_stream(0, Token(1));
+
+        backend_peer
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+            .expect("the backend peer must write its response");
+        backend_peer
+            .shutdown(std::net::Shutdown::Write)
+            .expect("the backend peer must send its FIN");
+        std::thread::sleep(Duration::from_millis(20));
+        backend.readiness_mut().event = Ready::READABLE;
+        let _ = backend.readable(&mut mux.context, EndpointServer(&mut mux.frontend));
+        assert!(
+            backend.readiness().event.is_hup(),
+            "a backend read that met the EOF must record HUP"
+        );
+        assert!(
+            mux.context.streams[0].back.is_terminated(),
+            "the bytes read with the EOF must still be parsed"
+        );
+
+        // The same stream carries the frontend's request.
+        mux.context.streams[0].state = StreamState::Idle;
+        frontend_peer
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("the client must write its request");
+        frontend_peer
+            .shutdown(std::net::Shutdown::Write)
+            .expect("the client must send its FIN");
+        std::thread::sleep(Duration::from_millis(20));
+        mux.frontend.readiness_mut().event = Ready::READABLE;
+        let _ = mux
+            .frontend
+            .readable(&mut mux.context, EndpointClient(&mut mux.router));
+        assert!(
+            !mux.frontend.readiness().event.is_readable(),
+            "precondition: the frontend read reached the EOF"
+        );
+        assert!(
+            !mux.frontend.readiness().event.is_hup(),
+            "a frontend read must leave HUP to the event loop"
+        );
+    }
+
+    /// A `ProxySession` for a `Mux::ready` pass that links no stream: only
+    /// `Mux::dial_backend` reads the session, and nothing in these tests
+    /// dials.
+    struct NoDialSession;
+
+    impl ProxySession for NoDialSession {
+        fn protocol(&self) -> Protocol {
+            unreachable!("a Mux pass that dials nothing never asks the session")
+        }
+        fn ready(&mut self, _session: Rc<RefCell<dyn ProxySession>>) -> SessionIsToBeClosed {
+            unreachable!("a Mux pass that dials nothing never asks the session")
+        }
+        fn update_readiness(&mut self, _token: Token, _events: Ready) {
+            unreachable!("a Mux pass that dials nothing never asks the session")
+        }
+        fn close(&mut self) {
+            unreachable!("a Mux pass that dials nothing never asks the session")
+        }
+        fn timeout(&mut self, _t: Token) -> SessionIsToBeClosed {
+            unreachable!("a Mux pass that dials nothing never asks the session")
+        }
+        fn last_event(&self) -> Instant {
+            unreachable!("a Mux pass that dials nothing never asks the session")
+        }
+        fn print_session(&self) {
+            unreachable!("a Mux pass that dials nothing never asks the session")
+        }
+        fn frontend_token(&self) -> Token {
+            unreachable!("a Mux pass that dials nothing never asks the session")
+        }
+        fn shutting_down(&mut self) -> SessionIsToBeClosed {
+            unreachable!("a Mux pass that dials nothing never asks the session")
+        }
+    }
+
+    /// An `L7Proxy` for a session that only ever removes backend sessions:
+    /// the dead-backend sweep of `Mux::ready_inner` and `Mux::close` call
+    /// `remove_session` once per backend and nothing else.
+    struct RemoveOnlyProxy;
+
+    impl L7Proxy for RemoveOnlyProxy {
+        fn kind(&self) -> sozu_command::proto::command::ListenerType {
+            unreachable!("closing a backend only removes its session")
+        }
+        fn register_socket(
+            &self,
+            _socket: &mut TcpStream,
+            _token: Token,
+            _interest: Interest,
+        ) -> Result<(), std::io::Error> {
+            unreachable!("closing a backend only removes its session")
+        }
+        fn deregister_socket(&self, _tcp_stream: &mut TcpStream) -> Result<(), std::io::Error> {
+            unreachable!("closing a backend only removes its session")
+        }
+        fn add_session(&self, _session: Rc<RefCell<dyn ProxySession>>) -> Token {
+            unreachable!("closing a backend only removes its session")
+        }
+        fn remove_session(&self, _token: Token) -> bool {
+            true
+        }
+        fn backends(&self) -> Rc<RefCell<crate::backends::BackendMap>> {
+            unreachable!("closing a backend only removes its session")
+        }
+        fn clusters(
+            &self,
+        ) -> &HashMap<sozu_command::state::ClusterId, sozu_command::proto::command::Cluster>
+        {
+            unreachable!("closing a backend only removes its session")
+        }
+        fn sessions(&self) -> Rc<RefCell<crate::server::SessionManager>> {
+            unreachable!("closing a backend only removes its session")
+        }
+    }
+
+    /// Read what the peer has been sent until it sees the FIN, or until the
+    /// bytes read end with a non-empty `until`, and report whether the FIN was
+    /// seen. Bounded: a peer that sees neither within the deadline reports
+    /// what it has.
+    fn drain_peer(peer: &mut std::net::TcpStream, until: &[u8]) -> (Vec<u8>, bool) {
+        use std::io::Read;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => return (bytes, true),
+                Ok(n) => {
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if !until.is_empty() && bytes.ends_with(until) {
+                        return (bytes, false);
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return (bytes, false);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => panic!("the test peer failed to read: {e}"),
+            }
+        }
+    }
+
+    /// Issue #1603: a backend whose last bytes and EOF come back from the same
+    /// `socket_read` is closed in that pass, after its bytes were parsed and
+    /// forwarded, instead of on the `EPOLLRDHUP` edge the kernel queued for
+    /// the same FIN — that edge cost one more `epoll_wait` round, which
+    /// returned at once.
+    ///
+    /// The backend's readiness carries READABLE and no HUP, which is what
+    /// the event loop hands a pass when the FIN lands after `epoll_wait`
+    /// returned. The backend peer has written the whole response and its FIN
+    /// before the pass runs.
+    ///
+    /// The close happens on the pass's next inner iteration: `dead` is
+    /// sampled at the top of each one, and the read armed the frontend, which
+    /// keeps the inner loop going.
+    ///
+    /// TO SEE THIS RED: delete the HUP insertion from
+    /// `ConnectionH1::readable` (`h1.rs`). The backend is then still in
+    /// `router.backends` after the pass: `the backend that read its EOF must
+    /// be closed in the same pass`.
+    #[test]
+    fn a_backend_eof_read_with_its_last_bytes_closes_the_backend_in_the_same_pass() {
+        use std::io::Write;
+
+        const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, mut frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let backend_token = Token(1);
+        let (mut connection, mut backend_peer) =
+            test_backend_connection(&mut mux, Duration::from_secs(30));
+        let Connection::H1(h1) = &mut connection else {
+            unreachable!("new_h1_client builds an H1 connection")
+        };
+        h1.stream = Some(0);
+        if let Position::Client(_, _, status) = &mut h1.position {
+            *status = BackendStatus::Connected;
+        }
+        // The request is already written; the backend waits to read.
+        h1.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+        h1.readiness.event = Ready::READABLE;
+        mux.router.backends.insert(backend_token, connection);
+        mux.context.link_stream(0, backend_token);
+        mux.frontend.readiness_mut().event = Ready::EMPTY;
+
+        backend_peer
+            .write_all(RESPONSE)
+            .expect("the backend peer must write its response");
+        backend_peer
+            .shutdown(std::net::Shutdown::Write)
+            .expect("the backend peer must send its FIN");
+        // Loopback delivers both before `write`/`shutdown` return; the margin
+        // only guards a scheduler that defers the softirq.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        let _ = mux.ready(session, proxy, &mut metrics);
+
+        assert!(
+            !mux.router.backends.contains_key(&backend_token),
+            "the backend that read its EOF must be closed in the same pass"
+        );
+        let (forwarded, _) = drain_peer(&mut frontend_peer, b"hello");
+        assert!(
+            forwarded.ends_with(b"hello"),
+            "the bytes read together with the EOF must still reach the client, \
+             got {:?}",
+            String::from_utf8_lossy(&forwarded)
+        );
+    }
+
+    // ── no write-side shutdown once the peer has closed ────────────────
+
+    /// Close a mux holding one backend whose readiness is `event` and whose
+    /// status is `status`, and return the `shutdown(SHUT_WR)` calls the close
+    /// issued together with what the backend peer then observed.
+    fn backend_shutdowns_of_a_close(
+        event: Ready,
+        status: BackendStatus,
+        peer_sends_fin: bool,
+    ) -> (usize, bool) {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        mux.context.streams[0].metrics.reset();
+        let (mut connection, mut backend_peer) =
+            test_backend_connection(&mut mux, Duration::from_secs(30));
+        if peer_sends_fin {
+            backend_peer
+                .shutdown(std::net::Shutdown::Write)
+                .expect("the backend peer must send its FIN");
+        }
+        *connection.position_mut() = match connection.position() {
+            Position::Client(cluster_id, backend, _) => {
+                Position::Client(cluster_id.clone(), backend.clone(), status)
+            }
+            Position::Server => unreachable!("new_h1_client builds a client"),
+        };
+        connection.readiness_mut().event = event;
+        mux.router.backends.insert(Token(1), connection);
+
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        let before = shutdown_writes();
+        mux.close(proxy, &mut metrics);
+        let shutdowns = shutdown_writes() - before;
+        // The descriptor closes when the mux drops, as it does with its
+        // session in production.
+        drop(mux);
+        let (_, saw_fin) = drain_peer(&mut backend_peer, &[]);
+        (shutdowns, saw_fin)
+    }
+
+    /// Issue #1603: `Mux::close` skips `shutdown(SHUT_WR)` on a backend that
+    /// has already closed, and the backend still gets its FIN from the close.
+    ///
+    /// The peer in the first case half-closed and is still reading: that is
+    /// the peer the skipped shutdown could have mattered to, and the FIN it
+    /// observes comes from `close(2)` alone.
+    ///
+    /// TO SEE THIS RED: make `shutdown_write` ignore `peer_closed`. The first
+    /// assertion then fails with `left: 1`, `right: 0`.
+    #[test]
+    fn mux_close_skips_the_backend_shutdown_once_the_backend_closed() {
+        let (shutdowns, saw_fin) =
+            backend_shutdowns_of_a_close(Ready::HUP, BackendStatus::Connected, true);
+        assert_eq!(
+            shutdowns, 0,
+            "a backend whose FIN was seen must not be shut down before its close"
+        );
+        assert!(
+            saw_fin,
+            "the close alone must still deliver the FIN to a half-closed peer"
+        );
+    }
+
+    /// The other half of #1603: a backend that has NOT closed keeps its
+    /// `shutdown(SHUT_WR)` and observes the FIN — including one sozu itself
+    /// is dropping, whose readiness `force_disconnect` overwrote with HUP.
+    #[test]
+    fn mux_close_keeps_the_backend_shutdown_while_the_backend_is_there() {
+        for (event, status, why) in [
+            (
+                Ready::READABLE | Ready::WRITABLE,
+                BackendStatus::Connected,
+                "a live backend",
+            ),
+            (
+                Ready::HUP,
+                BackendStatus::Disconnecting,
+                "a backend force_disconnect marked with HUP",
+            ),
+        ] {
+            let (shutdowns, saw_fin) = backend_shutdowns_of_a_close(event, status, false);
+            assert_eq!(shutdowns, 1, "{why} must keep its shutdown(SHUT_WR)");
+            assert!(saw_fin, "{why} must observe the FIN");
+        }
     }
 }

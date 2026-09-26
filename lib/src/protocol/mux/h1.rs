@@ -398,6 +398,27 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         );
         crate::protocol::mux::h2::record_metric(self.position.bytes_in_event(size));
         self.position.count_bytes_in(parts.metrics, size);
+        // A backend read that met the EOF records it as HUP, with or without
+        // bytes (sozu-proxy/sozu#1603). `Closed` from a backend socket means
+        // `read(2)` returned 0 or the connection was reset: the fact
+        // `Ready::from(&mio::event::Event)` (`command/src/ready.rs`) reports
+        // as HUP from `is_read_closed()`, and whose edge the kernel has
+        // already queued. When the FIN lands between the `epoll_wait` that
+        // woke this pass and this `recv`, waiting for that edge costs one
+        // more `epoll_wait`, which returns at once; with HUP recorded, the
+        // dead-backend check of `Mux::ready_inner` closes this connection on
+        // the pass's next inner iteration, after the bytes read here were
+        // parsed below. That is the order the pass already follows when
+        // `EPOLLRDHUP` arrives together with the last bytes.
+        //
+        // Backends only. A frontend `Closed` can also be a TLS
+        // `close_notify` on a connection whose TCP stream is still open
+        // (`FrontRustls::socket_read`), which the kernel does not report as
+        // read-closed, and a frontend HUP closes the whole session at the
+        // top of the next pass (`Mux::ready_inner`).
+        if status == SocketResult::Closed && self.position.is_client() {
+            self.readiness.event.insert(Ready::HUP);
+        }
         if update_readiness_after_read(size, status, &mut self.readiness) {
             // size=0: the socket returned EOF (Closed) or WouldBlock.
             // For a close-delimited backend response (no Content-Length, no

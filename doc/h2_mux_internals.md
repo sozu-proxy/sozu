@@ -1541,7 +1541,12 @@ H2 stream state, GOAWAY sequencing, and rustls buffering interact:
 - HTTPS uses `shutdown(Write)` rather than `shutdown(Both)`. On Linux,
   `shutdown(Both)` discards unread receive-buffer data and can convert an
   otherwise clean post-drain close into a TCP RST, truncating bytes that the
-  drain loop already flushed.
+  drain loop already flushed. It is skipped once the client has closed
+  (`mux::shutdown_write`, `FrontRustls::peer_disconnected`): the `close()`
+  that follows sends the same FIN or RST, and after the client's
+  `close_notify` the call only failed with `ENOTCONN`
+  ([#1603](https://github.com/sozu-proxy/sozu/issues/1603)). The
+  `close_notify` itself is still sent.
 
 ### complete_server_stream()
 

@@ -525,7 +525,7 @@ shutdown** on the front socket
 `lib/src/http.rs`):
 
 ```rust
-front_socket.shutdown(Shutdown::Write)
+mux::shutdown_write(front_socket, peer_closed)
 ```
 
 `Shutdown::Both` is forbidden on a TLS frontend. It includes
@@ -538,6 +538,37 @@ after the send buffer drains, preserving the response. The plaintext
 TCP path (`lib/src/tcp.rs:1568-1572, 1843-1848`) keeps `Shutdown::Both`
 because it has no encrypted send-buffer to truncate; the comment
 flags that a future TLS upgrade on TCP would need to switch modes.
+
+`shutdown_write` (`lib/src/protocol/mux/mod.rs`) skips the
+`shutdown(SHUT_WR)` once the peer has closed its side, on the front
+socket and on the backend sockets of `Mux::close` and of the
+`dead_backends` block alike
+([#1603](https://github.com/sozu-proxy/sozu/issues/1603)). The peer
+has closed when its connection's readiness carries HUP —
+`EPOLLRDHUP`/`EPOLLHUP` from the event loop, or an H1 backend read that
+met the EOF — or, on a TLS frontend, when a read met the client's EOF
+or `close_notify` (`FrontRustls::peer_disconnected`); a backend that
+sozu itself drops (`BackendStatus::Disconnecting`) keeps its shutdown.
+Nothing changes on the wire, for the reason the next paragraphs give:
+the `close()` that follows is the descriptor's last, and Linux's
+`tcp_close` then sends the FIN after the queued bytes itself when the
+receive queue is empty, or a RST when it is not, with or without a
+prior `shutdown(SHUT_WR)`. A peer that half-closed and is still
+reading therefore still gets its FIN; what goes away is one syscall
+per closed side, which on an H2 client that had already reset used to
+fail with `ENOTCONN`. HAProxy skips the socket shutdown on the same
+condition (`conn_sock_shutw`, `include/haproxy/connection.h`). The TLS
+`close_notify` is written before and is kept: RFC 8446 §6.1 requires
+it before the write side closes, whether or not the peer sent its own.
+
+A backend whose H1 read returns its last bytes together with the EOF
+records HUP on that read (`ConnectionH1::readable`,
+`lib/src/protocol/mux/h1.rs`), so the dead-backend check closes it on
+the same `ready` pass, after those bytes are parsed, instead of on the
+`EPOLLRDHUP` edge the kernel queued for the same FIN, which cost one
+more `epoll_wait`. A frontend read does not: over TLS its `Closed` can
+be a `close_notify` on a TCP stream that is still open, and a frontend
+HUP closes the whole session.
 
 After shutdown, `state.close(...)` closes the backend, flushes any
 close-notify, and releases buffers; the proxy removes the session
