@@ -285,18 +285,26 @@ jobs:
       # and bind ephemeral loopback ports. No root, no fixed port, no TTY — a
       # GitHub runner serves them fine. They stay `#[ignore]`d so a
       # contributor's `cargo test` stays fast, and this step is what runs them;
-      # before it existed they never ran anywhere. `sozu_top_e2e` is
-      # deliberately absent: it is `#![cfg(feature = "tui")]` and no matrix cell
-      # enables that feature, so its target compiles to an empty binary here.
-      # Enabling it would not suffice: `sozu top --snapshot` enters raw mode
-      # and fails with ENXIO without a controlling terminal, which a CI
-      # step normally lacks.
+      # before it existed they never ran anywhere. `sozu_top_e2e` is absent
+      # here: it is `#![cfg(feature = "tui")]` and no matrix cell's flags
+      # enable that feature, so its target compiles to an empty binary. The
+      # next step runs it.
       - name: Test sozu (process-level e2e)
         run: |
           cargo test -p sozu --locked ${{ matrix.flags }} --test load_state_rollback_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test frontend_validate_before_commit_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test listener_validate_before_commit_e2e -- --ignored
           cargo test -p sozu --locked ${{ matrix.flags }} --test sigterm_soft_stop_e2e -- --ignored
+
+      # `sozu_top_e2e` adds the `tui` feature, so it runs on the `msrv-full`
+      # cell only: that cell already resolves `tui` for `cargo doc
+      # --all-features`, and one extra build of the `sozu` binary with it
+      # covers the TUI's entry point. No controlling terminal is needed:
+      # `sozu top --snapshot` takes no terminal control and renders
+      # fixed-size frames to stdout (sozu#1574).
+      - name: Test sozu top (process-level e2e)
+        if: matrix.cell == 'msrv-full'
+        run: cargo test -p sozu --locked ${{ matrix.flags }} --features tui --test sozu_top_e2e -- --include-ignored
 
       # `tests::fuzz_tests::*` is `#[ignore]`d here and exercised in
       # the dedicated `fuzz` job below. Skipping it keeps the e2e

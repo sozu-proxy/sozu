@@ -156,7 +156,11 @@ even after a hard crash.
 
 - `--tick-once` drives one data tick + one render tick and exits.
   Useful for smoke tests and CI snapshots.
-- `--snapshot N` renders `N` frames and exits.
+- `--snapshot N` renders `N` frames to stdout and exits. It takes no
+  terminal control: no raw mode, no alternate screen, no mouse capture,
+  no keyboard input, and a fixed 80x24 frame instead of the terminal's
+  size. It therefore runs without a controlling terminal (CI, a pipe,
+  `ssh -T`); stdout receives the frames' ANSI escape sequences.
 - The `insta` snapshot tests under `bin/src/ctl/top/snapshots/`
   exercise every pane at 80x24 and 120x40; run with `cargo test
   -p sozu --features tui snapshot_tests`. Accept changes with

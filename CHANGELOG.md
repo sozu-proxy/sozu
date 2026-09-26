@@ -2695,8 +2695,19 @@
   `""` and failed to create one, so `sozu start` exited with `SaveStatePath("failed to create
   state file '\"\"'")` before the test reached the command socket. The test has failed this
   way since it was added. It now leaves `saved_state` unset, as its "minimum viable config"
-  intends; the configuration contract is unchanged. The test still needs a controlling
-  terminal, because `sozu top --snapshot` enters raw mode, so CI keeps it out.
+  intends; the configuration contract is unchanged.
+
+- **`fix(top)`: `sozu top --snapshot N` no longer takes terminal control, so it runs without a
+  controlling terminal ([#1574](https://github.com/sozu-proxy/sozu/issues/1574)).** The flag
+  is documented as a "test affordance, no terminal control", but `render::run`
+  (`bin/src/ctl/top/render.rs`) installed `RawModeGuard` unconditionally, whose
+  `enable_raw_mode()` opens `/dev/tty`: without a controlling terminal (CI, a pipe,
+  `ssh -T`) the run failed with `ResolvePath("sozu top render loop", … os error 6)` (ENXIO).
+  In snapshot mode the renderer now enters neither raw mode nor the alternate screen,
+  captures no mouse, installs no terminal-restoring panic hook, reads no input (crossterm's
+  event reader opens `/dev/tty` too; the loop sleeps instead), and draws into a fixed 80x24
+  viewport, since a pipe has no size to query. Frames go to stdout. Interactive mode is
+  unchanged. `sozu_top_e2e` now passes without a pty and runs in CI on the `msrv-full` cell.
 
 - **`fix(command)`: a channel socket error now leaves the channel marked for closing, so the
   master closes a worker session whose worker died with a message still unread
