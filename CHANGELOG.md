@@ -2522,6 +2522,40 @@
   which does not stick ignores the client's cookie — red when the caller maps every request to
   the sticky arm. `sozu-lib` goes 1129 to 1131 tests.
 
+- **`perf(metrics)`: the local drain's per-request emission path allocates nothing and no longer
+  scans the cluster's backends** ([#1548](https://github.com/sozu-proxy/sozu/issues/1548)).
+
+  Two defects on the path `SessionMetrics::register_end_of_session` drives for every request.
+  First, `LocalDrain::receive_cluster_metric` and `LocalDrain::receive_backend_metric` reached the
+  cluster row through `cluster_metrics.entry(cluster_id.to_owned())`: `BTreeMap::entry` takes an
+  owned key, so the copy of `cluster_id` was made on every cluster-labelled emission, up to nine
+  heap allocations per request at both the default `cluster` and the `backend` cardinality level,
+  whatever the number of backends. Both sites now try `get_mut(&str)` first and build the owned key
+  only on a cluster's first sighting. Second, `LocalClusterMetrics` kept its backends in a `Vec`
+  scanned by `backend_id` on each of the up to seven backend-labelled emissions of a request under
+  `metrics.detail = "backend"`, plus a second scan feeding only a `debug_assert!`. The backends are
+  now a `BTreeMap<String, MetricsMap>` looked up by `&str` through `Borrow<str>`: O(log n) and no
+  allocation, the owned id still built only on first sighting.
+
+  The one observable difference: `ClusterMetrics.backends` in a metrics query response is sorted by
+  backend id instead of listed in first-sighting order. The text output of `sozu metrics` regroups
+  the rows through a `HashMap` and never had a stable order.
+
+  The new `lib/benches/local_drain.rs` replays one request's emissions against a drain holding `n`
+  backends of one cluster and counts allocations with a counting global allocator: 9 per request
+  before, 0 after, at every `n`. Wall time per replayed request, one-minute load average between
+  1.8 and 2.6 for every figure: `cluster` level 399 ns before, 345 ns after; `backend` level at
+  n = 1, 10, 100 and 1000, 368 ns / 511 ns / 1.81 µs / 14.7 µs before and 310 ns / 383 ns /
+  543 ns / 753 ns after. The map is faster than the scanned `Vec` from n = 1, so there is no
+  crossover to weigh. A session-held index into the `Vec` was rejected: `remove_backend` can drop a
+  backend under a live session and every removal shifts the later indices.
+
+  `steady_state_emission_does_not_allocate` asserts zero allocations for a hundred replays against
+  a primed drain, counted per thread by a test-only global allocator; it fails before the fix with
+  4500. `backend_metrics_route_to_their_own_backend` checks every backend's aggregate against a
+  reference model over forty backends, two clusters, removals and re-appearances; it passes on the
+  former `Vec` and turns red when the lookup is sabotaged to return the first backend.
+
 ### 🐛 Fixed
 
 - **`fix(mux)`: the `peer=` slot of every `MUX` log line is read from the snapshot the frontend
