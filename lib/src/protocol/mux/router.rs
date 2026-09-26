@@ -832,12 +832,6 @@ impl Router {
                 return Err(cluster_error);
             }
         };
-        // Snapshot the pre-rewrite authority into an owned string so we
-        // can later stash it on `context.original_authority` without
-        // mutably aliasing the immutable borrow that `host: &str` still
-        // holds on `context`.
-        let captured_authority = host.to_owned();
-
         // ── TLS cert SAN ↔ HTTP :authority binding ────────────────────────
         // Reject any request whose `:authority` is not covered by a SAN of
         // the certificate Sōzu actually served at the TLS handshake, with
@@ -921,14 +915,6 @@ impl Router {
                 return Err(RetrieveClusterError::RetrieveFrontend(frontend_error));
             }
         };
-
-        // Stash the pre-rewrite authority unconditionally so log lines,
-        // access logs, and audit records that fire on ANY downstream
-        // path (denial, redirect, basic-auth 401, backend-connect
-        // failure, successful forward) carry the value the client
-        // actually sent. Capturing inside the rewrite helper alone would
-        // lose it on every branch where the rewrite is not applied.
-        context.original_authority = Some(captured_authority);
 
         // ── Resolve the routing decision ──────────────────────────────────
         // Snapshot the policy fields we need before consuming `route`, then
@@ -1296,10 +1282,10 @@ pub struct DialedBackend {
 ///    when `rewritten_host` is set — without a rewrite there is no host
 ///    swap to disclose, and HAProxy's `option forwardfor` style
 ///    headers (`X-Forwarded-For`, `X-Forwarded-Proto`) still flow from
-///    the kawa parser. The pre-rewrite authority itself is captured by
-///    the caller (`route_from_request`) into `context.original_authority`
-///    on every routed request so it survives every downstream code path
-///    (audit, deny, redirect, basic-auth 401, backend-connect failure).
+///    the kawa parser. The pre-rewrite authority is read from
+///    `context.authority`, which no rewrite touches, and recorded in
+///    `context.original_authority` only here, so a request without a
+///    host rewrite copies no authority.
 ///    Dedup rule: the synthetic Host AND any pre-existing Host header
 ///    are dropped in the retain pass below before the rewritten Host is
 ///    appended, so the wire never carries two `Host:` headers.
@@ -1327,13 +1313,12 @@ fn apply_request_rewrites_and_headers(
         return;
     }
 
-    // `route_from_request` already captured the pre-rewrite authority
-    // into `context.original_authority`. Re-borrow it here for the
-    // optional X-Forwarded-Host injection rather than re-parsing the
-    // kawa Store. Cloning a short header value (typically `host:port`)
-    // is cheaper than another UTF-8 decode of the request-line slice.
+    // `context.authority` is the authority the client sent: the rewrites
+    // below mutate the kawa status line and headers, never the context. It
+    // is copied only when the host is rewritten, for the X-Forwarded-Host
+    // injection, and the copy then moves into `context.original_authority`.
     let original_authority: Option<String> = if rewritten_host.is_some() {
-        context.original_authority.clone()
+        context.authority.clone()
     } else {
         None
     };
@@ -1455,6 +1440,7 @@ fn apply_request_rewrites_and_headers(
                 val: Store::from_string(orig.to_owned()),
             }));
         }
+        context.original_authority = original_authority;
         synth.append(&mut to_insert);
         to_insert = synth;
     }
@@ -1795,6 +1781,107 @@ mod tests {
             output.contains(TAG),
             "the access log of a request routed by `*.example.com` must carry that frontend's tags, got: {output}"
         );
+    }
+
+    /// `HttpContext::original_authority` records the authority the client
+    /// sent only when the frontend rewrites the host, the one case where it
+    /// is sent on as `X-Forwarded-Host`; a request without a host rewrite
+    /// leaves it `None` instead of paying a copy of the authority (#1589).
+    ///
+    /// To SEE THIS RED: stamp `context.original_authority` with a copy of
+    /// `host` in `Router::route_from_request` before the frontend lookup,
+    /// as it was before #1589. The plain request then carries
+    /// `Some("plain.example.com")`.
+    #[test]
+    fn only_a_host_rewrite_records_the_original_authority() {
+        let port = crate::testing::provide_port();
+        let address = SocketAddress::new_v4(127, 0, 0, 1, port);
+        let config = ListenerBuilder::new_http(address)
+            .to_http(None)
+            .expect("test http listener config must build");
+        let parts = crate::testing::prebuild_server(10, 16_384, false)
+            .expect("test server parts must build");
+        let pool = parts.pool.clone();
+        let mut proxy = HttpProxy::new(parts.registry, parts.sessions, parts.pool, parts.backends);
+        let token = mio::Token(0);
+        proxy
+            .add_listener(config, token)
+            .expect("test listener must register");
+        for (hostname, rewrite_host) in [
+            ("rewrite.example.com", Some("internal.example.com")),
+            ("plain.example.com", None),
+        ] {
+            proxy
+                .add_http_frontend(RequestHttpFrontend {
+                    cluster_id: Some("cluster-1589".to_owned()),
+                    address,
+                    hostname: hostname.to_owned(),
+                    path: PathRule::prefix("/".to_owned()),
+                    position: RulePosition::Tree.into(),
+                    rewrite_host: rewrite_host.map(str::to_owned),
+                    ..Default::default()
+                })
+                .unwrap_or_else(|error| panic!("{hostname} must register: {error}"));
+        }
+        let listener = proxy
+            .get_listener(&token)
+            .expect("the registered listener must be reachable");
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(proxy));
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+
+        for (authority, expected) in [
+            ("rewrite.example.com", Some("rewrite.example.com")),
+            ("plain.example.com", None),
+        ] {
+            let mut context = HttpContext::new(
+                rusty_ulid::Ulid::generate(),
+                rusty_ulid::Ulid::generate(),
+                crate::Protocol::HTTP,
+                "127.0.0.1:80"
+                    .parse()
+                    .expect("test public address must parse"),
+                None,
+                "SOZUBALANCEID".to_owned(),
+                "Sozu-Id".to_owned(),
+                false,
+                false,
+            );
+            context.authority = Some(authority.to_owned());
+            context.path = Some("/".to_owned());
+            context.method = Some(Method::Get);
+            let mut stream = Stream::new(
+                &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+                context,
+                crate::protocol::mux::test_support::test_answers(),
+                65_535,
+            )
+            .expect("test stream must check out its buffers");
+            let split = &mut stream;
+            let proxy_ref = proxy.borrow();
+            let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
+            router
+                .route_from_request(&mut split.context, &mut split.front, &listener, &view)
+                .unwrap_or_else(|error| panic!("{authority} must route: {error}"));
+
+            assert_eq!(
+                split.context.original_authority.as_deref(),
+                expected,
+                "{authority}: original_authority is recorded exactly when the host is rewritten",
+            );
+            let forwarded_host = split.front.blocks.iter().find_map(|block| match block {
+                kawa::Block::Header(pair)
+                    if pair.key.data(split.front.storage.buffer()) == b"X-Forwarded-Host" =>
+                {
+                    Some(pair.val.data(split.front.storage.buffer()).to_vec())
+                }
+                _ => None,
+            });
+            assert_eq!(
+                forwarded_host.as_deref(),
+                expected.map(str::as_bytes),
+                "{authority}: X-Forwarded-Host carries the authority the client sent, on a rewrite only",
+            );
+        }
     }
 
     #[test]
@@ -3112,9 +3199,12 @@ mod backend_selection_order_tests {
     /// Measured end to end — `plan_connect`, then on the gated path
     /// `consult_ip_gate` and `plan_connect_resume`, then the production
     /// release — against a control made of the two costs this branch does
-    /// not own and which run inside `plan_connect`: `route_from_request`
-    /// (the routing lookup, which returns an owned id cloned from the route
-    /// table) and the debug-build `DebugEvent::Str` history push. The gate's
+    /// not own and which run inside `plan_connect`: the cluster id
+    /// `route_from_request` clones out of the route table (`ClusterId` is a
+    /// `String` in sozu-command-lib) and the debug-build `DebugEvent::Str`
+    /// history push. The rest of `route_from_request` is measured, not
+    /// controlled: it copies no authority and the route lookup records its
+    /// trie segments on the stack (#1589). The gate's
     /// own `SessionManager` bookkeeping is left out of both sides: it is
     /// `lib/src/server.rs`'s and is not what this measures. Both paths run,
     /// because production traffic always carries a source address and so
@@ -3123,7 +3213,10 @@ mod backend_selection_order_tests {
     /// TO SEE THIS RED: stamp `stream_context.cluster_id` in `plan_connect`
     /// with a copy (`Some(cluster_id.to_owned())` of a borrowed id) instead
     /// of moving the routed `String` in: one allocation per request, on both
-    /// paths.
+    /// paths. The same count comes back if `route_from_request` stamps
+    /// `HttpContext::original_authority` with a copy of the authority on a
+    /// request without a host rewrite, or if `Router::lookup` hands the trie
+    /// a `Vec::with_capacity(16)` again.
     #[test]
     fn a_routed_request_on_a_reused_backend_connection_copies_no_cluster_id() {
         use std::hint::black_box;
@@ -3220,34 +3313,31 @@ mod backend_selection_order_tests {
                 }
                 allocated
             };
-            // The two costs `plan_connect` carries that are not this branch's.
-            let control = |router: &mut Router, context: &mut Context<HttpListener>| -> usize {
-                let listener = context.listener.clone();
+            // The two costs `plan_connect` carries that are not this branch's:
+            // the debug history push, and the cluster id `route_from_request`
+            // clones out of the route table (`ClusterId = String` in
+            // sozu-command-lib). Nothing else in routing may allocate.
+            let control = |context: &mut Context<HttpListener>| -> usize {
                 let before = allocations();
-                let stream = &mut context.streams[stream_id];
                 #[cfg(debug_assertions)]
-                context
-                    .debug
-                    .push(DebugEvent::Str(stream.context.get_route()));
-                let routed = router.route_from_request(
-                    &mut stream.context,
-                    &mut stream.front,
-                    &listener,
-                    black_box(&view),
-                );
+                {
+                    let route = context.streams[stream_id].context.get_route();
+                    context.debug.push(DebugEvent::Str(route));
+                }
+                let routed = black_box(black_box(H1_CLUSTER).to_owned());
                 let allocated = allocations() - before;
-                assert_eq!(routed.ok().as_deref(), Some(H1_CLUSTER));
+                drop(routed);
                 allocated
             };
 
             // Warm-up: metric keys, the reverse index and the ledger are
             // sized by the first request.
             branch(&mut router, &mut context);
-            control(&mut router, &mut context);
+            control(&mut context);
             let (mut branched, mut controlled) = (0, 0);
             for _ in 0..REQUESTS {
                 branched += branch(&mut router, &mut context);
-                controlled += control(&mut router, &mut context);
+                controlled += control(&mut context);
             }
 
             assert_eq!(
@@ -3259,7 +3349,8 @@ mod backend_selection_order_tests {
                 0,
                 "gated={gated}: {REQUESTS} requests on a reused keep-alive backend \
                  made {branched} heap allocations through the reuse branch against \
-                 {controlled} for routing alone, expected no difference"
+                 {controlled} for the cluster id copy and the debug history, \
+                 expected no difference"
             );
         }
     }

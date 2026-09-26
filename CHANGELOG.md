@@ -376,6 +376,29 @@
 
 ### 🔄 Changed
 
+- **`perf(router)`: routing a request copies no authority and allocates no trie path
+  ([#1589](https://github.com/sozu-proxy/sozu/issues/1589)).** Two of the three allocations #1583
+  left per routed request inside `Router::route_from_request` are gone. The authority is no longer
+  copied into `HttpContext::original_authority` on every request: `HttpContext::authority` still
+  holds what the client sent when the rewrite runs, so `apply_request_rewrites_and_headers` copies it
+  only for a `rewrite_host` frontend, where it feeds `X-Forwarded-Host`, and moves that copy into
+  `original_authority`, which is now `None` on a request without a host rewrite, as its
+  documentation already said; nothing else in the tree reads it. `Router::lookup` no longer hands
+  the trie a `Vec::with_capacity(16)` to record the wildcard and regex segments it matched: a new
+  crate-private `InlineTrieMatches` keeps the first 16 on the stack and spills to a `Vec` only
+  past them, so `$HOST[n]` templates still see every segment in the same order. `TrieMatches` and
+  `TrieNode::lookup_with_path` are unchanged, and no public type changes.
+  Measured with the counting allocator on a reused keep-alive backend: #1583 counted 3 allocations
+  per request in `route_from_request` in the release build; this change removes 2 of them (measured
+  as a difference of 128 over 64 requests in the debug test build) and holds the release build at 1,
+  the cluster id cloned out of the route table (`ClusterId = String` in sozu-command-lib), which
+  stays out of scope, as does the `SessionManager` bookkeeping on the gated path. The control of
+  `a_routed_request_on_a_reused_backend_connection_copies_no_cluster_id` is narrowed to that clone
+  and the debug-only history push, so the rest of routing is now measured rather than excused;
+  `a_tree_lookup_allocates_nothing_past_its_route_result` pins `Router::lookup` on a literal, a
+  wildcard and a regex host, and `a_host_capture_past_sixteen_trie_segments_keeps_every_segment`
+  drives a 20-segment regex host through the spill.
+
 - **`perf(mux)`: a request on a reused backend connection allocates nothing past routing
   ([#1583](https://github.com/sozu-proxy/sozu/issues/1583)).** Four per-request or per-dial
   allocations left after #1579 are gone. The backend reverse index keeps the emptied `Vec` in its
