@@ -19,7 +19,8 @@ use crate::metrics::names;
 use crate::{
     PeakEWMA,
     load_balancing::{
-        LeastLoaded, LoadBalancingAlgorithm, Maglev, PowerOfTwo, Random, Rendezvous, RoundRobin,
+        Candidates, LeastLoaded, LoadBalancingAlgorithm, Maglev, PowerOfTwo, Random, Rendezvous,
+        RoundRobin,
     },
     retry::{self, RetryPolicy},
     server::{self, push_event},
@@ -879,6 +880,12 @@ pub struct BackendList {
     /// state is `Copy`. Worker runtime is single-threaded, so a `Cell` is
     /// sound — no synchronisation needed.
     pub(crate) availability: Cell<ClusterAvailability>,
+    /// Positions in `backends` of the current selection's candidates, refilled
+    /// by `collect_candidates` on every selection and lent to the policy as a
+    /// [`Candidates`] view. Reused rather than rebuilt: `add_backend` reserves
+    /// room for every backend, so a selection never allocates and clones no
+    /// `Rc` but the one it returns.
+    candidates: Vec<usize>,
 }
 
 impl Default for BackendList {
@@ -895,6 +902,7 @@ impl BackendList {
             load_balancing: Box::new(Random::new()),
             fail_open_warned: false,
             availability: Cell::new(ClusterAvailability::Available),
+            candidates: Vec::new(),
         }
     }
 
@@ -1015,6 +1023,10 @@ impl BackendList {
         // table is rebuilt on mutation; selection never rebuilds. The default
         // `rebuild` is a no-op for the stateless policies.
         self.load_balancing.rebuild(&self.backends);
+        // Size the candidate buffer for the whole list here, on the control
+        // plane, so no selection ever grows it.
+        self.candidates.clear();
+        self.candidates.reserve(self.backends.len());
         #[cfg(debug_assertions)]
         self.check_invariants();
     }
@@ -1082,15 +1094,36 @@ impl BackendList {
             .filter(|b| b.borrow().can_open())
     }
 
+    /// The backends of one tier that can take a connection now, cloned into
+    /// a fresh `Vec`. Selection does not call this: it walks the same
+    /// predicate, `is_tier_candidate`, into a reused buffer instead.
     pub fn available_backends(&mut self, backup: bool) -> Vec<Rc<RefCell<Backend>>> {
         self.backends
             .iter()
-            .filter(|backend| {
-                let owned = backend.borrow();
-                owned.backup == backup && owned.can_open()
-            })
+            .filter(|backend| is_tier_candidate(&backend.borrow(), backup))
             .map(Clone::clone)
             .collect()
+    }
+
+    /// Refill `candidates` with the position of every backend `keep` accepts,
+    /// in list order, and return how many there are. Allocation-free once
+    /// `add_backend` has reserved the buffer.
+    fn collect_candidates(&mut self, keep: impl Fn(&Backend) -> bool) -> usize {
+        self.candidates.clear();
+        for (index, backend) in self.backends.iter().enumerate() {
+            if keep(&backend.borrow()) {
+                self.candidates.push(index);
+            }
+        }
+        debug_assert!(
+            self.candidates.len() <= self.backends.len(),
+            "candidate set cannot be larger than the full backend list"
+        );
+        debug_assert!(
+            self.candidates.windows(2).all(|pair| pair[0] < pair[1]),
+            "candidate positions must follow list order"
+        );
+        self.candidates.len()
     }
 
     pub fn next_available_backend(&mut self) -> Option<Rc<RefCell<Backend>>> {
@@ -1107,30 +1140,24 @@ impl BackendList {
         &mut self,
         key: Option<u64>,
     ) -> Option<Rc<RefCell<Backend>>> {
-        let mut backends = self.available_backends(false);
+        let mut available = self.collect_candidates(|backend| is_tier_candidate(backend, false));
 
-        if backends.is_empty() {
-            backends = self.available_backends(true);
+        if available == 0 {
+            available = self.collect_candidates(|backend| is_tier_candidate(backend, true));
         }
 
-        if !backends.is_empty() {
+        if available != 0 {
             // Healthy regime: log the fail-open exit transition exactly once.
             if self.fail_open_warned {
                 info!(
                     "fail-open: cluster recovered, {} backends now healthy",
-                    backends.len()
+                    available
                 );
                 self.fail_open_warned = false;
             }
-            // The candidate set is a subset of the live backend list, so a
-            // chosen backend is always a live cluster member.
-            debug_assert!(
-                backends.len() <= self.backends.len(),
-                "candidate set cannot be larger than the full backend list"
-            );
             let picked = self
                 .load_balancing
-                .next_available_backend(key, &mut backends);
+                .next_available_backend(key, Candidates::new(&self.backends, &self.candidates));
             debug_assert!(
                 picked.as_ref().is_none_or(|b| {
                     let addr = b.borrow().address;
@@ -1149,18 +1176,15 @@ impl BackendList {
         // still respecting the per-backend back-off window — hammering a
         // backend at line rate during its back-off would defeat the back-off
         // itself. Ref: Amazon "Implementing Health Checks".
-        backends = self
-            .backends
-            .iter()
-            .filter(|b| {
-                let owned = b.borrow();
-                owned.status == BackendStatus::Normal
-                    && matches!(owned.retry_policy.can_try(), Some(retry::RetryAction::OKAY))
-            })
-            .map(Clone::clone)
-            .collect();
+        let available = self.collect_candidates(|backend| {
+            backend.status == BackendStatus::Normal
+                && matches!(
+                    backend.retry_policy.can_try(),
+                    Some(retry::RetryAction::OKAY)
+                )
+        });
 
-        if backends.is_empty() {
+        if available == 0 {
             return None;
         }
 
@@ -1170,14 +1194,14 @@ impl BackendList {
         if !self.fail_open_warned {
             warn!(
                 "fail-open: all backends unhealthy, routing to {} normal backends with retry-policy OKAY",
-                backends.len()
+                available
             );
             self.fail_open_warned = true;
         }
         count!(names::backend::FAIL_OPEN, 1);
 
         self.load_balancing
-            .next_available_backend(key, &mut backends)
+            .next_available_backend(key, Candidates::new(&self.backends, &self.candidates))
     }
 
     pub fn set_load_balancing_policy(
@@ -1211,6 +1235,12 @@ impl BackendList {
             }
         }
     }
+}
+
+/// Whether `backend` is a candidate of the primary (`backup == false`) or the
+/// backup tier: it belongs to that tier and can take a connection now.
+fn is_tier_candidate(backend: &Backend, backup: bool) -> bool {
+    backend.backup == backup && backend.can_open()
 }
 
 #[cfg(test)]

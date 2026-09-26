@@ -1,8 +1,8 @@
-use std::{cell::RefCell, fmt::Debug, hash::Hasher, net::SocketAddr, rc::Rc};
+use std::{cell::RefCell, fmt::Debug, hash::Hasher, net::SocketAddr, ops::Index, rc::Rc};
 
 use rand::{
     RngExt, SeedableRng,
-    distr::{Distribution, weighted::WeightedIndex},
+    distr::uniform::{UniformInt, UniformSampler},
     prelude::IndexedRandom,
     rngs::{StdRng, SysRng},
 };
@@ -152,17 +152,88 @@ impl Hasher for FnvHasher {
     }
 }
 
+/// The candidates of one selection: a borrowed view of a cluster's backend
+/// list, restricted to the positions a caller retained.
+///
+/// Position `i` of the view is `backends[indices[i]]`, so a policy that
+/// indexes the view (`RoundRobin`'s cursor, `PowerOfTwo`'s two samples,
+/// `Random`'s draw) computes exactly the index it computed over the
+/// `Vec` of cloned candidates this view replaces. Building the view borrows
+/// and copies nothing: the caller owns `indices`, and only the backend a
+/// policy returns has its `Rc` cloned.
+#[derive(Clone, Copy, Debug)]
+pub struct Candidates<'a> {
+    backends: &'a [Rc<RefCell<Backend>>],
+    indices: &'a [usize],
+}
+
+impl<'a> Candidates<'a> {
+    /// View `backends` through `indices`. Every index must address a slot of
+    /// `backends`, and the indices must be strictly increasing.
+    pub fn new(backends: &'a [Rc<RefCell<Backend>>], indices: &'a [usize]) -> Self {
+        debug_assert!(
+            indices.iter().all(|&index| index < backends.len()),
+            "a candidate index must address a slot of the backend list"
+        );
+        // Strictly increasing positions keep the view in list order, which
+        // the first-wins tie-breaks of `LeastLoaded` and `Rendezvous` and the
+        // probe order of `Maglev` depend on, and rule out a duplicate.
+        debug_assert!(
+            indices.windows(2).all(|pair| pair[0] < pair[1]),
+            "candidate indices must be strictly increasing"
+        );
+        Self { backends, indices }
+    }
+
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    /// The candidate at position `index` of the view.
+    pub fn get(&self, index: usize) -> Option<&'a Rc<RefCell<Backend>>> {
+        self.indices.get(index).map(|&slot| &self.backends[slot])
+    }
+
+    /// The candidates in view order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &'a Rc<RefCell<Backend>>> + use<'a> {
+        let backends = self.backends;
+        self.indices.iter().map(move |&slot| &backends[slot])
+    }
+
+    /// A uniformly chosen candidate, drawn exactly as
+    /// `IndexedRandom::choose` draws over a slice of the same length.
+    fn choose<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> Option<&'a Rc<RefCell<Backend>>> {
+        self.indices.choose(rng).map(|&slot| &self.backends[slot])
+    }
+}
+
+impl Index<usize> for Candidates<'_> {
+    type Output = Rc<RefCell<Backend>>;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.backends[self.indices[index]]
+    }
+}
+
 pub trait LoadBalancingAlgorithm: Debug {
-    /// Select the next backend.
+    /// Select the next backend among `candidates`.
     ///
     /// `key` carries an optional affinity hash (e.g. a UDP flow key). The
     /// stateless/round-robin policies ignore it; the consistent-hashing
     /// policies ([`Rendezvous`], [`Maglev`]) use it to pin a key to a backend.
     /// Passing `None` preserves the historical, key-agnostic behavior.
+    ///
+    /// A policy reads the candidates through the borrowed [`Candidates`] view
+    /// and clones the `Rc` of the one backend it returns, nothing else, so a
+    /// selection allocates nothing.
     fn next_available_backend(
         &mut self,
         key: Option<u64>,
-        backends: &mut Vec<Rc<RefCell<Backend>>>,
+        candidates: Candidates<'_>,
     ) -> Option<Rc<RefCell<Backend>>>;
 
     /// Called by the control plane when the live backend set for a cluster
@@ -181,7 +252,7 @@ impl LoadBalancingAlgorithm for RoundRobin {
     fn next_available_backend(
         &mut self,
         _key: Option<u64>,
-        backends: &mut Vec<Rc<RefCell<Backend>>>,
+        backends: Candidates<'_>,
     ) -> Option<Rc<RefCell<Backend>>> {
         // Guard against an empty set: `% backends.len()` would panic with a
         // divide-by-zero. This also covers the `Rendezvous`/`Maglev` policies,
@@ -198,7 +269,7 @@ impl LoadBalancingAlgorithm for RoundRobin {
         // The reduced index always addresses a real slot, so the lookup yields
         // a backend (never the `None` arm of `get`).
         debug_assert!(index < backends.len(), "round-robin index out of bounds");
-        let res = backends.get(index).map(|backend| (*backend).clone());
+        let res = backends.get(index).cloned();
         debug_assert!(
             res.is_some(),
             "round-robin must select a backend from a non-empty set"
@@ -297,43 +368,85 @@ impl Random {
     }
 }
 
+impl Random {
+    /// Weighted draw over `backends`, identical, RNG draw for RNG draw, to
+    /// `rand::distr::weighted::WeightedIndex::<i32>` built over the same
+    /// weights, without the two `Vec`s building one allocates (the weights and
+    /// their cumulative sums).
+    ///
+    /// `WeightedIndex::new` accepts a set that is non-empty, holds no negative
+    /// weight, sums without `i32` overflow, and sums to more than zero; this
+    /// accepts exactly those, and returns `None` otherwise so the caller falls
+    /// back to the uniform draw as it did on `new`'s error. On acceptance it
+    /// draws once from the same `UniformInt::<i32>` over `[0, total)`, then
+    /// returns the first position whose inclusive prefix sum exceeds the draw:
+    /// the `partition_point` `WeightedIndex::sample` runs over its cumulative
+    /// weights, as a scan. `random_weighted_pick_matches_weighted_index`
+    /// holds the equivalence.
+    fn weighted_index(&mut self, backends: Candidates<'_>) -> Option<usize> {
+        if backends.is_empty() {
+            return None;
+        }
+        let mut total: i32 = 0;
+        for backend in backends.iter() {
+            let weight = random_weight(&backend.borrow());
+            if weight < 0 {
+                return None;
+            }
+            total = total.checked_add(weight)?;
+        }
+        if total == 0 {
+            return None;
+        }
+        let drawn = UniformInt::<i32>::new(0, total)
+            .expect("a positive total is a non-empty range")
+            .sample(&mut self.rng);
+        debug_assert!(
+            (0..total).contains(&drawn),
+            "the weighted draw must land inside [0, total)"
+        );
+
+        let last = backends.len() - 1;
+        let mut prefix: i32 = 0;
+        for (index, backend) in backends.iter().take(last).enumerate() {
+            prefix += random_weight(&backend.borrow());
+            if prefix > drawn {
+                return Some(index);
+            }
+        }
+        // Every earlier prefix is at most the draw, and the full sum `total`
+        // exceeds it: the draw falls in the last backend's share.
+        Some(last)
+    }
+}
+
+/// The weight `Random` draws with: the configured weight, or `DEFAULT_WEIGHT`
+/// when none is set. Unlike [`backend_weight`] it is not clamped, so a zero or
+/// negative weight reaches `Random::weighted_index` and is rejected there.
+fn random_weight(backend: &Backend) -> i32 {
+    backend
+        .load_balancing_parameters
+        .as_ref()
+        .map(|p| p.weight)
+        .unwrap_or(DEFAULT_WEIGHT)
+}
+
 impl LoadBalancingAlgorithm for Random {
     fn next_available_backend(
         &mut self,
         _key: Option<u64>,
-        backends: &mut Vec<Rc<RefCell<Backend>>>,
+        backends: Candidates<'_>,
     ) -> Option<Rc<RefCell<Backend>>> {
         let len = backends.len();
-        let weights: Vec<i32> = backends
-            .iter()
-            .map(|b| {
-                b.borrow()
-                    .load_balancing_parameters
-                    .as_ref()
-                    .map(|p| p.weight)
-                    .unwrap_or(100)
-            })
-            .collect();
-        // One weight per backend feeds the weighted distribution; a mismatch
-        // would make `dist.sample` index a backend that does not exist.
-        debug_assert_eq!(
-            weights.len(),
-            len,
-            "Random must derive exactly one weight per backend"
-        );
-
-        if let Ok(dist) = WeightedIndex::new(weights) {
-            let index = dist.sample(&mut self.rng);
-            // `WeightedIndex` only samples valid indices into the weight vector,
-            // which is the same length as `backends`, so the lookup hits.
+        if let Some(index) = self.weighted_index(backends) {
+            // The weighted draw only returns a position of the view.
             debug_assert!(index < len, "Random sampled an out-of-range index");
             backends.get(index).cloned()
         } else {
-            // `WeightedIndex::new` fails only when the set is empty or every
-            // weight is zero; the uniform `choose` then selects iff non-empty.
-            let chosen = (*backends)
-                .choose(&mut self.rng)
-                .map(|backend| (*backend).clone());
+            // The weighted draw declines only an empty set, a negative weight,
+            // an overflowing sum or an all-zero set; the uniform `choose` then
+            // selects iff non-empty.
+            let chosen = backends.choose(&mut self.rng).cloned();
             debug_assert_eq!(
                 chosen.is_some(),
                 len > 0,
@@ -353,19 +466,19 @@ impl LoadBalancingAlgorithm for LeastLoaded {
     fn next_available_backend(
         &mut self,
         _key: Option<u64>,
-        backends: &mut Vec<Rc<RefCell<Backend>>>,
+        backends: Candidates<'_>,
     ) -> Option<Rc<RefCell<Backend>>> {
         let was_empty = backends.is_empty();
         let opt_b = match self.metric {
             LoadMetric::Connections => backends
-                .iter_mut()
+                .iter()
                 .min_by_key(|backend| backend.borrow().active_connections),
             LoadMetric::Requests => backends
-                .iter_mut()
+                .iter()
                 .min_by_key(|backend| backend.borrow().active_requests),
             LoadMetric::ConnectionTime => {
                 let mut b = None;
-                for backend in backends.iter_mut() {
+                for backend in backends.iter() {
                     let cost2 = backend.borrow_mut().peak_ewma_connection();
 
                     match b.take() {
@@ -391,7 +504,7 @@ impl LoadBalancingAlgorithm for LeastLoaded {
             !was_empty,
             "LeastLoaded selects iff the candidate set is non-empty"
         );
-        opt_b.map(|backend| (*backend).clone())
+        opt_b.cloned()
     }
 }
 
@@ -406,10 +519,12 @@ impl LoadBalancingAlgorithm for LeastLoaded {
 ///
 /// That is a statement about load READS and nothing more. It is NOT a claim
 /// that a selection is `O(1)`: every selection, under every policy, first
-/// builds the candidate set in [`crate::backends::BackendList::available_backends`], which
-/// walks the cluster's backend list and clones each healthy backend into a
-/// fresh `Vec` before any policy runs. That walk is in the caller, this
-/// policy does not remove it, and no policy here is sub-linear per request.
+/// collects the candidate positions in
+/// [`crate::backends::BackendList::next_available_backend_with_key`], which
+/// walks the cluster's backend list and records the position of each healthy
+/// backend in a buffer the list reuses across selections, before any policy
+/// runs. That walk is in the caller, this policy does not remove it, and no
+/// policy here is sub-linear per request.
 /// So P2C is not the "cheap" alternative to a scan — picking it to shorten a
 /// per-request walk that lives somewhere else buys nothing.
 ///
@@ -518,14 +633,14 @@ impl LoadBalancingAlgorithm for PowerOfTwo {
     fn next_available_backend(
         &mut self,
         _key: Option<u64>,
-        backends: &mut Vec<Rc<RefCell<Backend>>>,
+        backends: Candidates<'_>,
     ) -> Option<Rc<RefCell<Backend>>> {
         let len = backends.len();
         match len {
             0 => return None,
             // A singleton set has no second candidate to compare against, so
             // the sample degenerates to the only backend there is.
-            1 => return backends.first().cloned(),
+            1 => return backends.get(0).cloned(),
             _ => {}
         }
 
@@ -655,7 +770,7 @@ impl LoadBalancingAlgorithm for Rendezvous {
     fn next_available_backend(
         &mut self,
         key: Option<u64>,
-        backends: &mut Vec<Rc<RefCell<Backend>>>,
+        backends: Candidates<'_>,
     ) -> Option<Rc<RefCell<Backend>>> {
         let Some(key) = key else {
             // No affinity key: behave exactly like RoundRobin.
@@ -775,6 +890,16 @@ impl Maglev {
     /// Rebuild the lookup table from `backends`. Called on backend-set change,
     /// NOT per packet. Honors backend weight via proportional slot share.
     pub fn rebuild(&mut self, backends: &[Rc<RefCell<Backend>>]) {
+        self.rebuild_from(backends.iter());
+    }
+
+    /// [`Maglev::rebuild`] over any ordered backend sequence, so the cold-start
+    /// build in `next_available_backend` can read its [`Candidates`] view
+    /// without collecting it.
+    fn rebuild_from<'a>(
+        &mut self,
+        backends: impl ExactSizeIterator<Item = &'a Rc<RefCell<Backend>>>,
+    ) {
         let n = backends.len();
         self.backend_addrs.clear();
         self.table.clear();
@@ -935,7 +1060,7 @@ impl LoadBalancingAlgorithm for Maglev {
     fn next_available_backend(
         &mut self,
         key: Option<u64>,
-        backends: &mut Vec<Rc<RefCell<Backend>>>,
+        backends: Candidates<'_>,
     ) -> Option<Rc<RefCell<Backend>>> {
         let Some(key) = key else {
             return self.round_robin.next_available_backend(None, backends);
@@ -953,7 +1078,7 @@ impl LoadBalancingAlgorithm for Maglev {
         // an actual set change — a partial outage (shrunk healthy subset) never
         // rebuilds, it is handled by the probe-forward below.
         if self.table.is_empty() {
-            self.rebuild(backends);
+            self.rebuild_from(backends.iter());
         }
 
         if self.table.is_empty() {
@@ -1030,6 +1155,17 @@ mod test {
         sozu_command::proto::command::{LoadBalancingParams, LoadMetric},
     };
 
+    /// Run `policy` over every backend of `backends`, the way a caller whose
+    /// whole list is available would.
+    fn pick(
+        policy: &mut (impl LoadBalancingAlgorithm + ?Sized),
+        key: Option<u64>,
+        backends: &[Rc<RefCell<Backend>>],
+    ) -> Option<Rc<RefCell<Backend>>> {
+        let indices: Vec<usize> = (0..backends.len()).collect();
+        policy.next_available_backend(key, Candidates::new(backends, &indices))
+    }
+
     fn create_backend(id: String, connections: Option<usize>) -> Backend {
         Backend {
             sticky_id: None,
@@ -1052,7 +1188,7 @@ mod test {
         let backend_with_least_connection =
             Rc::new(RefCell::new(create_backend("yolo".to_string(), Some(1))));
 
-        let mut backends = vec![
+        let backends = vec![
             Rc::new(RefCell::new(create_backend("nolo".to_string(), Some(10)))),
             Rc::new(RefCell::new(create_backend("philo".to_string(), Some(20)))),
             backend_with_least_connection.clone(),
@@ -1062,9 +1198,7 @@ mod test {
             metric: LoadMetric::Connections,
         };
 
-        let backend_res = least_connection_algorithm
-            .next_available_backend(None, &mut backends)
-            .unwrap();
+        let backend_res = pick(&mut least_connection_algorithm, None, &backends).unwrap();
         let backend = backend_res.borrow();
 
         assert!(*backend == *backend_with_least_connection.borrow());
@@ -1072,13 +1206,13 @@ mod test {
 
     #[test]
     fn it_shouldnt_find_backend_with_least_connections_when_list_is_empty() {
-        let mut backends = vec![];
+        let backends = vec![];
 
         let mut least_connection_algorithm = LeastLoaded {
             metric: LoadMetric::Connections,
         };
 
-        let backend = least_connection_algorithm.next_available_backend(None, &mut backends);
+        let backend = pick(&mut least_connection_algorithm, None, &backends);
         assert!(backend.is_none());
     }
 
@@ -1091,12 +1225,12 @@ mod test {
         ];
 
         let mut roundrobin = RoundRobin { next_backend: 1 };
-        let backend = roundrobin.next_available_backend(None, &mut backends);
+        let backend = pick(&mut roundrobin, None, &backends);
         assert_eq!(backend.as_ref(), backends.get(1));
 
         backends.remove(1);
 
-        let backend2 = roundrobin.next_available_backend(None, &mut backends);
+        let backend2 = pick(&mut roundrobin, None, &backends);
         assert_eq!(backend2.as_ref(), backends.first());
     }
 
@@ -1127,30 +1261,26 @@ mod test {
 
     #[test]
     fn hrw_is_deterministic_for_a_fixed_key() {
-        let mut backends = make_backends(5);
+        let backends = make_backends(5);
         let mut hrw = Rendezvous::new();
 
-        let first = hrw
-            .next_available_backend(Some(42), &mut backends)
-            .map(|b| chosen_addr(&b));
+        let first = pick(&mut hrw, Some(42), &backends).map(|b| chosen_addr(&b));
         for _ in 0..50 {
-            let again = hrw
-                .next_available_backend(Some(42), &mut backends)
-                .map(|b| chosen_addr(&b));
+            let again = pick(&mut hrw, Some(42), &backends).map(|b| chosen_addr(&b));
             assert_eq!(first, again, "HRW must be deterministic for a fixed key");
         }
     }
 
     #[test]
     fn hrw_none_key_falls_back_to_round_robin() {
-        let mut backends = make_backends(3);
+        let backends = make_backends(3);
         let mut hrw = Rendezvous::new();
 
         // With None it should cycle round-robin: addresses in order then wrap.
-        let a = chosen_addr(&hrw.next_available_backend(None, &mut backends).unwrap());
-        let b = chosen_addr(&hrw.next_available_backend(None, &mut backends).unwrap());
-        let c = chosen_addr(&hrw.next_available_backend(None, &mut backends).unwrap());
-        let d = chosen_addr(&hrw.next_available_backend(None, &mut backends).unwrap());
+        let a = chosen_addr(&pick(&mut hrw, None, &backends).unwrap());
+        let b = chosen_addr(&pick(&mut hrw, None, &backends).unwrap());
+        let c = chosen_addr(&pick(&mut hrw, None, &backends).unwrap());
+        let d = chosen_addr(&pick(&mut hrw, None, &backends).unwrap());
         assert_eq!(a, chosen_addr(&backends[0]));
         assert_eq!(b, chosen_addr(&backends[1]));
         assert_eq!(c, chosen_addr(&backends[2]));
@@ -1170,20 +1300,14 @@ mod test {
         // Record winners for many keys on the full set.
         let mut before = std::collections::HashMap::new();
         for key in 0..2000u64 {
-            let w = chosen_addr(
-                &hrw.next_available_backend(Some(key), &mut backends)
-                    .unwrap(),
-            );
+            let w = chosen_addr(&pick(&mut hrw, Some(key), &backends).unwrap());
             before.insert(key, w);
         }
 
         // Remove the backend and re-evaluate.
         backends.remove(3);
         for key in 0..2000u64 {
-            let after = chosen_addr(
-                &hrw.next_available_backend(Some(key), &mut backends)
-                    .unwrap(),
-            );
+            let after = chosen_addr(&pick(&mut hrw, Some(key), &backends).unwrap());
             let prev = before[&key];
             if prev != removed_addr {
                 assert_eq!(
@@ -1197,17 +1321,14 @@ mod test {
     #[test]
     fn hrw_distribution_is_roughly_even() {
         let n = 5u8;
-        let mut backends = make_backends(n);
+        let backends = make_backends(n);
         let mut hrw = Rendezvous::new();
 
         let total = 20_000u64;
         let mut counts: std::collections::HashMap<SocketAddr, u64> =
             std::collections::HashMap::new();
         for key in 0..total {
-            let w = chosen_addr(
-                &hrw.next_available_backend(Some(key), &mut backends)
-                    .unwrap(),
-            );
+            let w = chosen_addr(&pick(&mut hrw, Some(key), &backends).unwrap());
             *counts.entry(w).or_default() += 1;
         }
 
@@ -1228,24 +1349,24 @@ mod test {
         let mut mag = Maglev::new();
         mag.rebuild(&backends);
 
-        let mut sel = backends.clone();
-        let first = chosen_addr(&mag.next_available_backend(Some(12345), &mut sel).unwrap());
+        let sel = backends.clone();
+        let first = chosen_addr(&pick(&mut mag, Some(12345), &sel).unwrap());
         for _ in 0..50 {
-            let again = chosen_addr(&mag.next_available_backend(Some(12345), &mut sel).unwrap());
+            let again = chosen_addr(&pick(&mut mag, Some(12345), &sel).unwrap());
             assert_eq!(first, again, "Maglev must be deterministic for a fixed key");
         }
     }
 
     #[test]
     fn maglev_none_key_falls_back_to_round_robin() {
-        let mut backends = make_backends(3);
+        let backends = make_backends(3);
         let mut mag = Maglev::new();
         mag.rebuild(&backends);
 
-        let a = chosen_addr(&mag.next_available_backend(None, &mut backends).unwrap());
-        let b = chosen_addr(&mag.next_available_backend(None, &mut backends).unwrap());
-        let c = chosen_addr(&mag.next_available_backend(None, &mut backends).unwrap());
-        let d = chosen_addr(&mag.next_available_backend(None, &mut backends).unwrap());
+        let a = chosen_addr(&pick(&mut mag, None, &backends).unwrap());
+        let b = chosen_addr(&pick(&mut mag, None, &backends).unwrap());
+        let c = chosen_addr(&pick(&mut mag, None, &backends).unwrap());
+        let d = chosen_addr(&pick(&mut mag, None, &backends).unwrap());
         assert_eq!(a, chosen_addr(&backends[0]));
         assert_eq!(b, chosen_addr(&backends[1]));
         assert_eq!(c, chosen_addr(&backends[2]));
@@ -1263,9 +1384,9 @@ mod test {
         let total = 50_000u64;
         let mut counts: std::collections::HashMap<SocketAddr, u64> =
             std::collections::HashMap::new();
-        let mut sel = backends.clone();
+        let sel = backends.clone();
         for key in 0..total {
-            let w = chosen_addr(&mag.next_available_backend(Some(key), &mut sel).unwrap());
+            let w = chosen_addr(&pick(&mut mag, Some(key), &sel).unwrap());
             *counts.entry(w).or_default() += 1;
         }
 
@@ -1290,12 +1411,9 @@ mod test {
 
         let total = 20_000u64;
         let mut before = std::collections::HashMap::new();
-        let mut sel = backends5.clone();
+        let sel = backends5.clone();
         for key in 0..total {
-            before.insert(
-                key,
-                chosen_addr(&mag.next_available_backend(Some(key), &mut sel).unwrap()),
-            );
+            before.insert(key, chosen_addr(&pick(&mut mag, Some(key), &sel).unwrap()));
         }
 
         // Add a sixth backend and rebuild.
@@ -1304,9 +1422,9 @@ mod test {
         mag.rebuild(&backends6);
 
         let mut moved = 0u64;
-        let mut sel6 = backends6.clone();
+        let sel6 = backends6.clone();
         for key in 0..total {
-            let after = chosen_addr(&mag.next_available_backend(Some(key), &mut sel6).unwrap());
+            let after = chosen_addr(&pick(&mut mag, Some(key), &sel6).unwrap());
             if after != before[&key] {
                 moved += 1;
             }
@@ -1338,14 +1456,11 @@ mod test {
         // Record winners on the full healthy set.
         let total = 4000u64;
         let mut before = std::collections::HashMap::new();
-        let mut sel_full = full.clone();
+        let sel_full = full.clone();
         for key in 0..total {
             before.insert(
                 key,
-                chosen_addr(
-                    &mag.next_available_backend(Some(key), &mut sel_full)
-                        .unwrap(),
-                ),
+                chosen_addr(&pick(&mut mag, Some(key), &sel_full).unwrap()),
             );
         }
 
@@ -1354,14 +1469,14 @@ mod test {
         // `BackendList::next_available_backend_with_key` does when a backend
         // fails its health check / enters retry backoff.
         let unhealthy_addr = chosen_addr(&full[2]);
-        let mut subset: Vec<_> = full
+        let subset: Vec<_> = full
             .iter()
             .filter(|b| chosen_addr(b) != unhealthy_addr)
             .cloned()
             .collect();
 
         for key in 0..total {
-            let after = chosen_addr(&mag.next_available_backend(Some(key), &mut subset).unwrap());
+            let after = chosen_addr(&pick(&mut mag, Some(key), &subset).unwrap());
             // The unhealthy backend must never be selected.
             assert_ne!(
                 after, unhealthy_addr,
@@ -1401,13 +1516,13 @@ mod test {
         let table_before = mag.table.clone();
 
         // A disjoint healthy subset (different addresses than the table).
-        let mut fresh = vec![
+        let fresh = vec![
             rc(addr_backend("n0", 50, 9000, None)),
             rc(addr_backend("n1", 51, 9001, None)),
         ];
         let fresh_addrs: Vec<_> = fresh.iter().map(chosen_addr).collect();
 
-        let picked = chosen_addr(&mag.next_available_backend(Some(7), &mut fresh).unwrap());
+        let picked = chosen_addr(&pick(&mut mag, Some(7), &fresh).unwrap());
         assert!(
             fresh_addrs.contains(&picked),
             "fallback must route to a backend in the healthy subset"
@@ -1423,18 +1538,16 @@ mod test {
     fn maglev_cold_start_builds_table_once() {
         // A freshly constructed Maglev with no prior `rebuild` must still
         // select (one-time cold-start build), then keep the table populated.
-        let mut backends = make_backends(4);
+        let backends = make_backends(4);
         let mut mag = Maglev::with_seed_and_size(DEFAULT_HASH_SEED, 1009);
         assert!(mag.table.is_empty(), "table starts empty (cold)");
 
-        let _ = mag.next_available_backend(Some(99), &mut backends).unwrap();
+        let _ = pick(&mut mag, Some(99), &backends).unwrap();
         assert_eq!(mag.table.len(), mag.size, "cold start populated the table");
         let table_after_cold = mag.table.clone();
 
         // A subsequent selection (still the full set) must NOT rebuild.
-        let _ = mag
-            .next_available_backend(Some(100), &mut backends)
-            .unwrap();
+        let _ = pick(&mut mag, Some(100), &backends).unwrap();
         assert_eq!(
             mag.table, table_after_cold,
             "selection after cold start must not rebuild"
@@ -1444,16 +1557,16 @@ mod test {
     #[test]
     fn round_robin_empty_set_returns_none_without_panic() {
         // FIX 2 guard: `% backends.len()` would panic on an empty Vec.
-        let mut empty: Vec<Rc<RefCell<Backend>>> = vec![];
+        let empty: Vec<Rc<RefCell<Backend>>> = vec![];
         let mut rr = RoundRobin::new();
-        assert!(rr.next_available_backend(None, &mut empty).is_none());
+        assert!(pick(&mut rr, None, &empty).is_none());
 
         // Delegators (Rendezvous / Maglev with key == None) route through
         // RoundRobin and must be safe on an empty set too.
         let mut hrw = Rendezvous::new();
-        assert!(hrw.next_available_backend(None, &mut empty).is_none());
+        assert!(pick(&mut hrw, None, &empty).is_none());
         let mut mag = Maglev::new();
-        assert!(mag.next_available_backend(None, &mut empty).is_none());
+        assert!(pick(&mut mag, None, &empty).is_none());
     }
 
     #[test]
@@ -1467,11 +1580,11 @@ mod test {
             mag.size
         );
 
-        let mut backends = make_backends(3);
+        let backends = make_backends(3);
         // Building and selecting must not panic.
         mag.rebuild(&backends);
         assert_eq!(mag.table.len(), mag.size);
-        let _ = mag.next_available_backend(Some(1), &mut backends).unwrap();
+        let _ = pick(&mut mag, Some(1), &backends).unwrap();
     }
 
     #[test]
@@ -1498,10 +1611,9 @@ mod test {
         let heavy_addr = chosen_addr(&backends[1]);
         let total = 20_000u64;
         let mut heavy = 0u64;
-        let mut sel = backends.clone();
+        let sel = backends.clone();
         for key in 0..total {
-            if chosen_addr(&mag.next_available_backend(Some(key), &mut sel).unwrap()) == heavy_addr
-            {
+            if chosen_addr(&pick(&mut mag, Some(key), &sel).unwrap()) == heavy_addr {
                 heavy += 1;
             }
         }
@@ -1530,22 +1642,14 @@ mod test {
         let mut r1 = Random::with_seed(DEFAULT_HASH_SEED);
         let mut r2 = Random::with_seed(DEFAULT_HASH_SEED);
 
-        let mut sel1 = backends.clone();
-        let mut sel2 = backends.clone();
+        let sel1 = backends.clone();
+        let sel2 = backends.clone();
 
         let seq1: Vec<u8> = (0..20)
-            .map(|_| {
-                addr_index(chosen_addr(
-                    &r1.next_available_backend(None, &mut sel1).unwrap(),
-                ))
-            })
+            .map(|_| addr_index(chosen_addr(&pick(&mut r1, None, &sel1).unwrap())))
             .collect();
         let seq2: Vec<u8> = (0..20)
-            .map(|_| {
-                addr_index(chosen_addr(
-                    &r2.next_available_backend(None, &mut sel2).unwrap(),
-                ))
-            })
+            .map(|_| addr_index(chosen_addr(&pick(&mut r2, None, &sel2).unwrap())))
             .collect();
 
         // Reproducibility: same seed + same inputs + same call sequence must
@@ -1593,22 +1697,14 @@ mod test {
         let mut r1 = Random::new();
         let mut r2 = Random::new();
 
-        let mut sel1 = backends.clone();
-        let mut sel2 = backends.clone();
+        let sel1 = backends.clone();
+        let sel2 = backends.clone();
 
         let seq1: Vec<u8> = (0..32)
-            .map(|_| {
-                addr_index(chosen_addr(
-                    &r1.next_available_backend(None, &mut sel1).unwrap(),
-                ))
-            })
+            .map(|_| addr_index(chosen_addr(&pick(&mut r1, None, &sel1).unwrap())))
             .collect();
         let seq2: Vec<u8> = (0..32)
-            .map(|_| {
-                addr_index(chosen_addr(
-                    &r2.next_available_backend(None, &mut sel2).unwrap(),
-                ))
-            })
+            .map(|_| addr_index(chosen_addr(&pick(&mut r2, None, &sel2).unwrap())))
             .collect();
 
         // Collision probability over 32 draws across 4 backends is
@@ -1636,14 +1732,12 @@ mod test {
         let n = 5u8;
         let backends = make_backends(n);
         let mut r = Random::with_seed(DEFAULT_HASH_SEED);
-        let mut sel = backends.clone();
+        let sel = backends.clone();
 
         let total = 5_000u64;
         let mut counts = [0u64; 5];
         for _ in 0..total {
-            let idx = addr_index(chosen_addr(
-                &r.next_available_backend(None, &mut sel).unwrap(),
-            ));
+            let idx = addr_index(chosen_addr(&pick(&mut r, None, &sel).unwrap()));
             counts[idx as usize] += 1;
         }
 
@@ -1665,22 +1759,14 @@ mod test {
         let mut p1 = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
         let mut p2 = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
 
-        let mut sel1 = backends.clone();
-        let mut sel2 = backends.clone();
+        let sel1 = backends.clone();
+        let sel2 = backends.clone();
 
         let seq1: Vec<u8> = (0..20)
-            .map(|_| {
-                addr_index(chosen_addr(
-                    &p1.next_available_backend(None, &mut sel1).unwrap(),
-                ))
-            })
+            .map(|_| addr_index(chosen_addr(&pick(&mut p1, None, &sel1).unwrap())))
             .collect();
         let seq2: Vec<u8> = (0..20)
-            .map(|_| {
-                addr_index(chosen_addr(
-                    &p2.next_available_backend(None, &mut sel2).unwrap(),
-                ))
-            })
+            .map(|_| addr_index(chosen_addr(&pick(&mut p2, None, &sel2).unwrap())))
             .collect();
 
         // Reproducibility: `with_seed` is deterministic given the same seed
@@ -1756,22 +1842,14 @@ mod test {
         let mut p1 = PowerOfTwo::new(LoadMetric::Connections);
         let mut p2 = PowerOfTwo::new(LoadMetric::Connections);
 
-        let mut sel1 = backends.clone();
-        let mut sel2 = backends.clone();
+        let sel1 = backends.clone();
+        let sel2 = backends.clone();
 
         let seq1: Vec<u8> = (0..48)
-            .map(|_| {
-                addr_index(chosen_addr(
-                    &p1.next_available_backend(None, &mut sel1).unwrap(),
-                ))
-            })
+            .map(|_| addr_index(chosen_addr(&pick(&mut p1, None, &sel1).unwrap())))
             .collect();
         let seq2: Vec<u8> = (0..48)
-            .map(|_| {
-                addr_index(chosen_addr(
-                    &p2.next_available_backend(None, &mut sel2).unwrap(),
-                ))
-            })
+            .map(|_| addr_index(chosen_addr(&pick(&mut p2, None, &sel2).unwrap())))
             .collect();
 
         // Each draw picks one of four backends, so 48 draws give a collision
@@ -1804,14 +1882,12 @@ mod test {
         // `random_distribution_does_not_collapse`.
         let backends = make_backends(4);
         let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
-        let mut sel = backends.clone();
+        let sel = backends.clone();
 
         let total = 5_000u64;
         let mut counts = [0u64; 4];
         for _ in 0..total {
-            let idx = addr_index(chosen_addr(
-                &p.next_available_backend(None, &mut sel).unwrap(),
-            ));
+            let idx = addr_index(chosen_addr(&pick(&mut p, None, &sel).unwrap()));
             counts[idx as usize] += 1;
         }
 
@@ -1863,13 +1939,11 @@ mod test {
         }
 
         let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::ConnectionTime);
-        let mut sel = backends.clone();
+        let sel = backends.clone();
         let mut decided = 0usize;
         let mut second_measured_won = 0usize;
         for _ in 0..TOTAL {
-            let picked = addr_index(chosen_addr(
-                &p.next_available_backend(None, &mut sel).unwrap(),
-            ));
+            let picked = addr_index(chosen_addr(&pick(&mut p, None, &sel).unwrap()));
             let stamp_0 = backends[0].borrow().connection_time.last_event;
             let stamp_1 = backends[1].borrow().connection_time.last_event;
             // Two reads that the monotonic clock could not separate leave the
@@ -1919,8 +1993,8 @@ mod test {
         // The two-load-reads claim, MEASURED rather than asserted
         // structurally. It is a claim about how many backends the POLICY
         // reads, not about the cost of a selection: the caller has already
-        // walked every backend in `BackendList::available_backends` to build
-        // the candidate set handed in here, so a selection is `O(n)` whatever
+        // walked every backend in `BackendList::next_available_backend_with_key`
+        // to build the candidate set handed in here, so a selection is `O(n)` whatever
         // this policy does. `LoadMetric::ConnectionTime` reads a backend's load
         // through `Backend::peak_ewma_connection` -> `PeakEWMA::get` ->
         // `PeakEWMA::observe`, and `observe` stamps `last_event =
@@ -1934,7 +2008,7 @@ mod test {
         // make: the scan-then-coin-flip shape this replaced also returned a
         // backend, it just read all 64 first.
         const N: u8 = 64;
-        let mut backends = make_backends(N);
+        let backends = make_backends(N);
 
         // Stamp every backend with one instant, then spin until the
         // monotonic clock is strictly past it. After that point every
@@ -1949,7 +2023,7 @@ mod test {
         }
 
         let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::ConnectionTime);
-        assert!(p.next_available_backend(None, &mut backends).is_some());
+        assert!(pick(&mut p, None, &backends).is_some());
 
         let touched = backends
             .iter()
@@ -1975,11 +2049,9 @@ mod test {
         backends[1].borrow_mut().active_connections = 1;
 
         let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
-        let mut sel = backends.clone();
+        let sel = backends.clone();
         for call in 0..200 {
-            let picked = addr_index(chosen_addr(
-                &p.next_available_backend(None, &mut sel).unwrap(),
-            ));
+            let picked = addr_index(chosen_addr(&pick(&mut p, None, &sel).unwrap()));
             assert_eq!(
                 picked, 1,
                 "power-of-two must keep the lighter of the two sampled backends (call {call} \
@@ -1996,18 +2068,16 @@ mod test {
         // draw. A cluster scaled down to one backend is ordinary, not exotic.
         let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
 
-        let mut empty: Vec<Rc<RefCell<Backend>>> = vec![];
+        let empty: Vec<Rc<RefCell<Backend>>> = vec![];
         assert!(
-            p.next_available_backend(None, &mut empty).is_none(),
+            pick(&mut p, None, &empty).is_none(),
             "power-of-two selects nothing from an empty candidate set"
         );
 
-        let mut single = make_backends(1);
+        let single = make_backends(1);
         for _ in 0..10 {
             assert_eq!(
-                addr_index(chosen_addr(
-                    &p.next_available_backend(None, &mut single).unwrap()
-                )),
+                addr_index(chosen_addr(&pick(&mut p, None, &single).unwrap())),
                 0,
                 "power-of-two returns the only backend of a singleton set"
             );
@@ -2035,11 +2105,9 @@ mod test {
         backends[2].borrow_mut().active_connections = 5;
 
         let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
-        let mut sel = backends.clone();
+        let sel = backends.clone();
         for call in 0..2_000 {
-            let picked = addr_index(chosen_addr(
-                &p.next_available_backend(None, &mut sel).unwrap(),
-            ));
+            let picked = addr_index(chosen_addr(&pick(&mut p, None, &sel).unwrap()));
             assert_ne!(
                 picked, 2,
                 "power-of-two returned the strictly heaviest backend on call {call}: it is \
@@ -2076,14 +2144,11 @@ mod test {
         // `backends[0]` keeps 0 active connections: the unique minimum.
 
         let mut p = PowerOfTwo::with_seed(DEFAULT_HASH_SEED, LoadMetric::Connections);
-        let mut sel = backends.clone();
+        let sel = backends.clone();
         let total = 100_000u32;
         let mut hits = 0u32;
         for _ in 0..total {
-            if addr_index(chosen_addr(
-                &p.next_available_backend(None, &mut sel).unwrap(),
-            )) == 0
-            {
+            if addr_index(chosen_addr(&pick(&mut p, None, &sel).unwrap())) == 0 {
                 hits += 1;
             }
         }
@@ -2099,5 +2164,65 @@ mod test {
             "power-of-two consulted ~{k_est:.2} of {N} backends (unique minimum returned \
              {hits}/{total} times); the algorithm must sample exactly 2"
         );
+    }
+
+    /// The weighted draw `Random` made before it stopped allocating: collect
+    /// the weights, build a `WeightedIndex`, and fall back to a uniform
+    /// `choose` when `WeightedIndex::new` rejects them.
+    fn weighted_index_reference(rng: &mut StdRng, weights: &[i32]) -> Option<usize> {
+        use rand::distr::{Distribution, weighted::WeightedIndex};
+        match WeightedIndex::new(weights.to_vec()) {
+            Ok(distribution) => Some(distribution.sample(rng)),
+            Err(_) => {
+                let positions: Vec<usize> = (0..weights.len()).collect();
+                positions.choose(rng).copied()
+            }
+        }
+    }
+
+    #[test]
+    fn random_weighted_pick_matches_weighted_index() {
+        // Weight sets covering every branch of `WeightedIndex::new`: valid,
+        // zero weights among positive ones, all zero, a negative weight
+        // (first and later), an `i32` overflow, a singleton and the empty set.
+        let weight_sets: &[&[i32]] = &[
+            &[100, 100, 100],
+            &[1, 2, 3, 4, 5, 6, 7],
+            &[0, 5, 0, 0, 9, 0],
+            &[7, 0, 0],
+            &[0, 0, 0, 3],
+            &[0, 0, 0],
+            &[-1, 5, 5],
+            &[5, 5, -1, 5],
+            &[i32::MAX, 1],
+            &[i32::MAX / 2, i32::MAX / 2, 1],
+            &[i32::MAX / 2, i32::MAX / 2, 2],
+            &[42],
+            &[],
+        ];
+        for (set, weights) in weight_sets.iter().enumerate() {
+            let backends: Vec<_> = weights
+                .iter()
+                .enumerate()
+                .map(|(index, &weight)| rc(addr_backend("w", index as u8 + 1, 80, Some(weight))))
+                .collect();
+            for seed in 0..64 {
+                let mut policy = Random::with_seed(seed);
+                let mut reference = StdRng::seed_from_u64(seed);
+                for draw in 0..32 {
+                    let expected = weighted_index_reference(&mut reference, weights);
+                    let got = pick(&mut policy, None, &backends).map(|backend| {
+                        backends
+                            .iter()
+                            .position(|candidate| Rc::ptr_eq(candidate, &backend))
+                            .expect("the pick is one of the candidates")
+                    });
+                    assert_eq!(
+                        got, expected,
+                        "weight set {set} {weights:?}, seed {seed}, draw {draw}"
+                    );
+                }
+            }
+        }
     }
 }
