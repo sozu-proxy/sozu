@@ -426,6 +426,36 @@ The TCP proxy resolves its own tags with a structured key built by the same
 function on both sides (`sni_tags_key` in `lib/src/tcp.rs`); UDP keys by the
 frontend address on both sides. Neither has the L7 spelling asymmetry.
 
+### The request line of a rejected HTTP/1.1 request
+
+An HTTP/1.1 request answered `400` because its parse was rejected — kawa
+refused a header or the framing, or Sōzu's own CL.TE guard in
+`HttpContext::on_request_headers` refused it — still logs the parts of its
+request line that were parsed. The line format is unchanged; the method, path
+and authority columns stop reading `-` where the request supplied them:
+
+| Rejected request | Logged `authority method path` |
+|---|---|
+| `GET /diag?x=1 HTTP/1.1`, then an invalid header | `- GET /diag?x=1` |
+| `GET http://example.com:8080/abs HTTP/1.1`, then an invalid header | `example.com:8080 GET /abs` |
+| CL.TE rejection of `POST /upload` with `Host: example.com` | `example.com POST /upload` |
+| an invalid request line | `- - -` |
+
+The authority of an origin-form request is **not** taken from a `Host` header
+when a header was refused: whether the `Host` line was reached before the bad
+one is the client's choice, and it was never validated. Only an authority the
+request line itself carries (absolute-form, `CONNECT`) is logged. A CL.TE
+rejection logs the authority kawa resolved, since every header parsed.
+
+The line is emitted by `Stream::generate_access_log`
+(`lib/src/protocol/mux/stream.rs`) once the `400` is written, with message
+`H1::Complete` at `INFO` level: a parse rejection increments
+`http.frontend_parse_errors`, not `http.errors`. The request line is borrowed
+from the front buffer (`rejected_request_line` in the same file), so this adds
+no allocation to the access-log path. HTTP/2 is not covered: a request whose
+pseudo-headers are rejected is reset before it has a request line, and still
+logs `- - -`.
+
 ## Tracing — current state
 
 **This is W3C `traceparent` passthrough only.** No span lifecycle, no OTLP

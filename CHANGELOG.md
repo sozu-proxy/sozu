@@ -4217,6 +4217,30 @@
   rather than a green that skipped them. Documentation only: no behaviour, no test, no dependency and no
   `Cargo.lock` entry changes.
 
+- **`fix(mux-h1)`: the access log of a request rejected by its parse keeps the method, path and
+  authority it parsed, instead of `- - -` (#1085).**
+  A header kawa refused, or a request Sōzu's own CL.TE guard refused, was answered `400` and
+  logged with empty method, authority and path columns — the one line an operator needs to
+  identify a malformed request. The only writer of those `HttpContext` fields is
+  `HttpContext::on_request_headers` (`lib/src/protocol/kawa_h1/editor.rs`), which kawa invokes
+  only after `process_headers` succeeded, and whose CL.TE guard returns before its capture block.
+  kawa 0.7.1 already keeps the parsed request line in `detached.status_line` after the failure and
+  exposes it publicly, together with `kawa::h1::parser::primitives::parse_url`, so no kawa change
+  and no version bump are needed. `Stream::generate_access_log` (`lib/src/protocol/mux/stream.rs`)
+  now borrows that request line from the front buffer when the front is in error and the context
+  never captured a method: its signature, its eight callers, `#[must_use]` and its
+  `[Option<MetricEvent>; 2]` return are unchanged, and the path adds no allocation — the nominal
+  capture copies into `Option<String>`s, this one borrows the `&str`s `EndpointRecord::Http`
+  already takes. The authority of an origin-form request is never read from a `Host` block, since
+  whether the `Host` line was reached before the bad one is the client's choice; only an authority
+  the request line carries (absolute-form, `CONNECT`) is logged, and a CL.TE rejection logs the one
+  kawa resolved. Three tests drive a real `Position::Server` `ConnectionH1` through `readable` and
+  `writable`, and were seen red with the borrowed line replaced by `None`; they also pin the
+  emitting site as `ConnectionH1::writable` (message `H1::Complete`), so a parse rejection counts in
+  `http.frontend_parse_errors`, not `http.errors`. HTTP/2 is out of scope: a request whose
+  pseudo-headers `handle_header` (`lib/src/protocol/mux/pkawa.rs`) rejects never gets a request
+  line. Documented in `doc/observability.md`.
+
 ### ➖ Removed
 
 - **BREAKING (library API) — `refactor(udp)`: backend selection moves into the UDP core, closing

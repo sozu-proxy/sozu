@@ -1292,7 +1292,8 @@ mod tests {
             kawa_h1::editor::HttpContext,
             mux::{
                 BackendId, BackendSlot, Connection,
-                connection::EndpointServer,
+                connection::{EndpointClient, EndpointServer},
+                router::Router,
                 test_support::{connected_socket, test_context},
             },
         },
@@ -2000,6 +2001,159 @@ mod tests {
             "the first response-header byte arrives before the last response \
              byte: header_time {header_time:?} must not exceed response_time \
              {response_time:?}"
+        );
+    }
+
+    // ── The access log of a request the parse rejected (sozu-proxy/sozu#1085) ──
+    //
+    // DO NOT READ THESE TESTS AS COVERING H2. They drive a `Position::Server`
+    // `ConnectionH1` only. An H2 request whose pseudo-headers are rejected
+    // never gets a request line at all: every rejection in
+    // `handle_header` (`lib/src/protocol/mux/pkawa.rs`) returns before the
+    // `detached.status_line` assignment, so there is nothing to log and the
+    // H2 gap is a different fix.
+
+    /// Drive `request` through a real `Position::Server` `ConnectionH1`, the
+    /// way a client socket does: `readable` until the parse is rejected, then
+    /// `writable` until the 400 is written and its access log emitted.
+    /// Returns every log line the run produced.
+    ///
+    /// Driving both halves, rather than calling `Stream::generate_access_log`
+    /// on a staged stream, is what makes these tests say which site emits the
+    /// line and that the request bytes are still in the front buffer when it
+    /// does.
+    ///
+    /// The loops are bounded for the reason `feed_backend` gives: a loopback
+    /// write is a syscall away, not instantaneous.
+    fn access_log_of_a_rejected_h1_request(request: &'static [u8]) -> String {
+        crate::capture_test_logs(move || {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+            let mut context = test_context(&pool);
+            context
+                .create_stream(Ulid::generate(), 1 << 16)
+                .expect("the test pool must hand out stream buffers");
+            let (front_socket, mut front_peer) = connected_socket();
+            let mut server = h1_of(Connection::new_h1_server(
+                Ulid::generate(),
+                front_socket,
+                Duration::from_secs(60),
+            ));
+            server.stream = Some(0);
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+
+            front_peer
+                .write_all(request)
+                .expect("the loopback peer must accept the staged request bytes");
+            for _ in 0..64 {
+                server.readiness.event.insert(Ready::READABLE);
+                server.readable(&mut context, EndpointClient(&mut router));
+                if context.streams[0].front.is_error() {
+                    break;
+                }
+            }
+            assert!(
+                context.streams[0].front.is_error(),
+                "premise: the staged request must be rejected by the parse"
+            );
+            assert_eq!(
+                context.streams[0].context.method, None,
+                "premise: the rejection happened before `HttpContext` captured \
+                 the request line, which is the whole defect"
+            );
+
+            // `ConnectionH1::writable` resets the stream metrics right after
+            // it emits the access log, so a cleared start instant is the
+            // observable "the line went out".
+            for _ in 0..64 {
+                server.readiness.event.insert(Ready::WRITABLE);
+                server.writable(&mut context, EndpointClient(&mut router));
+                if context.streams[0].metrics.start.is_none() {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// A header the parser refuses, after a well-formed request line: the
+    /// access log must still name the method and the path.
+    ///
+    /// The authority is asserted ABSENT, on purpose. This request carries a
+    /// `Host` line before the bad one, so a `Host` block exists here — but a
+    /// client that puts the bad line first gets no `Host` block at all, so
+    /// reading it would log an unvalidated value whenever the client chose
+    /// to. Only an authority the request line itself carries is logged.
+    ///
+    /// To SEE THIS RED: in `Stream::generate_access_log`
+    /// (`lib/src/protocol/mux/stream.rs`), replace the
+    /// `rejected_request_line(&self.front)` call with
+    /// `None::<RejectedRequestLine<'_>>`. The line then renders
+    /// `- - - 400`.
+    #[test]
+    fn a_header_parse_error_keeps_the_method_and_path_in_the_access_log() {
+        let output = access_log_of_a_rejected_h1_request(
+            b"GET /diag?x=1 HTTP/1.1\r\nHost: example.com\r\nBad Header: x\r\n\r\n",
+        );
+
+        assert!(
+            output.contains("GET /diag?x=1 400"),
+            "the access log of a request rejected on a header must carry its \
+             method and path, got: {output}"
+        );
+        assert!(
+            output.contains("- GET /diag?x=1 400"),
+            "the authority of an origin-form request rejected on a header must \
+             not be read from a `Host` line, got: {output}"
+        );
+        assert!(
+            output.contains("H1::Complete"),
+            "the 400 of a parse error is logged by `ConnectionH1::writable` once \
+             the answer is written, not at session close, got: {output}"
+        );
+    }
+
+    /// Sōzu's own CL.TE guard in `HttpContext::on_request_headers`
+    /// (`lib/src/protocol/kawa_h1/editor.rs`) rejects a request kawa parsed
+    /// cleanly, and returns before the request line is captured. Here kawa's
+    /// `process_headers` already resolved the authority and the path, so all
+    /// three fields are logged.
+    ///
+    /// `identity` then `chunked` is the pair that reaches that guard: kawa
+    /// combines it to a chunked-final coding and accepts it, and the guard
+    /// refuses to forward two TE lines. A lone `Transfer-Encoding: gzip`
+    /// would not — kawa refuses it itself, before resolving the authority.
+    ///
+    /// To SEE THIS RED: the same substitution as
+    /// `a_header_parse_error_keeps_the_method_and_path_in_the_access_log`.
+    #[test]
+    fn a_cl_te_rejection_keeps_the_whole_request_line_in_the_access_log() {
+        let output = access_log_of_a_rejected_h1_request(
+            b"POST /upload HTTP/1.1\r\nHost: example.com\r\n\
+              Transfer-Encoding: identity\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+
+        assert!(
+            output.contains("example.com POST /upload 400"),
+            "the access log of a request rejected by the CL.TE guard must carry \
+             its authority, method and path, got: {output}"
+        );
+    }
+
+    /// The one authority a header rejection may log: the one the request
+    /// line itself carries. An absolute-form target names it, so it is
+    /// logged, split from the path the way kawa splits it.
+    ///
+    /// To SEE THIS RED: the same substitution as
+    /// `a_header_parse_error_keeps_the_method_and_path_in_the_access_log`.
+    #[test]
+    fn a_header_parse_error_logs_the_authority_an_absolute_form_carries() {
+        let output = access_log_of_a_rejected_h1_request(
+            b"GET http://example.com:8080/abs HTTP/1.1\r\nBad Header: x\r\n\r\n",
+        );
+
+        assert!(
+            output.contains("example.com:8080 GET /abs 400"),
+            "the access log of an absolute-form request rejected on a header \
+             must carry the authority of its request-target, got: {output}"
         );
     }
 }
