@@ -471,7 +471,7 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   request/response bytes flow both ways. Set by `Context::link_stream`
   (`mod.rs`), cleared by `Context::unlink_stream` (`mod.rs`).
 - `Unlinked` — backend finished or was reset; response may still need to drain
-  to the client. Transitions: `answers.rs:326/342`, `h1.rs:1098-1155`, and in
+  to the client. Transitions: `answers.rs:326/342`, `h1.rs:1113-1170`, and in
   `h2.rs` the `StreamState::Unlinked` assignments of `ConnectionH2::reset_stream`
   and `ConnectionH2::end_stream` (the client-side retirement plus the
   `ForwardTerminated` and `CloseDelimited` arms of the server side). By symbol,
@@ -562,7 +562,7 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   `Router::backend_from_request`; giving it a borrowed view of backend load
   state is Question 12's second part.
 - **Backend detach.** `Context::unlink_stream` (`mod.rs`) — called from the four
-  timeout arms of `Mux::timeout_inner` (`mod.rs`), from H1 EOF (`h1.rs:1065`),
+  timeout arms of `Mux::timeout_inner` (`mod.rs`), from H1 EOF (`h1.rs:1080`),
   and from `ConnectionH2::reset_stream` and `ConnectionH2::end_stream`
   (`h2.rs`), each of which opens with it. By symbol, not line, for the same
   reason as the `Unlinked` bullet above. Do not convert it back.
@@ -747,7 +747,7 @@ one block inside a method that does several unrelated things:
   at `h2.rs:2943` and `H2WritePhase::End`'s deferred `completed_streams` loop at
   `h2.rs:3343`.
 - `ConnectionH2::prune_inactive_streams_while_closing` (`h2.rs`).
-- `handle_window_update_frame` zero-increment path — `h2.rs:6639`.
+- `handle_window_update_frame` zero-increment path — `h2.rs:6654`.
 - `ConnectionH2::cancel_timed_out_streams` slow-multiplex guard (`h2.rs`).
 - `ConnectionH2::handle_continuation_header_state` CONTINUATION oversize
   (`h2.rs`).
@@ -762,7 +762,7 @@ reintroduced inline `self.streams.remove(...)` inside `ConnectionH2` fails
 with `E0609: no field 'streams'`). The one exception below does not remove at
 all:
 
-- `close` backend-stream teardown — `h2.rs:7674-7676` (does not remove, only
+- `close` backend-stream teardown — `h2.rs:7689-7691` (does not remove, only
   notifies the endpoint — the surrounding `close` path drops the whole
   connection, and every entry in the wire map (`self.stream_table`) with it,
   shortly after).
@@ -1409,11 +1409,11 @@ soft-stop.
 `ConnectionH2::end_stream` (`h2.rs`) is the server-side wiper for a single
 stream that has completed on the backend. Behavior depends on `Position`:
 
-- **Client** position (i.e. the backend's view) — `h2.rs:7044-7093`. Sends
+- **Client** position (i.e. the backend's view) — `h2.rs:7059-7108`. Sends
   RST_STREAM(CANCEL) unless both request and response have terminated, removes
   the wire mapping, marks the stream `Unlinked` if not already `Recycle`.
 - **Server** position — the `Position::Server` arm of `ConnectionH2::end_stream`
-  (`h2.rs:7094-7212`; the range start is one of eight identical
+  (`h2.rs:7109-7227`; the range start is one of eight identical
   `Position::Server => {` lines, hence the symbol). Dispatches on
   `end_stream_decision` (`shared.rs`): either `ForwardTerminated`,
   `CloseDelimited`, `ForwardUnterminated`, `SendDefault(status)`, `Reconnect`,

@@ -2770,6 +2770,7 @@ p90, p99, p99.9, p99.99, p99.999, p100) and sent as `|ms` values over StatsD.
 | `service_time`            | time | proxy, cluster   | Internal processing time excluding backend I/O (ms)            |
 | `backend_response_time`   | time | cluster, backend | Time from backend connection to last response byte (ms)        |
 | `backend_connection_time` | time | cluster, backend | TCP connection establishment time to backend (ms)              |
+| `backend_header_time`     | time | cluster, backend | Time from backend connection to response headers parsed (ms)   |
 | `frontend_matching_time`  | time | cluster          | Cluster/frontend route matching time (ms)                      |
 | `regex_matching_time`     | time | proxy            | Regex evaluation time for path-based routing (ms)              |
 
@@ -3036,6 +3037,17 @@ These metrics are recorded with `cluster_id` and `backend_id` labels via the
 | `bytes_out`               | counter | cluster, backend | Bytes sent to this backend                  |
 | `backend_response_time`   | time    | cluster, backend | Response time for this backend (ms)         |
 | `backend_connection_time` | time    | cluster, backend | Connection setup time for this backend (ms) |
+| `backend_header_time`     | time    | cluster, backend | Response-header time for this backend (ms)  |
+
+`backend_header_time` is the third of the three upstream timings nginx exposes
+(`$upstream_connect_time`, `$upstream_header_time`, `$upstream_response_time`),
+and it is emitted only where a response has headers to time — the HTTP/1.x and
+HTTP/2 paths. A raw-TCP cluster has none, so the key is **absent** for it
+rather than present as a zero. It is anchored on the FINAL response: after a
+1xx informational response the back buffer is cleared and the timing is retaken
+on the response that follows, which is the same response `backend_response_time`
+ends on. `backend_header_time <= backend_response_time` therefore holds for
+every request that reports both.
 
 #### ALPN negotiation
 

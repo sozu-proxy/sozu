@@ -341,6 +341,38 @@
   `debug_assert!` first — and is recorded in the test's doc comment as a guard no e2e test can
   reach, since no production path calls `generate_access_log` twice on one stream. Test-only; no
   production file changed.
+- **`feat(metrics)`: `backend_header_time`, the backend time-to-first-header-byte
+  ([#426](https://github.com/sozu-proxy/sozu/issues/426)).** The third and last of the three nginx
+  upstream timings asked for there. `backend_connection_time` (nginx's `$upstream_connect_time`) and
+  `backend_response_time` (`$upstream_response_time`) already existed; this adds
+  `$upstream_header_time` — established backend connection to the moment the response headers
+  finished parsing. Emitted as a `time` metric labelled `(cluster_id, backend_id)` by
+  `record_backend_metrics!` beside the other two, so it reaches StatsD, Prometheus and
+  `sozu metrics` with no new surface.
+  Armed in both L7 protocols, at the header -> body edge each already discriminates for its own
+  request-side accounting: `ConnectionH1::readable` on the `!was_main_phase &&
+  position.is_client()` transition, `ConnectionH2::handle_headers_frame` on the `was_initial &&
+  position.is_client()` branch — `was_initial` is what keeps an H2 trailer block from being mistaken
+  for a response header block. Raw TCP (`lib/src/tcp.rs`) has no headers and emits **nothing** under
+  the key rather than a zero, which is also why the accessor deliberately does NOT carry the
+  elapsed-so-far fallback `SessionMetrics::backend_response_time` has: a time to first header byte
+  where no header byte arrived is not an in-flight value, and publishing `now - connected` would
+  produce a number that grows with the wait and then freezes, indistinguishable on a dashboard from
+  a backend that answered slowly.
+  Anchored on the FINAL response, not the first bytes seen: a 1xx clears the back buffer
+  (`ConnectionH1::writable`'s 100-Continue and 103-Early-Hints arms,
+  `ConnectionH2::handle_1xx_reset`), so the transition fires again and the last write wins — the same
+  response `backend_stop` anchors on, and what nginx reports. A set-once instant would have floored
+  the metric at ~0ms for every `Expect: 100-continue` client and hidden the upstream think time the
+  metric exists to expose. A 101 has no successor and correctly keeps its own instant, so an upgraded
+  session still reports the time to its `101`.
+  Four tests, each seen red on its own named substitution. The two protocol tests pin the ordering
+  `backend_header_time <= backend_response_time` on `Duration`s rather than on the millisecond values
+  the histogram stores, because at millisecond resolution a fast test rounds both to 0 and the
+  relation would hold however wrong the placement is; each drives its own protocol's real read path
+  and asserts the header instant exists while `backend_stop` is still `None`, which no placement at a
+  response-end site can satisfy. Neither test covers the other protocol, and both say so.
+  `doc/configure.md` gains the key in both metric inventories.
 
 ### 🔄 Changed
 

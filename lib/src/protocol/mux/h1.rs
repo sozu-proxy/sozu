@@ -480,6 +480,21 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             self.readiness.interest.remove(Ready::READABLE);
         }
         if kawa.is_main_phase() {
+            if !was_main_phase && self.position.is_client() {
+                // The backend's response headers have just finished parsing:
+                // the client twin of the `is_server()` branch below, on the
+                // same header -> body edge. This is the whole of
+                // `backend_header_time`'s H1 arming — nginx's
+                // `$upstream_header_time` (sozu-proxy/sozu#426).
+                //
+                // Unconditional, including on a 1xx: a 100-Continue or a 103
+                // Early Hints clears the back buffer in
+                // `ConnectionH1::writable`, so the FINAL response re-enters
+                // this edge and overwrites, which is the response
+                // `SessionMetrics::backend_stop` also anchors on. A 101 has no
+                // successor and correctly keeps its own instant.
+                parts.metrics.backend_headers_received();
+            }
             if !was_main_phase && self.position.is_server() {
                 if parts.context.method.is_none()
                     || parts.context.authority.is_none()
@@ -1267,14 +1282,19 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, rc::Rc};
+    use std::{cell::Cell, cell::RefCell, io::Write, rc::Rc};
 
     use super::*;
     use crate::{
         Protocol as TransportKind,
+        pool::Pool,
         protocol::{
             kawa_h1::editor::HttpContext,
-            mux::{BackendId, BackendSlot, Connection},
+            mux::{
+                BackendId, BackendSlot, Connection,
+                connection::EndpointServer,
+                test_support::{connected_socket, test_context},
+            },
         },
         socket::SessionTcpStream,
     };
@@ -1783,6 +1803,203 @@ mod tests {
             !rendered.contains(&live_peer.to_string()),
             "the ConnectionH1 Debug must not render the transport address, which \
              is the load balancer on a PROXY frontend: {rendered}"
+        );
+    }
+
+    // ── `backend_header_time`, the H1 half (sozu-proxy/sozu#426) ─────────
+    //
+    // DO NOT READ THESE TESTS AS COVERING H2. They drive
+    // `ConnectionH1::readable` only. The H2 twin lives in
+    // `ConnectionH2::handle_headers_frame` (`lib/src/protocol/mux/h2.rs`) and
+    // is pinned by its own test there.
+
+    /// A `Position::Client` H1 backend connection whose stream is linked to a
+    /// frontend, staged at the exact moment a real dial completes: the
+    /// connection is `Connected`, `backend_connected` is armed, and not one
+    /// response byte has arrived.
+    ///
+    /// Both loopback peers are returned and must be held for the whole test —
+    /// dropping either tears the connection down and turns the next
+    /// `readable()` into a forced disconnect instead of a parse.
+    /// Held together rather than returned as a tuple, the way
+    /// `LedgerFixture` (`lib/src/protocol/mux/h2.rs`) is: the buffer pool and
+    /// both loopback peers are lifetime ballast with no business in a test
+    /// body, and a six-element tuple is `clippy::type_complexity`.
+    struct BackendReadFixture {
+        context: Context<crate::protocol::mux::test_support::TestListener>,
+        frontend: Connection<mio::net::TcpStream>,
+        client: ConnectionH1<mio::net::TcpStream>,
+        backend_peer: std::net::TcpStream,
+        _frontend_peer: std::net::TcpStream,
+        _pool: Rc<RefCell<Pool>>,
+    }
+
+    fn linked_backend_connection() -> BackendReadFixture {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let mut context = test_context(&pool);
+        context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("the test pool must hand out stream buffers");
+
+        let (front_socket, front_peer) = connected_socket();
+        let frontend =
+            Connection::new_h1_server(Ulid::generate(), front_socket, Duration::from_secs(60));
+
+        let (back_socket, back_peer) = connected_socket();
+        let session_ulid = Ulid::generate();
+        let mut client = h1_of(Connection::new_h1_client(
+            session_ulid,
+            back_socket,
+            "test-cluster".to_owned(),
+            test_backend_id(cached_peer()),
+            Duration::from_secs(60),
+        ));
+        // `new_h1_client` opens in `Connecting`; move it the way a completed
+        // dial does, so the read path runs its `Connected` accounting.
+        if let Position::Client(_, _, status) = &mut client.position {
+            *status = BackendStatus::Connected;
+        }
+        client.stream = Some(0);
+
+        let stream = &mut context.streams[0];
+        stream.state = StreamState::Linked(mio::Token(1));
+        stream.metrics.backend_id = Some("test-backend".to_owned());
+        stream.metrics.backend_start();
+        stream.metrics.backend_connected();
+
+        BackendReadFixture {
+            context,
+            frontend,
+            client,
+            backend_peer: back_peer,
+            _frontend_peer: front_peer,
+            _pool: pool,
+        }
+    }
+
+    /// Hand `bytes` to the backend peer and drive `ConnectionH1::readable`
+    /// until `done` holds, bounded.
+    ///
+    /// The loop is not a retry papering over a flaky assertion: a loopback
+    /// write is a syscall away, not instantaneous, so a single `readable()`
+    /// may legitimately see `WouldBlock` and read nothing. The bound is what
+    /// keeps a genuine failure a failure instead of a hang.
+    fn feed_backend<F>(
+        peer: &mut std::net::TcpStream,
+        client: &mut ConnectionH1<mio::net::TcpStream>,
+        context: &mut Context<crate::protocol::mux::test_support::TestListener>,
+        frontend: &mut Connection<mio::net::TcpStream>,
+        bytes: &[u8],
+        done: F,
+    ) where
+        F: Fn(&Context<crate::protocol::mux::test_support::TestListener>) -> bool,
+    {
+        peer.write_all(bytes)
+            .expect("the loopback peer must accept the staged response bytes");
+        for _ in 0..64 {
+            client.readiness.event.insert(Ready::READABLE);
+            client.readable(context, EndpointServer(frontend));
+            if done(context) {
+                return;
+            }
+        }
+        panic!("the backend read path never reached the staged state");
+    }
+
+    /// The whole point of the metric, pinned as an ordering: the H1 backend
+    /// time-to-first-header-byte instant is taken when the response HEADERS
+    /// finish parsing, which is strictly before the response ENDS.
+    ///
+    /// Two phases, and the split is what makes this discriminating. After the
+    /// headers alone (`Content-Length: 2`, body withheld) the header instant
+    /// must already exist while `backend_stop` — the response-end marker every
+    /// one of `ConnectionH1::writable`'s five sites owns — must still be
+    /// absent. An instant placed at any of those sites cannot satisfy that.
+    /// After the body, the instant must be UNCHANGED: the transition fires on
+    /// the header -> body edge, not on every read.
+    ///
+    /// The ordering assertion is then `header_time <= response_time` on
+    /// `Duration`s, not on the millisecond values the histogram stores: at
+    /// millisecond resolution a fast test rounds both to 0 and the relation
+    /// would hold however wrong the placement is.
+    ///
+    /// `backend_stop` is marked by the test rather than driven through
+    /// `ConnectionH1::writable` because that pass calls
+    /// `SessionMetrics::reset` immediately after its access log, which wipes
+    /// every instant before a test could read one.
+    ///
+    /// To SEE THIS RED: move `parts.metrics.backend_headers_received();` out
+    /// of the `!was_main_phase && self.position.is_client()` branch of
+    /// `ConnectionH1::readable` and put it immediately after the
+    /// `stream.metrics.backend_stop();` that precedes `Some("H1::Complete")`
+    /// in `ConnectionH1::writable`. Phase one then reports no header time at
+    /// all.
+    #[test]
+    fn the_h1_backend_header_instant_lands_on_the_headers_not_the_response_end() {
+        let mut fixture = linked_backend_connection();
+        let BackendReadFixture {
+            context,
+            frontend,
+            client,
+            backend_peer,
+            ..
+        } = &mut fixture;
+
+        // Premise: nothing has been received, so neither instant can be stale.
+        assert_eq!(context.streams[0].metrics.backend_header_time(), None);
+        assert_eq!(context.streams[0].metrics.backend_stop, None);
+
+        feed_backend(
+            backend_peer,
+            client,
+            context,
+            frontend,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n",
+            |context| context.streams[0].back.is_main_phase(),
+        );
+
+        let after_headers = context.streams[0]
+            .metrics
+            .backend_headers_received
+            .expect("the response headers must arm the backend header instant");
+        assert!(
+            !context.streams[0].back.is_terminated(),
+            "premise: the response is not over — its 2-byte body is still \
+             outstanding, so this phase cannot be observing the response end"
+        );
+        assert_eq!(
+            context.streams[0].metrics.backend_stop, None,
+            "the response-end marker must still be absent while only the \
+             headers have arrived"
+        );
+
+        feed_backend(backend_peer, client, context, frontend, b"ok", |context| {
+            context.streams[0].back.is_terminated()
+        });
+
+        assert_eq!(
+            context.streams[0].metrics.backend_headers_received,
+            Some(after_headers),
+            "the instant is taken on the header -> body edge, so the body \
+             reads must not move it"
+        );
+
+        // What the `Some("H1::Complete")` arm of `ConnectionH1::writable` does
+        // once the whole response has been forwarded.
+        context.streams[0].metrics.backend_stop();
+
+        let metrics = &context.streams[0].metrics;
+        let header_time = metrics
+            .backend_header_time()
+            .expect("a completed H1 response must report a backend header time");
+        let response_time = metrics
+            .backend_response_time()
+            .expect("a completed H1 response must report a backend response time");
+        assert!(
+            header_time <= response_time,
+            "the first response-header byte arrives before the last response \
+             byte: header_time {header_time:?} must not exceed response_time \
+             {response_time:?}"
         );
     }
 }

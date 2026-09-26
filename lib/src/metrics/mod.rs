@@ -1080,7 +1080,7 @@ macro_rules! time (
 
 #[macro_export]
 macro_rules! record_backend_metrics (
-  ($cluster_id:expr, $backend_id:expr, $response_time: expr, $backend_connection_time: expr, $bin: expr, $bout: expr) => {
+  ($cluster_id:expr, $backend_id:expr, $response_time: expr, $backend_connection_time: expr, $backend_header_time: expr, $bin: expr, $bout: expr) => {
     use $crate::metrics::{MetricValue,Subscriber};
     $crate::metrics::METRICS.with(|metrics| {
       let m = &mut *metrics.borrow_mut();
@@ -1092,6 +1092,12 @@ macro_rules! record_backend_metrics (
       m.receive_metric($crate::metrics::names::backend::RESPONSE_TIME, Some(cluster_id), Some(backend_id), MetricValue::Time($response_time as usize));
       if let Some(t) = $backend_connection_time {
         m.receive_metric($crate::metrics::names::backend::CONNECTION_TIME, Some(cluster_id), Some(backend_id), MetricValue::Time(t.as_millis() as usize));
+      }
+      // `Option`, like the connection time and unlike the response time: a
+      // protocol with no response headers at all (raw TCP) must record
+      // nothing here rather than a zero.
+      if let Some(t) = $backend_header_time {
+        m.receive_metric($crate::metrics::names::backend::HEADER_TIME, Some(cluster_id), Some(backend_id), MetricValue::Time(t.as_millis() as usize));
       }
 
       m.receive_metric($crate::metrics::names::backend::REQUESTS, Some(cluster_id), Some(backend_id), MetricValue::Count(1));

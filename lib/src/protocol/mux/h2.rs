@@ -6096,6 +6096,21 @@ impl ConnectionH2 {
             self.metric_events
                 .push(MetricEvent::WritableRearmedPeerHeaders);
         }
+        if was_initial && self.position.is_client() {
+            // The backend's response field block has just been decoded and
+            // parsed: the client twin of the `is_server()` branch below, on
+            // the same first-HEADERS edge (`was_initial` is what keeps a
+            // trailer block out of it). This is the whole of
+            // `backend_header_time`'s H2 arming — nginx's
+            // `$upstream_header_time` (sozu-proxy/sozu#426).
+            //
+            // Unconditional, including on a 1xx: `ConnectionH2::handle_1xx_reset`
+            // clears the back buffer once the informational response has been
+            // forwarded, so the FINAL response returns to the initial parsing
+            // phase and re-enters this edge, overwriting. That is the response
+            // `SessionMetrics::backend_stop` also anchors on.
+            stream.metrics.backend_headers_received();
+        }
         // was_initial prevents trailers from triggering connection
         if was_initial && self.position.is_server() {
             self.metric_events.push(MetricEvent::RequestStarted);
@@ -16364,6 +16379,130 @@ mod tests {
             settle(&mut fixture, &mut context),
             0,
             "reaping the only stream must leave no charge behind"
+        );
+    }
+
+    // ── `backend_header_time`, the H2 half (sozu-proxy/sozu#426) ─────────
+    //
+    // DO NOT READ THIS TEST AS COVERING H1. It drives
+    // `ConnectionH2::handle_headers_frame` only. The H1 twin lives in
+    // `ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs`) and is pinned by
+    // its own test there.
+
+    /// Stage a response field block in the connection's stream-0 storage and
+    /// hand back the `Headers` frame that names it, the way
+    /// `ConnectionH2::handle_read` hands one to
+    /// `ConnectionH2::handle_headers_frame`: the fragment is a `(start, len)`
+    /// window over `ConnectionH2::zero`'s buffer, not an owned slice.
+    ///
+    /// `0x88` is one HPACK indexed-header-field octet naming static-table
+    /// entry 8, `:status: 200` (RFC 7541 Appendix A) — a complete, valid
+    /// response field block in a single byte, so this needs no encoder.
+    fn stage_response_headers(core: &mut ConnectionH2, stream_id: u32) -> parser::Headers {
+        core.zero.storage.space()[..1].copy_from_slice(&[0x88]);
+        core.zero.storage.fill(1);
+        let buffer = core.zero.storage.buffer();
+        parser::Headers {
+            stream_id,
+            priority: None,
+            header_block_fragment: kawa::repr::Slice::new(buffer, &buffer[..1]),
+            end_stream: false,
+            end_headers: true,
+        }
+    }
+
+    /// The H2 twin of
+    /// `the_h1_backend_header_instant_lands_on_the_headers_not_the_response_end`:
+    /// a backend response HEADERS frame arms the time-to-first-header-byte
+    /// instant, and it arms it strictly before the response ends.
+    ///
+    /// `end_stream: false` is what makes it discriminating — the response body
+    /// is still outstanding, so `backend_stop` (which every one of
+    /// `ConnectionH2`'s four sites owns) must still be absent while the header
+    /// instant already exists. An instant placed at any of those sites cannot
+    /// satisfy that.
+    ///
+    /// The ordering is asserted on `Duration`s rather than on the millisecond
+    /// values the histogram stores, for the same reason as its H1 twin: at
+    /// millisecond resolution a fast test rounds both to 0 and the relation
+    /// holds however wrong the placement is.
+    ///
+    /// To SEE THIS RED: move `stream.metrics.backend_headers_received();` out
+    /// of the `was_initial && self.position.is_client()` branch of
+    /// `ConnectionH2::handle_headers_frame` and put it immediately after the
+    /// `stream.metrics.backend_stop();` that opens
+    /// `ConnectionH2::complete_server_stream` — the nominal `H2::Complete`
+    /// response-end site. The frame under test carries no END_STREAM, so
+    /// nothing arms the instant and the test reports no header time at all.
+    #[test]
+    fn the_h2_backend_header_instant_lands_on_the_headers_not_the_response_end() {
+        let pool = make_pool_for_invariant_16();
+        let mut context = test_context(&pool);
+        let mut fixture = ledger_fixture(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let gids = open_streams(&mut fixture, &mut context, 1);
+        let gid = gids[0];
+        let metrics = &mut context.streams[gid].metrics;
+        metrics.backend_id = Some("ledger-backend".to_owned());
+        metrics.backend_start();
+        metrics.backend_connected();
+
+        // Premise: nothing has been received, so neither instant can be stale.
+        assert_eq!(context.streams[gid].metrics.backend_header_time(), None);
+        assert_eq!(context.streams[gid].metrics.backend_stop, None);
+
+        let Connection::H2(shell) = &mut fixture.connection else {
+            unreachable!("the fixture was built as H2");
+        };
+        let stream_id = *shell
+            .core
+            .stream_table
+            .streams()
+            .keys()
+            .next()
+            .expect("the scenario opened one stream");
+        assert!(
+            context.streams[gid].back.is_initial(),
+            "premise: the backend read side must still be in its initial \
+             parsing phase, or `was_initial` would not fire"
+        );
+
+        let headers = stage_response_headers(&mut shell.core, stream_id);
+        shell
+            .core
+            .handle_headers_frame(headers, &mut context, EndpointClient(&mut router));
+
+        let after_headers = context.streams[gid]
+            .metrics
+            .backend_headers_received
+            .expect("a backend response HEADERS frame must arm the backend header instant");
+        assert_eq!(
+            context.streams[gid].metrics.backend_stop, None,
+            "the frame carried no END_STREAM, so the response-end marker must \
+             still be absent"
+        );
+
+        // What `ConnectionH2::mark_end_of_stream` does once the response ends.
+        context.streams[gid].metrics.backend_stop();
+
+        let metrics = &context.streams[gid].metrics;
+        assert_eq!(
+            metrics.backend_headers_received,
+            Some(after_headers),
+            "the response end must not move the header instant"
+        );
+        let header_time = metrics
+            .backend_header_time()
+            .expect("a completed H2 response must report a backend header time");
+        let response_time = metrics
+            .backend_response_time()
+            .expect("a completed H2 response must report a backend response time");
+        assert!(
+            header_time <= response_time,
+            "the first response-header byte arrives before the last response \
+             byte: header_time {header_time:?} must not exceed response_time \
+             {response_time:?}"
         );
     }
 }
