@@ -868,12 +868,17 @@ impl LocalDrain {
             "a tombstoned cluster must not reach the entry().or_default() insert"
         );
 
-        let local_cluster_metric = self
-            .cluster_metrics
+        // Look the row up by `&str` first: `BTreeMap::entry` takes an owned
+        // key, so reaching it on every emission would allocate a copy of
+        // `cluster_id` per metric. The copy is made only on the insert
+        // branch, a cluster's first sighting.
+        if let Some(local_cluster_metric) = self.cluster_metrics.get_mut(cluster_id) {
+            return local_cluster_metric.receive_metric(metric_name, metric);
+        }
+        self.cluster_metrics
             .entry(cluster_id.to_owned())
-            .or_default();
-
-        local_cluster_metric.receive_metric(metric_name, metric)
+            .or_default()
+            .receive_metric(metric_name, metric)
     }
 
     fn receive_backend_metric(
@@ -895,12 +900,15 @@ impl LocalDrain {
             "a tombstoned cluster must not reach the backend insert"
         );
 
-        let local_cluster_metric = self
-            .cluster_metrics
+        // Same `&str` lookup as `receive_cluster_metric`: the owned key is
+        // built only when the cluster row does not exist yet.
+        if let Some(local_cluster_metric) = self.cluster_metrics.get_mut(cluster_id) {
+            return local_cluster_metric.receive_backend_metric(metric_name, backend_id, metric);
+        }
+        self.cluster_metrics
             .entry(cluster_id.to_owned())
-            .or_default();
-
-        local_cluster_metric.receive_backend_metric(metric_name, backend_id, metric)
+            .or_default()
+            .receive_backend_metric(metric_name, backend_id, metric)
     }
 
     fn receive_proxy_metric(
@@ -1761,5 +1769,125 @@ mod tests {
             Some(Inner::Gauge(v)) => assert_eq!(*v, 0, "underflow must saturate to 0"),
             other => panic!("expected Gauge, got {other:?}"),
         }
+    }
+
+    /// Heap allocations made by the current thread, counted by the
+    /// test binary's global allocator so a test can assert that a code path
+    /// allocates nothing. Per thread, so concurrently running tests do not
+    /// pollute one another's count.
+    mod allocation_counter {
+        use std::{
+            alloc::{GlobalAlloc, Layout, System},
+            cell::Cell,
+        };
+
+        thread_local! {
+            static THREAD_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        struct CountingAllocator;
+
+        fn count_one() {
+            let _ = THREAD_ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+        }
+
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                count_one();
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                count_one();
+                unsafe { System.alloc_zeroed(layout) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                count_one();
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+
+        #[global_allocator]
+        static COUNTING: CountingAllocator = CountingAllocator;
+
+        pub(super) fn thread_allocations() -> usize {
+            THREAD_ALLOCATIONS.with(Cell::get)
+        }
+    }
+
+    /// Replays what `SessionMetrics::register_end_of_session` hands the
+    /// drain for one request: cluster-labelled and proxy-wide times, the six
+    /// `record_backend_metrics!` emissions and `access_logs.count`.
+    fn emit_end_of_session(drain: &mut LocalDrain, cluster_id: &str, backend_id: Option<&str>) {
+        let c = Some(cluster_id);
+        drain.receive_metric(
+            names::event_loop::REQUEST_TIME,
+            c,
+            None,
+            MetricValue::Time(12),
+        );
+        drain.receive_metric(
+            names::event_loop::SERVICE_TIME,
+            c,
+            None,
+            MetricValue::Time(3),
+        );
+        drain.receive_metric(
+            names::event_loop::REQUEST_TIME,
+            None,
+            None,
+            MetricValue::Time(12),
+        );
+        drain.receive_metric(
+            names::event_loop::SERVICE_TIME,
+            None,
+            None,
+            MetricValue::Time(3),
+        );
+        for (key, value) in [
+            (names::backend::BYTES_IN, MetricValue::Count(512)),
+            (names::backend::BYTES_OUT, MetricValue::Count(4096)),
+            (names::backend::RESPONSE_TIME, MetricValue::Time(9)),
+            (names::backend::CONNECTION_TIME, MetricValue::Time(1)),
+            (names::backend::HEADER_TIME, MetricValue::Time(7)),
+            (names::backend::REQUESTS, MetricValue::Count(1)),
+            (names::access_logs::COUNT, MetricValue::Count(1)),
+        ] {
+            drain.receive_metric(key, c, backend_id, value);
+        }
+    }
+
+    #[test]
+    fn steady_state_emission_does_not_allocate() {
+        // Once a cluster and its backends have been seen, recording a
+        // request's metrics must not touch the heap: the owned copies of
+        // `cluster_id`, `backend_id` and the metric name are made only on
+        // each key's first sighting. Covers both label shapes the
+        // cardinality knob can hand the drain (`cluster` strips the backend
+        // label before the drain, `backend` keeps it).
+        let mut drain = LocalDrain::new("prefix".to_string());
+        let backends = ["backend-0", "backend-1", "backend-2"];
+        for backend in backends {
+            emit_end_of_session(&mut drain, "cluster-a", Some(backend));
+        }
+        emit_end_of_session(&mut drain, "cluster-a", None);
+        emit_end_of_session(&mut drain, "cluster-b", None);
+
+        let before = allocation_counter::thread_allocations();
+        for _ in 0..100 {
+            for backend in backends {
+                emit_end_of_session(&mut drain, "cluster-a", Some(backend));
+            }
+            emit_end_of_session(&mut drain, "cluster-a", None);
+            emit_end_of_session(&mut drain, "cluster-b", None);
+        }
+        let allocations = allocation_counter::thread_allocations() - before;
+
+        assert_eq!(
+            allocations, 0,
+            "steady-state metric emission must not allocate"
+        );
     }
 }
