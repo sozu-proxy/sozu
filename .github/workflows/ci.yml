@@ -288,6 +288,9 @@ jobs:
       # before it existed they never ran anywhere. `sozu_top_e2e` is
       # deliberately absent: it is `#![cfg(feature = "tui")]` and no matrix cell
       # enables that feature, so its target compiles to an empty binary here.
+      # Enabling it would not suffice: `sozu top --snapshot` enters raw mode
+      # and fails with ENXIO without a controlling terminal, which a CI
+      # step normally lacks.
       - name: Test sozu (process-level e2e)
         run: |
           cargo test -p sozu --locked ${{ matrix.flags }} --test load_state_rollback_e2e -- --ignored
