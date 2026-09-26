@@ -284,7 +284,7 @@ a wedged session, or a security regression.
 2. **Write-only shutdown on TLS frontends.** Closing the frontend socket with
    `Shutdown::Both` discards any unread receive data and elicits a TCP RST,
    truncating the already-queued response. The canonical write-up lives at
-   `lib/src/https.rs:1020-1027`. Backends speak plaintext H1 today, so
+   `lib/src/https.rs:1023-1030`. Backends speak plaintext H1 today, so
    `Shutdown::Both` is permitted on the backend socket; that carve-out must be
    revisited when backend TLS lands.
 

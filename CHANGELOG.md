@@ -408,6 +408,34 @@
   `a_dial_moves_the_planned_cluster_id_into_the_backend_connection` drives a real
   `Mux::dial_backend` and checks the connection owns the very allocation the plan carried.
 
+- **`perf(server)`: an accepted connection no longer pays a `getpeername(2)` twice and a
+  `setsockopt(TCP_NODELAY)` once ([#1586](https://github.com/sozu-proxy/sozu/issues/1586)).**
+  `accept4(2)` already returns the peer address, but the HTTP, HTTPS and TCP listeners dropped
+  it, and the worker read it back with `getpeername(2)` twice: once in `Server::accept` for the
+  `client.connect.per_source.*` counter and once in the session constructor. The address now
+  travels from `accept(2)` through the accept queue into `create_session`: `ProxyConfiguration::accept`
+  returns `(TcpStream, SocketAddr)`, and `ProxyConfiguration::create_session`,
+  `HttpSession::new`, `HttpsSession::new` and the two `TcpSession` constructors take it as a
+  parameter. The values seen in logs and metrics do not change: `accept(2)` and
+  `getpeername(2)` answer the same address for a socket, and on an expect-proxy listener the
+  session still takes the client address from the PROXY header, the network address still
+  being the load balancer's. The one difference is a peer that resets between the accept and
+  the lookup: `getpeername(2)` then failed with `ENOTCONN`, the per-source counter skipped the
+  connection and the session started with no peer; now both get the address `accept(2)`
+  reported. `TCP_NODELAY` is now set once per listener, in `activate`, on whichever socket it
+  activates: freshly bound, inherited over SCM_RIGHTS at an upgrade, or parked after a failed
+  registration. The kernel copies the flag to every socket whose handshake completes after
+  that, on Linux and on FreeBSD, NetBSD, OpenBSD and macOS alike (each copies `TF_NODELAY` from
+  the listener when it builds the accepted socket). A connection already in the backlog when
+  the flag is set does not get it, which matters when a worker adopts the socket of a binary
+  that never set it: each listener's `accept` therefore sets the flag per connection until the
+  first `WouldBlock` after an activation, which drains exactly that backlog. Measured in
+  release with `intentrace -p` on the worker, 20 requests with one connection each:
+  `getpeername` goes from 2 to 0 per connection and `setsockopt` from 2 to 1 (the remaining one
+  is the backend socket's), for 26.95 → 23.75 syscalls per request in H1 and 62.00 → 59.05 in
+  H2 over TLS. `doc/lifetime_of_a_session.md` §3.1–3.2 and `doc/benchmark.md` describe the new
+  accept path.
+
 - **`perf(mux)`: the backend id is no longer copied into a `String` per request
   ([#1579](https://github.com/sozu-proxy/sozu/issues/1579)).** `HttpContext::backend_id` and
   `SessionMetrics::backend_id` are now `Option<Rc<str>>` instead of `Option<String>`, and the mux
