@@ -11,11 +11,8 @@
 //!         cluster: MetricsMap {
 //!             map: BTreeMap<metric_name, AggregatedMetric>
 //!         },
-//!         backends: Vec<LocalBackendMetrics {
-//!             backend_id,
-//!             MetricsMap {
-//!                 map: BTreeMap<metric_name, AggregatedMetric>
-//!             },
+//!         backends: BTreeMap<backend_id, MetricsMap {
+//!             map: BTreeMap<metric_name, AggregatedMetric>
 //!         }>
 //!     }>
 //! }
@@ -364,7 +361,11 @@ impl MetricsMap {
 #[derive(Debug, Default)]
 pub struct LocalClusterMetrics {
     cluster: MetricsMap,
-    backends: Vec<LocalBackendMetrics>,
+    /// backend_id -> backend metrics. A map rather than a scanned `Vec`:
+    /// every backend-labelled emission looks its backend up here, six times
+    /// per request, and `get_mut` takes the id as `&str` through
+    /// `Borrow<str>`, so the lookup allocates nothing.
+    backends: BTreeMap<String, MetricsMap>,
 }
 
 impl LocalClusterMetrics {
@@ -382,15 +383,9 @@ impl LocalClusterMetrics {
         backend_id: &str,
         new_value: MetricValue,
     ) -> Result<(), MetricError> {
-        let existed = self.contains_backend(backend_id);
         let before_len = self.backends.len();
-        let backend = self
-            .backends
-            .iter_mut()
-            .find(|backend| backend.backend_id == backend_id);
-
-        if let Some(backend) = backend {
-            backend.metrics.receive_metric(metric_name, new_value)?;
+        if let Some(backend) = self.backends.get_mut(backend_id) {
+            backend.receive_metric(metric_name, new_value)?;
             debug_assert_eq!(
                 self.backends.len(),
                 before_len,
@@ -402,25 +397,18 @@ impl LocalClusterMetrics {
         let mut metrics = MetricsMap::new();
         metrics.receive_metric(metric_name, new_value)?;
 
-        self.backends.push(LocalBackendMetrics {
-            backend_id: backend_id.to_owned(),
-            metrics,
-        });
-        // A fresh backend grows the vec by exactly one, and the
-        // backend_id must now be present. We also uphold the single-entry-
-        // per-backend invariant: a brand-new id was absent before.
+        // The only copy of `backend_id`, made on the backend's first sighting.
+        let previous = self.backends.insert(backend_id.to_owned(), metrics);
+        // A fresh backend grows the map by exactly one: the insert path only
+        // runs for an id the lookup above did not find.
         debug_assert!(
-            !existed,
+            previous.is_none(),
             "fresh backend insert path must only run for an absent backend_id"
         );
         debug_assert_eq!(
             self.backends.len(),
             before_len + 1,
-            "a fresh backend must grow the vec by exactly one"
-        );
-        debug_assert!(
-            self.contains_backend(backend_id),
-            "the backend_id must be present after a fresh insert"
+            "a fresh backend must grow the map by exactly one"
         );
         Ok(())
     }
@@ -428,10 +416,13 @@ impl LocalClusterMetrics {
     fn to_filtered_metrics(&self, metric_names: &[String]) -> Result<ClusterMetrics, MetricError> {
         let cluster = self.cluster.to_filtered_metrics(metric_names);
 
-        let mut backends: Vec<BackendMetrics> = Vec::new();
-        for backend in &self.backends {
-            backends.push(backend.to_filtered_metrics(metric_names)?);
-        }
+        let backends = self
+            .backends
+            .iter()
+            .map(|(backend_id, metrics)| {
+                backend_to_filtered_metrics(backend_id, metrics, metric_names)
+            })
+            .collect();
         Ok(ClusterMetrics { cluster, backends })
     }
 
@@ -441,41 +432,26 @@ impl LocalClusterMetrics {
             .metric_names()
             .chain(
                 self.backends
-                    .iter()
-                    .flat_map(|backend| backend.metrics_names()),
+                    .values()
+                    .flat_map(|backend| backend.metric_names()),
             )
             .filter(move |&item| dedup_set.insert(item))
     }
 
     fn contains_backend(&self, backend_id: &str) -> bool {
-        for backend in &self.backends {
-            if backend.backend_id == backend_id {
-                return true;
-            }
-        }
-        false
+        self.backends.contains_key(backend_id)
     }
 }
 
 /// local equivalent to proto::command::BackendMetrics
-#[derive(Debug, Clone)]
-pub struct LocalBackendMetrics {
-    backend_id: String,
-    metrics: MetricsMap,
-}
-
-impl LocalBackendMetrics {
-    fn to_filtered_metrics(&self, metric_names: &[String]) -> Result<BackendMetrics, MetricError> {
-        let filtered_backend_metrics = self.metrics.to_filtered_metrics(metric_names);
-
-        Ok(BackendMetrics {
-            backend_id: self.backend_id.to_owned(),
-            metrics: filtered_backend_metrics,
-        })
-    }
-
-    fn metrics_names(&self) -> impl Iterator<Item = &str> {
-        self.metrics.metric_names()
+fn backend_to_filtered_metrics(
+    backend_id: &str,
+    metrics: &MetricsMap,
+    metric_names: &[String],
+) -> BackendMetrics {
+    BackendMetrics {
+        backend_id: backend_id.to_owned(),
+        metrics: metrics.to_filtered_metrics(metric_names),
     }
 }
 
@@ -622,8 +598,8 @@ impl LocalDrain {
     pub fn remove_backend(&mut self, cluster_id: &str, backend_id: &str) {
         let drop_cluster = if let Some(cluster) = self.cluster_metrics.get_mut(cluster_id) {
             let before = cluster.backends.len();
-            cluster.backends.retain(|b| b.backend_id != backend_id);
-            // The targeted backend is gone, and `retain` removes at most one
+            cluster.backends.remove(backend_id);
+            // The targeted backend is gone, and `remove` drops at most one
             // entry (backend_ids are unique within a cluster).
             debug_assert!(
                 !cluster.contains_backend(backend_id),
@@ -771,12 +747,12 @@ impl LocalDrain {
         metric_names: &[String],
     ) -> Result<BackendMetrics, MetricError> {
         for cluster_metrics in self.cluster_metrics.values() {
-            if let Some(backend_metrics) = cluster_metrics
-                .backends
-                .iter()
-                .find(|backend_metrics| backend_metrics.backend_id == backend_id)
-            {
-                return backend_metrics.to_filtered_metrics(metric_names);
+            if let Some(backend_metrics) = cluster_metrics.backends.get(backend_id) {
+                return Ok(backend_to_filtered_metrics(
+                    backend_id,
+                    backend_metrics,
+                    metric_names,
+                ));
             }
         }
 
@@ -825,10 +801,13 @@ impl LocalDrain {
                 None => continue,
             };
 
-            let mut backend_metrics = Vec::new();
-            for backend in &cluster.backends {
-                backend_metrics.push(backend.to_filtered_metrics(metric_names)?);
-            }
+            let backend_metrics = cluster
+                .backends
+                .iter()
+                .map(|(backend_id, metrics)| {
+                    backend_to_filtered_metrics(backend_id, metrics, metric_names)
+                })
+                .collect();
 
             clusters.insert(
                 cluster_id.to_owned(),
@@ -1889,5 +1868,80 @@ mod tests {
             allocations, 0,
             "steady-state metric emission must not allocate"
         );
+    }
+
+    #[test]
+    fn backend_metrics_route_to_their_own_backend() {
+        // Every backend-labelled emission must aggregate into the row of its
+        // own `(cluster_id, backend_id)` pair and no other, whatever the
+        // container behind the per-cluster backend lookup. A reference model
+        // keyed by the pair replays the same interleaved sequence, including
+        // removals and a re-appearance after removal, and the drain must
+        // agree with it on every surviving backend and on which backends
+        // survive.
+        const NAME: &str = "backend.requests";
+        let clusters = ["cluster-a", "cluster-b"];
+        let backend_ids: Vec<String> = (0..40).map(|i| format!("backend-{i}")).collect();
+        let mut drain = LocalDrain::new("prefix".to_string());
+        let mut expected: BTreeMap<(String, String), i64> = BTreeMap::new();
+
+        let emit = |drain: &mut LocalDrain,
+                    expected: &mut BTreeMap<(String, String), i64>,
+                    round: usize| {
+            for (c, cluster) in clusters.iter().enumerate() {
+                // Walk the backends in a different order per cluster and per
+                // round, so first sightings interleave with updates.
+                for step in 0..backend_ids.len() {
+                    let b = (step * 7 + c * 13 + round * 3) % backend_ids.len();
+                    let backend = backend_ids[b].as_str();
+                    let value = (1 + b + 100 * c) as i64;
+                    drain.receive_metric(
+                        NAME,
+                        Some(cluster),
+                        Some(backend),
+                        MetricValue::Count(value),
+                    );
+                    *expected
+                        .entry((cluster.to_string(), backend.to_owned()))
+                        .or_default() += value;
+                }
+            }
+        };
+
+        emit(&mut drain, &mut expected, 0);
+        for b in [0, 5, 17, 39] {
+            drain.remove_backend("cluster-a", &backend_ids[b]);
+            expected.remove(&("cluster-a".to_owned(), backend_ids[b].clone()));
+        }
+        drain.remove_backend("cluster-b", &backend_ids[20]);
+        expected.remove(&("cluster-b".to_owned(), backend_ids[20].clone()));
+        emit(&mut drain, &mut expected, 1);
+        drain.remove_backend("cluster-a", &backend_ids[8]);
+        expected.remove(&("cluster-a".to_owned(), backend_ids[8].clone()));
+        emit(&mut drain, &mut expected, 2);
+        drain.remove_backend("cluster-b", &backend_ids[33]);
+        expected.remove(&("cluster-b".to_owned(), backend_ids[33].clone()));
+
+        let mut actual: BTreeMap<(String, String), i64> = BTreeMap::new();
+        for cluster in clusters {
+            let cluster_metrics = drain
+                .metrics_of_one_cluster(cluster, &[NAME.to_string()])
+                .expect("both clusters keep backend rows");
+            for backend in cluster_metrics.backends {
+                let count = match backend.metrics.get(NAME).and_then(|m| m.inner.as_ref()) {
+                    Some(Inner::Count(v)) => *v,
+                    other => panic!(
+                        "expected a Count for {cluster}/{}, got {other:?}",
+                        backend.backend_id
+                    ),
+                };
+                let previous = actual.insert((cluster.to_owned(), backend.backend_id), count);
+                assert!(
+                    previous.is_none(),
+                    "a backend id must appear once per cluster"
+                );
+            }
+        }
+        assert_eq!(actual, expected);
     }
 }

@@ -158,6 +158,26 @@ The tombstone is cleared on `AddCluster` for the same id (a cluster can
 come back after a remove) and on `sozu metrics clear` (operator-initiated
 full reset).
 
+Every request ends with a burst of emissions into the local drain
+(`SessionMetrics::register_end_of_session`: two cluster-labelled times and,
+under `metrics.detail = "backend"`, up to seven backend-labelled metrics —
+the connection and header times are absent when not measured), so its
+lookup path is held to **zero heap allocation in steady state**. Each level is
+a `BTreeMap` keyed by an owned `String` — `cluster_metrics` by cluster id, each
+cluster's `backends` by backend id, each `MetricsMap` by metric name — and
+each is searched with `get_mut(&str)` through `Borrow<str>`; the owned key is
+built only on the insert branch, a key's first sighting. `BTreeMap::entry`
+must not be reached on the hit path, because it takes an owned key and would
+allocate a copy on every emission. `steady_state_emission_does_not_allocate`
+holds the contract, and `lib/benches/local_drain.rs` measures the path per
+request for 1 to 10000 backends in one cluster. Because `backends` is a map, a
+metrics query lists a cluster's backends sorted by backend id.
+
+`RemoveBackend` drops the backend's row but, unlike `RemoveCluster`, arms no
+tombstone: a session still open on the removed backend re-creates the row
+when it ends, and nothing removes it again until the next `RemoveBackend` for
+that id, `RemoveCluster`, or `sozu metrics clear`.
+
 Implication for dashboards: counters in `sozu metrics` output are
 monotonic; charts should compute `rate()` / `irate()` rather than
 treating successive snapshots as windowed counts. Histograms accumulate
