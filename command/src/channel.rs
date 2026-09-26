@@ -51,7 +51,7 @@ pub enum ChannelError {
         message_len: usize,
         delimiter_size: usize,
     },
-    #[error("channel could not write on the back buffer")]
+    #[error("io write error")]
     Write(std::io::Error),
     #[error("channel buffer is full ({capacity} bytes, max {max} bytes), cannot grow more")]
     BufferFull { capacity: usize, max: usize },
@@ -136,16 +136,16 @@ pub enum ChannelError {
 /// - `NoByteToRead` -- `read(2)` returned zero, the peer is gone.
 ///   `readable()` has already set `interest = Ready::EMPTY` and raised HUP;
 ///   re-arming would contradict the hangup it just recorded.
-/// - `Read` -- a hard socket failure (`writable()` reports its write errors
-///   under this variant too), after which the failing call has already
+/// - `Read` -- a hard socket failure, after which `readable()` has already
 ///   cleared `interest` and raised HUP and ERROR (sozu-proxy/sozu#1560).
 /// - `Connection` -- either a failed `connect(2)` or `readable()`/`writable()`
 ///   rejecting the call because the interest gate is shut. Restoring from here
 ///   the very bit that gate just refused is the loop this function exists to
 ///   avoid.
 /// - `NoByteWritten`, `Write` -- back-buffer/socket write failures, raised on
-///   the write path and terminal there (`NoByteWritten` raises HUP); nothing
-///   about them says the read side may refill.
+///   the write path and terminal there (`NoByteWritten` raises HUP, a
+///   `writable()` socket error raises HUP and ERROR); nothing about them says
+///   the read side may refill.
 /// - `TimeoutReached` -- the blocking read path's deadline
 ///   (`read_message_blocking_timeout`), an operator-visible bound rather than a
 ///   framing state.
@@ -594,7 +594,7 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                         // looping while it is set and data is pending.
                         self.interest = Ready::EMPTY;
                         self.readiness = Ready::HUP | Ready::ERROR;
-                        return Err(ChannelError::Read(write_error));
+                        return Err(ChannelError::Write(write_error));
                     }
                 },
             }
@@ -997,6 +997,17 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
     }
 
     /// fills the back buffer with data AND writes on the socket
+    ///
+    /// Returns `Ok(())` only once the whole back buffer reached the socket.
+    /// A `write(2)` interrupted by a signal is retried; every other error is
+    /// returned as `ChannelError::Write`, and the bytes not yet written stay in
+    /// `back_buf` (sozu-proxy/sozu#1563).
+    ///
+    /// `WouldBlock` is not retried. On a blocking socket it only follows a send
+    /// timeout (`SO_SNDTIMEO`), and this channel never arms one: `set_timeout`
+    /// sets the read timeout alone. Retrying would spin on a descriptor someone
+    /// else made nonblocking, and success would claim a delivery that did not
+    /// happen, so it is reported like any other write failure.
     fn write_message_blocking(&mut self, message: &Tx) -> Result<(), ChannelError> {
         self.write_delimited_message(message)?;
 
@@ -1011,7 +1022,8 @@ impl<Tx: Debug + ProstMessage + Default, Rx: Debug + ProstMessage + Default> Cha
                 Ok(bytes_written) => {
                     self.back_buf.consume(bytes_written);
                 }
-                Err(_) => return Ok(()), // are we sure?
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => return Err(ChannelError::Write(error)),
             }
         }
         Ok(())
@@ -1312,11 +1324,14 @@ mod tests {
         writing_channel.blocking().expect("Could not block channel");
 
         trace!("reading message in a detached thread, with a timeout of 100 milliseconds...");
+        // Hand the channel back with the result: dropping it when the thread
+        // ends would close the peer, and the late write below would then fail
+        // with `EPIPE` instead of arriving too late (sozu-proxy/sozu#1563).
         let awaiting_with_timeout = thread::spawn(move || {
             let message =
                 reading_channel.read_message_blocking_timeout(Some(Duration::from_millis(100)));
             trace!("read message!");
-            message
+            (message, reading_channel)
         });
 
         trace!("Waiting 200 milliseconds…");
@@ -1327,7 +1342,7 @@ mod tests {
             .expect("Could not write message on channel");
         trace!("we wrote a message that should arrive too late!");
 
-        let arrived_too_late = awaiting_with_timeout
+        let (arrived_too_late, _reading_channel) = awaiting_with_timeout
             .join()
             .expect("error with receiving message from awaiting thread");
 
@@ -2062,7 +2077,8 @@ mod tests {
     }
 
     /// Same contract on the write side: `EPIPE` towards a closed peer must
-    /// mark the channel for closing, as `Ok(0)` already does.
+    /// mark the channel for closing, as `Ok(0)` already does, and is reported
+    /// as `ChannelError::Write`, not `Read` (sozu-proxy/sozu#1563).
     #[test]
     fn a_write_error_keeps_the_channel_marked_for_closing() {
         for initial in [
@@ -2080,8 +2096,10 @@ mod tests {
             local.interest.insert(Ready::WRITABLE);
             local.readiness = initial;
             match local.writable() {
-                Err(ChannelError::Read(error)) => assert_eq!(error.kind(), ErrorKind::BrokenPipe),
-                other => panic!("expected a broken pipe, got {other:?}"),
+                Err(ChannelError::Write(error)) => {
+                    assert_eq!(error.kind(), ErrorKind::BrokenPipe)
+                }
+                other => panic!("expected a broken pipe reported as a write error, got {other:?}"),
             }
             assert!(
                 local.readiness.is_hup() && local.readiness.is_error(),
@@ -2091,5 +2109,25 @@ mod tests {
             assert!(!local.readiness.is_readable() && !local.readiness.is_writable());
             assert_eq!(local.interest, Ready::EMPTY);
         }
+    }
+
+    /// A blocking write towards a closed peer must fail with the socket error.
+    /// It used to return `Ok(())` for any `write(2)` error, leaving the frame
+    /// in `back_buf` while the caller believed it delivered
+    /// (sozu-proxy/sozu#1563).
+    #[test]
+    fn a_blocking_write_to_a_closed_peer_is_an_error() {
+        let (mut blocking, peer) = test_channels();
+        assert!(blocking.is_blocking());
+        drop(peer);
+
+        match blocking.write_message(&ProtobufMessage { inner: 9 }) {
+            Err(ChannelError::Write(error)) => assert_eq!(error.kind(), ErrorKind::BrokenPipe),
+            other => panic!("expected a broken pipe reported as a write error, got {other:?}"),
+        }
+        assert!(
+            blocking.back_buf.available_data() > 0,
+            "the unsent frame must stay in the back buffer"
+        );
     }
 }
