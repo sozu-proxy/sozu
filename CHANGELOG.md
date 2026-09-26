@@ -2393,6 +2393,43 @@
   two `+1` stay macros where they already correctly sit, and the single `-1` is an event both record.
   Two e2e tests pin it per path, and both were seen red — see `doc/testing.md`.
 
+- **`refactor(mux-h1)`: `ConnectionH1`'s `Debug` renders the peer address instead of the socket.**
+  **No behaviour change** outside one rendered `Debug` line.
+
+  `.field("socket", &self.socket.socket_ref())` becomes `.field("peer_address",
+  &self.peer_address)` — the same field name, in the same slot, that `ConnectionH2`'s `Debug`
+  already renders (the `refactor(mux-h2)` entry in this section). `ConnectionH1` was the last
+  `Debug` in `protocol/mux/` still naming the raw socket: of the module's four `debug_struct`
+  sites it was the only one left handing `mio::net::TcpStream`'s own `Debug` a local address, a
+  live `getpeername(2)` taken at format time, and a file descriptor. `peer_address` is the
+  snapshot `Connection::new_h1_server` and `Connection::new_h1_client` each take once from
+  `SocketHandler::peer_addr`, and it is the source every `log_context!` line of the same
+  connection already renders — so until now one session ULID rendered two different peers
+  depending on whether a trace carried the struct or a log line. The three consequences are the
+  ones `doc/h2_mux_internals.md` already states for H2, and that document now says so for H1:
+  the descriptor, which named nothing outside this process, is gone; the address survives the
+  peer's reset, where the live lookup answers `ENOTCONN` on exactly the error lines an operator
+  reads during an incident; and on a PROXY-protocol frontend it names the client the header
+  advertised rather than the load balancer the transport is connected to.
+
+  `socket_ref()` code reaches in `h1.rs`'s production range go **4 to 3**, and `socket_mut()`
+  stays at 0. The three survivors are the `stats::socket_rtt` samples in `ConnectionH1::writable`:
+  those read a round-trip time rather than an address and are deliberately untouched. Unlike
+  `ConnectionH2`, which shed its `Front` parameter to `H2Shell`, `ConnectionH1` keeps
+  `Front: SocketHandler` — this is the rendering half of that change and none of its extraction
+  half, so no simulator or dev-dependency moves.
+
+  Seen red before it was trusted, on the VALUE rather than on a field name or a count.
+  `debug_renders_the_proxy_advertised_peer_not_the_transport_socket` builds a frontend connection
+  over a genuinely connected loopback socket whose `SessionTcpStream` declares `10.0.0.42:12345`,
+  asserts first that the live lookup is healthy and disagrees with that declaration — so the test
+  cannot pass for the wrong reason — and then asserts on what `{:?}` renders. Against the pre-fix
+  impl it fails with `socket: TcpStream { addr: 127.0.0.1:34880, peer: 127.0.0.1:33567, fd: 4 }`
+  and the declared address nowhere in the line: one test red, `1147 filtered out`, nothing else
+  moved. Because both assertions name addresses only, they share no literal with the production
+  diff. `sozu-lib` goes 1147 to 1148 tests; `sozu`, `sozu-command-lib`, `sozu-e2e` and `sozu-sim`
+  are unmoved.
+
 ### 🐛 Fixed
 
 - **`fix(mux)`: the `peer=` slot of every `MUX` log line is read from the snapshot the frontend

@@ -201,7 +201,7 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
         f.debug_struct("ConnectionH1")
             .field("position", &self.position)
             .field("readiness", &self.readiness)
-            .field("socket", &self.socket.socket_ref())
+            .field("peer_address", &self.peer_address)
             .field("stream", &self.stream)
             .field("reused_from_pool", &self.reused_from_pool)
             .finish()
@@ -1723,5 +1723,66 @@ mod tests {
             tags: None,
             access_log_message: None,
         }
+    }
+
+    /// `ConnectionH1`'s `Debug` renders the peer address the connection
+    /// snapshotted at construction, not the transport address the kernel knows.
+    ///
+    /// This is the twin of `ConnectionH2`'s `Debug`, which already renders
+    /// `peer_address` and names no socket at all. `ConnectionH1` was the last
+    /// `Debug` in this module handing `mio::net::TcpStream`'s own `Debug` a
+    /// `socket` field through `SocketHandler::socket_ref` — a local address, a
+    /// peer address and a file descriptor — and so the last one whose rendered
+    /// line could disagree with the `peer=` slot every `log_context!` line of
+    /// the same connection already carries.
+    ///
+    /// Staged like
+    /// [`log_context_renders_the_proxy_advertised_peer_not_the_load_balancer`]:
+    /// a genuinely connected loopback socket whose live lookup is healthy and
+    /// disagrees with the address its handler declares, which is the
+    /// PROXY-protocol frontend's shape. This pins the VALUE rendered rather
+    /// than a count — the two addresses differ, so only one of them can appear.
+    ///
+    /// To SEE THIS RED: in `impl Debug for ConnectionH1`, put
+    /// `.field("socket", &self.socket.socket_ref())` back in place of
+    /// `.field("peer_address", &self.peer_address)`. The rendered struct then
+    /// carries the loopback address the socket is really connected to — the
+    /// load balancer — so the first assertion fails on the missing advertised
+    /// client and the second on the transport address being present.
+    #[test]
+    fn debug_renders_the_proxy_advertised_peer_not_the_transport_socket() {
+        let (_listener, stream, live_peer) = connected_loopback_stream();
+        let advertised = cached_peer();
+
+        // Premise: the live lookup is healthy and disagrees with the declared
+        // address, so the assertions below cannot pass for the wrong reason.
+        assert_eq!(
+            stream.peer_addr().ok(),
+            Some(live_peer),
+            "the test socket must be genuinely connected, so a live lookup succeeds"
+        );
+        assert_ne!(
+            advertised, live_peer,
+            "the declared and transport addresses must differ for this test to discriminate"
+        );
+
+        let session_ulid = Ulid::generate();
+        let connection = h1_of(Connection::new_h1_server(
+            session_ulid,
+            SessionTcpStream::new(stream, session_ulid, Some(advertised)),
+            Duration::from_secs(30),
+        ));
+
+        let rendered = format!("{connection:?}");
+
+        assert!(
+            rendered.contains(&format!("Some({advertised})")),
+            "the ConnectionH1 Debug must render the declared peer: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&live_peer.to_string()),
+            "the ConnectionH1 Debug must not render the transport address, which \
+             is the load balancer on a PROXY frontend: {rendered}"
+        );
     }
 }
