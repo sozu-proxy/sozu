@@ -16466,7 +16466,7 @@ mod tests {
         let gids = open_streams(&mut fixture, &mut context, 1);
         let gid = gids[0];
         let metrics = &mut context.streams[gid].metrics;
-        metrics.backend_id = Some("ledger-backend".to_owned());
+        metrics.backend_id = Some("ledger-backend".into());
         metrics.backend_start();
         metrics.backend_connected();
 

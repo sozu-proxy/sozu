@@ -729,17 +729,17 @@ impl Router {
                 return Err(BackendConnectionError::MaxSessionsMemory);
             }
             // For reused backends: set context fields and metrics lifecycle.
-            // Both values are read off the connection's own `BackendId`, which
-            // copied them at dial. They are identity, immutable for the life
-            // of the registry entry, so this is the same answer the registry
-            // borrow used to give — without the core holding the handle.
+            // Both values are read off the connection's own `BackendId`; the id
+            // is an `Rc` clone, not a heap copy (#1579). They are identity,
+            // immutable for the life of the registry entry: the answer the
+            // registry borrow used to give, without the core holding the handle.
             if let Some(backend_conn) = self.backends.get(&token)
                 && let Position::Client(_, backend, _) = backend_conn.position()
             {
                 let stream = &mut context.streams[stream_id];
-                stream.context.backend_id = Some(backend.backend_id.to_string());
+                stream.context.backend_id = Some(Rc::clone(&backend.backend_id));
                 stream.context.backend_address = Some(backend.address);
-                stream.metrics.backend_id = Some(backend.backend_id.to_string());
+                stream.metrics.backend_id = Some(Rc::clone(&backend.backend_id));
                 stream.metrics.backend_start();
                 stream.metrics.backend_connected();
             }
@@ -1182,7 +1182,7 @@ impl Router {
             context.sticky_session = Some(sticky_session);
         }
 
-        context.backend_id = Some((*dialed.backend.backend_id).to_owned());
+        context.backend_id = Some(Rc::clone(&dialed.backend.backend_id));
         context.backend_address = Some(dialed.backend.address);
 
         Ok((dialed.socket, dialed.backend))
@@ -2924,6 +2924,135 @@ mod backend_selection_order_tests {
             );
         }
     }
+
+    /// #1579: the routing decision for a request that reuses a pooled
+    /// backend connection allocates nothing of its own, in steady state.
+    ///
+    /// The reuse branch of `Router::decide_after_gate` stamps the stream's
+    /// `HttpContext` and `SessionMetrics` with the id the connection's
+    /// `BackendId` carries. That id is an `Rc<str>`, so the stamp is a
+    /// reference-count increment; a `String` copy there costs one heap
+    /// allocation per field and per request.
+    ///
+    /// Measured as a difference against a control that performs the same mux
+    /// bookkeeping the branch triggers — `Connection::start_stream` then
+    /// `Context::link_stream` on the same keep-alive socket — and nothing
+    /// else. Both of those allocate once per request today, independently of
+    /// the router: `remove_backend_stream` drops the emptied reverse-index
+    /// `Vec` that `link_stream` rebuilds, and `Mux::apply_backend_deltas`
+    /// takes the delta ledger `start_stream` pushes into. Each request is
+    /// released the way production releases it (`Context::unlink_stream`,
+    /// then the ledger taken as a Mux pass takes it), so the control carries
+    /// exactly those costs and the difference is what the decision adds.
+    ///
+    /// TO SEE THIS RED: stamp either field with
+    /// `Some(backend.backend_id.to_string().into())` instead of the `Rc`
+    /// clone; the difference is then two allocations per request per field
+    /// (the `String`, then the `Rc<str>` built from it).
+    #[test]
+    fn a_request_on_a_reused_backend_connection_allocates_nothing() {
+        use std::hint::black_box;
+
+        use crate::test_allocations::allocations;
+
+        const REQUESTS: usize = 64;
+        let backend_token = Token(LOWEST_TOKEN);
+
+        let fixture = routing_fixture();
+        let mut context = Context::new(
+            Ulid::generate(),
+            Rc::downgrade(&fixture.pool),
+            fixture.listener.clone(),
+            None,
+            "127.0.0.1:80"
+                .parse()
+                .expect("test public address must parse"),
+        );
+        let stream_id = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out a stream");
+        context.streams[stream_id].context.method = Some(Method::Get);
+
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let mut backend_registry = BackendRegistry::default();
+        let (connection, _peer) =
+            staged_backend(&fixture.pool, &Staged::KeepAliveH1, &mut backend_registry);
+        router.backends.insert(backend_token, connection);
+
+        // Released as `ConnectionH1::end_stream` releases a terminated
+        // response on a keep-alive backend, then the ledger drained as the
+        // next Mux pass drains it.
+        let release = |router: &mut Router, context: &mut Context<HttpListener>| {
+            assert_eq!(
+                context.streams[stream_id].state,
+                StreamState::Linked(backend_token)
+            );
+            context.unlink_stream(stream_id);
+            drop(std::mem::take(&mut context.backend_deltas));
+            context.streams[stream_id].forget_upstream_replay();
+            context.streams[stream_id].state = StreamState::Link;
+            let Some(Connection::H1(h1)) = router.backends.get_mut(&backend_token) else {
+                unreachable!("the staged backend is an H1 connection")
+            };
+            h1.stream = None;
+            if let Position::Client(_, _, status) = &mut h1.position {
+                *status = BackendStatus::KeepAlive;
+            }
+        };
+        // One request through the routing decision.
+        let decision = |router: &mut Router, context: &mut Context<HttpListener>| -> usize {
+            let before = allocations();
+            let plan = router.decide_after_gate(
+                stream_id,
+                black_box(&mut *context),
+                black_box(H1_CLUSTER),
+                false,
+                false,
+            );
+            let allocated = allocations() - before;
+            assert!(
+                matches!(plan, Ok(ConnectPlan::Attached)),
+                "the keep-alive socket must be reused, got {plan:?}"
+            );
+            release(router, context);
+            allocated
+        };
+        // The same socket attached by hand: only the mux bookkeeping.
+        let control = |router: &mut Router, context: &mut Context<HttpListener>| -> usize {
+            let before = allocations();
+            let started = router
+                .backends
+                .get_mut(&backend_token)
+                .expect("the staged backend is registered")
+                .start_stream(stream_id, black_box(&mut *context));
+            context.link_stream(stream_id, backend_token);
+            let allocated = allocations() - before;
+            assert!(started, "the keep-alive socket must accept the stream");
+            release(router, context);
+            allocated
+        };
+
+        // Warm-up: metric keys and tables are sized by the first request.
+        decision(&mut router, &mut context);
+        control(&mut router, &mut context);
+        let (mut decided, mut controlled) = (0, 0);
+        for _ in 0..REQUESTS {
+            decided += decision(&mut router, &mut context);
+            controlled += control(&mut router, &mut context);
+        }
+
+        decision(&mut router, &mut context);
+        let stream = &context.streams[stream_id];
+        assert_eq!(stream.context.backend_id.as_deref(), Some("test-backend"));
+        assert_eq!(stream.metrics.backend_id.as_deref(), Some("test-backend"));
+        assert_eq!(
+            decided.saturating_sub(controlled),
+            0,
+            "{REQUESTS} requests on a reused keep-alive backend made {decided} \
+             heap allocations in the routing decision against {controlled} for \
+             the mux bookkeeping alone, expected no difference"
+        );
+    }
 }
 
 /// [`Router::backend_from_request`] against the embedder's real dialer.
@@ -3123,6 +3252,101 @@ mod backend_dialer_tests {
             Some(&*backend.backend_id),
             "a sticky frontend with no cookie answers with the chosen \
              backend's id when it has no sticky id of its own"
+        );
+    }
+
+    /// #1579: stamping a dialled backend onto the request allocates nothing.
+    ///
+    /// `Router::backend_from_request` runs once per backend dial and writes
+    /// the chosen backend's id into `HttpContext::backend_id`. The id arrives
+    /// as the `Rc<str>` of the dialled `BackendId`, so the stamp is a
+    /// reference-count increment. The dialer is a stub handing out sockets
+    /// connected beforehand, so the count covers the router's own work and
+    /// not `connect(2)` or the load balancer.
+    ///
+    /// TO SEE THIS RED: stamp `Some(dialed.backend.backend_id.to_string().into())`
+    /// instead of the `Rc` clone; the assertion then reports two allocations
+    /// per dial.
+    #[test]
+    fn stamping_a_dialled_backend_allocates_nothing() {
+        use std::hint::black_box;
+
+        use mio::net::TcpStream;
+
+        use super::{Affinity, BackendDialer, DialedBackend};
+        use crate::{backends::BackendError, test_allocations::allocations};
+
+        const DIALS: usize = 64;
+
+        /// Hands out one pre-connected socket per dial, always for `backend`.
+        struct StubDialer {
+            backend: BackendId,
+            sockets: Vec<TcpStream>,
+        }
+
+        impl BackendDialer for StubDialer {
+            fn select_and_dial(
+                &mut self,
+                _cluster_id: &str,
+                _affinity: Affinity<'_>,
+            ) -> Result<DialedBackend, BackendError> {
+                let socket = self
+                    .sockets
+                    .pop()
+                    .expect("the stub holds one socket per dial");
+                Ok(DialedBackend {
+                    backend: self.backend.clone(),
+                    socket,
+                    sticky_session: None,
+                })
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener must bind");
+        let address = listener
+            .local_addr()
+            .expect("a bound listener has an address");
+        let backend = std::rc::Rc::new(std::cell::RefCell::new(Backend::new(
+            "stamped-backend",
+            address,
+            None,
+            None,
+            None,
+        )));
+        let mut registry = BackendRegistry::default();
+        let mut dialer = StubDialer {
+            backend: registry.id_for(&backend),
+            sockets: (0..=DIALS)
+                .map(|_| TcpStream::connect(address).expect("a loopback connect must start"))
+                .collect(),
+        };
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let mut context = request(None);
+
+        // Warm-up: the first stamp fills the slot the later ones overwrite.
+        drop(
+            router
+                .backend_from_request(CLUSTER, false, &mut context, &mut dialer)
+                .expect("the stub dialer always dials"),
+        );
+        let mut allocated = 0;
+        for _ in 0..DIALS {
+            let before = allocations();
+            let dialed = router.backend_from_request(
+                black_box(CLUSTER),
+                false,
+                black_box(&mut context),
+                &mut dialer,
+            );
+            allocated += allocations() - before;
+            drop(dialed.expect("the stub dialer always dials"));
+        }
+
+        assert_eq!(context.backend_id.as_deref(), Some("stamped-backend"));
+        assert_eq!(
+            allocated, 0,
+            "{DIALS} dials made {allocated} heap allocations stamping the \
+             backend onto the request, expected none"
         );
     }
 }

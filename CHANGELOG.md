@@ -376,6 +376,25 @@
 
 ### 🔄 Changed
 
+- **`perf(mux)`: the backend id is no longer copied into a `String` per request
+  ([#1579](https://github.com/sozu-proxy/sozu/issues/1579)).** `HttpContext::backend_id` and
+  `SessionMetrics::backend_id` are now `Option<Rc<str>>` instead of `Option<String>`, and the mux
+  fills them with a clone of the `Rc<str>` the connection's `BackendId` already carries. On a
+  request that reuses a pooled backend connection, `Router::decide_after_gate`
+  (`lib/src/protocol/mux/router.rs`) made two heap copies of the id, one per field; it now makes
+  none. Measured with the counting allocator over 64 requests on a reused keep-alive backend,
+  against a control that performs only the mux bookkeeping the branch triggers: 256 allocations
+  against 128 before, 128 against 128 after. On every dial, `Router::backend_from_request` (64
+  allocations over 64 dials before, 0 after) and `Mux::dial_backend` (the second copy into
+  `SessionMetrics` and the gauge label) no longer copy it either. Both fields change type:
+  readers that went through `as_deref()` are unaffected, and the one production writer outside
+  the mux, raw TCP (`lib/src/tcp.rs`), still copies the id once per session, as before. Still
+  allocating on these paths, and left to separate changes: the dial's two `cluster_id` copies
+  (`ConnectPlan::Dial` and `Position::Client` own a `String`), the per-request
+  `HttpContext::cluster_id` copy in `Router::plan_connect`, the reverse-index `Vec` that
+  `Context::link_stream` rebuilds on every attach, and the delta ledger that
+  `Mux::apply_backend_deltas` takes instead of draining.
+
 - **`perf(mux)`: a redial of an already-interned backend allocates nothing
   ([#1564](https://github.com/sozu-proxy/sozu/issues/1564)).** `BackendRegistry::id_for`
   (`lib/src/protocol/mux/mod.rs`) runs once per backend connection a mux session opens, and copied

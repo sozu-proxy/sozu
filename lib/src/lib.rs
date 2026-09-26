@@ -1372,7 +1372,9 @@ pub struct SessionMetrics {
     pub service_start: Option<Instant>,
     pub wait_start: Instant,
 
-    pub backend_id: Option<String>,
+    /// The id of the backend serving this request. An `Rc<str>` so the mux
+    /// shares the one its `BackendId` carries instead of copying it (#1579).
+    pub backend_id: Option<Rc<str>>,
     pub backend_start: Option<Instant>,
     pub backend_connected: Option<Instant>,
     /// date at which the backend's response headers finished parsing — the

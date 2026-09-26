@@ -1744,7 +1744,7 @@ impl TcpSession {
         self.set_back_token(back_token);
         self.set_back_socket(stream);
 
-        self.metrics.backend_id = Some(backend.borrow().backend_id.clone());
+        self.metrics.backend_id = Some(Rc::from(backend.borrow().backend_id.as_str()));
         self.metrics.backend_start();
         self.set_backend_id(backend.borrow().backend_id.clone());
 

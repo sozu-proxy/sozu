@@ -303,13 +303,13 @@ pub struct BackendSlot(usize);
 /// `connection_time`, `health`, `status`) stays behind the slot, and the core
 /// reaches it only by emitting a [`BackendDelta`].
 ///
-/// `backend_id` is an `Rc<str>` because the `BackendStatus::Connecting` ->
-/// `BackendStatus::Connected` transition rebuilds the `Position::Client`
-/// variant once per dial. That reconstruction cost one `Rc` bump when the
-/// field was an `Rc<RefCell<Backend>>`; a `String` would make it a heap copy.
-/// For the same reason the registry keeps the `Rc<str>` it built at interning
-/// time, so minting the id for a redial is a reference-count increment rather
-/// than a fresh allocation (#1564).
+/// `backend_id` is an `Rc<str>` so that no step past interning copies it:
+/// rebuilding `Position::Client` on `Connecting` -> `Connected` once per dial,
+/// minting the id for a redial (the registry keeps the `Rc<str>` it built at
+/// interning, #1564), and stamping a request with the backend it runs on,
+/// dialled or reused, into `HttpContext::backend_id` and
+/// `SessionMetrics::backend_id` (#1579) are each a reference-count increment.
+/// A `String` would make every one of them a heap copy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendId {
     /// Private to this module: [`Mux::backend`] is the only way out.
@@ -1983,7 +1983,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             .listener
             .borrow()
             .get_h2_graceful_shutdown_deadline();
-        let backend_id_for_gauge = backend.backend_id.to_string();
+        let backend_id_for_gauge = Rc::clone(&backend.backend_id);
         let mut connection = if h2 {
             match Connection::new_h2_client(
                 context.session_ulid,
@@ -2029,7 +2029,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // --- Happy path: commit side-effects in one atomic-ish block ---
         let stream = &mut context.streams[stream_id];
         stream.metrics.backend_start();
-        stream.metrics.backend_id = stream.context.backend_id.to_owned();
+        stream.metrics.backend_id = stream.context.backend_id.clone();
         gauge_add!(names::backend::CONNECTIONS, 1);
         // `backend.pool.size` mirrors `backend.connections` exactly: one entry
         // per `Router::backends` token. The `-1` partners live in
