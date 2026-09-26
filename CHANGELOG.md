@@ -4301,6 +4301,27 @@
   Neither `access_logs_format = "protobuf"` nor any other backend is affected, no configuration key
   changes, and no production dependency is added.
 
+- **`fix(logging)`: a stopping worker no longer loses the access-log records still buffered for a
+  `file://` target.** A `file://` target writes through a `MultiLineWriter` that holds records back
+  until its 4096-byte buffer fills, which is what keeps it well under one `write(2)` per record. On
+  `sozu shutdown`, `sozu shutdown --hard` and `sozu upgrade --worker` the worker leaves its event
+  loop and returns from `begin_worker_process`; dropping its `Server` there closes the channel to the
+  main process, which answers the closed channel with `SIGKILL` from `Server::close_worker` — before
+  the thread-local `LOGGER` drops and flushes on its own. Measured on a one-worker proxy with
+  `access_logs_target = "file://…"` and 27 requests per run, five runs per path: 6 of 27 records
+  missing on every run of all three paths before, all 27 present after, the request paths read back
+  from the file identical to the ones sent. `begin_worker_process` now drains both log backends
+  while the channel is still open, through a new `InnerLogger::flush`, which `log::Log::flush` for
+  `CompatLogger` now also reaches instead of doing nothing. The per-record path is untouched: the
+  flush runs once per worker lifetime, and the access log costs the same 27 `write(2)` for 300
+  requests before and after, plus exactly one at exit. No `fsync` is added.
+  **Not covered, by decision:** a worker that dies without reaching the end of its event loop still
+  loses whatever is buffered — a crash, and also an external signal, since a worker installs no
+  handler. That includes `systemctl stop` on the shipped unit, which declares no `ExecStop=` and so
+  sends `SIGTERM` to the whole cgroup; the measured loss there is unchanged. Writing every record
+  through would close that gap at the cost of one syscall per record, which is not taken.
+  Seen red before green: `flushing_the_logger_writes_out_every_buffered_file_record` fails with 0 of
+  8 lines on both files when `CompatLogger`'s `flush` is emptied back to a no-op, and passes restored.
 
 ### ➖ Removed
 

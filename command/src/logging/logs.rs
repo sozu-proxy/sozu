@@ -307,6 +307,26 @@ fn log_arguments(
 }
 
 impl InnerLogger {
+    /// Drain the buffered records of both the main and the access-log backend.
+    ///
+    /// Called once, on a worker's way out: nothing on the per-record path
+    /// flushes, which is what lets a `file://` target batch many records into
+    /// one `write(2)`. Errors are printed rather than logged, because logging
+    /// from here would re-borrow the [`LOGGER`] cell this runs under.
+    pub fn flush(&mut self) {
+        if let Err(e) = self.backend.flush() {
+            println!("Could not flush logs to {}: {e:?}", self.backend.as_ref());
+        }
+        if let Some(access_backend) = self.access_backend.as_mut()
+            && let Err(e) = access_backend.flush()
+        {
+            println!(
+                "Could not flush access logs to {}: {e:?}",
+                access_backend.as_ref()
+            );
+        }
+    }
+
     pub fn log(&mut self, args: Arguments) {
         if let Err(e) = log_arguments(args, &mut self.backend, &mut self.buffer) {
             println!("Could not write log to {}: {e:?}", self.backend.as_ref());
@@ -437,6 +457,21 @@ impl LoggerBackend {
     fn revive(&mut self, log_target: &str) -> Result<(), LogError> {
         *self = target_to_backend(log_target)?;
         Ok(())
+    }
+
+    /// Write out whatever this backend still holds in user space.
+    ///
+    /// Only `File` (a [`MultiLineWriter`] that drains whole lines once its
+    /// buffer fills) and `Stdout` (a line-buffered `Stdout`) keep bytes back;
+    /// every other backend already sent each record in its own syscall, so
+    /// there is nothing left to write. No `fsync`: this empties the process
+    /// buffer, it does not make the kernel's page cache durable.
+    fn flush(&mut self) -> Result<(), IoError> {
+        match self {
+            LoggerBackend::File(file) => file.flush(),
+            LoggerBackend::Stdout(stdout) => stdout.flush(),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -1104,7 +1139,16 @@ impl log::Log for CompatLogger {
         })
     }
 
-    fn flush(&self) {}
+    /// Drain the thread's [`LOGGER`]. A no-op when that cell is already
+    /// borrowed, which only happens if `flush` is reached from inside a log
+    /// call on the same thread.
+    fn flush(&self) {
+        LOGGER.with(|logger| {
+            if let Ok(mut logger) = logger.try_borrow_mut() {
+                logger.flush();
+            }
+        })
+    }
 }
 
 /// start a logger used in test environment
