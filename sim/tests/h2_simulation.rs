@@ -1092,7 +1092,10 @@ impl H2Harness {
     /// The stream write pass. Mirrors `H2Shell::write_streams`.
     ///
     /// The `Vec<IoSlice<'static>>` bracket is this driver's own, and it opens
-    /// and closes inside this one function exactly as the shell's does.
+    /// and closes inside this one function exactly as the shell's does. The
+    /// shell keeps its vector in a private field to reuse the capacity across
+    /// passes; this driver keeps a local, because a test harness has no
+    /// allocation budget and the bracket is the same either way.
     fn write_streams(&mut self) -> MuxResult {
         let byte_totals = {
             let Self {

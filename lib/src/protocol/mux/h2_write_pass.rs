@@ -44,7 +44,10 @@
 //! `h2_transmit::confirm` must discharge them before the consume that may
 //! relocate that storage. Leaving the vector with the shell keeps that
 //! `unsafe` window exactly as wide as the three adjacent statements that open
-//! and close it, and stops the poll/handle boundary from spanning it.
+//! and close it, and stops the poll/handle boundary from spanning it. The
+//! shell keeps it as a private field for the connection's lifetime, so its
+//! capacity is reused from one pass to the next and a warm pass allocates
+//! nothing for it.
 //!
 //! The pass is a local threaded by `&mut`, never a field on `ConnectionH2`:
 //! every exit of `write_streams` ends it, and every phase transition falls
