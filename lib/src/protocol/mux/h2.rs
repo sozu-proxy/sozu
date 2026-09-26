@@ -2596,6 +2596,36 @@ impl ConnectionH2 {
                         return self.force_disconnect();
                     }
                 };
+                // Enlarge the connection-level receive window beyond the RFC
+                // default of 65 535 bytes, in the same `zero` flush as the
+                // SETTINGS above and the ACK `handle_frame` appends below: one
+                // `writev(2)` for the whole server preface instead of a second
+                // write pass for a queued WINDOW_UPDATE. RFC 9113 §3.4 only
+                // requires SETTINGS to come first. Skipped when the configured
+                // window is the default, since a zero-increment WINDOW_UPDATE
+                // violates RFC 9113 §6.9. Our own send window is untouched:
+                // this enlarges the peer's send allowance, not ours.
+                let increment = self
+                    .connection_config
+                    .initial_connection_window
+                    .saturating_sub(DEFAULT_INITIAL_WINDOW_SIZE);
+                if increment > 0 {
+                    match serializer::gen_window_update(kawa.storage.space(), 0, increment) {
+                        Ok((_, size)) => {
+                            kawa.storage.fill(size);
+                            self.metric_events
+                                .push(MetricEvent::WindowUpdateFramesSent(1));
+                        }
+                        Err(error) => {
+                            error!(
+                                "{} Could not serialize the connection WINDOW_UPDATE: {:?}",
+                                log_context!(self),
+                                error
+                            );
+                            return self.force_disconnect();
+                        }
+                    }
+                }
 
                 self.state = H2State::ServerSettings;
                 self.stream_table.set_expect_write(Some(H2StreamId::Zero));
@@ -4256,27 +4286,11 @@ impl ConnectionH2 {
                 H2WritableStateTarget::Done(MuxResult::Continue)
             }
             (H2State::ServerSettings, Position::Server) => {
-                // Enlarge the connection-level receive window beyond the RFC default
-                // of 65 535 bytes. The configured window size is too small for
-                // high-throughput proxying and causes excessive WINDOW_UPDATE
-                // round-trips. Use additive increment rather than unconditional
-                // assignment to preserve any window changes that occurred during
-                // setup. Skip if the configured window equals the default (no
-                // enlargement needed), since a zero-increment WINDOW_UPDATE
-                // violates RFC 9113 §6.9.
-                let increment = self
-                    .connection_config
-                    .initial_connection_window
-                    .saturating_sub(DEFAULT_INITIAL_WINDOW_SIZE);
-                if increment > 0 {
-                    self.queue_window_update(0, increment);
-                }
-                // Do NOT increment flow_control.window here: sending our own
-                // WINDOW_UPDATE enlarges the peer's send allowance, not ours.
-                // Our send window is only updated by WINDOW_UPDATEs we receive
-                // from the peer (RFC 9113 §6.9).
+                // The connection-window enlargement already left with the
+                // SETTINGS it follows: the `(ClientSettings, Server)` readable
+                // arm serialises both into `zero`, which the preamble above
+                // drained in one write.
                 self.expect_header();
-                // Keep WRITABLE so the queued WINDOW_UPDATE gets flushed.
                 H2WritableStateTarget::Done(MuxResult::Continue)
             }
             // Proxying states — writing application data (request/response).
@@ -6427,9 +6441,10 @@ impl ConnectionH2 {
         self.attribute_bytes_to_overhead();
 
         // Enlarge the connection-level receive window for backend H2
-        // connections (Position::Client). The server side does this in
-        // the ServerSettings writable path, but the client needs to do
-        // it here after receiving the server's initial SETTINGS.
+        // connections (Position::Client). The server side serialises it
+        // beside its own SETTINGS in the `(ClientSettings, Server)` readable
+        // arm, but the client needs to do it here after receiving the
+        // server's initial SETTINGS.
         if self.position.is_client()
             && self.flow_control.window() <= DEFAULT_INITIAL_WINDOW_SIZE as i32
         {
@@ -9522,6 +9537,11 @@ mod tests {
         /// delegated rounds are exactly what such an assertion has to be able
         /// to see.
         vectored_calls: usize,
+        /// How many NON-EMPTY `socket_write` calls reached this handler. On
+        /// `FrontRustls` each one ends in its own `write_tls`, so each one is
+        /// one `writev(2)` on the wire; an empty-buffer flush is counted by
+        /// `flushes` instead.
+        writes: usize,
     }
 
     impl BackpressuredTlsSocket {
@@ -9534,6 +9554,7 @@ mod tests {
                 vectored_script: std::collections::VecDeque::new(),
                 write_script: std::collections::VecDeque::new(),
                 vectored_calls: 0,
+                writes: 0,
             }
         }
     }
@@ -9550,6 +9571,7 @@ mod tests {
                 self.pending.set(self.pending.get() - drained);
                 return (0, SocketResult::Continue);
             }
+            self.writes += 1;
             match self.write_script.pop_front() {
                 Some((cap, status)) => (cap.min(buf.len()), status),
                 None => self.stream.socket_write(buf),
@@ -16503,6 +16525,93 @@ mod tests {
             "the first response-header byte arrives before the last response \
              byte: header_time {header_time:?} must not exceed response_time \
              {response_time:?}"
+        );
+    }
+
+    /// The server preface — SETTINGS, the connection-window enlargement and
+    /// the ACK of the client's SETTINGS — leaves in ONE socket write.
+    ///
+    /// On `FrontRustls` every non-empty `socket_write` ends in its own
+    /// `write_tls`, i.e. its own `writev(2)`. The enlargement used to be
+    /// queued by `dispatch_writable_state`'s `(ServerSettings, Server)` arm,
+    /// which runs after `drive_control_flush` already drained `zero`, so it
+    /// cost a second write pass and a second syscall on every connection.
+    ///
+    /// TO SEE THIS RED: move the `gen_window_update` call out of the
+    /// `(ClientSettings, Server)` readable arm back into a
+    /// `queue_window_update(0, increment)` in the `(ServerSettings, Server)`
+    /// writable arm. The write count becomes 2 and the first write carries 66
+    /// bytes, not 79.
+    #[test]
+    fn server_preface_settings_window_update_and_ack_share_one_write() {
+        use std::io::Read as _;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut connection, mut peer) =
+            connection_with_backpressure(&pool, 0, 0, H2State::ClientPreface);
+        connection
+            .core
+            .readiness
+            .interest
+            .insert(Ready::READABLE | Ready::WRITABLE);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        // Client preface + SETTINGS(MAX_CONCURRENT_STREAMS = 100).
+        let mut preface = serializer::H2_PRI.as_bytes().to_vec();
+        preface.extend_from_slice(&[0, 0, 6, 4, 0, 0, 0, 0, 0]);
+        preface.extend_from_slice(&parser::SETTINGS_MAX_CONCURRENT_STREAMS.to_be_bytes());
+        preface.extend_from_slice(&100u32.to_be_bytes());
+        let now = connection.core.now;
+        liveness_read(
+            &mut connection,
+            &mut context,
+            &mut router,
+            &mut peer,
+            now,
+            &preface,
+        );
+        liveness_write(&mut connection, &mut context, &mut router);
+
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "premise: the handshake must have reached the proxying state, got {:?}",
+            connection.core.state
+        );
+        assert_eq!(
+            connection.socket.writes, 1,
+            "SETTINGS, WINDOW_UPDATE(0) and the SETTINGS ACK must leave in a \
+             single socket write"
+        );
+
+        let settings_len = parser::FRAME_HEADER_SIZE
+            + (parser::SETTINGS_ENTRY_SIZE * parser::SETTINGS_COUNT) as usize;
+        let expected = settings_len + 13 + serializer::SETTINGS_ACKNOWLEDGEMENT.len();
+        let mut wire = vec![0u8; expected];
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("loopback read timeout must be settable");
+        peer.read_exact(&mut wire)
+            .expect("the peer must receive the whole server preface");
+        assert_eq!(
+            wire[3], 4,
+            "the first frame must be SETTINGS (RFC 9113 §3.4)"
+        );
+        assert_eq!(wire[4], 0, "the first SETTINGS must not be an ACK");
+        let window_update = &wire[settings_len..settings_len + 13];
+        assert_eq!(
+            window_update[3], 8,
+            "the second frame must be WINDOW_UPDATE"
+        );
+        assert_eq!(&window_update[5..9], &[0, 0, 0, 0], "on the connection");
+        assert_eq!(
+            u32::from_be_bytes(window_update[9..13].try_into().unwrap()),
+            H2ConnectionConfig::default().initial_connection_window - DEFAULT_INITIAL_WINDOW_SIZE,
+            "the enlargement must grant exactly the configured surplus"
+        );
+        assert_eq!(
+            &wire[settings_len + 13..],
+            &serializer::SETTINGS_ACKNOWLEDGEMENT,
+            "the ACK of the client's SETTINGS must close the preface"
         );
     }
 }
