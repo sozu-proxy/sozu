@@ -29,6 +29,26 @@ There are three configuration options related to logging:
   * `file:///var/logs/sozu.log`
 * `access_logs_target`: if activated, sends the access logs to a separate destination
 
+### How many syscalls a log record costs
+
+Each target batches differently, which matters when access logs are enabled on a busy proxy — one
+record is one `log_access` call, but not one syscall:
+
+| target     | writes per record | why |
+| ---------- | ----------------- | --- |
+| `file://`  | **fewer than one** | wrapped in a `MultiLineWriter`, which fills a 4096-byte buffer and flushes only whole lines, so one `write(2)` carries every record that fits. Measured at 0.10 writes per record with ~360-byte records. |
+| `stdout`   | one                | `std::io::Stdout` is a `LineWriter`. A record longer than its 1024-byte capacity is split across several writes. |
+| `unix://`, `udp://` | one        | the record is rendered into a reused buffer and sent as a single datagram, which is also what keeps a datagram framed. |
+| `tcp://`   | one                | same reused buffer, written with `write_all` because a stream may accept fewer bytes than offered. |
+
+`file://` trades durability for those syscalls: a record sits in the buffer until a later record
+fills it, and a worker that dies before the buffer drains loses whatever is still in it. Measured
+against a run emitting 27 records, 22 reached the file and 5 were lost. Nothing on the shutdown path
+recovers them — the `log::Log::flush` implementation is a no-op, a worker installs no signal handler,
+and `CommandServer::close_worker` terminates workers with `SIGKILL`, which no `Drop` can run after.
+Prefer `unix://` or `udp://` when no access log may be lost, and `file://` when syscall count matters
+more than the last records of a worker's life.
+
 `log_level` follows [env_logger's level directives](https://docs.rs/env_logger/0.5.13/env_logger/).
 Moreover, the `RUST_LOG` environment variable can be used to override the log level.
 

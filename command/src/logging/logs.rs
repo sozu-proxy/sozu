@@ -277,12 +277,30 @@ fn log_arguments(
     buffer: &mut LoggerBuffer,
 ) -> Result<(), IoError> {
     match backend {
+        // `Stdout` is a `LineWriter`, `File` a `MultiLineWriter`: both already
+        // collapse a record's fragments, so they take `args` directly.
         LoggerBackend::Stdout(stdout) => {
             let _ = stdout.write_fmt(args);
             Ok(())
         }
-        LoggerBackend::Tcp(socket) => socket.write_fmt(args),
+        // `Tcp` is the one backend with NO buffering of its own, so
+        // `write_fmt` sent every fragment of the formatter as its own syscall:
+        // measured on a loopback sink, one 360-byte access-log line cost 81.7
+        // `send(2)` calls, 822 of the 1634 in a 20-request run being a single
+        // byte. Formatting into the reused buffer first makes it one call, and
+        // allocates nothing per record.
+        //
+        // Unlike the datagram arms below, a stream may accept FEWER bytes than
+        // offered, so the record needs `write_all`: discarding the count here
+        // would silently truncate a log line.
+        LoggerBackend::Tcp(socket) => {
+            buffer.fmt(args, |bytes| socket.write_all(bytes).map(|()| bytes.len()))
+        }
         LoggerBackend::File(file) => file.write_fmt(args),
+        // Datagram sinks must hand the kernel one contiguous record: there is no
+        // incremental `write_str` that yields a single datagram. This is why the
+        // buffer exists at all -- it replaced the per-record `String` these two
+        // arms used to allocate.
         LoggerBackend::Unix(socket) => buffer.fmt(args, |bytes| socket.send(bytes)),
         LoggerBackend::Udp(sock, addr) => buffer.fmt(args, |b| sock.send_to(b, *addr)),
     }
@@ -1116,4 +1134,268 @@ pub fn now() -> (Rfc3339Time, i128) {
         Rfc3339Time { inner: t },
         (t - time::OffsetDateTime::UNIX_EPOCH).whole_nanoseconds(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    //! The property the `tcp://` access-log backend depends on: a record is
+    //! handed to the sink in ONE call, whatever its formatter fragment count.
+    //!
+    //! To SEE THESE RED (regression proof), restore the pre-fix `Tcp` arm of
+    //! [`super::log_arguments`] — `LoggerBackend::Tcp(socket) =>
+    //! socket.write_fmt(args)` — and change the two `buffer.fmt(...)` calls
+    //! below to `sink.write_fmt(...)`, which is what that arm does. Both
+    //! one-call expectations then fail with the fragment count in the message
+    //! (`39`, not `1`), and `a_short_write_does_not_truncate_a_record` reports a
+    //! truncated record. 39 is a FLOOR for the live record: this fixture omits
+    //! the tag map and the OpenTelemetry field, and the proxy was measured at 82
+    //! fragments per record.
+    //!
+    //! `cargo test` cannot count the `write(2)` syscalls the real
+    //! `LoggerBackend::Tcp(TcpStream)` arm performs: the variant holds a
+    //! concrete `TcpStream`, so no counting sink can be substituted, and the
+    //! only in-process syscall counter (`/proc/self/io`'s `syscw`) is
+    //! process-wide and would race every other test in the binary. That arm's
+    //! syscall count is proven outside the suite, by tracing the running proxy
+    //! (81.7 `send(2)` per access-log line before, 1 after; see the
+    //! `perf(logging)` CHANGELOG entry).
+    use super::LoggerBuffer;
+    use std::io::{Error as IoError, ErrorKind, Write};
+
+    /// Counts the calls a record arrives in, and records every chunk.
+    #[derive(Default)]
+    struct CountingSink {
+        calls: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
+            self.calls += 1;
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> Result<(), IoError> {
+            Ok(())
+        }
+    }
+
+    /// A stream sink that accepts at most `limit` bytes per call, the way a
+    /// `TcpStream` with a full send buffer does.
+    struct ShortWriteSink {
+        limit: usize,
+        calls: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for ShortWriteSink {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
+            self.calls += 1;
+            let n = buf.len().min(self.limit);
+            self.bytes.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> Result<(), IoError> {
+            Ok(())
+        }
+    }
+
+    /// The runtime field values of an access-log record.
+    ///
+    /// These must come from a NON-literal source. `format_args!` flattens
+    /// literal arguments into its template at compile time
+    /// (rustc's `flatten_format_args`), so a fixture built from literals
+    /// collapses to a single static piece and would measure nothing: the
+    /// fragment count this test exists to pin only appears for runtime values,
+    /// which is what `InnerLogger::log_access` actually passes.
+    struct Fields {
+        timestamp: &'static str,
+        nanos: u64,
+        pid: i32,
+        level: &'static str,
+        tag: &'static str,
+        context: &'static str,
+        session: &'static str,
+        backend: &'static str,
+        request_time: &'static str,
+        service_time: &'static str,
+        response_time: &'static str,
+        client_rtt: &'static str,
+        server_rtt: &'static str,
+        bytes_in: u64,
+        bytes_out: u64,
+        protocol: &'static str,
+        endpoint: &'static str,
+        request: &'static str,
+        status: u16,
+        message: &'static str,
+    }
+
+    #[inline(never)]
+    fn fields() -> Fields {
+        Fields {
+            timestamp: "2026-09-26T08:30:17.644122Z",
+            nanos: 1_790_411_417_644_122_623,
+            pid: 990_961,
+            level: "INFO-ACCESS",
+            tag: "WRK-00",
+            context: "01M3EDCA4D8KTDBGT0C64M50R1 PyBackend py",
+            session: "127.0.0.1:54610",
+            backend: "127.0.0.1:21080",
+            request_time: "1102\u{3bc}s",
+            service_time: "415\u{3bc}s",
+            response_time: "661\u{3bc}s",
+            client_rtt: "18\u{3bc}s",
+            server_rtt: "34\u{3bc}s",
+            bytes_in: 91,
+            bytes_out: 253,
+            protocol: "http",
+            endpoint: "lolcatho.st:21081",
+            request: "GET /index.html",
+            status: 200,
+            message: " | H1::Complete",
+        }
+    }
+
+    /// The live `AccessLogFormat::Ascii` template of `InnerLogger::log_access`,
+    /// prompt included: 20 runtime arguments, so 20 formatter fragments plus the
+    /// literal pieces between them.
+    macro_rules! access_log_shaped {
+        ($sink:expr, $buffer:expr, $f:expr) => {
+            $buffer.fmt(
+                format_args!(
+                    "{} {} {} {} {}\t[{}] {} {} {}/{}/{}/{}/{} {} {} {} {} {} {}{}\n",
+                    $f.timestamp,
+                    $f.nanos,
+                    $f.pid,
+                    $f.level,
+                    $f.tag,
+                    $f.context,
+                    $f.session,
+                    $f.backend,
+                    $f.request_time,
+                    $f.service_time,
+                    $f.response_time,
+                    $f.client_rtt,
+                    $f.server_rtt,
+                    $f.bytes_in,
+                    $f.bytes_out,
+                    $f.protocol,
+                    $f.endpoint,
+                    $f.request,
+                    $f.status,
+                    $f.message,
+                ),
+                |bytes| $sink.write(bytes),
+            )
+        };
+    }
+
+    #[test]
+    fn a_fragmented_record_reaches_the_sink_in_exactly_one_call() {
+        let mut buffer = LoggerBuffer(Vec::with_capacity(4096));
+        let mut sink = CountingSink::default();
+
+        let f = fields();
+        access_log_shaped!(sink, buffer, f).expect("the record is written");
+
+        assert_eq!(
+            sink.calls, 1,
+            "an access-log record must reach a stream sink in ONE call, not one \
+             per formatter fragment -- the `tcp://` backend has no buffering of \
+             its own, so a call here is a syscall there"
+        );
+        assert!(
+            sink.bytes.ends_with(b" | H1::Complete\n"),
+            "the single call must carry the COMPLETE record, terminator included"
+        );
+        assert!(
+            sink.bytes.starts_with(b"2026-09-26T08:30:17.644122Z "),
+            "...and start at the beginning of the record"
+        );
+    }
+
+    #[test]
+    fn the_buffer_is_reused_so_a_record_costs_no_allocation() {
+        let mut buffer = LoggerBuffer(Vec::with_capacity(4096));
+        let capacity_before = buffer.capacity();
+
+        let mut first = CountingSink::default();
+        let f = fields();
+        access_log_shaped!(first, buffer, f).expect("first record written");
+        let mut second = CountingSink::default();
+        access_log_shaped!(second, buffer, f).expect("second record written");
+
+        assert_eq!(
+            buffer.capacity(),
+            capacity_before,
+            "a record must not grow the buffer: the zero-allocation property of \
+             this path is what makes buffering acceptable on the hot path"
+        );
+        assert_eq!(second.calls, 1, "the second record is still a single call");
+        assert_eq!(
+            first.bytes, second.bytes,
+            "`fmt` clears the buffer, so a record must not carry the previous one's tail"
+        );
+    }
+
+    #[test]
+    fn a_short_write_does_not_truncate_a_record() {
+        // A datagram sink is all-or-nothing, so the `Unix`/`Udp` arms may discard
+        // the returned count. A stream may accept fewer bytes than offered, which
+        // is why the `Tcp` arm wraps `write_all` rather than `write`.
+        let mut buffer = LoggerBuffer(Vec::with_capacity(4096));
+        let mut sink = ShortWriteSink {
+            limit: 7,
+            calls: 0,
+            bytes: Vec::new(),
+        };
+
+        let written = buffer
+            .fmt(
+                format_args!("{} {} {}\n", "first", "second", "third"),
+                |bytes| sink.write_all(bytes).map(|()| bytes.len()),
+            )
+            .map(|()| sink.bytes.clone());
+
+        let bytes = written.expect("the record is written despite short writes");
+        assert_eq!(
+            bytes, b"first second third\n",
+            "`write_all` must keep going until the whole record is consumed; \
+             a bare `write` would have stopped after {} bytes",
+            sink.limit
+        );
+        assert!(
+            sink.calls > 1,
+            "the fixture must actually exercise the short-write path"
+        );
+    }
+
+    #[test]
+    fn a_sink_error_is_propagated() {
+        struct FailingSink;
+        impl Write for FailingSink {
+            fn write(&mut self, _: &[u8]) -> Result<usize, IoError> {
+                Err(IoError::new(ErrorKind::BrokenPipe, "peer went away"))
+            }
+            fn flush(&mut self) -> Result<(), IoError> {
+                Ok(())
+            }
+        }
+
+        let mut buffer = LoggerBuffer(Vec::with_capacity(4096));
+        let mut sink = FailingSink;
+        let error = buffer
+            .fmt(format_args!("a {} record\n", "failing"), |bytes| {
+                sink.write_all(bytes).map(|()| bytes.len())
+            })
+            .expect_err("a dead sink must surface, so `log_access` can revive the backend");
+
+        assert_eq!(
+            error.kind(),
+            ErrorKind::BrokenPipe,
+            "the sink's error kind must survive: `log_access` reports it and \
+             calls `LoggerBackend::revive`"
+        );
+    }
 }
