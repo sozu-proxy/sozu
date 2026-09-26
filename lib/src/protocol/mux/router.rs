@@ -270,14 +270,16 @@ pub(super) enum ConnectStep {
 /// The phase-one results the core needs handed back to finish deciding, plus
 /// what the embedder needs to consult the gate.
 ///
-/// Opaque on purpose: the embedder reads the four gate inputs through
-/// accessors and cannot reach — or forge — the routing results the core
-/// parked here. [`Router::plan_connect_resume`] takes it **by value**, so a
-/// resume cannot be replayed; that is `H2Shell::settled` taking its parked
-/// target, applied to this seam.
+/// Opaque on purpose: the embedder reads the gate inputs through accessors
+/// and cannot reach — or forge — the routing results the core parked here.
+/// The cluster the gate is keyed on is not among them: `plan_connect` has
+/// already stored it in the stream's `HttpContext`, and the embedder borrows
+/// it from there rather than the resume carrying a copy of its own (#1583).
+/// [`Router::plan_connect_resume`] takes it **by value**, so a resume cannot
+/// be replayed; that is `H2Shell::settled` taking its parked target, applied
+/// to this seam.
 #[derive(Debug)]
 pub(super) struct ConnectResume {
-    cluster_id: String,
     h2: bool,
     frontend_should_stick: bool,
     ip: IpAddr,
@@ -287,10 +289,6 @@ pub(super) struct ConnectResume {
 }
 
 impl ConnectResume {
-    /// The cluster routing resolved, which the gate is keyed on.
-    pub(super) fn cluster_id(&self) -> &str {
-        &self.cluster_id
-    }
     /// The source IP the gate is keyed on — proxy-protocol-aware when
     /// present, falling back to `peer_addr`.
     pub(super) fn ip(&self) -> IpAddr {
@@ -456,25 +454,28 @@ impl Router {
         // So a replay whose routing decision did not survive is refused
         // outright rather than re-routed against that drained kawa: 502 is
         // what the stream would have received before the replay existed.
+        //
+        // The routed id is moved into `HttpContext::cluster_id`, the one copy
+        // this request owns, and everything after this point borrows it from
+        // there: `decide_after_gate` and the embedder's gate included (#1583).
         let replaying = stream.front.consumed;
-        let cluster_id = if replaying {
-            stream
-                .context
-                .cluster_id
-                .clone()
-                .ok_or(BackendConnectionError::ReplayRefused(
-                    "no cluster_id survived the first attempt",
-                ))?
-        } else {
+        if !replaying {
             let (front_ref, stream_context_ref) = {
                 let stream_split = &mut *stream;
                 (&mut stream_split.front, &mut stream_split.context)
             };
-            self.route_from_request(stream_context_ref, front_ref, &context.listener, view)
-                .map_err(BackendConnectionError::RetrieveClusterError)?
+            let routed = self
+                .route_from_request(stream_context_ref, front_ref, &context.listener, view)
+                .map_err(BackendConnectionError::RetrieveClusterError)?;
+            stream.context.cluster_id = Some(routed);
+        }
+        let stream_context = &stream.context;
+        // Only a replay can find it unset: routing has just stored it otherwise.
+        let Some(cluster_id) = stream_context.cluster_id.as_deref() else {
+            return Err(BackendConnectionError::ReplayRefused(
+                "no cluster_id survived the first attempt",
+            ));
         };
-        let stream_context = &mut stream.context;
-        stream_context.cluster_id = Some(cluster_id.to_owned());
 
         let (
             frontend_should_stick,
@@ -484,7 +485,7 @@ impl Router {
             cluster_retry_after,
             cluster_max_connections_per_subnet,
         ) = view
-            .cluster(&cluster_id)
+            .cluster(cluster_id)
             .map(|cluster| {
                 (
                     cluster.sticky_session,
@@ -553,11 +554,10 @@ impl Router {
         // before, and is decided outright.
         let Some(ip) = stream_context.session_address.map(|sa| sa.ip()) else {
             return self
-                .decide_after_gate(stream_id, context, &cluster_id, h2, frontend_should_stick)
+                .decide_after_gate(stream_id, context, h2, frontend_should_stick)
                 .map(ConnectStep::Decided);
         };
         Ok(ConnectStep::CheckIpLimit(ConnectResume {
-            cluster_id,
             h2,
             frontend_should_stick,
             ip,
@@ -588,16 +588,14 @@ impl Router {
             context.streams[stream_id].context.retry_after_seconds =
                 Some(retry_after).filter(|v| *v > 0);
             return Err(BackendConnectionError::TooManyConnectionsPerIp {
-                cluster_id: resume.cluster_id,
+                cluster_id: context.streams[stream_id]
+                    .context
+                    .cluster_id
+                    .clone()
+                    .unwrap_or_default(),
             });
         }
-        self.decide_after_gate(
-            stream_id,
-            context,
-            &resume.cluster_id,
-            resume.h2,
-            resume.frontend_should_stick,
-        )
+        self.decide_after_gate(stream_id, context, resume.h2, resume.frontend_should_stick)
     }
 
     /// Everything the decision does once the gate has answered: the pool
@@ -605,15 +603,25 @@ impl Router {
     ///
     /// One body shared by both the gated and the ungated entry, so the two
     /// cannot drift — the thing a split like this most easily gets wrong.
+    ///
+    /// The cluster is read from the stream's `HttpContext`, where
+    /// `plan_connect` stored the routed id, rather than handed in as a copy.
     fn decide_after_gate<L: ListenerHandler + L7ListenerHandler>(
         &mut self,
         stream_id: GlobalStreamId,
         context: &mut Context<L>,
-        cluster_id: &str,
         h2: bool,
         frontend_should_stick: bool,
     ) -> Result<ConnectPlan, BackendConnectionError> {
-        let stream_context = &mut context.streams[stream_id].context;
+        let stream_context = &context.streams[stream_id].context;
+        let Some(cluster_id) = stream_context.cluster_id.as_deref() else {
+            error!(
+                "{} stream {} reached the backend decision without a routed cluster",
+                log_module_context!(stream_context),
+                stream_id
+            );
+            return Err(BackendConnectionError::MaxSessionsMemory);
+        };
 
         /*
         H2 connecting strategy (least-loaded):
@@ -764,6 +772,9 @@ impl Router {
         // epoll registration and their rollback. It now reads that way.
         // `Mux::ready_inner` performs it in the same order and calls back
         // into `Router::commit_dialed`.
+        //
+        // The one copy of the cluster id a dial makes: the new connection's
+        // `Position::Client` owns it, and `Mux::dial_backend` moves it there.
         Ok(ConnectPlan::Dial {
             cluster_id: cluster_id.to_owned(),
             h2,
@@ -2399,7 +2410,16 @@ mod backend_selection_order_tests {
             let ConnectStep::CheckIpLimit(resume) = step else {
                 panic!("a stream WITH a session address must reach the per-IP gate")
             };
-            let verdict = super::super::consult_ip_gate(&sessions, token, &resume);
+            let verdict = super::super::consult_ip_gate(
+                &sessions,
+                token,
+                context
+                    .http_context(stream_id)
+                    .cluster_id
+                    .as_deref()
+                    .expect("plan_connect stamps the routed cluster"),
+                &resume,
+            );
             let admitted = matches!(verdict, IpGateVerdict::Admitted);
             let outcome = router.plan_connect_resume(stream_id, &mut context, resume, verdict);
             let retry_after = context.streams[stream_id].context.retry_after_seconds;
@@ -2506,7 +2526,16 @@ mod backend_selection_order_tests {
             let ConnectStep::CheckIpLimit(resume) = step else {
                 panic!("a stream WITH a session address must reach the connection gate")
             };
-            let verdict = super::super::consult_ip_gate(&sessions, token, &resume);
+            let verdict = super::super::consult_ip_gate(
+                &sessions,
+                token,
+                context
+                    .http_context(stream_id)
+                    .cluster_id
+                    .as_deref()
+                    .expect("plan_connect stamps the routed cluster"),
+                &resume,
+            );
             let admitted = matches!(verdict, IpGateVerdict::Admitted);
             let outcome = router.plan_connect_resume(stream_id, &mut context, resume, verdict);
             (admitted, outcome)
@@ -2637,7 +2666,16 @@ mod backend_selection_order_tests {
             let ConnectStep::CheckIpLimit(resume) = step else {
                 panic!("a stream WITH a session address must reach the connection gate")
             };
-            let verdict = super::super::consult_ip_gate(&sessions, token, &resume);
+            let verdict = super::super::consult_ip_gate(
+                &sessions,
+                token,
+                context
+                    .http_context(stream_id)
+                    .cluster_id
+                    .as_deref()
+                    .expect("plan_connect stamps the routed cluster"),
+                &resume,
+            );
             matches!(verdict, IpGateVerdict::Admitted)
         };
 
@@ -2934,21 +2972,26 @@ mod backend_selection_order_tests {
     /// reference-count increment; a `String` copy there costs one heap
     /// allocation per field and per request.
     ///
-    /// Measured as a difference against a control that performs the same mux
-    /// bookkeeping the branch triggers — `Connection::start_stream` then
+    /// Measured against a control that performs the same mux bookkeeping the
+    /// branch triggers — `Connection::start_stream` then
     /// `Context::link_stream` on the same keep-alive socket — and nothing
-    /// else. Both of those allocate once per request today, independently of
-    /// the router: `remove_backend_stream` drops the emptied reverse-index
-    /// `Vec` that `link_stream` rebuilds, and `Mux::apply_backend_deltas`
-    /// takes the delta ledger `start_stream` pushes into. Each request is
-    /// released the way production releases it (`Context::unlink_stream`,
-    /// then the ledger taken as a Mux pass takes it), so the control carries
-    /// exactly those costs and the difference is what the decision adds.
+    /// else. Each request is released the way production releases it
+    /// (`Context::unlink_stream`, then the ledger drained through
+    /// `BackendRegistry::apply_all` as a Mux pass drains it), so the control
+    /// carries exactly the bookkeeping's costs and the difference is what the
+    /// decision adds.
+    ///
+    /// Both are also held at zero outright (#1583): the reverse-index entry
+    /// keeps its emptied `Vec` for the next `link_stream`, and the ledger is
+    /// drained in place, so the bookkeeping itself allocates nothing either.
     ///
     /// TO SEE THIS RED: stamp either field with
     /// `Some(backend.backend_id.to_string().into())` instead of the `Rc`
     /// clone; the difference is then two allocations per request per field
-    /// (the `String`, then the `Rc<str>` built from it).
+    /// (the `String`, then the `Rc<str>` built from it). For the absolute
+    /// half, make `remove_backend_stream` drop the emptied entry again, or
+    /// make `BackendRegistry::apply_all` iterate `mem::take(deltas)`: each
+    /// costs one allocation per request in both measurements.
     #[test]
     fn a_request_on_a_reused_backend_connection_allocates_nothing() {
         use std::hint::black_box;
@@ -2972,6 +3015,9 @@ mod backend_selection_order_tests {
             .create_stream(Ulid::generate(), 65_535)
             .expect("the test pool must hand out a stream");
         context.streams[stream_id].context.method = Some(Method::Get);
+        // Where `Router::plan_connect` leaves the routed cluster for the
+        // decision to read.
+        context.streams[stream_id].context.cluster_id = Some(H1_CLUSTER.to_owned());
 
         let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
         let mut backend_registry = BackendRegistry::default();
@@ -2982,13 +3028,14 @@ mod backend_selection_order_tests {
         // Released as `ConnectionH1::end_stream` releases a terminated
         // response on a keep-alive backend, then the ledger drained as the
         // next Mux pass drains it.
+        let backend_registry = &backend_registry;
         let release = |router: &mut Router, context: &mut Context<HttpListener>| {
             assert_eq!(
                 context.streams[stream_id].state,
                 StreamState::Linked(backend_token)
             );
             context.unlink_stream(stream_id);
-            drop(std::mem::take(&mut context.backend_deltas));
+            backend_registry.apply_all(&mut context.backend_deltas);
             context.streams[stream_id].forget_upstream_replay();
             context.streams[stream_id].state = StreamState::Link;
             let Some(Connection::H1(h1)) = router.backends.get_mut(&backend_token) else {
@@ -3002,13 +3049,7 @@ mod backend_selection_order_tests {
         // One request through the routing decision.
         let decision = |router: &mut Router, context: &mut Context<HttpListener>| -> usize {
             let before = allocations();
-            let plan = router.decide_after_gate(
-                stream_id,
-                black_box(&mut *context),
-                black_box(H1_CLUSTER),
-                false,
-                false,
-            );
+            let plan = router.decide_after_gate(stream_id, black_box(&mut *context), false, false);
             let allocated = allocations() - before;
             assert!(
                 matches!(plan, Ok(ConnectPlan::Attached)),
@@ -3051,6 +3092,279 @@ mod backend_selection_order_tests {
             "{REQUESTS} requests on a reused keep-alive backend made {decided} \
              heap allocations in the routing decision against {controlled} for \
              the mux bookkeeping alone, expected no difference"
+        );
+        assert_eq!(
+            (decided, controlled),
+            (0, 0),
+            "{REQUESTS} requests on a reused keep-alive backend must allocate \
+             nothing in the decision nor in the mux bookkeeping it triggers"
+        );
+    }
+
+    /// #1583: the whole reuse branch copies no cluster id, gated or not.
+    ///
+    /// `Router::plan_connect` stores the cluster id `route_from_request`
+    /// already handed it by value into the stream's `HttpContext` and every
+    /// later reader borrows it from there, so the reuse branch owes no copy of
+    /// its own; with the reverse-index entry and the delta ledger keeping
+    /// their capacity, the branch allocates nothing past routing.
+    ///
+    /// Measured end to end — `plan_connect`, then on the gated path
+    /// `consult_ip_gate` and `plan_connect_resume`, then the production
+    /// release — against a control made of the two costs this branch does
+    /// not own and which run inside `plan_connect`: `route_from_request`
+    /// (the routing lookup, which returns an owned id cloned from the route
+    /// table) and the debug-build `DebugEvent::Str` history push. The gate's
+    /// own `SessionManager` bookkeeping is left out of both sides: it is
+    /// `lib/src/server.rs`'s and is not what this measures. Both paths run,
+    /// because production traffic always carries a source address and so
+    /// always takes the gated one, while the fixtures above never do.
+    ///
+    /// TO SEE THIS RED: stamp `stream_context.cluster_id` in `plan_connect`
+    /// with a copy (`Some(cluster_id.to_owned())` of a borrowed id) instead
+    /// of moving the routed `String` in: one allocation per request, on both
+    /// paths.
+    #[test]
+    fn a_routed_request_on_a_reused_backend_connection_copies_no_cluster_id() {
+        use std::hint::black_box;
+
+        use crate::{protocol::mux::DebugEvent, test_allocations::allocations};
+
+        const REQUESTS: usize = 64;
+        let backend_token = Token(LOWEST_TOKEN);
+        let fixture = routing_fixture();
+        let sessions = fixture.proxy.borrow().sessions();
+
+        for gated in [false, true] {
+            let mut context = Context::new(
+                Ulid::generate(),
+                Rc::downgrade(&fixture.pool),
+                fixture.listener.clone(),
+                gated.then(|| {
+                    "127.0.0.1:4242"
+                        .parse()
+                        .expect("test session address must parse")
+                }),
+                "127.0.0.1:80"
+                    .parse()
+                    .expect("test public address must parse"),
+            );
+            let stream_id = context
+                .create_stream(Ulid::generate(), 65_535)
+                .expect("the test pool must hand out a stream");
+            {
+                let stream = &mut context.streams[stream_id];
+                stream.state = StreamState::Link;
+                stream.context.authority = Some(H1_AUTHORITY.to_owned());
+                stream.context.path = Some("/".to_owned());
+                stream.context.method = Some(Method::Get);
+            }
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            let mut backend_registry = BackendRegistry::default();
+            let (connection, _peer) =
+                staged_backend(&fixture.pool, &Staged::KeepAliveH1, &mut backend_registry);
+            router.backends.insert(backend_token, connection);
+            let proxy_ref = fixture.proxy.borrow();
+            let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
+
+            // One request through the whole branch, the gate's bookkeeping
+            // excluded, then released as production releases it.
+            let branch = |router: &mut Router, context: &mut Context<HttpListener>| -> usize {
+                let before = allocations();
+                let step = router
+                    .plan_connect(stream_id, black_box(&mut *context), &view)
+                    .expect("the reused request must be planned");
+                let mut allocated = allocations() - before;
+                let plan = match step {
+                    ConnectStep::Decided(plan) => {
+                        assert!(!gated, "a stream with a source address must be gated");
+                        plan
+                    }
+                    ConnectStep::CheckIpLimit(resume) => {
+                        assert!(gated, "a stream without a source address must not be gated");
+                        let verdict = super::super::consult_ip_gate(
+                            &sessions,
+                            Token(0),
+                            context
+                                .http_context(stream_id)
+                                .cluster_id
+                                .as_deref()
+                                .expect("plan_connect stamps the routed cluster"),
+                            &resume,
+                        );
+                        let before = allocations();
+                        let plan =
+                            router.plan_connect_resume(stream_id, &mut *context, resume, verdict);
+                        allocated += allocations() - before;
+                        plan.expect("the gate is unlimited, so the stream is admitted")
+                    }
+                };
+                assert!(
+                    matches!(plan, ConnectPlan::Attached),
+                    "the keep-alive socket must be reused, got {plan:?}"
+                );
+                let before = allocations();
+                context.unlink_stream(stream_id);
+                backend_registry.apply_all(&mut context.backend_deltas);
+                allocated += allocations() - before;
+                let stream = &mut context.streams[stream_id];
+                stream.forget_upstream_replay();
+                stream.state = StreamState::Link;
+                stream.attempts = 0;
+                let Some(Connection::H1(h1)) = router.backends.get_mut(&backend_token) else {
+                    unreachable!("the staged backend is an H1 connection")
+                };
+                h1.stream = None;
+                if let Position::Client(_, _, status) = &mut h1.position {
+                    *status = BackendStatus::KeepAlive;
+                }
+                allocated
+            };
+            // The two costs `plan_connect` carries that are not this branch's.
+            let control = |router: &mut Router, context: &mut Context<HttpListener>| -> usize {
+                let listener = context.listener.clone();
+                let before = allocations();
+                let stream = &mut context.streams[stream_id];
+                #[cfg(debug_assertions)]
+                context
+                    .debug
+                    .push(DebugEvent::Str(stream.context.get_route()));
+                let routed = router.route_from_request(
+                    &mut stream.context,
+                    &mut stream.front,
+                    &listener,
+                    black_box(&view),
+                );
+                let allocated = allocations() - before;
+                assert_eq!(routed.ok().as_deref(), Some(H1_CLUSTER));
+                allocated
+            };
+
+            // Warm-up: metric keys, the reverse index and the ledger are
+            // sized by the first request.
+            branch(&mut router, &mut context);
+            control(&mut router, &mut context);
+            let (mut branched, mut controlled) = (0, 0);
+            for _ in 0..REQUESTS {
+                branched += branch(&mut router, &mut context);
+                controlled += control(&mut router, &mut context);
+            }
+
+            assert_eq!(
+                context.http_context(stream_id).cluster_id.as_deref(),
+                Some(H1_CLUSTER)
+            );
+            assert_eq!(
+                branched.saturating_sub(controlled),
+                0,
+                "gated={gated}: {REQUESTS} requests on a reused keep-alive backend \
+                 made {branched} heap allocations through the reuse branch against \
+                 {controlled} for routing alone, expected no difference"
+            );
+        }
+    }
+
+    /// #1583: a dial copies the cluster id once, into the connection.
+    ///
+    /// `ConnectPlan::Dial` carries the one owned copy the new
+    /// `Position::Client` needs, and `Mux::dial_backend` moves it there: the
+    /// connection's id is the very allocation the plan handed over.
+    ///
+    /// TO SEE THIS RED: build the connection in `Mux::dial_backend` from
+    /// `cluster_id.clone()` (or `.to_owned()` of a borrowed id) instead of
+    /// moving it; the connection then owns a second copy at another address.
+    #[test]
+    fn a_dial_moves_the_planned_cluster_id_into_the_backend_connection() {
+        use crate::{Protocol, ProxySession, protocol::mux::Mux, server::ListenSession};
+
+        let fixture = routing_fixture();
+        let upstream =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener must bind");
+        fixture.proxy.borrow().backends().borrow_mut().add_backend(
+            H1_CLUSTER,
+            Backend::new(
+                "dial-backend",
+                upstream
+                    .local_addr()
+                    .expect("a bound listener has an address"),
+                None,
+                None,
+                None,
+            ),
+        );
+        let mut context = Context::new(
+            Ulid::generate(),
+            Rc::downgrade(&fixture.pool),
+            fixture.listener.clone(),
+            None,
+            "127.0.0.1:80"
+                .parse()
+                .expect("test public address must parse"),
+        );
+        let stream_id = context
+            .create_stream(Ulid::generate(), 65_535)
+            .expect("the test pool must hand out a stream");
+        {
+            let stream = &mut context.streams[stream_id];
+            stream.state = StreamState::Link;
+            stream.context.authority = Some(H1_AUTHORITY.to_owned());
+            stream.context.path = Some("/".to_owned());
+            stream.context.method = Some(Method::Get);
+        }
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let mut backend_registry = BackendRegistry::default();
+
+        let plan = {
+            let proxy_ref = fixture.proxy.borrow();
+            let view = RoutingView::new(proxy_ref.clusters(), proxy_ref.kind());
+            router
+                .plan_connect(stream_id, &mut context, &view)
+                .map(decided)
+                .expect("an empty router must ask for a dial")
+        };
+        let ConnectPlan::Dial {
+            cluster_id,
+            h2,
+            frontend_should_stick,
+        } = plan
+        else {
+            panic!("premise: an empty router has nothing to reuse, so it must ask for a dial")
+        };
+        let planned = cluster_id.as_ptr();
+
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(ListenSession {
+            protocol: Protocol::HTTPListen,
+        }));
+        Mux::<mio::net::TcpStream, HttpListener>::dial_backend(
+            &mut router,
+            &mut backend_registry,
+            stream_id,
+            &mut context,
+            &session,
+            &fixture.proxy,
+            cluster_id,
+            h2,
+            frontend_should_stick,
+        )
+        .expect("the loopback backend must dial");
+
+        let token = match context.streams[stream_id].state {
+            StreamState::Linked(token) => token,
+            other => panic!("the dial must link the stream, got {other:?}"),
+        };
+        let Some(Position::Client(owned, _, _)) =
+            router.backends.get(&token).map(Connection::position)
+        else {
+            panic!("the dialled connection must be a client")
+        };
+        assert_eq!(owned, H1_CLUSTER);
+        assert_eq!(
+            context.http_context(stream_id).cluster_id.as_deref(),
+            Some(H1_CLUSTER)
+        );
+        assert!(
+            std::ptr::eq(owned.as_ptr(), planned),
+            "the connection must own the id the plan carried, not a copy of it"
         );
     }
 }

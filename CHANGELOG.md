@@ -376,6 +376,38 @@
 
 ### 🔄 Changed
 
+- **`perf(mux)`: a request on a reused backend connection allocates nothing past routing
+  ([#1583](https://github.com/sozu-proxy/sozu/issues/1583)).** Four per-request or per-dial
+  allocations left after #1579 are gone. The backend reverse index keeps the emptied `Vec` in its
+  `Context::backend_streams` entry, so the next `Context::link_stream` on the same connection
+  reuses its capacity; the key now leaves with the connection, in the dead-backend sweep of
+  `Mux::ready_inner`, which bounds the index by the session's live backend connections, and the
+  debug consistency check of `ready_inner` asserts exactly that. The delta ledger is drained in
+  place by one `BackendRegistry::apply_all`, used by both drains, instead of being emptied with
+  `std::mem::take`, so the charge `Connection::start_stream` records on every request no longer
+  reallocates it. `Router::plan_connect` moves the cluster id `route_from_request` returned into
+  `HttpContext::cluster_id` instead of copying it, and `Router::decide_after_gate` and
+  `consult_ip_gate` borrow it from there, so `ConnectResume` no longer carries a copy. A dial
+  copies the id once instead of twice: `ConnectPlan::Dial` carries it and `Mux::dial_backend`
+  moves it into `Position::Client`. No public type changes; the one visible difference is that
+  `Context::backend_streams`, a `pub` field, may now hold an empty entry for a live backend
+  connection, so a reader must test the entry's emptiness rather than the key's presence (every
+  reader in the tree already did).
+  Measured with the counting allocator on a reused keep-alive backend, steady state: the reuse
+  branch (`plan_connect`, then `plan_connect_resume` on the gated path, then the release) made 9
+  allocations per request before and makes 6 after in the debug test build, 3 of which are the
+  debug-only `DebugEvent::Str` history push; the release build, measured after, makes 3. All three
+  are inside `route_from_request`, which is out of this change: the `original_authority` copy, the
+  route lookup's `trie_path` vector and the cluster id cloned out of the route table. On the gated
+  path, which is the production path, `consult_ip_gate` still makes 3 allocations per request
+  inside `SessionManager` bookkeeping (`lib/src/server.rs`), also out of scope. #1579's
+  `a_request_on_a_reused_backend_connection_allocates_nothing` now asserts zero outright for the
+  decision and the bookkeeping, not only their difference; the new
+  `a_routed_request_on_a_reused_backend_connection_copies_no_cluster_id` measures the whole branch
+  on both the gated and the ungated path against a control of exactly those out-of-scope costs, and
+  `a_dial_moves_the_planned_cluster_id_into_the_backend_connection` drives a real
+  `Mux::dial_backend` and checks the connection owns the very allocation the plan carried.
+
 - **`perf(mux)`: the backend id is no longer copied into a `String` per request
   ([#1579](https://github.com/sozu-proxy/sozu/issues/1579)).** `HttpContext::backend_id` and
   `SessionMetrics::backend_id` are now `Option<Rc<str>>` instead of `Option<String>`, and the mux

@@ -460,6 +460,22 @@ impl BackendRegistry {
         self.get(backend.slot())
     }
 
+    /// Perform every accounting change in `deltas`, in the order they were
+    /// pushed, and leave the ledger empty.
+    ///
+    /// The one drain both `Mux::apply_backend_deltas` and the pre-plan settle
+    /// in `Mux::ready_inner` go through.
+    ///
+    /// Drained in place rather than taken, so the ledger keeps its capacity
+    /// for the next change: the charge `Connection::start_stream` records on
+    /// every request would otherwise reallocate it each time (#1583). The
+    /// capacity is bounded by the most deltas a single pass has pushed.
+    pub(crate) fn apply_all(&self, deltas: &mut Vec<BackendDelta>) {
+        for delta in deltas.drain(..) {
+            self.apply(delta);
+        }
+    }
+
     /// Perform one accounting change the core decided.
     ///
     /// The before/after pair-assertions that used to sit at each emitting
@@ -718,6 +734,10 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// Reverse index: backend token -> global stream IDs currently in
     /// `StreamState::Linked(token)`. Eliminates O(n) scans of `streams`
     /// when handling backend connect/disconnect/timeout/close events.
+    ///
+    /// An entry may be empty: `remove_backend_stream` keeps an emptied `Vec`
+    /// for the next link on the same live connection (#1583), so "has linked
+    /// streams" is the entry's emptiness, not the key's presence.
     pub backend_streams: HashMap<Token, Vec<GlobalStreamId>>,
     /// Where every buffer this session's streams and connections need comes
     /// from, and the only thing allowed to refuse one.
@@ -1120,6 +1140,14 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
 /// Remove `stream_id` from the backend-token reverse index for `token`.
 /// Free function to allow split borrows when `context.streams` is already
 /// mutably borrowed (preventing a `Context::unlink_stream` call).
+///
+/// An emptied entry is kept, not removed: the next `Context::link_stream` on
+/// the same backend connection — every request on a keep-alive socket or an
+/// H2 multiplex slot — pushes into its retained capacity instead of
+/// allocating a fresh `Vec` (#1583). The key leaves with the connection
+/// itself, in the dead-backend sweep of `Mux::ready_inner`, and `Mux::close`
+/// clears the whole index, so the index stays bounded by the session's live
+/// backend connections.
 pub(super) fn remove_backend_stream(
     index: &mut HashMap<Token, Vec<GlobalStreamId>>,
     token: Token,
@@ -1127,9 +1155,6 @@ pub(super) fn remove_backend_stream(
 ) {
     if let Some(ids) = index.get_mut(&token) {
         ids.retain(|&id| id != stream_id);
-        if ids.is_empty() {
-            index.remove(&token);
-        }
     }
 }
 
@@ -1197,6 +1222,9 @@ pub struct Mux<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
 fn consult_ip_gate(
     sessions: &Rc<RefCell<crate::server::SessionManager>>,
     frontend_token: Token,
+    // The cluster routing resolved, borrowed from the stream's `HttpContext`
+    // where `Router::plan_connect` stored it (#1583).
+    cluster_id: &str,
     resume: &router::ConnectResume,
 ) -> router::IpGateVerdict {
     // BOTH caps are consulted here, through the one combined gate:
@@ -1208,7 +1236,7 @@ fn consult_ip_gate(
     // the previous per-IP consult.
     let at_limit = sessions.borrow().cluster_connection_at_limit(
         frontend_token,
-        resume.cluster_id(),
+        cluster_id,
         &resume.ip(),
         resume.max_connections_per_ip(),
         resume.max_connections_per_subnet(),
@@ -1224,7 +1252,7 @@ fn consult_ip_gate(
     // session close, via `untrack_all_cluster_ip`.
     sessions.borrow_mut().track_cluster_connection(
         frontend_token,
-        resume.cluster_id().to_owned(),
+        cluster_id.to_owned(),
         resume.ip(),
         resume.max_connections_per_subnet(),
     );
@@ -1240,19 +1268,17 @@ impl<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> Mux<Front, L>
     /// last drain, in the order it decided them.
     ///
     /// The ONLY writer of `Backend::active_requests` and
-    /// `Backend::active_connections` on the mux path. `mem::take` empties the
-    /// queue before the first change is applied, so running this twice in a
-    /// row is idempotent — the second call finds nothing and performs
-    /// nothing.
+    /// `Backend::active_connections` on the mux path. The drain leaves the
+    /// queue empty, so running this twice in a row is idempotent — the second
+    /// call finds nothing and performs nothing.
     ///
     /// Called from the four `Mux` wrappers that already owe the timer wheel a
     /// `reschedule` on every exit, and once more immediately before each
     /// `Router::plan_connect`, because that call's load balancer is the only
     /// reader of the counters this drains.
     pub(crate) fn apply_backend_deltas(&mut self) {
-        for delta in std::mem::take(&mut self.context.backend_deltas) {
-            self.backend_registry.apply(delta);
-        }
+        self.backend_registry
+            .apply_all(&mut self.context.backend_deltas);
     }
 }
 
@@ -1936,7 +1962,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         context: &mut Context<L>,
         session: &Rc<RefCell<dyn ProxySession>>,
         proxy: &Rc<RefCell<dyn L7Proxy>>,
-        cluster_id: &str,
+        // Owned: moved into the new connection's `Position::Client`, the one
+        // copy of the cluster id a dial makes (#1583).
+        cluster_id: String,
         h2: bool,
         frontend_should_stick: bool,
     ) -> Result<(), BackendConnectionError> {
@@ -1952,7 +1980,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 registry: backend_registry,
             };
             router.backend_from_request(
-                cluster_id,
+                &cluster_id,
                 frontend_should_stick,
                 &mut context.streams[stream_id].context,
                 &mut dialer,
@@ -1988,7 +2016,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             match Connection::new_h2_client(
                 context.session_ulid,
                 socket,
-                cluster_id.to_owned(),
+                cluster_id,
                 backend,
                 &mut *context.buffers,
                 router.configured_connect_timeout,
@@ -2006,7 +2034,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             Connection::new_h1_client(
                 context.session_ulid,
                 socket,
-                cluster_id.to_owned(),
+                cluster_id,
                 backend,
                 router.configured_connect_timeout,
             )
@@ -2038,10 +2066,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // decrement sites is the only defence against the gauge underflow
         // class of bug fixed by ff401b54 / aadb3fa4.
         gauge_add!(names::backend::POOL_SIZE, 1);
+        // The cluster id moved into the connection; the stream's own copy,
+        // stored by `Router::plan_connect`, names the same cluster.
         gauge_add!(
             names::backend::CONNECTIONS_PER_BACKEND,
             1,
-            Some(cluster_id),
+            stream.context.cluster_id.as_deref(),
             Some(&backend_id_for_gauge)
         );
 
@@ -2072,7 +2102,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 gauge_add!(
                     names::backend::CONNECTIONS_PER_BACKEND,
                     -1,
-                    Some(cluster_id),
+                    context.http_context(stream_id).cluster_id.as_deref(),
                     Some(&backend_id_for_gauge)
                 );
                 // Release the `active_requests` charge `start_stream` took.
@@ -2468,6 +2498,19 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 if !dead_backends.is_empty() {
                     for token in &dead_backends {
                         let proxy_borrow = proxy.borrow();
+                        // The reverse-index entry `remove_backend_stream`
+                        // kept for its capacity leaves with its connection.
+                        // Only an emptied one: an entry still naming a stream
+                        // is the drift the debug check at the end of this
+                        // pass reports, and removing it here would hide it.
+                        if self
+                            .context
+                            .backend_streams
+                            .get(token)
+                            .is_some_and(Vec::is_empty)
+                        {
+                            self.context.backend_streams.remove(token);
+                        }
                         if let Some(mut client) = self.router.backends.remove(token) {
                             // No explicit timer cancel: the token has left
                             // `router.backends`, so `Mux::reschedule` drops its
@@ -2614,9 +2657,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 // `active_connections` synchronously at the dial, inside this
                 // same loop iteration, so the next iteration's selection sees
                 // it (#1340, Question 6's second wrinkle).
-                for delta in std::mem::take(&mut context.backend_deltas) {
-                    self.backend_registry.apply(delta);
-                }
+                self.backend_registry.apply_all(&mut context.backend_deltas);
                 // Build the routing view once for this decision, from a single
                 // `proxy.borrow()`. Holding one `Ref` for the call is what
                 // gives every read inside it the same cluster map; the two
@@ -2642,9 +2683,18 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                         // gate, so a stream admitted but not yet counted is a
                         // slot a concurrent stream can take twice.
                         router::ConnectStep::CheckIpLimit(resume) => {
+                            // `plan_connect` stored the routed cluster before
+                            // it paused; an unset one is refused, not gated
+                            // against an empty key.
+                            let Some(cluster_id) =
+                                context.http_context(stream_id).cluster_id.as_deref()
+                            else {
+                                return Err(BackendConnectionError::MaxSessionsMemory);
+                            };
                             let verdict = consult_ip_gate(
                                 &proxy.borrow().sessions(),
                                 self.frontend_token,
+                                cluster_id,
                                 &resume,
                             );
                             self.router
@@ -2664,7 +2714,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             context,
                             &session,
                             &proxy,
-                            &cluster_id,
+                            cluster_id,
                             h2,
                             frontend_should_stick,
                         ),
@@ -2822,9 +2872,24 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     expected.entry(token).or_default().push(id);
                 }
             }
+            // An emptied entry is capacity kept for the next link on the same
+            // connection (#1583), not a link: it is left out of the count,
+            // and it must name a connection the router still holds, which is
+            // what keeps the index bounded by the live backends.
+            for (token, ids) in &self.context.backend_streams {
+                assert!(
+                    !ids.is_empty() || self.router.backends.contains_key(token),
+                    "backend_streams keeps an emptied entry for {token:?}, \
+                     which is not a live backend connection"
+                );
+            }
             assert_eq!(
                 expected.len(),
-                self.context.backend_streams.len(),
+                self.context
+                    .backend_streams
+                    .values()
+                    .filter(|ids| !ids.is_empty())
+                    .count(),
                 "backend_streams index key count mismatch: expected={:?}, actual={:?}",
                 expected,
                 self.context.backend_streams
