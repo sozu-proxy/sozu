@@ -567,9 +567,16 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 peer.arm_writable();
             }
         };
-        // 1xx informational: the 100 response skips main_phase (goes straight to
-        // Terminated), so the normal "set endpoint writable" above never fires.
-        // Trigger the frontend to write the 1xx response after all borrows end.
+        // 1xx informational: kawa sets `detached.status_line` as soon as the
+        // status line parses and only then moves to `ParsingPhase::Headers`,
+        // so a read that stops inside the 1xx headers leaves
+        // `is_main_phase()` false while `is_1xx_backend` is already true. On
+        // that pass only this arm wakes the frontend, early, before the 1xx is
+        // complete; the pass that completes the headers re-arms it through the
+        // `Linked` arm above either way. When the whole 1xx arrives in one
+        // read it parses to `Terminated`, which kawa counts as a main phase, so
+        // the `Linked` arm above has already fired and this call is redundant
+        // (`arm_writable` is idempotent).
         if is_1xx_backend && let StreamState::Linked(token) = stream.state {
             let peer = endpoint.readiness_mut(token);
             peer.arm_writable();
