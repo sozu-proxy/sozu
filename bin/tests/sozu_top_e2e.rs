@@ -101,7 +101,8 @@ fn sozu_version_reports_plus_tui() {
 /// for exactly one frame, and asserts a clean exit. `#[ignore]`d by
 /// default because it writes to a temp dir, binds an ephemeral port,
 /// and depends on graceful master shutdown (a hung master would block
-/// CI). Run manually with:
+/// CI). It also needs a controlling terminal: `sozu top --snapshot` still
+/// enters raw mode, which fails with ENXIO without one. Run manually with:
 ///
 /// ```bash
 /// cargo test -p sozu --features tui --tests -- --ignored sozu_top
@@ -114,8 +115,10 @@ fn sozu_top_tick_once_against_real_master() {
     let config_path = temp.path().join("config.toml");
 
     // Minimum viable config: command socket only, no listeners, no
-    // clusters, one worker, automatic-restart disabled (so the master
-    // exits cleanly when we send SIGTERM).
+    // clusters, no saved state, one worker, automatic-restart disabled
+    // (so the master exits cleanly when we send SIGTERM). `saved_state`
+    // is left unset rather than empty: `saved_state = ""` is a path, not
+    // an opt-out, and the master refuses to start when it cannot create it.
     let config = format!(
         r#"
 command_socket = "{socket}"
@@ -123,7 +126,6 @@ command_buffer_size = 16384
 max_command_buffer_size = 163840
 worker_count = 1
 worker_automatic_restart = false
-saved_state = ""
 log_level = "warn"
 log_target = "stderr"
 max_connections = 100

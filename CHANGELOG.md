@@ -2651,6 +2651,16 @@
   Covered by `a_blocking_write_to_a_closed_peer_is_an_error` and
   `a_write_error_keeps_the_channel_marked_for_closing`.
 
+- **`fix(top)`: the ignored `sozu_top_tick_once_against_real_master` e2e no longer sets
+  `saved_state = ""`, which the master rejected at config load
+  ([#1572](https://github.com/sozu-proxy/sozu/issues/1572)).** An empty `saved_state` is a
+  path, not an opt-out: `Config::saved_state_path` (`command/src/config.rs`) found no file at
+  `""` and failed to create one, so `sozu start` exited with `SaveStatePath("failed to create
+  state file '\"\"'")` before the test reached the command socket. The test has failed this
+  way since it was added. It now leaves `saved_state` unset, as its "minimum viable config"
+  intends; the configuration contract is unchanged. The test still needs a controlling
+  terminal, because `sozu top --snapshot` enters raw mode, so CI keeps it out.
+
 - **`fix(command)`: a channel socket error now leaves the channel marked for closing, so the
   master closes a worker session whose worker died with a message still unread
   ([#1560](https://github.com/sozu-proxy/sozu/issues/1560)).** `Channel::readable` and
