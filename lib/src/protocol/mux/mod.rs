@@ -1758,14 +1758,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         for (token, client) in &mut self.router.backends {
             let proxy_borrow = proxy.borrow();
             let socket = client.socket_mut();
-            if let Err(e) = proxy_borrow.deregister_socket(socket) {
-                error!(
-                    "{} error deregistering back socket({:?}): {:?}",
-                    log_context_lite!(self),
-                    socket,
-                    e
-                );
-            }
+            // No `EPOLL_CTL_DEL`: the socket stays in `router.backends` until
+            // this `Mux` drops with its session, before the event loop's next
+            // `epoll_wait`, and its last close removes it from the epoll set —
+            // the same invariant as the front socket in `HttpsSession::close`
+            // (`lib/src/https.rs`).
             // invariant: write-only shutdown — Shutdown::Both on a TLS frontend
             // discards the receive buffer and elicits TCP RST, truncating the
             // already-queued response. Canonical write-up: `HttpsSession::close`
@@ -2437,15 +2434,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             // `router.backends`, so `Mux::reschedule` drops its
                             // handle on the way out of `ready` and
                             // `TimeoutContainer::drop` cancels the entry.
+                            // No `EPOLL_CTL_DEL`: `client` drops at the end of
+                            // this block, and closing its socket removes it from
+                            // the epoll set — see `HttpsSession::close`
+                            // (`lib/src/https.rs`).
                             let socket = client.socket_mut();
-                            if let Err(e) = proxy_borrow.deregister_socket(socket) {
-                                error!(
-                                    "{} error deregistering back socket({:?}): {:?}",
-                                    log_context!(self),
-                                    socket,
-                                    e
-                                );
-                            }
                             // invariant: write-only shutdown — Shutdown::Both on a TLS frontend
                             // discards the receive buffer and elicits TCP RST, truncating the
                             // already-queued response. Canonical write-up: `HttpsSession::close`
@@ -3513,6 +3506,23 @@ pub(crate) mod test_support {
         fn get_answers(&self) -> &Rc<RefCell<HttpAnswers>> {
             &self.answers
         }
+    }
+
+    /// Whether the epoll instance behind `epoll` watches descriptor `fd`,
+    /// read from the `tfd:` lines Linux lists in `/proc/self/fdinfo`.
+    ///
+    /// Reading the kernel's own table, rather than counting calls, is what
+    /// lets a test tell "never deregistered" from "removed by the close".
+    #[cfg(target_os = "linux")]
+    pub(crate) fn epoll_watches(epoll: &impl std::os::fd::AsRawFd, fd: std::os::fd::RawFd) -> bool {
+        let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", epoll.as_raw_fd()))
+            .expect("the epoll instance must expose its fdinfo");
+        fdinfo.lines().any(|line| {
+            line.strip_prefix("tfd:")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|target| target.parse::<std::os::fd::RawFd>().ok())
+                == Some(fd)
+        })
     }
 
     /// A live, connected, non-blocking loopback socket. Reads return
@@ -4894,5 +4904,86 @@ mod tests {
             "the lite MUX peer= slot must not fall back to a live getpeername(2); \
              rendered: {rendered}"
         );
+    }
+
+    /// `Mux::close` issues no `EPOLL_CTL_DEL` for its backend sockets: each
+    /// stays in the epoll set until the `Mux` drops, and its last close is what
+    /// removes it. The second assertion is the half that makes skipping the
+    /// deregister safe — the socket is not duplicated anywhere, so dropping the
+    /// `Mux` really does take it out of the epoll set.
+    ///
+    /// To SEE THIS RED: in `Mux::close`'s backend loop, put back
+    /// `let _ = proxy_borrow.deregister_socket(socket);` after
+    /// `let socket = client.socket_mut();`. The first assertion then fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_leaves_backend_sockets_to_their_last_close() {
+        use std::os::fd::AsRawFd;
+
+        use mio::Interest;
+
+        use super::test_support::epoll_watches;
+        use crate::{backends::Backend, http::HttpProxy, socket::SessionTcpStream};
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut mux, _front_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(30));
+        let parts =
+            crate::testing::prebuild_server(4, 16_384, false).expect("test server must build");
+        let registry = parts
+            .registry
+            .try_clone()
+            .expect("the test registry must clone");
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(HttpProxy::new(
+            parts.registry,
+            parts.sessions,
+            parts.pool,
+            parts.backends,
+        )));
+
+        let (socket, _back_peer) = connected_socket();
+        let backend = Rc::new(RefCell::new(Backend::new(
+            "test-backend",
+            "127.0.0.1:2".parse().expect("backend address must parse"),
+            None,
+            None,
+            None,
+        )));
+        let backend_id = mux.backend_registry.id_for(&backend);
+        let session_ulid = mux.session_ulid;
+        let mut connection = Connection::new_h1_client(
+            session_ulid,
+            SessionTcpStream::new(socket, session_ulid, None),
+            "test-cluster".to_owned(),
+            backend_id,
+            Duration::from_secs(30),
+        );
+        let back_fd = connection.socket().as_raw_fd();
+        registry
+            .register(
+                connection.socket_mut(),
+                Token(7),
+                Interest::READABLE | Interest::WRITABLE,
+            )
+            .expect("the backend socket must register");
+        mux.router.backends.insert(Token(7), connection);
+        assert!(
+            epoll_watches(&registry, back_fd),
+            "precondition: the backend socket is in the epoll set"
+        );
+
+        mux.close(proxy, &mut SessionMetrics::new(None));
+        assert!(
+            epoll_watches(&registry, back_fd),
+            "Mux::close must not deregister a backend socket it is about to \
+             close: the close removes it, the EPOLL_CTL_DEL is a wasted syscall"
+        );
+
+        drop(mux);
+        assert!(
+            !epoll_watches(&registry, back_fd),
+            "dropping the Mux closes the backend socket's only descriptor, \
+             which must take it out of the epoll set"
+        );
+        drop(parts.event_loop);
     }
 }

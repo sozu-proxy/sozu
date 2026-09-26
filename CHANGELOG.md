@@ -376,6 +376,24 @@
 
 ### 🔄 Changed
 
+- **`perf(mux)`: closing a session no longer deregisters its sockets from epoll, two
+  `epoll_ctl` per request instead of four
+  ([#1567](https://github.com/sozu-proxy/sozu/issues/1567)).** `HttpSession::close` and `HttpsSession::close` issued
+  an `EPOLL_CTL_DEL` for the front socket, and `Mux::close` and the dead-backend sweep in
+  `Mux::ready` one for each backend socket, each immediately before that socket's `close(2)`.
+  Linux removes a file from every epoll set on its last close, so the call removed nothing the
+  close would not. It is only needed when a descriptor is duplicated, and nothing duplicates a
+  session socket: no `dup` or `try_clone`, no fork from a worker, and SCM_RIGHTS carries listeners
+  only. Every socket still closes before the event loop's next `epoll_wait`, so no event can
+  reach a recycled slab token. Measured on a release worker behind `python3 -m http.server`,
+  N=20 sequential requests, with `intentrace -p` and an `LD_PRELOAD` interposer agreeing:
+  `epoll_ctl` 4.00 → 2.00 per request on H1 and on H2 (40 ADD + 40 DEL → 40 ADD), every other
+  count unchanged; the worker holds 15 descriptors before and after 1000 further requests on each
+  protocol. mio 1.x keeps no per-source state on epoll or kqueue for a deregister to release.
+  `L7Proxy::deregister_socket` stays in the trait, now without a caller. Regression tests read the
+  kernel's epoll table from `/proc/self/fdinfo`; `doc/lifetime_of_a_session.md` §9 carries the
+  argument.
+
 - **`perf(backends)`: a backend selection allocates nothing and clones one `Rc`
   ([#1549](https://github.com/sozu-proxy/sozu/issues/1549)).** Every selection collected its
   candidates into a fresh `Vec` of cloned `Rc<RefCell<Backend>>` (`BackendList::available_backends`),
