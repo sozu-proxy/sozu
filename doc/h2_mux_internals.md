@@ -1022,8 +1022,16 @@ readiness turn, instead of one EAGAIN per frame after the first
 contract is unchanged: an EAGAIN always ends the call with
 `SocketResult::WouldBlock`, which `update_readiness_after_read` turns into
 "drop READABLE until the next event", and a full buffer answers `Continue` so
-READABLE stays. EOF and `close_notify` are answered `Closed` by the first
-call that finds no plaintext left, after the frames that preceded them.
+READABLE stays. A `recv` that answers fewer bytes than rustls offered ends the
+call the same way, once what it brought is processed and drained, because the
+receive queue is empty and another `recv` could only answer EAGAIN
+([#1602](https://github.com/sozu-proxy/sozu/issues/1602)); a call whose buffer
+that plaintext fills still answers `Continue`, and the EAGAIN then comes from a
+later call, which does not assume the queue is still empty. EOF and
+`close_notify` are answered `Closed` by the first call that finds no plaintext
+left, after the frames that preceded them; a TCP FIN behind a short read is
+read by the next call, which `update_readiness_after_read` makes once HUP was
+seen.
 `Error` is sticky: once `process_new_packets` fails, `FrontRustls::tls_fatal`
 makes every later call answer `(0, Error)` without serving plaintext decrypted
 from the records before the bad one.

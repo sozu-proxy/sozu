@@ -795,11 +795,28 @@ fn update_readiness(
     }
 }
 
+/// [`update_readiness`] for a read, with one exception: a short read after HUP.
+///
+/// The socket layer stops on a short read and answers `(n, WouldBlock)`
+/// without reading on to EOF (`plain_socket_read`, `rustls_socket_read` in
+/// `lib/src/socket.rs`). A FIN that arrived with the data raised its edge
+/// already, and HUP is that edge (`Ready::from(&Event)` in
+/// `command/src/ready.rs`); no later event will announce the EOF, so dropping
+/// READABLE here would leave it unread. Keeping READABLE makes the next pass
+/// read it as `(0, Closed)`, which the H1 close-delimited response path
+/// needs. HAProxy reads `read0` on the same condition (`src/raw_sock.c`,
+/// `FD_POLL_HUP` after `ret < try`), and tokio keeps closed readiness through
+/// `clear_readiness` (`tokio/src/runtime/io/scheduled_io.rs`). The next read
+/// returns bytes or answers with `size == 0`, which drops READABLE, so the
+/// exception cannot spin.
 fn update_readiness_after_read(
     size: usize,
     status: SocketResult,
     readiness: &mut Readiness,
 ) -> bool {
+    if size > 0 && status == SocketResult::WouldBlock && readiness.event.is_hup() {
+        return false;
+    }
     update_readiness(size, status, readiness, Ready::READABLE)
 }
 
@@ -3855,6 +3872,53 @@ mod tests {
             mux.shutting_down(),
             "shutting_down must refresh the clock snapshot itself, so a silent \
              draining session's forced-close budget still expires"
+        );
+    }
+
+    #[test]
+    fn a_short_read_after_hup_keeps_readable_to_read_the_eof() {
+        let mut readiness = Readiness {
+            event: Ready::READABLE | Ready::HUP,
+            interest: Ready::READABLE,
+        };
+
+        let should_yield =
+            update_readiness_after_read(17, SocketResult::WouldBlock, &mut readiness);
+
+        assert!(!should_yield);
+        assert!(
+            readiness.event.is_readable(),
+            "no edge will announce the queued EOF: READABLE must stay"
+        );
+    }
+
+    #[test]
+    fn a_short_read_without_hup_drops_readable() {
+        let mut readiness = Readiness {
+            event: Ready::READABLE,
+            interest: Ready::READABLE,
+        };
+
+        let should_yield =
+            update_readiness_after_read(17, SocketResult::WouldBlock, &mut readiness);
+
+        assert!(!should_yield);
+        assert!(!readiness.event.is_readable(), "the next edge re-arms it");
+    }
+
+    #[test]
+    fn an_empty_read_after_hup_still_drops_readable() {
+        let mut readiness = Readiness {
+            event: Ready::READABLE | Ready::HUP,
+            interest: Ready::READABLE,
+        };
+
+        let should_yield = update_readiness_after_read(0, SocketResult::WouldBlock, &mut readiness);
+
+        assert!(should_yield);
+        assert!(
+            !readiness.event.is_readable(),
+            "the exception must not spin"
         );
     }
 

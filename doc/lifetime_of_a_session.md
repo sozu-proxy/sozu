@@ -43,6 +43,21 @@ once when a socket transitions to readable or writable. If Sōzu does
 not drain the kernel buffer fully on that wake-up, it gets no other
 event until the *next* edge.
 
+On the read side, "drained" is detected without a wasted `recv(2)`
+([#1602](https://github.com/sozu-proxy/sozu/issues/1602)). A read that
+returns fewer bytes than it was offered has emptied the stream socket's
+receive queue (`man 7 epoll`), so `plain_socket_read` and
+`rustls_socket_read` (`lib/src/socket.rs`) stop there and answer
+`WouldBlock` with the bytes instead of reading on to an EAGAIN; any byte
+that arrives later raises a new edge. A read that fills its buffer is not
+a short read and answers `Continue`. The one exception is a FIN that
+arrived with the data: its edge is the HUP already folded into the
+readiness, and nothing will announce the EOF again, so
+`update_readiness_after_read` (`lib/src/protocol/mux/mod.rs`) keeps
+READABLE after a short read once HUP was seen and the next pass reads the
+EOF. The pipe and the pre-mux states act on HUP directly
+(`Pipe::frontend_hup`, `Pipe::backend_hup`) and need no EOF read.
+
 To survive that contract, every protocol module routes its readiness
 through a `Readiness` tracker (`Readiness` in `lib/src/lib.rs`, reached in
 the mux through `Connection::readiness_mut` in
