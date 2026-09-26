@@ -1,6 +1,5 @@
 ---
 source: bin/src/ctl/top/snapshot_tests.rs
-assertion_line: 299
 expression: out
 ---
 ╭ H2 · streams · flow control · flood mitigations ─────────────────────────────────────────────────────────────────────╮
@@ -28,8 +27,8 @@ expression: out
 ││settings_flood                                    0                ▁▁                                               ││
 ││priority_flood                                    0                ▁▁                                               ││
 ││window_update_dropped                             0                ▁▁                                               ││
+││rst_stream_dropped                                0                ▁▁                                               ││
 ││close_with_active_streams                         0                ▁▁                                               ││
-││                                                                                                                    ││
 ││                                                                                                                    ││
 ││                                                                                                                    ││
 ││                                                                                                                    ││

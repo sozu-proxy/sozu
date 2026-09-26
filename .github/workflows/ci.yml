@@ -280,6 +280,18 @@ jobs:
       - name: Test sozu
         run: cargo test -p sozu --locked ${{ matrix.flags }} --verbose
 
+      # The `sozu top` unit tests — `bin/src/ctl/top/`, including the insta
+      # snapshots of every pane — are `#[cfg(feature = "tui")]`, and no matrix
+      # cell's flags enable that feature, so the step above compiles them out.
+      # A pane snapshot went stale unnoticed that way (sozu#1576). They run
+      # on the `msrv-full` cell only: that cell already resolves the `tui`
+      # dependencies for `cargo doc --all-features`, nothing in `top` varies by
+      # crypto provider, and `--lib` keeps the extra cost to one build of the
+      # `sozu` library test binary.
+      - name: Test sozu top (unit and snapshot tests)
+        if: matrix.cell == 'msrv-full'
+        run: cargo test -p sozu --locked ${{ matrix.flags }} --features tui --lib --verbose
+
       # The `bin/tests/*_e2e.rs` process-level tests spawn a real master (and
       # for the replay suite a real worker) over a unix socket in a temp dir,
       # and bind ephemeral loopback ports. No root, no fixed port, no TTY — a
