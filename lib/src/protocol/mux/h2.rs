@@ -1914,6 +1914,10 @@ impl ConnectionH2 {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
+        debug_assert!(
+            !self.zero_holds_output(),
+            "no output may be pending in zero when a frame header is read"
+        );
         let i = self.zero.storage.data();
         trace!("{}   header: {:?}", log_context!(self), i);
         match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
@@ -2379,6 +2383,15 @@ impl ConnectionH2 {
             self.readiness.event.remove(Ready::READABLE);
             return H2ReadTarget::Done(MuxResult::Continue);
         };
+        // `zero` is read into from its first byte: while it holds output
+        // (an ACK or GOAWAY), a read there would parse that output as the
+        // peer's frame and clear it. Wait for the flush, which restores
+        // READABLE interest; the event is kept for that later read. A forced
+        // READABLE (the shutdown drive) must not bypass this either.
+        if stream_id == H2StreamId::Zero && self.zero_holds_output() {
+            self.readiness.interest.remove(Ready::READABLE);
+            return H2ReadTarget::Done(MuxResult::Continue);
+        }
         match stream_id {
             H2StreamId::Zero => {}
             H2StreamId::Other { .. } => {
@@ -4229,6 +4242,16 @@ impl ConnectionH2 {
             // written in the caller's control-frame preamble; let the readable
             // path consume the remaining frame payload.
             (H2State::Discard, _) => H2WritableStateTarget::Done(MuxResult::Continue),
+            // A GOAWAY waiting for a half-written stream frame: finish that
+            // frame first, or the GOAWAY is never sent.
+            (H2State::GoAway, _)
+                if matches!(
+                    self.stream_table.expect_write(),
+                    Some(H2StreamId::Other { .. })
+                ) =>
+            {
+                H2WritableStateTarget::WriteStreams
+            }
             (H2State::GoAway, _) => {
                 // Response DATA frames may still sit in rustls's output
                 // buffer — accepted by socket_write_vectored during
@@ -5152,8 +5175,11 @@ impl ConnectionH2 {
         // the elapsed check is still true, and we emit another
         // `warn!` + `goaway()` pair, each bumping `h2.goaway.sent.*`.
         self.settings_sent_at = None;
+        // Output already queued in `zero` (an ACK) stays ahead of the GOAWAY.
+        if !self.zero_holds_output() {
+            self.zero.storage.clear();
+        }
         let kawa = &mut self.zero;
-        kawa.storage.clear();
         // Severity tiering: only `InternalError` implies a sozu-side bug when
         // WE emit it. Every other non-`NoError` reason is "peer misbehaved,
         // sozu defended correctly" — operators don't need paging on abusive
@@ -5178,7 +5204,7 @@ impl ConnectionH2 {
                 kawa.storage.fill(size);
                 self.metric_events.push(MetricEvent::GoAwayFrameSent);
                 self.state = H2State::GoAway;
-                self.stream_table.set_expect_write(Some(H2StreamId::Zero));
+                self.park_zero_output();
                 self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
                 self.readiness.signal_pending_write();
                 MuxResult::Continue
@@ -5260,8 +5286,11 @@ impl ConnectionH2 {
         // Keep expect_read as-is: existing streams should continue reading
         // data during the drain window opened by the initial GOAWAY. Only
         // the final GOAWAY (via `goaway()`) removes READABLE.
+        // Output already queued in `zero` (an ACK) stays ahead of the GOAWAY.
+        if !self.zero_holds_output() {
+            self.zero.storage.clear();
+        }
         let kawa = &mut self.zero;
-        kawa.storage.clear();
         debug!(
             "{} GOAWAY (graceful, initial): last_stream_id=0x7FFFFFFF",
             log_context!(self)
@@ -5283,7 +5312,7 @@ impl ConnectionH2 {
                 // Keep READABLE so in-flight request bodies can still be received
                 // during the drain window. Only remove READABLE in the final GOAWAY
                 // (via `goaway()`).
-                self.stream_table.set_expect_write(Some(H2StreamId::Zero));
+                self.park_zero_output();
                 self.readiness.arm_writable();
                 MuxResult::Continue
             }
@@ -6499,6 +6528,14 @@ impl ConnectionH2 {
     fn queue_zero_output(&mut self) {
         self.readiness.interest.insert(Ready::WRITABLE);
         self.readiness.interest.remove(Ready::READABLE);
+        self.park_zero_output();
+        self.readiness.signal_pending_write();
+    }
+
+    /// Give `expect_write` to the output just appended to `zero`, unless a
+    /// stream frame is parked half-written: then the output waits for that
+    /// frame (`zero_output_deferred`).
+    fn park_zero_output(&mut self) {
         if matches!(
             self.stream_table.expect_write(),
             Some(H2StreamId::Other { .. })
@@ -6507,7 +6544,14 @@ impl ConnectionH2 {
         } else {
             self.stream_table.set_expect_write(Some(H2StreamId::Zero));
         }
-        self.readiness.signal_pending_write();
+    }
+
+    /// Whether `zero` holds output not yet flushed, flushing now or waiting
+    /// for a parked stream frame. While it does, nothing is read into `zero`
+    /// and nothing clears it.
+    fn zero_holds_output(&self) -> bool {
+        self.zero_output_deferred
+            || matches!(self.stream_table.expect_write(), Some(H2StreamId::Zero))
     }
 
     fn handle_ping_frame(&mut self, ping: parser::Ping) -> MuxResult {
@@ -10996,12 +11040,18 @@ mod tests {
 
     /// Park a 41-byte DATA frame on stream 1 after the socket took 20 bytes
     /// of it, feed `inbound` (a PING or SETTINGS), and read it. `between`
-    /// then runs before the socket is unthrottled and `writable()` is driven
-    /// until nothing is left to write. Returns the connection, whose socket
-    /// holds every byte the peer would read.
+    /// then runs before the socket is unthrottled, and the connection is
+    /// driven the way `Mux` drives it, `writable()` and `readable()` when
+    /// the filtered readiness allows them. Returns the connection, whose
+    /// socket holds every byte the peer would read.
     fn ack_after_half_written_frame(
         inbound: &[u8],
-        between: impl FnOnce(&mut H2Shell<PacedSocket>, GlobalStreamId),
+        between: impl FnOnce(
+            &mut H2Shell<PacedSocket>,
+            &mut Context<TestListener>,
+            &mut Router,
+            GlobalStreamId,
+        ),
     ) -> H2Shell<PacedSocket> {
         let pool = make_pool_for_invariant_16();
         let (socket, _peer) = connected_socket();
@@ -11073,16 +11123,33 @@ mod tests {
             "premise: the frame was read and its ACK queued"
         );
 
-        between(&mut connection, gid);
+        between(&mut connection, &mut context, &mut router, gid);
         connection.socket.budget = usize::MAX;
-        for _ in 0..8 {
+        for _ in 0..16 {
             connection.core.readiness.event.insert(Ready::WRITABLE);
-            if !connection.core.readiness.filter_interest().is_writable() {
-                break;
+            if connection.core.readiness.filter_interest().is_writable() {
+                connection.writable(&mut context, EndpointClient(&mut router));
             }
-            connection.writable(&mut context, EndpointClient(&mut router));
+            connection.core.readiness.event.insert(Ready::READABLE);
+            if connection.core.readiness.filter_interest().is_readable() {
+                connection.readable(&mut context, EndpointClient(&mut router));
+            }
         }
         connection
+    }
+
+    const HALF_WRITTEN_PING: &[u8] = b"\x00\x00\x08\x06\x00\x00\x00\x00\x00pingpong";
+    const SECOND_PING: &[u8] = b"\x00\x00\x08\x06\x00\x00\x00\x00\x00pingpon2";
+
+    /// `(type, flags, stream id)` of every frame the peer reads, or the
+    /// parse failure.
+    fn peer_frame_kinds(wire: &[u8]) -> Result<Vec<(u8, u8, u32)>, String> {
+        peer_frames(wire).map(|frames| {
+            frames
+                .into_iter()
+                .map(|(kind, flags, stream_id, _)| (kind, flags, stream_id))
+                .collect()
+        })
     }
 
     /// A PING that arrives while a stream frame is half-written must be
@@ -11102,10 +11169,7 @@ mod tests {
     /// fails with `... 0 remain")`. Verified 2026-09-26.
     #[test]
     fn a_ping_during_a_half_written_frame_is_acknowledged_after_it() {
-        let connection = ack_after_half_written_frame(
-            b"\x00\x00\x08\x06\x00\x00\x00\x00\x00pingpong",
-            |_, _| {},
-        );
+        let connection = ack_after_half_written_frame(HALF_WRITTEN_PING, |_, _, _, _| {});
 
         assert_eq!(
             peer_frames(&connection.socket.wire),
@@ -11125,7 +11189,7 @@ mod tests {
     #[test]
     fn a_settings_during_a_half_written_frame_is_acknowledged_after_it() {
         let connection =
-            ack_after_half_written_frame(b"\x00\x00\x00\x04\x00\x00\x00\x00\x00", |_, _| {});
+            ack_after_half_written_frame(b"\x00\x00\x00\x04\x00\x00\x00\x00\x00", |_, _, _, _| {});
 
         assert_eq!(
             peer_frames(&connection.socket.wire),
@@ -11142,33 +11206,165 @@ mod tests {
     }
 
     /// A deferred ACK whose parked stream is removed before its frame resumes
-    /// is flushed on the next `writable()`, and reading resumes: nothing else
-    /// would ever hand `zero` the write, and READABLE stays off until it is
-    /// flushed.
+    /// does not leave the connection unable to read: nothing else would
+    /// hand `zero` the write, and reads into `zero` wait for that flush.
+    ///
+    /// The bytes on the wire are deliberately not asserted. Removing a
+    /// stream parked mid-frame drops the rest of that frame
+    /// (`H2StreamTable::remove` nulls the park), so the peer reads a
+    /// truncated frame whatever follows it. That loss is older than the
+    /// deferral and is not fixed here.
     ///
     /// TO SEE THIS RED: in `ConnectionH2::control_flush_from`, delete the
     /// `if self.zero_output_deferred && self.stream_table.expect_write().is_none()`
-    /// block. The test then fails with `the deferred PING ACK must still be
-    /// sent`. Verified 2026-09-26.
+    /// block. The test then fails with `a deferred ACK must not strand
+    /// zero`. Verified 2026-09-27.
     #[test]
-    fn a_deferred_ack_is_sent_when_its_parked_stream_is_removed() {
-        let connection = ack_after_half_written_frame(
-            b"\x00\x00\x08\x06\x00\x00\x00\x00\x00pingpong",
-            |connection, gid| {
+    fn a_deferred_ack_does_not_strand_reads_when_its_parked_stream_is_removed() {
+        let connection =
+            ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, _, _, gid| {
                 connection
                     .core
                     .remove_dead_stream(REGISTERED_STREAM_ID, gid);
+            });
+
+        assert!(
+            connection.core.zero.storage.is_empty() && !connection.core.zero_holds_output(),
+            "a deferred ACK must not strand zero"
+        );
+        assert!(
+            connection.core.readiness.interest.is_readable(),
+            "once zero is flushed the connection must read again"
+        );
+    }
+
+    /// Two PINGs read while one frame stays parked are both acknowledged,
+    /// in order, after that frame.
+    #[test]
+    fn two_pings_during_one_park_are_acknowledged_after_the_frame() {
+        let connection = ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, _, _, _| {
+            connection.socket.inbound.extend(SECOND_PING);
+        });
+
+        assert_eq!(
+            peer_frames(&connection.socket.wire),
+            Ok(vec![
+                (0, 0, REGISTERED_STREAM_ID, HALF_WRITTEN_PAYLOAD.to_vec()),
+                (6, parser::FLAG_ACK, 0, b"pingpong".to_vec()),
+                (6, parser::FLAG_ACK, 0, b"pingpon2".to_vec()),
+            ]),
+            "both PING ACKs must follow the whole DATA frame, in order"
+        );
+    }
+
+    /// A SETTINGS then a PING during one park: both ACKs, in order.
+    #[test]
+    fn settings_then_ping_during_one_park_are_acknowledged_after_the_frame() {
+        let connection = ack_after_half_written_frame(
+            b"\x00\x00\x00\x04\x00\x00\x00\x00\x00",
+            |connection, _, _, _| {
+                connection.socket.inbound.extend(SECOND_PING);
             },
         );
 
         assert_eq!(
-            &connection.socket.wire[20..],
-            b"\x00\x00\x08\x06\x01\x00\x00\x00\x00pingpong",
-            "the deferred PING ACK must still be sent"
+            peer_frames(&connection.socket.wire),
+            Ok(vec![
+                (0, 0, REGISTERED_STREAM_ID, HALF_WRITTEN_PAYLOAD.to_vec()),
+                (4, parser::FLAG_ACK, 0, Vec::new()),
+                (6, parser::FLAG_ACK, 0, b"pingpon2".to_vec()),
+            ]),
+            "the SETTINGS ACK then the PING ACK must follow the whole DATA frame"
         );
-        assert!(
-            connection.core.readiness.interest.is_readable(),
-            "once the ACK is out the connection must read again"
+    }
+
+    /// The shutdown drive (`Mux::shutting_down`) calls `flush_zero_buffer`,
+    /// which leaves a deferred ACK in place while its frame is parked, then
+    /// forces READABLE and calls `readable()`. That read must not land in
+    /// `zero` on top of the ACK: `handle_header_state` would parse the ACK
+    /// as the peer's frame header and clear it.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::poll_read_target`, delete the
+    /// `if stream_id == H2StreamId::Zero && self.zero_holds_output()` block.
+    /// Under `cargo test` the test then panics on the `debug_assert!` in
+    /// `handle_header_state`, `no output may be pending in zero when a frame
+    /// header is read`; without that assertion it fails with `the forced
+    /// shutdown read must not eat the deferred ACK`. Verified 2026-09-27.
+    #[test]
+    fn a_forced_shutdown_read_does_not_eat_a_deferred_ack() {
+        let connection =
+            ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, context, router, _| {
+                connection.socket.inbound.extend(SECOND_PING);
+                connection.flush_zero_buffer();
+                connection.core.readiness.interest.insert(Ready::READABLE);
+                connection.core.readiness.event.insert(Ready::READABLE);
+                connection.readable(context, EndpointClient(router));
+            });
+
+        assert_eq!(
+            peer_frames(&connection.socket.wire),
+            Ok(vec![
+                (0, 0, REGISTERED_STREAM_ID, HALF_WRITTEN_PAYLOAD.to_vec()),
+                (6, parser::FLAG_ACK, 0, b"pingpong".to_vec()),
+                (6, parser::FLAG_ACK, 0, b"pingpon2".to_vec()),
+            ]),
+            "the forced shutdown read must not eat the deferred ACK"
+        );
+    }
+
+    /// A final GOAWAY while a frame is parked and an ACK deferred is sent
+    /// after both: `goaway()` neither clears `zero` nor takes
+    /// `expect_write` from the parked stream.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::goaway`, clear `zero`
+    /// unconditionally and replace `self.park_zero_output();` by
+    /// `self.stream_table.set_expect_write(Some(H2StreamId::Zero));`. The
+    /// test then fails with `the whole DATA frame, the PING ACK, then the
+    /// GOAWAY`. Verified 2026-09-27.
+    #[test]
+    fn a_goaway_during_a_half_written_frame_follows_it_and_the_ack() {
+        let connection =
+            ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, context, _, gid| {
+                // A stream being answered is linked; an idle one would be
+                // pruned by the closing connection before its frame resumes.
+                context.streams[gid].state = StreamState::Linked(mio::Token(1));
+                let _ = connection.core.goaway(H2Error::NoError);
+            });
+
+        assert_eq!(
+            peer_frame_kinds(&connection.socket.wire),
+            Ok(vec![
+                (0, 0, REGISTERED_STREAM_ID),
+                (6, parser::FLAG_ACK, 0),
+                (7, 0, 0)
+            ]),
+            "the whole DATA frame, the PING ACK, then the GOAWAY"
+        );
+    }
+
+    /// The initial graceful GOAWAY (`graceful_goaway` -> `send_initial_goaway`,
+    /// the call `Mux::shutting_down` makes) behaves like the final one.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::send_initial_goaway`, clear `zero`
+    /// unconditionally and replace `self.park_zero_output();` by
+    /// `self.stream_table.set_expect_write(Some(H2StreamId::Zero));`. The
+    /// test then fails with `the whole DATA frame, the PING ACK, then the
+    /// initial GOAWAY`. Verified 2026-09-27.
+    #[test]
+    fn an_initial_goaway_during_a_half_written_frame_follows_it_and_the_ack() {
+        let connection = ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, _, _, _| {
+            let now = connection.core.now;
+            let _ = connection.core.graceful_goaway(now);
+        });
+
+        assert_eq!(
+            peer_frame_kinds(&connection.socket.wire),
+            Ok(vec![
+                (0, 0, REGISTERED_STREAM_ID),
+                (6, parser::FLAG_ACK, 0),
+                (7, 0, 0)
+            ]),
+            "the whole DATA frame, the PING ACK, then the initial GOAWAY"
         );
     }
 

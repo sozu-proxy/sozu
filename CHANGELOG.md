@@ -2879,6 +2879,12 @@
   leaves such a park alone and marks the ACK deferred; the resume that completes the frame
   hands `expect_write` to `zero`, so the ACK follows the frame, as HAProxy appends it to the
   tail of its single output ring. READABLE stays withdrawn until the ACK is flushed, as before.
+  The final and the initial graceful GOAWAY now take the same path: they no longer clear an ACK
+  already queued in `zero` nor split a parked frame, and in `H2State::GoAway` the parked frame
+  is still completed so the GOAWAY follows it. While `zero` holds output, nothing is read into
+  it, including the read `Mux::shutting_down` forces, which used to parse the deferred ACK as
+  the peer's next frame header and drop it. Removing a stream parked mid-frame still truncates
+  that frame on the wire; that older loss is not fixed here.
 
 - **`fix(command)`: a blocking channel write reports a failed `write(2)` instead of claiming
   success, and `Channel::writable` names its write errors `ChannelError::Write`
