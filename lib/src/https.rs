@@ -29,6 +29,7 @@ use rustls::{
     SupportedCipherSuite, crypto::CryptoProvider,
 };
 use rusty_ulid::Ulid;
+use socket2::SockRef;
 use sozu_command::{
     certificate::Fingerprint,
     config::{DEFAULT_ALPN_PROTOCOLS, DEFAULT_CIPHER_LIST},
@@ -204,6 +205,7 @@ impl HttpsSession {
         public_address: StdSocketAddr,
         rustls_details: ServerConnection,
         sock: MioTcpStream,
+        peer: StdSocketAddr,
         token: Token,
         wait_time: Duration,
     ) -> HttpsSession {
@@ -224,7 +226,8 @@ impl HttpsSession {
             // Will be defined later once the expect proxy header has been received and parsed
             None
         } else {
-            sock.peer_addr().ok()
+            // The address `accept(2)` returned with `sock`.
+            Some(peer)
         };
 
         let request_id = Ulid::generate();
@@ -1170,6 +1173,12 @@ pub struct HttpsListener {
     /// and putting it there made a failed registration answer `ENOENT` from
     /// `deregister` and fail the whole soft stop.
     parked_listener: Option<MioTcpListener>,
+    /// Set by `activate()`, cleared by the first `accept()` that answers
+    /// `WouldBlock`: while set, `accept()` sets `TCP_NODELAY` on each socket
+    /// it returns, because a connection queued before `activate()` set the
+    /// flag on the listener did not inherit it. See the field of the same
+    /// name on `HttpListener` (`lib/src/http.rs`).
+    nodelay_backlog: bool,
     resolver: Arc<MutexCertificateResolver>,
     rustls_details: Arc<RustlsServerConfig>,
     tags: BTreeMap<String, CachedTags>,
@@ -1392,6 +1401,7 @@ impl HttpsListener {
         Ok(HttpsListener {
             listener: None,
             parked_listener: None,
+            nodelay_backlog: false,
             address: config.address.into(),
             resolver,
             rustls_details: server_config,
@@ -1489,6 +1499,18 @@ impl HttpsListener {
             }
         };
 
+        // Once per listener, on whichever socket won above — freshly bound,
+        // inherited over SCM_RIGHTS, or parked. Every socket accepted from now
+        // on inherits it; see `nodelay_backlog` for the ones already queued.
+        if let Err(e) = SockRef::from(&listener).set_tcp_nodelay(true) {
+            error!(
+                "{} error setting nodelay on listen socket({:?}): {:?}",
+                log_module_context!(),
+                listener,
+                e
+            );
+        }
+
         let registration = registry
             .register(&mut listener, self.token, Interest::READABLE)
             .map_err(ListenerError::SocketRegistration);
@@ -1507,6 +1529,7 @@ impl HttpsListener {
         }
 
         self.listener = Some(listener);
+        self.nodelay_backlog = true;
         self.active = true;
         // Post: an activated listener owns a bound socket and is flagged active,
         // so a later `activate()` short-circuits on the `self.active` guard and
@@ -1875,17 +1898,32 @@ impl HttpsListener {
             .map_err(ListenerError::RemoveFrontend)
     }
 
-    fn accept(&mut self) -> Result<MioTcpStream, AcceptError> {
+    fn accept(&mut self) -> Result<(MioTcpStream, StdSocketAddr), AcceptError> {
         if let Some(ref sock) = self.listener {
-            sock.accept()
-                .map_err(|e| match e.kind() {
-                    ErrorKind::WouldBlock => AcceptError::WouldBlock,
-                    _ => {
-                        error!("{} accept() IO error: {:?}", log_module_context!(), e);
-                        AcceptError::IoError
+            match sock.accept() {
+                Ok((frontend_sock, peer)) => {
+                    if self.nodelay_backlog
+                        && let Err(e) = frontend_sock.set_nodelay(true)
+                    {
+                        error!(
+                            "{} error setting nodelay on front socket({:?}): {:?}",
+                            log_module_context!(),
+                            frontend_sock,
+                            e
+                        );
                     }
-                })
-                .map(|(sock, _)| sock)
+                    Ok((frontend_sock, peer))
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    // The backlog queued before `activate()` is drained.
+                    self.nodelay_backlog = false;
+                    Err(AcceptError::WouldBlock)
+                }
+                Err(e) => {
+                    error!("{} accept() IO error: {:?}", log_module_context!(), e);
+                    Err(AcceptError::IoError)
+                }
+            }
         } else {
             error!(
                 "{} cannot accept connections, no listening socket available",
@@ -2428,7 +2466,7 @@ impl HttpsProxy {
 }
 
 impl ProxyConfiguration for HttpsProxy {
-    fn accept(&mut self, token: ListenToken) -> Result<MioTcpStream, AcceptError> {
+    fn accept(&mut self, token: ListenToken) -> Result<(MioTcpStream, StdSocketAddr), AcceptError> {
         match self.listeners.get(&Token(token.0)) {
             Some(listener) => listener.borrow_mut().accept(),
             None => Err(AcceptError::IoError),
@@ -2438,6 +2476,7 @@ impl ProxyConfiguration for HttpsProxy {
     fn create_session(
         &mut self,
         mut frontend_sock: MioTcpStream,
+        peer: StdSocketAddr,
         token: ListenToken,
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,
@@ -2446,14 +2485,9 @@ impl ProxyConfiguration for HttpsProxy {
             .listeners
             .get(&Token(token.0))
             .ok_or(AcceptError::IoError)?;
-        if let Err(e) = frontend_sock.set_nodelay(true) {
-            error!(
-                "{} error setting nodelay on front socket({:?}): {:?}",
-                log_module_context!(),
-                frontend_sock,
-                e
-            );
-        }
+        // No `set_nodelay` here: the socket has `TCP_NODELAY` from its
+        // listener, or from `HttpsListener::accept` if it was queued before
+        // the listener set it.
 
         let owned = listener.borrow();
         let rustls_details = ServerConnection::new(owned.rustls_details.clone()).map_err(|e| {
@@ -2511,6 +2545,7 @@ impl ProxyConfiguration for HttpsProxy {
             public_address,
             rustls_details,
             frontend_sock,
+            peer,
             session_token,
             wait_time,
         )));
@@ -3227,6 +3262,7 @@ mod tests {
 
         let listener = HttpsListener {
             parked_listener: None,
+            nodelay_backlog: false,
             listener: None,
             address: address.into(),
             fronts,
@@ -3520,6 +3556,9 @@ mod tests {
             public_address,
             rustls_details,
             stream,
+            // What `accept(2)` reports for this connection: the far end, which
+            // for the stand-in is the balancer.
+            balancer_peer,
             Token(0),
             Duration::from_secs(0),
         );
@@ -3576,15 +3615,15 @@ mod tests {
         );
     }
 
-    /// The `or_else` arm of [`FrontRustls::peer_addr`] is reachable, and this
-    /// is the route that reaches it. On the direct (non-expect-proxy) route
-    /// `HttpsSession::new` seeds `peer_address` from a best-effort
-    /// `sock.peer_addr().ok()` at accept — an `Option` because that
-    /// `getpeername(2)` can fail — so a session can legitimately hand the
-    /// handler `None`. Without the fallback the `peer=` slot would then be
-    /// blank for the whole connection even though the socket is healthy and
-    /// the kernel would answer, which is strictly worse than the live lookup
-    /// this change replaced.
+    /// The `or_else` arm of [`FrontRustls::peer_addr`] answers for a handler
+    /// built with no peer address. No production route builds one any more:
+    /// the direct (non-expect-proxy) route seeds `peer_address` with the
+    /// address `accept(2)` returned (sozu-proxy/sozu#1586), and the
+    /// expect-proxy route only reaches the handshake with the PROXY-advertised
+    /// source. The arm stays as defence in depth — without it a `None` would
+    /// blank the `peer=` slot for the whole connection even though the socket
+    /// is healthy and the kernel would answer — so the test builds that
+    /// handler by hand.
     ///
     /// `SessionTcpStream`'s identical arm has had
     /// `socket::tests::session_tcp_stream_peer_addr_falls_back_to_the_live_lookup`
@@ -3632,6 +3671,7 @@ mod tests {
             public_address,
             rustls_details,
             stream,
+            live_peer,
             Token(0),
             Duration::from_secs(0),
         );
@@ -3641,8 +3681,7 @@ mod tests {
             _ => panic!("a non-expect-proxy session must start in the TLS handshake state"),
         };
 
-        // What the direct route leaves behind when `getpeername(2)` failed at
-        // accept: the session knows no peer, and the handler must fall back.
+        // A session that knows no peer, which the handler must fall back from.
         session.peer_address = None;
         handshake.peer_address = None;
 

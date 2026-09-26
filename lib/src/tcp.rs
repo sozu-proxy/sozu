@@ -14,6 +14,7 @@ use mio::{
     unix::SourceFd,
 };
 use rusty_ulid::Ulid;
+use socket2::SockRef;
 use sozu_command::{
     ObjectKind,
     config::{
@@ -178,9 +179,11 @@ impl TcpSession {
         proxy_protocol: Option<ProxyProtocolConfig>,
         proxy: Rc<RefCell<TcpProxy>>,
         socket: MioTcpStream,
+        peer: SocketAddr,
         wait_time: Duration,
     ) -> TcpSession {
-        let frontend_address = socket.peer_addr().ok();
+        // The address `accept(2)` returned with `socket`.
+        let frontend_address = Some(peer);
         let mut frontend_buffer_session = None;
         let mut backend_buffer_session = None;
 
@@ -298,11 +301,13 @@ impl TcpSession {
         listener: Rc<RefCell<TcpListener>>,
         proxy: Rc<RefCell<TcpProxy>>,
         socket: MioTcpStream,
+        peer: SocketAddr,
         wait_time: Duration,
         preread_timeout: Duration,
         effective_max_bytes: usize,
     ) -> TcpSession {
-        let frontend_address = socket.peer_addr().ok();
+        // The address `accept(2)` returned with `socket`.
+        let frontend_address = Some(peer);
         let request_id = Ulid::generate();
 
         // Armed with the SHORT preread timeout directly (not the listener's
@@ -2067,6 +2072,12 @@ pub struct TcpListener {
     /// and putting it there made a failed registration answer `ENOENT` from
     /// `deregister` and fail the whole soft stop.
     parked_listener: Option<MioTcpListener>,
+    /// Set by `activate()`, cleared by the first `accept()` that answers
+    /// `WouldBlock`: while set, `accept()` sets `TCP_NODELAY` on each socket
+    /// it returns, because a connection queued before `activate()` set the
+    /// flag on the listener did not inherit it. See the field of the same
+    /// name on `HttpListener` (`lib/src/http.rs`).
+    nodelay_backlog: bool,
     /// SNI -> `(AlpnMatcher, ClusterId)` route table (sozu-proxy/sozu#1279).
     /// Populated by `add_tcp_front`/`remove_tcp_front` from
     /// `RequestTcpFrontend.sni`/`.alpn`; empty for a listener whose fronts
@@ -2112,6 +2123,7 @@ impl TcpListener {
             cluster_id: None,
             listener: None,
             parked_listener: None,
+            nodelay_backlog: false,
             token,
             address: config.address.into(),
             config,
@@ -2439,6 +2451,18 @@ impl TcpListener {
             }
         };
 
+        // Once per listener, on whichever socket won above — freshly bound,
+        // inherited over SCM_RIGHTS, or parked. Every socket accepted from now
+        // on inherits it; see `nodelay_backlog` for the ones already queued.
+        if let Err(e) = SockRef::from(&listener).set_tcp_nodelay(true) {
+            error!(
+                "{} error setting nodelay on listen socket({:?}): {:?}",
+                log_module_context!(),
+                listener,
+                e
+            );
+        }
+
         let registration = registry
             .register(&mut listener, self.token, Interest::READABLE)
             .map_err(ProxyError::RegisterListener);
@@ -2457,6 +2481,7 @@ impl TcpListener {
         }
 
         self.listener = Some(listener);
+        self.nodelay_backlog = true;
         self.active = true;
         Ok(self.token)
     }
@@ -3017,22 +3042,37 @@ impl ProxyConfiguration for TcpProxy {
         }
     }
 
-    fn accept(&mut self, token: ListenToken) -> Result<MioTcpStream, AcceptError> {
+    fn accept(&mut self, token: ListenToken) -> Result<(MioTcpStream, SocketAddr), AcceptError> {
         let internal_token = Token(token.0);
         if let Some(listener) = self.listeners.get(&internal_token) {
-            if let Some(tcp_listener) = &listener.borrow().listener {
-                tcp_listener
-                    .accept()
-                    .map(|(frontend_sock, _)| frontend_sock)
-                    .map_err(|e| match e.kind() {
-                        ErrorKind::WouldBlock => AcceptError::WouldBlock,
-                        _ => {
-                            error!("{} accept() IO error: {:?}", log_module_context!(), e);
-                            AcceptError::IoError
-                        }
-                    })
-            } else {
-                Err(AcceptError::IoError)
+            let mut listener = listener.borrow_mut();
+            let accepted = match &listener.listener {
+                Some(tcp_listener) => tcp_listener.accept(),
+                None => return Err(AcceptError::IoError),
+            };
+            match accepted {
+                Ok((frontend_sock, peer)) => {
+                    if listener.nodelay_backlog
+                        && let Err(e) = frontend_sock.set_nodelay(true)
+                    {
+                        error!(
+                            "{} error setting nodelay on front socket({:?}): {:?}",
+                            log_module_context!(),
+                            frontend_sock,
+                            e
+                        );
+                    }
+                    Ok((frontend_sock, peer))
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    // The backlog queued before `activate()` is drained.
+                    listener.nodelay_backlog = false;
+                    Err(AcceptError::WouldBlock)
+                }
+                Err(e) => {
+                    error!("{} accept() IO error: {:?}", log_module_context!(), e);
+                    Err(AcceptError::IoError)
+                }
             }
         } else {
             Err(AcceptError::IoError)
@@ -3042,6 +3082,7 @@ impl ProxyConfiguration for TcpProxy {
     fn create_session(
         &mut self,
         mut frontend_sock: MioTcpStream,
+        peer: SocketAddr,
         token: ListenToken,
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,
@@ -3083,14 +3124,9 @@ impl ProxyConfiguration for TcpProxy {
             return Err(AcceptError::IoError);
         }
 
-        if let Err(e) = frontend_sock.set_nodelay(true) {
-            error!(
-                "{} error setting nodelay on front socket({:?}): {:?}",
-                log_module_context!(),
-                frontend_sock,
-                e
-            );
-        }
+        // No `set_nodelay` here: the socket has `TCP_NODELAY` from its
+        // listener, or from `TcpProxy::accept` if it was queued before the
+        // listener set it.
 
         let mut session_manager = self.sessions.borrow_mut();
         let entry = session_manager.slab.vacant_entry();
@@ -3133,6 +3169,7 @@ impl ProxyConfiguration for TcpProxy {
                 listener.clone(),
                 proxy,
                 frontend_sock,
+                peer,
                 wait_time,
                 preread_timeout,
                 effective_max_bytes,
@@ -3155,6 +3192,7 @@ impl ProxyConfiguration for TcpProxy {
                 proxy_protocol,
                 proxy,
                 frontend_sock,
+                peer,
                 wait_time,
             )
         };
@@ -4687,13 +4725,11 @@ mod sni_routing_tests {
 
         // A non-blocking connect to a (likely unused) loopback port returns a
         // real `MioTcpStream` handle immediately, regardless of whether the
-        // connection completes; `new_sni_preread` only reads `peer_addr()`.
-        let socket = MioTcpStream::connect(
-            format!("127.0.0.1:{}", provide_port())
-                .parse()
-                .expect("loopback address must parse"),
-        )
-        .expect("mio connect must return a socket handle");
+        // connection completes; `new_sni_preread` reads nothing from it.
+        let peer: SocketAddr = format!("127.0.0.1:{}", provide_port())
+            .parse()
+            .expect("loopback address must parse");
+        let socket = MioTcpStream::connect(peer).expect("mio connect must return a socket handle");
 
         let before = sni_preread_active_gauge();
         let session = TcpSession::new_sni_preread(
@@ -4705,6 +4741,7 @@ mod sni_routing_tests {
             listener,
             proxy,
             socket,
+            peer,
             Duration::from_millis(0),
             Duration::from_secs(3),
             16384,
@@ -4878,7 +4915,7 @@ mod sni_routing_tests {
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let addr = std_listener.local_addr().expect("listener local addr");
         let mut client = std::net::TcpStream::connect(addr).expect("connect test client");
-        let (server, _) = std_listener.accept().expect("accept test server");
+        let (server, server_peer) = std_listener.accept().expect("accept test server");
         server.set_nonblocking(true).expect("server nonblocking");
 
         let (front_buffer, back_buffer) = {
@@ -4898,6 +4935,7 @@ mod sni_routing_tests {
             listener,
             proxy,
             MioTcpStream::from_std(server),
+            server_peer,
             Duration::from_millis(0),
             Duration::from_secs(3),
             16384,
@@ -5023,7 +5061,7 @@ mod sni_routing_tests {
             .local_addr()
             .expect("test frontend local addr");
         let client = std::net::TcpStream::connect(frontend_address).expect("connect test client");
-        let (frontend, _) = frontend_listener
+        let (frontend, frontend_peer) = frontend_listener
             .accept()
             .expect("accept the client connection");
         frontend
@@ -5061,6 +5099,7 @@ mod sni_routing_tests {
             Some(ProxyProtocolConfig::ExpectHeader),
             proxy,
             MioTcpStream::from_std(frontend),
+            frontend_peer,
             Duration::from_millis(0),
         )));
         let proxy_session: Rc<RefCell<dyn ProxySession>> = session.clone();
