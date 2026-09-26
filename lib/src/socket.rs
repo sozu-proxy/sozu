@@ -563,6 +563,12 @@ pub struct FrontRustls {
     /// Peer reset the connection (RST/ConnectionAborted/BrokenPipe). The TCP
     /// channel is dead; further writes are pointless and should short-circuit.
     pub peer_reset: bool,
+    /// `process_new_packets` failed on this connection: a corrupt record, a
+    /// fatal alert, a protocol violation. rustls keeps that error for good,
+    /// so from then on [`SocketHandler::socket_read`] answers `(0, Error)`
+    /// at once, without serving plaintext rustls decrypted before the
+    /// failure. See `rustls_socket_read`.
+    pub tls_fatal: bool,
     /// Connection/session ULID propagated from the enclosing mux session.
     /// Rendered into SOCKET-layer error logs via [`Self::session_ulid`].
     pub session_ulid: Ulid,
@@ -627,6 +633,12 @@ enum RustlsReadFault {
 /// - one record can hold several H2 frames: the later calls are served from
 ///   the plaintext buffer without a `recv`.
 ///
+/// [`SocketResult::Error`] from `process_new_packets` is sticky: the failing
+/// pass still reports the plaintext it had already copied into `buf` before
+/// reaching `read_tls` (a `(n, Error)` return), but it sets `tls_fatal`, and
+/// every later pass answers `(0, Error)` without draining anything rustls
+/// decrypted before the failure.
+///
 /// EOF and `close_notify` are reported as [`SocketResult::Closed`] by the
 /// first call that finds no plaintext left to deliver, never behind it: a
 /// peer's last frames are handed over before the close. A call the buffered
@@ -639,7 +651,17 @@ fn rustls_socket_read<R: Read>(
     buf: &mut [u8],
     peer_disconnected: &mut bool,
     peer_reset: &mut bool,
+    tls_fatal: &mut bool,
 ) -> (usize, SocketResult, Option<RustlsReadFault>) {
+    // `Error` is sticky. Once `process_new_packets` has failed, plaintext it
+    // appended from records that preceded the bad one may still sit in the
+    // reader; serving it would hand the mux frames from a session that is
+    // already dead, and the mux only drops READABLE on `Error`, so the next
+    // peer bytes would be parsed. The failure was logged on the pass that
+    // hit it; later passes answer silently.
+    if *tls_fatal {
+        return (0, SocketResult::Error, None);
+    }
     let mut size = 0usize;
     let mut can_read = true;
     let mut is_error = false;
@@ -753,6 +775,7 @@ fn rustls_socket_read<R: Read>(
 
         if let Err(e) = session.process_new_packets() {
             fault = Some(RustlsReadFault::ProcessPackets(e));
+            *tls_fatal = true;
             is_error = true;
             break;
         }
@@ -796,6 +819,7 @@ impl SocketHandler for FrontRustls {
             buf,
             &mut self.peer_disconnected,
             &mut self.peer_reset,
+            &mut self.tls_fatal,
         );
         match fault {
             None => {}
@@ -2200,6 +2224,7 @@ mod rustls_read_tests {
         session: ServerConnection,
         peer_disconnected: bool,
         peer_reset: bool,
+        tls_fatal: bool,
     }
 
     impl Front {
@@ -2215,8 +2240,28 @@ mod rustls_read_tests {
                 &mut buf,
                 &mut self.peer_disconnected,
                 &mut self.peer_reset,
+                &mut self.tls_fatal,
             );
             assert!(fault.is_none(), "unexpected read fault: {fault:?}");
+            buf.truncate(size);
+            (buf, result)
+        }
+
+        /// Same as [`Self::read`], for a pass that is expected to fault.
+        fn read_faulting(
+            &mut self,
+            transport: &mut CountingTransport,
+            len: usize,
+        ) -> (Vec<u8>, SocketResult) {
+            let mut buf = vec![0u8; len];
+            let (size, result, _fault) = rustls_socket_read(
+                &mut self.session,
+                transport,
+                &mut buf,
+                &mut self.peer_disconnected,
+                &mut self.peer_reset,
+                &mut self.tls_fatal,
+            );
             buf.truncate(size);
             (buf, result)
         }
@@ -2229,6 +2274,7 @@ mod rustls_read_tests {
                 session,
                 peer_disconnected: false,
                 peer_reset: false,
+                tls_fatal: false,
             },
             client,
         )
@@ -2399,6 +2445,74 @@ mod rustls_read_tests {
         let (read, result) = front.read(&mut transport, FRAME_HEADER_LEN);
         assert!(read.is_empty());
         assert_eq!(result, SocketResult::Closed, "EOF stays EOF, not an error");
+    }
+
+    /// A valid record of four frames followed, in the same arrival, by a
+    /// corrupted one. `process_new_packets` appends the first record's
+    /// plaintext and then fails on the second: the session is dead. Every
+    /// later call must answer `Error` without serving that plaintext, or the
+    /// mux (which only drops READABLE on `Error`) would parse frames from a
+    /// TLS session that has already failed as soon as the peer sends again.
+    #[test]
+    fn a_fatal_tls_error_stays_an_error_and_serves_no_buffered_plaintext() {
+        let (mut front, mut client) = front_and_client();
+        let frames = client_frames();
+        let mut wire = seal(&mut client, &frames.concat());
+        let mut corrupted = seal(&mut client, b"after the valid record");
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xff;
+        wire.extend(corrupted);
+        let mut transport = CountingTransport {
+            wire: wire.into(),
+            ..Default::default()
+        };
+
+        let (read, result) = front.read_faulting(&mut transport, FRAME_HEADER_LEN);
+        assert!(read.is_empty(), "the failing pass delivers nothing");
+        assert_eq!(result, SocketResult::Error);
+
+        for call in 0..2 * frames.len() {
+            transport.wire.extend([0u8; 16]);
+            let (read, result) = front.read_faulting(&mut transport, FRAME_HEADER_LEN);
+            assert_eq!(
+                (read.len(), result),
+                (0, SocketResult::Error),
+                "call {call} after a fatal TLS error must stay (0, Error)"
+            );
+        }
+    }
+
+    /// The pass that hits the fatal error keeps what it had already copied:
+    /// plaintext served from the buffer BEFORE `read_tls` met the corrupt
+    /// record is returned with `Error` (`(n, Error)`), and only later passes
+    /// are `(0, Error)`.
+    #[test]
+    fn plaintext_served_before_the_fatal_error_is_returned_with_it() {
+        let (mut front, mut client) = front_and_client();
+        let frames = client_frames();
+        let plaintext = frames.concat();
+        let mut transport = CountingTransport {
+            wire: seal(&mut client, &plaintext).into(),
+            ..Default::default()
+        };
+        let (read, result) = front.read(&mut transport, FRAME_HEADER_LEN);
+        assert_eq!(read, plaintext[..FRAME_HEADER_LEN]);
+        assert_eq!(result, SocketResult::Continue);
+
+        let mut corrupted = seal(&mut client, b"after the valid record");
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xff;
+        transport.wire.extend(corrupted);
+
+        let (read, result) = front.read_faulting(&mut transport, 16 * 1024);
+        assert_eq!(
+            read,
+            plaintext[FRAME_HEADER_LEN..],
+            "the rest of the valid record"
+        );
+        assert_eq!(result, SocketResult::Error);
+        let (read, result) = front.read_faulting(&mut transport, 16 * 1024);
+        assert_eq!((read.len(), result), (0, SocketResult::Error));
     }
 
     /// A reset is `Closed` with `peer_reset` set, so writes short-circuit.

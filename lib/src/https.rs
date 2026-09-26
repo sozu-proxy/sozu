@@ -549,6 +549,7 @@ impl HttpsSession {
             session: handshake.session,
             peer_disconnected: false,
             peer_reset: false,
+            tls_fatal: false,
             session_ulid,
             // `self.peer_address`, NOT `stream.peer_addr()`. On an expect-proxy
             // frontend `upgrade_expect` has already adopted the PROXY-advertised

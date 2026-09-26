@@ -978,6 +978,9 @@ contract is unchanged: an EAGAIN always ends the call with
 "drop READABLE until the next event", and a full buffer answers `Continue` so
 READABLE stays. EOF and `close_notify` are answered `Closed` by the first
 call that finds no plaintext left, after the frames that preceded them.
+`Error` is sticky: once `process_new_packets` fails, `FrontRustls::tls_fatal`
+makes every later call answer `(0, Error)` without serving plaintext decrypted
+from the records before the bad one.
 
 This is not `AsyncRead::poll_read`: nothing here is a future, `context` is the
 mux's own `Context` and not a `task::Context`, and `lib/` holds no

@@ -466,12 +466,18 @@
   answered `Closed` by the first call that finds no plaintext left, after the frames that
   preceded them, where a call that began with `read_tls` could answer `Closed` alongside the
   first of those frames and leave the rest stranded in rustls's buffer with READABLE dropped.
+  `Error` stays sticky, now explicitly: once `process_new_packets` fails (a corrupt record, a
+  fatal alert), the new `FrontRustls::tls_fatal` makes every later call answer `(0, Error)`
+  without serving plaintext rustls had decrypted from the records before the bad one — which
+  draining first would otherwise have handed to the mux, whose only reaction to a frontend
+  `Error` is to drop READABLE. The failing call still returns what it had already copied.
   No per-readiness-turn "EAGAIN seen" memory is added: after the change, 13 to 18 EAGAINs out of
   92-97 repeat one on the same socket within a single wakeup, and the sampled one followed a
   read that found fresh bytes, so such a memory would delay data to save them. The read loop
   moved into a helper generic over `Read` so `rustls_read_tests` can count every `recv` it
   issues: several frames in one record, a large H1-style buffer, a fragmented record,
-  `close_notify`, a FIN without `close_notify`, and a reset.
+  `close_notify`, a FIN without `close_notify`, a reset, a corrupt record behind a valid one,
+  and plaintext served in the same call as the failure.
 
 - **`perf(mux)`: the backend id is no longer copied into a `String` per request
   ([#1579](https://github.com/sozu-proxy/sozu/issues/1579)).** `HttpContext::backend_id` and
