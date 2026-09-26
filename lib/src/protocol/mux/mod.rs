@@ -657,6 +657,17 @@ pub trait Endpoint: Debug {
     /// socket property and stays on the embedder's side of the boundary; the
     /// cores receive an `Option<Duration>` that was captured for them.
     fn peer_rtt(&self, token: Token) -> Option<Duration>;
+    /// Smoothed round-trip time of the connection this endpoint was handed
+    /// TO — the local side, where [`Self::peer_rtt`] reports the other one.
+    ///
+    /// Asked by `ConnectionH2::snapshot_rtts` for the access log's
+    /// `client_rtt` cell, at the moment a stream is logged and at no other
+    /// time, so a pass that logs nothing costs no `getsockopt(TCP_INFO)`.
+    /// Neither `EndpointClient` nor `EndpointServer` owns the local socket,
+    /// so both answer `None`: the value comes from `h2::ShellEndpoint`, the
+    /// wrapper `H2Shell` puts around them, which samples its own socket at
+    /// most once per `Mux` pass. The core still never reaches a socket.
+    fn local_rtt(&self) -> Option<Duration>;
     /// If end_stream is called on a client it means the stream has PROPERLY finished,
     /// the server has completed serving the response and informs the endpoint that this stream won't be used anymore.
     /// If end_stream is called on a server it means the stream was BROKEN, the client was most likely disconnected or encountered an error
@@ -678,6 +689,32 @@ pub trait Endpoint: Debug {
         stream: GlobalStreamId,
         context: &mut Context<L>,
     ) -> bool;
+}
+
+/// Every `getsockopt(TCP_INFO)` the mux issues for an access log goes through
+/// here: `ConnectionH1`'s two cells, `Endpoint::peer_rtt`, the per-pass
+/// frontend sample of `h2::ShellEndpoint` and the teardown sweep of
+/// `Mux::close`.
+///
+/// One function so the tests can count the reads: under `cfg(test)` each call
+/// bumps a thread-local counter, read back by [`tcp_info_reads`]. The
+/// production body is the bare `socket_rtt` call.
+pub(super) fn sample_rtt<A: std::os::fd::AsRawFd>(socket: &A) -> Option<Duration> {
+    #[cfg(test)]
+    TCP_INFO_READS.with(|reads| reads.set(reads.get() + 1));
+    socket_rtt(socket)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TCP_INFO_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `getsockopt(TCP_INFO)` reads the calling thread has made through
+/// [`sample_rtt`] so far.
+#[cfg(test)]
+pub(super) fn tcp_info_reads() -> usize {
+    TCP_INFO_READS.with(std::cell::Cell::get)
 }
 
 /// Shared logic for half-close accounting: clear `bit` from `readiness.event` on
@@ -1564,13 +1601,13 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         false
     }
 
-    /// Sample the frontend's TCP round-trip time for this pass and hand it to
-    /// the H2 core.
+    /// Open a new frontend-RTT pass: forget the sample the previous pass may
+    /// have taken, so the next access log reads a fresh one.
     ///
-    /// The counterpart of `unix_epoch_ms` for a value that costs a syscall
-    /// instead of a clock read, and kept as one function for the same reason:
-    /// the three entry points below cannot drift apart on the gate or on
-    /// which socket is read.
+    /// Free: no syscall. The sample itself is taken lazily by
+    /// `h2::ShellEndpoint::local_rtt`, at the first access log the pass
+    /// emits, and reused by every other stream that finishes in the same
+    /// pass; a pass that emits no access log reads nothing (issue #1590).
     ///
     /// Called from [`SessionState::ready`], [`Mux::timeout_inner`] and
     /// [`Mux::shutting_down_inner`] — every `Mux` entry point that can reach
@@ -1579,21 +1616,21 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// `ConnectionH2::cancel_timed_out_streams` precisely when the peer has
     /// gone silent and no `ready()` has run for a while, which is when the
     /// previous pass's sample is oldest. `Mux::close` is deliberately NOT on
-    /// the list: it already takes its own sample for its own teardown loop,
-    /// and `H2Shell::close` emits no access log.
+    /// the list: it samples on its own, only when its teardown sweep finds a
+    /// stream to log, and `H2Shell::close` emits no access log.
     ///
     /// H1 is not gated out by accident. `ConnectionH1` reads its own socket at
     /// each access log, one stream at a time, and an H1 connection carries one
     /// request at a time, so there is nothing for a per-pass sample to
-    /// amortise there — taking one would add a syscall per pass and change
-    /// nothing a reader of the log can see.
+    /// amortise there.
     ///
-    /// Issue #1339 Q11. The rejected alternative was to refresh the value at
-    /// every `ConnectionH2` entry point the way `Context::now` is refreshed;
-    /// it measured 7.8–9.7× the syscall rate for +6.5% / +5.3% CPU.
-    fn refresh_client_rtt(&mut self) {
+    /// Issue #1339 Q11 made the value per pass; #1590 made it lazy. The
+    /// rejected alternative to both was to refresh the value at every
+    /// `ConnectionH2` entry point the way `Context::now` is refreshed; it
+    /// measured 7.8–9.7× the syscall rate for +6.5% / +5.3% CPU.
+    fn expire_client_rtt(&mut self) {
         if let Connection::H2(connection) = &mut self.frontend {
-            connection.core.client_rtt = socket_rtt(connection.socket.socket_ref());
+            connection.expire_local_rtt();
         }
     }
 }
@@ -1602,24 +1639,24 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     for Mux<Front, L>
 {
     /// Thin wrapper over `Mux::ready_inner` whose only job is to run
-    /// `Mux::reschedule` on the way out, and to take this pass's single
-    /// frontend-RTT sample on the way in. `ready_inner` has a dozen `return`
-    /// sites; arming the wheel at each of them by hand is precisely the
-    /// discipline this refactor exists to remove.
+    /// `Mux::reschedule` on the way out, and to open this pass's frontend-RTT
+    /// window on the way in. `ready_inner` has a dozen `return` sites; arming
+    /// the wheel at each of them by hand is precisely the discipline this
+    /// refactor exists to remove.
     ///
-    /// The sample is taken HERE and not inside `ready_inner`'s outer loop,
-    /// where `Context::now` is refreshed. The clock is free, so sharing one
-    /// instant per outer iteration costs nothing; the RTT is a
-    /// `getsockopt(TCP_INFO)` syscall, and an outer loop that goes round
-    /// several times would pay it several times per readiness sweep. One
-    /// sweep, one syscall — see `Mux::refresh_client_rtt`.
+    /// The window opens HERE and not inside `ready_inner`'s outer loop, where
+    /// `Context::now` is refreshed. The clock is free, so sharing one instant
+    /// per outer iteration costs nothing; the RTT is a `getsockopt(TCP_INFO)`
+    /// syscall, and an outer loop that goes round several times would pay it
+    /// several times per readiness sweep. One sweep, at most one syscall, and
+    /// none when the sweep logs nothing — see `Mux::expire_client_rtt`.
     fn ready(
         &mut self,
         session: Rc<RefCell<dyn ProxySession>>,
         proxy: Rc<RefCell<dyn L7Proxy>>,
         metrics: &mut SessionMetrics,
     ) -> SessionResult {
-        self.refresh_client_rtt();
+        self.expire_client_rtt();
         let result = self.ready_inner(session, proxy, metrics);
         self.apply_backend_deltas();
         self.reschedule();
@@ -1772,12 +1809,15 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // Generate access logs for in-flight streams on session teardown.
         // Skip streams that already had their access log emitted (metrics.start is
         // set to None by metrics.reset() after generate_access_log in the happy path).
-        // Frontend RTT is the same for every stream on this session — snapshot
-        // it once outside the loop instead of paying one TCP_INFO syscall per
-        // open stream.
-        let client_rtt = socket_rtt(self.frontend.socket());
+        // Frontend RTT is the same for every stream on this session: sample it
+        // once, at the first stream that still owes a log, and not at all on
+        // the ordinary close where every stream has already been logged
+        // (issue #1590).
+        let mut client_rtt = None;
         for stream in &mut self.context.streams {
             if stream.state.is_open() && stream.metrics.start.is_some() {
+                let client_rtt =
+                    *client_rtt.get_or_insert_with(|| sample_rtt(self.frontend.socket()));
                 stream.metrics.bin += share_in;
                 stream.metrics.bout += share_out;
                 stream.metrics.service_stop();
@@ -1792,7 +1832,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     self.router
                         .backends
                         .get(&token)
-                        .and_then(|c| socket_rtt(c.socket()))
+                        .and_then(|c| sample_rtt(c.socket()))
                 });
                 for event in stream
                     .generate_access_log(
@@ -2930,18 +2970,14 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             );
             return StateResult::Continue;
         }
-        // Deliberately BELOW the early-delivery gate, unlike the clock above
-        // it: `consume_timer_entry` reads `context.now` to decide, so the
-        // clock has to be fresh before it, while the RTT is only wanted by
-        // the access logs `cancel_timed_out_streams` emits further down. The
-        // wheel rounds to the nearest tick and re-validates, so a firing that
-        // turns out to be early is common (§7.6 of `LIFECYCLE.md`) — sampling
-        // above the gate would spend a `getsockopt(TCP_INFO)` on every one of
-        // those do-nothing passes, which is the cost this whole change is
-        // accounted in. A silent peer is what brings us here and is exactly
-        // when the last `ready()` sample is oldest, so the sample itself is
-        // load-bearing; its position is not symmetry with the clock.
-        self.refresh_client_rtt();
+        // Below the early-delivery gate, like the sample it expires used to
+        // be: an early firing (§7.6 of `LIFECYCLE.md`) emits no access log, so
+        // it has no pass of its own to open. A silent peer is what brings us
+        // here and is exactly when the last `ready()` sample is oldest, so
+        // expiring it is load-bearing: the access logs
+        // `cancel_timed_out_streams` emits further down must read a fresh
+        // value, not the one a `ready()` pass took before the peer went quiet.
+        self.expire_client_rtt();
         let front_is_h2 = match self.frontend {
             Connection::H1(_) => false,
             Connection::H2(_) => true,
@@ -3316,9 +3352,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // Same reasoning for the frontend RTT: `drive_frontend_shutdown_io`
         // below reaches `readable()` and `writable()`, so every
         // `ConnectionH2::snapshot_rtts` site is live on this path and a
-        // draining session would otherwise log the sample of its last
+        // draining session would otherwise reuse the sample of its last
         // `ready()` pass for the whole drain.
-        self.refresh_client_rtt();
+        self.expire_client_rtt();
         // RFC 9113 §6.8: initiate graceful shutdown with double-GOAWAY pattern.
         // Only send the initial GOAWAY once. The final GOAWAY (with the real
         // last_stream_id) is handled by finalize_write() when all streams drain.
@@ -4480,7 +4516,7 @@ mod tests {
     /// token must report that frontend's RTT rather than `None`.
     ///
     /// TO SEE THIS RED: in `EndpointServer::peer_rtt` (`connection.rs`),
-    /// return `None` instead of `socket_rtt(self.0.socket())`. It fails on
+    /// return `None` instead of `sample_rtt(self.0.socket())`. It fails on
     /// the first loop iteration with `EndpointServer must report its single
     /// frontend's RTT for any token` — the second never runs, which is why
     /// the loop is two tokens rather than an assertion about "any".
@@ -4499,19 +4535,19 @@ mod tests {
         }
     }
 
-    /// A `Mux` pass replaces the carried frontend-RTT sample, so a stream
-    /// finishing in a LATER pass reports a freshly measured value.
+    /// A `Mux` pass forgets the previous pass's frontend-RTT sample, and takes
+    /// no new one when nothing in the pass is logged (issue #1590).
     ///
-    /// The other half of `snapshot_rtts_reports_the_carried_pass_sample_to_every_stream`
+    /// The other half of `snapshot_rtts_samples_the_frontend_once_per_pass`
     /// (`h2.rs`). That one pins "one value for every stream in a pass"; this
-    /// one pins "a new value on the next pass". Neither is the contract
-    /// alone — a value that was carried but never refreshed would satisfy the
-    /// first while freezing the access log's `client_rtt` at the connection's
-    /// very first sample forever.
+    /// one pins "not the same value on the next pass" and "no read for a pass
+    /// that logs nothing". A sample that was memoized but never forgotten
+    /// would satisfy the first while freezing the access log's `client_rtt`
+    /// at the connection's first sample forever.
     ///
     /// Entered through [`SessionState::timeout`] rather than
     /// [`SessionState::ready`]. Both call the same
-    /// [`Mux::refresh_client_rtt`], which exists as one function so the three
+    /// [`Mux::expire_client_rtt`], which exists as one function so the three
     /// entry points cannot drift apart, but `ready` takes
     /// `Rc<RefCell<dyn ProxySession>>` and `Rc<RefCell<dyn L7Proxy>>` and this
     /// crate has no test implementation of either — `L7Proxy::sessions` alone
@@ -4520,12 +4556,15 @@ mod tests {
     /// silent peer's streams and emits their access logs, which is exactly
     /// when the previous pass's sample is oldest.
     ///
-    /// TO SEE THIS RED: delete the `self.refresh_client_rtt();` line from
-    /// [`Mux::timeout_inner`]. The frontend then still carries the sentinel
-    /// and the final assertion fails with `a Mux pass must replace the
-    /// carried frontend RTT with a fresh sample, got Some(4321s)`.
+    /// TO SEE THIS RED: delete the `self.expire_client_rtt();` line from
+    /// [`Mux::timeout_inner`]. The frontend then still holds the stale sample
+    /// and the first assertion fails with `a Mux pass must forget the previous
+    /// pass's frontend RTT`. Making `Mux::expire_client_rtt` sample eagerly
+    /// instead — the shape `Mux::refresh_client_rtt` had — fails the same
+    /// assertion with the fresh sample, `left: Some(Some(33µs))`; the second
+    /// assertion, `left: 1`, `right: 0`, is the syscall that sample cost.
     #[test]
-    fn a_mux_pass_refreshes_the_carried_client_rtt() {
+    fn a_mux_pass_forgets_the_previous_sample_and_reads_none_without_a_log() {
         /// A value no loopback SRTT can take, standing for the sample an
         /// earlier pass left behind.
         const STALE_SAMPLE: Duration = Duration::from_secs(4321);
@@ -4551,7 +4590,7 @@ mod tests {
         let Connection::H2(h2) = &mut frontend else {
             unreachable!("frontend was built as H2")
         };
-        h2.core.client_rtt = Some(STALE_SAMPLE);
+        h2.local_rtt.set(Some(Some(STALE_SAMPLE)));
         // A deadline already in the past, so `Mux::consume_timer_entry`
         // accepts the firing as a real expiry and the body below it runs.
         // Without this the connection carries the 30 s deadline it armed at
@@ -4572,21 +4611,106 @@ mod tests {
         };
 
         let mut metrics = SessionMetrics::new(None);
+        let before = tcp_info_reads();
         let _ = mux.timeout(Token(0), &mut metrics);
 
         let Connection::H2(h2) = &mux.frontend else {
             unreachable!("frontend was built as H2")
         };
-        assert!(
-            h2.core.client_rtt.is_some(),
-            "premise: TCP_INFO must answer on a live loopback frontend, \
-             otherwise this test cannot tell a refresh from a failed read"
+        assert_eq!(
+            h2.local_rtt.get(),
+            None,
+            "a Mux pass must forget the previous pass's frontend RTT"
         );
-        assert!(
-            h2.core.client_rtt.is_some_and(|rtt| rtt != STALE_SAMPLE),
-            "a Mux pass must replace the carried frontend RTT with a fresh \
-             sample, got {:?}",
-            h2.core.client_rtt
+        assert_eq!(
+            tcp_info_reads() - before,
+            0,
+            "a Mux pass that logs no stream must not read TCP_INFO"
+        );
+    }
+
+    /// An `L7Proxy` for [`Mux::close`] on a session that holds no backend:
+    /// the teardown only borrows the proxy per backend, so no method runs.
+    struct NoBackendProxy;
+
+    impl L7Proxy for NoBackendProxy {
+        fn kind(&self) -> sozu_command::proto::command::ListenerType {
+            unreachable!("Mux::close without a backend never asks the proxy")
+        }
+        fn register_socket(
+            &self,
+            _socket: &mut TcpStream,
+            _token: Token,
+            _interest: Interest,
+        ) -> Result<(), std::io::Error> {
+            unreachable!("Mux::close without a backend never asks the proxy")
+        }
+        fn deregister_socket(&self, _tcp_stream: &mut TcpStream) -> Result<(), std::io::Error> {
+            unreachable!("Mux::close without a backend never asks the proxy")
+        }
+        fn add_session(&self, _session: Rc<RefCell<dyn ProxySession>>) -> Token {
+            unreachable!("Mux::close without a backend never asks the proxy")
+        }
+        fn remove_session(&self, _token: Token) -> bool {
+            unreachable!("Mux::close without a backend never asks the proxy")
+        }
+        fn backends(&self) -> Rc<RefCell<crate::backends::BackendMap>> {
+            unreachable!("Mux::close without a backend never asks the proxy")
+        }
+        fn clusters(
+            &self,
+        ) -> &HashMap<sozu_command::state::ClusterId, sozu_command::proto::command::Cluster>
+        {
+            unreachable!("Mux::close without a backend never asks the proxy")
+        }
+        fn sessions(&self) -> Rc<RefCell<crate::server::SessionManager>> {
+            unreachable!("Mux::close without a backend never asks the proxy")
+        }
+    }
+
+    /// Close a mux whose only stream is in `state`, still owing its access log
+    /// or not, and return the `getsockopt(TCP_INFO)` reads the close made.
+    ///
+    /// `SessionMetrics::reset` is what every access-log site runs right after
+    /// the line goes out, so a reset stream is one whose log was written.
+    fn tcp_info_reads_of_a_close(state: StreamState, owes_a_log: bool) -> usize {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(30));
+        mux.context.streams[0].state = state;
+        if !owes_a_log {
+            mux.context.streams[0].metrics.reset();
+        }
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(NoBackendProxy));
+        let mut metrics = SessionMetrics::new(None);
+        let before = tcp_info_reads();
+        mux.close(proxy, &mut metrics);
+        tcp_info_reads() - before
+    }
+
+    /// `Mux::close` reads the frontend RTT only when a stream still owes an
+    /// access log — the ordinary close, where every stream was logged when it
+    /// finished, reads nothing (issue #1590).
+    ///
+    /// TO SEE THIS RED: in `Mux::close`, hoist the sample back above the loop
+    /// (`let client_rtt = sample_rtt(self.frontend.socket());`). The first
+    /// assertion then fails with `left: 1`, `right: 0`.
+    #[test]
+    fn mux_close_reads_the_frontend_rtt_only_for_a_stream_it_logs() {
+        assert_eq!(
+            tcp_info_reads_of_a_close(StreamState::Link, false),
+            0,
+            "a close with every stream already logged must not read TCP_INFO"
+        );
+        assert_eq!(
+            tcp_info_reads_of_a_close(StreamState::Recycle, true),
+            0,
+            "a recycled stream is not logged at close, so it costs no read"
+        );
+        assert_eq!(
+            tcp_info_reads_of_a_close(StreamState::Link, true),
+            1,
+            "an open stream logged at close costs exactly the frontend read: \
+             it has no backend, so no server_rtt read"
         );
     }
 

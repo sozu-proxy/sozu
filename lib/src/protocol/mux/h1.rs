@@ -20,11 +20,11 @@ use crate::{
         BackendStatus, Context, DebugEvent, Endpoint, GlobalStreamId, MuxResult, Position,
         StreamState, forcefully_terminate_answer,
         parser::H2Error,
-        remove_backend_stream, set_default_answer,
+        remove_backend_stream, sample_rtt, set_default_answer,
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
         update_readiness_after_read, update_readiness_after_write,
     },
-    socket::{SocketHandler, SocketResult, stats::socket_rtt},
+    socket::{SocketHandler, SocketResult},
 };
 
 /// Prefix applied to every [`ConnectionH1`] log line. Matches the RUSTLS
@@ -775,7 +775,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         kawa::StatusLine::Response { code: 101, .. } => {
                             debug!("{} ============== HANDLE UPGRADE!", log_context!(self));
                             stream.metrics.backend_stop();
-                            let client_rtt = socket_rtt(self.socket.socket_ref());
+                            let client_rtt = sample_rtt(self.socket.socket_ref());
                             let server_rtt =
                                 stream.linked_token().and_then(|t| endpoint.peer_rtt(t));
                             for event in stream
@@ -827,7 +827,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                 return MuxResult::Continue;
                             } else {
                                 stream.metrics.backend_stop();
-                                let client_rtt = socket_rtt(self.socket.socket_ref());
+                                let client_rtt = sample_rtt(self.socket.socket_ref());
                                 let server_rtt =
                                     stream.linked_token().and_then(|t| endpoint.peer_rtt(t));
                                 for event in stream
@@ -850,7 +850,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     }
                     incr!(names::http::E2E_HTTP11);
                     stream.metrics.backend_stop();
-                    let client_rtt = socket_rtt(self.socket.socket_ref());
+                    let client_rtt = sample_rtt(self.socket.socket_ref());
                     let server_rtt = stream.linked_token().and_then(|t| endpoint.peer_rtt(t));
                     for event in stream
                         .generate_access_log(
@@ -2096,6 +2096,40 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// The access log of an H1 request carries the frontend round-trip time,
+    /// read when the line is written, and no backend one when the request
+    /// never reached a backend (issue #1590 kept the H1 sites as they were:
+    /// one read per cell, at emission).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH1::writable`, at the `H1::Complete`
+    /// access log that writes the rejected request's 400, replace the
+    /// `sample_rtt(self.socket.socket_ref())` of `client_rtt` with `None`. The
+    /// line then carries `-` in that cell and the first assertion fails.
+    #[test]
+    fn the_h1_access_log_carries_the_frontend_rtt() {
+        let output =
+            access_log_of_a_rejected_h1_request(b"GET /rtt HTTP/1.1\r\nBad Header: x\r\n\r\n");
+        let line = output
+            .lines()
+            .find(|line| line.contains("GET /rtt 400"))
+            .unwrap_or_else(|| panic!("the 400 must be logged, got: {output}"));
+        let cells: Vec<&str> = line
+            .split_whitespace()
+            .find_map(|token| {
+                let cells: Vec<&str> = token.split('/').collect();
+                (cells.len() == 5).then_some(cells)
+            })
+            .unwrap_or_else(|| panic!("the line must carry the five durations: {line}"));
+        assert_ne!(
+            cells[3], "-",
+            "the H1 access log must carry the frontend client_rtt, got: {line}"
+        );
+        assert_eq!(
+            cells[4], "-",
+            "a request that never reached a backend has no server_rtt, got: {line}"
+        );
     }
 
     /// A header the parser refuses, after a well-formed request line: the

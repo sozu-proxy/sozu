@@ -678,6 +678,12 @@ impl Endpoint for SimEndpoint<'_> {
         None
     }
 
+    fn local_rtt(&self) -> Option<Duration> {
+        // The local side has no socket either. The H2 core asks for this only
+        // when it logs a stream, and `None` renders the access-log cell as `-`.
+        None
+    }
+
     fn end_stream<L: ListenerHandler + L7ListenerHandler>(
         &mut self,
         _token: Token,

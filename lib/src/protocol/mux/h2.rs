@@ -11,6 +11,7 @@
 //! `Readiness::arm_writable` / `Readiness::signal_pending_write` in `lib/src/lib.rs`).
 
 use std::{
+    cell::Cell,
     cmp::min,
     collections::BTreeMap,
     io::{IoSlice, Write as _},
@@ -889,22 +890,6 @@ pub struct ConnectionH2 {
     /// across six frame handlers. The macro reads `$self.now`, so those ten
     /// call sites stay as they were.
     pub(super) now: Instant,
-    /// The frontend's kernel-measured TCP round-trip time, sampled by
-    /// [`super::Mux`] once per pass and read by [`Self::snapshot_rtts`] for
-    /// the access log's `client_rtt` cell. `None` until the first sample, and
-    /// on any connection whose kernel refuses `getsockopt(TCP_INFO)`.
-    ///
-    /// The value belongs to the frontend socket, so it is meaningful only
-    /// while `position` is [`Position::Server`]; a backend H2 connection
-    /// carries whatever `Mux` never wrote, which stays `None`.
-    ///
-    /// A carried sample rather than a live read, for the same reason
-    /// `Self::now` is one: the read is an ambient host reach a byte-in /
-    /// byte-out core cannot perform. `now` is a clock read and free, so `Mux`
-    /// refreshes it per outer loop iteration; this one is a syscall, so `Mux`
-    /// refreshes it once per pass — see `Mux::refresh_client_rtt`. Issue
-    /// #1339 Q11 decided that trade on measurement.
-    pub(super) client_rtt: Option<Duration>,
     /// A [`Self::force_disconnect`] raised at a site with no socket in reach,
     /// waiting for the shell to read `tls_wants_write` and settle it through
     /// [`Self::force_disconnect_after_query`].
@@ -931,7 +916,8 @@ pub struct ConnectionH2 {
 /// No production body in this file reaches `SocketHandler::socket_ref` any
 /// more, and `socket_mut` never had one. `ConnectionH2::snapshot_rtts` held
 /// the last of them until issue #1339 Q11 moved the frontend RTT read out to
-/// `Mux::refresh_client_rtt`; the remaining spellings are all in `mod tests`.
+/// the shell (`ShellEndpoint::local_rtt` since #1590); the remaining spellings
+/// are all in `mod tests`.
 impl std::fmt::Debug for ConnectionH2 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionH2")
@@ -1902,7 +1888,6 @@ impl ConnectionH2 {
             refuse_window_start: now,
             mcs_backpressure_applied: false,
             now,
-            client_rtt: None,
             pending_force_disconnect: None,
         })
     }
@@ -4345,18 +4330,19 @@ impl ConnectionH2 {
 
     /// Report the access-log RTTs for the local frontend and the linked backend.
     ///
-    /// **The two cells no longer share a sampling instant.** `client_rtt` is
-    /// [`Self::client_rtt`], the value `Mux::refresh_client_rtt` sampled once
-    /// at the top of this pass, so every stream finishing in one pass reports
-    /// the same number. `server_rtt` is still read here, through
-    /// [`Endpoint::peer_rtt`], because the backend socket is the other side of
-    /// the connection and this core cannot hold a sample for it. Issue #1339
-    /// Q11 decided that asymmetry on measurement; `doc/configure.md` states it
-    /// for operators reading the log.
+    /// Both cells are asked of `endpoint`, at the moment the stream is logged
+    /// and at no other time. `client_rtt` comes from [`Endpoint::local_rtt`]:
+    /// `ShellEndpoint` samples the frontend socket at the first stream logged
+    /// in a `Mux` pass and hands every later stream of the same pass that one
+    /// value, so several streams finishing together still report one number
+    /// (issue #1339 Q11), and a pass that logs nothing reads nothing (issue
+    /// #1590). `server_rtt` comes from [`Endpoint::peer_rtt`], read per stream
+    /// from the backend socket. `doc/configure.md` states both for operators
+    /// reading the log.
     ///
-    /// Nothing in this method reaches a socket any more, which is the point:
-    /// the local RTT was the last `SocketHandler::socket_ref` read in this
-    /// file.
+    /// Nothing in this method reaches a socket, which is the point: the local
+    /// RTT was the last `SocketHandler::socket_ref` read in this file, and the
+    /// shell that owns the socket answers it now.
     ///
     /// `Position::Server`-only. On a backend H2 connection (`Position::Client`)
     /// the report would write swapped values onto the shared `Stream.metrics`:
@@ -4379,7 +4365,7 @@ impl ConnectionH2 {
             return (None, None);
         }
         (
-            self.client_rtt,
+            endpoint.local_rtt(),
             linked_token.and_then(|t| endpoint.peer_rtt(t)),
         )
     }
@@ -7347,6 +7333,13 @@ pub struct H2Shell<Front: SocketHandler> {
     /// `h2_transmit::confirm` brackets; private so that bracket cannot be
     /// split from outside this module.
     io_slices: Vec<IoSlice<'static>>,
+    /// This pass's sample of [`Self::socket`]'s round-trip time, for the
+    /// access log's `client_rtt` cell: `None` until the first stream logged
+    /// in the pass asks for it through [`ShellEndpoint::local_rtt`], then
+    /// `Some(sample)` for every later one. `Mux` forgets it at the start of
+    /// each pass through [`Self::expire_local_rtt`]. A `Cell` because
+    /// `Endpoint::local_rtt` takes `&self`.
+    pub(super) local_rtt: Cell<Option<Option<Duration>>>,
 }
 
 /// Renders the core and nothing else.
@@ -7391,6 +7384,80 @@ impl<Front: SocketHandler> std::fmt::Debug for H2Shell<Front> {
 /// contribution would leak upward permanently, with no resync and no
 /// underflow to notice — which is what
 /// `dropping_a_connection_releases_its_ready_incremental_contribution` pins.
+/// The [`Endpoint`] the shell hands its core: every call forwards to `inner`,
+/// except [`Endpoint::local_rtt`], which the shell answers from its own socket.
+///
+/// The core asks for the local round-trip time only when it logs a stream
+/// (`ConnectionH2::snapshot_rtts`), so the `getsockopt(TCP_INFO)` happens then
+/// and only then, at most once per `Mux` pass: the first ask samples and
+/// stores into `sample`, every later one in the pass reuses it. Built per core
+/// call from disjoint borrows of the shell's fields, so the core never holds
+/// the socket. Issue #1590.
+struct ShellEndpoint<'a, E, Front> {
+    inner: &'a mut E,
+    socket: &'a Front,
+    sample: &'a Cell<Option<Option<Duration>>>,
+}
+
+impl<'a, E, Front> ShellEndpoint<'a, E, Front> {
+    fn new(
+        inner: &'a mut E,
+        socket: &'a Front,
+        sample: &'a Cell<Option<Option<Duration>>>,
+    ) -> Self {
+        ShellEndpoint {
+            inner,
+            socket,
+            sample,
+        }
+    }
+}
+
+impl<E: Endpoint, Front: SocketHandler> std::fmt::Debug for ShellEndpoint<'_, E, Front> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShellEndpoint")
+            .field("inner", &self.inner)
+            .field("sample", &self.sample.get())
+            .finish()
+    }
+}
+
+impl<E: Endpoint, Front: SocketHandler> Endpoint for ShellEndpoint<'_, E, Front> {
+    fn readiness(&self, token: mio::Token) -> &Readiness {
+        self.inner.readiness(token)
+    }
+    fn readiness_mut(&mut self, token: mio::Token) -> &mut Readiness {
+        self.inner.readiness_mut(token)
+    }
+    fn peer_rtt(&self, token: mio::Token) -> Option<Duration> {
+        self.inner.peer_rtt(token)
+    }
+    fn local_rtt(&self) -> Option<Duration> {
+        if let Some(sample) = self.sample.get() {
+            return sample;
+        }
+        let sample = super::sample_rtt(self.socket.socket_ref());
+        self.sample.set(Some(sample));
+        sample
+    }
+    fn end_stream<L: ListenerHandler + L7ListenerHandler>(
+        &mut self,
+        token: mio::Token,
+        stream: GlobalStreamId,
+        context: &mut Context<L>,
+    ) {
+        self.inner.end_stream(token, stream, context)
+    }
+    fn start_stream<L: ListenerHandler + L7ListenerHandler>(
+        &mut self,
+        token: mio::Token,
+        stream: GlobalStreamId,
+        context: &mut Context<L>,
+    ) -> bool {
+        self.inner.start_stream(token, stream, context)
+    }
+}
+
 impl<Front: SocketHandler> Drop for H2Shell<Front> {
     fn drop(&mut self) {
         self.core.release_connection_gauges();
@@ -7751,6 +7818,7 @@ impl<Front: SocketHandler> H2Shell<Front> {
             core,
             socket,
             io_slices: Vec::new(),
+            local_rtt: Cell::new(None),
         })
     }
 }
@@ -7880,6 +7948,14 @@ impl<Front: SocketHandler> H2Shell<Front> {
         started
     }
 
+    /// Forget this pass's frontend-RTT sample, so the next stream logged
+    /// reads a fresh one. Free: the sample is taken lazily, by
+    /// `ShellEndpoint::local_rtt`. Called by `Mux` at the start of each
+    /// pass — see `Mux::expire_client_rtt`.
+    pub fn expire_local_rtt(&mut self) {
+        self.local_rtt.set(None);
+    }
+
     /// [`ConnectionH2::cancel_timed_out_streams`], settled.
     ///
     /// The core answers nothing and already discards the flood-violation
@@ -7891,7 +7967,10 @@ impl<Front: SocketHandler> H2Shell<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        self.core.cancel_timed_out_streams(context, endpoint);
+        self.core.cancel_timed_out_streams(
+            context,
+            &mut ShellEndpoint::new(endpoint, &self.socket, &self.local_rtt),
+        );
         self.settle();
     }
 
@@ -8023,18 +8102,23 @@ impl<Front: SocketHandler> H2Shell<Front> {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
-        match self.core.poll_read_target(context, &mut endpoint) {
+        match self.core.poll_read_target(
+            context,
+            &mut ShellEndpoint::new(&mut endpoint, &self.socket, &self.local_rtt),
+        ) {
             H2ReadTarget::Done(result) => result,
-            H2ReadTarget::Skip(stream_id) => {
-                self.core
-                    .handle_read(context, endpoint, stream_id, H2ReadOutcome::Skipped)
-            }
+            H2ReadTarget::Skip(stream_id) => self.core.handle_read(
+                context,
+                ShellEndpoint::new(&mut endpoint, &self.socket, &self.local_rtt),
+                stream_id,
+                H2ReadOutcome::Skipped,
+            ),
             H2ReadTarget::Fill { stream_id, amount } => {
                 let space = self.core.read_space(context, stream_id, amount);
                 let (size, status) = self.socket.socket_read(space);
                 self.core.handle_read(
                     context,
-                    endpoint,
+                    ShellEndpoint::new(&mut endpoint, &self.socket, &self.local_rtt),
                     stream_id,
                     H2ReadOutcome::Filled {
                         amount,
@@ -8219,10 +8303,11 @@ impl<Front: SocketHandler> H2Shell<Front> {
         let mut pass = H2WritePass::new(self.core.compute_stream_byte_totals(context));
 
         loop {
-            match self
-                .core
-                .poll_write_target(context, &mut endpoint, &mut pass)
-            {
+            match self.core.poll_write_target(
+                context,
+                &mut ShellEndpoint::new(&mut endpoint, &self.socket, &self.local_rtt),
+                &mut pass,
+            ) {
                 H2WriteTarget::Done(result) => return result,
                 H2WriteTarget::Finalize {
                     socket_write,
@@ -11515,78 +11600,199 @@ mod tests {
         (connection, peer)
     }
 
-    /// `snapshot_rtts` reports the sample `Mux` took for the whole pass, not a
-    /// fresh `getsockopt(TCP_INFO)` per finishing stream.
+    /// `snapshot_rtts` samples the frontend once per pass, when the first
+    /// stream of the pass is logged, and hands every later stream of that pass
+    /// the same value (issues #1339 Q11 and #1590).
     ///
-    /// This is the observable change of issue #1339 Q11. The access log's
-    /// `client_rtt` used to mean "the frontend RTT when THIS stream finished"
-    /// and now means "the frontend RTT at the last `Mux` pass", so several
-    /// streams completing in one pass report one identical value. The two
-    /// calls below stand for two streams recycling inside one pass: all five
+    /// The two calls stand for two streams recycling inside one pass: all five
     /// production callers of this method sit on a recycle or reset path, and
-    /// more than one of them can run in a single `write_streams` sweep.
+    /// more than one of them can run in a single `write_streams` sweep. The
+    /// counter is [`super::super::tcp_info_reads`], bumped by every
+    /// `getsockopt(TCP_INFO)` the mux issues.
     ///
-    /// The premise is asserted first, and it is what makes the test
-    /// discriminating: the connection sits on a live loopback socket, so
-    /// `TCP_INFO` really does answer, and it answers a sub-millisecond SRTT
-    /// that can never equal the carried sentinel. Without that half, a
-    /// `snapshot_rtts` that had merely lost the ability to read the socket
-    /// would pass this test while reporting nothing at all.
+    /// The premise is that the sample is `Some`: the connection sits on a live
+    /// loopback socket, so `TCP_INFO` answers. Without it a `local_rtt` that
+    /// had lost the socket would pass the equality assertions while reporting
+    /// nothing at all.
     ///
-    /// `server_rtt` is deliberately NOT carried: it is the other side of the
-    /// connection, `Endpoint::peer_rtt` still reads it per call, and
-    /// `endpoint_client_peer_rtt_is_keyed_by_token` (`mod.rs`) pins that half.
-    ///
-    /// TO SEE THIS RED: in [`ConnectionH2::snapshot_rtts`], put
-    /// `socket_rtt(self.socket.socket_ref())` back in place of
-    /// `self.client_rtt`. Both reports then carry the live loopback SRTT and
-    /// the first assertion fails with ``assertion `left == right` failed: the
-    /// first stream to finish in the pass must report the sample Mux carried
-    /// in, not a fresh TCP_INFO read``, `left: Some(72µs)` against
-    /// `right: Some(4321s)`.
+    /// TO SEE THIS RED: in `ShellEndpoint::local_rtt`, delete the early
+    /// `return sample;` of the memo hit. Every call then reads the socket and
+    /// the second assertion fails with ``a second stream finishing in the SAME
+    /// pass must reuse the pass sample, not read TCP_INFO again``,
+    /// `left: 2`, `right: 1`.
     #[test]
-    fn snapshot_rtts_reports_the_carried_pass_sample_to_every_stream() {
-        use crate::socket::stats::socket_rtt;
-
-        /// A value no loopback SRTT can take, so the assertions below can only
-        /// be satisfied by the carried field.
-        const PASS_SAMPLE: Duration = Duration::from_secs(4321);
-
+    fn snapshot_rtts_samples_the_frontend_once_per_pass() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
         let (mut connection, _peer) = test_h2_connection(&pool, None);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let mut inner = EndpointClient(&mut router);
 
-        let live = socket_rtt(connection.socket.socket_ref());
-        assert!(
-            live.is_some_and(|rtt| rtt != PASS_SAMPLE),
-            "premise: TCP_INFO must answer on a live loopback frontend, and \
-             never with the sentinel — otherwise a snapshot_rtts that still \
-             read the socket would be indistinguishable from one that carries \
-             the pass sample, got {live:?}"
-        );
-
-        connection.core.client_rtt = Some(PASS_SAMPLE);
-
-        let endpoint = EndpointClient(&mut router);
+        let before = super::super::tcp_info_reads();
+        let endpoint = ShellEndpoint::new(&mut inner, &connection.socket, &connection.local_rtt);
         let first = connection
             .core
             .snapshot_rtts(&endpoint, Some(mio::Token(1)));
+        assert!(
+            first.0.is_some(),
+            "premise: TCP_INFO must answer on a live loopback frontend"
+        );
         let second = connection
             .core
             .snapshot_rtts(&endpoint, Some(mio::Token(2)));
-
         assert_eq!(
-            first.0,
-            Some(PASS_SAMPLE),
-            "the first stream to finish in the pass must report the sample Mux \
-             carried in, not a fresh TCP_INFO read"
+            super::super::tcp_info_reads() - before,
+            1,
+            "a second stream finishing in the SAME pass must reuse the pass \
+             sample, not read TCP_INFO again"
         );
         assert_eq!(
             second.0, first.0,
-            "a second stream finishing in the SAME pass must report the same \
-             client_rtt — that identity is what #1339 Q11 traded the \
-             per-recycle syscall for, and it is what an operator trending the \
-             field will see"
+            "every stream finishing in one pass reports one client_rtt — the \
+             identity #1339 Q11 traded the per-recycle syscall for"
+        );
+        assert_eq!(
+            (first.1, second.1),
+            (None, None),
+            "the router holds no backend, so server_rtt stays None and costs \
+             no read"
+        );
+
+        connection.expire_local_rtt();
+        let endpoint = ShellEndpoint::new(&mut inner, &connection.socket, &connection.local_rtt);
+        let next_pass = connection.core.snapshot_rtts(&endpoint, None);
+        assert_eq!(
+            super::super::tcp_info_reads() - before,
+            2,
+            "the next pass must take a fresh sample, not log the previous \
+             pass's forever"
+        );
+        assert!(next_pass.0.is_some());
+    }
+
+    /// A pass that logs no stream reads no `TCP_INFO`, and a backend H2
+    /// connection never reads one for the access log (issue #1590).
+    ///
+    /// TO SEE THIS RED: make `ShellEndpoint::new` sample eagerly — call
+    /// `super::sample_rtt(socket.socket_ref())` and store it in `sample` —
+    /// which is the shape `Mux::refresh_client_rtt` had. The first assertion
+    /// fails with ``a pass that logs no stream must not read TCP_INFO``,
+    /// `left: 1`, `right: 0`.
+    #[test]
+    fn a_pass_that_logs_nothing_reads_no_tcp_info() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let before = super::super::tcp_info_reads();
+        connection.cancel_timed_out_streams(&mut context, &mut EndpointClient(&mut router));
+        assert_eq!(
+            super::super::tcp_info_reads() - before,
+            0,
+            "a pass that logs no stream must not read TCP_INFO"
+        );
+        assert_eq!(connection.local_rtt.get(), None);
+
+        connection.core.position = Position::Client(
+            "rtt-cluster".to_owned(),
+            super::super::BackendId {
+                slot: super::super::BackendSlot(0),
+                backend_id: Rc::from("rtt-backend"),
+                address: "127.0.0.1:1".parse().expect("a literal socket address"),
+            },
+            BackendStatus::Connected,
+        );
+        let mut inner = EndpointClient(&mut router);
+        let endpoint = ShellEndpoint::new(&mut inner, &connection.socket, &connection.local_rtt);
+        assert_eq!(
+            connection
+                .core
+                .snapshot_rtts(&endpoint, Some(mio::Token(1))),
+            (None, None),
+            "a backend H2 connection must not report RTTs onto the shared stream"
+        );
+        assert_eq!(
+            super::super::tcp_info_reads() - before,
+            0,
+            "a backend H2 connection must not read TCP_INFO for the access log"
+        );
+    }
+
+    /// Two streams reaped in one pass: two access-log lines, one frontend
+    /// `TCP_INFO` read between them, and the same `client_rtt` on both lines.
+    ///
+    /// Drives the real log path — `H2Shell::cancel_timed_out_streams` through
+    /// `ShellEndpoint`, `snapshot_rtts` and `Stream::generate_access_log` —
+    /// and reads the lines the logger wrote, so it pins what an operator sees:
+    /// the `client_rtt` cell is present (not `-`) and coherent across the
+    /// pass, and `server_rtt` is `-` for streams that never reached a backend.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::snapshot_rtts`, return `None` in
+    /// place of `endpoint.local_rtt()`. Both lines then carry `-` in the
+    /// `client_rtt` cell and the presence assertion fails.
+    #[test]
+    fn streams_reaped_in_one_pass_log_one_present_client_rtt() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reads_in_pass = reads.clone();
+        let output = crate::capture_test_logs(move || {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+            let (mut connection, _peer) = test_h2_connection(&pool, None);
+            let mut context = test_context(&pool);
+            let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+            let armed_at = connection.core.now;
+            for stream_id in [1, 3] {
+                let gid = context
+                    .create_stream(Ulid::generate(), 1 << 16)
+                    .expect("test context must create a stream");
+                connection
+                    .core
+                    .stream_table
+                    .register(stream_id, gid, armed_at);
+            }
+            context.now = armed_at + connection.core.stream_idle_timeout + Duration::from_millis(1);
+
+            let before = super::super::tcp_info_reads();
+            connection.cancel_timed_out_streams(&mut context, &mut EndpointClient(&mut router));
+            reads_in_pass.store(
+                super::super::tcp_info_reads() - before,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        });
+
+        let cells: Vec<(&str, &str)> = output
+            .lines()
+            .filter_map(|line| {
+                line.split_whitespace().find_map(|token| {
+                    let cells: Vec<&str> = token.split('/').collect();
+                    (cells.len() == 5).then(|| (cells[3], cells[4]))
+                })
+            })
+            .collect();
+        assert_eq!(
+            cells.len(),
+            2,
+            "two reaped streams must write two access-log lines, got: {output}"
+        );
+        for (client_rtt, server_rtt) in &cells {
+            assert_ne!(
+                *client_rtt, "-",
+                "the access log's client_rtt must be present, got: {output}"
+            );
+            assert_eq!(
+                *server_rtt, "-",
+                "a stream that never reached a backend has no server_rtt, got: {output}"
+            );
+        }
+        assert_eq!(
+            cells[0].0, cells[1].0,
+            "streams logged in one pass share one client_rtt, got: {output}"
+        );
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "two streams logged in one pass must cost one frontend TCP_INFO \
+             read and no backend read"
         );
     }
 
