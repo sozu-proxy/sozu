@@ -386,7 +386,10 @@ now-unhealthy backend stays until idle-timeout (the flow table pins it). Probes
 run **non-blocking in the event loop** (`UdpProxy::health_poll` `udp.rs`,
 driven from `Server::run`'s health tick, `lib/src/server.rs`; `health_owns_token`/`health_ready` route readiness,
 `udp.rs`, `Server::ready`'s UDP health arm, `lib/src/server.rs`). No background threads — consistent with the
-single-threaded worker model.
+single-threaded worker model. The per-turn call borrows the proxy's `Registry`
+and allocates no descriptor: cloning it there cost an `fcntl(F_DUPFD_CLOEXEC)`
+and a `close` on every event-loop turn, and skipped probing outright when the
+worker was out of descriptors (`EMFILE`).
 
 ---
 

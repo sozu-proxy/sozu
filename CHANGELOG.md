@@ -2588,6 +2588,23 @@
   reference model over forty backends, two clusters, removals and re-appearances; it passes on the
   former `Vec` and turns red when the lookup is sabotaged to return the first backend.
 
+- **`perf(udp)`: stop cloning the mio registry on every event-loop turn.** `UdpProxy::health_poll`
+  (`lib/src/udp.rs`), which `Server::run` calls once per turn, cloned the worker's `Registry`
+  before driving the UDP health prober. `Registry::try_clone` is an `fcntl(F_DUPFD_CLOEXEC)` of the
+  epoll descriptor and dropping the clone a `close`, so **every** turn paid two syscalls — with or
+  without a UDP cluster, since the prober's own "nothing configured" early return runs after the
+  clone. The prober now borrows the registry it already has. Measured on a release build, one
+  worker, a `python3 -m http.server` backend and 20 sequential `curl` requests, counted by an
+  `LD_PRELOAD` interposer and cross-checked by `intentrace -p` on the same window (both agree on every
+  count): **H1** `close` 7.00 → 2.00 and `fcntl` 5.00 → 0.00 per request, **H2** `close` 8.10 →
+  2.00 and `fcntl` 6.10 → 0.00 per request. Every removed `close` targeted an `anon_inode:[eventpoll]`
+  duplicate, one per `epoll_wait`; the two left per request are the client and backend sockets.
+  No allocation is added. The clone also hid a defect: when the worker was out of descriptors
+  (`EMFILE`) the clone failed and the prober was skipped silently, so an in-flight probe was never
+  timed out. `lib/tests/udp_health_descriptor_exhaustion.rs` exhausts the descriptor table and
+  asserts a timed-out probe is still recorded; with the clone restored it fails with
+  `left: 0, right: 1`.
+
 ### 🐛 Fixed
 
 - **`fix(command)`: a blocking channel write reports a failed `write(2)` instead of claiming
