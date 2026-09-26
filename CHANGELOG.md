@@ -376,6 +376,26 @@
 
 ### 🔄 Changed
 
+- **`perf(mux)`: a redial of an already-interned backend allocates nothing
+  ([#1564](https://github.com/sozu-proxy/sozu/issues/1564)).** `BackendRegistry::id_for`
+  (`lib/src/protocol/mux/mod.rs`) runs once per backend connection a mux session opens, and copied
+  `Backend::backend_id` into a fresh `Rc<str>` every time even though `intern` had already reused
+  the backend's slot. Measured with a counting global allocator over 64 redials of each of two
+  interned backends: 128 allocations before, one per dial; 0 after. Each registry slot now keeps
+  the `Rc<str>` id and the address it read when the session first interned the backend, and
+  `id_for` clones them, so a redial is a reference-count increment and no longer borrows the
+  `RefCell`. The id is still copied once per session and backend, at interning. The cache cannot
+  go stale: neither field is written after `Backend::new`, and a reload that replaces a backend
+  builds a new `Rc`, which takes a new slot. Making `Backend::backend_id` itself an `Rc<str>`
+  would have removed that last copy too, but changes a public field of `sozu_lib::backends::Backend`
+  and breaks 14 sites in `lib/` alone before its tests and `e2e/` compile, so it was not taken.
+  `sozu-lib`'s unit-test binary now has one shared thread-local counting allocator
+  (`lib/src/lib.rs`, `test_allocations`) so private hot-path calls can carry an allocation budget;
+  `a_redial_of_an_interned_backend_allocates_nothing` pins this one at zero. The local drain's
+  `steady_state_emission_does_not_allocate` moves onto it from its private
+  `#[global_allocator]` (added by #1561), which could not coexist with a second one in the same
+  binary; its zero-allocation assertion is unchanged.
+
 - **`perf(mux)`: closing a session no longer deregisters its sockets from epoll, two
   `epoll_ctl` per request instead of four
   ([#1567](https://github.com/sozu-proxy/sozu/issues/1567)).** `HttpSession::close` and `HttpsSession::close` issued

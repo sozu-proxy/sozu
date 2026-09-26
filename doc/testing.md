@@ -114,6 +114,21 @@ Notes:
   swarm) is proposed but intentionally not added by the change that introduced
   this simulator — wiring CI is a separate decision. Run it manually with the
   command in "Targeted runs" until that decision is made.
+- **Allocation budgets.** `sozu-lib`'s unit-test binary has exactly one
+  counting global allocator, `test_allocations` in `lib/src/lib.rs`, and every
+  unit test that pins a heap-allocation count uses it: take
+  `crate::test_allocations::allocations()` before and after the code under
+  test and assert on the difference. The counter is thread-local, so the
+  harness's other test threads cannot pollute a measurement. Never add a
+  second `#[global_allocator]` under `#[cfg(test)]` anywhere in `lib/src`: a
+  binary accepts one, and the test build fails with "cannot define multiple
+  global allocators" even when both changes merge without a textual conflict.
+  Current users: `a_redial_of_an_interned_backend_allocates_nothing`
+  (`lib/src/protocol/mux/mod.rs`, [#1564](https://github.com/sozu-proxy/sozu/issues/1564))
+  and `steady_state_emission_does_not_allocate` (`lib/src/metrics/local_drain.rs`),
+  both held at zero. A budget measured through the public API lives in its own
+  `lib/tests/` binary with its own allocator instead, as
+  `lib/tests/backend_selection.rs` does.
 - **Router hostname resolution is unit-tested with `quickcheck`**
   (`lib/src/router/mod.rs`,
   `qc_router_hostname_resolution_matches_the_documented_semantics`), on top of
@@ -808,7 +823,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **A test that only reddens under CI load is not automatically a flake — find
   the production site first.** Before retrying or quarantining, ask whether the
   symptom is reachable at all. #1353's 421 has exactly one emission site
-  (`lib/src/protocol/mux/mod.rs:2686`), reachable only through
+  (`lib/src/protocol/mux/mod.rs:2725`), reachable only through
   `RetrieveClusterError::SniAuthorityMismatch`, which is constructed at exactly
   one site (`lib/src/protocol/mux/router.rs:897`) immediately after
   `incr!(names::http::SNI_AUTHORITY_MISMATCH)` — and the failing run reported

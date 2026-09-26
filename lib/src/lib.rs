@@ -1777,6 +1777,70 @@ pub mod testing {
     }
 }
 
+/// The counting global allocator of this crate's unit-test binary, so a test
+/// can pin how many heap allocations a hot-path call makes.
+///
+/// A binary has exactly one global allocator, so every unit test in
+/// `sozu-lib` that counts allocations goes through this module: read
+/// [`allocations`] before and after the code under test and assert on the
+/// difference. Never declare a second `#[global_allocator]` under
+/// `#[cfg(test)]`; the test build then fails with "cannot define multiple
+/// global allocators".
+///
+/// Every method forwards to [`std::alloc::System`] unchanged; the counter is
+/// thread-local, so the harness's other test threads cannot pollute a
+/// measurement. Same shape as the allocator `lib/tests/backend_selection.rs`
+/// installs in its own binary.
+#[cfg(test)]
+pub(crate) mod test_allocations {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
+
+    struct CountingAllocator;
+
+    thread_local! {
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn record_allocation() {
+        // `try_with`: the slot may already be torn down while a thread exits.
+        let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+    }
+
+    // SAFETY: every method forwards to `System` unchanged; the only addition
+    // is a thread-local counter increment, which neither allocates nor unwinds.
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record_allocation();
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAllocator = CountingAllocator;
+
+    /// Heap allocations the calling thread has made so far.
+    pub(crate) fn allocations() -> usize {
+        ALLOCATIONS.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn capture_test_logs(run: impl FnOnce() + Send + 'static) -> String {
     capture_test_logs_at_level("info", run)

@@ -294,9 +294,11 @@ pub struct BackendSlot(usize);
 /// A backend as the core sees it: the opaque slot, plus the two identity
 /// fields the datapath renders.
 ///
-/// `backend_id` and `address` are copied once, when the backend is dialled.
-/// Both are immutable for the life of a registry entry, so carrying them is
-/// not a cached view of mutable state — no load state crosses this boundary.
+/// `backend_id` and `address` are copied once, when the session first interns
+/// the backend in its `BackendRegistry`, and every later dial of it clones
+/// them from there. Both are immutable for the life of a registry entry, so
+/// carrying them is not a cached view of mutable state — no load state
+/// crosses this boundary.
 /// The mutable half (`active_connections`, `active_requests`, `failures`,
 /// `connection_time`, `health`, `status`) stays behind the slot, and the core
 /// reaches it only by emitting a [`BackendDelta`].
@@ -305,6 +307,9 @@ pub struct BackendSlot(usize);
 /// `BackendStatus::Connected` transition rebuilds the `Position::Client`
 /// variant once per dial. That reconstruction cost one `Rc` bump when the
 /// field was an `Rc<RefCell<Backend>>`; a `String` would make it a heap copy.
+/// For the same reason the registry keeps the `Rc<str>` it built at interning
+/// time, so minting the id for a redial is a reference-count increment rather
+/// than a fresh allocation (#1564).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendId {
     /// Private to this module: [`Mux::backend`] is the only way out.
@@ -365,7 +370,22 @@ pub enum BackendChange {
 /// are. Nothing hands a `&Rc<RefCell<Backend>>` out of here except
 /// [`Mux::backend`], whose one caller is the WebSocket upgrade.
 #[derive(Debug, Default)]
-pub(crate) struct BackendRegistry(Vec<Rc<RefCell<Backend>>>);
+pub(crate) struct BackendRegistry(Vec<RegistryEntry>);
+
+/// One slot of the [`BackendRegistry`]: the handle, plus the [`BackendId`]
+/// identity fields read from it once, when it was interned.
+///
+/// The cached `backend_id` is what keeps `BackendRegistry::id_for`
+/// allocation-free on every dial after a backend's first (#1564). It cannot go
+/// stale: `Backend::backend_id` and `Backend::address` are never written after
+/// construction, and a reload that replaces the backend builds a new `Rc`,
+/// which takes a new slot with its own entry.
+#[derive(Debug)]
+struct RegistryEntry {
+    handle: Rc<RefCell<Backend>>,
+    backend_id: Rc<str>,
+    address: SocketAddr,
+}
 
 impl BackendRegistry {
     /// Name `backend` with a slot, reusing the one it already has.
@@ -376,29 +396,48 @@ impl BackendRegistry {
     /// The scan is linear over the backends ONE session has dialled, which
     /// is the cluster's backend count at worst — the same order as the
     /// `Router::backends` walk the caller has just done.
+    ///
+    /// A new slot copies the backend's id into an `Rc<str>` here, once per
+    /// session and backend; that copy and the table's own growth are the only
+    /// allocations this path makes.
     fn intern(&mut self, backend: &Rc<RefCell<Backend>>) -> BackendSlot {
-        match self.0.iter().position(|known| Rc::ptr_eq(known, backend)) {
+        match self
+            .0
+            .iter()
+            .position(|known| Rc::ptr_eq(&known.handle, backend))
+        {
             Some(slot) => BackendSlot(slot),
             None => {
-                self.0.push(backend.clone());
+                let (backend_id, address) = {
+                    let borrow = backend.borrow();
+                    (Rc::from(borrow.backend_id.as_str()), borrow.address)
+                };
+                self.0.push(RegistryEntry {
+                    handle: backend.clone(),
+                    backend_id,
+                    address,
+                });
                 BackendSlot(self.0.len() - 1)
             }
         }
     }
 
     /// Build the core's view of a backend it is about to be handed.
+    ///
+    /// Runs once per backend dial. Past a backend's first dial in this
+    /// session it clones the id cached in its slot and allocates nothing.
     fn id_for(&mut self, backend: &Rc<RefCell<Backend>>) -> BackendId {
         let slot = self.intern(backend);
-        let borrow = backend.borrow();
+        let entry = &self.0[slot.0];
         BackendId {
             slot,
-            backend_id: Rc::from(borrow.backend_id.as_str()),
-            address: borrow.address,
+            backend_id: entry.backend_id.clone(),
+            address: entry.address,
         }
     }
 
     fn get(&self, slot: BackendSlot) -> Option<&Rc<RefCell<Backend>>> {
-        self.0.get(slot.0)
+        self.0.get(slot.0).map(|entry| &entry.handle)
     }
 
     /// Resolve one of the core's opaque [`BackendId`]s to the registry handle
@@ -4484,6 +4523,54 @@ mod tests {
              sample, got {:?}",
             h2.core.client_rtt
         );
+    }
+
+    /// #1564: naming an already-interned backend for another dial allocates
+    /// nothing. `BackendRegistry::id_for` runs once per backend connection a
+    /// session opens; the first dial of a backend pays for its slot, every
+    /// later one must only bump reference counts. Two backends, so a cache
+    /// that held a single id instead of one per slot fails too.
+    #[test]
+    fn a_redial_of_an_interned_backend_allocates_nothing() {
+        use std::hint::black_box;
+
+        use crate::test_allocations::allocations;
+
+        const DIALS: usize = 64;
+        let new_backend = |id: &str, port: u16| {
+            Rc::new(RefCell::new(Backend::new(
+                id,
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                None,
+                None,
+                None,
+            )))
+        };
+        let first = new_backend("redial-first", 7001);
+        let second = new_backend("redial-second", 7002);
+
+        let mut registry = BackendRegistry::default();
+        // Warm-up: the first dial of each backend interns it.
+        let warm = [registry.id_for(&first), registry.id_for(&second)];
+
+        let before = allocations();
+        for _ in 0..DIALS {
+            black_box(registry.id_for(black_box(&first)));
+            black_box(registry.id_for(black_box(&second)));
+        }
+        let allocated = allocations() - before;
+        assert_eq!(
+            allocated, 0,
+            "{DIALS} redials of two interned backends made {allocated} heap \
+             allocations, expected none"
+        );
+
+        // The redial still names the right slot, id and address.
+        let again = registry.id_for(&second);
+        assert_eq!(again, warm[1]);
+        assert_eq!(&*again.backend_id, "redial-second");
+        assert_eq!(again.address, SocketAddr::from(([127, 0, 0, 1], 7002)));
+        assert_ne!(warm[0].slot(), warm[1].slot());
     }
 
     /// An H1 backend connection on a live loopback socket, plus the peer the

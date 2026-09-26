@@ -334,8 +334,8 @@ from `Mux::ready`. Termination may be triggered by:
 - Frontend HUP — detected by the `readiness().event.is_hup()` branch of
   `Mux::ready` (`lib/src/protocol/mux/mod.rs`), subject to
   `delay_close_for_frontend_flush` (`mod.rs`) to avoid truncating TLS.
-- `MuxResult::CloseSession` from any readable/writable path (`mod.rs:2135`,
-  `mod.rs:2503`, etc.).
+- `MuxResult::CloseSession` from any readable/writable path (`mod.rs:2174`,
+  `mod.rs:2542`, etc.).
 - A loop-iteration budget overrun (`MAX_LOOP_ITERATIONS = 10_000`, `mod.rs`,
   checked in the inner loop of `Mux::ready_inner`).
 - Timeout (`Mux::timeout`, `mod.rs`).
@@ -588,7 +588,7 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
 `StreamState::Recycle` marks a slot as **logically free but still allocated**.
 It means:
 
-- The pool buffers have been cleared (`mod.rs:1045-1048`).
+- The pool buffers have been cleared (`mod.rs:1084-1087`).
 - Metrics have been reset — the `SessionMetrics::reset` call in
   `Context::create_stream`'s recycled-slot branch (`mod.rs`).
 - The slot can be handed back to a new request by `Context::create_stream`
@@ -627,12 +627,12 @@ runs — see §6.
 
 ### 4.2 `Context.streams` (per-session buffer array)
 
-- Type: `Vec<Stream>` — `mod.rs:675`.
+- Type: `Vec<Stream>` — `mod.rs:714`.
 - Scope: one `Vec` per `Mux` session. **Both** H1 and H2 frontends use it, and
   **every** backend `ConnectionH2` attached to this session indexes into it.
 - Index: `GlobalStreamId = usize` (`mod.rs`).
 - Mutated by:
-  - push — `create_stream` when no `Recycle` slot is available (`mod.rs:1062`).
+  - push — `create_stream` when no `Recycle` slot is available (`mod.rs:1101`).
   - pop — `shrink_trailing_recycle` (`mod.rs`).
   - in-place state edits — everywhere.
 
@@ -645,7 +645,7 @@ runs — see §6.
    wire-id entry (never a public surface).
 3. A `StreamState::Linked(token)` must have a matching entry in
    `context.backend_streams[token]`. This is asserted in debug builds at
-   `mod.rs:2777-2807` after every `ready()` pass.
+   `mod.rs:2816-2846` after every `ready()` pass.
 
 The H1 side keeps its single `stream: Option<GlobalStreamId>` in `ConnectionH1`
 — there is no hashmap because H1 multiplexing is limited to request pipelining
@@ -724,7 +724,7 @@ become out-of-bounds later on if:
 
 Step 1 happens in every `remove_dead_stream` caller and in every reset / cancel
 path (see §8). Step 2 happens on every `create_stream` call that finds a
-recycled slot to reuse and then crosses the shrink ratio (`mod.rs:1056-1057`).
+recycled slot to reuse and then crosses the shrink ratio (`mod.rs:1095-1096`).
 Step 3 follows automatically.
 
 ### 5.4 Who invalidates these fields
@@ -800,7 +800,7 @@ pub fn shrink_trailing_recycle(&mut self) {
 ### 6.1 When it runs
 
 Called from `Context::create_stream` after a `Recycle` slot is reused, guarded
-by a ratio threshold so we don't thrash on every request (`mod.rs:1056-1057`):
+by a ratio threshold so we don't thrash on every request (`mod.rs:1095-1096`):
 
 ```rust
 if total > 1 && active > 0 && total > active * self.h2_stream_shrink_ratio {
@@ -849,8 +849,8 @@ re-validates every delivery and puts an early one back — §7.6.
   embedder to call back at. The wheel handle lives in `Mux.timeouts` under the
   frontend token — see §7.7.
 - Fired when: no traffic observed for `configured_frontend_timeout`
-  (`mod.rs:1098`) while any stream is live, or the shorter `request_timeout`
-  until the first `Link` transition (`mod.rs:2562-2564`).
+  (`mod.rs:1137`) while any stream is live, or the shorter `request_timeout`
+  until the first `Link` transition (`mod.rs:2601-2603`).
 - Reset: on meaningful activity — HEADERS for an existing stream, DATA bytes
   read, and a write-pass transmit that moved a stream's bytes — see
   `ConnectionH2::handle_headers_frame` (`h2.rs`), the `arm_timeout()` call in
@@ -869,7 +869,7 @@ re-validates every delivery and puts an early one back — §7.6.
   flushed a PING ACK reset the deadline the read side had just refused to
   reset. The write site is now per transmit and gated on the bytes, so an
   acknowledgement-only pass arms nothing.
-- Handling: `Mux::timeout` inspects each stream's state (`mod.rs:2881`) and
+- Handling: `Mux::timeout` inspects each stream's state (`mod.rs:2920`) and
   either writes a default 408/503/504 answer, forcefully terminates, or keeps
   draining.
 - Access-log discriminator: before each `set_default_answer` or
@@ -953,8 +953,8 @@ deadlines are compared against `ConnectionH2.now` (§7.5):
   (`Connection::set_timeout_duration`, called from `Mux::ready_inner`).
 - Fired by: timer wheel → `Mux::timeout` with the backend token.
 - Action: for each stream linked to that backend, either send 504, or forcefully
-  terminate, or keep draining — see `mod.rs:2982-3037`. The timeout is re-armed
-  if the session stays alive (`mod.rs:3112`) to avoid the "immortal zombie"
+  terminate, or keep draining — see `mod.rs:3021-3076`. The timeout is re-armed
+  if the session stays alive (`mod.rs:3151`) to avoid the "immortal zombie"
   state.
 - Access-log discriminator: the "response not started" arm sets
   `stream.context.access_log_message = Some("backend_timeout")`; the "response
@@ -986,16 +986,16 @@ read the same `ConnectionH2.now` — see §7.5.
 
 Every deadline above is evaluated against a snapshot, not against a fresh
 `Instant::now()`. **`Mux` is the only clock sampler in the mux.** It writes
-`Context.now` (`mod.rs:780`) at three points:
+`Context.now` (`mod.rs:819`) at three points:
 
-- once per **outer** `Mux::ready` pass (`mod.rs:2115`), so that the inner loop
+- once per **outer** `Mux::ready` pass (`mod.rs:2154`), so that the inner loop
   deliberately shares one instant — that is the property the snapshot exists
   for, not a claim about how long a sweep takes. `MAX_LOOP_ITERATIONS` is a
-  count and bounds iterations, not wall clock, and `counter` (`mod.rs:2067`)
+  count and bounds iterations, not wall clock, and `counter` (`mod.rs:2106`)
   sits above both loops, so one `ready()` call can spend the whole budget
   under a single snapshot;
 - at the top of `Mux::timeout_inner` (`mod.rs`);
-- at the top of `Mux::shutting_down_inner` (`mod.rs:3210`), which runs outside
+- at the top of `Mux::shutting_down_inner` (`mod.rs:3249`), which runs outside
   `ready()` entirely. That line is load-bearing, not belt-and-braces:
   `drive_frontend_shutdown_io` (`mod.rs`) always reaches `readable()` for
   an H2 frontend — `force_h2_read` is unconditionally true, so the early
@@ -1245,7 +1245,7 @@ Two GOAWAY frames in `ConnectionH2::graceful_goaway` (`h2.rs`):
 1. **Initial GOAWAY** — send GOAWAY with `last_stream_id = 0x7FFFFFFF`
    (`STREAM_ID_MAX`, `h2.rs`); keep `READABLE` so in-flight request bodies
    can still arrive. Called first time from `Mux::shutting_down_inner` at
-   `mod.rs:3224`. Draining flag set.
+   `mod.rs:3263`. Draining flag set.
 2. **Final GOAWAY** — on the second invocation (draining already true), call
    `goaway(NoError)` (`h2.rs:5218`) with the actual `highest_peer_stream_id`,
    remove `READABLE` interest (`h2.rs:5174`), transition to `H2State::GoAway`.
@@ -1268,7 +1268,7 @@ Three directions:
   [`enqueue_rst`](#proxy-rst-emission-path), and counts against
   `record_rst_emitted` (CVE-2025-8671 MadeYouReset) unless `NoError`.
 - **Proxy-initiated, idle cancel** — `cancel_timed_out_streams` (§7.2); the
-  per-stream `forcefully_terminate_answer` call in the `mod.rs:2936` timeout
+  per-stream `forcefully_terminate_answer` call in the `mod.rs:2975` timeout
   path now arms `Ready::WRITABLE` via `arm_writable()` so the pair with
   `event::WRITABLE` actually schedules the next `writable()` tick under
   edge-triggered epoll.
@@ -1372,7 +1372,7 @@ RFC 9113 §§5.3, 6.9, 8.1.2.
 `Mux::shutting_down` (`mod.rs`) is called by the server loop during process
 shutdown or listener reload. It:
 
-1. Initiates the double-GOAWAY (`mod.rs:3224`).
+1. Initiates the double-GOAWAY (`mod.rs:3263`).
 2. Drives frontend I/O outside the epoll loop (`drive_frontend_shutdown_io`,
    `mod.rs`) — H2 needs extra passes for the peer's END_STREAM and final TLS
    flush.
@@ -1563,7 +1563,7 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
 2. **Backend index consistency.** If
    `context.streams[gid].state == StreamState::Linked(token)`, then
    `context.backend_streams[&token]` contains `gid`. Asserted under
-   `debug_assertions` in `Mux::ready` at `mod.rs:2777-2807`.
+   `debug_assertions` in `Mux::ready` at `mod.rs:2816-2846`.
 3. **`expect_write` validity.** If
    `expect_write == Some(H2StreamId::Other { gid, .. })`, then
    `gid < context.streams.len()` and the slot at `gid` is not `Recycle`. Every
@@ -1573,7 +1573,7 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
 4. **`expect_read` validity.** Same as (3) for `expect_read`.
 5. **Recycled slot cleanliness.** A `StreamState::Recycle` slot has cleared
    `front`, `back`, `front.storage`, `back.storage`, reset metrics
-   (`mod.rs:1045-1050`).
+   (`mod.rs:1084-1089`).
 6. **No stale `Linked` after backend close.** Before transitioning a stream away
    from `Linked(token)`, call `unlink_stream` (`mod.rs`) or
    `remove_backend_stream` (`mod.rs`) to keep the reverse index honest.
@@ -1635,7 +1635,7 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
    that never arms is the opposite defect — an unconditional session cap — and
    a "the deadline did not move" assertion alone cannot tell the two apart.
 10. **Single `graceful_goaway` per session outside the final GOAWAY.**
-    `Mux::shutting_down_inner` (`mod.rs:3223-3224`) only calls it if
+    `Mux::shutting_down_inner` (`mod.rs:3262-3263`) only calls it if
     `!self.frontend.is_draining()`; a second unconditional call would
     collapse the initial GOAWAY into the final one and disconnect
     in-flight streams.
@@ -1727,6 +1727,14 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
     `Rc` inside `Position::Client` used to give. Keying on the backend's name
     would split a balanced pair across two `Backend` values, leaving the
     superseded one charged forever and the fresh one saturating at zero.
+    The slot also keeps the two identity fields a `BackendId` carries, read
+    once when the session interns the backend, so minting the id for every
+    later dial of it bumps a reference count instead of copying the backend's
+    name into a fresh `Rc<str>`
+    ([#1564](https://github.com/sozu-proxy/sozu/issues/1564)). The copy cannot
+    go stale for the reason above: a replaced backend is a new `Rc` in a new
+    slot. `a_redial_of_an_interned_backend_allocates_nothing` (`mod.rs`) pins
+    the redial at zero allocations.
 15. **Incremental scheduler — solo-bucket non-yield.** The converter
     (`converter.rs` `H2BlockConverter::call` DATA arm) must only yield after a
     DATA frame when `incremental_mode == true` _and_
