@@ -2870,6 +2870,16 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux-h2)`: a PING or SETTINGS ACK received while a stream frame is half-written is
+  sent after that frame, not inside it ([#1600](https://github.com/sozu-proxy/sozu/issues/1600)).**
+  Both acknowledgements are serialised into `zero` and used to set `expect_write = Some(Zero)`
+  unconditionally, overwriting the park of a HEADERS or DATA frame the socket had only partly
+  taken. The next `writable()` flushed `zero` first, so the peer read the first part of the
+  frame, the ACK, then the rest: a corrupt frame stream. `ConnectionH2::queue_zero_output` now
+  leaves such a park alone and marks the ACK deferred; the resume that completes the frame
+  hands `expect_write` to `zero`, so the ACK follows the frame, as HAProxy appends it to the
+  tail of its single output ring. READABLE stays withdrawn until the ACK is flushed, as before.
+
 - **`fix(command)`: a blocking channel write reports a failed `write(2)` instead of claiming
   success, and `Channel::writable` names its write errors `ChannelError::Write`
   ([#1563](https://github.com/sozu-proxy/sozu/issues/1563)).** `write_message_blocking`
