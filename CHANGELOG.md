@@ -408,6 +408,34 @@
   `a_dial_moves_the_planned_cluster_id_into_the_backend_connection` drives a real
   `Mux::dial_backend` and checks the connection owns the very allocation the plan carried.
 
+- **`perf(socket)`: a TLS frontend read no longer issues a `recv(2)` while rustls already
+  holds the plaintext it asks for ([#1588](https://github.com/sozu-proxy/sozu/issues/1588)).**
+  `FrontRustls::socket_read` (`lib/src/socket.rs`) called `read_tls` on every entry, before
+  looking at the plaintext rustls had already decrypted. The H2 read path asks for one 9-byte
+  frame header and then one payload at a time, and one TLS record usually carries several
+  frames, so every frame block after the first of a record cost a `recv` that could only
+  answer EAGAIN. The pass, now the private `rustls_socket_read`, drains the buffered plaintext
+  first and calls `read_tls` only while the caller's buffer is still short — the order
+  tokio-rustls follows, and the one OpenSSL's `SSL_read` gives HAProxy. Measured on a release
+  build, one worker, 20 requests to a local backend, before (`b5169d44`) and after, each
+  pass started at LOAD1 < 8: H2 with one connection per request goes from 16.00 to 6.00
+  `recvfrom` per request under `intentrace -p` (62.05 to 51.90-52.05 syscalls per request),
+  and from 20.70-20.90 to 11.35-12.30 `recv` under an `LD_PRELOAD` fd tracer, with EAGAIN
+  answers from 262-264 to 92-97; H2 with the 20 requests multiplexed on one connection goes
+  from 9.35 to 4.10 `recvfrom` per request (25.05 to 19.80 syscalls per request), EAGAIN from
+  126-133 to 37. `SocketResult` and the edge-triggered readiness contract are unchanged: an
+  EAGAIN still ends the call with `WouldBlock`, which drops READABLE until the next event, and a
+  full buffer still answers `Continue`. One ordering changes: EOF and `close_notify` are now
+  answered `Closed` by the first call that finds no plaintext left, after the frames that
+  preceded them, where a call that began with `read_tls` could answer `Closed` alongside the
+  first of those frames and leave the rest stranded in rustls's buffer with READABLE dropped.
+  No per-readiness-turn "EAGAIN seen" memory is added: after the change, 13 to 18 EAGAINs out of
+  92-97 repeat one on the same socket within a single wakeup, and the sampled one followed a
+  read that found fresh bytes, so such a memory would delay data to save them. The read loop
+  moved into a helper generic over `Read` so `rustls_read_tests` can count every `recv` it
+  issues: several frames in one record, a large H1-style buffer, a fragmented record,
+  `close_notify`, a FIN without `close_notify`, and a reset.
+
 - **`perf(mux)`: the backend id is no longer copied into a `String` per request
   ([#1579](https://github.com/sozu-proxy/sozu/issues/1579)).** `HttpContext::backend_id` and
   `SessionMetrics::backend_id` are now `Option<Rc<str>>` instead of `Option<String>`, and the mux
