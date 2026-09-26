@@ -395,6 +395,30 @@
   `Context::link_stream` rebuilds on every attach, and the delta ledger that
   `Mux::apply_backend_deltas` takes instead of draining.
 
+- **`perf(mux-h1)`: a warm H1 write pass no longer allocates its `IoSlice` vector
+  ([#1580](https://github.com/sozu-proxy/sozu/issues/1580)).** `ConnectionH1::writable` built a
+  fresh `Vec<IoSlice>` on every write pass, in both directions (response to the frontend, request
+  to the backend): one allocation on the first descriptor, then one `realloc` per doubling. The
+  H1 `BlockConverter` emits one `Store` per piece of a header block, so a header write carries
+  dozens of descriptors: `intentrace` shows 45 in the `writev(2)` of a `curl` request and 32 in
+  that of a `python3 -m http.server` response. The vector is now a `pub(super)` `io_slices` field
+  of `ConnectionH1`, set only by its two constructors, and `writable` fills and discharges it
+  through `h2_transmit::gather` and `h2_transmit::confirm`, the pair the H2 write pass already
+  uses, instead of its own loop. Only the capacity survives a pass, never a descriptor: `gather`
+  clears the vector on entry, and `confirm` clears it before `Kawa::consume`. Between the two
+  `writable` only writes, copies the accepted bytes into the replay capture (which writes to
+  `retry_buffer`, never to `kawa`) and pushes a debug event, and its one early `return` there is
+  taken only when the vector is empty. `h1.rs` gains its first `unsafe` block, the call to
+  `gather` under that function's existing safety contract; no new `unsafe` code and no new
+  dependency. `a_warm_h1_response_write_pass_allocates_nothing` and
+  `a_warm_h1_request_write_pass_allocates_nothing` count one warm 16-block pass through the shared
+  `test_allocations` counter: 3 → 0 allocations on each position, under both `cargo test` and
+  `cargo test --release`. Measured on a release build with one worker, an H1 listener and a
+  `python3 -m http.server` backend, `intentrace -p <worker> --trace writev`: 200 `writev(2)` before
+  and after for 100 sequential connections, and 200 before and after for 100 requests on one
+  connection, with the same 45 and 32 descriptors per call. The H2 twin is
+  [#1571](https://github.com/sozu-proxy/sozu/issues/1571).
+
 - **`perf(mux)`: a redial of an already-interned backend allocates nothing
   ([#1564](https://github.com/sozu-proxy/sozu/issues/1564)).** `BackendRegistry::id_for`
   (`lib/src/protocol/mux/mod.rs`) runs once per backend connection a mux session opens, and copied

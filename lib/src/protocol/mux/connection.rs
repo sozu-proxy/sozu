@@ -112,6 +112,7 @@ impl<Front: SocketHandler> Connection<Front> {
             close_notify_sent: false,
             session_ulid,
             reused_from_pool: false,
+            io_slices: Vec::new(),
         })
     }
     pub fn new_h1_client(
@@ -146,6 +147,7 @@ impl<Front: SocketHandler> Connection<Front> {
             close_notify_sent: false,
             session_ulid,
             reused_from_pool: false,
+            io_slices: Vec::new(),
         })
     }
 

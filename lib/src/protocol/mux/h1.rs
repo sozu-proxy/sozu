@@ -194,6 +194,16 @@ pub struct ConnectionH1<Front: SocketHandler> {
     /// request capture (sozu-proxy/sozu#1442). Always false on a
     /// `Position::Server` connection.
     pub reused_from_pool: bool,
+    /// `writable`'s vectored-write scratch, kept for the connection's
+    /// lifetime so a write pass reuses its capacity instead of allocating
+    /// and growing a fresh vector (sozu-proxy/sozu#1580).
+    ///
+    /// Empty outside one `h2_transmit::gather` / `h2_transmit::confirm`
+    /// bracket inside `writable`: only the capacity survives a pass, never a
+    /// descriptor. `pub(super)` rather than private (as in `H2Shell`) only
+    /// because `ConnectionH1` has no constructor in this module: both are
+    /// struct literals in `connection.rs`. Nothing else in `mux` touches it.
+    pub(super) io_slices: Vec<IoSlice<'static>>,
 }
 
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
@@ -648,27 +658,34 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             super::shared::apply_response_header_edits(kawa, &edits);
         }
         kawa.prepare(&mut kawa::h1::BlockConverter);
-        let mut io_slices = Vec::new();
-        for block in kawa.out.iter() {
-            match block {
-                kawa::OutBlock::Delimiter => break,
-                kawa::OutBlock::Store(store) => {
-                    io_slices.push(IoSlice::new(store.data(kawa.storage.buffer())));
-                }
-            }
-        }
+        // SAFETY: the descriptors `gather` pushes borrow memory `kawa` owns:
+        // a `Store::Slice` or `Detached` points into `kawa.storage`, while an
+        // `Alloc`, `Static` or `Shared` store points at bytes held by the
+        // block in `kawa.out` itself. So nothing may mutate `kawa`, neither
+        // `storage` nor `out`, while they are live: no `push_out`, no
+        // `storage.fill`, no `consume` and no `clear` between this call and
+        // the `h2_transmit::confirm` below, which clears `self.io_slices`
+        // before its own `Kawa::consume`. In between, the pass only writes
+        // the descriptors to the socket, which reborrows them for the call
+        // and cannot retain them, copies them into the replay capture, which
+        // mutates `retry_buffer` and never `kawa`, and pushes a debug event
+        // onto `context.debug`. Its one `return` in that window is taken only
+        // when the vector is empty, so no descriptor outlives the pass.
+        let queued = unsafe { super::h2_transmit::gather(kawa, &mut self.io_slices) };
         let can_finalize_server_close = matches!(self.position, Position::Server)
             && kawa.is_terminated()
             && kawa.is_completed();
-        if io_slices.is_empty() && !self.socket.socket_wants_write() && !can_finalize_server_close {
+        if self.io_slices.is_empty()
+            && !self.socket.socket_wants_write()
+            && !can_finalize_server_close
+        {
             self.readiness.interest.remove(Ready::WRITABLE);
             return MuxResult::Continue;
         }
-        let tls_only_flush = io_slices.is_empty();
-        // Total bytes we offered the socket across the gathered slices; a
+        let tls_only_flush = self.io_slices.is_empty();
+        // `queued` is the total the gathered slices offer the socket; a
         // vectored write can never report more consumed than we handed it.
-        let queued: usize = io_slices.iter().map(|s| s.len()).sum();
-        let (size, status) = self.socket.socket_write_vectored(&io_slices);
+        let (size, status) = self.socket.socket_write_vectored(&self.io_slices);
         debug_assert!(
             size <= queued,
             "socket_write_vectored reported more bytes written than were queued"
@@ -710,7 +727,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 Some(buffer) if size <= retry_budget.saturating_sub(buffer.len()) => {
                     buffer.reserve(size);
                     let mut remaining = size;
-                    for slice in &io_slices {
+                    for slice in &self.io_slices {
                         if remaining == 0 {
                             break;
                         }
@@ -727,7 +744,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
             }
         }
         context.debug.push(DebugEvent::StreamEvent(1, size));
-        kawa.consume(size);
+        super::h2_transmit::confirm(kawa, &mut self.io_slices, size);
         crate::protocol::mux::h2::record_metric(self.position.bytes_out_event(size));
         self.position.count_bytes_out(parts.metrics, size);
         let should_yield = update_readiness_after_write(size, status, &mut self.readiness);
@@ -2161,6 +2178,131 @@ mod tests {
             output.contains("example.com:8080 GET /abs 400"),
             "the access log of an absolute-form request rejected on a header \
              must carry the authority of its request-target, got: {output}"
+        );
+    }
+
+    // ── A warm H1 write pass allocates nothing ───────────────────────────
+    //
+    // DO NOT READ THESE TESTS AS COVERING H2. `H2Shell::write_streams`
+    // (`lib/src/protocol/mux/h2.rs`) is a separate write path with its own
+    // allocation test.
+
+    /// `Store` blocks each measured pass queues. A fresh `Vec<IoSlice>`
+    /// reserves four descriptors on its first push, so a pass over more than
+    /// four blocks also exercises the growth a per-pass vector would pay.
+    /// One H1 header block is already dozens of them: the `BlockConverter`
+    /// emits every name, separator, value and CRLF as its own `Store`.
+    const WARM_PASS_BLOCKS: usize = 16;
+
+    /// Queue [`WARM_PASS_BLOCKS`] blocks on `kawa`, drive two write passes
+    /// through `write`, and return the heap allocations the SECOND one made.
+    ///
+    /// The first pass is the warm-up and may grow whatever the connection
+    /// keeps; the second queues the same blocks again and is the measurement.
+    /// Both go to a live loopback peer, so the write is a real `writev(2)`.
+    /// The blocks are `Store::Static`, so queueing them touches no storage
+    /// and the kawa never terminates: the pass stops after the write, before
+    /// the completion arm and its access log, which is not the hot path.
+    fn allocations_of_a_warm_write_pass(
+        context: &mut Context<crate::protocol::mux::test_support::TestListener>,
+        outgoing: fn(
+            &mut crate::protocol::mux::Stream,
+        ) -> &mut crate::protocol::mux::GenericHttpStream,
+        mut write: impl FnMut(&mut Context<crate::protocol::mux::test_support::TestListener>),
+    ) -> usize {
+        let mut measured = 0;
+        for pass in 0..2 {
+            let kawa = outgoing(&mut context.streams[0]);
+            for _ in 0..WARM_PASS_BLOCKS {
+                kawa.out
+                    .push_back(kawa::OutBlock::Store(kawa::Store::Static(
+                        b"x-warm: pass\r\n",
+                    )));
+            }
+            let before = crate::test_allocations::allocations();
+            write(context);
+            let allocations = crate::test_allocations::allocations() - before;
+            assert!(
+                outgoing(&mut context.streams[0]).out.is_empty(),
+                "premise: write pass {pass} must drain every queued block, or \
+                 the measured pass would start from a different state"
+            );
+            measured = allocations;
+        }
+        measured
+    }
+
+    /// The frontend side: a `Position::Server` pass writing the response.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH1::writable`, declare
+    /// `let mut io_slices: Vec<IoSlice<'static>> = Vec::new();` above the
+    /// `gather` call and hand that local to `gather`, the emptiness checks,
+    /// the write, the replay capture and `confirm` in place of
+    /// `self.io_slices`. Measured with 16 blocks: `left: 3, right: 0` under
+    /// both `cargo test` and `cargo test --release` — one allocation and two
+    /// `realloc`s per pass, as the per-pass vector grows 4 → 8 → 16.
+    #[test]
+    fn a_warm_h1_response_write_pass_allocates_nothing() {
+        let mut fixture = linked_backend_connection();
+        let BackendReadFixture {
+            context, frontend, ..
+        } = &mut fixture;
+        let Connection::H1(server) = frontend else {
+            unreachable!("new_h1_server builds an H1 connection");
+        };
+        server.stream = Some(0);
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+
+        let allocations = allocations_of_a_warm_write_pass(
+            context,
+            |stream| &mut stream.back,
+            |context| {
+                server.readiness.event.insert(Ready::WRITABLE);
+                server.writable(context, EndpointClient(&mut router));
+            },
+        );
+
+        assert_eq!(
+            allocations, 0,
+            "a warm H1 response write pass must not allocate"
+        );
+    }
+
+    /// The backend side: a `Position::Client` pass writing the request.
+    ///
+    /// The fixture's connection was dialled fresh, not taken from the
+    /// keep-alive pool, so the replay capture stays off: its `reserve` is the
+    /// one allocation a pooled upstream is documented to pay, and it is not
+    /// what this pins.
+    ///
+    /// TO SEE THIS RED: the same substitution as
+    /// `a_warm_h1_response_write_pass_allocates_nothing`.
+    #[test]
+    fn a_warm_h1_request_write_pass_allocates_nothing() {
+        let mut fixture = linked_backend_connection();
+        let BackendReadFixture {
+            context,
+            frontend,
+            client,
+            ..
+        } = &mut fixture;
+        assert!(
+            !client.reused_from_pool,
+            "premise: a freshly dialled upstream does not capture for replay"
+        );
+
+        let allocations = allocations_of_a_warm_write_pass(
+            context,
+            |stream| &mut stream.front,
+            |context| {
+                client.readiness.event.insert(Ready::WRITABLE);
+                client.writable(context, EndpointServer(frontend));
+            },
+        );
+
+        assert_eq!(
+            allocations, 0,
+            "a warm H1 request write pass must not allocate"
         );
     }
 }

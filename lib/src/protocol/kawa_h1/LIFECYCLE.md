@@ -214,7 +214,7 @@ short-circuit anything else in kawa — the very next line back in
 `kawa::h1::parse`'s loop re-checks `parsing_phase`, sees `Error`, and returns.
 
 The resulting `ParsingPhase::Error` is observed by the mux H1 connection in
-`ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs:421`), which checks
+`ConnectionH1::readable` (`lib/src/protocol/mux/h1.rs:431`), which checks
 `kawa.is_error()` immediately after `kawa::h1::parse` and, on the server side,
 calls
 `set_default_answer(..., 400, ...)` and returns — before routing or the
