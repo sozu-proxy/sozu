@@ -58,6 +58,14 @@ READABLE after a short read once HUP was seen and the next pass reads the
 EOF. The pipe and the pre-mux states act on HUP directly
 (`Pipe::frontend_hup`, `Pipe::backend_hup`) and need no EOF read.
 
+The guarantee has one known hole: TCP urgent data. `recv` stops before
+an urgent (out-of-band) mark even with bytes queued behind it, so a
+short read while such a mark is pending leaves those bytes in the kernel
+with no further edge. A stream that carries OOB data (telnet, rlogin,
+FTP `ABOR`) can stall until the peer's next send. HAProxy and tokio
+behave the same, and Sōzu never read out-of-band data before this
+change either.
+
 To survive that contract, every protocol module routes its readiness
 through a `Readiness` tracker (`Readiness` in `lib/src/lib.rs`, reached in
 the mux through `Connection::readiness_mut` in

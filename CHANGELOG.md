@@ -428,7 +428,10 @@
   and tokio (sticky closed readiness) do. The pipe and the pre-mux states act on HUP directly and
   need no EOF read. A pass does not remember a short read of an earlier call, because an edge may
   have arrived in between; the EAGAIN that follows a call whose buffer filled from the last short
-  read's plaintext therefore remains.
+  read's plaintext therefore remains. Known limit: `recv` stops before a TCP urgent (out-of-band)
+  mark even with bytes queued behind it, so a stream that carries OOB data (telnet, rlogin, FTP
+  `ABOR`) can stall until the peer's next send; HAProxy and tokio behave the same, and sozu never
+  read out-of-band data before either.
   Measured on release builds of `f165a3dc` and this change, one worker, loopback, 20 requests per
   scenario, LD_PRELOAD `fdtrace` interposer: H1 `recv` 114 → 58 (EAGAIN 51 → 0), total traced
   calls 24.80 → 22.00 per request; H2 over TLS `recv` 236 → 171 (EAGAIN 103 → 66), 38.50 → 34.05

@@ -204,6 +204,16 @@ fn log_socket_module_prefix(
 /// (`src/raw_sock.c`, `fd_cant_recv` when `ret < try`) and tokio
 /// (`tokio/src/io/poll_evented.rs`, `clear_readiness` when `0 < n < len`) do.
 ///
+/// One exception to that guarantee: TCP urgent data. `recv` stops before an
+/// urgent (out-of-band) mark even when bytes are queued behind it, so a short
+/// read does NOT prove the queue empty while such a mark is pending. Measured
+/// on a loopback socket: `AAAA`, `send(B, MSG_OOB)`, `CCCC` raise one edge,
+/// this read answers `(4, WouldBlock)` with `AAAA`, no further event comes,
+/// and `CCCC` stays in the kernel until the peer sends again. A stream that
+/// carries OOB data (telnet, rlogin, FTP `ABOR`) can therefore stall until the
+/// peer's next send. HAProxy and tokio behave the same, and sozu never read
+/// out-of-band data before either.
+///
 /// Readiness contract:
 ///
 /// - a short read answers `(n, WouldBlock)`, exactly what the previous loop

@@ -3892,6 +3892,85 @@ mod tests {
         );
     }
 
+    /// The case the HUP exception exists for, on a real loopback socket
+    /// registered edge-triggered with mio: the data and the FIN arrive before
+    /// the worker polls, so ONE event carries both `readable` and
+    /// `read_closed`. The short read returns the data and stops before the
+    /// EOF, and no later event will ever announce it. READABLE must survive
+    /// `update_readiness_after_read` so the next pass reads `(0, Closed)`.
+    ///
+    /// To SEE THIS RED: remove the `is_hup()` exception from
+    /// `update_readiness_after_read`; READABLE is dropped after the short read
+    /// and the queued EOF is never read.
+    #[test]
+    fn data_and_fin_in_one_edge_keep_readable_until_the_eof_is_read() {
+        use std::io::Write as _;
+
+        use crate::socket::SocketHandler as _;
+
+        let token = mio::Token(9);
+        let mut poll = mio::Poll::new().expect("a poll instance must open");
+        let mut events = mio::Events::with_capacity(8);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let mut client = std::net::TcpStream::connect(
+            listener
+                .local_addr()
+                .expect("test listener must report its local address"),
+        )
+        .expect("loopback connect must complete");
+        let (accepted, _) = listener.accept().expect("the connection must be accepted");
+        accepted
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        let mut server = mio::net::TcpStream::from_std(accepted);
+
+        // Data and FIN are both queued before the socket is registered, so
+        // the first poll reports them in a single edge.
+        client.write_all(b"DATA").expect("the client must write");
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("the client must half-close");
+        poll.registry()
+            .register(&mut server, token, mio::Interest::READABLE)
+            .expect("the stream must register");
+        poll.poll(&mut events, Some(std::time::Duration::from_secs(5)))
+            .expect("poll must succeed");
+        let event = events
+            .iter()
+            .find(|event| event.token() == token)
+            .expect("the arrival must raise an event");
+        assert!(
+            event.is_readable() && event.is_read_closed(),
+            "premise: data and FIN must share one edge, got {event:?}"
+        );
+        let mut readiness = Readiness {
+            event: Ready::from(event),
+            interest: Ready::READABLE,
+        };
+
+        let mut buf = vec![0u8; 16 * 1024];
+        let (size, status) = server.socket_read(&mut buf);
+        assert_eq!((size, status), (4, SocketResult::WouldBlock));
+        assert!(!update_readiness_after_read(size, status, &mut readiness));
+        assert!(
+            readiness.event.is_readable(),
+            "HUP was seen: READABLE must stay so the EOF is read"
+        );
+
+        poll.poll(&mut events, Some(std::time::Duration::from_millis(300)))
+            .expect("poll must succeed");
+        assert!(
+            events.iter().all(|event| event.token() != token),
+            "edge-triggered: no further event announces the queued EOF"
+        );
+
+        let (size, status) = server.socket_read(&mut buf);
+        assert_eq!((size, status), (0, SocketResult::Closed));
+        assert!(update_readiness_after_read(size, status, &mut readiness));
+        assert!(!readiness.event.is_readable());
+    }
+
     #[test]
     fn a_short_read_without_hup_drops_readable() {
         let mut readiness = Readiness {
