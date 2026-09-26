@@ -124,9 +124,14 @@ Notes:
   binary accepts one, and the test build fails with "cannot define multiple
   global allocators" even when both changes merge without a textual conflict.
   Current users: `a_redial_of_an_interned_backend_allocates_nothing`
-  (`lib/src/protocol/mux/mod.rs`, [#1564](https://github.com/sozu-proxy/sozu/issues/1564))
-  and `steady_state_emission_does_not_allocate` (`lib/src/metrics/local_drain.rs`),
-  both held at zero. A budget measured through the public API lives in its own
+  (`lib/src/protocol/mux/mod.rs`, [#1564](https://github.com/sozu-proxy/sozu/issues/1564)),
+  `a_request_on_a_reused_backend_connection_allocates_nothing` and
+  `stamping_a_dialled_backend_allocates_nothing` (`lib/src/protocol/mux/router.rs`,
+  [#1579](https://github.com/sozu-proxy/sozu/issues/1579)), and
+  `steady_state_emission_does_not_allocate` (`lib/src/metrics/local_drain.rs`),
+  all held at zero. When the code under test triggers bookkeeping that
+  allocates for reasons of its own, measure that bookkeeping alone as a
+  control and assert on the difference, as the reused-connection test does. A budget measured through the public API lives in its own
   `lib/tests/` binary with its own allocator instead, as
   `lib/tests/backend_selection.rs` does.
 - **Router hostname resolution is unit-tested with `quickcheck`**

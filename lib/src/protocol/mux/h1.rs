@@ -1871,7 +1871,7 @@ mod tests {
 
         let stream = &mut context.streams[0];
         stream.state = StreamState::Linked(mio::Token(1));
-        stream.metrics.backend_id = Some("test-backend".to_owned());
+        stream.metrics.backend_id = Some("test-backend".into());
         stream.metrics.backend_start();
         stream.metrics.backend_connected();
 
