@@ -37,10 +37,12 @@
 //! fixed 65535-octet initial value — no SETTINGS parameter can change the
 //! connection-level window, only `WINDOW_UPDATE` on stream 0 can — plus every
 //! stream-0 `WINDOW_UPDATE` Sōzu sends it: the one-shot enlargement to
-//! `H2ConnectionConfig::initial_connection_window`, queued by
-//! `H2Shell::writable`'s `(H2State::ServerSettings, Position::Server)`
-//! arm on a frontend connection and by `ConnectionH2::handle_settings_frame`
-//! on a backend one, and then the periodic grants back. On this side that
+//! `H2ConnectionConfig::initial_connection_window`, serialised straight into
+//! `zero` beside the server SETTINGS by `ConnectionH2::readable`'s
+//! `(H2State::ClientSettings, Position::Server)` arm on a frontend connection
+//! (so the whole server preface leaves in one write) and queued by
+//! `ConnectionH2::handle_settings_frame` on a backend one, and then the
+//! periodic grants back. On this side that
 //! configured number governs exactly two things: how large that one-shot
 //! enlargement is, and how often credit is returned —
 //! `ConnectionH2::handle_data_frame` passes `initial_connection_window / 2`
@@ -192,8 +194,9 @@ impl H2FlowControl {
     /// default) at construction time — `ConnectionH2::new` never starts a
     /// connection pre-enlarged; the enlargement to
     /// `H2ConnectionConfig::initial_connection_window` happens later, via a
-    /// queued WINDOW_UPDATE, once the handshake reaches `ServerSettings` /
-    /// the client's first SETTINGS ACK.
+    /// stream-0 WINDOW_UPDATE: serialised with the server SETTINGS on a
+    /// frontend connection, queued once the server's SETTINGS arrive on a
+    /// backend one.
     pub(super) fn new(initial_window: i32) -> Self {
         let flow_control = H2FlowControl {
             window: initial_window,

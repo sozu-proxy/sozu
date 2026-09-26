@@ -407,6 +407,20 @@
   `random_weighted_pick_matches_weighted_index` compares the new draw with `WeightedIndex` over
   valid, zero, negative, overflowing, singleton and empty weight sets.
 
+- **`perf(mux-h2)`: the frontend server preface leaves in one `writev(2)` instead of two.** The
+  one-shot stream-0 `WINDOW_UPDATE` that enlarges the connection receive window to
+  `h2_initial_connection_window` was queued by the `(ServerSettings, Server)` arm of the write
+  pass, which runs after that pass already drained `zero` (server SETTINGS + ACK of the client's
+  SETTINGS), so it cost a second write pass and a second TLS record on every H2 connection. The
+  `(ClientSettings, Server)` read arm now serialises it straight into `zero` between the SETTINGS
+  and the ACK: wire order SETTINGS, WINDOW_UPDATE, SETTINGS ACK — RFC 9113 §3.4 only requires
+  SETTINGS first. No allocation, no flow-control change (it only ever enlarged the peer's send
+  allowance), and the backend (`Position::Client`) path is unchanged. Measured on a release build,
+  one worker, `python3 -m http.server` backend, `curl --http2` N=20 sequential connections: worker
+  `writev` **7.00 → 6.00 per connection**, identical with `intentrace -p` and the `LD_PRELOAD`
+  interposer; the preface record goes from 88 + 35 bytes in two writes to 101 bytes in one. On one
+  connection carrying 20 requests: 45 → 44, i.e. the saving is per connection, not per request.
+
 - **`refactor(mux)`: `Position::Client` holds an opaque backend id, and backend accounting leaves
   the core as deltas ([#1340](https://github.com/sozu-proxy/sozu/issues/1340), Q12).** The core no
   longer holds `Rc<RefCell<Backend>>` anywhere. `Position::Client` carried one so that six
