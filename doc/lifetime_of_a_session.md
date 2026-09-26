@@ -145,12 +145,29 @@ with mio and tracked through a `ListenSession` slab entry. Hot
 reconfig adds and removes listeners at runtime via the master-to-
 worker channel (`Server::notify_proxys`, `lib/src/server.rs`).
 
+`TCP_NODELAY` is set once per listener, in each listener's `activate`
+(`HttpListener::activate`, `HttpsListener::activate`,
+`TcpListener::activate`), on whichever socket it activates: freshly bound,
+inherited over SCM_RIGHTS at an upgrade, or parked by a failed registration.
+The kernel copies the flag to every socket whose handshake completes
+afterwards, so an accepted socket needs no `setsockopt(2)` of its own. A
+connection that completed its handshake before the listener had the flag —
+the backlog of a socket inherited from a worker that never set it — does not
+inherit it, so each listener's `accept` sets it per connection until its first
+`WouldBlock` after an activation (`nodelay_backlog`), which is exactly that
+backlog. See sozu-proxy/sozu#1586.
+
 ### 3.2 The accept queue
 
 When a listener becomes readable, the proxy accepts every pending
 connection in a single batch and parks each `TcpStream` on an internal
 `accept_queue: VecDeque<…>` (`Server::accept_queue`,
-`lib/src/server.rs`). Sessions are
+`lib/src/server.rs`), together with the peer address `accept(2)` returned
+for it. That address feeds the `client.connect.per_source.*` counter and is
+handed to `create_session`, which seeds the session with it: nothing on the
+accept path calls `getpeername(2)`. On an expect-proxy listener it stays the
+network peer (the load balancer); the client address comes from the PROXY
+header when the session upgrades. Sessions are
 *not* created synchronously inside the accept loop. The queue is
 drained later, newest-first, so connections that have been waiting
 too long are dropped before they are turned into a session. The
@@ -212,7 +229,7 @@ with browser-driven coalescing on legitimate wildcard certs.
 ### 4.2 ALPN and `disable_http11`
 
 After the handshake completes, Sōzu inspects the negotiated ALPN
-protocol (`lib/src/https.rs:444-503`) and decides which mux
+protocol (`lib/src/https.rs:447-506`) and decides which mux
 flavour to instantiate:
 
 - ALPN `h2` → HTTP/2 mux.
@@ -226,10 +243,10 @@ counted with two distinct keys so dashboards can split refusals by
 cause:
 
 - `https.alpn.rejected.unsupported` — peer offered an ALPN that Sōzu
-  does not implement (e.g. `h3`) (`lib/src/https.rs:481`).
+  does not implement (e.g. `h3`) (`lib/src/https.rs:484`).
 - `https.alpn.rejected.http11_disabled` — peer wanted `http/1.1` but
   the listener has `disable_http11 = true`
-  (`lib/src/https.rs:464, 494`).
+  (`lib/src/https.rs:467, 497`).
 
 The startup-time validator at `command/src/config.rs:1279-1283, 1301-1307`
 catches the obvious operator mistake of pairing `disable_http11 = true` with
@@ -518,7 +535,7 @@ Linux the subsequent `close()` then sends a TCP RST instead of a FIN,
 destroying any data still in the send buffer — including the TLS
 records the drain loop just flushed. `Shutdown::Write` sends FIN only
 after the send buffer drains, preserving the response. The plaintext
-TCP path (`lib/src/tcp.rs:1563-1567, 1838-1843`) keeps `Shutdown::Both`
+TCP path (`lib/src/tcp.rs:1568-1572, 1843-1848`) keeps `Shutdown::Both`
 because it has no encrypted send-buffer to truncate; the comment
 flags that a future TLS upgrade on TCP would need to switch modes.
 
@@ -609,7 +626,7 @@ set to read a session's life from a dashboard:
   (`TlsHandshake::record_handshake_duration_ms` /
   `handshake_failure_reason`, `lib/src/protocol/rustls.rs`).
 - `https.alpn.rejected.{unsupported,http11_disabled}` — ALPN refusal
-  causes (`lib/src/https.rs:464, 481, 494`).
+  causes (`lib/src/https.rs:467, 484, 497`).
 - `client.connections`, `client.connections_max`,
   `client.connections_percent` — slab-backed lifecycle gauges
   (`client.connections` is sampled per increment/decrement in

@@ -13,6 +13,7 @@ use mio::{
     net::{TcpListener as MioTcpListener, TcpStream},
 };
 use rusty_ulid::Ulid;
+use socket2::SockRef;
 use sozu_command::{
     logging::CachedTags,
     proto::command::{
@@ -127,6 +128,7 @@ impl HttpSession {
         proxy: Rc<RefCell<HttpProxy>>,
         public_address: SocketAddr,
         sock: TcpStream,
+        peer: SocketAddr,
         token: Token,
         wait_time: Duration,
     ) -> Result<Self, AcceptError> {
@@ -145,7 +147,10 @@ impl HttpSession {
             ))
         } else {
             gauge_add!(names::protocol::HTTP, 1);
-            let session_address = sock.peer_addr().ok();
+            // The address `accept(2)` returned. On an expect-proxy listener
+            // the other branch ignores it: the session address comes from the
+            // PROXY header at `upgrade_expect`.
+            let session_address = Some(peer);
             let session_ulid = rusty_ulid::Ulid::generate();
             let sock = crate::socket::SessionTcpStream::new(sock, session_ulid, session_address);
 
@@ -775,6 +780,20 @@ pub struct HttpListener {
     /// none of those things, and putting it there made a failed registration
     /// answer `ENOENT` from `deregister` and fail the whole soft stop.
     parked_listener: Option<MioTcpListener>,
+    /// Set by `activate()`, cleared by the first `accept()` that answers
+    /// `WouldBlock`: while set, `accept()` sets `TCP_NODELAY` on each socket
+    /// it returns.
+    ///
+    /// `activate()` sets `TCP_NODELAY` on the listening socket, and the kernel
+    /// copies it to every socket whose handshake completes afterwards, so a
+    /// steady-state accept needs no `setsockopt(2)` of its own
+    /// (sozu-proxy/sozu#1586). A connection that completed its handshake
+    /// BEFORE that call does not get it: the flag is copied when the
+    /// handshake completes, not when the socket is accepted. That is the
+    /// backlog of a socket inherited from a worker that never set the flag,
+    /// and whatever a fresh socket queued between `listen(2)` and
+    /// `activate()`. The first accept drain takes exactly that backlog.
+    nodelay_backlog: bool,
     tags: BTreeMap<String, CachedTags>,
     token: Token,
 }
@@ -1291,6 +1310,7 @@ impl HttpListener {
             fronts: Router::new(),
             listener: None,
             parked_listener: None,
+            nodelay_backlog: false,
             tags: BTreeMap::new(),
             token,
         })
@@ -1375,6 +1395,20 @@ impl HttpListener {
             }
         };
 
+        // Once per listener, on whichever socket won above — freshly bound,
+        // inherited over SCM_RIGHTS from a worker that may never have set it,
+        // or parked by a failed registration. Every socket this listener
+        // accepts from now on inherits it; see `nodelay_backlog` for the ones
+        // already queued.
+        if let Err(e) = SockRef::from(&listener).set_tcp_nodelay(true) {
+            error!(
+                "{} error setting nodelay on listen socket({:?}): {:?}",
+                log_module_context!(),
+                listener,
+                e
+            );
+        }
+
         let registration = registry
             .register(&mut listener, self.token, Interest::READABLE)
             .map_err(ListenerError::SocketRegistration);
@@ -1393,6 +1427,7 @@ impl HttpListener {
         }
 
         self.listener = Some(listener);
+        self.nodelay_backlog = true;
         self.active = true;
         Ok(self.token)
     }
@@ -1564,17 +1599,32 @@ impl HttpListener {
             .map_err(ListenerError::RemoveFrontend)
     }
 
-    fn accept(&mut self) -> Result<TcpStream, AcceptError> {
+    fn accept(&mut self) -> Result<(TcpStream, SocketAddr), AcceptError> {
         if let Some(ref sock) = self.listener {
-            sock.accept()
-                .map_err(|e| match e.kind() {
-                    ErrorKind::WouldBlock => AcceptError::WouldBlock,
-                    _ => {
-                        error!("{} accept() IO error: {:?}", log_module_context!(), e);
-                        AcceptError::IoError
+            match sock.accept() {
+                Ok((frontend_sock, peer)) => {
+                    if self.nodelay_backlog
+                        && let Err(e) = frontend_sock.set_nodelay(true)
+                    {
+                        error!(
+                            "{} error setting nodelay on front socket({:?}): {:?}",
+                            log_module_context!(),
+                            frontend_sock,
+                            e
+                        );
                     }
-                })
-                .map(|(sock, _)| sock)
+                    Ok((frontend_sock, peer))
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    // The backlog queued before `activate()` is drained.
+                    self.nodelay_backlog = false;
+                    Err(AcceptError::WouldBlock)
+                }
+                Err(e) => {
+                    error!("{} accept() IO error: {:?}", log_module_context!(), e);
+                    Err(AcceptError::IoError)
+                }
+            }
         } else {
             error!(
                 "{} cannot accept connections, no listening socket available",
@@ -1702,7 +1752,7 @@ impl ProxyConfiguration for HttpProxy {
         }
     }
 
-    fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
+    fn accept(&mut self, token: ListenToken) -> Result<(TcpStream, SocketAddr), AcceptError> {
         if let Some(listener) = self.listeners.get(&Token(token.0)) {
             listener.borrow_mut().accept()
         } else {
@@ -1713,6 +1763,7 @@ impl ProxyConfiguration for HttpProxy {
     fn create_session(
         &mut self,
         mut frontend_sock: TcpStream,
+        peer: SocketAddr,
         listener_token: ListenToken,
         wait_time: Duration,
         proxy: Rc<RefCell<Self>>,
@@ -1723,14 +1774,9 @@ impl ProxyConfiguration for HttpProxy {
             .cloned()
             .ok_or(AcceptError::IoError)?;
 
-        if let Err(e) = frontend_sock.set_nodelay(true) {
-            error!(
-                "{} error setting nodelay on front socket({:?}): {:?}",
-                log_module_context!(),
-                frontend_sock,
-                e
-            );
-        }
+        // No `set_nodelay` here: the socket has `TCP_NODELAY` from its
+        // listener, or from `HttpListener::accept` if it was queued before the
+        // listener set it.
         let mut session_manager = self.sessions.borrow_mut();
         let slab_len_before = session_manager.slab.len();
         let session_entry = session_manager.slab.vacant_entry();
@@ -1776,6 +1822,7 @@ impl ProxyConfiguration for HttpProxy {
             proxy,
             public_address,
             frontend_sock,
+            peer,
             session_token,
             wait_time,
         )?;
@@ -2458,6 +2505,7 @@ mod tests {
 
         let listener = HttpListener {
             parked_listener: None,
+            nodelay_backlog: false,
             listener: None,
             address: address.into(),
             fronts,
@@ -2676,7 +2724,7 @@ mod tests {
                 .expect("the test peer listener has an address"),
         )
         .expect("connect the test client");
-        let (accepted, _) = peer_listener.accept().expect("accept the test client");
+        let (accepted, peer) = peer_listener.accept().expect("accept the test client");
         accepted
             .set_nonblocking(true)
             .expect("the front socket must go non-blocking");
@@ -2688,6 +2736,7 @@ mod tests {
             .borrow_mut()
             .create_session(
                 front,
+                peer,
                 ListenToken(listener_token.0),
                 Duration::ZERO,
                 proxy.clone(),
@@ -2716,6 +2765,75 @@ mod tests {
             !epoll_watches(&registry, front_fd),
             "dropping the session closes the front socket's only descriptor, \
              which must take it out of the epoll set"
+        );
+        drop(parts.event_loop);
+    }
+
+    /// A connection accepted once the listener is live carries `TCP_NODELAY`
+    /// without a per-connection `setsockopt(2)`, and is handed over with the
+    /// peer address `accept(2)` returned (sozu-proxy/sozu#1586).
+    ///
+    /// The kernel copies `TCP_NODELAY` from a listening socket to each socket
+    /// it accepts, at the moment the handshake completes. The listener sets it
+    /// once in `activate`. The first accept drain still sets it per connection
+    /// for whatever was already in the backlog, so this test drains that pass
+    /// first, until `WouldBlock`, and only then opens the connection whose flag
+    /// it reads: that one can only have it from the listener.
+    ///
+    /// To SEE THIS RED: in `HttpListener::activate`, delete the
+    /// `SockRef::from(&listener).set_tcp_nodelay(true)` block. The listener then
+    /// has no flag to pass on and the accepted socket reads `false`.
+    #[test]
+    fn a_steady_state_accepted_socket_inherits_nodelay_and_its_peer_address() {
+        let address = SocketAddress::new_v4(127, 0, 0, 1, crate::testing::provide_port());
+        let parts = crate::testing::prebuild_server(4, 16_384, false)
+            .expect("test server parts must build");
+        let listener_token = {
+            let mut sessions = parts.sessions.borrow_mut();
+            let entry = sessions.slab.vacant_entry();
+            let key = entry.key();
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::HTTPListen,
+            })));
+            Token(key)
+        };
+        let mut proxy = HttpProxy::new(parts.registry, parts.sessions, parts.pool, parts.backends);
+        proxy
+            .add_listener(
+                ListenerBuilder::new_http(address)
+                    .to_http(None)
+                    .expect("test listener config must build"),
+                listener_token,
+            )
+            .expect("test listener must register");
+        proxy
+            .activate_listener(&address.into(), None)
+            .expect("test listener must activate");
+
+        // The first drain after the activation, with an empty backlog.
+        assert!(
+            matches!(
+                proxy.accept(ListenToken(listener_token.0)),
+                Err(AcceptError::WouldBlock)
+            ),
+            "precondition: nothing is queued on a freshly bound listener"
+        );
+
+        let client =
+            TcpStream::connect(SocketAddr::from(address)).expect("connect the test client");
+        let (accepted, peer) = proxy
+            .accept(ListenToken(listener_token.0))
+            .expect("the completed connection must be accepted");
+
+        assert_eq!(
+            socket2::SockRef::from(&accepted).tcp_nodelay().ok(),
+            Some(true),
+            "a socket accepted in steady state must inherit TCP_NODELAY from its listener"
+        );
+        assert_eq!(
+            peer,
+            client.local_addr().expect("the test client has an address"),
+            "the peer address handed over must be the client's"
         );
         drop(parts.event_loop);
     }

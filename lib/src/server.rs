@@ -1172,18 +1172,12 @@ pub enum ServerError {
 pub struct Server {
     accept_queue_timeout: Duration,
     /// Tuple layout: `(socket, listen token, protocol, accept time, peer
-    /// address)`. The peer is captured via `TcpStream::peer_addr()` at accept
-    /// time so the `client.connect.per_source.*` counter can be attributed
-    /// without the socket having to be alive at session-creation time. The
-    /// peer is `Option` because `peer_addr()` is best-effort: a peer that
-    /// races to close before we read it is rare but possible.
-    accept_queue: VecDeque<(
-        TcpStream,
-        ListenToken,
-        Protocol,
-        Instant,
-        Option<SocketAddr>,
-    )>,
+    /// address)`. The peer is the address `accept(2)` returned with the
+    /// socket: it attributes the `client.connect.per_source.*` counter at
+    /// accept time and is handed to `create_session`, so no one has to read it
+    /// back with `getpeername(2)` (sozu-proxy/sozu#1586). Unlike that lookup,
+    /// which fails once the peer has reset, `accept(2)` always reports it.
+    accept_queue: VecDeque<(TcpStream, ListenToken, Protocol, Instant, SocketAddr)>,
     /// When the accept queue saturates and `check_limits` refuses, evict the
     /// oldest non-listener sessions to make room. Default off — see
     /// `command::config::DEFAULT_EVICT_ON_QUEUE_FULL` for the rationale.
@@ -3739,17 +3733,13 @@ impl Server {
                 ),
             };
             match result {
-                Ok(sock) => {
-                    // peer_addr() is one syscall (`getpeername(2)`) and runs
-                    // exactly once per accepted socket. It can fail if the
-                    // peer raced to close — recorded as `None` and silently
-                    // skipped for the per-source counter.
-                    let peer = sock.peer_addr().ok();
+                Ok((sock, peer)) => {
+                    // `peer` is the address `accept(2)` returned: the counter
+                    // and the session below both use it, and neither costs a
+                    // `getpeername(2)`.
                     incr!(names::listener::ACCEPTED_TOTAL);
                     incr!(proto_key);
-                    if let Some(peer_addr) = peer.as_ref() {
-                        incr!(per_source_bucket(peer_addr));
-                    }
+                    incr!(per_source_bucket(&peer));
                     let queue_before = self.accept_queue.len();
                     self.accept_queue.push_back((
                         sock,
@@ -3784,7 +3774,7 @@ impl Server {
     }
 
     pub fn create_sessions(&mut self) {
-        while let Some((sock, token, protocol, timestamp, _peer)) = self.accept_queue.pop_back() {
+        while let Some((sock, token, protocol, timestamp, peer)) = self.accept_queue.pop_back() {
             let wait_time = Instant::now() - timestamp;
             time!(names::accept_queue::WAIT_TIME, wait_time.as_millis());
             if wait_time > self.accept_queue_timeout {
@@ -3861,7 +3851,7 @@ impl Server {
                     if self
                         .tcp
                         .borrow_mut()
-                        .create_session(sock, token, wait_time, proxy)
+                        .create_session(sock, peer, token, wait_time, proxy)
                         .is_err()
                     {
                         break;
@@ -3872,7 +3862,7 @@ impl Server {
                     if self
                         .http
                         .borrow_mut()
-                        .create_session(sock, token, wait_time, proxy)
+                        .create_session(sock, peer, token, wait_time, proxy)
                         .is_err()
                     {
                         break;
@@ -3882,7 +3872,7 @@ impl Server {
                     if self
                         .https
                         .borrow_mut()
-                        .create_session(sock, token, wait_time, self.https.clone())
+                        .create_session(sock, peer, token, wait_time, self.https.clone())
                         .is_err()
                     {
                         break;
@@ -5316,6 +5306,12 @@ mod scm_listener_handoff_tests {
     /// back below the `if let Some(state) = initial_state` block. All four
     /// assertions fail — each listener binds its own socket, and the queued
     /// connections and datagram stay on the abandoned descriptors.
+    ///
+    /// The `TCP_NODELAY` assertions guard the backlog drain of
+    /// sozu-proxy/sozu#1586. To SEE THEM RED: delete the
+    /// `self.nodelay_backlog = true;` line from `HttpListener::activate`. The
+    /// listener still gets the flag, but the connection queued before it did
+    /// is accepted without it.
     #[test]
     fn inherited_listener_sockets_are_adopted_by_the_initial_activation() {
         let ServerParts {
@@ -5351,11 +5347,11 @@ mod scm_listener_handoff_tests {
         // preserve: a completed connection in the accept backlog, and a
         // datagram in the receive buffer. The clients stay alive for the whole
         // test so the connections are not closed from under the backlog.
-        let _http_client = StdTcpStream::connect::<SocketAddr>(http_address.into())
+        let http_client = StdTcpStream::connect::<SocketAddr>(http_address.into())
             .expect("could not queue a connection on the inherited HTTP socket");
-        let _https_client = StdTcpStream::connect::<SocketAddr>(https_address.into())
+        let https_client = StdTcpStream::connect::<SocketAddr>(https_address.into())
             .expect("could not queue a connection on the inherited HTTPS socket");
-        let _tcp_client = StdTcpStream::connect::<SocketAddr>(tcp_address.into())
+        let tcp_client = StdTcpStream::connect::<SocketAddr>(tcp_address.into())
             .expect("could not queue a connection on the inherited TCP socket");
         let datagram_sender =
             StdUdpSocket::bind("127.0.0.1:0").expect("could not bind the test datagram sender");
@@ -5423,6 +5419,35 @@ mod scm_listener_handoff_tests {
             accepted.contains(&Protocol::TCPListen),
             "the connection queued on the inherited TCP socket must survive the hand-off, got {accepted:?}"
         );
+
+        // What those queued connections are handed to the sessions with. They
+        // completed their handshake BEFORE the new worker set `TCP_NODELAY` on
+        // the inherited socket, and a socket inherits the flag when its
+        // handshake completes, not when it is accepted, so the listener alone
+        // cannot have given it to them: the first accept drain after an
+        // activation must. And the peer address queued with each one is the
+        // one `accept(2)` returned, which is the client's own address.
+        for (protocol, client) in [
+            (Protocol::HTTPListen, &http_client),
+            (Protocol::HTTPSListen, &https_client),
+            (Protocol::TCPListen, &tcp_client),
+        ] {
+            let (sock, _, _, _, peer) = server
+                .accept_queue
+                .iter()
+                .find(|(_, _, queued, _, _)| *queued == protocol)
+                .expect("the queued connection was asserted above");
+            assert_eq!(
+                socket2::SockRef::from(sock).tcp_nodelay().ok(),
+                Some(true),
+                "a {protocol:?} connection queued before the hand-off must carry TCP_NODELAY"
+            );
+            assert_eq!(
+                *peer,
+                client.local_addr().expect("the test client has an address"),
+                "the {protocol:?} peer address must be the client's"
+            );
+        }
 
         let (_, adopted_udp_socket) = server
             .udp
