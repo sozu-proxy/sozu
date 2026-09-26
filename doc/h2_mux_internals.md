@@ -522,7 +522,7 @@ must be attributed proportionally.
 
 A **free function**, not a method:
 
-```rust lib/src/protocol/mux/h2.rs:456-464
+```rust lib/src/protocol/mux/h2.rs:457-465
 fn distribute_overhead(
     metrics: &mut SessionMetrics,
     overhead_bin: &mut usize,
@@ -596,7 +596,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4436-4449
+```rust lib/src/protocol/mux/h2.rs:4422-4435
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -622,7 +622,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4484-4490
+```rust lib/src/protocol/mux/h2.rs:4470-4476
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -639,9 +639,9 @@ The other three sites take the `&mut self` wrapper
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:6354`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:6340`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:7033`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:7019`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -651,10 +651,10 @@ for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
 taken at the top of `H2WritePhase::Flush`'s post-flush tail
-(`lib/src/protocol/mux/h2.rs:3203`) and passes `stream.linked_token()` straight
+(`lib/src/protocol/mux/h2.rs:3188`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3262-3263
+```rust lib/src/protocol/mux/h2.rs:3247-3248
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -663,17 +663,18 @@ This ensures `metrics.bin` and `metrics.bout` in the access log include the
 stream's proportional share of connection overhead, and that the
 TCP_INFO-derived `client_rtt` / `server_rtt` cells are populated.
 
-Neither cell is read from a socket by this file any more, and the two are not
-sampled at the same instant:
+Neither cell is read from a socket by this file, and both are asked of the
+endpoint at the moment the stream is logged:
 
-- `client_rtt` is `ConnectionH2::client_rtt`, a plain field. `Mux` writes it
-  once per pass in `Mux::refresh_client_rtt` and `snapshot_rtts` hands the
-  carried value to every stream finishing in that pass. Several streams
-  completing together therefore report one identical number — the
-  operator-visible half of this, and what it costs, is stated in
-  `doc/configure.md`'s "When each cell is measured".
-- `server_rtt` is still read per call, through `Endpoint::peer_rtt(token)`,
-  which returns an `Option<Duration>` already sampled by the embedder. It
+- `client_rtt` is `Endpoint::local_rtt()`. `H2Shell` hands the core a
+  `ShellEndpoint` that answers it from the shell's own socket, sampling at the
+  first stream logged in a `Mux` pass and reusing that sample for every later
+  stream of the pass, so several streams completing together report one
+  identical number and a pass that logs nothing costs no syscall (issue
+  #1590). The operator-visible half of this is stated in `doc/configure.md`'s
+  "When each cell is measured".
+- `server_rtt` is read per call, through `Endpoint::peer_rtt(token)`, which
+  returns an `Option<Duration>` already sampled by the embedder. It
   deliberately does NOT return the socket: the predecessor,
   `Endpoint::socket(token) -> Option<&TcpStream>`, handed out a concrete
   `mio::net::TcpStream`, so any connection could reach any other connection's
@@ -681,7 +682,7 @@ sampled at the same instant:
 
 RTT is intrinsically a live-socket property and stays on the embedder's side
 of the boundary in both directions; the cores receive a value captured for
-them, whether it arrives through a trait method or through a field.
+them through a trait method.
 
 
 ---
@@ -869,17 +870,19 @@ connection rendered two different peers depending on which struct a trace
 carried: the H2 one the snapshot, the H1 one a live `getpeername(2)` taken at
 format time — which answers `ENOTCONN` once the peer has reset — alongside a
 file descriptor. The third reason does not transfer. `ConnectionH1` is still
-generic over `Front: SocketHandler`, and the three `stats::socket_rtt` samples
-in `ConnectionH1::writable` still reach `socket_ref`; those read a round-trip
+generic over `Front: SocketHandler`, and the three `sample_rtt` reads (the
+counted wrapper over `stats::socket_rtt` in `protocol/mux/mod.rs`) in
+`ConnectionH1::writable` still reach `socket_ref`; those read a round-trip
 time rather than an address, and they stay. Pinned by
 `debug_renders_the_proxy_advertised_peer_not_the_transport_socket`
 (`lib/src/protocol/mux/h1.rs`).
 
 ### What the RTT read cost to remove
 
-Q11's local half is the step that removed it. `ConnectionH2::client_rtt` is now
-a carried field, `Mux::refresh_client_rtt` writes it once per pass, and
-`snapshot_rtts` reads it. Three shapes were on the table:
+Q11's local half is the step that removed it. It made `ConnectionH2::client_rtt`
+a carried field that `Mux::refresh_client_rtt` wrote once per pass and
+`snapshot_rtts` read — a shape issue #1590 has since replaced, see the next
+section. Three shapes were on the table:
 
 - **Per entry point** — mirror the value in wherever `ConnectionH2.now` is
   mirrored from `Context::now`. Rejected on measurement: 7.8–9.7× the syscall
@@ -921,9 +924,52 @@ Paying that is the price of the core no longer holding an OS handle. The
 access-log-as-output shape is what removes the cost entirely, and it can
 supersede this step without rework.
 
+### Making the read lazy (issue #1590)
+
+The paragraph above has since been answered without the access-log-as-output
+shape. `Endpoint` gained `local_rtt`, and `H2Shell` hands its core a
+`ShellEndpoint` — built per core call from disjoint borrows of the shell's own
+`core`, `socket` and `local_rtt` fields — that answers it from the shell's
+socket. The core still holds no OS handle; it asks, the way it already asked
+for `server_rtt`, and it asks only in `snapshot_rtts`, that is when it logs a
+stream. The first ask of a pass samples and stores into `H2Shell::local_rtt`,
+later asks in the pass reuse the value, and `Mux::expire_client_rtt` forgets it
+at the top of the next pass without a syscall. `Mux::close` samples only when
+its teardown sweep finds a stream to log. HAProxy works the same way: it reads
+`TCP_INFO` in `tcp_get_info` (`src/proto_tcp.c`) only when a `fc_rtt` /
+`bc_rtt` sample fetch (`src/tcp_sample.c`) is evaluated, never per event.
+
+Nothing periodic needed the eager sample: the access log is the only consumer
+of `TCP_INFO` in the tree, so the read now happens once per log line at most.
+
+Measured on a release build (`--no-default-features --features
+crypto-ring,opentelemetry,splice,simd`), one worker, python `http.server`
+backend on loopback, `curl`, 20 requests, `LD_PRELOAD` interposer counting
+`getsockopt(SOL_TCP, TCP_INFO)` with a backtrace per call, 1-minute load
+average 2–8. `intentrace -p` on the same scenarios agrees on the direction
+(H1 2.00 → 1.00, H2 6.00 → 1.00, multiplexed 3.15 → 1.00 in its aligned
+window).
+
+| scenario                                   | `TCP_INFO` per request before (`e49d78ab`) | after |
+| ------------------------------------------ | ------------------------------------------ | ----- |
+| H1, 20 sequential connections              | 2.80                                       | 1.85  |
+| H2, 20 sequential connections              | 7.85                                       | 1.85  |
+| H2, 20 streams multiplexed on 1 connection | 5.60                                       | 1.80  |
+
+Every remaining read is an access-log cell: one `client_rtt` per request and one
+`server_rtt` per request whose backend connection is still in the router when
+the line is written. The python backend closes its connection after each
+response, so a few `server_rtt` cells are `-` on both sides of the change and
+that read never happens; the per-request figure is therefore just under 2. The
+reads removed are the per-pass samples (5.95 per H2 request, one of them the
+first `ready()` after the TLS handshake re-enters the new `Mux` from
+`HttpsSession::ready`) and the unconditional one in `Mux::close` (one per
+connection, H1 and H2); in their place each H2 request pays the one lazy
+`client_rtt` read its log line needs.
+
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8012-8016
+```rust lib/src/protocol/mux/h2.rs:8091-8095
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1031,7 +1077,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8084-8088
+```rust lib/src/protocol/mux/h2.rs:8168-8172
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1460,7 +1506,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:7533
+```rust lib/src/protocol/mux/h2.rs:7600
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
@@ -1613,7 +1659,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6398-6400
+```rust lib/src/protocol/mux/h2.rs:6384-6386
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1621,7 +1667,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6412-6418
+```rust lib/src/protocol/mux/h2.rs:6398-6404
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
@@ -1797,7 +1843,7 @@ return errors that are converted to GOAWAY or RST_STREAM rather than panicking.
 The compile-time assertion at the top of `h2.rs` guards against silent pointer
 truncation on sub-32-bit platforms:
 
-```rust lib/src/protocol/mux/h2.rs:23-26
+```rust lib/src/protocol/mux/h2.rs:24-27
 const _: () = assert!(
     std::mem::size_of::<usize>() >= 4,
     "sozu requires at least 32-bit pointers"

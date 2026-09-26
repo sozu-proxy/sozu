@@ -29,13 +29,10 @@ use super::{
     BackendChange, BackendId, BackendStatus, ConnectionH1, Context, Endpoint, GlobalStreamId,
     MuxResult, Position, Router,
     h2::{self, H2Shell, H2StreamId},
-    h2_flood_detector,
+    h2_flood_detector, sample_rtt,
 };
 use crate::metrics::names;
-use crate::{
-    L7ListenerHandler, ListenerHandler, Readiness,
-    socket::{SocketHandler, stats::socket_rtt},
-};
+use crate::{L7ListenerHandler, ListenerHandler, Readiness, socket::SocketHandler};
 
 /// Module-level prefix used on every log line emitted from this module.
 /// Produces a bold bright-white `MUX-CONN` label (uniform across every
@@ -612,7 +609,10 @@ impl<Front: SocketHandler + Debug> Endpoint for EndpointServer<'_, Front> {
         self.0.readiness_mut()
     }
     fn peer_rtt(&self, _token: Token) -> Option<Duration> {
-        socket_rtt(self.0.socket())
+        sample_rtt(self.0.socket())
+    }
+    fn local_rtt(&self) -> Option<Duration> {
+        None
     }
 
     fn end_stream<L>(&mut self, _token: Token, stream: GlobalStreamId, context: &mut Context<L>)
@@ -670,7 +670,10 @@ impl Endpoint for EndpointClient<'_> {
         self.0
             .backends
             .get(&token)
-            .and_then(|c| socket_rtt(c.socket()))
+            .and_then(|c| sample_rtt(c.socket()))
+    }
+    fn local_rtt(&self) -> Option<Duration> {
+        None
     }
 
     fn end_stream<L>(&mut self, token: Token, stream: GlobalStreamId, context: &mut Context<L>)

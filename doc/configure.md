@@ -3334,36 +3334,41 @@ On every path except HTTP/2, both cells are read at access-log emission time
 and cost one `getsockopt(TCP_INFO)` syscall per side, so each one is the
 kernel's SRTT estimate for that socket at the moment that request finished.
 
-**On HTTP/2, `client_rtt` is no longer measured per request.** It is sampled
-once per readiness sweep of the connection — at most one `getsockopt(TCP_INFO)`
-per `Mux::ready`, `Mux::timeout` and `Mux::shutting_down` pass, taken before
-anything in that pass can emit an access log — and every stream that finishes
-during that pass reports that one value. `server_rtt` is unchanged: it is still
+**On HTTP/2, `client_rtt` is measured once per readiness sweep, at the first
+access log of the sweep.** A `Mux::ready`, `Mux::timeout` or
+`Mux::shutting_down` pass reads the frontend's `TCP_INFO` when it emits its
+first access log, and every other stream that finishes during that pass reports
+the same value. A pass that emits no access log reads nothing. `server_rtt` is
 read per request, through `Endpoint::peer_rtt`, because the backend socket is
 the other side of the connection.
 
 Two consequences for anyone trending the field:
 
-- **`client_rtt` means "the frontend SRTT at the last readiness sweep", not
-  "the frontend SRTT when this stream finished".** Several H2 access logs
-  emitted from one sweep carry an identical `client_rtt`, so repeated values
-  across concurrent streams are expected and are not a sign of a stuck
-  measurement. A percentile computed over H2 access logs is now weighted by
-  how many streams happened to complete together, and the value can be up to
-  one sweep old.
-- **The two cells on one H2 log line no longer share a sampling instant.**
-  `client_rtt` may predate `server_rtt` by the duration of the pass. Do not
-  subtract one from the other on an H2 line and read the difference as a
-  network asymmetry.
+- **`client_rtt` means "the frontend SRTT when the first stream of this sweep
+  was logged".** Several H2 access logs emitted from one sweep carry an
+  identical `client_rtt`, so repeated values across concurrent streams are
+  expected and are not a sign of a stuck measurement. A percentile computed
+  over H2 access logs is weighted by how many streams happened to complete
+  together. For a stream that finishes alone in its sweep — every stream of a
+  connection carrying one request at a time — the value is the SRTT at the
+  moment its response was logged, exactly as on H1.
+- **The two cells on one H2 log line share a sampling instant only for the
+  first stream of a sweep.** For a later stream of the same sweep, `client_rtt`
+  may predate `server_rtt` by the time between the two logs. Do not subtract
+  one from the other on an H2 line and read the difference as a network
+  asymmetry.
 
-This changed in issue #1339 (question 11). The frontend RTT was the last thing
-the H2 core read from an operating-system socket handle, and moving that read
-out to the connection's owner is what lets the core be driven by something
-other than a real TCP socket. Sampling it per readiness sweep instead of at
-every entry point was the cheaper of the two ways to do that — see
-`doc/h2_mux_internals.md` for the measurements behind the choice, including
-the case where the per-sweep sample costs *more* syscalls than the per-request
-read it replaced.
+`Mux::close`, which logs the streams still in flight when a session is torn
+down, reads the frontend once if it finds such a stream and not at all
+otherwise.
+
+The per-sweep value comes from issue #1339 (question 11): the frontend RTT was
+the last thing the H2 core read from an operating-system socket handle, and the
+core now asks its connection's owner for it instead. Issue #1590 made that ask
+lazy — before it, the sample was taken at the top of every sweep whether or not
+the sweep logged anything, which cost 7.85 `getsockopt(TCP_INFO)` per H2
+request for the two cells its access log prints. See
+`doc/h2_mux_internals.md` for the measurements.
 
 #### HTTP/2 flood mitigations
 

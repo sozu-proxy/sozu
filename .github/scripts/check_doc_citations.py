@@ -1462,6 +1462,13 @@ LINE_COMMENT = re.compile(r"//.*$", re.MULTILINE)
 # change leaves a trace. The checker holds the forwarding pointer live: the
 # value must itself name a `fn`, or the citation is reported.
 RENAMED_TESTS = {
+    # sozu#1590 made the frontend RTT sample lazy and removed the carried
+    # field these two pinned; each was rewritten to pin the lazy contract
+    # that replaced it, and the CHANGELOG records the old names on purpose.
+    "snapshot_rtts_reports_the_carried_pass_sample_to_every_stream":
+        "snapshot_rtts_samples_the_frontend_once_per_pass",
+    "a_mux_pass_refreshes_the_carried_client_rtt":
+        "a_mux_pass_forgets_the_previous_sample_and_reads_none_without_a_log",
     # Renamed because the old name claimed an ordering the body could not
     # observe: it inspects the IoSlice vector only after `confirm` returns,
     # where clear-before-consume and clear-after-consume both leave it empty.

@@ -399,6 +399,39 @@
   wildcard and a regex host, and `a_host_capture_past_sixteen_trie_segments_keeps_every_segment`
   drives a 20-segment regex host through the spill.
 
+- **`perf(mux)`: `getsockopt(TCP_INFO)` is read only when an access log needs it
+  ([#1590](https://github.com/sozu-proxy/sozu/issues/1590)).** The access log's `client_rtt` and
+  `server_rtt` are the only consumers of `TCP_INFO` in the tree, but the H2 frontend was sampled
+  at the top of every `Mux` pass — `ready`, `timeout`, `shutting_down`, including the first
+  `ready()` after the TLS handshake — whether or not the pass logged anything, and `Mux::close`
+  sampled the frontend unconditionally before looking for a stream that still owed a log. The H2
+  core now asks for the frontend value through a new `Endpoint::local_rtt`, exactly as it already
+  asked for `server_rtt` through `Endpoint::peer_rtt`; `H2Shell` answers it from its own socket
+  through `ShellEndpoint`, sampling at the first stream logged in a pass and reusing that value
+  for the rest of the pass, and `Mux::expire_client_rtt` forgets it at the next pass without a
+  syscall. The core still holds no OS handle. `Mux::close` samples only for a stream it logs.
+  `ConnectionH2::client_rtt` and `Mux::refresh_client_rtt` are removed; every mux `TCP_INFO` read
+  now goes through `protocol::mux::sample_rtt`, which the tests count. `Endpoint` gains a
+  required `local_rtt`: an implementor with no local socket answers `None`, as the simulator's
+  `SimEndpoint` (`sim/tests/h2_simulation.rs`) does.
+  **Operator-visible:** none in meaning. Streams finishing in one pass still share one
+  `client_rtt`; it is now the SRTT when the first of them is logged instead of at the top of the
+  pass, so a stream finishing alone reports the SRTT at the moment its response was logged, as on
+  H1.
+  Measured on a release build, one worker, python backend, 20 requests, `LD_PRELOAD` interposer
+  on `getsockopt(TCP_INFO)`: H1 2.80 → 1.85 per request, H2 7.85 → 1.85, 20 H2 streams
+  multiplexed on one connection 5.60 → 1.80 (`intentrace -p`: 2.00 → 1.00, 6.00 → 1.00,
+  3.15 → 1.00). Pinned by `snapshot_rtts_samples_the_frontend_once_per_pass`,
+  `a_pass_that_logs_nothing_reads_no_tcp_info` and
+  `streams_reaped_in_one_pass_log_one_present_client_rtt` (`h2.rs`),
+  `a_mux_pass_forgets_the_previous_sample_and_reads_none_without_a_log` and
+  `mux_close_reads_the_frontend_rtt_only_for_a_stream_it_logs` (`mod.rs`), and
+  `the_h1_access_log_carries_the_frontend_rtt` (`h1.rs`), each seen red first. The two tests that
+  pinned the eager shape, `snapshot_rtts_reports_the_carried_pass_sample_to_every_stream` and
+  `a_mux_pass_refreshes_the_carried_client_rtt`, are rewritten into the first and fourth of these:
+  they pinned the field this change removes, and their contracts — one value per pass, a fresh
+  value on the next pass — are kept.
+
 - **`perf(mux)`: a request on a reused backend connection allocates nothing past routing
   ([#1583](https://github.com/sozu-proxy/sozu/issues/1583)).** Four per-request or per-dial
   allocations left after #1579 are gone. The backend reverse index keeps the emptied `Vec` in its
