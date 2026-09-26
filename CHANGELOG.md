@@ -2590,6 +2590,30 @@
 
 ### 🐛 Fixed
 
+- **`fix(command)`: a blocking channel write reports a failed `write(2)` instead of claiming
+  success, and `Channel::writable` names its write errors `ChannelError::Write`
+  ([#1563](https://github.com/sozu-proxy/sozu/issues/1563)).** `write_message_blocking`
+  (`command/src/channel.rs`) answered every socket error with `Ok(())`, so `EPIPE` or
+  `ECONNRESET` towards a peer that was gone left the frame unsent in `back_buf` while the
+  caller believed it delivered. It now retries `Interrupted` and returns
+  `ChannelError::Write` for every other error, `WouldBlock` included: on a blocking socket
+  that kind only follows a send timeout, which the channel never arms (`set_timeout` sets the
+  read timeout alone). The blocking writers are the `sozu` CLI and `sozu top` requests, which
+  now fail at the write with the socket error rather than at the following read; the worker's
+  initial `Status` reply, which logs it; the master's configuration handoff to a new worker,
+  which cannot see `EPIPE` because the master still holds the worker's end during that write;
+  and the new master's upgrade confirmation. That last one is the visible change: when the old
+  master has already closed the confirmation channel, `begin_new_main_process` now fails with
+  `UpgradeError::SendConfirmation`, as its `?` intended. The old master closes it once its
+  confirmation read fails, after which it reports the upgrade failed and keeps running, so
+  carrying on left two masters; if the old master died instead, the new one now exits too. `Channel::writable` returned its
+  socket errors as `ChannelError::Read`, so logs and callers matching on the variant took a
+  failed write for a failed read; its readiness handling from
+  [#1560](https://github.com/sozu-proxy/sozu/issues/1560) is unchanged. The `Write` message
+  reads `io write error`, mirroring `Read`, since it no longer covers only the back buffer.
+  Covered by `a_blocking_write_to_a_closed_peer_is_an_error` and
+  `a_write_error_keeps_the_channel_marked_for_closing`.
+
 - **`fix(command)`: a channel socket error now leaves the channel marked for closing, so the
   master closes a worker session whose worker died with a message still unread
   ([#1560](https://github.com/sozu-proxy/sozu/issues/1560)).** `Channel::readable` and
