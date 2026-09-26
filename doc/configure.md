@@ -938,9 +938,9 @@ An unset `weight` defaults to 100 wherever one is read.
 
 **The "load reads" column is not the per-request cost of the policy.** Every
 selection, under every policy, first builds the candidate set: Sōzu walks the
-cluster's backend list, keeps the healthy backends and collects them into a
-fresh vector (`BackendList::available_backends`, `lib/src/backends.rs`) before
-the policy is consulted at all. All six policies are therefore `O(n)` per
+cluster's backend list and records each healthy backend's position in a reused
+buffer (`BackendList::next_available_backend_with_key`, `lib/src/backends.rs`)
+without allocating, before the policy runs. All six policies are thus `O(n)` per
 request, and none of them removes that walk. What `POWER_OF_TWO` removes is
 the load reads layered on top of it — two instead of `n`. That saving is
 largest with `load_metric = "connection_time"`, where every load read decays

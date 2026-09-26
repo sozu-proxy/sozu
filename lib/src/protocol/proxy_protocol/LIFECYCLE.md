@@ -171,7 +171,7 @@ PROXY phase and the downstream protocol.
     is not a socket state change, so edge-triggered epoll owes no new edge
     for it. The `Interrupted` arm is defensive and unreachable in
     production: the backend socket comes from `mio::net::TcpStream::connect`
-    (`lib/src/backends.rs:332`), so it is always non-blocking and its `send` answers
+    (`lib/src/backends.rs:333`), so it is always non-blocking and its `send` answers
     EAGAIN, never EINTR. Exercising it takes a deliberately blocking
     socketpair — see
     `back_writable_keeps_its_readiness_when_a_signal_interrupts_the_write`

@@ -443,10 +443,12 @@ the cluster's `load_metric`.
 
 Those load-read counts are not the per-request cost of a policy. Whatever the
 policy, `BackendList::next_available_backend_with_key` first builds the
-candidate set with `BackendList::available_backends`, which walks the
-cluster's backend list and clones every healthy backend into a fresh `Vec`.
-Every policy is `O(n)` per request because of that walk; power-of-two-choices
-only removes the `n` load reads layered on top of it.
+candidate set: it walks the cluster's backend list and records the position of
+every healthy backend in a buffer the list reuses across selections, then lends
+the policy a borrowed `Candidates` view of those positions. The walk allocates
+nothing and clones no `Rc` but the chosen backend's, yet every policy is still
+`O(n)` per request because of it; power-of-two-choices only removes the `n`
+load reads layered on top of it.
 
 Sticky sessions are implemented as an opt-in cookie-based override:
 when a request carries a sticky cookie that names a still-healthy

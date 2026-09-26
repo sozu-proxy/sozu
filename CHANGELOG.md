@@ -376,6 +376,37 @@
 
 ### 🔄 Changed
 
+- **`perf(backends)`: a backend selection allocates nothing and clones one `Rc`
+  ([#1549](https://github.com/sozu-proxy/sozu/issues/1549)).** Every selection collected its
+  candidates into a fresh `Vec` of cloned `Rc<RefCell<Backend>>` (`BackendList::available_backends`),
+  once per tier it tried, because `LoadBalancingAlgorithm::next_available_backend` took
+  `&mut Vec<Rc<RefCell<Backend>>>`. Measured with a counting global allocator over 256 steady-state
+  selections of a ten-backend cluster: 2 allocations per selection on the primary and fail-open
+  tiers (the `Vec` is allocated, then grown past its first capacity), 1 on the backup tier, plus 2
+  more under `RANDOM` (its weight `Vec` and the cumulative weights inside `WeightedIndex`), and one
+  `Rc` increment and decrement per healthy candidate. After: 0 allocations under all six policies
+  and every load metric, on all three tiers, and one `Rc` increment — the returned backend's.
+  `BackendList` now owns a `Vec<usize>` of candidate positions that `add_backend` sizes on the
+  control plane and each selection clears and refills with the same predicates as before (primary,
+  then backup, then fail-open). **Contract change:** `LoadBalancingAlgorithm::next_available_backend`
+  takes a `Candidates<'_>` view — the backend list plus those positions, `Copy`, with
+  `len`/`is_empty`/`get`/`iter` and `Index` — instead of the `&mut Vec`. Position `i` of the view is
+  the `i`-th candidate in list order, so every policy computes the same index it computed over the
+  collected `Vec`; no caller outside `lib/src/backends.rs` and `lib/src/load_balancing.rs` implements
+  or calls the trait. `RANDOM` draws with a scan that accepts exactly the weight sets
+  `WeightedIndex::new` accepts, samples the same `UniformInt<i32>` over `[0, total)` and picks the
+  same position `WeightedIndex::sample`'s `partition_point` picks, so a seeded `Random` produces the
+  same sequence as before. `Maglev`'s cold-start table build reads the view directly;
+  `Maglev::rebuild` keeps its slice signature. `BackendList::available_backends` stays public and
+  unchanged, off the selection path. `lib/tests/backend_selection.rs` pins both halves:
+  `backend_selection_allocates_nothing_in_steady_state` (red on the previous code, 256–1024
+  allocations per 256 selections depending on tier and policy) and
+  `backend_selection_pick_sequences_are_pinned`, which replays pick sequences recorded from the
+  previous code for every policy on lists whose unavailable and backup backends are interleaved
+  with the candidates, and whose excluded backends are the least loaded. The unit test
+  `random_weighted_pick_matches_weighted_index` compares the new draw with `WeightedIndex` over
+  valid, zero, negative, overflowing, singleton and empty weight sets.
+
 - **`refactor(mux)`: `Position::Client` holds an opaque backend id, and backend accounting leaves
   the core as deltas ([#1340](https://github.com/sozu-proxy/sozu/issues/1340), Q12).** The core no
   longer holds `Rc<RefCell<Backend>>` anywhere. `Position::Client` carried one so that six
