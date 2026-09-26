@@ -2014,11 +2014,11 @@ mod tests {
     // ── The access log of a request the parse rejected (sozu-proxy/sozu#1085) ──
     //
     // DO NOT READ THESE TESTS AS COVERING H2. They drive a `Position::Server`
-    // `ConnectionH1` only. An H2 request whose pseudo-headers are rejected
-    // never gets a request line at all: every rejection in
-    // `handle_header` (`lib/src/protocol/mux/pkawa.rs`) returns before the
-    // `detached.status_line` assignment, so there is nothing to log and the
-    // H2 gap is a different fix.
+    // `ConnectionH1` only. An H2 request whose field block `handle_header`
+    // (`lib/src/protocol/mux/pkawa.rs`) refuses takes another path,
+    // `record_rejected_request` in the same file, and is covered by the
+    // `h2` tests beside `rejected_request_line`
+    // (`lib/src/protocol/mux/stream.rs`).
 
     /// Drive `request` through a real `Position::Server` `ConnectionH1`, the
     /// way a client socket does: `readable` until the parse is rejected, then

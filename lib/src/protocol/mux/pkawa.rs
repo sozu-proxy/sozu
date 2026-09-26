@@ -39,12 +39,14 @@ macro_rules! log_module_context {
 }
 
 /// QW7 helper: dispatch a request pseudo-header (`:method`, `:scheme`,
-/// `:path`, `:authority`) through `store_pseudo_header`, recording the
-/// per-reason rejection metric and flipping `invalid_headers` on
-/// failure. The four call sites in `handle_header` differ only by the
-/// destination identifier; the macro keeps the dispatch shape uniform
-/// so a future fifth pseudo-header inherits both the reject metric and
-/// the invalid-flag plumbing automatically.
+/// `:path`) through `store_pseudo_header`, recording the per-reason
+/// rejection metric and flipping `invalid_headers` on failure. The three
+/// call sites in `handle_header` differ only by the destination
+/// identifier; the macro keeps the dispatch shape uniform so a future
+/// pseudo-header inherits both the reject metric and the invalid-flag
+/// plumbing automatically. `:authority` expands it by hand, because its
+/// refusal must also be remembered for the access log (see
+/// `record_rejected_request`).
 macro_rules! store_or_reject {
     ($field:expr, $regular:expr, $kawa:expr, $value:expr, $invalid:expr, $events:expr) => {
         match store_pseudo_header(&$field, $regular, $kawa, &$value) {
@@ -453,6 +455,56 @@ fn set_content_length(body_size: &mut BodySize, length: usize) -> bool {
     accepted
 }
 
+/// Keep, on a request `handle_header` refused, the pseudo-headers decoded
+/// before the refusal, for the access log alone (sozu-proxy/sozu#1566).
+///
+/// `Stream::generate_access_log` (`lib/src/protocol/mux/stream.rs`) reads
+/// them back through `rejected_request_line`, which requires the front to
+/// be in error and to hold a `StatusLine::Request`. The stores are the
+/// `Store::Slice`s `store_pseudo_header` wrote into `kawa.storage`, or
+/// `Store::Empty` for a pseudo-header that was absent or refused: nothing
+/// is copied, and nothing is allocated. `uri` stays `Store::Empty`, which
+/// is how `rejected_request_line` tells an H2 line from an H1 one without
+/// re-parsing it. Every pseudo value stored here has passed
+/// `has_invalid_pseudo_value_byte` (and `:method` `is_tchar`), so none
+/// carries a control byte into the log line, whose formatter escapes
+/// nothing.
+///
+/// The caller passes `Store::Empty` for an authority that was not
+/// validated. `:method` and `:path` keep the first value stored, as the H1
+/// rejection path logs what was parsed.
+///
+/// The blocks already pushed are dropped, as `forcefully_terminate_answer`
+/// (`lib/src/protocol/mux/answers.rs`) drops them on the back buffer: they
+/// are never forwarded, and an empty queue keeps `Stream::is_quiesced`
+/// answering what it answered before this front was marked in error.
+fn record_rejected_request(
+    kawa: &mut GenericHttpStream,
+    method: Store,
+    authority: Store,
+    path: Store,
+) {
+    debug_assert!(
+        matches!(kawa.kind, Kind::Request),
+        "only a request line is recorded for a rejected H2 field block"
+    );
+    kawa.blocks.clear();
+    kawa.out.clear();
+    kawa.detached.status_line = StatusLine::Request {
+        version: Version::V20,
+        method,
+        uri: Store::Empty,
+        authority,
+        path,
+    };
+    kawa.parsing_phase
+        .error("H2 request headers rejected".into());
+    debug_assert!(
+        kawa.is_error() && kawa.is_completed(),
+        "a rejected H2 request front must be in error with nothing queued"
+    );
+}
+
 /// Store a pseudo-header value into kawa storage.
 ///
 /// Returns `Ok(Store::Slice)` on success, or `Err(RejectReason)` describing
@@ -830,6 +882,11 @@ where
             // exactly one ``Host:`` line from the authority pseudo-header.
             let mut host_value: Option<Vec<u8>> = None;
             let mut host_conflict = false;
+            // Set when an `:authority` field was refused, including a second
+            // one: the first value is then still stored, but a request naming
+            // two authorities has no validated one. Read only on rejection,
+            // by `record_rejected_request`'s caller.
+            let mut authority_refused = false;
             let invalid_headers = decode_headers_with_budget(
                 decoder,
                 input,
@@ -868,14 +925,16 @@ where
                         }
                         store_or_reject!(path, regular_headers, kawa, v, invalid_headers, events);
                     } else if compare_no_case(&k, b":authority") {
-                        store_or_reject!(
-                            authority,
-                            regular_headers,
-                            kawa,
-                            v,
-                            invalid_headers,
-                            events
-                        );
+                        // `store_or_reject!` expanded by hand: the refusal
+                        // must also be remembered, see `authority_refused`.
+                        match store_pseudo_header(&authority, regular_headers, kawa, &v) {
+                            Ok(s) => authority = s,
+                            Err(reason) => {
+                                metric_reject(reason, events);
+                                *invalid_headers = true;
+                                authority_refused = true;
+                            }
+                        }
                     } else if k.starts_with(b":") {
                         metric_reject(RejectReason::UnknownPseudo, events);
                         *invalid_headers = true;
@@ -1020,67 +1079,93 @@ where
                     }
                 },
             );
-            // `?` cannot early-return the tuple this function now answers
-            // with, so the exit is explicit and carries the events
-            // accumulated so far.
-            let invalid_headers = match invalid_headers {
-                Ok(invalid) => invalid,
-                Err(error) => return (events, Err(error)),
-            };
-            // Post-decode :path form validation (deferred because :method may
-            // arrive after :path in HPACK — RFC 9113 does not mandate ordering).
-            // RFC 9112 §3.2 / RFC 9113 §8.3.1: for http/https URIs we accept
-            // origin-form (starts with `/`) and — only when the method is
-            // OPTIONS — asterisk-form (`*`).
-            if let Some(path_data) = path.data_opt(kawa.storage.buffer()) {
-                let is_asterisk = path_data == b"*";
-                let starts_with_slash = path_data.first() == Some(&b'/');
-                let method_is_options = method
-                    .data_opt(kawa.storage.buffer())
-                    .is_some_and(|m| m == b"OPTIONS");
-                if !(starts_with_slash || (is_asterisk && method_is_options)) {
-                    return (events, Err((H2Error::ProtocolError, false)));
+            // Every refusal below breaks out of this block instead of
+            // returning, so the one exit after it can record what was decoded
+            // for the access log (`record_rejected_request`).
+            let rejection: Option<(H2Error, bool)> = 'validate: {
+                // `?` cannot early-return the tuple this function now answers
+                // with, so the exit is explicit and carries the events
+                // accumulated so far.
+                let invalid_headers = match invalid_headers {
+                    Ok(invalid) => invalid,
+                    Err(error) => break 'validate Some(error),
+                };
+                // Post-decode :path form validation (deferred because :method may
+                // arrive after :path in HPACK — RFC 9113 does not mandate ordering).
+                // RFC 9112 §3.2 / RFC 9113 §8.3.1: for http/https URIs we accept
+                // origin-form (starts with `/`) and — only when the method is
+                // OPTIONS — asterisk-form (`*`).
+                if let Some(path_data) = path.data_opt(kawa.storage.buffer()) {
+                    let is_asterisk = path_data == b"*";
+                    let starts_with_slash = path_data.first() == Some(&b'/');
+                    let method_is_options = method
+                        .data_opt(kawa.storage.buffer())
+                        .is_some_and(|m| m == b"OPTIONS");
+                    if !(starts_with_slash || (is_asterisk && method_is_options)) {
+                        break 'validate Some((H2Error::ProtocolError, false));
+                    }
                 }
-            }
-            // RFC 9113 §8.3.1 requires all four pseudo-headers to be present and non-empty.
-            // Note: Store::is_empty() only matches Store::Empty — a pseudo-header stored
-            // with an empty value yields Store::Slice { len: 0 } which is_empty() misses.
-            // HPACK never produces zero-length pseudo-header values for valid requests, so
-            // is_empty() is sufficient here; store_pseudo_header already rejects duplicates.
-            // Note: CONNECT requests (RFC 9113 §8.5) only need :method + :authority,
-            // but we don't advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so CONNECT is
-            // intentionally unsupported for now.
-            if invalid_headers
-                || method.is_empty()
-                || authority.is_empty()
-                || path.is_empty()
-                || scheme.is_empty()
-            {
-                error!("{} INVALID HEADERS", log_module_context!());
-                return (events, Err((H2Error::ProtocolError, false)));
-            }
-            // RFC 9113 §8.3.1: if a literal ``host`` header appears, it must
-            // match ``:authority`` (modulo optional port) and be deduplicated
-            // so the H1 serializer emits exactly one ``Host:`` line. Mismatches
-            // are request-smuggling vectors and are rejected as PROTOCOL_ERROR.
-            if host_conflict {
-                error!(
-                    "{} H2 host header: multiple disagreeing values",
-                    log_module_context!()
-                );
-                return (events, Err((H2Error::ProtocolError, false)));
-            }
-            if let Some(ref host) = host_value {
-                let authority_bytes = authority.data_opt(kawa.storage.buffer()).unwrap_or(&[]);
-                if !host_matches_authority(host, authority_bytes) {
+                // RFC 9113 §8.3.1 requires all four pseudo-headers to be present and non-empty.
+                // Note: Store::is_empty() only matches Store::Empty — a pseudo-header stored
+                // with an empty value yields Store::Slice { len: 0 } which is_empty() misses.
+                // HPACK never produces zero-length pseudo-header values for valid requests, so
+                // is_empty() is sufficient here; store_pseudo_header already rejects duplicates.
+                // Note: CONNECT requests (RFC 9113 §8.5) only need :method + :authority,
+                // but we don't advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so CONNECT is
+                // intentionally unsupported for now.
+                if invalid_headers
+                    || method.is_empty()
+                    || authority.is_empty()
+                    || path.is_empty()
+                    || scheme.is_empty()
+                {
+                    error!("{} INVALID HEADERS", log_module_context!());
+                    break 'validate Some((H2Error::ProtocolError, false));
+                }
+                // RFC 9113 §8.3.1: if a literal ``host`` header appears, it must
+                // match ``:authority`` (modulo optional port) and be deduplicated
+                // so the H1 serializer emits exactly one ``Host:`` line. Mismatches
+                // are request-smuggling vectors and are rejected as PROTOCOL_ERROR.
+                if host_conflict {
                     error!(
-                        "{} H2 host header does not match :authority",
+                        "{} H2 host header: multiple disagreeing values",
                         log_module_context!()
                     );
-                    return (events, Err((H2Error::ProtocolError, false)));
+                    break 'validate Some((H2Error::ProtocolError, false));
                 }
-                // Match — drop it. kawa's H1 serializer emits Host: from
-                // :authority on its own.
+                if let Some(ref host) = host_value {
+                    let authority_bytes = authority.data_opt(kawa.storage.buffer()).unwrap_or(&[]);
+                    if !host_matches_authority(host, authority_bytes) {
+                        error!(
+                            "{} H2 host header does not match :authority",
+                            log_module_context!()
+                        );
+                        break 'validate Some((H2Error::ProtocolError, false));
+                    }
+                    // Match — drop it. kawa's H1 serializer emits Host: from
+                    // :authority on its own.
+                }
+                None
+            };
+            if let Some(error) = rejection {
+                // The authority is logged only if it was validated: refused
+                // (a second `:authority` included) or disputed by a `host`
+                // field, it is not, whatever made the request fail first.
+                let origin_disputed = authority_refused
+                    || host_conflict
+                    || host_value.as_deref().is_some_and(|host| {
+                        !host_matches_authority(
+                            host,
+                            authority.data_opt(kawa.storage.buffer()).unwrap_or(&[]),
+                        )
+                    });
+                let authority = if origin_disputed {
+                    Store::Empty
+                } else {
+                    authority
+                };
+                record_rejected_request(kawa, method, authority, path);
+                return (events, Err(error));
             }
             // All four mandatory request pseudo-headers passed the presence gate
             // above (RFC 9113 §8.3.1); none may be Store::Empty at this point.

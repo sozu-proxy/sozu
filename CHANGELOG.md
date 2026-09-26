@@ -4456,6 +4456,23 @@
   process's handler and on 4 of 27 missing records without the worker's `SIG_IGN`, and passes with
   both.
 
+- **`fix(mux-h2)`: the access log of an HTTP/2 request whose field block was refused keeps the
+  method, path and authority it decoded, instead of `- - -` (#1566).**
+  `handle_header` (`lib/src/protocol/mux/pkawa.rs`) returned on every refusal before assigning the
+  request line, so the pseudo-headers it had already written into the front buffer were lost and the
+  reset stream was logged `- - - -`. Every refusal now leaves one exit, which keeps what was decoded
+  as a `Version::V20` request line and marks the front in error (`record_rejected_request`);
+  `rejected_request_line` (`lib/src/protocol/mux/stream.rs`) reads it back, borrowed, so the
+  access-log path still allocates nothing. `:authority` is logged only when it was validated: a
+  refused or repeated one, or one a `host` field disputes, is logged `-`. No control byte reaches
+  the line — the formatter escapes nothing, but a pseudo value holding one is refused before it is
+  stored. Five tests in `lib/src/protocol/mux/stream.rs` run the real `handle_header` on a real
+  stream and assert the logged line; they were seen red with the request-line assignment removed,
+  and the authority rule was seen red on its own. Unchanged, and documented in
+  `doc/observability.md`: the line is still emitted at session close (`session close`), not at the
+  reset, and a connection-level refusal (`GOAWAY`) logs none.
+
+
 ### ➖ Removed
 
 - **BREAKING (library API) — `refactor(udp)`: backend selection moves into the UDP core, closing
