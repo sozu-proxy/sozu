@@ -101,8 +101,9 @@ fn sozu_version_reports_plus_tui() {
 /// for exactly one frame, and asserts a clean exit. `#[ignore]`d by
 /// default because it writes to a temp dir, binds an ephemeral port,
 /// and depends on graceful master shutdown (a hung master would block
-/// CI). It also needs a controlling terminal: `sozu top --snapshot` still
-/// enters raw mode, which fails with ENXIO without one. Run manually with:
+/// CI). It needs no controlling terminal: `sozu top --snapshot` takes no
+/// terminal control and renders fixed-size frames to stdout, so CI runs it
+/// on the `msrv-full` cell. Run manually with:
 ///
 /// ```bash
 /// cargo test -p sozu --features tui --tests -- --ignored sozu_top

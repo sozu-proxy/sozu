@@ -201,7 +201,7 @@ Common flags:
 | `--skin <NAME>` | Resolve `$XDG_CONFIG_HOME/sozu/skins/<NAME>.toml` (`SOZU_TOP_SKIN` env wins). |
 | `--glyphs <MODE>` | Force a glyph mode (`braille|block|tty`); auto-detect by default. |
 | `--no-mouse` | Disable SGR mouse capture (helps with multiplexers that mis-route mouse events). |
-| `--snapshot <N>`, `--tick-once` | Render N frames / one tick and exit (test affordances). |
+| `--snapshot <N>`, `--tick-once` | Render N frames / one tick and exit (test affordances). `--snapshot` takes no terminal control and renders fixed 80x24 frames to stdout. |
 
 Key bindings (operator quick reference; see `doc/sozu-top.md` for the
 full list):

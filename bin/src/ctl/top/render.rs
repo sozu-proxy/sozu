@@ -23,12 +23,12 @@ use crossterm::terminal::{
     BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
     disable_raw_mode, enable_raw_mode,
 };
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Tabs};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use tui_big_text::{BigText, PixelSize};
 use tui_input::backend::crossterm::EventHandler;
 
@@ -41,6 +41,17 @@ use super::transport::{CertsSnapshot, ListenersSnapshot, Snapshot, TopEvent};
 /// events arrive. Higher rates only burn CPU on tmux + non-Sixel
 /// terminals; 33 ms is the documented btop-style upper bound.
 const RENDER_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Fixed frame size for `--snapshot` runs, which render to stdout without
+/// terminal control: stdout may be a pipe or a file, so there is no terminal
+/// to ask for its size. 80x24 matches the smaller of the two sizes the
+/// `insta` snapshot tests render every pane at.
+const SNAPSHOT_AREA: Rect = Rect {
+    x: 0,
+    y: 0,
+    width: 80,
+    height: 24,
+};
 
 pub struct RenderConfig {
     pub mouse: bool,
@@ -85,9 +96,17 @@ pub fn run(
     // `PanicHookGuard` restores the prior hook on clean return so repeated
     // `run` calls in the same process (tests, embedded callers) do not
     // stack hook layers indefinitely.
-    let _panic_guard = PanicHookGuard::install(|| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+    //
+    // `--snapshot` takes no terminal control (see `cli.rs`): it enters
+    // neither raw mode nor the alternate screen, reads no input, and renders
+    // fixed-size frames to stdout, so it runs without a controlling terminal
+    // (CI, a pipe, `ssh -T`). There is nothing to restore, so no hook either.
+    let snapshot_mode = cfg.snapshot_frames.is_some();
+    let _panic_guard = (!snapshot_mode).then(|| {
+        PanicHookGuard::install(|| {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        })
     });
 
     // SIGINT/SIGTERM handler: flips a shared flag the loop checks every
@@ -132,9 +151,23 @@ pub fn run(
         app.status = msg;
     }
 
-    let _guard = RawModeGuard::install(cfg.mouse)?;
+    let _guard = if snapshot_mode {
+        None
+    } else {
+        Some(RawModeGuard::install(cfg.mouse)?)
+    };
     let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = if snapshot_mode {
+        // A fixed viewport is never sized from, nor resized to, the terminal.
+        Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(SNAPSHOT_AREA),
+            },
+        )?
+    } else {
+        Terminal::new(backend)?
+    };
 
     // Opt-out for terminals that don't speak DEC mode 2026 synchronised
     // output. `SOZU_TOP_SYNC=0` skips the `BeginSynchronizedUpdate` /
@@ -185,7 +218,11 @@ pub fn run(
             .saturating_duration_since(now)
             .min(Duration::from_millis(50));
 
-        if poll(timeout)? {
+        if snapshot_mode {
+            // crossterm's event reader opens the controlling terminal, so a
+            // snapshot run reads no input and only paces the loop.
+            std::thread::sleep(timeout);
+        } else if poll(timeout)? {
             match read()? {
                 CtEvent::Key(key) if key.kind == KeyEventKind::Press => {
                     handle_key(&mut app, key);
