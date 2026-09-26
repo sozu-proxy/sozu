@@ -14,7 +14,6 @@ use std::{
     collections::{BTreeMap, HashMap, hash_map::Entry},
     io::ErrorKind,
     net::{Shutdown, SocketAddr as StdSocketAddr},
-    os::unix::io::AsRawFd,
     rc::{Rc, Weak},
     str::{from_utf8, from_utf8_unchecked},
     sync::Arc,
@@ -24,7 +23,6 @@ use std::{
 use mio::{
     Interest, Registry, Token,
     net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
-    unix::SourceFd,
 };
 use rustls::{
     CipherSuite, ProtocolVersion, ServerConfig as RustlsServerConfig, ServerConnection,
@@ -1047,17 +1045,15 @@ impl ProxySession for HttpsSession {
             }
         }
 
-        // deregister the frontend and remove it
+        // No `EPOLL_CTL_DEL` for the front socket: its only descriptor closes
+        // when this session drops, which `shut_down_sessions_by_frontend_tokens`
+        // (`lib/src/server.rs`) does before the event loop's next `epoll_wait`,
+        // and Linux removes a file from every epoll set on its last close.
+        // That holds because nothing duplicates a session socket: no `dup` or
+        // `try_clone`, no fork from a worker, and SCM_RIGHTS only carries
+        // listeners. The explicit deregister was one syscall per connection
+        // that bought nothing; see §9 of `doc/lifetime_of_a_session.md`.
         let proxy = self.proxy.borrow();
-        let fd = front_socket.as_raw_fd();
-        if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-            error!(
-                "{} error deregistering front socket({:?}) while closing HTTPS session: {:?}",
-                log_context!(self),
-                fd,
-                e
-            );
-        }
         proxy.remove_session(self.frontend_token);
 
         self.has_been_closed = true;

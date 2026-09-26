@@ -373,7 +373,7 @@ ratebar matches the sum of the labelled buckets.
 
 ### 5.5 `https.alpn.rejected.unsupported` counter
 
-Source: `HttpsSession::upgrade_handshake` (`lib/src/https.rs:483`).
+Source: `HttpsSession::upgrade_handshake` (`lib/src/https.rs:481`).
 Documented in `doc/configure.md:3059`.
 
 Fires on the rustls accept path when the negotiated ALPN protocol is

@@ -212,7 +212,7 @@ with browser-driven coalescing on legitimate wildcard certs.
 ### 4.2 ALPN and `disable_http11`
 
 After the handshake completes, Sōzu inspects the negotiated ALPN
-protocol (`lib/src/https.rs:446-505`) and decides which mux
+protocol (`lib/src/https.rs:444-503`) and decides which mux
 flavour to instantiate:
 
 - ALPN `h2` → HTTP/2 mux.
@@ -226,10 +226,10 @@ counted with two distinct keys so dashboards can split refusals by
 cause:
 
 - `https.alpn.rejected.unsupported` — peer offered an ALPN that Sōzu
-  does not implement (e.g. `h3`) (`lib/src/https.rs:483`).
+  does not implement (e.g. `h3`) (`lib/src/https.rs:481`).
 - `https.alpn.rejected.http11_disabled` — peer wanted `http/1.1` but
   the listener has `disable_http11 = true`
-  (`lib/src/https.rs:466, 496`).
+  (`lib/src/https.rs:464, 494`).
 
 The startup-time validator at `command/src/config.rs:1279-1283, 1301-1307`
 catches the obvious operator mistake of pairing `disable_http11 = true` with
@@ -524,8 +524,30 @@ flags that a future TLS upgrade on TCP would need to switch modes.
 
 After shutdown, `state.close(...)` closes the backend, flushes any
 close-notify, and releases buffers; the proxy removes the session
-from the slab under both front and back tokens, mio deregisters the
-sockets, and the slab entries return to the free list. Half-closed
+from the slab under both front and back tokens, and the slab entries
+return to the free list.
+
+The sockets are **not** deregistered from epoll. Each one closes when
+its owner drops: a dead backend connection at the end of the
+`dead_backends` block in `Mux::ready`, and the front socket plus every
+remaining backend when the session itself drops, which
+`shut_down_sessions_by_frontend_tokens` (`lib/src/server.rs`) does
+before the event loop's next `epoll_wait`. Linux removes a file from
+every epoll set on its last close, so an `EPOLL_CTL_DEL` just before
+that close costs a syscall and removes nothing the close would not.
+The argument needs the close to be the *last* one: a duplicated
+descriptor would keep the file, and its registration, alive, and
+would report events under a slab token that may already belong to a
+new session. Nothing duplicates a session socket: there is no `dup` or
+`try_clone` of one, a worker never forks, and the SCM_RIGHTS channel
+(`command/src/scm_socket.rs`) only carries listeners. mio keeps no
+per-source state on epoll or kqueue that a deregister would release,
+and BSD also drops a descriptor's kevents on close. The regression
+tests are `closed_sessions_leave_their_sockets_to_close` in
+`lib/src/http.rs` (front socket) and
+`close_leaves_backend_sockets_to_their_last_close` in
+`lib/src/protocol/mux/mod.rs` (backend sockets); each reads the
+kernel's epoll table from `/proc/self/fdinfo`. Half-closed
 H2 streams unwind the same way — per-stream cleanup in `mux::mod` and
 `mux::router` decrements `backend.pool.size`
 (`Mux::close` in `lib/src/protocol/mux/mod.rs`, `Router::plan_connect` in
@@ -587,7 +609,7 @@ set to read a session's life from a dashboard:
   (`TlsHandshake::record_handshake_duration_ms` /
   `handshake_failure_reason`, `lib/src/protocol/rustls.rs`).
 - `https.alpn.rejected.{unsupported,http11_disabled}` — ALPN refusal
-  causes (`lib/src/https.rs:466, 483, 496`).
+  causes (`lib/src/https.rs:464, 481, 494`).
 - `client.connections`, `client.connections_max`,
   `client.connections_percent` — slab-backed lifecycle gauges
   (`client.connections` is sampled per increment/decrement in

@@ -3,7 +3,6 @@ use std::{
     collections::{BTreeMap, HashMap, hash_map::Entry},
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
-    os::unix::io::AsRawFd,
     rc::{Rc, Weak},
     str::from_utf8_unchecked,
     time::{Duration, Instant},
@@ -12,7 +11,6 @@ use std::{
 use mio::{
     Interest, Registry, Token,
     net::{TcpListener as MioTcpListener, TcpStream},
-    unix::SourceFd,
 };
 use rusty_ulid::Ulid;
 use sozu_command::{
@@ -648,17 +646,15 @@ impl ProxySession for HttpSession {
             }
         }
 
-        // deregister the frontend and remove it
+        // No `EPOLL_CTL_DEL` for the front socket: its only descriptor closes
+        // when this session drops, which `shut_down_sessions_by_frontend_tokens`
+        // (`lib/src/server.rs`) does before the event loop's next `epoll_wait`,
+        // and Linux removes a file from every epoll set on its last close.
+        // That holds because nothing duplicates a session socket: no `dup` or
+        // `try_clone`, no fork from a worker, and SCM_RIGHTS only carries
+        // listeners. The explicit deregister was one syscall per connection
+        // that bought nothing; see §9 of `doc/lifetime_of_a_session.md`.
         let proxy = self.proxy.borrow();
-        let fd = front_socket.as_raw_fd();
-        if let Err(e) = proxy.registry.deregister(&mut SourceFd(&fd)) {
-            error!(
-                "{} error deregistering front socket({:?}) while closing HTTP session: {:?}",
-                log_context!(self),
-                fd,
-                e
-            );
-        }
         proxy.remove_session(self.frontend_token);
 
         self.has_been_closed = true;
@@ -2625,5 +2621,102 @@ mod tests {
                 .contains_key("cluster_1"),
             "the published registry must carry the cluster overrides forward"
         );
+    }
+
+    /// A closed session issues no `EPOLL_CTL_DEL` for its front socket: the
+    /// socket stays in the epoll set until the session drops, and its last
+    /// close is what removes it. The second assertion is the half that makes
+    /// skipping the deregister safe — nothing else holds the descriptor, so
+    /// dropping the session really does take it out of the epoll set before
+    /// its slab token can be handed to a new connection.
+    ///
+    /// To SEE THIS RED: in `HttpSession::close`, put back
+    /// `let _ = proxy.registry.deregister(&mut mio::unix::SourceFd(&front_socket.as_raw_fd()));`
+    /// before `proxy.remove_session`. The first assertion then fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closed_sessions_leave_their_sockets_to_close() {
+        use std::os::fd::AsRawFd;
+
+        use crate::protocol::mux::test_support::epoll_watches;
+
+        let address = SocketAddress::new_v4(127, 0, 0, 1, crate::testing::provide_port());
+        let parts = crate::testing::prebuild_server(4, 16_384, false)
+            .expect("test server parts must build");
+        let registry = parts
+            .registry
+            .try_clone()
+            .expect("the test registry must clone");
+        let sessions = parts.sessions.clone();
+        let listener_token = {
+            let mut sessions = sessions.borrow_mut();
+            let entry = sessions.slab.vacant_entry();
+            let key = entry.key();
+            entry.insert(Rc::new(RefCell::new(crate::server::ListenSession {
+                protocol: Protocol::HTTPListen,
+            })));
+            Token(key)
+        };
+        let mut proxy = HttpProxy::new(parts.registry, parts.sessions, parts.pool, parts.backends);
+        proxy
+            .add_listener(
+                ListenerBuilder::new_http(address)
+                    .to_http(None)
+                    .expect("test listener config must build"),
+                listener_token,
+            )
+            .expect("test listener must register");
+        let proxy = Rc::new(RefCell::new(proxy));
+
+        let peer_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind the test peer listener");
+        let _client = TcpStream::connect(
+            peer_listener
+                .local_addr()
+                .expect("the test peer listener has an address"),
+        )
+        .expect("connect the test client");
+        let (accepted, _) = peer_listener.accept().expect("accept the test client");
+        accepted
+            .set_nonblocking(true)
+            .expect("the front socket must go non-blocking");
+        let front = mio::net::TcpStream::from_std(accepted);
+        let front_fd = front.as_raw_fd();
+
+        let session_token = sessions.borrow().slab.vacant_key();
+        proxy
+            .borrow_mut()
+            .create_session(
+                front,
+                ListenToken(listener_token.0),
+                Duration::ZERO,
+                proxy.clone(),
+            )
+            .expect("the session must be created");
+        assert!(
+            sessions.borrow().slab.contains(session_token),
+            "the session takes the slot that was vacant"
+        );
+        assert!(
+            epoll_watches(&registry, front_fd),
+            "precondition: the front socket is in the epoll set"
+        );
+
+        // What `Server::shut_down_sessions_by_frontend_tokens` does.
+        let session = sessions.borrow_mut().slab.remove(session_token);
+        session.borrow_mut().close();
+        assert!(
+            epoll_watches(&registry, front_fd),
+            "HttpSession::close must not deregister a front socket it is about \
+             to close: the close removes it, the EPOLL_CTL_DEL is a wasted syscall"
+        );
+
+        drop(session);
+        assert!(
+            !epoll_watches(&registry, front_fd),
+            "dropping the session closes the front socket's only descriptor, \
+             which must take it out of the epoll set"
+        );
+        drop(parts.event_loop);
     }
 }
