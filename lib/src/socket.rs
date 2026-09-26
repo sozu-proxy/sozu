@@ -584,158 +584,245 @@ impl std::fmt::Debug for FrontRustls {
     }
 }
 
-impl SocketHandler for FrontRustls {
-    fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
-        let mut size = 0usize;
-        let mut can_read = true;
-        let mut is_error = false;
-        let mut is_closed = false;
+/// A failure [`rustls_socket_read`] hit, handed back rather than logged so the
+/// caller can render it with its full socket context: the helper borrows the
+/// stream mutably for the whole pass, which is exactly what
+/// `log_socket_context!` needs to read.
+#[derive(Debug)]
+enum RustlsReadFault {
+    /// The pass ran [`MAX_LOOP_ITERATIONS`] times without settling.
+    LoopLimit,
+    /// `read_tls` failed with something other than `WouldBlock`, a reset, or
+    /// rustls's own "plaintext buffer full".
+    ReadTls(std::io::Error),
+    /// `process_new_packets` rejected what `read_tls` delivered.
+    ProcessPackets(rustls::Error),
+    /// The plaintext reader failed with something other than `WouldBlock` or
+    /// a reset.
+    Plaintext(std::io::Error),
+}
 
-        let mut counter = 0;
-        loop {
-            counter += 1;
-            if counter > MAX_LOOP_ITERATIONS {
-                error!(
-                    "{} MAX_LOOP_ITERATION reached in FrontRustls::socket_read",
-                    log_socket_context!(self)
-                );
-                incr!(names::rustls::READ_INFINITE_LOOP_ERROR);
-                is_error = true;
-                break;
-            }
+/// Body of [`FrontRustls::socket_read`], generic over the transport so tests
+/// can count every read the pass issues against it.
+///
+/// Each pass drains the plaintext rustls already decrypted, and only then —
+/// if the caller's buffer is still not full — calls `read_tls` (one `recv(2)`)
+/// and `process_new_packets`. That order is what tokio-rustls follows
+/// (`tokio-rustls-0.26.4/src/common/mod.rs:198-212`: `read_tls` only while
+/// `wants_read()`, then the plaintext), and what OpenSSL gives HAProxy for
+/// free: `SSL_read` serves an already-decrypted record without touching the
+/// socket.
+///
+/// Readiness contract, unchanged by that order:
+///
+/// - every `recv` that answers EAGAIN ends the call with
+///   [`SocketResult::WouldBlock`], because the drain ran first and so the
+///   buffer is not full; the mux then drops READABLE until the next mio
+///   event (`update_readiness`), which is the edge-triggered re-arm;
+/// - [`SocketResult::Continue`] with a full buffer means "more may be
+///   buffered", so READABLE stays and the next call drains before it reads;
+/// - a `read_tls` that returns bytes but completes no record produces no
+///   plaintext, so the pass loops and reads again until EAGAIN, EOF or a
+///   full buffer;
+/// - one record can hold several H2 frames: the later calls are served from
+///   the plaintext buffer without a `recv`.
+///
+/// EOF and `close_notify` are reported as [`SocketResult::Closed`] by the
+/// first call that finds no plaintext left to deliver, never behind it: a
+/// peer's last frames are handed over before the close. A call the buffered
+/// plaintext can satisfy completely returns `Continue` without looking at
+/// the socket, so a FIN that is already queued is seen one call later than
+/// when every call began with `read_tls`.
+fn rustls_socket_read<R: Read>(
+    session: &mut ServerConnection,
+    stream: &mut R,
+    buf: &mut [u8],
+    peer_disconnected: &mut bool,
+    peer_reset: &mut bool,
+) -> (usize, SocketResult, Option<RustlsReadFault>) {
+    let mut size = 0usize;
+    let mut can_read = true;
+    let mut is_error = false;
+    let mut is_closed = false;
+    let mut fault = None;
 
-            // Loop invariant: the plaintext cursor never overshoots the caller's
-            // buffer, so every `&mut buf[size..]` below is a valid slice.
-            debug_assert!(
-                size <= buf.len(),
-                "rustls read cursor {size} overran buffer len {} (would slice out of bounds)",
-                buf.len()
-            );
-            if size == buf.len() {
-                break;
-            }
+    let mut counter = 0;
+    loop {
+        counter += 1;
+        if counter > MAX_LOOP_ITERATIONS {
+            fault = Some(RustlsReadFault::LoopLimit);
+            is_error = true;
+            break;
+        }
 
-            if !can_read | is_error | is_closed {
-                break;
-            }
-
-            match self.session.read_tls(&mut self.stream) {
-                Ok(0) => {
-                    // Graceful FIN on the read side: peer closed its write
-                    // half. Keep `peer_reset` unset so outbound writes can
-                    // still flush rustls's buffered records (half-close).
-                    can_read = false;
-                    is_closed = true;
-                    self.peer_disconnected = true;
+        // Plaintext first: rustls may already hold decrypted bytes from a
+        // record an earlier call read — under H2, which asks for one 9-byte
+        // frame header and then one payload at a time, the rest of that
+        // record's frames. Serving them before `read_tls` is what keeps a
+        // call the buffer can satisfy from issuing a `recv(2)` that can only
+        // answer EAGAIN. `wants_read()` is false exactly while plaintext is
+        // pending or `close_notify` has been received
+        // (rustls-0.23.45/src/common_state.rs:674-684); in the second case the
+        // reader answers `Ok(0)` and the `read_tls` below reports it.
+        while !session.wants_read() {
+            match session.reader().read(&mut buf[size..]) {
+                Ok(0) => break,
+                Ok(sz) => {
+                    // The rustls reader cannot return more plaintext than
+                    // the remaining slice it was handed.
+                    debug_assert!(
+                        sz <= buf.len() - size,
+                        "rustls reader returned {sz} bytes into a {}-byte remaining slice",
+                        buf.len() - size
+                    );
+                    size += sz;
                 }
-                Ok(_sz) => {}
                 Err(e) => match e.kind() {
                     ErrorKind::WouldBlock => {
-                        can_read = false;
+                        break;
                     }
                     ErrorKind::ConnectionReset
                     | ErrorKind::ConnectionAborted
                     | ErrorKind::BrokenPipe => {
-                        // Full RST/abort: the TCP channel is dead. Mark
-                        // `peer_reset` so writes short-circuit (nothing can
-                        // reach the peer anymore) but still set
-                        // `peer_disconnected` for back-compatible read-side
-                        // logic.
                         is_closed = true;
-                        self.peer_disconnected = true;
-                        self.peer_reset = true;
+                        break;
                     }
-                    // https://github.com/rustls/rustls/blob/main/rustls/src/conn.rs#L482-L500
-                    // rustls's 16 KB received_plaintext buffer is full — expected
-                    // under H2 where frame-at-a-time reads drain less than a full
-                    // TLS record. The outer loop will drain plaintext next iteration.
-                    ErrorKind::Other => {}
                     _ => {
-                        error!(
-                            "{} could not read TLS stream from socket: {:?}",
-                            log_socket_context!(self),
-                            e
-                        );
+                        fault = Some(RustlsReadFault::Plaintext(e));
                         is_error = true;
                         break;
                     }
                 },
             }
-
-            if let Err(e) = self.session.process_new_packets() {
-                error!(
-                    "{} could not process read TLS packets: {:?}",
-                    log_socket_context!(self),
-                    e
-                );
-                is_error = true;
-                break;
-            }
-
-            while !self.session.wants_read() {
-                match self.session.reader().read(&mut buf[size..]) {
-                    Ok(0) => break,
-                    Ok(sz) => {
-                        // The rustls reader cannot return more plaintext than
-                        // the remaining slice it was handed.
-                        debug_assert!(
-                            sz <= buf.len() - size,
-                            "rustls reader returned {sz} bytes into a {}-byte remaining slice",
-                            buf.len() - size
-                        );
-                        size += sz;
-                    }
-                    Err(e) => match e.kind() {
-                        ErrorKind::WouldBlock => {
-                            break;
-                        }
-                        ErrorKind::ConnectionReset
-                        | ErrorKind::ConnectionAborted
-                        | ErrorKind::BrokenPipe => {
-                            is_closed = true;
-                            break;
-                        }
-                        _ => {
-                            error!(
-                                "{} could not read data from TLS stream: {:?}",
-                                log_socket_context!(self),
-                                e
-                            );
-                            is_error = true;
-                            break;
-                        }
-                    },
-                }
-            }
         }
 
-        // Post-condition: we never report more plaintext than the caller asked
-        // for, and Error/Closed are mutually exclusive (the loop `break`s on the
-        // first one set, so both can never be true on the same pass).
+        // Loop invariant: the plaintext cursor never overshoots the caller's
+        // buffer, so the next pass's `&mut buf[size..]` is a valid slice.
         debug_assert!(
             size <= buf.len(),
-            "rustls socket_read returned {size} bytes for a {}-byte buffer",
+            "rustls read cursor {size} overran buffer len {} (would slice out of bounds)",
             buf.len()
         );
-        debug_assert!(
-            !(is_error && is_closed),
-            "rustls socket_read cannot be both Error and Closed"
-        );
-        if is_error {
-            (size, SocketResult::Error)
-        } else if is_closed {
-            (size, SocketResult::Closed)
-        } else if size == buf.len() {
-            // The full requested amount was read (possibly from the rustls
-            // plaintext buffer). Report Continue so the caller keeps
-            // READABLE in the readiness set — there may be more decrypted
-            // data available without a new mio event.
-            (size, SocketResult::Continue)
-        } else if !can_read {
-            (size, SocketResult::WouldBlock)
-        } else {
-            (size, SocketResult::Continue)
+        if size == buf.len() {
+            break;
         }
+
+        if !can_read | is_error | is_closed {
+            break;
+        }
+
+        match session.read_tls(stream) {
+            Ok(0) => {
+                // Graceful FIN on the read side: peer closed its write
+                // half. Keep `peer_reset` unset so outbound writes can
+                // still flush rustls's buffered records (half-close).
+                can_read = false;
+                is_closed = true;
+                *peer_disconnected = true;
+            }
+            Ok(_sz) => {}
+            Err(e) => match e.kind() {
+                ErrorKind::WouldBlock => {
+                    can_read = false;
+                }
+                ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe => {
+                    // Full RST/abort: the TCP channel is dead. Mark
+                    // `peer_reset` so writes short-circuit (nothing can
+                    // reach the peer anymore) but still set
+                    // `peer_disconnected` for back-compatible read-side
+                    // logic.
+                    is_closed = true;
+                    *peer_disconnected = true;
+                    *peer_reset = true;
+                }
+                // rustls-0.23.45/src/conn.rs:761-766: rustls's 16 KB
+                // received_plaintext buffer is full. The drain above empties
+                // it before every `read_tls` unless the caller's buffer
+                // filled first, which breaks out before reaching here, so
+                // this arm is defensive; the next pass drains again.
+                ErrorKind::Other => {}
+                _ => {
+                    fault = Some(RustlsReadFault::ReadTls(e));
+                    is_error = true;
+                    break;
+                }
+            },
+        }
+
+        if let Err(e) = session.process_new_packets() {
+            fault = Some(RustlsReadFault::ProcessPackets(e));
+            is_error = true;
+            break;
+        }
+    }
+
+    // Post-condition: we never report more plaintext than the caller asked
+    // for, and Error/Closed are mutually exclusive (the loop `break`s on the
+    // first one set, so both can never be true on the same pass).
+    debug_assert!(
+        size <= buf.len(),
+        "rustls socket_read returned {size} bytes for a {}-byte buffer",
+        buf.len()
+    );
+    debug_assert!(
+        !(is_error && is_closed),
+        "rustls socket_read cannot be both Error and Closed"
+    );
+    let result = if is_error {
+        SocketResult::Error
+    } else if is_closed {
+        SocketResult::Closed
+    } else if size == buf.len() {
+        // The full requested amount was read (possibly from the rustls
+        // plaintext buffer). Report Continue so the caller keeps
+        // READABLE in the readiness set — there may be more decrypted
+        // data available without a new mio event.
+        SocketResult::Continue
+    } else if !can_read {
+        SocketResult::WouldBlock
+    } else {
+        SocketResult::Continue
+    };
+    (size, result, fault)
+}
+
+impl SocketHandler for FrontRustls {
+    fn socket_read(&mut self, buf: &mut [u8]) -> (usize, SocketResult) {
+        let (size, result, fault) = rustls_socket_read(
+            &mut self.session,
+            &mut self.stream,
+            buf,
+            &mut self.peer_disconnected,
+            &mut self.peer_reset,
+        );
+        match fault {
+            None => {}
+            Some(RustlsReadFault::LoopLimit) => {
+                error!(
+                    "{} MAX_LOOP_ITERATION reached in FrontRustls::socket_read",
+                    log_socket_context!(self)
+                );
+                incr!(names::rustls::READ_INFINITE_LOOP_ERROR);
+            }
+            Some(RustlsReadFault::ReadTls(e)) => error!(
+                "{} could not read TLS stream from socket: {:?}",
+                log_socket_context!(self),
+                e
+            ),
+            Some(RustlsReadFault::ProcessPackets(e)) => error!(
+                "{} could not process read TLS packets: {:?}",
+                log_socket_context!(self),
+                e
+            ),
+            Some(RustlsReadFault::Plaintext(e)) => error!(
+                "{} could not read data from TLS stream: {:?}",
+                log_socket_context!(self),
+                e
+            ),
+        }
+        (size, result)
     }
 
     /// Keep these two functions structurally symmetric — a divergence
@@ -1906,5 +1993,427 @@ mod tests {
             "the SOCKET peer= slot must not collapse to None while a cache exists; \
              rendered: {rendered}"
         );
+    }
+}
+
+/// [`rustls_socket_read`] against an in-memory transport that counts every
+/// read the pass issues: each one is a `recv(2)` on the real socket.
+#[cfg(test)]
+mod rustls_read_tests {
+    use std::{collections::VecDeque, io::Write, sync::Arc};
+
+    use super::*;
+
+    /// SNI the test certificate is registered under.
+    const TEST_SNI: &str = "lolcatho.st";
+
+    /// A frame header, then its payload: what the H2 read path asks for, one
+    /// `socket_read` at a time (`lib/src/protocol/mux/h2.rs`, `readable_inner`).
+    const FRAME_HEADER_LEN: usize = 9;
+
+    /// The frames of a client's first flight after the preface — SETTINGS,
+    /// WINDOW_UPDATE, HEADERS, PING — as `(header, payload)` byte blocks. Only
+    /// their lengths matter to the transport layer; the contents are
+    /// distinct so a misordered or duplicated read cannot compare equal.
+    fn client_frames() -> Vec<Vec<u8>> {
+        [6usize, 4, 37, 8]
+            .iter()
+            .enumerate()
+            .flat_map(|(index, &payload_len)| {
+                let mut header = vec![0u8; FRAME_HEADER_LEN];
+                header[..3].copy_from_slice(&(payload_len as u32).to_be_bytes()[1..]);
+                header[3] = index as u8;
+                let payload = (0..payload_len)
+                    .map(|byte| (index * 64 + byte) as u8)
+                    .collect();
+                [header, payload]
+            })
+            .collect()
+    }
+
+    /// A non-blocking transport: `wire` is what the kernel holds, served by at
+    /// most one read, and `eof` is a received FIN once `wire` is drained.
+    #[derive(Default)]
+    struct CountingTransport {
+        wire: VecDeque<u8>,
+        eof: bool,
+        reset: bool,
+        reads: usize,
+    }
+
+    impl Read for CountingTransport {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.reset {
+                return Err(ErrorKind::ConnectionReset.into());
+            }
+            if self.wire.is_empty() {
+                return if self.eof {
+                    Ok(0)
+                } else {
+                    Err(ErrorKind::WouldBlock.into())
+                };
+            }
+            let len = buf.len().min(self.wire.len());
+            for (slot, byte) in buf.iter_mut().zip(self.wire.drain(..len)) {
+                *slot = byte;
+            }
+            Ok(len)
+        }
+    }
+
+    /// Accepts whatever certificate the server presents: the client is the
+    /// encryption oracle for the bytes under test, not a party whose trust
+    /// decision is being checked. `lib/assets/certificate.pem` carries no
+    /// subjectAltName, so rustls's web-PKI verifier would refuse it.
+    #[derive(Debug)]
+    struct AcceptAnyServerCertificate;
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCertificate {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            crate::crypto::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// Move every pending TLS byte from `from` to `to`, in memory.
+    fn pump_tls<A, B>(
+        from: &mut rustls::ConnectionCommon<A>,
+        to: &mut rustls::ConnectionCommon<B>,
+    ) {
+        let mut wire = Vec::new();
+        while from.wants_write() {
+            from.write_tls(&mut wire)
+                .expect("a TLS flight must serialize into memory");
+        }
+        let mut cursor = std::io::Cursor::new(wire.as_slice());
+        while (cursor.position() as usize) < wire.len() {
+            to.read_tls(&mut cursor)
+                .expect("a TLS flight must be readable from memory");
+            to.process_new_packets()
+                .expect("a TLS flight must process cleanly");
+        }
+    }
+
+    /// A settled TLS 1.3 server session and the client that feeds it.
+    fn handshaken_pair() -> (ServerConnection, rustls::ClientConnection) {
+        let provider = Arc::new(crate::crypto::default_provider());
+        let resolver = Arc::new(crate::tls::MutexCertificateResolver::default());
+        resolver
+            .0
+            .lock()
+            .expect("the test resolver lock must be available")
+            .add_certificate(&sozu_command::proto::command::AddCertificate {
+                address: sozu_command::proto::command::SocketAddress::new_v4(127, 0, 0, 1, 8443),
+                certificate: sozu_command::proto::command::CertificateAndKey {
+                    certificate: include_str!("../assets/certificate.pem").to_owned(),
+                    key: include_str!("../assets/key.pem").to_owned(),
+                    names: vec![TEST_SNI.to_owned()],
+                    ..Default::default()
+                },
+                expired_at: None,
+            })
+            .expect("the test certificate must load into the resolver");
+        let mut server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("the test provider must support TLS 1.3")
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+        server_config.send_tls13_tickets = 0;
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("the test provider must support TLS 1.3")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertificate))
+            .with_no_client_auth();
+        let mut server = ServerConnection::new(Arc::new(server_config))
+            .expect("the test server session must initialize");
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client_config),
+            rustls::pki_types::ServerName::try_from(TEST_SNI)
+                .expect("the test SNI must be a valid DNS name"),
+        )
+        .expect("the test client session must initialize");
+        for _ in 0..16 {
+            if !client.is_handshaking() && !server.is_handshaking() && !client.wants_write() {
+                break;
+            }
+            pump_tls(&mut client, &mut server);
+            pump_tls(&mut server, &mut client);
+        }
+        assert!(
+            !server.is_handshaking() && !client.is_handshaking(),
+            "premise: the in-memory handshake must complete"
+        );
+        (server, client)
+    }
+
+    /// Encrypt `plaintext` as ONE `write_all` + drain, so a flight smaller
+    /// than a record's 16 KiB limit lands in a single TLS record.
+    fn seal(client: &mut rustls::ClientConnection, plaintext: &[u8]) -> Vec<u8> {
+        client
+            .writer()
+            .write_all(plaintext)
+            .expect("the client must absorb the plaintext");
+        let mut wire = Vec::new();
+        while client.wants_write() {
+            client
+                .write_tls(&mut wire)
+                .expect("the client record must serialize");
+        }
+        wire
+    }
+
+    /// The server side under test: a session plus the flags `FrontRustls`
+    /// threads through [`rustls_socket_read`].
+    struct Front {
+        session: ServerConnection,
+        peer_disconnected: bool,
+        peer_reset: bool,
+    }
+
+    impl Front {
+        fn read(
+            &mut self,
+            transport: &mut CountingTransport,
+            len: usize,
+        ) -> (Vec<u8>, SocketResult) {
+            let mut buf = vec![0u8; len];
+            let (size, result, fault) = rustls_socket_read(
+                &mut self.session,
+                transport,
+                &mut buf,
+                &mut self.peer_disconnected,
+                &mut self.peer_reset,
+            );
+            assert!(fault.is_none(), "unexpected read fault: {fault:?}");
+            buf.truncate(size);
+            (buf, result)
+        }
+    }
+
+    fn front_and_client() -> (Front, rustls::ClientConnection) {
+        let (session, client) = handshaken_pair();
+        (
+            Front {
+                session,
+                peer_disconnected: false,
+                peer_reset: false,
+            },
+            client,
+        )
+    }
+
+    /// Several H2 frames in ONE TLS record, read the way the H2 path reads
+    /// them: header, payload, header, payload. The record costs one `recv`;
+    /// every later frame is already decrypted and must be served from
+    /// rustls's plaintext buffer, and the only other `recv` is the one that
+    /// reports `EAGAIN` once that buffer is empty.
+    ///
+    /// Before the fix every call started with `read_tls`, so each frame block
+    /// after the first issued one `recv` that returned `EAGAIN`: 1 + 7 + 1.
+    #[test]
+    fn frames_sharing_one_record_cost_one_recv_plus_the_final_eagain() {
+        let (mut front, mut client) = front_and_client();
+        let frames = client_frames();
+        let record = seal(&mut client, &frames.concat());
+        let mut transport = CountingTransport {
+            wire: record.into(),
+            ..Default::default()
+        };
+
+        for (index, block) in frames.iter().enumerate() {
+            let (read, result) = front.read(&mut transport, block.len());
+            assert_eq!(
+                &read, block,
+                "frame block {index} must arrive intact and in order"
+            );
+            assert_eq!(result, SocketResult::Continue, "frame block {index}");
+        }
+        let (read, result) = front.read(&mut transport, FRAME_HEADER_LEN);
+        assert!(read.is_empty(), "nothing is left after the last frame");
+        assert_eq!(result, SocketResult::WouldBlock);
+
+        assert_eq!(
+            transport.reads,
+            2,
+            "one recv for the record and one EAGAIN once the plaintext is drained, \
+             for {} frame blocks",
+            frames.len()
+        );
+        assert!(!front.peer_disconnected && !front.peer_reset);
+    }
+
+    /// A caller buffer larger than everything received (the H1 path) takes the
+    /// whole record, then stops on `EAGAIN` within the same call.
+    #[test]
+    fn a_large_buffer_drains_the_record_then_reports_would_block() {
+        let (mut front, mut client) = front_and_client();
+        let plaintext = client_frames().concat();
+        let mut transport = CountingTransport {
+            wire: seal(&mut client, &plaintext).into(),
+            ..Default::default()
+        };
+
+        let (read, result) = front.read(&mut transport, 16 * 1024);
+        assert_eq!(read, plaintext);
+        assert_eq!(result, SocketResult::WouldBlock);
+        assert_eq!(transport.reads, 2, "the record, then EAGAIN");
+    }
+
+    /// A record split across two arrivals: the first `read_tls` returns bytes
+    /// but `process_new_packets` produces no plaintext, so the pass must read
+    /// again — and, finding `EAGAIN`, report `WouldBlock` with nothing
+    /// delivered. The rest of the record then completes it.
+    #[test]
+    fn a_fragmented_record_is_read_again_until_it_completes() {
+        let (mut front, mut client) = front_and_client();
+        let frames = client_frames();
+        let record = seal(&mut client, &frames.concat());
+        let (head, tail) = record.split_at(record.len() / 2);
+        let mut transport = CountingTransport {
+            wire: head.iter().copied().collect(),
+            ..Default::default()
+        };
+
+        let (read, result) = front.read(&mut transport, FRAME_HEADER_LEN);
+        assert!(read.is_empty(), "half a record decrypts to nothing");
+        assert_eq!(result, SocketResult::WouldBlock);
+        assert_eq!(transport.reads, 2, "the partial record, then EAGAIN");
+
+        transport.wire.extend(tail);
+        for (index, block) in frames.iter().enumerate() {
+            let (read, result) = front.read(&mut transport, block.len());
+            assert_eq!(&read, block, "frame block {index}");
+            assert_eq!(result, SocketResult::Continue, "frame block {index}");
+        }
+        assert_eq!(transport.reads, 3, "the rest of the record costs one recv");
+    }
+
+    /// `close_notify` behind the data in the same flight: every frame is
+    /// still delivered, then the pass reports `Closed` — from rustls's own
+    /// `read_tls` early return, without another `recv`.
+    #[test]
+    fn close_notify_after_the_frames_reports_closed_once_they_are_read() {
+        let (mut front, mut client) = front_and_client();
+        let frames = client_frames();
+        let mut wire = seal(&mut client, &frames.concat());
+        client.send_close_notify();
+        while client.wants_write() {
+            client
+                .write_tls(&mut wire)
+                .expect("the close_notify alert must serialize");
+        }
+        let mut transport = CountingTransport {
+            wire: wire.into(),
+            ..Default::default()
+        };
+
+        for (index, block) in frames.iter().enumerate() {
+            let (read, result) = front.read(&mut transport, block.len());
+            assert_eq!(&read, block, "frame block {index}");
+            assert_eq!(result, SocketResult::Continue, "frame block {index}");
+        }
+        let (read, result) = front.read(&mut transport, FRAME_HEADER_LEN);
+        assert!(read.is_empty());
+        assert_eq!(
+            result,
+            SocketResult::Closed,
+            "close_notify must close the read side"
+        );
+        assert!(
+            front.peer_disconnected,
+            "a clean close is a read-side disconnect"
+        );
+        assert!(!front.peer_reset, "a clean close is not a reset");
+        assert_eq!(
+            transport.reads, 1,
+            "close_notify needs no recv beyond the flight"
+        );
+
+        let (read, result) = front.read(&mut transport, FRAME_HEADER_LEN);
+        assert!(read.is_empty());
+        assert_eq!(
+            result,
+            SocketResult::Closed,
+            "a closed session stays closed"
+        );
+    }
+
+    /// A TCP FIN without `close_notify`: buffered frames are delivered first,
+    /// then `Closed` (never `Error`), and a later call is `Closed` again.
+    #[test]
+    fn tcp_eof_without_close_notify_reports_closed_after_the_buffered_frames() {
+        let (mut front, mut client) = front_and_client();
+        let frames = client_frames();
+        let mut transport = CountingTransport {
+            wire: seal(&mut client, &frames.concat()).into(),
+            eof: true,
+            ..Default::default()
+        };
+
+        for (index, block) in frames.iter().enumerate() {
+            let (read, result) = front.read(&mut transport, block.len());
+            assert_eq!(&read, block, "frame block {index}");
+            assert_eq!(result, SocketResult::Continue, "frame block {index}");
+        }
+        let (read, result) = front.read(&mut transport, FRAME_HEADER_LEN);
+        assert!(read.is_empty());
+        assert_eq!(
+            result,
+            SocketResult::Closed,
+            "a FIN must close the read side"
+        );
+        assert!(front.peer_disconnected && !front.peer_reset);
+
+        let (read, result) = front.read(&mut transport, FRAME_HEADER_LEN);
+        assert!(read.is_empty());
+        assert_eq!(result, SocketResult::Closed, "EOF stays EOF, not an error");
+    }
+
+    /// A reset is `Closed` with `peer_reset` set, so writes short-circuit.
+    #[test]
+    fn a_reset_reports_closed_and_marks_the_peer_reset() {
+        let (mut front, _client) = front_and_client();
+        let mut transport = CountingTransport {
+            reset: true,
+            ..Default::default()
+        };
+
+        let (read, result) = front.read(&mut transport, FRAME_HEADER_LEN);
+        assert!(read.is_empty());
+        assert_eq!(result, SocketResult::Closed);
+        assert!(front.peer_disconnected && front.peer_reset);
+        assert_eq!(transport.reads, 1);
     }
 }

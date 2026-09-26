@@ -964,6 +964,21 @@ zero-length read answers `(0, SocketResult::Continue)`, and
 frame carrying no payload (an empty SETTINGS, an empty DATA, a SETTINGS ACK)
 would stop being parsed at all.
 
+On a TLS frontend the read lands in `FrontRustls::socket_read`
+(`lib/src/socket.rs`), whose body is the private `rustls_socket_read`. One
+TLS record usually carries several frames, so after the first header most
+of these one-frame reads can be served from plaintext rustls has already
+decrypted. The pass therefore drains that plaintext **before** it calls
+`read_tls`, and only reaches the socket when the buffer is still short: a
+record of N frames costs one `recv(2)` plus the single EAGAIN that ends the
+readiness turn, instead of one EAGAIN per frame after the first
+([#1588](https://github.com/sozu-proxy/sozu/issues/1588)). The readiness
+contract is unchanged: an EAGAIN always ends the call with
+`SocketResult::WouldBlock`, which `update_readiness_after_read` turns into
+"drop READABLE until the next event", and a full buffer answers `Continue` so
+READABLE stays. EOF and `close_notify` are answered `Closed` by the first
+call that finds no plaintext left, after the frames that preceded them.
+
 This is not `AsyncRead::poll_read`: nothing here is a future, `context` is the
 mux's own `Context` and not a `task::Context`, and `lib/` holds no
 asynchronous function. The names follow the sibling UDP core's `UdpManager::poll_output`
