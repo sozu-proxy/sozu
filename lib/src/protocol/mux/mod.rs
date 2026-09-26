@@ -166,7 +166,7 @@ use crate::{
     BackendConnectionError, FrontendFromRequestError, L7ListenerHandler, L7Proxy, ListenerHandler,
     Protocol, ProxySession, Readiness, RetrieveClusterError, SessionIsToBeClosed, SessionMetrics,
     SessionResult, StateResult,
-    backends::{Backend, BackendError},
+    backends::{Backend, BackendError, BackendMap},
     http::HttpListener,
     https::HttpsListener,
     pool::{Checkout, Pool},
@@ -1904,12 +1904,24 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         h2: bool,
         frontend_should_stick: bool,
     ) -> Result<(), BackendConnectionError> {
-        let (socket, backend) = router.backend_from_request(
-            cluster_id,
-            frontend_should_stick,
-            &mut context.streams[stream_id].context,
-            proxy.clone(),
-        )?;
+        // One `borrow_mut` of the worker's `BackendMap` for exactly the
+        // selection and its dial, and no longer: nothing else on this path
+        // borrows the map, and the `RefMut` drops before `add_session` and
+        // `register_socket` borrow the proxy below.
+        let (socket, backend) = {
+            let backends = proxy.borrow().backends();
+            let mut backends = backends.borrow_mut();
+            let mut dialer = RegistryDialer {
+                backends: &mut backends,
+                registry: backend_registry,
+            };
+            router.backend_from_request(
+                cluster_id,
+                frontend_should_stick,
+                &mut context.streams[stream_id].context,
+                &mut dialer,
+            )?
+        };
 
         if let Err(e) = socket.set_nodelay(true) {
             error!(
@@ -1919,13 +1931,6 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 e
             );
         }
-
-        // The one place a registry handle becomes an opaque id: the
-        // embedder's table names it, copies the two identity fields the
-        // datapath renders, and the `Rc` goes no further. Everything below
-        // this line — and every `Position::Client` built from it — holds
-        // `backend`, never the handle.
-        let backend = backend_registry.id_for(&backend);
 
         // Cache the backend's configured address so SOCKET log lines fired on
         // ECONNREFUSED (or any failed async `connect()`) can still render
@@ -3340,6 +3345,61 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             }
         }
         can_stop
+    }
+}
+
+/// The embedder's [`router::BackendDialer`]: the worker's backend set and this
+/// session's registry, lent together for one selection.
+///
+/// It is the one place a registry handle becomes an opaque [`BackendId`]: the
+/// backend is chosen and dialled by the `BackendMap`, named by the session's
+/// table, and the `Rc` goes no further. Everything past
+/// [`router::BackendDialer::select_and_dial`] — and every `Position::Client`
+/// built from it — holds the id, never the handle.
+struct RegistryDialer<'a> {
+    backends: &'a mut BackendMap,
+    registry: &'a mut BackendRegistry,
+}
+
+impl router::BackendDialer for RegistryDialer<'_> {
+    fn select_and_dial(
+        &mut self,
+        cluster_id: &str,
+        affinity: router::Affinity<'_>,
+    ) -> Result<router::DialedBackend, BackendError> {
+        let (handle, socket) = match affinity {
+            router::Affinity::Sticky(Some(cookie)) => self
+                .backends
+                .backend_from_sticky_session(cluster_id, cookie)?,
+            router::Affinity::Sticky(None) | router::Affinity::Unpinned => {
+                self.backends.backend_from_cluster_id(cluster_id)?
+            }
+        };
+        let sticky_session = match affinity {
+            router::Affinity::Sticky(_) => {
+                let chosen = handle.borrow();
+                Some(
+                    chosen
+                        .sticky_id
+                        .clone()
+                        .unwrap_or_else(|| chosen.backend_id.to_owned()),
+                )
+            }
+            router::Affinity::Unpinned => None,
+        };
+        let backend = self.registry.id_for(&handle);
+        // The id names the handle the map just dialled, not a copy of it.
+        debug_assert!(
+            self.registry
+                .get(backend.slot())
+                .is_some_and(|known| Rc::ptr_eq(known, &handle)),
+            "the minted id must resolve to the very backend that was dialled"
+        );
+        Ok(router::DialedBackend {
+            backend,
+            socket,
+            sticky_session,
+        })
     }
 }
 

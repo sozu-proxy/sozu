@@ -315,9 +315,10 @@ constructed it. Conceptually the lifecycle is:
    `HttpContext` callbacks in `lib/src/protocol/kawa_h1/editor.rs`.
 2. **Route the request** to a cluster via `Router::route_from_request`
    (`lib/src/protocol/mux/router.rs`).
-3. **Pick a backend** via `Router::backend_from_request` and **connect to
-   it** via `Router::plan_connect` (same file). A previously-opened keep-alive
-   socket may be reused after a liveness probe.
+3. **Pick a backend and connect to it** via `Router::backend_from_request`
+   (same file), which `Mux::dial_backend` (`lib/src/protocol/mux/mod.rs`) calls
+   once `Router::plan_connect` has decided to dial. A previously-opened
+   keep-alive socket may be reused after a liveness probe.
 4. **Forward bytes** in both directions through the per-`Stream`
    front/back Kawa buffer pair (`lib/src/protocol/mux/stream.rs`),
    registering writable interest with `arm_writable` as needed.
