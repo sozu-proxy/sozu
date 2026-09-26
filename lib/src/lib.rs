@@ -1375,6 +1375,11 @@ pub struct SessionMetrics {
     pub backend_id: Option<String>,
     pub backend_start: Option<Instant>,
     pub backend_connected: Option<Instant>,
+    /// date at which the backend's response headers finished parsing — the
+    /// time-to-first-header-byte anchor nginx calls `$upstream_header_time`.
+    /// Set by the L7 read paths only; raw TCP has no headers and leaves it
+    /// `None` (see [`SessionMetrics::backend_header_time`]).
+    pub backend_headers_received: Option<Instant>,
     pub backend_stop: Option<Instant>,
     pub backend_bin: usize,
     pub backend_bout: usize,
@@ -1394,6 +1399,7 @@ impl SessionMetrics {
             backend_id: None,
             backend_start: None,
             backend_connected: None,
+            backend_headers_received: None,
             backend_stop: None,
             backend_bin: 0,
             backend_bout: 0,
@@ -1410,6 +1416,7 @@ impl SessionMetrics {
         self.service_start = None;
         self.backend_start = None;
         self.backend_connected = None;
+        self.backend_headers_received = None;
         self.backend_stop = None;
         self.backend_bin = 0;
         self.backend_bout = 0;
@@ -1484,6 +1491,24 @@ impl SessionMetrics {
         self.backend_connected = Some(Instant::now());
     }
 
+    /// The backend's response headers have just finished parsing. Called from
+    /// the L7 read paths at the header -> body transition, once per response.
+    ///
+    /// Overwrites, exactly like [`Self::backend_stop`] and for the same
+    /// reason: a 1xx informational response is forwarded and the back buffer
+    /// is then cleared — `ConnectionH1::writable` (`lib/src/protocol/mux/h1.rs`)
+    /// in its 100-Continue and 103-Early-Hints arms, `ConnectionH2::handle_1xx_reset`
+    /// (`lib/src/protocol/mux/h2.rs`) — so the final response re-enters that
+    /// transition from the initial parsing phase. Last write wins, which anchors
+    /// this on the FINAL response headers — the same response `backend_stop`
+    /// anchors on, and what nginx reports in `$upstream_header_time`. A
+    /// set-once guard would anchor the pair on two different responses and
+    /// floor the metric at ~0ms for every `Expect: 100-continue` client,
+    /// hiding the upstream think time the metric exists to expose.
+    pub fn backend_headers_received(&mut self) {
+        self.backend_headers_received = Some(Instant::now());
+    }
+
     pub fn backend_stop(&mut self) {
         self.backend_stop = Some(Instant::now());
     }
@@ -1499,6 +1524,27 @@ impl SessionMetrics {
     pub fn backend_connection_time(&self) -> Option<Duration> {
         match (self.backend_start, self.backend_connected) {
             (Some(start), Some(end)) => Some(end - start),
+            _ => None,
+        }
+    }
+
+    /// Time from the established backend connection to the moment its response
+    /// headers finished parsing — nginx's `$upstream_header_time`, the third
+    /// of the three upstream timings of sozu-proxy/sozu#426.
+    ///
+    /// Deliberately WITHOUT the elapsed-so-far fallback that
+    /// [`Self::backend_response_time`] carries for its `backend_stop`-is-None
+    /// case. That fallback serves a live read of a response still streaming;
+    /// a time-to-first-header-byte has no in-flight meaning, because no header
+    /// byte has arrived. Returning `Instant::now() - connected` anyway would
+    /// publish a value that grows with the wait and then freezes wherever the
+    /// session ended — indistinguishable, on a dashboard, from a slow backend
+    /// that did answer. `None` is the honest answer, and it is also what keeps
+    /// raw TCP (`lib/src/tcp.rs`, no headers at all) recording nothing here
+    /// instead of recording a zero.
+    pub fn backend_header_time(&self) -> Option<Duration> {
+        match (self.backend_connected, self.backend_headers_received) {
+            (Some(connected), Some(headers)) => Some(headers - connected),
             _ => None,
         }
     }
@@ -1530,6 +1576,7 @@ impl SessionMetrics {
                 backend_id,
                 backend_response_time.as_millis(),
                 self.backend_connection_time(),
+                self.backend_header_time(),
                 self.backend_bin,
                 self.backend_bout
             );
@@ -1858,5 +1905,88 @@ mod log_redaction_tests {
                 output.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod backend_header_time_tests {
+    use super::*;
+
+    /// A protocol with no response headers at all — raw TCP
+    /// (`sozu_lib::tcp::TcpSession`, which calls
+    /// `SessionMetrics::register_end_of_session` like the L7 paths do) — must
+    /// record NOTHING under `backend_header_time`, not a zero and not an
+    /// elapsed-so-far value.
+    ///
+    /// This is the whole of the `None`-fallback decision, in its only
+    /// observable shape: `backend_response_time` deliberately answers
+    /// `Instant::now() - connected` when `backend_stop` is absent, and
+    /// `backend_header_time` deliberately does not. Without the distinction a
+    /// TCP session would publish a header time that is really its whole
+    /// lifetime, under a key whose name promises a time to first header byte.
+    ///
+    /// To SEE THIS RED: add `(Some(connected), None) => Some(Instant::now() -
+    /// connected),` to the match in `SessionMetrics::backend_header_time`,
+    /// mirroring the arm `SessionMetrics::backend_response_time` carries.
+    #[test]
+    fn a_session_that_received_no_response_headers_reports_no_header_time() {
+        let mut metrics = SessionMetrics::new(None);
+        metrics.backend_start();
+        metrics.backend_connected();
+        metrics.backend_stop();
+
+        // Premise: this session is otherwise fully timed, so a `None` below
+        // cannot come from a missing connection instant.
+        assert!(
+            metrics.backend_connection_time().is_some(),
+            "premise: the connection time must be available"
+        );
+        assert!(
+            metrics.backend_response_time().is_some(),
+            "premise: the response time must be available"
+        );
+
+        assert_eq!(
+            metrics.backend_header_time(),
+            None,
+            "a session whose backend produced no response headers must report \
+             no header time"
+        );
+    }
+
+    /// `SessionMetrics::reset` recycles one `SessionMetrics` across the
+    /// requests of an H1 keep-alive connection, so a field it forgets is a
+    /// field the NEXT request inherits. `backend_response_time` was miscounted
+    /// exactly this way once (commit `5f3371b7`); this pins that the new
+    /// instant joins the three it sits beside.
+    ///
+    /// To SEE THIS RED: drop `self.backend_headers_received = None;` from
+    /// `SessionMetrics::reset`.
+    #[test]
+    fn reset_clears_the_backend_headers_instant_with_its_siblings() {
+        let mut metrics = SessionMetrics::new(None);
+        metrics.backend_start();
+        metrics.backend_connected();
+        metrics.backend_headers_received();
+        assert!(
+            metrics.backend_header_time().is_some(),
+            "premise: the first request must have a header time to forget"
+        );
+
+        metrics.reset();
+
+        assert_eq!(
+            metrics.backend_headers_received, None,
+            "reset must clear the headers instant, or the next keep-alive \
+             request inherits the previous response's headers"
+        );
+        // Restaged as a fresh request would: connected now, no headers yet.
+        metrics.backend_connected();
+        assert_eq!(
+            metrics.backend_header_time(),
+            None,
+            "a recycled SessionMetrics must not report a header time earned by \
+             the previous request"
+        );
     }
 }

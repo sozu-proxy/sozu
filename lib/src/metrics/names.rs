@@ -48,6 +48,10 @@ pub mod backend {
     pub const POOL_SIZE: &str = "backend.pool.size";
     pub const CONNECTIONS_PER_BACKEND: &str = "connections_per_backend";
     pub const CONNECTION_TIME: &str = "backend_connection_time";
+    /// Backend time-to-first-header-byte: established connection -> response
+    /// headers parsed. nginx's `$upstream_header_time` (sozu-proxy/sozu#426).
+    /// L7 only — raw TCP has no headers and emits nothing under this key.
+    pub const HEADER_TIME: &str = "backend_header_time";
     pub const RESPONSE_TIME: &str = "backend_response_time";
     pub const REQUESTS: &str = "requests";
     pub const FAIL_OPEN: &str = "backends.fail_open";
