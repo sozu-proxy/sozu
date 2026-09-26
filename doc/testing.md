@@ -131,7 +131,14 @@ Notes:
   `steady_state_emission_does_not_allocate` (`lib/src/metrics/local_drain.rs`),
   all held at zero. When the code under test triggers bookkeeping that
   allocates for reasons of its own, measure that bookkeeping alone as a
-  control and assert on the difference, as the reused-connection test does. A budget measured through the public API lives in its own
+  control and assert on the difference, as the reused-connection test does.
+  `a_routed_request_on_a_reused_backend_connection_copies_no_cluster_id`
+  (`lib/src/protocol/mux/router.rs`) and
+  `a_tree_lookup_allocates_nothing_past_its_route_result`
+  (`lib/src/router/mod.rs`, [#1589](https://github.com/sozu-proxy/sozu/issues/1589))
+  are of that kind: their controls hold only the cluster id cloned out of the
+  route table (and, in the debug build, the `DebugEvent::Str` history push),
+  so any other allocation in routing fails them. A budget measured through the public API lives in its own
   `lib/tests/` binary with its own allocator instead, as
   `lib/tests/backend_selection.rs` does.
 - **Router hostname resolution is unit-tested with `quickcheck`**
@@ -830,7 +837,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
   symptom is reachable at all. #1353's 421 has exactly one emission site
   (`lib/src/protocol/mux/mod.rs:2775`), reachable only through
   `RetrieveClusterError::SniAuthorityMismatch`, which is constructed at exactly
-  one site (`lib/src/protocol/mux/router.rs:908`) immediately after
+  one site (`lib/src/protocol/mux/router.rs:902`) immediately after
   `incr!(names::http::SNI_AUTHORITY_MISMATCH)` — and the failing run reported
   that counter unmoved, alongside a correct backend request count. The proxy was
   innocent by construction, and sixteen serial local reproductions were never

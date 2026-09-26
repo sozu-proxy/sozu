@@ -202,6 +202,69 @@ impl<'a, 'b> SubMatchSink<'a, 'b> for TrieMatches<'a, 'b> {
     }
 }
 
+/// Segments of the trie walk kept on the stack by [`InlineTrieMatches`]
+/// before it spills to the heap. A hostname carries one non-literal segment
+/// per label at most, and routing tables rarely stack more than a couple.
+const INLINE_TRIE_MATCHES: usize = 16;
+
+/// Record of the non-literal segments a walk matched, for
+/// [`crate::router::Router::lookup`]: the first [`INLINE_TRIE_MATCHES`]
+/// entries live in a fixed array on the caller's stack, later ones in a
+/// `Vec` that allocates only when an entry actually lands there.
+///
+/// [`TrieMatches`] is the same record as a plain `Vec`, which a lookup had to
+/// allocate up front even for a literal host that records nothing. The fixed
+/// array plays the part of HAProxy's `regmatch_t pmatch[MAX_MATCH]`
+/// (`src/sample.c:3487` at haproxy `0ceb8c65`), except that HAProxy clamps a
+/// match at `MAX_MATCH` (`src/regex.c:155-156`) where this spills, so no
+/// segment is ever dropped from a `$HOST[n]` template.
+pub(crate) struct InlineTrieMatches<'a, 'b> {
+    inline: [Option<TrieSubMatch<'a, 'b>>; INLINE_TRIE_MATCHES],
+    spilled: Vec<TrieSubMatch<'a, 'b>>,
+    len: usize,
+}
+
+impl<'a, 'b> InlineTrieMatches<'a, 'b> {
+    pub(crate) fn new() -> Self {
+        Self {
+            inline: [const { None }; INLINE_TRIE_MATCHES],
+            spilled: Vec::new(),
+            len: 0,
+        }
+    }
+
+    /// The recorded segments, in walk order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &TrieSubMatch<'a, 'b>> {
+        self.inline[..self.len.min(INLINE_TRIE_MATCHES)]
+            .iter()
+            .flatten()
+            .chain(self.spilled.iter())
+    }
+}
+
+impl<'a, 'b> SubMatchSink<'a, 'b> for InlineTrieMatches<'a, 'b> {
+    fn mark(&self) -> usize {
+        self.len
+    }
+
+    fn rewind(&mut self, mark: usize) {
+        debug_assert!(mark <= self.len, "a rewind never moves forward");
+        // Inline slots past `len` are dead: `iter` never reads them and the
+        // next `push` overwrites them, so only the spill needs truncating.
+        self.spilled
+            .truncate(mark.saturating_sub(INLINE_TRIE_MATCHES));
+        self.len = mark;
+    }
+
+    fn push(&mut self, sub_match: TrieSubMatch<'a, 'b>) {
+        match self.inline.get_mut(self.len) {
+            Some(slot) => *slot = Some(sub_match),
+            None => self.spilled.push(sub_match),
+        }
+        self.len += 1;
+    }
+}
+
 impl<V: PartialEq> std::cmp::PartialEq for TrieNode<V> {
     fn eq(&self, other: &Self) -> bool {
         self.key_value == other.key_value
@@ -809,6 +872,21 @@ impl<V: Debug + Clone> TrieNode<V> {
     ) -> Option<(&'b KeyValue<Key, V>, TrieMatches<'a, 'b>)> {
         self.lookup_recursive(partial_key, accept_wildcard, &mut trace, accept)
             .map(|key_value| (key_value, trace))
+    }
+
+    /// [`TrieNode::lookup_with_path`] recording into a caller-owned
+    /// [`InlineTrieMatches`], so a lookup that records at most
+    /// [`INLINE_TRIE_MATCHES`] segments allocates nothing. `trace` must be
+    /// empty; it holds the segments of the candidate that answered.
+    pub(crate) fn lookup_with_inline_path<'a, 'b>(
+        &'b self,
+        partial_key: &'a [u8],
+        accept_wildcard: bool,
+        trace: &mut InlineTrieMatches<'a, 'b>,
+        accept: &mut dyn FnMut(&KeyValue<Key, V>) -> bool,
+    ) -> Option<&'b KeyValue<Key, V>> {
+        debug_assert_eq!(trace.mark(), 0, "a lookup starts from an empty record");
+        self.lookup_recursive(partial_key, accept_wildcard, trace, accept)
     }
 
     /// Request-addressed lookup: which entry serves `partial_key`.
@@ -2343,5 +2421,54 @@ mod tests {
             Some(7),
             "and the wildcard serves the one it was not",
         );
+    }
+
+    /// [`InlineTrieMatches`] is a drop-in for the `Vec` record: the same
+    /// pushes and rewinds, including across the boundary between its inline
+    /// slots and its spill, leave the same segments in the same order.
+    #[test]
+    fn inline_trie_matches_rewinds_across_the_spill_like_a_vec() {
+        let labels: Vec<Vec<u8>> = (0..INLINE_TRIE_MATCHES + 8)
+            .map(|index| format!("s{index}").into_bytes())
+            .collect();
+        let mut inline = InlineTrieMatches::new();
+        let mut heap: TrieMatches<'_, '_> = Vec::new();
+        let segments = |sub_matches: Vec<&TrieSubMatch<'_, '_>>| -> Vec<Vec<u8>> {
+            sub_matches
+                .into_iter()
+                .map(|sub_match| match sub_match {
+                    TrieSubMatch::Wildcard(segment) | TrieSubMatch::Regexp(segment, _) => {
+                        segment.to_vec()
+                    }
+                })
+                .collect()
+        };
+
+        // Fill past the inline slots, rewind into them, refill, then rewind
+        // inside the spill only.
+        let steps: [(usize, usize); 3] = [
+            (INLINE_TRIE_MATCHES + 4, INLINE_TRIE_MATCHES - 3),
+            (INLINE_TRIE_MATCHES + 8, INLINE_TRIE_MATCHES + 2),
+            (INLINE_TRIE_MATCHES + 8, 0),
+        ];
+        for (fill, rewind) in steps {
+            for label in &labels[inline.mark()..fill] {
+                SubMatchSink::push(&mut inline, TrieSubMatch::Wildcard(label));
+                SubMatchSink::push(&mut heap, TrieSubMatch::Wildcard(label));
+            }
+            assert_eq!(
+                segments(inline.iter().collect()),
+                segments(heap.iter().collect()),
+                "after filling to {fill}",
+            );
+            SubMatchSink::rewind(&mut inline, rewind);
+            SubMatchSink::rewind(&mut heap, rewind);
+            assert_eq!(inline.mark(), heap.mark());
+            assert_eq!(
+                segments(inline.iter().collect()),
+                segments(heap.iter().collect()),
+                "after rewinding to {rewind}",
+            );
+        }
     }
 }
