@@ -127,7 +127,9 @@ Notes:
   (`lib/src/protocol/mux/mod.rs`, [#1564](https://github.com/sozu-proxy/sozu/issues/1564)),
   `a_request_on_a_reused_backend_connection_allocates_nothing` and
   `stamping_a_dialled_backend_allocates_nothing` (`lib/src/protocol/mux/router.rs`,
-  [#1579](https://github.com/sozu-proxy/sozu/issues/1579)), and
+  [#1579](https://github.com/sozu-proxy/sozu/issues/1579)),
+  `creating_a_debug_history_allocates_nothing` (`lib/src/protocol/mux/debug.rs`,
+  [#1585](https://github.com/sozu-proxy/sozu/issues/1585)), and
   `steady_state_emission_does_not_allocate` (`lib/src/metrics/local_drain.rs`),
   all held at zero. When the code under test triggers bookkeeping that
   allocates for reasons of its own, measure that bookkeeping alone as a

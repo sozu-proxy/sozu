@@ -408,6 +408,20 @@
   `a_dial_moves_the_planned_cluster_id_into_the_backend_connection` drives a real
   `Mux::dial_backend` and checks the connection owns the very allocation the plan carried.
 
+- **`perf(mux)`: a session no longer preallocates its 48 KiB debug history in release builds
+  ([#1585](https://github.com/sozu-proxy/sozu/issues/1585)).** `DebugHistory::default`
+  (`lib/src/protocol/mux/debug.rs`), which `Context::new` runs for every HTTP and HTTPS session,
+  reserved its whole 512-event ring up front, 49 152 bytes, although only a `debug_assertions`
+  build ever records into it or dumps it on close. The ring now starts empty and the first `push`
+  reserves the full capacity, so a release session allocates nothing for it while a debug build
+  keeps the same 512-event capacity, the same oldest-first eviction and the same dump. Measured on
+  a release binary (system allocator, one worker) with an `LD_PRELOAD` malloc counter over 20
+  sequential HTTP/1.1 requests, one connection each: 84 505 bytes and 59.6 `malloc` per request
+  before, 35 273 bytes and 58.6 after, so the ring was 58 % of the bytes a request allocated.
+  `creating_a_debug_history_allocates_nothing` pins construction at zero allocations in both
+  profiles; `debug_history_keeps_the_newest_events_up_to_its_capacity` pins the debug ring (one
+  allocation, eviction at 512, dump) and `release_history_records_nothing` the release no-op.
+
 - **`perf(mux)`: the backend id is no longer copied into a `String` per request
   ([#1579](https://github.com/sozu-proxy/sozu/issues/1579)).** `HttpContext::backend_id` and
   `SessionMetrics::backend_id` are now `Option<Rc<str>>` instead of `Option<String>`, and the mux
