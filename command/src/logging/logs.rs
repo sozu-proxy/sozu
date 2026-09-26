@@ -14,9 +14,8 @@ use mio::net::UnixDatagram;
 use prost::{Message, encoding::encoded_len_varint};
 
 use crate::{
-    AsString,
     config::{Config, DEFAULT_LOG_TARGET},
-    logging::{LogDuration, LogError, LogMessage, RequestRecord},
+    logging::{LogAddress, LogDuration, LogError, LogMessage, RequestRecord},
     proto::command::ProtobufAccessLogFormat,
     writer::MultiLineWriter,
 };
@@ -383,8 +382,8 @@ impl InnerLogger {
                     formats: ["{} {} {} {}/{}/{}/{}/{} {} {} [{}] {:?} {} {}{}\n"],
                     args: [
                         log.context,
-                        log.session_address.as_string_or("-"),
-                        log.backend_address.as_string_or("-"),
+                        LogAddress(log.session_address),
+                        LogAddress(log.backend_address),
                         LogDuration(Some(log.request_time)),
                         LogDuration(Some(log.service_time)),
                         LogDuration(log.response_time),

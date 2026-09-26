@@ -77,6 +77,9 @@ impl<T> DuplicateOwnership for &[T] {
 
 pub struct LogMessage<'a>(pub Option<&'a str>);
 pub struct LogDuration(pub Option<Duration>);
+/// Renders a socket address, or `-` when there is none, straight into the
+/// formatter: an access-log line must not build a `String` per address.
+pub struct LogAddress(pub Option<SocketAddr>);
 
 /// Prefix block attached to every log line. Rendered as
 /// `[<session_id> <request_id_or_-> <cluster_id_or_-> <backend_id_or_->]`

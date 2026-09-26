@@ -408,6 +408,24 @@
   `a_dial_moves_the_planned_cluster_id_into_the_backend_connection` drives a real
   `Mux::dial_backend` and checks the connection owns the very allocation the plan carried.
 
+- **`perf(logging)`: an access-log line allocates nothing in steady state
+  ([#1587](https://github.com/sozu-proxy/sozu/issues/1587)).** Rendering one ASCII line
+  allocated 10 times although every `RequestRecord` field is a borrow and the logger reuses its
+  buffer: two per socket address (`AsString::as_string_or`), one per ULID of the `[…]` context
+  (`rusty_ulid`'s `Display` builds a `String`), three for the user agent (chained
+  `str::replace`) and one for the status code. Each field now writes straight into the
+  formatter (`LogAddress`, a stack Crockford encoder for the ULIDs, `EscapedUserAgent`,
+  `write_status` in `command/src/logging/display.rs`). The output is unchanged byte for byte,
+  pinned against the previous renderers, including the user-agent edge cases (control bytes,
+  quotes, other whitespace and non-ASCII still pass through; only space, `[` and `]` are
+  rewritten). `a_file_access_log_line_does_not_allocate` and
+  `a_udp_access_log_line_does_not_allocate` hold 0 allocations per line on both rendering
+  paths under a counting allocator. On a release worker serving 20 sequential HTTP/1.1
+  requests to a `file://` target, `malloc` plus `realloc` fell from 83.8 to 73.7 per request.
+  Main-log lines that carry a `LogContext` stop allocating their ULIDs too. No public
+  signature changes: `AsString` stays, and `LogAddress` is a new public wrapper beside
+  `LogDuration`. See `doc/observability.md` §The cost of one access-log line.
+
 - **`perf(mux)`: the backend id is no longer copied into a `String` per request
   ([#1579](https://github.com/sozu-proxy/sozu/issues/1579)).** `HttpContext::backend_id` and
   `SessionMetrics::backend_id` are now `Option<Rc<str>>` instead of `Option<String>`, and the mux
