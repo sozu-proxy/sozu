@@ -15,6 +15,7 @@ use libc::pid_t;
 use mio::net::UnixStream;
 use nix::{
     errno::Errno,
+    sys::signal::{SigHandler, Signal, signal},
     unistd::{ForkResult, fork},
 };
 use sozu_command_lib::{
@@ -37,6 +38,8 @@ use crate::util::{self, UtilError};
 
 #[derive(thiserror::Error, Debug)]
 pub enum WorkerError {
+    #[error("could not ignore SIGTERM: {0}")]
+    IgnoreSigterm(Errno),
     #[error("could not read on the channel")]
     ReadChannel(ChannelError),
     #[error("could not parse configuration from temporary file: {0}")]
@@ -115,6 +118,15 @@ pub fn begin_worker_process(
             && worker_to_main_scm_fd != configuration_state_fd,
         "the channel, SCM and state descriptors must be three distinct fds, never aliased"
     );
+
+    // A unit without `ExecStop=` stops with SIGTERM to its whole control
+    // group. The main process turns its own SIGTERM into a soft stop of the
+    // workers (`CommandHub::handle_sigterm`); a worker killed by the same
+    // signal would die with its log buffers unflushed. If the main process dies
+    // instead, the worker still leaves: its channel closes and `Server::run`
+    // returns.
+    // SAFETY: `SigIgn` installs no handler code.
+    unsafe { signal(Signal::SIGTERM, SigHandler::SigIgn) }.map_err(WorkerError::IgnoreSigterm)?;
 
     let mut worker_to_main_channel: Channel<WorkerResponse, ServerConfig> = Channel::new(
         // SAFETY: `worker_to_main_channel_fd` was just inherited from the

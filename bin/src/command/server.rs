@@ -11,13 +11,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::{self, Debug},
     fs::{DirBuilder, File, OpenOptions, Permissions},
-    io::{Error as IoError, Write},
+    io::{Error as IoError, ErrorKind, Read, Write},
     ops::{Deref, DerefMut},
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd},
         unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     },
     path::Path,
+    sync::atomic::{AtomicI32, Ordering},
     time::{Duration, Instant},
 };
 
@@ -27,7 +28,8 @@ use mio::{
     net::{UnixListener, UnixStream},
 };
 use nix::{
-    sys::signal::{Signal, kill},
+    errno::Errno,
+    sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, sigaction},
     unistd::Pid,
 };
 use sozu_command_lib::{
@@ -47,6 +49,7 @@ use sozu_lib::metrics::names;
 use super::upgrade::SerializedWorkerSession;
 use crate::{
     command::{
+        requests::begin_stop,
         sessions::{
             ClientResult, ClientSession, OptionalClient, WorkerResult, WorkerSession, wants_to_tick,
         },
@@ -55,6 +58,35 @@ use crate::{
     util::{UtilError, disable_close_on_exec, enable_close_on_exec, get_executable_path},
     worker::{WorkerError, fork_main_into_worker},
 };
+
+/// Token of the read end of the `SIGTERM` self-pipe. `Token(0)` is the
+/// command socket and sessions count up from 1 (`next_session_token`), so the
+/// top of the range never collides with a session.
+const SIGTERM_TOKEN: Token = Token(usize::MAX);
+
+/// Write end of the `SIGTERM` self-pipe, `-1` until
+/// [`CommandHub::handle_sigterm`] installs the handler. The descriptor is never
+/// closed, so the handler can never write into a recycled one.
+static SIGTERM_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+/// `SIGTERM` handler of the main process. It only wakes the event loop, which
+/// turns the signal into a stop (`CommandHub::on_sigterm`). Everything here is
+/// async-signal-safe: an atomic load and one non-blocking `send(2)`, with
+/// `errno` restored for the code the signal interrupted. A full socket buffer
+/// drops the byte, which is harmless: the loop has a wake-up pending anyway.
+extern "C" fn sigterm_handler(_signal: libc::c_int) {
+    let errno = Errno::last_raw();
+    let fd = SIGTERM_WRITE_FD.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = 1u8;
+        // SAFETY: `fd` is the write end of the self-pipe, which stays open for
+        // the life of the process, and `byte` outlives the call.
+        unsafe {
+            libc::send(fd, (&raw const byte).cast(), 1, libc::MSG_NOSIGNAL);
+        }
+    }
+    Errno::set_raw(errno);
+}
 
 pub type ClientId = u32;
 pub type SessionId = usize;
@@ -382,6 +414,8 @@ pub struct CommandHub {
     /// accepted [`ClientSession::socket_path`]. Stored as `Arc<str>` so it
     /// clones cheaply per-session.
     command_socket_path: std::sync::Arc<str>,
+    /// read end of the `SIGTERM` self-pipe, set by [`CommandHub::handle_sigterm`]
+    sigterm_receiver: Option<UnixStream>,
 }
 
 impl Deref for CommandHub {
@@ -413,7 +447,83 @@ impl CommandHub {
             clients: HashMap::new(),
             tasks: HashMap::new(),
             command_socket_path,
+            sigterm_receiver: None,
         })
+    }
+
+    /// Turn `SIGTERM` into a stop of the workers instead of an immediate death.
+    ///
+    /// A unit without `ExecStop=` stops with `SIGTERM` to every process of its
+    /// control group. Workers ignore it (`begin_worker_process`); the main
+    /// process catches it here and stops them the way `sozu shutdown` does:
+    /// the first `SIGTERM` is a soft stop, a second one while the workers still
+    /// drain is a hard stop. Each worker then leaves its event loop and flushes
+    /// its log buffers. Bounding the drain is left to the supervisor: systemd
+    /// sends `SIGKILL` once `TimeoutStopSec` expires.
+    ///
+    /// The handler writes to a socket pair whose read end joins the event loop
+    /// under `SIGTERM_TOKEN`; the loop does the actual work
+    /// (`CommandHub::on_sigterm`). Call it once per process, from the two entry
+    /// points that run the loop: `begin_main_process` and
+    /// `begin_new_main_process`.
+    pub fn handle_sigterm(&mut self) -> Result<(), ServerError> {
+        let (sender, mut receiver) = UnixStream::pair().map_err(ServerError::SigtermPipe)?;
+        self.server
+            .poll
+            .registry()
+            .register(&mut receiver, SIGTERM_TOKEN, Interest::READABLE)
+            .map_err(ServerError::SigtermPipe)?;
+        self.sigterm_receiver = Some(receiver);
+        let previous = SIGTERM_WRITE_FD.swap(sender.into_raw_fd(), Ordering::Relaxed);
+        debug_assert_eq!(
+            previous, -1,
+            "the SIGTERM handler is installed once per process"
+        );
+
+        let action = SigAction::new(
+            SigHandler::Handler(sigterm_handler),
+            SaFlags::SA_RESTART,
+            SigSet::empty(),
+        );
+        // SAFETY: `sigterm_handler` only performs async-signal-safe operations.
+        unsafe { sigaction(Signal::SIGTERM, &action) }.map_err(ServerError::SigtermHandler)?;
+        Ok(())
+    }
+
+    /// Drain the `SIGTERM` self-pipe, then stop once per signal received: soft
+    /// while running, hard while the workers still drain, nothing once the
+    /// main process itself is stopping.
+    fn on_sigterm(&mut self) {
+        let Some(receiver) = self.sigterm_receiver.as_mut() else {
+            return;
+        };
+        let mut signals = 0;
+        let mut buffer = [0u8; 16];
+        loop {
+            match receiver.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => signals += read,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    error!("could not read the SIGTERM self-pipe: {}", error);
+                    break;
+                }
+            }
+        }
+        for _ in 0..signals {
+            match self.server.run_state {
+                ServerState::Running => {
+                    info!("received SIGTERM, soft stopping the workers");
+                    begin_stop(&mut self.server, None, false);
+                }
+                ServerState::WorkersStopping => {
+                    info!("received SIGTERM while the workers stop, hard stopping them");
+                    begin_stop(&mut self.server, None, true);
+                }
+                ServerState::Stopping => {}
+            }
+        }
     }
 
     fn register_client(&mut self, mut stream: UnixStream) {
@@ -595,6 +705,7 @@ impl CommandHub {
             clients: HashMap::new(),
             tasks: HashMap::new(),
             command_socket_path,
+            sigterm_receiver: None,
         })
     }
 
@@ -682,6 +793,8 @@ impl CommandHub {
             trace!("Polling timeout: {:?}", poll_timeout);
             match self.poll.poll(&mut events, poll_timeout) {
                 Ok(()) => {}
+                // a signal, `SIGTERM` included, interrupts the wait
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Err(error) => error!("Error while polling: {:?}", error),
             }
 
@@ -705,6 +818,7 @@ impl CommandHub {
                             }
                         }
                     }
+                    SIGTERM_TOKEN => self.on_sigterm(),
                     token => {
                         trace!("{:?} got event: {:?}", token, event);
                         if let Some((server, client)) = self.get_client_mut(&token) {
@@ -928,6 +1042,10 @@ impl CommandHub {
 pub enum ServerError {
     #[error("Could not create Poll with MIO: {0:?}")]
     CreatePoll(IoError),
+    #[error("could not set up the SIGTERM self-pipe: {0}")]
+    SigtermPipe(IoError),
+    #[error("could not install the SIGTERM handler: {0}")]
+    SigtermHandler(nix::Error),
     #[error("Could not register channel in MIO registry: {0:?}")]
     RegisterChannel(IoError),
     #[error("Could not fork the main into a new worker: {0}")]

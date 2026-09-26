@@ -59,7 +59,19 @@ reach both ends without juggling two mutable borrows.
 ### 1.3 Shutdown and re-exec
 
 Soft / hard stops are dispatched from `requests.rs::stop`
-(`bin/src/command/requests.rs`) via `StopTask` (`requests.rs`).
+(`bin/src/command/requests.rs`) through `requests.rs::begin_stop` via
+`StopTask` (`requests.rs`).
+
+`SIGTERM` reaches the same path without a client. `CommandHub::handle_sigterm`
+(`server.rs`), called from `begin_main_process` and `begin_new_main_process`,
+installs a handler that writes one byte to a socket pair whose read end the
+event loop polls under `SIGTERM_TOKEN`. `CommandHub::on_sigterm` drains it and
+calls `begin_stop` once per signal: a soft stop while `Running`, a hard stop
+while `WorkersStopping`, nothing once `Stopping`. Workers ignore `SIGTERM`
+(`begin_worker_process`, `bin/src/worker.rs`), so a `SIGTERM` sent to the whole
+control group, as systemd does for a unit without `ExecStop=`, leaves the
+workers to the main process's soft stop. A worker whose main process dies
+still leaves: its channel closes and its event loop returns.
 Hot upgrades are dispatched from `upgrade::upgrade_main`
 (`bin/src/upgrade.rs::fork_main_into_new_main`) and
 re-enter the new master via the same `begin_main_process` path with
@@ -107,7 +119,7 @@ peer. Between the `SO_PEERCRED` snapshot and the `/proc` read the kernel
 could (a) recycle the PID into a different process, or (b) the original
 process could `execve()` and become a different binary. To prevent (a)
 from leaking the recycled owner's name into the audit line, the function
-opens `/proc/<pid>/stat` first (`bin/src/command/server.rs:1700`); if the stat read fails
+opens `/proc/<pid>/stat` first (`bin/src/command/server.rs:1818`); if the stat read fails
 the PID is gone and `peer_comm` returns `None`. Case (b) cannot be
 detected by `starttime` alone — `execve` does not change `starttime` —
 but `exec` is not adversarial in our deployment (the `sozu` CLI never
@@ -253,7 +265,7 @@ live in `WorkerSession` (`bin/src/command/sessions.rs`).
 1. On `UpgradeMain`, calls `upgrade_main` (`bin/src/command/upgrade.rs`)
    which serialises the master state via
    `SerializedWorkerSession::try_from(&worker_session)`
-   (`bin/src/command/server.rs:1620`) into an `UpgradeData` blob, forks a
+   (`Server::generate_upgrade_data`, `bin/src/command/server.rs`) into an `UpgradeData` blob, forks a
    replacement master via `fork_main_into_new_main`
    (`bin/src/upgrade.rs`), hands the blob over a pipe, and exits once
    the new master takes over.

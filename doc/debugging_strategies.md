@@ -46,13 +46,15 @@ fills it. A worker drains that buffer on its way out, before it closes its chann
 process — the main process answers that channel closing with `SIGKILL` (`Server::close_worker`) —
 so no record is lost when a worker stops through `sozu shutdown`, `sozu shutdown --hard` or
 `sozu upgrade --worker`: measured over five runs of 27 records on each of the three, 6 records were
-missing on every run before that drain existed and none after. Records still buffered are lost when
-a worker does not reach that point: a crash, or a signal a worker does not handle, such as the
-`SIGTERM` that `systemctl stop` sends to every process of the unit when the unit declares no
-`ExecStop=` — tracked in [#1555](https://github.com/sozu-proxy/sozu/issues/1555) and
-[#1559](https://github.com/sozu-proxy/sozu/pull/1559). Stop through `sozu shutdown` when the last
-records of a `file://` access log matter, or use `unix://` or `udp://`, which send each record as it
-is logged.
+missing on every run before that drain existed and none after. `SIGTERM` takes the same path:
+`systemctl stop` sends it to every process of the unit when the unit declares no `ExecStop=`, a
+worker ignores it, and the main process turns it into a soft stop of the workers
+(`CommandHub::handle_sigterm`), a second `SIGTERM` into a hard stop. Measured the same way, with
+`SIGTERM` sent to the main process then to the worker, 6 to 8 records were missing on every run
+before and none after. Records still buffered are lost only when a worker does not reach the end of
+its event loop: a crash, or a `SIGKILL`, including the one systemd sends once `TimeoutStopSec`
+expires. Use `unix://` or `udp://` when even those records matter: they send each record as it is
+logged.
 
 `log_level` follows [env_logger's level directives](https://docs.rs/env_logger/0.5.13/env_logger/).
 Moreover, the `RUST_LOG` environment variable can be used to override the log level.
