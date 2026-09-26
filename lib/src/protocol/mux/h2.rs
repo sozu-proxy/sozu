@@ -14747,6 +14747,7 @@ mod tests {
             session: server,
             peer_disconnected: false,
             peer_reset: false,
+            tls_fatal: false,
             session_ulid: Ulid::generate(),
             configured_peer: None,
         };
