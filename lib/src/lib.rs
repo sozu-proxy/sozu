@@ -990,8 +990,6 @@ pub trait L7Proxy {
         interest: Interest,
     ) -> Result<(), std::io::Error>;
 
-    fn deregister_socket(&self, tcp_stream: &mut TcpStream) -> Result<(), std::io::Error>;
-
     fn add_session(&self, session: Rc<RefCell<dyn ProxySession>>) -> Token;
 
     /// Remove the session from the session manager slab.
