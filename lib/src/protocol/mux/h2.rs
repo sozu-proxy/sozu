@@ -40,7 +40,8 @@ use crate::{
         h2_control_tx,
         h2_drain::{self, GracefulDrainDecision},
         h2_flood_detector::{self, H2FloodConfig, H2FloodViolation},
-        h2_flow_control, h2_header_reassembly, h2_scheduler, h2_stream_table, h2_transmit,
+        h2_flow_control, h2_header_reassembly, h2_output, h2_scheduler, h2_stream_table,
+        h2_transmit,
         h2_write_pass::{H2WritePass, H2WritePhase},
         hpack_state,
         parser::{self, Frame, FrameHeader, FrameType, H2Error, Headers, WindowUpdate},
@@ -418,6 +419,18 @@ const DEFAULT_MAX_PENDING_WINDOW_UPDATES: usize = 1 + DEFAULT_MAX_CONCURRENT_STR
 /// sending GOAWAY with SETTINGS_TIMEOUT error code.
 const SETTINGS_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Wire size of the SETTINGS frame `serializer::gen_settings` writes.
+const SETTINGS_FRAME_SIZE: usize =
+    parser::FRAME_HEADER_SIZE + (parser::SETTINGS_ENTRY_SIZE * parser::SETTINGS_COUNT) as usize;
+/// Wire size of one WINDOW_UPDATE frame.
+const WINDOW_UPDATE_FRAME_SIZE: usize =
+    parser::FRAME_HEADER_SIZE + parser::WINDOW_UPDATE_PAYLOAD_SIZE as usize;
+/// Wire size of one RST_STREAM frame.
+const RST_STREAM_FRAME_SIZE: usize =
+    parser::FRAME_HEADER_SIZE + parser::RST_STREAM_PAYLOAD_SIZE as usize;
+/// Wire size of one GOAWAY frame without debug data.
+const GOAWAY_FRAME_SIZE: usize = parser::FRAME_HEADER_SIZE + parser::GOAWAY_PAYLOAD_SIZE as usize;
+
 #[inline(always)]
 fn error_nom_to_h2(error: nom::Err<parser::ParserError>) -> H2Error {
     match error {
@@ -756,14 +769,22 @@ pub struct ConnectionH2 {
     /// nothing outside `h2_drain.rs` can reach the raw fields — see
     /// [`h2_drain::H2DrainState`].
     pub(super) drain: h2_drain::H2DrainState,
-    /// Control-frame write scratch (WINDOW_UPDATE, RST_STREAM, GOAWAY,
-    /// SETTINGS) and the read landing zone for every stream-0 frame's own
-    /// header/payload bytes for the duration of ONE frame's read. It no
-    /// longer doubles as a HEADERS+CONTINUATION reassembly buffer — that
-    /// role moved to `Self::header_reassembly`; see that field's doc and
+    /// The read landing zone for every frame header and every stream-0
+    /// frame's own payload bytes, for the duration of ONE frame's read. It is
+    /// input only: control frames are serialised into `Self::output`
+    /// (#1604), and a HEADERS+CONTINUATION block is reassembled in
+    /// `Self::header_reassembly`; see that field's doc and
     /// `h2_header_reassembly.rs` for why, and LIFECYCLE.md invariant 24 for
-    /// the bugs the split closes.
+    /// the bugs the two splits close.
     pub zero: GenericHttpStream,
+    /// The single ordered output queue: every control frame, and the unsent
+    /// rest of the one stream frame a partial write cut, each queued whole.
+    /// Stream transmits send it first. See `h2_output.rs`.
+    output: h2_output::H2Output,
+    /// READABLE interest was withdrawn because [`Self::output`] reached the
+    /// read cap (`Self::output_read_cap`), and is restored once it drains
+    /// below it — HAProxy's `H2_CF_DEM_MROOM`.
+    reads_wait_for_output: bool,
     /// Owned accumulator for an in-progress HEADERS+CONTINUATION field
     /// block (`H2State::ContinuationHeader`/`ContinuationFrame`). Separated
     /// from [`Self::zero`] so a control-frame flush that clears and reuses
@@ -797,12 +818,6 @@ pub struct ConnectionH2 {
     /// 9113 §4.3: field-compression state is scoped to the connection, not
     /// the stream. See `LIFECYCLE.md`'s Discard section.
     discarded_field_block: Option<DiscardedFieldBlock>,
-    /// `zero` holds a PING or SETTINGS ACK that waits for the stream frame
-    /// parked in `expect_write` to be completed. Set by
-    /// [`Self::queue_zero_output`]; the write side hands `expect_write` to
-    /// `zero` once that frame is out, so the ACK follows it on the wire
-    /// instead of splitting it.
-    zero_output_deferred: bool,
     /// True once we've asked rustls to emit TLS close_notify for this frontend.
     close_notify_sent: bool,
     /// Per-listener H2 connection tuning (window size, max streams, shrink ratio).
@@ -1011,9 +1026,9 @@ pub(super) enum MetricEvent {
     StreamsReadyIncrementalByUrgency(i64),
 
     // ── Frames written to the peer ──────────────────────────────────────
-    /// A SETTINGS frame was serialised into the connection's zero buffer.
+    /// A SETTINGS frame was queued in the connection's output.
     SettingsFrameSent,
-    /// A PING ACK was serialised into the connection's zero buffer.
+    /// A PING ACK was queued in the connection's output.
     PingAckFrameSent,
     /// A GOAWAY frame was serialised. Deliberately **not** folded into
     /// [`Self::GoAwaySent`]: the decision to go away is unconditional, while
@@ -1375,11 +1390,11 @@ pub enum H2WriteTarget {
     /// [`h2_transmit::confirm`], then answer with
     /// [`ConnectionH2::handle_write`].
     ///
-    /// `stream_id` is never [`H2StreamId::Zero`]. Several sites park `Zero` in
-    /// `expect_write`, but the resume phase matches [`H2StreamId::Other`]
-    /// only and the scheduler loop walks real stream ids; `self.zero` is
-    /// flushed by `H2Shell::flush_zero_to_socket`, outside this pass
-    /// entirely.
+    /// `stream_id` is never [`H2StreamId::Zero`]: `self.zero` is input only,
+    /// the resume phase parks and matches [`H2StreamId::Other`] only, and the
+    /// scheduler loop walks real stream ids. The transmit sends the ordered
+    /// output queue first (`ConnectionH2::gather_transmit`), so the rest of a
+    /// frame an earlier write cut always leaves ahead of the next frame.
     Transmit { stream_id: H2StreamId },
     /// The pass is over and owes the readiness decision of LIFECYCLE §9
     /// invariant 16. Read `H2Shell::tls_wants_write`, hand it to
@@ -1395,6 +1410,28 @@ pub enum H2WriteTarget {
         socket_write: bool,
         bytes_written: usize,
     },
+}
+
+/// What one [`H2WriteTarget::Transmit`] write did, split the way
+/// [`ConnectionH2::handle_write`] settles it.
+///
+/// The transmit sends the ordered output queue first, then the stream's
+/// frames (`h2_transmit::gather_after`), so the socket's count is split at
+/// the queue's length; and when the write stopped inside a stream frame, the
+/// rest of that frame is adopted by the queue (#1604).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct H2Written {
+    /// What the socket took, all of it.
+    pub size: usize,
+    /// The part of `size` that came from the output queue. The rest,
+    /// `size - from_output`, is the stream's, and the caller already
+    /// confirmed exactly that much on the stream's `kawa`.
+    pub from_output: usize,
+    /// The unsent rest of the frame (or header block) the write cut, as
+    /// `h2_transmit::frame_tail` measured it before the confirm: still at the
+    /// front of the stream's `kawa.out`, and moved to the output queue by
+    /// [`ConnectionH2::handle_write`].
+    pub tail: usize,
 }
 
 /// What [`ConnectionH2::finalize_write`] wants its caller to do before it may
@@ -1438,11 +1475,11 @@ pub enum H2FinalizeTarget {
 /// What [`ConnectionH2::flush_pending_control_frames`] wants its caller to do
 /// with the pass it just ran a control-frame preamble over.
 ///
-/// [`Self::Stalled`] is what replaces the TLS re-arm the three stalled-drain
-/// tails used to perform inline. A zero-buffer flush that stalled has to be
-/// followed by a FRESH `H2Shell::tls_wants_write` — that write is what
-/// changes the answer, so no value read before it can stand in — and the
-/// shell that owns the socket is the layer that reads it.
+/// [`Self::Stalled`] is what replaces the TLS re-arm the stalled-drain tails
+/// used to perform inline. An output flush that stalled has to be followed by
+/// a FRESH `H2Shell::tls_wants_write` — that write is what changes the
+/// answer, so no value read before it can stand in — and the shell that owns
+/// the socket is the layer that reads it.
 ///
 /// [`Self::Proceed`] is the former `None`: it carries no `MuxResult` because
 /// the preamble did not end the pass, and `writable()` falls through to its
@@ -1453,61 +1490,28 @@ pub enum H2ControlFlushTarget {
     /// dispatch.
     Proceed,
     /// The preamble ended the pass by itself — a SETTINGS-ACK timeout GOAWAY,
-    /// an RST_STREAM lifetime-cap GOAWAY, or the deferred initial GOAWAY. This
-    /// is the pass's result, and no TLS query follows it.
+    /// an RST_STREAM lifetime-cap GOAWAY, or a deferred initial GOAWAY that
+    /// could not be serialised. This is the pass's result, and no TLS query
+    /// follows it.
     Done(MuxResult),
-    /// One of the three zero-buffer flushes stalled. Read
-    /// `tls_wants_write`, hand it to
+    /// The output flush stalled. Read `tls_wants_write`, hand it to
     /// [`ConnectionH2::ensure_tls_flushed`], and answer the pass with
     /// [`MuxResult::Continue`].
     Stalled,
-    /// A stage has put bytes in the connection's `zero` buffer, or resumed a
-    /// partially written one, and cannot move them itself. Drain the buffer to
-    /// the socket and answer with
-    /// [`ConnectionH2::handle_control_flush`], naming the stage back.
-    FlushZero(H2ControlFlushStage),
+    /// The connection's ordered output queue holds bytes: the control frames
+    /// this walk just serialised behind whatever was already queued. Drain
+    /// [`ConnectionH2::output_pending`] to the socket and answer with
+    /// [`ConnectionH2::handle_control_flush`].
+    FlushOutput,
 }
 
-/// Which of [`ConnectionH2::flush_pending_control_frames`]' three zero-buffer
-/// flushes an [`H2ControlFlushTarget::FlushZero`] is asking for.
-///
-/// It travels out with the request and back in with the answer, so
-/// [`ConnectionH2::handle_control_flush`] runs the continuation that belongs
-/// to the stage that asked rather than a shared one. The three differ: only
-/// `ResumeZero` re-enables READABLE interest on success, and only the two
-/// serialising stages re-arm `expect_write` on a stall.
-///
-/// Carrying the stage is what lets the `bool` stay a pure answer to "did that
-/// write stall". The alternative — a flag on the connection saying which stage
-/// is outstanding — would be a second place for the same fact to live, and
-/// `h2_close::TlsFlushPhase` documents what that costs on this very path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2ControlFlushStage {
-    /// The partially written zero buffer a previous pass left behind.
-    ResumeZero,
-    /// A freshly serialised WINDOW_UPDATE batch.
-    WindowUpdates,
-    /// A freshly serialised RST_STREAM batch.
-    RstStreams,
-}
-
-/// Where [`ConnectionH2::control_flush_from`] re-enters the stage sequence.
-///
-/// Ordered, and compared with `<=`, because the stages are a sequence: a
-/// continuation resumes at its own point and runs everything below it. Not
-/// [`H2ControlFlushStage`] reused — that enum names the three stages that
-/// ASK for a flush, while this one names the three points the walk can be
-/// entered at, and they are not the same three. `DeferredGoaway` covers the
-/// initial-GOAWAY stage, which asks for no flush of its own and so has no
-/// `H2ControlFlushStage`, while `RstCap` covers the cap check that precedes
-/// the RST drain.
-/// What a control-flush walk answers once every
-/// [`H2ControlFlushTarget::FlushZero`] it raised has been performed.
+/// What a control-flush walk answers once the
+/// [`H2ControlFlushTarget::FlushOutput`] it raised has been performed.
 ///
 /// [`H2ControlFlushTarget`] minus that variant. A separate enum rather than
 /// the same one, for the reason [`H2WritableStateTarget`] gives against
 /// reusing [`H2FinalizeTarget`]: `H2Shell::drive_control_flush` consumes every
-/// `FlushZero` itself, so sharing the enum would force a named-impossible arm
+/// `FlushOutput` itself, so sharing the enum would force a named-impossible arm
 /// into the write pass's match — a reader would have to work out that it
 /// cannot happen, and a later edit could make it happen without the match
 /// noticing.
@@ -1518,18 +1522,8 @@ enum ControlFlushOutcome {
     Proceed,
     /// The walk ended the pass by itself.
     Done(MuxResult),
-    /// One of the flushes stalled.
+    /// The output flush stalled.
     Stalled,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ControlFlushResume {
-    /// The whole sequence, from the zero-buffer resume onwards.
-    ResumeZero,
-    /// The deferred initial GOAWAY and everything below it.
-    DeferredGoaway,
-    /// The RST_STREAM lifetime-cap check and the drain below it.
-    RstCap,
 }
 
 /// What [`ConnectionH2::dispatch_writable_state`] wants its caller to do with
@@ -1778,7 +1772,7 @@ impl ConnectionH2 {
             && matches!(self.state, H2State::GoAway | H2State::Error)
             && self.stream_table.streams().is_empty()
             && self.stream_table.expect_write().is_none()
-            && self.zero.storage.is_empty()
+            && self.output.is_empty()
     }
 
     /// The next instant this connection wants its embedder to call `timeout()`
@@ -1873,6 +1867,8 @@ impl ConnectionH2 {
             pending_table_size_update: None,
             drain: h2_drain::H2DrainState::new(graceful_shutdown_deadline),
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
+            output: h2_output::H2Output::default(),
+            reads_wait_for_output: false,
             header_reassembly: h2_header_reassembly::HeaderBlockAccumulator::new(),
             bytes: H2ByteAccounting {
                 zero_bytes_read: 0,
@@ -1883,7 +1879,6 @@ impl ConnectionH2 {
             settings_sent_at: None,
             control_tx: h2_control_tx::H2ControlTx::new(),
             discarded_field_block: None,
-            zero_output_deferred: false,
             close_notify_sent: false,
             max_pending_window_updates: 1 + connection_config.max_concurrent_streams as usize * 4,
             connection_config,
@@ -1914,10 +1909,6 @@ impl ConnectionH2 {
     where
         L: ListenerHandler + L7ListenerHandler,
     {
-        debug_assert!(
-            !self.zero_holds_output(),
-            "no output may be pending in zero when a frame header is read"
-        );
         let i = self.zero.storage.data();
         trace!("{}   header: {:?}", log_context!(self), i);
         match parser::frame_header(i, self.local_settings.settings_max_frame_size) {
@@ -2383,13 +2374,14 @@ impl ConnectionH2 {
             self.readiness.event.remove(Ready::READABLE);
             return H2ReadTarget::Done(MuxResult::Continue);
         };
-        // `zero` is read into from its first byte: while it holds output (an
-        // ACK, a GOAWAY, the tail of a stalled WINDOW_UPDATE or RST_STREAM
-        // flush, a backend `end_stream` RST), a read there would parse that output as the
-        // peer's frame and clear it. Wait for the flush, which restores
-        // READABLE interest; the event is kept for that later read. A forced
-        // READABLE (the shutdown drive) must not bypass this either.
-        if stream_id == H2StreamId::Zero && self.zero_holds_output() {
+        // Every frame read can queue an answer in `self.output` (an ACK, a
+        // RST_STREAM, a WINDOW_UPDATE). Past one buffer of queued output the
+        // peer is not reading, so stop reading it too until that drains, as
+        // HAProxy's demux stops on a full `mbuf` (`H2_CF_DEM_MROOM`). The event
+        // is kept for the later read, and `Self::consume_output` restores the
+        // interest. A forced READABLE (the shutdown drive) is stopped as well.
+        if self.output.len() >= self.output_read_cap() {
+            self.reads_wait_for_output = true;
             self.readiness.interest.remove(Ready::READABLE);
             return H2ReadTarget::Done(MuxResult::Continue);
         }
@@ -2616,10 +2608,11 @@ impl ConnectionH2 {
                     }
                     Err(_) => return self.force_disconnect(),
                 };
-                let kawa = &mut self.zero;
-                match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
-                    Ok((_, size)) => {
-                        kawa.storage.fill(size);
+                let local_settings = &self.local_settings;
+                match self.output.push_frames(SETTINGS_FRAME_SIZE, |buf| {
+                    serializer::gen_settings(buf, local_settings).map(|(_, size)| size)
+                }) {
+                    Ok(_) => {
                         self.metric_events.push(MetricEvent::SettingsFrameSent);
                         // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
                         self.settings_sent_at = Some(self.now);
@@ -2634,7 +2627,7 @@ impl ConnectionH2 {
                     }
                 };
                 // Enlarge the connection-level receive window beyond the RFC
-                // default of 65 535 bytes, in the same `zero` flush as the
+                // default of 65 535 bytes, in the same output flush as the
                 // SETTINGS above and the ACK `handle_frame` appends below: one
                 // `writev(2)` for the whole server preface instead of a second
                 // write pass for a queued WINDOW_UPDATE. RFC 9113 §3.4 only
@@ -2647,9 +2640,10 @@ impl ConnectionH2 {
                     .initial_connection_window
                     .saturating_sub(DEFAULT_INITIAL_WINDOW_SIZE);
                 if increment > 0 {
-                    match serializer::gen_window_update(kawa.storage.space(), 0, increment) {
-                        Ok((_, size)) => {
-                            kawa.storage.fill(size);
+                    match self.output.push_frames(WINDOW_UPDATE_FRAME_SIZE, |buf| {
+                        serializer::gen_window_update(buf, 0, increment).map(|(_, size)| size)
+                    }) {
+                        Ok(_) => {
                             self.metric_events
                                 .push(MetricEvent::WindowUpdateFramesSent(1));
                         }
@@ -2665,7 +2659,6 @@ impl ConnectionH2 {
                 }
 
                 self.state = H2State::ServerSettings;
-                self.stream_table.set_expect_write(Some(H2StreamId::Zero));
                 self.readiness.signal_pending_write();
                 return self.handle_frame(settings, 0, context, endpoint);
             }
@@ -2951,7 +2944,9 @@ impl ConnectionH2 {
                             &self.position,
                             write_stream,
                         );
-                        if !kawa.out.is_empty() {
+                        // The queue can hold the adopted rest of this very
+                        // stream's frame: it goes out first, in this transmit.
+                        if !kawa.out.is_empty() || !self.output.is_empty() {
                             return H2WriteTarget::Transmit {
                                 stream_id: write_stream,
                             };
@@ -3017,14 +3012,6 @@ impl ConnectionH2 {
                                 endpoint.end_stream(token, global_stream_id, context);
                             }
                         }
-                    }
-                    if self.zero_output_deferred {
-                        // The parked frame is complete: the ACK waiting in
-                        // `zero` goes next, before any other stream frame.
-                        self.zero_output_deferred = false;
-                        self.stream_table.set_expect_write(Some(H2StreamId::Zero));
-                        self.readiness.signal_pending_write();
-                        return H2WriteTarget::Done(MuxResult::Continue);
                     }
                     self.begin_scheduler_pass(context, pass);
                 }
@@ -3235,7 +3222,10 @@ impl ConnectionH2 {
                             &self.position,
                             write_stream,
                         );
-                        if !kawa.out.is_empty() {
+                        // A write that cut this stream's last frame left its
+                        // rest in the output queue and `kawa.out` empty: that
+                        // rest goes now, not after another stream's frames.
+                        if !kawa.out.is_empty() || !self.output.is_empty() {
                             // The pre-image raised this flag at the top of every
                             // round of the SCHEDULER loop's flush and never in
                             // the resume path's, which passed `None` for it.
@@ -3561,12 +3551,37 @@ impl ConnectionH2 {
         &mut self,
         context: &mut Context<L>,
         stream_id: H2StreamId,
-        size: usize,
+        written: H2Written,
         status: SocketResult,
         pass: &mut H2WritePass,
     ) where
         L: ListenerHandler + L7ListenerHandler,
     {
+        let H2Written {
+            size,
+            from_output,
+            tail,
+        } = written;
+        // The queue went first. Its own bytes are connection overhead, and
+        // `consume_output` restores reading if they were holding it back.
+        if from_output > 0 {
+            self.consume_output(from_output);
+        }
+        // The stream's share: what the socket took past the queue, plus the
+        // unsent rest of the frame it cut, which the queue adopts now and
+        // sends ahead of anything queued later (#1604). That rest is counted
+        // to the stream here, since it is committed and the stream may be
+        // gone by the time the queue sends it.
+        if tail > 0 {
+            let kawa = write_buffer(
+                &mut self.zero,
+                &mut context.streams,
+                &self.position,
+                stream_id,
+            );
+            self.output.adopt_tail(kawa, tail);
+        }
+        let committed = size - from_output + tail;
         let resuming = matches!(pass.phase, H2WritePhase::Resume { .. });
         // `2` for the resume path and `3` for the scheduler loop, the two
         // `debug_site` values the pre-image passed from its two call sites.
@@ -3587,7 +3602,7 @@ impl ConnectionH2 {
         context
             .debug
             .push(DebugEvent::SocketIO(debug_site, global_stream_id, size));
-        let event = self.position.bytes_out_event(size);
+        let event = self.position.bytes_out_event(committed);
         self.metric_events.push(event);
         if let H2StreamId::Other {
             gid: global_stream_id,
@@ -3595,7 +3610,7 @@ impl ConnectionH2 {
         } = stream_id
         {
             self.position
-                .count_bytes_out(&mut context.streams[global_stream_id].metrics, size);
+                .count_bytes_out(&mut context.streams[global_stream_id].metrics, committed);
             // LIFECYCLE §9 invariant 9, write side. Outbound APPLICATION data
             // is activity; an acknowledgement is not. Both halves of this
             // condition are load-bearing and neither is implied by reaching
@@ -3606,14 +3621,14 @@ impl ConnectionH2 {
             // at pass entry, so arming from here lands on the same instant the
             // top of the pass would have computed — the gate is the whole
             // change, not the moment.
-            if size > 0 {
+            if committed > 0 {
                 self.arm_timeout();
             }
         }
         if resuming {
-            pass.resume_bytes = pass.resume_bytes.saturating_add(size);
+            pass.resume_bytes = pass.resume_bytes.saturating_add(committed);
         } else {
-            pass.stream_bytes = pass.stream_bytes.saturating_add(size);
+            pass.stream_bytes = pass.stream_bytes.saturating_add(committed);
         }
         if let Some(amount) = cross_read_amount {
             // Resume path: same stream is parked waiting for buffer space.
@@ -3673,12 +3688,11 @@ impl ConnectionH2 {
     /// condition — and pass that binding: nothing mutates the socket in
     /// between, so a second query would answer the same. The sixth, the
     /// [`H2ControlFlushTarget::Stalled`] arm of [`H2Shell::writable`], has no
-    /// such binding and must read it AFTER the `H2Shell::flush_zero_to_socket`
+    /// such binding and must read it AFTER the `H2Shell::flush_output_to_socket`
     /// whose stall brought it there: that write is what changes the answer.
-    /// The three stalled-drain tails of
-    /// [`Self::flush_pending_control_frames`] used to read it and re-arm
-    /// individually; they now answer [`H2ControlFlushTarget::Stalled`] and
-    /// that one arm re-arms for all three.
+    /// The stalled-drain tails of [`Self::flush_pending_control_frames`] used
+    /// to read it and re-arm individually; its one output flush now answers
+    /// [`H2ControlFlushTarget::Stalled`] and that arm re-arms.
     pub fn ensure_tls_flushed(&mut self, tls_wants_write: bool) {
         if tls_wants_write {
             self.readiness.signal_pending_write();
@@ -3753,11 +3767,7 @@ impl ConnectionH2 {
         self.discarded_field_block = None;
         self.stream_table
             .set_expect_read(Some((H2StreamId::Zero, remaining)));
-        // While `zero` holds unflushed output, READABLE stays off: the
-        // `ResumeZero` flush stage restores it once that output is gone.
-        if !self.zero_holds_output() {
-            self.readiness.interest.insert(Ready::READABLE);
-        }
+        self.readiness.interest.insert(Ready::READABLE);
     }
 
     /// Whether the read in progress is an orphaned DATA remainder that is
@@ -3867,7 +3877,9 @@ impl ConnectionH2 {
             self.stream_table.expect_write().is_some(),
             bytes_written_this_pass > 0,
             || any_stream_has_pending_back(self.stream_table.streams(), &context.streams),
-            self.control_tx.has_pending() || !self.flow_control.pending_window_updates_is_empty(),
+            self.control_tx.has_pending()
+                || !self.flow_control.pending_window_updates_is_empty()
+                || !self.output.is_empty(),
         );
         match action {
             // A parked `expect_write` owns the next tick: no bit moves.
@@ -3885,14 +3897,15 @@ impl ConnectionH2 {
                 ));
                 H2FinalizeTarget::Done(MuxResult::Continue)
             }
-            // Control-frame liveness: `flush_pending_control_frames` is gated
-            // on `expect_write.is_none()`, so when a prior partial write
-            // deferred the flush the RST / WINDOW_UPDATE queues stay non-empty
-            // after `expect_write` finally drains. Without this rearm the next
-            // tick would drop `Ready::WRITABLE` and the queued RST would stall
-            // until an unrelated event re-triggered writable — which is
-            // exactly the scenario h2spec trips by sending back-to-back
-            // malformed streams.
+            // Control-frame liveness: a pass that ended before
+            // `flush_pending_control_frames` drained the RST / WINDOW_UPDATE
+            // queues, or with bytes still in the ordered output queue, must
+            // keep `Ready::WRITABLE`. Without this rearm the next tick would
+            // drop it and the queued frame would stall until an unrelated
+            // event re-triggered writable — which is exactly the scenario
+            // h2spec trips by sending back-to-back malformed streams. A
+            // stalled output flush parks the pass before it gets here, so
+            // the output leg is defence in depth (#1604).
             FinalizeAction::ArmControlQueue => {
                 #[cfg(debug_assertions)]
                 context.debug.push(DebugEvent::Str(
@@ -3989,31 +4002,15 @@ impl ConnectionH2 {
     /// no longer representable as bytes a control-frame flush can touch, by
     /// construction, not by convention.
     ///
-    /// What THIS flag still guards is narrower but still real: a single
-    /// CONTINUATION frame's payload can be *mid-flight* in `zero.storage` —
-    /// a `socket_read()` that has only partially filled this one frame —
-    /// when a write pass runs in the same event-loop sweep (`mod.rs`'s
-    /// inner loop dispatches frontend `readable()` then `writable()`
-    /// together). Losing those bytes would still corrupt an otherwise-
-    /// completable block. Checked at every site that clears or reuses
-    /// `zero.storage`'s write-scratch role: the frontend-hung-up-while-
-    /// draining, WINDOW_UPDATE-drain and RST_STREAM-drain stages and the
-    /// deferred-initial-GOAWAY-readiness check, all four in
-    /// [`Self::flush_pending_control_frames`]; plus [`Self::graceful_goaway`]'s
-    /// own defer-or-send decision and [`H2Shell::flush_zero_buffer`]'s no-op
-    /// guard — six call sites in total. All six were already present
-    /// except the frontend-hung-up-while-draining one, added in the review
-    /// that found #1423's premise wrong: that stage used to assume
-    /// `Ready::HUP` means no further bytes can ever arrive, which mio's own
-    /// `is_read_closed()` documentation contradicts (a TCP half-close can
-    /// still have unread data queued) — see that stage's own comment and
-    /// `h2_header_reassembly.rs`'s module doc for the full account.
-    ///
-    /// The write side already protects the mirror case — while a zero-buffer
-    /// write is stalled (`expect_write == Some(Zero)`), READABLE interest is
-    /// explicitly disabled (see the comment a few lines below) so a fresh
-    /// frame read cannot clobber the pending write. This is the missing
-    /// other half of that same invariant.
+    /// Since #1604 `zero` is input only, too: control frames are queued in
+    /// `self.output`, so no write-side site can clear or reuse the bytes of
+    /// a CONTINUATION frame still *mid-flight* in `zero.storage` either. The
+    /// one remaining reader is the initial graceful GOAWAY's defer-or-send
+    /// decision ([`Self::graceful_goaway`], and its deferred send in
+    /// [`Self::flush_pending_control_frames`]), which `h2_drain` still
+    /// defers until the block completes. That deferral no longer protects a
+    /// buffer; it only delays an advisory frame, and is kept because
+    /// removing it would be a change to the drain policy, not to the output.
     fn header_block_reassembly_in_progress(&self) -> bool {
         matches!(
             self.state,
@@ -4021,60 +4018,38 @@ impl ConnectionH2 {
         )
     }
 
-    /// Flush pending control frames (zero-buffer resume, WINDOW_UPDATEs, RST_STREAMs)
-    /// before entering the main writable state machine.
+    /// Queue pending control frames (WINDOW_UPDATEs, RST_STREAMs) behind the
+    /// ordered output and flush it, before entering the main writable state
+    /// machine.
     ///
     /// Answers [`H2ControlFlushTarget`]: [`H2ControlFlushTarget::Proceed`]
     /// when `writable()` should carry on into its state dispatch,
     /// [`H2ControlFlushTarget::Done`] when a GOAWAY already ended the pass,
-    /// [`H2ControlFlushTarget::FlushZero`] when a stage has bytes in `zero`
-    /// for the caller to move, and [`H2ControlFlushTarget::Stalled`] when one
-    /// of those moves stalled — in which case the caller reads
-    /// `tls_wants_write` and hands it to [`Self::ensure_tls_flushed`].
+    /// [`H2ControlFlushTarget::FlushOutput`] when [`Self::output_pending`]
+    /// holds bytes for the caller to move, and
+    /// [`H2ControlFlushTarget::Stalled`] when that move stalled — in which
+    /// case the caller reads `tls_wants_write` and hands it to
+    /// [`Self::ensure_tls_flushed`].
     ///
-    /// `flush_zero_to_socket` no longer lives here, and could not: it writes
-    /// to a socket this type no longer owns. What is left in its place is the
-    /// same protocol the rest of this file's write path already speaks — the
-    /// core answers a step, the caller performs the socket work, and the core
-    /// is told what the socket said, through
-    /// [`Self::handle_control_flush`]. Three stages ask for it, so
-    /// [`H2ControlFlushStage`] names which one is asking and the answer comes
-    /// back to the continuation that belongs to it.
+    /// The socket write is the caller's, as everywhere on this write path:
+    /// the core answers a step, the caller performs the socket work, and the
+    /// core is told what the socket said, through
+    /// [`Self::handle_control_flush`].
     ///
-    /// The stages are a SEQUENCE, not a set, and each one's post-flush action
-    /// differs, which is why this is a resumable walk rather than three
-    /// independent calls. The walk cannot restart from the top after a flush:
-    /// the two stages above the preamble — the hung-up-while-draining cleanup
-    /// and the SETTINGS-ACK timeout — are not idempotent with respect to a
-    /// partly drained connection, and re-entering them mid-pass would let a
-    /// `frontend_hung_up_while_draining()` connection clear a buffer the
-    /// caller has just been told to send.
+    /// There is one flush, at the end. Every stage appends whole frames to
+    /// the one ordered output queue (#1604), so a stage no longer has to wait
+    /// for an earlier one's bytes to leave a shared buffer before it can
+    /// serialise, and whatever was already queued — an ACK, the rest of a
+    /// stream frame a partial write cut — stays ahead of what this walk adds.
     pub fn flush_pending_control_frames(&mut self) -> H2ControlFlushTarget {
-        // CORRECTION (review of e1c3c2fb, B2): this stage used to clear
-        // `zero.storage` unconditionally here, on the theory that
-        // `frontend_hung_up_while_draining()` firing meant "no further
-        // bytes can ever arrive". That is false: `Ready::HUP` is
-        // `is_read_closed() || is_write_closed()`
-        // (`command/src/ready.rs`), and mio documents `is_read_closed()` as
-        // true not only on a full close but also when "the peer stream has
-        // shutdown the write half of its socket" (TCP half-close) — a
-        // FIN with data the peer already sent still sitting in the kernel
-        // receive queue, unread. `drive_frontend_shutdown_io` (`mod.rs`)
-        // force-calls `readable()` for H2 on every `shutting_down()` poll,
-        // so a CONTINUATION frame split across TCP segments can have its
-        // partial payload wiped here — mid-flight, not stale — one
-        // `readable()` pass before the rest of it would have been read.
-        // `self.header_reassembly` still protects the ACCUMULATED history
-        // of a block from every other write-side site (see
-        // `h2_header_reassembly.rs`); what this stage could still corrupt
-        // is the same narrower "one frame still mid-`socket_read()`" window
-        // the three sibling stages below already guard — so it now shares
-        // their guard instead of being the one stage that does not.
+        // The peer hung up while the connection drains: nothing queued for it
+        // will be read. Only OUTPUT is dropped. `zero` is input only, and a
+        // `Ready::HUP` can be a TCP half-close with frames the peer already
+        // sent still unread (review of e1c3c2fb, B2), which the shutdown
+        // drive's forced `readable()` goes on to read.
         if self.frontend_hung_up_while_draining() {
             self.stream_table.set_expect_write(None);
-            if !self.header_block_reassembly_in_progress() {
-                self.zero.storage.clear();
-            }
+            self.clear_output();
             self.flow_control.clear_pending_window_updates();
             self.control_tx.clear_pending();
         }
@@ -4091,138 +4066,49 @@ impl ConnectionH2 {
             return H2ControlFlushTarget::Done(self.goaway(H2Error::SettingsTimeout));
         }
 
-        self.control_flush_from(ControlFlushResume::ResumeZero)
-    }
-
-    /// Answer the [`H2ControlFlushTarget::FlushZero`] the caller just
-    /// performed, and carry the walk on from there.
-    ///
-    /// `stage` is the one the answer belongs to and `stalled` is what the
-    /// caller's write reported — two parameters of ONE function that the
-    /// raising side cannot have pre-bound, which is the discipline
-    /// [`H2WritableStateTarget::Flush`] keeps by carrying no `bool`. Each
-    /// stage's post-flush action is different and lives in its own arm:
-    /// only the zero-buffer resume re-enables READABLE, and only the two
-    /// serialising stages re-arm `expect_write` on a stall, because only they
-    /// put bytes in `zero` that nothing else would come back for.
-    pub fn handle_control_flush(
-        &mut self,
-        stage: H2ControlFlushStage,
-        stalled: bool,
-    ) -> H2ControlFlushTarget {
-        match stage {
-            H2ControlFlushStage::ResumeZero => {
-                if stalled {
-                    return H2ControlFlushTarget::Stalled;
-                }
-                // When H2StreamId::Zero is used to write, READABLE is disabled —
-                // re-enable it now that the flush is complete.
-                self.readiness.interest.insert(Ready::READABLE);
-                self.stream_table.set_expect_write(None);
-                self.zero_output_deferred = false;
-                self.control_flush_from(ControlFlushResume::DeferredGoaway)
-            }
-            H2ControlFlushStage::WindowUpdates => {
-                if stalled {
-                    self.stream_table.set_expect_write(Some(H2StreamId::Zero));
-                    return H2ControlFlushTarget::Stalled;
-                }
-                self.control_flush_from(ControlFlushResume::RstCap)
-            }
-            H2ControlFlushStage::RstStreams => {
-                if stalled {
-                    self.stream_table.set_expect_write(Some(H2StreamId::Zero));
-                    return H2ControlFlushTarget::Stalled;
-                }
-                H2ControlFlushTarget::Proceed
-            }
-        }
-    }
-
-    /// The stage sequence itself, entered at `resume`.
-    ///
-    /// Private, and deliberately not a public resumption surface: the only
-    /// legal entry points are the top of the walk
-    /// ([`Self::flush_pending_control_frames`]) and the three continuations
-    /// ([`Self::handle_control_flush`]). A caller able to name an arbitrary
-    /// resume point could skip the SETTINGS-ACK timeout or re-run a
-    /// serialisation into a buffer the socket is still draining.
-    fn control_flush_from(&mut self, resume: ControlFlushResume) -> H2ControlFlushTarget {
-        if resume <= ControlFlushResume::ResumeZero {
-            // Stage — resume zero-buffer flush.
-            // If a previous write was partial, finish it before serialising any
-            // new control frames. Don't reset the timeout for control frame
-            // writes (SETTINGS ACK, PING response, WINDOW_UPDATE) — only
-            // application-data writes should reset it.
-            if let Some(H2StreamId::Zero) = self.stream_table.expect_write() {
-                return H2ControlFlushTarget::FlushZero(H2ControlFlushStage::ResumeZero);
-            }
-            // A deferred ACK whose parked stream was removed before its frame
-            // resumed: nothing is half-written any more, so `zero` goes now.
-            if self.zero_output_deferred && self.stream_table.expect_write().is_none() {
-                self.stream_table.set_expect_write(Some(H2StreamId::Zero));
-                return H2ControlFlushTarget::FlushZero(H2ControlFlushStage::ResumeZero);
+        // Stage — queue a deferred initial GOAWAY.
+        // `graceful_goaway` defers it while a header block is being
+        // reassembled — see its comment and `send_initial_goaway`. Queue it now
+        // that reassembly has completed, and let the flush below send it this
+        // pass; if reassembly is still in progress, leave the flag set and
+        // retry on a later pass (nothing is lost: `graceful_goaway` already
+        // armed WRITABLE). The reassembly check stays here, computed by this
+        // caller: `H2DrainState` has no `self.state` to compute it itself —
+        // see `h2_drain`'s module doc.
+        if self
+            .drain
+            .take_deferred_initial_goaway(!self.header_block_reassembly_in_progress())
+        {
+            let result = self.send_initial_goaway();
+            if !matches!(result, MuxResult::Continue) {
+                return H2ControlFlushTarget::Done(result);
             }
         }
 
-        if resume <= ControlFlushResume::DeferredGoaway {
-            // Stage — send a deferred initial GOAWAY.
-            // `graceful_goaway` could not serialize into `self.zero.storage`
-            // while `header_block_reassembly_in_progress()` was true — see its
-            // comment and `send_initial_goaway`. Send it now that reassembly has
-            // completed; if it is still in progress this call, leave the flag
-            // set and retry on a later pass (nothing is lost: `graceful_goaway`
-            // already armed WRITABLE, and completing the reassembly re-enters
-            // this function via the next writable() call in the same
-            // readable()/writable() sweep). The readiness/reassembly check stays
-            // here, computed by this caller: `H2DrainState` has neither
-            // `self.stream_table` nor `self.state` to compute it itself — see
-            // `h2_drain`'s module doc.
-            let ready_to_flush_initial_goaway = self.stream_table.expect_write().is_none()
-                && !self.header_block_reassembly_in_progress();
-            if self
-                .drain
-                .take_deferred_initial_goaway(ready_to_flush_initial_goaway)
-            {
-                return H2ControlFlushTarget::Done(self.send_initial_goaway());
-            }
-
-            // Stage — drain pending WINDOW_UPDATE frames.
-            // Serialize and flush them inline to avoid extra event loop
-            // iterations that could cause response data to be sent before
-            // subsequent frames are validated.
-            //
-            // Deferred while a header block is being reassembled: this stage
-            // clears and reuses `self.zero.storage`, which right now holds the
-            // bytes accumulated from an earlier HEADERS/CONTINUATION frame on
-            // some (possibly different) stream, awaiting its own CONTINUATION.
-            // The queued WINDOW_UPDATEs stay queued — WRITABLE was already
-            // armed when they were enqueued (`Self::queue_window_update`), so
-            // the next `writable()` call after the block completes drains them
-            // normally; nothing is lost, only delayed.
-            if !self.flow_control.pending_window_updates_is_empty()
-                && self.stream_table.expect_write().is_none()
-                && !self.header_block_reassembly_in_progress()
-            {
-                let kawa = &mut self.zero;
-                kawa.storage.clear();
-                let buf = kawa.storage.space();
-                // Emission order is the deterministic ascending stream_id order
-                // `H2FlowControl` guarantees — see its module doc — not
-                // insertion/arrival order.
-                let (offset, frames_written) = self.flow_control.drain_window_updates_into(buf);
-                if frames_written > 0 {
-                    self.metric_events
-                        .push(MetricEvent::WindowUpdateFramesSent(frames_written as i64));
-                }
-                if offset > 0 {
-                    kawa.storage.fill(offset);
-                    return H2ControlFlushTarget::FlushZero(H2ControlFlushStage::WindowUpdates);
-                }
+        // Stage — queue pending WINDOW_UPDATE frames.
+        // Queued inline to avoid extra event loop iterations that could cause
+        // response data to be sent before subsequent frames are validated.
+        let pending = self.flow_control.pending_window_updates_len();
+        if pending > 0 {
+            let flow_control = &mut self.flow_control;
+            let mut frames_written = 0;
+            // Emission order is the deterministic ascending stream_id order
+            // `H2FlowControl` guarantees — see its module doc — not
+            // insertion/arrival order.
+            let _ = self
+                .output
+                .push_frames(pending * WINDOW_UPDATE_FRAME_SIZE, |buf| {
+                    let (offset, frames) = flow_control.drain_window_updates_into(buf);
+                    frames_written = frames;
+                    Ok::<_, std::convert::Infallible>(offset)
+                });
+            if frames_written > 0 {
+                self.metric_events
+                    .push(MetricEvent::WindowUpdateFramesSent(frames_written as i64));
             }
         }
 
-        // Stage — RST_STREAM cap check + drain.
+        // Stage — RST_STREAM cap check + queue.
         // Check the lifetime total (not just pending queue length) because
         // writable() drains the queue between readable() calls, so the
         // pending count alone may never reach the cap even under sustained
@@ -4239,32 +4125,37 @@ impl ConnectionH2 {
             return H2ControlFlushTarget::Done(self.goaway(H2Error::EnhanceYourCalm));
         }
 
-        // Flush pending RST_STREAM frames (queued when refusing streams).
-        // Accounting happens at queue-time inside `Self::enqueue_rst`, so
-        // this drain only serialises and flushes — no metric/flood calls
-        // here would double-count.
-        //
-        // Deferred while a header block is being reassembled, for the same
-        // `self.zero.storage` reuse reason as the WINDOW_UPDATE stage above
-        // — `Self::enqueue_rst` already arms WRITABLE, so this is a delay,
-        // not a drop.
-        if self.control_tx.has_pending()
-            && self.stream_table.expect_write().is_none()
-            && !self.header_block_reassembly_in_progress()
-        {
-            let kawa = &mut self.zero;
-            kawa.storage.clear();
-            let buf = kawa.storage.space();
-            // Emission order is queue order, which is arrival order over
-            // already-deduped stream ids — see `h2_control_tx`'s module doc.
-            let (offset, _frames_written) = self.control_tx.drain_rst_streams_into(buf);
-            if offset > 0 {
-                kawa.storage.fill(offset);
-                return H2ControlFlushTarget::FlushZero(H2ControlFlushStage::RstStreams);
-            }
+        // Queue pending RST_STREAM frames (queued when refusing streams).
+        // Accounting happens at queue-time inside `Self::enqueue_rst`, so this
+        // only serialises — no metric/flood calls here would double-count.
+        // Emission order is queue order, which is arrival order over
+        // already-deduped stream ids — see `h2_control_tx`'s module doc.
+        let pending = self.control_tx.pending_len();
+        if pending > 0 {
+            let control_tx = &mut self.control_tx;
+            let _ = self
+                .output
+                .push_frames(pending * RST_STREAM_FRAME_SIZE, |buf| {
+                    let (offset, _frames_written) = control_tx.drain_rst_streams_into(buf);
+                    Ok::<_, std::convert::Infallible>(offset)
+                });
         }
 
-        H2ControlFlushTarget::Proceed
+        if self.output.is_empty() {
+            H2ControlFlushTarget::Proceed
+        } else {
+            H2ControlFlushTarget::FlushOutput
+        }
+    }
+
+    /// Answer the [`H2ControlFlushTarget::FlushOutput`] the caller just
+    /// performed: `stalled` is what the caller's write reported.
+    pub fn handle_control_flush(&mut self, stalled: bool) -> H2ControlFlushTarget {
+        if stalled {
+            H2ControlFlushTarget::Stalled
+        } else {
+            H2ControlFlushTarget::Proceed
+        }
     }
 
     /// Take `writable()`'s `(H2State, Position)` decision, given the answer
@@ -4330,8 +4221,12 @@ impl ConnectionH2 {
             // written in the caller's control-frame preamble; let the readable
             // path consume the remaining frame payload.
             (H2State::Discard, _) => H2WritableStateTarget::Done(MuxResult::Continue),
-            // A GOAWAY waiting for a half-written stream frame: finish that
-            // frame first, or the GOAWAY is never sent.
+            // A stream parked by a stalled write still has whole frames
+            // queued. The rest of the frame the stall cut, if any, already
+            // went with the GOAWAY from the ordered output (#1604); finish
+            // the others before the close decision, since a GOAWAY does not
+            // close the streams at or below its last stream id (RFC 9113
+            // §6.8).
             (H2State::GoAway, _)
                 if matches!(
                     self.stream_table.expect_write(),
@@ -4369,14 +4264,12 @@ impl ConnectionH2 {
             }
             (H2State::ClientPreface, Position::Client(..)) => {
                 trace!("{} Preparing preface and settings", log_context!(self));
-                let pri = serializer::H2_PRI.as_bytes();
-                let kawa = &mut self.zero;
-
-                kawa.storage.space()[0..pri.len()].copy_from_slice(pri);
-                kawa.storage.fill(pri.len());
-                match serializer::gen_settings(kawa.storage.space(), &self.local_settings) {
-                    Ok((_, size)) => {
-                        kawa.storage.fill(size);
+                self.output.push(serializer::H2_PRI.as_bytes());
+                let local_settings = &self.local_settings;
+                match self.output.push_frames(SETTINGS_FRAME_SIZE, |buf| {
+                    serializer::gen_settings(buf, local_settings).map(|(_, size)| size)
+                }) {
+                    Ok(_) => {
                         self.metric_events.push(MetricEvent::SettingsFrameSent);
                         // RFC 9113 §6.5: start tracking SETTINGS ACK timeout
                         self.settings_sent_at = Some(self.now);
@@ -4392,7 +4285,7 @@ impl ConnectionH2 {
                 };
 
                 self.state = H2State::ClientSettings;
-                self.stream_table.set_expect_write(Some(H2StreamId::Zero));
+                self.readiness.signal_pending_write();
                 H2WritableStateTarget::Done(MuxResult::Continue)
             }
             (H2State::ClientSettings, Position::Client(..)) => {
@@ -4400,6 +4293,11 @@ impl ConnectionH2 {
                 self.state = H2State::ServerSettings;
                 self.stream_table
                     .set_expect_read(Some((H2StreamId::Zero, 9)));
+                // A backend connection starts write-only
+                // (`Connection::new_h2_client`); it reads from here on, for
+                // the server's SETTINGS. The preamble's output flush used to
+                // turn READABLE on as a side effect of draining `zero`.
+                self.readiness.interest.insert(Ready::READABLE);
                 self.readiness.interest.remove(Ready::WRITABLE);
                 H2WritableStateTarget::Done(MuxResult::Continue)
             }
@@ -5263,11 +5161,6 @@ impl ConnectionH2 {
         // the elapsed check is still true, and we emit another
         // `warn!` + `goaway()` pair, each bumping `h2.goaway.sent.*`.
         self.settings_sent_at = None;
-        // Output already queued in `zero` (an ACK) stays ahead of the GOAWAY.
-        if !self.zero_holds_output() {
-            self.zero.storage.clear();
-        }
-        let kawa = &mut self.zero;
         // Severity tiering: only `InternalError` implies a sozu-side bug when
         // WE emit it. Every other non-`NoError` reason is "peer misbehaved,
         // sozu defended correctly" — operators don't need paging on abusive
@@ -5282,17 +5175,16 @@ impl ConnectionH2 {
         }
         self.metric_events.push(MetricEvent::GoAwaySent(error));
 
-        // RFC 9113 §6.8: last_stream_id is the highest peer-initiated stream we processed
-        match serializer::gen_goaway(
-            kawa.storage.space(),
-            self.stream_table.highest_peer_stream_id(),
-            error,
-        ) {
-            Ok((_, size)) => {
-                kawa.storage.fill(size);
+        // RFC 9113 §6.8: last_stream_id is the highest peer-initiated stream
+        // we processed. Queued behind whatever output is already waiting (an
+        // ACK, the rest of a stream frame), never in place of it.
+        let last_stream_id = self.stream_table.highest_peer_stream_id();
+        match self.output.push_frames(GOAWAY_FRAME_SIZE, |buf| {
+            serializer::gen_goaway(buf, last_stream_id, error).map(|(_, size)| size)
+        }) {
+            Ok(_) => {
                 self.metric_events.push(MetricEvent::GoAwayFrameSent);
                 self.state = H2State::GoAway;
-                self.park_zero_output();
                 self.readiness.interest = Ready::WRITABLE | Ready::HUP | Ready::ERROR;
                 self.readiness.signal_pending_write();
                 MuxResult::Continue
@@ -5324,16 +5216,16 @@ impl ConnectionH2 {
     /// `ready()` and therefore outside the pass that last refreshed the
     /// mirror. In-module callers pass `self.now`.
     pub fn graceful_goaway(&mut self, now: Instant) -> MuxResult {
-        // `self.zero.storage` is also the read-side accumulation buffer for
-        // an in-flight HEADERS/CONTINUATION field block
-        // (`header_block_reassembly_in_progress`, a few lines above the
-        // WINDOW_UPDATE stage of `flush_pending_control_frames`): clearing it
-        // here to serialize the GOAWAY would destroy that reassembly out from
-        // under it, directly contradicting the "existing streams should
-        // continue reading" promise below. `H2DrainState::begin_graceful_drain`
-        // decides whether to defer for exactly that reason, given this
-        // caller-computed check — the module has no `H2State` of its own to
-        // read it with.
+        // While a HEADERS/CONTINUATION field block is being reassembled
+        // (`header_block_reassembly_in_progress`), the advisory GOAWAY is
+        // deferred until the block completes. Since #1604 that defers nothing
+        // a buffer needs: the GOAWAY is queued in the separate `self.output`,
+        // which shares nothing with `zero` or `header_reassembly`, so it
+        // could not clobber the block. The deferral is kept as drain policy
+        // (LIFECYCLE.md invariant 24, as amended) rather than removed here,
+        // since that would change the drain, not the output.
+        // `H2DrainState::begin_graceful_drain` takes this caller-computed
+        // check because the module has no `H2State` of its own to read.
         let reassembly_in_progress = self.header_block_reassembly_in_progress();
         match self.drain.begin_graceful_drain(now, reassembly_in_progress) {
             // Second GOAWAY: send with the real last_stream_id.
@@ -5363,7 +5255,8 @@ impl ConnectionH2 {
 
     /// Serializes and queues the first, advisory GOAWAY
     /// (`NO_ERROR`, `last_stream_id = STREAM_ID_MAX`) of a graceful drain
-    /// into `self.zero.storage`.
+    /// in the ordered output queue (`self.output`), behind whatever is
+    /// already queued there.
     ///
     /// Split out of [`Self::graceful_goaway`] so
     /// [`Self::flush_pending_control_frames`] can call it once an in-flight
@@ -5374,11 +5267,6 @@ impl ConnectionH2 {
         // Keep expect_read as-is: existing streams should continue reading
         // data during the drain window opened by the initial GOAWAY. Only
         // the final GOAWAY (via `goaway()`) removes READABLE.
-        // Output already queued in `zero` (an ACK) stays ahead of the GOAWAY.
-        if !self.zero_holds_output() {
-            self.zero.storage.clear();
-        }
-        let kawa = &mut self.zero;
         debug!(
             "{} GOAWAY (graceful, initial): last_stream_id=0x7FFFFFFF",
             log_context!(self)
@@ -5391,16 +5279,17 @@ impl ConnectionH2 {
         self.metric_events
             .push(MetricEvent::GoAwaySent(H2Error::NoError));
 
-        match serializer::gen_goaway(kawa.storage.space(), STREAM_ID_MAX, H2Error::NoError) {
-            Ok((_, size)) => {
-                kawa.storage.fill(size);
+        // Queued behind whatever output is already waiting, like the final one.
+        match self.output.push_frames(GOAWAY_FRAME_SIZE, |buf| {
+            serializer::gen_goaway(buf, STREAM_ID_MAX, H2Error::NoError).map(|(_, size)| size)
+        }) {
+            Ok(_) => {
                 self.metric_events.push(MetricEvent::GoAwayFrameSent);
                 // Stay in the current state so the connection can continue processing
                 // existing streams. The final GOAWAY will transition to GoAway state.
                 // Keep READABLE so in-flight request bodies can still be received
                 // during the drain window. Only remove READABLE in the final GOAWAY
                 // (via `goaway()`).
-                self.park_zero_output();
                 self.readiness.arm_writable();
                 MuxResult::Continue
             }
@@ -5478,10 +5367,42 @@ impl ConnectionH2 {
         )
     }
 
+    /// Gather one [`H2WriteTarget::Transmit`]: the ordered output queue
+    /// first, then `stream_id`'s queued frames, through
+    /// [`h2_transmit::gather_after`]. Answers `(prefix_len, bytes_offered)`.
+    ///
+    /// # Safety
+    ///
+    /// [`h2_transmit::gather_after`]'s contract: neither this connection's
+    /// output queue nor the stream's `kawa` may be mutated or dropped until
+    /// `io_slices` is emptied, which [`h2_transmit::confirm`] does first.
+    pub unsafe fn gather_transmit<L>(
+        &self,
+        context: &Context<L>,
+        stream_id: H2StreamId,
+        io_slices: &mut Vec<std::io::IoSlice<'static>>,
+    ) -> (usize, usize)
+    where
+        L: ListenerHandler + L7ListenerHandler,
+    {
+        let H2StreamId::Other { gid, .. } = stream_id else {
+            unreachable!("no transmit names the connection's input buffer");
+        };
+        let stream = &context.streams[gid];
+        // The WRITE side of `Stream::split`: a server writes the response
+        // from `back`, a client the request from `front`.
+        let kawa = match self.position {
+            Position::Client(..) => &stream.front,
+            Position::Server => &stream.back,
+        };
+        // SAFETY: forwarded, see this function's contract.
+        unsafe { h2_transmit::gather_after(self.output.pending(), kawa, io_slices) }
+    }
+
     /// The buffer an [`H2WriteTarget::Transmit`] names.
     ///
     /// The write half of the same surface, and the one a driver brackets with
-    /// [`h2_transmit::gather`] and [`h2_transmit::confirm`] around its own
+    /// [`Self::gather_transmit`] and [`h2_transmit::confirm`] around its own
     /// vectored write. See `write_buffer` for why it takes `context` apart
     /// from `self`.
     pub fn write_buffer<'a, L>(
@@ -5500,60 +5421,46 @@ impl ConnectionH2 {
         )
     }
 
-    /// The control-frame bytes an [`H2ControlFlushTarget::FlushZero`] is
+    /// The queued output bytes an [`H2ControlFlushTarget::FlushOutput`] is
     /// asking the caller to move, or empty when there are none left.
-    pub fn zero_pending(&self) -> &[u8] {
-        self.zero.storage.data()
+    pub fn output_pending(&self) -> &[u8] {
+        self.output.pending()
     }
 
-    /// Whether [`Self::zero_pending`] ends with the last bytes this connection
-    /// will ever send, so the caller may queue the TLS `close_notify` behind
-    /// them and flush both at once.
+    /// Whether [`Self::output_pending`] ends with the last bytes this
+    /// connection will ever send, so the caller may queue the TLS
+    /// `close_notify` behind them and flush both at once.
     ///
     /// Only [`Self::goaway`] sets [`H2State::GoAway`], and only once its final
-    /// GOAWAY is serialised into `zero`; the state's writable arm then closes
+    /// GOAWAY is queued; the state's writable arm then closes
     /// (`h2_close::goaway_close_action`). Every other condition rules out a
     /// write the same pass would still make after this flush:
     ///
-    /// - `expect_write == Some(Zero)`: this is the zero-buffer resume, not a
-    ///   GOAWAY deferred behind a half-written stream frame
-    ///   ([`Self::park_zero_output`]) nor a WINDOW_UPDATE or RST_STREAM batch;
-    /// - no stream left, no WINDOW_UPDATE or RST_STREAM queued: the later
-    ///   stages of [`Self::flush_pending_control_frames`] serialise nothing;
+    /// - no stream left: no stream frame follows, and no stream is parked
+    ///   (`H2StreamTable::remove` nulls its park);
+    /// - no WINDOW_UPDATE or RST_STREAM queued: the preamble already moved
+    ///   every one of them into the output this flush drains;
     /// - `Position::Server`: `close_notify` is a frontend TLS alert, as in
     ///   [`H2Shell::initiate_close_notify`];
     /// - `close_notify_sent` unset: the alert is queued once.
-    fn zero_flush_closes_connection(&self) -> bool {
+    fn output_flush_closes_connection(&self) -> bool {
         self.position.is_server()
             && matches!(self.state, H2State::GoAway)
             && !self.close_notify_sent
-            && matches!(self.stream_table.expect_write(), Some(H2StreamId::Zero))
             && self.stream_table.streams().is_empty()
             && self.flow_control.pending_window_updates_is_empty()
             && !self.control_tx.has_pending()
     }
 
-    /// Account for one write of [`Self::zero_pending`], and answer whether the
-    /// caller should stop.
+    /// Account for one write of [`Self::output_pending`], and answer whether
+    /// the caller should stop.
     ///
     /// `true` means the write stalled (WouldBlock or a zero-length write) and
     /// the caller must wait for its next writable event; `false` means carry
-    /// on until [`Self::zero_pending`] is empty, then call
-    /// [`Self::finish_zero_flush`].
-    pub fn consume_zero_flush(&mut self, size: usize, status: SocketResult) -> bool {
-        self.zero.storage.consume(size);
-        let event = self.position.bytes_out_event(size);
-        self.metric_events.push(event);
-        self.bytes.overhead_bout += size;
+    /// on until [`Self::output_pending`] is empty.
+    pub fn consume_output_flush(&mut self, size: usize, status: SocketResult) -> bool {
+        self.consume_output(size);
         update_readiness_after_write(size, status, &mut self.readiness)
-    }
-
-    /// Reset the zero buffer once a caller has drained it completely.
-    ///
-    /// `consume()` advances `start` but never resets it, so without this the
-    /// next fill would panic.
-    pub fn finish_zero_flush(&mut self) {
-        self.zero.storage.clear();
     }
 
     /// [`H2Shell::has_pending_write`] with the TLS answer supplied instead of
@@ -5565,9 +5472,7 @@ impl ConnectionH2 {
         if self.peer_gone_after_final_goaway() {
             return false;
         }
-        self.stream_table.expect_write().is_some()
-            || !self.zero.storage.is_empty()
-            || tls_wants_write
+        self.stream_table.expect_write().is_some() || !self.output.is_empty() || tls_wants_write
     }
 
     pub fn has_pending_control_write(&self) -> bool {
@@ -6613,60 +6518,54 @@ impl ConnectionH2 {
             // from the peer (RFC 9113 §6.9).
         }
 
-        let kawa = &mut self.zero;
-        let ack = &serializer::SETTINGS_ACKNOWLEDGEMENT;
-        let buf = kawa.storage.space();
-        if buf.len() < ack.len() {
-            error!(
-                "{} No space in zero buffer for SETTINGS ACK ({} available, {} needed)",
-                log_context!(self),
-                buf.len(),
-                ack.len()
-            );
-            return self.force_disconnect();
-        }
-        buf[..ack.len()].copy_from_slice(ack);
-        kawa.storage.fill(ack.len());
-
-        self.queue_zero_output();
+        self.output.push(&serializer::SETTINGS_ACKNOWLEDGEMENT);
+        self.queue_output();
         MuxResult::Continue
     }
 
-    /// Hand the acknowledgement just serialised into `zero` to the write side.
+    /// Hand the frame just queued in [`Self::output`] to the write side.
     ///
-    /// READABLE is withdrawn until `zero` is flushed, since frame headers are
-    /// read into `zero` too. A stream frame parked half-written in
-    /// `expect_write` keeps the park: flushing `zero` now would put the ACK
-    /// inside that frame. The ACK then waits for the frame
-    /// (`zero_output_deferred`), as HAProxy appends it after the frame in its
-    /// single output ring.
-    fn queue_zero_output(&mut self) {
+    /// Reading goes on: `zero` is input only, so the next frame header no
+    /// longer lands on queued output. The frame goes out after everything
+    /// queued before it, including the rest of a stream frame a partial
+    /// write cut (#1604), as HAProxy appends it to its single output ring.
+    fn queue_output(&mut self) {
         self.readiness.interest.insert(Ready::WRITABLE);
-        self.readiness.interest.remove(Ready::READABLE);
-        self.park_zero_output();
         self.readiness.signal_pending_write();
     }
 
-    /// Give `expect_write` to the output just appended to `zero`, unless a
-    /// stream frame is parked half-written: then the output waits for that
-    /// frame (`zero_output_deferred`).
-    fn park_zero_output(&mut self) {
-        if matches!(
-            self.stream_table.expect_write(),
-            Some(H2StreamId::Other { .. })
-        ) {
-            self.zero_output_deferred = true;
-        } else {
-            self.stream_table.set_expect_write(Some(H2StreamId::Zero));
+    /// How much queued output stops reading, as HAProxy's demux stops on a
+    /// full `mbuf` (`H2_CF_DEM_MROOM`): one buffer's worth. Every queued
+    /// control frame answers a frame the peer sent, so a peer that sends
+    /// while never reading cannot grow [`Self::output`] past this.
+    fn output_read_cap(&self) -> usize {
+        self.zero.storage.capacity()
+    }
+
+    /// Drop everything queued in [`Self::output`], and restore reading if the
+    /// read cap had withdrawn it: the only thing reads waited for is gone.
+    /// Every site that empties the queue goes through here or through
+    /// [`Self::consume_output`], so `reads_wait_for_output` never outlives
+    /// the output it waited on.
+    fn clear_output(&mut self) {
+        self.output.clear();
+        if self.reads_wait_for_output {
+            self.reads_wait_for_output = false;
+            self.readiness.interest.insert(Ready::READABLE);
         }
     }
 
-    /// Whether `zero` holds output not yet flushed, flushing now or waiting
-    /// for a parked stream frame. While it does, nothing is read into `zero`
-    /// and nothing clears it.
-    fn zero_holds_output(&self) -> bool {
-        self.zero_output_deferred
-            || matches!(self.stream_table.expect_write(), Some(H2StreamId::Zero))
+    /// Account for `size` bytes the socket took from [`Self::output`], and
+    /// restore reading once it drains below [`Self::output_read_cap`].
+    fn consume_output(&mut self, size: usize) {
+        let overhead = self.output.consume(size);
+        self.metric_events
+            .push(self.position.bytes_out_event(overhead));
+        self.bytes.overhead_bout += overhead;
+        if self.reads_wait_for_output && self.output.len() < self.output_read_cap() {
+            self.reads_wait_for_output = false;
+            self.readiness.interest.insert(Ready::READABLE);
+        }
     }
 
     fn handle_ping_frame(&mut self, ping: parser::Ping) -> MuxResult {
@@ -6678,20 +6577,11 @@ impl ConnectionH2 {
         self.flood_detector.record_ping_frame();
         check_flood_or_return!(self);
         self.attribute_bytes_to_overhead();
-        let kawa = &mut self.zero;
         let ping_response_size = serializer::PING_ACKNOWLEDGEMENT_HEADER.len() + 8;
-        if kawa.storage.space().len() < ping_response_size {
-            error!(
-                "{} No space in zero buffer for PING response ({} available, {} needed)",
-                log_context!(self),
-                kawa.storage.space().len(),
-                ping_response_size
-            );
-            return self.force_disconnect();
-        }
-        match serializer::gen_ping_acknowledgement(kawa.storage.space(), &ping.payload) {
-            Ok((_, size)) => {
-                kawa.storage.fill(size);
+        match self.output.push_frames(ping_response_size, |buf| {
+            serializer::gen_ping_acknowledgement(buf, &ping.payload).map(|(_, size)| size)
+        }) {
+            Ok(_) => {
                 self.metric_events.push(MetricEvent::PingAckFrameSent);
             }
             Err(error) => {
@@ -6703,7 +6593,7 @@ impl ConnectionH2 {
                 return self.force_disconnect();
             }
         };
-        self.queue_zero_output();
+        self.queue_output();
         MuxResult::Continue
     }
 
@@ -7272,38 +7162,23 @@ impl ConnectionH2 {
                     let stream = &context.streams[stream_gid];
                     let fully_completed =
                         stream.back_received_end_of_stream && stream.front.is_terminated();
-                    // `zero` can carry the RST unless it holds bytes read
-                    // from the backend: it is empty, or holds only output.
-                    let zero_takes_output =
-                        self.zero.storage.is_empty() || self.zero_holds_output();
                     if !fully_completed && !self.stream_table.rst_sent_contains(id) {
-                        if zero_takes_output {
-                            let kawa = &mut self.zero;
-                            let mut frame = [0; 13];
-                            if let Ok((_, _size)) =
-                                serializer::gen_rst_stream(&mut frame, id, H2Error::Cancel)
-                            {
-                                let buf = kawa.storage.space();
-                                if buf.len() >= frame.len() {
-                                    buf[..frame.len()].copy_from_slice(&frame);
-                                    kawa.storage.fill(frame.len());
-                                    self.metric_events
-                                        .push(MetricEvent::RstStreamSent(H2Error::Cancel));
-                                    // Same path as a PING or SETTINGS ACK:
-                                    // READABLE off until `zero` is flushed,
-                                    // after any half-written stream frame
-                                    // (#1597). `handle_header_state` parses
-                                    // `zero` from its first byte.
-                                    self.queue_zero_output();
-                                    self.stream_table.rst_sent_mut().insert(id);
-                                }
-                            }
-                        } else {
-                            // `zero` is busy: queue the RST for the control
-                            // flush, like every other reset. A flood verdict
-                            // is dropped here as `cancel_timed_out_streams`
-                            // drops it; the sticky counter re-raises it.
-                            let _ = self.enqueue_rst(id, H2Error::Cancel);
+                        // Same path as a PING or SETTINGS ACK: queued whole
+                        // behind any output already waiting, including the
+                        // rest of a stream frame a partial write cut, and
+                        // flushed by the next write pass (#1597, #1604).
+                        if self
+                            .output
+                            .push_frames(RST_STREAM_FRAME_SIZE, |buf| {
+                                serializer::gen_rst_stream(buf, id, H2Error::Cancel)
+                                    .map(|(_, size)| size)
+                            })
+                            .is_ok()
+                        {
+                            self.metric_events
+                                .push(MetricEvent::RstStreamSent(H2Error::Cancel));
+                            self.queue_output();
+                            self.stream_table.rst_sent_mut().insert(id);
                         }
                     }
                     // Retire the stream and invalidate expect_write/expect_read
@@ -7730,12 +7605,12 @@ impl<Front: SocketHandler> H2Shell<Front> {
     /// connection-level write pass's — its unconditional preamble, and the
     /// second one [`H2WritableStateTarget::Flush`] asks for on behalf of the
     /// `H2State::GoAway` arm now in [`ConnectionH2::dispatch_writable_state`]. The
-    /// fourth is [`Self::flush_zero_buffer`].
+    /// fourth is [`Self::flush_output_buffer`].
     ///
     /// Returns the handler's `(size, SocketResult)` unchanged. Three of the
     /// four callers discard both and re-query [`Self::tls_wants_write`]
     /// instead — deliberately, since a flush that moved bytes may still leave
-    /// records behind — and only [`Self::flush_zero_buffer`] consumes the
+    /// records behind — and only [`Self::flush_output_buffer`] consumes the
     /// status, through `update_readiness_after_write`.
     fn flush_tls_records(&mut self) -> (usize, SocketResult) {
         self.socket.socket_write(&[])
@@ -7778,8 +7653,9 @@ impl<Front: SocketHandler> H2Shell<Front> {
     }
 
     /// Returns `true` if there is data queued waiting to be flushed:
-    /// - H2 control frames in the zero buffer (GOAWAY, SETTINGS ACK, etc.)
-    /// - A partially-written stream or control frame (`expect_write`)
+    /// - The ordered output queue: control frames (GOAWAY, SETTINGS ACK,
+    ///   etc.) and the rest of a stream frame a stalled write cut
+    /// - A stream parked by a stalled write (`expect_write`)
     /// - Encrypted TLS records in rustls's output buffer not yet flushed to TCP
     ///
     /// The TLS check is critical: `shutting_down()` uses this to prevent
@@ -7806,76 +7682,56 @@ impl<Front: SocketHandler> H2Shell<Front> {
             || any_stream_has_pending_back(self.core.stream_table.streams(), &context.streams)
     }
 
-    /// Flush the zero buffer to the socket, counting bytes as connection overhead.
+    /// Flush the ordered output queue to the socket, counting its own bytes
+    /// as connection overhead.
     ///
     /// Returns `true` if the socket stalled (WouldBlock / zero-length write),
     /// meaning the caller should stop writing and wait for the next writable event.
-    /// Returns `false` when the buffer has been fully drained.
-    fn flush_zero_to_socket(&mut self) -> bool {
-        while !self.core.zero_pending().is_empty() {
+    /// Returns `false` when the queue has been fully drained.
+    fn flush_output_to_socket(&mut self) -> bool {
+        while !self.core.output_pending().is_empty() {
             // The final GOAWAY takes the `close_notify` with it: one
             // `write_tls` instead of this one and `H2Shell::close`'s.
-            let (size, status) = if self.core.zero_flush_closes_connection() {
-                let pending = self.core.zero_pending().len();
+            let (size, status) = if self.core.output_flush_closes_connection() {
+                let pending = self.core.output_pending().len();
                 let (size, status) = self
                     .socket
-                    .socket_write_then_close(self.core.zero_pending());
+                    .socket_write_then_close(self.core.output_pending());
                 if size == pending {
                     self.core.close_notify_sent = true;
                 }
                 (size, status)
             } else {
-                self.socket.socket_write(self.core.zero_pending())
+                self.socket.socket_write(self.core.output_pending())
             };
             #[cfg(debug_assertions)]
             trace!(
-                "{} flush_zero_to_socket: written={}, status={:?}, wants_write={}",
+                "{} flush_output_to_socket: written={}, status={:?}, wants_write={}",
                 log_context!(self.core),
                 size,
                 status,
                 self.tls_wants_write()
             );
-            if self.core.consume_zero_flush(size, status) {
+            if self.core.consume_output_flush(size, status) {
                 return true;
             }
         }
-        // Reset buffer positions after draining. consume() advances start but
-        // never resets it, so without clear() the next fill would panic.
-        self.core.zero.storage.clear();
         false
     }
 
-    /// Directly flush the zero buffer to the socket without going through
-    /// the full writable() path. Used during shutdown when the event loop
-    /// won't deliver new epoll events for this session (edge-triggered).
+    /// Directly flush the ordered output queue to the socket without going
+    /// through the full writable() path. Used during shutdown when the event
+    /// loop won't deliver new epoll events for this session (edge-triggered).
     ///
-    /// No-op while `header_block_reassembly_in_progress()`: `self.zero` is
-    /// also the read-side accumulation buffer for an in-flight
-    /// HEADERS/CONTINUATION field block, and `Mux::shutting_down` calls this
-    /// unconditionally right after `graceful_goaway` — including when
-    /// `graceful_goaway` deferred its GOAWAY for that exact reason and left
-    /// nothing queued. `expect_write == Some(H2StreamId::Zero)` (the only
-    /// case with legitimate bytes to flush here) already cannot coexist with
-    /// reassembly in progress — READABLE is disabled for the whole time a
-    /// zero-buffer write is stalled — so skipping is always safe and never
-    /// drops a real write.
-    pub fn flush_zero_buffer(&mut self) {
-        if self.core.header_block_reassembly_in_progress() {
+    /// Whatever is queued can go at any time: every entry is a whole frame
+    /// (or the rest of one a stalled write cut), queued in wire order, and
+    /// the queue shares nothing with the read side (#1604). A stream parked
+    /// by a stalled write keeps its park; only its already-started frame
+    /// lives in the queue.
+    pub fn flush_output_buffer(&mut self) {
+        if self.flush_output_to_socket() {
             return;
         }
-        // A deferred ACK must not split the stream frame still parked.
-        if self.core.zero_output_deferred
-            && matches!(
-                self.core.stream_table.expect_write(),
-                Some(H2StreamId::Other { .. })
-            )
-        {
-            return;
-        }
-        if self.flush_zero_to_socket() {
-            return;
-        }
-        self.core.stream_table.set_expect_write(None);
         if self.tls_wants_write() {
             let (_size, status) = self.flush_tls_records();
             let _ = update_readiness_after_write(0, status, &mut self.core.readiness);
@@ -8229,21 +8085,21 @@ impl<Front: SocketHandler> H2Shell<Front> {
     }
 
     /// Drive [`ConnectionH2::flush_pending_control_frames`] to a terminal
-    /// answer, performing each zero-buffer flush it asks for.
+    /// answer, performing the output flush it asks for.
     ///
     /// The loop is the shell's because the socket is: the core walks its
-    /// stages, stops at each one that has bytes it cannot move, and is told
-    /// what the write reported. At most three iterations run — one per stage —
-    /// and a stall on any of them leaves the loop with
+    /// stages, queues their frames behind the ordered output, and stops once
+    /// with the bytes it cannot move, then is told what the write reported.
+    /// At most two iterations run, and a stall leaves the loop with
     /// [`H2ControlFlushTarget::Stalled`], which is the caller's cue to read
     /// the TLS query the stalled write just changed the answer to.
     fn drive_control_flush(&mut self) -> ControlFlushOutcome {
         let mut target = self.core.flush_pending_control_frames();
         loop {
             match target {
-                H2ControlFlushTarget::FlushZero(stage) => {
-                    let stalled = self.flush_zero_to_socket();
-                    target = self.core.handle_control_flush(stage, stalled);
+                H2ControlFlushTarget::FlushOutput => {
+                    let stalled = self.flush_output_to_socket();
+                    target = self.core.handle_control_flush(stalled);
                 }
                 H2ControlFlushTarget::Proceed => return ControlFlushOutcome::Proceed,
                 H2ControlFlushTarget::Done(result) => return ControlFlushOutcome::Done(result),
@@ -8282,11 +8138,12 @@ impl<Front: SocketHandler> H2Shell<Front> {
     /// - [`Drop`].
     ///
     /// The remaining public entry points — `close`, `initiate_close_notify`,
-    /// `flush_zero_buffer`, `has_pending_write`, `has_pending_write_full` —
-    /// reach no producer: they touch the TLS layer, the zero buffer and
-    /// readiness, and the core methods they call
-    /// (`consume_zero_flush`, `ensure_tls_flushed`, `has_pending_write_with`,
-    /// `zero_pending`) queue nothing.
+    /// `flush_output_buffer`, `has_pending_write`, `has_pending_write_full` —
+    /// reach no producer but one: they touch the TLS layer, the output queue
+    /// and readiness, and of the core methods they call
+    /// (`consume_output_flush`, `ensure_tls_flushed`, `has_pending_write_with`,
+    /// `output_pending`) only `consume_output_flush` queues a metric, the
+    /// overhead byte count, which the next [`Self::settled`] records.
     ///
     /// A step that reached none of the three would still not lose an event:
     /// the queue is FIFO, so the next drain records the same values, and
@@ -8421,8 +8278,8 @@ impl<Front: SocketHandler> H2Shell<Front> {
 
         match self.drive_control_flush() {
             ControlFlushOutcome::Done(result) => return result,
-            // The stalled-drain tail the three stages used to run inline. The
-            // query belongs here and not there: `flush_zero_to_socket` is what
+            // The stalled-drain tail the stages used to run inline. The
+            // query belongs here and not there: `flush_output_to_socket` is what
             // changed the answer, so it has to be read after the stall, and
             // this is the layer that owns the socket.
             ControlFlushOutcome::Stalled => {
@@ -8573,27 +8430,52 @@ impl<Front: SocketHandler> H2Shell<Front> {
                     return self.core.finalize_write_after_flush(tls_wants_write);
                 }
                 H2WriteTarget::Transmit { stream_id } => {
-                    // Gather / write / confirm. The gather borrows
-                    // `kawa.storage` and hands back descriptors with an
-                    // extended lifetime; `confirm` discharges that obligation
-                    // before the consume.
-                    let kawa = self.core.write_buffer(context, stream_id);
-                    // SAFETY: `kawa` is neither dropped nor mutated between
-                    // this call and the `confirm` three statements below, and
-                    // that `confirm` clears `self.io_slices` before the
+                    // Gather / write / measure / confirm. The gather borrows
+                    // the queued output and `kawa.storage`, and hands back
+                    // descriptors with an extended lifetime; `confirm`
+                    // discharges that obligation before the consume.
+                    //
+                    // SAFETY: neither the output queue nor `kawa` is dropped
+                    // or mutated between this call and the `confirm` below,
+                    // and that `confirm` clears `self.io_slices` before the
                     // `Kawa::consume` which may relocate `kawa.storage`. The
-                    // only thing entered while the descriptors are live is the
-                    // vectored write, which reborrows them for the duration of
-                    // the call and cannot retain them.
-                    let offered = unsafe { h2_transmit::gather(kawa, &mut self.io_slices) };
+                    // only things entered while the descriptors are live are
+                    // the vectored write, which reborrows them for the
+                    // duration of the call and cannot retain them, and
+                    // `frame_tail`, which only reads them.
+                    let (prefix, offered) = unsafe {
+                        self.core
+                            .gather_transmit(context, stream_id, &mut self.io_slices)
+                    };
                     let (size, status) = self.socket.socket_write_vectored(&self.io_slices);
                     debug_assert!(
                         size <= offered,
                         "the socket reported {size} bytes written for an offer of {offered}"
                     );
-                    h2_transmit::confirm(kawa, &mut self.io_slices, size);
-                    self.core
-                        .handle_write(context, stream_id, size, status, &mut pass);
+                    let stream_size = size.saturating_sub(prefix);
+                    // A write that took everything cut nothing: the walk is
+                    // only for a partial write.
+                    let tail = if size < offered {
+                        h2_transmit::frame_tail(
+                            &self.io_slices[usize::from(prefix > 0)..],
+                            stream_size,
+                        )
+                    } else {
+                        0
+                    };
+                    let kawa = self.core.write_buffer(context, stream_id);
+                    h2_transmit::confirm(kawa, &mut self.io_slices, stream_size);
+                    self.core.handle_write(
+                        context,
+                        stream_id,
+                        H2Written {
+                            size,
+                            from_output: size - stream_size,
+                            tail,
+                        },
+                        status,
+                        &mut pass,
+                    );
                 }
             }
         }
@@ -9858,14 +9740,14 @@ mod tests {
         /// The record model cannot express this either. `pending` /
         /// `drain_per_flush` answer "does rustls still hold records?", which
         /// is the EMPTY-buffer flush question; this one is "did the kernel
-        /// take the bytes `flush_zero_to_socket` handed it?". A loopback
+        /// take the bytes `flush_output_to_socket` handed it?". A loopback
         /// socket with default buffers always takes 13 bytes of
         /// WINDOW_UPDATE, so the stalled branch of the control-frame drains
         /// is unreachable without scripting the answer.
         ///
         /// Each `size` is a CAP, clamped to what the caller actually offered:
-        /// `flush_zero_to_socket` feeds the answer straight to
-        /// `kawa::Buffer::consume`, which panics past the filled length.
+        /// `flush_output_to_socket` feeds the answer straight to
+        /// `H2Output::consume`, which asserts it never passes the queue.
         write_script: std::collections::VecDeque<(usize, SocketResult)>,
         /// How many times `socket_write_vectored` was called, whether the
         /// answer came from the script or from the delegated loopback socket.
@@ -10235,11 +10117,13 @@ mod tests {
 
     // ── The control-frame drains' own edge-triggered re-arm ─────────────
     //
-    // `ConnectionH2::flush_pending_control_frames`'s WINDOW_UPDATE-drain
-    // and RST_STREAM-drain stages end the same way: the zero-buffer flush
-    // stalled, so `update_readiness_after_write` (`mux/mod.rs`) has just
-    // REMOVED the WRITABLE event bit, and the stage puts it back when the
-    // socket still holds records it could not hand to the kernel.
+    // `ConnectionH2::flush_pending_control_frames` queues the WINDOW_UPDATE
+    // and RST_STREAM frames behind the ordered output and asks for ONE flush
+    // (#1604). When that flush stalls, `update_readiness_after_write`
+    // (`mux/mod.rs`) has just REMOVED the WRITABLE event bit, and the
+    // `Stalled` answer puts it back when the socket still holds records it
+    // could not hand to the kernel. Before #1604 each of the two stages had a
+    // stall tail of its own; the two tests below cover the one that remains.
     //
     // Until the two tests below existed, nothing in the suite reached either
     // stalled branch. Measured by replacing each re-arm with a `panic!` and
@@ -10254,33 +10138,27 @@ mod tests {
     // are indistinguishable from outside, by construction — `insert` cannot
     // clear a neighbouring bit, so the two are the same state transition.
     // What they detect is the re-arm going missing, which strands the
-    // connection: the serialized frame is parked in `expect_write` and no
+    // connection: the serialized frame waits in the output queue and no
     // further epoll edge is coming for it.
 
     /// The WINDOW_UPDATE drain re-signals WRITABLE when its flush stalls.
     ///
-    /// TO SEE THIS RED: in the WINDOW_UPDATE-drain stage of
-    /// `ConnectionH2::flush_pending_control_frames`, replace that stall
-    /// tail's `return H2ControlFlushTarget::Stalled;` with
-    /// `return H2ControlFlushTarget::Done(MuxResult::Continue);` — the pass
-    /// still ends on `Continue`, and the only thing lost is the TLS re-arm
-    /// `H2Shell::writable` performs for `Stalled`. The last assertion
-    /// fails with `the stalled WINDOW_UPDATE drain must re-signal the
-    /// WRITABLE event`: `flush_zero_to_socket` cleared the bit on the way in
-    /// and nothing else on this path sets it. Measured: `1114 passed; 1
-    /// failed`, this test and nothing else — the sibling RST_STREAM stage has
-    /// a tail of its own and keeps it. Deleting the whole
-    /// `if self.flush_zero_to_socket() { .. }` branch instead reddens the
-    /// `expect_write` premise first, measured as `left: None, right:
-    /// Some(Zero)` — the pass still returns `Continue`, so the assertion above
-    /// it does not discriminate.
+    /// TO SEE THIS RED: in `ConnectionH2::handle_control_flush`, replace
+    /// `H2ControlFlushTarget::Stalled` with
+    /// `H2ControlFlushTarget::Done(MuxResult::Continue)` — the pass still
+    /// ends on `Continue`, and the only thing lost is the TLS re-arm
+    /// `H2Shell::writable` performs for `Stalled`. The last assertion fails
+    /// with `the stalled WINDOW_UPDATE drain must re-signal the WRITABLE
+    /// event`: `flush_output_to_socket` cleared the bit on the way in and
+    /// nothing else on this path sets it. Measured 2026-09-27: this test and
+    /// its RST_STREAM sibling fail, and no other test of the pair's filter.
     #[test]
     fn a_stalled_window_update_drain_re_signals_the_writable_event() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
         // One record rustls still holds and a kernel that accepts nothing, so
         // `socket_wants_write()` answers true for the whole test.
         let (mut connection, _peer) = connection_with_backpressure(&pool, 1, 0, H2State::Header);
-        // The zero-buffer flush stalls on its first round. `(0, WouldBlock)`
+        // The output flush stalls on its first round. `(0, WouldBlock)`
         // is what `update_readiness_after_write` reads as a stall, and it
         // removes the WRITABLE event bit before the drain stage can re-arm.
         connection
@@ -10310,11 +10188,10 @@ mod tests {
             "a stalled control-frame flush parks the pass and continues, got \
              {result:?}"
         );
-        assert_eq!(
-            connection.core.stream_table.expect_write(),
-            Some(H2StreamId::Zero),
+        assert!(
+            !connection.core.output.is_empty(),
             "premise: the pass must have taken the STALLED branch of the \
-             WINDOW_UPDATE drain, the only site that parks the zero buffer here"
+             output flush, which leaves the WINDOW_UPDATE queued"
         );
         assert!(
             connection.core.readiness.event.is_writable(),
@@ -10331,13 +10208,10 @@ mod tests {
     /// No WINDOW_UPDATE is queued on purpose: that stage returns early, so
     /// queueing one would make this test exercise the wrong drain.
     ///
-    /// TO SEE THIS RED: in the RST_STREAM-drain stage of
-    /// `ConnectionH2::flush_pending_control_frames`, replace that stall
-    /// tail's `return H2ControlFlushTarget::Stalled;` with
-    /// `return H2ControlFlushTarget::Done(MuxResult::Continue);`. The last
-    /// assertion fails with `the stalled RST_STREAM drain must re-signal the
-    /// WRITABLE event`. Measured: `1114 passed; 1 failed`, this test and
-    /// nothing else.
+    /// TO SEE THIS RED: the `handle_control_flush` mutation described on the
+    /// WINDOW_UPDATE test above. The last assertion fails with `the stalled
+    /// RST_STREAM drain must re-signal the WRITABLE event`. Measured
+    /// 2026-09-27.
     #[test]
     fn a_stalled_rst_stream_drain_re_signals_the_writable_event() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
@@ -10377,11 +10251,10 @@ mod tests {
             "a stalled control-frame flush parks the pass and continues, got \
              {result:?}"
         );
-        assert_eq!(
-            connection.core.stream_table.expect_write(),
-            Some(H2StreamId::Zero),
+        assert!(
+            !connection.core.output.is_empty(),
             "premise: the pass must have taken the STALLED branch of the \
-             RST_STREAM drain, the only site that parks the zero buffer here"
+             output flush, which leaves the RST_STREAM queued"
         );
         assert!(
             connection.core.readiness.event.is_writable(),
@@ -10415,7 +10288,7 @@ mod tests {
     //     said **Uncovered** until that test existed, and it was already
     //     wrong before this changeset renamed what it points at.
     //
-    // The fourth, in `flush_zero_buffer`, is NOT a triple: it keeps the
+    // The fourth, in `flush_output_buffer`, is NOT a triple: it keeps the
     // `status` the flush returned instead of re-querying. Also uncovered.
     //
     // The tests below target none of those. They target **the vectored loop
@@ -10521,8 +10394,11 @@ mod tests {
     }
 
     /// Bytes the two blocks below carry, and the whole response as far as
-    /// this stream is concerned.
-    const FIRST_BLOCK: &[u8] = b"HTTP/2 response prefix";
+    /// this stream is concerned: ONE DATA frame on stream 1, split across two
+    /// blocks, 22 + 21 bytes. A stream's `kawa.out` only ever holds whole H2
+    /// frames, and since #1604 the write pass relies on it to find where the
+    /// frame a partial write cut ends (`h2_transmit::frame_tail`).
+    const FIRST_BLOCK: &[u8] = b"\x00\x00\x22\x00\x00\x00\x00\x00\x01HTTP/2 respon";
     const SECOND_BLOCK: &[u8] = b" and its continuation";
     const TOTAL_QUEUED: usize = FIRST_BLOCK.len() + SECOND_BLOCK.len();
 
@@ -11198,13 +11074,78 @@ mod tests {
             GlobalStreamId,
         ),
     ) -> H2Shell<PacedSocket> {
+        let (_pool, mut connection, mut context, mut router, gid) = park_half_written_frame();
+
+        connection.socket.inbound.extend(inbound);
+        for _ in 0..8 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            if !connection.core.readiness.filter_interest().is_readable() {
+                break;
+            }
+            connection.readable(&mut context, EndpointClient(&mut router));
+        }
+        assert!(
+            connection.socket.inbound.is_empty() && !connection.core.output.is_empty(),
+            "premise: the frame was read and its ACK queued"
+        );
+
+        between(&mut connection, &mut context, &mut router, gid);
+        drive_unthrottled(&mut connection, &mut context, &mut router);
+        connection
+    }
+
+    /// Drive `connection` the way `Mux` does, `writable()` and `readable()`
+    /// when the filtered readiness allows them, with the socket unthrottled.
+    fn drive_unthrottled(
+        connection: &mut H2Shell<PacedSocket>,
+        context: &mut Context<TestListener>,
+        router: &mut Router,
+    ) {
+        connection.socket.budget = usize::MAX;
+        for _ in 0..16 {
+            connection.core.readiness.event.insert(Ready::WRITABLE);
+            if connection.core.readiness.filter_interest().is_writable() {
+                connection.writable(context, EndpointClient(router));
+            }
+            connection.core.readiness.event.insert(Ready::READABLE);
+            if connection.core.readiness.filter_interest().is_readable() {
+                connection.readable(context, EndpointClient(router));
+            }
+        }
+    }
+
+    /// Park a 41-byte DATA frame on stream 1 after the socket took 20 bytes
+    /// of it, and return the buffer pool, which must outlive the rest, the
+    /// connection, its context and router, and the stream's global id.
+    fn park_half_written_frame() -> (
+        Rc<RefCell<Pool>>,
+        H2Shell<PacedSocket>,
+        Context<TestListener>,
+        Router,
+        GlobalStreamId,
+    ) {
+        park_cut_frames(&[HALF_WRITTEN_HEADER, HALF_WRITTEN_PAYLOAD], 20)
+    }
+
+    /// [`park_half_written_frame`] for any whole frames of stream 1, queued
+    /// as `blocks`, of which the socket takes `budget` bytes.
+    fn park_cut_frames(
+        blocks: &[&'static [u8]],
+        budget: usize,
+    ) -> (
+        Rc<RefCell<Pool>>,
+        H2Shell<PacedSocket>,
+        Context<TestListener>,
+        Router,
+        GlobalStreamId,
+    ) {
         let pool = make_pool_for_invariant_16();
         let (socket, _peer) = connected_socket();
         let mut connection = H2Shell::new(
             Ulid::generate(),
             PacedSocket {
                 stream: socket,
-                budget: 20,
+                budget,
                 wire: Vec::new(),
                 inbound: std::collections::VecDeque::new(),
             },
@@ -11229,7 +11170,7 @@ mod tests {
             .core
             .stream_table
             .register(REGISTERED_STREAM_ID, gid, connection.core.now);
-        for block in [HALF_WRITTEN_HEADER, HALF_WRITTEN_PAYLOAD] {
+        for &block in blocks {
             context.streams[gid]
                 .back
                 .out
@@ -11245,42 +11186,15 @@ mod tests {
                 connection.core.stream_table.expect_write()
             ),
             (
-                20,
+                budget,
                 Some(H2StreamId::Other {
                     id: REGISTERED_STREAM_ID,
                     gid
                 })
             ),
-            "premise: the DATA frame is half-written and its stream parked"
+            "premise: the frames are cut and their stream parked"
         );
-
-        connection.socket.inbound.extend(inbound);
-        for _ in 0..8 {
-            connection.core.readiness.event.insert(Ready::READABLE);
-            if !connection.core.readiness.filter_interest().is_readable() {
-                break;
-            }
-            connection.readable(&mut context, EndpointClient(&mut router));
-        }
-        assert!(
-            connection.socket.inbound.is_empty()
-                && !connection.core.readiness.interest.is_readable(),
-            "premise: the frame was read and its ACK queued"
-        );
-
-        between(&mut connection, &mut context, &mut router, gid);
-        connection.socket.budget = usize::MAX;
-        for _ in 0..16 {
-            connection.core.readiness.event.insert(Ready::WRITABLE);
-            if connection.core.readiness.filter_interest().is_writable() {
-                connection.writable(&mut context, EndpointClient(&mut router));
-            }
-            connection.core.readiness.event.insert(Ready::READABLE);
-            if connection.core.readiness.filter_interest().is_readable() {
-                connection.readable(&mut context, EndpointClient(&mut router));
-            }
-        }
-        connection
+        (pool, connection, context, router, gid)
     }
 
     const HALF_WRITTEN_PING: &[u8] = b"\x00\x00\x08\x06\x00\x00\x00\x00\x00pingpong";
@@ -11301,17 +11215,22 @@ mod tests {
     /// acknowledged AFTER that frame, never inside it (#1600).
     ///
     /// The socket takes 20 bytes of a 41-byte DATA frame, so the stream is
-    /// parked in `expect_write`. The peer then sends a PING. Its ACK must not
-    /// take `expect_write` from the parked stream: the next `writable()`
-    /// would flush `zero` first and put the 17 ACK bytes in the middle of
-    /// the DATA frame, which the peer reads as a corrupt frame stream.
+    /// parked in `expect_write` and the 21-byte rest of its frame is adopted
+    /// by the ordered output queue (#1604). The peer then sends a PING. Its
+    /// ACK is queued behind that rest, so the peer reads the whole DATA
+    /// frame, then the ACK, and never 17 ACK bytes in the middle of the
+    /// frame.
     ///
-    /// TO SEE THIS RED: in `ConnectionH2::queue_zero_output`, replace the
-    /// `if`/`else` by its `else` branch alone, so the ACK always takes
-    /// `expect_write`. The test then fails with `the peer must read the
-    /// whole DATA frame, then the PING ACK`, `left: Err("frame type 0x64
-    /// announces 6579300 bytes, 8 remain")`, and its SETTINGS sibling below
-    /// fails with `... 0 remain")`. Verified 2026-09-26.
+    /// TO SEE THIS RED: in `ConnectionH2::handle_write`, replace
+    /// `self.output.adopt_tail(kawa, tail);` by `let _ = (kawa, tail);`, so
+    /// the rest of the cut frame stays with its stream. Every test on this
+    /// fixture then fails: this one and the other #1601 tests on
+    /// `frame_tail`'s `a frame runs past the gathered bytes` debug assertion
+    /// (the stream's `kawa.out` no longer starts on a frame boundary), the
+    /// three #1604 tests below on their wire assertion. Verified 2026-09-27.
+    /// Before #1604 the equivalent mutation was in `queue_zero_output` and
+    /// failed with `left: Err("frame type 0x64 announces 6579300 bytes, 8
+    /// remain")` (verified 2026-09-26).
     #[test]
     fn a_ping_during_a_half_written_frame_is_acknowledged_after_it() {
         let connection = ack_after_half_written_frame(HALF_WRITTEN_PING, |_, _, _, _| {});
@@ -11350,20 +11269,16 @@ mod tests {
         );
     }
 
-    /// A deferred ACK whose parked stream is removed before its frame resumes
-    /// does not leave the connection unable to read: nothing else would
-    /// hand `zero` the write, and reads into `zero` wait for that flush.
+    /// An ACK queued behind a half-written frame whose stream is removed
+    /// before the frame resumes still leaves, and the connection keeps
+    /// reading: the removal takes nothing that was queued. What the peer
+    /// reads is asserted by
+    /// `a_removed_half_written_stream_still_completes_its_frame` (#1604).
     ///
-    /// The bytes on the wire are deliberately not asserted. Removing a
-    /// stream parked mid-frame drops the rest of that frame
-    /// (`H2StreamTable::remove` nulls the park), so the peer reads a
-    /// truncated frame whatever follows it. That loss is older than the
-    /// deferral and is not fixed here.
-    ///
-    /// TO SEE THIS RED: in `ConnectionH2::control_flush_from`, delete the
-    /// `if self.zero_output_deferred && self.stream_table.expect_write().is_none()`
-    /// block. The test then fails with `a deferred ACK must not strand
-    /// zero`. Verified 2026-09-27.
+    /// TO SEE THIS RED: in `ConnectionH2::flush_pending_control_frames`,
+    /// answer `H2ControlFlushTarget::Proceed` unconditionally at its end. The
+    /// test then fails with `an ACK behind a removed stream's frame must not
+    /// be stranded`.
     #[test]
     fn a_deferred_ack_does_not_strand_reads_when_its_parked_stream_is_removed() {
         let connection =
@@ -11374,12 +11289,12 @@ mod tests {
             });
 
         assert!(
-            connection.core.zero.storage.is_empty() && !connection.core.zero_holds_output(),
-            "a deferred ACK must not strand zero"
+            connection.core.output.is_empty(),
+            "an ACK behind a removed stream's frame must not be stranded"
         );
         assert!(
             connection.core.readiness.interest.is_readable(),
-            "once zero is flushed the connection must read again"
+            "once the output is flushed the connection must read again"
         );
     }
 
@@ -11423,24 +11338,24 @@ mod tests {
         );
     }
 
-    /// The shutdown drive (`Mux::shutting_down`) calls `flush_zero_buffer`,
-    /// which leaves a deferred ACK in place while its frame is parked, then
-    /// forces READABLE and calls `readable()`. That read must not land in
-    /// `zero` on top of the ACK: `handle_header_state` would parse the ACK
-    /// as the peer's frame header and clear it.
+    /// The shutdown drive (`Mux::shutting_down`) calls `flush_output_buffer`,
+    /// then forces READABLE and calls `readable()`. That read must not eat
+    /// the queued ACK. Since #1604 it cannot by construction: the read lands
+    /// in `zero`, which is input only, and the ACK waits in the output queue
+    /// behind the rest of the half-written frame.
     ///
-    /// TO SEE THIS RED: in `ConnectionH2::poll_read_target`, delete the
-    /// `if stream_id == H2StreamId::Zero && self.zero_holds_output()` block.
-    /// Under `cargo test` the test then panics on the `debug_assert!` in
-    /// `handle_header_state`, `no output may be pending in zero when a frame
-    /// header is read`; without that assertion it fails with `the forced
-    /// shutdown read must not eat the deferred ACK`. Verified 2026-09-27.
+    /// TO SEE THIS RED: the `adopt_tail` mutation described on
+    /// `a_ping_during_a_half_written_frame_is_acknowledged_after_it` fails it
+    /// on `a frame runs past the gathered bytes`. Verified 2026-09-27. Before
+    /// #1604, deleting the `zero_holds_output()` block of `poll_read_target`
+    /// failed it on `no output may be pending in zero when a frame header is
+    /// read` (verified 2026-09-27).
     #[test]
     fn a_forced_shutdown_read_does_not_eat_a_deferred_ack() {
         let connection =
             ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, context, router, _| {
                 connection.socket.inbound.extend(SECOND_PING);
-                connection.flush_zero_buffer();
+                connection.flush_output_buffer();
                 connection.core.readiness.interest.insert(Ready::READABLE);
                 connection.core.readiness.event.insert(Ready::READABLE);
                 connection.readable(context, EndpointClient(router));
@@ -11457,15 +11372,13 @@ mod tests {
         );
     }
 
-    /// A final GOAWAY while a frame is parked and an ACK deferred is sent
-    /// after both: `goaway()` neither clears `zero` nor takes
-    /// `expect_write` from the parked stream.
+    /// A final GOAWAY while a frame is parked and an ACK queued is sent after
+    /// both: `goaway()` appends to the ordered output queue, behind the rest
+    /// of the frame and the ACK.
     ///
-    /// TO SEE THIS RED: in `ConnectionH2::goaway`, clear `zero`
-    /// unconditionally and replace `self.park_zero_output();` by
-    /// `self.stream_table.set_expect_write(Some(H2StreamId::Zero));`. The
-    /// test then fails with `the whole DATA frame, the PING ACK, then the
-    /// GOAWAY`. Verified 2026-09-27.
+    /// TO SEE THIS RED: in `ConnectionH2::goaway`, call `self.output.clear()`
+    /// before queueing the GOAWAY. The test then fails with `the whole DATA
+    /// frame, the PING ACK, then the GOAWAY`. Verified 2026-09-27.
     #[test]
     fn a_goaway_during_a_half_written_frame_follows_it_and_the_ack() {
         let connection =
@@ -11490,11 +11403,10 @@ mod tests {
     /// The initial graceful GOAWAY (`graceful_goaway` -> `send_initial_goaway`,
     /// the call `Mux::shutting_down` makes) behaves like the final one.
     ///
-    /// TO SEE THIS RED: in `ConnectionH2::send_initial_goaway`, clear `zero`
-    /// unconditionally and replace `self.park_zero_output();` by
-    /// `self.stream_table.set_expect_write(Some(H2StreamId::Zero));`. The
-    /// test then fails with `the whole DATA frame, the PING ACK, then the
-    /// initial GOAWAY`. Verified 2026-09-27.
+    /// TO SEE THIS RED: in `ConnectionH2::send_initial_goaway`, call
+    /// `self.output.clear()` before queueing the GOAWAY. The test then fails
+    /// with `the whole DATA frame, the PING ACK, then the initial GOAWAY`.
+    /// Verified 2026-09-27.
     #[test]
     fn an_initial_goaway_during_a_half_written_frame_follows_it_and_the_ack() {
         let connection = ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, _, _, _| {
@@ -11510,6 +11422,165 @@ mod tests {
                 (7, 0, 0)
             ]),
             "the whole DATA frame, the PING ACK, then the initial GOAWAY"
+        );
+    }
+
+    /// A peer RST_STREAM for stream 1, whose DATA frame the fixture parks.
+    const RST_STREAM_1: &[u8] = b"\x00\x00\x04\x03\x00\x00\x00\x00\x01\x00\x00\x00\x08";
+
+    /// A stream parked half-way through a frame and then removed must not
+    /// leave that frame truncated on the wire (#1604): the bytes written
+    /// after the removal would land inside what the peer still parses as
+    /// that frame. Here the removal is `remove_dead_stream` itself, the
+    /// chokepoint of every removal path, and the next frame is a PING ACK
+    /// read after the removal.
+    ///
+    /// TO SEE THIS RED: on the pre-image, `a0785505` (stream frames written
+    /// from `kawa.out` and serialised only through `expect_write`), this test
+    /// and its two siblings below fail on their wire assertion with, in
+    /// order, `left: Err("frame type 0x0 announces 65536 bytes, 4 remain")`,
+    /// `... 0 remain")` and `left: Err("frame type 0x0 announces 32 bytes,
+    /// 28 remain")`: the peer reads the next frame's bytes as the rest of the
+    /// truncated one. On this tree, the `adopt_tail` mutation described on
+    /// `a_ping_during_a_half_written_frame_is_acknowledged_after_it` fails
+    /// all three with the same messages. Verified 2026-09-27.
+    #[test]
+    fn a_removed_half_written_stream_still_completes_its_frame() {
+        let connection =
+            ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, _, _, gid| {
+                connection
+                    .core
+                    .remove_dead_stream(REGISTERED_STREAM_ID, gid);
+                connection.socket.inbound.extend(SECOND_PING);
+            });
+
+        assert_eq!(
+            peer_frames(&connection.socket.wire),
+            Ok(vec![
+                (0, 0, REGISTERED_STREAM_ID, HALF_WRITTEN_PAYLOAD.to_vec()),
+                (6, parser::FLAG_ACK, 0, b"pingpong".to_vec()),
+                (6, parser::FLAG_ACK, 0, b"pingpon2".to_vec()),
+            ]),
+            "the removed stream's frame must be completed before the ACKs"
+        );
+        assert!(
+            connection.core.readiness.interest.is_readable(),
+            "once the output is flushed the connection must read again"
+        );
+    }
+
+    /// The same removal followed by another stream's frame (#1604): the
+    /// next stream's DATA frame must follow the whole parked frame.
+    #[test]
+    fn a_removed_half_written_stream_does_not_corrupt_the_next_stream_frame() {
+        const NEXT_STREAM_ID: StreamId = 3;
+        const NEXT_HEADER: &[u8] = &[0, 0, 4, 0, 1, 0, 0, 0, 3];
+        const NEXT_PAYLOAD: &[u8] = b"next";
+        let connection =
+            ack_after_half_written_frame(HALF_WRITTEN_PING, |connection, context, _, gid| {
+                connection
+                    .core
+                    .remove_dead_stream(REGISTERED_STREAM_ID, gid);
+                let next = context
+                    .create_stream(Ulid::generate(), 1 << 16)
+                    .expect("test context must create a second stream");
+                connection
+                    .core
+                    .stream_table
+                    .register(NEXT_STREAM_ID, next, connection.core.now);
+                for block in [NEXT_HEADER, NEXT_PAYLOAD] {
+                    context.streams[next]
+                        .back
+                        .out
+                        .push_back(kawa::OutBlock::Store(kawa::Store::Static(block)));
+                }
+            });
+
+        assert_eq!(
+            peer_frames(&connection.socket.wire),
+            Ok(vec![
+                (0, 0, REGISTERED_STREAM_ID, HALF_WRITTEN_PAYLOAD.to_vec()),
+                (6, parser::FLAG_ACK, 0, b"pingpong".to_vec()),
+                (0, 1, NEXT_STREAM_ID, NEXT_PAYLOAD.to_vec()),
+            ]),
+            "the next stream's frame must follow the whole parked frame"
+        );
+    }
+
+    /// HEADERS without END_HEADERS, then its CONTINUATION, on stream 1.
+    const CUT_BLOCK_HEADERS: &[u8] = b"\x00\x00\x10\x01\x00\x00\x00\x00\x01hpack-fragment-1";
+    const CUT_BLOCK_CONTINUATION: &[u8] = b"\x00\x00\x10\x09\x04\x00\x00\x00\x01hpack-fragment-2";
+
+    /// A header block cut by a partial write keeps everything else out until
+    /// END_HEADERS (RFC 9113 §6.10): the PING ACK read meanwhile follows the
+    /// CONTINUATION, whether the write stopped inside the HEADERS frame or
+    /// exactly on the boundary between the two frames, where no frame is
+    /// half-written but the block still is (#1604).
+    ///
+    /// TO SEE THIS RED: in `h2_transmit::frame_tail`, append `&& false` to
+    /// the `in_block` expression, so the rest stops at the cut frame's end.
+    /// The test then fails with `the ACK must follow END_HEADERS`, the ACK
+    /// sitting between the HEADERS and the CONTINUATION. Verified
+    /// 2026-09-27.
+    #[test]
+    fn a_cut_header_block_is_completed_before_the_ack() {
+        for budget in [20, CUT_BLOCK_HEADERS.len()] {
+            let (_pool, mut connection, mut context, mut router, _gid) =
+                park_cut_frames(&[CUT_BLOCK_HEADERS, CUT_BLOCK_CONTINUATION], budget);
+            connection.socket.inbound.extend(HALF_WRITTEN_PING);
+            for _ in 0..4 {
+                connection.core.readiness.event.insert(Ready::READABLE);
+                connection.readable(&mut context, EndpointClient(&mut router));
+            }
+            assert!(
+                connection.socket.inbound.is_empty(),
+                "premise: the PING was read while the block is cut"
+            );
+            drive_unthrottled(&mut connection, &mut context, &mut router);
+
+            assert_eq!(
+                peer_frame_kinds(&connection.socket.wire),
+                Ok(vec![
+                    (1, 0, REGISTERED_STREAM_ID),
+                    (9, parser::FLAG_END_HEADERS, REGISTERED_STREAM_ID),
+                    (6, parser::FLAG_ACK, 0),
+                ]),
+                "the ACK must follow END_HEADERS (cut at {budget})"
+            );
+        }
+    }
+
+    /// The peer resets the parked stream (#1604). Its RST_STREAM is read
+    /// while the frame is half-written, and retires the stream; the rest of
+    /// that frame must still reach the wire before the PING ACK behind it.
+    #[test]
+    fn a_peer_reset_of_a_half_written_stream_still_completes_its_frame() {
+        let (_pool, mut connection, mut context, mut router, _gid) = park_half_written_frame();
+        connection.socket.inbound.extend(RST_STREAM_1);
+        connection.core.readiness.event.insert(Ready::READABLE);
+        connection.readable(&mut context, EndpointClient(&mut router));
+        connection.core.readiness.event.insert(Ready::READABLE);
+        connection.readable(&mut context, EndpointClient(&mut router));
+        assert!(
+            connection.socket.inbound.is_empty()
+                && !connection
+                    .core
+                    .stream_table
+                    .streams()
+                    .contains_key(&REGISTERED_STREAM_ID),
+            "premise: the RST was read and retired the parked stream"
+        );
+
+        connection.socket.inbound.extend(HALF_WRITTEN_PING);
+        drive_unthrottled(&mut connection, &mut context, &mut router);
+
+        assert_eq!(
+            peer_frames(&connection.socket.wire),
+            Ok(vec![
+                (0, 0, REGISTERED_STREAM_ID, HALF_WRITTEN_PAYLOAD.to_vec()),
+                (6, parser::FLAG_ACK, 0, b"pingpong".to_vec()),
+            ]),
+            "the reset stream's frame must be completed before the ACK"
         );
     }
 
@@ -13547,7 +13618,7 @@ mod tests {
 
         let read_on =
             drive_reads_with_readiness_forced(&mut connection, &mut context, &mut router, |c| {
-                !c.core.zero.storage.is_empty()
+                !c.core.output.is_empty()
             });
         assert!(
             read_on,
@@ -13597,7 +13668,7 @@ mod tests {
             &mut connection,
             &mut context,
             &mut router,
-            |c| !c.core.zero.storage.is_empty(),
+            |c| !c.core.output.is_empty(),
         ));
 
         // A threshold of 1 hands back everything accumulated since the last
@@ -13653,7 +13724,7 @@ mod tests {
 
         let read_on =
             drive_reads_with_readiness_forced(&mut connection, &mut context, &mut router, |c| {
-                !c.core.zero.storage.is_empty()
+                !c.core.output.is_empty()
             });
         assert!(
             read_on,
@@ -13735,7 +13806,7 @@ mod tests {
             if connection.core.readiness.filter_interest().is_readable() {
                 connection.readable(&mut context, EndpointClient(&mut router));
             }
-            if !connection.core.zero.storage.is_empty() {
+            if !connection.core.output.is_empty() {
                 read_on = true;
                 break;
             }
@@ -13754,18 +13825,21 @@ mod tests {
     /// #1597, backend form: `end_stream` on a `Position::Client` connection
     /// (the client gave up, or the backend timeout fired) while the backend
     /// is mid-way through a response DATA frame. The RST_STREAM(CANCEL)
-    /// `end_stream` writes into `zero` must reach the backend before the
-    /// connection reads another frame header: `handle_header_state` parses
-    /// `zero` from its first byte, so an unflushed RST there is read back as
-    /// if the backend had sent it, then cleared, and never sent.
+    /// `end_stream` queues must reach the backend, ahead of the PING ACK the
+    /// connection queues once it reads on. Before #1604 the RST was written
+    /// into `zero`, which `handle_header_state` parses from its first byte,
+    /// so an unflushed RST there was read back as if the backend had sent it,
+    /// then cleared, and never sent; the output queue shares nothing with the
+    /// read side any more.
     ///
     /// The loop drives the connection the way `Mux` does: `writable()` and
     /// `readable()` only when the filtered readiness allows them.
     ///
     /// TO SEE THIS RED: in the `Position::Client` arm of
-    /// [`ConnectionH2::end_stream`], replace `self.queue_zero_output();` by
-    /// `self.readiness.arm_writable();`. The test then fails with `the backend must receive exactly RST_STREAM(CANCEL) for
-    /// stream 1, then the PING ACK`.
+    /// [`ConnectionH2::end_stream`], make the RST's `if` condition start with
+    /// `false &&`, so the RST is never queued. The test then fails with `the
+    /// backend must receive exactly RST_STREAM(CANCEL) for stream 1, then the
+    /// PING ACK`, `left` being the ACK alone. Verified 2026-09-27.
     #[test]
     fn end_stream_on_a_backend_mid_data_payload_sends_its_rst_before_reading_on() {
         use std::io::{Read, Write};
@@ -13880,52 +13954,208 @@ mod tests {
         );
     }
 
-    /// #1597: skipping an orphaned remainder must not turn READABLE back on
-    /// while `zero` still holds unflushed output (`expect_write == Zero`).
-    /// The `ResumeZero` flush stage restores it once that output is gone;
-    /// reading earlier would parse the output as the peer's next frame
-    /// header.
+    /// #1597, with #1604's split: skipping an orphaned remainder turns
+    /// READABLE back on even while output is queued, and leaves that output
+    /// alone. The skip reads into `zero`, which is input only, so there is
+    /// nothing to wait for; the queued frame still leaves in order.
     ///
-    /// TO SEE THIS RED: in [`ConnectionH2::skip_orphaned_data_payload`],
-    /// insert READABLE unconditionally. The test fails with `READABLE must
-    /// stay off while zero holds output`.
+    /// Replaces the pre-#1604 test that pinned the opposite (READABLE kept
+    /// off while zero held output), for the pre-image, where `zero` also held
+    /// our output and a read into it would have parsed that output.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::skip_orphaned_data_payload`], only
+    /// insert READABLE when `self.output.is_empty()`. The test fails with
+    /// `the skip must read on while output is queued`.
     #[test]
-    fn skipping_an_orphaned_payload_keeps_readable_off_while_zero_holds_output() {
+    fn skipping_an_orphaned_payload_reads_on_while_output_is_queued() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
         let (mut connection, _peer) = test_h2_connection(&pool, None);
-        connection.core.zero.storage.space()[..13].fill(0);
-        connection.core.zero.storage.fill(13);
-        connection
-            .core
-            .stream_table
-            .set_expect_write(Some(H2StreamId::Zero));
+        let window_update = orphan_frame(8, 0, 1, 4, &16_384u32.to_be_bytes());
+        connection.core.output.push(&window_update);
         connection.core.readiness.interest.remove(Ready::READABLE);
 
         connection.core.skip_orphaned_data_payload(6, 10);
 
         assert!(
-            !connection.core.readiness.interest.is_readable(),
-            "READABLE must stay off while zero holds output"
+            connection.core.readiness.interest.is_readable(),
+            "the skip must read on while output is queued"
         );
         assert_eq!(
             connection.core.stream_table.expect_read(),
             Some((H2StreamId::Zero, 6)),
             "the remainder must still be scheduled for skipping"
         );
+        assert_eq!(
+            connection.core.output_pending(),
+            &window_update[..],
+            "the skip must leave the queued output untouched"
+        );
     }
 
-    /// #1597: no frame header is read into `zero` while it still holds our
-    /// own output. A stalled WINDOW_UPDATE flush leaves exactly that state
-    /// (`expect_write == Zero`, READABLE interest still on); the CI e2e
-    /// suite caught it through `handle_header_state`'s `debug_assert!`, with
-    /// `zero` holding a stream-1 WINDOW_UPDATE followed by the peer's next
-    /// DATA header.
+    /// A backend (client-side) H2 connection starts write-only, sends its
+    /// preface and SETTINGS, and must then READ, for the server's SETTINGS.
+    /// The pre-image turned READABLE on as a side effect of flushing `zero`;
+    /// with the output queue separate from the input, the
+    /// `(ClientSettings, Client)` arm turns it on itself.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::dispatch_writable_state`]'s
+    /// `(H2State::ClientSettings, Position::Client(..))` arm, delete
+    /// `self.readiness.interest.insert(Ready::READABLE);`. The test fails
+    /// with `a backend connection must read once its preface is out`.
+    #[test]
+    fn a_backend_connection_reads_once_its_preface_is_out() {
+        use std::io::Read;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (socket, mut peer) = connected_socket();
+        let backend = Rc::new(RefCell::new(crate::backends::Backend::new(
+            "preface-backend",
+            "127.0.0.1:2".parse().expect("backend address must parse"),
+            None,
+            None,
+            None,
+        )));
+        let mut registry = crate::protocol::mux::BackendRegistry::default();
+        let mut connection = H2Shell::new(
+            Ulid::generate(),
+            socket,
+            Position::Client(
+                "preface-cluster".to_owned(),
+                registry.id_for(&backend),
+                BackendStatus::Connected,
+            ),
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            None,
+            Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        for _ in 0..2 {
+            connection.core.readiness.event.insert(Ready::WRITABLE);
+            connection.writable(&mut context, EndpointClient(&mut router));
+        }
+
+        let mut preface = [0u8; 24];
+        peer.read_exact(&mut preface)
+            .expect("the backend must receive the client preface");
+        assert_eq!(&preface[..], serializer::H2_PRI.as_bytes());
+        assert!(
+            matches!(connection.core.state, H2State::ServerSettings),
+            "premise: the preface went out, got {:?}",
+            connection.core.state
+        );
+        assert!(
+            connection.core.readiness.interest.is_readable(),
+            "a backend connection must read once its preface is out"
+        );
+    }
+
+    /// A peer that sends while never reading cannot grow the output queue
+    /// without bound: once one buffer's worth is queued, reading stops, as
+    /// HAProxy's demux stops on a full `mbuf` (`H2_CF_DEM_MROOM`), and it
+    /// resumes once the queue drains below that.
     ///
     /// TO SEE THIS RED: in [`ConnectionH2::poll_read_target`], delete the
-    /// `zero_holds_output()` early return. `readable()` then panics with `no
-    /// output may be pending in zero when a frame header is read`.
+    /// `self.output.len() >= self.output_read_cap()` early return. The test
+    /// fails with `a full output queue must stop reading`.
     #[test]
-    fn no_frame_header_is_read_while_zero_holds_unflushed_output() {
+    fn a_full_output_queue_stops_reading_until_it_drains() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection.core.state = H2State::Header;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+        let cap = connection.core.output_read_cap();
+        connection.core.output.push(&vec![0; cap]);
+        connection.core.readiness.interest.insert(Ready::READABLE);
+        connection.core.readiness.event.insert(Ready::READABLE);
+
+        connection.readable(&mut context, EndpointClient(&mut router));
+
+        assert!(
+            !connection.core.readiness.interest.is_readable(),
+            "a full output queue must stop reading"
+        );
+        assert!(
+            connection.core.readiness.event.is_readable(),
+            "the READABLE event must be kept for the read that follows the drain"
+        );
+        connection.core.consume_output(1);
+        assert!(
+            connection.core.readiness.interest.is_readable(),
+            "draining below the cap must restore reading"
+        );
+    }
+
+    /// Clearing the output queue, as a peer that hung up while the
+    /// connection drains does, also ends the read cap's hold on READABLE:
+    /// otherwise `reads_wait_for_output` would outlive the output it waited on
+    /// and the shutdown drive's reads would stay withdrawn.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::clear_output`, drop everything but
+    /// `self.output.clear();`. The test then fails with `a cleared queue must
+    /// release the read cap`. Verified 2026-09-27.
+    #[test]
+    fn clearing_the_output_releases_the_read_cap() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection.core.state = H2State::Header;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+        let cap = connection.core.output_read_cap();
+        connection.core.output.push(&vec![0; cap]);
+        connection.core.readiness.interest.insert(Ready::READABLE);
+        connection.core.readiness.event.insert(Ready::READABLE);
+        connection.readable(&mut context, EndpointClient(&mut router));
+        assert!(
+            connection.core.reads_wait_for_output
+                && !connection.core.readiness.interest.is_readable(),
+            "premise: the read cap withdrew READABLE"
+        );
+
+        connection.core.clear_output();
+
+        assert!(
+            !connection.core.reads_wait_for_output
+                && connection.core.readiness.interest.is_readable(),
+            "a cleared queue must release the read cap"
+        );
+    }
+
+    /// #1597, with #1604's split: a frame header read while output is still
+    /// queued lands in `zero` and leaves that output intact, and the answer
+    /// to the frame read queues BEHIND it. A stalled WINDOW_UPDATE flush
+    /// leaves exactly that state; the CI e2e suite once caught the
+    /// pre-image, where both shared `zero`, through `handle_header_state`'s
+    /// `debug_assert!`, with `zero` holding a stream-1 WINDOW_UPDATE followed
+    /// by the peer's next DATA header.
+    ///
+    /// Replaces the pre-#1604 test that pinned the pre-image's cure (no frame
+    /// header read at all while zero held unflushed output until the flush):
+    /// the hazard it guarded no longer exists, and what the peer must receive
+    /// is unchanged and still asserted below.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::handle_ping_frame`], queue the ACK
+    /// in front of the output instead of behind it (`self.output.clear()`
+    /// before `push_frames`). The test fails with `the PING ACK must queue
+    /// behind the WINDOW_UPDATE`.
+    #[test]
+    fn a_frame_header_read_leaves_queued_output_intact() {
         use std::io::{Read, Write};
 
         let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
@@ -13942,36 +14172,29 @@ mod tests {
 
         // What a stalled WINDOW_UPDATE flush leaves behind.
         let window_update = orphan_frame(8, 0, 1, 4, &16_384u32.to_be_bytes());
-        connection.core.zero.storage.space()[..window_update.len()].copy_from_slice(&window_update);
-        connection.core.zero.storage.fill(window_update.len());
-        connection
-            .core
-            .stream_table
-            .set_expect_write(Some(H2StreamId::Zero));
+        connection.core.output.push(&window_update);
         connection.core.readiness.interest.insert(Ready::READABLE);
 
         peer.write_all(&orphan_ping())
             .expect("loopback write must complete");
-        for _ in 0..16 {
+        let mut expected = window_update.clone();
+        expected.extend(orphan_frame(6, parser::FLAG_ACK, 0, 8, b"pingpong"));
+        for _ in 0..64 {
             connection.core.readiness.event.insert(Ready::READABLE);
             connection.readable(&mut context, EndpointClient(&mut router));
+            if connection.core.output.len() >= expected.len() {
+                break;
+            }
             std::thread::yield_now();
         }
         assert_eq!(
-            connection.core.zero.storage.data(),
-            &window_update[..],
-            "nothing may be read into zero while it holds our output"
-        );
-        assert!(
-            !connection.core.readiness.interest.is_readable(),
-            "READABLE must wait for the zero flush"
+            connection.core.output_pending(),
+            &expected[..],
+            "the PING ACK must queue behind the WINDOW_UPDATE"
         );
 
-        // Driven the way `Mux` does, the output leaves first, then the PING
-        // is read and answered.
+        // Driven the way `Mux` does, the queue leaves in order.
         let mut received = Vec::new();
-        let mut expected = window_update.clone();
-        expected.extend(orphan_frame(6, parser::FLAG_ACK, 0, 8, b"pingpong"));
         for _ in 0..256 {
             connection
                 .core
@@ -14148,6 +14371,13 @@ mod tests {
     // clobbered by completely unrelated connection-level flow-control
     // housekeeping before its CONTINUATION frame ever arrives — no
     // adversarial peer required.
+    //
+    // That was the pre-image of #1396/#1397/#1401 and, for the write
+    // scratch, of #1604: the accumulator moved to `header_reassembly`, and
+    // every control frame is now queued in the separate `output`. The tests
+    // below keep pinning the outcome, a block that survives every
+    // interleaved flush; their RED notes describe the tree they were written
+    // against.
 
     /// To SEE THIS RED: this is the pre-existing behaviour on `main`, no
     /// mutation needed. `flush_pending_control_frames`'s WINDOW_UPDATE-drain
@@ -14422,11 +14652,11 @@ mod tests {
         );
 
         // Mirror `Mux::shutting_down_inner` exactly: it calls
-        // `flush_zero_buffer()` immediately after `graceful_goaway()`
+        // `flush_output_buffer()` immediately after `graceful_goaway()`
         // returns `Continue`, because edge-triggered epoll won't deliver a
         // fresh WRITABLE event for an already-writable socket. Must be a
         // no-op while reassembly is still in progress.
-        connection.flush_zero_buffer();
+        connection.flush_output_buffer();
 
         // Now the CONTINUATION frame completing the block arrives.
         let mut continuation_frame = Vec::with_capacity(9 + second_half.len());
@@ -14494,7 +14724,7 @@ mod tests {
         for _ in 0..8 {
             connection.writable(&mut context, EndpointClient(&mut router));
             if !connection.core.drain.__test_initial_goaway_pending()
-                && connection.core.stream_table.expect_write().is_none()
+                && connection.core.output.is_empty()
             {
                 break;
             }
@@ -14505,7 +14735,7 @@ mod tests {
              not left pending forever"
         );
         assert!(
-            connection.core.stream_table.expect_write().is_none(),
+            connection.core.output.is_empty(),
             "the advisory GOAWAY must have been fully flushed to the socket"
         );
 
@@ -15787,6 +16017,15 @@ mod tests {
 
             let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
             let (mut connection, mut peer) = test_h2_connection(&pool, None);
+            // The interleaved WINDOW_UPDATE flush really writes to the socket
+            // since #1604 (it used to be deferred while a block was being
+            // reassembled). Once sozu's end sends data, Linux switches it to
+            // delayed ACKs ("pingpong" mode), so the peer's last segment is
+            // acknowledged up to 40 ms late, and the peer's Nagle holds its
+            // next small CONTINUATION until that ACK: longer than the
+            // yield-bounded read loops below wait. H2 clients disable Nagle.
+            peer.set_nodelay(true)
+                .expect("the loopback peer must accept TCP_NODELAY");
             let mut context = test_context(&pool);
             let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
 
@@ -16073,12 +16312,34 @@ mod tests {
     /// comparison against a constant fill cannot see bytes delivered out of
     /// order or a block delivered twice, which is half of what "no truncation"
     /// has to mean.
+    ///
+    /// Laid out as whole DATA frames on stream 1, each 16 KiB on the wire: a
+    /// stream's `kawa.out` only ever holds whole H2 frames, and since #1604
+    /// the write pass reads their headers to find where the frame a partial
+    /// write cut ends (`h2_transmit::frame_tail`). The pattern runs through
+    /// the headers as well, so the oracle still compares every byte.
     fn queued_response_body() -> &'static [u8] {
+        const FRAME_LEN: usize = 16 * 1024;
+        const PAYLOAD_LEN: usize = FRAME_LEN - 9;
+        const _: () = assert!(QUEUED_RESPONSE_LEN.is_multiple_of(FRAME_LEN));
         static BODY: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
         BODY.get_or_init(|| {
-            let body: Vec<u8> = (0..QUEUED_RESPONSE_LEN)
+            let mut body: Vec<u8> = (0..QUEUED_RESPONSE_LEN)
                 .map(|index| (index % 251) as u8)
                 .collect();
+            for frame in body.chunks_mut(FRAME_LEN) {
+                frame[..9].copy_from_slice(&[
+                    (PAYLOAD_LEN >> 16) as u8,
+                    (PAYLOAD_LEN >> 8) as u8,
+                    PAYLOAD_LEN as u8,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                ]);
+            }
             Box::leak(body.into_boxed_slice())
         })
     }
@@ -16327,9 +16588,9 @@ mod tests {
     /// client sees the 17-byte GOAWAY and then a clean end of stream, which
     /// rustls reports only once it has read `close_notify`.
     ///
-    /// TO SEE THIS RED: in `H2Shell::flush_zero_to_socket`, drop the
-    /// `zero_flush_closes_connection` branch so every zero flush goes through
-    /// `socket_write`. The GOAWAY then leaves alone and `close` sends the
+    /// TO SEE THIS RED: in `H2Shell::flush_output_to_socket`, drop the
+    /// `output_flush_closes_connection` branch so every output flush goes
+    /// through `socket_write`. The GOAWAY then leaves alone and `close` sends the
     /// alert in a second write: this test fails on `the final GOAWAY and
     /// close_notify must share one TLS write`, with 2 writes. For the order:
     /// in `FrontRustls::socket_write_then_close`, call `send_close_notify`
@@ -16847,7 +17108,7 @@ mod tests {
     /// above and the Error arm by
     /// `a_rustls_frontend_in_error_state_re_arms_until_its_records_drain`; this
     /// one completes the set. The fourth `socket_write(&[])` site,
-    /// `flush_zero_buffer`, is deliberately not targeted here: it keeps the
+    /// `flush_output_buffer`, is deliberately not targeted here: it keeps the
     /// status its flush returned instead of re-querying, so it is not this
     /// shape and a test aimed at it would prove nothing about the vector.
     ///
@@ -16985,9 +17246,9 @@ mod tests {
     /// because they need a `dyn ProxySession` and a `dyn L7Proxy`; the seam
     /// under test is the same on all five.
     ///
-    /// The flush is `Connection::flush_zero_buffer` — the same call
+    /// The flush is `Connection::flush_output_buffer` — the same call
     /// `Mux::shutting_down_inner` makes for exactly this purpose, on a
-    /// connection whose zero buffer is empty so nothing but the alert reaches
+    /// connection whose output queue is empty so nothing but the alert reaches
     /// the wire. `FrontRustls::socket_write(&[])` takes its "flush pending TLS
     /// records even if no application data was written" block, which is what
     /// hands the record to `write_tls`.
@@ -17060,7 +17321,7 @@ mod tests {
         let mut received = Vec::new();
         let mut peer_saw_close_notify = false;
         for _ in 0..MAX_DRIVE_TICKS {
-            mux.frontend.flush_zero_buffer();
+            mux.frontend.flush_output_buffer();
             // Loopback delivery is softirq-driven, not synchronous with
             // `write_tls`: give it a slot rather than spinning the CPU.
             std::thread::yield_now();
@@ -17390,21 +17651,19 @@ mod tests {
                 t0 + ping_at,
                 &liveness_ping_frame(),
             );
-            assert_eq!(
-                connection.core.stream_table.expect_write(),
-                Some(H2StreamId::Zero),
-                "premise: the PING must really have been answered and parked, \
+            assert!(
+                !connection.core.output.is_empty(),
+                "premise: the PING must really have been answered and queued, \
                  so the write pass below is the ACK-only pass this test is \
                  about and not a no-op"
             );
 
             liveness_write(&mut connection, &mut context, &mut router);
 
-            assert_eq!(
-                connection.core.stream_table.expect_write(),
-                None,
+            assert!(
+                connection.core.output.is_empty(),
                 "premise: the ACK flush must have completed, which is what \
-                 lets `flush_pending_control_frames` answer None and fall \
+                 lets `flush_pending_control_frames` answer Proceed and fall \
                  through into the proxying-state write pass"
             );
             assert_eq!(
@@ -17506,18 +17765,16 @@ mod tests {
             t0 + Duration::from_secs(40),
             &liveness_settings_frame(),
         );
-        assert_eq!(
-            connection.core.stream_table.expect_write(),
-            Some(H2StreamId::Zero),
+        assert!(
+            !connection.core.output.is_empty(),
             "premise: the SETTINGS must really have been acknowledged and \
-             parked, so the write pass below is the ACK-only pass"
+             queued, so the write pass below is the ACK-only pass"
         );
 
         liveness_write(&mut connection, &mut context, &mut router);
 
-        assert_eq!(
-            connection.core.stream_table.expect_write(),
-            None,
+        assert!(
+            connection.core.output.is_empty(),
             "premise: the ACK flush must have completed and fallen through \
              into the proxying-state write pass"
         );
@@ -17535,11 +17792,10 @@ mod tests {
             &mut router,
             gid,
             t0 + response_at,
-            &[FIRST_BLOCK],
+            &[FIRST_BLOCK, SECOND_BLOCK],
         );
         assert_eq!(
-            written,
-            FIRST_BLOCK.len(),
+            written, TOTAL_QUEUED,
             "premise for the positive leg: the pass must really have moved the \
              response bytes"
         );

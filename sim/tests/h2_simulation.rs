@@ -16,14 +16,14 @@
 //! Byte-in / byte-out, with no socket anywhere in this file. [`ConnectionH2`]
 //! is not generic and holds no `Front`: the harness builds one directly, hands
 //! it `&[u8]` through `ConnectionH2::read_space` and collects `Vec<u8>` from
-//! `ConnectionH2::write_buffer` and `ConnectionH2::zero_pending`, and drives
+//! `ConnectionH2::gather_transmit` and `ConnectionH2::output_pending`, and drives
 //! the same `pub` poll/handle pairs `H2Shell` drives — `poll_read_target` /
 //! `handle_read`, `poll_write_target` / `handle_write`,
 //! `flush_pending_control_frames` / `handle_control_flush`,
 //! `dispatch_writable_state` / `dispatch_writable_state_after_flush`,
 //! `finalize_write` / `finalize_write_after_flush`, and the
-//! `h2_transmit::gather` / `h2_transmit::confirm` bracket around its own
-//! vectored write.
+//! `ConnectionH2::gather_transmit` / `h2_transmit::frame_tail` /
+//! `h2_transmit::confirm` bracket around its own vectored write.
 //!
 //! That is what makes this harness the measurement rather than a test of one:
 //! `H2Shell` is the in-tree driver over a `SocketHandler`, this is an
@@ -255,8 +255,8 @@ use sozu_lib::{
         mux::{
             CLIENT_PREFACE_SIZE, ConnectionH2, Context, Endpoint, H2ConnectionConfig,
             H2ControlFlushTarget, H2FinalizeTarget, H2FloodConfig, H2ReadOutcome, H2ReadTarget,
-            H2StreamId, H2WritableStateTarget, H2WritePass, H2WriteTarget, MuxResult, Position,
-            StreamState, h2_transmit,
+            H2StreamId, H2WritableStateTarget, H2WritePass, H2WriteTarget, H2Written, MuxResult,
+            Position, StreamState, h2_transmit,
         },
     },
     router::RouteResult,
@@ -997,7 +997,7 @@ impl H2Harness {
     }
 
     /// Drive the control-frame walk to a terminal answer, performing each
-    /// zero-buffer flush it asks for. Mirrors `H2Shell::drive_control_flush`.
+    /// output flush it asks for. Mirrors `H2Shell::drive_control_flush`.
     ///
     /// Returns `None` when the walk said `Proceed`, `Some(result)` when it
     /// ended the pass by itself or stalled.
@@ -1005,9 +1005,9 @@ impl H2Harness {
         let mut target = self.connection.flush_pending_control_frames();
         loop {
             match target {
-                H2ControlFlushTarget::FlushZero(stage) => {
-                    let stalled = self.flush_zero_to_wire();
-                    target = self.connection.handle_control_flush(stage, stalled);
+                H2ControlFlushTarget::FlushOutput => {
+                    let stalled = self.flush_output_to_wire();
+                    target = self.connection.handle_control_flush(stalled);
                 }
                 H2ControlFlushTarget::Proceed => return None,
                 H2ControlFlushTarget::Done(result) => return Some(result),
@@ -1023,9 +1023,9 @@ impl H2Harness {
     }
 
     /// Move the core's queued control bytes onto the wire.
-    /// Mirrors `H2Shell::flush_zero_to_socket`.
-    fn flush_zero_to_wire(&mut self) -> bool {
-        while !self.connection.zero_pending().is_empty() {
+    /// Mirrors `H2Shell::flush_output_to_socket`.
+    fn flush_output_to_wire(&mut self) -> bool {
+        while !self.connection.output_pending().is_empty() {
             let (size, status) = {
                 let Self {
                     connection,
@@ -1033,13 +1033,12 @@ impl H2Harness {
                     write_chunk,
                     ..
                 } = self;
-                wire_write(outbound, *write_chunk, connection.zero_pending())
+                wire_write(outbound, *write_chunk, connection.output_pending())
             };
-            if self.connection.consume_zero_flush(size, status) {
+            if self.connection.consume_output_flush(size, status) {
                 return true;
             }
         }
-        self.connection.finish_zero_flush();
         false
     }
 
@@ -1148,22 +1147,40 @@ impl H2Harness {
                     return connection.finalize_write_after_flush(tls_wants_write);
                 }
                 H2WriteTarget::Transmit { stream_id } => {
-                    let kawa = connection.write_buffer(context, stream_id);
-                    // SAFETY: `kawa` is neither dropped nor mutated between
-                    // this call and the `confirm` three statements below, and
-                    // that `confirm` clears `io_slices` before the
-                    // `Kawa::consume` which may relocate `kawa.storage`. The
-                    // only thing entered while the descriptors are live is
-                    // `wire_write_vectored`, which copies out of them and
-                    // cannot retain them.
-                    let offered = unsafe { h2_transmit::gather(kawa, &mut io_slices) };
+                    // SAFETY: neither the connection's output queue nor
+                    // `kawa` is mutated or dropped between this call and the
+                    // `confirm` below, and that `confirm` clears `io_slices`
+                    // before the `Kawa::consume` which may relocate
+                    // `kawa.storage`. The only things entered while the
+                    // descriptors are live are `wire_write_vectored`, which
+                    // copies out of them and cannot retain them, and
+                    // `frame_tail`, which only reads them.
+                    let (prefix, offered) =
+                        unsafe { connection.gather_transmit(context, stream_id, &mut io_slices) };
                     let (size, status) = wire_write_vectored(outbound, *write_chunk, &io_slices);
                     debug_assert!(
                         size <= offered,
                         "the wire reported {size} bytes written for an offer of {offered}"
                     );
-                    h2_transmit::confirm(kawa, &mut io_slices, size);
-                    connection.handle_write(context, stream_id, size, status, &mut pass);
+                    let stream_size = size.saturating_sub(prefix);
+                    let tail = if size < offered {
+                        h2_transmit::frame_tail(&io_slices[usize::from(prefix > 0)..], stream_size)
+                    } else {
+                        0
+                    };
+                    let kawa = connection.write_buffer(context, stream_id);
+                    h2_transmit::confirm(kawa, &mut io_slices, stream_size);
+                    connection.handle_write(
+                        context,
+                        stream_id,
+                        H2Written {
+                            size,
+                            from_output: size - stream_size,
+                            tail,
+                        },
+                        status,
+                        &mut pass,
+                    );
                 }
             }
         }

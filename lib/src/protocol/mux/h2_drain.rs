@@ -19,7 +19,7 @@
 //! the DECISION those functions make — draining or not, defer-or-send,
 //! budget-elapsed-or-not — as pure `debug_assert!`-guarded transitions over
 //! [`H2DrainState`]'s own fields. Every I/O consequence of a decision
-//! (serializing a GOAWAY frame into `self.zero`, logging, metrics,
+//! (queueing a GOAWAY frame in `self.output`, logging, metrics,
 //! `self.readiness`, `self.stream_table`, `self.state`) stays on
 //! `ConnectionH2`, which owns the socket, `Context` and every other piece a
 //! decision needs but this module deliberately does not have:
@@ -29,14 +29,13 @@
 //!   [`GracefulDrainDecision`] telling the caller whether to send the FINAL
 //!   GOAWAY (`ConnectionH2::goaway`), defer the initial one
 //!   (`self.readiness.arm_writable()` plus a `debug!` log — reassembly is in
-//!   progress and `self.zero` is off-limits, see below), or send the initial
-//!   one now (`ConnectionH2::send_initial_goaway`).
+//!   progress, see below), or send the initial one now
+//!   (`ConnectionH2::send_initial_goaway`).
 //! - [`H2DrainState::take_deferred_initial_goaway`] replaces the
 //!   `initial_goaway_pending` check-and-clear at the top of
 //!   `ConnectionH2::flush_pending_control_frames`'s GOAWAY stage. The caller
-//!   computes `ready_to_flush` (`expect_write().is_none() &&
-//!   !header_block_reassembly_in_progress()`) — this module has neither
-//!   `H2StreamTable` nor `H2State` to compute it itself.
+//!   computes `ready_to_flush` (`!header_block_reassembly_in_progress()`)
+//!   — this module has no `H2State` to compute it itself.
 //! - [`H2DrainState::enter_final_goaway`] replaces the two-field mutation at
 //!   the top of `ConnectionH2::goaway`.
 //! - [`H2DrainState::observe_peer_goaway`] replaces the two-field mutation in
@@ -51,11 +50,18 @@
 //! `ConnectionH2::peer_gone_after_final_goaway` and `ConnectionH2::force_disconnect`
 //! stay on `ConnectionH2` untouched: the former reads `self.drain.draining()`
 //! (one line) but is otherwise entirely about `self.readiness.event`,
-//! `self.stream_table` and `self.zero.storage` — socket/session state this
+//! `self.stream_table` and `self.output` — socket/session state this
 //! module does not have reason to hold. The latter does not reference
 //! `self.drain` at all.
 //!
 //! ## The `zero.storage` dual-role hazard (LIFECYCLE.md invariant 24)
+//!
+//! Historical since #1604: control frames are now queued in the connection's
+//! separate output queue and `zero` is input only, so no GOAWAY can clobber a
+//! header block any more. The deferral below survives as a drain policy — it
+//! delays an advisory frame until the block completes — and removing it
+//! would be a behaviour change of its own, outside #1604's scope. What
+//! follows is the account it was written against.
 //!
 //! `self.zero.storage` is simultaneously the read-side HEADERS+CONTINUATION
 //! reassembly accumulator and the write-side scratch buffer every
@@ -122,7 +128,7 @@ pub(super) struct H2DrainState {
 /// Outcome of [`H2DrainState::begin_graceful_drain`] — tells
 /// `ConnectionH2::graceful_goaway` which I/O to perform next. This module
 /// stays I/O-free: it decides, the caller (which owns the socket,
-/// `self.zero`, logging and `self.readiness`) acts.
+/// `self.output`, logging and `self.readiness`) acts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum GracefulDrainDecision {
     /// The connection was already draining — the caller must send the FINAL
@@ -130,7 +136,7 @@ pub(super) enum GracefulDrainDecision {
     /// `last_stream_id`.
     AlreadyDraining,
     /// First drain, but reassembly is in progress. `initial_goaway_pending`
-    /// is now set; the caller must NOT touch `self.zero` and must
+    /// is now set; the caller must NOT queue the GOAWAY yet and must
     /// `self.readiness.arm_writable()` so the deferred send is retried once
     /// `ConnectionH2::flush_pending_control_frames` observes reassembly has
     /// completed.
@@ -260,9 +266,8 @@ impl H2DrainState {
 
     /// Returns `true` (and clears the flag) exactly when a deferred initial
     /// GOAWAY should be sent now. `ready_to_flush` is the caller's own
-    /// `expect_write().is_none() && !header_block_reassembly_in_progress()`
-    /// check — this module has neither `self.zero` nor `H2State` to compute
-    /// it. A caller that gets `false` back must not treat that as "nothing
+    /// `!header_block_reassembly_in_progress()` check — this module has no
+    /// `H2State` to compute it. A caller that gets `false` back must not treat that as "nothing
     /// pending": the flag survives untouched for a later pass to retry,
     /// exactly as `H2FlowControl::drain_window_updates_into`'s partial-drain
     /// path leaves the remainder queued rather than dropping it.

@@ -93,10 +93,14 @@ ConnectionH2
  |                                         // total_rst_streams_queued (never-decaying, behind the
  |                                         // CVE-2025-8671 cap) and max_pending
  |-- settings_sent_at: Option<Instant>      // SETTINGS ACK timeout tracking
- |-- zero: GenericHttpStream                // Control-frame write scratch + per-frame
- |                                         // read landing zone for stream 0. No longer a
- |                                         // HEADERS+CONTINUATION reassembly buffer — see
- |                                         // header_reassembly below and h2_header_reassembly.rs
+ |-- zero: GenericHttpStream                // Per-frame read landing zone: frame headers and
+ |                                         // stream-0 payloads. Input only since #1604, and
+ |                                         // not a HEADERS+CONTINUATION reassembly buffer —
+ |                                         // see header_reassembly below
+ |-- output: H2Output                       // The ordered output queue (h2_output.rs): every
+ |                                         // control frame and the rest of the one stream
+ |                                         // frame a partial write cut, each queued whole
+ |-- reads_wait_for_output: bool           // READABLE withdrawn at the output read cap
  |-- header_reassembly: h2_header_reassembly::HeaderBlockAccumulator  // Closed API
  |                                         // (h2_header_reassembly.rs, private fields): the
  |                                         // owned HEADERS+CONTINUATION field-block accumulator,
@@ -468,7 +472,7 @@ connection-level window; `SETTINGS_INITIAL_WINDOW_SIZE` sizes the *per-stream*
 one — plus every stream-0 `WINDOW_UPDATE` Sōzu sends. Those are the one-shot
 enlargement from 65535 to `initial_connection_window` — serialised by
 `ConnectionH2::readable`'s `(H2State::ClientSettings, Position::Server)` arm
-into the same `zero` flush as the server SETTINGS and the ACK of the client's,
+into the same output flush as the server SETTINGS and the ACK of the client's,
 so a frontend connection's whole server preface costs one `writev(2)`, and
 queued by `ConnectionH2::handle_settings_frame` on a backend one — followed by
 the periodic grants back. So the peer reads a number, and the
@@ -523,7 +527,7 @@ must be attributed proportionally.
 
 A **free function**, not a method:
 
-```rust lib/src/protocol/mux/h2.rs:457-465
+```rust lib/src/protocol/mux/h2.rs:470-478
 fn distribute_overhead(
     metrics: &mut SessionMetrics,
     overhead_bin: &mut usize,
@@ -585,8 +589,11 @@ Bytes are classified as overhead in two places:
 - **`attribute_bytes_to_overhead()`**: Called after processing connection-level
   frames (SETTINGS, PING, WINDOW_UPDATE). Moves `zero_bytes_read` into
   `bytes.overhead_bin`.
-- **`flush_zero_to_socket()`**: Every byte written from the zero buffer
-  (connection-level frames) increments `bytes.overhead_bout`.
+- **`ConnectionH2::consume_output()`**: Every byte written from the output
+  queue (connection-level frames) increments `bytes.overhead_bout` — except
+  the adopted rest of a stream frame, which `handle_write` already counted to
+  its stream when it adopted it (the stream may be gone by the time it is
+  written).
 
 ### How it feeds into SessionMetrics
 
@@ -597,7 +604,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4555-4568
+```rust lib/src/protocol/mux/h2.rs:4453-4466
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -623,7 +630,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4603-4609
+```rust lib/src/protocol/mux/h2.rs:4501-4507
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -640,9 +647,9 @@ The other three sites take the `&mut self` wrapper
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:6506`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:6408`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:7216`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:7103`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -652,10 +659,10 @@ for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
 taken at the top of `H2WritePhase::Flush`'s post-flush tail
-(`lib/src/protocol/mux/h2.rs:3248`) and passes `stream.linked_token()` straight
+(`lib/src/protocol/mux/h2.rs:3238`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3307-3308
+```rust lib/src/protocol/mux/h2.rs:3297-3298
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -748,22 +755,23 @@ was widened to `pub` to let the socket keep working**. The `pub` surface that
 did grow exists for a driver outside this crate.
 
 What moved to the shell is everything that touches `Front`: the three seams,
-`readable`, `writable`, `write_streams`, `flush_zero_to_socket`,
-`flush_zero_buffer`, `initiate_close_notify`, `has_pending_write`,
+`readable`, `writable`, `write_streams`, `flush_output_to_socket`,
+`flush_output_buffer`, `initiate_close_notify`, `has_pending_write`,
 `has_pending_write_full` and `close`. What stayed is the state machine.
 
 Three core steps had to change shape to stay in the core, because each one
 used to reach the socket from somewhere the shell cannot stand:
 
 - **`ConnectionH2::flush_pending_control_frames`** used to call
-  `flush_zero_to_socket` at three points. It is now a resumable walk: it
-  answers `H2ControlFlushTarget::FlushZero(H2ControlFlushStage)`, the caller
-  moves the bytes, and `ConnectionH2::handle_control_flush` runs the
-  continuation belonging to the stage that asked. The three continuations
-  differ — only the zero-buffer resume re-enables READABLE interest, and only
-  the two serialising stages re-arm `expect_write` on a stall — which is why
-  the stage travels out with the request and back with the answer instead of a
-  flag living on the connection.
+  `flush_zero_to_socket` at three points. It answers
+  `H2ControlFlushTarget::FlushOutput`, the caller moves the bytes of
+  `ConnectionH2::output_pending`, and `ConnectionH2::handle_control_flush`
+  turns the caller's `stalled` answer into `Stalled` or `Proceed`. Since #1604
+  there is one flush, at the end of the walk: every stage appends whole
+  frames to the one ordered output queue, so no stage waits for another's
+  bytes to leave a shared buffer, and the per-stage continuations (a READABLE
+  re-enable, an `expect_write = Zero` re-arm) are gone with the buffer they
+  protected.
 - **`ConnectionH2::close`** hands `&mut self.socket` whole to
   `shared::drain_tls_close_notify`, which runs its own drain loop on the far
   side. It moved to the shell entire; `ConnectionH1::close` shares that helper
@@ -795,7 +803,7 @@ the `HUP` readiness event. What it defers is the `h2_close::force_disconnect_act
 decision, the `ReArmAndContinue` readiness write, and the three `debug!` lines
 that render `wants_write=`. `peer_gone_after_final_goaway()` is computed at the
 raising site and **carried** in the target rather than re-read at settlement:
-it reads `stream_table` and `zero.storage`, and `ConnectionH2::remove_dead_stream`
+it reads `stream_table` and the output queue, and `ConnectionH2::remove_dead_stream`
 runs between raise and settlement on the `ConnectionH2::reset_stream` paths.
 
 The provisional answer is exact for every case but one. `Position::Client`
@@ -970,7 +978,7 @@ connection, H1 and H2); in their place each H2 request pays the one lazy
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8327-8331
+```rust lib/src/protocol/mux/h2.rs:8184-8188
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1071,13 +1079,13 @@ Parses a 9-byte frame header from `self.zero`, validates the stream (new, existi
 closed, or idle), creates new streams for HEADERS on odd-numbered IDs, and
 transitions to `H2State::Frame(header)` for payload reading.
 
-`self.zero` is parsed from its first byte, so it must not hold any of our own
-unflushed output at this point: `debug_assert!(!self.zero_holds_output())`,
-enforced by the `poll_read_target` read guard (#1600). The backend
-`end_stream` RST_STREAM(CANCEL) goes through `queue_zero_output` like the
-PING and SETTINGS acknowledgements (#1597). A stalled WINDOW_UPDATE or
-RST_STREAM flush leaves its tail under `expect_write = Zero` with READABLE
-still on, and the same guard covers it.
+`self.zero` is parsed from its first byte, and it holds nothing but input:
+since #1604 our own output — the PING and SETTINGS acknowledgements, the
+backend `end_stream` RST_STREAM(CANCEL) (#1597), the tail of a stalled
+WINDOW_UPDATE or RST_STREAM flush — waits in the separate output queue, so a
+frame header read can no longer land on it (#1600). Reading goes on while
+output is queued, up to the output read cap (`poll_read_target`), where it
+stops until the queue drains, as HAProxy's demux stops on a full `mbuf`.
 
 Key decisions in this method:
 - MAX_CONCURRENT_STREAMS enforcement: queues RST_STREAM(REFUSED_STREAM) and
@@ -1103,7 +1111,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8404-8408
+```rust lib/src/protocol/mux/h2.rs:8261-8265
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1118,7 +1126,7 @@ call its own body used to make inline — the preamble flush and the two queries
 around it, the stalled-drain re-arm query, and the `H2State::GoAway` arm's flush
 and post-flush query — and the `(H2State, Position)` dispatch between them takes
 no `Front`, no `Context` and no `Endpoint`. Two seam reads reached on the same
-pass are not `writable`'s: the one inside `flush_zero_to_socket`, which
+pass are not `writable`'s: the one inside `flush_output_to_socket`, which
 `flush_pending_control_frames` still performs and whose lift is a separate step,
 and the one inside `force_disconnect`, which is `h2_close`'s third close site.
 
@@ -1169,47 +1177,40 @@ deadline is armed per transmit inside `handle_write` and not on the way in here
 
 ### flush_pending_control_frames()
 
-Flushes control data before application frames, in order:
+Queues control data behind the ordered output and flushes it before
+application frames, in order:
 
 1. **Frontend-hung-up-while-draining cleanup**: if
    `frontend_hung_up_while_draining()` (`Position::Server`, draining, AND a
-   HUP/ERROR readiness event — all three), clears `expect_write`, the
-   pending WINDOW_UPDATE queue and
-   `pending_rst_streams` unconditionally — the peer is gone, so nothing
-   queued here will ever reach it — but clears `zero.storage` itself only
-   when `!header_block_reassembly_in_progress()`, the same guard stages 4-6
-   below already carry. This step's first version (sozu-proxy/sozu#1423)
-   shipped this stage genuinely unguarded, reasoning that `Ready::HUP`
-   means "no further bytes can ever arrive" — that reasoning is wrong:
-   `Ready::HUP` is `is_read_closed() || is_write_closed()`
-   (`command/src/ready.rs`), and mio documents `is_read_closed()` as true
-   not only on a full close but also on a TCP half-close, where data the
-   peer already sent can still be sitting, unread, in the kernel receive
-   queue. `drive_frontend_shutdown_io` (`mod.rs`) force-calls `readable()`
-   for H2 on every `shutting_down()` poll, so a CONTINUATION frame split
-   across TCP segments landing a HUP event alongside its first segment is
-   the ordinary soft-stop path. Review of this step's first version
-   (`e1c3c2fb`) proved the unguarded version corrupts exactly that case
-   (`StringDecodingError(NotEnoughOctets)` / decoder desync); this stage now
-   shares the guard instead
+   HUP/ERROR readiness event — all three), clears `expect_write`, the output
+   queue, the pending WINDOW_UPDATE queue and `pending_rst_streams` — the peer
+   is gone, so nothing queued for it will ever reach it. It clears output
+   only: `zero` is input, and `Ready::HUP` is `is_read_closed() ||
+   is_write_closed()` (`command/src/ready.rs`), which mio documents as true on
+   a TCP half-close too, where data the peer already sent can still be sitting
+   unread in the kernel receive queue. `drive_frontend_shutdown_io` (`mod.rs`)
+   force-calls `readable()` for H2 on every `shutting_down()` poll, so a
+   CONTINUATION frame split across TCP segments landing a HUP event alongside
+   its first segment is the ordinary soft-stop path. Review of this stage's
+   first version (`e1c3c2fb`, sozu-proxy/sozu#1423) proved that clearing
+   `zero` there corrupts exactly that case (`StringDecodingError(NotEnoughOctets)`
+   / decoder desync); before #1604 split the output out, the stage had to
+   guard its clear on `!header_block_reassembly_in_progress()` instead
 2. **SETTINGS ACK timeout check**: If peer hasn't ACK'd within 5 seconds,
    sends GOAWAY(SETTINGS_TIMEOUT)
-3. **Zero buffer resume**: If a previous control frame write was partial
-   (WouldBlock), resume flushing via `flush_zero_to_socket()`
-4. **Deferred initial GOAWAY**: `H2DrainState::take_deferred_initial_goaway`
+3. **Deferred initial GOAWAY**: `H2DrainState::take_deferred_initial_goaway`
    check-and-clears the deferred advisory (`graceful_goaway` deferred it — see
-   below), and it is serialized via `ConnectionH2::send_initial_goaway`
-5. **WINDOW_UPDATE frames**: `H2FlowControl::drain_window_updates_into`
-   (`h2_flow_control.rs`) serializes every queued entry into the zero buffer
-   and removes what it wrote — coalescing already happened at queue time
-   (`queue_window_update`, keyed by stream ID; `0` is the connection-level
-   entry). Drain order is the map's ascending stream-id order, deterministic
-   across processes — see that module's doc comment
-6. **Pending RST_STREAM frames**: Asks `H2ControlTx::drain_rst_streams_into`
-   (`h2_control_tx.rs`) to serialize as many whole queued frames as fit into
-   the zero buffer, with flood detection (`MAX_PENDING_RST_STREAMS` cap).
-   A frame that would straddle the end of the buffer stays queued for the next
-   pass. Proxy-emitted RSTs (DATA-on-closed, `refuse_stream_and_discard`,
+   below), and it is queued via `ConnectionH2::send_initial_goaway`
+4. **WINDOW_UPDATE frames**: `H2FlowControl::drain_window_updates_into`
+   (`h2_flow_control.rs`) serializes every queued entry into room reserved at
+   the end of the output queue and removes what it wrote — coalescing already
+   happened at queue time (`queue_window_update`, keyed by stream ID; `0` is
+   the connection-level entry). Drain order is the map's ascending stream-id
+   order, deterministic across processes — see that module's doc comment
+5. **Pending RST_STREAM frames**: Asks `H2ControlTx::drain_rst_streams_into`
+   (`h2_control_tx.rs`) to serialize every queued frame into room reserved at
+   the end of the output queue, with flood detection (`MAX_PENDING_RST_STREAMS`
+   cap). Proxy-emitted RSTs (DATA-on-closed, `refuse_stream_and_discard`,
    `reset_stream`, `cancel_timed_out_streams`) are queued via the canonical
    `ConnectionH2::enqueue_rst` helper, which delegates to
    `H2ControlTx::enqueue_rst` — dedupes through the wire-map's `rst_sent` set
@@ -1233,41 +1234,78 @@ Flushes control data before application frames, in order:
    present in the wire map, so it survives `remove_dead_stream` eviction
    (which the per-stream error callers invoke synchronously after
    `reset_stream` returns). `finalize_write` retains `Ready::WRITABLE`
-   whenever the queue is non-empty so a partial write that deferred the
-   flush (the RST_STREAM drain stage is gated on
-   `stream_table.expect_write().is_none()`) re-runs on the next tick rather
-   than stranding the queued RST.
+   whenever the queue is non-empty, so a pass that ends before this stage
+   re-runs on the next tick rather than stranding the queued RST.
+6. **One output flush**: when the output queue holds anything — what the
+   stages above queued, behind whatever was already waiting (an ACK, the rest
+   of a stream frame a partial write cut) — the walk answers `FlushOutput`.
 
-Stages 1, 4, 5, and 6 all defer clearing/reusing `zero.storage` — leaving
-their respective queue/flag untouched — while
-`header_block_reassembly_in_progress()` is true (`self.state` is
-`ContinuationHeader`/`ContinuationFrame`). Since the HEADERS+CONTINUATION
-accumulator moved out of `zero.storage` into `self.header_reassembly`, what
-all four stages protect is narrower than before the accumulator move: a
-single CONTINUATION frame's own not-yet-fully-read payload (a partial
-`socket_read()`), not the block's accumulated multi-frame history (which is
-unreachable from any of these stages regardless of the guard, since none
-names `self.header_reassembly`). That narrower window is still real on an
-otherwise-healthy connection, where more bytes genuinely are still coming
-— and, per stage 1's own history above, "the frontend already hung up"
-does not reliably rule it out either. Nothing is lost — queuing a
-WINDOW_UPDATE or RST_STREAM already arms `WRITABLE`, and `graceful_goaway`
-arms it explicitly when it defers — the flush just waits for the block to
-complete. Stage 4 is the one exception among the four where "nothing is
-lost" isn't free: unlike the WINDOW_UPDATE/RST_STREAM queues, there is no
-separate pending-GOAWAY queue to fall back on, so the
-`initial_goaway_pending` flag itself is what guarantees the advisory GOAWAY
-is still sent once reassembly completes rather than silently dropped.
+Before #1604 each stage serialised into `zero`, which was also the read
+landing zone, so the WINDOW_UPDATE, RST_STREAM and GOAWAY stages had to defer
+while `header_block_reassembly_in_progress()` was true and could not
+serialise while an earlier flush still owned the buffer. The output queue
+shares nothing with the read side, so only the deferred initial GOAWAY still
+waits for a block to complete, as a drain policy: the
+`initial_goaway_pending` flag is what guarantees that advisory GOAWAY is
+still sent once reassembly completes rather than silently dropped.
 
 Answers `H2ControlFlushTarget`: `Done(MuxResult)` when a GOAWAY already ended
 the pass, `Proceed` when `writable()` should carry on into its state dispatch,
-and `Stalled` when one of the three `flush_zero_to_socket` calls stalled — in
-which case `writable` reads `tls_wants_write` and hands it to
-`ensure_tls_flushed`, which is the re-arm the three tails used to perform
-themselves. The query has to happen AFTER the write that stalled, so it cannot
-be an input, and the shell that owns the socket is the layer that makes it.
-`flush_zero_to_socket` itself stays inside: it is a byte mover on the
-control-frame path, not a TLS seam.
+`FlushOutput` when the output queue holds bytes, and — through
+`handle_control_flush` — `Stalled` when that flush stalled, in which case
+`writable` reads `tls_wants_write` and hands it to `ensure_tls_flushed`. The
+query has to happen AFTER the write that stalled, so it cannot be an input,
+and the shell that owns the socket is the layer that makes it.
+`flush_output_to_socket` itself stays inside the shell: it is a byte mover on
+the control-frame path, not a TLS seam.
+
+### The ordered output queue (`h2_output.rs`)
+
+`ConnectionH2::output` is the connection's single, ordered output queue, and
+the answer to #1604. Every byte the connection sends that is not still owned
+by a stream goes through it, in wire order: the control frames it serialises
+and the unsent rest of the one stream frame a partial write cut. Each entry is
+a WHOLE frame when it is queued.
+
+Stream frames stay zero-copy. A stream transmit
+(`ConnectionH2::gather_transmit`, `h2_transmit::gather_after`) offers the
+kernel the queue first, as one descriptor, then the stream's `kawa.out`
+blocks, as `IoSlice`s straight into `kawa.storage`. What the socket took is
+split at the queue's length: the queue's part goes back to
+`ConnectionH2::consume_output`, the rest is the stream's and is confirmed on
+its `kawa` exactly as before. When the write stopped inside a stream frame,
+`h2_transmit::frame_tail` reads the frame headers in the gathered descriptors
+and measures the rest of that frame — extended through the CONTINUATION
+frames of an unfinished header block, since RFC 9113 §6.10 allows no other
+frame in between — and `ConnectionH2::handle_write` has the queue adopt it
+(`H2Output::adopt_tail`): the bytes are copied, consumed from the stream, and
+counted to the stream right away. A stream therefore only ever owns frames the
+wire has not started, and removing it — a peer RST, `end_stream`, expiry,
+`prune_inactive_streams_while_closing` — drops whole unsent frames, never the
+second half of one the peer is already parsing. That keeps the framing whole,
+not the HPACK tables: an unsent header block was already encoded, and dropping
+it leaves the peer's decoder behind the connection's encoder
+([#1627](https://github.com/sozu-proxy/sozu/issues/1627), older than this
+queue).
+
+The copy is bounded by one frame or one header block and happens only on a
+partial write. HAProxy owns its in-flight bytes by copying every frame into
+its `mbuf` ring (`h2c_ack_settings`, `h2c_send_ping` append with `br_tail`),
+or by swapping a whole stream buffer into the ring in `h2s_make_data`'s
+zero-copy path; `h2` holds an in-flight DATA payload by value in
+`FramedWrite`'s `Encoder::next` until it is written, its `Bytes` reference
+count keeping it alive. Sōzu's stream storage is a pool buffer that a removed
+stream gives back, with no reference count, so the in-flight rest is copied.
+The queue itself holds 128 bytes inline — a frontend's whole server preface is
+79 — and spills to the heap only past that, so a connection that never meets
+backpressure allocates nothing for its output, as the pool buffer `zero` it
+replaces did not.
+
+Reading is independent of the queue, but bounded by it: past one buffer of
+queued output (`output_read_cap`, the size of `zero`) the peer is not reading
+what it asked for, so `poll_read_target` withdraws READABLE until
+`consume_output` drains the queue below the cap — HAProxy's
+`H2_CF_DEM_MROOM`.
 
 ### write_streams(), poll_write_target() and handle_write()
 
@@ -1325,13 +1363,11 @@ what makes a re-entry after a transmit different from a first entry:
 2. `Resume` — flushes the stream a previous pass parked. It pre-computes
    `byte_totals` for overhead distribution (in `H2WritePass::new`), and a
    stall here ends the pass with `Done` before the scheduler pass begins.
-   When a PING or SETTINGS ACK was queued in `zero` while the stream was
-   parked (`zero_output_deferred`), completing the resume also ends the pass,
-   with `expect_write = Some(Zero)`: the ACK goes out after the parked frame
-   and before any other stream frame, never inside it (#1600). A GOAWAY
-   queued meanwhile (`goaway`, `send_initial_goaway`) is deferred the same
-   way and appended after the ACK, and nothing is read into `zero` until it
-   is flushed.
+   The rest of the frame the parking write cut already waits in the output
+   queue, so it leaves first — in the preamble flush or ahead of this
+   resume's transmit — and a PING or SETTINGS ACK, GOAWAY or RST queued
+   meanwhile follows it, never inside it (#1600, #1604). The park only keeps
+   the stream's whole remaining frames first in line.
 3. The `Resume`/`Start` → `Prepare` transition (`begin_scheduler_pass`) opens
    a `H2ConverterPass` holding the reusable scratch and the pending RFC 7541
    §6.3 size-update signal, and asks `H2Scheduler::begin_pass` for the pass
@@ -1453,7 +1489,7 @@ arm would turn a new variant into a release-mode panic on the write path instead
 of a compile error. And `ConnectionH2::flush_tls_records`' `(size, status)` is
 discarded at its `write_streams` call site, as it is at the close sites: the
 post-flush `ConnectionH2::tls_wants_write` query is how this path learns whether
-the flush landed, so no `SocketResult` reaches the decision. `flush_zero_buffer()` is the one site on the write path that does
+the flush landed, so no `SocketResult` reaches the decision. `flush_output_buffer()` is the one site on the write path that does
 consume a status, through `update_readiness_after_write`.
 
 
@@ -1548,21 +1584,22 @@ one has to be a visible signature change. Note that a stalled pass is not fair
 to the streams it did not reach — see the module header and LIFECYCLE
 invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
-### flush_zero_to_socket()
+### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:7814
-fn flush_zero_to_socket(&mut self) -> bool {
+```rust lib/src/protocol/mux/h2.rs:7691
+fn flush_output_to_socket(&mut self) -> bool {
 ```
 
-Writes the zero buffer to the socket in a loop. Returns `true` if the socket
-stalled (WouldBlock), `false` when fully drained. Counts written bytes as
-`overhead_bout`. Clears the buffer after draining to reset positions.
+Writes the ordered output queue to the socket in a loop. Returns `true` if the
+socket stalled (WouldBlock), `false` when fully drained. Counts the queue's
+own bytes as `overhead_bout` (`ConnectionH2::consume_output`); the adopted
+rest of a stream frame was counted to its stream already.
 
-When `ConnectionH2::zero_flush_closes_connection` answers yes — a server
-connection in `H2State::GoAway` whose zero buffer holds the final GOAWAY, with
+When `ConnectionH2::output_flush_closes_connection` answers yes — a server
+connection in `H2State::GoAway` whose queue ends with the final GOAWAY, with
 no stream, WINDOW_UPDATE or RST_STREAM left to write after it — the loop writes
 through `SocketHandler::socket_write_then_close` instead of `socket_write`, and
-sets `close_notify_sent` once the whole buffer was taken. `FrontRustls` hands
+sets `close_notify_sent` once the whole queue was taken. `FrontRustls` hands
 rustls the GOAWAY, queues `close_notify` behind it and flushes both records
 with one `write_tls`, so the close costs one `writev(2)` instead of two
 ([#1607](https://github.com/sozu-proxy/sozu/issues/1607)); `H2Shell::close`
@@ -1720,7 +1757,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6550-6552
+```rust lib/src/protocol/mux/h2.rs:6455-6457
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1728,7 +1765,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6564-6570
+```rust lib/src/protocol/mux/h2.rs:6469-6475
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

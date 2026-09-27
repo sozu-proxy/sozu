@@ -3216,6 +3216,42 @@
   numbering as `$HOST[3]` for `a`'s digits, `$HOST[1]` for the letter and `$HOST[2]` for the
   trailing digit becomes `$HOST[1]`, `$HOST[2]` and `$HOST[3]`.
 
+- **`fix(mux-h2)`: a stream removed while its frame is half-written no longer leaves that frame
+  truncated on the wire ([#1604](https://github.com/sozu-proxy/sozu/issues/1604)).** `zero`
+  was both the frame-header input buffer and the control-frame output buffer, and stream frames
+  were written from each stream's own `kawa.out`, serialised against `zero` only through
+  `expect_write`. When a partial write parked a stream mid-frame and the stream was then removed
+  (a peer RST_STREAM, `end_stream`, expiry, `prune_inactive_streams_while_closing`), the rest of
+  the frame went with it, and the next bytes on the connection — a control frame or another
+  stream's frame — landed inside what the peer still parsed as that frame. The connection now
+  has one ordered output queue (`h2_output.rs`) that receives every control frame and the unsent
+  rest of the one stream frame a partial write cut, each whole when queued, and `zero` is input
+  only. Stream frames stay zero-copy: a transmit sends the queue first, then the stream's
+  `kawa.out` as `IoSlice`s, in the same `writev(2)`; when it stops inside a frame,
+  `h2_transmit::frame_tail` measures the rest of that frame, extended to END_HEADERS for an
+  unfinished header block (RFC 9113 §6.10), and the queue adopts it, a copy bounded by one frame
+  and paid only on a partial write, as `h2` holds an in-flight DATA frame in `FramedWrite` and
+  HAProxy owns every frame in its `mbuf` ring. Reads no longer stop while an ACK waits; they
+  stop once one buffer of output is queued, as HAProxy's demux does on a full `mbuf`. The
+  control-frame preamble queues its WINDOW_UPDATE and RST_STREAM frames behind the queue and
+  flushes once, the deferred initial GOAWAY goes out in the pass that queues it, and a backend
+  H2 connection turns READABLE on itself after its preface, which the old `zero` resume did as a
+  side effect. Gone with the shared buffer: `zero_output_deferred`, `queue_zero_output` /
+  `park_zero_output`, the `zero_holds_output` read guard, the `ResumeZero` flush stage and its
+  `H2ControlFlushStage` / `ControlFlushResume` walk, and `expect_write = Some(Zero)`.
+  `flush_zero_buffer` is now `flush_output_buffer`. Pinned by three tests that fail on the
+  pre-image with the peer's own parse error (`frame type 0x0 announces 65536 bytes, 4 remain`),
+  alongside the #1601 half-written-frame tests, which keep passing. Tests that read internals
+  of the old mechanism (an ACK found in `zero`, `expect_write == Some(Zero)`, READABLE withdrawn
+  while an ACK is queued) now read the output queue, and two that pinned the shared-buffer read
+  guard are replaced by tests of the property that replaces it. The frame walk that measures
+  a cut frame's rest is linear in the gathered slices and runs only after a partial write;
+  the queue compacts its sent heap bytes while it is still in use, and emptying it releases the
+  read cap. Not fixed here, and older than this change: a stream removed with an encoded but
+  unsent HEADERS block still leaves the peer's HPACK decoder behind the encoder
+  ([#1627](https://github.com/sozu-proxy/sozu/issues/1627)); the queue keeps the framing whole,
+  not that table.
+
 - **`fix(mux-h2)`: a PING or SETTINGS ACK received while a stream frame is half-written is
   sent after that frame, not inside it ([#1600](https://github.com/sozu-proxy/sozu/issues/1600)).**
   Both acknowledgements are serialised into `zero` and used to set `expect_write = Some(Zero)`

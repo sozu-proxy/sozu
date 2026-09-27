@@ -23,11 +23,12 @@
 //! - **`Readiness`.** Queueing a frame must arm `Ready::WRITABLE` (LIFECYCLE
 //!   invariant 15) or the frame sits until an unrelated event re-triggers
 //!   `writable()`. The connection owns readiness, so it is a parameter.
-//! - **The decision to drain.** Three conditions gate the drain — nothing
-//!   queued, a partially-written zero buffer (`expect_write`), or a header
-//!   block mid-reassembly — and all three read `ConnectionH2` state this
-//!   module has no business holding. The caller decides *whether*; this
-//!   module only decides *what bytes*.
+//! - **The decision to drain.** The caller drains whenever frames are
+//!   queued, into the room it sizes from [`H2ControlTx::pending_len`] at the
+//!   end of its ordered output queue (#1604); before that queue existed, a
+//!   partially-written zero buffer or a header block mid-reassembly also
+//!   gated it. The caller decides *whether*; this module only decides *what
+//!   bytes*.
 //! - **Metrics, logs and the flood detector.** Accounting happens once, at
 //!   queue time, in `ConnectionH2::account_emitted_rst`, because a lifetime-cap
 //!   trip converts to a connection-wide GOAWAY that only the connection can
@@ -41,8 +42,9 @@
 //!   caller-supplied `&mut [u8]`, the shape
 //!   [`super::h2_flow_control::H2FlowControl::drain_window_updates_into`]
 //!   already uses and that `serializer::gen_*` established before either.
-//!   The caller passes `zero.storage.space()` and `fill()`s the returned
-//!   byte count, so this module never holds a second buffer whose lifetime
+//!   The caller passes room it reserved at the end of its ordered output
+//!   queue (`h2_output::H2Output::push_frames`) and keeps the returned byte
+//!   count, so this module never holds a second buffer whose lifetime
 //!   someone has to remember to coordinate — the hazard LIFECYCLE invariant
 //!   24 exists to name.
 //!
@@ -303,6 +305,12 @@ impl H2ControlTx {
     /// True while frames are queued but not yet serialized.
     pub(super) fn has_pending(&self) -> bool {
         !self.pending_rst_streams.is_empty()
+    }
+
+    /// How many frames are queued, so the caller can size the room it hands
+    /// [`Self::drain_rst_streams_into`] for all of them.
+    pub(super) fn pending_len(&self) -> usize {
+        self.pending_rst_streams.len()
     }
 
     /// The queued frames, in emission order.
