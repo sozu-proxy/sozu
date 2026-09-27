@@ -5375,7 +5375,9 @@
   cleared (`forcefully_terminate_answer`, a default answer); and
   `H2BlockConverter::check_header_capacity` cleared a block that outgrew
   `MAX_HEADER_LIST_SIZE` after its first fields were inserted and its pending size update was
-  taken. Dynamic entries are numbered from the newest (RFC 7541 §2.3.3), so every insertion the
+  taken; and H1 trailers split across two reads were encoded line by line (kawa queues the
+  closing flags only with the final CRLF, and `ParsingPhase::Trailers` is a main phase), then
+  dropped unfinished by `H2BlockConverter::finalize`, losing the trailers too. Dynamic entries are numbered from the newest (RFC 7541 §2.3.3), so every insertion the
   peer missed moved the older entries one index down in Sōzu's table only: a later block naming
   an older entry was decoded by the peer as a different field, with no error (measured:
   `x-c: 3` encoded, `x-a: 1` decoded, and a literal naming `x-c` read under the name `x-a`),
@@ -5389,13 +5391,20 @@
   a frame-header walk that runs only on a park), and the next pass resets the table when that
   block is gone; the oversized-block abort resets it directly and re-arms the connection's
   pending signal, which `H2WritePhase::End` now takes back from the pass instead of clearing
-  whenever an earlier block carried it. The cost is the dynamic entries the next blocks would
+  whenever an earlier block carried it. A field block is now encoded only once its closing
+  `Flags { end_header }` is queued, so split trailers are sent whole when the last one arrives,
+  and every converter path that still drops encoded bytes goes through
+  `H2BlockConverter::discard_encoded_block`, which resets the table. The cost is the dynamic entries the next blocks would
   have reused, once per dropped block; nothing is sent for the dead stream and nothing is
   allocated. Covered by `a_header_block_dropped_with_its_stream_keeps_the_peer_table_in_sync`
   and `a_header_block_cleared_from_a_parked_stream_keeps_the_peer_table_in_sync` (red on
   `58550dd4`: the peer fails to decode the next stream's block),
   `an_oversized_block_dropped_after_encoding_keeps_the_peer_table_in_sync` (red:
   `Err(InvalidIndex)`), `a_dropped_block_substitutes_fields_until_the_table_is_reset`,
+  `h1_trailers_split_across_reads_are_encoded_whole` (red: the trailer never reaches the peer
+  and the next block fails to decode), `a_header_block_parked_across_two_stalled_passes_keeps_the_peer_table_in_sync`,
+  `an_oversized_block_reset_outlives_the_pass_that_dropped_it`,
+  `an_unknown_status_line_keeps_the_size_update_signal`,
   `holds_header_frame_finds_a_block_behind_other_frames`, and a drop-and-reset operation added
   to the `fuzz_hpack_roundtrip` script.
 

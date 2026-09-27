@@ -805,6 +805,14 @@ fn the_h2_converter_signals_the_smallest_table_size_first() {
             status: Store::Static(b"200"),
             reason: Store::Static(b"OK"),
         };
+        // The closing flags are queued, as the converter requires before it
+        // encodes a field block; the block is read from `out` before them.
+        kawa.blocks.push_back(Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: true,
+        }));
         let mut converter = pass.converter(hpack.encoder_mut(), 1, 65535, false, 0);
         assert!(converter.call(Block::StatusLine, &mut kawa));
         assert!(converter.call(

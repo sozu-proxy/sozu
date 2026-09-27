@@ -2509,16 +2509,28 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       `H2WritePhase::Start` calls `ConnectionH2::reset_encoder_table` when
       the park is gone (the stream was removed) or its `kawa.out` is empty
       (`forcefully_terminate_answer` or a default answer cleared it).
-      `H2BlockConverter::check_header_capacity` does the same for the block
-      it clears. `Encoder::reset_table` empties the table and records the
+      Inside the converter, every path that throws encoded bytes away —
+      `H2BlockConverter::check_header_capacity`, the `StatusLine::Unknown`
+      abort, `finalize` clearing an unfinished block — goes through
+      `H2BlockConverter::discard_encoded_block`, which does the same and
+      re-arms the pass's signal; and a field block is never encoded before
+      its closing `Flags { end_header }` is queued
+      (`header_block_is_queued_whole`): kawa's H1 parser queues trailer
+      lines one by one and the closing flags only with the final CRLF, while
+      `ParsingPhase::Trailers` is a main phase, so a pass used to encode a
+      trailer still arriving and drop it. `Encoder::reset_table` empties the table and records the
       size updates `0`, then the maximum size, which the next block opens
       with (RFC 7541 §4.2), so the peer's decoder empties its table too. No
       frame is sent for the dropped block. Pinned by
       `a_header_block_dropped_with_its_stream_keeps_the_peer_table_in_sync`
       and `a_header_block_cleared_from_a_parked_stream_keeps_the_peer_table_in_sync`
       (`h2.rs`, red on `58550dd4`),
-      `an_oversized_block_dropped_after_encoding_keeps_the_peer_table_in_sync`
-      (`converter.rs`), `a_dropped_block_substitutes_fields_until_the_table_is_reset`
+      `a_header_block_parked_across_two_stalled_passes_keeps_the_peer_table_in_sync`,
+      `an_oversized_block_reset_outlives_the_pass_that_dropped_it` (`h2.rs`),
+      `an_oversized_block_dropped_after_encoding_keeps_the_peer_table_in_sync`,
+      `h1_trailers_split_across_reads_are_encoded_whole` (red on `fedb4304`),
+      `an_unknown_status_line_keeps_the_size_update_signal`,
+      `test_converter_finalize_clears_remaining_buffer` (`converter.rs`), `a_dropped_block_substitutes_fields_until_the_table_is_reset`
       (`hpack/tests.rs`), `holds_header_frame_finds_a_block_behind_other_frames`
       (`h2_transmit.rs`) and the `fuzz_hpack_roundtrip` target.
     - **Queued output goes out before any new stream frame.** It is flushed

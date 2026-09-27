@@ -1818,7 +1818,13 @@ used to drop one unsent
   `kawa.out` is cleared (`forcefully_terminate_answer`, a default answer);
 - `H2BlockConverter::check_header_capacity` clears a block that outgrew
   `MAX_HEADER_LIST_SIZE`, after its first fields and its size update were
-  encoded.
+  encoded;
+- `H2BlockConverter::finalize` clears a field block left unfinished. kawa's H1
+  parser queues one `Block::Header` per trailer line as it reads it and the
+  closing `Flags { end_header }` only with the final CRLF, and
+  `ParsingPhase::Trailers` counts as a main phase, so a write pass between the
+  two reads encoded the first trailer lines and dropped them: the trailers
+  were lost as well.
 
 The damage is not limited to a decoding error. Entries are numbered from the
 newest (RFC 7541 §2.3.3), so each insertion the peer missed moves every older
@@ -1850,9 +1856,15 @@ is resumed or gone:
   runs only on a park). The next pass's `H2WritePhase::Start` takes the flag
   and, when the park is gone or its `kawa.out` is empty, calls
   `ConnectionH2::reset_encoder_table` before anything is encoded.
-- `check_header_capacity` calls `Encoder::reset_table` itself and re-arms the
-  converter's pending signal, so the next stream of the same pass opens with
-  the updates; the stream's own earlier frames, already queued, go out before
+- A field block is encoded only once its closing flags are queued
+  (`header_block_is_queued_whole`): the converter puts the first field back
+  and ends the `prepare`, and the backend read that completes the trailers
+  wakes the writer again, so the trailers go out whole.
+- Every converter path that still throws encoded bytes away
+  (`check_header_capacity`, the `StatusLine::Unknown` abort, `finalize`) goes
+  through `H2BlockConverter::discard_encoded_block`, which calls
+  `Encoder::reset_table` and re-arms the converter's pending signal, so the
+  next stream of the same pass opens with the updates; the stream's own earlier frames, already queued, go out before
   that stream is prepared. `H2WritePhase::End` then takes the pass's remaining
   signal (`H2ConverterPass::pending_table_size_update`) as the connection's,
   instead of clearing it whenever some block carried the old one.

@@ -160,16 +160,8 @@ impl H2BlockConverter<'_> {
     /// immutable borrow of `kawa.storage.buffer()` for the duration of
     /// the body; `finalize` runs after that borrow is released.
     ///
-    /// The cleared block was already encoded: its incremental-indexing
-    /// insertions are in the connection's encoder table, and a size update
-    /// it opened with was taken from the pending signal. The peer sees none
-    /// of it, so the encoder's table is emptied and the next block opens with
-    /// `0`, then the maximum size, which empties the peer's table too and
-    /// re-signals whatever size update the dropped block carried
-    /// (sozu-proxy/sozu#1627; `Encoder::reset_table`,
-    /// `lib/src/protocol/mux/hpack/encoder.rs`). No block encoded before
-    /// this one can reach the wire after that next block: a stream's own
-    /// earlier frames go out before any other stream is prepared.
+    /// The cleared block was already encoded, so it goes through
+    /// [`Self::discard_encoded_block`].
     fn check_header_capacity(&mut self) -> bool {
         if self.out.len() > MAX_HEADER_LIST_SIZE {
             error!(
@@ -178,20 +170,61 @@ impl H2BlockConverter<'_> {
                 self.out.len(),
                 MAX_HEADER_LIST_SIZE
             );
-            self.out.clear();
-            let max_size = self.encoder.reset_table();
-            self.pending_table_size_update = Some(u32::try_from(max_size).unwrap_or(u32::MAX));
-            // The prefix this converter wrote, if any, went with the block.
-            self.size_update_emitted = false;
+            self.discard_encoded_block();
             self.pending_oversized_abort = true;
-            debug_assert!(
-                self.out.is_empty() && self.pending_table_size_update.is_some(),
-                "the dropped block leaves nothing queued and re-arms the table reset"
-            );
             return false;
         }
         true
     }
+
+    /// Drop the field block encoded so far in `self.out`, which will never
+    /// reach the peer. Every path that throws encoded bytes away goes
+    /// through here (sozu-proxy/sozu#1627).
+    ///
+    /// Those bytes were already encoded: their incremental-indexing
+    /// insertions are in the connection's encoder table, and a size update
+    /// they opened with was taken from the pending signal. The peer sees
+    /// none of it, so the encoder's table is emptied and the next block opens
+    /// with `0`, then the maximum size, which empties the peer's table too
+    /// and re-signals whatever size update the dropped bytes carried
+    /// (`Encoder::reset_table`, `lib/src/protocol/mux/hpack/encoder.rs`). No
+    /// block encoded before this one can reach the wire after that next
+    /// block: a stream's own earlier frames go out before any other stream
+    /// is prepared.
+    fn discard_encoded_block(&mut self) {
+        if self.out.is_empty() {
+            return;
+        }
+        self.out.clear();
+        let max_size = self.encoder.reset_table();
+        self.pending_table_size_update = Some(u32::try_from(max_size).unwrap_or(u32::MAX));
+        // The prefix this converter wrote, if any, went with the block.
+        self.size_update_emitted = false;
+        debug_assert!(
+            self.out.is_empty() && self.pending_table_size_update.is_some(),
+            "the dropped block leaves nothing queued and re-arms the table reset"
+        );
+    }
+}
+
+/// Whether the field block that starts at the front of `kawa.blocks` is
+/// queued up to its closing `Flags { end_header }`.
+///
+/// kawa's H1 parser pushes one `Block::Header` per trailer line as it reads
+/// it, and the closing flags only with the final CRLF, while
+/// `ParsingPhase::Trailers` already counts as a main phase: a write pass can
+/// reach a trailer block that is still arriving. A field block is only ever
+/// encoded whole, because encoding it changes the connection's HPACK table
+/// and a block cut in two cannot be sent (sozu-proxy/sozu#1627). The first
+/// `Block::Flags` of the queue closes the block the fields belong to.
+fn header_block_is_queued_whole<T: AsBuffer>(kawa: &Kawa<T>) -> bool {
+    kawa.blocks
+        .iter()
+        .find_map(|block| match block {
+            Block::Flags(flags) => Some(flags.end_header),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 /// Everything an [`H2BlockConverter`] must carry from one stream's
@@ -394,6 +427,21 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
         if matches!(kawa.parsing_phase, ParsingPhase::Error { .. }) {
             return false;
         }
+        // A field block is encoded whole or not at all: when its closing
+        // flags are not queued yet (H1 trailers still arriving), put its
+        // first field back and wait for the rest (sozu-proxy/sozu#1627).
+        // `self.out` is empty exactly when no field of the block was encoded.
+        if self.out.is_empty()
+            && matches!(block, Block::StatusLine | Block::Cookies | Block::Header(_))
+            && !header_block_is_queued_whole(kawa)
+        {
+            kawa.blocks.push_front(block);
+            debug_assert!(
+                self.out.is_empty() && !kawa.blocks.is_empty(),
+                "a deferred field block encodes nothing and stays queued"
+            );
+            return false;
+        }
         let buffer = kawa.storage.buffer();
         // RFC 7541 §6.3: when the peer reduced SETTINGS_HEADER_TABLE_SIZE
         // (or changed it in any direction), the very first header block we
@@ -445,6 +493,8 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                         "{} status line must be Request or Response before H2 conversion",
                         log_module_context!()
                     );
+                    // A size update may already open `self.out`: `finalize`
+                    // drops it through `discard_encoded_block`.
                     return false;
                 }
             },
@@ -790,7 +840,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
             // a follow-on prepare pass (e.g. on the back-pressure return
             // path) would still try to encode headers/data after our RST.
             kawa.blocks.clear();
-            self.out.clear();
+            self.discard_encoded_block();
             self.metric_events
                 .push(MetricEvent::HeadersRejectedBudgetOverrun);
             return;
@@ -801,8 +851,9 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                 log_module_context!(),
                 self.out.len()
             );
-            self.out.clear();
+            self.discard_encoded_block();
         }
+        debug_assert!(self.out.is_empty(), "no encoded byte outlives its prepare");
     }
 }
 
@@ -895,6 +946,18 @@ mod tests {
         }
     }
 
+    /// Queue the `Flags { end_header }` that closes a field block, as every
+    /// producer does before a write pass may encode the block: the converter
+    /// defers a block whose closing flags are not queued yet.
+    fn queue_header_end<T: AsBuffer>(kawa: &mut Kawa<T>) {
+        kawa.blocks.push_back(Block::Flags(Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: false,
+        }));
+    }
+
     /// Create a Kawa response stream with a buffer for testing.
     fn make_kawa(buf: &mut [u8], kind: Kind) -> Kawa<SliceBuffer<'_>> {
         Kawa::new(kind, Buffer::new(SliceBuffer(buf)))
@@ -908,6 +971,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         // "connection: close" should be filtered (return true = continue, no output)
         let result = conv.call(
@@ -927,6 +991,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         let result = conv.call(
             Block::Header(Pair {
@@ -945,6 +1010,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         let result = conv.call(
             Block::Header(Pair {
@@ -966,6 +1032,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         let result = conv.call(
             Block::Header(Pair {
@@ -984,6 +1051,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         let result = conv.call(
             Block::Header(Pair {
@@ -1002,6 +1070,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         let result = conv.call(
             Block::Header(Pair {
@@ -1023,6 +1092,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         // TE: gzip should be filtered
         let result = conv.call(
@@ -1045,6 +1115,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         // TE: trailers should be kept
         let result = conv.call(
@@ -1067,6 +1138,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         let result = conv.call(
             Block::Header(Pair {
@@ -1085,6 +1157,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         let result = conv.call(
             Block::Header(Pair {
@@ -1105,6 +1178,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         // Write the key/val into the kawa buffer so Store::Slice works
         std::io::Write::write_all(&mut kawa.storage, b"Content-Type").unwrap();
@@ -1132,6 +1206,7 @@ mod tests {
 
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
         kawa.detached.status_line = StatusLine::Response {
             version: kawa::Version::V20,
             code: 200,
@@ -1173,6 +1248,7 @@ mod tests {
 
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
         kawa.detached.status_line = StatusLine::Response {
             version: kawa::Version::V20,
             code: 200,
@@ -1208,6 +1284,7 @@ mod tests {
 
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
         kawa.detached.status_line = StatusLine::Response {
             version: kawa::Version::V20,
             code: 200,
@@ -1251,6 +1328,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         let result = conv.call(
             Block::Header(Pair {
@@ -1274,6 +1352,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         // Header name with a null byte (control char <= 0x20)
         let result = conv.call(
@@ -1296,6 +1375,7 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
         // Header name with byte >= 0x7f
         let result = conv.call(
@@ -1439,8 +1519,10 @@ mod tests {
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
 
-        // Add a header but don't emit Flags (so out buffer is non-empty)
+        // Encode a header and stop before its queued closing Flags, as a
+        // prepare cut short would (so the out buffer is non-empty)
         conv.call(
             Block::Header(Pair {
                 key: Store::Static(b"x-test"),
@@ -1452,6 +1534,49 @@ mod tests {
 
         conv.finalize(&mut kawa);
         assert!(conv.out.is_empty(), "finalize should clear the out buffer");
+        // The cleared field was encoded with incremental indexing: the table
+        // is reset and the next block must say so (sozu-proxy/sozu#1627).
+        // TO SEE THIS RED: in `H2BlockConverter::finalize`, replace the
+        // non-abort branch's `self.discard_encoded_block()` with
+        // `self.out.clear()`. Verified 2026-09-27.
+        assert_eq!(
+            conv.pending_table_size_update,
+            Some(4096),
+            "dropping encoded bytes re-arms a table reset"
+        );
+    }
+
+    /// A `Block::StatusLine` whose detached status line is `Unknown` aborts
+    /// the block after the pending size update was written into `out`. No
+    /// producer queues that shape — kawa's H1 parser, `pkawa` and the default
+    /// answers all set the status line before pushing its block, and
+    /// `StatusLine::pop` leaves an empty `Request`/`Response`, never
+    /// `Unknown` — but the size update must not be lost if one does: the
+    /// bytes `finalize` drops go through `discard_encoded_block`
+    /// (sozu-proxy/sozu#1627).
+    ///
+    /// TO SEE THIS RED: in `H2BlockConverter::finalize`, replace the
+    /// non-abort branch's `self.discard_encoded_block()` with
+    /// `self.out.clear()`. The signal is then gone: `left: None, right:
+    /// Some(256)`. Verified 2026-09-27.
+    #[test]
+    fn an_unknown_status_line_keeps_the_size_update_signal() {
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        encoder.change_max_table_size(256);
+        let mut conv = test_converter(&mut encoder);
+        conv.pending_table_size_update = Some(256);
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+        queue_header_end(&mut kawa);
+        assert!(!conv.call(Block::StatusLine, &mut kawa), "the block aborts");
+        conv.finalize(&mut kawa);
+        assert!(conv.out.is_empty(), "nothing of the block is left");
+        assert_eq!(
+            conv.pending_table_size_update,
+            Some(256),
+            "the next block still carries the size update"
+        );
+        assert!(!conv.size_update_emitted, "no emitted prefix survived");
     }
 
     #[test]
@@ -1842,6 +1967,136 @@ mod tests {
             pass.pending_table_size_update(),
             None,
             "stream 3's block carried the signal"
+        );
+    }
+
+    /// Every frame `kawa.out` holds, as `(type, flags, payload)`, then the
+    /// queue consumed as if the socket took it all.
+    fn take_out_frames<T: AsBuffer>(kawa: &mut Kawa<T>) -> Vec<(u8, u8, Vec<u8>)> {
+        let mut wire = Vec::new();
+        for block in &kawa.out {
+            if let kawa::OutBlock::Store(store) = block {
+                wire.extend_from_slice(store.data(kawa.storage.buffer()));
+            }
+        }
+        kawa.consume(wire.len());
+        let mut frames = Vec::new();
+        let mut rest = &wire[..];
+        while rest.len() >= parser::FRAME_HEADER_SIZE {
+            let len = usize::from(rest[0]) << 16 | usize::from(rest[1]) << 8 | usize::from(rest[2]);
+            let end = parser::FRAME_HEADER_SIZE + len;
+            frames.push((
+                rest[3],
+                rest[4],
+                rest[parser::FRAME_HEADER_SIZE..end].to_vec(),
+            ));
+            rest = &rest[end..];
+        }
+        assert!(rest.is_empty(), "kawa.out holds whole frames");
+        frames
+    }
+
+    /// H1 trailers that arrive in two reads must not be encoded before their
+    /// last line (sozu-proxy/sozu#1627). kawa pushes one `Block::Header` per
+    /// trailer line as it parses it, and the closing `Flags { end_header }`
+    /// only with the final CRLF, while `ParsingPhase::Trailers` already
+    /// counts as a main phase, so a write pass prepares the stream between
+    /// the two reads. The converter used to encode `x-checksum: abc` then
+    /// (inserting it in the encoder's table) and `finalize` dropped the
+    /// unfinished block: the trailer was lost and the next block naming
+    /// `x-checksum` sent an index the peer never had.
+    ///
+    /// Driven through the real H1 parser and the real converter, one encoder
+    /// and one peer decoder, as a backend response relayed to an H2 client.
+    ///
+    /// TO SEE THIS RED: in `H2BlockConverter::call`, delete the early return
+    /// that defers a field block whose `Flags { end_header }` is not queued.
+    /// The trailers never reach the wire: `left: [(1, 1, [..])]`, the second
+    /// response fails with `Err(InvalidIndex)`. Verified 2026-09-27.
+    #[test]
+    fn h1_trailers_split_across_reads_are_encoded_whole() {
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        let mut peer = crate::protocol::mux::hpack::Decoder::new();
+        peer.set_max_allowed_table_size(4096);
+        let mut events = Vec::new();
+        type Fields = Vec<(Vec<u8>, Vec<u8>)>;
+        let mut decoded: Vec<(u32, Fields)> = Vec::new();
+        let mut kinds = Vec::new();
+        let mut drive = |kawa: &mut Kawa<SliceBuffer<'_>>,
+                         encoder: &mut crate::protocol::mux::hpack::Encoder,
+                         stream_id: u32| {
+            let mut pass = H2ConverterPass::new(
+                16384,
+                b"https",
+                false,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            );
+            let mut converter = pass.converter(encoder, stream_id, 65535, false, 0);
+            kawa.prepare(&mut converter);
+            pass.reclaim(converter, &mut events);
+            for (kind, flags, payload) in take_out_frames(kawa) {
+                kinds.push((stream_id, kind, flags & parser::FLAG_END_STREAM));
+                if kind == 0x1 {
+                    let mut fields = Vec::new();
+                    let status = peer.decode_with_cb(&payload, |name, value| {
+                        fields.push((name.into_owned(), value.into_owned()));
+                    });
+                    decoded.push((stream_id, status.map(|()| fields).unwrap_or_default()));
+                }
+            }
+        };
+        let feed = |kawa: &mut Kawa<SliceBuffer<'_>>, bytes: &[u8]| {
+            kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+            kawa.storage.fill(bytes.len());
+            kawa::h1::parse(kawa, &mut kawa::h1::NoCallbacks);
+        };
+
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+        feed(
+            &mut kawa,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nx-checksum: abc\r\n",
+        );
+        assert_eq!(
+            kawa.parsing_phase,
+            ParsingPhase::Trailers,
+            "premise: the trailer line is parsed, the block is not closed"
+        );
+        drive(&mut kawa, &mut encoder, 1);
+        feed(&mut kawa, b"\r\n");
+        assert!(
+            kawa.is_terminated(),
+            "premise: the final CRLF closes the trailers"
+        );
+        drive(&mut kawa, &mut encoder, 1);
+
+        let mut buf = vec![0u8; 4096];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+        feed(
+            &mut kawa,
+            b"HTTP/1.1 200 OK\r\nx-checksum: abc\r\nContent-Length: 0\r\n\r\n",
+        );
+        drive(&mut kawa, &mut encoder, 3);
+
+        let field = |name: &[u8], value: &[u8]| (name.to_vec(), value.to_vec());
+        assert_eq!(
+            decoded,
+            vec![
+                (1, vec![field(b":status", b"200")]),
+                (1, vec![field(b"x-checksum", b"abc")]),
+                (
+                    3,
+                    vec![
+                        field(b":status", b"200"),
+                        field(b"x-checksum", b"abc"),
+                        field(b"content-length", b"0"),
+                    ]
+                ),
+            ],
+            "the trailer reaches the peer whole, and the next block decodes (frames {kinds:?})"
         );
     }
 
