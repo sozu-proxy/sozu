@@ -3162,6 +3162,12 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux-h2)`: an HPACK size update carried by a header block dropped for exceeding
+  `MAX_HEADER_LIST_SIZE` is signalled again on the next block
+  ([#1627](https://github.com/sozu-proxy/sozu/issues/1627)).** The pass had already marked the
+  signal as sent, so a peer that lowered `SETTINGS_HEADER_TABLE_SIZE` was never told. Part of
+  the dynamic-table reset described under Security.
+
 - **`fix(hpack)`: a table size lowered then raised between two header blocks is signalled as
   both sizes ([#1622](https://github.com/sozu-proxy/sozu/issues/1622)).** When a peer sent two
   `SETTINGS_HEADER_TABLE_SIZE` changes before Sōzu wrote its next header block, for example 0
@@ -3247,10 +3253,10 @@
   guard are replaced by tests of the property that replaces it. The frame walk that measures
   a cut frame's rest is linear in the gathered slices and runs only after a partial write;
   the queue compacts its sent heap bytes while it is still in use, and emptying it releases the
-  read cap. Not fixed here, and older than this change: a stream removed with an encoded but
-  unsent HEADERS block still leaves the peer's HPACK decoder behind the encoder
-  ([#1627](https://github.com/sozu-proxy/sozu/issues/1627)); the queue keeps the framing whole,
-  not that table.
+  read cap. Not fixed by this change, and older than it: a stream removed with an encoded but
+  unsent HEADERS block left the peer's HPACK decoder behind the encoder
+  ([#1627](https://github.com/sozu-proxy/sozu/issues/1627), fixed separately, see Security); the
+  queue keeps the framing whole, not that table.
 
 - **`fix(mux-h2)`: a PING or SETTINGS ACK received while a stream frame is half-written is
   sent after that frame, not inside it ([#1600](https://github.com/sozu-proxy/sozu/issues/1600)).**
@@ -5358,6 +5364,40 @@
   `sozu_lib::protocol::udp`.
 
 ### 🔐 Security
+
+- **`fix(mux-h2)`: a header block HPACK-encoded and then dropped unsent no longer shifts the
+  peer's dynamic table, which could make the peer read one field in place of another
+  ([#1627](https://github.com/sozu-proxy/sozu/issues/1627)).** The connection's encoder changes
+  its dynamic table when it encodes a block in `kawa.prepare`, not when the block reaches the
+  wire. Two paths dropped an encoded block without sending it: a stream parked by socket
+  backpressure with its HEADERS/CONTINUATION (or trailers) still queued was removed (peer
+  RST_STREAM, expiry, `end_stream`, `prune_inactive_streams_while_closing`) or had its queue
+  cleared (`forcefully_terminate_answer`, a default answer); and
+  `H2BlockConverter::check_header_capacity` cleared a block that outgrew
+  `MAX_HEADER_LIST_SIZE` after its first fields were inserted and its pending size update was
+  taken. Dynamic entries are numbered from the newest (RFC 7541 §2.3.3), so every insertion the
+  peer missed moved the older entries one index down in Sōzu's table only: a later block naming
+  an older entry was decoded by the peer as a different field, with no error (measured:
+  `x-c: 3` encoded, `x-a: 1` decoded, and a literal naming `x-c` read under the name `x-a`),
+  and naming a newer one failed with `COMPRESSION_ERROR`. On a backend connection, where the
+  streams of several clients share one encoder, the substituted field can belong to another
+  client's request. The fix uses the reset RFC 7541 §4.2 provides ("setting a maximum size of
+  0, which can subsequently be restored"): `Encoder::reset_table` empties the encoder's table
+  and the next header block opens with the size updates `0`, then the maximum size, which
+  empty the peer's table too. `ConnectionH2::parked_header_block` records, where a write pass
+  parks a stream, whether its queue still holds a field block (`h2_transmit::holds_header_frame`,
+  a frame-header walk that runs only on a park), and the next pass resets the table when that
+  block is gone; the oversized-block abort resets it directly and re-arms the connection's
+  pending signal, which `H2WritePhase::End` now takes back from the pass instead of clearing
+  whenever an earlier block carried it. The cost is the dynamic entries the next blocks would
+  have reused, once per dropped block; nothing is sent for the dead stream and nothing is
+  allocated. Covered by `a_header_block_dropped_with_its_stream_keeps_the_peer_table_in_sync`
+  and `a_header_block_cleared_from_a_parked_stream_keeps_the_peer_table_in_sync` (red on
+  `58550dd4`: the peer fails to decode the next stream's block),
+  `an_oversized_block_dropped_after_encoding_keeps_the_peer_table_in_sync` (red:
+  `Err(InvalidIndex)`), `a_dropped_block_substitutes_fields_until_the_table_is_reset`,
+  `holds_header_frame_finds_a_block_behind_other_frames`, and a drop-and-reset operation added
+  to the `fuzz_hpack_roundtrip` script.
 
 - **`fix(mux-h2)`: bound `pending_rst_streams` at the insert, so one mass idle-timeout reap cannot
   grow the queue past the cap `check_invariants` asserts.** `enqueue_rst_into` had no per-insert

@@ -361,6 +361,62 @@ fn frame_tail_walk(slices: &[IoSlice], written: usize) -> (usize, usize) {
     }
 }
 
+/// Whether `kawa.out` still holds a HEADERS, PUSH_PROMISE or CONTINUATION
+/// frame: a field block the connection's HPACK encoder already produced and
+/// the wire has not started (sozu-proxy/sozu#1627).
+///
+/// `kawa.out` starts on a frame boundary for every H2 stream (LIFECYCLE
+/// invariant 28), so the walk reads each frame header and skips its payload.
+/// Called only where a write pass parks a stream, never per write. Frames
+/// that do not tile the queue answer `true`: a reset of the encoder's table
+/// is always safe once nothing encoded before it is sent after it, while a
+/// missed field block silently desynchronises the peer's table.
+pub fn holds_header_frame<T: AsBuffer>(kawa: &Kawa<T>) -> bool {
+    const HEADERS: u8 = 0x1;
+    const PUSH_PROMISE: u8 = 0x5;
+    const CONTINUATION: u8 = 0x9;
+    const FRAME_HEADER: usize = 9;
+
+    let buffer = kawa.storage.buffer();
+    let mut head = [0u8; FRAME_HEADER];
+    let mut filled = 0usize;
+    let mut payload_left = 0usize;
+    for block in kawa.out.iter() {
+        let kawa::OutBlock::Store(store) = block else {
+            break;
+        };
+        let mut data = store.data(buffer);
+        while !data.is_empty() {
+            if payload_left > 0 {
+                let skipped = payload_left.min(data.len());
+                payload_left -= skipped;
+                data = &data[skipped..];
+                continue;
+            }
+            let copied = (FRAME_HEADER - filled).min(data.len());
+            head[filled..filled + copied].copy_from_slice(&data[..copied]);
+            filled += copied;
+            data = &data[copied..];
+            if filled == FRAME_HEADER {
+                if matches!(head[3], HEADERS | PUSH_PROMISE | CONTINUATION) {
+                    return true;
+                }
+                payload_left = (usize::from(head[0]) << 16)
+                    | (usize::from(head[1]) << 8)
+                    | usize::from(head[2]);
+                filled = 0;
+            }
+        }
+    }
+    debug_assert!(
+        filled < FRAME_HEADER,
+        "a whole frame header is consumed as soon as it is read"
+    );
+    // A frame cut short (a partial header, or a payload the queue does not
+    // hold) is not a whole frame: answer the safe side.
+    filled != 0 || payload_left != 0
+}
+
 /// Apply the byte count the shell accepted, and discharge [`gather`]'s safety
 /// obligation in the same step.
 ///
@@ -881,5 +937,41 @@ mod tests {
             let rst = frame(3, 0, &8u32.to_be_bytes());
             assert_eq!(tail(&[&headers, &rst], headers.len()), 0);
         }
+    }
+    /// `holds_header_frame` finds a field block behind DATA frames, split
+    /// across stores anywhere, and answers `false` for DATA and RST_STREAM
+    /// alone (sozu-proxy/sozu#1627).
+    #[test]
+    fn holds_header_frame_finds_a_block_behind_other_frames() {
+        let data = [0, 0, 3, 0, 0, 0, 0, 0, 1, b'a', b'b', b'c'];
+        let rst = [0, 0, 4, 3, 0, 0, 0, 0, 1, 0, 0, 0, 8];
+        let trailers = [0, 0, 1, 1, 5, 0, 0, 0, 1, 0x88];
+        let mut frames = Vec::new();
+        frames.extend_from_slice(&data);
+        frames.extend_from_slice(&rst);
+        let no_block = frames.len();
+        frames.extend_from_slice(&trailers);
+        for cut in 1..frames.len() {
+            let mut buf = vec![0u8; 64];
+            let kawa = kawa_with_out(&mut buf, &frames, &[cut]);
+            let before = crate::test_allocations::allocations();
+            assert!(holds_header_frame(&kawa), "cut at {cut}");
+            assert_eq!(
+                crate::test_allocations::allocations() - before,
+                0,
+                "the walk allocates nothing"
+            );
+        }
+        for cut in 1..no_block {
+            let mut buf = vec![0u8; 64];
+            let kawa = kawa_with_out(&mut buf, &frames[..no_block], &[cut]);
+            assert!(!holds_header_frame(&kawa), "cut at {cut}");
+        }
+        let mut buf = vec![0u8; 64];
+        let kawa = kawa_with_out(&mut buf, &data[..5], &[]);
+        assert!(
+            holds_header_frame(&kawa),
+            "a cut frame answers the safe side"
+        );
     }
 }

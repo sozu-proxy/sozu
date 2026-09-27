@@ -157,6 +157,45 @@ impl Encoder {
         updates
     }
 
+    /// Empties the dynamic table and records the size updates that make the
+    /// peer's decoder empty its own: `0`, then the current maximum size. RFC
+    /// 7541 §4.2 provides exactly this: "This mechanism can be used to
+    /// completely clear entries from the dynamic table by setting a maximum
+    /// size of 0, which can subsequently be restored." Returns that maximum
+    /// size, which the caller signals through
+    /// [`Self::encode_size_updates_into`] at the start of its next block.
+    ///
+    /// The table changes when a block is ENCODED, not when it reaches the
+    /// peer, so this is how a caller that dropped a block it encoded brings
+    /// the two tables back together (sozu-proxy/sozu#1627). Entries are
+    /// numbered from the newest (§2.3.3): every insertion the peer missed
+    /// moves the older entries down one index in this table only, and a later
+    /// block naming one of them makes the peer read another field, with no
+    /// error. After the reset both tables are empty, whatever the peer missed,
+    /// at the cost of the entries the next blocks would have reused.
+    ///
+    /// Sound only when no block encoded before this call reaches the peer
+    /// after the block that carries the updates: that later block would name
+    /// entries of the table this empties.
+    pub fn reset_table(&mut self) -> usize {
+        let max_size = self.table.max_size();
+        self.change_max_table_size(0);
+        self.change_max_table_size(max_size);
+        debug_assert!(
+            self.table.len() == 0 && self.table.max_size() == max_size,
+            "the table is empty and keeps its maximum size"
+        );
+        debug_assert_eq!(
+            self.pending_size_update,
+            Some(PendingSizeUpdate {
+                smallest: 0,
+                last: max_size,
+            }),
+            "the next block opens with 0, then the maximum size"
+        );
+        max_size
+    }
+
     #[cfg(test)]
     pub(super) fn table(&self) -> &DynamicTable {
         &self.table

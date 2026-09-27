@@ -22,8 +22,10 @@
 //!
 //! It does not make those frames side-effect free. A HEADERS/CONTINUATION
 //! block the stream still owns was already HPACK-encoded, and encoding it
-//! changed the connection's encoder table; dropping it unsent leaves the
-//! peer's decoder table behind (sozu-proxy/sozu#1627, predating this queue).
+//! changed the connection's encoder table. Dropping it unsent is repaired
+//! outside this queue: the next write pass resets the encoder's table
+//! (`ConnectionH2::reset_encoder_table`, `lib/src/protocol/mux/h2.rs`;
+//! sozu-proxy/sozu#1627).
 //!
 //! The rest runs to the end of the frame, extended through the CONTINUATION
 //! frames of an unfinished header block: RFC 9113 §6.10 forbids any other

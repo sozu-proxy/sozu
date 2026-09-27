@@ -125,13 +125,15 @@ Source: `fuzz/fuzz_targets/fuzz_hpack_roundtrip.rs`.
 Reads the input as a script of fields — a control octet choosing the
 representation (the proxy policy, incremental indexing, without indexing,
 never indexed), the Huffman flag and an optional size update opening a new
-block, then a name and a value — and feeds it through one encoder and one
-decoder. Every decoded list must equal the list sent, which holds only while
-both dynamic tables stay identical; the whole input is also Huffman-encoded
-and must decode back to itself.
+block, or else an optional drop of the block encoded so far followed by
+`Encoder::reset_table`, then a name and a value — and feeds it through one
+encoder and one decoder. Every decoded list must equal the list sent, which
+holds only while both dynamic tables stay identical; the whole input is also
+Huffman-encoded and must decode back to itself.
 
-Bug class defended: encoder/decoder dynamic-table drift across evictions and
-size updates, and any asymmetry between the Huffman encoder and decoder.
+Bug class defended: encoder/decoder dynamic-table drift across evictions,
+size updates and blocks encoded but never sent (sozu-proxy/sozu#1627), and
+any asymmetry between the Huffman encoder and decoder.
 
 ### 2.3 `fuzz_udp_flow`
 

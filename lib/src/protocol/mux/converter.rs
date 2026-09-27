@@ -84,13 +84,14 @@ pub struct H2BlockConverter<'a> {
     ///
     /// [`emit_pending_size_update_if_new_block`] consumes this on the first
     /// `Block::StatusLine` / `Block::Header` of each pass; the containing
-    /// `ConnectionH2` clears its own mirror only after confirming the signal
-    /// reached the wire (see `size_update_emitted` below).
+    /// `ConnectionH2` takes back what the pass has left of it when the pass
+    /// ends (`H2ConverterPass::pending_table_size_update`).
+    /// [`Self::check_header_capacity`] re-arms it after a block is dropped.
     pub pending_table_size_update: Option<u32>,
     /// `true` once [`emit_pending_size_update_if_new_block`] has actually
-    /// written a size-update prefix into `self.out` during this write pass.
-    /// The caller in `ConnectionH2::write_streams` reads this flag to know
-    /// whether it is safe to clear its own mirror of the pending state.
+    /// written a size-update prefix into `self.out` during this write pass,
+    /// and `false` again if [`Self::check_header_capacity`] dropped the block
+    /// that carried it.
     pub size_update_emitted: bool,
     /// `true` when [`Self::check_header_capacity`] tripped the
     /// `MAX_HEADER_LIST_SIZE` budget mid-encoding. Set during `call()`,
@@ -158,6 +159,17 @@ impl H2BlockConverter<'_> {
     /// Defer-then-commit is necessary because `call` already holds an
     /// immutable borrow of `kawa.storage.buffer()` for the duration of
     /// the body; `finalize` runs after that borrow is released.
+    ///
+    /// The cleared block was already encoded: its incremental-indexing
+    /// insertions are in the connection's encoder table, and a size update
+    /// it opened with was taken from the pending signal. The peer sees none
+    /// of it, so the encoder's table is emptied and the next block opens with
+    /// `0`, then the maximum size, which empties the peer's table too and
+    /// re-signals whatever size update the dropped block carried
+    /// (sozu-proxy/sozu#1627; `Encoder::reset_table`,
+    /// `lib/src/protocol/mux/hpack/encoder.rs`). No block encoded before
+    /// this one can reach the wire after that next block: a stream's own
+    /// earlier frames go out before any other stream is prepared.
     fn check_header_capacity(&mut self) -> bool {
         if self.out.len() > MAX_HEADER_LIST_SIZE {
             error!(
@@ -167,7 +179,15 @@ impl H2BlockConverter<'_> {
                 MAX_HEADER_LIST_SIZE
             );
             self.out.clear();
+            let max_size = self.encoder.reset_table();
+            self.pending_table_size_update = Some(u32::try_from(max_size).unwrap_or(u32::MAX));
+            // The prefix this converter wrote, if any, went with the block.
+            self.size_update_emitted = false;
             self.pending_oversized_abort = true;
+            debug_assert!(
+                self.out.is_empty() && self.pending_table_size_update.is_some(),
+                "the dropped block leaves nothing queued and re-arms the table reset"
+            );
             return false;
         }
         true
@@ -303,10 +323,20 @@ impl H2ConverterPass {
         converter.window
     }
 
+    /// The RFC 7541 §6.3 signal the pass has not written into a header block
+    /// yet: the one it started with when no block carried it, `None` once
+    /// one did, or the table reset a dropped block re-armed
+    /// ([`H2BlockConverter::check_header_capacity`]). The connection takes
+    /// it back as its pending signal when the pass ends.
+    pub fn pending_table_size_update(&self) -> Option<u32> {
+        self.pending_table_size_update
+    }
+
     /// `true` once some stream in this pass actually wrote the
-    /// dynamic-table-size-update prefix. The connection clears its own
-    /// mirror of the pending update only then: a DATA-only pass emits no
-    /// header block, so the signal must stay queued.
+    /// dynamic-table-size-update prefix. Tests read it; the connection reads
+    /// [`Self::pending_table_size_update`] instead, which also carries a
+    /// reset re-armed after the prefix was written.
+    #[cfg(test)]
     pub fn size_update_emitted(&self) -> bool {
         self.size_update_emitted
     }
@@ -1698,6 +1728,120 @@ mod tests {
         assert!(
             !cont,
             "post-error call() must short-circuit so we do not append frames after RST_STREAM"
+        );
+    }
+
+    /// A block dropped for its size was already encoded, and the peer must
+    /// not fall behind for it (sozu-proxy/sozu#1627, path 2).
+    ///
+    /// Two responses go through one write pass and one encoder, as two
+    /// streams of a connection do, after the peer lowered its table to 256:
+    /// the pass must open its first header block with that size. Stream 1's
+    /// block inserts `x-a: 1`, then an `etag` value overflows
+    /// `MAX_HEADER_LIST_SIZE`, so the block is replaced by a RST_STREAM —
+    /// after it took the size update and inserted `x-a`. Stream 3's block encodes `x-a: 1` again. A peer decoder
+    /// fed only the HEADERS that reach the wire must read it, and must learn
+    /// the 256.
+    ///
+    /// TO SEE THIS RED: in `H2BlockConverter::check_header_capacity`, delete
+    /// the three statements from `let max_size = self.encoder.reset_table();`
+    /// to `self.size_update_emitted = false;`. Stream 3's block is then the
+    /// octets `:status: 200` (static) then `Indexed(62)`, with no size update,
+    /// and the peer cannot resolve 62: `left: Err(InvalidIndex), right:
+    /// Ok([..])`. Verified 2026-09-27 (red on `58550dd4`).
+    #[test]
+    fn an_oversized_block_dropped_after_encoding_keeps_the_peer_table_in_sync() {
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        encoder.change_max_table_size(256);
+        let mut pass = H2ConverterPass::new(
+            16384,
+            b"https",
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(256),
+        );
+        let mut events = Vec::new();
+        let mut peer = crate::protocol::mux::hpack::Decoder::new();
+        peer.set_max_allowed_table_size(4096);
+        let oversized = vec![b'v'; super::MAX_HEADER_LIST_SIZE + 1];
+        let mut frames = Vec::new();
+        for (stream_id, overflow) in [(1, true), (3, false)] {
+            let mut buf = vec![0u8; 64];
+            let mut kawa = make_kawa(&mut buf, Kind::Response);
+            kawa.detached.status_line = StatusLine::Response {
+                version: kawa::Version::V20,
+                code: 200,
+                status: Store::Static(b"200"),
+                reason: Store::Empty,
+            };
+            kawa.blocks.push_back(Block::StatusLine);
+            kawa.blocks.push_back(Block::Header(Pair {
+                key: Store::Static(b"x-a"),
+                val: Store::Static(b"1"),
+            }));
+            if overflow {
+                // A name of the static table: the proxy policy sends it
+                // without indexing, so the overflow itself inserts nothing
+                // and `x-a` stays in the encoder's table.
+                kawa.blocks.push_back(Block::Header(Pair {
+                    key: Store::Static(b"etag"),
+                    val: Store::from_slice(&oversized),
+                }));
+            }
+            kawa.blocks.push_back(Block::Flags(Flags {
+                end_body: false,
+                end_chunk: false,
+                end_header: true,
+                end_stream: true,
+            }));
+            let mut converter = pass.converter(&mut encoder, stream_id, 65535, false, 0);
+            kawa.prepare(&mut converter);
+            pass.reclaim(converter, &mut events);
+
+            let mut wire = Vec::new();
+            for block in &kawa.out {
+                if let kawa::OutBlock::Store(store) = block {
+                    wire.extend_from_slice(store.data(kawa.storage.buffer()));
+                }
+            }
+            let mut rest = &wire[..];
+            while rest.len() >= parser::FRAME_HEADER_SIZE {
+                let len =
+                    usize::from(rest[0]) << 16 | usize::from(rest[1]) << 8 | usize::from(rest[2]);
+                let payload = &rest[parser::FRAME_HEADER_SIZE..parser::FRAME_HEADER_SIZE + len];
+                frames.push((stream_id, rest[3], payload.to_vec()));
+                rest = &rest[parser::FRAME_HEADER_SIZE + len..];
+            }
+        }
+        let kinds: Vec<(u32, u8)> = frames.iter().map(|(id, kind, _)| (*id, *kind)).collect();
+        assert_eq!(
+            kinds,
+            vec![(1, 0x3), (3, 0x1)],
+            "premise: stream 1 is reset without HEADERS, stream 3 answers"
+        );
+        let mut decoded = Vec::new();
+        let status = peer.decode_with_cb(&frames[1].2, |name, value| {
+            decoded.push((name.into_owned(), value.into_owned()));
+        });
+        assert_eq!(
+            status.map(|()| decoded),
+            Ok(vec![
+                (b":status".to_vec(), b"200".to_vec()),
+                (b"x-a".to_vec(), b"1".to_vec()),
+            ]),
+            "the peer must read stream 3's block with its own table"
+        );
+        assert!(
+            frames[1].2.starts_with(&[0x20, 0x3f, 0xe1, 0x01]),
+            "the block opens with 0, then 256: {:02x?}",
+            frames[1].2
+        );
+        assert_eq!(
+            pass.pending_table_size_update(),
+            None,
+            "stream 3's block carried the signal"
         );
     }
 

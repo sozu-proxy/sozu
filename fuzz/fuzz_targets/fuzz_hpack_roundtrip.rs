@@ -4,7 +4,8 @@
 //!
 //! The input is read as a script: each field takes a control octet (the
 //! representation, the Huffman flag, and whether a table size update opens a
-//! new block), a name length, a value length, then the bytes. One encoder
+//! new block or, without one, whether the block so far is dropped unsent and
+//! the encoder's table reset), a name length, a value length, then the bytes. One encoder
 //! writes the blocks and one decoder reads them; every decoded list must equal
 //! the list sent, which only holds while both dynamic tables stay identical.
 //! Corpus + run instructions live in `fuzz/README.md`.
@@ -32,6 +33,15 @@ fuzz_target!(|data: &[u8]| {
             let size = usize::from(control & 0x3f) * 64;
             encoder.set_max_table_size(size);
             encode_integer(size, 5, 0x20, &mut block);
+        } else if control & 0x40 != 0 {
+            // The block encoded so far is dropped unsent, as a mux drops the
+            // block of a removed stream (sozu-proxy/sozu#1627): the encoder
+            // empties its table and the next block opens with the updates
+            // that make the decoder empty its own.
+            block.clear();
+            sent.clear();
+            let size = encoder.reset_table();
+            encoder.encode_size_updates_into(size, &mut block);
         }
         let representation = match control & 0x03 {
             0 => Representation::Proxy,
