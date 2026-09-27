@@ -861,7 +861,8 @@
   `epoll_ctl` 4.00 → 2.00 per request on H1 and on H2 (40 ADD + 40 DEL → 40 ADD), every other
   count unchanged; the worker holds 15 descriptors before and after 1000 further requests on each
   protocol. mio 1.x keeps no per-source state on epoll or kqueue for a deregister to release.
-  `L7Proxy::deregister_socket` stays in the trait, now without a caller. Regression tests read the
+  `L7Proxy::deregister_socket` was left without a caller and is removed by
+  [#1615](https://github.com/sozu-proxy/sozu/issues/1615). Regression tests read the
   kernel's epoll table from `/proc/self/fdinfo`; `doc/lifetime_of_a_session.md` §9 carries the
   argument.
 
@@ -5107,6 +5108,16 @@
 
 
 ### ➖ Removed
+
+- **BREAKING (library API) — `refactor(lib)`: `L7Proxy::deregister_socket` is removed
+  ([#1615](https://github.com/sozu-proxy/sozu/issues/1615)).** It has had no caller since
+  [#1567](https://github.com/sozu-proxy/sozu/issues/1567) stopped closing sessions with
+  `EPOLL_CTL_DEL`: the last close of a session socket removes it from the epoll set
+  (`doc/lifetime_of_a_session.md` §9). The trait declaration goes with its `HttpProxy` and
+  `HttpsProxy` implementations and two `unreachable!` test doubles. An embedder implementing
+  `L7Proxy` drops the method; one that called it through the trait calls `Registry::deregister`
+  on its own `mio::Registry` instead, as the health checker and the listener paths already do.
+  No runtime behaviour changes.
 
 - **BREAKING (library API) — `refactor(udp)`: backend selection moves into the UDP core, closing
   the last place this repository routed outside it

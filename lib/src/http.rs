@@ -1863,10 +1863,6 @@ impl L7Proxy for HttpProxy {
         self.registry.register(source, token, interest)
     }
 
-    fn deregister_socket(&self, tcp_stream: &mut TcpStream) -> Result<(), std::io::Error> {
-        self.registry.deregister(tcp_stream)
-    }
-
     fn add_session(&self, session: Rc<RefCell<dyn ProxySession>>) -> Token {
         let mut session_manager = self.sessions.borrow_mut();
         let len_before = session_manager.slab.len();

@@ -5069,9 +5069,6 @@ mod tests {
         ) -> Result<(), std::io::Error> {
             unreachable!("Mux::close without a backend never asks the proxy")
         }
-        fn deregister_socket(&self, _tcp_stream: &mut TcpStream) -> Result<(), std::io::Error> {
-            unreachable!("Mux::close without a backend never asks the proxy")
-        }
         fn add_session(&self, _session: Rc<RefCell<dyn ProxySession>>) -> Token {
             unreachable!("Mux::close without a backend never asks the proxy")
         }
@@ -5770,9 +5767,13 @@ mod tests {
     /// deregister safe — the socket is not duplicated anywhere, so dropping the
     /// `Mux` really does take it out of the epoll set.
     ///
-    /// To SEE THIS RED: in `Mux::close`'s backend loop, put back
-    /// `let _ = proxy_borrow.deregister_socket(socket);` after
-    /// `let socket = client.socket_mut();`. The first assertion then fails.
+    /// To SEE THIS RED: make `Mux::close`'s backend loop issue an
+    /// `EPOLL_CTL_DEL` after `let socket = client.socket_mut();`. `L7Proxy`
+    /// no longer carries `deregister_socket` (sozu#1615), so restore it for
+    /// the experiment — its `HttpProxy` body was
+    /// `self.registry.deregister(tcp_stream)` — and call
+    /// `let _ = proxy_borrow.deregister_socket(socket);` there. The first
+    /// assertion then fails.
     #[cfg(target_os = "linux")]
     #[test]
     fn close_leaves_backend_sockets_to_their_last_close() {
@@ -5976,9 +5977,6 @@ mod tests {
             _token: Token,
             _interest: Interest,
         ) -> Result<(), std::io::Error> {
-            unreachable!("closing a backend only removes its session")
-        }
-        fn deregister_socket(&self, _tcp_stream: &mut TcpStream) -> Result<(), std::io::Error> {
             unreachable!("closing a backend only removes its session")
         }
         fn add_session(&self, _session: Rc<RefCell<dyn ProxySession>>) -> Token {
