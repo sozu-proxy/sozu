@@ -5392,8 +5392,12 @@
   block is gone; the oversized-block abort resets it directly and re-arms the connection's
   pending signal, which `H2WritePhase::End` now takes back from the pass instead of clearing
   whenever an earlier block carried it. A field block is now encoded only once its closing
-  `Flags { end_header }` is queued, so split trailers are sent whole when the last one arrives,
-  and every converter path that still drops encoded bytes goes through
+  `Flags { end_header }` is queued, so split trailers are sent whole when the last one arrives;
+  a block followed by flags that do not close it is dropped unencoded instead of waited on, and
+  a chunked response its H1 backend closes before the final CRLF — trailers included — ends
+  with RST_STREAM in `ConnectionH2::end_stream`'s close-delimited arm, as
+  `ConnectionH1::terminate_close_delimited` already did, so no stream waits on trailers that
+  never come. Every converter path that still drops encoded bytes goes through
   `H2BlockConverter::discard_encoded_block`, which resets the table. The cost is the dynamic entries the next blocks would
   have reused, once per dropped block; nothing is sent for the dead stream and nothing is
   allocated. Covered by `a_header_block_dropped_with_its_stream_keeps_the_peer_table_in_sync`
@@ -5405,6 +5409,8 @@
   and the next block fails to decode), `a_header_block_parked_across_two_stalled_passes_keeps_the_peer_table_in_sync`,
   `an_oversized_block_reset_outlives_the_pass_that_dropped_it`,
   `an_unknown_status_line_keeps_the_size_update_signal`,
+  `a_chunked_response_closed_inside_its_trailers_ends_with_a_reset` (red: the stream stayed open
+  with its trailer queued), `a_field_block_cut_short_never_stalls_its_stream`,
   `holds_header_frame_finds_a_block_behind_other_frames`, and a drop-and-reset operation added
   to the `fuzz_hpack_roundtrip` script.
 

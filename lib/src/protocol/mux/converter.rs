@@ -196,14 +196,44 @@ impl H2BlockConverter<'_> {
             return;
         }
         self.out.clear();
+        self.reset_encoder_table();
+        debug_assert!(
+            self.out.is_empty() && self.pending_table_size_update.is_some(),
+            "the dropped block leaves nothing queued and re-arms the table reset"
+        );
+    }
+
+    /// Empty the encoder's table and re-arm the signal that makes the next
+    /// block open with `0`, then the maximum size — the second half of
+    /// [`Self::discard_encoded_block`], for a block already moved out of
+    /// `self.out`.
+    fn reset_encoder_table(&mut self) {
         let max_size = self.encoder.reset_table();
         self.pending_table_size_update = Some(u32::try_from(max_size).unwrap_or(u32::MAX));
         // The prefix this converter wrote, if any, went with the block.
         self.size_update_emitted = false;
         debug_assert!(
-            self.out.is_empty() && self.pending_table_size_update.is_some(),
-            "the dropped block leaves nothing queued and re-arms the table reset"
+            self.pending_table_size_update.is_some() && !self.size_update_emitted,
+            "the next block owes the reset"
         );
+    }
+
+    /// A frame header failed to serialise after its block was encoded. It
+    /// cannot: the buffer is exactly [`parser::FRAME_HEADER_SIZE`] bytes and
+    /// every length is at most `max_frame_size` (< 2^24). If it ever does,
+    /// the block does not reach the peer whole, so the encoder's table is
+    /// reset like for any dropped block (sozu-proxy/sozu#1627).
+    fn header_frame_failed(&mut self, error: cookie_factory::GenError) {
+        debug_assert!(
+            false,
+            "a 9-byte buffer always holds a frame header: {error:?}"
+        );
+        error!(
+            "{} failed to serialize a HEADERS/CONTINUATION frame header: {:?}",
+            log_module_context!(),
+            error
+        );
+        self.reset_encoder_table();
     }
 }
 
@@ -217,14 +247,15 @@ impl H2BlockConverter<'_> {
 /// encoded whole, because encoding it changes the connection's HPACK table
 /// and a block cut in two cannot be sent (sozu-proxy/sozu#1627). The first
 /// `Block::Flags` of the queue closes the block the fields belong to.
-fn header_block_is_queued_whole<T: AsBuffer>(kawa: &Kawa<T>) -> bool {
-    kawa.blocks
-        .iter()
-        .find_map(|block| match block {
-            Block::Flags(flags) => Some(flags.end_header),
-            _ => None,
-        })
-        .unwrap_or(false)
+///
+/// `None` while the block is still arriving (no flags queued yet), `Some(true)`
+/// when its closing flags are queued, `Some(false)` when the next flags do not
+/// close it: the block was cut short and can never be completed.
+fn header_block_closing<T: AsBuffer>(kawa: &Kawa<T>) -> Option<bool> {
+    kawa.blocks.iter().find_map(|block| match block {
+        Block::Flags(flags) => Some(flags.end_header),
+        _ => None,
+    })
 }
 
 /// Everything an [`H2BlockConverter`] must carry from one stream's
@@ -433,14 +464,30 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
         // `self.out` is empty exactly when no field of the block was encoded.
         if self.out.is_empty()
             && matches!(block, Block::StatusLine | Block::Cookies | Block::Header(_))
-            && !header_block_is_queued_whole(kawa)
         {
-            kawa.blocks.push_front(block);
-            debug_assert!(
-                self.out.is_empty() && !kawa.blocks.is_empty(),
-                "a deferred field block encodes nothing and stays queued"
-            );
-            return false;
+            match header_block_closing(kawa) {
+                Some(true) => {}
+                None => {
+                    kawa.blocks.push_front(block);
+                    debug_assert!(
+                        self.out.is_empty() && !kawa.blocks.is_empty(),
+                        "a deferred field block encodes nothing and stays queued"
+                    );
+                    return false;
+                }
+                // The flags that follow do not close the block: it was cut
+                // short and never completes. Waiting for it would stall the
+                // stream forever, so its fields are dropped unencoded — the
+                // table is untouched — and the stream goes on to those flags.
+                Some(false) => {
+                    warn!(
+                        "{} H2BlockConverter: dropping a field block cut short before its end",
+                        log_module_context!()
+                    );
+                    debug_assert!(self.out.is_empty(), "nothing of the block was encoded");
+                    return true;
+                }
+            }
         }
         let buffer = kawa.storage.buffer();
         // RFC 7541 §6.3: when the peer reduced SETTINGS_HEADER_TABLE_SIZE
@@ -708,11 +755,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                 stream_id: self.stream_id,
                             },
                         ) {
-                            error!(
-                                "{} failed to serialize HEADERS frame header: {:?}",
-                                log_module_context!(),
-                                e
-                            );
+                            self.header_frame_failed(e);
                             return false;
                         }
                         kawa.push_out(Store::from_slice(&header));
@@ -740,11 +783,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                         stream_id: self.stream_id,
                                     },
                                 ) {
-                                    error!(
-                                        "{} failed to serialize HEADERS frame header: {:?}",
-                                        log_module_context!(),
-                                        e
-                                    );
+                                    self.header_frame_failed(e);
                                     return false;
                                 }
                                 self.metric_events.push(MetricEvent::HeadersFrameSent);
@@ -757,11 +796,7 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                                     stream_id: self.stream_id,
                                 },
                             ) {
-                                error!(
-                                    "{} failed to serialize CONTINUATION frame header: {:?}",
-                                    log_module_context!(),
-                                    e
-                                );
+                                self.header_frame_failed(e);
                                 return false;
                             } else {
                                 self.metric_events.push(MetricEvent::ContinuationFrameSent);
@@ -2098,6 +2133,45 @@ mod tests {
             ],
             "the trailer reaches the peer whole, and the next block decodes (frames {kinds:?})"
         );
+    }
+
+    /// A field block followed by flags that do not close it was cut short
+    /// and never completes. The converter must not wait on it — the stream
+    /// would never end — nor encode it: its fields are dropped unencoded and
+    /// the stream goes on to its flags (sozu-proxy/sozu#1627).
+    ///
+    /// TO SEE THIS RED: in `H2BlockConverter::call`, make the `Some(false)`
+    /// arm of `header_block_closing` defer like `None`. The prepare then emits
+    /// nothing and keeps both blocks queued: `left: [], right: [(0, 1)]`.
+    /// Verified 2026-09-27.
+    #[test]
+    fn a_field_block_cut_short_never_stalls_its_stream() {
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
+        let mut buf = vec![0u8; 256];
+        let mut kawa = make_kawa(&mut buf, Kind::Response);
+        kawa.parsing_phase = ParsingPhase::Terminated;
+        kawa.blocks.push_back(Block::Header(Pair {
+            key: Store::Static(b"x-cut"),
+            val: Store::Static(b"1"),
+        }));
+        kawa.blocks.push_back(Block::Flags(Flags {
+            end_body: true,
+            end_chunk: false,
+            end_header: false,
+            end_stream: true,
+        }));
+        let mut conv = test_converter(&mut encoder);
+        kawa.prepare(&mut conv);
+        drop(conv);
+        let frames: Vec<(u8, u8)> = take_out_frames(&mut kawa)
+            .into_iter()
+            .map(|(kind, flags, _)| (kind, flags & parser::FLAG_END_STREAM))
+            .collect();
+        assert_eq!(frames, vec![(0x0, 1)], "the stream ends with an empty DATA");
+        assert!(kawa.blocks.is_empty(), "nothing stays queued");
+        let mut out = Vec::new();
+        encoder.encode_header_into((b"x-cut", b"1"), &mut out);
+        assert_eq!(out[0], 0x40, "the dropped field never entered the table");
     }
 
     /// `finalize` commits the abort in the SAME prepare pass:

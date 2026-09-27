@@ -978,7 +978,7 @@ connection, H1 and H2); in their place each H2 request pays the one lazy
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8249-8253
+```rust lib/src/protocol/mux/h2.rs:8282-8286
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1111,7 +1111,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8326-8330
+```rust lib/src/protocol/mux/h2.rs:8359-8363
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1586,7 +1586,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:7756
+```rust lib/src/protocol/mux/h2.rs:7789
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1857,9 +1857,14 @@ is resumed or gone:
   and, when the park is gone or its `kawa.out` is empty, calls
   `ConnectionH2::reset_encoder_table` before anything is encoded.
 - A field block is encoded only once its closing flags are queued
-  (`header_block_is_queued_whole`): the converter puts the first field back
+  (`header_block_closing`): the converter puts the first field back
   and ends the `prepare`, and the backend read that completes the trailers
-  wakes the writer again, so the trailers go out whole.
+  wakes the writer again, so the trailers go out whole. Waiting must always
+  end: a block the next queued flags do not close was cut short and is dropped
+  unencoded, and `ConnectionH2::end_stream`'s close-delimited arm ends a
+  chunked response its H1 backend closed mid-body, trailers included, with
+  RST_STREAM (the truncation `ConnectionH1::terminate_close_delimited` already
+  reports the same way, RFC 9112 §7.1) and drops its unencoded blocks.
 - Every converter path that still throws encoded bytes away
   (`check_header_capacity`, the `StatusLine::Unknown` abort, `finalize`) goes
   through `H2BlockConverter::discard_encoded_block`, which calls

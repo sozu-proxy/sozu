@@ -7280,6 +7280,39 @@ impl ConnectionH2 {
                         self.readiness.arm_writable();
                         context.debug.set_interesting(true);
                     }
+                    EndStreamAction::CloseDelimited
+                        if stream.back.body_size == kawa::BodySize::Chunked =>
+                    {
+                        // A chunked body the backend closed before its
+                        // terminating `0\r\n\r\n` (or inside its trailers) is
+                        // truncated: end it with RST_STREAM, never a silent
+                        // END_STREAM, as `ConnectionH1::terminate_close_delimited`
+                        // does (RFC 9112 §7.1). The blocks not yet encoded go
+                        // with it, among them a trailer block still waiting for
+                        // its closing flags, which the converter would otherwise
+                        // wait on forever; none of them touched the HPACK table
+                        // (sozu-proxy/sozu#1627).
+                        warn!(
+                            "{} H1 backend closed a chunked response mid-body on H2 stream {}: emitting RST_STREAM",
+                            log_context!(self),
+                            stream_gid
+                        );
+                        incr!(names::h1::BACKEND_EOF_BEFORE_MESSAGE_COMPLETE);
+                        stream.back.blocks.clear();
+                        stream
+                            .back
+                            .parsing_phase
+                            .error(kawa::ParsingErrorKind::Processing {
+                                message: "INTERNAL_ERROR",
+                            });
+                        stream.state = StreamState::Unlinked;
+                        self.readiness.arm_writable();
+                        context.debug.set_interesting(true);
+                        debug_assert!(
+                            stream.back.is_error() && stream.back.blocks.is_empty(),
+                            "a truncated chunked response ends in Error with nothing left to encode"
+                        );
+                    }
                     EndStreamAction::CloseDelimited => {
                         debug!(
                             "{} CLOSE DELIMITED H2 STREAM {} {:?}",
@@ -11960,6 +11993,92 @@ mod tests {
             "the peer must decode stream 3's block with its own table"
         );
         assert_eq!(status, vec![b"200".to_vec()]);
+    }
+
+    /// An H1 backend answers chunked with `Connection: close`, sends the
+    /// last chunk and a first trailer line, then closes before the final
+    /// CRLF. The trailer block can never be completed, and the converter
+    /// defers a field block until its closing flags are queued
+    /// (sozu-proxy/sozu#1627). `ConnectionH2::end_stream`'s
+    /// `EndStreamAction::CloseDelimited` arm must not leave the stream
+    /// waiting on that block: the chunked body was cut short, so it ends
+    /// with RST_STREAM, exactly as `ConnectionH1::terminate_close_delimited`
+    /// (`lib/src/protocol/mux/h1.rs`) does, and the unfinished trailer is
+    /// dropped unencoded, so the next response still decodes on the peer.
+    ///
+    /// Red on `d12c3299`, which deferred the trailer with no way out: the
+    /// stream stayed open with its trailer queued forever, `stream 1 must end
+    /// with RST_STREAM`, frames `[(1, 0), (0, 0)]`. TO SEE THIS RED now: in
+    /// `ConnectionH2::end_stream`, delete the `EndStreamAction::CloseDelimited`
+    /// arm guarded by `body_size == kawa::BodySize::Chunked`. The truncated
+    /// response then ends silently: frames `[(1, 0), (0, 0), (0, 1)]`.
+    /// Verified 2026-09-27.
+    #[test]
+    fn a_chunked_response_closed_inside_its_trailers_ends_with_a_reset() {
+        let (_pool, mut connection, mut context, mut router, _peer) = two_requests_read(usize::MAX);
+        let gid = |connection: &H2Shell<PacedSocket>, id: u32| {
+            *connection
+                .core
+                .stream_table
+                .streams()
+                .get(&id)
+                .expect("the stream is open")
+        };
+        let (first, third) = (gid(&connection, 1), gid(&connection, 3));
+        {
+            let stream = &mut context.streams[first];
+            stream.context.keep_alive_backend = false;
+            let bytes: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nx-checksum: abc\r\n";
+            let kawa = &mut stream.back;
+            kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+            kawa.storage.fill(bytes.len());
+            kawa::h1::parse(kawa, &mut kawa::h1::NoCallbacks);
+            assert_eq!(
+                kawa.parsing_phase,
+                kawa::ParsingPhase::Trailers,
+                "premise: the backend stopped inside the trailers"
+            );
+            stream.state = StreamState::Unlinked;
+        }
+        connection.core.readiness.arm_writable();
+        drive_both_ways(&mut connection, &mut context, &mut router);
+        connection.core.end_stream(first, &mut context);
+        drive_both_ways(&mut connection, &mut context, &mut router);
+
+        let frames: Vec<(u8, u8)> = peer_frames(&connection.socket.wire)
+            .unwrap()
+            .iter()
+            .filter(|(_, _, id, _)| *id == 1)
+            .map(|(kind, flags, _, _)| (*kind, flags & parser::FLAG_END_STREAM))
+            .collect();
+        assert_eq!(
+            frames.last().map(|(kind, _)| *kind),
+            Some(0x3),
+            "stream 1 must end with RST_STREAM, frames {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|(_, end_stream)| *end_stream != 0),
+            "a truncated chunked body never ends cleanly: {frames:?}"
+        );
+        assert!(
+            !connection.core.stream_table.streams().contains_key(&1),
+            "stream 1 is retired"
+        );
+
+        queue_response(
+            &mut connection,
+            &mut context,
+            third,
+            vec![(b"x-checksum", kawa::Store::Static(b"abc"))],
+        );
+        drive_both_ways(&mut connection, &mut context, &mut router);
+        let (seen, status) = peer_header_blocks(&connection.socket.wire);
+        assert_eq!(
+            seen,
+            vec![(1, true), (3, true)],
+            "every block the peer reads decodes with its own table"
+        );
+        assert_eq!(status, vec![b"200".to_vec(), b"200".to_vec()]);
     }
 
     /// The same block dropped while its stream stays parked:

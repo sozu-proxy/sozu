@@ -799,7 +799,7 @@ reintroduced inline `self.streams.remove(...)` inside `ConnectionH2` fails
 with `E0609: no field 'streams'`). The one exception below does not remove at
 all:
 
-- `close` backend-stream teardown — `h2.rs:7931-7933` (does not remove, only
+- `close` backend-stream teardown — `h2.rs:7964-7966` (does not remove, only
   notifies the endpoint — the surrounding `close` path drops the whole
   connection, and every entry in the wire map (`self.stream_table`) with it,
   shortly after).
@@ -1487,7 +1487,7 @@ stream that has completed on the backend. Behavior depends on `Position`:
   RST_STREAM(CANCEL) unless both request and response have terminated, removes
   the wire mapping, marks the stream `Unlinked` if not already `Recycle`.
 - **Server** position — the `Position::Server` arm of `ConnectionH2::end_stream`
-  (`h2.rs:7261-7379`; the range start is one of eight identical
+  (`h2.rs:7261-7412`; the range start is one of eight identical
   `Position::Server => {` lines, hence the symbol). Dispatches on
   `end_stream_decision` (`shared.rs`): either `ForwardTerminated`,
   `CloseDelimited`, `ForwardUnterminated`, `SendDefault(status)`, `Reconnect`,
@@ -2515,10 +2515,17 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       `H2BlockConverter::discard_encoded_block`, which does the same and
       re-arms the pass's signal; and a field block is never encoded before
       its closing `Flags { end_header }` is queued
-      (`header_block_is_queued_whole`): kawa's H1 parser queues trailer
+      (`header_block_closing`): kawa's H1 parser queues trailer
       lines one by one and the closing flags only with the final CRLF, while
       `ParsingPhase::Trailers` is a main phase, so a pass used to encode a
-      trailer still arriving and drop it. `Encoder::reset_table` empties the table and records the
+      trailer still arriving and drop it. A block that the next queued flags
+      do not close was cut short: it is dropped unencoded rather than waited
+      on, and `ConnectionH2::end_stream`'s close-delimited arm ends a chunked
+      response its backend closed mid-body (trailers included) with
+      RST_STREAM, as `ConnectionH1::terminate_close_delimited` does, so no
+      stream waits forever on trailers. A frame header that fails to serialise
+      (it cannot: 9-byte buffer, length < 2^24) also resets the table.
+      `Encoder::reset_table` empties the table and records the
       size updates `0`, then the maximum size, which the next block opens
       with (RFC 7541 §4.2), so the peer's decoder empties its table too. No
       frame is sent for the dropped block. Pinned by
@@ -2529,7 +2536,9 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       `an_oversized_block_reset_outlives_the_pass_that_dropped_it` (`h2.rs`),
       `an_oversized_block_dropped_after_encoding_keeps_the_peer_table_in_sync`,
       `h1_trailers_split_across_reads_are_encoded_whole` (red on `fedb4304`),
-      `an_unknown_status_line_keeps_the_size_update_signal`,
+      `a_chunked_response_closed_inside_its_trailers_ends_with_a_reset` (`h2.rs`,
+      red on `d12c3299`), `an_unknown_status_line_keeps_the_size_update_signal`,
+      `a_field_block_cut_short_never_stalls_its_stream`,
       `test_converter_finalize_clears_remaining_buffer` (`converter.rs`), `a_dropped_block_substitutes_fields_until_the_table_is_reset`
       (`hpack/tests.rs`), `holds_header_frame_finds_a_block_behind_other_frames`
       (`h2_transmit.rs`) and the `fuzz_hpack_roundtrip` target.
