@@ -647,9 +647,9 @@ The other three sites take the `&mut self` wrapper
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:6407`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:6408`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:7089`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:7103`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -978,7 +978,7 @@ connection, H1 and H2); in their place each H2 request pays the one lazy
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8170-8174
+```rust lib/src/protocol/mux/h2.rs:8184-8188
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1111,7 +1111,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8247-8251
+```rust lib/src/protocol/mux/h2.rs:8261-8265
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1282,7 +1282,11 @@ frame in between — and `ConnectionH2::handle_write` has the queue adopt it
 counted to the stream right away. A stream therefore only ever owns frames the
 wire has not started, and removing it — a peer RST, `end_stream`, expiry,
 `prune_inactive_streams_while_closing` — drops whole unsent frames, never the
-second half of one the peer is already parsing.
+second half of one the peer is already parsing. That keeps the framing whole,
+not the HPACK tables: an unsent header block was already encoded, and dropping
+it leaves the peer's decoder behind the connection's encoder
+([#1627](https://github.com/sozu-proxy/sozu/issues/1627), older than this
+queue).
 
 The copy is bounded by one frame or one header block and happens only on a
 partial write. HAProxy owns its in-flight bytes by copying every frame into
@@ -1582,7 +1586,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:7677
+```rust lib/src/protocol/mux/h2.rs:7691
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1753,7 +1757,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6454-6456
+```rust lib/src/protocol/mux/h2.rs:6455-6457
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1761,7 +1765,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6468-6474
+```rust lib/src/protocol/mux/h2.rs:6469-6475
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

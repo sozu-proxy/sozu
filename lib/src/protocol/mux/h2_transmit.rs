@@ -264,7 +264,62 @@ unsafe fn push_out_blocks<T: AsBuffer>(
 /// running past the gathered bytes cannot happen (the converter queues whole
 /// frames and no delimiter), and answers what is left, after a debug
 /// assertion.
+///
+/// Linear in the number of slices: the walk reads each frame header through a
+/// forward-only cursor, so a queue of many small frames (an H1 chunked body
+/// with tiny chunks) is not rescanned from its first slice for every frame.
+/// Callers skip it entirely when the write took everything it was offered.
 pub fn frame_tail(slices: &[IoSlice], written: usize) -> usize {
+    frame_tail_walk(slices, written).0
+}
+
+/// A forward-only position in a list of slices. `steps` counts how many
+/// slices it has moved past, which is what bounds [`frame_tail`]'s cost.
+struct SliceCursor<'a, 'b> {
+    slices: &'a [IoSlice<'b>],
+    index: usize,
+    offset: usize,
+    steps: usize,
+}
+
+impl SliceCursor<'_, '_> {
+    /// Move forward by `count` bytes; `false` when the slices run out first.
+    fn skip(&mut self, mut count: usize) -> bool {
+        while count > 0 {
+            let Some(slice) = self.slices.get(self.index) else {
+                return false;
+            };
+            let left = slice.len() - self.offset;
+            if count < left {
+                self.offset += count;
+                return true;
+            }
+            count -= left;
+            self.index += 1;
+            self.offset = 0;
+            self.steps += 1;
+        }
+        true
+    }
+
+    /// The byte under the cursor, then move past it.
+    fn next_byte(&mut self) -> Option<u8> {
+        loop {
+            let slice = self.slices.get(self.index)?;
+            if self.offset < slice.len() {
+                let byte = slice[self.offset];
+                self.skip(1);
+                return Some(byte);
+            }
+            self.index += 1;
+            self.offset = 0;
+            self.steps += 1;
+        }
+    }
+}
+
+/// [`frame_tail`], also answering how many slices the walk stepped past.
+fn frame_tail_walk(slices: &[IoSlice], written: usize) -> (usize, usize) {
     const HEADERS: u8 = 0x1;
     const PUSH_PROMISE: u8 = 0x5;
     const CONTINUATION: u8 = 0x9;
@@ -272,36 +327,36 @@ pub fn frame_tail(slices: &[IoSlice], written: usize) -> usize {
     const FRAME_HEADER: usize = 9;
 
     let total: usize = slices.iter().map(|slice| slice.len()).sum();
-    let byte_at = |mut offset: usize| -> u8 {
-        for slice in slices {
-            if offset < slice.len() {
-                return slice[offset];
-            }
-            offset -= slice.len();
-        }
-        0
+    let mut cursor = SliceCursor {
+        slices,
+        index: 0,
+        offset: 0,
+        steps: 0,
     };
     let mut boundary = 0usize;
     let mut in_block = false;
     loop {
         if boundary >= written && !in_block {
-            return boundary - written;
+            return (boundary - written, cursor.steps);
         }
         if boundary + FRAME_HEADER > total {
             debug_assert!(false, "a frame runs past the gathered bytes");
-            return total.saturating_sub(written);
+            return (total.saturating_sub(written), cursor.steps);
         }
-        let payload_len = (usize::from(byte_at(boundary)) << 16)
-            | (usize::from(byte_at(boundary + 1)) << 8)
-            | usize::from(byte_at(boundary + 2));
-        let frame_type = byte_at(boundary + 3);
-        let flags = byte_at(boundary + 4);
+        // The cursor sits on `boundary`: read the length, type and flags,
+        // then skip the stream id and the payload to the next boundary.
+        let mut head = [0u8; 5];
+        for byte in &mut head {
+            *byte = cursor.next_byte().unwrap_or(0);
+        }
+        let payload_len =
+            (usize::from(head[0]) << 16) | (usize::from(head[1]) << 8) | usize::from(head[2]);
         in_block =
-            matches!(frame_type, HEADERS | PUSH_PROMISE | CONTINUATION) && flags & END_HEADERS == 0;
+            matches!(head[3], HEADERS | PUSH_PROMISE | CONTINUATION) && head[4] & END_HEADERS == 0;
         boundary += FRAME_HEADER + payload_len;
-        if boundary > total {
+        if boundary > total || !cursor.skip(FRAME_HEADER - head.len() + payload_len) {
             debug_assert!(false, "a frame runs past the gathered bytes");
-            return total.saturating_sub(written);
+            return (total.saturating_sub(written), cursor.steps);
         }
     }
 }
@@ -710,7 +765,7 @@ mod tests {
     mod frame_tail_cases {
         use std::io::IoSlice;
 
-        use super::super::frame_tail;
+        use super::super::{frame_tail, frame_tail_walk};
 
         fn frame(kind: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
             let len = payload.len();
@@ -785,6 +840,39 @@ mod tests {
             );
             assert_eq!(tail(&blocks, block_len), 0, "after END_HEADERS");
             assert_eq!(tail(&blocks, block_len + 2), data.len() - 2);
+        }
+
+        /// The walk steps past each slice at most once however many frames
+        /// the queue holds: 2700 one-byte DATA frames, each a header slice and
+        /// a payload slice, the shape an H1 chunked body with tiny chunks
+        /// produces. The rescan-from-the-first-slice walk this replaced
+        /// visited on the order of 5 × frames × slices.
+        ///
+        /// TO SEE THIS RED: in `frame_tail_walk`, restart the cursor from the
+        /// first slice for every frame (`cursor.index = 0; cursor.offset = 0;
+        /// cursor.skip(boundary);` before reading the frame header). The test
+        /// then fails with `the walk stepped past 7292700 slices for 5400
+        /// slices`. Verified 2026-09-27.
+        #[test]
+        fn the_walk_is_linear_in_the_slices() {
+            const FRAMES: usize = 2700;
+            let frames: Vec<Vec<u8>> = (0..FRAMES).map(|_| frame(0, 0, b"x")).collect();
+            let mut blocks: Vec<&[u8]> = Vec::with_capacity(FRAMES * 2);
+            for frame in &frames {
+                let (head, payload) = frame.split_at(9);
+                blocks.push(head);
+                blocks.push(payload);
+            }
+            let slices: Vec<IoSlice> = blocks.iter().map(|block| IoSlice::new(block)).collect();
+            let total = FRAMES * 10;
+
+            let (tail, steps) = frame_tail_walk(&slices, total - 5);
+            assert_eq!(tail, 5, "the last frame is cut 5 bytes before its end");
+            assert!(
+                steps <= slices.len(),
+                "the walk stepped past {steps} slices for {} slices",
+                slices.len()
+            );
         }
 
         #[test]

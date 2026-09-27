@@ -17,8 +17,13 @@
 //! the frame's unsent rest is the only committed byte still owned by a
 //! stream, and [`H2Output::adopt_tail`] moves it here, so the stream owns
 //! only frames the wire has not started. Removing the stream then drops
-//! whole unsent frames, which the peer never sees, instead of the second half
-//! of one it is already parsing.
+//! whole unsent frames instead of the second half of one the peer is already
+//! parsing, which keeps the FRAMING intact.
+//!
+//! It does not make those frames side-effect free. A HEADERS/CONTINUATION
+//! block the stream still owns was already HPACK-encoded, and encoding it
+//! changed the connection's encoder table; dropping it unsent leaves the
+//! peer's decoder table behind (sozu-proxy/sozu#1627, predating this queue).
 //!
 //! The rest runs to the end of the frame, extended through the CONTINUATION
 //! frames of an unfinished header block: RFC 9113 §6.10 forbids any other
@@ -201,8 +206,30 @@ impl H2Output {
         self.prepaid -= prepaid;
         if self.is_empty() {
             self.clear();
+        } else {
+            self.compact();
         }
         size - prepaid
+    }
+
+    /// Give back the heap bytes already sent while the queue is still in use.
+    ///
+    /// `consume` only advances `head`, and a queue under steady backpressure
+    /// may never drain to empty, so without this the sent prefix would grow
+    /// with every frame appended behind it. Once that prefix is both past
+    /// [`RETAINED_CAPACITY`] and larger than what is still queued, the queued
+    /// bytes move to the front (a copy no larger than the prefix it frees),
+    /// and a capacity more than four times what is left is shrunk.
+    fn compact(&mut self) {
+        if !self.spilled || self.head < RETAINED_CAPACITY || self.head < self.len() {
+            return;
+        }
+        self.heap.drain(..self.head);
+        self.head = 0;
+        let len = self.heap.len();
+        if self.heap.capacity() > RETAINED_CAPACITY && self.heap.capacity() > 4 * len {
+            self.heap.shrink_to(RETAINED_CAPACITY.max(2 * len));
+        }
     }
 
     /// Drop everything queued: the peer is gone and nothing will be sent.
@@ -320,6 +347,33 @@ mod tests {
         assert!(!output.spilled, "79 bytes must not allocate");
         assert_eq!(output.heap.capacity(), 0);
         assert_eq!(output.len(), 79);
+    }
+
+    /// A queue that never drains to empty still gives its sent heap bytes
+    /// back: under steady backpressure a frame is queued behind each partial
+    /// send, and without compaction the sent prefix grew without bound.
+    ///
+    /// TO SEE THIS RED: in `H2Output::consume`, delete the `else` branch that
+    /// calls `self.compact()`. The test then fails with `the heap must stay
+    /// bounded while the queue never drains`. Verified 2026-09-27.
+    #[test]
+    fn a_queue_that_never_drains_stays_bounded() {
+        let mut output = H2Output::default();
+        let frame = [7u8; 4096];
+        output.push(&frame);
+        for _ in 0..1000 {
+            output.push(&frame);
+            assert_eq!(output.consume(frame.len()), frame.len());
+            assert_eq!(output.len(), frame.len(), "one frame always left queued");
+        }
+        assert!(
+            output.head <= RETAINED_CAPACITY.max(output.len())
+                && output.heap.capacity() <= 4 * (RETAINED_CAPACITY + 2 * frame.len()),
+            "the heap must stay bounded while the queue never drains: head {}, capacity {}",
+            output.head,
+            output.heap.capacity()
+        );
+        assert_eq!(output.pending(), &frame[..], "the queued frame is intact");
     }
 
     /// Crossing the inline capacity keeps every byte, in order: first by

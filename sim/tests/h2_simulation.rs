@@ -1163,8 +1163,11 @@ impl H2Harness {
                         "the wire reported {size} bytes written for an offer of {offered}"
                     );
                     let stream_size = size.saturating_sub(prefix);
-                    let tail =
-                        h2_transmit::frame_tail(&io_slices[usize::from(prefix > 0)..], stream_size);
+                    let tail = if size < offered {
+                        h2_transmit::frame_tail(&io_slices[usize::from(prefix > 0)..], stream_size)
+                    } else {
+                        0
+                    };
                     let kawa = connection.write_buffer(context, stream_id);
                     h2_transmit::confirm(kawa, &mut io_slices, stream_size);
                     connection.handle_write(

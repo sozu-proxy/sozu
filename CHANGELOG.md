@@ -3244,7 +3244,13 @@
   alongside the #1601 half-written-frame tests, which keep passing. Tests that read internals
   of the old mechanism (an ACK found in `zero`, `expect_write == Some(Zero)`, READABLE withdrawn
   while an ACK is queued) now read the output queue, and two that pinned the shared-buffer read
-  guard are replaced by tests of the property that replaces it.
+  guard are replaced by tests of the property that replaces it. The frame walk that measures
+  a cut frame's rest is linear in the gathered slices and runs only after a partial write;
+  the queue compacts its sent heap bytes while it is still in use, and emptying it releases the
+  read cap. Not fixed here, and older than this change: a stream removed with an encoded but
+  unsent HEADERS block still leaves the peer's HPACK decoder behind the encoder
+  ([#1627](https://github.com/sozu-proxy/sozu/issues/1627)); the queue keeps the framing whole,
+  not that table.
 
 - **`fix(mux-h2)`: a PING or SETTINGS ACK received while a stream frame is half-written is
   sent after that frame, not inside it ([#1600](https://github.com/sozu-proxy/sozu/issues/1600)).**

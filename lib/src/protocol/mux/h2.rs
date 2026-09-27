@@ -4049,7 +4049,7 @@ impl ConnectionH2 {
         // drive's forced `readable()` goes on to read.
         if self.frontend_hung_up_while_draining() {
             self.stream_table.set_expect_write(None);
-            self.output.clear();
+            self.clear_output();
             self.flow_control.clear_pending_window_updates();
             self.control_tx.clear_pending();
         }
@@ -5216,16 +5216,16 @@ impl ConnectionH2 {
     /// `ready()` and therefore outside the pass that last refreshed the
     /// mirror. In-module callers pass `self.now`.
     pub fn graceful_goaway(&mut self, now: Instant) -> MuxResult {
-        // `self.zero.storage` is also the read-side accumulation buffer for
-        // an in-flight HEADERS/CONTINUATION field block
-        // (`header_block_reassembly_in_progress`, a few lines above the
-        // WINDOW_UPDATE stage of `flush_pending_control_frames`): clearing it
-        // here to serialize the GOAWAY would destroy that reassembly out from
-        // under it, directly contradicting the "existing streams should
-        // continue reading" promise below. `H2DrainState::begin_graceful_drain`
-        // decides whether to defer for exactly that reason, given this
-        // caller-computed check — the module has no `H2State` of its own to
-        // read it with.
+        // While a HEADERS/CONTINUATION field block is being reassembled
+        // (`header_block_reassembly_in_progress`), the advisory GOAWAY is
+        // deferred until the block completes. Since #1604 that defers nothing
+        // a buffer needs: the GOAWAY is queued in the separate `self.output`,
+        // which shares nothing with `zero` or `header_reassembly`, so it
+        // could not clobber the block. The deferral is kept as drain policy
+        // (LIFECYCLE.md invariant 24, as amended) rather than removed here,
+        // since that would change the drain, not the output.
+        // `H2DrainState::begin_graceful_drain` takes this caller-computed
+        // check because the module has no `H2State` of its own to read.
         let reassembly_in_progress = self.header_block_reassembly_in_progress();
         match self.drain.begin_graceful_drain(now, reassembly_in_progress) {
             // Second GOAWAY: send with the real last_stream_id.
@@ -5255,7 +5255,8 @@ impl ConnectionH2 {
 
     /// Serializes and queues the first, advisory GOAWAY
     /// (`NO_ERROR`, `last_stream_id = STREAM_ID_MAX`) of a graceful drain
-    /// into `self.zero.storage`.
+    /// in the ordered output queue (`self.output`), behind whatever is
+    /// already queued there.
     ///
     /// Split out of [`Self::graceful_goaway`] so
     /// [`Self::flush_pending_control_frames`] can call it once an in-flight
@@ -6539,6 +6540,19 @@ impl ConnectionH2 {
     /// while never reading cannot grow [`Self::output`] past this.
     fn output_read_cap(&self) -> usize {
         self.zero.storage.capacity()
+    }
+
+    /// Drop everything queued in [`Self::output`], and restore reading if the
+    /// read cap had withdrawn it: the only thing reads waited for is gone.
+    /// Every site that empties the queue goes through here or through
+    /// [`Self::consume_output`], so `reads_wait_for_output` never outlives
+    /// the output it waited on.
+    fn clear_output(&mut self) {
+        self.output.clear();
+        if self.reads_wait_for_output {
+            self.reads_wait_for_output = false;
+            self.readiness.interest.insert(Ready::READABLE);
+        }
     }
 
     /// Account for `size` bytes the socket took from [`Self::output`], and
@@ -8439,10 +8453,16 @@ impl<Front: SocketHandler> H2Shell<Front> {
                         "the socket reported {size} bytes written for an offer of {offered}"
                     );
                     let stream_size = size.saturating_sub(prefix);
-                    let tail = h2_transmit::frame_tail(
-                        &self.io_slices[usize::from(prefix > 0)..],
-                        stream_size,
-                    );
+                    // A write that took everything cut nothing: the walk is
+                    // only for a partial write.
+                    let tail = if size < offered {
+                        h2_transmit::frame_tail(
+                            &self.io_slices[usize::from(prefix > 0)..],
+                            stream_size,
+                        )
+                    } else {
+                        0
+                    };
                     let kawa = self.core.write_buffer(context, stream_id);
                     h2_transmit::confirm(kawa, &mut self.io_slices, stream_size);
                     self.core.handle_write(
@@ -14075,6 +14095,45 @@ mod tests {
         assert!(
             connection.core.readiness.interest.is_readable(),
             "draining below the cap must restore reading"
+        );
+    }
+
+    /// Clearing the output queue, as a peer that hung up while the
+    /// connection drains does, also ends the read cap's hold on READABLE:
+    /// otherwise `reads_wait_for_output` would outlive the output it waited on
+    /// and the shutdown drive's reads would stay withdrawn.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::clear_output`, drop everything but
+    /// `self.output.clear();`. The test then fails with `a cleared queue must
+    /// release the read cap`. Verified 2026-09-27.
+    #[test]
+    fn clearing_the_output_releases_the_read_cap() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection.core.state = H2State::Header;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+        let cap = connection.core.output_read_cap();
+        connection.core.output.push(&vec![0; cap]);
+        connection.core.readiness.interest.insert(Ready::READABLE);
+        connection.core.readiness.event.insert(Ready::READABLE);
+        connection.readable(&mut context, EndpointClient(&mut router));
+        assert!(
+            connection.core.reads_wait_for_output
+                && !connection.core.readiness.interest.is_readable(),
+            "premise: the read cap withdrew READABLE"
+        );
+
+        connection.core.clear_output();
+
+        assert!(
+            !connection.core.reads_wait_for_output
+                && connection.core.readiness.interest.is_readable(),
+            "a cleared queue must release the read cap"
         );
     }
 
