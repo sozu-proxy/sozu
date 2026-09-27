@@ -2920,6 +2920,37 @@
   it, including the read `Mux::shutting_down` forces, which used to parse the deferred ACK as
   the peer's next frame header and drop it. Removing a stream parked mid-frame still truncates
   that frame on the wire; that older loss is not fixed here.
+- **`fix(mux-h2)`: reaping a stream in the middle of its DATA payload no longer stops the
+  connection from reading ([#1597](https://github.com/sozu-proxy/sozu/issues/1597)).** When
+  a stream was removed (per-stream idle reap, reset) while the connection was reading a DATA
+  payload into that stream's buffer, `H2StreamTable::remove` nulled `expect_read` and nothing
+  else changed. The connection stayed in `H2State::Frame` with nothing to read, so every later
+  `readable()` pass returned without touching the socket: the rest of the payload, and every
+  PING, HEADERS or DATA behind it, went unread until the connection timeout, which stalled
+  every other stream on that connection. A stream parked on buffer pressure and then reaped
+  hit the same state with READABLE interest also removed, and `try_resume_reading` could not
+  restore it because the stream no longer existed. `ConnectionH2::remove_dead_stream` now
+  moves the connection to `H2State::Discard` for the unread remainder
+  (`skip_orphaned_data_payload`) and restores READABLE interest. The remainder is read and
+  dropped in pieces no larger than the free space in the connection buffer, never buffered
+  whole and never answered with a GOAWAY, the way HAProxy skips a dropped frame's payload.
+  The frame's whole `payload_len`, padding included, is credited to the connection receive
+  window, as `handle_data_frame` does for DATA on a closed stream (RFC 9113 §6.9). Without
+  that credit, each reap would permanently shrink the peer's window.
+  The skip made a backend-side issue reachable, and this changeset fixes it too:
+  `ConnectionH2::end_stream` on a backend connection wrote its RST_STREAM(CANCEL) into the
+  connection buffer, but neither marked that buffer as holding output nor stopped reading.
+  The RST was then never flushed, and the next frame header was read in behind it. The
+  backend connection took our own RST for a frame from the backend and answered with
+  GOAWAY(PROTOCOL_ERROR), which killed every other stream multiplexed on it. The RST now
+  goes through `queue_zero_output`, the path the PING and SETTINGS acknowledgements take
+  since #1600: READABLE interest is removed until the buffer is flushed, and the flush waits
+  for a half-written stream frame. When the buffer holds bytes read from the backend, the RST
+  goes through the control queue (`enqueue_rst`) instead. `skip_orphaned_data_payload`
+  restores READABLE only while `zero_holds_output()` is false. A stalled WINDOW_UPDATE or
+  RST_STREAM flush, which leaves its unsent tail in `zero` with READABLE still on, is
+  covered by the same `zero_holds_output()` read guard. A regression test pins that case,
+  which slower CI runners had hit.
 
 - **`fix(command)`: a blocking channel write reports a failed `write(2)` instead of claiming
   success, and `Channel::writable` names its write errors `ChannelError::Write`

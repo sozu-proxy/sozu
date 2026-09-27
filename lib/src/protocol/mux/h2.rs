@@ -2383,8 +2383,9 @@ impl ConnectionH2 {
             self.readiness.event.remove(Ready::READABLE);
             return H2ReadTarget::Done(MuxResult::Continue);
         };
-        // `zero` is read into from its first byte: while it holds output
-        // (an ACK or GOAWAY), a read there would parse that output as the
+        // `zero` is read into from its first byte: while it holds output (an
+        // ACK, a GOAWAY, the tail of a stalled WINDOW_UPDATE or RST_STREAM
+        // flush, a backend `end_stream` RST), a read there would parse that output as the
         // peer's frame and clear it. Wait for the flush, which restores
         // READABLE interest; the event is kept for that later read. A forced
         // READABLE (the shutdown drive) must not bypass this either.
@@ -2400,6 +2401,7 @@ impl ConnectionH2 {
                 self.arm_timeout();
             }
         }
+        let skipping = self.skipping_orphaned_payload();
         let kawa = read_buffer(
             &mut self.zero,
             &mut context.streams,
@@ -2414,7 +2416,16 @@ impl ConnectionH2 {
             amount
         );
         if amount > 0 {
-            if amount > kawa.storage.available_space() {
+            let available = kawa.storage.available_space();
+            // An orphaned DATA remainder is read and dropped, never kept, so
+            // it only needs *some* room: read what fits and come back for the
+            // rest instead of waiting for room for all of it.
+            let amount = if skipping {
+                amount.min(available)
+            } else {
+                amount
+            };
+            if amount == 0 || amount > available {
                 self.readiness.interest.remove(Ready::READABLE);
                 return H2ReadTarget::Done(MuxResult::Continue);
             }
@@ -2450,6 +2461,7 @@ impl ConnectionH2 {
         E: Endpoint,
         L: ListenerHandler + L7ListenerHandler,
     {
+        let skipping = self.skipping_orphaned_payload();
         let kawa = read_buffer(
             &mut self.zero,
             &mut context.streams,
@@ -2471,7 +2483,9 @@ impl ConnectionH2 {
                     } => global_stream_id,
                 };
                 context.debug.push(DebugEvent::SocketIO(0, did, size));
-                kawa.storage.fill(size);
+                if !skipping {
+                    kawa.storage.fill(size);
+                }
                 let event = self.position.bytes_in_event(size);
                 self.metric_events.push(event);
                 self.bytes.zero_bytes_read += size;
@@ -2487,6 +2501,19 @@ impl ConnectionH2 {
                         self.stream_table.set_expect_read(None);
                     }
                     return MuxResult::Continue;
+                } else if skipping {
+                    // `amount` was capped to the room in `zero`; the debt is
+                    // what `expect_read` still names.
+                    let remaining = self
+                        .stream_table
+                        .expect_read()
+                        .map_or(0, |(_, remaining)| remaining.saturating_sub(size));
+                    if remaining > 0 {
+                        self.stream_table
+                            .set_expect_read(Some((stream_id, remaining)));
+                        return MuxResult::Continue;
+                    }
+                    self.stream_table.set_expect_read(None);
                 } else if size == amount {
                     self.stream_table.set_expect_read(None);
                 } else {
@@ -2528,18 +2555,23 @@ impl ConnectionH2 {
                 // earlier frames' bytes for a CONTINUATION refusal — see
                 // `DiscardedFieldBlock`) before it is dropped, so our
                 // decoder does not fall behind the peer's encoder.
-                if let Some(discarded) = self.discarded_field_block.take()
-                    && let Err(error) =
+                //
+                // Without a field block this is an orphaned DATA remainder
+                // (`Self::skip_orphaned_data_payload`): its bytes were never
+                // kept, and `zero` may still hold unflushed output.
+                if let Some(discarded) = self.discarded_field_block.take() {
+                    if let Err(error) =
                         decode_discarded_field_block(self.hpack.decoder_mut(), i, discarded)
-                {
-                    error!(
-                        "{} discarded stream's HPACK field block failed to decode: {:?}",
-                        log_context!(self),
-                        error
-                    );
-                    return self.goaway(error);
+                    {
+                        error!(
+                            "{} discarded stream's HPACK field block failed to decode: {:?}",
+                            log_context!(self),
+                            error
+                        );
+                        return self.goaway(error);
+                    }
+                    kawa.storage.clear();
                 }
-                kawa.storage.clear();
                 self.attribute_bytes_to_overhead();
                 self.expect_header();
             }
@@ -3666,7 +3698,20 @@ impl ConnectionH2 {
     /// clean as a postcondition; forgetting `prioriser` here would still
     /// cause unbounded memory growth on long-lived connections with many
     /// cancelled streams, so it stays a second, explicit call.
+    ///
+    /// When the stream owns the DATA payload being read, the rest of that
+    /// payload is skipped instead of left unread — see
+    /// [`Self::skip_orphaned_data_payload`].
     fn remove_dead_stream(&mut self, stream_id: StreamId, global_stream_id: GlobalStreamId) {
+        // Read before `H2StreamTable::remove` nulls `expect_read`.
+        let orphaned = match (self.stream_table.expect_read(), &self.state) {
+            (Some((H2StreamId::Other { gid, .. }, remaining)), H2State::Frame(header))
+                if gid == global_stream_id =>
+            {
+                Some((remaining, header.payload_len))
+            }
+            _ => None,
+        };
         if self.stream_table.remove(stream_id, global_stream_id)
             == h2_stream_table::RemoveOutcome::NotPresent
         {
@@ -3677,6 +3722,49 @@ impl ConnectionH2 {
             );
         }
         self.scheduler.remove_stream(&stream_id);
+        if let Some((remaining, payload_len)) = orphaned {
+            self.skip_orphaned_data_payload(remaining, payload_len);
+        }
+    }
+
+    /// Keep the connection reading after the stream that owned the DATA
+    /// payload being read was removed mid-frame (idle reap, reset).
+    ///
+    /// Nulling `expect_read` alone left the connection in `H2State::Frame`
+    /// with nothing to read, so it never read again (#1597). The remaining
+    /// `remaining` bytes are read and dropped through `H2State::Discard`,
+    /// in pieces as small as the room in `zero` allows, like HAProxy's
+    /// "skipping remaining frame payload". `handle_data_frame` will never
+    /// see this frame, so its whole `payload_len`, padding included, is
+    /// credited to the connection receive window here (RFC 9113 §6.9), as
+    /// its closed-stream branch does. READABLE interest is restored because
+    /// the stream may have been parked on buffer pressure, and
+    /// `try_resume_reading` only resumes a stream that still exists.
+    fn skip_orphaned_data_payload(&mut self, remaining: usize, payload_len: u32) {
+        let conn_threshold = self.connection_config.initial_connection_window / 2;
+        if let Some(increment) = self
+            .flow_control
+            .account_received_bytes(payload_len, conn_threshold)
+        {
+            self.queue_window_update(0, increment);
+            self.readiness.arm_writable();
+        }
+        self.state = H2State::Discard;
+        self.discarded_field_block = None;
+        self.stream_table
+            .set_expect_read(Some((H2StreamId::Zero, remaining)));
+        // While `zero` holds unflushed output, READABLE stays off: the
+        // `ResumeZero` flush stage restores it once that output is gone.
+        if !self.zero_holds_output() {
+            self.readiness.interest.insert(Ready::READABLE);
+        }
+    }
+
+    /// Whether the read in progress is an orphaned DATA remainder that is
+    /// dropped as it is read ([`Self::skip_orphaned_data_payload`]). A
+    /// refused HEADERS discard always carries a field block.
+    fn skipping_orphaned_payload(&self) -> bool {
+        matches!(self.state, H2State::Discard) && self.discarded_field_block.is_none()
     }
 
     /// Drop stream-id mappings for streams that never became active before a
@@ -7157,21 +7245,38 @@ impl ConnectionH2 {
                     let stream = &context.streams[stream_gid];
                     let fully_completed =
                         stream.back_received_end_of_stream && stream.front.is_terminated();
+                    // `zero` can carry the RST unless it holds bytes read
+                    // from the backend: it is empty, or holds only output.
+                    let zero_takes_output =
+                        self.zero.storage.is_empty() || self.zero_holds_output();
                     if !fully_completed && !self.stream_table.rst_sent_contains(id) {
-                        let kawa = &mut self.zero;
-                        let mut frame = [0; 13];
-                        if let Ok((_, _size)) =
-                            serializer::gen_rst_stream(&mut frame, id, H2Error::Cancel)
-                        {
-                            let buf = kawa.storage.space();
-                            if buf.len() >= frame.len() {
-                                buf[..frame.len()].copy_from_slice(&frame);
-                                kawa.storage.fill(frame.len());
-                                self.metric_events
-                                    .push(MetricEvent::RstStreamSent(H2Error::Cancel));
-                                self.readiness.arm_writable();
-                                self.stream_table.rst_sent_mut().insert(id);
+                        if zero_takes_output {
+                            let kawa = &mut self.zero;
+                            let mut frame = [0; 13];
+                            if let Ok((_, _size)) =
+                                serializer::gen_rst_stream(&mut frame, id, H2Error::Cancel)
+                            {
+                                let buf = kawa.storage.space();
+                                if buf.len() >= frame.len() {
+                                    buf[..frame.len()].copy_from_slice(&frame);
+                                    kawa.storage.fill(frame.len());
+                                    self.metric_events
+                                        .push(MetricEvent::RstStreamSent(H2Error::Cancel));
+                                    // Same path as a PING or SETTINGS ACK:
+                                    // READABLE off until `zero` is flushed,
+                                    // after any half-written stream frame
+                                    // (#1597). `handle_header_state` parses
+                                    // `zero` from its first byte.
+                                    self.queue_zero_output();
+                                    self.stream_table.rst_sent_mut().insert(id);
+                                }
                             }
+                        } else {
+                            // `zero` is busy: queue the RST for the control
+                            // flush, like every other reset. A flood verdict
+                            // is dropped here as `cancel_timed_out_streams`
+                            // drops it; the sticky counter re-raises it.
+                            let _ = self.enqueue_rst(id, H2Error::Cancel);
                         }
                     }
                     // Retire the stream and invalidate expect_write/expect_read
@@ -13263,6 +13368,595 @@ mod tests {
             vec![(b"x-sozu-probe".to_vec(), b"alpha".to_vec())],
             "the refused stream's field block must have been decoded into the \
              connection's HPACK context"
+        );
+    }
+
+    /// Serialise one frame header followed by `payload`.
+    fn orphan_frame(
+        frame_type: u8,
+        flags: u8,
+        stream_id: u32,
+        len: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(9 + payload.len());
+        frame.extend_from_slice(&len.to_be_bytes()[1..]);
+        frame.push(frame_type);
+        frame.push(flags);
+        frame.extend_from_slice(&stream_id.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// A PING the peer sends after the orphaned payload: once its ACK sits in
+    /// `zero`, the connection has provably read past that payload.
+    fn orphan_ping() -> Vec<u8> {
+        orphan_frame(6, 0, 0, 8, b"pingpong")
+    }
+
+    /// Open stream 1 with a request whose body follows, then send a DATA
+    /// header announcing `payload_len` bytes and the first `sent` of them,
+    /// and drive `readable()` until the connection waits on that payload.
+    /// Returns what `expect_read` then names.
+    fn open_stream_mid_data_payload(
+        connection: &mut H2Shell<mio::net::TcpStream>,
+        peer: &mut std::net::TcpStream,
+        context: &mut Context<crate::protocol::mux::test_support::TestListener>,
+        router: &mut Router,
+        payload_len: u32,
+        sent: usize,
+    ) -> Option<(H2StreamId, usize)> {
+        use std::io::Write;
+
+        connection.core.state = H2State::Header;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+        let block = loona_hpack::Encoder::new().encode([
+            (&b":method"[..], &b"POST"[..]),
+            (&b":scheme"[..], &b"https"[..]),
+            (&b":authority"[..], &b"example.com"[..]),
+            (&b":path"[..], &b"/upload"[..]),
+        ]);
+        let mut bytes = orphan_frame(1, parser::FLAG_END_HEADERS, 1, block.len() as u32, &block);
+        bytes.extend(orphan_frame(0, 0, 1, payload_len, &vec![b'x'; sent]));
+        peer.write_all(&bytes)
+            .expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+        for _ in 0..64 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            connection.readable(context, EndpointClient(router));
+            if let Some((H2StreamId::Other { .. }, remaining)) =
+                connection.core.stream_table.expect_read()
+                && (remaining == payload_len as usize - sent
+                    || !connection.core.readiness.interest.is_readable())
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        connection.core.stream_table.expect_read()
+    }
+
+    /// Drive `readable()` until `done` holds, re-inserting the READABLE event
+    /// AND interest before every pass, so a lost edge-triggered event cannot
+    /// be what stalls the connection. Returns whether `done` held.
+    fn drive_reads_with_readiness_forced(
+        connection: &mut H2Shell<mio::net::TcpStream>,
+        context: &mut Context<crate::protocol::mux::test_support::TestListener>,
+        router: &mut Router,
+        done: impl Fn(&H2Shell<mio::net::TcpStream>) -> bool,
+    ) -> bool {
+        for _ in 0..256 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            connection.core.readiness.interest.insert(Ready::READABLE);
+            connection.readable(context, EndpointClient(router));
+            if done(connection) {
+                return true;
+            }
+            std::thread::yield_now();
+        }
+        false
+    }
+
+    /// Regression test for #1597: a stream reaped by the per-stream idle
+    /// guard while it owns the DATA payload being read must not leave the
+    /// connection unable to read.
+    ///
+    /// `H2StreamTable::remove` nulls an `expect_read` naming the removed
+    /// stream. Before the fix nothing else changed, so the connection stayed
+    /// in `H2State::Frame` with nothing to read, and every later `readable()`
+    /// returned at the `expect_read() == None` early exit — the remaining
+    /// payload, the PING behind it and every later frame were never read.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::remove_dead_stream`], delete the
+    /// `skip_orphaned_data_payload` call. The test fails with `after the reap
+    /// the connection must still read the PING behind the orphaned payload;
+    /// state=Frame(FrameHeader { payload_len: 10, frame_type: Data, flags: 0,
+    /// stream_id: 1 }) expect_read=None`. Verified 2026-09-26.
+    #[test]
+    fn reaping_a_stream_mid_data_payload_keeps_the_connection_reading() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let expect = open_stream_mid_data_payload(
+            &mut connection,
+            &mut peer,
+            &mut context,
+            &mut router,
+            10,
+            4,
+        );
+        assert!(
+            matches!(expect, Some((H2StreamId::Other { .. }, 6))),
+            "premise: mid DATA payload with 6 bytes left, got {expect:?}"
+        );
+
+        // The peer pauses past `stream_idle_timeout` (30 s in
+        // `test_h2_connection`), then sends the rest and a PING.
+        context.now += Duration::from_secs(31);
+        let mut rest = b"efghij".to_vec();
+        rest.extend(orphan_ping());
+        peer.write_all(&rest).expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        let read_on =
+            drive_reads_with_readiness_forced(&mut connection, &mut context, &mut router, |c| {
+                !c.core.zero.storage.is_empty()
+            });
+        assert!(
+            read_on,
+            "after the reap the connection must still read the PING behind the \
+             orphaned payload; state={:?} expect_read={:?}",
+            connection.core.state,
+            connection.core.stream_table.expect_read()
+        );
+        assert!(
+            connection.core.stream_table.is_empty(),
+            "premise: the idle guard reaped stream 1"
+        );
+    }
+
+    /// #1597: the orphaned frame never reaches `handle_data_frame`, so its
+    /// whole wire length must still be credited to the connection receive
+    /// window (RFC 9113 §6.9), or every reap shrinks the peer's window.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::skip_orphaned_data_payload`],
+    /// delete the `account_received_bytes` block. The test then fails with
+    /// `the whole orphaned DATA frame must be credited to the connection
+    /// window`. Verified 2026-09-26.
+    #[test]
+    fn a_skipped_orphaned_data_payload_is_credited_to_the_connection_window() {
+        use std::io::Write;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let expect = open_stream_mid_data_payload(
+            &mut connection,
+            &mut peer,
+            &mut context,
+            &mut router,
+            10,
+            4,
+        );
+        assert!(matches!(expect, Some((H2StreamId::Other { .. }, 6))));
+        context.now += Duration::from_secs(31);
+        let mut rest = b"efghij".to_vec();
+        rest.extend(orphan_ping());
+        peer.write_all(&rest).expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+        assert!(drive_reads_with_readiness_forced(
+            &mut connection,
+            &mut context,
+            &mut router,
+            |c| !c.core.zero.storage.is_empty(),
+        ));
+
+        // A threshold of 1 hands back everything accumulated since the last
+        // connection WINDOW_UPDATE: exactly the orphaned frame's length.
+        assert_eq!(
+            connection.core.flow_control.account_received_bytes(0, 1),
+            Some(10),
+            "the whole orphaned DATA frame must be credited to the connection window"
+        );
+    }
+
+    /// #1597: a remainder close to `max_frame_size` is skipped in pieces as
+    /// small as the room in `zero` allows, never by waiting for room for all
+    /// of it. With 4 KiB buffers a 16 KiB remainder can never fit at once.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::poll_read_target`], replace
+    /// `amount.min(available)` by `amount`. The connection then parks for
+    /// good on the full remainder and the test fails with `the orphaned
+    /// remainder must be skipped in pieces`.
+    #[test]
+    fn a_remainder_near_max_frame_size_is_skipped_in_pieces() {
+        use std::io::Write;
+
+        const PAYLOAD_LEN: u32 = 16_384;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 4_096)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let expect = open_stream_mid_data_payload(
+            &mut connection,
+            &mut peer,
+            &mut context,
+            &mut router,
+            PAYLOAD_LEN,
+            0,
+        );
+        assert!(
+            matches!(expect, Some((H2StreamId::Other { .. }, n)) if n == PAYLOAD_LEN as usize),
+            "premise: waiting on the whole DATA payload, got {expect:?}"
+        );
+        assert!(
+            connection.core.zero.storage.capacity() < PAYLOAD_LEN as usize,
+            "premise: the remainder cannot fit in `zero` at once"
+        );
+
+        context.now += Duration::from_secs(31);
+        let mut rest = vec![b'x'; PAYLOAD_LEN as usize];
+        rest.extend(orphan_ping());
+        peer.write_all(&rest).expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        let read_on =
+            drive_reads_with_readiness_forced(&mut connection, &mut context, &mut router, |c| {
+                !c.core.zero.storage.is_empty()
+            });
+        assert!(
+            read_on,
+            "the orphaned remainder must be skipped in pieces; state={:?} expect_read={:?}",
+            connection.core.state,
+            connection.core.stream_table.expect_read()
+        );
+        assert!(
+            matches!(connection.core.state, H2State::Header),
+            "the connection must be back on frame headers, not in {:?}",
+            connection.core.state
+        );
+        assert_eq!(
+            connection.core.flow_control.account_received_bytes(0, 1),
+            Some(PAYLOAD_LEN),
+            "the whole orphaned DATA frame must be credited to the connection window"
+        );
+    }
+
+    /// #1597, parked form: a stream parked on buffer pressure (READABLE
+    /// interest removed until `try_resume_reading` sees room) and then
+    /// reaped by `Mux::timeout`'s `cancel_timed_out_streams` must resume
+    /// reading. `try_resume_reading` only resumes a stream that still
+    /// exists, so nothing else restores the interest.
+    ///
+    /// Unlike the other #1597 tests, this one never re-inserts READABLE
+    /// interest itself: it calls `readable()` only when the mux would.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::skip_orphaned_data_payload`],
+    /// delete `self.readiness.interest.insert(Ready::READABLE);`. The test
+    /// fails with `a reaped parked stream must not leave the connection
+    /// unable to read`.
+    #[test]
+    fn reaping_a_stream_parked_on_buffer_pressure_resumes_reading() {
+        use std::io::Write;
+
+        const PAYLOAD_LEN: u32 = 16_384;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 4_096)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let expect = open_stream_mid_data_payload(
+            &mut connection,
+            &mut peer,
+            &mut context,
+            &mut router,
+            PAYLOAD_LEN,
+            0,
+        );
+        assert!(
+            matches!(expect, Some((H2StreamId::Other { .. }, n)) if n == PAYLOAD_LEN as usize),
+            "premise: waiting on the whole DATA payload, got {expect:?}"
+        );
+        // The next pass finds no room for the frame in the stream buffer.
+        connection.readable(&mut context, EndpointClient(&mut router));
+        assert!(
+            !connection.core.readiness.interest.is_readable(),
+            "premise: the stream buffer cannot take the frame, so the read parked"
+        );
+
+        let mut rest = vec![b'x'; PAYLOAD_LEN as usize];
+        rest.extend(orphan_ping());
+        peer.write_all(&rest).expect("loopback write must complete");
+        peer.flush().expect("loopback flush must complete");
+
+        // `Mux::timeout` reaps the parked stream.
+        context.now += Duration::from_secs(31);
+        connection.cancel_timed_out_streams(&mut context, &mut EndpointClient(&mut router));
+        assert!(
+            connection.core.stream_table.is_empty(),
+            "premise: the idle guard reaped stream 1"
+        );
+
+        let mut read_on = false;
+        for _ in 0..256 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            if connection.core.readiness.filter_interest().is_readable() {
+                connection.readable(&mut context, EndpointClient(&mut router));
+            }
+            if !connection.core.zero.storage.is_empty() {
+                read_on = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            read_on,
+            "a reaped parked stream must not leave the connection unable to read; \
+             state={:?} expect_read={:?} interest={:?}",
+            connection.core.state,
+            connection.core.stream_table.expect_read(),
+            connection.core.readiness.interest
+        );
+    }
+
+    /// #1597, backend form: `end_stream` on a `Position::Client` connection
+    /// (the client gave up, or the backend timeout fired) while the backend
+    /// is mid-way through a response DATA frame. The RST_STREAM(CANCEL)
+    /// `end_stream` writes into `zero` must reach the backend before the
+    /// connection reads another frame header: `handle_header_state` parses
+    /// `zero` from its first byte, so an unflushed RST there is read back as
+    /// if the backend had sent it, then cleared, and never sent.
+    ///
+    /// The loop drives the connection the way `Mux` does: `writable()` and
+    /// `readable()` only when the filtered readiness allows them.
+    ///
+    /// TO SEE THIS RED: in the `Position::Client` arm of
+    /// [`ConnectionH2::end_stream`], replace `self.queue_zero_output();` by
+    /// `self.readiness.arm_writable();`. The test then fails with `the backend must receive exactly RST_STREAM(CANCEL) for
+    /// stream 1, then the PING ACK`.
+    #[test]
+    fn end_stream_on_a_backend_mid_data_payload_sends_its_rst_before_reading_on() {
+        use std::io::{Read, Write};
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (socket, mut peer) = connected_socket();
+        peer.set_nonblocking(true)
+            .expect("the loopback peer must switch to non-blocking");
+        let backend = Rc::new(RefCell::new(crate::backends::Backend::new(
+            "orphan-backend",
+            "127.0.0.1:2".parse().expect("backend address must parse"),
+            None,
+            None,
+            None,
+        )));
+        let mut registry = crate::protocol::mux::BackendRegistry::default();
+        let mut connection = H2Shell::new(
+            Ulid::generate(),
+            socket,
+            Position::Client(
+                "orphan-cluster".to_owned(),
+                registry.id_for(&backend),
+                BackendStatus::Connected,
+            ),
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            Some((H2StreamId::Zero, 9)),
+            Ready::READABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("a pool with free buffers must yield an H2 connection");
+        connection.core.state = H2State::Header;
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let gid = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("test context must create a stream");
+        context.streams[gid].state = StreamState::Linked(mio::Token(1));
+        connection
+            .core
+            .stream_table
+            .register(1, gid, connection.core.now);
+
+        // The backend starts a 10-byte response DATA frame and sends 4 bytes.
+        peer.write_all(&orphan_frame(0, 0, 1, 10, b"abcd"))
+            .expect("loopback write must complete");
+        for _ in 0..64 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            connection.readable(&mut context, EndpointClient(&mut router));
+            if matches!(
+                connection.core.stream_table.expect_read(),
+                Some((H2StreamId::Other { .. }, 6))
+            ) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(
+                connection.core.stream_table.expect_read(),
+                Some((H2StreamId::Other { .. }, 6))
+            ),
+            "premise: mid response DATA payload with 6 bytes left, got {:?}",
+            connection.core.stream_table.expect_read()
+        );
+
+        connection.end_stream(gid, &mut context);
+
+        // The backend, not yet aware of the RST, finishes the frame and pings.
+        let mut rest = b"efghij".to_vec();
+        rest.extend(orphan_ping());
+        peer.write_all(&rest).expect("loopback write must complete");
+
+        let mut received = Vec::new();
+        let expected_len = 13 + 17;
+        for _ in 0..256 {
+            connection
+                .core
+                .readiness
+                .event
+                .insert(Ready::READABLE | Ready::WRITABLE);
+            if connection.core.readiness.filter_interest().is_writable() {
+                connection.writable(&mut context, EndpointClient(&mut router));
+            }
+            if connection.core.readiness.filter_interest().is_readable() {
+                connection.readable(&mut context, EndpointClient(&mut router));
+            }
+            let mut buf = [0u8; 256];
+            if let Ok(n) = peer.read(&mut buf) {
+                received.extend_from_slice(&buf[..n]);
+            }
+            if received.len() >= expected_len
+                || matches!(connection.core.state, H2State::GoAway | H2State::Error)
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        let mut expected = orphan_frame(3, 0, 1, 4, &(H2Error::Cancel as u32).to_be_bytes());
+        expected.extend(orphan_frame(6, parser::FLAG_ACK, 0, 8, b"pingpong"));
+        assert_eq!(
+            received,
+            expected,
+            "the backend must receive exactly RST_STREAM(CANCEL) for stream 1, then the \
+             PING ACK; state={:?} expect_read={:?}",
+            connection.core.state,
+            connection.core.stream_table.expect_read()
+        );
+    }
+
+    /// #1597: skipping an orphaned remainder must not turn READABLE back on
+    /// while `zero` still holds unflushed output (`expect_write == Zero`).
+    /// The `ResumeZero` flush stage restores it once that output is gone;
+    /// reading earlier would parse the output as the peer's next frame
+    /// header.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::skip_orphaned_data_payload`],
+    /// insert READABLE unconditionally. The test fails with `READABLE must
+    /// stay off while zero holds output`.
+    #[test]
+    fn skipping_an_orphaned_payload_keeps_readable_off_while_zero_holds_output() {
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        connection.core.zero.storage.space()[..13].fill(0);
+        connection.core.zero.storage.fill(13);
+        connection
+            .core
+            .stream_table
+            .set_expect_write(Some(H2StreamId::Zero));
+        connection.core.readiness.interest.remove(Ready::READABLE);
+
+        connection.core.skip_orphaned_data_payload(6, 10);
+
+        assert!(
+            !connection.core.readiness.interest.is_readable(),
+            "READABLE must stay off while zero holds output"
+        );
+        assert_eq!(
+            connection.core.stream_table.expect_read(),
+            Some((H2StreamId::Zero, 6)),
+            "the remainder must still be scheduled for skipping"
+        );
+    }
+
+    /// #1597: no frame header is read into `zero` while it still holds our
+    /// own output. A stalled WINDOW_UPDATE flush leaves exactly that state
+    /// (`expect_write == Zero`, READABLE interest still on); the CI e2e
+    /// suite caught it through `handle_header_state`'s `debug_assert!`, with
+    /// `zero` holding a stream-1 WINDOW_UPDATE followed by the peer's next
+    /// DATA header.
+    ///
+    /// TO SEE THIS RED: in [`ConnectionH2::poll_read_target`], delete the
+    /// `zero_holds_output()` early return. `readable()` then panics with `no
+    /// output may be pending in zero when a frame header is read`.
+    #[test]
+    fn no_frame_header_is_read_while_zero_holds_unflushed_output() {
+        use std::io::{Read, Write};
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 20, 16_384)));
+        let (mut connection, mut peer) = test_h2_connection(&pool, None);
+        peer.set_nonblocking(true)
+            .expect("the loopback peer must switch to non-blocking");
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        connection.core.state = H2State::Header;
+        connection
+            .core
+            .stream_table
+            .set_expect_read(Some((H2StreamId::Zero, 9)));
+
+        // What a stalled WINDOW_UPDATE flush leaves behind.
+        let window_update = orphan_frame(8, 0, 1, 4, &16_384u32.to_be_bytes());
+        connection.core.zero.storage.space()[..window_update.len()].copy_from_slice(&window_update);
+        connection.core.zero.storage.fill(window_update.len());
+        connection
+            .core
+            .stream_table
+            .set_expect_write(Some(H2StreamId::Zero));
+        connection.core.readiness.interest.insert(Ready::READABLE);
+
+        peer.write_all(&orphan_ping())
+            .expect("loopback write must complete");
+        for _ in 0..16 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            connection.readable(&mut context, EndpointClient(&mut router));
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            connection.core.zero.storage.data(),
+            &window_update[..],
+            "nothing may be read into zero while it holds our output"
+        );
+        assert!(
+            !connection.core.readiness.interest.is_readable(),
+            "READABLE must wait for the zero flush"
+        );
+
+        // Driven the way `Mux` does, the output leaves first, then the PING
+        // is read and answered.
+        let mut received = Vec::new();
+        let mut expected = window_update.clone();
+        expected.extend(orphan_frame(6, parser::FLAG_ACK, 0, 8, b"pingpong"));
+        for _ in 0..256 {
+            connection
+                .core
+                .readiness
+                .event
+                .insert(Ready::READABLE | Ready::WRITABLE);
+            connection.core.readiness.interest.insert(Ready::WRITABLE);
+            if connection.core.readiness.filter_interest().is_writable() {
+                connection.writable(&mut context, EndpointClient(&mut router));
+            }
+            if connection.core.readiness.filter_interest().is_readable() {
+                connection.readable(&mut context, EndpointClient(&mut router));
+            }
+            let mut buf = [0u8; 256];
+            if let Ok(n) = peer.read(&mut buf) {
+                received.extend_from_slice(&buf[..n]);
+            }
+            if received.len() >= expected.len() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            received, expected,
+            "the peer must receive the WINDOW_UPDATE, then the PING ACK"
         );
     }
 
