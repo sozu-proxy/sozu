@@ -8,14 +8,15 @@ framing. The crate is intentionally outside the main Cargo workspace (see
 builds do not pull the rest of the workspace through libFuzzer's build
 flags.
 
-This document covers the layout, the five harnesses, how to run them
+This document covers the layout, the six harnesses, how to run them
 locally, how to triage findings, how CI's dedicated nightly fuzz job
 exercises them, and what would additionally be required to wire the
 project into ClusterFuzzLite / OSS-Fuzz.
 
-`fuzz_command_channel` is new and, unlike the other four, is not yet wired
-into `.github/workflows/ci.yml`'s `fuzz` job or `e2e/src/tests/fuzz_tests.rs`
--- that wiring is a separate, proposed-not-added decision (see §3 and §6).
+`fuzz_command_channel` and `fuzz_hpack_roundtrip` are new and, unlike the
+other four, are not yet wired into `.github/workflows/ci.yml`'s `fuzz` job or
+`e2e/src/tests/fuzz_tests.rs` -- that wiring is a separate,
+proposed-not-added decision (see §3 and §6).
 
 ---
 
@@ -28,6 +29,7 @@ fuzz/
 ├── fuzz_targets/
 │   ├── fuzz_frame_parser.rs          # H2 frame-codec fuzzer (RFC 9113)
 │   ├── fuzz_hpack_decoder.rs         # HPACK-decoder fuzzer (RFC 7541)
+│   ├── fuzz_hpack_roundtrip.rs       # HPACK encoder → decoder round trip
 │   ├── fuzz_udp_flow.rs              # sans-io UDP load-balancing core fuzzer
 │   ├── fuzz_tcp_clienthello.rs       # sans-io TCP SNI-preread core fuzzer
 │   └── fuzz_command_channel.rs       # command-channel IPC framing fuzzer
@@ -54,6 +56,7 @@ fuzz/
 └── artifacts/                        # crash artifacts, not committed
     ├── fuzz_frame_parser/
     ├── fuzz_hpack_decoder/
+    ├── fuzz_hpack_roundtrip/
     ├── fuzz_udp_flow/
     ├── fuzz_tcp_clienthello/
     └── fuzz_command_channel/
@@ -99,19 +102,36 @@ gate that keeps it honest.
 
 Source: `fuzz/fuzz_targets/fuzz_hpack_decoder.rs`.
 
-Drives the `loona-hpack` decoder against arbitrary header-block fragments
-under three dynamic-table profiles:
+Drives the in-tree sans-io HPACK decoder (`sozu_lib::protocol::mux::hpack`,
+RFC 7541) against arbitrary header blocks under three dynamic-table
+profiles, and the same bytes through the Huffman decoder alone:
 
-- default table size (`fuzz_hpack_decoder.rs:16`);
-- 256-byte table to stress eviction (`fuzz_hpack_decoder.rs:27-29`);
-- zero-byte table to force every entry to evict immediately
-  (`fuzz_hpack_decoder.rs:32-34`).
+- default table size, decoding the input twice so the second pass meets a
+  table the first one filled;
+- 256-byte table to stress eviction;
+- zero-byte table to force every entry to evict immediately;
+- the raw input as one Huffman string, whose output must stay within the
+  decoded-length bound.
 
-Bug class defended: header-block oversize, incomplete-update, and table
-resize edge cases. The decoder is the canonical RFC 7541 implementation
-imported through `loona-hpack = "0.4"` (`fuzz/Cargo.toml:12`); the fuzzer
-covers the worst-case shapes that the in-tree HPACK consumer
-(`lib/src/protocol/mux/pkawa.rs`) routes into the decoder.
+Bug class defended: header-block oversize, incomplete-update, table resize
+edge cases, Huffman padding and EOS. The fuzzer covers the worst-case shapes
+that the in-tree HPACK consumer (`lib/src/protocol/mux/pkawa.rs`) routes
+into the decoder.
+
+### 2.2b `fuzz_hpack_roundtrip`
+
+Source: `fuzz/fuzz_targets/fuzz_hpack_roundtrip.rs`.
+
+Reads the input as a script of fields — a control octet choosing the
+representation (the proxy policy, incremental indexing, without indexing,
+never indexed), the Huffman flag and an optional size update opening a new
+block, then a name and a value — and feeds it through one encoder and one
+decoder. Every decoded list must equal the list sent, which holds only while
+both dynamic tables stay identical; the whole input is also Huffman-encoded
+and must decode back to itself.
+
+Bug class defended: encoder/decoder dynamic-table drift across evictions and
+size updates, and any asymmetry between the Huffman encoder and decoder.
 
 ### 2.3 `fuzz_udp_flow`
 
@@ -460,7 +480,7 @@ Until ClusterFuzzLite is added, the existing safety nets are:
   `command/src/channel.rs` (`fuzz_command_channel`, not yet CI-wired — run
   it manually until it is, see §6.1);
 - the in-tree `e2e/src/tests/fuzz_tests.rs` ten-second smoke check (four of
-  the five targets).
+  the six targets).
 
 ---
 
@@ -472,8 +492,8 @@ Until ClusterFuzzLite is added, the existing safety nets are:
 - `lib/src/protocol/mux/parser.rs` — the H2 frame parser the
   `fuzz_frame_parser` target drives.
 - `lib/src/protocol/mux/pkawa.rs` — in-tree HPACK consumer; the
-  `fuzz_hpack_decoder` target verifies the underlying `loona-hpack`
-  decoder it relies on.
+  `fuzz_hpack_decoder` and `fuzz_hpack_roundtrip` targets verify the
+  in-tree `hpack` module it relies on.
 - `lib/src/protocol/mux/LIFECYCLE.md` — context for the framing rules
   the parser enforces.
 - `lib/src/protocol/udp/manager.rs` — the sans-io UDP load-balancing core

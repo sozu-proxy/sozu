@@ -280,6 +280,7 @@ const T_SETTINGS: u8 = 0x4;
 const T_PING: u8 = 0x6;
 const T_GOAWAY: u8 = 0x7;
 const T_WINDOW_UPDATE: u8 = 0x8;
+const T_CONTINUATION: u8 = 0x9;
 
 const F_ACK: u8 = 0x1;
 const F_END_STREAM: u8 = 0x1;
@@ -288,6 +289,7 @@ const F_END_HEADERS: u8 = 0x4;
 /// RFC 9113 §7 error codes used by the oracles below.
 const E_NO_ERROR: u32 = 0x0;
 const E_REFUSED_STREAM: u32 = 0x7;
+const E_COMPRESSION_ERROR: u32 = 0x9;
 
 /// RFC 9113 §6.5.2 identifiers.
 const S_INITIAL_WINDOW_SIZE: u16 = 0x4;
@@ -2784,4 +2786,231 @@ fn env_parse_accepts_hex_and_decimal() {
     assert_eq!(parse_u64("0xdeadbeef"), Some(0xdead_beef));
     assert_eq!(parse_u64("0XFF"), Some(0xFF));
     assert_eq!(parse_u64("notanumber"), None);
+}
+
+// --------------------------------------------------------------------------
+// HPACK: the dynamic table under fragmentation.
+// --------------------------------------------------------------------------
+
+/// RFC 7541 §5.1 integer, hand-rolled like the rest of this file's wire
+/// encoding: `flags` occupies the bits above the `prefix`-bit prefix.
+fn hpack_integer(value: usize, prefix: u8, flags: u8, out: &mut Vec<u8>) {
+    let max = (1usize << prefix) - 1;
+    if value < max {
+        out.push(flags | value as u8);
+        return;
+    }
+    out.push(flags | max as u8);
+    let mut rest = value - max;
+    while rest >= 128 {
+        out.push((rest % 128) as u8 | 0x80);
+        rest /= 128;
+    }
+    out.push(rest as u8);
+}
+
+/// RFC 7541 §5.2 string literal, never Huffman-coded.
+fn hpack_string(bytes: &[u8], out: &mut Vec<u8>) {
+    hpack_integer(bytes.len(), 7, 0, out);
+    out.extend_from_slice(bytes);
+}
+
+/// The client's model of the dynamic table the core decodes with, written
+/// from RFC 7541 §2.3.2 and §4 and nothing else: newest entry first, 32
+/// octets of overhead per entry, eviction from the oldest end.
+struct ModelTable {
+    entries: VecDeque<(Vec<u8>, Vec<u8>)>,
+    size: usize,
+    max: usize,
+}
+
+impl ModelTable {
+    fn set_max(&mut self, max: usize) {
+        self.max = max;
+        self.evict();
+    }
+
+    fn insert(&mut self, name: &[u8], value: &[u8]) {
+        self.entries.push_front((name.to_vec(), value.to_vec()));
+        self.size += name.len() + value.len() + 32;
+        self.evict();
+    }
+
+    fn evict(&mut self) {
+        while self.size > self.max {
+            let (name, value) = self.entries.pop_back().expect("size > 0 means an entry");
+            self.size -= name.len() + value.len() + 32;
+        }
+    }
+
+    /// RFC 7541 §2.3.3: dynamic entries start at index 62.
+    fn index_of(&self, name: &[u8], value: &[u8]) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|(n, v)| n == name && v == value)
+            .map(|position| 62 + position)
+    }
+
+    /// Appends `name: value`: indexed when the model holds it, otherwise a
+    /// literal with incremental indexing — with the static name index when
+    /// there is one — which the model then inserts.
+    fn encode(&mut self, name: &[u8], static_name: Option<usize>, value: &[u8], out: &mut Vec<u8>) {
+        if let Some(index) = self.index_of(name, value) {
+            hpack_integer(index, 7, 0x80, out);
+            return;
+        }
+        match static_name {
+            Some(index) => hpack_integer(index, 6, 0x40, out),
+            None => {
+                out.push(0x40);
+                hpack_string(name, out);
+            }
+        }
+        hpack_string(value, out);
+        self.insert(name, value);
+    }
+}
+
+/// xorshift64*: a seeded source independent of moonpool, for a property that
+/// needs no virtual clock.
+struct HpackRng(u64);
+
+impl HpackRng {
+    fn below(&mut self, bound: usize) -> usize {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        (self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % bound as u64) as usize
+    }
+}
+
+/// **Property — the core's HPACK dynamic table stays in step with the
+/// peer's across fragmented reads, split field blocks and size updates.**
+///
+/// Each seed opens 96 streams on one connection. Every request block names
+/// `:authority`, `:path` and a custom field from small pools, each one sent
+/// as an indexed reference once the client's [`ModelTable`] holds it and as
+/// a literal with incremental indexing otherwise, so most fields of most
+/// blocks are dynamic-table references. One block in six opens with a
+/// dynamic table size update (RFC 7541 §6.3) to 0, 64, 160 or 4096 octets,
+/// so entries are evicted and re-inserted all along. Every block is split
+/// into a HEADERS frame and up to three CONTINUATION frames at seed-chosen
+/// boundaries, and every pump reads a seed-chosen 1 to 17 octets at a time.
+///
+/// The oracle is the wire and the client's own model, written from RFC 7541
+/// and sharing no code with `sozu_lib::protocol::mux::hpack`. A table that
+/// drifted would make a reference resolve to another entry — a `:path`
+/// without its leading `/`, a missing or duplicated pseudo-header, which the
+/// core refuses with RST_STREAM — or to no entry at all, which is a GOAWAY
+/// with COMPRESSION_ERROR. So no RST_STREAM and no GOAWAY may appear. The
+/// last block is a canary proving that oracle can fire: it references one
+/// entry past the model's table and must end the connection with
+/// COMPRESSION_ERROR.
+#[test]
+fn h2_hpack_dynamic_table_stays_in_step_under_fragmentation() {
+    const STREAMS: u32 = 96;
+    let seeds: Vec<u64> = match env_u64("SOZU_H2_SIM_SEED") {
+        Some(seed) => vec![seed],
+        None => (0..32).collect(),
+    };
+    for seed in seeds {
+        let mut rng = HpackRng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let config = H2ConnectionConfig::new(65_535, STREAMS + 8, 2);
+        let base = Instant::now();
+        let mut harness = H2Harness::new(
+            config,
+            HarnessTimeouts::default(),
+            base,
+            PINNED_REQUEST_ID_SEED,
+        );
+        harness.bootstrap(base, 65_535);
+        harness.feed(&settings_ack());
+        let mut model = ModelTable {
+            entries: VecDeque::new(),
+            size: 0,
+            max: 4096,
+        };
+        let authorities: [&[u8]; 3] = [b"sim.invalid", b"a.sim.invalid", b"b.sim.invalid"];
+        for index in 0..STREAMS {
+            let id = 1 + index * 2;
+            let mut block = Vec::new();
+            if rng.below(6) == 0 {
+                let size = [0, 64, 160, 4096][rng.below(4)];
+                hpack_integer(size, 5, 0x20, &mut block);
+                model.set_max(size);
+            }
+            // :method GET, :scheme https.
+            block.extend_from_slice(&[0x82, 0x87]);
+            model.encode(
+                b":authority",
+                Some(1),
+                authorities[rng.below(3)],
+                &mut block,
+            );
+            let path = format!("/p/{}", rng.below(5));
+            model.encode(b":path", Some(4), path.as_bytes(), &mut block);
+            let name = format!("x-sim-{}", rng.below(6));
+            let value = format!("value-{}", rng.below(3));
+            model.encode(name.as_bytes(), None, value.as_bytes(), &mut block);
+
+            let pieces = 1 + rng.below(4);
+            let mut cuts: Vec<usize> = (1..pieces).map(|_| rng.below(block.len() + 1)).collect();
+            cuts.push(0);
+            cuts.push(block.len());
+            cuts.sort_unstable();
+            for (n, window) in cuts.windows(2).enumerate() {
+                let fragment = &block[window[0]..window[1]];
+                let last = n + 2 == cuts.len();
+                let end_headers = if last { F_END_HEADERS } else { 0 };
+                let bytes = if n == 0 {
+                    frame(T_HEADERS, end_headers | F_END_STREAM, id, fragment)
+                } else {
+                    frame(T_CONTINUATION, end_headers, id, fragment)
+                };
+                harness.feed(&bytes);
+            }
+            harness.pump(
+                base + Duration::from_millis(u64::from(index) + 1),
+                1 + rng.below(17),
+                1 + rng.below(64),
+            );
+            assert!(
+                !harness.goaway_seen() && harness.emitted_of(T_RST_STREAM).next().is_none(),
+                "seed {seed} stream {id}: the core refused a block the RFC 7541 model \
+                 encoded against its own table — the two dynamic tables drifted; \
+                 emitted {:?}",
+                harness
+                    .emitted
+                    .iter()
+                    .map(WireFrame::render)
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        // The canary: one entry past the model's table.
+        let canary = 1 + STREAMS * 2;
+        let mut block = vec![0x82, 0x87];
+        hpack_integer(62 + model.entries.len(), 7, 0x80, &mut block);
+        harness.feed(&frame(
+            T_HEADERS,
+            F_END_HEADERS | F_END_STREAM,
+            canary,
+            &block,
+        ));
+        harness.pump(
+            base + Duration::from_millis(u64::from(STREAMS) + 1),
+            usize::MAX,
+            usize::MAX,
+        );
+        let errors: Vec<Option<u32>> = harness
+            .emitted_of(T_GOAWAY)
+            .map(WireFrame::goaway_error)
+            .collect();
+        assert_eq!(
+            errors,
+            [Some(E_COMPRESSION_ERROR)],
+            "seed {seed}: an index past the dynamic table must be a GOAWAY with \
+             COMPRESSION_ERROR"
+        );
+    }
 }

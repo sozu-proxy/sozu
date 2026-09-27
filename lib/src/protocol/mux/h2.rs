@@ -1701,7 +1701,7 @@ enum DiscardedFieldBlock {
 /// `&mut self` would conflict with that borrow. Taking `decoder` and
 /// `payload` as disjoint parameters keeps the borrow legal.
 fn decode_discarded_field_block(
-    decoder: &mut loona_hpack::Decoder<'static>,
+    decoder: &mut crate::protocol::mux::hpack::Decoder,
     payload: &[u8],
     discarded: DiscardedFieldBlock,
 ) -> Result<(), H2Error> {
@@ -13296,7 +13296,7 @@ mod tests {
     /// [`decode_discarded_field_block`], restoring the unconditional
     /// `kawa.storage.clear()`. The peer's second block is then a one-byte
     /// reference to dynamic index 62 that our decoder has never been told
-    /// about, and the decode fails with `HeaderIndexOutOfBounds`. Verified
+    /// about, and the decode fails with an out-of-table index. Verified
     /// 2026-09-21 (see this commit's message for the exact failure output).
     #[test]
     fn a_refused_stream_keeps_the_hpack_decoder_in_sync() {
@@ -13319,10 +13319,10 @@ mod tests {
             .set_expect_read(Some((H2StreamId::Zero, 9)));
         connection.core.drain.__test_set_draining();
 
-        // The peer's encoder. `loona_hpack` indexes a header whose *name* is in
+        // The peer's encoder. It indexes a header whose *name* is in
         // neither table, so this block appends `x-sozu-probe: alpha` to the
         // peer's dynamic table at index 62.
-        let mut peer_encoder = loona_hpack::Encoder::new();
+        let mut peer_encoder = crate::protocol::mux::hpack::Encoder::new();
         let refused_block = peer_encoder.encode([
             (&b":method"[..], &b"GET"[..]),
             (&b":scheme"[..], &b"https"[..]),
@@ -13453,7 +13453,7 @@ mod tests {
             .core
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
-        let block = loona_hpack::Encoder::new().encode([
+        let block = crate::protocol::mux::hpack::Encoder::new().encode([
             (&b":method"[..], &b"POST"[..]),
             (&b":scheme"[..], &b"https"[..]),
             (&b":authority"[..], &b"example.com"[..]),
@@ -14040,7 +14040,7 @@ mod tests {
 
         // Same probe technique as the sibling test: this appends
         // `x-sozu-probe: alpha` to the peer's dynamic table at index 62.
-        let mut peer_encoder = loona_hpack::Encoder::new();
+        let mut peer_encoder = crate::protocol::mux::hpack::Encoder::new();
         let field_block = peer_encoder.encode([
             (&b":method"[..], &b"GET"[..]),
             (&b":scheme"[..], &b"https"[..]),
@@ -14179,7 +14179,7 @@ mod tests {
         // peer's dynamic table at a known index — the same technique
         // `a_refused_stream_keeps_the_hpack_decoder_in_sync` uses to prove
         // decoder sync, here applied to a stream that is never refused.
-        let mut peer_encoder = loona_hpack::Encoder::new();
+        let mut peer_encoder = crate::protocol::mux::hpack::Encoder::new();
         let field_block = peer_encoder.encode([
             (&b":method"[..], &b"GET"[..]),
             (&b":scheme"[..], &b"https"[..]),
@@ -14334,7 +14334,7 @@ mod tests {
         // peer's dynamic table at a known index — the same technique
         // `a_legitimate_continuation_survives_an_unrelated_window_update_flush`
         // uses to prove decoder sync.
-        let mut peer_encoder = loona_hpack::Encoder::new();
+        let mut peer_encoder = crate::protocol::mux::hpack::Encoder::new();
         let field_block = peer_encoder.encode([
             (&b":method"[..], &b"GET"[..]),
             (&b":scheme"[..], &b"https"[..]),
@@ -14591,7 +14591,7 @@ mod tests {
         // peer's dynamic table at a known index — the same technique the
         // sibling WINDOW_UPDATE/graceful_goaway tests use to prove decoder
         // sync.
-        let mut peer_encoder = loona_hpack::Encoder::new();
+        let mut peer_encoder = crate::protocol::mux::hpack::Encoder::new();
         let field_block = peer_encoder.encode([
             (&b":method"[..], &b"GET"[..]),
             (&b":scheme"[..], &b"https"[..]),
@@ -14761,7 +14761,7 @@ mod tests {
         // — but the FIRST frame also carries an RFC 7540 PRIORITY field
         // whose stream dependency is stream 1 itself (RFC 9113 §5.3.1: a
         // stream cannot depend on itself).
-        let mut peer_encoder = loona_hpack::Encoder::new();
+        let mut peer_encoder = crate::protocol::mux::hpack::Encoder::new();
         let field_block = peer_encoder.encode([
             (&b":method"[..], &b"GET"[..]),
             (&b":scheme"[..], &b"https"[..]),
@@ -14924,7 +14924,7 @@ mod tests {
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
 
-        let mut peer_encoder = loona_hpack::Encoder::new();
+        let mut peer_encoder = crate::protocol::mux::hpack::Encoder::new();
         let field_block = peer_encoder.encode([
             (&b":method"[..], &b"GET"[..]),
             (&b":scheme"[..], &b"https"[..]),
@@ -15161,7 +15161,7 @@ mod tests {
             .stream_table
             .set_expect_read(Some((H2StreamId::Zero, 9)));
 
-        let mut peer_encoder = loona_hpack::Encoder::new();
+        let mut peer_encoder = crate::protocol::mux::hpack::Encoder::new();
         for &stream_id in stream_ids {
             let field_block = peer_encoder.encode([
                 (&b":method"[..], &b"GET"[..]),
@@ -15263,7 +15263,7 @@ mod tests {
     ///     pass then re-emits the prefix, and the second assertion fails with
     ///     `only the FIRST header block of a pass carries the size update;
     ///     stream 3 opened with 0x3f`;
-    /// (b) pass a fresh `loona_hpack::Encoder::new()` to `pass.converter(..)`
+    /// (b) pass a fresh `crate::protocol::mux::hpack::Encoder::new()` to `pass.converter(..)`
     ///     in `write_streams` instead of `self.hpack.encoder_mut()` — every
     ///     block becomes self-contained and the LAST assertion fails with
     ///     `the second block must depend on the dynamic table the first one
@@ -15307,7 +15307,7 @@ mod tests {
         );
 
         // Positive half: the peer's single decoder replays the pass in order.
-        let mut peer_decoder = loona_hpack::Decoder::new();
+        let mut peer_decoder = crate::protocol::mux::hpack::Decoder::new();
         peer_decoder.set_max_allowed_table_size(TABLE_SIZE as usize);
         for (stream_id, block) in &blocks {
             let mut decoded = Vec::new();
@@ -15330,7 +15330,7 @@ mod tests {
         // dynamic-table entries only the first block created, so a decoder
         // that never saw the first block cannot read it. Without this, a
         // per-stream encoder would satisfy every assertion above.
-        let mut fresh_decoder = loona_hpack::Decoder::new();
+        let mut fresh_decoder = crate::protocol::mux::hpack::Decoder::new();
         fresh_decoder.set_max_allowed_table_size(TABLE_SIZE as usize);
         let status = fresh_decoder.decode_with_cb(&blocks[1].1, |_, _| {});
         assert!(
@@ -15597,7 +15597,7 @@ mod tests {
                 ));
             }
 
-            let mut peer_decoder = loona_hpack::Decoder::new();
+            let mut peer_decoder = crate::protocol::mux::hpack::Decoder::new();
             peer_decoder.set_max_allowed_table_size(usize::from(plan.table_size));
             for (stream_id, block) in &blocks {
                 let mut decoded = Vec::new();
@@ -15796,7 +15796,7 @@ mod tests {
                 .stream_table
                 .set_expect_read(Some((H2StreamId::Zero, 9)));
 
-            let mut peer_encoder = loona_hpack::Encoder::new();
+            let mut peer_encoder = crate::protocol::mux::hpack::Encoder::new();
             let field_block = peer_encoder.encode([
                 (&b":method"[..], &b"GET"[..]),
                 (&b":scheme"[..], &b"https"[..]),
@@ -17197,7 +17197,7 @@ mod tests {
 
     /// A HEADERS frame opening `stream_id`, END_STREAM | END_HEADERS.
     fn liveness_headers_frame(stream_id: u32) -> Vec<u8> {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let block = encoder.encode([
             (&b":method"[..], &b"GET"[..]),
             (&b":scheme"[..], &b"https"[..]),

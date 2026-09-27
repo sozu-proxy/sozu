@@ -376,6 +376,71 @@
 
 ### 🔄 Changed
 
+- **`perf(mux-h2)`: HPACK is a sans-io module of `sozu-lib`, and `loona-hpack` is gone
+  ([#1616](https://github.com/sozu-proxy/sozu/issues/1616)).** `loona-hpack` 0.4.3, unchanged since
+  2024-11-03, built a 257-entry `HashMap` for every Huffman-coded string it decoded and kept every
+  dynamic-table entry as two owned `Vec<u8>`. Measured on a release build without jemalloc, the
+  Huffman tables alone were about a third of the allocations of an HTTP/2 connection. The new
+  `sozu_lib::protocol::mux::hpack` is written from RFC 7541:
+
+  - no I/O — the decoder reads a complete block from a `&[u8]` and calls back per field, and the
+    encoder appends to the caller's buffer;
+  - Huffman decoding runs a nibble state machine that a `const fn` derives from Appendix B while
+    the crate compiles, and allocates nothing;
+  - raw strings and table hits are borrowed, never copied;
+  - the dynamic table keeps its entries in one byte buffer with a ring of offsets, grown to a
+    high-water mark bounded by the table size.
+
+  **Measured**, per request with 20 requests (release, `--no-default-features --features
+  crypto-ring,opentelemetry,splice,simd`, one worker, `LD_PRELOAD` counter, three repetitions):
+
+  | Scenario | Allocations | Bytes |
+  |---|---|---|
+  | H2, one connection per request | 389.4 → 257.2 (−34 %) | 69 186 → 47 112 (−32 %) |
+  | H2, 20 requests multiplexed on one connection | 63.2 → 55.6 (−12 %) | 6 073 → 4 939 (−19 %) |
+
+  System calls are unchanged: 818 and 819 for the first scenario (one `epoll_wait` apart), 290
+  and 290 for the second.
+
+  **The wire does not change.** The encoder reproduces the representations `loona-hpack` chose,
+  down to naming the *last* static entry holding a name (`:status: 201` names index 14), and a
+  differential quickcheck against `loona-hpack`, run before the dependency was removed, found no
+  difference in 3 000 random encoder sequences or 20 000 random blocks.
+
+  **Two stricter rules.** RFC 7541 §4.2 allows a dynamic table size update only at the start of a
+  block, and at most two of them there. `loona-hpack` enforced neither; both are now a
+  COMPRESSION_ERROR, like an update that ends the block already was. Every other malformed input
+  is a typed `DecoderError`: an integer longer than five octets, a truncated block, an index
+  outside both tables, an update above `SETTINGS_HEADER_TABLE_SIZE`, EOS in a Huffman string, and
+  Huffman padding that is not all ones or longer than seven bits.
+
+  **Tests.** At the module level, `lib/src/protocol/mux/hpack/tests.rs` covers:
+
+  - RFC 7541 Appendix C.1 to C.6, in decoding and in encoding;
+  - one test per malformed input, each checking its error;
+  - blocks split at every boundary, and table sizes changed between blocks;
+  - quickcheck round trips;
+  - a seeded simulation of an encoder and a decoder whose tables must match after every block;
+  - two allocation criteria: a steady-state block and a Huffman string decode with 0
+    allocations, against 257 and 64 on `loona-hpack`.
+
+  Beyond the module:
+
+  - `e2e/src/tests/h2_hpack_tests.rs` drives a running Sōzu through indexed fields, table reuse
+    across fragmented blocks, `SETTINGS_HEADER_TABLE_SIZE` changes, Huffman-coded
+    `:authority`/`:path`, a header list past the limit, and six invalid blocks, each answered with
+    GOAWAY(COMPRESSION_ERROR);
+  - `sim/tests/h2_simulation.rs`'s `h2_hpack_dynamic_table_stays_in_step_under_fragmentation`
+    checks the H2 core against a table model written from the RFC, under one-octet reads and
+    CONTINUATION splits;
+  - `fuzz_hpack_decoder` now targets the module, and the new `fuzz_hpack_roundtrip` is not yet
+    CI-wired, like `fuzz_command_channel`.
+
+  **Dependencies.** `loona-hpack` leaves `Cargo.toml`, `lib/Cargo.toml`, `fuzz/Cargo.toml` and
+  both lock files, and nothing is added. No code comes from `loona-hpack` or `hpack-rs` (MIT): the
+  static and Huffman tables are transcribed from the RFC, and the code table was checked against
+  HAProxy's.
+
 - **`perf(tls)`: no `recv` that can only answer EAGAIN in the TLS handshake, at its upgrade, or
   between two reads of one record ([#1609](https://github.com/sozu-proxy/sozu/issues/1609)).**
   Three causes, established with symbolized backtraces of every `recv` on a release build, each
