@@ -904,8 +904,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                             endpoint.end_stream(token, stream_id, context);
                         }
                         self.readiness.interest.insert(Ready::READABLE);
+                        // The next request on this connection is a new
+                        // request: it gets its own id, minted from the same
+                        // per-session source as an H2 stream's.
+                        let request_id = context.next_request_id();
                         let stream = &mut context.streams[stream_id];
-                        stream.context.reset();
+                        stream.context.reset(request_id);
                         stream.back.clear();
                         stream.back.storage.clear();
                         stream.front.clear();

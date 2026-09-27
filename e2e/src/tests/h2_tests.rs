@@ -9906,3 +9906,75 @@ fn test_h2_active_requests_balances_over_one_request() {
         State::Success
     );
 }
+
+// ============================================================================
+// Request id per stream
+// ============================================================================
+
+/// Two streams of one H2 connection each carry their own `Sozu-Id`.
+///
+/// Both requests go through one hyper client inside one runtime, so the
+/// second reuses the pooled connection the first opened: a runtime per
+/// request would drop that connection with its runtime and open a fresh one,
+/// and the test would then compare two connections instead of two streams.
+///
+/// TO SEE THIS RED: make `Context::next_request_id`
+/// (`lib/src/protocol/mux/mod.rs`) return `self.session_ulid`, one id per
+/// connection. Both responses then carry the same value, which also proves
+/// the two streams share a connection.
+fn try_h2_streams_carry_distinct_request_ids() -> State {
+    let (mut worker, mut backends, front_port) = setup_h2_test("H2-REQUEST-ID", 1);
+
+    let client = build_h2_client();
+    let runtime = tokio::runtime::Runtime::new().expect("Could not create Runtime");
+    let ids: Vec<Option<String>> = runtime.block_on(async {
+        let mut ids = Vec::new();
+        for stream in 0..2 {
+            let uri: hyper::Uri = format!("https://localhost:{front_port}/api/{stream}")
+                .parse()
+                .expect("the request URI must parse");
+            let response = tokio::time::timeout(Duration::from_secs(10), client.get(uri)).await;
+            let id = match response {
+                Ok(Ok(response)) if response.status().is_success() => response
+                    .headers()
+                    .get("sozu-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToOwned::to_owned),
+                other => {
+                    println!("H2 request id - stream {stream} failed: {other:?}");
+                    None
+                }
+            };
+            ids.push(id);
+        }
+        ids
+    });
+    drop(client);
+    drop(runtime);
+
+    worker.soft_stop();
+    let stopped = worker.wait_for_server_stop();
+    backends[0].stop_and_get_aggregator();
+
+    println!("H2 request id - Sozu-Id per stream: {ids:?}");
+    match ids.as_slice() {
+        [Some(first), Some(second)]
+            if stopped && first.len() == 26 && second.len() == 26 && first != second =>
+        {
+            State::Success
+        }
+        _ => State::Fail,
+    }
+}
+
+#[test]
+fn test_h2_streams_carry_distinct_request_ids() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "H2: each stream of a connection carries its own Sozu-Id",
+            try_h2_streams_carry_distinct_request_ids
+        ),
+        State::Success
+    );
+}

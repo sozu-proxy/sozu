@@ -3190,6 +3190,24 @@
   signal as sent, so a peer that lowered `SETTINGS_HEADER_TABLE_SIZE` was never told. Part of
   the dynamic-table reset described under Security.
 
+- **`fix(http)`: every request of an HTTP/1.1 keep-alive connection gets its own request id.**
+  `HttpContext::reset` cleared the per-request state between two keep-alive requests but kept
+  `HttpContext::id`, and asserted that it did, so every request of a connection carried the first
+  one's ULID: the generated `X-Request-Id`, `Sozu-Id` on the request and on the response,
+  `%REQUEST_ID` in default answers and the access log's `request_id` were constant for the whole
+  connection (one ULID across 20 keep-alive requests in the access log), although
+  `doc/configure.md` and `lib/src/protocol/kawa_h1/LIFECYCLE.md` said it rotated per request.
+  **Visible change: `X-Request-Id` (when Sōzu generates it) and `Sozu-Id` now change on every
+  request of a keep-alive connection.** `reset` now takes the next request's id, minted by
+  `Context::next_request_id` — the per-session clock snapshot and seeded RNG that already number
+  H2 streams — so the fix adds no syscall and no allocation. H2 was not affected: each stream
+  already received its own id. A client-supplied `X-Request-Id` is still forwarded verbatim, and
+  a retried request keeps its id. Pinned by `test_keep_alive_rotates_request_id` (e2e, H1) and
+  `test_h2_streams_carry_distinct_request_ids` (e2e, H2), plus the unit tests
+  `test_reset_preserves_connection_state` and
+  `header_editing_output_is_byte_exact_across_keep_alive_requests`, which asserted the old
+  behaviour.
+
 - **`fix(hpack)`: a table size lowered then raised between two header blocks is signalled as
   both sizes ([#1622](https://github.com/sozu-proxy/sozu/issues/1622)).** When a peer sent two
   `SETTINGS_HEADER_TABLE_SIZE` changes before Sōzu wrote its next header block, for example 0
