@@ -144,9 +144,11 @@ pub enum TrieSubMatch<'a, 'b> {
 }
 
 /// Ordered list of non-literal trie segments visited during a successful
-/// `lookup_with_path` traversal. Routers feed the entries into rewrite
-/// templates (`$HOST[n]`) so frontend rewrites can reach into the matched
-/// segments. Empty when only literal segments matched.
+/// `lookup_with_path` traversal, in walk order: the trie walks a hostname from
+/// its rightmost label, so the first entry is the rightmost matched segment.
+/// Routers feed the entries into rewrite templates (`$HOST[n]`) so frontend
+/// rewrites can reach into the matched segments, and number them in hostname
+/// order, left to right (sozu#1595). Empty when only literal segments matched.
 pub type TrieMatches<'a, 'b> = Vec<TrieSubMatch<'a, 'b>>;
 
 /// Sink for the non-literal trie segments a lookup consumed.
@@ -233,8 +235,9 @@ impl<'a, 'b> InlineTrieMatches<'a, 'b> {
         }
     }
 
-    /// The recorded segments, in walk order.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &TrieSubMatch<'a, 'b>> {
+    /// The recorded segments, in walk order (rightmost label first); iterate
+    /// it in reverse for hostname order.
+    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &TrieSubMatch<'a, 'b>> {
         self.inline[..self.len.min(INLINE_TRIE_MATCHES)]
             .iter()
             .flatten()

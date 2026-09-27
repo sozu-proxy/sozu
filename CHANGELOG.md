@@ -3096,6 +3096,30 @@
 
 ### 🐛 Fixed
 
+- **BREAKING (behaviour) — `fix(router)`: a tree rule numbers its `$HOST[n]` captures left to
+  right, like a pre/post rule ([#1595](https://github.com/sozu-proxy/sozu/issues/1595)).** A
+  `Tree`-position hostname (the default) is matched one label at a time while the trie walks from
+  the rightmost label, and `RouteResult::new_with_trie` numbered the captures in that walk order;
+  a `Pre`/`Post` hostname is one whole-host regex, numbered left to right. The same hostname
+  therefore gave different `$HOST[n]` values depending on its position: with
+  `hostname = "/a([0-9]+)/./([a-z])([0-9])/.example.com"` and
+  `rewrite_host = "$HOST[1]-$HOST[2]-$HOST[3]"`, `a1.x9.example.com` was rewritten to `x-9-1` on the
+  trie and to `1-x-9` on `Pre`/`Post`. The router now reads the trie's record in reverse, so both
+  give `1-x-9`; the groups of one segment keep their regex order, and the reverse read walks the
+  on-stack record of #1594 without allocating (`a_tree_lookup_allocates_nothing_past_its_route_result`
+  still passes). `doc/configure.md` now states the order. The #1594 entry above says its change
+  kept "the same order"; that held for #1594, and this entry is the one that changes it: the
+  20-segment test `a_host_capture_past_sixteen_trie_segments_keeps_every_segment` now expects
+  `1-2-…-20`, and `a_tree_rule_numbers_its_host_captures_like_a_pre_or_post_rule` holds a tree rule
+  against a pre and a post rule on the same host.
+  **Who is affected:** a `Tree`-position frontend whose hostname has two or more capturing regex
+  labels and whose `rewrite_host` or `rewrite_path` uses `$HOST[n]` with `n >= 1`. `$HOST[0]`, a
+  hostname with a single capturing label, and every `Pre`/`Post` frontend are unchanged.
+  **Migration:** renumber the template in hostname order. Take the capturing labels left to right
+  and each label's groups in regex order: on the hostname above, a template that expected the old
+  numbering as `$HOST[3]` for `a`'s digits, `$HOST[1]` for the letter and `$HOST[2]` for the
+  trailing digit becomes `$HOST[1]`, `$HOST[2]` and `$HOST[3]`.
+
 - **`fix(mux-h2)`: a PING or SETTINGS ACK received while a stream frame is half-written is
   sent after that frame, not inside it ([#1600](https://github.com/sozu-proxy/sozu/issues/1600)).**
   Both acknowledgements are serialised into `zero` and used to set `expect_write = Some(Zero)`

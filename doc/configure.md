@@ -2086,7 +2086,13 @@ to surface a login prompt with the cluster's `www_authenticate` realm.
 
 `rewrite_host` and `rewrite_path` accept a small template grammar: `$HOST[n]`
 references the n-th host capture (0 is the full hostname; 1+ are regex /
-wildcard subgroups), and `$PATH[n]` references the n-th path capture. When the
+wildcard subgroups), and `$PATH[n]` references the n-th path capture.
+Host captures are numbered left to right in the hostname, whatever the rule's
+`position`, and the groups of one regex label keep their order: in
+`/a([0-9]+)/./([a-z])([0-9])/.example.com`, `a1.x9.example.com` gives
+`$HOST[1] = 1`, `$HOST[2] = x` and `$HOST[3] = 9`. Up to and including 2.2.1 a
+`Tree` rule (the default) numbered its labels from the rightmost one instead
+(`x`, `9`, `1` above); the changelog carries the migration (sozu#1595). When the
 host is rewritten, Sōzu injects the original host into `X-Forwarded-Host` so
 backends can reconstruct the request URL.
 

@@ -2426,6 +2426,11 @@ impl RouteResult {
     ///
     /// Tree matches carry the captures collected by the trie traversal
     /// (`InlineTrieMatches`) alongside the matched leaf path rule.
+    ///
+    /// The trie records segments in walk order, rightmost label first, so
+    /// they are read back in reverse: `$HOST[n]` counts left to right, as the
+    /// whole-host regex of a pre/post rule does (sozu#1595). Each segment's
+    /// own groups keep their regex order.
     fn new_with_trie<'a, 'b>(
         domain: &'a [u8],
         domain_submatches: &InlineTrieMatches<'a, 'b>,
@@ -2441,7 +2446,7 @@ impl RouteResult {
         let mut captures_host: Vec<&str> = Vec::with_capacity(frontend.capture_cap_host);
         if frontend.capture_cap_host > 0 {
             captures_host.push(from_utf8(domain).unwrap_or_default());
-            for submatch in domain_submatches.iter() {
+            for submatch in domain_submatches.iter().rev() {
                 match submatch {
                     TrieSubMatch::Wildcard(part) => {
                         captures_host.push(from_utf8(part).unwrap_or_default());
@@ -6338,16 +6343,18 @@ mod tests {
     }
 
     /// A trie walk records every non-literal segment it matched, in walk
-    /// order, and `RouteResult::new_with_trie` numbers the `$HOST[n]`
-    /// captures in that order. The record keeps its first 16 entries on the
-    /// stack; this hostname has 20 regex segments, so the last four spill
-    /// past them, and every one of the 20 must still reach the template in
-    /// the same position.
+    /// order, and `RouteResult::new_with_trie` reads that record back in
+    /// reverse to number the `$HOST[n]` captures. The record keeps its first
+    /// 16 entries on the stack; this hostname has 20 regex segments, so four
+    /// spill past them, and every one of the 20 must still reach the
+    /// template in the same position.
     ///
-    /// The walk runs from the rightmost label, so a tree rule numbers its
-    /// segment captures right to left, where a pre/post rule reads the
-    /// whole-host regex left to right. This test pins the tree order as it
-    /// stands; it is not what the spill boundary is allowed to change.
+    /// The walk runs from the rightmost label, so the spilled entries are
+    /// the four LEFTMOST segments, `s1` to `s4`, and the reversed read has to
+    /// cross from the spill into the inline array. The expected order is
+    /// left to right, the order a pre/post rule reads its whole-host regex
+    /// in (sozu#1595); `a_tree_rule_numbers_its_host_captures_like_a_pre_or_post_rule`
+    /// holds the two positions against each other.
     #[test]
     fn a_host_capture_past_sixteen_trie_segments_keeps_every_segment() {
         const SEGMENTS: usize = 20;
@@ -6379,8 +6386,7 @@ mod tests {
             .add_http_front(&front)
             .unwrap_or_else(|error| panic!("the tree frontend must build: {error}"));
 
-        let walk_order = (1..=SEGMENTS)
-            .rev()
+        let hostname_order = (1..=SEGMENTS)
             .map(|segment| segment.to_string())
             .collect::<Vec<_>>()
             .join("-");
@@ -6389,9 +6395,47 @@ mod tests {
                 .lookup(&request, "/", &Method::Get)
                 .ok()
                 .and_then(|result| result.rewritten_host),
-            Some(walk_order),
-            "every trie segment, inline or spilled, must reach $HOST[n] in walk order",
+            Some(hostname_order),
+            "every trie segment, inline or spilled, must reach $HOST[n] in hostname order",
         );
+    }
+
+    /// The same hostname numbers its `$HOST[n]` captures the same way
+    /// whichever position compiled it (sozu#1595). A pre/post rule reads
+    /// one whole-host regex, so its groups come left to right; a tree rule
+    /// matches one regex per label while the trie walks from the rightmost
+    /// label, and `RouteResult::new_with_trie` renumbers them left to right.
+    /// The second segment carries two groups, which keep their order inside
+    /// the segment: reversing the flattened captures instead of the
+    /// segments would be caught too.
+    ///
+    /// TO SEE THIS RED: drop the `.rev()` in `RouteResult::new_with_trie`;
+    /// the tree rule then yields `x-9-1` where the pre/post rules yield
+    /// `1-x-9`.
+    #[test]
+    fn a_tree_rule_numbers_its_host_captures_like_a_pre_or_post_rule() {
+        let rewritten_host = |position: RulePosition| {
+            let mut front = test_http_frontend();
+            front.hostname = "/a([0-9]+)/./([a-z])([0-9])/.example.com".to_owned();
+            front.position = position;
+            front.rewrite_host = Some("$HOST[1]-$HOST[2]-$HOST[3]".to_owned());
+            let mut router = Router::new();
+            router
+                .add_http_front(&front)
+                .unwrap_or_else(|error| panic!("{position:?} frontend must build: {error}"));
+            router
+                .lookup("a1.x9.example.com", "/", &Method::Get)
+                .ok()
+                .and_then(|result| result.rewritten_host)
+        };
+
+        for position in [RulePosition::Pre, RulePosition::Post, RulePosition::Tree] {
+            assert_eq!(
+                rewritten_host(position).as_deref(),
+                Some("1-x-9"),
+                "{position:?}: $HOST[n] must number the captures left to right",
+            );
+        }
     }
 
     /// Grouping must not rescue a hostname the router rejects today. The
