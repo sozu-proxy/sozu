@@ -298,7 +298,7 @@ inline at the start of `writable()`, avoiding extra event loop iterations.
 - **Inbound**: `parser.rs` (nom) decodes binary frames. `pkawa.rs` decodes HPACK headers
   into Kawa blocks. DATA payloads are zero-copy slices into the stream's storage buffer.
 - **Outbound**: `converter.rs` (`H2BlockConverter`) encodes Kawa blocks into H2 frames.
-  HPACK encoding uses `loona-hpack::Encoder`. Large header blocks are automatically split
+  HPACK encoding uses the in-tree sans-io `hpack::Encoder`. Large header blocks are automatically split
   into HEADERS + CONTINUATION frames respecting `max_frame_size`.
 
 #### Module layout
@@ -326,6 +326,8 @@ lib/src/protocol/mux/
 │                            per-stream liveness and stall caches
 ├── h2_transmit.rs           Vectored gather/confirm of one stream's pending output
 ├── h2_write_pass.rs         Owned state and phase of one write_streams pass
+├── hpack/                   Sans-io RFC 7541 codec: decoder, encoder, dynamic table,
+│                            Huffman state machine computed at compile time
 ├── hpack_state.rs           Connection HPACK codec pair (RFC 7541) and its reusable
 │                            scratch buffers
 ├── parser.rs                H2 binary frame parser (nom), wire format constants

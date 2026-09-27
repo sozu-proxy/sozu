@@ -788,10 +788,10 @@ fn is_status_healthy(actual: u32, expected: u32) -> bool {
 /// HEADERS frame on stream 1 carrying `GET <path>` with
 /// END_STREAM | END_HEADERS.
 ///
-/// HPACK encoding is delegated to `loona_hpack::Encoder` — the same
-/// encoder the H2 mux uses for live traffic (`lib/src/protocol/mux/converter.rs`).
-/// The probe inherits whatever static/dynamic-table behaviour the
-/// encoder picks, including any future Huffman support. The connection
+/// HPACK encoding is delegated to `crate::protocol::mux::hpack::Encoder` —
+/// the same encoder the H2 mux uses for live traffic
+/// (`lib/src/protocol/mux/converter.rs`). The probe inherits whatever
+/// static/dynamic-table behaviour the encoder picks. The connection
 /// preface comes from `serializer::H2_PRI` so the probe and the live
 /// mux stay in lockstep.
 fn build_h2c_probe_bytes(uri: &str, address: SocketAddr) -> Vec<u8> {
@@ -800,7 +800,7 @@ fn build_h2c_probe_bytes(uri: &str, address: SocketAddr) -> Vec<u8> {
     // Build the HPACK header block first so we know its length for the
     // HEADERS frame header. A fresh encoder per probe keeps things
     // stateless — we never reuse the dynamic table across probes.
-    let mut encoder = loona_hpack::Encoder::new();
+    let mut encoder = crate::protocol::mux::hpack::Encoder::new();
     let mut hpack: Vec<u8> = Vec::new();
     let headers: [(&[u8], &[u8]); 4] = [
         (b":method", b"GET"),
@@ -808,13 +808,7 @@ fn build_h2c_probe_bytes(uri: &str, address: SocketAddr) -> Vec<u8> {
         (b":path", uri.as_bytes()),
         (b":authority", authority.as_bytes()),
     ];
-    // Encoder::encode_into writes to an io::Write. Vec<u8> implements
-    // it infallibly, so the ? cannot fire in practice.
-    if encoder.encode_into(headers, &mut hpack).is_err() {
-        // Defensive: return an empty buffer so the probe records as
-        // failed via the read path instead of panicking.
-        return Vec::new();
-    }
+    encoder.encode_into(headers, &mut hpack);
 
     // Pre-allocate: preface + SETTINGS (9) + HEADERS header (9) + block.
     let mut out = Vec::with_capacity(H2_PRI.len() + FRAME_HEADER_SIZE * 2 + hpack.len());
@@ -849,7 +843,7 @@ fn build_h2c_probe_bytes(uri: &str, address: SocketAddr) -> Vec<u8> {
 
 /// Walk the buffered H2 frames looking for a HEADERS frame (plus any
 /// CONTINUATION frames until END_HEADERS) on stream 1, then HPACK-decode
-/// the assembled block via `loona_hpack::Decoder` and pull `:status`.
+/// the assembled block via `crate::protocol::mux::hpack::Decoder` and pull `:status`.
 ///
 /// Returns:
 ///
@@ -1013,13 +1007,13 @@ fn strip_padded_priority(payload: &[u8], flags: u8) -> Option<&[u8]> {
     Some(block)
 }
 
-/// Run `loona_hpack::Decoder` over the assembled HEADERS block and
+/// Run `crate::protocol::mux::hpack::Decoder` over the assembled HEADERS block and
 /// return whether `:status` matches `config.expected_status`. Unknown
 /// HPACK encodings, malformed integers, Huffman fallbacks, and
 /// `:status` values that fail UTF-8 / numeric parsing all collapse to
 /// `false` — the probe is recorded as unhealthy, never as a panic.
 fn decode_status_from_block(block: &[u8], config: &HealthCheckConfig) -> bool {
-    let mut decoder = loona_hpack::Decoder::new();
+    let mut decoder = crate::protocol::mux::hpack::Decoder::new();
     let mut status: Option<u32> = None;
     let decode_result = decoder.decode_with_cb(block, |name, value| {
         if status.is_some() {
@@ -1133,14 +1127,12 @@ mod tests {
 
     /// Encode `:status <code>` (plus optional extra response headers) into
     /// a fresh HPACK block via the same encoder the live mux uses. This
-    /// keeps the tests aligned with whatever loona_hpack picks for static
-    /// vs. literal vs. (future) Huffman encoding instead of pinning bytes.
+    /// keeps the tests aligned with whatever the encoder picks for static
+    /// vs. literal vs. Huffman encoding instead of pinning bytes.
     fn encode_response_headers(headers: &[(&[u8], &[u8])]) -> Vec<u8> {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut out = Vec::new();
-        encoder
-            .encode_into(headers.iter().copied(), &mut out)
-            .unwrap();
+        encoder.encode_into(headers.iter().copied(), &mut out);
         out
     }
 
@@ -1172,7 +1164,7 @@ mod tests {
 
         // The HEADERS payload must HPACK-decode back to the four pseudo-headers.
         let payload_start = headers_start + 9;
-        let mut decoder = loona_hpack::Decoder::new();
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
         let mut method = None;
         let mut scheme = None;
         let mut path = None;
@@ -1185,7 +1177,7 @@ mod tests {
                 b":authority" => authority = Some(value.to_vec()),
                 _ => {}
             })
-            .expect("loona_hpack decodes a freshly-encoded probe");
+            .expect("the HPACK decoder decodes a freshly-encoded probe");
         assert_eq!(method.as_deref(), Some(b"GET" as &[u8]));
         assert_eq!(scheme.as_deref(), Some(b"http" as &[u8]));
         assert_eq!(path.as_deref(), Some(b"/health" as &[u8]));
@@ -1245,7 +1237,7 @@ mod tests {
     fn h2c_response_with_padded_priority_headers_decodes_status_200() {
         // Build a HEADERS frame with both PADDED and PRIORITY flags so the
         // parser must strip 1 + 5 = 6 bytes before handing the block to
-        // loona_hpack.
+        // the HPACK decoder.
         let block = encode_response_headers(&[(b":status", b"200")]);
         let pad_len: u8 = 3;
 

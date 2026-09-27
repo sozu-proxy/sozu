@@ -1474,14 +1474,12 @@ mod tests {
         crate::capture_test_logs(move || {
             let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 2, 16384)));
             let mut stream = test_stream(&pool);
-            let mut encoder = loona_hpack::Encoder::new();
+            let mut encoder = crate::protocol::mux::hpack::Encoder::new();
             let mut block = Vec::new();
             for &(name, value) in headers {
-                encoder
-                    .encode_header_into((name, value), &mut block)
-                    .expect("the test field block must encode");
+                encoder.encode_header_into((name, value), &mut block);
             }
-            let mut decoder = loona_hpack::Decoder::new();
+            let mut decoder = crate::protocol::mux::hpack::Decoder::new();
             let mut prioriser = crate::protocol::mux::h2_scheduler::Prioriser::default();
             let (_events, status) = crate::protocol::mux::pkawa::handle_header(
                 &mut decoder,

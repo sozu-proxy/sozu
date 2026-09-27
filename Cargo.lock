@@ -1945,16 +1945,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
-name = "loona-hpack"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ce904bae9ecfd9b658b0be156ad278d4b2432f171472f1f0289aed75eed02a3"
-dependencies = [
- "thiserror 1.0.69",
- "tracing",
-]
-
-[[package]]
 name = "lru"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3380,7 +3370,6 @@ dependencies = [
  "itoa",
  "kawa",
  "libc",
- "loona-hpack",
  "memchr",
  "mio",
  "nom 8.0.0",

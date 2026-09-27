@@ -1,35 +1,33 @@
 #![no_main]
-//! Fuzz target for the HPACK decoder (RFC 7541, `loona-hpack`).
+//! Fuzz target for the HPACK decoder (RFC 7541, `sozu_lib::protocol::mux::hpack`).
 //!
-//! Drives `decode_with_cb` against arbitrary header block fragments under
-//! three dynamic-table profiles (default, 256 bytes, zero) so the
-//! resize/eviction paths are exercised. The decoder must never panic and
-//! must reject malformed input cleanly. Defends against header-block
-//! oversize and incomplete-update flaws. Corpus + run instructions live
-//! in `fuzz/README.md`.
+//! Drives `decode_with_cb` against arbitrary header blocks under three
+//! dynamic-table profiles (default, 256 bytes, zero) so the resize/eviction
+//! paths are exercised, and a fourth decoder that sees the input twice so the
+//! second pass meets a table the first one filled. The decoder must never
+//! panic, must reject malformed input with a typed error, and must never let
+//! its table exceed the size it was given. Defends against header-block
+//! oversize, incomplete-update and Huffman padding flaws. Corpus + run
+//! instructions live in `fuzz/README.md`.
 
 use libfuzzer_sys::fuzz_target;
+use sozu_lib::protocol::mux::hpack::{Decoder, huffman};
 
 fuzz_target!(|data: &[u8]| {
-    // Create a fresh decoder for each input to avoid cross-contamination
-    // between fuzzer-generated inputs (dynamic table state)
-    let mut decoder = loona_hpack::Decoder::new();
+    let mut decoder = Decoder::new();
+    let _ = decoder.decode_with_cb(data, |_key, _value| {});
+    let _ = decoder.decode_with_cb(data, |_key, _value| {});
 
-    // Try decoding the input as an HPACK header block fragment.
-    // The callback collects decoded headers but we discard them -- the goal
-    // is to verify the decoder never panics on arbitrary input.
-    let _ = decoder.decode_with_cb(data, |_key, _value| {
-        // no-op: we only care that it doesn't panic
-    });
+    for size in [256, 0] {
+        let mut decoder = Decoder::new();
+        decoder.set_max_allowed_table_size(size);
+        decoder.set_max_table_size(size);
+        let _ = decoder.decode_with_cb(data, |_key, _value| {});
+    }
 
-    // Also exercise the decoder with a constrained dynamic table size,
-    // which exercises different resize/eviction paths.
-    let mut small_table_decoder = loona_hpack::Decoder::new();
-    small_table_decoder.set_max_table_size(256);
-    let _ = small_table_decoder.decode_with_cb(data, |_key, _value| {});
-
-    // Zero-size table: forces all entries to be evicted immediately
-    let mut zero_table_decoder = loona_hpack::Decoder::new();
-    zero_table_decoder.set_max_table_size(0);
-    let _ = zero_table_decoder.decode_with_cb(data, |_key, _value| {});
+    // The raw bytes as one Huffman string: decodes or fails, never more
+    // octets than the bound.
+    let mut out = Vec::new();
+    let _ = huffman::decode(data, &mut out);
+    assert!(out.len() <= data.len() / 5 * 8 + 8);
 });

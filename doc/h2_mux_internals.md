@@ -12,6 +12,7 @@ Source files covered by this document:
 | `lib/src/protocol/mux/h2_flow_control.rs` | `H2FlowControl` — connection-level send window, receive-side byte accounting + pending WINDOW_UPDATE queue (RFC 9113 §6.9), closed API. There is no receive *window*: the advertised one is not enforced — see below |
 | `lib/src/protocol/mux/h2_flood_detector.rs` | `H2FloodConfig`, `H2FloodViolation`, `H2FloodDetector` — CVE-2023-44487 / CVE-2024-27316 / CVE-2025-8671 flood/abuse detection, closed API |
 | `lib/src/protocol/mux/pkawa.rs` | HPACK decoding, pseudo-header validation, RFC 9218 priority parsing |
+| `lib/src/protocol/mux/hpack/` | The sans-io RFC 7541 codec: `Decoder`, `Encoder`, dynamic table, Huffman state machine computed at compile time |
 | `lib/src/protocol/mux/mod.rs` | Mux session, Stream, Router, ready() loop, stream lifecycle |
 | `lib/src/protocol/mux/converter.rs` | Kawa-to-H2 frame encoding (`H2BlockConverter`) |
 | `lib/src/protocol/mux/parser.rs` | H2 binary frame parser (nom) |
@@ -1765,7 +1766,7 @@ per-`prepare` `H2BlockConverter` — a `Vec` move, never a copy of the bytes.
 The pass gives them back at the end, and `HpackState::shrink_converter_buffers`
 then caps each one:
 
-```rust lib/src/protocol/mux/hpack_state.rs:128-138
+```rust lib/src/protocol/mux/hpack_state.rs:126-136
 pub(super) fn shrink_converter_buffers(&mut self) {
     if self.converter_buf.capacity() > 16_384 {
         self.converter_buf.shrink_to(4096);
@@ -1789,6 +1790,83 @@ quiet-time path instead. `ConnectionH2::cancel_timed_out_streams` calls
 independently, and `H2Scheduler::reclaim_idle_buffer`, which applies the same
 guard to the order buffer — one `capacity() > retain_size * 4` guard each,
 shrinking only those that individually exceed it.
+
+### The sans-io codec (`hpack/`)
+
+The codec both coders of `HpackState` are built from lives in
+`lib/src/protocol/mux/hpack/`, written from RFC 7541. It replaced the
+`loona-hpack` crate (sozu-proxy/sozu#1616), whose decoder built a 257-entry
+`HashMap` for every Huffman-coded string and kept every dynamic-table entry as
+two owned `Vec<u8>`.
+
+**No I/O.** `Decoder::decode_with_cb` takes one complete field block as
+`&[u8]` and calls back with `(name, value)` for each field;
+`Encoder::encode_header_into` appends to a `Vec<u8>` the caller owns. The
+state is explicit: the dynamic table, the table-size bound, and one scratch
+buffer. Errors are the typed `DecoderError`, every variant a
+COMPRESSION_ERROR. The block must be complete: `h2_header_reassembly.rs`
+joins HEADERS and CONTINUATION fragments before `pkawa.rs` decodes them.
+
+**Zero copy, zero allocation once warm.** The callback's two `Cow`s are
+always borrowed:
+
+| Source of the octets | Where the callback's slice points |
+|---|---|
+| String sent raw | the block itself |
+| Indexed field or indexed name | the static table, or the dynamic table |
+| Huffman string | the decoder's scratch buffer, cleared per field |
+
+Huffman decoding reads a 256-state × 16-nibble transition table that a
+`const fn` derives from RFC 7541 Appendix B while the crate compiles, the
+layout of nghttp2's `huff_decode_table`. A string decodes without building
+or allocating anything. The dynamic table stores all its entries back to
+back in one byte buffer, with a ring of offsets beside it. Eviction moves a
+start offset, and the live bytes are compacted to the front only when the
+evicted prefix is at least as long as them. The three buffers (scratch,
+table bytes, offset ring) grow to a high-water mark and are then reused; a
+steady-state block allocates nothing.
+`hpack::tests::a_steady_state_block_allocates_nothing` and
+`hpack::tests::huffman_decoding_allocates_nothing` hold that at zero.
+Against `loona-hpack` the same two measurements were 257 and 64
+allocations. `HpackState::reclaim_idle_buffers` releases the scratch buffer
+on the quiet-time path with the other scratch buffers.
+
+**Guards.** Every one is a `DecoderError`, never a panic:
+
+- an integer longer than five octets;
+- a block ending inside an integer or a string;
+- index 0, or an index past both tables;
+- a size update above the advertised `SETTINGS_HEADER_TABLE_SIZE`, after a
+  field, beyond the two §4.2 allows, or ending the block;
+- EOS inside a Huffman string, padding that is not all ones, or padding
+  longer than seven bits.
+
+The header-list budget stays in `decode_headers_with_budget`, which counts
+what the callback receives. The decoder decodes the whole block past that
+budget, because the table must stay in step with the peer's encoder.
+
+**Encoder policy.** `Representation::Proxy` is what sozu sends, and it
+reproduces `loona-hpack`'s choices so the wire does not change:
+
+- a field found whole is indexed;
+- a name found is a literal without indexing, naming the *last* entry that
+  holds that name;
+- a new name is a literal with incremental indexing and enters the table;
+- strings are never Huffman-coded.
+
+The other representations (`IncrementalIndexing`, `WithoutIndexing`,
+`NeverIndexed`, with or without Huffman coding) reproduce RFC 7541
+Appendix C, and let a test peer or a fuzz target produce every shape a
+decoder meets.
+
+**Tests.** From the codec alone to the running proxy:
+
+| Level | Where | What |
+|---|---|---|
+| Unit | `hpack/tests.rs` | Appendix C.1 to C.6 in decoding and encoding; one test per malformed input and its error; blocks split at every boundary; size changes between blocks; quickcheck round trips; the two allocation criteria; a seeded simulation of one encoder and one decoder whose tables are compared after every block (`SOZU_HPACK_SIM_SEED` replays a seed) |
+| Fuzz | `fuzz_hpack_decoder`, `fuzz_hpack_roundtrip` | Arbitrary blocks; scripted encoder → decoder round trips |
+| Simulation | `sim/tests/h2_simulation.rs`, `h2_hpack_dynamic_table_stays_in_step_under_fragmentation` | The H2 core decodes dynamic-table references and size updates across fragmented reads and CONTINUATION splits, against a table model written from the RFC |
+| E2E | `e2e/src/tests/h2_hpack_tests.rs` | A running Sōzu: indexed fields, table reuse across requests, `SETTINGS_HEADER_TABLE_SIZE` changes, Huffman and raw strings, a list past the limit, invalid blocks answered with GOAWAY(COMPRESSION_ERROR) |
 
 ---
 
@@ -1814,6 +1892,7 @@ The files that carry H2 coverage, and what each is for:
 | `e2e/src/tests/h2_correctness_tests.rs` | Large-asset and wake-gap regressions — see the section below |
 | `e2e/src/tests/h2_security_tests.rs` | Flood detection thresholds, rapid reset, CONTINUATION bombs, settings flood, empty DATA flood, glitch counting, malformed frame handling |
 | `e2e/src/tests/h2_security_parser.rs` | Frame-parser and HPACK adversarial input |
+| `e2e/src/tests/h2_hpack_tests.rs` | HPACK through a running Sōzu: indexed fields, dynamic-table reuse over fragmented blocks, table-size changes, Huffman, size limit, COMPRESSION_ERROR |
 | `e2e/src/tests/h2_security_header_injection.rs` | Pseudo-header ordering, CRLF/NUL injection, smuggling vectors |
 | `e2e/src/tests/h2_security_session.rs` | Session-level abuse: idle timeouts, concurrency caps, back-pressure |
 | `e2e/src/tests/h2_security_sni.rs` | SNI binding and certificate selection under H2 |

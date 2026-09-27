@@ -4,7 +4,7 @@
 //! reusable scratch buffers behind a narrow, closed API. `ConnectionH2`
 //! still owns a single [`HpackState`] field, so ownership does not split —
 //! but every field here is private to this module, so nothing outside
-//! `hpack_state.rs` can reach the raw `loona_hpack::Decoder`/`Encoder` or
+//! `hpack_state.rs` can reach the raw [`super::hpack::Decoder`]/`Encoder` or
 //! the scratch `Vec`s directly; every access goes through an accessor
 //! declared here.
 //!
@@ -22,8 +22,8 @@
 //! allocator. [`HpackState::new`] is fallible for that reason: a source that
 //! refuses refuses the whole connection, on the same path as a refused
 //! stream-0 buffer. What the source does *not* reach is documented on the
-//! trait — `loona_hpack`'s own tables, and growth of a buffer already handed
-//! over.
+//! trait — the codec's own tables and Huffman scratch buffer, and growth of a
+//! buffer already handed over.
 //!
 //! The pass-ordering buffer `priorities_buf` arrived here with that
 //! relocation and left again with the scheduler extraction: it holds
@@ -33,8 +33,8 @@
 /// The connection-level HPACK decoder/encoder pair plus their reusable
 /// scratch buffers.
 pub(super) struct HpackState {
-    decoder: loona_hpack::Decoder<'static>,
-    encoder: loona_hpack::Encoder<'static>,
+    decoder: crate::protocol::mux::hpack::Decoder,
+    encoder: crate::protocol::mux::hpack::Encoder,
     /// Reusable buffer for HPACK-encoded headers in the H2 block converter.
     converter_buf: Vec<u8>,
     /// Reusable buffer for lowercasing header keys in the H2 block converter.
@@ -52,10 +52,8 @@ impl HpackState {
     /// dynamic table size updates from the peer.
     ///
     /// Returns `None` when the source refuses a scratch buffer. The codec
-    /// pair is built only once all three have been granted, so a refusal
-    /// costs no `loona_hpack` allocation either — which is the sense in which
-    /// the codecs are under the contract, given the crate offers no
-    /// capacity-supplied constructor to route their tables through.
+    /// pair allocates nothing when built — its tables and scratch buffer grow
+    /// on first use — so a refusal costs no codec allocation either.
     pub(super) fn new(
         buffers: &mut dyn super::buffer_source::BufferSource,
         header_table_size: usize,
@@ -63,22 +61,22 @@ impl HpackState {
         let converter_buf = buffers.scratch()?;
         let lowercase_buf = buffers.scratch()?;
         let cookie_buf = buffers.scratch()?;
-        let mut decoder = loona_hpack::Decoder::new();
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
         decoder.set_max_allowed_table_size(header_table_size);
         Some(HpackState {
             decoder,
-            encoder: loona_hpack::Encoder::new(),
+            encoder: crate::protocol::mux::hpack::Encoder::new(),
             converter_buf,
             lowercase_buf,
             cookie_buf,
         })
     }
 
-    pub(super) fn decoder_mut(&mut self) -> &mut loona_hpack::Decoder<'static> {
+    pub(super) fn decoder_mut(&mut self) -> &mut crate::protocol::mux::hpack::Decoder {
         &mut self.decoder
     }
 
-    pub(super) fn encoder_mut(&mut self) -> &mut loona_hpack::Encoder<'static> {
+    pub(super) fn encoder_mut(&mut self) -> &mut crate::protocol::mux::hpack::Encoder {
         &mut self.encoder
     }
 
@@ -137,7 +135,8 @@ impl HpackState {
         }
     }
 
-    /// Quiet-time reclaim of every scratch buffer once it holds 4x
+    /// Quiet-time reclaim of every scratch buffer, the HPACK decoder's
+    /// Huffman scratch included, once it holds 4x
     /// `retain_size`. Called from `cancel_timed_out_streams`, which only runs
     /// on a session idle long enough to risk timing out a stream — see that
     /// call site for why this is the right place to reclaim a high-water-mark
@@ -153,5 +152,6 @@ impl HpackState {
         if self.cookie_buf.capacity() > retain_size * 4 {
             self.cookie_buf.shrink_to(retain_size);
         }
+        self.decoder.shrink_scratch(retain_size * 4);
     }
 }

@@ -720,7 +720,7 @@ pub(super) fn parse_rfc9218_priority(value: &[u8]) -> (u8, bool) {
 /// Returns the final value of the `invalid_headers` flag so the caller can
 /// combine it with kind-specific validity checks (e.g. mandatory pseudo-headers).
 fn decode_headers_with_budget<F>(
-    decoder: &mut loona_hpack::Decoder<'static>,
+    decoder: &mut crate::protocol::mux::hpack::Decoder,
     input: &[u8],
     max_decoded_bytes: usize,
     max_header_fields: u32,
@@ -830,7 +830,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 pub fn handle_header<C>(
-    decoder: &mut loona_hpack::Decoder<'static>,
+    decoder: &mut crate::protocol::mux::hpack::Decoder,
     prioriser: &mut Prioriser,
     stream_id: StreamId,
     kawa: &mut GenericHttpStream,
@@ -1421,7 +1421,7 @@ pub fn handle_trailer(
     kawa: &mut GenericHttpStream,
     input: &[u8],
     end_stream: bool,
-    decoder: &mut loona_hpack::Decoder<'static>,
+    decoder: &mut crate::protocol::mux::hpack::Decoder,
     max_header_list_size: u32,
     max_header_fields: u32,
     elide_x_real_ip: bool,
@@ -1959,15 +1959,13 @@ mod tests {
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> GenericHttpStream {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut encoded = Vec::new();
         for &(name, value) in headers {
-            encoder
-                .encode_header_into((name, value), &mut encoded)
-                .unwrap();
+            encoder.encode_header_into((name, value), &mut encoded);
         }
 
-        let mut decoder = loona_hpack::Decoder::new();
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
         let mut prioriser = Prioriser::default();
         let mut kawa = make_generic_kawa(pool, Kind::Request);
 
@@ -2012,14 +2010,12 @@ mod tests {
         max_header_list_size: u32,
         max_header_fields: u32,
     ) -> Result<GenericHttpStream, (H2Error, bool)> {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut encoded = Vec::new();
         for (name, value) in headers {
-            encoder
-                .encode_header_into((name.as_slice(), value.as_slice()), &mut encoded)
-                .unwrap();
+            encoder.encode_header_into((name.as_slice(), value.as_slice()), &mut encoded);
         }
-        let mut decoder = loona_hpack::Decoder::new();
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
         let mut prioriser = Prioriser::default();
         let mut kawa = make_generic_kawa(pool, Kind::Request);
         struct NoOpCallbacks;
@@ -2355,14 +2351,12 @@ mod tests {
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<(), (H2Error, bool)> {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut encoded = Vec::new();
         for &(name, value) in headers {
-            encoder
-                .encode_header_into((name, value), &mut encoded)
-                .unwrap();
+            encoder.encode_header_into((name, value), &mut encoded);
         }
-        let mut decoder = loona_hpack::Decoder::new();
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
         let mut prioriser = Prioriser::default();
         let mut kawa = make_generic_kawa(pool, Kind::Request);
         struct NoOpCallbacks;
@@ -2390,14 +2384,12 @@ mod tests {
         headers: &[(&[u8], &[u8])],
         end_stream: bool,
     ) -> Result<(), (H2Error, bool)> {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut encoded = Vec::new();
         for &(name, value) in headers {
-            encoder
-                .encode_header_into((name, value), &mut encoded)
-                .unwrap();
+            encoder.encode_header_into((name, value), &mut encoded);
         }
-        let mut decoder = loona_hpack::Decoder::new();
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
         let mut prioriser = Prioriser::default();
         let mut kawa = make_generic_kawa(pool, Kind::Response);
         struct NoOpCallbacks;
@@ -2737,12 +2729,10 @@ mod tests {
             path: Store::Static(b"/"),
         };
         // HPACK-encode a trailer with LF in the value.
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut encoded = Vec::new();
-        encoder
-            .encode_header_into((&b"x-trailer"[..], &b"val\nsmuggled"[..]), &mut encoded)
-            .unwrap();
-        let mut decoder = loona_hpack::Decoder::new();
+        encoder.encode_header_into((&b"x-trailer"[..], &b"val\nsmuggled"[..]), &mut encoded);
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
         let err = handle_trailer(
             &mut kawa,
             &encoded,
@@ -2962,15 +2952,13 @@ mod tests {
         pool: &mut crate::pool::Pool,
         trailers: &[(&[u8], &[u8])],
     ) -> GenericHttpStream {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut encoded = Vec::new();
         for &(name, value) in trailers {
-            encoder
-                .encode_header_into((name, value), &mut encoded)
-                .unwrap();
+            encoder.encode_header_into((name, value), &mut encoded);
         }
 
-        let mut decoder = loona_hpack::Decoder::new();
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
         let mut kawa = make_generic_kawa(pool, Kind::Request);
 
         let result = handle_trailer(

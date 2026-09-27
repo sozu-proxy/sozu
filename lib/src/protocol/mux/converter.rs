@@ -1,6 +1,6 @@
 //! H2 kawa-to-wire converter.
 //!
-//! Owns the per-connection [`loona_hpack::Encoder`] and emits HEADERS / DATA
+//! Owns the per-connection [`crate::protocol::mux::hpack::Encoder`] and emits HEADERS / DATA
 //! frames on top of `Stream`-owned Kawa buffers (zero-copy slices into stream
 //! storage). HEADERS payloads exceeding `max_frame_size` are split into a
 //! HEADERS prefix plus CONTINUATION frames per RFC 9113 §6.10. Final frame
@@ -40,7 +40,7 @@ pub struct H2BlockConverter<'a> {
     pub max_frame_size: usize,
     pub window: i32,
     pub stream_id: StreamId,
-    pub encoder: &'a mut loona_hpack::Encoder<'static>,
+    pub encoder: &'a mut crate::protocol::mux::hpack::Encoder,
     pub out: Vec<u8>,
     /// Metric events this converter produced, for the connection to hand its
     /// shell. Reused across streams exactly as `out`, `lowercase_buf` and
@@ -119,20 +119,7 @@ impl H2BlockConverter<'_> {
             return;
         }
         if let Some(new_size) = self.pending_table_size_update.take() {
-            if let Err(e) =
-                loona_hpack::encoder::encode_integer_into(new_size as usize, 5, 0x20, &mut self.out)
-            {
-                error!(
-                    "{} HPACK encoding of dynamic-table-size-update signal failed: {:?}",
-                    log_module_context!(),
-                    e
-                );
-                // Leave `size_update_emitted` false so the caller retries
-                // on the next write pass. `pending_table_size_update` has
-                // already been `.take()`n — restore it so we don't drop it.
-                self.pending_table_size_update = Some(new_size);
-                return;
-            }
+            crate::protocol::mux::hpack::encode_integer(new_size as usize, 5, 0x20, &mut self.out);
             self.size_update_emitted = true;
         }
     }
@@ -247,7 +234,7 @@ impl H2ConverterPass {
     /// [`Self::reclaim`]: the pass is left holding empty buffers until then.
     pub fn converter<'a>(
         &mut self,
-        encoder: &'a mut loona_hpack::Encoder<'static>,
+        encoder: &'a mut crate::protocol::mux::hpack::Encoder,
         stream_id: StreamId,
         window: i32,
         incremental_mode: bool,
@@ -380,75 +367,30 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     path,
                     ..
                 } => {
-                    if let Err(e) = self
-                        .encoder
-                        .encode_header_into((b":method", method.data(buffer)), &mut self.out)
-                    {
-                        error!(
-                            "{} HPACK encoding of :method pseudo-header failed: {:?}",
-                            log_module_context!(),
-                            e
-                        );
-                        return false;
-                    }
+                    self.encoder
+                        .encode_header_into((b":method", method.data(buffer)), &mut self.out);
                     if !self.check_header_capacity() {
                         return false;
                     }
-                    if let Err(e) = self
-                        .encoder
-                        .encode_header_into((b":authority", authority.data(buffer)), &mut self.out)
-                    {
-                        error!(
-                            "{} HPACK encoding of :authority pseudo-header failed: {:?}",
-                            log_module_context!(),
-                            e
-                        );
-                        return false;
-                    }
+                    self.encoder
+                        .encode_header_into((b":authority", authority.data(buffer)), &mut self.out);
                     if !self.check_header_capacity() {
                         return false;
                     }
-                    if let Err(e) = self
-                        .encoder
-                        .encode_header_into((b":path", path.data(buffer)), &mut self.out)
-                    {
-                        error!(
-                            "{} HPACK encoding of :path pseudo-header failed: {:?}",
-                            log_module_context!(),
-                            e
-                        );
-                        return false;
-                    }
+                    self.encoder
+                        .encode_header_into((b":path", path.data(buffer)), &mut self.out);
                     if !self.check_header_capacity() {
                         return false;
                     }
-                    if let Err(e) = self
-                        .encoder
-                        .encode_header_into((b":scheme", self.scheme), &mut self.out)
-                    {
-                        error!(
-                            "{} HPACK encoding of :scheme pseudo-header failed: {:?}",
-                            log_module_context!(),
-                            e
-                        );
-                        return false;
-                    }
+                    self.encoder
+                        .encode_header_into((b":scheme", self.scheme), &mut self.out);
                     if !self.check_header_capacity() {
                         return false;
                     }
                 }
                 StatusLine::Response { status, .. } => {
-                    if let Err(e) = self
-                        .encoder
-                        .encode_header_into((b":status", status.data(buffer)), &mut self.out)
-                    {
-                        error!(
-                            "{} HPACK encoding of :status pseudo-header failed: {:?}",
-                            log_module_context!(),
-                            e
-                        );
-                        return false;
-                    }
+                    self.encoder
+                        .encode_header_into((b":status", status.data(buffer)), &mut self.out);
                     if !self.check_header_capacity() {
                         return false;
                     }
@@ -475,17 +417,8 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     self.cookie_buf.extend_from_slice(cookie.key.data(buffer));
                     self.cookie_buf.push(b'=');
                     self.cookie_buf.extend_from_slice(cookie.val.data(buffer));
-                    if let Err(e) = self
-                        .encoder
-                        .encode_header_into((b"cookie", &self.cookie_buf), &mut self.out)
-                    {
-                        error!(
-                            "{} HPACK encoding of cookie header failed: {:?}",
-                            log_module_context!(),
-                            e
-                        );
-                        return false;
-                    }
+                    self.encoder
+                        .encode_header_into((b"cookie", &self.cookie_buf), &mut self.out);
                     if !self.check_header_capacity() {
                         return false;
                     }
@@ -544,17 +477,8 @@ impl<T: AsBuffer> BlockConverter<T> for H2BlockConverter<'_> {
                     );
                     return true;
                 }
-                if let Err(e) = self
-                    .encoder
-                    .encode_header_into((&self.lowercase_buf, val.data(buffer)), &mut self.out)
-                {
-                    error!(
-                        "{} HPACK encoding of header failed: {:?}",
-                        log_module_context!(),
-                        e
-                    );
-                    return false;
-                }
+                self.encoder
+                    .encode_header_into((&self.lowercase_buf, val.data(buffer)), &mut self.out);
                 if !self.check_header_capacity() {
                     return false;
                 }
@@ -858,7 +782,7 @@ mod tests {
     /// `left: 0, right: 2` — the pass swallowing what the converter produced.
     #[test]
     fn reclaim_hands_the_converter_events_out_and_the_allocation_back() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut pass = H2ConverterPass::new(
             16384,
             b"https",
@@ -894,7 +818,9 @@ mod tests {
     }
 
     /// Create a fresh H2BlockConverter with default settings for testing.
-    fn test_converter<'a>(encoder: &'a mut loona_hpack::Encoder<'static>) -> H2BlockConverter<'a> {
+    fn test_converter<'a>(
+        encoder: &'a mut crate::protocol::mux::hpack::Encoder,
+    ) -> H2BlockConverter<'a> {
         H2BlockConverter {
             metric_events: Vec::new(),
             max_frame_size: 16384,
@@ -933,7 +859,7 @@ mod tests {
 
     #[test]
     fn test_converter_filters_connection_header() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -952,7 +878,7 @@ mod tests {
 
     #[test]
     fn test_converter_filters_upgrade_header() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -970,7 +896,7 @@ mod tests {
 
     #[test]
     fn test_converter_filters_transfer_encoding_header() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -991,7 +917,7 @@ mod tests {
 
     #[test]
     fn test_converter_filters_keep_alive_header() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1009,7 +935,7 @@ mod tests {
 
     #[test]
     fn test_converter_filters_host_header() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1027,7 +953,7 @@ mod tests {
 
     #[test]
     fn test_converter_filters_http2_settings_header() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1048,7 +974,7 @@ mod tests {
 
     #[test]
     fn test_converter_filters_te_non_trailers() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1070,7 +996,7 @@ mod tests {
 
     #[test]
     fn test_converter_keeps_te_trailers() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1092,7 +1018,7 @@ mod tests {
 
     #[test]
     fn test_converter_filters_trailer_header() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1110,7 +1036,7 @@ mod tests {
 
     #[test]
     fn test_converter_keeps_valid_header() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1130,7 +1056,7 @@ mod tests {
 
     #[test]
     fn test_converter_lowercases_header_name() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1155,7 +1081,7 @@ mod tests {
 
     #[test]
     fn test_converter_emits_pending_size_update_on_first_header_block() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.pending_table_size_update = Some(256);
 
@@ -1196,7 +1122,7 @@ mod tests {
 
     #[test]
     fn test_converter_skips_size_update_when_no_pending() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         // pending_table_size_update is None by default.
 
@@ -1231,7 +1157,7 @@ mod tests {
 
     #[test]
     fn test_converter_emits_size_update_only_once_per_block() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.pending_table_size_update = Some(128);
 
@@ -1276,7 +1202,7 @@ mod tests {
 
     #[test]
     fn test_converter_skips_elided_header() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1299,7 +1225,7 @@ mod tests {
 
     #[test]
     fn test_converter_skips_header_with_control_chars() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1321,7 +1247,7 @@ mod tests {
 
     #[test]
     fn test_converter_skips_header_with_high_bytes() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1345,7 +1271,7 @@ mod tests {
 
     #[test]
     fn test_converter_data_within_window() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.window = 1000;
         let mut buf = vec![0u8; 4096];
@@ -1362,7 +1288,7 @@ mod tests {
 
     #[test]
     fn test_converter_data_stalls_on_zero_window() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.window = 0;
         let mut buf = vec![0u8; 4096];
@@ -1377,7 +1303,7 @@ mod tests {
 
     #[test]
     fn test_converter_data_stalls_on_negative_window() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.window = -100;
         let mut buf = vec![0u8; 4096];
@@ -1391,7 +1317,7 @@ mod tests {
 
     #[test]
     fn test_converter_data_splits_for_small_window() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.window = 3; // smaller than data
         let mut buf = vec![0u8; 4096];
@@ -1409,7 +1335,7 @@ mod tests {
 
     #[test]
     fn test_converter_end_stream_on_headers() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1440,7 +1366,7 @@ mod tests {
 
     #[test]
     fn test_converter_end_stream_without_headers_emits_empty_data() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1464,7 +1390,7 @@ mod tests {
 
     #[test]
     fn test_converter_finalize_clears_remaining_buffer() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1485,7 +1411,7 @@ mod tests {
 
     #[test]
     fn test_converter_finalize_noop_when_empty() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1499,7 +1425,7 @@ mod tests {
 
     #[test]
     fn test_converter_chunk_header_noop() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1530,7 +1456,7 @@ mod tests {
         // peer_count = 1 means this stream is alone in the incremental
         // bucket. The yield MUST be skipped so the stream drains in the
         // same pass. Returning `true` signals `kawa.prepare` to continue.
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.incremental_mode = true;
         conv.incremental_peer_count = 1;
@@ -1551,7 +1477,7 @@ mod tests {
     fn test_converter_incremental_pair_yields() {
         // peer_count = 2 is the smallest bucket where interleaving has any
         // effect. Must yield to allow the peer to run.
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.incremental_mode = true;
         conv.incremental_peer_count = 2;
@@ -1572,7 +1498,7 @@ mod tests {
     fn test_converter_incremental_trio_yields() {
         // peer_count = 3 is the canonical multi-peer case. Yield is
         // required so the scheduler's round-robin cursor advances.
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.incremental_mode = true;
         conv.incremental_peer_count = 3;
@@ -1596,7 +1522,7 @@ mod tests {
         // consistently, but the converter must not misbehave if they
         // disagree (defence-in-depth).
         for peers in [0usize, 1, 2, 5] {
-            let mut encoder = loona_hpack::Encoder::new();
+            let mut encoder = crate::protocol::mux::hpack::Encoder::new();
             let mut conv = test_converter(&mut encoder);
             conv.incremental_mode = false;
             conv.incremental_peer_count = peers;
@@ -1622,7 +1548,7 @@ mod tests {
         // if the next queued block is a closing `Block::Flags` (end_stream
         // = true), yielding would strand END_STREAM. Tier 3c:
         // converter must drain the closing Flags in the same pass.
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.incremental_mode = true;
         conv.incremental_peer_count = 3;
@@ -1653,7 +1579,7 @@ mod tests {
         // Flags blocks without `end_stream=true` (e.g. inter-chunk
         // `end_chunk` markers the H1 parser emits mid-body) must NOT
         // suppress the yield — they do not terminate the stream.
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.incremental_mode = true;
         conv.incremental_peer_count = 3;
@@ -1681,7 +1607,7 @@ mod tests {
     fn test_converter_yields_before_chunk_block() {
         // Sanity: the close-race guard only triggers on Block::Flags —
         // a trailing Block::Chunk does NOT suppress the yield.
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.incremental_mode = true;
         conv.incremental_peer_count = 3;
@@ -1712,7 +1638,7 @@ mod tests {
     /// `initialize` synthesises a typed RST_STREAM frame.
     #[test]
     fn test_converter_aborts_on_header_budget_overrun() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         let mut buf = vec![0u8; 4096];
         let mut kawa = make_kawa(&mut buf, Kind::Response);
@@ -1769,7 +1695,7 @@ mod tests {
     /// - the abort flag is reset so the converter is reusable.
     #[test]
     fn test_converter_finalize_commits_oversized_abort() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.stream_id = 7;
         let mut buf = vec![0u8; 4096];
@@ -1829,7 +1755,7 @@ mod tests {
     /// RST_STREAM(InternalError) frame and push it onto `kawa.out`.
     #[test]
     fn test_converter_initialize_emits_rst_stream_on_error_phase() {
-        let mut encoder = loona_hpack::Encoder::new();
+        let mut encoder = crate::protocol::mux::hpack::Encoder::new();
         let mut conv = test_converter(&mut encoder);
         conv.stream_id = 5;
         let mut buf = vec![0u8; 4096];

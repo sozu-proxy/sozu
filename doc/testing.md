@@ -424,6 +424,7 @@ before extending the file.
 # From inside fuzz/ (requires cargo-fuzz + nightly):
 cargo +nightly fuzz run fuzz_frame_parser
 cargo +nightly fuzz run fuzz_hpack_decoder
+cargo +nightly fuzz run fuzz_hpack_roundtrip
 cargo +nightly fuzz run fuzz_udp_flow
 cargo +nightly fuzz run fuzz_tcp_clienthello
 cargo +nightly fuzz run fuzz_command_channel
@@ -682,7 +683,8 @@ The out-of-workspace `sozu-fuzz` crate (`fuzz/`) has five cargo-fuzz targets
 | Target | Surface | Defends against |
 |---|---|---|
 | `fuzz_frame_parser` | H2 frame parser (`protocol::mux::parser`, RFC 9113 §6) | length-confusion / framing CVEs (`ensure_frame_size!`); parser must reject via `H2Error`/`nom::Err`, never panic |
-| `fuzz_hpack_decoder` | HPACK decoder (RFC 7541, `loona-hpack`) under three dynamic-table profiles | header-block oversize and incomplete-update flaws; resize/eviction paths |
+| `fuzz_hpack_decoder` | HPACK decoder (RFC 7541, `sozu_lib::protocol::mux::hpack`) under three dynamic-table profiles, plus a raw Huffman decode | header-block oversize and incomplete-update flaws; resize/eviction paths; Huffman padding and EOS |
+| `fuzz_hpack_roundtrip` | HPACK encoder → decoder over a script of fields, representations, Huffman flags and size updates | encoder/decoder dynamic-table drift; Huffman encode/decode asymmetry |
 | `fuzz_udp_flow` | the sans-io UDP core + flow-key extraction + PPv2 DGRAM framing | flow-count overrun, gauge underflow, fd/slab leak; reuses the same invariants the simulator asserts |
 | `fuzz_tcp_clienthello` | the sans-io TCP SNI-preread core (`protocol::tcp_preread`, [#1279](https://github.com/sozu-proxy/sozu/issues/1279)) — TLS record/ClientHello parsing, PROXY-v2 stripping, SNI/ALPN routing | the core mutating the fed byte window, a latched terminal verdict (`Routed`/`Reject`) changing on a later call, `NeedMore` reappearing after a terminal, `content_offset` exceeding the fed window, a `NeedMore` deadline regressing across calls |
 | `fuzz_command_channel` | the command channel's length-delimited IPC framing (`sozu_command_lib::channel::Channel`, `command/src/channel.rs`) — `try_read_delimited_message` (reached via the public, purely in-memory `read_message()`) and `write_delimited_message`, against truncated frames, an under-delimiter/zero/oversize/split-across-boundary declared length, and valid frames followed by garbage | a `read_message()` call increasing pending data; a successful decode not consuming exactly the declared frame length; `MessageLengthUnderDelimiter` not dropping exactly the delimiter to resync; `MessageTooLarge` consuming bytes or growing the buffer before rejecting; byte-conservation drift between fed and consumed bytes; a write/read round trip losing the encoded `id` |
@@ -710,7 +712,9 @@ targets to `fuzz_seconds` (default 900 s) via its `extended-fuzz` job matrix.
 `fuzz_command_channel` step to all three, mirroring `fuzz_tcp_clienthello`'s,
 is proposed but intentionally left for a separate CI-wiring decision. Until
 then run it manually with the commands above when touching
-`command/src/channel.rs`.
+`command/src/channel.rs`. `fuzz_hpack_roundtrip` is in the same position, by
+the same decision: run it with `fuzz_hpack_decoder` when touching
+`lib/src/protocol/mux/hpack/`.
 
 **When to run fuzzers.** Any H2 parser, HPACK, UDP-core, TCP SNI-preread, or
 command-channel-framing change must run the focused unit/e2e tests *and* the
@@ -837,7 +841,7 @@ skipping it produced a real flaky-test or papered-over-bug commit.
 - **A test that only reddens under CI load is not automatically a flake — find
   the production site first.** Before retrying or quarantining, ask whether the
   symptom is reachable at all. #1353's 421 has exactly one emission site
-  (`lib/src/protocol/mux/mod.rs:3116`), reachable only through
+  (`lib/src/protocol/mux/mod.rs:3117`), reachable only through
   `RetrieveClusterError::SniAuthorityMismatch`, which is constructed at exactly
   one site (`lib/src/protocol/mux/router.rs:1074`) immediately after
   `incr!(names::http::SNI_AUTHORITY_MISMATCH)` — and the failing run reported

@@ -35,7 +35,6 @@ base64 = { workspace = true }
 cookie-factory = { workspace = true }
 hdrhistogram = { workspace = true }
 hex = { workspace = true }
-loona-hpack = { workspace = true }
 idna = { workspace = true }
 itoa = { workspace = true }
 kawa = { workspace = true }

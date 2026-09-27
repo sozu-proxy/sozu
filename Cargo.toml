@@ -12,7 +12,6 @@ flate2 = "^1.1.10"
 futures = "^0.3.34"
 hdrhistogram = "^7.6.0"
 hex = "^0.4.3"
-loona-hpack = "^0.4.3"
 http-body-util = "^0.1.5"
 hyper = "^1.11.1"
 hyper-rustls = { version = "^0.27.9", default-features = false }

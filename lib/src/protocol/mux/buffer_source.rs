@@ -34,13 +34,13 @@
 //!
 //! Not under it, deliberately:
 //!
-//! - **`loona_hpack`'s own allocations.** The crate exposes `Decoder::new` /
-//!   `Encoder::new` and no capacity-supplied constructor, so its dynamic
-//!   tables cannot be routed through a source without forking it. They are
-//!   brought under the contract at *acquisition* — the pair is built inside a
-//!   fallible `HpackState::new` — and bounded where they already were, by the
-//!   RFC 7541 §4.2 table-size settings. Growth after acquisition still reaches
-//!   the global allocator.
+//! - **Growth of the HPACK codec's own buffers.** The dynamic tables of the
+//!   `crate::protocol::mux::hpack` pair and the decoder's Huffman scratch
+//!   buffer start empty and grow to a high-water mark bounded by the RFC 7541
+//!   §4.2 table-size settings and the longest decoded string. They are brought
+//!   under the contract at *acquisition* — the pair is built inside a fallible
+//!   `HpackState::new` — and their growth after acquisition reaches the global
+//!   allocator, like a scratch buffer's below.
 //! - **Growth of an already-acquired scratch buffer.** `scratch` hands over an
 //!   empty `Vec` that the core then grows and reclaims on its own schedule.
 //!   Pre-sizing one and refusing to grow it is a behaviour change — it needs
