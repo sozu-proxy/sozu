@@ -37,7 +37,7 @@ hdrhistogram = { workspace = true }
 hex = { workspace = true }
 idna = { workspace = true }
 itoa = { workspace = true }
-kawa = { workspace = true }
+kawa = { workspace = true, features = ["rc-alloc"] }
 libc = { workspace = true }
 memchr = { workspace = true }
 mio = { workspace = true, features = ["os-poll", "os-ext", "net"] }

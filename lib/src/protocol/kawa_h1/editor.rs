@@ -252,8 +252,11 @@ pub struct HttpContext {
     /// Value of the `x-request-id` header observed (if propagated from the
     /// client/upstream LB) or generated (from `self.id`). Universal correlation
     /// header — populated unconditionally by `on_request_headers` so the access
-    /// log can record the exact value forwarded to the backend.
-    pub x_request_id: Option<String>,
+    /// log can record the exact value forwarded to the backend. `Rc` because
+    /// a generated value is the one rendering of `self.id` that the forwarded
+    /// `X-Request-Id` and both correlation headers share
+    /// (`kawa::Store::Shared`).
+    pub x_request_id: Option<Rc<str>>,
     /// Verbatim value of the client-supplied `X-Forwarded-For` header as
     /// observed before Sōzu appended its own hop. Captured here, not at
     /// request edit time, so the access log records the upstream-attested
@@ -492,6 +495,41 @@ pub struct HeaderEditSnapshot {
     pub key: Vec<u8>,
     pub val: Vec<u8>,
     pub mode: HeaderEditMode,
+}
+
+/// A ULID in its canonical 26-character Crockford base-32 form, rendered on
+/// the stack: `Ulid`'s `Display` allocates a `String` to render it.
+fn render_ulid(id: Ulid) -> [u8; 26] {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let value = u128::from(id);
+    let mut rendered = [0u8; 26];
+    // 26 digits of 5 bits carry 130 bits: the first digit holds the top 3
+    // bits of the 128-bit value, every later one the next 5.
+    for (index, digit) in rendered.iter_mut().enumerate() {
+        let shift = 5 * (25 - index);
+        *digit = CROCKFORD[((value >> shift) & 0x1f) as usize];
+    }
+    // Post: every digit is a Crockford base-32 character, so the rendering
+    // is ASCII and CR/LF-free wherever it is spliced into a header.
+    debug_assert!(
+        rendered.iter().all(|digit| CROCKFORD.contains(digit)),
+        "a rendered ULID must only carry Crockford base-32 digits"
+    );
+    rendered
+}
+
+/// The store of a correlation-header name: the default `Sozu-Id` — what
+/// `L7ListenerHandler::get_sozu_id_header` (`lib/src/lib.rs`) and its
+/// `HttpListener` and `HttpsListener` implementations answer when the
+/// listener does not rename it — is a `'static` literal and costs nothing; a
+/// renamed header is copied.
+fn correlation_header_name(name: &str) -> kawa::Store {
+    const DEFAULT: &str = "Sozu-Id";
+    if name == DEFAULT {
+        kawa::Store::Static(DEFAULT.as_bytes())
+    } else {
+        kawa::Store::from_slice(name.as_bytes())
+    }
 }
 
 impl kawa::h1::ParserCallbacks<Checkout> for HttpContext {
@@ -840,7 +878,7 @@ impl HttpContext {
                             .val
                             .data_opt(buf)
                             .and_then(|data| from_utf8(data).ok())
-                            .map(ToOwned::to_owned);
+                            .map(Rc::from);
                     } else {
                         #[cfg(feature = "opentelemetry")]
                         if compare_no_case(key, b"traceparent") {
@@ -892,8 +930,15 @@ impl HttpContext {
             let has_x_for = x_for.is_some();
             let has_forwarded = forwarded.is_some();
 
-            // Buffer for building header values — ownership is transferred to Store
-            // via `take`, so each header gets its own allocation.
+            // One scratch buffer renders every value below, and each header
+            // takes an exact-size copy of it (`Store::from_slice`) before the
+            // scratch is cleared for the next. Handing the scratch itself over
+            // (`Store::from_vec` of a `take`n buffer) cost two more heap
+            // operations per header: `into_boxed_slice` reallocates to shrink
+            // the spare capacity away, and the next header regrows an empty
+            // buffer from zero — 8, 16, 32, 64 bytes for a synthesised
+            // `Forwarded`. The pinned count is
+            // `a_bare_request_costs_one_scratch_and_one_copy_per_forwarding_header`.
             let mut hdr_buf = Vec::with_capacity(128);
 
             if let Some(header) = x_for {
@@ -912,7 +957,8 @@ impl HttpContext {
                     is_crlf_free(&hdr_buf[prior_len..]),
                     "the X-Forwarded-For hop we append must be CR/LF-free (anti-injection)"
                 );
-                header.val = kawa::Store::from_vec(std::mem::take(&mut hdr_buf));
+                header.val = kawa::Store::from_slice(&hdr_buf);
+                hdr_buf.clear();
             }
             if let Some(header) = &mut forwarded {
                 let prior_len = header.val.data(buf).len();
@@ -930,7 +976,8 @@ impl HttpContext {
                     is_crlf_free(&hdr_buf[prior_len..]),
                     "the Forwarded element we append must be CR/LF-free (anti-injection)"
                 );
-                header.val = kawa::Store::from_vec(std::mem::take(&mut hdr_buf));
+                header.val = kawa::Store::from_slice(&hdr_buf);
+                hdr_buf.clear();
             }
 
             if !has_x_for {
@@ -940,9 +987,11 @@ impl HttpContext {
                     is_crlf_free(&hdr_buf),
                     "a synthesised X-Forwarded-For value must be CR/LF-free"
                 );
+                let val = kawa::Store::from_slice(&hdr_buf);
+                hdr_buf.clear();
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"X-Forwarded-For"),
-                    val: kawa::Store::from_vec(std::mem::take(&mut hdr_buf)),
+                    val,
                 }));
                 debug_assert_eq!(
                     request.blocks.len(),
@@ -959,9 +1008,11 @@ impl HttpContext {
                     is_crlf_free(&hdr_buf),
                     "a synthesised Forwarded value must be CR/LF-free"
                 );
+                let val = kawa::Store::from_slice(&hdr_buf);
+                hdr_buf.clear();
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"Forwarded"),
-                    val: kawa::Store::from_vec(std::mem::take(&mut hdr_buf)),
+                    val,
                 }));
                 debug_assert_eq!(
                     request.blocks.len(),
@@ -984,7 +1035,7 @@ impl HttpContext {
                 let blocks_before = request.blocks.len();
                 debug_assert!(
                     hdr_buf.is_empty(),
-                    "the header scratch buffer was taken before reuse"
+                    "the header scratch buffer was cleared before reuse"
                 );
                 let _ = write!(hdr_buf, "{peer_ip}");
                 // The proxy-generated value is a rendered IpAddr — non-empty
@@ -993,9 +1044,11 @@ impl HttpContext {
                     !hdr_buf.is_empty() && is_crlf_free(&hdr_buf),
                     "the injected X-Real-IP value must be a CR/LF-free IP"
                 );
+                let val = kawa::Store::from_slice(&hdr_buf);
+                hdr_buf.clear();
                 request.push_block(kawa::Block::Header(kawa::Pair {
                     key: kawa::Store::Static(b"X-Real-IP"),
-                    val: kawa::Store::from_vec(std::mem::take(&mut hdr_buf)),
+                    val,
                 }));
                 debug_assert_eq!(
                     request.blocks.len(),
@@ -1047,7 +1100,11 @@ impl HttpContext {
         if has_x_request_id {
             incr!(names::http::X_REQUEST_ID_PROPAGATED);
         } else {
-            let value = self.id.to_string();
+            // The one rendering of `self.id` this request allocates: the
+            // forwarded header, the access log and both correlation headers
+            // share it (`Self::shared_id`).
+            let rendered = render_ulid(self.id);
+            let value: Rc<str> = Rc::from(from_utf8(&rendered).expect("a rendered ULID is ASCII"));
             // The generated id is a ULID rendering — Crockford base-32, so
             // CR/LF-free by construction.
             debug_assert!(
@@ -1056,7 +1113,7 @@ impl HttpContext {
             );
             request.push_block(kawa::Block::Header(kawa::Pair {
                 key: kawa::Store::Static(b"X-Request-Id"),
-                val: kawa::Store::from_string(value.clone()),
+                val: kawa::Store::Shared(Rc::<[u8]>::from(value.clone()), 0),
             }));
             self.x_request_id = Some(value);
             incr!(names::http::X_REQUEST_ID_GENERATED);
@@ -1072,8 +1129,8 @@ impl HttpContext {
         // renamed via the `sozu_id_header` listener config knob).
         let blocks_before_sozu_id = request.blocks.len();
         request.push_block(kawa::Block::Header(kawa::Pair {
-            key: kawa::Store::from_string(self.sozu_id_header.clone()),
-            val: kawa::Store::from_string(self.id.to_string()),
+            key: correlation_header_name(&self.sozu_id_header),
+            val: kawa::Store::Shared(self.shared_id(), 0),
         }));
         debug_assert_eq!(
             request.blocks.len(),
@@ -1182,8 +1239,8 @@ impl HttpContext {
         // renamed via the `sozu_id_header` listener config knob).
         let blocks_before_sozu_id = response.blocks.len();
         response.push_block(kawa::Block::Header(kawa::Pair {
-            key: kawa::Store::from_string(self.sozu_id_header.clone()),
-            val: kawa::Store::from_string(self.id.to_string()),
+            key: correlation_header_name(&self.sozu_id_header),
+            val: kawa::Store::Shared(self.shared_id(), 0),
         }));
         debug_assert_eq!(
             response.blocks.len(),
@@ -1197,6 +1254,29 @@ impl HttpContext {
             response.blocks.len() >= blocks_at_entry,
             "header editing must never drop a block from the response"
         );
+    }
+
+    /// `self.id` rendered, as a shared value for the correlation header.
+    ///
+    /// When the request carried no `X-Request-Id`, `on_request_headers`
+    /// generated one from `self.id` and kept it in `self.x_request_id`: the
+    /// same 26 bytes, shared with a reference-count bump. A client-supplied
+    /// `X-Request-Id` is a different value, and `self.id` is then rendered
+    /// into a copy of its own, because the correlation header always carries
+    /// Sōzu's id, whatever the client sent.
+    fn shared_id(&self) -> Rc<[u8]> {
+        let rendered = render_ulid(self.id);
+        let shared = match &self.x_request_id {
+            Some(generated) if generated.as_bytes() == rendered => {
+                Rc::<[u8]>::from(generated.clone())
+            }
+            _ => Rc::from(&rendered[..]),
+        };
+        debug_assert_eq!(
+            &*shared, &rendered,
+            "the correlation header must carry this request's own id"
+        );
+        shared
     }
 
     pub fn reset(&mut self) {
@@ -1472,7 +1552,7 @@ mod tests {
         ctx.status = Some(200);
         ctx.reason = Some("OK".to_owned());
         ctx.user_agent = Some("curl/7.81".to_owned());
-        ctx.x_request_id = Some("client-xrid-123".to_owned());
+        ctx.x_request_id = Some(Rc::from("client-xrid-123"));
         ctx.xff_chain = Some("203.0.113.5, 198.51.100.10".to_owned());
         ctx.redirect_location = Some("https://example.com/".to_owned());
         ctx.www_authenticate = Some("Basic realm=\"sozu\"".to_owned());
@@ -1772,5 +1852,321 @@ mod tests {
             assert_eq!(parsed_trace_id, trace_id);
             assert_eq!(parsed_parent_id, parent_id);
         }
+    }
+
+    // ── header-editing allocations ─────────────────────────────────────
+
+    /// A bare keep-alive request: no forwarding header, no `X-Request-Id`,
+    /// no `User-Agent`, so every header the editor adds is synthesised.
+    const BARE_REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+    /// Parse `request` through the real parser, and so through
+    /// `on_request_headers`, into `kawa`, and return the heap allocations
+    /// the parse made.
+    ///
+    /// `kawa` is cleared first, the way the H1 keep-alive path clears a
+    /// stream's front kawa between two requests, so a caller that parses on
+    /// the same kawa twice measures the second parse without the growth of
+    /// kawa's own block queue.
+    fn allocations_of_request_parse(
+        ctx: &mut HttpContext,
+        kawa: &mut GenericHttpStream,
+        request: &[u8],
+    ) -> usize {
+        use crate::test_allocations::allocations;
+        kawa.clear();
+        kawa.storage.clear();
+        kawa.storage.space()[..request.len()].copy_from_slice(request);
+        kawa.storage.fill(request.len());
+        let before = allocations();
+        kawa::h1::parse(kawa, ctx);
+        let parsed = allocations() - before;
+        assert!(kawa.is_main_phase(), "premise: the request must parse");
+        parsed
+    }
+
+    /// A kawa on its own pool buffer, its block queue warmed by one parse on
+    /// a throwaway context so later measurements see only the editor.
+    fn warm_request_kawa(pool: &mut crate::pool::Pool) -> GenericHttpStream {
+        let mut kawa: GenericHttpStream = kawa::Kawa::new(
+            kawa::Kind::Request,
+            kawa::Buffer::new(
+                pool.checkout()
+                    .expect("the test pool must hand out a buffer"),
+            ),
+        );
+        allocations_of_request_parse(&mut make_context(), &mut kawa, BARE_REQUEST);
+        kawa
+    }
+
+    /// The bytes `kawa` would send upstream, serialised the way
+    /// `ConnectionH1::writable` serialises them.
+    fn serialized_request(kawa: &mut GenericHttpStream) -> String {
+        kawa.prepare(&mut kawa::h1::BlockConverter);
+        let buffer = kawa.storage.buffer();
+        let bytes = kawa
+            .out
+            .iter()
+            .flat_map(|block| match block {
+                kawa::OutBlock::Store(store) => store.data(buffer).to_vec(),
+                kawa::OutBlock::Delimiter => Vec::new(),
+            })
+            .collect::<Vec<u8>>();
+        String::from_utf8(bytes).expect("the serialised request must be UTF-8")
+    }
+
+    /// The `traceparent` line `on_request_headers` synthesises for a request
+    /// that carried none, rendered from the ids it recorded on `ctx.otel`;
+    /// empty without the `opentelemetry` feature, which adds no header.
+    fn synthesised_traceparent_line(ctx: &HttpContext) -> String {
+        #[cfg(feature = "opentelemetry")]
+        {
+            let otel = ctx
+                .otel
+                .as_ref()
+                .expect("on_request_headers records the trace context it forwards");
+            let value = build_traceparent(&otel.trace_id, &otel.span_id);
+            format!(
+                "traceparent: {}\r\n",
+                from_utf8(&value).expect("a traceparent is ASCII hex")
+            )
+        }
+        #[cfg(not(feature = "opentelemetry"))]
+        {
+            let _ = ctx;
+            String::new()
+        }
+    }
+
+    /// Heap operations of the `traceparent` header `on_request_headers`
+    /// synthesises under the `opentelemetry` feature: its value is built on
+    /// the stack (`build_traceparent`) and copied once
+    /// (`kawa::Store::from_slice`), the same one exact copy as every other
+    /// synthesised header. Without the feature there is no such header.
+    const SYNTHESISED_TRACEPARENT: usize = if cfg!(feature = "opentelemetry") {
+        1
+    } else {
+        0
+    };
+
+    /// A bare request: every forwarding header is synthesised, and each
+    /// costs one exact-size copy of one shared scratch; the request id is
+    /// rendered once.
+    ///
+    /// The seven: `authority` and `path` captured for routing and the access
+    /// log (2), the scratch (1), `X-Forwarded-For` and `Forwarded` (2),
+    /// `X-Forwarded-Port` (1), and the one rendering of the request id that
+    /// `X-Request-Id`, the access log and the `Sozu-Id` value share (1). The
+    /// default `Sozu-Id` name is a `'static` literal (0). Under the
+    /// `opentelemetry` feature, the synthesised `traceparent` adds its one
+    /// copy ([`SYNTHESISED_TRACEPARENT`]).
+    ///
+    /// TO SEE THIS RED, either of:
+    /// - in `on_request_headers`, hand the scratch itself to each header
+    ///   again — `kawa::Store::from_vec(std::mem::take(&mut hdr_buf))` in
+    ///   place of the `from_slice` + `clear` pairs. Measured: `left: 11,
+    ///   right: 7`, the shrink of `X-Forwarded-For` and the 8 → 16 → 32 → 64
+    ///   regrowth and shrink of `Forwarded`.
+    /// - render the id per header again: `kawa::Store::from_string(
+    ///   self.id.to_string())` for the `Sozu-Id` value, `from_string(
+    ///   self.sozu_id_header.clone())` for its name, and a `self.id
+    ///   .to_string()` copied for `X-Request-Id`. Measured: `left: 10,
+    ///   right: 7`.
+    #[test]
+    fn a_bare_request_costs_one_scratch_and_one_copy_per_forwarding_header() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = warm_request_kawa(&mut pool);
+        let mut ctx = make_context();
+
+        let first = allocations_of_request_parse(&mut ctx, &mut kawa, BARE_REQUEST);
+
+        assert_eq!(
+            first,
+            7 + SYNTHESISED_TRACEPARENT,
+            "a bare request's header editing must cost one scratch, one exact \
+             copy per synthesised forwarding header and one rendering of the \
+             request id"
+        );
+    }
+
+    /// Parse `response` through the real parser, and so through
+    /// `on_response_headers`, into a warm response kawa; return the heap
+    /// allocations the parse made and the serialised response.
+    fn response_parse(ctx: &mut HttpContext, response: &[u8]) -> (usize, String) {
+        use crate::test_allocations::allocations;
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa: GenericHttpStream = kawa::Kawa::new(
+            kawa::Kind::Response,
+            kawa::Buffer::new(
+                pool.checkout()
+                    .expect("the test pool must hand out a buffer"),
+            ),
+        );
+        let mut measured = 0;
+        // The first parse warms kawa's block queue on a throwaway context.
+        for context in [&mut make_context(), ctx] {
+            kawa.clear();
+            kawa.storage.clear();
+            kawa.storage.space()[..response.len()].copy_from_slice(response);
+            kawa.storage.fill(response.len());
+            let before = allocations();
+            kawa::h1::parse(&mut kawa, context);
+            measured = allocations() - before;
+            assert!(kawa.is_main_phase(), "premise: the response must parse");
+        }
+        kawa.prepare(&mut kawa::h1::BlockConverter);
+        let buffer = kawa.storage.buffer();
+        let bytes = kawa
+            .out
+            .iter()
+            .flat_map(|block| match block {
+                kawa::OutBlock::Store(store) => store.data(buffer).to_vec(),
+                kawa::OutBlock::Delimiter => Vec::new(),
+            })
+            .collect::<Vec<u8>>();
+        (
+            measured,
+            String::from_utf8(bytes).expect("the serialised response must be UTF-8"),
+        )
+    }
+
+    /// The response's `Sozu-Id` shares the rendering the request generated
+    /// for `X-Request-Id`, and still carries Sōzu's own id when the client
+    /// chose its `X-Request-Id`.
+    ///
+    /// The one allocation left on the generated path is the `reason`
+    /// captured for the access log.
+    ///
+    /// TO SEE THIS RED: in `on_response_headers`, push the correlation
+    /// header as `key: kawa::Store::from_string(self.sozu_id_header
+    /// .clone())` and `val: kawa::Store::from_string(self.id.to_string())`.
+    /// Measured: `left: 3, right: 1`.
+    #[test]
+    fn a_response_shares_the_request_id_rendering() {
+        const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = warm_request_kawa(&mut pool);
+
+        let mut generated = make_context();
+        allocations_of_request_parse(&mut generated, &mut kawa, BARE_REQUEST);
+        let (allocations, response) = response_parse(&mut generated, RESPONSE);
+        let id = generated.id.to_string();
+        assert_eq!(
+            response,
+            format!("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nSozu-Id: {id}\r\n\r\n")
+        );
+        assert_eq!(
+            allocations, 1,
+            "the response must share the id rendering the request generated"
+        );
+
+        let mut client_chosen = make_context();
+        allocations_of_request_parse(
+            &mut client_chosen,
+            &mut kawa,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Request-Id: client-chosen\r\n\r\n",
+        );
+        let (_, response) = response_parse(&mut client_chosen, RESPONSE);
+        assert_eq!(
+            response,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nSozu-Id: {}\r\n\r\n",
+                client_chosen.id
+            ),
+            "the correlation header carries Sōzu's id, not the client's"
+        );
+    }
+
+    /// `render_ulid` agrees with `Ulid`'s own `Display` at both ends of the
+    /// 128-bit range and on generated ids.
+    #[test]
+    fn render_ulid_matches_the_display_rendering() {
+        let ids = [
+            Ulid::from(0u128),
+            Ulid::from(u128::MAX),
+            Ulid::from(1u128 << 127),
+            Ulid::generate(),
+            Ulid::generate(),
+            Ulid::generate(),
+        ];
+        for id in ids {
+            assert_eq!(
+                from_utf8(&render_ulid(id)).expect("a rendered ULID is ASCII"),
+                id.to_string()
+            );
+        }
+        assert_eq!(render_ulid(Ulid::from(u128::MAX))[0], b'7');
+    }
+
+    /// Byte-exact output of the header editing, for the synthesised headers
+    /// and for the chains a client supplied, on the first request of a
+    /// connection and on the next one after `reset`.
+    #[test]
+    fn header_editing_output_is_byte_exact_across_keep_alive_requests() {
+        let mut pool = crate::pool::Pool::with_capacity(1, 1, 4096);
+        let mut kawa = warm_request_kawa(&mut pool);
+        let mut ctx = HttpContext::new(
+            Ulid::generate(),
+            Ulid::generate(),
+            Protocol::HTTP,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                54321,
+            )),
+            "SERVERID".to_owned(),
+            "X-Edge-Id".to_owned(),
+            false,
+            true,
+        );
+        let id = ctx.id.to_string();
+
+        for request in 0..3 {
+            allocations_of_request_parse(&mut ctx, &mut kawa, BARE_REQUEST);
+            let traceparent = synthesised_traceparent_line(&ctx);
+            assert_eq!(
+                serialized_request(&mut kawa),
+                format!(
+                    "GET / HTTP/1.1\r\nHost: example.com\r\n\
+                     X-Forwarded-For: 10.0.0.1\r\n\
+                     Forwarded: proto=http;for=\"10.0.0.1:54321\";by=127.0.0.1\r\n\
+                     X-Real-IP: 10.0.0.1\r\n\
+                     {traceparent}\
+                     X-Forwarded-Port: 8080\r\n\
+                     X-Forwarded-Proto: http\r\n\
+                     X-Request-Id: {id}\r\n\
+                     X-Edge-Id: {id}\r\n\r\n"
+                ),
+                "request {request} of the connection"
+            );
+            assert_eq!(ctx.x_request_id.as_deref(), Some(id.as_str()));
+            ctx.reset();
+        }
+
+        allocations_of_request_parse(
+            &mut ctx,
+            &mut kawa,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\
+              X-Forwarded-For: 192.0.2.7\r\n\
+              Forwarded: for=192.0.2.7\r\n\
+              X-Request-Id: client-chosen\r\n\r\n",
+        );
+        let traceparent = synthesised_traceparent_line(&ctx);
+        assert_eq!(
+            serialized_request(&mut kawa),
+            format!(
+                "GET / HTTP/1.1\r\nHost: example.com\r\n\
+                 X-Forwarded-For: 192.0.2.7, 10.0.0.1\r\n\
+                 Forwarded: for=192.0.2.7, proto=http;for=\"10.0.0.1:54321\";by=127.0.0.1\r\n\
+                 X-Request-Id: client-chosen\r\n\
+                 X-Real-IP: 10.0.0.1\r\n\
+                 {traceparent}\
+                 X-Forwarded-Port: 8080\r\n\
+                 X-Forwarded-Proto: http\r\n\
+                 X-Edge-Id: {id}\r\n\r\n"
+            ),
+            "client chains are extended, a client X-Request-Id is kept verbatim"
+        );
+        assert_eq!(ctx.x_request_id.as_deref(), Some("client-chosen"));
     }
 }

@@ -161,10 +161,10 @@ combined final coding is not `chunked` (RFC 9112 §6.3), returning before
   0.7.1, and forwarding both lines is what the count clause refuses.
 
 The guard therefore folds over every non-elided `Transfer-Encoding` header in
-`request.blocks` (`editor.rs:638-658`), producing `te_count` and
+`request.blocks` (`editor.rs:676-696`), producing `te_count` and
 `te_all_suffix_chunked` — the latter true only when EVERY such value's literal
 trailing bytes are `chunked` (`compare_no_case` over the last seven bytes). The
-rejection predicate is exactly (`editor.rs:659-662`):
+rejection predicate is exactly (`editor.rs:697-700`):
 
 ```rust
 te_count > 1
