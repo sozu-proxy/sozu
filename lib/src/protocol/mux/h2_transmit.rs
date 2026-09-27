@@ -161,6 +161,54 @@ pub unsafe fn gather<T: AsBuffer>(kawa: &Kawa<T>, io_slices: &mut Vec<IoSlice<'s
     // from four through every power of two up to the block count (#1610); a
     // vector that already holds the capacity is left alone.
     io_slices.reserve(kawa.out.len());
+    // SAFETY: forwarded verbatim; this function's own contract.
+    unsafe { push_out_blocks(kawa, io_slices) }
+}
+
+/// [`gather`] for an H2 stream transmit: `prefix`, the connection's queued
+/// output (`super::h2_output::H2Output::pending`), goes first as one more
+/// descriptor, then the stream's blocks exactly as [`gather`] pushes them.
+///
+/// Answers `(prefix_len, bytes_offered)`, the second counting the prefix too.
+/// The caller splits what the socket took at `prefix_len`: the prefix part
+/// goes back to the output queue, the rest is the stream's.
+///
+/// # Safety
+///
+/// [`gather`]'s contract, extended to `prefix`: neither `prefix`'s owner nor
+/// `kawa` may be mutated or dropped until `io_slices` is emptied, which
+/// [`confirm`] does first.
+pub unsafe fn gather_after<T: AsBuffer>(
+    prefix: &[u8],
+    kawa: &Kawa<T>,
+    io_slices: &mut Vec<IoSlice<'static>>,
+) -> (usize, usize) {
+    io_slices.clear();
+    // One descriptor per queued block, plus one for the prefix only when
+    // there is one: a warm vector sized for `gather` must not grow here.
+    io_slices.reserve(kawa.out.len() + usize::from(!prefix.is_empty()));
+    if !prefix.is_empty() {
+        // SAFETY: see this function's contract.
+        let prefix: &'static [u8] =
+            unsafe { std::slice::from_raw_parts(prefix.as_ptr(), prefix.len()) };
+        io_slices.push(IoSlice::new(prefix));
+    }
+    // SAFETY: see this function's contract.
+    let stream = unsafe { push_out_blocks(kawa, io_slices) };
+    (prefix.len(), prefix.len() + stream)
+}
+
+/// Push `kawa.out`'s blocks, up to the first delimiter, behind whatever
+/// `io_slices` already holds, and answer the bytes they describe.
+///
+/// # Safety
+///
+/// [`gather`]'s contract.
+unsafe fn push_out_blocks<T: AsBuffer>(
+    kawa: &Kawa<T>,
+    io_slices: &mut Vec<IoSlice<'static>>,
+) -> usize {
+    let already = io_slices.len();
     let buffer = kawa.storage.buffer();
     let mut bytes_offered = 0usize;
     for block in kawa.out.iter() {
@@ -183,7 +231,7 @@ pub unsafe fn gather<T: AsBuffer>(kawa: &Kawa<T>, io_slices: &mut Vec<IoSlice<'s
         }
     }
     debug_assert_eq!(
-        io_slices.iter().map(|s| s.len()).sum::<usize>(),
+        io_slices[already..].iter().map(|s| s.len()).sum::<usize>(),
         bytes_offered,
         "the reported offer must equal the bytes the descriptors describe"
     );
@@ -194,10 +242,68 @@ pub unsafe fn gather<T: AsBuffer>(kawa: &Kawa<T>, io_slices: &mut Vec<IoSlice<'s
     // that offers no bytes, which the pre-image handled without complaint and
     // an `assert_eq!` on the two emptinesses would have turned into a panic.
     debug_assert!(
-        bytes_offered == 0 || !io_slices.is_empty(),
+        bytes_offered == 0 || io_slices.len() > already,
         "a non-zero offer must be backed by at least one descriptor"
     );
     bytes_offered
+}
+
+/// How many bytes past `written` the frame that `written` cut still needs,
+/// read from `slices`, the stream's H2 frames exactly as gathered.
+///
+/// `0` when the write stopped on a frame boundary that is not inside a header
+/// block. Otherwise the answer runs to the end of the cut frame, and on
+/// through the CONTINUATION frames up to END_HEADERS when that frame opened
+/// or continued an unfinished header block: RFC 9113 §6.10 forbids any other
+/// frame in between, so the peer must see the whole block before anything
+/// the connection queues next.
+///
+/// `slices` must start on a frame boundary outside a header block, which
+/// holds for every H2 stream because every write either ends on such a
+/// boundary or has its rest adopted by `super::h2_output::H2Output`. A frame
+/// running past the gathered bytes cannot happen (the converter queues whole
+/// frames and no delimiter), and answers what is left, after a debug
+/// assertion.
+pub fn frame_tail(slices: &[IoSlice], written: usize) -> usize {
+    const HEADERS: u8 = 0x1;
+    const PUSH_PROMISE: u8 = 0x5;
+    const CONTINUATION: u8 = 0x9;
+    const END_HEADERS: u8 = 0x4;
+    const FRAME_HEADER: usize = 9;
+
+    let total: usize = slices.iter().map(|slice| slice.len()).sum();
+    let byte_at = |mut offset: usize| -> u8 {
+        for slice in slices {
+            if offset < slice.len() {
+                return slice[offset];
+            }
+            offset -= slice.len();
+        }
+        0
+    };
+    let mut boundary = 0usize;
+    let mut in_block = false;
+    loop {
+        if boundary >= written && !in_block {
+            return boundary - written;
+        }
+        if boundary + FRAME_HEADER > total {
+            debug_assert!(false, "a frame runs past the gathered bytes");
+            return total.saturating_sub(written);
+        }
+        let payload_len = (usize::from(byte_at(boundary)) << 16)
+            | (usize::from(byte_at(boundary + 1)) << 8)
+            | usize::from(byte_at(boundary + 2));
+        let frame_type = byte_at(boundary + 3);
+        let flags = byte_at(boundary + 4);
+        in_block =
+            matches!(frame_type, HEADERS | PUSH_PROMISE | CONTINUATION) && flags & END_HEADERS == 0;
+        boundary += FRAME_HEADER + payload_len;
+        if boundary > total {
+            debug_assert!(false, "a frame runs past the gathered bytes");
+            return total.saturating_sub(written);
+        }
+    }
 }
 
 /// Apply the byte count the shell accepted, and discharge [`gather`]'s safety
@@ -300,6 +406,36 @@ mod tests {
         assert_eq!(offered, payload.len());
         assert_eq!(slices.len(), 3, "three blocks, three descriptors");
         assert_eq!(gathered_bytes(&slices), payload.to_vec());
+        confirm(&mut kawa, &mut slices, offered);
+    }
+
+    /// `gather_after` puts the connection's queued output first, as one more
+    /// descriptor, and none at all when the queue is empty.
+    #[test]
+    fn gather_after_offers_the_prefix_first_and_only_when_there_is_one() {
+        let mut buf = vec![0u8; 256];
+        let payload = b"abcdefghijklmnop";
+        let mut kawa = kawa_with_out(&mut buf, payload, &[4, 9]);
+        let mut slices: Vec<IoSlice<'static>> = Vec::new();
+        let prefix = b"queued";
+
+        // SAFETY: `prefix` and `kawa` outlive `slices` and are untouched
+        // until the `slices.clear()` below.
+        let (prefix_len, offered) = unsafe { gather_after(prefix, &kawa, &mut slices) };
+        assert_eq!(
+            (prefix_len, offered),
+            (prefix.len(), prefix.len() + payload.len())
+        );
+        assert_eq!(slices.len(), 4, "the prefix, then the three blocks");
+        let mut expected = prefix.to_vec();
+        expected.extend_from_slice(payload);
+        assert_eq!(gathered_bytes(&slices), expected);
+        slices.clear();
+
+        // SAFETY: as above.
+        let (prefix_len, offered) = unsafe { gather_after(b"", &kawa, &mut slices) };
+        assert_eq!((prefix_len, offered), (0, payload.len()));
+        assert_eq!(slices.len(), 3, "no descriptor for an empty prefix");
         confirm(&mut kawa, &mut slices, offered);
     }
 
@@ -567,6 +703,95 @@ mod tests {
                 }
                 TestResult::passed()
             }
+        }
+    }
+
+    /// `frame_tail` over the frames `h2_output`'s adoption relies on.
+    mod frame_tail_cases {
+        use std::io::IoSlice;
+
+        use super::super::frame_tail;
+
+        fn frame(kind: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
+            let len = payload.len();
+            let mut frame = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
+            frame.extend_from_slice(&1u32.to_be_bytes());
+            frame.extend_from_slice(payload);
+            frame
+        }
+
+        fn tail(blocks: &[&[u8]], written: usize) -> usize {
+            let slices: Vec<IoSlice> = blocks.iter().map(|block| IoSlice::new(block)).collect();
+            frame_tail(&slices, written)
+        }
+
+        #[test]
+        fn a_write_on_a_frame_boundary_leaves_no_tail() {
+            let data = frame(0, 0, b"abcd");
+            let rst = frame(3, 0, &8u32.to_be_bytes());
+            assert_eq!(tail(&[&data, &rst], 0), 0);
+            assert_eq!(tail(&[&data, &rst], data.len()), 0);
+            assert_eq!(tail(&[&data, &rst], data.len() + rst.len()), 0);
+        }
+
+        #[test]
+        fn a_write_inside_a_frame_owes_the_rest_of_that_frame_only() {
+            let data = frame(0, 0, b"abcdef");
+            let rst = frame(3, 0, &8u32.to_be_bytes());
+            assert_eq!(tail(&[&data, &rst], 4), data.len() - 4, "inside the header");
+            assert_eq!(
+                tail(&[&data, &rst], 11),
+                data.len() - 11,
+                "inside the payload"
+            );
+            assert_eq!(
+                tail(&[&data, &rst], data.len() + 1),
+                rst.len() - 1,
+                "inside the RST"
+            );
+        }
+
+        #[test]
+        fn a_frame_header_split_across_blocks_is_read_whole() {
+            let data = frame(0, 0, b"abcdef");
+            let (head, rest) = data.split_at(4);
+            assert_eq!(tail(&[head, rest], 2), data.len() - 2);
+            assert_eq!(tail(&[head, rest], 12), data.len() - 12);
+        }
+
+        #[test]
+        fn an_empty_end_stream_data_frame_is_a_whole_frame() {
+            let end = frame(0, 0x1, b"");
+            assert_eq!(tail(&[&end], 5), 4);
+            assert_eq!(tail(&[&end], 9), 0);
+        }
+
+        /// RFC 9113 §6.10: nothing may come between a HEADERS without
+        /// END_HEADERS and its last CONTINUATION, so a cut anywhere in the
+        /// block, a frame boundary inside it included, owes the whole rest.
+        #[test]
+        fn a_cut_header_block_is_owed_up_to_end_headers() {
+            let headers = frame(1, 0, b"hpack-1");
+            let continuation = frame(9, 0, b"hpack-2");
+            let last = frame(9, 0x4, b"hpack-3");
+            let data = frame(0, 0x1, b"body");
+            let blocks: [&[u8]; 4] = [&headers, &continuation, &last, &data];
+            let block_len = headers.len() + continuation.len() + last.len();
+            assert_eq!(tail(&blocks, 3), block_len - 3, "inside the HEADERS");
+            assert_eq!(
+                tail(&blocks, headers.len()),
+                block_len - headers.len(),
+                "on the HEADERS/CONTINUATION boundary"
+            );
+            assert_eq!(tail(&blocks, block_len), 0, "after END_HEADERS");
+            assert_eq!(tail(&blocks, block_len + 2), data.len() - 2);
+        }
+
+        #[test]
+        fn an_end_headers_headers_frame_closes_its_block() {
+            let headers = frame(1, 0x4 | 0x1, b"hpack");
+            let rst = frame(3, 0, &8u32.to_be_bytes());
+            assert_eq!(tail(&[&headers, &rst], headers.len()), 0);
         }
     }
 }

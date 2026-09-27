@@ -139,7 +139,7 @@
 //! `H2WriteTarget::Transmit` for the same stream), and any
 //! decision function that took a `SocketResult` and treated
 //! `status != Continue` as a terminator would silently drop that second
-//! attempt. `H2Shell::flush_zero_buffer` is the site that does consume a
+//! attempt. `H2Shell::flush_output_buffer` is the site that does consume a
 //! status; it is a different symbol and stays inline.
 
 /// Which of the two `socket_wants_write()` questions the caller is answering.

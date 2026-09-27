@@ -499,9 +499,9 @@ impl<Front: SocketHandler> Connection<Front> {
         forward!(self, initiate_close_notify())
     }
 
-    pub(super) fn flush_zero_buffer(&mut self) {
+    pub(super) fn flush_output_buffer(&mut self) {
         if let Connection::H2(c) = self {
-            c.flush_zero_buffer();
+            c.flush_output_buffer();
         }
     }
 

@@ -58,12 +58,16 @@
 //! but not the literal, narrow complaint #1423 was filed against, which is
 //! answered below.
 //!
-//! **What is *not* eliminated, and still needs guarding** — checked via
-//! `header_block_reassembly_in_progress()` at six call sites in `h2.rs`:
-//! the frontend-hung-up-while-draining, WINDOW_UPDATE-drain and
-//! RST_STREAM-drain stages plus the deferred-initial-GOAWAY-readiness check
-//! (all four in `flush_pending_control_frames`), `graceful_goaway`'s own
-//! defer-or-send decision, and `flush_zero_buffer`'s no-op guard: a single
+//! **Eliminated since #1604 as well**: control frames are serialised into the
+//! connection's separate ordered output queue, so no write-side site clears
+//! or reuses `zero.storage` any more, and the six guards this paragraph used
+//! to list (the hung-up, WINDOW_UPDATE and RST_STREAM stages, the
+//! deferred-initial-GOAWAY check, `graceful_goaway`'s decision and the
+//! shutdown flush) are gone but for `graceful_goaway`'s defer-or-send drain
+//! policy. The paragraph below is the account they were written against.
+//!
+//! **What was *not* eliminated by this module, and needed guarding until
+//! #1604** — checked via `header_block_reassembly_in_progress()`: a single
 //! CONTINUATION frame's payload can still be *mid-flight* in `zero.storage`
 //! — a partial `socket_read()` that has not yet finished this one frame —
 //! when a write pass runs in the same event-loop sweep. That window is real

@@ -149,6 +149,7 @@ mod h2_drain;
 mod h2_flood_detector;
 mod h2_flow_control;
 mod h2_header_reassembly;
+mod h2_output;
 mod h2_scheduler;
 mod h2_stream_table;
 pub mod h2_transmit;
@@ -193,8 +194,8 @@ pub use crate::protocol::mux::{
     h2::H2ByteAccounting,
     h2::H2ConnectionConfig,
     h2::{
-        H2ControlFlushStage, H2ControlFlushTarget, H2FinalizeTarget, H2ForceDisconnectTarget,
-        H2ReadOutcome, H2ReadTarget, H2Shell, H2StreamId, H2WritableStateTarget, H2WriteTarget,
+        H2ControlFlushTarget, H2FinalizeTarget, H2ForceDisconnectTarget, H2ReadOutcome,
+        H2ReadTarget, H2Shell, H2StreamId, H2WritableStateTarget, H2WriteTarget, H2Written,
     },
     h2_flood_detector::H2FloodConfig,
     h2_write_pass::H2WritePass,
@@ -3668,7 +3669,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     // graceful_goaway() queued a GOAWAY frame. Flush it directly
                     // since the event loop uses edge-triggered epoll and won't
                     // deliver a new WRITABLE event for an already-writable socket.
-                    self.frontend.flush_zero_buffer();
+                    self.frontend.flush_output_buffer();
                 }
                 _ => {}
             }
@@ -3679,7 +3680,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             );
             // shut_down_sessions() runs outside ready(), so retry flushing any
             // previously-buffered GOAWAY/TLS records on each pass.
-            self.frontend.flush_zero_buffer();
+            self.frontend.flush_output_buffer();
         }
         if self.drive_frontend_shutdown_io() {
             return true;
