@@ -1250,9 +1250,15 @@ mod backends_test {
 
     use super::*;
 
-    fn run_mock_tcp_server(addr: &str, stopper: Receiver<()>) {
+    /// Start a TCP server that accepts connections, and return its address.
+    ///
+    /// The kernel picks the port (`:0`): a fixed port collides with any other
+    /// process bound to it, including a concurrent `cargo test` of this crate,
+    /// and fails the test with `AddrInUse` before it asserts anything.
+    fn run_mock_tcp_server(stopper: Receiver<()>) -> SocketAddr {
         let mut run = true;
-        let listener = TcpListener::bind(addr).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
 
         thread::spawn(move || {
             while run {
@@ -1264,6 +1270,7 @@ mod backends_test {
                 }
             }
         });
+        addr
     }
 
     #[test]
@@ -1271,19 +1278,12 @@ mod backends_test {
         let mut backend_map = BackendMap::new();
         let cluster_id = "mycluster";
 
-        let backend_addr = "127.0.0.1:1236";
         let (sender, receiver) = channel();
-        run_mock_tcp_server(backend_addr, receiver);
+        let backend_addr = run_mock_tcp_server(receiver);
 
         backend_map.add_backend(
             cluster_id,
-            Backend::new(
-                &format!("{cluster_id}-1"),
-                backend_addr.parse().unwrap(),
-                None,
-                None,
-                None,
-            ),
+            Backend::new(&format!("{cluster_id}-1"), backend_addr, None, None, None),
         );
 
         assert!(backend_map.backend_from_cluster_id(cluster_id).is_ok());
@@ -1319,9 +1319,8 @@ mod backends_test {
         let cluster_id = "mycluster";
         let sticky_session = "server-2";
 
-        let backend_addr = "127.0.0.1:3456";
         let (sender, receiver) = channel();
-        run_mock_tcp_server(backend_addr, receiver);
+        let backend_addr = run_mock_tcp_server(receiver);
 
         backend_map.add_backend(
             cluster_id,
@@ -1348,7 +1347,7 @@ mod backends_test {
             cluster_id,
             Backend::new(
                 &format!("{cluster_id}-3"),
-                backend_addr.parse().unwrap(),
+                backend_addr,
                 Some("server-3".to_string()),
                 None,
                 None,
