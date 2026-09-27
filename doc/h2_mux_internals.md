@@ -676,13 +676,14 @@ endpoint at the moment the stream is logged:
 
 - `client_rtt` is `Endpoint::local_rtt()`. `H2Shell` hands the core a
   `ShellEndpoint` that answers it from the shell's own socket, sampling at the
-  first stream logged in a `Mux` pass and reusing that sample for every later
-  stream of the pass, so several streams completing together report one
-  identical number and a pass that logs nothing costs no syscall (issue
-  #1590). The operator-visible half of this is stated in `doc/configure.md`'s
-  "When each cell is measured".
-- `server_rtt` is read per call, through `Endpoint::peer_rtt(token)`, which
-  returns an `Option<Duration>` already sampled by the embedder. It
+  first stream logged on the connection and reusing that sample for every
+  later stream, so every stream of a connection reports one identical number
+  and a connection that logs nothing costs no syscall (issue #1590, then the
+  per-connection sample). The operator-visible half of this is stated in
+  `doc/configure.md`'s "When each cell is measured".
+- `server_rtt` is asked per call, through `Endpoint::peer_rtt(token)`, which
+  returns an `Option<Duration>` already sampled by the embedder — the backend
+  connection's one sample, taken by `Connection::rtt` at its first ask. It
   deliberately does NOT return the socket: the predecessor,
   `Endpoint::socket(token) -> Option<&TcpStream>`, handed out a concrete
   `mio::net::TcpStream`, so any connection could reach any other connection's
@@ -976,9 +977,45 @@ first `ready()` after the TLS handshake re-enters the new `Mux` from
 connection, H1 and H2); in their place each H2 request pays the one lazy
 `client_rtt` read its log line needs.
 
+### One sample per connection
+
+The lazy read above still paid one `client_rtt` and one `server_rtt` read per
+request: `Mux::expire_client_rtt` forgot the H2 frontend sample at every pass,
+and the H1 sites and `Endpoint::peer_rtt` read their socket at every access
+log. On an H1 keep-alive connection that was two `getsockopt(TCP_INFO)` per
+request, about 17 % of the worker's syscalls. Each connection now reads its
+socket once: `memoized_rtt` (`lib/src/protocol/mux/mod.rs`) stores the first
+sample in the connection (`ConnectionH1::rtt`, `H2Shell::local_rtt`) and
+`Connection::rtt` answers every later ask from it, frontend and backend alike,
+including a backend connection reused from the keep-alive pool.
+`Mux::expire_client_rtt` and `H2Shell::expire_local_rtt` are gone.
+
+The sample stays lazy, at the connection's first access log, rather than at
+`accept`: on Linux `tcpi_rtt` is already the handshake RTT straight out of
+`accept` (27–34 µs on loopback) and of `connect` on the dialling side, so an
+earlier read would be valid, but the lazy one costs nothing on a connection
+that never logs, and a backend dial is still in flight when its non-blocking
+`connect(2)` returns.
+
+Measured with `intentrace -p` on the worker, release build
+(`--no-default-features --features jemallocator,crypto-aws-lc-rs`), one
+worker, python `http.server` backend on loopback, `curl`, 20 requests on one
+client connection, base `58550dd4`, two interleaved runs each:
+
+| scenario                               | syscalls per request before | after | `getsockopt` per request before | after |
+| -------------------------------------- | --------------------------- | ----- | ------------------------------- | ----- |
+| H1 keep-alive, plaintext               | 11.55                       | 9.65  | 2.00                            | 0.10  |
+| H1 keep-alive, TLS                     | 11.85                       | 9.95  | 2.00                            | 0.10  |
+| H2, 20 streams multiplexed on 1 client | 12.20–12.35                 | 11.30–11.35 | 2.00                      | 1.05  |
+
+The two H1 remainders are the frontend and backend connection's single reads.
+In the H2 case sozu dials one backend connection per concurrent stream, so the
+20 backend reads remain — one per connection — and only the 19 repeated
+frontend reads go away.
+
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8282-8286
+```rust lib/src/protocol/mux/h2.rs:8270-8274
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1111,7 +1148,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8359-8363
+```rust lib/src/protocol/mux/h2.rs:8347-8351
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1586,7 +1623,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:7789
+```rust lib/src/protocol/mux/h2.rs:7785
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 

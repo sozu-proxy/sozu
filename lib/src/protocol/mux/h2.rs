@@ -4429,12 +4429,12 @@ impl ConnectionH2 {
     /// Both cells are asked of `endpoint`, at the moment the stream is logged
     /// and at no other time. `client_rtt` comes from [`Endpoint::local_rtt`]:
     /// `ShellEndpoint` samples the frontend socket at the first stream logged
-    /// in a `Mux` pass and hands every later stream of the same pass that one
-    /// value, so several streams finishing together still report one number
-    /// (issue #1339 Q11), and a pass that logs nothing reads nothing (issue
-    /// #1590). `server_rtt` comes from [`Endpoint::peer_rtt`], read per stream
-    /// from the backend socket. `doc/configure.md` states both for operators
-    /// reading the log.
+    /// on the connection and hands every later stream that one value, so
+    /// every stream of a connection reports one number (issue #1339 Q11
+    /// asked for one per pass), and a connection that logs nothing reads
+    /// nothing (issue #1590). `server_rtt` comes from [`Endpoint::peer_rtt`],
+    /// the backend connection's own one sample. `doc/configure.md` states
+    /// both for operators reading the log.
     ///
     /// Nothing in this method reaches a socket, which is the point: the local
     /// RTT was the last `SocketHandler::socket_ref` read in this file, and the
@@ -7520,11 +7520,12 @@ pub struct H2Shell<Front: SocketHandler> {
     /// `h2_transmit::confirm` brackets; private so that bracket cannot be
     /// split from outside this module.
     io_slices: Vec<IoSlice<'static>>,
-    /// This pass's sample of [`Self::socket`]'s round-trip time, for the
-    /// access log's `client_rtt` cell: `None` until the first stream logged
-    /// in the pass asks for it through [`ShellEndpoint::local_rtt`], then
-    /// `Some(sample)` for every later one. `Mux` forgets it at the start of
-    /// each pass through [`Self::expire_local_rtt`]. A `Cell` because
+    /// This connection's one sample of [`Self::socket`]'s round-trip time:
+    /// `None` until the first stream logged on the connection asks for it
+    /// through [`ShellEndpoint::local_rtt`] (a frontend's `client_rtt`) or
+    /// `Connection::rtt` (a backend's `server_rtt`), then `Some(sample)` for
+    /// the rest of the connection's life — see
+    /// [`memoized_rtt`](super::memoized_rtt). A `Cell` because
     /// `Endpoint::local_rtt` takes `&self`.
     pub(super) local_rtt: Cell<Option<Option<Duration>>>,
 }
@@ -7576,8 +7577,8 @@ impl<Front: SocketHandler> std::fmt::Debug for H2Shell<Front> {
 ///
 /// The core asks for the local round-trip time only when it logs a stream
 /// (`ConnectionH2::snapshot_rtts`), so the `getsockopt(TCP_INFO)` happens then
-/// and only then, at most once per `Mux` pass: the first ask samples and
-/// stores into `sample`, every later one in the pass reuses it. Built per core
+/// and only then, once per connection: the first ask samples and stores into
+/// `sample`, every later one on the connection reuses it. Built per core
 /// call from disjoint borrows of the shell's fields, so the core never holds
 /// the socket. Issue #1590.
 struct ShellEndpoint<'a, E, Front> {
@@ -7620,12 +7621,7 @@ impl<E: Endpoint, Front: SocketHandler> Endpoint for ShellEndpoint<'_, E, Front>
         self.inner.peer_rtt(token)
     }
     fn local_rtt(&self) -> Option<Duration> {
-        if let Some(sample) = self.sample.get() {
-            return sample;
-        }
-        let sample = super::sample_rtt(self.socket.socket_ref());
-        self.sample.set(Some(sample));
-        sample
+        super::memoized_rtt(self.sample, self.socket.socket_ref())
     }
     fn end_stream<L: ListenerHandler + L7ListenerHandler>(
         &mut self,
@@ -8136,14 +8132,6 @@ impl<Front: SocketHandler> H2Shell<Front> {
         let started = self.core.start_stream(stream, context);
         self.settle();
         started
-    }
-
-    /// Forget this pass's frontend-RTT sample, so the next stream logged
-    /// reads a fresh one. Free: the sample is taken lazily, by
-    /// `ShellEndpoint::local_rtt`. Called by `Mux` at the start of each
-    /// pass — see `Mux::expire_client_rtt`.
-    pub fn expire_local_rtt(&mut self) {
-        self.local_rtt.set(None);
     }
 
     /// [`ConnectionH2::cancel_timed_out_streams`], settled.
@@ -12879,14 +12867,17 @@ mod tests {
         (connection, peer)
     }
 
-    /// `snapshot_rtts` samples the frontend once per pass, when the first
-    /// stream of the pass is logged, and hands every later stream of that pass
-    /// the same value (issues #1339 Q11 and #1590).
+    /// `snapshot_rtts` samples the frontend once per connection, when the
+    /// first stream of the connection is logged, and hands every later stream
+    /// the same value, in the same pass or in a later one (issues #1339 Q11
+    /// and #1590).
     ///
-    /// The two calls stand for two streams recycling inside one pass: all five
-    /// production callers of this method sit on a recycle or reset path, and
-    /// more than one of them can run in a single `write_streams` sweep. The
-    /// counter is [`super::super::tcp_info_reads`], bumped by every
+    /// The first two calls stand for two streams recycling inside one pass:
+    /// all five production callers of this method sit on a recycle or reset
+    /// path, and more than one of them can run in a single `write_streams`
+    /// sweep. The third, through a fresh `ShellEndpoint`, stands for a stream
+    /// logged in a later pass. The counter is
+    /// [`super::super::tcp_info_reads`], bumped by every
     /// `getsockopt(TCP_INFO)` the mux issues.
     ///
     /// The premise is that the sample is `Some`: the connection sits on a live
@@ -12894,15 +12885,15 @@ mod tests {
     /// had lost the socket would pass the equality assertions while reporting
     /// nothing at all.
     ///
-    /// TO SEE THIS RED: in `ShellEndpoint::local_rtt`, delete the early
-    /// `return sample;` of the memo hit. Every call then reads the socket and
-    /// the second assertion fails with ``a second stream finishing in the SAME
-    /// pass must reuse the pass sample, not read TCP_INFO again``,
-    /// `left: 2`, `right: 1`.
+    /// TO SEE THIS RED: in `memoized_rtt` (`lib/src/protocol/mux/mod.rs`),
+    /// delete the early `return sample;` of the memo hit. Every call then
+    /// reads the socket and the second assertion fails with ``a second stream
+    /// finishing in the SAME pass must reuse the connection sample, not read
+    /// TCP_INFO again``, `left: 2`, `right: 1`.
     #[test]
-    fn snapshot_rtts_samples_the_frontend_once_per_pass() {
+    fn snapshot_rtts_samples_the_frontend_once_per_connection() {
         let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
-        let (mut connection, _peer) = test_h2_connection(&pool, None);
+        let (connection, _peer) = test_h2_connection(&pool, None);
         let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
         let mut inner = EndpointClient(&mut router);
 
@@ -12921,8 +12912,8 @@ mod tests {
         assert_eq!(
             super::super::tcp_info_reads() - before,
             1,
-            "a second stream finishing in the SAME pass must reuse the pass \
-             sample, not read TCP_INFO again"
+            "a second stream finishing in the SAME pass must reuse the \
+             connection sample, not read TCP_INFO again"
         );
         assert_eq!(
             second.0, first.0,
@@ -12936,16 +12927,19 @@ mod tests {
              no read"
         );
 
-        connection.expire_local_rtt();
         let endpoint = ShellEndpoint::new(&mut inner, &connection.socket, &connection.local_rtt);
         let next_pass = connection.core.snapshot_rtts(&endpoint, None);
         assert_eq!(
             super::super::tcp_info_reads() - before,
-            2,
-            "the next pass must take a fresh sample, not log the previous \
-             pass's forever"
+            1,
+            "a stream logged in a later pass must reuse the connection's one \
+             sample, not read TCP_INFO again"
         );
-        assert!(next_pass.0.is_some());
+        assert_eq!(
+            next_pass.0, first.0,
+            "every stream of one connection reports that connection's one \
+             client_rtt"
+        );
     }
 
     /// A pass that logs no stream reads no `TCP_INFO`, and a backend H2

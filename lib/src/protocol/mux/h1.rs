@@ -6,6 +6,7 @@
 //! connections. Long-form lifecycle: `lib/src/protocol/mux/LIFECYCLE.md`.
 
 use std::{
+    cell::Cell,
     io::IoSlice,
     time::{Duration, Instant},
 };
@@ -18,9 +19,9 @@ use crate::{
     L7ListenerHandler, ListenerHandler, Readiness,
     protocol::mux::{
         BackendStatus, Context, DebugEvent, Endpoint, GlobalStreamId, MuxResult, Position,
-        StreamState, forcefully_terminate_answer,
+        StreamState, forcefully_terminate_answer, memoized_rtt,
         parser::H2Error,
-        remove_backend_stream, sample_rtt, set_default_answer,
+        remove_backend_stream, set_default_answer,
         shared::{EndStreamAction, drain_tls_close_notify, end_stream_decision},
         update_readiness_after_read, update_readiness_after_write,
     },
@@ -204,6 +205,14 @@ pub struct ConnectionH1<Front: SocketHandler> {
     /// because `ConnectionH1` has no constructor in this module: both are
     /// struct literals in `connection.rs`. Nothing else in `mux` touches it.
     pub(super) io_slices: Vec<IoSlice<'static>>,
+    /// This connection's one `getsockopt(TCP_INFO)` sample, `None` until its
+    /// first access log asks for it. Read through `Connection::rtt` and
+    /// [`Self::rtt`], both of which go through
+    /// [`memoized_rtt`](super::memoized_rtt); never reset, so a keep-alive
+    /// connection pays one read, not one per request. `pub(super)` for the
+    /// same reason as `io_slices`: the struct literals live in
+    /// `connection.rs`.
+    pub(super) rtt: Cell<Option<Option<Duration>>>,
 }
 
 impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
@@ -219,6 +228,12 @@ impl<Front: SocketHandler> std::fmt::Debug for ConnectionH1<Front> {
 }
 
 impl<Front: SocketHandler> ConnectionH1<Front> {
+    /// Smoothed RTT of this connection's socket, sampled at the first access
+    /// log that asks for it and reused for the connection's whole life.
+    fn rtt(&self) -> Option<Duration> {
+        memoized_rtt(&self.rtt, self.socket.socket_ref())
+    }
+
     /// The next instant this connection wants its embedder to call `timeout()`
     /// at, or `None` for "no timer". The adapter reflects this onto the real
     /// wheel; nothing here touches `crate::timer`.
@@ -803,7 +818,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                         kawa::StatusLine::Response { code: 101, .. } => {
                             debug!("{} ============== HANDLE UPGRADE!", log_context!(self));
                             stream.metrics.backend_stop();
-                            let client_rtt = sample_rtt(self.socket.socket_ref());
+                            let client_rtt = self.rtt();
                             let server_rtt =
                                 stream.linked_token().and_then(|t| endpoint.peer_rtt(t));
                             for event in stream
@@ -855,7 +870,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                                 return MuxResult::Continue;
                             } else {
                                 stream.metrics.backend_stop();
-                                let client_rtt = sample_rtt(self.socket.socket_ref());
+                                let client_rtt = self.rtt();
                                 let server_rtt =
                                     stream.linked_token().and_then(|t| endpoint.peer_rtt(t));
                                 for event in stream
@@ -878,7 +893,7 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                     }
                     incr!(names::http::E2E_HTTP11);
                     stream.metrics.backend_stop();
-                    let client_rtt = sample_rtt(self.socket.socket_ref());
+                    let client_rtt = self.rtt();
                     let server_rtt = stream.linked_token().and_then(|t| endpoint.peer_rtt(t));
                     for event in stream
                         .generate_access_log(
@@ -1350,6 +1365,7 @@ mod tests {
                 BackendId, BackendSlot, Connection,
                 connection::{EndpointClient, EndpointServer},
                 router::Router,
+                tcp_info_reads,
                 test_support::{connected_socket, test_context},
             },
         },
@@ -2131,13 +2147,12 @@ mod tests {
     }
 
     /// The access log of an H1 request carries the frontend round-trip time,
-    /// read when the line is written, and no backend one when the request
-    /// never reached a backend (issue #1590 kept the H1 sites as they were:
-    /// one read per cell, at emission).
+    /// the connection's one sample, taken here because this is its first
+    /// line, and no backend one when the request never reached a backend.
     ///
     /// TO SEE THIS RED: in `ConnectionH1::writable`, at the `H1::Complete`
     /// access log that writes the rejected request's 400, replace the
-    /// `sample_rtt(self.socket.socket_ref())` of `client_rtt` with `None`. The
+    /// `self.rtt()` of `client_rtt` with `None`. The
     /// line then carries `-` in that cell and the first assertion fails.
     #[test]
     fn the_h1_access_log_carries_the_frontend_rtt() {
@@ -2161,6 +2176,152 @@ mod tests {
         assert_eq!(
             cells[4], "-",
             "a request that never reached a backend has no server_rtt, got: {line}"
+        );
+    }
+
+    /// Twenty keep-alive requests on one frontend connection, each answered
+    /// through the same backend connection taken back out of the keep-alive
+    /// pool, cost one `getsockopt(TCP_INFO)` per side — not one per request
+    /// and side — and every one of the twenty access lines still carries both
+    /// RTTs, the same value on each line.
+    ///
+    /// Driven through the real `H1::Complete` site of
+    /// `ConnectionH1::writable` and the real `EndpointClient::peer_rtt`, with
+    /// the backend recycled by `ConnectionH1::end_stream` and
+    /// `ConnectionH1::start_stream` exactly as a `Mux` does between two
+    /// requests. The request side is staged rather than parsed: what is under
+    /// test is the log emission, not routing.
+    ///
+    /// TO SEE THIS RED: in `memoized_rtt` (`lib/src/protocol/mux/mod.rs`),
+    /// delete the early return on `memo.get()`. Every request then reads both
+    /// sockets again and the count assertion fails with `left: 40`,
+    /// `right: 2`.
+    #[test]
+    fn keep_alive_requests_read_tcp_info_once_per_connection() {
+        const REQUESTS: usize = 20;
+        const BACKEND: mio::Token = mio::Token(1);
+        let (reads_sender, reads_receiver) = std::sync::mpsc::channel();
+
+        let output = crate::capture_test_logs(move || {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+            let mut context = test_context(&pool);
+            context
+                .create_stream(Ulid::generate(), 1 << 16)
+                .expect("the test pool must hand out stream buffers");
+            let (front_socket, mut front_peer) = connected_socket();
+            front_peer
+                .set_nonblocking(true)
+                .expect("the frontend peer is drained without blocking");
+            let mut frontend =
+                Connection::new_h1_server(Ulid::generate(), front_socket, Duration::from_secs(60));
+            let (back_socket, mut back_peer) = connected_socket();
+            let backend_ulid = Ulid::generate();
+            let mut client = h1_of(Connection::new_h1_client(
+                backend_ulid,
+                SessionTcpStream::new(back_socket, backend_ulid, None),
+                "test-cluster".into(),
+                test_backend_id(cached_peer()),
+                Duration::from_secs(60),
+            ));
+            // The first request finds the connection freshly dialled; every
+            // later one takes it back out of the pool through `start_stream`.
+            if let Position::Client(_, _, status) = &mut client.position {
+                *status = BackendStatus::KeepAlive;
+            }
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            router.backends.insert(BACKEND, Connection::H1(client));
+
+            let before = tcp_info_reads();
+            let mut drained = [0u8; 4096];
+            for request in 0..REQUESTS {
+                let Some(Connection::H1(client)) = router.backends.get_mut(&BACKEND) else {
+                    unreachable!("the backend was inserted as H1")
+                };
+                assert!(
+                    client.start_stream(0, &mut context),
+                    "premise: the pooled backend must accept request {request}"
+                );
+                let stream = &mut context.streams[0];
+                stream.state = StreamState::Linked(BACKEND);
+                stream.context.keep_alive_frontend = true;
+                stream.metrics.service_start();
+                stream.metrics.backend_id = Some("test-backend".into());
+                stream.metrics.backend_start();
+                stream.metrics.backend_connected();
+
+                back_peer
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .expect("the loopback backend peer must accept the response");
+                for _ in 0..64 {
+                    client.readiness.event.insert(Ready::READABLE);
+                    client.readable(&mut context, EndpointServer(&mut frontend));
+                    if context.streams[0].back.is_terminated() {
+                        break;
+                    }
+                }
+                assert!(
+                    context.streams[0].back.is_terminated(),
+                    "premise: response {request} must be read whole"
+                );
+
+                for _ in 0..64 {
+                    frontend.readiness_mut().event.insert(Ready::WRITABLE);
+                    frontend.writable(&mut context, EndpointClient(&mut router));
+                    if context.streams[0].metrics.start.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    context.streams[0].state,
+                    StreamState::Idle,
+                    "premise: request {request} must complete through the \
+                     keep-alive branch of `H1::Complete`"
+                );
+                while let Ok(read) = std::io::Read::read(&mut front_peer, &mut drained) {
+                    if read == 0 {
+                        break;
+                    }
+                }
+            }
+            reads_sender
+                .send(tcp_info_reads() - before)
+                .expect("the test thread must report its TCP_INFO reads");
+        });
+
+        let lines: Vec<&str> = output
+            .lines()
+            .filter(|line| line.contains("H1::Complete"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            REQUESTS,
+            "every request must be logged, got: {output}"
+        );
+        let mut rtts = Vec::with_capacity(REQUESTS);
+        for line in &lines {
+            let cells: Vec<&str> = line
+                .split_whitespace()
+                .find_map(|token| {
+                    let cells: Vec<&str> = token.split('/').collect();
+                    (cells.len() == 5).then_some(cells)
+                })
+                .unwrap_or_else(|| panic!("the line must carry the five durations: {line}"));
+            assert_ne!(cells[3], "-", "every line must carry client_rtt: {line}");
+            assert_ne!(cells[4], "-", "every line must carry server_rtt: {line}");
+            rtts.push((cells[3], cells[4]));
+        }
+        assert_eq!(
+            reads_receiver
+                .recv()
+                .expect("the test thread must report its TCP_INFO reads"),
+            2,
+            "{REQUESTS} keep-alive requests must read TCP_INFO once for the \
+             frontend and once for the backend"
+        );
+        assert!(
+            rtts.windows(2).all(|pair| pair[0] == pair[1]),
+            "every request of one connection reports that connection's one \
+             sample, got: {rtts:?}"
         );
     }
 

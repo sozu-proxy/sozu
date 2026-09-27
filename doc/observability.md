@@ -555,24 +555,28 @@ the end of the connection. A refusal that closes the whole connection with
 frontend and backend socket, read with `getsockopt(TCP_INFO)`. They feed the
 access log and nothing else: no metric, histogram or load-balancing cost reads
 `TCP_INFO` (`PeakEWMA` is fed from the connect time, `lib/src/backends.rs`), so
-no periodic sampling cadence exists and none is needed. The read happens when
-the line is formatted, and only then:
+no periodic sampling cadence exists and none is needed. Each connection is read
+once, at its first access log, and the value is reused for every later line of
+that connection:
 
-- **H1, pipe (WebSocket) and TCP**: both cells are read at the access log, one
-  `getsockopt` per side, for that request.
-- **H2**: `server_rtt` likewise; `client_rtt` is read at the first access log a
-  `Mux` pass emits and reused by every other stream logged in the same pass,
-  so streams that finish together share one value, which is the frontend SRTT
-  when the first of them was logged. A pass that logs nothing reads nothing.
-- **`Mux::close`** reads the frontend only if it finds a stream that still owes
-  its access log.
+- **H1 and H2**: `client_rtt` is the frontend connection's sample, taken at the
+  first request it logs; `server_rtt` is the backend connection's sample, taken
+  at the first response logged through it, and kept across keep-alive pool
+  reuse. Every line of one connection carries the same value in each cell. A
+  connection that logs nothing reads nothing.
+- **Pipe (WebSocket) and TCP**: one access log per session, at its end, which
+  reads both sides once.
+- **`Mux::close`** asks for the frontend's sample only if it finds a stream that
+  still owes its access log.
 
 Before issue #1590 the H2 frontend was sampled at the top of every pass whether
 or not the pass logged, and `Mux::close` sampled unconditionally: 7.85
 `TCP_INFO` reads per H2 request and 2.80 per H1 request, against at most the
 two each log line prints; after it, 1.85 for both (release build, 20 requests,
-the counts in `doc/h2_mux_internals.md`). The operator-facing contract is in
-[`configure.md`](configure.md) §"When each cell is measured".
+the counts in `doc/h2_mux_internals.md`). The per-connection sample then took a
+keep-alive connection from two reads per request to two per connection. The
+operator-facing contract is in [`configure.md`](configure.md) §"When each cell
+is measured".
 
 ## Tracing — current state
 
