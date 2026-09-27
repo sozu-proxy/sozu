@@ -250,7 +250,9 @@ A flow is reaped on the **first** of these (`CloseReason`, `flow.rs`):
 **Idle is a single armed deadline + generation tokens, not a per-flow timer.**
 The manager only ever asks the shell to arm **one** deadline (`armed_deadline`,
 `ArmTimer`, `UdpManager::reschedule`, `manager.rs`); the shell owns the actual `TIMER`
-wheel (`arm_timer`, `udp.rs`; `server::TIMER`). Each flow carries a
+wheel (`arm_timer`, `udp.rs`; `server::TIMER`), counting the delay from the
+drain's own `now` so the entry lands on the grid point the deadline maps to.
+Each flow carries a
 `timer_gen` token (`flow.rs`) bumped on every `UdpFlow::touch` (`flow.rs`).
 A wheel expiry only closes a flow whose deadline is still `<= now`
 (`UdpManager::handle_timeout`, `manager.rs`); a flow that saw traffic has been
@@ -304,7 +306,9 @@ event loop as extra wakeups.
 (`early_expiry_that_finds_nothing_due_still_rearms` and
 `repeated_early_expiries_each_rearm`, `manager.rs`;
 `an_early_wheel_fire_still_evicts_the_idle_flow`, `udp.rs`, drives the real
-wheel end to end.)
+wheel end to end on a simulated clock — `Timer::set_timeout_from` and
+`Timer::poll_at` in `timer.rs`, `UdpListenerSession::timeout_at` in `udp.rs` —
+so host load cannot move the arming or the early fire past the deadline.)
 
 Every close path emits `FlowEvicted` then `CloseFlow` (`UdpManager::close_flow`,
 `manager.rs`); the shell's `on_close_flow` (`udp.rs`) closes the
