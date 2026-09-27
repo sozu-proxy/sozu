@@ -2986,9 +2986,12 @@ pool footprint is `N * max_buffers * buffer_size`.
 #### Backend pool
 
 H2 mux reuses backend connections via
-`Router::backends: BTreeMap<Token, Connection>`
+`Router::backends: BackendConnections`
 (`lib/src/protocol/mux/router.rs`). There is no separate pool abstraction: the
-map is the pool. Reuse picks an existing non-draining H2 multiplex slot (below
+map is the pool. It keeps the lowest-token connection inline and the others in
+a `BTreeMap<Token, Connection>`, so the one backend connection a session
+usually holds costs no heap allocation (a `BTreeMap` leaf would have been
+~18.8 KiB, 11 slots of a ~1.7 KiB `Connection`; sozu-proxy/sozu#1610). Reuse picks an existing non-draining H2 multiplex slot (below
 `SETTINGS_MAX_CONCURRENT_STREAMS`) or an H1 keep-alive socket; misses dial a
 fresh backend socket.
 

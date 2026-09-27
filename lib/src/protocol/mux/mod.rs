@@ -412,6 +412,12 @@ impl BackendRegistry {
                     let borrow = backend.borrow();
                     (Rc::from(borrow.backend_id.as_str()), borrow.address)
                 };
+                // A session almost always dials one backend: its first entry
+                // sizes the table for exactly one instead of four (#1610),
+                // and a second distinct backend grows it as usual.
+                if self.0.capacity() == 0 {
+                    self.0.reserve_exact(1);
+                }
                 self.0.push(RegistryEntry {
                     handle: backend.clone(),
                     backend_id,
@@ -1096,9 +1102,12 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
     /// Register a stream as linked to a backend token in the reverse index.
     pub fn link_stream(&mut self, stream_id: GlobalStreamId, token: Token) {
         self.streams[stream_id].state = StreamState::Linked(token);
+        // An H1 backend carries one stream at a time, so a new entry holds
+        // one instead of the four a first `push` reserves (#1610); an H2
+        // backend grows it as usual.
         self.backend_streams
             .entry(token)
-            .or_default()
+            .or_insert_with(|| Vec::with_capacity(1))
             .push(stream_id);
     }
 
@@ -2332,7 +2341,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 }
 
                 let mut all_backends_readiness_are_empty = true;
-                let mut dead_backends = Vec::new();
+                self.router.dead_backends.clear();
                 let mut backend_close: Option<(&'static str, Token)> = None;
                 for (token, client) in self.router.backends.iter_mut() {
                     let readiness = client.readiness_mut();
@@ -2595,7 +2604,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             }
                         }
                         client.close(&mut self.context, EndpointServer(&mut self.frontend));
-                        dead_backends.push(*token);
+                        self.router.dead_backends.push(*token);
                     }
 
                     if !client.readiness().filter_interest().is_empty() {
@@ -2608,8 +2617,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 // the loop above; if we return SessionResult::Close before
                 // removing them, Mux::close() would decrement again
                 // (double-decrement → gauge underflow).
-                if !dead_backends.is_empty() {
-                    for token in &dead_backends {
+                if !self.router.dead_backends.is_empty() {
+                    for token in &self.router.dead_backends {
                         let proxy_borrow = proxy.borrow();
                         // The reverse-index entry `remove_backend_stream`
                         // kept for its capacity leaves with its connection.
@@ -4963,6 +4972,79 @@ mod tests {
         assert_ne!(warm[0].slot(), warm[1].slot());
     }
 
+    /// #1610: a session's first interned backend sizes the registry for one
+    /// entry, not the four a first `Vec::push` reserves.
+    ///
+    /// The interning pays for the entry and for the `Rc<str>` copy of its id,
+    /// and for nothing else; the id copy is measured on its own, so the
+    /// assertion carries no size literal.
+    ///
+    /// TO SEE THIS RED: drop the `reserve_exact(1)` in
+    /// `BackendRegistry::intern`. The first entry then allocates four
+    /// `RegistryEntry` slots.
+    #[test]
+    fn the_first_interned_backend_sizes_the_registry_for_one() {
+        use crate::test_allocations::bytes;
+
+        let backend = Rc::new(RefCell::new(Backend::new(
+            "interned-first",
+            SocketAddr::from(([127, 0, 0, 1], 7003)),
+            None,
+            None,
+            None,
+        )));
+        let before = bytes();
+        let id_copy: Rc<str> = Rc::from(backend.borrow().backend_id.as_str());
+        let id_bytes = bytes() - before;
+        drop(id_copy);
+
+        let mut registry = BackendRegistry::default();
+        let before = bytes();
+        let id = registry.id_for(&backend);
+        let interned = bytes() - before;
+
+        assert_eq!(
+            interned,
+            std::mem::size_of::<RegistryEntry>() + id_bytes,
+            "the first interned backend must size the registry for one entry"
+        );
+        assert_eq!(&*id.backend_id, "interned-first");
+    }
+
+    /// #1610: a backend token's reverse-index entry is sized for the one
+    /// stream an H1 backend carries, not the four a first `Vec::push`
+    /// reserves.
+    ///
+    /// The first `link_stream` of the session also allocates the map's
+    /// table; the second token lands in that table without growing it, so
+    /// its measurement is the entry's vector alone.
+    ///
+    /// TO SEE THIS RED: in `Context::link_stream`, put `.or_default()` back in
+    /// place of `.or_insert_with(|| Vec::with_capacity(1))`.
+    #[test]
+    fn a_new_backend_entry_in_the_reverse_index_is_sized_for_one_stream() {
+        use crate::test_allocations::bytes;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let second = mux
+            .context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("the test pool must hand out a second stream");
+        mux.context.link_stream(0, Token(1));
+
+        let before = bytes();
+        mux.context.link_stream(second, Token(2));
+        let linked = bytes() - before;
+
+        assert_eq!(
+            linked,
+            std::mem::size_of::<GlobalStreamId>(),
+            "a new reverse-index entry must hold exactly one stream"
+        );
+        assert_eq!(mux.context.backend_streams[&Token(2)], [second]);
+    }
+
     /// An H1 backend connection on a live loopback socket, plus the peer the
     /// caller must keep alive.
     fn test_backend_connection(
@@ -5646,6 +5728,64 @@ mod tests {
                 }
                 Err(e) => panic!("the test peer failed to read: {e}"),
             }
+        }
+    }
+
+    /// #1610: a session whose backend connections die one pass after another
+    /// sizes its dead-backend list once, then reuses it.
+    ///
+    /// Each pass closes one idle keep-alive backend whose event carries HUP,
+    /// the shape a backend that closes after every response leaves on a
+    /// keep-alive frontend. Past the first such pass, a pass allocates
+    /// nothing at all, so the list must not either.
+    ///
+    /// TO SEE THIS RED: in `Mux::ready_inner`, collect the dead tokens in a
+    /// local `Vec::new()` again instead of `self.router.dead_backends`. Every
+    /// pass that closes a backend then allocates the list.
+    #[test]
+    fn successive_dead_backends_reuse_one_dead_backend_list() {
+        use crate::test_allocations::allocations;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        mux.frontend.readiness_mut().event = Ready::EMPTY;
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+
+        let mut close_one = |mux: &mut Mux<_, _>, token: Token| {
+            let (mut connection, backend_peer) =
+                test_backend_connection(mux, Duration::from_secs(30));
+            let Connection::H1(h1) = &mut connection else {
+                unreachable!("new_h1_client builds an H1 connection")
+            };
+            if let Position::Client(_, _, status) = &mut h1.position {
+                *status = BackendStatus::KeepAlive;
+            }
+            h1.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+            h1.readiness.event = Ready::HUP;
+            mux.router.backends.insert(token, connection);
+            drop(backend_peer);
+
+            let before = allocations();
+            let _ = mux.ready(session.clone(), proxy.clone(), &mut metrics);
+            let allocated = allocations() - before;
+            assert!(
+                !mux.router.backends.contains_key(&token),
+                "premise: the HUP must close the backend in this pass"
+            );
+            allocated
+        };
+
+        // Warm-up: the session's first dead backend sizes the list, and the
+        // thread's first pass initialises state that outlives the session.
+        close_one(&mut mux, Token(1));
+        for token in [Token(2), Token(3)] {
+            assert_eq!(
+                close_one(&mut mux, token),
+                0,
+                "a later pass that closes a backend must not allocate"
+            );
         }
     }
 

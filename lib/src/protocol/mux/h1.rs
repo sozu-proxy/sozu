@@ -573,6 +573,12 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
                 // Set request_counted after the last use of `parts` to satisfy the borrow checker
                 stream.request_counted = true;
                 stream.state = StreamState::Link;
+                // An H1 frontend has one request in flight, so its session
+                // never queues more than one link: size the queue for exactly
+                // that on first use instead of four (#1610).
+                if context.pending_links.capacity() == 0 {
+                    context.pending_links.reserve_exact(1);
+                }
                 context.pending_links.push_back(stream_id);
                 // Post: the stream is queued for backend linking exactly once
                 // and is now in the Link state the ready loop expects.
@@ -2251,23 +2257,24 @@ mod tests {
     const WARM_PASS_BLOCKS: usize = 16;
 
     /// Queue [`WARM_PASS_BLOCKS`] blocks on `kawa`, drive two write passes
-    /// through `write`, and return the heap allocations the SECOND one made.
+    /// through `write`, and return the heap allocations each one made.
     ///
-    /// The first pass is the warm-up and may grow whatever the connection
-    /// keeps; the second queues the same blocks again and is the measurement.
+    /// The first pass is the cold one of a fresh connection and may grow
+    /// whatever the connection keeps; the second queues the same blocks again
+    /// and is the warm measurement.
     /// Both go to a live loopback peer, so the write is a real `writev(2)`.
     /// The blocks are `Store::Static`, so queueing them touches no storage
     /// and the kawa never terminates: the pass stops after the write, before
     /// the completion arm and its access log, which is not the hot path.
-    fn allocations_of_a_warm_write_pass(
+    fn allocations_of_two_write_passes(
         context: &mut Context<crate::protocol::mux::test_support::TestListener>,
         outgoing: fn(
             &mut crate::protocol::mux::Stream,
         ) -> &mut crate::protocol::mux::GenericHttpStream,
         mut write: impl FnMut(&mut Context<crate::protocol::mux::test_support::TestListener>),
-    ) -> usize {
-        let mut measured = 0;
-        for pass in 0..2 {
+    ) -> [usize; 2] {
+        let mut measured = [0; 2];
+        for (pass, slot) in measured.iter_mut().enumerate() {
             let kawa = outgoing(&mut context.streams[0]);
             for _ in 0..WARM_PASS_BLOCKS {
                 kawa.out
@@ -2283,7 +2290,7 @@ mod tests {
                 "premise: write pass {pass} must drain every queued block, or \
                  the measured pass would start from a different state"
             );
-            measured = allocations;
+            *slot = allocations;
         }
         measured
     }
@@ -2309,7 +2316,7 @@ mod tests {
         server.stream = Some(0);
         let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
 
-        let allocations = allocations_of_a_warm_write_pass(
+        let [_, warm] = allocations_of_two_write_passes(
             context,
             |stream| &mut stream.back,
             |context| {
@@ -2318,10 +2325,7 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            allocations, 0,
-            "a warm H1 response write pass must not allocate"
-        );
+        assert_eq!(warm, 0, "a warm H1 response write pass must not allocate");
     }
 
     /// The backend side: a `Position::Client` pass writing the request.
@@ -2347,7 +2351,7 @@ mod tests {
             "premise: a freshly dialled upstream does not capture for replay"
         );
 
-        let allocations = allocations_of_a_warm_write_pass(
+        let [_, warm] = allocations_of_two_write_passes(
             context,
             |stream| &mut stream.front,
             |context| {
@@ -2356,9 +2360,140 @@ mod tests {
             },
         );
 
+        assert_eq!(warm, 0, "a warm H1 request write pass must not allocate");
+    }
+
+    /// #1610: an H1 frontend sizes its session's link queue for the one
+    /// request it has in flight, not the four a first `push_back` reserves.
+    ///
+    /// Measured against a control whose queue already holds room for one
+    /// link, so the difference is the queue's own allocation and nothing else
+    /// the parse allocates.
+    ///
+    /// TO SEE THIS RED: drop the `reserve_exact(1)` before the
+    /// `context.pending_links.push_back(stream_id)` that queues a parsed
+    /// request in `ConnectionH1::readable`. The queue then allocates four
+    /// slots.
+    #[test]
+    fn a_parsed_h1_request_queues_its_link_in_a_queue_sized_for_one() {
+        use crate::test_allocations::bytes;
+
+        let parse = |presized: bool| {
+            let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+            let mut context = test_context(&pool);
+            context
+                .create_stream(Ulid::generate(), 1 << 16)
+                .expect("the test pool must hand out stream buffers");
+            if presized {
+                context.pending_links.reserve_exact(1);
+            }
+            let (front_socket, mut front_peer) = connected_socket();
+            let mut server = h1_of(Connection::new_h1_server(
+                Ulid::generate(),
+                front_socket,
+                Duration::from_secs(60),
+            ));
+            server.stream = Some(0);
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            front_peer
+                .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .expect("the loopback peer must accept the staged request bytes");
+
+            let before = bytes();
+            for _ in 0..64 {
+                server.readiness.event.insert(Ready::READABLE);
+                server.readable(&mut context, EndpointClient(&mut router));
+                if !context.pending_links.is_empty() {
+                    break;
+                }
+            }
+            let parsed = bytes() - before;
+            assert_eq!(
+                context.pending_links,
+                [0],
+                "premise: the parsed request must be queued for linking"
+            );
+            parsed
+        };
+
+        // The thread's first parse also initialises state that outlives the
+        // session; run one before measuring.
+        let _ = parse(true);
         assert_eq!(
-            allocations, 0,
-            "a warm H1 request write pass must not allocate"
+            parse(false) - parse(true),
+            std::mem::size_of::<GlobalStreamId>(),
+            "an H1 frontend must queue its link in a queue sized for one"
+        );
+    }
+
+    /// #1610: the first write pass of a fresh connection sizes its descriptor
+    /// vector in ONE allocation, on both sides.
+    ///
+    /// Measured against a control that is the same pass on a connection whose
+    /// `io_slices` already holds [`WARM_PASS_BLOCKS`] descriptors, so the
+    /// difference is the vector's own cost and nothing else the first pass
+    /// sets up (which differs between debug and release builds).
+    ///
+    /// TO SEE THIS RED: drop the `io_slices.reserve(kawa.out.len())` in
+    /// `h2_transmit::gather`. The fresh vector then doubles 4 → 8 → 16 over the
+    /// [`WARM_PASS_BLOCKS`] blocks: three allocations per side.
+    #[test]
+    fn a_cold_h1_write_pass_sizes_its_descriptor_vector_once() {
+        let response = |presized: bool| {
+            let mut fixture = linked_backend_connection();
+            let BackendReadFixture {
+                context, frontend, ..
+            } = &mut fixture;
+            let Connection::H1(server) = frontend else {
+                unreachable!("new_h1_server builds an H1 connection");
+            };
+            if presized {
+                server.io_slices.reserve(WARM_PASS_BLOCKS);
+            }
+            server.stream = Some(0);
+            let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+            allocations_of_two_write_passes(
+                context,
+                |stream| &mut stream.back,
+                |context| {
+                    server.readiness.event.insert(Ready::WRITABLE);
+                    server.writable(context, EndpointClient(&mut router));
+                },
+            )[0]
+        };
+        let request = |presized: bool| {
+            let mut fixture = linked_backend_connection();
+            let BackendReadFixture {
+                context,
+                frontend,
+                client,
+                ..
+            } = &mut fixture;
+            if presized {
+                client.io_slices.reserve(WARM_PASS_BLOCKS);
+            }
+            allocations_of_two_write_passes(
+                context,
+                |stream| &mut stream.front,
+                |context| {
+                    client.readiness.event.insert(Ready::WRITABLE);
+                    client.writable(context, EndpointServer(frontend));
+                },
+            )[0]
+        };
+
+        // The thread's first pass also initialises state that outlives the
+        // connection; run one of each before measuring.
+        let _ = (response(true), request(true));
+        assert_eq!(
+            response(false) - response(true),
+            1,
+            "a fresh H1 frontend must size its descriptor vector in one allocation"
+        );
+        assert_eq!(
+            request(false) - request(true),
+            1,
+            "a fresh H1 backend must size its descriptor vector in one allocation"
         );
     }
 }

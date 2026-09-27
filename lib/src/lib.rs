@@ -1793,7 +1793,9 @@ pub mod testing {
 /// [`allocations`] before and after the code under test and assert on the
 /// difference. Never declare a second `#[global_allocator]` under
 /// `#[cfg(test)]`; the test build then fails with "cannot define multiple
-/// global allocators".
+/// global allocators". [`bytes`] counts the sizes those allocations asked
+/// for, for the code whose cost is the size of one allocation rather than
+/// their number.
 ///
 /// Every method forwards to [`std::alloc::System`] unchanged; the counter is
 /// thread-local, so the harness's other test threads cannot pollute a
@@ -1810,28 +1812,30 @@ pub(crate) mod test_allocations {
 
     thread_local! {
         static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        static BYTES: Cell<usize> = const { Cell::new(0) };
     }
 
-    fn record_allocation() {
+    fn record_allocation(size: usize) {
         // `try_with`: the slot may already be torn down while a thread exits.
         let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+        let _ = BYTES.try_with(|bytes| bytes.set(bytes.get() + size));
     }
 
     // SAFETY: every method forwards to `System` unchanged; the only addition
     // is a thread-local counter increment, which neither allocates nor unwinds.
     unsafe impl GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            record_allocation();
+            record_allocation(layout.size());
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            record_allocation();
+            record_allocation(layout.size());
             unsafe { System.alloc_zeroed(layout) }
         }
 
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            record_allocation();
+            record_allocation(new_size);
             unsafe { System.realloc(ptr, layout, new_size) }
         }
 
@@ -1846,6 +1850,13 @@ pub(crate) mod test_allocations {
     /// Heap allocations the calling thread has made so far.
     pub(crate) fn allocations() -> usize {
         ALLOCATIONS.with(Cell::get)
+    }
+
+    /// Bytes the calling thread's allocations have asked for so far: the
+    /// requested size of each allocation, and the new size of each
+    /// reallocation.
+    pub(crate) fn bytes() -> usize {
+        BYTES.with(Cell::get)
     }
 }
 

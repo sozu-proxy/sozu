@@ -425,6 +425,43 @@
   red first; `a_large_body_over_tls_arrives_intact` now pins 0 EAGAIN instead of 1, and the
   socket tests that add bytes between two calls now deliver the event those bytes raise.
 
+- **`perf(mux)`: setting up a session allocates 54 % fewer bytes per H1 request
+  ([#1610](https://github.com/sozu-proxy/sozu/issues/1610)).** `Router::backends` was a
+  `BTreeMap<Token, Connection<SessionTcpStream>>`, and `std`'s B-tree stores values inline in
+  11-slot leaves: with a `Connection` of ~1.7 KiB, the first insertion allocated ~18.8 KiB to hold
+  the one backend connection a session almost always has, 53 % of the bytes an H1 request
+  allocated. It is now a `BackendConnections` that keeps the lowest-token connection inline and
+  only the others in the `BTreeMap`: one backend costs no allocation, iteration keeps the total
+  order on `Token` of #1338, and point operations stay `O(log n)`. HAProxy needs no container at
+  all, a stream reaching its one server connection by pointer (`include/haproxy/stream-t.h`,
+  `scb`); a mux session can hold several. `h2_transmit::gather` reserves one descriptor per
+  queued block before it pushes, so a fresh connection sizes its `io_slices` in one allocation
+  instead of doubling from 4 up to 64 (9 allocations per H1 request, frontend and backend,
+  become 2). The vectors a session almost always fills with exactly one element are sized for
+  one on first use instead of four: the `BackendRegistry` (224 → 56 bytes), a backend token's
+  `backend_streams` entry and the H1 frontend's `pending_links` (32 → 8 bytes each). The
+  dead-backend list of `Mux::ready` moves to `Router::dead_backends`, emptied at each sweep and
+  kept for its capacity, so a keep-alive frontend whose backend closes after every response no
+  longer allocates it on every such pass. The trade-off: the inline slot makes the session
+  itself (`Rc<RefCell<HttpSession>>`, still one allocation) grow from 2 920 to 4 648 bytes, a
+  cost paid once per session against the 18 760-byte leaf it replaces. A `Stream` (1 616 bytes)
+  is unchanged, already reserved one at a time. Per H1 request, grouped by allocation site with
+  an `LD_PRELOAD` backtrace interposer: `Router::backends` 1 allocation / 18 760 bytes → none,
+  `io_slices` 9 / 2 944 → 2 / 1 225, `BackendRegistry` 224 → 56 bytes, `backend_streams` and
+  `pending_links` 32 → 8 bytes each. Measured on a release build, one
+  worker, python backend, 20 sequential `curl` requests, `LD_PRELOAD` malloc counter, two runs
+  each: H1, one request per connection, 67.5–67.9 → 59.6–59.7 allocations and 35 108–35 415 →
+  16 218–16 297 bytes per request; H2, one request per TLS connection, 397.8–398.4 →
+  392.1–392.4 allocations and 87 788–88 258 → 69 249–69 502 bytes; H2 multiplexed, 20 streams
+  on one connection, 67.6–67.7 → 63.0–63.2 allocations and 8 154–8 160 → 6 052–6 058 bytes.
+  Pinned by `the_first_backend_connection_of_a_session_allocates_nothing` (`router.rs`),
+  `a_cold_h1_write_pass_sizes_its_descriptor_vector_once` and
+  `a_parsed_h1_request_queues_its_link_in_a_queue_sized_for_one` (`h1.rs`),
+  `the_first_interned_backend_sizes_the_registry_for_one`,
+  `a_new_backend_entry_in_the_reverse_index_is_sized_for_one_stream` and
+  `successive_dead_backends_reuse_one_dead_backend_list` (`mod.rs`), each seen failing without
+  its change; `crate::test_allocations` gains `bytes()` to measure the size-only ones.
+
 - **`perf(mux-h2)`: the final GOAWAY and the TLS `close_notify` of an H2 frontend leave in one
   write ([#1607](https://github.com/sozu-proxy/sozu/issues/1607)).** Closing an H2 connection over
   TLS on its final GOAWAY cost two `writev(2)` back to back, in the same pass: the GOAWAY, flushed
