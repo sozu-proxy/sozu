@@ -604,7 +604,7 @@ the free function directly rather than through the `&mut self` wrapper — a
 spelling choice, not a constraint, since the wrapper would credit the same
 shares at this site:
 
-```rust lib/src/protocol/mux/h2.rs:4453-4466
+```rust lib/src/protocol/mux/h2.rs:4518-4531
 let stream_bytes = (
     stream.metrics.bin + stream.metrics.backend_bin,
     stream.metrics.bout + stream.metrics.backend_bout,
@@ -630,7 +630,7 @@ This one keeps a line rather than a symbol: `generate_access_log` has four call
 sites in `h2.rs` and the paragraph below is about this call's arguments, not the
 method.
 
-```rust lib/src/protocol/mux/h2.rs:4501-4507
+```rust lib/src/protocol/mux/h2.rs:4566-4572
 let events = stream.generate_access_log(
     false,
     Some("H2::Complete"),
@@ -647,9 +647,9 @@ The other three sites take the `&mut self` wrapper
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:6408`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:6473`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:7103`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:7168`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -659,10 +659,10 @@ for one `kawa.prepare` call rather than held across the per-stream write loop,
 so no borrow of `self.hpack` is outstanding at this call site. The call below
 sits inside the `let stream = &mut context.streams[global_stream_id];` borrow
 taken at the top of `H2WritePhase::Flush`'s post-flush tail
-(`lib/src/protocol/mux/h2.rs:3238`) and passes `stream.linked_token()` straight
+(`lib/src/protocol/mux/h2.rs:3277`) and passes `stream.linked_token()` straight
 out of it:
 
-```rust lib/src/protocol/mux/h2.rs:3297-3298
+```rust lib/src/protocol/mux/h2.rs:3337-3338
                         let (client_rtt, server_rtt) =
                             self.snapshot_rtts(endpoint, stream.linked_token());
 ```
@@ -978,7 +978,7 @@ connection, H1 and H2); in their place each H2 request pays the one lazy
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8184-8188
+```rust lib/src/protocol/mux/h2.rs:8282-8286
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1111,7 +1111,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8261-8265
+```rust lib/src/protocol/mux/h2.rs:8359-8363
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1282,11 +1282,11 @@ frame in between — and `ConnectionH2::handle_write` has the queue adopt it
 counted to the stream right away. A stream therefore only ever owns frames the
 wire has not started, and removing it — a peer RST, `end_stream`, expiry,
 `prune_inactive_streams_while_closing` — drops whole unsent frames, never the
-second half of one the peer is already parsing. That keeps the framing whole,
-not the HPACK tables: an unsent header block was already encoded, and dropping
-it leaves the peer's decoder behind the connection's encoder
-([#1627](https://github.com/sozu-proxy/sozu/issues/1627), older than this
-queue).
+second half of one the peer is already parsing. That keeps the framing whole.
+The HPACK tables are kept by a separate mechanism: an unsent header block was
+already encoded, so dropping it resets the encoder's table (see "A dropped
+header block resets both tables" below,
+[#1627](https://github.com/sozu-proxy/sozu/issues/1627)).
 
 The copy is bounded by one frame or one header block and happens only on a
 partial write. HAProxy owns its in-flight bytes by copying every frame into
@@ -1586,7 +1586,7 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_output_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:7691
+```rust lib/src/protocol/mux/h2.rs:7789
 fn flush_output_to_socket(&mut self) -> bool {
 ```
 
@@ -1757,7 +1757,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6455-6457
+```rust lib/src/protocol/mux/h2.rs:6520-6522
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1765,7 +1765,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6469-6475
+```rust lib/src/protocol/mux/h2.rs:6534-6540
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.
@@ -1802,6 +1802,90 @@ the last, then the last (RFC 7541 §4.2) — at most the two updates a block may
 open with. `ConnectionH2::pending_table_size_update` still holds the last size
 only; it says whether a signal is owed, the encoder says what it is.
 
+### A dropped header block resets both tables
+
+The encoder changes its dynamic table when it ENCODES a block, in
+`kawa.prepare`, not when the block reaches the wire: a field whose name is in
+no table is sent with incremental indexing and inserted at once, and a size
+update is taken from the pending signal. Every block the encoder produced must
+therefore reach the peer, in order (RFC 7541 §2.2, RFC 9113 §4.3). Two paths
+used to drop one unsent
+([#1627](https://github.com/sozu-proxy/sozu/issues/1627)):
+
+- a stream parked with an encoded HEADERS/CONTINUATION block still in its
+  `kawa.out` is removed (a peer RST_STREAM, `end_stream`, expiry,
+  `prune_inactive_streams_while_closing`), or keeps its park while its
+  `kawa.out` is cleared (`forcefully_terminate_answer`, a default answer);
+- `H2BlockConverter::check_header_capacity` clears a block that outgrew
+  `MAX_HEADER_LIST_SIZE`, after its first fields and its size update were
+  encoded;
+- `H2BlockConverter::finalize` clears a field block left unfinished. kawa's H1
+  parser queues one `Block::Header` per trailer line as it reads it and the
+  closing `Flags { end_header }` only with the final CRLF, and
+  `ParsingPhase::Trailers` counts as a main phase, so a write pass between the
+  two reads encoded the first trailer lines and dropped them: the trailers
+  were lost as well.
+
+The damage is not limited to a decoding error. Entries are numbered from the
+newest (RFC 7541 §2.3.3), so each insertion the peer missed moves every older
+entry one index down in the encoder's table only, and a later block naming an
+older entry makes the peer read a different field with no error at all:
+`hpack::tests::a_dropped_block_substitutes_fields_until_the_table_is_reset`
+encodes `x-c: 3` and the peer reads `x-a: 1`. On a backend connection, where
+the streams of several clients share one encoder, that is one client's field
+delivered in another client's request.
+
+The repair is the one RFC 7541 §4.2 provides: "This mechanism can be used to
+completely clear entries from the dynamic table by setting a maximum size of 0,
+which can subsequently be restored." `Encoder::reset_table` empties the
+encoder's table and records the size updates `0`, then the current maximum,
+and the caller re-arms `pending_table_size_update`, so the next block opens
+with both and the peer's decoder empties its table too. Both tables are then
+equal whatever the peer missed; the cost is the entries the next blocks would
+have reused, once per dropped block. No frame is sent for the dead stream.
+
+It is sound because no block encoded before the reset can reach the wire after
+the block that carries it. A write pass flushes each stream it prepares before
+it prepares the next and ends at the first stall, so only the stream parked in
+`expect_write` can hold unsent frames, and nothing is encoded until that stream
+is resumed or gone:
+
+- `ConnectionH2::parked_header_block` records, where a pass parks a stream,
+  whether its `kawa.out` still holds a HEADERS, PUSH_PROMISE or CONTINUATION
+  frame (`h2_transmit::holds_header_frame`, a walk over the frame headers that
+  runs only on a park). The next pass's `H2WritePhase::Start` takes the flag
+  and, when the park is gone or its `kawa.out` is empty, calls
+  `ConnectionH2::reset_encoder_table` before anything is encoded.
+- A field block is encoded only once its closing flags are queued
+  (`header_block_closing`): the converter puts the first field back
+  and ends the `prepare`, and the backend read that completes the trailers
+  wakes the writer again, so the trailers go out whole. Waiting must always
+  end: a block the next queued flags do not close was cut short and is dropped
+  unencoded, and `ConnectionH2::end_stream`'s close-delimited arm ends a
+  chunked response its H1 backend closed mid-body, trailers included, with
+  RST_STREAM (the truncation `ConnectionH1::terminate_close_delimited` already
+  reports the same way, RFC 9112 §7.1) and drops its unencoded blocks.
+- Every converter path that still throws encoded bytes away
+  (`check_header_capacity`, the `StatusLine::Unknown` abort, `finalize`) goes
+  through `H2BlockConverter::discard_encoded_block`, which calls
+  `Encoder::reset_table` and re-arms the converter's pending signal, so the
+  next stream of the same pass opens with the updates; the stream's own earlier frames, already queued, go out before
+  that stream is prepared. `H2WritePhase::End` then takes the pass's remaining
+  signal (`H2ConverterPass::pending_table_size_update`) as the connection's,
+  instead of clearing it whenever some block carried the old one.
+
+The reference implementations avoid the hazard differently. `h2` (hyperium)
+encodes a HEADERS frame only when `FramedWrite::buffer`
+(`src/codec/framed_write.rs`) writes it into the connection's output buffer,
+and a reset stream's queued frames are dropped before that
+(`Prioritize::clear_queue`), so they never touched the table. HAProxy's
+encoder (`hpack_encode_header`, `src/hpack-enc.c`) keeps no dynamic table: it
+names static entries only, so a block it drops cannot shift an index it
+uses. Encoding at send time would move the
+encoding out of `kawa.prepare`, which the converter and the zero-copy output
+queue are built around; the reset keeps both and sends nothing for a dead
+stream.
+
 ### Buffer shrinking after large headers
 
 `converter_buf`, `lowercase_buf` and `cookie_buf` live in `HpackState`, which
@@ -1814,7 +1898,7 @@ per-`prepare` `H2BlockConverter` — a `Vec` move, never a copy of the bytes.
 The pass gives them back at the end, and `HpackState::shrink_converter_buffers`
 then caps each one:
 
-```rust lib/src/protocol/mux/hpack_state.rs:130-140
+```rust lib/src/protocol/mux/hpack_state.rs:138-148
 pub(super) fn shrink_converter_buffers(&mut self) {
     if self.converter_buf.capacity() > 16_384 {
         self.converter_buf.shrink_to(4096);

@@ -805,6 +805,14 @@ fn the_h2_converter_signals_the_smallest_table_size_first() {
             status: Store::Static(b"200"),
             reason: Store::Static(b"OK"),
         };
+        // The closing flags are queued, as the converter requires before it
+        // encodes a field block; the block is read from `out` before them.
+        kawa.blocks.push_back(Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: true,
+        }));
         let mut converter = pass.converter(hpack.encoder_mut(), 1, 65535, false, 0);
         assert!(converter.call(Block::StatusLine, &mut kawa));
         assert!(converter.call(
@@ -1104,4 +1112,59 @@ fn the_callback_always_borrows() {
             assert!(matches!(value, Cow::Borrowed(_)));
         })
         .expect("decodes");
+}
+
+/// Issue #1627: the encoder's table changes when a block is ENCODED, so a
+/// block encoded and then dropped unsent leaves the peer's decoder behind —
+/// and not only with an error. Entries are numbered from the newest (RFC 7541
+/// §2.3.3): each entry the dropped block inserted moves the older ones one
+/// index down in the encoder's table only. A later block naming an older
+/// entry then makes the peer read ANOTHER field, silently: here `x-c: 3` is
+/// read as `x-a: 1`, and a literal naming `x-c` is read under the name `x-a`.
+/// `Encoder::reset_table` repairs it: the next block opens with the size
+/// updates 0, then the maximum size, and both tables are empty again.
+#[test]
+fn a_dropped_block_substitutes_fields_until_the_table_is_reset() {
+    let a: Field = (b"x-a".to_vec(), b"1".to_vec());
+    let c: Field = (b"x-c".to_vec(), b"3".to_vec());
+    let mut encoder = Encoder::new();
+    let mut decoder = Decoder::new();
+    decoder.set_max_allowed_table_size(4096);
+
+    let sent = encoder.encode([(&a.0[..], &a.1[..]), (&c.0[..], &c.1[..])]);
+    assert_eq!(decode(&mut decoder, &sent), Ok(vec![a.clone(), c.clone()]));
+    let _dropped = encoder.encode([(&b"x-b"[..], &b"2"[..])]);
+    assert_eq!(
+        entries(encoder.table()).len(),
+        3,
+        "the dropped block inserted x-b"
+    );
+
+    let block = encoder.encode([(&c.0[..], &c.1[..]), (&c.0[..], &b"other"[..])]);
+    assert_eq!(
+        decode(&mut decoder, &block),
+        Ok(vec![a.clone(), (a.0.clone(), b"other".to_vec())]),
+        "the peer reads x-a where x-c was encoded, with no error"
+    );
+
+    let before = allocations();
+    let max_size = encoder.reset_table();
+    assert_eq!(allocations() - before, 0, "the reset allocates nothing");
+    assert_eq!(max_size, 4096);
+    assert!(entries(encoder.table()).is_empty());
+    let block = exchange_after_size_changes(
+        &mut encoder,
+        &mut decoder,
+        max_size,
+        std::slice::from_ref(&c),
+    );
+    assert!(
+        block.starts_with(&size_updates(&[0, 4096])),
+        "the reset opens the block with 0, then the size: {block:02x?}"
+    );
+    assert_eq!(
+        entries(decoder.table()),
+        vec![c],
+        "both tables restart empty"
+    );
 }

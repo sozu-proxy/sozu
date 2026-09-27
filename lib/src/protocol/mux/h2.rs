@@ -765,6 +765,21 @@ pub struct ConnectionH2 {
     /// requirement, not a nicety — see the RFC 9113 encoder-decoder
     /// synchronisation contract (§6.5.2).
     pub pending_table_size_update: Option<u32>,
+    /// `true` when the stream parked in `expect_write` still holds, in its
+    /// `kawa.out`, a HEADERS or CONTINUATION frame the wire has not started.
+    ///
+    /// That block was HPACK-encoded when it was prepared, so the encoder's
+    /// dynamic table already holds its insertions. Only the parked stream can
+    /// hold unsent frames — a pass flushes each stream it prepares before the
+    /// next one and stops at the first stall — so if the next write pass
+    /// finds the park gone (the stream was removed) or its `kawa.out` empty
+    /// (a default answer or a forced termination cleared it), that block was
+    /// dropped and never will reach the peer, and the pass resets the
+    /// encoder's table before any other block is encoded
+    /// ([`Self::reset_encoder_table`], sozu-proxy/sozu#1627). Set where a
+    /// write pass parks a stream, cleared by the next pass's
+    /// `H2WritePhase::Start`.
+    parked_header_block: bool,
     /// RFC 9113 §6.8 double-GOAWAY drain bookkeeping, encapsulated so
     /// nothing outside `h2_drain.rs` can reach the raw fields — see
     /// [`h2_drain::H2DrainState`].
@@ -1865,6 +1880,7 @@ impl ConnectionH2 {
             timeout_deadline: now.checked_add(timeout_duration),
             flow_control: h2_flow_control::H2FlowControl::new(DEFAULT_INITIAL_WINDOW_SIZE as i32),
             pending_table_size_update: None,
+            parked_header_block: false,
             drain: h2_drain::H2DrainState::new(graceful_shutdown_deadline),
             zero: kawa::Kawa::new(kawa::Kind::Request, kawa::Buffer::new(buffer)),
             output: h2_output::H2Output::default(),
@@ -2892,6 +2908,28 @@ impl ConnectionH2 {
         loop {
             match pass.phase {
                 H2WritePhase::Start => {
+                    // sozu-proxy/sozu#1627: a header block the last pass left
+                    // parked and unsent is gone if its stream was removed or
+                    // its `kawa.out` cleared. Nothing encoded after it is
+                    // queued anywhere, so emptying the encoder's table here,
+                    // before this pass encodes a block, resynchronises the
+                    // peer through that block's leading size updates.
+                    if std::mem::take(&mut self.parked_header_block) {
+                        let dropped = match self.stream_table.expect_write() {
+                            Some(parked @ H2StreamId::Other { .. }) => write_buffer(
+                                &mut self.zero,
+                                &mut context.streams,
+                                &self.position,
+                                parked,
+                            )
+                            .out
+                            .is_empty(),
+                            _ => true,
+                        };
+                        if dropped {
+                            self.reset_encoder_table();
+                        }
+                    }
                     if let Some(
                         write_stream @ H2StreamId::Other {
                             id: stream_id,
@@ -2977,6 +3015,7 @@ impl ConnectionH2 {
                         // finalize: the scheduler pass never began, so LIFECYCLE
                         // §9 invariant 16's readiness policy has nothing to
                         // decide and the park must survive untouched.
+                        self.parked_header_block = h2_transmit::holds_header_frame(kawa);
                         return H2WriteTarget::Done(MuxResult::Continue);
                     }
                     self.stream_table.set_expect_write(None);
@@ -3284,6 +3323,7 @@ impl ConnectionH2 {
                         pass.total_bytes_written.saturating_add(pass.stream_bytes);
                     if pass.stalled {
                         self.stream_table.set_expect_write(Some(write_stream));
+                        self.parked_header_block = h2_transmit::holds_header_frame(kawa);
                         pass.phase = H2WritePhase::End;
                         continue;
                     }
@@ -3347,13 +3387,14 @@ impl ConnectionH2 {
                     // in `begin_scheduler_pass` runs before the pass census exists,
                     // so sampling there would publish the previous pass's value.
                     self.ready_incremental_streams = census.ready_total();
-                    // RFC 7541 §6.3: clear our mirror of the pending size-update only
-                    // AFTER the pass confirmed the signal reached a header block. A
-                    // DATA-only pass leaves `size_update_emitted` as `false` so the
-                    // signal stays queued for the next pass with a header block.
-                    if converter_pass.size_update_emitted() {
-                        self.pending_table_size_update = None;
-                    }
+                    // RFC 7541 §6.3: the pass hands back the signal no header block
+                    // carried. It is `None` once a block did, and unchanged after a
+                    // DATA-only pass, so the signal stays queued for the next pass
+                    // with a header block. A block dropped for its size re-arms it
+                    // with a table reset (`H2BlockConverter::check_header_capacity`),
+                    // which must survive the pass even when an earlier block of the
+                    // same pass carried the old signal.
+                    self.pending_table_size_update = converter_pass.pending_table_size_update();
                     // End the pass and take its three reusable buffers back. They are
                     // moved, not copied: the pass never owned an allocation of its own.
                     let (converter_out, lowercase_buf, cookie_buf) = converter_pass.into_buffers();
@@ -3464,10 +3505,9 @@ impl ConnectionH2 {
         // callable inside it. The pass carries the three reusable scratch
         // buffers — moved, never copied — plus the RFC 7541 §6.3 pending
         // size-update, so the first header block of this pass prepends the
-        // signal and no later one repeats it. We clear the connection-side
-        // mirror only AFTER the pass confirms emission via
-        // `size_update_emitted()`, so a DATA-only write pass (no header
-        // block) does not drop the signal.
+        // signal and no later one repeats it. `H2WritePhase::End` takes back
+        // whatever signal the pass has left (`pending_table_size_update()`),
+        // so a DATA-only write pass (no header block) does not drop it.
         let converter_pass = converter::H2ConverterPass::new(
             self.peer_settings.settings_max_frame_size as usize,
             scheme,
@@ -3739,6 +3779,31 @@ impl ConnectionH2 {
         if let Some((remaining, payload_len)) = orphaned {
             self.skip_orphaned_data_payload(remaining, payload_len);
         }
+    }
+
+    /// Empty the encoder's dynamic table after a header block it encoded was
+    /// dropped unsent, and queue the size updates `0`, then the maximum size,
+    /// for the next block, which empty the peer's table as well (RFC 7541
+    /// §4.2; sozu-proxy/sozu#1627). The caller guarantees that no block
+    /// encoded before this call is still queued for the wire.
+    fn reset_encoder_table(&mut self) {
+        let max_size = self.hpack.reset_encoder_table();
+        let signal = u32::try_from(max_size).unwrap_or(u32::MAX);
+        debug_assert_eq!(
+            usize::try_from(signal).ok(),
+            Some(max_size),
+            "the encoder's maximum size came from a u32 setting"
+        );
+        self.pending_table_size_update = Some(signal);
+        debug!(
+            "{} H2 an encoded header block was dropped unsent: HPACK encoder table reset, next block signals 0 then {}",
+            log_context!(self),
+            max_size
+        );
+        debug_assert!(
+            self.pending_table_size_update.is_some(),
+            "the reset is signalled on the next header block"
+        );
     }
 
     /// Keep the connection reading after the stream that owned the DATA
@@ -7214,6 +7279,39 @@ impl ConnectionH2 {
                         stream.state = StreamState::Unlinked;
                         self.readiness.arm_writable();
                         context.debug.set_interesting(true);
+                    }
+                    EndStreamAction::CloseDelimited
+                        if stream.back.body_size == kawa::BodySize::Chunked =>
+                    {
+                        // A chunked body the backend closed before its
+                        // terminating `0\r\n\r\n` (or inside its trailers) is
+                        // truncated: end it with RST_STREAM, never a silent
+                        // END_STREAM, as `ConnectionH1::terminate_close_delimited`
+                        // does (RFC 9112 §7.1). The blocks not yet encoded go
+                        // with it, among them a trailer block still waiting for
+                        // its closing flags, which the converter would otherwise
+                        // wait on forever; none of them touched the HPACK table
+                        // (sozu-proxy/sozu#1627).
+                        warn!(
+                            "{} H1 backend closed a chunked response mid-body on H2 stream {}: emitting RST_STREAM",
+                            log_context!(self),
+                            stream_gid
+                        );
+                        incr!(names::h1::BACKEND_EOF_BEFORE_MESSAGE_COMPLETE);
+                        stream.back.blocks.clear();
+                        stream
+                            .back
+                            .parsing_phase
+                            .error(kawa::ParsingErrorKind::Processing {
+                                message: "INTERNAL_ERROR",
+                            });
+                        stream.state = StreamState::Unlinked;
+                        self.readiness.arm_writable();
+                        context.debug.set_interesting(true);
+                        debug_assert!(
+                            stream.back.is_error() && stream.back.blocks.is_empty(),
+                            "a truncated chunked response ends in Error with nothing left to encode"
+                        );
                     }
                     EndStreamAction::CloseDelimited => {
                         debug!(
@@ -11582,6 +11680,445 @@ mod tests {
             ]),
             "the reset stream's frame must be completed before the ACK"
         );
+    }
+
+    /// Park stream 1's encoded 404 unsent behind a socket that takes nothing,
+    /// let `drop_block` discard it, then drive the connection unthrottled and
+    /// decode every HEADERS the peer reads with ONE decoder, as the peer does.
+    /// Answers `(stream id, decoded)` per HEADERS and the `:status` values read.
+    ///
+    /// Both requests get the same 404, so stream 1's block inserts the
+    /// answer's fields into the connection's encoder table and stream 3's
+    /// identical block names them by index: a peer that missed stream 1's
+    /// block cannot read stream 3's without a table reset.
+    fn peer_reads_after_a_dropped_parked_block(
+        drop_block: impl FnOnce(&mut H2Shell<PacedSocket>, &mut Context<TestListener>, &mut Router),
+    ) -> (Vec<(u32, bool)>, Vec<Vec<u8>>) {
+        let (_pool, mut connection, mut context, mut router, _peer) = two_requests_read(0);
+        let answers = context.listener.borrow().get_answers().clone();
+        let open: Vec<GlobalStreamId> = connection
+            .core
+            .stream_table
+            .streams()
+            .values()
+            .copied()
+            .collect();
+        for gid in open {
+            crate::protocol::mux::answers::set_default_answer(
+                &mut context.streams[gid],
+                &mut connection.core.readiness,
+                404,
+                &answers.borrow(),
+            );
+        }
+        connection.core.readiness.event.insert(Ready::WRITABLE);
+        connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            connection.socket.wire.is_empty()
+                && connection.core.stream_table.expect_write().is_some(),
+            "premise: stream 1's block was encoded and parked unsent"
+        );
+        drop_block(&mut connection, &mut context, &mut router);
+        connection.socket.budget = usize::MAX;
+        drive_both_ways(&mut connection, &mut context, &mut router);
+        peer_header_blocks(&connection.socket.wire)
+    }
+
+    /// An H2 server connection over a [`PacedSocket`] taking `budget` bytes,
+    /// with GET requests on streams 1 and 3 read and not answered.
+    fn two_requests_read(
+        budget: usize,
+    ) -> (
+        Rc<RefCell<Pool>>,
+        H2Shell<PacedSocket>,
+        Context<TestListener>,
+        Router,
+        std::net::TcpStream,
+    ) {
+        let pool = make_pool_for_invariant_16();
+        let (socket, peer) = connected_socket();
+        let mut connection = H2Shell::new(
+            Ulid::generate(),
+            PacedSocket {
+                stream: socket,
+                budget,
+                wire: Vec::new(),
+                inbound: std::collections::VecDeque::new(),
+            },
+            Position::Server,
+            &mut PoolBufferSource::new(Rc::downgrade(&pool)),
+            H2FloodConfig::default(),
+            H2ConnectionConfig::default(),
+            Duration::from_secs(30),
+            None,
+            Duration::from_secs(30),
+            Some((H2StreamId::Zero, 9)),
+            Ready::READABLE | Ready::WRITABLE | Ready::HUP | Ready::ERROR,
+        )
+        .expect("pool");
+        connection.core.state = H2State::Header;
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+        let mut peer_encoder = crate::protocol::mux::hpack::Encoder::new();
+        for stream_id in [1u32, 3] {
+            let block = peer_encoder.encode([
+                (&b":method"[..], &b"GET"[..]),
+                (&b":scheme"[..], &b"https"[..]),
+                (&b":authority"[..], &b"example.com"[..]),
+                (&b":path"[..], &b"/repro"[..]),
+            ]);
+            let mut frame = (block.len() as u32).to_be_bytes()[1..].to_vec();
+            frame.push(1);
+            frame.push(parser::FLAG_END_STREAM | parser::FLAG_END_HEADERS);
+            frame.extend_from_slice(&stream_id.to_be_bytes());
+            frame.extend_from_slice(&block);
+            connection.socket.inbound.extend(frame);
+        }
+        for _ in 0..8 {
+            connection.core.readiness.event.insert(Ready::READABLE);
+            connection.readable(&mut context, EndpointClient(&mut router));
+        }
+        assert_eq!(
+            connection.core.stream_table.len(),
+            2,
+            "premise: both requests were read"
+        );
+        (pool, connection, context, router, peer)
+    }
+
+    /// Drive the connection the way `Mux` does, `writable()` and
+    /// `readable()` when the filtered readiness allows them.
+    fn drive_both_ways(
+        connection: &mut H2Shell<PacedSocket>,
+        context: &mut Context<TestListener>,
+        router: &mut Router,
+    ) {
+        for _ in 0..16 {
+            connection.core.readiness.event.insert(Ready::WRITABLE);
+            if connection.core.readiness.filter_interest().is_writable() {
+                connection.writable(context, EndpointClient(router));
+            }
+            connection.core.readiness.event.insert(Ready::READABLE);
+            if connection.core.readiness.filter_interest().is_readable() {
+                connection.readable(context, EndpointClient(router));
+            }
+        }
+    }
+
+    /// Decode every HEADERS on `wire` with ONE decoder, as the peer does.
+    /// Answers `(stream id, decoded)` per HEADERS and the `:status` values read.
+    fn peer_header_blocks(wire: &[u8]) -> (Vec<(u32, bool)>, Vec<Vec<u8>>) {
+        let mut decoder = crate::protocol::mux::hpack::Decoder::new();
+        let mut seen = Vec::new();
+        let mut status = Vec::new();
+        for (kind, _, stream_id, payload) in peer_frames(wire).unwrap() {
+            if kind == 1 {
+                let decoded = decoder.decode_with_cb(&payload, |name, value| {
+                    if &*name == b":status" {
+                        status.push(value.into_owned());
+                    }
+                });
+                seen.push((stream_id, decoded.is_ok()));
+            }
+        }
+        (seen, status)
+    }
+
+    /// A header block the encoder produced but the wire never started is
+    /// dropped with its stream, and the peer's HPACK table must not fall
+    /// behind for it (sozu-proxy/sozu#1627, path 1): the peer's RST_STREAM(1)
+    /// removes the parked stream 1, and stream 3's block must still decode.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::poll_write_target`'s
+    /// `H2WritePhase::Start` arm, delete the `self.reset_encoder_table()` call.
+    /// The peer then fails to decode stream 3's block: `left: [(3, false)],
+    /// right: [(3, true)]`. Verified 2026-09-27 (red on `58550dd4`).
+    #[test]
+    fn a_header_block_dropped_with_its_stream_keeps_the_peer_table_in_sync() {
+        let (seen, status) =
+            peer_reads_after_a_dropped_parked_block(|connection, context, router| {
+                connection.socket.inbound.extend(RST_STREAM_1);
+                for _ in 0..4 {
+                    connection.core.readiness.event.insert(Ready::READABLE);
+                    connection.readable(context, EndpointClient(router));
+                }
+                assert!(
+                    !connection.core.stream_table.streams().contains_key(&1),
+                    "premise: the RST removed stream 1"
+                );
+            });
+        assert_eq!(
+            seen,
+            vec![(3, true)],
+            "the peer must decode stream 3's block with its own table"
+        );
+        assert_eq!(status, vec![b"404".to_vec()], "and read what was encoded");
+    }
+
+    /// The park outlives a second write pass that is stalled too: that pass
+    /// resumes the parked stream, writes nothing, and parks it again, so it
+    /// must record again that the park holds an encoded block. The peer's
+    /// RST_STREAM(1) then removes it, and stream 3's block must still decode
+    /// (sozu-proxy/sozu#1627).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::poll_write_target`'s
+    /// `H2WritePhase::Resume` arm, delete the `self.parked_header_block = ..`
+    /// assignment before the stalled `return`. The peer then fails on stream
+    /// 3's block: `left: [(3, false)], right: [(3, true)]`. Verified
+    /// 2026-09-27.
+    #[test]
+    fn a_header_block_parked_across_two_stalled_passes_keeps_the_peer_table_in_sync() {
+        let (seen, status) =
+            peer_reads_after_a_dropped_parked_block(|connection, context, router| {
+                connection.core.readiness.event.insert(Ready::WRITABLE);
+                connection.writable(context, EndpointClient(router));
+                assert!(
+                    connection.socket.wire.is_empty()
+                        && connection.core.stream_table.expect_write().is_some(),
+                    "premise: the second pass resumed nothing and kept the park"
+                );
+                connection.socket.inbound.extend(RST_STREAM_1);
+                for _ in 0..4 {
+                    connection.core.readiness.event.insert(Ready::READABLE);
+                    connection.readable(context, EndpointClient(router));
+                }
+                assert!(
+                    !connection.core.stream_table.streams().contains_key(&1),
+                    "premise: the RST removed stream 1"
+                );
+            });
+        assert_eq!(
+            seen,
+            vec![(3, true)],
+            "the peer must decode stream 3's block with its own table"
+        );
+        assert_eq!(status, vec![b"404".to_vec()], "and read what was encoded");
+    }
+
+    /// Queue on `gid`'s response side a 200 whose field block is `fields`,
+    /// closed with END_STREAM, the way a relayed response reaches the write
+    /// pass.
+    fn queue_response(
+        connection: &mut H2Shell<PacedSocket>,
+        context: &mut Context<TestListener>,
+        gid: GlobalStreamId,
+        fields: Vec<(&'static [u8], kawa::Store)>,
+    ) {
+        let stream = &mut context.streams[gid];
+        let kawa = &mut stream.back;
+        kawa.detached.status_line = kawa::StatusLine::Response {
+            version: kawa::Version::V20,
+            code: 200,
+            status: kawa::Store::Static(b"200"),
+            reason: kawa::Store::Empty,
+        };
+        kawa.push_block(kawa::Block::StatusLine);
+        for (name, value) in fields {
+            kawa.push_block(kawa::Block::Header(kawa::Pair {
+                key: kawa::Store::Static(name),
+                val: value,
+            }));
+        }
+        kawa.push_block(kawa::Block::Flags(kawa::Flags {
+            end_body: false,
+            end_chunk: false,
+            end_header: true,
+            end_stream: true,
+        }));
+        kawa.parsing_phase = kawa::ParsingPhase::Terminated;
+        stream.state = StreamState::Unlinked;
+        connection.core.readiness.arm_writable();
+    }
+
+    /// A block dropped for exceeding `MAX_HEADER_LIST_SIZE` re-arms a table
+    /// reset that must outlive the write pass when no other block of that
+    /// pass carries it (sozu-proxy/sozu#1627, path 2). Stream 1's response
+    /// inserts `x-a: 1`, then an `etag` value past the limit aborts it into a
+    /// RST_STREAM, and it is the only header block of its pass. Stream 3's
+    /// response, answered afterwards, encodes `x-a: 1` again, and the peer
+    /// must read it: its block has to open with the reset.
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::poll_write_target`'s
+    /// `H2WritePhase::End` arm, restore the pre-image
+    /// `if converter_pass.size_update_emitted() { self.pending_table_size_update
+    /// = None; }` instead of taking `converter_pass.pending_table_size_update()`.
+    /// The reset is then lost with the pass: `the reset is still owed after
+    /// the pass`, `left: None, right: Some(4096)`. Verified 2026-09-27.
+    #[test]
+    fn an_oversized_block_reset_outlives_the_pass_that_dropped_it() {
+        let (_pool, mut connection, mut context, mut router, _peer) = two_requests_read(usize::MAX);
+        let gid = |connection: &H2Shell<PacedSocket>, id: u32| {
+            *connection
+                .core
+                .stream_table
+                .streams()
+                .get(&id)
+                .expect("the stream is open")
+        };
+        let (first, third) = (gid(&connection, 1), gid(&connection, 3));
+        let oversized = vec![b'v'; MAX_HEADER_LIST_SIZE + 1];
+        queue_response(
+            &mut connection,
+            &mut context,
+            first,
+            vec![
+                (b"x-a", kawa::Store::Static(b"1")),
+                (b"etag", kawa::Store::from_slice(&oversized)),
+            ],
+        );
+        drive_both_ways(&mut connection, &mut context, &mut router);
+        assert!(
+            peer_frames(&connection.socket.wire)
+                .unwrap()
+                .iter()
+                .any(|(kind, _, id, _)| *kind == 3 && *id == 1),
+            "premise: stream 1 was reset without HEADERS"
+        );
+        assert_eq!(
+            connection.core.pending_table_size_update,
+            Some(4096),
+            "the reset is still owed after the pass"
+        );
+        queue_response(
+            &mut connection,
+            &mut context,
+            third,
+            vec![(b"x-a", kawa::Store::Static(b"1"))],
+        );
+        drive_both_ways(&mut connection, &mut context, &mut router);
+        let (seen, status) = peer_header_blocks(&connection.socket.wire);
+        assert_eq!(
+            seen,
+            vec![(3, true)],
+            "the peer must decode stream 3's block with its own table"
+        );
+        assert_eq!(status, vec![b"200".to_vec()]);
+    }
+
+    /// An H1 backend answers chunked with `Connection: close`, sends the
+    /// last chunk and a first trailer line, then closes before the final
+    /// CRLF. The trailer block can never be completed, and the converter
+    /// defers a field block until its closing flags are queued
+    /// (sozu-proxy/sozu#1627). `ConnectionH2::end_stream`'s
+    /// `EndStreamAction::CloseDelimited` arm must not leave the stream
+    /// waiting on that block: the chunked body was cut short, so it ends
+    /// with RST_STREAM, exactly as `ConnectionH1::terminate_close_delimited`
+    /// (`lib/src/protocol/mux/h1.rs`) does, and the unfinished trailer is
+    /// dropped unencoded, so the next response still decodes on the peer.
+    ///
+    /// Red on `d12c3299`, which deferred the trailer with no way out: the
+    /// stream stayed open with its trailer queued forever, `stream 1 must end
+    /// with RST_STREAM`, frames `[(1, 0), (0, 0)]`. TO SEE THIS RED now: in
+    /// `ConnectionH2::end_stream`, delete the `EndStreamAction::CloseDelimited`
+    /// arm guarded by `body_size == kawa::BodySize::Chunked`. The truncated
+    /// response then ends silently: frames `[(1, 0), (0, 0), (0, 1)]`.
+    /// Verified 2026-09-27.
+    #[test]
+    fn a_chunked_response_closed_inside_its_trailers_ends_with_a_reset() {
+        let (_pool, mut connection, mut context, mut router, _peer) = two_requests_read(usize::MAX);
+        let gid = |connection: &H2Shell<PacedSocket>, id: u32| {
+            *connection
+                .core
+                .stream_table
+                .streams()
+                .get(&id)
+                .expect("the stream is open")
+        };
+        let (first, third) = (gid(&connection, 1), gid(&connection, 3));
+        {
+            let stream = &mut context.streams[first];
+            stream.context.keep_alive_backend = false;
+            let bytes: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nx-checksum: abc\r\n";
+            let kawa = &mut stream.back;
+            kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+            kawa.storage.fill(bytes.len());
+            kawa::h1::parse(kawa, &mut kawa::h1::NoCallbacks);
+            assert_eq!(
+                kawa.parsing_phase,
+                kawa::ParsingPhase::Trailers,
+                "premise: the backend stopped inside the trailers"
+            );
+            stream.state = StreamState::Unlinked;
+        }
+        connection.core.readiness.arm_writable();
+        drive_both_ways(&mut connection, &mut context, &mut router);
+        connection.core.end_stream(first, &mut context);
+        drive_both_ways(&mut connection, &mut context, &mut router);
+
+        let frames: Vec<(u8, u8)> = peer_frames(&connection.socket.wire)
+            .unwrap()
+            .iter()
+            .filter(|(_, _, id, _)| *id == 1)
+            .map(|(kind, flags, _, _)| (*kind, flags & parser::FLAG_END_STREAM))
+            .collect();
+        assert_eq!(
+            frames.last().map(|(kind, _)| *kind),
+            Some(0x3),
+            "stream 1 must end with RST_STREAM, frames {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|(_, end_stream)| *end_stream != 0),
+            "a truncated chunked body never ends cleanly: {frames:?}"
+        );
+        assert!(
+            !connection.core.stream_table.streams().contains_key(&1),
+            "stream 1 is retired"
+        );
+
+        queue_response(
+            &mut connection,
+            &mut context,
+            third,
+            vec![(b"x-checksum", kawa::Store::Static(b"abc"))],
+        );
+        drive_both_ways(&mut connection, &mut context, &mut router);
+        let (seen, status) = peer_header_blocks(&connection.socket.wire);
+        assert_eq!(
+            seen,
+            vec![(1, true), (3, true)],
+            "every block the peer reads decodes with its own table"
+        );
+        assert_eq!(status, vec![b"200".to_vec(), b"200".to_vec()]);
+    }
+
+    /// The same block dropped while its stream stays parked:
+    /// `forcefully_terminate_answer` (a backend that closed mid-response)
+    /// clears the parked stream's `kawa.out`, which held the encoded block.
+    /// Stream 1 then ends with a RST_STREAM, and stream 3's block must still
+    /// decode on the peer (sozu-proxy/sozu#1627).
+    ///
+    /// TO SEE THIS RED: in `ConnectionH2::poll_write_target`'s
+    /// `H2WritePhase::Start` arm, append `&& false` to the `.is_empty()` that
+    /// judges a park still in place. The peer then fails on stream 3's block:
+    /// `left: [(3, false)], right: [(3, true)]`, and this is the only test
+    /// that fails. Verified 2026-09-27.
+    #[test]
+    fn a_header_block_cleared_from_a_parked_stream_keeps_the_peer_table_in_sync() {
+        let (seen, status) =
+            peer_reads_after_a_dropped_parked_block(|connection, context, _router| {
+                let gid = *connection
+                    .core
+                    .stream_table
+                    .streams()
+                    .get(&1)
+                    .expect("stream 1 is open");
+                forcefully_terminate_answer(
+                    &mut context.streams[gid],
+                    &mut connection.core.readiness,
+                    H2Error::InternalError,
+                );
+                assert!(
+                    context.streams[gid].back.out.is_empty()
+                        && connection.core.stream_table.expect_write().is_some(),
+                    "premise: stream 1 stays parked with its block cleared"
+                );
+            });
+        assert_eq!(
+            seen,
+            vec![(3, true)],
+            "the peer must decode stream 3's block with its own table"
+        );
+        assert_eq!(status, vec![b"404".to_vec()], "and read what was encoded");
     }
 
     /// Resume-path bytes are not pass progress.

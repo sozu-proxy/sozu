@@ -447,7 +447,7 @@ than the fixture. RFC 7541 §5.1 encodes a string length ≥ 127 as a
 `0x80..=0xFF` by construction: a 263-byte header value writes
 `7f 88 01`, and 1542 distinct lengths below 100 000 put a `0x88` octet
 in the block. A raw value byte ≥ `0x80` is a second route —
-`lib/src/protocol/mux/converter.rs:388-391` rejects only
+`lib/src/protocol/mux/converter.rs:513-516` rejects only
 `0x00..=0x08 | 0x0A..=0x1F | 0x7F` and passes everything else through
 verbatim. `headers_ok_response` runs on *proxied* responses in the
 strict-off and coalescing tests, where backend headers are arbitrary, so

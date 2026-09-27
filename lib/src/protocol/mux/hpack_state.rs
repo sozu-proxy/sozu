@@ -96,6 +96,14 @@ impl HpackState {
         self.encoder.change_max_table_size(size);
     }
 
+    /// Empty the encoder's dynamic table after a block it encoded was
+    /// dropped unsent, and answer the maximum size the next block must
+    /// signal after a `0` — see `Encoder::reset_table`
+    /// (`lib/src/protocol/mux/hpack/encoder.rs`).
+    pub(super) fn reset_encoder_table(&mut self) -> usize {
+        self.encoder.reset_table()
+    }
+
     /// Takes ownership of the converter scratch buffer, leaving an empty
     /// `Vec` in its place — mirrors the pre-move `std::mem::take(&mut
     /// self.converter_buf)` call sites.

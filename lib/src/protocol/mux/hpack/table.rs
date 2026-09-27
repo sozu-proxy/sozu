@@ -141,7 +141,6 @@ impl DynamicTable {
         self.size
     }
 
-    #[cfg(test)]
     pub(super) fn max_size(&self) -> usize {
         self.max_size
     }
