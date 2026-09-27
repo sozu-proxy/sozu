@@ -58,6 +58,18 @@ READABLE after a short read once HUP was seen and the next pass reads the
 EOF. The pipe and the pre-mux states act on HUP directly
 (`Pipe::frontend_hup`, `Pipe::backend_hup`) and need no EOF read.
 
+The stop has a price, and it is HAProxy's (`src/raw_sock.c`: stop when
+`ret < try`, let the poller report the EOF). When a backend's FIN lands
+after the `epoll_wait` that woke the pass, the event carries READABLE
+without HUP; the short read returns the last bytes and does not issue the
+`recv` that would have found the EOF, so the backend is closed one
+`epoll_wait` round later, on the `EPOLLRDHUP` edge the FIN queued, and no
+later (`a_fin_after_epoll_wait_closes_the_backend_on_the_next_round_at_the_latest`).
+When the FIN reached the kernel before `epoll_wait` returned, the edge
+carries HUP and the backend is closed in the same pass. The `recv` saved
+answers EAGAIN on every short read not followed by a FIN, which is the
+common case.
+
 The guarantee has one known hole: TCP urgent data. `recv` stops before
 an urgent (out-of-band) mark even with bytes queued behind it, so a
 short read while such a mark is pending leaves those bytes in the kernel

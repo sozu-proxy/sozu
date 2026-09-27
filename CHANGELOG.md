@@ -432,12 +432,26 @@
   mark even with bytes queued behind it, so a stream that carries OOB data (telnet, rlogin, FTP
   `ABOR`) can stall until the peer's next send; HAProxy and tokio behave the same, and sozu never
   read out-of-band data before either.
-  Measured on release builds of `f165a3dc` and this change, one worker, loopback, 20 requests per
-  scenario, LD_PRELOAD `fdtrace` interposer: H1 `recv` 114 → 58 (EAGAIN 51 → 0), total traced
-  calls 24.80 → 22.00 per request; H2 over TLS `recv` 236 → 171 (EAGAIN 103 → 66), 38.50 → 34.05
-  per request; 20 requests multiplexed on one H2 connection `recv` 136 → 84 (EAGAIN 50 → 23),
-  19.95 → 16.20 per request. `intentrace -p` agrees on `recvfrom` (H1 4.00 → 2.00, H2 6.00 → 5.00,
-  multiplexed 4.10 → 3.10 per request).
+  Trade with #1603: an H1 backend whose FIN lands after the `epoll_wait` that woke the pass
+  (READABLE without HUP) is now closed one `epoll_wait` round later, on the `EPOLLRDHUP` edge the
+  FIN queued, instead of in the same pass: the pass no longer issues the `recv` that found the
+  EOF, because that `recv` answers EAGAIN whenever no FIN follows. When the FIN reached the kernel
+  before `epoll_wait` returned, the edge carries HUP and the backend is still closed in the same
+  pass. This is HAProxy's choice (`src/raw_sock.c`: stop on `ret < try`, let the poller report
+  the EOF). The two #1603 tests are rewritten to that contract rather than removed:
+  `an_h1_backend_eof_read_records_hup_and_a_frontend_one_does_not` reads the EOF on its second
+  `readable`, `a_backend_eof_read_with_its_last_bytes_closes_the_backend_in_the_same_pass` covers
+  the coalesced edge, and `a_fin_after_epoll_wait_closes_the_backend_on_the_next_round_at_the_latest`
+  pins the one extra round, and no more, on a real socket with mio.
+  Measured on release builds of main `13269c5e` (with #1603) and this change, one worker,
+  loopback, a backend that closes after each response, 20 requests per scenario, LOAD1 below 2.
+  Syscalls per request, `fdtrace` LD_PRELOAD interposer: H1 20.35 → 18.65 (`recv` 4.45 → 2.30,
+  EAGAIN 31 → 0 over the run, `epoll_wait` 5.60 → 5.95); H2 over TLS 35.25 → 34.35 (`recv`
+  10.70 → 9.45, EAGAIN 88 → 68, `epoll_wait` 8.45 → 8.65); 20 requests multiplexed on one H2
+  connection 15.95 → 14.70 (`recv` 5.35 → 4.00, EAGAIN 34 → 23, `epoll_wait` 3.90 → 4.05).
+  `intentrace -p`: H1 20.65 → 18.85 (`recvfrom` 4.00 → 2.00, `epoll_wait` 4.55 → 4.75), H2
+  42.10 → 41.05 (`recvfrom` 6.00 → 5.00, `epoll_wait` 4.95 → 4.90), multiplexed 16.45 → 15.45
+  (`recvfrom` 4.10 → 3.10, `epoll_wait` 3.10 → 3.10).
   **Operator-visible:** the counter `socket.read.infinite_loop.error` is removed: the plain read no
   longer loops, so its safety breaker cannot fire. `socket.write.infinite_loop.error` and
   `rustls.read.infinite_loop.error` are unchanged.

@@ -5469,12 +5469,16 @@ mod tests {
     /// An H1 backend read that meets the EOF records HUP; the same read on
     /// the frontend leaves HUP to the event loop.
     ///
-    /// Both peers write bytes and their FIN before the read, so the read
-    /// returns `(n > 0, Closed)`: the case whose HUP used to wait for the
-    /// `EPOLLRDHUP` edge.
+    /// Both peers write bytes and their FIN before the read. Since
+    /// sozu-proxy/sozu#1606 a read stops on a short read, as HAProxy does
+    /// (`src/raw_sock.c`, `fd_cant_recv` when `ret < try`): the first
+    /// `readable` delivers the bytes and stops before the EOF, and the EOF is
+    /// read by the next `readable`, which the poller's `EPOLLRDHUP` edge (or a
+    /// HUP already in the same event) triggers. That second read is the one
+    /// that meets the EOF and must record HUP.
     ///
     /// TO SEE THIS RED: delete the HUP insertion from `ConnectionH1::readable`
-    /// (`h1.rs`). The first assertion fails with `a backend read that met the
+    /// (`h1.rs`). The backend assertion fails with `a backend read that met the
     /// EOF must record HUP`.
     #[test]
     fn an_h1_backend_eof_read_records_hup_and_a_frontend_one_does_not() {
@@ -5500,12 +5504,17 @@ mod tests {
         backend.readiness_mut().event = Ready::READABLE;
         let _ = backend.readable(&mut mux.context, EndpointServer(&mut mux.frontend));
         assert!(
-            backend.readiness().event.is_hup(),
-            "a backend read that met the EOF must record HUP"
+            mux.context.streams[0].back.is_terminated(),
+            "the bytes read before the EOF must be parsed"
         );
         assert!(
-            mux.context.streams[0].back.is_terminated(),
-            "the bytes read with the EOF must still be parsed"
+            !backend.readiness().event.is_hup(),
+            "the short read stops before the EOF, so it has not met it (#1606)"
+        );
+        let _ = backend.readable(&mut mux.context, EndpointServer(&mut mux.frontend));
+        assert!(
+            backend.readiness().event.is_hup(),
+            "a backend read that met the EOF must record HUP"
         );
 
         // The same stream carries the frontend's request.
@@ -5518,6 +5527,11 @@ mod tests {
             .expect("the client must send its FIN");
         std::thread::sleep(Duration::from_millis(20));
         mux.frontend.readiness_mut().event = Ready::READABLE;
+        // The first read takes the request and stops short (#1606); the
+        // second meets the EOF.
+        let _ = mux
+            .frontend
+            .readable(&mut mux.context, EndpointClient(&mut mux.router));
         let _ = mux
             .frontend
             .readable(&mut mux.context, EndpointClient(&mut mux.router));
@@ -5635,25 +5649,25 @@ mod tests {
         }
     }
 
-    /// Issue #1603: a backend whose last bytes and EOF come back from the same
-    /// `socket_read` is closed in that pass, after its bytes were parsed and
-    /// forwarded, instead of on the `EPOLLRDHUP` edge the kernel queued for
-    /// the same FIN — that edge cost one more `epoll_wait` round, which
-    /// returned at once.
+    /// Issues #1603 and #1606: a backend whose last bytes and FIN reached the
+    /// kernel before `epoll_wait` returned is closed in that same pass, after
+    /// its bytes were parsed and forwarded.
     ///
-    /// The backend's readiness carries READABLE and no HUP, which is what
-    /// the event loop hands a pass when the FIN lands after `epoll_wait`
-    /// returned. The backend peer has written the whole response and its FIN
-    /// before the pass runs.
+    /// The event carries READABLE and HUP together, as
+    /// `Ready::from(&mio::event::Event)` builds it for an `EPOLLIN|EPOLLRDHUP`
+    /// edge (`data_and_fin_in_one_edge_keep_readable_until_the_eof_is_read`
+    /// shows a real socket reporting both in one edge). The first read stops
+    /// short before the EOF (#1606, as HAProxy does in `src/raw_sock.c`), and
+    /// the dead-backend check of `Mux::ready_inner`, which reads the HUP the
+    /// edge already carried, closes the backend on the pass's next inner
+    /// iteration. The bytes read before the EOF are forwarded first. (When the
+    /// stream still needs the EOF, as a close-delimited body does,
+    /// `update_readiness_after_read` keeps READABLE so it is read first:
+    /// `data_and_fin_in_one_edge_keep_readable_until_the_eof_is_read`.)
     ///
-    /// The close happens on the pass's next inner iteration: `dead` is
-    /// sampled at the top of each one, and the read armed the frontend, which
-    /// keeps the inner loop going.
-    ///
-    /// TO SEE THIS RED: delete the HUP insertion from
-    /// `ConnectionH1::readable` (`h1.rs`). The backend is then still in
-    /// `router.backends` after the pass: `the backend that read its EOF must
-    /// be closed in the same pass`.
+    /// TO SEE THIS RED: drop `readiness.event.is_hup() ||` from `dead` in
+    /// `Mux::ready_inner`. The backend then survives the pass: `the backend
+    /// that read its EOF must be closed in the same pass`.
     #[test]
     fn a_backend_eof_read_with_its_last_bytes_closes_the_backend_in_the_same_pass() {
         use std::io::Write;
@@ -5672,9 +5686,10 @@ mod tests {
         if let Position::Client(_, _, status) = &mut h1.position {
             *status = BackendStatus::Connected;
         }
-        // The request is already written; the backend waits to read.
+        // The request is already written; the backend waits to read. Data and
+        // FIN share one edge.
         h1.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
-        h1.readiness.event = Ready::READABLE;
+        h1.readiness.event = Ready::READABLE | Ready::HUP;
         mux.router.backends.insert(backend_token, connection);
         mux.context.link_stream(0, backend_token);
         mux.frontend.readiness_mut().event = Ready::EMPTY;
@@ -5704,6 +5719,105 @@ mod tests {
             "the bytes read together with the EOF must still reach the client, \
              got {:?}",
             String::from_utf8_lossy(&forwarded)
+        );
+    }
+
+    /// Issues #1603 and #1606: the FIN lands AFTER the `epoll_wait` that
+    /// woke the pass, so the event carries READABLE without HUP. The pass
+    /// reads the response in one short read and stops before the EOF (#1606):
+    /// it does not issue the `recv` that would find the FIN, exactly as
+    /// HAProxy stops on a short read and lets the poller report the EOF
+    /// (`src/raw_sock.c`, `fd_cant_recv` when `ret < try`). The backend is
+    /// therefore closed one `epoll_wait` round later, on the `EPOLLRDHUP` edge
+    /// the FIN queued — and not later: that edge is already pending when the
+    /// pass ends, so a zero-timeout poll returns it.
+    ///
+    /// That round is the price of not issuing a `recv` after every short
+    /// read, which answers EAGAIN whenever no FIN follows (the common case).
+    /// Real loopback socket, registered edge-triggered with mio.
+    #[test]
+    fn a_fin_after_epoll_wait_closes_the_backend_on_the_next_round_at_the_latest() {
+        use std::io::Write;
+
+        const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, mut frontend_peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let backend_token = Token(1);
+        let (mut connection, mut backend_peer) =
+            test_backend_connection(&mut mux, Duration::from_secs(30));
+        let mut poll = mio::Poll::new().expect("a poll instance must open");
+        let mut events = mio::Events::with_capacity(8);
+        let Connection::H1(h1) = &mut connection else {
+            unreachable!("new_h1_client builds an H1 connection")
+        };
+        poll.registry()
+            .register(
+                &mut h1.socket.stream,
+                backend_token,
+                mio::Interest::READABLE,
+            )
+            .expect("the backend socket must register");
+        h1.stream = Some(0);
+        if let Position::Client(_, _, status) = &mut h1.position {
+            *status = BackendStatus::Connected;
+        }
+        h1.readiness.interest = Ready::READABLE | Ready::HUP | Ready::ERROR;
+
+        // The response arrives; `epoll_wait` reports it, without a FIN.
+        backend_peer
+            .write_all(RESPONSE)
+            .expect("the backend peer must write its response");
+        poll.poll(&mut events, Some(Duration::from_secs(5)))
+            .expect("poll must succeed");
+        let event = events
+            .iter()
+            .find(|event| event.token() == backend_token)
+            .expect("the response must raise an edge");
+        assert!(
+            event.is_readable() && !event.is_read_closed(),
+            "premise: no FIN yet in the edge that wakes the pass"
+        );
+        h1.readiness.event = Ready::from(event);
+        mux.router.backends.insert(backend_token, connection);
+        mux.context.link_stream(0, backend_token);
+        mux.frontend.readiness_mut().event = Ready::EMPTY;
+
+        // The FIN lands after `epoll_wait` returned, before the pass reads.
+        backend_peer
+            .shutdown(std::net::Shutdown::Write)
+            .expect("the backend peer must send its FIN");
+        std::thread::sleep(Duration::from_millis(20));
+
+        let session: Rc<RefCell<dyn ProxySession>> = Rc::new(RefCell::new(NoDialSession));
+        let proxy: Rc<RefCell<dyn L7Proxy>> = Rc::new(RefCell::new(RemoveOnlyProxy));
+        let mut metrics = SessionMetrics::new(None);
+        let _ = mux.ready(session.clone(), proxy.clone(), &mut metrics);
+        let (forwarded, _) = drain_peer(&mut frontend_peer, b"hello");
+        assert!(
+            forwarded.ends_with(b"hello"),
+            "the response must reach the client in the first pass, got {:?}",
+            String::from_utf8_lossy(&forwarded)
+        );
+        assert!(
+            mux.router.backends.contains_key(&backend_token),
+            "the short read stopped before the EOF: the close waits one round (#1606)"
+        );
+
+        // One round: the RDHUP edge is already queued, a zero-timeout poll
+        // returns it.
+        poll.poll(&mut events, Some(Duration::ZERO))
+            .expect("poll must succeed");
+        let event = events
+            .iter()
+            .find(|event| event.token() == backend_token)
+            .expect("the FIN's edge must already be pending when the pass ends");
+        assert!(event.is_read_closed(), "the pending edge is the FIN");
+        mux.update_readiness(backend_token, Ready::from(event));
+        let _ = mux.ready(session, proxy, &mut metrics);
+        assert!(
+            !mux.router.backends.contains_key(&backend_token),
+            "the backend must be closed on that round, not later"
         );
     }
 

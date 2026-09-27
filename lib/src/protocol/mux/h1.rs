@@ -403,13 +403,14 @@ impl<Front: SocketHandler> ConnectionH1<Front> {
         // `read(2)` returned 0 or the connection was reset: the fact
         // `Ready::from(&mio::event::Event)` (`command/src/ready.rs`) reports
         // as HUP from `is_read_closed()`, and whose edge the kernel has
-        // already queued. When the FIN lands between the `epoll_wait` that
-        // woke this pass and this `recv`, waiting for that edge costs one
-        // more `epoll_wait`, which returns at once; with HUP recorded, the
-        // dead-backend check of `Mux::ready_inner` closes this connection on
-        // the pass's next inner iteration, after the bytes read here were
-        // parsed below. That is the order the pass already follows when
-        // `EPOLLRDHUP` arrives together with the last bytes.
+        // already queued. With HUP recorded, the dead-backend check of
+        // `Mux::ready_inner` closes this connection on the pass's next inner
+        // iteration, after the bytes read here were parsed below. Since
+        // sozu-proxy/sozu#1606 a read stops on a short read, so the last bytes
+        // and the EOF no longer come back from one `recv`: the EOF is read by
+        // a later `readable`, in the same pass when the edge already carried
+        // HUP, one `epoll_wait` round later when the FIN landed after that
+        // `epoll_wait` returned (HAProxy's trade, `src/raw_sock.c`).
         //
         // Backends only. A frontend `Closed` can also be a TLS
         // `close_notify` on a connection whose TCP stream is still open
