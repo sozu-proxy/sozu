@@ -304,6 +304,26 @@ fn try_h2_settings_ack_timeout_goaways_the_frontend() -> State {
 
     let front_addr: SocketAddr = format!("127.0.0.1:{front_port}").parse().unwrap();
     let mut tls = raw_h2_connection(front_addr);
+    // Finish the TLS handshake BEFORE shortening the read timeout (#1624).
+    // `raw_h2_connection` only connects the socket: rustls drives the
+    // handshake lazily from the first `write_all` below
+    // (`Stream::complete_prior_io`), whose reads wait for the ServerHello
+    // under whatever timeout the socket carries. With `POLL_READ_TIMEOUT`
+    // already installed, a worker that takes over 100 ms to answer — routine
+    // when the suite shares one CPU — surfaced as `WouldBlock` from the
+    // preface write with `is_handshaking() == true`, before the SETTINGS
+    // exchange this test is about had even started. The handshake runs under
+    // the connection's own timeout, the same one every `h2_handshake` caller
+    // gets; only the quiet-connection polls below use the short one.
+    while tls.conn.is_handshaking() {
+        if let Err(error) = tls.conn.complete_io(&mut tls.sock) {
+            println!("H2 SETTINGS-ACK deadline - TLS handshake failed: {error}");
+            let _ = verify_sozu_alive(front_port);
+            worker.soft_stop();
+            let _ = worker.wait_for_server_stop();
+            return State::Fail;
+        }
+    }
     tls.sock.set_read_timeout(Some(POLL_READ_TIMEOUT)).ok();
 
     // Half a handshake: preface + our SETTINGS, and deliberately never the
