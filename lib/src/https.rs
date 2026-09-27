@@ -796,7 +796,7 @@ impl HttpsSession {
             // Carry the already-armed handshake entry into the adapter rather
             // than dropping it and arming a fresh one: the session's request
             // timeout started when the socket was accepted.
-            timeouts: HashMap::from([(self.frontend_token, handshake.container_frontend_timeout)]),
+            timeouts: mux::MuxTimeouts::new(handshake.container_frontend_timeout),
             backend_registry: mux::BackendRegistry::default(),
         }))
     }
@@ -813,14 +813,11 @@ impl HttpsSession {
         // http.active_requests was already decremented by generate_access_log()
         // in h1.rs before MuxResult::Upgrade was returned to us.
 
-        // The cores no longer own a wheel handle; the `Mux` adapter does. Take
-        // the frontend's out of the adapter map before dismantling the
+        // The cores no longer own a wheel handle; the `Mux` adapter does. Move
+        // the frontend's out of the adapter before dismantling the
         // connection, so the WebSocket `Pipe` inherits the same live entry it
         // used to inherit from `ConnectionH1`.
-        let mut container_frontend_timeout = mux
-            .timeouts
-            .remove(&mux.frontend_token)
-            .unwrap_or_else(|| TimeoutContainer::new_empty(mux.configured_frontend_timeout));
+        let mut container_frontend_timeout = mux.timeouts.frontend;
         let (frontend_readiness, frontend_socket) = match mux.frontend {
             mux::Connection::H1(mux::ConnectionH1 {
                 readiness, socket, ..
@@ -851,6 +848,7 @@ impl HttpsSession {
         };
         let mut container_backend_timeout = mux
             .timeouts
+            .backends
             .remove(&back_token)
             .unwrap_or_else(|| TimeoutContainer::new_empty(mux.router.configured_backend_timeout));
         let (cluster_id, backend_id, backend_readiness, backend_socket) = match backend {

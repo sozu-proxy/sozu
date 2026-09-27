@@ -17,7 +17,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt::Debug,
     io::ErrorKind,
     net::{Shutdown, SocketAddr},
@@ -845,7 +845,7 @@ pub struct Context<L: ListenerHandler + L7ListenerHandler> {
     /// An entry may be empty: `remove_backend_stream` keeps an emptied `Vec`
     /// for the next link on the same live connection (#1583), so "has linked
     /// streams" is the entry's emptiness, not the key's presence.
-    pub backend_streams: HashMap<Token, Vec<GlobalStreamId>>,
+    pub backend_streams: InlineTokenMap<LinkedStreams>,
     /// Where every buffer this session's streams and connections need comes
     /// from, and the only thing allowed to refuse one.
     ///
@@ -1024,7 +1024,7 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
         Self {
             streams: Vec::new(),
             pending_links: VecDeque::new(),
-            backend_streams: HashMap::new(),
+            backend_streams: InlineTokenMap::new(),
             buffers: Box::new(PoolBufferSource::new(pool)),
             listener,
             session_ulid,
@@ -1102,12 +1102,10 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
     /// Register a stream as linked to a backend token in the reverse index.
     pub fn link_stream(&mut self, stream_id: GlobalStreamId, token: Token) {
         self.streams[stream_id].state = StreamState::Linked(token);
-        // An H1 backend carries one stream at a time, so a new entry holds
-        // one instead of the four a first `push` reserves (#1610); an H2
-        // backend grows it as usual.
+        // An H1 backend carries one stream at a time, which a new entry
+        // holds inline (#1613); an H2 backend spills into a `Vec`.
         self.backend_streams
-            .entry(token)
-            .or_insert_with(|| Vec::with_capacity(1))
+            .get_or_insert_with(token, LinkedStreams::default)
             .push(stream_id);
     }
 
@@ -1247,6 +1245,212 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
     }
 }
 
+/// A map keyed by [`Token`] that holds its lowest-token entry inline.
+///
+/// A session almost always has exactly one backend connection, so the two
+/// per-backend indexes a mux session keeps — [`Context::backend_streams`] and
+/// the backend half of [`MuxTimeouts`] — almost always hold one entry. A
+/// `HashMap` allocated its table on that first insert, once per session and
+/// so once per request on a one-request connection (#1613). Here the first
+/// entry costs nothing and only a second backend reaches the overflow map.
+///
+/// The shape is [`BackendConnections`](router::BackendConnections)'s: `first`
+/// is `None` only when `rest` is empty, and its token is below every token in
+/// `rest`, so iteration runs in ascending `Token` order.
+pub struct InlineTokenMap<V> {
+    first: Option<(Token, V)>,
+    rest: BTreeMap<Token, V>,
+}
+
+impl<V> InlineTokenMap<V> {
+    pub const fn new() -> Self {
+        Self {
+            first: None,
+            rest: BTreeMap::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    pub fn contains_key(&self, token: &Token) -> bool {
+        self.get(token).is_some()
+    }
+
+    pub fn get(&self, token: &Token) -> Option<&V> {
+        match &self.first {
+            Some((first, value)) if first == token => Some(value),
+            _ => self.rest.get(token),
+        }
+    }
+
+    pub fn get_mut(&mut self, token: &Token) -> Option<&mut V> {
+        match &mut self.first {
+            Some((first, value)) if first == token => Some(value),
+            _ => self.rest.get_mut(token),
+        }
+    }
+
+    /// The value under `token`, inserting `default()` first when there is none.
+    pub fn get_or_insert_with(&mut self, token: Token, default: impl FnOnce() -> V) -> &mut V {
+        let first_token = self.first.as_ref().map(|(first, _)| *first);
+        if first_token.is_some_and(|first| token > first) {
+            return self.rest.entry(token).or_insert_with(default);
+        }
+        if first_token.is_some_and(|first| token < first)
+            && let Some((displaced_token, displaced)) = self.first.take()
+        {
+            self.rest.insert(displaced_token, displaced);
+        }
+        &mut self.first.get_or_insert_with(|| (token, default())).1
+    }
+
+    /// Remove and return the value under `token`.
+    pub fn remove(&mut self, token: &Token) -> Option<V> {
+        match &self.first {
+            Some((first, _)) if first == token => {
+                let removed = std::mem::replace(&mut self.first, self.rest.pop_first());
+                removed.map(|(_, value)| value)
+            }
+            _ => self.rest.remove(token),
+        }
+    }
+
+    /// Keep only the entries `keep` answers `true` for.
+    pub fn retain(&mut self, mut keep: impl FnMut(&Token, &mut V) -> bool) {
+        let keep_first = match &mut self.first {
+            Some((token, value)) => keep(token, value),
+            None => true,
+        };
+        self.rest.retain(|token, value| keep(token, value));
+        if !keep_first {
+            self.first = self.rest.pop_first();
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.first = None;
+        self.rest.clear();
+    }
+
+    /// The entries in ascending `Token` order.
+    pub fn iter(&self) -> impl Iterator<Item = (&Token, &V)> {
+        self.first
+            .iter()
+            .map(|(token, value)| (token, value))
+            .chain(self.rest.iter())
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.iter().map(|(_, value)| value)
+    }
+}
+
+impl<V> Default for InlineTokenMap<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<V: Debug> Debug for InlineTokenMap<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+/// The streams linked to one backend connection, in link order.
+///
+/// An H1 backend carries one stream at a time, so the first link is held
+/// inline and allocates nothing; a second concurrent link (an H2 backend)
+/// moves both into a `Vec` sized for four — the allocation the `Vec` this
+/// replaces made at the same point — and the entry keeps that capacity for
+/// the rest of the connection's life (#1583).
+pub enum LinkedStreams {
+    Inline(Option<GlobalStreamId>),
+    Spilled(Vec<GlobalStreamId>),
+}
+
+impl LinkedStreams {
+    pub fn push(&mut self, stream_id: GlobalStreamId) {
+        match self {
+            LinkedStreams::Inline(None) => *self = LinkedStreams::Inline(Some(stream_id)),
+            LinkedStreams::Inline(Some(held)) => {
+                let mut ids = Vec::with_capacity(4);
+                ids.push(*held);
+                ids.push(stream_id);
+                *self = LinkedStreams::Spilled(ids);
+            }
+            LinkedStreams::Spilled(ids) => ids.push(stream_id),
+        }
+    }
+
+    /// Drop `stream_id` from the list, keeping the order of the others.
+    pub fn remove(&mut self, stream_id: GlobalStreamId) {
+        match self {
+            LinkedStreams::Inline(held) => {
+                if *held == Some(stream_id) {
+                    *held = None;
+                }
+            }
+            LinkedStreams::Spilled(ids) => ids.retain(|&id| id != stream_id),
+        }
+    }
+}
+
+impl Default for LinkedStreams {
+    fn default() -> Self {
+        LinkedStreams::Inline(None)
+    }
+}
+
+impl std::ops::Deref for LinkedStreams {
+    type Target = [GlobalStreamId];
+
+    fn deref(&self) -> &[GlobalStreamId] {
+        match self {
+            LinkedStreams::Inline(held) => held.as_slice(),
+            LinkedStreams::Spilled(ids) => ids,
+        }
+    }
+}
+
+impl Debug for LinkedStreams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+/// The `Mux` adapter's timer-wheel handles: the frontend's, and one per live
+/// backend connection.
+///
+/// The frontend's key never changes for the life of a session, so its handle
+/// is a named field; the backends' are an open set, held in an
+/// [`InlineTokenMap`] so the usual single backend costs no allocation. The
+/// `HashMap<Token, TimeoutContainer>` this replaces allocated its table when
+/// the session was built (#1613).
+///
+/// HAProxy goes further: a stream's deadlines are fixed fields (`conn_exp` in
+/// `include/haproxy/stream-t.h`, each channel's `analyse_exp` in
+/// `include/haproxy/channel-t.h`) that `process_stream` folds into its one
+/// task's `expire` with `tick_first` (`src/stream.c`), so there is no table at
+/// all. A sozu session keeps one wheel entry per connection instead, because
+/// each connection's core publishes its own deadline.
+#[derive(Debug)]
+pub struct MuxTimeouts {
+    pub frontend: TimeoutContainer,
+    pub backends: InlineTokenMap<TimeoutContainer>,
+}
+
+impl MuxTimeouts {
+    pub const fn new(frontend: TimeoutContainer) -> Self {
+        Self {
+            frontend,
+            backends: InlineTokenMap::new(),
+        }
+    }
+}
+
 /// Remove `stream_id` from the backend-token reverse index for `token`.
 /// Free function to allow split borrows when `context.streams` is already
 /// mutably borrowed (preventing a `Context::unlink_stream` call).
@@ -1259,12 +1463,12 @@ impl<L: ListenerHandler + L7ListenerHandler> Context<L> {
 /// clears the whole index, so the index stays bounded by the session's live
 /// backend connections.
 pub(super) fn remove_backend_stream(
-    index: &mut HashMap<Token, Vec<GlobalStreamId>>,
+    index: &mut InlineTokenMap<LinkedStreams>,
     token: Token,
     stream_id: GlobalStreamId,
 ) {
     if let Some(ids) = index.get_mut(&token) {
-        ids.retain(|&id| id != stream_id);
+        ids.remove(stream_id);
     }
 }
 
@@ -1286,7 +1490,7 @@ pub struct Mux<Front: SocketHandler, L: ListenerHandler + L7ListenerHandler> {
     /// A handle for a token that has left `router.backends` is dropped by
     /// `reschedule`'s `retain`, and `TimeoutContainer::drop` cancels its entry
     /// — which is why no backend-removal site has to remember to cancel.
-    pub timeouts: HashMap<Token, TimeoutContainer>,
+    pub timeouts: MuxTimeouts,
     /// The registry handles the core's [`BackendSlot`]s stand for.
     ///
     /// The embedder's half of Question 12's perimeter: the core carries an
@@ -1452,7 +1656,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// A token with no core (an unknown token, or a backend already evicted)
     /// is reported due and handled by the caller's unknown-token branch.
     fn consume_timer_entry(&mut self, token: Token) -> bool {
-        if let Some(container) = self.timeouts.get_mut(&token) {
+        if token == self.frontend_token {
+            self.timeouts.frontend.triggered();
+        } else if let Some(container) = self.timeouts.backends.get_mut(&token) {
             container.triggered();
         }
         let core_deadline = if token == self.frontend_token {
@@ -1487,24 +1693,27 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// Departed tokens need no explicit cancel: `retain` drops their handle and
     /// `TimeoutContainer::drop` cancels the entry.
     fn reschedule(&mut self) {
-        let frontend_token = self.frontend_token;
         Self::sync_timeout(
-            &mut self.timeouts,
-            frontend_token,
+            &mut self.timeouts.frontend,
+            self.frontend_token,
             self.frontend.poll_timeout(),
             self.frontend.timeout_duration(),
         );
         for (token, backend) in &self.router.backends {
+            let duration = backend.timeout_duration();
             Self::sync_timeout(
-                &mut self.timeouts,
+                self.timeouts
+                    .backends
+                    .get_or_insert_with(*token, || TimeoutContainer::new_empty(duration)),
                 *token,
                 backend.poll_timeout(),
-                backend.timeout_duration(),
+                duration,
             );
         }
         let backends = &self.router.backends;
         self.timeouts
-            .retain(|token, _| *token == frontend_token || backends.contains_key(token));
+            .backends
+            .retain(|token, _| backends.contains_key(token));
 
         self.debug_assert_timer_coherence();
     }
@@ -1526,14 +1735,11 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
     /// deadline alone, against a mirror that a firing does not clear, and every
     /// wheel delivery that changes nothing becomes a session with no timer.
     fn sync_timeout(
-        timeouts: &mut HashMap<Token, TimeoutContainer>,
+        container: &mut TimeoutContainer,
         token: Token,
         next: Option<Instant>,
         duration: Duration,
     ) {
-        let container = timeouts
-            .entry(token)
-            .or_insert_with(|| TimeoutContainer::new_empty(duration));
         if container.duration() != duration {
             // Keep the handle's configured duration current without moving the
             // armed entry: the WebSocket upgrade hands these containers to
@@ -1562,7 +1768,8 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         #[cfg(debug_assertions)]
         {
             let frontend_token = self.frontend_token;
-            for (token, container) in &self.timeouts {
+            let frontend = std::iter::once((&frontend_token, &self.timeouts.frontend));
+            for (token, container) in frontend.chain(self.timeouts.backends.iter()) {
                 let core = if *token == frontend_token {
                     self.frontend.poll_timeout()
                 } else {
@@ -1770,15 +1977,21 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         #[cfg(debug_assertions)]
         {
             let now = self.context.now;
-            let duration = if token == self.frontend_token {
-                Some(self.frontend.timeout_duration())
+            let (duration, container) = if token == self.frontend_token {
+                (
+                    Some(self.frontend.timeout_duration()),
+                    Some(&self.timeouts.frontend),
+                )
             } else {
-                self.router
-                    .backends
-                    .get(&token)
-                    .map(|b| b.timeout_duration())
+                (
+                    self.router
+                        .backends
+                        .get(&token)
+                        .map(|b| b.timeout_duration()),
+                    self.timeouts.backends.get(&token),
+                )
             };
-            if let Some(container) = self.timeouts.get(&token)
+            if let Some(container) = container
                 && let Some(next) = container.deadline()
                 && duration.is_some_and(|d| !d.is_zero())
             {
@@ -1937,8 +2150,12 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         // Release every wheel handle: the session is going away and
         // `TimeoutContainer::drop` cancels each entry. This replaces the
         // per-backend `timeout_container().cancel()` the loop below used to do
-        // and additionally covers the frontend, which it never did.
-        self.timeouts.clear();
+        // and additionally covers the frontend, which it never did. The
+        // frontend's handle is a field rather than a map entry, so it is
+        // replaced by an unarmed one, which is what a later `reschedule`
+        // would have inserted in its place.
+        self.timeouts.frontend = TimeoutContainer::new_empty(self.timeouts.frontend.duration());
+        self.timeouts.backends.clear();
 
         for (token, client) in &mut self.router.backends {
             let proxy_borrow = proxy.borrow();
@@ -2429,7 +2646,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                 let mut started = 0;
                                 if let Some(ids) = self.context.backend_streams.get(token) {
                                     started = ids.len();
-                                    for &stream_id in ids {
+                                    for &stream_id in ids.iter() {
                                         self.context.streams[stream_id].metrics.backend_connected();
                                     }
                                 }
@@ -2629,7 +2846,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             .context
                             .backend_streams
                             .get(token)
-                            .is_some_and(Vec::is_empty)
+                            .is_some_and(|ids| ids.is_empty())
                         {
                             self.context.backend_streams.remove(token);
                         }
@@ -3000,7 +3217,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
             // connection (#1583), not a link: it is left out of the count,
             // and it must name a connection the router still holds, which is
             // what keeps the index bounded by the live backends.
-            for (token, ids) in &self.context.backend_streams {
+            for (token, ids) in self.context.backend_streams.iter() {
                 assert!(
                     !ids.is_empty() || self.router.backends.contains_key(token),
                     "backend_streams keeps an emptied entry for {token:?}, \
@@ -3023,8 +3240,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                     .context
                     .backend_streams
                     .get(&token)
-                    .cloned()
-                    .unwrap_or_default();
+                    .map_or_else(Vec::new, |ids| ids.to_vec());
                 expected_ids.sort();
                 actual_ids.sort();
                 assert_eq!(
@@ -3217,7 +3433,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                 .context
                 .backend_streams
                 .get(&token)
-                .map_or_else(Vec::new, |ids| ids.to_owned());
+                .map_or_else(Vec::new, |ids| ids.to_vec());
             for stream_id in linked_ids {
                 // This stream is linked to the backend that timedout
                 if self.context.streams[stream_id].back.is_terminated()
@@ -3867,7 +4083,7 @@ mod tests {
             router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
             context,
             session_ulid: Ulid::generate(),
-            timeouts: HashMap::new(),
+            timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(Duration::from_secs(30))),
             backend_registry: BackendRegistry::default(),
         };
 
@@ -4055,7 +4271,7 @@ mod tests {
             router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
             context,
             session_ulid: Ulid::generate(),
-            timeouts: HashMap::new(),
+            timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(frontend_timeout)),
             backend_registry: BackendRegistry::default(),
         };
         (mux, peer)
@@ -4507,10 +4723,7 @@ mod tests {
         let result = mux.timeout(Token(0), &mut metrics);
         assert_eq!(result, StateResult::Continue);
 
-        let container = mux
-            .timeouts
-            .get(&Token(0))
-            .expect("the adapter keeps a handle for the frontend token");
+        let container = &mux.timeouts.frontend;
         assert!(
             container.is_armed(),
             "the wheel entry was consumed by the delivery; if the memoized \
@@ -4640,6 +4853,7 @@ mod tests {
         );
         assert!(
             mux.timeouts
+                .backends
                 .get(&backend_token)
                 .and_then(TimeoutContainer::deadline)
                 .is_none_or(|next| next > fired_at),
@@ -4652,7 +4866,7 @@ mod tests {
     /// drops the handle and `TimeoutContainer::drop` cancels the entry — so the
     /// eviction has to be pinned somewhere.
     ///
-    /// To SEE THIS RED: delete the `self.timeouts.retain(...)` call from
+    /// To SEE THIS RED: delete the `self.timeouts.backends.retain(...)` call from
     /// `Mux::reschedule`. The handle then outlives its connection and
     /// `debug_assert_timer_coherence` panics with "timer handle for Token(1)
     /// outlived its connection".
@@ -4667,7 +4881,7 @@ mod tests {
 
         mux.reschedule();
         assert!(
-            mux.timeouts.contains_key(&backend_token),
+            mux.timeouts.backends.contains_key(&backend_token),
             "a live backend must hold a wheel handle"
         );
 
@@ -4675,7 +4889,7 @@ mod tests {
         mux.reschedule();
 
         assert!(
-            !mux.timeouts.contains_key(&backend_token),
+            !mux.timeouts.backends.contains_key(&backend_token),
             "a departed backend must not leave a wheel handle behind"
         );
     }
@@ -4816,7 +5030,7 @@ mod tests {
             router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
             context: test_context(&pool),
             session_ulid: Ulid::generate(),
-            timeouts: HashMap::new(),
+            timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(Duration::from_secs(30))),
             backend_registry: BackendRegistry::default(),
         };
 
@@ -5011,19 +5225,50 @@ mod tests {
         assert_eq!(&*id.backend_id, "interned-first");
     }
 
-    /// #1610: a backend token's reverse-index entry is sized for the one
-    /// stream an H1 backend carries, not the four a first `Vec::push`
-    /// reserves.
+    /// #1613: the first backend entry of a session's reverse index holds its
+    /// one stream inline, so linking it allocates nothing. The `HashMap` of
+    /// `Vec`s it replaces allocated its table and the entry's vector here —
+    /// two allocations, 156 bytes — once per session, so once per request
+    /// on a one-request connection. (#1610 had already cut that vector from
+    /// four slots to one.)
     ///
-    /// The first `link_stream` of the session also allocates the map's
-    /// table; the second token lands in that table without growing it, so
-    /// its measurement is the entry's vector alone.
-    ///
-    /// TO SEE THIS RED: in `Context::link_stream`, put `.or_default()` back in
-    /// place of `.or_insert_with(|| Vec::with_capacity(1))`.
+    /// TO SEE THIS RED: in `LinkedStreams::push`, spill into the `Vec` on
+    /// the first link as well (1 allocation); or in
+    /// `InlineTokenMap::get_or_insert_with`, send every token to `rest`
+    /// (the `BTreeMap` leaf is allocated).
     #[test]
     fn a_new_backend_entry_in_the_reverse_index_is_sized_for_one_stream() {
-        use crate::test_allocations::bytes;
+        use crate::test_allocations::{allocations, bytes};
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+
+        let (before, before_bytes) = (allocations(), bytes());
+        mux.context.link_stream(0, Token(1));
+        let linked = (allocations() - before, bytes() - before_bytes);
+
+        assert_eq!(
+            linked,
+            (0, 0),
+            "the first reverse-index entry must hold its one stream without allocating"
+        );
+        assert_eq!(
+            mux.context
+                .backend_streams
+                .get(&Token(1))
+                .map(|ids| ids.to_vec()),
+            Some(vec![0])
+        );
+    }
+
+    /// The other side of the inline slot: a second stream linked to the same
+    /// backend (an H2 backend multiplexing) moves both into one `Vec` sized
+    /// for four, in link order — the single 32-byte allocation the `Vec` the
+    /// slot replaced made at the same point — and a later link on that
+    /// connection reuses it.
+    #[test]
+    fn a_second_stream_on_one_backend_spills_the_reverse_index_entry_once() {
+        use crate::test_allocations::{allocations, bytes};
 
         let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
         let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
@@ -5033,16 +5278,70 @@ mod tests {
             .expect("the test pool must hand out a second stream");
         mux.context.link_stream(0, Token(1));
 
-        let before = bytes();
-        mux.context.link_stream(second, Token(2));
-        let linked = bytes() - before;
+        let (before, before_bytes) = (allocations(), bytes());
+        mux.context.link_stream(second, Token(1));
+        let spilled = (allocations() - before, bytes() - before_bytes);
+        assert_eq!(
+            spilled,
+            (1, 4 * std::mem::size_of::<GlobalStreamId>()),
+            "the second stream must spill both into one four-slot vector"
+        );
+        assert_eq!(
+            mux.context
+                .backend_streams
+                .get(&Token(1))
+                .map(|ids| ids.to_vec()),
+            Some(vec![0, second]),
+            "the spill must keep the link order"
+        );
+
+        mux.context.unlink_stream(0);
+        let before = allocations();
+        mux.context.link_stream(0, Token(1));
+        assert_eq!(
+            allocations() - before,
+            0,
+            "a spilled entry keeps its capacity for the next link (#1583)"
+        );
+    }
+
+    /// #1613: the wheel handles of the usual session — the frontend's and one
+    /// backend's — cost no allocation, because the frontend's is a field of
+    /// `MuxTimeouts` and the first backend's is held inline. The
+    /// `HashMap<Token, TimeoutContainer>` they replace allocated its table
+    /// (one allocation, 340 bytes) once per session.
+    ///
+    /// Neither core wants a deadline here, so `reschedule` never reaches the
+    /// timer wheel, and what is measured is the handles' storage alone.
+    ///
+    /// TO SEE THIS RED: in `InlineTokenMap::get_or_insert_with`, send every
+    /// token to `rest` (the `BTreeMap` leaf is allocated).
+    #[test]
+    fn a_session_holds_its_frontend_and_first_backend_wheel_handles_without_allocating() {
+        use crate::test_allocations::{allocations, bytes};
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let (mut mux, _peer) = h1_mux_with_idle_stream(&pool, Duration::from_secs(60));
+        let backend_token = Token(1);
+        let (mut connection, _backend_peer) =
+            test_backend_connection(&mut mux, Duration::from_secs(30));
+        connection.clear_timeout();
+        mux.frontend.clear_timeout();
+
+        let (before, before_bytes) = (allocations(), bytes());
+        mux.router.backends.insert(backend_token, connection);
+        mux.reschedule();
+        let held = (allocations() - before, bytes() - before_bytes);
 
         assert_eq!(
-            linked,
-            std::mem::size_of::<GlobalStreamId>(),
-            "a new reverse-index entry must hold exactly one stream"
+            held,
+            (0, 0),
+            "the frontend and first backend handles must not allocate"
         );
-        assert_eq!(mux.context.backend_streams[&Token(2)], [second]);
+        assert!(
+            mux.timeouts.backends.contains_key(&backend_token),
+            "the live backend must hold a wheel handle"
+        );
     }
 
     /// An H1 backend connection on a live loopback socket, plus the peer the
@@ -5128,7 +5427,7 @@ mod tests {
             mux.context
                 .backend_streams
                 .get(&backend_token)
-                .map(Vec::len),
+                .map(|ids| ids.len()),
             Some(1),
             "precondition: the backend carries exactly one linked stream"
         );
@@ -5389,7 +5688,7 @@ mod tests {
             router: Router::new(Duration::from_secs(30), Duration::from_secs(30)),
             context: test_context(pool),
             session_ulid,
-            timeouts: HashMap::new(),
+            timeouts: MuxTimeouts::new(TimeoutContainer::new_empty(Duration::from_secs(60))),
             backend_registry: BackendRegistry::default(),
         }
     }

@@ -17028,7 +17028,9 @@ mod tests {
             // that reaches `delay_close_for_frontend_flush`.
             context: test_context(&pool),
             session_ulid: Ulid::generate(),
-            timeouts: HashMap::new(),
+            timeouts: crate::protocol::mux::MuxTimeouts::new(
+                crate::timer::TimeoutContainer::new_empty(Duration::from_secs(30)),
+            ),
             backend_registry: crate::protocol::mux::BackendRegistry::default(),
         };
         let mut metrics = SessionMetrics::new(None);
