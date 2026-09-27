@@ -1695,6 +1695,30 @@ impl UdpListenerSession {
         }
     }
 
+    /// The body of [`ProxySession::timeout`], evaluated at `now` instead of
+    /// the current instant, so a test can deliver a wheel expiry at an exact
+    /// point of a simulated clock.
+    fn timeout_at(&mut self, token: Token, now: Instant) -> SessionIsToBeClosed {
+        if token == self.listener_token {
+            // The wheel entry that fired is CONSUMED: `Timer::poll` removed it
+            // from the timer's slab. Say so, so the field is true on its own
+            // terms rather than by an argument made in `timer.rs` — a handle
+            // left here is inert (`cancel_timeout`'s tick guard can never match
+            // a delivered entry) but claims an arming that does not exist.
+            self.timer_handle = None;
+            self.manager.borrow_mut().handle_timeout(now);
+            // Re-arm: `handle_timeout` cleared the manager's `armed_deadline`
+            // for the same reason, so `reschedule` emits a fresh ArmTimer
+            // whenever a flow is still scheduled — including when this expiry
+            // found nothing due, which is the common case for an entry the
+            // wheel delivered early (`crate::timer` rounds to the nearest
+            // tick). `drain_outputs` applies it. Never close the listener on a
+            // flow timeout.
+            self.drain_outputs(now);
+        }
+        false
+    }
+
     /// Map the single manager-wide `ArmTimer(deadline)` onto the thread-local
     /// `TIMER`, keyed by the **listener token**: when it fires, the run loop
     /// calls `Server::timeout(listener_token)` → `session.timeout(token)` →
@@ -1710,7 +1734,10 @@ impl UdpListenerSession {
             if let Some(old) = self.timer_handle.take() {
                 let _ = timer.cancel_timeout(&old);
             }
-            self.timer_handle = Some(timer.set_timeout(delay, self.listener_token));
+            // Counted from `now`, the instant `deadline` was computed against,
+            // not from a fresh clock read: the entry then lands on the grid
+            // point `deadline` itself maps to, however late this drain runs.
+            self.timer_handle = Some(timer.set_timeout_from(now, delay, self.listener_token));
         });
     }
 
@@ -1868,25 +1895,7 @@ impl ProxySession for UdpListenerSession {
     }
 
     fn timeout(&mut self, token: Token) -> SessionIsToBeClosed {
-        if token == self.listener_token {
-            let now = Instant::now();
-            // The wheel entry that fired is CONSUMED: `Timer::poll` removed it
-            // from the timer's slab. Say so, so the field is true on its own
-            // terms rather than by an argument made in `timer.rs` — a handle
-            // left here is inert (`cancel_timeout`'s tick guard can never match
-            // a delivered entry) but claims an arming that does not exist.
-            self.timer_handle = None;
-            self.manager.borrow_mut().handle_timeout(now);
-            // Re-arm: `handle_timeout` cleared the manager's `armed_deadline`
-            // for the same reason, so `reschedule` emits a fresh ArmTimer
-            // whenever a flow is still scheduled — including when this expiry
-            // found nothing due, which is the common case for an entry the
-            // wheel delivered early (`crate::timer` rounds to the nearest
-            // tick). `drain_outputs` applies it. Never close the listener on a
-            // flow timeout.
-            self.drain_outputs(now);
-        }
-        false
+        self.timeout_at(token, Instant::now())
     }
 
     fn close(&mut self) {
@@ -2161,6 +2170,15 @@ mod tests {
     /// early — and the assertions below check that against the wheel rather
     /// than assuming it.
     ///
+    /// The clock is simulated, not the wheel. The real `TIMER`, with its real
+    /// nearest-tick rounding, is armed with `Timer::set_timeout_from` and
+    /// polled with `Timer::poll_at`, and the session handles each expiry
+    /// through `timeout_at` — all at instants the test derives from one
+    /// `Instant::now()` read. The defect lives entirely in `duration_to_tick`'s
+    /// arithmetic on those instants, so nothing is lost, and no scheduling
+    /// delay can move an arming onto the next grid point or push the early
+    /// fire past the deadline (issue #1619).
+    ///
     /// To SEE THIS RED: remove `self.armed_deadline = None;` from the top of
     /// `UdpManager::handle_timeout` (`lib/src/protocol/udp/manager.rs`). The
     /// `wheel re-armed after the early fire` assertion fails first, reporting a
@@ -2181,16 +2199,6 @@ mod tests {
     fn an_early_wheel_fire_still_evicts_the_idle_flow() {
         use crate::backends::Backend;
         use crate::testing::{ServerParts, prebuild_server, provide_port};
-
-        /// Park the thread until `at`. The wheel is driven by real time here on
-        /// purpose: the whole defect lives in the gap between the wheel's tick
-        /// grid and the manager's deadline, and a mocked clock cannot show it.
-        fn sleep_until(at: Instant) {
-            let now = Instant::now();
-            if at > now {
-                std::thread::sleep(at - now);
-            }
-        }
 
         const CLUSTER: &str = "udp-idle-eviction";
 
@@ -2245,19 +2253,24 @@ mod tests {
         // A ruler for the wheel: park a throwaway entry, read the absolute
         // instant the wheel would fire it, and leave it there to be consumed
         // below (cancelling it would leave a stale `next_tick` behind).
+        //
+        // `now` is the simulated clock's origin, and the only clock read that
+        // steers this test. It is taken inside `TIMER.with`, after the thread-local
+        // wheel exists, so its private `start` can never lie after it.
         let probe_token = Token(usize::MAX);
-        let grid = TIMER.with(|timer| {
+        let (now, grid) = TIMER.with(|timer| {
             let mut timer = timer.borrow_mut();
-            timer.set_timeout(Duration::from_millis(0), probe_token);
-            timer
+            let now = Instant::now();
+            timer.set_timeout_from(now, Duration::ZERO, probe_token);
+            let grid = timer
                 .next_poll_date()
-                .expect("the probe must put a date on the wheel")
+                .expect("the probe must put a date on the wheel");
+            (now, grid)
         });
 
         // The grid point the flow's entry will be delivered at: strictly after
         // the probe's (so they land in different wheel slots) and far enough
         // ahead that the flow is armed before it.
-        let now = Instant::now();
         let mut fires_at = grid + Duration::from_millis(100);
         while fires_at < now + Duration::from_millis(60) {
             fires_at += Duration::from_millis(100);
@@ -2297,9 +2310,8 @@ mod tests {
 
         // Consume the ruler. Its slot is reset by the poll, so the wheel is
         // clean and `next_poll_date` now reports the flow's entry alone.
-        sleep_until(grid + Duration::from_millis(5));
         assert_eq!(
-            TIMER.with(|timer| timer.borrow_mut().poll()),
+            TIMER.with(|timer| timer.borrow_mut().poll_at(grid)),
             Some(probe_token),
             "the probe entry must be delivered first"
         );
@@ -2320,18 +2332,19 @@ mod tests {
              {deadline:?} (grid {grid:?}, expected fire {fires_at:?})"
         );
 
-        // The early fire itself, exactly as `Server`'s run loop drives it.
-        sleep_until(wheel_at + Duration::from_millis(5));
+        // The early fire itself, exactly as `Server`'s run loop drives it, at
+        // the wheel's own date.
+        let fire = wheel_at;
         assert_eq!(
-            TIMER.with(|timer| timer.borrow_mut().poll()),
+            TIMER.with(|timer| timer.borrow_mut().poll_at(fire)),
             Some(listener_token),
             "the listener's wheel entry must be delivered at the wheel's date"
         );
         assert!(
-            Instant::now() < deadline,
+            fire < deadline,
             "the fire must land before the flow's deadline for this test to mean anything"
         );
-        session.borrow_mut().timeout(listener_token);
+        session.borrow_mut().timeout_at(listener_token, fire);
 
         // Nothing was due, so nothing closed — and the wheel entry is gone.
         assert_eq!(
@@ -2355,11 +2368,11 @@ mod tests {
              (next wheel date {rearmed:?}, deadline {deadline:?})"
         );
 
-        // Past the real deadline AND past the grid point the re-arm rounded up
-        // to, the run loop drains the wheel again.
-        sleep_until(deadline + Duration::from_millis(150));
-        while let Some(token) = TIMER.with(|timer| timer.borrow_mut().poll()) {
-            session.borrow_mut().timeout(token);
+        // Past the deadline AND past the grid point the re-arm rounded up to,
+        // the run loop drains the wheel again.
+        let later = deadline + Duration::from_millis(150);
+        while let Some(token) = TIMER.with(|timer| timer.borrow_mut().poll_at(later)) {
+            session.borrow_mut().timeout_at(token, later);
         }
         assert_eq!(
             session.borrow().manager.borrow().flow_count(),

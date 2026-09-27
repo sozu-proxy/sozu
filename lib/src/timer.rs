@@ -391,7 +391,23 @@ impl<T> Timer<T> {
     ///
     /// When the timeout occurs, the given state becomes available via `poll`.
     pub fn set_timeout(&mut self, delay_from_now: Duration, state: T) -> Timeout {
-        let delay_from_start = self.start.elapsed() + delay_from_now;
+        self.set_timeout_from(Instant::now(), delay_from_now, state)
+    }
+
+    /// [`Self::set_timeout`], counting `delay_from_now` from the caller's
+    /// `now` instead of re-reading the clock.
+    ///
+    /// A caller that already holds the instant its deadline was computed
+    /// against uses this so the entry lands on the grid point that deadline
+    /// maps to, however long ago `now` was read — and a test can place an
+    /// entry at an exact instant.
+    pub fn set_timeout_from(
+        &mut self,
+        now: Instant,
+        delay_from_now: Duration,
+        state: T,
+    ) -> Timeout {
+        let delay_from_start = now.saturating_duration_since(self.start) + delay_from_now;
         self.set_timeout_at(delay_from_start, state)
     }
 
@@ -477,6 +493,13 @@ impl<T> Timer<T> {
     /// timer, if any.
     pub fn poll(&mut self) -> Option<T> {
         let target_tick = current_tick(self.start, self.tick_ms);
+        self.poll_to(target_tick)
+    }
+
+    /// [`Self::poll`] as of `now` rather than the current instant, so a test
+    /// can drive the wheel from a simulated clock.
+    pub fn poll_at(&mut self, now: Instant) -> Option<T> {
+        let target_tick = duration_to_tick(now.saturating_duration_since(self.start), self.tick_ms);
         self.poll_to(target_tick)
     }
 

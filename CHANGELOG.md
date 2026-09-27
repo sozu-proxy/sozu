@@ -3097,6 +3097,22 @@
 
 ### 🐛 Fixed
 
+- **`test(udp)`: `an_early_wheel_fire_still_evicts_the_idle_flow` runs on a simulated clock
+  ([#1619](https://github.com/sozu-proxy/sozu/issues/1619)).** The test slept on the real clock
+  between steps, and the shell's wheel read that clock twice on its own: `Timer::set_timeout` added
+  the delay to `start.elapsed()`, and `UdpListenerSession::timeout` passed `Instant::now()` to the
+  manager. Under host load the arming rounded onto the next grid point (the `wheel must fire
+  EARLY` precondition fails) or the fire landed past the deadline (the `fire must land before the
+  flow's deadline` one does): 15 red runs out of 20 with eight `yes` hogs on the test's CPU.
+  `Timer` gains `set_timeout_from(now, delay, state)` and `poll_at(now)`, `set_timeout` and `poll`
+  keep their behaviour, and the session's expiry body moves to `timeout_at(token, now)`, which
+  `timeout` calls with `Instant::now()`. The test drives the real wheel and the real session
+  through these at instants derived from one clock read, with every assertion unchanged: 50 green
+  runs out of 50 under the same load, and still red when `UdpManager::handle_timeout` stops
+  clearing `armed_deadline`. One production change comes with it: `arm_timer` counts the delay
+  from the drain's `now` rather than from a fresh clock read, so the listener's entry lands on
+  the grid point its deadline maps to however late the drain runs.
+
 - **BREAKING (behaviour) — `fix(router)`: a tree rule numbers its `$HOST[n]` captures left to
   right, like a pre/post rule ([#1595](https://github.com/sozu-proxy/sozu/issues/1595)).** A
   `Tree`-position hostname (the default) is matched one label at a time while the trie walks from
