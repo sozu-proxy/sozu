@@ -639,9 +639,9 @@ The other three sites take the `&mut self` wrapper
   `reason` variable, one of `H2::WindowStall` or `H2::IdleTimeout`, and counts
   the reap under a different metric for each so a DoS-mitigation reap stays
   distinguishable from an ordinary idle one.
-- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:6479`) uses
+- `handle_rst_stream_frame` (`lib/src/protocol/mux/h2.rs:6506`) uses
   `H2::ResetFrame`.
-- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:7189`) uses
+- `ConnectionH2::reset_stream` (`lib/src/protocol/mux/h2.rs:7216`) uses
   `H2::Reset`.
 
 Only the last two are reset paths; the first is the idle/stall sweep.
@@ -856,8 +856,8 @@ Three consequences, in the order they matter:
 
 `ConnectionH2` requires **nothing** of `SocketHandler`: it does not name the
 trait and has no `Front` parameter. `H2Shell` requires `socket_read`,
-`socket_write`, `socket_write_vectored`, `socket_wants_write`, `socket_close`
-and `peer_addr` — and `socket_ref` only through `Connection::socket`, which the
+`socket_write`, `socket_write_vectored`, `socket_wants_write`, `socket_close`,
+`socket_write_then_close` and `peer_addr` — and `socket_ref` only through `Connection::socket`, which the
 event loop needs for registration. `H2Shell`'s own `Debug` is hand-written
 rather than derived for exactly the reason this section gives: a derive would
 render `socket` through `Front`'s `Debug` and hand the descriptor straight back
@@ -969,7 +969,7 @@ connection, H1 and H2); in their place each H2 request pays the one lazy
 
 ### readable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8287-8291
+```rust lib/src/protocol/mux/h2.rs:8327-8331
 pub fn readable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1093,7 +1093,7 @@ each CONTINUATION frame's payload has actually been read, not derived from a
 
 ### writable() entry point
 
-```rust lib/src/protocol/mux/h2.rs:8364-8368
+```rust lib/src/protocol/mux/h2.rs:8404-8408
 pub fn writable<E, L>(&mut self, context: &mut Context<L>, endpoint: E) -> MuxResult
 where
     E: Endpoint,
@@ -1529,13 +1529,25 @@ invariant 26 for why the trailing urgency buckets are the ones that suffer.
 
 ### flush_zero_to_socket()
 
-```rust lib/src/protocol/mux/h2.rs:7787
+```rust lib/src/protocol/mux/h2.rs:7814
 fn flush_zero_to_socket(&mut self) -> bool {
 ```
 
 Writes the zero buffer to the socket in a loop. Returns `true` if the socket
 stalled (WouldBlock), `false` when fully drained. Counts written bytes as
 `overhead_bout`. Clears the buffer after draining to reset positions.
+
+When `ConnectionH2::zero_flush_closes_connection` answers yes — a server
+connection in `H2State::GoAway` whose zero buffer holds the final GOAWAY, with
+no stream, WINDOW_UPDATE or RST_STREAM left to write after it — the loop writes
+through `SocketHandler::socket_write_then_close` instead of `socket_write`, and
+sets `close_notify_sent` once the whole buffer was taken. `FrontRustls` hands
+rustls the GOAWAY, queues `close_notify` behind it and flushes both records
+with one `write_tls`, so the close costs one `writev(2)` instead of two
+([#1607](https://github.com/sozu-proxy/sozu/issues/1607)); `H2Shell::close`
+then finds nothing left to drain. The alert still follows the GOAWAY on the
+wire, as RFC 8446 §6.1 requires it before the write side closes. Other
+handlers write, then call `socket_close`, which is what they did before.
 
 ### Shutdown and close path
 
@@ -1687,7 +1699,7 @@ SETTINGS are acknowledged:
 
 On receiving a SETTINGS ACK from the peer:
 
-```rust lib/src/protocol/mux/h2.rs:6523-6525
+```rust lib/src/protocol/mux/h2.rs:6550-6552
 self.hpack.set_decoder_max_allowed_table_size(
     self.local_settings.settings_header_table_size as usize,
 );
@@ -1695,7 +1707,7 @@ self.hpack.set_decoder_max_allowed_table_size(
 
 On receiving the peer's own SETTINGS, in the `SETTINGS_HEADER_TABLE_SIZE` arm:
 
-```rust lib/src/protocol/mux/h2.rs:6537-6543
+```rust lib/src/protocol/mux/h2.rs:6564-6570
 parser::SETTINGS_HEADER_TABLE_SIZE => {
 // Cap to the configured maximum — a malicious peer can
 // advertise up to 4 GB to inflate HPACK encoder memory.

@@ -65,6 +65,22 @@ pub trait SocketHandler {
         false
     }
     fn socket_close(&mut self) {}
+    /// Write `buf`, then begin the close [`Self::socket_close`] begins, and
+    /// report what [`Self::socket_write`] would for `buf`.
+    ///
+    /// The close is begun only when the whole of `buf` was accepted, so a
+    /// caller that gets back less resumes with the rest and the close still
+    /// follows its last byte. A handler without a close of its own does
+    /// exactly the two calls; [`FrontRustls`] puts the plaintext and its
+    /// `close_notify` behind one flush, so the last application bytes and
+    /// the alert leave in one `writev(2)` instead of two.
+    fn socket_write_then_close(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+        let (size, status) = self.socket_write(buf);
+        if size == buf.len() {
+            self.socket_close();
+        }
+        (size, status)
+    }
     fn socket_ref(&self) -> &TcpStream;
     fn socket_mut(&mut self) -> &mut TcpStream;
     /// Peer address of this connection, preferring a snapshot taken when the
@@ -614,6 +630,32 @@ pub struct FrontRustls {
     pub configured_peer: Option<SocketAddr>,
 }
 
+/// One `write_tls` of `session` into `stream`: at most one `writev(2)`, and
+/// none when rustls holds no record (`ChunkVecBuffer::write_to` returns
+/// `Ok(0)` before touching the socket, `rustls-0.23.45/src/vecbuf.rs`).
+///
+/// Every `FrontRustls` write goes through here so tests can count the writes
+/// that reach the socket ([`tls_writes`]).
+fn flush_tls(session: &mut ServerConnection, stream: &mut TcpStream) -> std::io::Result<usize> {
+    #[cfg(test)]
+    if session.wants_write() {
+        TLS_WRITES.with(|writes| writes.set(writes.get() + 1));
+    }
+    session.write_tls(stream)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TLS_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many `write_tls` calls holding at least one record the calling thread
+/// has issued through [`flush_tls`] so far.
+#[cfg(test)]
+pub(crate) fn tls_writes() -> usize {
+    TLS_WRITES.with(std::cell::Cell::get)
+}
+
 impl std::fmt::Debug for FrontRustls {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FrontRustls")
@@ -1012,7 +1054,7 @@ impl SocketHandler for FrontRustls {
             }
 
             loop {
-                match self.session.write_tls(&mut self.stream) {
+                match flush_tls(&mut self.session, &mut self.stream) {
                     Ok(0) => {
                         //can_write = false;
                         break;
@@ -1053,7 +1095,7 @@ impl SocketHandler for FrontRustls {
         // is never called.
         if !is_error && !is_closed && can_write && self.session.wants_write() {
             loop {
-                match self.session.write_tls(&mut self.stream) {
+                match flush_tls(&mut self.session, &mut self.stream) {
                     Ok(0) => break,
                     Ok(_) => {}
                     Err(e) => match e.kind() {
@@ -1205,7 +1247,7 @@ impl SocketHandler for FrontRustls {
             // caller can consume and retry with adjusted slices.
             if buffered_size > 0 && buffered_size < total_len {
                 loop {
-                    match self.session.write_tls(&mut self.stream) {
+                    match flush_tls(&mut self.session, &mut self.stream) {
                         Ok(0) => break,
                         Ok(_) => {}
                         Err(e) => match e.kind() {
@@ -1238,7 +1280,7 @@ impl SocketHandler for FrontRustls {
             }
 
             loop {
-                match self.session.write_tls(&mut self.stream) {
+                match flush_tls(&mut self.session, &mut self.stream) {
                     Ok(0) => {
                         break;
                     }
@@ -1273,7 +1315,7 @@ impl SocketHandler for FrontRustls {
 
         if !is_error && !is_closed && can_write && self.session.wants_write() {
             loop {
-                match self.session.write_tls(&mut self.stream) {
+                match flush_tls(&mut self.session, &mut self.stream) {
                     Ok(0) => break,
                     Ok(_) => {}
                     Err(e) => match e.kind() {
@@ -1328,6 +1370,36 @@ impl SocketHandler for FrontRustls {
 
     fn socket_close(&mut self) {
         self.session.send_close_notify();
+    }
+
+    /// Queue `buf` and the `close_notify` behind it, then flush both with one
+    /// `write_tls`, which hands every pending record to one `write_vectored`
+    /// (`rustls-0.23.45/src/vecbuf.rs`, `ChunkVecBuffer::write_to`).
+    ///
+    /// The plaintext must be queued first: rustls encrypts it into the send
+    /// buffer at once (the handshake is over on every connection the mux
+    /// drives), and the alert queued after it is the next record on the wire,
+    /// so the peer reads the bytes and then the close. The other order would
+    /// end the peer's reading before the bytes.
+    ///
+    /// When rustls does not take all of `buf` (its send buffer is full) the
+    /// alert is not queued, as the trait requires, and the caller's next call
+    /// carries the rest. A write error falls back to [`Self::socket_write`],
+    /// which reports it with the socket context.
+    fn socket_write_then_close(&mut self, buf: &[u8]) -> (usize, SocketResult) {
+        if self.peer_reset {
+            return (0, SocketResult::Closed);
+        }
+        match self.session.writer().write(buf) {
+            Ok(absorbed) => {
+                if absorbed == buf.len() {
+                    self.session.send_close_notify();
+                }
+                let (_flushed, status) = self.socket_write(&[]);
+                (absorbed, status)
+            }
+            Err(_) => self.socket_write(buf),
+        }
     }
 
     fn socket_wants_write(&self) -> bool {

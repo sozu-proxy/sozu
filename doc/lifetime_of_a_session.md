@@ -595,6 +595,10 @@ fail with `ENOTCONN`. HAProxy skips the socket shutdown on the same
 condition (`conn_sock_shutw`, `include/haproxy/connection.h`). The TLS
 `close_notify` is written before and is kept: RFC 8446 §6.1 requires
 it before the write side closes, whether or not the peer sent its own.
+On an H2 frontend closed by its final GOAWAY, rustls sends that GOAWAY
+and the `close_notify` behind it in one `writev(2)`
+(`H2Shell::flush_zero_to_socket`,
+[#1607](https://github.com/sozu-proxy/sozu/issues/1607)).
 
 A backend whose H1 read returns its last bytes together with the EOF
 records HUP on that read (`ConnectionH1::readable`,
