@@ -58,6 +58,20 @@ READABLE after a short read once HUP was seen and the next pass reads the
 EOF. The pipe and the pre-mux states act on HUP directly
 (`Pipe::frontend_hup`, `Pipe::backend_hup`) and need no EOF read.
 
+A TLS frontend also carries that proof from one read call to the next
+([#1609](https://github.com/sozu-proxy/sozu/issues/1609)). The H2 read
+path asks for one frame header, then one payload, so the frames of one
+record are served by several calls from rustls's plaintext buffer, and
+the call that emptied it used to `recv` once more for an EAGAIN.
+`FrontRustls::recv_memory` (`RecvMemory`, `lib/src/socket.rs`) remembers
+that a `recv` answered short or EAGAIN, and `HttpsSession::update_readiness`
+(`lib/src/https.rs`) clears it on every event delivered for the frontend
+token, in every session state: a byte that arrived after the proof raised
+an edge that is either pending in epoll, and re-arms READABLE when the next
+`epoll_wait` delivers it, or already delivered, which cleared the memory.
+HUP or ERROR turns the memory off for good, so a FIN that arrived with the
+data is read by the next call as above.
+
 The stop has a price, and it is HAProxy's (`src/raw_sock.c`: stop when
 `ret < try`, let the poller report the EOF). When a backend's FIN lands
 after the `epoll_wait` that woke the pass, the event carries READABLE
@@ -238,6 +252,21 @@ itself is driven from `lib/src/protocol/rustls.rs`; the listener-level config
 (certificate stores, ALPN list, SNI binding policy) lives in
 `lib/src/https.rs` and `lib/src/tls.rs`.
 
+The handshake reads the way the established session does (§2.2,
+[#1609](https://github.com/sozu-proxy/sozu/issues/1609)): `handshake_read`
+(`lib/src/protocol/rustls.rs`) stops on a `recv` that answers fewer bytes
+than the 4096 rustls offered, as on EAGAIN, and drops READABLE; the next
+segment of a ClientHello split across several raises the next edge. A TLS 1.3
+server wants to read again as soon as its own flight is queued, so without that
+stop the ClientHello and the client `Finished` were each followed by a `recv`
+that answered EAGAIN. The handshake closes on HUP before reading, so it needs
+no EOF exception. When the handshake completes, `upgraded_frontend_events`
+(`lib/src/https.rs`) arms the mux frontend for WRITABLE, and for READABLE only
+when the handshake still held a READABLE edge or rustls already holds
+plaintext (the HTTP/2 preface sharing a segment with the `Finished`) or a
+`close_notify`; a socket the handshake proved empty gets no read until its
+next edge. The TCP urgent data reserve of §2.2 applies to the handshake too.
+
 ### 4.1 SNI / `:authority` binding
 
 If `strict_sni_binding` is enabled on a listener
@@ -264,7 +293,7 @@ with browser-driven coalescing on legitimate wildcard certs.
 ### 4.2 ALPN and `disable_http11`
 
 After the handshake completes, Sōzu inspects the negotiated ALPN
-protocol (`lib/src/https.rs:447-506`) and decides which mux
+protocol (`lib/src/https.rs:477-536`) and decides which mux
 flavour to instantiate:
 
 - ALPN `h2` → HTTP/2 mux.
@@ -278,10 +307,10 @@ counted with two distinct keys so dashboards can split refusals by
 cause:
 
 - `https.alpn.rejected.unsupported` — peer offered an ALPN that Sōzu
-  does not implement (e.g. `h3`) (`lib/src/https.rs:484`).
+  does not implement (e.g. `h3`) (`lib/src/https.rs:514`).
 - `https.alpn.rejected.http11_disabled` — peer wanted `http/1.1` but
   the listener has `disable_http11 = true`
-  (`lib/src/https.rs:467, 497`).
+  (`lib/src/https.rs:497, 527`).
 
 The startup-time validator at `command/src/config.rs:1279-1283, 1301-1307`
 catches the obvious operator mistake of pairing `disable_http11 = true` with
@@ -696,7 +725,7 @@ set to read a session's life from a dashboard:
   (`TlsHandshake::record_handshake_duration_ms` /
   `handshake_failure_reason`, `lib/src/protocol/rustls.rs`).
 - `https.alpn.rejected.{unsupported,http11_disabled}` — ALPN refusal
-  causes (`lib/src/https.rs:467, 484, 497`).
+  causes (`lib/src/https.rs:497, 514, 527`).
 - `client.connections`, `client.connections_max`,
   `client.connections_percent` — slab-backed lifecycle gauges
   (`client.connections` is sampled per increment/decrement in

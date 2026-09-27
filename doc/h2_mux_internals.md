@@ -1025,9 +1025,18 @@ contract is unchanged: an EAGAIN always ends the call with
 READABLE stays. A `recv` that answers fewer bytes than rustls offered ends the
 call the same way, once what it brought is processed and drained, because the
 receive queue is empty and another `recv` could only answer EAGAIN
-([#1602](https://github.com/sozu-proxy/sozu/issues/1602)); a call whose buffer
-that plaintext fills still answers `Continue`, and the EAGAIN then comes from a
-later call, which does not assume the queue is still empty. EOF and
+([#1602](https://github.com/sozu-proxy/sozu/issues/1602)). A call whose buffer
+that plaintext fills still answers `Continue`, and the proof outlives it:
+`FrontRustls::recv_memory` (`RecvMemory`, `lib/src/socket.rs`) records that a
+`recv` answered short or EAGAIN, so the later call that finds the plaintext
+empty answers `WouldBlock` without a `recv` — once per request on a
+multiplexed connection before
+[#1609](https://github.com/sozu-proxy/sozu/issues/1609). The memory is
+cleared by every event the event loop delivers for the frontend token
+(`HttpsSession::update_readiness` calls `FrontRustls::readiness_delivered`,
+whatever the session state), because a byte that arrived after the proof raised
+an edge that is either still pending in epoll or already delivered; HUP or ERROR
+turns it off for good, so the EOF behind a short read is still read. EOF and
 `close_notify` are answered `Closed` by the first call that finds no plaintext
 left, after the frames that preceded them; a TCP FIN behind a short read is
 read by the next call, which `update_readiness_after_read` makes once HUP was

@@ -16216,6 +16216,7 @@ mod tests {
             tls_fatal: false,
             session_ulid: Ulid::generate(),
             configured_peer: None,
+            recv_memory: Default::default(),
         };
         (socket, peer, client)
     }

@@ -262,6 +262,12 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         self.frontend.socket_ref()
     }
 
+    /// The frontend socket handler itself, for what only it knows how to
+    /// record: `FrontRustls::readiness_delivered` (`lib/src/https.rs`).
+    pub fn front_socket_handler_mut(&mut self) -> &mut Front {
+        &mut self.frontend
+    }
+
     pub fn front_socket_mut(&mut self) -> &mut TcpStream {
         self.frontend.socket_mut()
     }
