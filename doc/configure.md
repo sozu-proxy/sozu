@@ -3465,7 +3465,6 @@ behind each reject reason.
 
 | Metric                             | Type    | Scope | Description                                     |
 | ---------------------------------- | ------- | ----- | ----------------------------------------------- |
-| `socket.read.infinite_loop.error`  | counter | proxy | TCP socket read loop safety breaker triggered   |
 | `socket.write.infinite_loop.error` | counter | proxy | TCP socket write loop safety breaker triggered  |
 | `tcp.read.error`                   | counter | proxy | TCP socket read error                           |
 | `tcp.write.error`                  | counter | proxy | TCP socket write error                          |

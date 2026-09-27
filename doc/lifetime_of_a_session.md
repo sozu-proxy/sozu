@@ -43,6 +43,41 @@ once when a socket transitions to readable or writable. If Sōzu does
 not drain the kernel buffer fully on that wake-up, it gets no other
 event until the *next* edge.
 
+On the read side, "drained" is detected without a wasted `recv(2)`
+([#1602](https://github.com/sozu-proxy/sozu/issues/1602)). A read that
+returns fewer bytes than it was offered has emptied the stream socket's
+receive queue (`man 7 epoll`), so `plain_socket_read` and
+`rustls_socket_read` (`lib/src/socket.rs`) stop there and answer
+`WouldBlock` with the bytes instead of reading on to an EAGAIN; any byte
+that arrives later raises a new edge. A read that fills its buffer is not
+a short read and answers `Continue`. The one exception is a FIN that
+arrived with the data: its edge is the HUP already folded into the
+readiness, and nothing will announce the EOF again, so
+`update_readiness_after_read` (`lib/src/protocol/mux/mod.rs`) keeps
+READABLE after a short read once HUP was seen and the next pass reads the
+EOF. The pipe and the pre-mux states act on HUP directly
+(`Pipe::frontend_hup`, `Pipe::backend_hup`) and need no EOF read.
+
+The stop has a price, and it is HAProxy's (`src/raw_sock.c`: stop when
+`ret < try`, let the poller report the EOF). When a backend's FIN lands
+after the `epoll_wait` that woke the pass, the event carries READABLE
+without HUP; the short read returns the last bytes and does not issue the
+`recv` that would have found the EOF, so the backend is closed one
+`epoll_wait` round later, on the `EPOLLRDHUP` edge the FIN queued, and no
+later (`a_fin_after_epoll_wait_closes_the_backend_on_the_next_round_at_the_latest`).
+When the FIN reached the kernel before `epoll_wait` returned, the edge
+carries HUP and the backend is closed in the same pass. The `recv` saved
+answers EAGAIN on every short read not followed by a FIN, which is the
+common case.
+
+The guarantee has one known hole: TCP urgent data. `recv` stops before
+an urgent (out-of-band) mark even with bytes queued behind it, so a
+short read while such a mark is pending leaves those bytes in the kernel
+with no further edge. A stream that carries OOB data (telnet, rlogin,
+FTP `ABOR`) can stall until the peer's next send. HAProxy and tokio
+behave the same, and Sōzu never read out-of-band data before this
+change either.
+
 To survive that contract, every protocol module routes its readiness
 through a `Readiness` tracker (`Readiness` in `lib/src/lib.rs`, reached in
 the mux through `Connection::readiness_mut` in

@@ -411,6 +411,51 @@
   `https_close_keeps_the_frontend_shutdown_while_the_client_is_there` (`https.rs`), each seen red
   first; the two "keeps" tests check that a peer still there receives the FIN.
 
+- **`perf(socket)`: a read stops on a short read instead of reading on to EAGAIN
+  ([#1602](https://github.com/sozu-proxy/sozu/issues/1602)).** A stream socket that answers
+  fewer bytes than it was offered has emptied its receive queue (`man 7 epoll`), so the `recv(2)`
+  every read path issued next could only answer EAGAIN. `tcp_socket_read` now issues one read per
+  call through a new private `plain_socket_read`, generic over `Read` like `rustls_socket_read`
+  so tests count every `recv`: a short read answers `(n, WouldBlock)` — what the loop answered one
+  EAGAIN later — and a read that fills the buffer is not a short read and answers `Continue`.
+  `rustls_socket_read` observes the length `read_tls` offered through a `ShortReadProbe` adapter
+  and makes no second `recv` in a pass after a short one; it still processes and drains what
+  arrived, and still reports a `close_notify` that arrived with it, since that `read_tls` touches
+  no socket. mio registers every socket edge-triggered, and bytes arriving after the short read
+  raise the next event. The one exception is a FIN that arrived with the data: its edge is the HUP
+  already folded into the readiness, so `update_readiness_after_read` keeps READABLE after a short
+  read once HUP was seen, and the next pass reads the EOF, as HAProxy (`read0` on `FD_POLL_HUP`)
+  and tokio (sticky closed readiness) do. The pipe and the pre-mux states act on HUP directly and
+  need no EOF read. A pass does not remember a short read of an earlier call, because an edge may
+  have arrived in between; the EAGAIN that follows a call whose buffer filled from the last short
+  read's plaintext therefore remains. Known limit: `recv` stops before a TCP urgent (out-of-band)
+  mark even with bytes queued behind it, so a stream that carries OOB data (telnet, rlogin, FTP
+  `ABOR`) can stall until the peer's next send; HAProxy and tokio behave the same, and sozu never
+  read out-of-band data before either.
+  Trade with #1603: an H1 backend whose FIN lands after the `epoll_wait` that woke the pass
+  (READABLE without HUP) is now closed one `epoll_wait` round later, on the `EPOLLRDHUP` edge the
+  FIN queued, instead of in the same pass: the pass no longer issues the `recv` that found the
+  EOF, because that `recv` answers EAGAIN whenever no FIN follows. When the FIN reached the kernel
+  before `epoll_wait` returned, the edge carries HUP and the backend is still closed in the same
+  pass. This is HAProxy's choice (`src/raw_sock.c`: stop on `ret < try`, let the poller report
+  the EOF). The two #1603 tests are rewritten to that contract rather than removed:
+  `an_h1_backend_eof_read_records_hup_and_a_frontend_one_does_not` reads the EOF on its second
+  `readable`, `a_backend_eof_read_with_its_last_bytes_closes_the_backend_in_the_same_pass` covers
+  the coalesced edge, and `a_fin_after_epoll_wait_closes_the_backend_on_the_next_round_at_the_latest`
+  pins the one extra round, and no more, on a real socket with mio.
+  Measured on release builds of main `13269c5e` (with #1603) and this change, one worker,
+  loopback, a backend that closes after each response, 20 requests per scenario, LOAD1 below 2.
+  Syscalls per request, `fdtrace` LD_PRELOAD interposer: H1 20.35 → 18.65 (`recv` 4.45 → 2.30,
+  EAGAIN 31 → 0 over the run, `epoll_wait` 5.60 → 5.95); H2 over TLS 35.25 → 34.35 (`recv`
+  10.70 → 9.45, EAGAIN 88 → 68, `epoll_wait` 8.45 → 8.65); 20 requests multiplexed on one H2
+  connection 15.95 → 14.70 (`recv` 5.35 → 4.00, EAGAIN 34 → 23, `epoll_wait` 3.90 → 4.05).
+  `intentrace -p`: H1 20.65 → 18.85 (`recvfrom` 4.00 → 2.00, `epoll_wait` 4.55 → 4.75), H2
+  42.10 → 41.05 (`recvfrom` 6.00 → 5.00, `epoll_wait` 4.95 → 4.90), multiplexed 16.45 → 15.45
+  (`recvfrom` 4.10 → 3.10, `epoll_wait` 3.10 → 3.10).
+  **Operator-visible:** the counter `socket.read.infinite_loop.error` is removed: the plain read no
+  longer loops, so its safety breaker cannot fire. `socket.write.infinite_loop.error` and
+  `rustls.read.infinite_loop.error` are unchanged.
+
 - **`perf(router)`: routing a request copies no authority and allocates no trie path
   ([#1589](https://github.com/sozu-proxy/sozu/issues/1589)).** Two of the three allocations #1583
   left per routed request inside `Router::route_from_request` are gone. The authority is no longer

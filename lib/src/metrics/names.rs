@@ -424,7 +424,6 @@ pub mod slab {
 
 /// Raw-socket counters.
 pub mod socket {
-    pub const READ_INFINITE_LOOP_ERROR: &str = "socket.read.infinite_loop.error";
     pub const WRITE_INFINITE_LOOP_ERROR: &str = "socket.write.infinite_loop.error";
 }
 

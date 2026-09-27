@@ -1398,8 +1398,8 @@ impl TcpSession {
             // further frontend event will ever arrive -- returning here
             // would stall the session forever waiting for a wake-up that
             // never comes. Clear the now-consumed HUP bit and fall through
-            // into the loop below so `readable` (drains the kernel tail to
-            // EOF) and `back_writable` (flushes `frontend_buffer`) can run
+            // into the loop below so `readable` (drains the kernel tail) and
+            // `back_writable` (flushes `frontend_buffer`) can run
             // synchronously in this same pass, exactly how a backend HUP is
             // already handled inside the loop.
             self.front_readiness().event.remove(Ready::HUP);

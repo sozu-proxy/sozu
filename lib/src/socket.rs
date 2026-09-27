@@ -192,93 +192,125 @@ fn log_socket_module_prefix(
     )
 }
 
+/// Body of [`tcp_socket_read`], generic over the transport so tests can count
+/// every read a call issues against it.
+///
+/// One `read` per call. A stream socket that answers fewer bytes than it was
+/// offered has emptied its receive queue: `man 7 epoll` (man-pages 6.13, the
+/// EPOLLET question) — "if you call read(2) by asking to read a certain
+/// amount of data and read(2) returns a lower number of bytes, you can be sure
+/// of having exhausted the read I/O space for the file descriptor". A second
+/// `recv(2)` could only answer EAGAIN, so the call stops there, as HAProxy
+/// (`src/raw_sock.c`, `fd_cant_recv` when `ret < try`) and tokio
+/// (`tokio/src/io/poll_evented.rs`, `clear_readiness` when `0 < n < len`) do.
+///
+/// One exception to that guarantee: TCP urgent data. `recv` stops before an
+/// urgent (out-of-band) mark even when bytes are queued behind it, so a short
+/// read does NOT prove the queue empty while such a mark is pending. Measured
+/// on a loopback socket: `AAAA`, `send(B, MSG_OOB)`, `CCCC` raise one edge,
+/// this read answers `(4, WouldBlock)` with `AAAA`, no further event comes,
+/// and `CCCC` stays in the kernel until the peer sends again. A stream that
+/// carries OOB data (telnet, rlogin, FTP `ABOR`) can therefore stall until the
+/// peer's next send. HAProxy and tokio behave the same, and sozu never read
+/// out-of-band data before either.
+///
+/// Readiness contract:
+///
+/// - a short read answers `(n, WouldBlock)`, exactly what the previous loop
+///   answered one EAGAIN later; the caller drops READABLE, and mio registers
+///   every socket edge-triggered (`mio/src/sys/unix/selector/epoll.rs`,
+///   `EPOLLET`), where "an event will be generated upon each receipt of a
+///   chunk of data" (`man 7 epoll`), so bytes arriving after this `recv`
+///   raise the next event;
+/// - a read that fills `buf` is not a short read: it answers `(n, Continue)`
+///   and READABLE stays, because more may be queued;
+/// - EOF behind the data is left for the next call. A FIN that was already
+///   signalled comes with no further edge, so a caller that saw HUP must keep
+///   READABLE to read it: `update_readiness_after_read` in the mux does.
+///
+/// The returned error, when there is one, is a transport failure the caller
+/// logs with its socket context; the result is then [`SocketResult::Error`].
+fn plain_socket_read<R: Read>(
+    stream: &mut R,
+    buf: &mut [u8],
+) -> (usize, SocketResult, Option<std::io::Error>) {
+    // An empty slice reads nothing and says nothing about the socket; callers
+    // guard against it, and `(0, Continue)` is what they expect back.
+    if buf.is_empty() {
+        return (0, SocketResult::Continue, None);
+    }
+    match stream.read(buf) {
+        Ok(0) => (0, SocketResult::Closed, None),
+        Ok(sz) => {
+            // `read` cannot report more bytes than the slice it was given.
+            debug_assert!(
+                sz <= buf.len(),
+                "read reported {sz} bytes into a {}-byte slice",
+                buf.len()
+            );
+            if sz == buf.len() {
+                (sz, SocketResult::Continue, None)
+            } else {
+                (sz, SocketResult::WouldBlock, None)
+            }
+        }
+        Err(e) => match e.kind() {
+            ErrorKind::WouldBlock => (0, SocketResult::WouldBlock, None),
+            // Treat `ConnectionRefused` as a closed socket, mirroring the
+            // write path. On Linux a failed asynchronous `connect()`
+            // surfaces as `ECONNREFUSED` on the first read; it is
+            // operationally identical to any other benign peer-initiated
+            // close and does not warrant a log line on every backend
+            // that happens to be down.
+            ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionRefused => (0, SocketResult::Closed, None),
+            _ => (0, SocketResult::Error, Some(e)),
+        },
+    }
+}
+
 /// Shared read/write/vectored-write logic used by both
 /// [`impl SocketHandler for TcpStream`] and
 /// [`impl SocketHandler for SessionTcpStream`]. Free-function entry point:
 /// `self` is out of scope here, so error logs use [`log_socket_module_prefix`]
 /// which renders the same `Session(peer, rtt, protocol)` context as
 /// [`log_socket_context!`] by reading from the `stream` + `session_ulid`
-/// parameters threaded through each helper.
+/// parameters threaded through each helper. The read itself is
+/// [`plain_socket_read`].
 fn tcp_socket_read(
     stream: &mut TcpStream,
     buf: &mut [u8],
     session_ulid: Option<Ulid>,
     configured_peer: Option<SocketAddr>,
 ) -> (usize, SocketResult) {
-    let mut size = 0usize;
-    let mut counter = 0;
-    loop {
-        counter += 1;
-        if counter > MAX_LOOP_ITERATIONS {
-            error!(
-                "{} MAX_LOOP_ITERATION reached in TcpStream::socket_read",
-                log_socket_module_prefix(stream, session_ulid, configured_peer)
-            );
-            incr!(names::socket::READ_INFINITE_LOOP_ERROR);
-            return (size, SocketResult::Error);
-        }
-        // Loop invariant: the running cursor never overshoots the buffer, so the
-        // `&mut buf[size..]` slice below can never panic on a bad offset.
-        debug_assert!(
-            size <= buf.len(),
-            "read cursor {size} overran buffer len {} (would slice out of bounds)",
-            buf.len()
-        );
-        if size == buf.len() {
-            return (size, SocketResult::Continue);
-        }
-        match stream.read(&mut buf[size..]) {
-            Ok(0) => return (size, SocketResult::Closed),
-            Ok(sz) => {
-                // `read` cannot report more bytes than the slice it was given.
-                debug_assert!(
-                    sz <= buf.len() - size,
-                    "read reported {sz} bytes into a {}-byte remaining slice",
-                    buf.len() - size
-                );
-                size += sz;
-            }
-            Err(e) => match e.kind() {
-                ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
-                // Treat `ConnectionRefused` as a closed socket, mirroring the
-                // write path. On Linux a failed asynchronous `connect()`
-                // surfaces as `ECONNREFUSED` on the first read; it is
-                // operationally identical to any other benign peer-initiated
-                // close and does not warrant a log line on every backend
-                // that happens to be down.
-                ErrorKind::ConnectionReset
-                | ErrorKind::ConnectionAborted
-                | ErrorKind::BrokenPipe
-                | ErrorKind::ConnectionRefused => return (size, SocketResult::Closed),
-                // Noisy-expected transport failures: backend unreachable,
-                // TCP_USER_TIMEOUT expiry, post-close reads. Keep a log line
-                // so operators can still trend the rate, but `warn!` — this
-                // is reality-at-scale, not a sozu invariant break.
-                ErrorKind::HostUnreachable
-                | ErrorKind::NetworkUnreachable
-                | ErrorKind::TimedOut
-                | ErrorKind::NotConnected => {
-                    warn!(
-                        "{} socket_read error={:?}",
-                        log_socket_module_prefix(stream, session_ulid, configured_peer),
-                        e
-                    );
-                    return (size, SocketResult::Error);
-                }
-                // Genuinely loud variants (`PermissionDenied`, `AddrNotAvailable`,
-                // `InvalidInput`/`Data`, …) and the unknown catch-all stay at
-                // `error!` so operators keep paging on real misconfig.
-                _ => {
-                    error!(
-                        "{} socket_read error={:?}",
-                        log_socket_module_prefix(stream, session_ulid, configured_peer),
-                        e
-                    );
-                    return (size, SocketResult::Error);
-                }
-            },
+    let (size, result, fault) = plain_socket_read(stream, buf);
+    if let Some(e) = fault {
+        match e.kind() {
+            // Noisy-expected transport failures: backend unreachable,
+            // TCP_USER_TIMEOUT expiry, post-close reads. Keep a log line
+            // so operators can still trend the rate, but `warn!` — this
+            // is reality-at-scale, not a sozu invariant break.
+            ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::TimedOut
+            | ErrorKind::NotConnected => warn!(
+                "{} socket_read error={:?}",
+                log_socket_module_prefix(stream, session_ulid, configured_peer),
+                e
+            ),
+            // Genuinely loud variants (`PermissionDenied`, `AddrNotAvailable`,
+            // `InvalidInput`/`Data`, …) and the unknown catch-all stay at
+            // `error!` so operators keep paging on real misconfig.
+            _ => error!(
+                "{} socket_read error={:?}",
+                log_socket_module_prefix(stream, session_ulid, configured_peer),
+                e
+            ),
         }
     }
+    (size, result)
 }
 
 fn tcp_socket_write(
@@ -608,6 +640,27 @@ enum RustlsReadFault {
     Plaintext(std::io::Error),
 }
 
+/// A [`Read`] adapter that records whether its last read returned fewer bytes
+/// than it was offered.
+///
+/// `ServerConnection::read_tls` issues exactly one `read` into its deframer
+/// buffer (`rustls-0.23.45/src/msgs/deframer/buffers.rs:208`) and returns only
+/// the byte count, not the length it offered, so a short read is invisible
+/// from its return value. An `Ok(0)` is EOF, not a short read, and an error is
+/// neither.
+struct ShortReadProbe<'a, R> {
+    inner: &'a mut R,
+    short: bool,
+}
+
+impl<R: Read> Read for ShortReadProbe<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.short = 0 < read && read < buf.len();
+        Ok(read)
+    }
+}
+
 /// Body of [`FrontRustls::socket_read`], generic over the transport so tests
 /// can count every read the pass issues against it.
 ///
@@ -625,11 +678,19 @@ enum RustlsReadFault {
 ///   [`SocketResult::WouldBlock`], because the drain ran first and so the
 ///   buffer is not full; the mux then drops READABLE until the next mio
 ///   event (`update_readiness`), which is the edge-triggered re-arm;
+/// - so does a `read_tls` whose `recv` answered fewer bytes than rustls
+///   offered (4096, `rustls-0.23.45/src/msgs/deframer/buffers.rs:220`): the
+///   receive queue is empty, as for [`plain_socket_read`], so the pass makes
+///   no second `recv` that could only answer EAGAIN. It still processes what
+///   arrived and drains the plaintext, and answers `WouldBlock` only when
+///   the buffer is still not full, and `Closed` when that arrival carried
+///   `close_notify`. [`ShortReadProbe`] sees the offered length, which
+///   `read_tls` does not return;
 /// - [`SocketResult::Continue`] with a full buffer means "more may be
 ///   buffered", so READABLE stays and the next call drains before it reads;
-/// - a `read_tls` that returns bytes but completes no record produces no
-///   plaintext, so the pass loops and reads again until EAGAIN, EOF or a
-///   full buffer;
+/// - a `read_tls` that fills what rustls offered but completes no record
+///   produces no plaintext, so the pass loops and reads again until a short
+///   read, EAGAIN, EOF or a full buffer;
 /// - one record can hold several H2 frames: the later calls are served from
 ///   the plaintext buffer without a `recv`.
 ///
@@ -644,7 +705,9 @@ enum RustlsReadFault {
 /// peer's last frames are handed over before the close. A call the buffered
 /// plaintext can satisfy completely returns `Continue` without looking at
 /// the socket, so a FIN that is already queued is seen one call later than
-/// when every call began with `read_tls`.
+/// when every call began with `read_tls`. A TCP FIN queued behind a short
+/// read is likewise seen by the next call, which the mux makes once it has
+/// seen HUP (`update_readiness_after_read`).
 fn rustls_socket_read<R: Read>(
     session: &mut ServerConnection,
     stream: &mut R,
@@ -664,6 +727,7 @@ fn rustls_socket_read<R: Read>(
     }
     let mut size = 0usize;
     let mut can_read = true;
+    let mut drained = false;
     let mut is_error = false;
     let mut is_closed = false;
     let mut fault = None;
@@ -733,7 +797,24 @@ fn rustls_socket_read<R: Read>(
             break;
         }
 
-        match session.read_tls(stream) {
+        // A short `recv` earlier in this pass emptied the receive queue, so a
+        // `read_tls` that would `recv` again can only answer EAGAIN. One that
+        // would not — `close_notify` received, which is exactly when
+        // `wants_read()` is false with the plaintext drained — still runs:
+        // it answers `Ok(0)` without touching the socket
+        // (rustls-0.23.45/src/conn.rs:768-770) and reports the close.
+        if drained && session.wants_read() {
+            can_read = false;
+            break;
+        }
+
+        let mut probe = ShortReadProbe {
+            inner: &mut *stream,
+            short: false,
+        };
+        let read = session.read_tls(&mut probe);
+        drained |= probe.short;
+        match read {
             Ok(0) => {
                 // Graceful FIN on the read side: peer closed its write
                 // half. Keep `peer_reset` unset so outbound writes can
@@ -1263,15 +1344,16 @@ impl SocketHandler for FrontRustls {
         &mut self.stream
     }
 
-    /// The fallback is reachable, and only the expect-proxy route makes it
-    /// look otherwise. There, `upgrade_expect` returns `None` unless both
-    /// PROXY addresses parse, so `peer_address` really is `Some` by the time
-    /// a handshake exists. The direct route has no such guarantee:
-    /// `HttpsSession::new` seeds `peer_address` with a best-effort
-    /// `sock.peer_addr().ok()` at accept (`https.rs`), an `Option` precisely
-    /// because that `getpeername(2)` can fail. Do not delete this arm —
-    /// `https::tests::front_rustls_peer_addr_falls_back_to_the_live_lookup`
-    /// fails without it.
+    /// No production route reaches the fallback any more. The expect-proxy
+    /// route gets there only through `upgrade_expect`, which returns `None`
+    /// unless both PROXY addresses parse, so `peer_address` is `Some` by the
+    /// time a handshake exists; the direct route seeds it in
+    /// `HttpsSession::new` (`https.rs`) with the address `accept(2)` returned
+    /// with the socket, which cannot fail the way `getpeername(2)` can. The
+    /// arm stays as defence in depth: a handler built without a peer would
+    /// otherwise blank the `peer=` slot of a healthy connection. Do not
+    /// delete it — `https::tests::front_rustls_peer_addr_falls_back_to_the_live_lookup`
+    /// builds such a handler by hand and fails without it.
     fn peer_addr(&self) -> Option<SocketAddr> {
         self.configured_peer
             .or_else(|| self.stream.peer_addr().ok())
@@ -2020,8 +2102,9 @@ mod tests {
     }
 }
 
-/// [`rustls_socket_read`] against an in-memory transport that counts every
-/// read the pass issues: each one is a `recv(2)` on the real socket.
+/// [`rustls_socket_read`] and [`plain_socket_read`] against an in-memory
+/// transport that counts every read a call issues: each one is a `recv(2)` on
+/// the real socket.
 #[cfg(test)]
 mod rustls_read_tests {
     use std::{collections::VecDeque, io::Write, sync::Arc};
@@ -2057,12 +2140,15 @@ mod rustls_read_tests {
 
     /// A non-blocking transport: `wire` is what the kernel holds, served by at
     /// most one read, and `eof` is a received FIN once `wire` is drained.
+    /// `eagains` counts the reads that found nothing, the ones a short read
+    /// makes unnecessary.
     #[derive(Default)]
     struct CountingTransport {
         wire: VecDeque<u8>,
         eof: bool,
         reset: bool,
         reads: usize,
+        eagains: usize,
     }
 
     impl Read for CountingTransport {
@@ -2075,6 +2161,7 @@ mod rustls_read_tests {
                 return if self.eof {
                     Ok(0)
                 } else {
+                    self.eagains += 1;
                     Err(ErrorKind::WouldBlock.into())
                 };
             }
@@ -2321,9 +2408,13 @@ mod rustls_read_tests {
     }
 
     /// A caller buffer larger than everything received (the H1 path) takes the
-    /// whole record, then stops on `EAGAIN` within the same call.
+    /// whole record in one short `recv` and stops there: the queue is empty,
+    /// so a second `recv` could only answer EAGAIN.
+    ///
+    /// Before the stop on a short read the pass called `read_tls` again and
+    /// counted 2 reads, the second one EAGAIN.
     #[test]
-    fn a_large_buffer_drains_the_record_then_reports_would_block() {
+    fn a_large_buffer_drains_the_record_in_one_short_recv() {
         let (mut front, mut client) = front_and_client();
         let plaintext = client_frames().concat();
         let mut transport = CountingTransport {
@@ -2334,13 +2425,114 @@ mod rustls_read_tests {
         let (read, result) = front.read(&mut transport, 16 * 1024);
         assert_eq!(read, plaintext);
         assert_eq!(result, SocketResult::WouldBlock);
-        assert_eq!(transport.reads, 2, "the record, then EAGAIN");
+        assert_eq!(
+            (transport.reads, transport.eagains),
+            (1, 0),
+            "one short recv for the record and no EAGAIN"
+        );
+    }
+
+    /// `close_notify` in the same arrival as the data, read with a large
+    /// buffer: the pass stops reading the socket after the short `recv`, but
+    /// must still report the close rustls already processed, in the same call.
+    /// A pass that skipped every `read_tls` after a short read would answer
+    /// `WouldBlock` here and leave the close unreported until a later event.
+    #[test]
+    fn close_notify_in_the_short_read_is_reported_in_the_same_call() {
+        let (mut front, mut client) = front_and_client();
+        let plaintext = client_frames().concat();
+        let mut wire = seal(&mut client, &plaintext);
+        client.send_close_notify();
+        while client.wants_write() {
+            client
+                .write_tls(&mut wire)
+                .expect("the close_notify alert must serialize");
+        }
+        let mut transport = CountingTransport {
+            wire: wire.into(),
+            ..Default::default()
+        };
+
+        let (read, result) = front.read(&mut transport, 16 * 1024);
+        assert_eq!(read, plaintext, "the data precedes the close");
+        assert_eq!(result, SocketResult::Closed);
+        assert!(front.peer_disconnected && !front.peer_reset);
+        assert_eq!((transport.reads, transport.eagains), (1, 0));
+    }
+
+    /// A TCP FIN behind the data, read with a large buffer: the short `recv`
+    /// delivers the data and stops, and the FIN is read by the next call. The
+    /// mux makes that call because it saw HUP
+    /// (`update_readiness_after_read`).
+    #[test]
+    fn a_fin_behind_a_short_read_is_reported_by_the_next_call() {
+        let (mut front, mut client) = front_and_client();
+        let plaintext = client_frames().concat();
+        let mut transport = CountingTransport {
+            wire: seal(&mut client, &plaintext).into(),
+            eof: true,
+            ..Default::default()
+        };
+
+        let (read, result) = front.read(&mut transport, 16 * 1024);
+        assert_eq!(read, plaintext);
+        assert_eq!(result, SocketResult::WouldBlock);
+        assert!(!front.peer_disconnected, "the FIN has not been read yet");
+
+        let (read, result) = front.read(&mut transport, 16 * 1024);
+        assert!(read.is_empty());
+        assert_eq!(result, SocketResult::Closed);
+        assert!(front.peer_disconnected && !front.peer_reset);
+        assert_eq!((transport.reads, transport.eagains), (2, 0));
+    }
+
+    /// A body spanning several records and many 4096-byte `read_tls` calls,
+    /// read with the H1 buffer size: every byte arrives in order and the full
+    /// reads keep the pass going.
+    ///
+    /// Exactly one read answers EAGAIN. The final short `recv` happens in a
+    /// call whose buffer then fills from the plaintext it decrypted, so that
+    /// call answers `Continue`; the next call drains the rest and must `recv`
+    /// once more. A pass does not carry "the queue was empty" over to a later
+    /// call on purpose: an edge may have arrived in between, and the mux would
+    /// already have folded it into the READABLE it kept.
+    #[test]
+    fn a_large_body_over_tls_arrives_intact() {
+        let (mut front, mut client) = front_and_client();
+        let body: Vec<u8> = (0..(64 * 1024 + 123)).map(|i| (i % 251) as u8).collect();
+        // One record per 16 KiB chunk: the client's outgoing buffer would
+        // refuse the whole body in one `write_all`.
+        let mut transport = CountingTransport {
+            wire: body
+                .chunks(16 * 1024)
+                .flat_map(|chunk| seal(&mut client, chunk))
+                .collect(),
+            ..Default::default()
+        };
+
+        let mut received = Vec::new();
+        loop {
+            let (read, result) = front.read(&mut transport, 16 * 1024);
+            received.extend_from_slice(&read);
+            match result {
+                SocketResult::Continue => assert_eq!(read.len(), 16 * 1024),
+                SocketResult::WouldBlock => break,
+                other => panic!("unexpected {other:?} after {} bytes", received.len()),
+            }
+        }
+        assert_eq!(received, body);
+        assert!(transport.wire.is_empty());
+        assert_eq!(
+            transport.eagains, 1,
+            "only the call after the one that filled from the last short read"
+        );
     }
 
     /// A record split across two arrivals: the first `read_tls` returns bytes
-    /// but `process_new_packets` produces no plaintext, so the pass must read
-    /// again — and, finding `EAGAIN`, report `WouldBlock` with nothing
-    /// delivered. The rest of the record then completes it.
+    /// but `process_new_packets` produces no plaintext. That `recv` was short,
+    /// so the queue is empty and the pass reports `WouldBlock` with nothing
+    /// delivered, without a second `recv`. The rest of the record then
+    /// completes it.
     #[test]
     fn a_fragmented_record_is_read_again_until_it_completes() {
         let (mut front, mut client) = front_and_client();
@@ -2355,7 +2547,11 @@ mod rustls_read_tests {
         let (read, result) = front.read(&mut transport, FRAME_HEADER_LEN);
         assert!(read.is_empty(), "half a record decrypts to nothing");
         assert_eq!(result, SocketResult::WouldBlock);
-        assert_eq!(transport.reads, 2, "the partial record, then EAGAIN");
+        assert_eq!(
+            (transport.reads, transport.eagains),
+            (1, 0),
+            "the partial record, in one short recv"
+        );
 
         transport.wire.extend(tail);
         for (index, block) in frames.iter().enumerate() {
@@ -2363,7 +2559,7 @@ mod rustls_read_tests {
             assert_eq!(&read, block, "frame block {index}");
             assert_eq!(result, SocketResult::Continue, "frame block {index}");
         }
-        assert_eq!(transport.reads, 3, "the rest of the record costs one recv");
+        assert_eq!(transport.reads, 2, "the rest of the record costs one recv");
     }
 
     /// `close_notify` behind the data in the same flight: every frame is
@@ -2529,5 +2725,213 @@ mod rustls_read_tests {
         assert_eq!(result, SocketResult::Closed);
         assert!(front.peer_disconnected && front.peer_reset);
         assert_eq!(transport.reads, 1);
+    }
+
+    /// Read everything `transport` holds through [`plain_socket_read`] with a
+    /// `len`-byte buffer, one call at a time, until a call answers something
+    /// other than `Continue`.
+    fn plain_read_all(transport: &mut CountingTransport, len: usize) -> (Vec<u8>, SocketResult) {
+        let mut received = Vec::new();
+        loop {
+            let mut buf = vec![0u8; len];
+            let (size, result, fault) = plain_socket_read(transport, &mut buf);
+            assert!(fault.is_none(), "unexpected read fault: {fault:?}");
+            received.extend_from_slice(&buf[..size]);
+            if result != SocketResult::Continue {
+                return (received, result);
+            }
+            assert_eq!(size, len, "Continue means the buffer filled");
+        }
+    }
+
+    /// A request smaller than the buffer (the H1 path, one request per
+    /// connection) costs one `recv`: it answers fewer bytes than offered, the
+    /// queue is empty, and the call reports `WouldBlock` with the bytes.
+    ///
+    /// Before the stop on a short read `tcp_socket_read` looped and counted 2
+    /// reads, the second one EAGAIN.
+    #[test]
+    fn a_short_plain_read_costs_one_recv_and_no_eagain() {
+        let request = b"GET /index.html HTTP/1.1\r\nHost: lolcatho.st\r\n\r\n".to_vec();
+        let mut transport = CountingTransport {
+            wire: request.iter().copied().collect(),
+            ..Default::default()
+        };
+
+        let mut buf = vec![0u8; 16 * 1024];
+        let (size, result, fault) = plain_socket_read(&mut transport, &mut buf);
+        assert!(fault.is_none());
+        assert_eq!(&buf[..size], &request[..]);
+        assert_eq!(result, SocketResult::WouldBlock);
+        assert_eq!(
+            (transport.reads, transport.eagains),
+            (1, 0),
+            "one short recv and no EAGAIN"
+        );
+    }
+
+    /// A read that fills the buffer is not a short read: it answers
+    /// `Continue`, READABLE stays, and the next call reads on.
+    #[test]
+    fn a_full_plain_buffer_is_not_a_short_read() {
+        let mut transport = CountingTransport {
+            wire: (0..250u8).collect(),
+            ..Default::default()
+        };
+
+        let mut buf = vec![0u8; 100];
+        let (size, result, _) = plain_socket_read(&mut transport, &mut buf);
+        assert_eq!((size, result), (100, SocketResult::Continue));
+        let (size, result, _) = plain_socket_read(&mut transport, &mut buf);
+        assert_eq!((size, result), (100, SocketResult::Continue));
+        let (size, result, _) = plain_socket_read(&mut transport, &mut buf);
+        assert_eq!((size, result), (50, SocketResult::WouldBlock));
+        assert_eq!((transport.reads, transport.eagains), (3, 0));
+    }
+
+    /// Data followed by a FIN: the short read delivers the data, and the next
+    /// call reads the EOF as `Closed`. An empty queue with a FIN is `Closed`
+    /// at once.
+    #[test]
+    fn a_fin_behind_a_short_plain_read_is_closed_on_the_next_call() {
+        let mut transport = CountingTransport {
+            wire: (0..50u8).collect(),
+            eof: true,
+            ..Default::default()
+        };
+
+        let mut buf = vec![0u8; 16 * 1024];
+        let (size, result, _) = plain_socket_read(&mut transport, &mut buf);
+        assert_eq!((size, result), (50, SocketResult::WouldBlock));
+        assert_eq!(buf[..size], (0..50u8).collect::<Vec<_>>()[..]);
+        let (size, result, _) = plain_socket_read(&mut transport, &mut buf);
+        assert_eq!((size, result), (0, SocketResult::Closed));
+        let (size, result, _) = plain_socket_read(&mut transport, &mut buf);
+        assert_eq!((size, result), (0, SocketResult::Closed), "EOF stays EOF");
+        assert_eq!(transport.eagains, 0);
+    }
+
+    /// A message arriving in fragments: each arrival costs one short `recv`
+    /// and ends its call, and the bytes concatenate in order.
+    #[test]
+    fn a_fragmented_plain_message_costs_one_recv_per_arrival() {
+        let message: Vec<u8> = (0..70u8).collect();
+        let mut transport = CountingTransport::default();
+        let mut received = Vec::new();
+
+        for chunk in message.chunks(30) {
+            transport.wire.extend(chunk);
+            let mut buf = vec![0u8; 16 * 1024];
+            let (size, result, _) = plain_socket_read(&mut transport, &mut buf);
+            assert_eq!((size, result), (chunk.len(), SocketResult::WouldBlock));
+            received.extend_from_slice(&buf[..size]);
+        }
+        assert_eq!(received, message);
+        assert_eq!((transport.reads, transport.eagains), (3, 0));
+    }
+
+    /// A body much larger than the buffer: every full read answers `Continue`,
+    /// the final short read answers `WouldBlock`, every byte arrives in order,
+    /// and no read answers EAGAIN.
+    #[test]
+    fn a_large_plain_body_arrives_intact_without_eagain() {
+        let body: Vec<u8> = (0..(1024 * 1024 + 123)).map(|i| (i % 251) as u8).collect();
+        let mut transport = CountingTransport {
+            wire: body.iter().copied().collect(),
+            ..Default::default()
+        };
+
+        let (received, result) = plain_read_all(&mut transport, 16 * 1024);
+        assert_eq!(result, SocketResult::WouldBlock);
+        assert_eq!(received, body);
+        assert_eq!(
+            (transport.reads, transport.eagains),
+            (65, 0),
+            "64 full reads and the short tail"
+        );
+    }
+
+    /// A body that is an exact multiple of the buffer ends on a full read, so
+    /// the only way to learn the queue is empty is the EAGAIN that follows: a
+    /// full buffer is never taken for a short read.
+    #[test]
+    fn a_plain_body_ending_on_a_full_buffer_still_needs_its_eagain() {
+        let body: Vec<u8> = (0..(4 * 16 * 1024)).map(|i| (i % 251) as u8).collect();
+        let mut transport = CountingTransport {
+            wire: body.iter().copied().collect(),
+            ..Default::default()
+        };
+
+        let (received, result) = plain_read_all(&mut transport, 16 * 1024);
+        assert_eq!(result, SocketResult::WouldBlock);
+        assert_eq!(received, body);
+        assert_eq!((transport.reads, transport.eagains), (5, 1));
+    }
+
+    /// The kernel property the stop relies on, on a real socket registered
+    /// edge-triggered with mio: after a short read, bytes that arrive later
+    /// raise a new READABLE event, and a FIN raises one too. No event is
+    /// pending in between, so nothing else would have woken the reader.
+    #[test]
+    fn after_a_short_read_new_bytes_raise_a_new_edge() {
+        use std::io::Write as _;
+
+        let token = mio::Token(7);
+        let mut poll = mio::Poll::new().expect("a poll instance must open");
+        let mut events = mio::Events::with_capacity(8);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let mut client = std::net::TcpStream::connect(
+            listener
+                .local_addr()
+                .expect("test listener must report its local address"),
+        )
+        .expect("loopback connect must complete");
+        let (accepted, _) = listener.accept().expect("the connection must be accepted");
+        accepted
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+        let mut server = TcpStream::from_std(accepted);
+        poll.registry()
+            .register(&mut server, token, mio::Interest::READABLE)
+            .expect("the stream must register");
+        let wait_for_edge = |poll: &mut mio::Poll, events: &mut mio::Events| {
+            poll.poll(events, Some(std::time::Duration::from_secs(5)))
+                .expect("poll must succeed");
+            events
+                .iter()
+                .any(|event| event.token() == token && event.is_readable())
+        };
+        let mut buf = vec![0u8; 16 * 1024];
+
+        client.write_all(b"first").expect("the client must write");
+        assert!(wait_for_edge(&mut poll, &mut events), "the first arrival");
+        assert_eq!(
+            tcp_socket_read(&mut server, &mut buf, None, None),
+            (5, SocketResult::WouldBlock)
+        );
+
+        poll.poll(&mut events, Some(std::time::Duration::from_millis(50)))
+            .expect("poll must succeed");
+        assert!(events.is_empty(), "edge-triggered: nothing new, no event");
+
+        client.write_all(b"second").expect("the client must write");
+        assert!(
+            wait_for_edge(&mut poll, &mut events),
+            "bytes arriving after a short read must raise a new edge"
+        );
+        assert_eq!(
+            tcp_socket_read(&mut server, &mut buf, None, None),
+            (6, SocketResult::WouldBlock)
+        );
+
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("the client must half-close");
+        assert!(wait_for_edge(&mut poll, &mut events), "the FIN");
+        assert_eq!(
+            tcp_socket_read(&mut server, &mut buf, None, None),
+            (0, SocketResult::Closed)
+        );
     }
 }

@@ -569,8 +569,11 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
             );
             if self.frontend_readiness.event.is_readable() {
                 // Keep reading: the kernel still has the tail of the payload
-                // queued behind the FIN. The `SocketResult::Closed` arm in
-                // `readable` finishes the lifecycle once that tail hits EOF.
+                // queued behind the FIN. `readable` drains it, possibly in one
+                // short read that stops before the EOF (`plain_socket_read`);
+                // `frontend_status` is already `Closed`, so the
+                // `check_connections` that follows the flush finishes the
+                // lifecycle either way, as does a `SocketResult::Closed` read.
                 self.frontend_readiness.interest.insert(Ready::READABLE);
             }
             self.backend_readiness.arm_writable();
