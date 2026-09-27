@@ -462,6 +462,41 @@
   `successive_dead_backends_reuse_one_dead_backend_list` (`mod.rs`), each seen failing without
   its change; `crate::test_allocations` gains `bytes()` to measure the size-only ones.
 
+- **`perf(mux)`: a session's wheel handles and backend reverse index no longer allocate
+  ([#1613](https://github.com/sozu-proxy/sozu/issues/1613)).** Two `hashbrown` tables were
+  still built once per session, so once per request on a one-request connection:
+  `Mux::timeouts`, a `HashMap<Token, TimeoutContainer>` allocated when the session was built
+  (1 allocation, 340 bytes), and `Context::backend_streams`, a `HashMap<Token, Vec<GlobalStreamId>>`
+  whose first `link_stream` allocated its table and the entry's vector (2 allocations,
+  156 bytes). The timeout keys are tokens, not timeout kinds: the frontend's never changes for
+  the life of a session and becomes the `frontend` field of a `MuxTimeouts`, while the backends'
+  are an open set, held in an `InlineTokenMap` — `BackendConnections`' shape, the lowest-token
+  entry inline and the others in a `BTreeMap`, iterated in ascending `Token` order. The reverse
+  index becomes an `InlineTokenMap<LinkedStreams>`, whose entry holds its first stream inline and
+  spills into a `Vec` sized for four only when a second stream links to the same connection (the
+  allocation the old vector made at that point); an emptied entry is still kept for the next link
+  (#1583). The frontend and one backend therefore keep their handles, and link their stream,
+  without allocating. `Mux::close` replaces the frontend's handle with an unarmed one where it
+  used to drop the map entry, and the WebSocket upgrade moves it out instead of removing it. Only
+  the debug consistency checks iterate either structure, so no log or metric depends on the
+  order. HAProxy (at `0ceb8c65f`) keeps no per-stream table at all: a stream's deadlines are fixed fields
+  (`include/haproxy/stream-t.h:276` `conn_exp`, `include/haproxy/channel-t.h:208`
+  `analyse_exp`) folded into its one task's `expire` (`include/haproxy/task-t.h:150`) with
+  `tick_first` in `process_stream` (`src/stream.c:2748`); a sozu session keeps one wheel entry
+  per connection because each connection's core publishes its own deadline. The trade-off: the
+  session object (`Rc<RefCell<HttpSession>>`, still one allocation) grows from 4 648 to
+  4 784 bytes. Measured on a release build, one worker, python backend, 20 sequential `curl`
+  requests, `LD_PRELOAD` malloc counter, two runs each, per request: H1, one request per
+  connection, 59.5–59.9 → 56.55–57.0 allocations and 16 178–16 454 → 15 819–16 172 bytes; H2,
+  one request per TLS connection, 392.45–392.6 → 389.3–389.6 allocations and 69 694–69 883 →
+  69 514–69 583 bytes; H2 multiplexed, 20 streams on one connection, one table of each per
+  connection amortized over 20 requests, within the run-to-run noise (62.7–65.25 → 61.55–63.55
+  allocations). Pinned by `a_session_holds_its_frontend_and_first_backend_wheel_handles_without_allocating`
+  (1 allocation / 340 bytes → none) and
+  `a_new_backend_entry_in_the_reverse_index_is_sized_for_one_stream` (2 allocations / 156 bytes
+  → none), each seen failing on the code before this change, and bounded on the spill side by
+  `a_second_stream_on_one_backend_spills_the_reverse_index_entry_once` (`mod.rs`).
+
 - **`perf(mux-h2)`: the final GOAWAY and the TLS `close_notify` of an H2 frontend leave in one
   write ([#1607](https://github.com/sozu-proxy/sozu/issues/1607)).** Closing an H2 connection over
   TLS on its final GOAWAY cost two `writev(2)` back to back, in the same pass: the GOAWAY, flushed

@@ -87,12 +87,19 @@ MuxState
 │       ├── Token(12) → H2(ConnectionH2)  ◄── backend to cluster "app-2" (h2c)
 │       └── ...
 │
+├── timeouts: MuxTimeouts                 ◄── the session's timer-wheel handles
+│   ├── frontend: TimeoutContainer
+│   └── backends: InlineTokenMap<TimeoutContainer>  (lowest token inline)
+│
 └── context: Context
     ├── streams: Vec<Stream>              ◄── shared stream pool
     │   ├── [0] Stream { state: Linked(Token(7)),  front: Kawa, back: Kawa, ... }
     │   ├── [1] Stream { state: Linked(Token(12)), front: Kawa, back: Kawa, ... }
     │   ├── [2] Stream { state: Recycle, ... }
     │   └── ...
+    ├── backend_streams: InlineTokenMap<LinkedStreams>
+    │                                     ◄── backend token → linked streams
+    │                                         (lowest token and first stream inline)
     ├── buffers: Box<dyn BufferSource>    ◄── caller-supplied buffer source
     │                                         (PoolBufferSource over the worker Pool)
     └── listener: Rc<RefCell<L>>
