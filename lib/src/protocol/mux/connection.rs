@@ -257,6 +257,14 @@ impl<Front: SocketHandler> Connection<Front> {
             Connection::H2(c) => c.socket.socket_mut(),
         }
     }
+    /// The socket handler itself, for what only it knows how to record:
+    /// `FrontRustls::readiness_delivered` (`lib/src/https.rs`).
+    pub fn socket_handler_mut(&mut self) -> &mut Front {
+        match self {
+            Connection::H1(c) => &mut c.socket,
+            Connection::H2(c) => &mut c.socket,
+        }
+    }
     /// The peer address this connection snapshotted at construction —
     /// `ConnectionH1::peer_address` / `ConnectionH2::peer_address`, the single
     /// [`SocketHandler::peer_addr`] read taken on its whole lifetime.

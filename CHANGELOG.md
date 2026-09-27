@@ -376,6 +376,55 @@
 
 ### 🔄 Changed
 
+- **`perf(tls)`: no `recv` that can only answer EAGAIN in the TLS handshake, at its upgrade, or
+  between two reads of one record ([#1609](https://github.com/sozu-proxy/sozu/issues/1609)).**
+  Three causes, established with symbolized backtraces of every `recv` on a release build, each
+  removed on its own terms. (1) The handshake read loop (`TlsHandshake::readable`, now
+  `handshake_read` in `lib/src/protocol/rustls.rs`) called `read_tls` until `WouldBlock`; a TLS 1.3
+  server wants to read again as soon as its flight is queued, so the ClientHello and the client
+  `Finished` were each followed by an EAGAIN. It now wraps the stream in the `ShortReadProbe` of
+  #1606 (made `pub(crate)` in `lib/src/socket.rs`, not duplicated) and stops on a short read,
+  dropping READABLE; a read that fills the 4096 bytes rustls offered still reads on, and the
+  handshake closes on HUP before reading, so it needs no EOF exception. (2) The upgrade armed the
+  mux frontend with READABLE unconditionally (`upgrade_handshake`, `lib/src/https.rs`), so every
+  new TLS session began with a `recv` on a socket the handshake had just proved empty; the new
+  `upgraded_frontend_events` arms READABLE only when the handshake still held a READABLE edge or
+  rustls already holds plaintext or a `close_notify`, which no edge would announce — the HTTP/2
+  preface sharing a segment with the `Finished` is still read at once. WRITABLE stays
+  unconditional. (3) #1606 made no second `recv` after a short one within a call, but did not
+  carry that proof to the next call on purpose, since an edge may be delivered in between; the H2
+  read path asks for one frame header and then one payload per call, so the call that emptied a
+  record's plaintext issued one EAGAIN per request on a multiplexed connection.
+  `FrontRustls::recv_memory` (`RecvMemory`) now carries the proof, and `HttpsSession::update_readiness`
+  clears it on every event delivered for the frontend token, whatever the session state: a byte
+  that arrived after the proof raised an edge that is either still pending in epoll or already
+  delivered. HUP or ERROR turns the memory off for good, so the EOF behind a short read is still
+  read (`update_readiness_after_read`). Same known limit as #1606: TCP urgent data. Prior art:
+  HAProxy returns from `ssl_sock_handshake` on `SSL_ERROR_WANT_READ` (`src/ssl_sock.c:6676-6682`)
+  and its BIO reads through `raw_sock_to_buf`, which stops on `ret < try`
+  (`src/raw_sock.c:315-317`); tokio-rustls loops `read_tls` until `Pending`
+  (`tokio-rustls-0.26.4/src/common/mod.rs:161-170`), which costs no `recv` after a short read
+  because tokio clears the readiness when `0 < n < len` (`tokio-1.53.1/src/io/poll_evented.rs:211-213`).
+  Measured on release builds of `b74d5d97` and this change, one worker, loopback python backend,
+  20 requests, LOAD1 < 3, three runs each. H2 with one TLS connection per request, `LD_PRELOAD`
+  fd tracer: EAGAIN 56–60 → 0 per 20 connections (handshake 30–33, upgrade 20, between two reads
+  5–9), `recv` 8.65–9.35 → 5.65–6.05 per connection, `epoll_wait` 8.05–8.20 →
+  8.60–8.85, total 31.75–32.90 → 29.45–30.15. H2 multiplexed on one connection: EAGAIN 21–22 → 0 (between two reads 19, upgrade 1,
+  handshake 1–2),
+  total 14.85–15.00 → 13.70–14.30 per request. `intentrace -p`: multiplexed total 15.45 → 14.50
+  per request (`recvfrom` 3.10 → 2.10); one connection per request 41.00–41.05 → 41.00–41.10, with
+  `recvfrom` 5.00 → 4.00 and `epoll_wait` 4.90–4.95 → 5.90–6.00: under ptrace the client's next
+  flight lands while the worker is still in the pass, so the removed `recv` found data there and
+  an `epoll_wait` now collects it, the trade #1606 already made. Pinned by
+  `a_short_handshake_read_stops_without_an_eagain`, `a_full_handshake_read_reads_again` and
+  `a_client_hello_in_three_segments_completes_on_a_loopback_socket` (`rustls.rs`, a real loopback
+  socket registered with mio), `the_upgraded_frontend_reads_only_when_a_read_is_due`
+  (`https.rs`), `frames_sharing_one_record_cost_one_recv`,
+  `an_event_after_a_short_read_lets_the_next_call_read` and
+  `a_hup_delivered_after_a_short_read_lets_the_next_call_read_the_eof` (`socket.rs`), each seen
+  red first; `a_large_body_over_tls_arrives_intact` now pins 0 EAGAIN instead of 1, and the
+  socket tests that add bytes between two calls now deliver the event those bytes raise.
+
 - **`perf(mux-h2)`: the final GOAWAY and the TLS `close_notify` of an H2 frontend leave in one
   write ([#1607](https://github.com/sozu-proxy/sozu/issues/1607)).** Closing an H2 connection over
   TLS on its final GOAWAY cost two `writev(2)` back to back, in the same pass: the GOAWAY, flushed

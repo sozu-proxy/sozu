@@ -16,7 +16,7 @@ use mio::net::{TcpListener, TcpStream, UdpSocket};
 use rustls::{ProtocolVersion, ServerConnection};
 use rusty_ulid::Ulid;
 use socket2::{Domain, Protocol, Socket, Type};
-use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::ansi_palette};
+use sozu_command::{config::MAX_LOOP_ITERATIONS, logging::ansi_palette, ready::Ready};
 
 use crate::metrics::names;
 
@@ -628,6 +628,79 @@ pub struct FrontRustls {
     /// case and would die with `ENOTCONN` in both. Read through
     /// [`SocketHandler::peer_addr`].
     pub configured_peer: Option<SocketAddr>,
+    /// What the read path may assume about `stream`'s receive queue from one
+    /// [`SocketHandler::socket_read`] call to the next. See [`RecvMemory`].
+    pub recv_memory: RecvMemory,
+}
+
+impl FrontRustls {
+    /// Record that the event loop delivered `events` for `stream`: whatever a
+    /// `recv` proved before, bytes may have arrived since. The HTTPS session
+    /// calls it for every event on its frontend token, whatever its state
+    /// (`HttpsSession::update_readiness`, `lib/src/https.rs`), which is the
+    /// only way events reach a session (`Server::ready`, `lib/src/server.rs`).
+    pub fn readiness_delivered(&mut self, events: Ready) {
+        self.recv_memory.event_delivered(events);
+    }
+}
+
+/// What `rustls_socket_read` may assume about the receive queue between two
+/// calls.
+///
+/// The H2 read path makes one call per frame header and one per payload
+/// (`lib/src/protocol/mux/h2.rs`, `readable_inner`), so the frames of one
+/// record are served by several calls: the first one's `recv` is short, the
+/// rest come from rustls's plaintext buffer. Without a memory, the call that
+/// finds that buffer empty issued one more `recv`, which could only answer
+/// EAGAIN — once per request on a multiplexed connection (#1609).
+///
+/// `drained` carries the proof across calls, and is safe for as long as no
+/// readiness event has been delivered since it was set. mio registers every
+/// socket edge-triggered (`mio/src/sys/unix/selector/epoll.rs`, `EPOLLET`),
+/// and "an event will be generated upon each receipt of a chunk of data"
+/// (`man 7 epoll`), so a byte that arrives after the proof either raises an
+/// event still pending in epoll — the next `epoll_wait` delivers it and
+/// re-arms READABLE — or one already delivered, which cleared `drained`. A
+/// delivery that lands while the mux still holds READABLE changes nothing the
+/// mux can see, which is why the memory is cleared at delivery rather than
+/// inferred from READABLE.
+///
+/// `hup_seen` turns the memory off for good once HUP or ERROR is delivered.
+/// A FIN that arrived with the data raised its edge already, and no later
+/// event will announce the EOF behind a short read; the mux keeps READABLE
+/// for it (`update_readiness_after_read`), and the next call must read it.
+///
+/// The TCP urgent data reserve of `plain_socket_read` applies unchanged: a
+/// `recv` stopped short by an urgent mark proves nothing, and the stream
+/// stalls until the peer's next send, as it does within a call since #1606.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RecvMemory {
+    /// A `recv` answered short or EAGAIN, and no event has been delivered
+    /// since.
+    drained: bool,
+    /// HUP or ERROR has been delivered.
+    hup_seen: bool,
+}
+
+impl RecvMemory {
+    /// The memory a session starts with once its handshake is over. `drained`
+    /// is what the handshake proved: a `recv` that answered short or EAGAIN
+    /// dropped READABLE from its event, and only a delivered event with
+    /// READABLE put it back (`handshake_read`, `lib/src/protocol/rustls.rs`).
+    /// A handshake closes on HUP or ERROR, so none was seen.
+    pub fn after_handshake(drained: bool) -> Self {
+        RecvMemory {
+            drained,
+            hup_seen: false,
+        }
+    }
+
+    fn event_delivered(&mut self, events: Ready) {
+        self.drained = false;
+        if events.is_hup() || events.is_error() {
+            self.hup_seen = true;
+        }
+    }
 }
 
 /// One `write_tls` of `session` into `stream`: at most one `writev(2)`, and
@@ -690,9 +763,29 @@ enum RustlsReadFault {
 /// the byte count, not the length it offered, so a short read is invisible
 /// from its return value. An `Ok(0)` is EOF, not a short read, and an error is
 /// neither.
-struct ShortReadProbe<'a, R> {
+///
+/// Two callers wrap `read_tls` in it: [`rustls_socket_read`] once the session
+/// is established, and `handshake_read` (`lib/src/protocol/rustls.rs`) while
+/// the handshake runs.
+pub(crate) struct ShortReadProbe<'a, R> {
     inner: &'a mut R,
     short: bool,
+}
+
+impl<'a, R> ShortReadProbe<'a, R> {
+    pub(crate) fn new(inner: &'a mut R) -> Self {
+        ShortReadProbe {
+            inner,
+            short: false,
+        }
+    }
+
+    /// Whether the last read answered fewer bytes than it was offered, which
+    /// on a stream socket proves its receive queue empty (see
+    /// [`plain_socket_read`] for the one exception, TCP urgent data).
+    pub(crate) fn was_short(&self) -> bool {
+        self.short
+    }
 }
 
 impl<R: Read> Read for ShortReadProbe<'_, R> {
@@ -734,7 +827,12 @@ impl<R: Read> Read for ShortReadProbe<'_, R> {
 ///   produces no plaintext, so the pass loops and reads again until a short
 ///   read, EAGAIN, EOF or a full buffer;
 /// - one record can hold several H2 frames: the later calls are served from
-///   the plaintext buffer without a `recv`.
+///   the plaintext buffer without a `recv`, and the call that empties that
+///   buffer makes no `recv` either when an earlier call's `recv` answered
+///   short or EAGAIN and no readiness event was delivered since: `memory`
+///   carries that proof ([`RecvMemory`]), so the call answers `WouldBlock`
+///   without touching the socket. Once HUP or ERROR has been delivered the
+///   memory is off, and a call that finds the plaintext empty reads.
 ///
 /// [`SocketResult::Error`] from `process_new_packets` is sticky: the failing
 /// pass still reports the plaintext it had already copied into `buf` before
@@ -749,7 +847,8 @@ impl<R: Read> Read for ShortReadProbe<'_, R> {
 /// the socket, so a FIN that is already queued is seen one call later than
 /// when every call began with `read_tls`. A TCP FIN queued behind a short
 /// read is likewise seen by the next call, which the mux makes once it has
-/// seen HUP (`update_readiness_after_read`).
+/// seen HUP (`update_readiness_after_read`), and which reads because that HUP
+/// turned the memory off.
 fn rustls_socket_read<R: Read>(
     session: &mut ServerConnection,
     stream: &mut R,
@@ -757,6 +856,7 @@ fn rustls_socket_read<R: Read>(
     peer_disconnected: &mut bool,
     peer_reset: &mut bool,
     tls_fatal: &mut bool,
+    memory: &mut RecvMemory,
 ) -> (usize, SocketResult, Option<RustlsReadFault>) {
     // `Error` is sticky. Once `process_new_packets` has failed, plaintext it
     // appended from records that preceded the bad one may still sit in the
@@ -769,7 +869,9 @@ fn rustls_socket_read<R: Read>(
     }
     let mut size = 0usize;
     let mut can_read = true;
-    let mut drained = false;
+    // Seeded from the memory: a `recv` in an earlier call may already have
+    // proved the queue empty, with no event delivered since.
+    let mut drained = memory.drained && !memory.hup_seen;
     let mut is_error = false;
     let mut is_closed = false;
     let mut fault = None;
@@ -839,8 +941,10 @@ fn rustls_socket_read<R: Read>(
             break;
         }
 
-        // A short `recv` earlier in this pass emptied the receive queue, so a
-        // `read_tls` that would `recv` again can only answer EAGAIN. One that
+        // A short or EAGAIN `recv` earlier in this pass — or in an earlier
+        // call, with no event delivered since (`RecvMemory`) — emptied the
+        // receive queue, so a `read_tls` that would `recv` again can only
+        // answer EAGAIN. One that
         // would not — `close_notify` received, which is exactly when
         // `wants_read()` is false with the plaintext drained — still runs:
         // it answers `Ok(0)` without touching the socket
@@ -850,12 +954,9 @@ fn rustls_socket_read<R: Read>(
             break;
         }
 
-        let mut probe = ShortReadProbe {
-            inner: &mut *stream,
-            short: false,
-        };
+        let mut probe = ShortReadProbe::new(&mut *stream);
         let read = session.read_tls(&mut probe);
-        drained |= probe.short;
+        drained |= probe.was_short();
         match read {
             Ok(0) => {
                 // Graceful FIN on the read side: peer closed its write
@@ -869,6 +970,7 @@ fn rustls_socket_read<R: Read>(
             Err(e) => match e.kind() {
                 ErrorKind::WouldBlock => {
                     can_read = false;
+                    drained = true;
                 }
                 ErrorKind::ConnectionReset
                 | ErrorKind::ConnectionAborted
@@ -916,6 +1018,8 @@ fn rustls_socket_read<R: Read>(
         !(is_error && is_closed),
         "rustls socket_read cannot be both Error and Closed"
     );
+    // Carried to the next call; `FrontRustls::readiness_delivered` clears it.
+    memory.drained = drained;
     let result = if is_error {
         SocketResult::Error
     } else if is_closed {
@@ -943,6 +1047,7 @@ impl SocketHandler for FrontRustls {
             &mut self.peer_disconnected,
             &mut self.peer_reset,
             &mut self.tls_fatal,
+            &mut self.recv_memory,
         );
         match fault {
             None => {}
@@ -2178,13 +2283,13 @@ mod tests {
 /// transport that counts every read a call issues: each one is a `recv(2)` on
 /// the real socket.
 #[cfg(test)]
-mod rustls_read_tests {
+pub(crate) mod rustls_read_tests {
     use std::{collections::VecDeque, io::Write, sync::Arc};
 
     use super::*;
 
     /// SNI the test certificate is registered under.
-    const TEST_SNI: &str = "lolcatho.st";
+    pub(crate) const TEST_SNI: &str = "lolcatho.st";
 
     /// A frame header, then its payload: what the H2 read path asks for, one
     /// `socket_read` at a time (`lib/src/protocol/mux/h2.rs`, `readable_inner`).
@@ -2215,12 +2320,12 @@ mod rustls_read_tests {
     /// `eagains` counts the reads that found nothing, the ones a short read
     /// makes unnecessary.
     #[derive(Default)]
-    struct CountingTransport {
-        wire: VecDeque<u8>,
-        eof: bool,
-        reset: bool,
-        reads: usize,
-        eagains: usize,
+    pub(crate) struct CountingTransport {
+        pub(crate) wire: VecDeque<u8>,
+        pub(crate) eof: bool,
+        pub(crate) reset: bool,
+        pub(crate) reads: usize,
+        pub(crate) eagains: usize,
     }
 
     impl Read for CountingTransport {
@@ -2308,8 +2413,10 @@ mod rustls_read_tests {
         }
     }
 
-    /// A settled TLS 1.3 server session and the client that feeds it.
-    fn handshaken_pair() -> (ServerConnection, rustls::ClientConnection) {
+    /// A TLS 1.3 server session serving the test certificate for
+    /// [`TEST_SNI`], and a client that accepts it and offers `alpn`, neither
+    /// started.
+    pub(crate) fn fresh_pair(alpn: Vec<Vec<u8>>) -> (ServerConnection, rustls::ClientConnection) {
         let provider = Arc::new(crate::crypto::default_provider());
         let resolver = Arc::new(crate::tls::MutexCertificateResolver::default());
         resolver
@@ -2339,14 +2446,21 @@ mod rustls_read_tests {
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertificate))
             .with_no_client_auth();
-        let mut server = ServerConnection::new(Arc::new(server_config))
+        let server = ServerConnection::new(Arc::new(server_config))
             .expect("the test server session must initialize");
-        let mut client = rustls::ClientConnection::new(
+        let client = rustls::ClientConnection::new_with_alpn(
             Arc::new(client_config),
             rustls::pki_types::ServerName::try_from(TEST_SNI)
                 .expect("the test SNI must be a valid DNS name"),
+            alpn,
         )
         .expect("the test client session must initialize");
+        (server, client)
+    }
+
+    /// A settled TLS 1.3 server session and the client that feeds it.
+    fn handshaken_pair() -> (ServerConnection, rustls::ClientConnection) {
+        let (mut server, mut client) = fresh_pair(Vec::new());
         for _ in 0..16 {
             if !client.is_handshaking() && !server.is_handshaking() && !client.wants_write() {
                 break;
@@ -2384,6 +2498,7 @@ mod rustls_read_tests {
         peer_disconnected: bool,
         peer_reset: bool,
         tls_fatal: bool,
+        memory: RecvMemory,
     }
 
     impl Front {
@@ -2400,6 +2515,7 @@ mod rustls_read_tests {
                 &mut self.peer_disconnected,
                 &mut self.peer_reset,
                 &mut self.tls_fatal,
+                &mut self.memory,
             );
             assert!(fault.is_none(), "unexpected read fault: {fault:?}");
             buf.truncate(size);
@@ -2420,9 +2536,16 @@ mod rustls_read_tests {
                 &mut self.peer_disconnected,
                 &mut self.peer_reset,
                 &mut self.tls_fatal,
+                &mut self.memory,
             );
             buf.truncate(size);
             (buf, result)
+        }
+
+        /// What `FrontRustls::readiness_delivered` does when the event loop
+        /// delivers `events` for the socket.
+        fn deliver(&mut self, events: Ready) {
+            self.memory.event_delivered(events);
         }
     }
 
@@ -2434,6 +2557,7 @@ mod rustls_read_tests {
                 peer_disconnected: false,
                 peer_reset: false,
                 tls_fatal: false,
+                memory: RecvMemory::default(),
             },
             client,
         )
@@ -2442,13 +2566,16 @@ mod rustls_read_tests {
     /// Several H2 frames in ONE TLS record, read the way the H2 path reads
     /// them: header, payload, header, payload. The record costs one `recv`;
     /// every later frame is already decrypted and must be served from
-    /// rustls's plaintext buffer, and the only other `recv` is the one that
-    /// reports `EAGAIN` once that buffer is empty.
+    /// rustls's plaintext buffer, and the call that finds that buffer empty
+    /// answers `WouldBlock` without a `recv`: the first call's short `recv`
+    /// proved the queue empty and no event was delivered since.
     ///
-    /// Before the fix every call started with `read_tls`, so each frame block
+    /// Before #1606 every call started with `read_tls`, so each frame block
     /// after the first issued one `recv` that returned `EAGAIN`: 1 + 7 + 1.
+    /// Before #1609 the memory did not outlive a call, and the last call still
+    /// issued one: 1 + 1.
     #[test]
-    fn frames_sharing_one_record_cost_one_recv_plus_the_final_eagain() {
+    fn frames_sharing_one_record_cost_one_recv() {
         let (mut front, mut client) = front_and_client();
         let frames = client_frames();
         let record = seal(&mut client, &frames.concat());
@@ -2470,13 +2597,64 @@ mod rustls_read_tests {
         assert_eq!(result, SocketResult::WouldBlock);
 
         assert_eq!(
-            transport.reads,
-            2,
-            "one recv for the record and one EAGAIN once the plaintext is drained, \
+            (transport.reads, transport.eagains),
+            (1, 0),
+            "one recv for the record and no EAGAIN once the plaintext is drained, \
              for {} frame blocks",
             frames.len()
         );
         assert!(!front.peer_disconnected && !front.peer_reset);
+    }
+
+    /// An event delivered after the proof clears it: the bytes that raised it
+    /// are read by the next call, with no EAGAIN on either side.
+    #[test]
+    fn an_event_after_a_short_read_lets_the_next_call_read() {
+        let (mut front, mut client) = front_and_client();
+        let frames = client_frames();
+        let mut transport = CountingTransport {
+            wire: seal(&mut client, &frames.concat()).into(),
+            ..Default::default()
+        };
+        for block in &frames {
+            assert_eq!(&front.read(&mut transport, block.len()).0, block);
+        }
+        assert_eq!(
+            front.read(&mut transport, FRAME_HEADER_LEN),
+            (Vec::new(), SocketResult::WouldBlock),
+            "no event since the short read: nothing is read"
+        );
+
+        transport.wire.extend(seal(&mut client, &frames[0]));
+        front.deliver(Ready::READABLE);
+        let (read, result) = front.read(&mut transport, frames[0].len());
+        assert_eq!(read, frames[0], "the new arrival is read");
+        assert_eq!(result, SocketResult::Continue);
+        assert_eq!((transport.reads, transport.eagains), (2, 0));
+    }
+
+    /// A FIN whose edge is delivered after the proof, as HUP: the memory is
+    /// off from then on, and the next call reads the EOF.
+    #[test]
+    fn a_hup_delivered_after_a_short_read_lets_the_next_call_read_the_eof() {
+        let (mut front, mut client) = front_and_client();
+        let frames = client_frames();
+        let mut transport = CountingTransport {
+            wire: seal(&mut client, &frames.concat()).into(),
+            ..Default::default()
+        };
+        for block in &frames {
+            assert_eq!(&front.read(&mut transport, block.len()).0, block);
+        }
+
+        transport.eof = true;
+        front.deliver(Ready::HUP);
+        assert_eq!(
+            front.read(&mut transport, FRAME_HEADER_LEN),
+            (Vec::new(), SocketResult::Closed)
+        );
+        assert!(front.peer_disconnected);
+        assert_eq!((transport.reads, transport.eagains), (2, 0));
     }
 
     /// A caller buffer larger than everything received (the H1 path) takes the
@@ -2545,6 +2723,9 @@ mod rustls_read_tests {
             eof: true,
             ..Default::default()
         };
+        // The FIN came with the data: one edge, delivered as HUP, which turns
+        // the memory off so the next call reads the EOF.
+        front.deliver(Ready::READABLE | Ready::HUP);
 
         let (read, result) = front.read(&mut transport, 16 * 1024);
         assert_eq!(read, plaintext);
@@ -2562,12 +2743,12 @@ mod rustls_read_tests {
     /// read with the H1 buffer size: every byte arrives in order and the full
     /// reads keep the pass going.
     ///
-    /// Exactly one read answers EAGAIN. The final short `recv` happens in a
-    /// call whose buffer then fills from the plaintext it decrypted, so that
-    /// call answers `Continue`; the next call drains the rest and must `recv`
-    /// once more. A pass does not carry "the queue was empty" over to a later
-    /// call on purpose: an edge may have arrived in between, and the mux would
-    /// already have folded it into the READABLE it kept.
+    /// No read answers EAGAIN. The final short `recv` happens in a call whose
+    /// buffer then fills from the plaintext it decrypted, so that call answers
+    /// `Continue`; the next call drains the rest and answers `WouldBlock`
+    /// without a `recv`, because no event was delivered since the short one
+    /// ([`RecvMemory`]). Before #1609 that call issued one `recv` for an
+    /// EAGAIN.
     #[test]
     fn a_large_body_over_tls_arrives_intact() {
         let (mut front, mut client) = front_and_client();
@@ -2595,8 +2776,8 @@ mod rustls_read_tests {
         assert_eq!(received, body);
         assert!(transport.wire.is_empty());
         assert_eq!(
-            transport.eagains, 1,
-            "only the call after the one that filled from the last short read"
+            transport.eagains, 0,
+            "the call after the one that filled from the last short read reads nothing"
         );
     }
 
@@ -2626,6 +2807,8 @@ mod rustls_read_tests {
         );
 
         transport.wire.extend(tail);
+        // The tail's arrival raises the edge the event loop delivers.
+        front.deliver(Ready::READABLE);
         for (index, block) in frames.iter().enumerate() {
             let (read, result) = front.read(&mut transport, block.len());
             assert_eq!(&read, block, "frame block {index}");
@@ -2695,6 +2878,8 @@ mod rustls_read_tests {
             eof: true,
             ..Default::default()
         };
+        // The FIN came with the data: one edge, delivered as HUP.
+        front.deliver(Ready::READABLE | Ready::HUP);
 
         for (index, block) in frames.iter().enumerate() {
             let (read, result) = front.read(&mut transport, block.len());
@@ -2771,6 +2956,7 @@ mod rustls_read_tests {
         let last = corrupted.len() - 1;
         corrupted[last] ^= 0xff;
         transport.wire.extend(corrupted);
+        front.deliver(Ready::READABLE);
 
         let (read, result) = front.read_faulting(&mut transport, 16 * 1024);
         assert_eq!(

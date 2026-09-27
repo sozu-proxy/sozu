@@ -65,7 +65,7 @@ use crate::{
     },
     router::{RouteResult, Router},
     server::{ListenToken, SessionManager},
-    socket::{FrontRustls, server_bind},
+    socket::{FrontRustls, RecvMemory, server_bind},
     timer::TimeoutContainer,
     tls::MutexCertificateResolver,
 };
@@ -144,6 +144,36 @@ fn successful_tls_handshake_summary(sni: Option<&str>, alpn: Option<&str>) -> St
         sni.map(str::len),
         alpn.map(str::len),
     )
+}
+
+/// The readiness events the upgraded mux frontend starts with.
+///
+/// WRITABLE always: the H2 server must send its SETTINGS whatever the peer
+/// does next, and an upgrade from `TlsHandshake::writable` has no fresh event.
+///
+/// READABLE only when a read is due without a new edge:
+///
+/// - `handshake_event` still carries READABLE. `handshake_read`
+///   (`lib/src/protocol/rustls.rs`) drops it exactly when a `recv` proved the
+///   receive queue empty — EAGAIN or a short read — and any segment that
+///   arrived since raised an edge that `TlsHandshake::update_readiness` put
+///   back;
+/// - `rustls_holds_input`: `ServerConnection::wants_read()` is false, so
+///   rustls already decrypted plaintext — the HTTP/2 preface or an HTTP/1.1
+///   request that shared a segment with the client `Finished` — or received
+///   `close_notify`. Neither will raise an edge, and the mux read serves both
+///   without a `recv`.
+///
+/// Anything else means the socket was drained after the last edge, and bytes
+/// arriving later raise their own event (mio registers edge-triggered, see
+/// `plain_socket_read` in `lib/src/socket.rs`), so an unconditional READABLE
+/// only bought a `recv` that answered EAGAIN on every TLS connection.
+fn upgraded_frontend_events(handshake_event: Ready, rustls_holds_input: bool) -> Ready {
+    if handshake_event.is_readable() || rustls_holds_input {
+        Ready::READABLE | Ready::WRITABLE
+    } else {
+        Ready::WRITABLE
+    }
 }
 
 /// Render an SNI trie key as the `domain` of a [`CertificateSummary`].
@@ -546,6 +576,17 @@ impl HttpsSession {
 
         gauge_add!(names::protocol::TLS_HANDSHAKE, -1);
 
+        // Read before `handshake.session` moves into `FrontRustls` below.
+        let frontend_events = upgraded_frontend_events(
+            handshake.frontend_readiness.event,
+            !handshake.session.wants_read(),
+        );
+        // No READABLE left in the handshake's event: its last `recv` proved
+        // the socket empty and no data event was delivered since, so the
+        // first mux read serves what rustls holds without a `recv`.
+        let recv_memory =
+            RecvMemory::after_handshake(!handshake.frontend_readiness.event.is_readable());
+
         let session_ulid = rusty_ulid::Ulid::generate();
         let front_stream = FrontRustls {
             stream: handshake.stream,
@@ -562,6 +603,7 @@ impl HttpsSession {
             // id. This is the same value handed to `Context::new` below, so the
             // two halves of the session agree by construction.
             configured_peer: self.peer_address,
+            recv_memory,
         };
         let router = mux::Router::new(
             self.configured_backend_timeout,
@@ -713,26 +755,27 @@ impl HttpsSession {
                 )?
             }
         };
-        // Ensure the upgraded connection can both read and write immediately.
-        // With TLS 1.3 + NewSessionTicket, the upgrade may happen from writable()
-        // where READABLE is no longer in the event (consumed by the prior readable()
-        // call). The HTTP/2 preface may already be in rustls's plaintext buffer
-        // (not on the TCP socket), so no new READABLE event from epoll will arrive.
-        // Without WRITABLE in the event, the H2 state machine cannot transition from
-        // reading the preface to writing SETTINGS, causing a deadlock with clients
-        // (like hyper) that wait for the server's SETTINGS before proceeding.
-        frontend
-            .readiness_mut()
-            .event
-            .insert(Ready::READABLE | Ready::WRITABLE);
+        // Arm the upgraded connection. With TLS 1.3 + NewSessionTicket, the
+        // upgrade may happen from writable() where READABLE is no longer in the
+        // event (consumed by the prior readable() call). The HTTP/2 preface may
+        // already be in rustls's plaintext buffer (not on the TCP socket), so no
+        // new READABLE event from epoll will arrive: `upgraded_frontend_events`
+        // arms READABLE for it, and for an edge the handshake has not read yet,
+        // but not for a socket the handshake proved empty (#1609). Without
+        // WRITABLE in the event, the H2 state machine cannot transition from
+        // reading the preface to writing SETTINGS, causing a deadlock with
+        // clients (like hyper) that wait for the server's SETTINGS before
+        // proceeding.
+        frontend.readiness_mut().event.insert(frontend_events);
 
-        // Post-handoff: the mux frontend MUST be armed for both directions or the
-        // H2 preface→SETTINGS exchange deadlocks (see the comment above). This is
+        // Post-handoff: the mux frontend MUST be armed for WRITABLE, and for
+        // READABLE whenever a read is due without a new edge, or the H2
+        // preface→SETTINGS exchange deadlocks (see the comment above). This is
         // the structural guarantee the insert just made — assert it survived.
         debug_assert!(
-            frontend.readiness_mut().event.is_readable()
-                && frontend.readiness_mut().event.is_writable(),
-            "post-handshake mux frontend must be armed for READABLE and WRITABLE"
+            frontend.readiness_mut().event.is_writable()
+                && (!frontend_events.is_readable() || frontend.readiness_mut().event.is_readable()),
+            "post-handshake mux frontend must be armed for WRITABLE, and READABLE when due"
         );
         // The two crate halves of the H2/H1 session reference streams by a shared
         // ulid; the handshake-derived ulid must thread through both the connection
@@ -1111,6 +1154,23 @@ impl ProxySession for HttpsSession {
         );
         self.last_event = Instant::now();
         self.metrics.wait_start();
+        if token == self.frontend_token {
+            // Whatever a `recv` proved about the frontend's receive queue,
+            // bytes may have arrived since: `RecvMemory` (`lib/src/socket.rs`).
+            match &mut self.state {
+                HttpsStateMachine::Mux(mux) => mux
+                    .frontend
+                    .socket_handler_mut()
+                    .readiness_delivered(events),
+                HttpsStateMachine::WebSocket(pipe) => {
+                    pipe.front_socket_handler_mut().readiness_delivered(events)
+                }
+                // No `FrontRustls` yet, or none any more.
+                HttpsStateMachine::Expect(..)
+                | HttpsStateMachine::Handshake(_)
+                | HttpsStateMachine::FailedUpgrade(_) => {}
+            }
+        }
         self.state.update_readiness(token, events);
     }
 
@@ -2971,6 +3031,33 @@ mod tests {
         router::{MethodRule, PathRule, Route, Router, pattern_trie::TrieNode},
         socket::SocketHandler,
     };
+
+    /// A handshake whose last `recv` proved the socket empty hands over no
+    /// READABLE: the upgraded mux must not `recv` for an EAGAIN (#1609).
+    /// READABLE survives when the handshake still had it, or when rustls
+    /// holds decrypted input; WRITABLE always does.
+    #[test]
+    fn the_upgraded_frontend_reads_only_when_a_read_is_due() {
+        assert_eq!(
+            upgraded_frontend_events(Ready::EMPTY, false),
+            Ready::WRITABLE,
+            "a drained socket and an empty rustls need no read"
+        );
+        assert_eq!(
+            upgraded_frontend_events(Ready::WRITABLE, false),
+            Ready::WRITABLE
+        );
+        assert_eq!(
+            upgraded_frontend_events(Ready::READABLE, false),
+            Ready::READABLE | Ready::WRITABLE,
+            "an edge not yet read must survive the upgrade"
+        );
+        assert_eq!(
+            upgraded_frontend_events(Ready::EMPTY, true),
+            Ready::READABLE | Ready::WRITABLE,
+            "plaintext rustls already holds raises no edge"
+        );
+    }
 
     #[test]
     fn successful_tls_handshake_log_bounds_sni_and_alpn() {
