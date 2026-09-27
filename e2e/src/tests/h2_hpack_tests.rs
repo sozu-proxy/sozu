@@ -13,6 +13,8 @@
 //!   every block split into HEADERS + CONTINUATION fragments;
 //! - `SETTINGS_HEADER_TABLE_SIZE` changed by the client, and size updates
 //!   opening the client's own blocks;
+//! - `SETTINGS_HEADER_TABLE_SIZE` lowered then raised before one block, which
+//!   Sōzu signals as the smallest size, then the last;
 //! - Huffman-coded and raw strings, including a Huffman `:authority` and
 //!   `:path` that Sōzu must decode to route the request;
 //! - header lists at the size limit: a list past what Sōzu accepts refuses
@@ -354,6 +356,75 @@ fn test_h2_hpack_table_size_changes() {
             3,
             "HPACK: SETTINGS_HEADER_TABLE_SIZE changes are signalled and honoured",
             try_h2_hpack_table_size_changes,
+        ),
+        State::Success,
+    );
+}
+
+/// Issue #1622: the client lowers `SETTINGS_HEADER_TABLE_SIZE` to 0, then
+/// raises it back to 4096, in two SETTINGS frames sent before its request.
+/// Sōzu's response block must open with two size updates, the smallest size
+/// reached (0), then the last (4096) — RFC 7541 §4.2 — and a second response
+/// on the connection must still decode. Before the fix the block opened with
+/// 4096 alone.
+fn try_h2_hpack_table_size_lowered_then_raised() -> State {
+    let (worker, backends, front_port) = setup_h2_test("H2-HPACK-TABLE-SIZE-MIN", 1);
+    let mut tls = raw_h2_connection(front_addr(front_port));
+    h2_handshake(&mut tls);
+
+    let mut encoder = Encoder::new();
+    let mut decoder = Decoder::new();
+    decoder.set_max_allowed_table_size(4096);
+    let mut ok = true;
+    for size in [0u32, 4096] {
+        let settings = H2Frame::settings(&[(SETTINGS_HEADER_TABLE_SIZE, size)]);
+        ok &= tls.write_all(&settings.encode()).is_ok() && tls.flush().is_ok();
+    }
+
+    let mut expected_prefix = Vec::new();
+    encode_integer(0, 5, 0x20, &mut expected_prefix);
+    encode_integer(4096, 5, 0x20, &mut expected_prefix);
+    for (sid, expects_updates) in [(1u32, true), (3, false)] {
+        let block = request_block(&mut encoder, Representation::Proxy, false, &[]);
+        ok &= send_block(&mut tls, sid, &block, block.len());
+        let frames = read_until_done(&mut tls, &[sid], Duration::from_secs(5));
+        log_frames("HPACK table size lowered then raised", &frames);
+        let first_block = frames
+            .iter()
+            .find(|(ft, _, s, _)| *ft == H2_FRAME_HEADERS && *s == sid)
+            .map(|(.., payload)| payload.clone())
+            .unwrap_or_default();
+        let opens_with_updates = first_block.starts_with(&expected_prefix);
+        let opens_with_any_update = first_block.first().is_some_and(|b| b & 0xe0 == 0x20);
+        let decoded = decode_responses(&mut decoder, &frames);
+        let routed = matches!(&decoded, Ok(responses) if all_ok(responses, &[sid]));
+        println!(
+            "HPACK table size 0 then 4096, stream {sid} - opens_with_updates={opens_with_updates} \
+             opens_with_any_update={opens_with_any_update} routed={routed} decoded={decoded:?}"
+        );
+        ok &= routed
+            && if expects_updates {
+                opens_with_updates
+            } else {
+                !opens_with_any_update
+            };
+    }
+
+    let infra_ok = teardown(tls, front_port, worker, backends);
+    if infra_ok && ok {
+        State::Success
+    } else {
+        State::Fail
+    }
+}
+
+#[test]
+fn test_h2_hpack_table_size_lowered_then_raised() {
+    assert_eq!(
+        repeat_until_error_or(
+            3,
+            "HPACK: a table size lowered then raised is signalled as both sizes",
+            try_h2_hpack_table_size_lowered_then_raised,
         ),
         State::Success,
     );

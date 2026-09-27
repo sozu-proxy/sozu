@@ -3162,6 +3162,20 @@
 
 ### 🐛 Fixed
 
+- **`fix(hpack)`: a table size lowered then raised between two header blocks is signalled as
+  both sizes ([#1622](https://github.com/sozu-proxy/sozu/issues/1622)).** When a peer sent two
+  `SETTINGS_HEADER_TABLE_SIZE` changes before Sōzu wrote its next header block, for example 0
+  then 4096, the block opened with one dynamic table size update carrying the last value only.
+  Sōzu's encoder had emptied its table at 0; the peer's decoder, told only 4096, kept every
+  entry. RFC 7541 §4.2 requires the smallest size reached, then the final one. The encoder
+  now records both (`Encoder::change_max_table_size`) and opens the next block with the
+  smallest size when it is below the final one, then the final one
+  (`Encoder::encode_size_updates_into`), with no allocation. A single change, or changes that
+  never go below the final value, still produce the one update Sōzu sent before. Covered by
+  `hpack::tests::a_size_lowered_then_raised_between_blocks_signals_both`,
+  `hpack::tests::the_h2_converter_signals_the_smallest_table_size_first` and the e2e
+  `test_h2_hpack_table_size_lowered_then_raised`.
+
 - **`test(udp)`: `an_early_wheel_fire_still_evicts_the_idle_flow` runs on a simulated clock
   ([#1619](https://github.com/sozu-proxy/sozu/issues/1619)).** The test slept on the real clock
   between steps, and the shell's wheel read that clock twice on its own: `Timer::set_timeout` added
