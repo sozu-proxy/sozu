@@ -216,7 +216,7 @@ impl WriteQueue {
 pub struct UdpListener {
     active: SessionIsToBeClosed,
     address: SocketAddr,
-    cluster_id: Option<String>,
+    cluster_id: Option<ClusterId>,
     config: UdpListenerConfig,
     socket: Option<UdpSocket>,
     /// A socket this listener holds but has NOT registered.
@@ -382,7 +382,7 @@ impl UdpListener {
 /// implement `ProxyConfiguration` / `L7Proxy`; the server drives it through the
 /// inherent [`notify`](Self::notify) plus the activate/give-back helpers.
 pub struct UdpProxy {
-    fronts: HashMap<String, Token>,
+    fronts: HashMap<ClusterId, Token>,
     backends: Rc<RefCell<BackendMap>>,
     listeners: HashMap<Token, Rc<RefCell<UdpListener>>>,
     /// The built listener session per listener token. The server inserts the
@@ -746,6 +746,7 @@ impl UdpProxy {
 
     pub fn add_udp_front(&mut self, front: RequestUdpFrontend) -> Result<(), ProxyError> {
         let address = front.address.into();
+        let cluster_id = ClusterId::from(front.cluster_id);
         let token = {
             let mut listener = self
                 .listeners
@@ -753,14 +754,12 @@ impl UdpProxy {
                 .find(|l| l.borrow().address == address)
                 .ok_or(ProxyError::NoListenerFound(address))?
                 .borrow_mut();
-            self.fronts
-                .insert(front.cluster_id.to_string(), listener.token);
+            self.fronts.insert(cluster_id.clone(), listener.token);
             listener.set_tags(address.to_string(), Some(front.tags));
-            listener.cluster_id = Some(front.cluster_id.clone());
+            listener.cluster_id = Some(cluster_id.clone());
             listener.token
         };
-        self.cluster_for_listener
-            .insert(token, front.cluster_id.clone());
+        self.cluster_for_listener.insert(token, cluster_id);
 
         // Commit the cluster routing into the manager so admitted flows know
         // which cluster to `SelectBackend` against.
@@ -870,10 +869,10 @@ impl UdpProxy {
         match &cluster.udp {
             Some(udp) => {
                 self.cluster_udp_config
-                    .insert(cluster.cluster_id.clone(), udp.clone());
+                    .insert(cluster.cluster_id.as_str().into(), udp.clone());
             }
             None => {
-                self.cluster_udp_config.remove(&cluster.cluster_id);
+                self.cluster_udp_config.remove(cluster.cluster_id.as_str());
             }
         }
 
@@ -885,7 +884,7 @@ impl UdpProxy {
         let tokens: Vec<Token> = self
             .cluster_for_listener
             .iter()
-            .filter(|(_, c)| **c == cluster.cluster_id)
+            .filter(|(_, c)| ***c == *cluster.cluster_id)
             .map(|(t, _)| *t)
             .collect();
         for token in tokens {
@@ -928,7 +927,7 @@ impl UdpProxy {
                 let tokens: Vec<Token> = self
                     .cluster_for_listener
                     .iter()
-                    .filter(|(_, c)| **c == cluster_id)
+                    .filter(|(_, c)| ***c == *cluster_id)
                     .map(|(t, _)| *t)
                     .collect();
                 for token in tokens {
@@ -939,7 +938,7 @@ impl UdpProxy {
                         );
                     }
                 }
-                self.cluster_udp_config.remove(&cluster_id);
+                self.cluster_udp_config.remove(cluster_id.as_str());
                 self.health.remove_cluster(&cluster_id, &self.registry);
                 WorkerResponse::ok(message.id)
             }
@@ -1959,7 +1958,7 @@ impl ProxySession for UdpListenerSession {
         false
     }
 
-    fn cluster_id(&self) -> Option<String> {
+    fn cluster_id(&self) -> Option<ClusterId> {
         self.listener.borrow().cluster_id.clone()
     }
 }
@@ -2283,7 +2282,7 @@ mod tests {
             let mut manager = session.manager.borrow_mut();
             manager.handle_input(
                 ManagerInput::Config(ConfigEvent::SetCluster(ClusterConfig {
-                    cluster: CLUSTER.to_owned(),
+                    cluster: CLUSTER.into(),
                     front_timeout: idle_timeout,
                     back_timeout: idle_timeout,
                     ..Default::default()

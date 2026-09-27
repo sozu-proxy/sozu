@@ -1514,7 +1514,7 @@ mod tests {
         let connection = h1_of(Connection::new_h1_client(
             session_ulid,
             SessionTcpStream::new(stream, session_ulid, Some(backend_address)),
-            "test-cluster".to_owned(),
+            "test-cluster".into(),
             test_backend_id(backend_address),
             Duration::from_secs(30),
         ));
@@ -1903,7 +1903,7 @@ mod tests {
         let mut client = h1_of(Connection::new_h1_client(
             session_ulid,
             back_socket,
-            "test-cluster".to_owned(),
+            "test-cluster".into(),
             test_backend_id(cached_peer()),
             Duration::from_secs(60),
         ));

@@ -893,7 +893,7 @@ mod tests {
 
     fn cluster(name: &str) -> ClusterConfig {
         ClusterConfig {
-            cluster: name.to_owned(),
+            cluster: name.into(),
             front_timeout: Duration::from_secs(30),
             back_timeout: Duration::from_secs(30),
             ..Default::default()

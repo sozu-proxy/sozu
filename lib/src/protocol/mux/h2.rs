@@ -12973,7 +12973,7 @@ mod tests {
         assert_eq!(connection.local_rtt.get(), None);
 
         connection.core.position = Position::Client(
-            "rtt-cluster".to_owned(),
+            "rtt-cluster".into(),
             super::super::BackendId {
                 slot: super::super::BackendSlot(0),
                 backend_id: Rc::from("rtt-backend"),
@@ -14397,7 +14397,7 @@ mod tests {
             Ulid::generate(),
             socket,
             Position::Client(
-                "orphan-cluster".to_owned(),
+                "orphan-cluster".into(),
                 registry.id_for(&backend),
                 BackendStatus::Connected,
             ),
@@ -14557,7 +14557,7 @@ mod tests {
             Ulid::generate(),
             socket,
             Position::Client(
-                "preface-cluster".to_owned(),
+                "preface-cluster".into(),
                 registry.id_for(&backend),
                 BackendStatus::Connected,
             ),
@@ -18533,7 +18533,7 @@ mod tests {
         let mut connection = Connection::new_h2_client(
             session_ulid,
             SessionTcpStream::new(socket, session_ulid, Some(address)),
-            "ledger-cluster".to_owned(),
+            "ledger-cluster".into(),
             backend_id,
             &mut PoolBufferSource::new(Rc::downgrade(pool)),
             Duration::from_secs(30),
@@ -18781,7 +18781,7 @@ mod tests {
         let mut connection = Connection::new_h1_client(
             session_ulid,
             SessionTcpStream::new(socket, session_ulid, Some(address)),
-            "h1-keepalive-cluster".to_owned(),
+            "h1-keepalive-cluster".into(),
             backend_id,
             Duration::from_secs(30),
         );

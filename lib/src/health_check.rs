@@ -724,10 +724,10 @@ impl HealthChecker {
     pub fn remove_cluster(&mut self, cluster_id: &str) {
         self.last_check_time.remove(cluster_id);
         self.in_flight
-            .retain(|check| check.cluster_id != cluster_id);
+            .retain(|check| *check.cluster_id != *cluster_id);
         // Post-condition: no in-flight probe references the removed cluster.
         debug_assert!(
-            self.in_flight.iter().all(|c| c.cluster_id != cluster_id),
+            self.in_flight.iter().all(|c| *c.cluster_id != *cluster_id),
             "remove_cluster must drop every in-flight check for the cluster"
         );
         debug_assert!(

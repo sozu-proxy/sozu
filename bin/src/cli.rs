@@ -1,10 +1,7 @@
 use std::{collections::BTreeMap, io::IsTerminal, net::SocketAddr, path::PathBuf};
 
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
-use sozu_command_lib::{
-    proto::command::{LoadBalancingAlgorithms, TlsVersion},
-    state::ClusterId as StateClusterId,
-};
+use sozu_command_lib::proto::command::{LoadBalancingAlgorithms, TlsVersion};
 
 #[derive(Parser, PartialEq, Eq, Clone, Debug)]
 #[clap(author, version, about)]
@@ -703,9 +700,10 @@ pub enum ClusterId {
     Deny,
 }
 
+/// The proto `cluster_id` field of a frontend request: `None` denies.
 #[allow(clippy::from_over_into)]
-impl std::convert::Into<Option<StateClusterId>> for ClusterId {
-    fn into(self) -> Option<StateClusterId> {
+impl std::convert::Into<Option<String>> for ClusterId {
+    fn into(self) -> Option<String> {
         match self {
             ClusterId::Deny => None,
             ClusterId::Id { id } => Some(id),

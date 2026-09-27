@@ -1219,7 +1219,7 @@ impl HttpAnswers {
         }
         let compiled = Self::templates(answers)?;
         self.cluster_answers
-            .entry(cluster_id.to_owned())
+            .entry(cluster_id.into())
             .or_default()
             .extend(
                 compiled

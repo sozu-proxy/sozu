@@ -169,7 +169,7 @@ impl UdpHealthChecker {
     ) {
         match settings {
             Some(s) => {
-                self.settings.insert(cluster_id.to_owned(), s);
+                self.settings.insert(cluster_id.into(), s);
             }
             None => {
                 self.settings.remove(cluster_id);
@@ -180,7 +180,7 @@ impl UdpHealthChecker {
                 // refill.
                 let mut kept = Vec::with_capacity(self.in_flight.len());
                 for mut probe in self.in_flight.drain(..) {
-                    if probe.cluster_id == cluster_id {
+                    if *probe.cluster_id == *cluster_id {
                         probe.socket.deregister(registry);
                     } else {
                         kept.push(probe);
@@ -366,7 +366,7 @@ impl UdpHealthChecker {
         self.in_flight.push(InFlightProbe {
             socket: ProbeSocket::Tcp(stream),
             token,
-            cluster_id: cluster_id.to_owned(),
+            cluster_id: cluster_id.into(),
             backend_id: backend_id.to_owned(),
             address,
             started_at: now,
@@ -432,7 +432,7 @@ impl UdpHealthChecker {
         self.in_flight.push(InFlightProbe {
             socket: ProbeSocket::Udp(socket),
             token,
-            cluster_id: cluster_id.to_owned(),
+            cluster_id: cluster_id.into(),
             backend_id: backend_id.to_owned(),
             address,
             started_at: now,

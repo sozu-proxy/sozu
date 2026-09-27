@@ -1163,7 +1163,8 @@ impl HttpProxy {
                     })?;
             }
         }
-        self.clusters.insert(cluster.cluster_id.clone(), cluster);
+        self.clusters
+            .insert(cluster.cluster_id.as_str().into(), cluster);
         Ok(())
     }
 
@@ -2155,7 +2156,7 @@ mod tests {
                 })
                 .expect("could not send AddHttpFrontend");
             let backend = Backend {
-                cluster_id: "cluster_1".to_owned(),
+                cluster_id: "cluster_1".into(),
                 backend_id: "cluster_1-0".to_owned(),
                 address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
@@ -2278,7 +2279,7 @@ mod tests {
                 address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
                 backend_id: "cluster_1-0".to_owned(),
                 backup: None,
-                cluster_id: "cluster_1".to_owned(),
+                cluster_id: "cluster_1".into(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
                 sticky_id: None,
             };
@@ -2403,9 +2404,9 @@ mod tests {
 
     #[test]
     fn frontend_from_request_test() {
-        let cluster_id1 = "cluster_1".to_owned();
-        let cluster_id2 = "cluster_2".to_owned();
-        let cluster_id3 = "cluster_3".to_owned();
+        let cluster_id1 = ClusterId::from("cluster_1");
+        let cluster_id2 = ClusterId::from("cluster_2");
+        let cluster_id3 = ClusterId::from("cluster_3");
         let uri1 = "/".to_owned();
         let uri2 = "/yolo".to_owned();
         let uri3 = "/yolo/swag".to_owned();
@@ -2478,7 +2479,7 @@ mod tests {
                 method: None,
                 path: PathRule::prefix("/test".to_owned()),
                 position: RulePosition::Tree,
-                cluster_id: Some("cluster_1".to_owned()),
+                cluster_id: Some("cluster_1".into()),
                 tags: None,
                 redirect: None,
                 redirect_scheme: None,

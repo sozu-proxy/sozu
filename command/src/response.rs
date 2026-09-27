@@ -90,7 +90,7 @@ impl fmt::Debug for HttpFrontend {
         });
 
         f.debug_struct("HttpFrontend")
-            .field("cluster_id_len", &self.cluster_id.as_ref().map(String::len))
+            .field("cluster_id_len", &self.cluster_id.as_deref().map(str::len))
             .field("address", &self.address)
             .field("hostname_len", &self.hostname.len())
             .field("path_kind", &self.path.kind)
@@ -127,7 +127,7 @@ impl From<HttpFrontend> for RequestHttpFrontend {
         let source_address = val.address;
         let source_hostname = val.hostname.clone();
         let request_frontend = RequestHttpFrontend {
-            cluster_id: val.cluster_id,
+            cluster_id: val.cluster_id.as_deref().map(str::to_owned),
             address: val.address.into(),
             hostname: val.hostname,
             path: val.path,
@@ -168,7 +168,7 @@ impl From<Backend> for AddBackend {
         let source_cluster_id = val.cluster_id.clone();
         let source_backend_id = val.backend_id.clone();
         let add_backend = AddBackend {
-            cluster_id: val.cluster_id,
+            cluster_id: val.cluster_id.to_string(),
             backend_id: val.backend_id,
             address: val.address.into(),
             sticky_id: val.sticky_id,
@@ -181,7 +181,7 @@ impl From<Backend> for AddBackend {
         // be registered under the wrong key and never receive (or steal)
         // traffic.
         debug_assert_eq!(
-            add_backend.cluster_id, source_cluster_id,
+            *add_backend.cluster_id, *source_cluster_id,
             "backend cluster_id must survive the proto conversion"
         );
         debug_assert_eq!(
@@ -307,7 +307,7 @@ impl fmt::Display for PathRule {
 /// A TCP frontend, as used *within* Sōzu
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TcpFrontend {
-    pub cluster_id: String,
+    pub cluster_id: ClusterId,
     pub address: SocketAddr,
     /// custom tags to identify the frontend in the access logs
     pub tags: BTreeMap<String, String>,
@@ -328,7 +328,7 @@ impl From<TcpFrontend> for RequestTcpFrontend {
         let source_sni = val.sni.clone();
         let source_alpn = val.alpn.clone();
         let request_frontend = RequestTcpFrontend {
-            cluster_id: val.cluster_id,
+            cluster_id: val.cluster_id.to_string(),
             address: val.address.into(),
             tags: val.tags,
             sni: val.sni,
@@ -338,7 +338,7 @@ impl From<TcpFrontend> for RequestTcpFrontend {
         // POST: cluster identity and the wire address are preserved across the
         // proto conversion (same routing guarantee as the HTTP frontend path).
         debug_assert_eq!(
-            request_frontend.cluster_id, source_cluster_id,
+            *request_frontend.cluster_id, *source_cluster_id,
             "TCP frontend cluster_id must survive the proto conversion"
         );
         debug_assert_eq!(
@@ -364,7 +364,7 @@ impl From<TcpFrontend> for RequestTcpFrontend {
 /// A UDP frontend, as used *within* Sōzu
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UdpFrontend {
-    pub cluster_id: String,
+    pub cluster_id: ClusterId,
     pub address: SocketAddr,
     /// custom tags to identify the frontend in the access logs
     pub tags: BTreeMap<String, String>,
@@ -373,7 +373,7 @@ pub struct UdpFrontend {
 impl From<UdpFrontend> for RequestUdpFrontend {
     fn from(val: UdpFrontend) -> Self {
         RequestUdpFrontend {
-            cluster_id: val.cluster_id,
+            cluster_id: val.cluster_id.to_string(),
             address: val.address.into(),
             tags: val.tags,
         }
@@ -383,7 +383,7 @@ impl From<UdpFrontend> for RequestUdpFrontend {
 /// A backend, as used *within* Sōzu
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Backend {
-    pub cluster_id: String,
+    pub cluster_id: ClusterId,
     pub backend_id: String,
     pub address: SocketAddr,
     #[serde(default)]
@@ -443,7 +443,7 @@ impl Backend {
         let source_address = self.address;
         let source_backend_id = self.backend_id.clone();
         let add_backend = AddBackend {
-            cluster_id: self.cluster_id,
+            cluster_id: self.cluster_id.to_string(),
             address: self.address.into(),
             sticky_id: self.sticky_id,
             backend_id: self.backend_id,

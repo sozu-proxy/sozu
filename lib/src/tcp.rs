@@ -114,7 +114,7 @@ pub struct TcpSession {
     backend_id: Option<String>,
     backend_token: Option<Token>,
     backend: Option<Rc<RefCell<Backend>>>,
-    cluster_id: Option<String>,
+    cluster_id: Option<ClusterId>,
     configured_backend_timeout: Duration,
     connection_attempt: u8,
     container_backend_timeout: TimeoutContainer,
@@ -169,7 +169,7 @@ impl TcpSession {
     fn new(
         backend_buffer: Checkout,
         backend_id: Option<String>,
-        cluster_id: Option<String>,
+        cluster_id: Option<ClusterId>,
         configured_backend_timeout: Duration,
         configured_connect_timeout: Duration,
         configured_frontend_timeout: Duration,
@@ -2055,7 +2055,7 @@ impl ProxySession for TcpSession {
 pub struct TcpListener {
     active: SessionIsToBeClosed,
     address: SocketAddr,
-    cluster_id: Option<String>,
+    cluster_id: Option<ClusterId>,
     config: TcpListenerConfig,
     listener: Option<MioTcpListener>,
     /// A socket this listener holds but has NOT registered.
@@ -2396,13 +2396,13 @@ impl TcpListener {
     /// matching `(AlpnMatcher, ClusterId)` entry, then `domain_remove`s the
     /// SNI key itself once its `Vec` is empty (no stranded empty entries in
     /// the trie).
-    fn remove_sni_route(&mut self, sni: String, alpn: Vec<String>, cluster_id: &ClusterId) {
+    fn remove_sni_route(&mut self, sni: String, alpn: Vec<String>, cluster_id: &str) {
         let (key, matcher) = route_key_and_matcher(&sni, alpn);
         // `accept_wildcard: false` — same reasoning as `insert_sni_route`:
         // removing the exact key must never reach into and strip a sibling
         // wildcard's entries.
         if let Some((_, entries)) = self.sni_routes.domain_lookup_mut(&key, false) {
-            entries.retain(|(m, c)| !(*m == matcher && c == cluster_id));
+            entries.retain(|(m, c)| !(*m == matcher && **c == *cluster_id));
             if entries.is_empty() {
                 self.sni_routes.domain_remove(&key);
             }
@@ -2714,7 +2714,7 @@ pub struct ClusterConfiguration {
 }
 
 pub struct TcpProxy {
-    fronts: HashMap<String, Token>,
+    fronts: HashMap<ClusterId, Token>,
     backends: Rc<RefCell<BackendMap>>,
     listeners: HashMap<Token, Rc<RefCell<TcpListener>>>,
     configs: HashMap<ClusterId, ClusterConfiguration>,
@@ -2890,8 +2890,8 @@ impl TcpProxy {
         // config.rs entirely.
         listener.validate_new_tcp_front(&front)?;
 
-        self.fronts
-            .insert(front.cluster_id.to_string(), listener.token);
+        let cluster_id = ClusterId::from(front.cluster_id);
+        self.fronts.insert(cluster_id.clone(), listener.token);
 
         match front.sni {
             Some(sni) => {
@@ -2899,14 +2899,14 @@ impl TcpProxy {
                 // listener, so the bare-address key (kept for no-SNI fronts
                 // below) would clobber siblings — see `sni_tags_key`.
                 listener.set_tags(sni_tags_key(&address, &sni, &front.alpn), Some(front.tags));
-                listener.insert_sni_route(sni, front.alpn, front.cluster_id)?;
+                listener.insert_sni_route(sni, front.alpn, cluster_id)?;
             }
             None => {
                 listener.set_tags(
                     TcpFrontendTagsKey::Address(address).to_string(),
                     Some(front.tags),
                 );
-                listener.cluster_id = Some(front.cluster_id);
+                listener.cluster_id = Some(cluster_id);
             }
         }
 
@@ -2940,7 +2940,7 @@ impl TcpProxy {
                 // for every sibling front on the listener.
                 listener.set_tags(sni_tags_key(&address, &sni, &front.alpn), None);
                 listener.remove_sni_route(sni, front.alpn, &front.cluster_id);
-                self.fronts.remove(&front.cluster_id);
+                self.fronts.remove(front.cluster_id.as_str());
             }
             None => {
                 listener.set_tags(TcpFrontendTagsKey::Address(address).to_string(), None);
@@ -3013,11 +3013,11 @@ impl ProxyConfiguration for TcpProxy {
                     max_connections_per_ip: cluster.max_connections_per_ip,
                     max_connections_per_subnet: cluster.max_connections_per_subnet,
                 };
-                self.configs.insert(cluster.cluster_id, config);
+                self.configs.insert(cluster.cluster_id.into(), config);
                 WorkerResponse::ok(message.id)
             }
             RequestType::RemoveCluster(cluster_id) => {
-                self.configs.remove(&cluster_id);
+                self.configs.remove(cluster_id.as_str());
                 WorkerResponse::ok(message.id)
             }
             RequestType::RemoveListener(remove) => {
@@ -3483,7 +3483,7 @@ mod tests {
                 ..Default::default()
             };
             let backend = sozu_command_lib::response::Backend {
-                cluster_id: "yolo".to_owned(),
+                cluster_id: "yolo".into(),
                 backend_id: "yolo-0".to_owned(),
                 address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
@@ -3511,7 +3511,7 @@ mod tests {
                 ..Default::default()
             };
             let backend = sozu_command::response::Backend {
-                cluster_id: "yolo".to_owned(),
+                cluster_id: "yolo".into(),
                 backend_id: "yolo-0".to_owned(),
                 address: SocketAddress::new_v4(127, 0, 0, 1, backend_port).into(),
                 load_balancing_parameters: Some(LoadBalancingParams::default()),
@@ -3651,13 +3651,13 @@ mod sni_routing_tests {
     fn empty_alpn_maps_to_any_non_empty_maps_to_one_of() {
         let mut listener = test_listener();
         listener
-            .insert_sni_route("example.com".to_owned(), vec![], "cluster-any".to_owned())
+            .insert_sni_route("example.com".to_owned(), vec![], "cluster-any".into())
             .expect("insert_sni_route must succeed for a valid test SNI");
         listener
             .insert_sni_route(
                 "h2.example.com".to_owned(),
                 vec!["h2".to_owned(), "http/1.1".to_owned()],
-                "cluster-h2".to_owned(),
+                "cluster-h2".into(),
             )
             .expect("insert_sni_route must succeed for a valid test SNI");
 
@@ -3665,10 +3665,7 @@ mod sni_routing_tests {
             .sni_routes
             .domain_lookup(b"example.com", true)
             .expect("example.com must be routable");
-        assert_eq!(
-            any_entries,
-            &vec![(AlpnMatcher::Any, "cluster-any".to_owned())]
-        );
+        assert_eq!(any_entries, &vec![(AlpnMatcher::Any, "cluster-any".into())]);
 
         let (_, h2_entries) = listener
             .sni_routes
@@ -3678,7 +3675,7 @@ mod sni_routing_tests {
             h2_entries,
             &vec![(
                 AlpnMatcher::OneOf([b"h2".to_vec(), b"http/1.1".to_vec()].into_iter().collect()),
-                "cluster-h2".to_owned()
+                "cluster-h2".into()
             )]
         );
     }
@@ -3690,15 +3687,11 @@ mod sni_routing_tests {
             .insert_sni_route(
                 "example.com".to_owned(),
                 vec!["h2".to_owned()],
-                "cluster-h2".to_owned(),
+                "cluster-h2".into(),
             )
             .expect("insert_sni_route must succeed for a valid test SNI");
         listener
-            .insert_sni_route(
-                "example.com".to_owned(),
-                vec![],
-                "cluster-default".to_owned(),
-            )
+            .insert_sni_route("example.com".to_owned(), vec![], "cluster-default".into())
             .expect("insert_sni_route must succeed for a valid test SNI");
 
         let (_, entries) = listener
@@ -3715,21 +3708,17 @@ mod sni_routing_tests {
             .insert_sni_route(
                 "example.com".to_owned(),
                 vec!["h2".to_owned()],
-                "cluster-h2".to_owned(),
+                "cluster-h2".into(),
             )
             .expect("insert_sni_route must succeed for a valid test SNI");
         listener
-            .insert_sni_route(
-                "example.com".to_owned(),
-                vec![],
-                "cluster-default".to_owned(),
-            )
+            .insert_sni_route("example.com".to_owned(), vec![], "cluster-default".into())
             .expect("insert_sni_route must succeed for a valid test SNI");
 
         listener.remove_sni_route(
             "example.com".to_owned(),
             vec!["h2".to_owned()],
-            &"cluster-h2".to_owned(),
+            "cluster-h2",
         );
 
         let (_, entries) = listener
@@ -3738,7 +3727,7 @@ mod sni_routing_tests {
             .expect("example.com must still be routable via the remaining entry");
         assert_eq!(
             entries,
-            &vec![(AlpnMatcher::Any, "cluster-default".to_owned())],
+            &vec![(AlpnMatcher::Any, "cluster-default".into())],
             "removing one entry must not disturb the other"
         );
     }
@@ -3747,11 +3736,11 @@ mod sni_routing_tests {
     fn remove_sni_route_empties_the_trie_key_when_the_last_entry_goes() {
         let mut listener = test_listener();
         listener
-            .insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned())
+            .insert_sni_route("example.com".to_owned(), vec![], "cluster-a".into())
             .expect("insert_sni_route must succeed for a valid test SNI");
         assert!(!listener.sni_routes.is_empty());
 
-        listener.remove_sni_route("example.com".to_owned(), vec![], &"cluster-a".to_owned());
+        listener.remove_sni_route("example.com".to_owned(), vec![], "cluster-a");
 
         assert!(
             listener.sni_routes.is_empty(),
@@ -3769,16 +3758,12 @@ mod sni_routing_tests {
     fn remove_sni_route_on_an_absent_sni_is_a_harmless_no_op() {
         let mut listener = test_listener();
         listener
-            .insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned())
+            .insert_sni_route("example.com".to_owned(), vec![], "cluster-a".into())
             .expect("insert_sni_route must succeed for a valid test SNI");
 
         // Removing a route for a SNI that was never inserted must not panic
         // and must not disturb the existing route.
-        listener.remove_sni_route(
-            "other.example.net".to_owned(),
-            vec![],
-            &"cluster-a".to_owned(),
-        );
+        listener.remove_sni_route("other.example.net".to_owned(), vec![], "cluster-a");
 
         assert!(
             listener
@@ -3799,7 +3784,7 @@ mod sni_routing_tests {
             .insert_sni_route(
                 "*.example.com".to_owned(),
                 vec![],
-                "cluster-wildcard".to_owned(),
+                "cluster-wildcard".into(),
             )
             .expect("insert_sni_route must succeed for a valid test SNI");
         // Exact ALPN-scoped route for one specific subdomain.
@@ -3807,7 +3792,7 @@ mod sni_routing_tests {
             .insert_sni_route(
                 "a.example.com".to_owned(),
                 vec!["h2".to_owned()],
-                "cluster-a-h2".to_owned(),
+                "cluster-a-h2".into(),
             )
             .expect("insert_sni_route must succeed for a valid test SNI");
 
@@ -3823,7 +3808,7 @@ mod sni_routing_tests {
             a_entries,
             &vec![(
                 AlpnMatcher::OneOf([b"h2".to_vec()].into_iter().collect()),
-                "cluster-a-h2".to_owned()
+                "cluster-a-h2".into()
             )],
             "the exact key's own Vec must hold only its own entry, not the wildcard's"
         );
@@ -3837,7 +3822,7 @@ mod sni_routing_tests {
             .expect("b.example.com must fall back to the wildcard catch-all");
         assert_eq!(
             b_entries,
-            &vec![(AlpnMatcher::Any, "cluster-wildcard".to_owned())],
+            &vec![(AlpnMatcher::Any, "cluster-wildcard".into())],
             "an unrelated subdomain must see ONLY the wildcard's entry"
         );
     }
@@ -3849,7 +3834,7 @@ mod sni_routing_tests {
             .insert_sni_route(
                 "*.example.com".to_owned(),
                 vec![],
-                "cluster-wildcard".to_owned(),
+                "cluster-wildcard".into(),
             )
             .expect("insert_sni_route must succeed for a valid test SNI");
 
@@ -3872,7 +3857,7 @@ mod sni_routing_tests {
             .insert_sni_route(
                 "*.example.com".to_owned(),
                 vec![],
-                "cluster-wildcard".to_owned(),
+                "cluster-wildcard".into(),
             )
             .expect("insert_sni_route must succeed for a valid test SNI");
 
@@ -3897,7 +3882,7 @@ mod sni_routing_tests {
             .insert_sni_route(
                 "*.example.com".to_owned(),
                 vec!["h2".to_owned()],
-                "cluster-wildcard-h2".to_owned(),
+                "cluster-wildcard-h2".into(),
             )
             .expect("insert_sni_route must succeed for a valid test SNI");
 
@@ -3917,7 +3902,7 @@ mod sni_routing_tests {
             .insert_sni_route(
                 "*.example.com".to_owned(),
                 vec![],
-                "cluster-wildcard".to_owned(),
+                "cluster-wildcard".into(),
             )
             .expect("insert_sni_route must succeed for a valid test SNI");
 
@@ -4310,7 +4295,7 @@ mod sni_routing_tests {
             .insert_sni_route(
                 "*.example.com".to_owned(),
                 vec![],
-                "cluster-wildcard".to_owned(),
+                "cluster-wildcard".into(),
             )
             .expect("insert_sni_route must succeed for a valid test SNI");
 
@@ -4319,11 +4304,7 @@ mod sni_routing_tests {
         // (e.g. a stale `RemoveTcpFrontend` replayed from a hand-edited
         // `LoadState`) must be a no-op here, not reach into and strip the
         // WILDCARD's own catch-all entry.
-        listener.remove_sni_route(
-            "a.example.com".to_owned(),
-            vec![],
-            &"cluster-wildcard".to_owned(),
-        );
+        listener.remove_sni_route("a.example.com".to_owned(), vec![], "cluster-wildcard");
 
         let (_, wildcard_entries) = listener
             .sni_routes
@@ -4333,7 +4314,7 @@ mod sni_routing_tests {
             );
         assert_eq!(
             wildcard_entries,
-            &vec![(AlpnMatcher::Any, "cluster-wildcard".to_owned())]
+            &vec![(AlpnMatcher::Any, "cluster-wildcard".into())]
         );
     }
 
@@ -4342,7 +4323,7 @@ mod sni_routing_tests {
     #[test]
     fn a_no_sni_front_leaves_the_route_table_empty() {
         let mut listener = test_listener();
-        listener.cluster_id = Some("legacy-catch-all".to_owned());
+        listener.cluster_id = Some("legacy-catch-all".into());
         assert!(
             listener.sni_routes.is_empty(),
             "a listener with only a no-SNI front must never populate sni_routes"
@@ -4353,7 +4334,7 @@ mod sni_routing_tests {
     fn an_sni_scoped_front_leaves_cluster_id_unset() {
         let mut listener = test_listener();
         listener
-            .insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned())
+            .insert_sni_route("example.com".to_owned(), vec![], "cluster-a".into())
             .expect("insert_sni_route must succeed for a valid test SNI");
         assert!(
             listener.cluster_id.is_none(),
@@ -4409,7 +4390,7 @@ mod sni_routing_tests {
                 // Lowercased at insert time regardless of wire-form casing.
                 .domain_lookup(b"example.com", true)
                 .expect("example.com must be routable after add_tcp_front");
-            assert_eq!(entries, &vec![(AlpnMatcher::Any, "cluster-a".to_owned())]);
+            assert_eq!(entries, &vec![(AlpnMatcher::Any, "cluster-a".into())]);
         }
         assert_eq!(proxy.fronts.get("cluster-a"), Some(&token));
 
@@ -4460,7 +4441,7 @@ mod sni_routing_tests {
                 .expect("listener must be present")
                 .borrow()
                 .cluster_id,
-            Some("cluster-legacy".to_owned())
+            Some("cluster-legacy".into())
         );
 
         proxy
@@ -4907,7 +4888,7 @@ mod sni_routing_tests {
 
         let mut bare_listener = test_listener();
         bare_listener
-            .insert_sni_route("example.com".to_owned(), vec![], "cluster-a".to_owned())
+            .insert_sni_route("example.com".to_owned(), vec![], "cluster-a".into())
             .expect("insert_sni_route must succeed for a valid test SNI");
         let configured_front_timeout = bare_listener.config.front_timeout;
         let listener = Rc::new(RefCell::new(bare_listener));
@@ -5089,7 +5070,7 @@ mod sni_routing_tests {
         let session = Rc::new(RefCell::new(TcpSession::new(
             backend_buffer,
             None,
-            Some("cluster-expect".to_owned()),
+            Some("cluster-expect".into()),
             Duration::from_secs(30),
             Duration::from_secs(30),
             Duration::from_secs(30),

@@ -499,7 +499,12 @@ impl Server {
             }
             RequestType::QueryClustersHashes(_) => Some(
                 ContentType::ClusterHashes(ClusterHashes {
-                    map: self.state.hash_state(),
+                    map: self
+                        .state
+                        .hash_state()
+                        .into_iter()
+                        .map(|(cluster_id, hash)| (cluster_id.to_string(), hash))
+                        .collect(),
                 })
                 .into(),
             ),
@@ -5894,7 +5899,7 @@ mod load_state_rollback_tests {
             .tcp_fronts
             .iter()
             .filter(|(_, fronts)| !fronts.is_empty())
-            .map(|(cluster_id, _)| cluster_id.as_str())
+            .map(|(cluster_id, _)| &**cluster_id)
             .collect();
         surviving.sort_unstable();
         assert_eq!(

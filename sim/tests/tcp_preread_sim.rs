@@ -285,7 +285,7 @@ fn routed(
     matched_alpn: AlpnMatcher,
 ) -> Output {
     Output::Routed {
-        cluster: cluster.to_owned(),
+        cluster: cluster.into(),
         content_offset,
         proxy_source,
         sni: sni.to_owned(),
@@ -300,37 +300,37 @@ fn routed(
 // (Any-only, OneOf-only with no fallback, and OneOf+Any mixed).
 // --------------------------------------------------------------------------
 
-fn build_route_table() -> TrieNode<Vec<(AlpnMatcher, String)>> {
+fn build_route_table() -> TrieNode<Vec<(AlpnMatcher, Arc<str>)>> {
     let mut routes = TrieNode::root();
     routes.domain_insert(
         b"exact.example.com".to_vec(),
-        vec![(AlpnMatcher::Any, "cluster-exact-any".to_owned())],
+        vec![(AlpnMatcher::Any, "cluster-exact-any".into())],
     );
     routes.domain_insert(
         b"*.wild.example.com".to_vec(),
-        vec![(AlpnMatcher::Any, "cluster-wild".to_owned())],
+        vec![(AlpnMatcher::Any, "cluster-wild".into())],
     );
     routes.domain_insert(
         b"prefs.example.com".to_vec(),
         vec![
-            (one_of(&[b"http/1.1"]), "cluster-http11".to_owned()),
-            (one_of(&[b"h2"]), "cluster-h2".to_owned()),
+            (one_of(&[b"http/1.1"]), "cluster-http11".into()),
+            (one_of(&[b"h2"]), "cluster-h2".into()),
         ],
     );
     routes.domain_insert(
         b"mixed.example.com".to_vec(),
         vec![
-            (one_of(&[b"h2"]), "cluster-h2mixed".to_owned()),
-            (AlpnMatcher::Any, "cluster-default-mixed".to_owned()),
+            (one_of(&[b"h2"]), "cluster-h2mixed".into()),
+            (AlpnMatcher::Any, "cluster-default-mixed".into()),
         ],
     );
     routes.domain_insert(
         b"alpn.example.com".to_vec(),
-        vec![(one_of(&[b"h2"]), "cluster-h2-only".to_owned())],
+        vec![(one_of(&[b"h2"]), "cluster-h2-only".into())],
     );
     routes.domain_insert(
         b"split.example.com".to_vec(),
-        vec![(AlpnMatcher::Any, "cluster-split".to_owned())],
+        vec![(AlpnMatcher::Any, "cluster-split".into())],
     );
     routes
 }
@@ -1226,7 +1226,7 @@ async fn finalize_if_needed(
 async fn run_connection(
     ctx: &SimContext,
     base: Instant,
-    routes: &TrieNode<Vec<(AlpnMatcher, String)>>,
+    routes: &TrieNode<Vec<(AlpnMatcher, Arc<str>)>>,
     scenario: &Scenario,
     conn_idx: usize,
 ) -> (Output, bool) {

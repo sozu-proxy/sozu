@@ -138,9 +138,10 @@ Notes:
   (`lib/src/protocol/mux/router.rs`) and
   `a_tree_lookup_allocates_nothing_past_its_route_result`
   (`lib/src/router/mod.rs`, [#1589](https://github.com/sozu-proxy/sozu/issues/1589))
-  are of that kind: their controls hold only the cluster id cloned out of the
-  route table (and, in the debug build, the `DebugEvent::Str` history push),
-  so any other allocation in routing fails them. A budget measured through the public API lives in its own
+  are of that kind: the first controls only for the debug build's
+  `DebugEvent::Str` history push, so any allocation in routing or in the
+  per-(cluster, source-IP) gate fails it; the second only for building the
+  `RouteResult`, whose cluster id is a shared handle rather than a copy. A budget measured through the public API lives in its own
   `lib/tests/` binary with its own allocator instead, as
   `lib/tests/backend_selection.rs` does.
 - **Router hostname resolution is unit-tested with `quickcheck`**

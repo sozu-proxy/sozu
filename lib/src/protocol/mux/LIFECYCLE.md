@@ -547,10 +547,12 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   The cluster the gate is keyed on does not travel in `ConnectResume`.
   `plan_connect` moves the id `route_from_request` returned into the stream's
   `HttpContext::cluster_id`, and `consult_ip_gate` and
-  `Router::decide_after_gate` borrow it from there, so a request owns one copy
-  of its cluster id rather than one per step (#1583). The only further copy is
-  the one a dial makes: `ConnectPlan::Dial` carries it and `Mux::dial_backend`
-  moves it into the new connection's `Position::Client`.
+  `Router::decide_after_gate` borrow it from there (#1583). `ClusterId` is a
+  reference-counted `Arc<str>`, so that id is itself a handle on the route
+  table's allocation, and so are the keys `SessionManager::track_cluster_ip`
+  stores and the id a dial hands over: `ConnectPlan::Dial` carries a handle
+  and `Mux::dial_backend` moves it into the new connection's
+  `Position::Client`. No step of a request copies its cluster id.
 
   Two things make the split hard to get wrong rather than merely documented.
   `ConnectResume` is taken **by value**, so a parked decision cannot be

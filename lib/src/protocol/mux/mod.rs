@@ -552,7 +552,7 @@ impl BackendRegistry {
 }
 
 pub enum Position {
-    Client(String, BackendId, BackendStatus),
+    Client(sozu_command::state::ClusterId, BackendId, BackendStatus),
     Server,
 }
 
@@ -1540,7 +1540,7 @@ fn consult_ip_gate(
     frontend_token: Token,
     // The cluster routing resolved, borrowed from the stream's `HttpContext`
     // where `Router::plan_connect` stored it (#1583).
-    cluster_id: &str,
+    cluster_id: &sozu_command::state::ClusterId,
     resume: &router::ConnectResume,
 ) -> router::IpGateVerdict {
     // BOTH caps are consulted here, through the one combined gate:
@@ -1568,7 +1568,7 @@ fn consult_ip_gate(
     // session close, via `untrack_all_cluster_ip`.
     sessions.borrow_mut().track_cluster_connection(
         frontend_token,
-        cluster_id.to_owned(),
+        cluster_id.clone(),
         resume.ip(),
         resume.max_connections_per_subnet(),
     );
@@ -2303,9 +2303,9 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
         context: &mut Context<L>,
         session: &Rc<RefCell<dyn ProxySession>>,
         proxy: &Rc<RefCell<dyn L7Proxy>>,
-        // Owned: moved into the new connection's `Position::Client`, the one
-        // copy of the cluster id a dial makes (#1583).
-        cluster_id: String,
+        // Owned: moved into the new connection's `Position::Client`, a handle
+        // on the stream's routed id rather than a copy of it (#1583).
+        cluster_id: sozu_command::state::ClusterId,
         h2: bool,
         frontend_should_stick: bool,
     ) -> Result<(), BackendConnectionError> {
@@ -2627,7 +2627,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         kind: EventKind::BackendUp as i32,
                                         backend_id: Some(backend.backend_id.to_string()),
                                         address: Some(backend.address.into()),
-                                        cluster_id: Some(cluster_id.to_owned()),
+                                        cluster_id: Some(cluster_id.to_string()),
                                         metric_detail: None,
                                     });
                                 }
@@ -2789,7 +2789,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                                         kind: EventKind::BackendDown as i32,
                                         backend_id: Some(backend.backend_id.to_string()),
                                         address: Some(backend.address.into()),
-                                        cluster_id: Some(cluster_id.to_owned()),
+                                        cluster_id: Some(cluster_id.to_string()),
                                         metric_detail: None,
                                     });
                                 }
@@ -3030,7 +3030,7 @@ impl<Front: SocketHandler + std::fmt::Debug, L: ListenerHandler + L7ListenerHand
                             // it paused; an unset one is refused, not gated
                             // against an empty key.
                             let Some(cluster_id) =
-                                context.http_context(stream_id).cluster_id.as_deref()
+                                context.http_context(stream_id).cluster_id.as_ref()
                             else {
                                 return Err(BackendConnectionError::MaxSessionsMemory);
                             };
@@ -5364,7 +5364,7 @@ mod tests {
         let connection = Connection::new_h1_client(
             Ulid::generate(),
             SessionTcpStream::new(backend_socket, mux.session_ulid, Some(backend_address)),
-            "test-cluster".to_owned(),
+            "test-cluster".into(),
             backend,
             duration,
         );
@@ -5814,7 +5814,7 @@ mod tests {
         let mut connection = Connection::new_h1_client(
             session_ulid,
             SessionTcpStream::new(socket, session_ulid, None),
-            "test-cluster".to_owned(),
+            "test-cluster".into(),
             backend_id,
             Duration::from_secs(30),
         );

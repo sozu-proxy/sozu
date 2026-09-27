@@ -33,7 +33,7 @@ use sozu_command::{
     },
     ready::Ready,
     scm_socket::{Listeners, ScmSocket, ScmSocketError},
-    state::ConfigState,
+    state::{ClusterId, ConfigState},
 };
 
 use crate::metrics::names;
@@ -362,22 +362,22 @@ pub struct SessionManager {
     /// The per-request hot path (`cluster_ip_at_limit`, called from
     /// `mux/router::plan_connect` for every cluster-resolving request) used
     /// to allocate a `String` to build the compound key on every
-    /// lookup. Splitting the storage so the outer key is `String`
+    /// lookup. Splitting the storage so the outer key is a [`ClusterId`]
     /// lets the lookup take `&str` — `HashMap::get(cluster_id)` on a
-    /// `HashMap<String, _>` accepts a borrow via the `Borrow<str>`
-    /// impl. The hot path no longer allocates; the only `String` clone
-    /// is in `track_cluster_ip`, which runs at most once per
-    /// `(cluster, ip)` pair per session. Memory footprint is unchanged
+    /// `HashMap<ClusterId, _>` accepts a borrow via the `Borrow<str>`
+    /// impl. The hot path no longer allocates, and `track_cluster_ip`
+    /// keys the maps with the caller's reference-counted handle, so no
+    /// key is ever a copy of the id. Memory footprint is unchanged
     /// in steady state — entries are still reaped to zero on session
     /// close.
-    connections_per_cluster_ip: HashMap<String, HashMap<IpAddr, usize>>,
+    connections_per_cluster_ip: HashMap<ClusterId, HashMap<IpAddr, usize>>,
     /// Reverse index: per-token map of `cluster_id` → set of source IPs
     /// already counted against `connections_per_cluster_ip`. Used to
     /// make `track_cluster_ip` idempotent within a session (so H2
     /// streams to the same cluster from the same client only consume
     /// one slot in the limit) and to drain a session's contributions on
     /// close. Same nesting rationale as above.
-    cluster_ip_tracks: HashMap<Token, HashMap<String, HashSet<IpAddr>>>,
+    cluster_ip_tracks: HashMap<Token, HashMap<ClusterId, HashSet<IpAddr>>>,
     /// Default per-(cluster, source-SUBNET) connection limit. `0`
     /// disables the subnet limiter, which is the default; cluster-level
     /// overrides take precedence at check time.
@@ -411,10 +411,10 @@ pub struct SessionManager {
     /// default genuinely free rather than merely inert — no second
     /// allocation, no second hash, no second entry per session for an
     /// operator who never turns the feature on.
-    connections_per_cluster_subnet: HashMap<String, HashMap<IpAddr, usize>>,
+    connections_per_cluster_subnet: HashMap<ClusterId, HashMap<IpAddr, usize>>,
     /// Reverse index for `connections_per_cluster_subnet`, mirroring
     /// `cluster_ip_tracks`. Also empty while the limiter is disabled.
-    cluster_subnet_tracks: HashMap<Token, HashMap<String, HashSet<IpAddr>>>,
+    cluster_subnet_tracks: HashMap<Token, HashMap<ClusterId, HashSet<IpAddr>>>,
 }
 
 impl SessionManager {
@@ -598,10 +598,10 @@ impl SessionManager {
     /// `(cluster, ip)` is a no-op so H2 retries / multi-stream opens
     /// to the same cluster do not double-count.
     ///
-    /// Allocates a single owned `String` per `(token, cluster)` pair on
-    /// first observation — `entry(cluster_id.clone())` materialises a
-    /// new outer-map slot. Subsequent IPs under the same `(token,
-    /// cluster)` reuse the existing slot.
+    /// Copies no cluster id: `entry(cluster_id.clone())` only bumps the
+    /// [`ClusterId`] count. A first `(token, cluster)` observation
+    /// allocates the new slot's IP set; later IPs under it reuse the
+    /// set, and a repeat call allocates nothing.
     ///
     /// ── A FAILED backend dial keeps the slot, and that is deliberate ──
     ///
@@ -671,7 +671,7 @@ impl SessionManager {
     /// `Connection: close`, the opt-out `doc/rate-limit-design.md`
     /// already records for the 429 template. An operator who takes it
     /// holds one slot per failed dial until the client goes away.
-    pub fn track_cluster_ip(&mut self, token: Token, cluster_id: String, ip: IpAddr) {
+    pub fn track_cluster_ip(&mut self, token: Token, cluster_id: ClusterId, ip: IpAddr) {
         // Snapshot the forward count for this (cluster, ip) before the insert
         // so we can pair-assert the delta. Ungated `let`: read only inside the
         // debug_assert! below → optimised out in release (no E0425).
@@ -735,7 +735,7 @@ impl SessionManager {
     pub fn track_cluster_subnet(
         &mut self,
         token: Token,
-        cluster_id: String,
+        cluster_id: ClusterId,
         ip: IpAddr,
         override_value: Option<u64>,
     ) {
@@ -802,7 +802,7 @@ impl SessionManager {
     pub fn track_cluster_connection(
         &mut self,
         token: Token,
-        cluster_id: String,
+        cluster_id: ClusterId,
         ip: IpAddr,
         subnet_override: Option<u64>,
     ) {
@@ -2419,7 +2419,12 @@ impl Server {
                 push_queue(WorkerResponse::ok_with_content(
                     message.id.clone(),
                     ContentType::ClusterHashes(ClusterHashes {
-                        map: self.config_state.hash_state(),
+                        map: self
+                            .config_state
+                            .hash_state()
+                            .into_iter()
+                            .map(|(cluster_id, hash)| (cluster_id.to_string(), hash))
+                            .collect(),
                     })
                     .into(),
                 ));
@@ -6109,7 +6114,7 @@ mod scm_listener_handoff_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionManager, mask_ipv4, mask_ipv6, subnet_key};
+    use super::{ClusterId, SessionManager, mask_ipv4, mask_ipv6, subnet_key};
     use mio::Token;
     use slab::Slab;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -6124,7 +6129,7 @@ mod tests {
     fn a_cluster_override_dropping_to_zero_after_a_track_is_a_no_op() {
         let manager = SessionManager::new(Slab::with_capacity(8), 8, 0, 0, 0, 24, 56);
         let token = Token(1);
-        let cluster = "api".to_owned();
+        let cluster = ClusterId::from("api");
         let ip: IpAddr = "203.0.113.9".parse().expect("test address must parse");
 
         // Tracked under a positive per-cluster override.
