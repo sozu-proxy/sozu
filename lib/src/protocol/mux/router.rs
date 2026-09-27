@@ -29,9 +29,10 @@
 //! - the H1 `BackendStatus::KeepAlive` arm assigns and breaks, so the FIRST
 //!   matching keep-alive socket wins.
 //!
-//! The map is now a `BTreeMap`, so the scan is the total order on `Token` —
-//! fixed, reproducible, and free (`BTreeMap` iteration is already sorted; no
-//! extra sort step, no injected seed to thread through construction and
+//! The map is now a [`BackendConnections`] (a `BTreeMap` behind one inline
+//! slot for the lowest token, #1610), so the scan is the total order on
+//! `Token` — fixed, reproducible, and free (its iteration is already sorted;
+//! no extra sort step, no injected seed to thread through construction and
 //! tests). The three decisions above resolve to the lowest `Token`, the
 //! highest `Token` and the lowest `Token` respectively. Pinning is all this
 //! does: the last-wins shape of the connecting fallback is preserved, not
@@ -69,7 +70,8 @@
 //!
 //! What changes complexity class is the point lookup: `get` / `get_mut` /
 //! `insert` / `remove` / `contains_key` go from `HashMap`'s amortized `O(1)`
-//! to `BTreeMap`'s `O(log n)`, and `Mux::ready` does one `get_mut`
+//! to `BTreeMap`'s `O(log n)` (the inline slot adds one comparison), and
+//! `Mux::ready` does one `get_mut`
 //! per backend event through `EndpointClient`. Every iteration site —
 //! `Router::plan_connect`'s scan, `Mux::reschedule`, the two
 //! `Mux::ready` sweeps — already walks all `n` and keeps its `O(n)`. At the
@@ -357,23 +359,193 @@ pub(super) enum ConnectPlan {
     },
 }
 
+/// The backend connections of one session, keyed and iterated by [`Token`].
+///
+/// A session almost always holds exactly one backend connection, and a
+/// `Connection<SessionTcpStream>` is about 1.7 KiB. A `BTreeMap` stores its
+/// values inline in 11-slot leaves, so the first insertion into one allocated
+/// ~18.8 KiB to hold that single connection (#1610). The lowest-token
+/// connection therefore lives inline in `first`, and only the others reach
+/// the `BTreeMap`: one backend costs no allocation at all, and every point
+/// operation stays `O(log n)` for the multi-backend sessions the module
+/// header sizes.
+///
+/// Invariant: `first` is `None` only when `rest` is empty, and its token is
+/// below every token in `rest`. Iteration is `first` then `rest`, which is the
+/// total order on `Token` #1338 requires.
+///
+/// HAProxy needs no container here because a stream has one server
+/// connection, reached by pointer (`include/haproxy/stream-t.h`, `scb`); a
+/// mux session can hold several, hence the overflow map.
+pub struct BackendConnections {
+    first: Option<(Token, Connection<SessionTcpStream>)>,
+    rest: BTreeMap<Token, Connection<SessionTcpStream>>,
+}
+
+impl BackendConnections {
+    pub const fn new() -> Self {
+        Self {
+            first: None,
+            rest: BTreeMap::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        usize::from(self.first.is_some()) + self.rest.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    pub fn contains_key(&self, token: &Token) -> bool {
+        self.get(token).is_some()
+    }
+
+    pub fn get(&self, token: &Token) -> Option<&Connection<SessionTcpStream>> {
+        match &self.first {
+            Some((first, connection)) if first == token => Some(connection),
+            _ => self.rest.get(token),
+        }
+    }
+
+    pub fn get_mut(&mut self, token: &Token) -> Option<&mut Connection<SessionTcpStream>> {
+        match &mut self.first {
+            Some((first, connection)) if first == token => Some(connection),
+            _ => self.rest.get_mut(token),
+        }
+    }
+
+    /// Insert `connection` under `token`, returning the one it replaces.
+    pub fn insert(
+        &mut self,
+        token: Token,
+        connection: Connection<SessionTcpStream>,
+    ) -> Option<Connection<SessionTcpStream>> {
+        match &mut self.first {
+            None => {
+                self.first = Some((token, connection));
+                None
+            }
+            Some((first, held)) if *first == token => Some(std::mem::replace(held, connection)),
+            Some((first, held)) if token < *first => {
+                let displaced_token = std::mem::replace(first, token);
+                let displaced = std::mem::replace(held, connection);
+                self.rest.insert(displaced_token, displaced)
+            }
+            Some(_) => self.rest.insert(token, connection),
+        }
+    }
+
+    /// Remove and return the connection under `token`.
+    pub fn remove(&mut self, token: &Token) -> Option<Connection<SessionTcpStream>> {
+        match &self.first {
+            Some((first, _)) if first == token => {
+                let removed = std::mem::replace(&mut self.first, self.rest.pop_first());
+                removed.map(|(_, connection)| connection)
+            }
+            _ => self.rest.remove(token),
+        }
+    }
+
+    /// The connections in ascending `Token` order.
+    pub fn iter(&self) -> BackendConnectionsIter<'_> {
+        let split: fn(&BackendEntry) -> (&Token, &Connection<SessionTcpStream>) =
+            |(token, connection)| (token, connection);
+        self.first.iter().map(split).chain(self.rest.iter())
+    }
+
+    /// The connections in ascending `Token` order, mutably.
+    pub fn iter_mut(&mut self) -> BackendConnectionsIterMut<'_> {
+        let split: fn(&mut BackendEntry) -> (&Token, &mut Connection<SessionTcpStream>) =
+            |(token, connection)| (&*token, connection);
+        self.first.iter_mut().map(split).chain(self.rest.iter_mut())
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &Token> {
+        self.iter().map(|(token, _)| token)
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut Connection<SessionTcpStream>> {
+        self.iter_mut().map(|(_, connection)| connection)
+    }
+}
+
+type BackendEntry = (Token, Connection<SessionTcpStream>);
+
+/// [`BackendConnections::iter`]: the inline connection, then the overflow map.
+pub type BackendConnectionsIter<'a> = std::iter::Chain<
+    std::iter::Map<
+        std::option::Iter<'a, BackendEntry>,
+        fn(&'a BackendEntry) -> (&'a Token, &'a Connection<SessionTcpStream>),
+    >,
+    std::collections::btree_map::Iter<'a, Token, Connection<SessionTcpStream>>,
+>;
+
+/// [`BackendConnections::iter_mut`]: the inline connection, then the overflow map.
+pub type BackendConnectionsIterMut<'a> = std::iter::Chain<
+    std::iter::Map<
+        std::option::IterMut<'a, BackendEntry>,
+        fn(&'a mut BackendEntry) -> (&'a Token, &'a mut Connection<SessionTcpStream>),
+    >,
+    std::collections::btree_map::IterMut<'a, Token, Connection<SessionTcpStream>>,
+>;
+
+impl<'a> IntoIterator for &'a BackendConnections {
+    type Item = (&'a Token, &'a Connection<SessionTcpStream>);
+    type IntoIter = BackendConnectionsIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut BackendConnections {
+    type Item = (&'a Token, &'a mut Connection<SessionTcpStream>);
+    type IntoIter = BackendConnectionsIterMut<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl Default for BackendConnections {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for BackendConnections {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct Router {
-    pub backends: BTreeMap<Token, Connection<SessionTcpStream>>,
+    pub backends: BackendConnections,
     pub configured_backend_timeout: Duration,
     pub configured_connect_timeout: Duration,
     /// Fallback readiness used when a backend token is missing from the map.
     /// This prevents panicking in the Endpoint trait methods that return references.
     pub(super) fallback_readiness: Readiness,
+    /// Tokens of the backend connections a `Mux::ready` pass found dead,
+    /// awaiting their removal from [`Self::backends`] later in that pass.
+    ///
+    /// Emptied at the start of every sweep and kept for its capacity, so a
+    /// session whose backends close one after another allocates it once
+    /// rather than once per pass that closes one (#1610).
+    pub(super) dead_backends: Vec<Token>,
 }
 
 impl Router {
     pub fn new(configured_backend_timeout: Duration, configured_connect_timeout: Duration) -> Self {
         Self {
-            backends: BTreeMap::new(),
+            backends: BackendConnections::new(),
             configured_backend_timeout,
             configured_connect_timeout,
             fallback_readiness: Readiness::new(),
+            dead_backends: Vec::new(),
         }
     }
 
@@ -2164,7 +2336,8 @@ mod authority_matched_cert_name_tests {
 ///
 /// **To SEE THESE RED:** in this module, put `Router::backends` back to
 /// `HashMap<Token, Connection<SessionTcpStream>>`, `Router::new`'s initialiser
-/// back to `HashMap::new()` and the import back to `collections::HashMap`.
+/// back to `HashMap::new()` and the import back to `collections::HashMap`
+/// (the `BackendConnections` type then has no user left; delete it).
 /// Reverting the file wholesale deletes these tests instead of reddening them.
 #[cfg(test)]
 mod backend_selection_order_tests {
@@ -3457,6 +3630,61 @@ mod backend_selection_order_tests {
             std::ptr::eq(owned.as_ptr(), planned),
             "the connection must own the id the plan carried, not a copy of it"
         );
+    }
+
+    /// #1610: a session's first backend connection is stored without a heap
+    /// allocation, and the connections still iterate in `Token` order however
+    /// they were inserted and removed.
+    ///
+    /// `Router::backends` was a `BTreeMap`, whose first insertion allocates an
+    /// 11-slot leaf of ~1.7 KiB connections, ~18.8 KiB, for the one backend a
+    /// session almost always has.
+    ///
+    /// TO SEE THIS RED: in `BackendConnections::insert`, send the `None` arm
+    /// to `self.rest.insert(token, connection)` instead of filling `first`
+    /// (and let `remove` and `is_empty` read `rest` alone). The first
+    /// insertion then makes one allocation.
+    #[test]
+    fn the_first_backend_connection_of_a_session_allocates_nothing() {
+        use crate::test_allocations::allocations;
+
+        let fixture = routing_fixture();
+        let mut backend_registry = BackendRegistry::default();
+        let mut staged = |router: &mut Router, token: usize| {
+            let (connection, peer) =
+                staged_backend(&fixture.pool, &Staged::KeepAliveH1, &mut backend_registry);
+            let before = allocations();
+            let replaced = router.backends.insert(Token(token), connection);
+            let allocated = allocations() - before;
+            assert!(replaced.is_none(), "Token({token}) was not held yet");
+            (allocated, peer)
+        };
+
+        let mut router = Router::new(Duration::from_secs(10), Duration::from_secs(10));
+        let (first, _first_peer) = staged(&mut router, LOWEST_TOKEN + 2);
+        assert_eq!(
+            first, 0,
+            "the first backend connection of a session must not allocate"
+        );
+
+        // A lower token takes the inline slot, a higher one goes to the map.
+        let (_, _lower_peer) = staged(&mut router, LOWEST_TOKEN);
+        let (_, _higher_peer) = staged(&mut router, LOWEST_TOKEN + 5);
+        let order = |router: &Router| router.backends.keys().map(|t| t.0).collect::<Vec<_>>();
+        assert_eq!(
+            order(&router),
+            [LOWEST_TOKEN, LOWEST_TOKEN + 2, LOWEST_TOKEN + 5]
+        );
+        assert_eq!(router.backends.len(), 3);
+
+        // Removing the inline connection promotes the lowest remaining one.
+        assert!(router.backends.remove(&Token(LOWEST_TOKEN)).is_some());
+        assert_eq!(order(&router), [LOWEST_TOKEN + 2, LOWEST_TOKEN + 5]);
+        assert!(router.backends.contains_key(&Token(LOWEST_TOKEN + 2)));
+        assert!(!router.backends.contains_key(&Token(LOWEST_TOKEN)));
+        assert!(router.backends.remove(&Token(LOWEST_TOKEN + 5)).is_some());
+        assert!(router.backends.remove(&Token(LOWEST_TOKEN + 2)).is_some());
+        assert!(router.backends.is_empty());
     }
 }
 

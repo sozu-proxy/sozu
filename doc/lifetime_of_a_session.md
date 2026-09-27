@@ -645,7 +645,9 @@ return to the free list.
 
 The sockets are **not** deregistered from epoll. Each one closes when
 its owner drops: a dead backend connection at the end of the
-`dead_backends` block in `Mux::ready`, and the front socket plus every
+`dead_backends` block in `Mux::ready` (the tokens are collected in
+`Router::dead_backends`, emptied at each sweep and kept for its capacity,
+sozu-proxy/sozu#1610), and the front socket plus every
 remaining backend when the session itself drops, which
 `shut_down_sessions_by_frontend_tokens` (`lib/src/server.rs`) does
 before the event loop's next `epoll_wait`. Linux removes a file from

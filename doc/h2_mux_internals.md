@@ -1494,6 +1494,17 @@ into the replay capture, which writes to the stream's `retry_buffer` and never
 to `kawa`, and its one early `return` inside the window is taken only when the
 vector is empty.
 
+**The first pass of a connection.** A reused field still starts empty on every
+new connection, and pushing one descriptor per block doubled it from four up to
+the block count: 5 allocations for a frontend's 64 descriptors and 4 for a
+backend's 32, 9 per H1 request served on its own connection. `gather` now
+reserves `kawa.out.len()` descriptors before it pushes, an upper bound on what
+it can push, so a fresh connection sizes the vector in one allocation and a
+vector that already holds the capacity is left alone
+([#1610](https://github.com/sozu-proxy/sozu/issues/1610)).
+`a_cold_h1_write_pass_sizes_its_descriptor_vector_once` (`h1.rs`) pins it on
+both sides.
+
 **Why the pair is exported asymmetrically.** `poll_read_target`,
 `handle_read`, `poll_write_target` and `handle_write` were widened so a driver
 outside this crate can eventually stand where `readable` and `write_streams`

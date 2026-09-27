@@ -82,7 +82,7 @@ MuxState
 │   └── H2(ConnectionH2)
 │
 ├── router: Router
-│   └── backends: BTreeMap<Token, Connection<SessionTcpStream>>
+│   └── backends: BackendConnections       (lowest token inline, the rest in a BTreeMap)
 │       ├── Token(7)  → H1(ConnectionH1)  ◄── backend to cluster "app-1"
 │       ├── Token(12) → H2(ConnectionH2)  ◄── backend to cluster "app-2" (h2c)
 │       └── ...

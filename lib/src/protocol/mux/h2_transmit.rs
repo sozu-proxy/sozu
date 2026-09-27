@@ -156,6 +156,11 @@ use kawa::{AsBuffer, Kawa};
 /// early `return` inside the window is taken only when the vector is empty.
 pub unsafe fn gather<T: AsBuffer>(kawa: &Kawa<T>, io_slices: &mut Vec<IoSlice<'static>>) -> usize {
     io_slices.clear();
+    // At most one descriptor per queued block. Reserving them up front sizes
+    // a fresh connection's vector in one allocation instead of doubling it
+    // from four through every power of two up to the block count (#1610); a
+    // vector that already holds the capacity is left alone.
+    io_slices.reserve(kawa.out.len());
     let buffer = kawa.storage.buffer();
     let mut bytes_offered = 0usize;
     for block in kawa.out.iter() {
