@@ -13,7 +13,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, hash_map::Entry},
     io::ErrorKind,
-    net::{Shutdown, SocketAddr as StdSocketAddr},
+    net::SocketAddr as StdSocketAddr,
     rc::{Rc, Weak},
     str::{from_utf8, from_utf8_unchecked},
     sync::Arc,
@@ -1036,8 +1036,23 @@ impl ProxySession for HttpsSession {
         // instead of FIN, destroying any data still in the send buffer — including
         // TLS records that the drain loop just flushed. Using SHUT_WR only sends
         // FIN after all send buffer data is delivered, preserving the response.
+        // Skipped once the client has closed its side: the close that follows
+        // sends the same FIN or RST on its own (`mux::shutdown_write`). Over
+        // TLS that includes a client whose EOF or `close_notify` a read has
+        // already met (`FrontRustls::peer_disconnected`), which no epoll
+        // event reports when the close follows in the same pass.
+        let peer_closed = match &self.state {
+            HttpsStateMachine::Mux(mux) => {
+                mux.frontend_peer_closed()
+                    || match &mux.frontend {
+                        mux::Connection::H1(connection) => connection.socket.peer_disconnected,
+                        mux::Connection::H2(connection) => connection.socket.peer_disconnected,
+                    }
+            }
+            _ => false,
+        };
         let front_socket = self.state.front_socket();
-        if let Err(e) = front_socket.shutdown(Shutdown::Write) {
+        if let Err(e) = mux::shutdown_write(front_socket, peer_closed) {
             // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
             if e.kind() != ErrorKind::NotConnected {
                 error!(
@@ -3756,5 +3771,150 @@ mod tests {
             0,
             "normalising the query must not make an unrelated domain match",
         );
+    }
+
+    /// An HTTPS session upgraded to the mux over a live loopback connection,
+    /// with the accepted peer standing in for the client. The TLS handshake
+    /// never ran; nothing here reads what the client receives beyond the FIN.
+    fn https_mux_session_with_peer() -> (HttpsSession, std::net::TcpStream) {
+        let proxy = proxy_with_certificate_domain("lolcatho.st".to_owned());
+        let listener = proxy
+            .listeners
+            .values()
+            .next()
+            .expect("the test proxy has one listener")
+            .clone();
+        let pool = Rc::downgrade(&proxy.pool);
+        let rustls_details = ServerConnection::new(listener.borrow().rustls_details.clone())
+            .expect("a test rustls server session must be created");
+        let public_address = *listener.borrow().get_addr();
+        let proxy = Rc::new(RefCell::new(proxy));
+
+        let accepting = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener must bind to a loopback port");
+        let address = accepting
+            .local_addr()
+            .expect("test listener must report its local address");
+        let stream = std::net::TcpStream::connect(address).expect("loopback connect must complete");
+        let (client, client_address) = accepting.accept().expect("loopback accept must complete");
+        client
+            .set_nonblocking(true)
+            .expect("the client stand-in must be nonblocking");
+        stream
+            .set_nonblocking(true)
+            .expect("mio requires a nonblocking stream");
+
+        let mut session = HttpsSession::new(
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            false,
+            listener,
+            pool,
+            proxy,
+            public_address,
+            rustls_details,
+            MioTcpStream::from_std(stream),
+            client_address,
+            Token(0),
+            Duration::from_secs(0),
+        );
+        let handshake = match session.state.take() {
+            HttpsStateMachine::Handshake(handshake) => handshake,
+            _ => panic!("a non-expect-proxy session must start in the TLS handshake state"),
+        };
+        session.state = session
+            .upgrade_handshake(handshake)
+            .expect("the handshake must upgrade to a mux session");
+        (session, client)
+    }
+
+    /// Close `session`, drop it as the event loop does, and return the
+    /// `shutdown(SHUT_WR)` calls the close issued and whether `client` then
+    /// observed the FIN.
+    fn frontend_shutdowns_of_a_close(
+        mut session: HttpsSession,
+        client: &mut std::net::TcpStream,
+    ) -> (usize, bool) {
+        use std::io::Read;
+
+        let before = mux::shutdown_writes();
+        session.close();
+        let shutdowns = mux::shutdown_writes() - before;
+        drop(session);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut chunk = [0u8; 4096];
+        let saw_fin = loop {
+            match client.read(&mut chunk) {
+                Ok(0) => break true,
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break false,
+            }
+        };
+        (shutdowns, saw_fin)
+    }
+
+    /// Issue #1603: once the client has closed its side, `HttpsSession::close`
+    /// does not `shutdown(SHUT_WR)` the frontend socket — on an H2 client that
+    /// had already reset, that call failed with `ENOTCONN` on every
+    /// connection. The client, which only half-closed here and is still
+    /// reading, gets its FIN from the close alone.
+    ///
+    /// TO SEE THIS RED: make `mux::shutdown_write` ignore `peer_closed`, or
+    /// drop the `peer_disconnected` arm from `HttpsSession::close` (then only
+    /// the `read EOF` case fails). The first assertion fails with `left: 1`,
+    /// `right: 0`.
+    ///
+    /// Two ways to know it: the HUP the event loop records for the client's
+    /// FIN, and `FrontRustls::peer_disconnected`, set by the read that met the
+    /// EOF or the `close_notify` — the H2 case, where the close follows in
+    /// the same pass and no epoll event reports it.
+    #[test]
+    fn https_close_skips_the_frontend_shutdown_once_the_client_closed() {
+        for how in ["epoll HUP", "read EOF"] {
+            let (mut session, mut client) = https_mux_session_with_peer();
+            client
+                .shutdown(std::net::Shutdown::Write)
+                .expect("the client stand-in must send its FIN");
+            let HttpsStateMachine::Mux(mux) = &mut session.state else {
+                unreachable!("https_mux_session_with_peer returns a mux session")
+            };
+            if how == "epoll HUP" {
+                mux.frontend.readiness_mut().event.insert(Ready::HUP);
+            } else {
+                match &mut mux.frontend {
+                    mux::Connection::H1(connection) => connection.socket.peer_disconnected = true,
+                    mux::Connection::H2(connection) => connection.socket.peer_disconnected = true,
+                }
+            }
+
+            let (shutdowns, saw_fin) = frontend_shutdowns_of_a_close(session, &mut client);
+            assert_eq!(
+                shutdowns, 0,
+                "a frontend whose client closed ({how}) must not be shut down before its close"
+            );
+            assert!(
+                saw_fin,
+                "the close alone must still deliver the FIN to a half-closed client ({how})"
+            );
+        }
+    }
+
+    /// The other half of #1603: a client that is still there keeps the
+    /// frontend `shutdown(SHUT_WR)` and observes the FIN.
+    #[test]
+    fn https_close_keeps_the_frontend_shutdown_while_the_client_is_there() {
+        let (session, mut client) = https_mux_session_with_peer();
+        let (shutdowns, saw_fin) = frontend_shutdowns_of_a_close(session, &mut client);
+        assert_eq!(
+            shutdowns, 1,
+            "a frontend whose client is still there must keep its shutdown(SHUT_WR)"
+        );
+        assert!(saw_fin, "the client must observe the FIN");
     }
 }

@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, hash_map::Entry},
     io::ErrorKind,
-    net::{Shutdown, SocketAddr},
+    net::SocketAddr,
     rc::{Rc, Weak},
     str::from_utf8_unchecked,
     time::{Duration, Instant},
@@ -633,13 +633,17 @@ impl ProxySession for HttpSession {
         // defer backend closing to the state
         self.state.close(self.proxy.clone(), &mut self.metrics);
 
+        // Skipped once the client has closed its side: the close that follows
+        // sends the same FIN or RST on its own (`mux::shutdown_write`).
+        let peer_closed =
+            matches!(&self.state, HttpStateMachine::Mux(mux) if mux.frontend_peer_closed());
         let front_socket = self.state.front_socket();
         // invariant: write-only shutdown — Shutdown::Both on a TLS frontend
         // discards the receive buffer and elicits TCP RST, truncating the
         // already-queued response. Canonical write-up: the `Shutdown::Write`
         // block of `HttpsSession::close` (`lib/src/https.rs`). Backend sockets
         // follow the same discipline for symmetry.
-        if let Err(e) = front_socket.shutdown(Shutdown::Write) {
+        if let Err(e) = mux::shutdown_write(front_socket, peer_closed) {
             // error 107 NotConnected can happen when was never fully connected, or was already disconnected due to error
             if e.kind() != ErrorKind::NotConnected {
                 error!(

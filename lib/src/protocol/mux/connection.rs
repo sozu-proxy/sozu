@@ -226,6 +226,22 @@ impl<Front: SocketHandler> Connection<Front> {
     pub fn position(&self) -> &Position {
         forward!(&self, position)
     }
+    /// Whether the peer has closed its side of this connection: its readiness
+    /// carries `Ready::HUP`, recorded by epoll (`EPOLLRDHUP`/`EPOLLHUP`, see
+    /// `Ready::from(&mio::event::Event)`) or, on an H1 backend, by a read that
+    /// met the EOF or a reset (`ConnectionH1::readable`).
+    ///
+    /// A backend that sozu itself is dropping does not count:
+    /// `force_disconnect` writes HUP into the readiness of a live backend
+    /// and marks it `BackendStatus::Disconnecting`, so that state is excluded
+    /// and its peer keeps its `shutdown(SHUT_WR)` (see `mux::shutdown_write`).
+    pub fn peer_closed(&self) -> bool {
+        self.readiness().event.is_hup()
+            && !matches!(
+                self.position(),
+                Position::Client(_, _, BackendStatus::Disconnecting)
+            )
+    }
     pub fn position_mut(&mut self) -> &mut Position {
         forward!(&mut self, position)
     }
