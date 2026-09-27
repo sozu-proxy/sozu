@@ -376,6 +376,28 @@
 
 ### 🔄 Changed
 
+- **`perf(h1)`: a request renders its id once, and the default `Sozu-Id` name not at all.** The
+  generated `X-Request-Id`, its copy for the access log and the `Sozu-Id` value of the request and of
+  the response were four renderings of the same 26-character ULID, each a `String` from `Ulid`'s
+  `Display`, and the `Sozu-Id` name was copied onto the request and the response. The id is now
+  rendered once on the stack and copied once into an `Rc<str>` that all four share through
+  `kawa::Store::Shared`; the default `Sozu-Id` name is a `'static` literal, and only a renamed
+  correlation header is still copied. A request with its own `X-Request-Id` keeps it verbatim and its
+  `Sozu-Id` still carries Sōzu's id. This enables kawa's `rc-alloc` feature, part of kawa's default
+  set, on the already-pinned kawa 0.7.1; no dependency is added. `HttpContext::x_request_id` is now
+  an `Option<Rc<str>>`. A bare request's header editing costs 7 heap operations instead of 10, and
+  the response's 1 instead of 3 (`a_response_shares_the_request_id_rendering`).
+
+- **`perf(h1)`: the forwarding headers of a request share one scratch buffer.** `on_request_headers`
+  handed its scratch `Vec` to the first synthesised header and let the next one regrow an empty
+  buffer, and `into_boxed_slice` reallocated each to shrink its spare capacity: seven heap operations
+  for `X-Forwarded-For` and `Forwarded` on a request that carried neither. Each header now takes an
+  exact-size copy of one reused scratch: three. The header editing of a bare request costs 10 heap
+  operations instead of 14 (`a_bare_request_costs_one_scratch_and_one_copy_per_forwarding_header`),
+  and the bytes forwarded are unchanged
+  (`header_editing_output_is_byte_exact_across_keep_alive_requests`). The editor is shared by the
+  H1 and H2 frontends, so every HTTP/2 stream gains the same.
+
 - **`perf(mux-h2)`: HPACK is a sans-io module of `sozu-lib`, and `loona-hpack` is gone
   ([#1616](https://github.com/sozu-proxy/sozu/issues/1616)).** `loona-hpack` 0.4.3, unchanged since
   2024-11-03, built a 257-entry `HashMap` for every Huffman-coded string it decoded and kept every
