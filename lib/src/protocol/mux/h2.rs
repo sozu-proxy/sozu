@@ -5506,6 +5506,33 @@ impl ConnectionH2 {
         self.zero.storage.data()
     }
 
+    /// Whether [`Self::zero_pending`] ends with the last bytes this connection
+    /// will ever send, so the caller may queue the TLS `close_notify` behind
+    /// them and flush both at once.
+    ///
+    /// Only [`Self::goaway`] sets [`H2State::GoAway`], and only once its final
+    /// GOAWAY is serialised into `zero`; the state's writable arm then closes
+    /// (`h2_close::goaway_close_action`). Every other condition rules out a
+    /// write the same pass would still make after this flush:
+    ///
+    /// - `expect_write == Some(Zero)`: this is the zero-buffer resume, not a
+    ///   GOAWAY deferred behind a half-written stream frame
+    ///   ([`Self::park_zero_output`]) nor a WINDOW_UPDATE or RST_STREAM batch;
+    /// - no stream left, no WINDOW_UPDATE or RST_STREAM queued: the later
+    ///   stages of [`Self::flush_pending_control_frames`] serialise nothing;
+    /// - `Position::Server`: `close_notify` is a frontend TLS alert, as in
+    ///   [`H2Shell::initiate_close_notify`];
+    /// - `close_notify_sent` unset: the alert is queued once.
+    fn zero_flush_closes_connection(&self) -> bool {
+        self.position.is_server()
+            && matches!(self.state, H2State::GoAway)
+            && !self.close_notify_sent
+            && matches!(self.stream_table.expect_write(), Some(H2StreamId::Zero))
+            && self.stream_table.streams().is_empty()
+            && self.flow_control.pending_window_updates_is_empty()
+            && !self.control_tx.has_pending()
+    }
+
     /// Account for one write of [`Self::zero_pending`], and answer whether the
     /// caller should stop.
     ///
@@ -7786,7 +7813,20 @@ impl<Front: SocketHandler> H2Shell<Front> {
     /// Returns `false` when the buffer has been fully drained.
     fn flush_zero_to_socket(&mut self) -> bool {
         while !self.core.zero_pending().is_empty() {
-            let (size, status) = self.socket.socket_write(self.core.zero_pending());
+            // The final GOAWAY takes the `close_notify` with it: one
+            // `write_tls` instead of this one and `H2Shell::close`'s.
+            let (size, status) = if self.core.zero_flush_closes_connection() {
+                let pending = self.core.zero_pending().len();
+                let (size, status) = self
+                    .socket
+                    .socket_write_then_close(self.core.zero_pending());
+                if size == pending {
+                    self.core.close_notify_sent = true;
+                }
+                (size, status)
+            } else {
+                self.socket.socket_write(self.core.zero_pending())
+            };
             #[cfg(debug_assertions)]
             trace!(
                 "{} flush_zero_to_socket: written={}, status={:?}, wants_write={}",
@@ -16270,6 +16310,113 @@ mod tests {
             socket.socket_write(&[]);
         }
         !socket.socket_wants_write()
+    }
+
+    /// The final GOAWAY and the TLS `close_notify` leave in ONE write, and the
+    /// peer reads the GOAWAY before the close.
+    ///
+    /// Drives what a client GOAWAY on an idle connection sets off:
+    /// `goaway(NoError)`, the `writable` pass that flushes it and closes, and
+    /// `close`. Every TLS write in between is counted through
+    /// `crate::socket::tls_writes`, which counts each `write_tls` holding at
+    /// least one record, i.e. each `writev(2)` `FrontRustls` issues. The wire
+    /// is then read raw, so the ORDER is checked on the records themselves
+    /// (TLS 1.3 hides the inner type, not the length: 5 + 17 + 1 + 16 = 39 for
+    /// the GOAWAY, 5 + 2 + 1 + 16 = 24 for the alert), and decrypted, so the
+    /// client sees the 17-byte GOAWAY and then a clean end of stream, which
+    /// rustls reports only once it has read `close_notify`.
+    ///
+    /// TO SEE THIS RED: in `H2Shell::flush_zero_to_socket`, drop the
+    /// `zero_flush_closes_connection` branch so every zero flush goes through
+    /// `socket_write`. The GOAWAY then leaves alone and `close` sends the
+    /// alert in a second write: this test fails on `the final GOAWAY and
+    /// close_notify must share one TLS write`, with 2 writes. For the order:
+    /// in `FrontRustls::socket_write_then_close`, call `send_close_notify`
+    /// before `writer().write`; it fails on the records, `[24, 39]`.
+    #[test]
+    fn the_final_goaway_and_close_notify_leave_in_one_tls_write() {
+        use std::io::Read as _;
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(2, 4, 16384)));
+        let (mut connection, mut peer, mut client) = rustls_h2_connection(&pool, H2State::Header);
+        let mut context = test_context(&pool);
+        let mut router = Router::new(Duration::from_secs(30), Duration::from_secs(30));
+
+        let writes_before = crate::socket::tls_writes();
+        let queued = connection.core.goaway(H2Error::NoError);
+        assert!(
+            matches!(queued, MuxResult::Continue),
+            "premise: the GOAWAY must serialise, got {queued:?}"
+        );
+        let result = connection.writable(&mut context, EndpointClient(&mut router));
+        assert!(
+            matches!(result, MuxResult::CloseSession),
+            "the pass that flushed the final GOAWAY must close, got {result:?}"
+        );
+        connection.close(&mut context, EndpointClient(&mut router));
+        assert_eq!(
+            crate::socket::tls_writes() - writes_before,
+            1,
+            "the final GOAWAY and close_notify must share one TLS write"
+        );
+
+        let mut wire = Vec::new();
+        for _ in 0..MAX_DRIVE_TICKS {
+            let mut chunk = [0u8; 256];
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(size) => wire.extend_from_slice(&chunk[..size]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if wire.len() >= 39 + 24 {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("the peer must read the frontend's records: {error:?}"),
+            }
+        }
+        let mut records = Vec::new();
+        let mut offset = 0;
+        while offset + 5 <= wire.len() {
+            let length = 5 + usize::from(u16::from_be_bytes([wire[offset + 3], wire[offset + 4]]));
+            records.push(length);
+            offset += length;
+        }
+        assert_eq!(
+            records,
+            vec![39, 24],
+            "the peer must receive the GOAWAY record, then the close_notify record"
+        );
+
+        let mut cursor = std::io::Cursor::new(wire.as_slice());
+        while (cursor.position() as usize) < wire.len() {
+            client
+                .read_tls(&mut cursor)
+                .expect("the peer must read the frontend's records");
+            client
+                .process_new_packets()
+                .expect("the peer must decrypt the frontend's records");
+        }
+        let mut frame = [0u8; 64];
+        let size = client
+            .reader()
+            .read(&mut frame)
+            .expect("the GOAWAY must be readable before the close");
+        assert_eq!(size, 17, "the GOAWAY frame is 9 + 8 bytes");
+        assert_eq!(frame[3], 0x07, "the first plaintext must be a GOAWAY frame");
+        assert_eq!(
+            &frame[13..17],
+            &[0, 0, 0, 0],
+            "the GOAWAY must carry NO_ERROR"
+        );
+        assert_eq!(
+            client
+                .reader()
+                .read(&mut frame)
+                .expect("a close_notify ends the stream cleanly"),
+            0,
+            "the close_notify must follow the GOAWAY"
+        );
     }
 
     /// `FrontRustls` answers a blocked write with bytes taken AND `WouldBlock`,

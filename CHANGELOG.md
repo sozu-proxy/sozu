@@ -376,6 +376,31 @@
 
 ### 🔄 Changed
 
+- **`perf(mux-h2)`: the final GOAWAY and the TLS `close_notify` of an H2 frontend leave in one
+  write ([#1607](https://github.com/sozu-proxy/sozu/issues/1607)).** Closing an H2 connection over
+  TLS on its final GOAWAY cost two `writev(2)` back to back, in the same pass: the GOAWAY, flushed
+  by `H2Shell::flush_zero_to_socket` through `FrontRustls::socket_write`, which runs `write_tls` at
+  once, then the `close_notify` from `H2Shell::close`. When the zero buffer holds that final GOAWAY
+  on a server connection with no stream, WINDOW_UPDATE or RST_STREAM left to write after it
+  (`ConnectionH2::zero_flush_closes_connection`), the flush now goes through the new
+  `SocketHandler::socket_write_then_close`: `FrontRustls` hands rustls the GOAWAY, queues the alert
+  behind it, and flushes both records with one `write_tls`, which rustls turns into one
+  `write_vectored`. The `close_notify` is still sent (RFC 8446 §6.1) and still after the GOAWAY;
+  only the number of writes changes. The trait's default body writes and then calls
+  `socket_close`, so the other handlers behave as before. HAProxy keeps two writes here:
+  `h2_release` flushes the mux buffer, then `conn_xprt_shutw` reaches `ssl_sock_shutw` and its own
+  `SSL_shutdown`. Measured on a release build, one worker, python backend, 20 sequential
+  `curl --http2` requests each on its own TLS connection, `LD_PRELOAD` fd tracer, four runs before
+  and three after: close writes 35–40 → 20 per 20 connections, the pair `len=39` then `len=24`
+  replaced by one `len=63` write on 17 to 19 of them, the others having closed on the client's HUP
+  before any GOAWAY, which sends the alert alone as before; `writev` 6.85–7.15 → 6.05–6.30 per
+  connection; `epoll_wait` 8.00–8.30 → 8.00–8.40, unchanged. Under `intentrace -p` every connection
+  takes that HUP path, both before and after, so its counts do not move (`writev` 6.00). Pinned by
+  `the_final_goaway_and_close_notify_leave_in_one_tls_write` (`h2.rs`), which counts the TLS writes
+  from the GOAWAY to `close` over a real `FrontRustls` (1, and 2 without the change) and reads the
+  records off the wire: 39 bytes then 24, decrypting to the 17-byte GOAWAY and then a clean end of
+  stream.
+
 - **`perf(mux)`: the close path no longer waits for an EOF it already read, nor shuts down a
   socket whose peer has closed ([#1603](https://github.com/sozu-proxy/sozu/issues/1603)).** Up to two
   syscalls per closed connection are gone. An H1 backend read that returns its last bytes together

@@ -237,7 +237,7 @@ Declared in `h2.rs` (`pub enum H2State`):
   drift rule cannot tell from staleness, because it keys on the citation text
   rather than on where it sits (sozu-proxy/sozu#1447). Do not convert it back.
 - `Continuation*` states handle multi-frame HEADERS per RFC 9113 §4.3 — enter at
-  `h2.rs:6086`.
+  `h2.rs:6113`.
 - **Discard does not skip HPACK.** HPACK field-compression state is scoped to
   the *connection* (RFC 9113 §4.3), not the stream, so the bytes `Discard`
   drops on a refused stream are still a field block the peer's encoder has
@@ -788,7 +788,7 @@ one block inside a method that does several unrelated things:
   at `h2.rs:3010` and `H2WritePhase::End`'s deferred `completed_streams` loop at
   `h2.rs:3418`.
 - `ConnectionH2::prune_inactive_streams_while_closing` (`h2.rs`).
-- `handle_window_update_frame` zero-increment path — `h2.rs:6825`.
+- `handle_window_update_frame` zero-increment path — `h2.rs:6852`.
 - `ConnectionH2::cancel_timed_out_streams` slow-multiplex guard (`h2.rs`).
 - `ConnectionH2::handle_continuation_header_state` CONTINUATION oversize
   (`h2.rs`).
@@ -803,7 +803,7 @@ reintroduced inline `self.streams.remove(...)` inside `ConnectionH2` fails
 with `E0609: no field 'streams'`). The one exception below does not remove at
 all:
 
-- `close` backend-stream teardown — `h2.rs:7973-7975` (does not remove, only
+- `close` backend-stream teardown — `h2.rs:8013-8015` (does not remove, only
   notifies the endpoint — the surrounding `close` path drops the whole
   connection, and every entry in the wire map (`self.stream_table`) with it,
   shortly after).
@@ -1088,7 +1088,7 @@ asymmetry that produces it is architectural:
 - An **arm** site runs at an arbitrary depth into its pass — the liveness
   refreshes in the DATA-payload arm of `ConnectionH2::poll_read_target` (`h2.rs`, by
   symbol for the collision the liveness `Reset:` bullet above records — do not
-  convert it back) and at `h2.rs:6107` (HEADERS), the
+  convert it back) and at `h2.rs:6134` (HEADERS), the
   outbound-byte refreshes in the `H2WritePhase::Resume` branch of
   `ConnectionH2::poll_write_target` (`h2.rs`, by symbol because the `writable`
   lift moved another citation onto the number this one used to carry — do not
@@ -1492,11 +1492,11 @@ soft-stop.
 `ConnectionH2::end_stream` (`h2.rs`) is the server-side wiper for a single
 stream that has completed on the backend. Behavior depends on `Position`:
 
-- **Client** position (i.e. the backend's view) — `h2.rs:7230-7296`. Sends
+- **Client** position (i.e. the backend's view) — `h2.rs:7257-7323`. Sends
   RST_STREAM(CANCEL) unless both request and response have terminated, removes
   the wire mapping, marks the stream `Unlinked` if not already `Recycle`.
 - **Server** position — the `Position::Server` arm of `ConnectionH2::end_stream`
-  (`h2.rs:7297-7415`; the range start is one of eight identical
+  (`h2.rs:7324-7442`; the range start is one of eight identical
   `Position::Server => {` lines, hence the symbol). Dispatches on
   `end_stream_decision` (`shared.rs`): either `ForwardTerminated`,
   `CloseDelimited`, `ForwardUnterminated`, `SendDefault(status)`, `Reconnect`,
