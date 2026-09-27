@@ -2295,7 +2295,10 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       is what stops a second stream re-emitting it. `H2WritePhase::End` clears
       `ConnectionH2::pending_table_size_update` only when
       `H2ConverterPass::size_update_emitted` reports a block actually carried
-      it, so a DATA-only pass keeps the signal queued.
+      it, so a DATA-only pass keeps the signal queued. The prefix is one or
+      two updates: `Encoder::encode_size_updates_into` puts the smallest size
+      the peer set since the last block before the last one when it is lower
+      (RFC 7541 §4.2).
 
     Neither property is visible to `converter.rs`'s own unit tests, which
     drive one converter over one kawa. Both are pinned on the wire by

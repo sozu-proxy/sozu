@@ -1754,6 +1754,17 @@ arm therefore also sets `ConnectionH2::pending_table_size_update`, which
 the RFC 7541 §6.3 `001xxxxx` dynamic-table-size-update directive to the next
 header block this connection emits.
 
+The peer may change the size more than once before that block, for example
+to 0 and then back to 4096. The encoder evicted everything at 0, so
+announcing 4096 alone would leave the peer's decoder holding entries the
+encoder no longer has. `HpackState::set_encoder_max_table_size` therefore calls
+`Encoder::change_max_table_size`, which records the smallest size set since the
+last block beside the last one, and the converter emits through
+`Encoder::encode_size_updates_into`: the smallest size first when it is below
+the last, then the last (RFC 7541 §4.2) — at most the two updates a block may
+open with. `ConnectionH2::pending_table_size_update` still holds the last size
+only; it says whether a signal is owed, the encoder says what it is.
+
 ### Buffer shrinking after large headers
 
 `converter_buf`, `lowercase_buf` and `cookie_buf` live in `HpackState`, which
@@ -1766,7 +1777,7 @@ per-`prepare` `H2BlockConverter` — a `Vec` move, never a copy of the bytes.
 The pass gives them back at the end, and `HpackState::shrink_converter_buffers`
 then caps each one:
 
-```rust lib/src/protocol/mux/hpack_state.rs:126-136
+```rust lib/src/protocol/mux/hpack_state.rs:130-140
 pub(super) fn shrink_converter_buffers(&mut self) {
     if self.converter_buf.capacity() > 16_384 {
         self.converter_buf.shrink_to(4096);

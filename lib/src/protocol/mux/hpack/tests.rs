@@ -635,6 +635,217 @@ fn table_size_changes_between_blocks() {
     }
 }
 
+/// The size updates `Encoder::encode_size_updates_into` should open a block
+/// with, built with the integer encoder rather than spelled as octets.
+fn size_updates(sizes: &[usize]) -> Vec<u8> {
+    let mut expected = Vec::new();
+    for &size in sizes {
+        encode_integer(size, 5, 0x20, &mut expected);
+    }
+    expected
+}
+
+/// Encodes `fields` into a block opened by the recorded size updates, the
+/// way `H2BlockConverter` opens its first block after a SETTINGS change,
+/// decodes it, and checks both tables hold the same entries.
+fn exchange_after_size_changes(
+    encoder: &mut Encoder,
+    decoder: &mut Decoder,
+    last_size: usize,
+    fields: &[Field],
+) -> Vec<u8> {
+    let mut block = Vec::new();
+    encoder.encode_size_updates_into(last_size, &mut block);
+    for (name, value) in fields {
+        encoder.encode_header_into((name, value), &mut block);
+    }
+    let decoded = decode(decoder, &block).expect("the block decodes");
+    assert_eq!(&decoded, fields);
+    assert_eq!(
+        entries(encoder.table()),
+        entries(decoder.table()),
+        "the dynamic tables diverged"
+    );
+    block
+}
+
+/// Fields whose names are in no table, so the proxy policy inserts them.
+fn dynamic_fields(tag: &str) -> Vec<Field> {
+    (0..4)
+        .map(|at| {
+            (
+                format!("x-{tag}-{at}").into_bytes(),
+                format!("value-{at}").into_bytes(),
+            )
+        })
+        .collect()
+}
+
+/// Issue #1622, RFC 7541 §4.2: the peer sends `SETTINGS_HEADER_TABLE_SIZE` 0
+/// then 4096 between two blocks. The encoder emptied its table at 0, so the
+/// next block must open with 0, then 4096; announcing 4096 alone leaves the
+/// peer's decoder holding the entries of the first block, which the encoder
+/// then inserts again.
+///
+/// To SEE THIS RED: in `Encoder::encode_size_updates_into`, drop the branch
+/// that appends `pending.smallest`. The table comparison in
+/// `exchange_after_size_changes` fails ("the dynamic tables diverged"): the
+/// decoder holds eight entries, the encoder four.
+#[test]
+fn a_size_lowered_then_raised_between_blocks_signals_both() {
+    let mut encoder = Encoder::new();
+    let mut decoder = Decoder::new();
+    decoder.set_max_allowed_table_size(4096);
+    let fields = dynamic_fields("sized");
+    let mut block = Vec::new();
+    for (name, value) in &fields {
+        encoder.encode_header_into((name, value), &mut block);
+    }
+    assert_eq!(decode(&mut decoder, &block).as_deref(), Ok(&fields[..]));
+    assert_eq!(entries(decoder.table()).len(), fields.len());
+
+    encoder.change_max_table_size(0);
+    encoder.change_max_table_size(4096);
+    let block = exchange_after_size_changes(&mut encoder, &mut decoder, 4096, &fields);
+    assert!(
+        block.starts_with(&size_updates(&[0, 4096])),
+        "the block opens with the smallest size, then the last: {block:02x?}"
+    );
+    assert_eq!(entries(decoder.table()).len(), fields.len());
+
+    // Nothing stays recorded: the next change is signalled alone.
+    encoder.change_max_table_size(2048);
+    let block = exchange_after_size_changes(&mut encoder, &mut decoder, 2048, &fields);
+    assert!(block.starts_with(&size_updates(&[2048])));
+    assert!(!block[size_updates(&[2048]).len()..].starts_with(&[0x20]));
+}
+
+/// One change between two blocks, and changes that never go below the last
+/// size, open the block with that size alone — the bytes sozu sent before
+/// issue #1622.
+#[test]
+fn a_size_never_lowered_below_the_last_signals_it_alone() {
+    for changes in [&[1024][..], &[4096], &[4096, 4096], &[512, 256, 256]] {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        decoder.set_max_allowed_table_size(4096);
+        let fields = dynamic_fields("once");
+        exchange_after_size_changes(&mut encoder, &mut decoder, 4096, &fields);
+        for &size in changes {
+            encoder.change_max_table_size(size);
+        }
+        let last = *changes.last().expect("one change at least");
+        let mut block = Vec::new();
+        assert_eq!(encoder.encode_size_updates_into(last, &mut block), 1);
+        assert_eq!(block, size_updates(&[last]), "changes {changes:?}");
+        for (name, value) in &fields {
+            encoder.encode_header_into((name, value), &mut block);
+        }
+        assert_eq!(decode(&mut decoder, &block).as_deref(), Ok(&fields[..]));
+        assert_eq!(entries(encoder.table()), entries(decoder.table()));
+    }
+}
+
+/// When the smallest size is the last one (4096, then 0, then 64, then 0),
+/// one update carries both.
+#[test]
+fn a_smallest_size_equal_to_the_last_is_signalled_once() {
+    let mut encoder = Encoder::new();
+    let mut decoder = Decoder::new();
+    decoder.set_max_allowed_table_size(4096);
+    exchange_after_size_changes(&mut encoder, &mut decoder, 4096, &dynamic_fields("eq"));
+    for size in [4096, 0, 64, 0] {
+        encoder.change_max_table_size(size);
+    }
+    let mut block = Vec::new();
+    assert_eq!(encoder.encode_size_updates_into(0, &mut block), 1);
+    assert_eq!(block, size_updates(&[0]));
+    exchange_after_size_changes(&mut encoder, &mut decoder, 0, &dynamic_fields("zero"));
+    assert!(entries(decoder.table()).is_empty());
+}
+
+/// Issue #1622 on the path the H2 connection takes, with only the calls
+/// `ConnectionH2::handle_settings_frame` and `ConnectionH2::write_streams`
+/// (`lib/src/protocol/mux/h2.rs`) make: `HpackState::set_encoder_max_table_size`
+/// per SETTINGS, the last size mirrored into an `H2ConverterPass`, and one
+/// `H2BlockConverter` encoding the next response block.
+///
+/// To SEE THIS RED: restore `HpackState::set_encoder_max_table_size` to
+/// `Encoder::set_max_table_size` and `emit_pending_size_update_if_new_block`
+/// to the single `encode_integer` it made. The block opens with 4096 alone
+/// and the decoder keeps the first response's entry.
+#[test]
+fn the_h2_converter_signals_the_smallest_table_size_first() {
+    use kawa::{Block, BlockConverter, Buffer, Kawa, Kind, Pair, SliceBuffer, StatusLine, Store};
+
+    use crate::protocol::mux::{
+        buffer_source::PoolBufferSource, converter::H2ConverterPass, hpack_state::HpackState,
+    };
+
+    let mut source = PoolBufferSource::new(std::rc::Weak::new());
+    let mut hpack = HpackState::new(&mut source, 4096).expect("scratch buffers");
+    let mut decoder = Decoder::new();
+    decoder.set_max_allowed_table_size(4096);
+
+    let mut respond = |hpack: &mut HpackState, pending: Option<u32>, name: &'static [u8]| {
+        let mut pass = H2ConverterPass::new(
+            16384,
+            b"https",
+            false,
+            hpack.take_converter_buf(),
+            hpack.take_lowercase_buf(),
+            hpack.take_cookie_buf(),
+            pending,
+        );
+        let mut storage = vec![0u8; 1024];
+        let mut kawa = Kawa::new(Kind::Response, Buffer::new(SliceBuffer(&mut storage)));
+        kawa.detached.status_line = StatusLine::Response {
+            version: kawa::Version::V20,
+            code: 200,
+            status: Store::Static(b"200"),
+            reason: Store::Static(b"OK"),
+        };
+        let mut converter = pass.converter(hpack.encoder_mut(), 1, 65535, false, 0);
+        assert!(converter.call(Block::StatusLine, &mut kawa));
+        assert!(converter.call(
+            Block::Header(Pair {
+                key: Store::Static(name),
+                val: Store::Static(b"sozu"),
+            }),
+            &mut kawa,
+        ));
+        let block = converter.out.clone();
+        pass.reclaim(converter, &mut Vec::new());
+        assert_eq!(pass.size_update_emitted(), pending.is_some());
+        let (out, lowercase, cookie) = pass.into_buffers();
+        hpack.put_converter_buf(out);
+        hpack.put_lowercase_buf(lowercase);
+        hpack.put_cookie_buf(cookie);
+        let decoded = decode(&mut decoder, &block).expect("the response block decodes");
+        assert_eq!(decoded[1], (name.to_vec(), b"sozu".to_vec()));
+        (block, entries(decoder.table()))
+    };
+
+    let (_, peer_table) = respond(&mut hpack, None, b"x-first");
+    assert_eq!(peer_table.len(), 1, "the first response fills the table");
+
+    // Two SETTINGS before the next block, as `handle_settings_frame` applies
+    // them: the connection's mirror ends up holding the last size only.
+    hpack.set_encoder_max_table_size(0);
+    hpack.set_encoder_max_table_size(4096);
+    let (block, peer_table) = respond(&mut hpack, Some(4096), b"x-second");
+    assert!(
+        block.starts_with(&size_updates(&[0, 4096])),
+        "the block opens with 0, then 4096: {block:02x?}"
+    );
+    assert_eq!(
+        peer_table,
+        entries(hpack.encoder_mut().table()),
+        "the peer's decoder holds what our encoder holds"
+    );
+    assert_eq!(peer_table.len(), 1);
+}
+
 /// The default policy keeps the bytes `loona-hpack` sent: a field found whole
 /// is indexed, a name found is a literal without indexing, and only a field
 /// with a new name enters the dynamic table.

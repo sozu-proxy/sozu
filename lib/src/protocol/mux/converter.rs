@@ -113,15 +113,30 @@ impl H2BlockConverter<'_> {
     /// is `Some(_)`.
     ///
     /// Encoding per RFC 7541 §5.1 + §6.3: prefix bits `001`, 5-bit prefix
-    /// integer carrying the new maximum table size.
+    /// integer carrying the new maximum table size. When the peer lowered the
+    /// size further in between (two SETTINGS before this block, e.g. 0 then
+    /// 4096), the encoder first emits that smallest size (§4.2), so the peer's
+    /// decoder evicts what our encoder evicted — see
+    /// `Encoder::encode_size_updates_into`
+    /// (`lib/src/protocol/mux/hpack/encoder.rs`).
     fn emit_pending_size_update_if_new_block(&mut self) {
         if !self.out.is_empty() {
             return;
         }
         if let Some(new_size) = self.pending_table_size_update.take() {
-            crate::protocol::mux::hpack::encode_integer(new_size as usize, 5, 0x20, &mut self.out);
+            let updates = self
+                .encoder
+                .encode_size_updates_into(new_size as usize, &mut self.out);
+            debug_assert!(
+                (1..=2).contains(&updates) && !self.out.is_empty(),
+                "a pending signal opens the block with one or two size updates"
+            );
             self.size_update_emitted = true;
         }
+        debug_assert!(
+            self.pending_table_size_update.is_none(),
+            "an empty block consumes the pending signal"
+        );
     }
 
     /// Guard the HPACK output buffer against [`MAX_HEADER_LIST_SIZE`] and

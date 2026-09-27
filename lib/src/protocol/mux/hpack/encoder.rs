@@ -50,10 +50,27 @@ enum Found {
     Nothing,
 }
 
+/// The table-size changes the peer's decoder has not been told about yet.
+///
+/// RFC 7541 §4.2: when the maximum size changes more than once between two
+/// blocks, the next block opens with the smallest size reached, then the final
+/// size. The smallest one is what decides which entries this encoder evicted;
+/// the final one is what both tables hold from then on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingSizeUpdate {
+    /// The smallest maximum size set since the last size update was encoded.
+    smallest: usize,
+    /// The maximum size set last.
+    last: usize,
+}
+
 /// The connection-level HPACK encoder of one direction.
 #[derive(Debug)]
 pub struct Encoder {
     table: DynamicTable,
+    /// Set by [`Encoder::change_max_table_size`], emptied by
+    /// [`Encoder::encode_size_updates_into`].
+    pending_size_update: Option<PendingSizeUpdate>,
 }
 
 impl Default for Encoder {
@@ -67,15 +84,77 @@ impl Encoder {
     pub const fn new() -> Self {
         Encoder {
             table: DynamicTable::new(DEFAULT_MAX_SIZE),
+            pending_size_update: None,
         }
     }
 
     /// Sets the maximum size of the table, at most the peer's
     /// `SETTINGS_HEADER_TABLE_SIZE`, and evicts until it fits (§4.3). The
     /// caller signals the change to the peer with a size update (§6.3) at the
-    /// start of its next block.
+    /// start of its next block; [`Self::change_max_table_size`] records it for
+    /// [`Self::encode_size_updates_into`] instead.
     pub fn set_max_table_size(&mut self, max_size: usize) {
         self.table.set_max_size(max_size);
+    }
+
+    /// Sets the maximum size like [`Self::set_max_table_size`] and records the
+    /// change for the size updates that open the next block (§4.2): the
+    /// smallest size set since the last block, and the last one.
+    pub fn change_max_table_size(&mut self, max_size: usize) {
+        self.table.set_max_size(max_size);
+        let smallest = self
+            .pending_size_update
+            .map_or(max_size, |pending| pending.smallest.min(max_size));
+        self.pending_size_update = Some(PendingSizeUpdate {
+            smallest,
+            last: max_size,
+        });
+        debug_assert!(
+            smallest <= max_size,
+            "the smallest size reached never exceeds the last one"
+        );
+        debug_assert!(
+            self.pending_size_update
+                .is_some_and(|pending| pending.last == max_size),
+            "the change is recorded as the last one"
+        );
+    }
+
+    /// Appends the size updates (§6.3) that open a block after the maximum
+    /// size changed to `last_size`, and forgets the changes recorded by
+    /// [`Self::change_max_table_size`].
+    ///
+    /// When the size went below `last_size` since the last block, the
+    /// smallest size goes first (§4.2): the peer's decoder must evict what
+    /// this encoder evicted, or the two tables no longer hold the same
+    /// entries. `last_size` follows, alone when nothing smaller was set.
+    /// Returns the number of updates appended, 1 or 2 — the most a block may
+    /// open with.
+    pub fn encode_size_updates_into(&mut self, last_size: usize, out: &mut Vec<u8>) -> usize {
+        let pending = self.pending_size_update.take();
+        debug_assert!(
+            pending.is_none_or(|pending| pending.last == last_size),
+            "the size the caller signals is the last one recorded"
+        );
+        let start = out.len();
+        let mut updates = 0;
+        if let Some(pending) = pending
+            && pending.smallest < last_size
+        {
+            encode_integer(pending.smallest, 5, 0x20, out);
+            updates += 1;
+        }
+        encode_integer(last_size, 5, 0x20, out);
+        updates += 1;
+        debug_assert!(
+            (1..=2).contains(&updates),
+            "a block opens with at most two size updates (§4.2)"
+        );
+        debug_assert!(
+            out[start] & 0xe0 == 0x20 && self.pending_size_update.is_none(),
+            "the appended bytes open with a size update, and nothing stays recorded"
+        );
+        updates
     }
 
     #[cfg(test)]

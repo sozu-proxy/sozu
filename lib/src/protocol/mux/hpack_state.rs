@@ -87,9 +87,13 @@ impl HpackState {
     }
 
     /// RFC 7541 §4.2: cap the encoder's dynamic table to the peer-advertised
-    /// (and locally capped) `SETTINGS_HEADER_TABLE_SIZE`.
+    /// (and locally capped) `SETTINGS_HEADER_TABLE_SIZE`, and record the change
+    /// so the next header block opens with the smallest size reached since the
+    /// previous block, then this one — see
+    /// `Encoder::encode_size_updates_into`
+    /// (`lib/src/protocol/mux/hpack/encoder.rs`).
     pub(super) fn set_encoder_max_table_size(&mut self, size: usize) {
-        self.encoder.set_max_table_size(size);
+        self.encoder.change_max_table_size(size);
     }
 
     /// Takes ownership of the converter scratch buffer, leaving an empty
