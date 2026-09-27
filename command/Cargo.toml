@@ -39,7 +39,7 @@ nom = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
 rusty_ulid = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 prettytable-rs = { workspace = true }

@@ -2359,7 +2359,8 @@ impl HttpsProxy {
                     })?;
             }
         }
-        self.clusters.insert(cluster.cluster_id.clone(), cluster);
+        self.clusters
+            .insert(cluster.cluster_id.as_str().into(), cluster);
         Ok(None)
     }
 
@@ -3305,9 +3306,9 @@ mod tests {
 
     #[test]
     fn frontend_from_request_test() {
-        let cluster_id1 = "cluster_1".to_owned();
-        let cluster_id2 = "cluster_2".to_owned();
-        let cluster_id3 = "cluster_3".to_owned();
+        let cluster_id1 = ClusterId::from("cluster_1");
+        let cluster_id2 = ClusterId::from("cluster_2");
+        let cluster_id3 = ClusterId::from("cluster_3");
         let uri1 = "/".to_owned();
         let uri2 = "/yolo".to_owned();
         let uri3 = "/yolo/swag".to_owned();

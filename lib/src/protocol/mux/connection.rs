@@ -23,7 +23,7 @@ use std::{
 
 use mio::{Token, net::TcpStream};
 use rusty_ulid::Ulid;
-use sozu_command::{logging::ansi_palette, ready::Ready};
+use sozu_command::{logging::ansi_palette, ready::Ready, state::ClusterId};
 
 use super::{
     BackendChange, BackendId, BackendStatus, ConnectionH1, Context, Endpoint, GlobalStreamId,
@@ -115,7 +115,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub fn new_h1_client(
         session_ulid: Ulid,
         front_stream: Front,
-        cluster_id: String,
+        cluster_id: ClusterId,
         backend: BackendId,
         timeout_duration: Duration,
     ) -> Connection<Front> {
@@ -178,7 +178,7 @@ impl<Front: SocketHandler> Connection<Front> {
     pub fn new_h2_client(
         session_ulid: Ulid,
         front_stream: Front,
-        cluster_id: String,
+        cluster_id: ClusterId,
         backend: BackendId,
         buffers: &mut dyn super::buffer_source::BufferSource,
         timeout_duration: Duration,

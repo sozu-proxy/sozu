@@ -527,7 +527,7 @@ impl BackendMap {
     /// connect to the same backends.
     pub fn set_cluster_http2(&mut self, cluster_id: &str, http2: bool) {
         if http2 {
-            self.cluster_http2.insert(cluster_id.to_owned(), true);
+            self.cluster_http2.insert(cluster_id.into(), true);
         } else {
             self.cluster_http2.remove(cluster_id);
         }
@@ -536,7 +536,7 @@ impl BackendMap {
     pub fn set_health_check_config(&mut self, cluster_id: &str, config: Option<HealthCheckConfig>) {
         match config {
             Some(c) => {
-                self.health_check_configs.insert(cluster_id.to_owned(), c);
+                self.health_check_configs.insert(cluster_id.into(), c);
             }
             None => {
                 self.health_check_configs.remove(cluster_id);
@@ -567,7 +567,7 @@ impl BackendMap {
         self.backends
             .extend(backends.iter().map(|(cluster_id, backend_vec)| {
                 (
-                    cluster_id.to_string(),
+                    cluster_id.clone(),
                     BackendList::import_configuration_state(backend_vec),
                 )
             }));
@@ -585,7 +585,7 @@ impl BackendMap {
     pub fn add_backend(&mut self, cluster_id: &str, backend: Backend) {
         let address = backend.address;
         self.backends
-            .entry(cluster_id.to_string())
+            .entry(cluster_id.into())
             .or_default()
             .add_backend(backend);
         // Adding a backend must leave the cluster present and containing the
@@ -840,7 +840,7 @@ impl BackendMap {
     }
 
     pub fn get_or_create_backend_list_for_cluster(&mut self, cluster_id: &str) -> &mut BackendList {
-        self.backends.entry(cluster_id.to_string()).or_default()
+        self.backends.entry(cluster_id.into()).or_default()
     }
 }
 
@@ -1671,8 +1671,7 @@ mod backends_test {
     fn record_cluster_availability_empty_cluster_stays_available() {
         let mut map = BackendMap::new();
         let cluster_id = "c-empty";
-        map.backends
-            .insert(cluster_id.to_owned(), BackendList::new());
+        map.backends.insert(cluster_id.into(), BackendList::new());
         // total == 0 path: never report AllDown — avoids log spam during
         // cluster bootstrap when backends are still being registered.
         map.record_cluster_availability(cluster_id);
@@ -1704,9 +1703,9 @@ mod backends_test {
         let mut map = BackendMap::new();
         let mut input = HashMap::new();
         input.insert(
-            cluster_id.to_owned(),
+            cluster_id.into(),
             vec![sozu_command_lib::response::Backend {
-                cluster_id: cluster_id.to_owned(),
+                cluster_id: cluster_id.into(),
                 backend_id: "b1".to_owned(),
                 address: "127.0.0.1:9701".parse().unwrap(),
                 sticky_id: None,

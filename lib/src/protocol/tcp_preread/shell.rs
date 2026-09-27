@@ -505,7 +505,7 @@ mod tests {
 
             assert_eq!(
                 preread.handle_output(Output::Routed {
-                    cluster,
+                    cluster: cluster.into(),
                     content_offset: 0,
                     proxy_source: None,
                     sni: sni.clone(),
@@ -688,7 +688,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-a".into())],
         );
         let cfg = PrereadConfig {
             routes: &routes,

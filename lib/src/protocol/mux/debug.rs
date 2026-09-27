@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 
 use kawa::ParsingPhase;
 use mio::Token;
-use sozu_command::ready::Ready;
+use sozu_command::{ready::Ready, state::ClusterId};
 
 use super::{BackendConnectionError, MuxResult, Readiness, StreamState};
 
@@ -69,7 +69,7 @@ pub enum DebugEvent {
     CW(Token, MuxResult, Readiness),
     CR(Token, MuxResult, Readiness),
     CC(usize, StreamState),
-    CCS(Token, String),
+    CCS(Token, ClusterId),
     CCF(usize, BackendConnectionError),
     CH(Token, Readiness),
     S(u32, usize, ParsingPhase, usize, usize),

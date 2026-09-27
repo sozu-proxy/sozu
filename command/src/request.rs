@@ -20,6 +20,7 @@ use crate::{
         display::format_request_type,
     },
     response::HttpFrontend,
+    state::ClusterId,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -220,7 +221,7 @@ impl RequestHttpFrontend {
         let requested_cluster_id = self.cluster_id.clone();
         let frontend = HttpFrontend {
             address: self.address.into(),
-            cluster_id: self.cluster_id,
+            cluster_id: self.cluster_id.map(ClusterId::from),
             hostname: self.hostname,
             path: self.path,
             method: self.method,
@@ -251,7 +252,8 @@ impl RequestHttpFrontend {
             "hostname must survive the frontend conversion"
         );
         debug_assert_eq!(
-            frontend.cluster_id, requested_cluster_id,
+            frontend.cluster_id.as_deref(),
+            requested_cluster_id.as_deref(),
             "cluster_id must survive the frontend conversion"
         );
         Ok(frontend)

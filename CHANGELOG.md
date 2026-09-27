@@ -376,6 +376,60 @@
 
 ### 🔄 Changed
 
+- **`refactor(command)`: `ClusterId` is a reference-counted `Arc<str>`, and no step of a request
+  copies its cluster id anymore.** `sozu_command_lib::state::ClusterId` was `String`, so routing
+  cloned the id out of the route table on every request, and the per-(cluster, source-IP) gate
+  cloned it three more times (`consult_ip_gate`, `SessionManager::track_cluster_connection`, and
+  the `entry` key of `SessionManager::track_cluster_ip`, paid even when the track is an idempotent
+  no-op). The route table, `HttpContext::cluster_id`, the gate's maps, `ConnectPlan::Dial` and the
+  backend connection's `Position::Client` now share the one allocation the frontend was added
+  with; the TCP and UDP listeners, sessions and pipes share theirs the same way. The protobuf
+  messages keep `String`: the id is converted once, where a request or saved state enters
+  `ConfigState` or a proxy.
+
+  **Measured** with the `test_allocations` counter of `sozu-lib`, per routed request on a reused
+  backend connection (`plan_connect`, the gate with its `SessionManager` bookkeeping,
+  `plan_connect_resume`, release), 64 requests after one warm-up, `cargo test --release`:
+
+  | Backend connection | Gate | Before | After |
+  |---|---|---|---|
+  | H1 keep-alive | none (no source address) | 1 | 0 |
+  | H1 keep-alive | per-(cluster, source-IP) | 4 | 0 |
+  | H2 connected | none | 1.28 | 0.28 |
+  | H2 connected | per-(cluster, source-IP) | 4.28 | 0.28 |
+
+  The remaining 0.28 on H2 is the backend connection's stream table growing, not a cluster id.
+  Production traffic always carries a source address, so it always takes the gated row. The
+  debug build drops from 4 to 3 (ungated) and 7 to 3 (gated), the rest being its history push.
+  `a_routed_request_on_a_reused_backend_connection_copies_no_cluster_id` now measures the gate's
+  bookkeeping too and controls only for the debug history,
+  `a_tree_lookup_allocates_nothing_past_its_route_result` no longer counts a cluster id copy in
+  its control, and `a_dial_moves_the_planned_cluster_id_into_the_backend_connection` also
+  asserts that the connection and the stream point at the same id.
+
+  `Arc`, not `Rc`, because `ConfigState` and the `response` types are public API that embedders
+  share across threads: an embedder keeping `ConfigState` behind a `tokio::sync::RwLock` in an
+  `Arc`, captured by multi-threaded `tokio::spawn` tasks and used as an axum extension, needs it
+  `Send + Sync`, and `Rc<str>` would break its build on the next `cargo update`. A compile-time
+  assertion next to the alias (`command/src/state.rs`) now holds `ClusterId`, `ConfigState`,
+  `StateError` and `response::{HttpFrontend, TcpFrontend, UdpFrontend, Backend}` to
+  `Send + Sync`. The deterministic simulations need `Send` too (moonpool-sim's `Workload::run`
+  future). The refcount is never contended: each worker is single-threaded.
+
+  **API break in `sozu-command-lib`** (and in `sozu-lib` signatures carrying a cluster id):
+  `state::ClusterId` changes from `String` to `Arc<str>`, and with it the keys of
+  `ConfigState::{clusters, backends, tcp_fronts, udp_fronts}`, the return types of
+  `ConfigState::hash_state` and `ConfigState::get_cluster_ids_by_domain`, the fields of
+  `StateError::UdpFrontendAddressTaken`, and `cluster_id` on `response::{HttpFrontend,
+  TcpFrontend, UdpFrontend, Backend}`. `sozu-command-lib` enables serde's `rc` feature so these
+  types keep deriving `Serialize`/`Deserialize`; the JSON of a saved state, and every hash, is
+  unchanged, since `Arc<str>` serializes and hashes as the `str` it holds. In `sozu-lib`:
+  `HttpContext::cluster_id`, `SessionManager::{track_cluster_ip, track_cluster_subnet,
+  track_cluster_connection}`, `BackendConnectionError::{MaxConnectionRetries,
+  TooManyConnectionsPerIp}`, `ProxySession::cluster_id`, `Pipe::set_cluster_id` and
+  `protocol::udp::ClusterConfig::cluster` take or return `ClusterId`. Build one from a `&str` or
+  `String` with `.into()` or `ClusterId::from`.
+
 - **`perf(h1)`: a request renders its id once, and the default `Sozu-Id` name not at all.** The
   generated `X-Request-Id`, its copy for the access log and the `Sozu-Id` value of the request and of
   the response were four renderings of the same 26-character ULID, each a `String` from `Ulid`'s

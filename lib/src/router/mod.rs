@@ -2164,7 +2164,7 @@ impl Frontend {
                      Strict-Transport-Security; the config layer that built \
                      this HstsConfig must substitute DEFAULT_HSTS_MAX_AGE.",
                     log_module_context!(),
-                    cluster_id.as_ref().map(String::len),
+                    cluster_id.as_deref().map(str::len),
                 );
                 crate::incr!(names::http::HSTS_UNRENDERED);
             }
@@ -2509,7 +2509,7 @@ mod tests {
 
     fn test_http_frontend() -> HttpFrontend {
         HttpFrontend {
-            cluster_id: Some("cluster".to_owned()),
+            cluster_id: Some("cluster".into()),
             address: "127.0.0.1:8080"
                 .parse()
                 .expect("test frontend address must parse"),
@@ -2587,7 +2587,7 @@ mod tests {
         let output = crate::capture_test_logs(move || {
             let mut router = Router::new();
             let mut front = test_http_frontend();
-            front.cluster_id = Some(cluster_id);
+            front.cluster_id = Some(cluster_id.into());
             front.hsts = Some(HstsConfig {
                 enabled: Some(true),
                 max_age: None,
@@ -2824,7 +2824,7 @@ mod tests {
         // from 1y → 2y must end up with the 2y entry on its
         // headers_response, with no leftover 1y entry.
         let frontend = Frontend {
-            cluster_id: Some("api".to_owned()),
+            cluster_id: Some("api".into()),
             redirect: RedirectPolicy::Forward,
             redirect_scheme: RedirectScheme::UseSame,
             redirect_template: None,
@@ -2876,7 +2876,7 @@ mod tests {
         // Listener-default HSTS removed → strip the existing STS edit
         // and add nothing. Operator response headers stay in place.
         let frontend = Frontend {
-            cluster_id: Some("api".to_owned()),
+            cluster_id: Some("api".into()),
             redirect: RedirectPolicy::Forward,
             redirect_scheme: RedirectScheme::UseSame,
             redirect_template: None,
@@ -2914,7 +2914,7 @@ mod tests {
         // `enabled = Some(false)` is the explicit-disable signal; the
         // existing STS entry is dropped and no new one is added.
         let frontend = Frontend {
-            cluster_id: Some("api".to_owned()),
+            cluster_id: Some("api".into()),
             redirect: RedirectPolicy::Forward,
             redirect_scheme: RedirectScheme::UseSame,
             redirect_template: None,
@@ -2957,7 +2957,7 @@ mod tests {
             post: Vec::new(),
         };
         let inheriting = Frontend {
-            cluster_id: Some("api".to_owned()),
+            cluster_id: Some("api".into()),
             redirect: RedirectPolicy::Forward,
             redirect_scheme: RedirectScheme::UseSame,
             redirect_template: None,
@@ -2977,7 +2977,7 @@ mod tests {
             inherits_listener_hsts: true,
         };
         let explicit = Frontend {
-            cluster_id: Some("legacy".to_owned()),
+            cluster_id: Some("legacy".into()),
             redirect: RedirectPolicy::Forward,
             redirect_scheme: RedirectScheme::UseSame,
             redirect_template: None,
@@ -3060,7 +3060,7 @@ mod tests {
                 DomainRule::Any,
                 PathRule::Prefix("/".to_owned()),
                 MethodRule::new(None),
-                Route::ClusterId("api".to_owned()),
+                Route::ClusterId("api".into()),
             )],
         };
 
@@ -3162,7 +3162,7 @@ mod tests {
                 DomainRule::Any,
                 PathRule::Prefix("/".to_owned()),
                 MethodRule::new(None),
-                Route::ClusterId("api".to_owned()),
+                Route::ClusterId("api".into()),
             )],
             tree: TrieNode::root(),
             post: vec![(
@@ -3224,7 +3224,7 @@ mod tests {
                 DomainRule::Any,
                 PathRule::Prefix("/".to_owned()),
                 MethodRule::new(None),
-                Route::ClusterId("api".to_owned()),
+                Route::ClusterId("api".into()),
             )],
         };
 
@@ -3279,7 +3279,7 @@ mod tests {
                 DomainRule::Any,
                 PathRule::Prefix("/".to_owned()),
                 MethodRule::new(None),
-                Route::ClusterId("api".to_owned()),
+                Route::ClusterId("api".into()),
             )],
             tree: TrieNode::root(),
             post: Vec::new(),
@@ -3338,7 +3338,7 @@ mod tests {
             b"example.com",
             &path_rule,
             &method_rule,
-            &Route::ClusterId("api".to_owned()),
+            &Route::ClusterId("api".into()),
         ));
 
         let new_hsts = HstsConfig {
@@ -3533,7 +3533,7 @@ mod tests {
             &"*.foo.example.com".parse::<DomainRule>().unwrap(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("wildcard".to_string()),
+            &Route::ClusterId("wildcard".into()),
         ));
 
         let method = Method::new(&b"GET"[..]);
@@ -3549,7 +3549,7 @@ mod tests {
         // Happy case: single-label leftmost matches via the pre-rule path.
         assert_eq!(
             router.lookup("x.foo.example.com", "/", &method),
-            Ok(RouteResult::forward("wildcard".to_string()))
+            Ok(RouteResult::forward("wildcard".into()))
         );
     }
 
@@ -3587,27 +3587,27 @@ mod tests {
             b"*.sozu.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("base".to_string())
+            &Route::ClusterId("base".into())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(RouteResult::forward("base".to_string()))
+            Ok(RouteResult::forward("base".into()))
         );
         assert!(router.add_tree_rule(
             b"*.sozu.io",
             &PathRule::Prefix("/api".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("api".to_string())
+            &Route::ClusterId("api".into())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/ap", &Method::Get),
-            Ok(RouteResult::forward("base".to_string()))
+            Ok(RouteResult::forward("base".into()))
         );
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(RouteResult::forward("api".to_string()))
+            Ok(RouteResult::forward("api".into()))
         );
     }
 
@@ -3626,27 +3626,27 @@ mod tests {
             b"*.sozu.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("base".to_string())
+            &Route::ClusterId("base".into())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(RouteResult::forward("base".to_string()))
+            Ok(RouteResult::forward("base".into()))
         );
         assert!(router.add_tree_rule(
             b"api.sozu.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("api".to_string())
+            &Route::ClusterId("api".into())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/api", &Method::Get),
-            Ok(RouteResult::forward("base".to_string()))
+            Ok(RouteResult::forward("base".into()))
         );
         assert_eq!(
             router.lookup("api.sozu.io", "/api", &Method::Get),
-            Ok(RouteResult::forward("api".to_string()))
+            Ok(RouteResult::forward("api".into()))
         );
     }
 
@@ -3682,7 +3682,7 @@ mod tests {
                     hostname,
                     &PathRule::Prefix("/".to_string()),
                     &MethodRule::new(Some("GET".to_string())),
-                    &Route::ClusterId("cluster".to_string()),
+                    &Route::ClusterId("cluster".into()),
                 ),
                 "{:?} must be rejected, not inserted",
                 String::from_utf8_lossy(hostname),
@@ -3807,23 +3807,23 @@ mod tests {
             b"www./.*/.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("base".to_string())
+            &Route::ClusterId("base".into())
         ));
         println!("{:#?}", router.tree);
         assert!(router.add_tree_rule(
             b"www.doc./.*/.io",
             &PathRule::Prefix("".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("doc".to_string())
+            &Route::ClusterId("doc".into())
         ));
         println!("{:#?}", router.tree);
         assert_eq!(
             router.lookup("www.sozu.io", "/", &Method::Get),
-            Ok(RouteResult::forward("base".to_string()))
+            Ok(RouteResult::forward("base".into()))
         );
         assert_eq!(
             router.lookup("www.doc.sozu.io", "/", &Method::Get),
-            Ok(RouteResult::forward("doc".to_string()))
+            Ok(RouteResult::forward("doc".into()))
         );
         assert!(router.remove_tree_rule(
             b"www./.*/.io",
@@ -3834,7 +3834,7 @@ mod tests {
         assert!(router.lookup("www.sozu.io", "/", &Method::Get).is_err());
         assert_eq!(
             router.lookup("www.doc.sozu.io", "/", &Method::Get),
-            Ok(RouteResult::forward("doc".to_string()))
+            Ok(RouteResult::forward("doc".into()))
         );
     }
 
@@ -3846,30 +3846,30 @@ mod tests {
             &"*".parse::<DomainRule>().unwrap(),
             &PathRule::Prefix("/.well-known/acme-challenge".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("acme".to_string())
+            &Route::ClusterId("acme".into())
         ));
         assert!(router.add_tree_rule(
             "www.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("example".to_string())
+            &Route::ClusterId("example".into())
         ));
         assert!(router.add_tree_rule(
             "*.test.example.com".as_bytes(),
             &PathRule::Regex(Regex::new("/hello[A-Z]+/").unwrap()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("examplewildcard".to_string())
+            &Route::ClusterId("examplewildcard".into())
         ));
         assert!(router.add_tree_rule(
             "/test[0-9]/.example.com".as_bytes(),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("exampleregex".to_string())
+            &Route::ClusterId("exampleregex".into())
         ));
 
         assert_eq!(
             router.lookup("www.example.com", "/helloA", &Method::new(&b"GET"[..])),
-            Ok(RouteResult::forward("example".to_string()))
+            Ok(RouteResult::forward("example".into()))
         );
         assert_eq!(
             router.lookup(
@@ -3877,7 +3877,7 @@ mod tests {
                 "/.well-known/acme-challenge",
                 &Method::new(&b"GET"[..])
             ),
-            Ok(RouteResult::forward("acme".to_string()))
+            Ok(RouteResult::forward("acme".into()))
         );
         assert!(
             router
@@ -3890,11 +3890,11 @@ mod tests {
                 "/helloAB/",
                 &Method::new(&b"GET"[..])
             ),
-            Ok(RouteResult::forward("examplewildcard".to_string()))
+            Ok(RouteResult::forward("examplewildcard".into()))
         );
         assert_eq!(
             router.lookup("test1.example.com", "/helloAB/", &Method::new(&b"GET"[..])),
-            Ok(RouteResult::forward("exampleregex".to_string()))
+            Ok(RouteResult::forward("exampleregex".into()))
         );
     }
 
@@ -3910,7 +3910,7 @@ mod tests {
             b"www.example.com",
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("cluster1".to_string())
+            &Route::ClusterId("cluster1".into())
         ));
         assert!(router.has_hostname("www.example.com"));
         assert!(!router.has_hostname("api.example.com"));
@@ -3928,7 +3928,7 @@ mod tests {
             &DomainRule::Exact("api.example.com".to_string()),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(None),
-            &Route::ClusterId("cluster2".to_string())
+            &Route::ClusterId("cluster2".into())
         ));
         assert!(router.has_hostname("api.example.com"));
         assert!(!router.has_hostname("www.example.com"));
@@ -3938,7 +3938,7 @@ mod tests {
             &DomainRule::Exact("cdn.example.com".to_string()),
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(None),
-            &Route::ClusterId("cluster3".to_string())
+            &Route::ClusterId("cluster3".into())
         ));
         assert!(router.has_hostname("cdn.example.com"));
 
@@ -3961,13 +3961,13 @@ mod tests {
             b"www.example.com",
             &PathRule::Prefix("/".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("cluster1".to_string())
+            &Route::ClusterId("cluster1".into())
         ));
         assert!(router.add_tree_rule(
             b"www.example.com",
             &PathRule::Prefix("/api".to_string()),
             &MethodRule::new(Some("GET".to_string())),
-            &Route::ClusterId("cluster2".to_string())
+            &Route::ClusterId("cluster2".into())
         ));
         assert!(router.has_hostname("www.example.com"));
 
@@ -4025,25 +4025,25 @@ mod tests {
             b"foo./test[0-9]/.example.com",
             &path,
             &method,
-            &Route::ClusterId("deeper".to_string()),
+            &Route::ClusterId("deeper".into()),
         ));
         assert!(
             router.add_tree_rule(
                 b"/test[0-9]/.example.com",
                 &path,
                 &method,
-                &Route::ClusterId("leftmost".to_string()),
+                &Route::ClusterId("leftmost".into()),
             ),
             "a leftmost-regex frontend must be accepted after a deeper sibling",
         );
         assert_eq!(
             router.lookup("test4.example.com", "/", &Method::Get),
-            Ok(RouteResult::forward("leftmost".to_string())),
+            Ok(RouteResult::forward("leftmost".into())),
             "the leftmost-regex frontend must actually route, not just report OK",
         );
         assert_eq!(
             router.lookup("foo.test4.example.com", "/", &Method::Get),
-            Ok(RouteResult::forward("deeper".to_string())),
+            Ok(RouteResult::forward("deeper".into())),
             "the deeper frontend must still route",
         );
 
@@ -4053,21 +4053,21 @@ mod tests {
             b"/test[0-9]/.example.com",
             &path,
             &method,
-            &Route::ClusterId("leftmost".to_string()),
+            &Route::ClusterId("leftmost".into()),
         ));
         assert!(router.add_tree_rule(
             b"foo./test[0-9]/.example.com",
             &path,
             &method,
-            &Route::ClusterId("deeper".to_string()),
+            &Route::ClusterId("deeper".into()),
         ));
         assert_eq!(
             router.lookup("test4.example.com", "/", &Method::Get),
-            Ok(RouteResult::forward("leftmost".to_string())),
+            Ok(RouteResult::forward("leftmost".into())),
         );
         assert_eq!(
             router.lookup("foo.test4.example.com", "/", &Method::Get),
-            Ok(RouteResult::forward("deeper".to_string())),
+            Ok(RouteResult::forward("deeper".into())),
         );
 
         // And removal through the public surface still takes exactly one.
@@ -4079,7 +4079,7 @@ mod tests {
         );
         assert_eq!(
             router.lookup("foo.test4.example.com", "/", &Method::Get),
-            Ok(RouteResult::forward("deeper".to_string())),
+            Ok(RouteResult::forward("deeper".into())),
         );
     }
 
@@ -4122,7 +4122,7 @@ mod tests {
 
         let mut router = Router::new();
         for (index, (hostname, routable)) in sequence.iter().enumerate() {
-            let cluster = format!("cluster{index}");
+            let cluster = ClusterId::from(format!("cluster{index}"));
             let added =
                 router.add_tree_rule(hostname, &path, &method, &Route::ClusterId(cluster.clone()));
             let resolved = router.lookup(routable, "/", &Method::Get);
@@ -4152,7 +4152,7 @@ mod tests {
                     hostname,
                     &path,
                     &method,
-                    &Route::ClusterId("rejected".to_string()),
+                    &Route::ClusterId("rejected".into()),
                 ),
                 "{:?} must be rejected",
                 String::from_utf8_lossy(hostname),
@@ -4185,7 +4185,7 @@ mod tests {
             b"www.example.com",
             &path,
             &MethodRule::new(method.map(str::to_owned)),
-            &Route::ClusterId(cluster.to_owned()),
+            &Route::ClusterId(cluster.into()),
         )
     }
 
@@ -4195,6 +4195,7 @@ mod tests {
             .lookup("www.example.com", path, &Method::Get)
             .ok()
             .and_then(|result| result.cluster_id)
+            .map(|cluster_id| cluster_id.to_string())
     }
 
     /// Declare `first` then `second` — each with its own `method` — and resolve
@@ -4267,12 +4268,9 @@ mod tests {
             let mut router = Router::new();
             let get = (
                 MethodRule::new(Some("GET".to_owned())),
-                Route::ClusterId("GET-RULE".to_owned()),
+                Route::ClusterId("GET-RULE".into()),
             );
-            let all = (
-                MethodRule::new(None),
-                Route::ClusterId("ALL-RULE".to_owned()),
-            );
+            let all = (MethodRule::new(None), Route::ClusterId("ALL-RULE".into()));
             let (a, b) = if first_is_get { (get, all) } else { (all, get) };
             for (method, route) in [a, b] {
                 assert!(router.add_tree_rule(
@@ -5463,7 +5461,7 @@ mod tests {
         let mut router = Router::new();
         let mut deny = test_http_frontend();
         deny.hostname = "www.example.com".to_owned();
-        deny.cluster_id = Some("DENIED".to_owned());
+        deny.cluster_id = Some("DENIED".into());
         deny.path = CommandPathRule::regex("/admin.*".to_owned());
         deny.method = Some("GET".to_owned());
         deny.redirect = Some(RedirectPolicy::Unauthorized as i32);
@@ -5654,7 +5652,7 @@ mod tests {
                 pattern,
                 &PathRule::Prefix("/".to_owned()),
                 &MethodRule::new(Some("GET".to_owned())),
-                &Route::ClusterId("ALTERNATION".to_owned()),
+                &Route::ClusterId("ALTERNATION".into()),
             ));
             router
                 .lookup(hostname, "/", &Method::Get)
@@ -5758,7 +5756,7 @@ mod tests {
         let mut front = test_http_frontend();
         front.hostname = pattern.to_owned();
         front.position = position;
-        front.cluster_id = Some("REGEX-HOST".to_owned());
+        front.cluster_id = Some("REGEX-HOST".into());
         let mut router = Router::new();
         router
             .add_http_front(&front)
@@ -5767,6 +5765,7 @@ mod tests {
             .lookup(hostname, "/", &Method::Get)
             .ok()
             .and_then(|result| result.cluster_id)
+            .map(|cluster_id| cluster_id.to_string())
     }
 
     /// The companion of
@@ -6282,16 +6281,19 @@ mod tests {
     }
 
     /// A tree lookup allocates nothing of its own: whatever host shape
-    /// answers, the only heap work is building the [`RouteResult`], here the
-    /// cluster id cloned out of a legacy [`Route::ClusterId`] entry, which
-    /// the control reproduces.
+    /// answers, the only heap work is building the [`RouteResult`] itself,
+    /// which the control reproduces. The cluster id is not part of it: the
+    /// result carries a handle on the legacy [`Route::ClusterId`] entry's
+    /// reference-counted id, and so does the control.
     ///
     /// The three shapes cover every sink push the walk makes: a literal host
     /// records no segment, a wildcard host records one on its leaf, a regex
     /// host records one on the way down.
     ///
     /// TO SEE THIS RED: hand `lookup_with_path` a `Vec::with_capacity(16)`
-    /// again in `Router::lookup`, one allocation per lookup on every shape.
+    /// again in `Router::lookup`, one allocation per lookup on every shape;
+    /// or build the legacy arm of `RouteResult::new_with_trie` from
+    /// `ClusterId::from(&**id)` instead of `id.clone()`, one more.
     #[test]
     fn a_tree_lookup_allocates_nothing_past_its_route_result() {
         use std::hint::black_box;
@@ -6311,9 +6313,10 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{hostname} must register: {error}"));
         }
 
+        let cluster = ClusterId::from("cluster");
         let control = || {
             let before = allocations();
-            let result = RouteResult::forward(black_box("cluster").to_owned());
+            let result = RouteResult::forward(black_box(&cluster).clone());
             let allocated = allocations() - before;
             drop(black_box(result));
             allocated
@@ -6478,7 +6481,7 @@ mod tests {
                 unbalanced.as_bytes(),
                 &PathRule::Prefix("/".to_owned()),
                 &MethodRule::new(Some("GET".to_owned())),
-                &Route::ClusterId("RESCUED".to_owned()),
+                &Route::ClusterId("RESCUED".into()),
             ),
             "{unbalanced} must not be storable in the trie either",
         );
@@ -6520,7 +6523,7 @@ mod tests {
                     hostname,
                     &PathRule::Prefix("/".to_owned()),
                     &MethodRule::new(Some("GET".to_owned())),
-                    &Route::ClusterId(cluster.to_owned()),
+                    &Route::ClusterId(cluster.into()),
                 ));
             }
             router
@@ -6551,7 +6554,7 @@ mod tests {
             numbered,
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(Some("GET".to_owned())),
-            &Route::ClusterId("REGIONAL".to_owned()),
+            &Route::ClusterId("REGIONAL".into()),
         ));
         assert_eq!(
             router
@@ -6600,13 +6603,13 @@ mod tests {
             b"/test[0-9]/.example.com",
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(None),
-            &Route::ClusterId("REGEX-FAMILY".to_owned()),
+            &Route::ClusterId("REGEX-FAMILY".into()),
         ));
         assert!(router.add_tree_rule(
             b"test4.example.com",
             &PathRule::Prefix("/only-for-test4".to_owned()),
             &MethodRule::new(None),
-            &Route::ClusterId("EXACT-SPECIFIC".to_owned()),
+            &Route::ClusterId("EXACT-SPECIFIC".into()),
         ));
 
         let resolve = |hostname: &str, path: &str| {
@@ -6663,7 +6666,7 @@ mod tests {
                     hostname,
                     &PathRule::Prefix(path.to_owned()),
                     &MethodRule::new(None),
-                    &Route::ClusterId(cluster.to_owned()),
+                    &Route::ClusterId(cluster.into()),
                 ));
             }
             [
@@ -6726,7 +6729,7 @@ mod tests {
                     hostname,
                     &PathRule::Prefix("/".to_owned()),
                     &MethodRule::new(None),
-                    &Route::ClusterId((*cluster).to_owned()),
+                    &Route::ClusterId((*cluster).into()),
                 ));
             }
             router
@@ -6792,7 +6795,7 @@ mod tests {
                 hostname,
                 &PathRule::Prefix(path.to_owned()),
                 &MethodRule::new(None),
-                &Route::ClusterId(cluster.to_owned()),
+                &Route::ClusterId(cluster.into()),
             ));
         }
 
@@ -6847,13 +6850,13 @@ mod tests {
             b"/test[0-9]/.example.com",
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(Some("POST".to_owned())),
-            &Route::ClusterId("POST-ONLY".to_owned()),
+            &Route::ClusterId("POST-ONLY".into()),
         ));
         assert!(router.add_tree_rule(
             b"/[a-z]+[0-9]/.example.com",
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(Some("GET".to_owned())),
-            &Route::ClusterId("GET-ONLY".to_owned()),
+            &Route::ClusterId("GET-ONLY".into()),
         ));
 
         let resolve = |method: &Method| {
@@ -6961,7 +6964,7 @@ mod tests {
             b"www.example.com",
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(Some("GET".to_owned())),
-            &Route::ClusterId("CASE".to_owned()),
+            &Route::ClusterId("CASE".into()),
         ));
 
         let resolve = |hostname: &str| {
@@ -6999,7 +7002,7 @@ mod tests {
             b"WWW.EXAMPLE.COM",
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(Some("GET".to_owned())),
-            &Route::ClusterId("CASE".to_owned()),
+            &Route::ClusterId("CASE".into()),
         ));
 
         for host in ["www.example.com", "WWW.EXAMPLE.COM"] {
@@ -7034,13 +7037,13 @@ mod tests {
             b"*.wild.example.com",
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(Some("GET".to_owned())),
-            &Route::ClusterId("WILDCARD".to_owned()),
+            &Route::ClusterId("WILDCARD".into()),
         ));
         assert!(router.add_tree_rule(
             b"/API[0-9]/.rx.example.com",
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(Some("GET".to_owned())),
-            &Route::ClusterId("REGEX".to_owned()),
+            &Route::ClusterId("REGEX".into()),
         ));
 
         let resolve = |hostname: &str| {
@@ -7081,13 +7084,13 @@ mod tests {
             &exact,
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(None),
-            &Route::ClusterId("PRE".to_owned()),
+            &Route::ClusterId("PRE".into()),
         ));
         assert!(router.add_post_rule(
             &wildcard,
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(None),
-            &Route::ClusterId("POST".to_owned()),
+            &Route::ClusterId("POST".into()),
         ));
 
         let resolve = |hostname: &str| {
@@ -7130,7 +7133,7 @@ mod tests {
             &uppercase_regex,
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(None),
-            &Route::ClusterId("RX".to_owned()),
+            &Route::ClusterId("RX".into()),
         ));
 
         let resolve = |hostname: &str| {
@@ -7172,7 +7175,7 @@ mod tests {
             &unicode_class,
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(None),
-            &Route::ClusterId("UNICODE".to_owned()),
+            &Route::ClusterId("UNICODE".into()),
         ));
 
         let resolve = |hostname: &str| {
@@ -7217,13 +7220,13 @@ mod tests {
             b"test4.example.com",
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(Some("GET".to_owned())),
-            &Route::ClusterId("EXACT".to_owned()),
+            &Route::ClusterId("EXACT".into()),
         ));
         assert!(router.add_tree_rule(
             b"/test[0-9]/.example.com",
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(Some("GET".to_owned())),
-            &Route::ClusterId("REGEX-FAMILY".to_owned()),
+            &Route::ClusterId("REGEX-FAMILY".into()),
         ));
 
         let resolve = |hostname: &str| {
@@ -7277,7 +7280,7 @@ mod tests {
             b"tree.example.com",
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(Some("GET".to_owned())),
-            &Route::ClusterId("TREE".to_owned()),
+            &Route::ClusterId("TREE".into()),
         ));
         assert!(
             router.add_pre_rule(
@@ -7286,7 +7289,7 @@ mod tests {
                     .expect("an exact domain rule must parse"),
                 &PathRule::Prefix("/".to_owned()),
                 &MethodRule::new(None),
-                &Route::ClusterId("PRE".to_owned()),
+                &Route::ClusterId("PRE".into()),
             )
         );
 
@@ -7369,7 +7372,7 @@ mod tests {
             b"www.example.com",
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(Some("GET".to_owned())),
-            &Route::ClusterId("CASE".to_owned()),
+            &Route::ClusterId("CASE".into()),
         ));
 
         assert!(
@@ -7421,7 +7424,7 @@ mod tests {
             "/\\D+/.rx.example.com".as_bytes(),
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(None),
-            &Route::ClusterId("NOT-A-DIGIT".to_owned()),
+            &Route::ClusterId("NOT-A-DIGIT".into()),
         ));
 
         let resolve = |hostname: &str| {
@@ -7467,7 +7470,7 @@ mod tests {
                     hostname.as_bytes(),
                     &PathRule::Prefix("/".to_owned()),
                     &MethodRule::new(None),
-                    &Route::ClusterId("ESCAPE".to_owned()),
+                    &Route::ClusterId("ESCAPE".into()),
                 ),
                 "{hostname} must install",
             );
@@ -7514,7 +7517,7 @@ mod tests {
             hostname.as_bytes(),
             &PathRule::Prefix("/".to_owned()),
             &MethodRule::new(None),
-            &Route::ClusterId("IDN".to_owned()),
+            &Route::ClusterId("IDN".into()),
         ));
 
         // `idna::domain_to_ascii("MÜNCHEN")` -> `"xn--mnchen-3ya"`
@@ -8125,7 +8128,7 @@ mod tests {
                 hostname.as_bytes(),
                 &PathRule::Prefix(rule.path.to_owned()),
                 &MethodRule::new(None),
-                &Route::ClusterId(rule.cluster.clone()),
+                &Route::ClusterId(rule.cluster.as_str().into()),
             ) {
                 eprintln!(
                     "INSERT REFUSED hostname={hostname:?} path={:?} cluster={:?} \

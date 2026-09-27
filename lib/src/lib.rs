@@ -419,7 +419,7 @@ pub trait ProxySession {
     /// the session most recently keep-alive'd to. Used for log/metric
     /// attribution, not for accounting (the tracker keeps the canonical
     /// per-stream `(cluster, IP)` set).
-    fn cluster_id(&self) -> Option<String> {
+    fn cluster_id(&self) -> Option<ClusterId> {
         None
     }
     /// Source address as observed by Sōzu, with proxy-protocol awareness.
@@ -702,7 +702,7 @@ pub enum BackendConnectionError {
     #[error("Not found: {0:?}")]
     NotFound(ObjectKind),
     #[error("Too many connections on cluster {0:?}")]
-    MaxConnectionRetries(Option<String>),
+    MaxConnectionRetries(Option<ClusterId>),
     #[error("the sessions slab has reached maximum capacity")]
     MaxSessionsMemory,
     #[error("error from the backend: {0}")]
@@ -717,7 +717,7 @@ pub enum BackendConnectionError {
     /// close for raw TCP. The `cluster_id` is included so log/metric
     /// pipelines can attribute the rejection.
     #[error("per-(cluster, source-IP) connection limit reached for cluster {cluster_id:?}")]
-    TooManyConnectionsPerIp { cluster_id: String },
+    TooManyConnectionsPerIp { cluster_id: ClusterId },
     /// A stale-upstream replay could not be carried out. `Stream::retry_buffer`
     /// holds H1 wire bytes captured under the FIRST attempt's routing
     /// decision, so the replay is valid only while that decision still holds:

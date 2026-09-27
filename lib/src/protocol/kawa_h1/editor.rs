@@ -278,7 +278,7 @@ pub struct HttpContext {
     /// the value of the custom header, named "Sozu-Id", that Kawa should write (request and response)
     pub id: Ulid,
     pub backend_id: Option<Rc<str>>,
-    pub cluster_id: Option<String>,
+    pub cluster_id: Option<sozu_command_lib::state::ClusterId>,
     /// the value of the protocol Kawa should write in the Forwarded headers of the request
     pub protocol: Protocol,
     /// the value of the public address Kawa should write in the Forwarded headers of the request
@@ -1613,7 +1613,7 @@ mod tests {
     fn test_reset_preserves_connection_state() {
         let mut ctx = make_context();
         ctx.closing = true;
-        ctx.cluster_id = Some("cluster-1".to_owned());
+        ctx.cluster_id = Some("cluster-1".into());
         ctx.backend_id = Some("backend-1".into());
         ctx.sticky_session = Some("session-abc".to_owned());
 

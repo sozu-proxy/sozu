@@ -35,7 +35,26 @@ use crate::{
 };
 
 /// To use throughout Sōzu
-pub type ClusterId = String;
+///
+/// `Arc`, not `Rc`, although each worker is single-threaded: embedders keep
+/// [`ConfigState`] and the `response` types behind locks shared across
+/// threads (a multi-threaded tokio runtime, axum extensions), so they must
+/// stay `Send + Sync`. The assertion below holds that contract.
+pub type ClusterId = std::sync::Arc<str>;
+
+// Public contract: every type carrying a `ClusterId` stays `Send + Sync`.
+// Switching the alias to `Rc<str>` fails to compile here rather than in an
+// embedder's build.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ClusterId>();
+    assert_send_sync::<ConfigState>();
+    assert_send_sync::<StateError>();
+    assert_send_sync::<crate::response::HttpFrontend>();
+    assert_send_sync::<crate::response::TcpFrontend>();
+    assert_send_sync::<crate::response::UdpFrontend>();
+    assert_send_sync::<crate::response::Backend>();
+};
 
 #[derive(thiserror::Error)]
 pub enum StateError {
@@ -323,7 +342,8 @@ impl ConfigState {
         // under (replay re-keys on `cluster.cluster_id`).
         for (cluster_id, cluster) in &self.clusters {
             debug_assert_eq!(
-                &cluster.cluster_id, cluster_id,
+                cluster.cluster_id.as_str(),
+                &**cluster_id,
                 "cluster value cluster_id must match its map key"
             );
         }
@@ -466,15 +486,17 @@ impl ConfigState {
         // AddCluster is an upsert (replacing an existing cluster_id keeps the
         // entry count flat), so we assert on presence/key-coherence rather than
         // a strict +1 on len.
-        let cluster_id = cluster.cluster_id.clone();
+        let cluster_id = ClusterId::from(cluster.cluster_id.as_str());
         self.clusters.insert(cluster_id.clone(), cluster);
         debug_assert!(
             self.clusters.contains_key(&cluster_id),
             "add_cluster must leave the cluster present in the map"
         );
         debug_assert_eq!(
-            self.clusters.get(&cluster_id).map(|c| &c.cluster_id),
-            Some(&cluster_id),
+            self.clusters
+                .get(&cluster_id)
+                .map(|c| c.cluster_id.as_str()),
+            Some(&*cluster_id),
             "stored cluster must be keyed by its own cluster_id"
         );
         Ok(())
@@ -522,7 +544,7 @@ impl ConfigState {
                 reason,
             });
         }
-        match self.clusters.get_mut(&set.cluster_id) {
+        match self.clusters.get_mut(set.cluster_id.as_str()) {
             Some(cluster) => {
                 cluster.health_check = Some(set.config.to_owned());
                 Ok(())
@@ -551,12 +573,12 @@ impl ConfigState {
         let map = self
             .clusters
             .iter()
-            .filter(|(id, _)| cluster_id.is_none_or(|filter| filter == id.as_str()))
+            .filter(|(id, _)| cluster_id.is_none_or(|filter| filter == &id[..]))
             .filter_map(|(id, cluster)| {
                 cluster
                     .health_check
                     .as_ref()
-                    .map(|hc| (id.to_owned(), hc.to_owned()))
+                    .map(|hc| (id.to_string(), hc.to_owned()))
             })
             .collect();
         HealthChecksList { map }
@@ -1522,16 +1544,19 @@ impl ConfigState {
         );
 
         let tcp_frontend = TcpFrontend {
-            cluster_id: front.cluster_id.clone(),
+            cluster_id: front.cluster_id.as_str().into(),
             address,
             tags: front.tags.clone(),
             sni: normalized_sni,
             alpn,
         };
-        let tcp_frontends = self.tcp_fronts.entry(front.cluster_id.clone()).or_default();
+        let tcp_frontends = self
+            .tcp_fronts
+            .entry(tcp_frontend.cluster_id.clone())
+            .or_default();
         let before = tcp_frontends.len();
         debug_assert_eq!(
-            tcp_frontend.cluster_id, front.cluster_id,
+            *tcp_frontend.cluster_id, *front.cluster_id,
             "the built frontend must carry its bucket's cluster_id"
         );
         tcp_frontends.push(tcp_frontend);
@@ -1549,7 +1574,7 @@ impl ConfigState {
     ) -> Result<(), StateError> {
         let tcp_frontends =
             self.tcp_fronts
-                .get_mut(&front_to_remove.cluster_id)
+                .get_mut(front_to_remove.cluster_id.as_str())
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::TcpFrontend,
                     id: format!(
@@ -1635,7 +1660,7 @@ impl ConfigState {
     fn add_udp_frontend(&mut self, front: &RequestUdpFrontend) -> Result<(), StateError> {
         let address: SocketAddr = front.address.into();
         let udp_frontend = UdpFrontend {
-            cluster_id: front.cluster_id.clone(),
+            cluster_id: front.cluster_id.as_str().into(),
             address,
             tags: front.tags.clone(),
         };
@@ -1664,7 +1689,7 @@ impl ConfigState {
             }
             return Err(StateError::UdpFrontendAddressTaken {
                 address,
-                cluster_id: front.cluster_id.clone(),
+                cluster_id: udp_frontend.cluster_id.clone(),
                 current_cluster_id: current.cluster_id.clone(),
                 current_tags: current.tags.clone(),
             });
@@ -1679,7 +1704,10 @@ impl ConfigState {
             "add_udp_frontend must not mutate udp_fronts before every admission check has passed"
         );
 
-        let udp_frontends = self.udp_fronts.entry(front.cluster_id.clone()).or_default();
+        let udp_frontends = self
+            .udp_fronts
+            .entry(udp_frontend.cluster_id.clone())
+            .or_default();
         let before = udp_frontends.len();
         udp_frontends.push(udp_frontend);
         debug_assert_eq!(
@@ -1706,13 +1734,13 @@ impl ConfigState {
         &mut self,
         front_to_remove: &RequestUdpFrontend,
     ) -> Result<(), StateError> {
-        let udp_frontends =
-            self.udp_fronts
-                .get_mut(&front_to_remove.cluster_id)
-                .ok_or(StateError::NotFound {
-                    kind: ObjectKind::UdpFrontend,
-                    id: format!("{front_to_remove:?}"),
-                })?;
+        let udp_frontends = self
+            .udp_fronts
+            .get_mut(front_to_remove.cluster_id.as_str())
+            .ok_or(StateError::NotFound {
+                kind: ObjectKind::UdpFrontend,
+                id: format!("{front_to_remove:?}"),
+            })?;
 
         let len = udp_frontends.len();
         let remove_address: SocketAddr = front_to_remove.address.into();
@@ -1752,7 +1780,7 @@ impl ConfigState {
     fn add_backend(&mut self, add_backend: &AddBackend) -> Result<(), StateError> {
         let backend = Backend {
             address: add_backend.address.into(),
-            cluster_id: add_backend.cluster_id.clone(),
+            cluster_id: add_backend.cluster_id.as_str().into(),
             backend_id: add_backend.backend_id.clone(),
             sticky_id: add_backend.sticky_id.clone(),
             load_balancing_parameters: add_backend.load_balancing_parameters,
@@ -1798,7 +1826,7 @@ impl ConfigState {
     fn remove_backend(&mut self, backend: &RemoveBackend) -> Result<(), StateError> {
         let backend_list =
             self.backends
-                .get_mut(&backend.cluster_id)
+                .get_mut(backend.cluster_id.as_str())
                 .ok_or(StateError::NotFound {
                     kind: ObjectKind::Backend,
                     id: backend.backend_id.to_owned(),
@@ -2440,7 +2468,7 @@ impl ConfigState {
 
                     v.push(
                         RequestType::RemoveBackend(RemoveBackend {
-                            cluster_id: backend.cluster_id.clone(),
+                            cluster_id: backend.cluster_id.to_string(),
                             backend_id: backend.backend_id.clone(),
                             address: SocketAddress::from(backend.address),
                         })
@@ -2456,7 +2484,7 @@ impl ConfigState {
 
                     v.push(
                         RequestType::RemoveBackend(RemoveBackend {
-                            cluster_id: backend.cluster_id.clone(),
+                            cluster_id: backend.cluster_id.to_string(),
                             backend_id: backend.backend_id.clone(),
                             address: SocketAddress::from(backend.address),
                         })
@@ -2801,7 +2829,7 @@ impl ConfigState {
             if domain_check(&front.hostname, &front.path, &hostname, &path)
                 && let Some(id) = &front.cluster_id
             {
-                cluster_ids.insert(id.to_string());
+                cluster_ids.insert(id.clone());
             }
         });
 
@@ -2809,7 +2837,7 @@ impl ConfigState {
             if domain_check(&front.hostname, &front.path, &hostname, &path)
                 && let Some(id) = &front.cluster_id
             {
-                cluster_ids.insert(id.to_string());
+                cluster_ids.insert(id.clone());
             }
         });
 
@@ -3787,8 +3815,8 @@ mod tests {
                 address: "127.0.0.1:5353"
                     .parse()
                     .expect("test UDP frontend address must parse"),
-                cluster_id: long_value(),
-                current_cluster_id: long_value(),
+                cluster_id: long_value().into(),
+                current_cluster_id: long_value().into(),
                 current_tags: BTreeMap::from([(long_value(), long_value())]),
             },
         ];
@@ -4348,11 +4376,11 @@ mod tests {
             .expect("Could not execute request");
 
         let mut cluster1_cluster2: HashSet<ClusterId> = HashSet::new();
-        cluster1_cluster2.insert(String::from("MyCluster_1"));
-        cluster1_cluster2.insert(String::from("MyCluster_2"));
+        cluster1_cluster2.insert(ClusterId::from("MyCluster_1"));
+        cluster1_cluster2.insert(ClusterId::from("MyCluster_2"));
 
         let mut cluster2: HashSet<ClusterId> = HashSet::new();
-        cluster2.insert(String::from("MyCluster_2"));
+        cluster2.insert(ClusterId::from("MyCluster_2"));
 
         let empty: HashSet<ClusterId> = HashSet::new();
         assert_eq!(
@@ -4392,7 +4420,7 @@ mod tests {
             .expect("Could not execute request");
 
         let b = Backend {
-            cluster_id: String::from("cluster_1"),
+            cluster_id: ClusterId::from("cluster_1"),
             backend_id: String::from("cluster_1-0"),
             address: "127.0.0.1:1026".parse().unwrap(),
             load_balancing_parameters: Some(LoadBalancingParams::default()),
@@ -6698,9 +6726,12 @@ mod tests {
                     SocketAddr::from(address),
                     "the refusal must name the contested address"
                 );
-                assert_eq!(cluster_id, "syslog", "the refusal must name the claimant");
                 assert_eq!(
-                    current_cluster_id, &owner_cluster,
+                    &**cluster_id, "syslog",
+                    "the refusal must name the claimant"
+                );
+                assert_eq!(
+                    **current_cluster_id, *owner_cluster,
                     "the refusal must name the cluster already holding the address"
                 );
                 assert_eq!(

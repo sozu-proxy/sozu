@@ -153,7 +153,7 @@ fn cluster_config(r: &mut Reader) -> ClusterConfig {
     let front = Duration::from_secs((r.u8() % 40) as u64);
     let back = Duration::from_secs((r.u8() % 40) as u64);
     ClusterConfig {
-        cluster,
+        cluster: cluster.into(),
         affinity_with_port: flags & 0b0000_0010 != 0,
         // 0 = unlimited; otherwise a small cap so the teardown fires often.
         responses: (r.u8() % 4) as u32,

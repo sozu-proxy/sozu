@@ -661,7 +661,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-a".into())],
         );
         let cfg = cfg(&routes);
         let wire = hello("example.com", &[]);
@@ -693,7 +693,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-a".into())],
         );
         let wire = hello_no_alpn("example.com");
 
@@ -701,7 +701,7 @@ mod tests {
         exact_cfg.max_bytes = wire.len();
         let mut core = SniPrereadCore::new();
         match feed(&mut core, &exact_cfg, &wire) {
-            Output::Routed { cluster, .. } => assert_eq!(cluster, "cluster-a"),
+            Output::Routed { cluster, .. } => assert_eq!(&*cluster, "cluster-a"),
             other => panic!("expected Routed at exactly the cap, got {other:?}"),
         }
 
@@ -729,7 +729,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-a".into())],
         );
         let wire = hello("example.com", &[b"h2"]);
         let mut over = wire.clone();
@@ -747,7 +747,7 @@ mod tests {
                 sni,
                 ..
             } => {
-                assert_eq!(cluster, "cluster-a");
+                assert_eq!(&*cluster, "cluster-a");
                 assert_eq!(content_offset, 0);
                 assert_eq!(sni, "example.com");
             }
@@ -816,7 +816,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-a".into())],
         );
         let cfg = cfg(&routes);
         let mut core = SniPrereadCore::new();
@@ -848,7 +848,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-a".into())],
         );
         let cfg = cfg(&routes);
         let mut core = SniPrereadCore::new();
@@ -864,7 +864,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-a".into())],
         );
         let cfg = cfg(&routes);
         let mut core = SniPrereadCore::new();
@@ -883,7 +883,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-a".into())],
         );
         let cfg = cfg(&routes);
         let mut core = SniPrereadCore::new();
@@ -919,14 +919,14 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"/a|b|c/.example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-alt".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-alt".into())],
         );
         let cfg = cfg(&routes);
 
         for whole in ["a.example.com", "b.example.com", "c.example.com"] {
             let mut core = SniPrereadCore::new();
             match feed(&mut core, &cfg, &hello_no_alpn(whole)) {
-                Output::Routed { cluster, .. } => assert_eq!(cluster, "cluster-alt"),
+                Output::Routed { cluster, .. } => assert_eq!(&*cluster, "cluster-alt"),
                 other => panic!("expected Routed for {whole}, got {other:?}"),
             }
         }
@@ -953,7 +953,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(one_of(&[b"h2"]), "cluster-a".to_owned())],
+            vec![(one_of(&[b"h2"]), "cluster-a".into())],
         );
         let cfg = cfg(&routes);
         let mut core = SniPrereadCore::new();
@@ -1011,7 +1011,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-a".into())],
         );
         let cfg = cfg(&routes);
         let wire = hello("example.com", &[b"h2"]);
@@ -1024,7 +1024,7 @@ mod tests {
         }
         match feed(&mut core, &cfg, &wire) {
             Output::Routed { cluster, sni, .. } => {
-                assert_eq!(cluster, "cluster-a");
+                assert_eq!(&*cluster, "cluster-a");
                 assert_eq!(sni, "example.com");
             }
             other => panic!("expected Routed at full length, got {other:?}"),
@@ -1047,7 +1047,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-a".into())],
         );
         let mut cfg = cfg(&routes);
         cfg.timeout = Duration::from_secs(5);
@@ -1121,14 +1121,14 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"split.example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-split".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-split".into())],
         );
         let cfg = cfg(&routes);
         let wire = hello("split.example.com", &[b"h2"]);
         let split = parser::split_into_records(&wire, 4);
         let mut core = SniPrereadCore::new();
         match feed(&mut core, &cfg, &split) {
-            Output::Routed { cluster, .. } => assert_eq!(cluster, "cluster-split"),
+            Output::Routed { cluster, .. } => assert_eq!(&*cluster, "cluster-split"),
             other => panic!("expected Routed for a multi-record ClientHello, got {other:?}"),
         }
     }
@@ -1140,7 +1140,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-a".into())],
         );
         let mut proxy_cfg = cfg(&routes);
         proxy_cfg.inbound_proxy = true;
@@ -1163,7 +1163,7 @@ mod tests {
                 proxy_source,
                 ..
             } => {
-                assert_eq!(cluster, "cluster-a");
+                assert_eq!(&*cluster, "cluster-a");
                 assert_eq!(content_offset, proxy_header.len());
                 assert_eq!(proxy_source, Some(src));
             }
@@ -1195,7 +1195,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-a".into())],
         );
         let mut proxy_cfg = cfg(&routes);
         proxy_cfg.inbound_proxy = true;
@@ -1222,7 +1222,7 @@ mod tests {
             } => {
                 // Routing and framing are untouched: the header is still
                 // consumed whole, only its address block is dropped.
-                assert_eq!(cluster, "cluster-a");
+                assert_eq!(&*cluster, "cluster-a");
                 assert_eq!(content_offset, proxy_header.len());
                 assert_eq!(
                     proxy_source, None,
@@ -1238,7 +1238,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "cluster-a".to_owned())],
+            vec![(AlpnMatcher::Any, "cluster-a".into())],
         );
         let mut proxy_cfg = cfg(&routes);
         proxy_cfg.inbound_proxy = true;
@@ -1265,11 +1265,11 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"*.example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "wildcard-cluster".to_owned())],
+            vec![(AlpnMatcher::Any, "wildcard-cluster".into())],
         );
         routes.domain_insert(
             b"a.example.com".to_vec(),
-            vec![(one_of(&[b"h2"]), "exact-cluster".to_owned())],
+            vec![(one_of(&[b"h2"]), "exact-cluster".into())],
         );
         let cfg = cfg(&routes);
 
@@ -1289,7 +1289,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"*.example.com".to_vec(),
-            vec![(AlpnMatcher::Any, "wildcard-cluster".to_owned())],
+            vec![(AlpnMatcher::Any, "wildcard-cluster".into())],
         );
         let cfg = cfg(&routes);
 
@@ -1302,7 +1302,7 @@ mod tests {
                 matched_alpn,
                 ..
             } => {
-                assert_eq!(cluster, "wildcard-cluster");
+                assert_eq!(&*cluster, "wildcard-cluster");
                 // The matched-route identity is the trie KEY (the
                 // configured wildcard pattern), NOT the client's concrete
                 // SNI -- downstream tags keying depends on this.
@@ -1334,8 +1334,8 @@ mod tests {
         routes.domain_insert(
             b"example.com".to_vec(),
             vec![
-                (one_of(&[b"http/1.1"]), "cluster-http11".to_owned()),
-                (one_of(&[b"h2"]), "cluster-h2".to_owned()),
+                (one_of(&[b"http/1.1"]), "cluster-http11".into()),
+                (one_of(&[b"h2"]), "cluster-h2".into()),
             ],
         );
         let cfg = cfg(&routes);
@@ -1348,7 +1348,7 @@ mod tests {
             &cfg,
             &hello("example.com", &[b"h2", b"http/1.1"]),
         ) {
-            Output::Routed { cluster, .. } => assert_eq!(cluster, "cluster-h2"),
+            Output::Routed { cluster, .. } => assert_eq!(&*cluster, "cluster-h2"),
             other => panic!("expected the client's first preference, got {other:?}"),
         }
 
@@ -1358,7 +1358,7 @@ mod tests {
             &cfg,
             &hello("example.com", &[b"http/1.1", b"h2"]),
         ) {
-            Output::Routed { cluster, .. } => assert_eq!(cluster, "cluster-http11"),
+            Output::Routed { cluster, .. } => assert_eq!(&*cluster, "cluster-http11"),
             other => panic!("expected the client's first preference, got {other:?}"),
         }
     }
@@ -1369,8 +1369,8 @@ mod tests {
         routes.domain_insert(
             b"example.com".to_vec(),
             vec![
-                (one_of(&[b"h2"]), "cluster-h2".to_owned()),
-                (AlpnMatcher::Any, "cluster-default".to_owned()),
+                (one_of(&[b"h2"]), "cluster-h2".into()),
+                (AlpnMatcher::Any, "cluster-default".into()),
             ],
         );
         let cfg = cfg(&routes);
@@ -1378,7 +1378,7 @@ mod tests {
         // Offers something nobody claims via OneOf -> falls through to Any.
         let mut core = SniPrereadCore::new();
         match feed(&mut core, &cfg, &hello("example.com", &[b"spdy/1"])) {
-            Output::Routed { cluster, .. } => assert_eq!(cluster, "cluster-default"),
+            Output::Routed { cluster, .. } => assert_eq!(&*cluster, "cluster-default"),
             other => panic!("expected the Any catch-all, got {other:?}"),
         }
 
@@ -1386,7 +1386,7 @@ mod tests {
         let mut core = SniPrereadCore::new();
         match feed(&mut core, &cfg, &hello_no_alpn("example.com")) {
             Output::Routed { cluster, alpn, .. } => {
-                assert_eq!(cluster, "cluster-default");
+                assert_eq!(&*cluster, "cluster-default");
                 assert!(alpn.is_empty());
             }
             other => panic!("expected the Any catch-all for a no-ALPN client, got {other:?}"),
@@ -1398,7 +1398,7 @@ mod tests {
         let mut routes = TrieNode::root();
         routes.domain_insert(
             b"example.com".to_vec(),
-            vec![(one_of(&[b"h2"]), "cluster-h2".to_owned())],
+            vec![(one_of(&[b"h2"]), "cluster-h2".into())],
         );
         let cfg = cfg(&routes);
         let mut core = SniPrereadCore::new();

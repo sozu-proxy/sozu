@@ -52,10 +52,10 @@ use sozu_lib::{
     router::pattern_trie::TrieNode,
 };
 
-/// `sozu_command::state::ClusterId` is a plain `String` alias; re-declaring
+/// `sozu_command::state::ClusterId` is a plain `Arc<str>` alias; re-declaring
 /// it locally avoids pulling `sozu-command` into the fuzz crate's dependency
 /// graph just for a type alias.
-type ClusterId = String;
+type ClusterId = std::sync::Arc<str>;
 
 /// Fixed SNI key pool: a mix of exact hosts and `*.` wildcards so both the
 /// exact-match and wildcard-match trie paths are reachable.
@@ -126,7 +126,7 @@ fn build_routes(r: &mut Reader) -> TrieNode<Vec<(AlpnMatcher, ClusterId)>> {
             }
             AlpnMatcher::OneOf(set)
         };
-        routes.domain_insert(key, vec![(matcher, format!("cluster-{i}"))]);
+        routes.domain_insert(key, vec![(matcher, format!("cluster-{i}").into())]);
     }
     routes
 }

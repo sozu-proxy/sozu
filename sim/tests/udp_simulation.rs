@@ -424,7 +424,7 @@ fn random_cluster(ctx: &SimContext, allow_empty: bool) -> ClusterConfig {
         format!("cluster-{}", ctx.random().random_range(0..3u8))
     };
     ClusterConfig {
-        cluster,
+        cluster: cluster.into(),
         affinity_with_port: ctx.random().random_bool(0.5),
         responses: if ctx.random().random_bool(0.6) {
             0

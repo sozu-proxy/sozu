@@ -14,6 +14,7 @@ use rusty_ulid::Ulid;
 use sozu_command::{
     config::MAX_LOOP_ITERATIONS,
     logging::{EndpointRecord, LogContext, ansi_palette},
+    state::ClusterId,
 };
 
 use crate::metrics::names;
@@ -92,7 +93,7 @@ pub struct Pipe<Front: SocketHandler, L: ListenerHandler> {
     backend_status: ConnectionStatus,
     backend_token: Option<Token>,
     pub backend: Option<Rc<RefCell<Backend>>>,
-    cluster_id: Option<String>,
+    cluster_id: Option<ClusterId>,
     pub container_backend_timeout: Option<TimeoutContainer>,
     pub container_frontend_timeout: Option<TimeoutContainer>,
     frontend_buffer: Checkout,
@@ -149,7 +150,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         backend: Option<Rc<RefCell<Backend>>>,
         container_backend_timeout: Option<TimeoutContainer>,
         container_frontend_timeout: Option<TimeoutContainer>,
-        cluster_id: Option<String>,
+        cluster_id: Option<ClusterId>,
         frontend_buffer: Checkout,
         frontend_token: Token,
         frontend: Front,
@@ -306,7 +307,7 @@ impl<Front: SocketHandler, L: ListenerHandler> Pipe<Front, L> {
         }
     }
 
-    pub fn set_cluster_id(&mut self, cluster_id: Option<String>) {
+    pub fn set_cluster_id(&mut self, cluster_id: Option<ClusterId>) {
         self.cluster_id = cluster_id;
     }
 

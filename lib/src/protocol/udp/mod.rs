@@ -272,7 +272,7 @@ pub struct ClusterConfig {
 impl Default for ClusterConfig {
     fn default() -> Self {
         ClusterConfig {
-            cluster: String::new(),
+            cluster: ClusterId::from(""),
             affinity_with_port: false,
             responses: 0,
             requests: 0,
