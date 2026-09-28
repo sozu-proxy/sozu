@@ -105,12 +105,19 @@ mutable companion to the Kawa parser. Its `kawa::h1::ParserCallbacks` impl
   code (`standard_reason`, `editor.rs`) when the backend sent exactly that
   phrase, and copied otherwise; the forwarded status line is kawa's own and
   never reads it. It also clears `keep_alive_backend` on a backend
-  `Connection: close`. That flag is what sends a backend EOF into
+  `Connection: close`, and forwards that header unchanged. That flag is what
+  sends a backend EOF into
   `ConnectionH1::terminate_close_delimited` (`lib/src/protocol/mux/h1.rs`),
   where only a body with neither `Content-Length` nor chunked coding ends
   cleanly: a body the close cut short ends in `ParsingPhase::Error`,
   RST_STREAM to an H2 client and a closed connection to an H1 one
-  (`lib/src/protocol/mux/LIFECYCLE.md` §8.4).
+  (`lib/src/protocol/mux/LIFECYCLE.md` §8.4). It is also what closes an H1
+  client connection after the response, cleanly ended or not:
+  `ConnectionH1::writable` keeps the connection only while both
+  `keep_alive_frontend` and `keep_alive_backend` hold (RFC 9112 §9.6,
+  sozu-proxy/sozu#1642). The callback never clears `keep_alive_frontend`
+  itself: `HttpContext` also serves H2 frontends, where that flag sends a
+  GOAWAY (`ConnectionH2::write_streams`, `lib/src/protocol/mux/h2.rs`).
 
 `HttpContext::extract_route` (`editor.rs`) hands the mux router the
 authority, path and method it needs, and `HttpContext::log_context`

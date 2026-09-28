@@ -1546,6 +1546,34 @@ body. `Mux::close` logs the stream as an error. Pinned by
 (`h2.rs`), and the e2e `test_h2_content_length_truncated_*`,
 `test_h1_content_length_truncated_*` and `*_chunked_truncated_*` tests.
 
+**The H1 client connection closes after that response even when it ended
+cleanly** (sozu-proxy/sozu#1642). `HttpContext::on_response_headers` forwards
+the backend's `Connection: close` to the client, so RFC 9112 §9.6 requires
+sozu to close the connection after the response and to process no further
+request on it; a close-delimited body, moreover, ends for the client only
+with the close (§6.3 rule 8). The `Terminated` branch of
+`ConnectionH1::writable` therefore keeps the connection only while both
+`keep_alive_frontend` and `keep_alive_backend` hold, and otherwise takes the
+same `defer_close_for_tls_flush("response-complete")` exit as a client
+`Connection: close`: write-only shutdown once the response is flushed, after
+its `H1::Complete` access log. A pipelined request already buffered in
+`stream.front` is dropped with the connection rather than parsed, so its
+response can never follow the close-delimited body; the client retries it on
+a new connection (§9.3.2). Before this, the client waited for more body until
+the frontend timeout and the next pipelined response was appended to the
+body. This is an H1-frontend decision only: `keep_alive_frontend` is not
+cleared, because `ConnectionH2::write_streams` reads it to send GOAWAY, and an
+H2 client neither sees `Connection` (RFC 9113 §8.2.2) nor needs the close to
+end the body, which carries END_STREAM. HAProxy's `h1_set_cli_conn_mode`
+(`src/mux_h1.c`) closes the client on a response without a known length as
+well; sozu does not re-frame such a body as chunked to keep the connection.
+Pinned by the e2e `test_h1_close_delimited_body_closes_client`,
+`test_h1_close_delimited_body_read_with_the_eof_closes_client`,
+`test_h1_close_delimited_body_is_not_followed_by_a_pipelined_response`,
+`test_h1_content_length_complete_then_backend_close_closes_client`,
+`test_h1_framed_keep_alive_responses_keep_the_client` and
+`test_h2_*_keeps_the_h2_connection`.
+
 ### 8.5 Stale-upstream replay (`ReplayOnFreshBackend`)
 
 `end_stream_decision` splits "the backend closed without answering" in three,

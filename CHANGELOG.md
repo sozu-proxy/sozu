@@ -3304,6 +3304,26 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux)`: an H1 client connection closes after a response carrying the backend's
+  `Connection: close` ([#1642](https://github.com/sozu-proxy/sozu/issues/1642)).** sozu forwards
+  that header to the client, but `ConnectionH1::writable` kept a keep-alive client connection
+  open after the response on the client's own `Connection` alone. For a close-delimited body
+  (neither `Content-Length` nor chunked coding, RFC 9112 §6.3 rule 8), which can only end with
+  the close, the client waited for more body until the frontend timeout, and a pipelined
+  request's response was appended to that body. `ConnectionH1::writable` now keeps the
+  connection only when neither the client nor the backend asked to close it; otherwise it
+  closes once the response is flushed, through the same write-only shutdown as a client
+  `Connection: close` (RFC 9112 §9.6), and a buffered pipelined request is not processed. The
+  H2 frontend is unchanged: `Connection` never reaches an H2 client and the stream ends with
+  END_STREAM. Covered by the e2e `test_h1_close_delimited_body_closes_client`,
+  `test_h1_close_delimited_body_read_with_the_eof_closes_client`,
+  `test_h1_close_delimited_body_is_not_followed_by_a_pipelined_response`,
+  `test_h1_content_length_complete_then_backend_close_closes_client` and `test_keep_alive`,
+  with `test_h1_framed_keep_alive_responses_keep_the_client`,
+  `test_h2_close_delimited_body_keeps_the_h2_connection` and
+  `test_h2_content_length_with_connection_close_keeps_the_h2_connection` pinning keep-alive
+  where it is kept.
+
 - **`perf(mux)`: a draining H2 session no longer spins 10 000 empty writes at every shutdown
   tick.** During a soft stop, `shut_down_sessions()` visits every draining session every
   100 ms, and `Mux::drive_frontend_shutdown_io` forces one `writable()` pass on each H2
