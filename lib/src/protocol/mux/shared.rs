@@ -39,9 +39,12 @@ pub(super) enum EndStreamAction {
     /// keep-alive AND no Content-Length); mark the response terminated so the
     /// converter emits a final DATA frame with END_STREAM.
     CloseDelimited,
-    /// Backend produced a partial response but the connection is keep-alive
-    /// (or otherwise expected to terminate cleanly): the backend went away
-    /// mid-response — caller must forcefully terminate with an internal error.
+    /// Backend produced a partial response and went away mid-response: the
+    /// connection is keep-alive (or otherwise expected to terminate cleanly),
+    /// or the response already failed (Error phase, e.g. a body truncated by
+    /// the backend close) after some of it reached the client. The caller must
+    /// forcefully terminate with an internal error: RST_STREAM on H2, a
+    /// connection close on H1.
     ForwardUnterminated,
     /// No response is available and the request was already partially consumed,
     /// so retrying is unsafe — send the given default status (502 Bad Gateway).
@@ -75,6 +78,14 @@ pub(super) fn end_stream_decision(stream: &Stream) -> EndStreamAction {
         } else {
             EndStreamAction::ForwardUnterminated
         }
+    } else if stream.back.is_error() && stream.back.consumed {
+        // The response failed after part of it was already handed to the
+        // client (`Kawa::consume` sets `consumed` from the H1 write path and
+        // the H2 converter). A default answer would clear the kawa and follow
+        // those bytes as a second response: an H1 client would read it as body
+        // bytes, an H2 client as DATA of the stream it already has HEADERS
+        // for. End the stream in error instead (sozu-proxy/sozu#1633).
+        EndStreamAction::ForwardUnterminated
     } else if stream.front.consumed {
         // The request reached the upstream. That is only replayable in the
         // stale-keep-alive case: no response byte was received, the method is
@@ -650,5 +661,48 @@ mod tests {
         assert_eq!(pairs[0].0, b"server");
         assert_eq!(pairs[1].0, b"strict-transport-security");
         assert_eq!(pairs[1].1, b"max-age=31536000");
+    }
+
+    /// `end_stream_decision` on a response already in the Error phase: once
+    /// part of it was handed to the client (`consumed`), a default answer
+    /// would follow those bytes as a second response, so the stream ends in
+    /// error. Before any byte left, a clean 502 is still the answer.
+    ///
+    /// Red on `d5161919`, which answered `SendDefault(502)` in both cases, so
+    /// a 502 was written into the body of a truncated 200
+    /// (sozu-proxy/sozu#1633).
+    #[test]
+    fn an_errored_response_already_handed_to_the_client_is_not_replaced() {
+        use std::{cell::RefCell, rc::Rc};
+
+        use rusty_ulid::Ulid;
+
+        use super::{EndStreamAction, end_stream_decision};
+        use crate::{pool::Pool, protocol::mux::test_support::test_context};
+
+        let pool = Rc::new(RefCell::new(Pool::with_capacity(4, 8, 16384)));
+        let mut context = test_context(&pool);
+        let id = context
+            .create_stream(Ulid::generate(), 1 << 16)
+            .expect("the test pool must hand out stream buffers");
+        let stream = &mut context.streams[id];
+        stream.front.consumed = true;
+        stream
+            .back
+            .parsing_phase
+            .error(kawa::ParsingErrorKind::Processing {
+                message: "INTERNAL_ERROR",
+            });
+        assert_eq!(
+            end_stream_decision(stream),
+            EndStreamAction::SendDefault(502),
+            "nothing of the response left yet: a clean 502 replaces it"
+        );
+        stream.back.consumed = true;
+        assert_eq!(
+            end_stream_decision(stream),
+            EndStreamAction::ForwardUnterminated,
+            "part of the response left: it ends in error, never followed by a 502"
+        );
     }
 }

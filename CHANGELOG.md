@@ -3280,6 +3280,36 @@
 
 ### 🐛 Fixed
 
+- **`fix(mux)`: a `Content-Length` response truncated by a backend close is no longer
+  forwarded as complete ([#1633](https://github.com/sozu-proxy/sozu/issues/1633)).** A
+  `Connection: close` H1 backend that closed before its announced `Content-Length` had its body
+  ended as if whole: END_STREAM to an H2 client, and to an H1 client the short body followed by a
+  keep-alive wait, logged `H1::Complete`. `ConnectionH1::terminate_close_delimited` and the
+  close-delimited arm of `ConnectionH2::end_stream` now treat a `Content-Length` body still
+  expecting bytes like a chunked body without its zero chunk (RFC 9112 §6.3 rule 5, §7.1):
+  `warn!`, `h1.backend_eof_before_message_complete`, and the response ends in error. Only a
+  body with neither framing ends cleanly at the close (rule 8).
+  The same fix repairs the chunked case behind a `Connection: close` backend, which the
+  earlier chunked fix did not cover: the errored response reached `end_stream_decision`,
+  which answered `SendDefault(502)` and wrote a 502 behind the bytes already sent — into the
+  body of the 200 for an H1 client, as DATA with END_STREAM on the same stream for an H2
+  client. A response in the Error phase whose kawa is already `consumed` now gets
+  `ForwardUnterminated` instead; before any byte left, the clean 502 stands. An H2 client
+  receives RST_STREAM(INTERNAL_ERROR). `ConnectionH1::writable` closes an H1 client
+  connection once an errored response is flushed (write-only shutdown, never kept alive), so
+  the client sees a close before `Content-Length` and no pipelined response can follow; this
+  also ends the hang, until the frontend timeout, of an H1 client whose keep-alive backend
+  died mid-response. Covered by `h1::tests::only_a_close_delimited_body_ends_cleanly_at_the_backend_eof`,
+  `shared::tests::an_errored_response_already_handed_to_the_client_is_not_replaced`,
+  `h2::tests::a_content_length_response_cut_short_ends_with_a_reset` and the e2e
+  `test_h2_content_length_truncated_by_backend_close_rsts`,
+  `test_h2_content_length_truncated_after_forwarded_head_rsts`,
+  `test_h2_chunked_truncated_by_closing_backend_rsts`,
+  `test_h1_content_length_truncated_by_backend_close_closes_client`,
+  `test_h1_content_length_truncated_after_forwarded_head_closes_client` and
+  `test_h1_chunked_truncated_by_backend_close_closes_client`, with complete and
+  close-delimited bodies pinned unchanged on both frontends.
+
 - **`fix(mux-h2)`: an HPACK size update carried by a header block dropped for exceeding
   `MAX_HEADER_LIST_SIZE` is signalled again on the next block
   ([#1627](https://github.com/sozu-proxy/sozu/issues/1627)).** The pass had already marked the

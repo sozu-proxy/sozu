@@ -467,7 +467,9 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   request/response bytes flow both ways. Set by `Context::link_stream`
   (`mod.rs`), cleared by `Context::unlink_stream` (`mod.rs`).
 - `Unlinked` — backend finished or was reset; response may still need to drain
-  to the client. Transitions: `answers.rs:326/342`, `h1.rs:1184-1241`, and in
+  to the client. Transitions: `set_default_answer_with_retry_after` and
+  `forcefully_terminate_answer` (`answers.rs`), the `StreamState::Unlinked`
+  assignments of `ConnectionH1::end_stream` (`h1.rs`), and in
   `h2.rs` the `StreamState::Unlinked` assignments of `ConnectionH2::reset_stream`
   and `ConnectionH2::end_stream` (the client-side retirement plus the
   `ForwardTerminated` and `CloseDelimited` arms of the server side). By symbol,
@@ -590,7 +592,8 @@ StreamState:     Idle  → Link → Linked(Token) → Unlinked → Recycle
   (`router.rs`) holds that property. `L7Proxy::backends` has no caller left;
   removing it from the trait is separate work.
 - **Backend detach.** `Context::unlink_stream` (`mod.rs`) — called from the four
-  timeout arms of `Mux::timeout_inner` (`mod.rs`), from H1 EOF (`h1.rs:1151`),
+  timeout arms of `Mux::timeout_inner` (`mod.rs`), from H1 EOF
+  (`ConnectionH1::end_stream`, `h1.rs`),
   and from `ConnectionH2::reset_stream` and `ConnectionH2::end_stream`
   (`h2.rs`), each of which opens with it. By symbol, not line, for the same
   reason as the `Unlinked` bullet above. Do not convert it back.
@@ -1504,6 +1507,39 @@ stream that has completed on the backend. Behavior depends on `Position`:
   `CloseDelimited`, `ForwardUnterminated`, `SendDefault(status)`, `Reconnect`,
   or `ReplayOnFreshBackend` — each path sets the appropriate `StreamState` and
   schedules the frontend write.
+
+**A backend close before the end of the response** (sozu-proxy/sozu#1633).
+With `Connection: close` (`keep_alive_backend == false`) the backend's EOF
+reaches `ConnectionH1::terminate_close_delimited` (`h1.rs`) from both EOF
+branches of `ConnectionH1::readable`. Only a body with neither
+`Content-Length` nor chunked coding (`BodySize::Empty`) is delimited by the
+close (RFC 9112 §6.3 rule 8) and ends `Terminated`. A `Content-Length` body
+still expecting bytes (rule 5) or a chunked body without its terminating zero
+chunk (§7.1) is truncated: `warn!`,
+`h1.backend_eof_before_message_complete`, and the kawa goes to `Error`. When
+the backend goes away without that read path ending the body (a socket error,
+a backend timeout), the `CloseDelimited` arm of `ConnectionH2::end_stream`
+applies the same `body_size != BodySize::Empty` test, with the same `warn!`
+and metric, and ends the stream in `Error`.
+
+A response in `Error` then ends in error on both frontends, never with a
+substitute answer once part of it left: `end_stream_decision` answers
+`ForwardUnterminated` for a back kawa in `Error` whose `consumed` is set
+(`Kawa::consume`, called by the H1 write path and the H2 converter), where
+`SendDefault(502)` would have cleared the kawa and written a 502 behind the
+bytes already sent — into the body of the 200 on H1, as DATA of the same
+stream on H2. Before any byte left, the clean 502 stands. The H2 converter
+turns `Error` into RST_STREAM(INTERNAL_ERROR). H1 has no stream reset, so
+`ConnectionH1::writable` closes the frontend (`defer_close_for_tls_flush`,
+write-only shutdown) once the errored response is flushed, never keeping it
+alive: the client sees a close before `Content-Length`, the incomplete-message
+signal of RFC 9112 §6.3, and no pipelined response can follow the truncated
+body. `Mux::close` logs the stream as an error. Pinned by
+`only_a_close_delimited_body_ends_cleanly_at_the_backend_eof` (`h1.rs`),
+`an_errored_response_already_handed_to_the_client_is_not_replaced`
+(`shared.rs`), `a_content_length_response_cut_short_ends_with_a_reset`
+(`h2.rs`), and the e2e `test_h2_content_length_truncated_*`,
+`test_h1_content_length_truncated_*` and `*_chunked_truncated_*` tests.
 
 ### 8.5 Stale-upstream replay (`ReplayOnFreshBackend`)
 
@@ -2532,8 +2568,9 @@ touches `h2.rs`, `mod.rs`, or `stream.rs`.
       trailer still arriving and drop it. A block that the next queued flags
       do not close was cut short: it is dropped unencoded rather than waited
       on, and `ConnectionH2::end_stream`'s close-delimited arm ends a chunked
-      response its backend closed mid-body (trailers included) with
-      RST_STREAM, as `ConnectionH1::terminate_close_delimited` does, so no
+      response its backend closed mid-body (trailers included), like a
+      `Content-Length` one short of its length, with RST_STREAM, as
+      `ConnectionH1::terminate_close_delimited` does (§8.4), so no
       stream waits forever on trailers. A frame header that fails to serialise
       (it cannot: 9-byte buffer, length < 2^24) also resets the table.
       `Encoder::reset_table` empties the table and records the

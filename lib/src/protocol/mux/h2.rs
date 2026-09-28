@@ -7281,20 +7281,20 @@ impl ConnectionH2 {
                         context.debug.set_interesting(true);
                     }
                     EndStreamAction::CloseDelimited
-                        if stream.back.body_size == kawa::BodySize::Chunked =>
+                        if stream.back.body_size != kawa::BodySize::Empty =>
                     {
-                        // A chunked body the backend closed before its
-                        // terminating `0\r\n\r\n` (or inside its trailers) is
-                        // truncated: end it with RST_STREAM, never a silent
-                        // END_STREAM, as `ConnectionH1::terminate_close_delimited`
-                        // does (RFC 9112 §7.1). The blocks not yet encoded go
+                        // A `Content-Length` body short of its length, or a chunked body cut before
+                        // its `0\r\n\r\n` or in its trailers, is truncated (RFC 9112 §6.3, §7.1,
+                        // sozu-proxy/sozu#1633): RST_STREAM, never END_STREAM, as does
+                        // `ConnectionH1::terminate_close_delimited`. The blocks not yet encoded go
                         // with it, among them a trailer block still waiting for
                         // its closing flags, which the converter would otherwise
                         // wait on forever; none of them touched the HPACK table
                         // (sozu-proxy/sozu#1627).
                         warn!(
-                            "{} H1 backend closed a chunked response mid-body on H2 stream {}: emitting RST_STREAM",
+                            "{} H1 backend closed a {:?} response mid-body on H2 stream {}: emitting RST_STREAM",
                             log_context!(self),
+                            stream.back.body_size,
                             stream_gid
                         );
                         incr!(names::h1::BACKEND_EOF_BEFORE_MESSAGE_COMPLETE);
@@ -7310,7 +7310,7 @@ impl ConnectionH2 {
                         context.debug.set_interesting(true);
                         debug_assert!(
                             stream.back.is_error() && stream.back.blocks.is_empty(),
-                            "a truncated chunked response ends in Error with nothing left to encode"
+                            "a truncated response ends in Error with nothing left to encode"
                         );
                     }
                     EndStreamAction::CloseDelimited => {
@@ -11998,7 +11998,7 @@ mod tests {
     /// stream stayed open with its trailer queued forever, `stream 1 must end
     /// with RST_STREAM`, frames `[(1, 0), (0, 0)]`. TO SEE THIS RED now: in
     /// `ConnectionH2::end_stream`, delete the `EndStreamAction::CloseDelimited`
-    /// arm guarded by `body_size == kawa::BodySize::Chunked`. The truncated
+    /// arm guarded by `body_size != kawa::BodySize::Empty`. The truncated
     /// response then ends silently: frames `[(1, 0), (0, 0), (0, 1)]`.
     /// Verified 2026-09-27.
     #[test]
@@ -12067,6 +12067,63 @@ mod tests {
             "every block the peer reads decodes with its own table"
         );
         assert_eq!(status, vec![b"200".to_vec(), b"200".to_vec()]);
+    }
+
+    /// An H1 backend answers `Content-Length: 10` with `Connection: close`,
+    /// sends 4 body bytes, and its connection goes away without the EOF read
+    /// path ending the body (a socket error or a backend timeout), so
+    /// `ConnectionH2::end_stream` meets the response still in its body phase.
+    /// Its `EndStreamAction::CloseDelimited` arm must end the stream with
+    /// RST_STREAM: the body is 6 bytes short of its `content-length`, and
+    /// only a body with neither `Content-Length` nor chunked coding is
+    /// delimited by the close (RFC 9112 §6.3; RFC 9113 §8.1.1).
+    ///
+    /// Red on `d5161919`, whose guard covered chunked only: stream 1 ended
+    /// with DATA carrying END_STREAM (sozu-proxy/sozu#1633).
+    #[test]
+    fn a_content_length_response_cut_short_ends_with_a_reset() {
+        let (_pool, mut connection, mut context, mut router, _peer) = two_requests_read(usize::MAX);
+        let first = *connection
+            .core
+            .stream_table
+            .streams()
+            .get(&1)
+            .expect("the stream is open");
+        {
+            let stream = &mut context.streams[first];
+            stream.context.keep_alive_backend = false;
+            let bytes: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabcd";
+            let kawa = &mut stream.back;
+            kawa.storage.space()[..bytes.len()].copy_from_slice(bytes);
+            kawa.storage.fill(bytes.len());
+            kawa::h1::parse(kawa, &mut kawa::h1::NoCallbacks);
+            assert!(
+                kawa.is_main_phase() && !kawa.is_terminated() && kawa.expects == 6,
+                "premise: the body is 6 bytes short, {:?}",
+                kawa.parsing_phase
+            );
+            stream.state = StreamState::Unlinked;
+        }
+        connection.core.readiness.arm_writable();
+        drive_both_ways(&mut connection, &mut context, &mut router);
+        connection.core.end_stream(first, &mut context);
+        drive_both_ways(&mut connection, &mut context, &mut router);
+
+        let frames: Vec<(u8, u8)> = peer_frames(&connection.socket.wire)
+            .unwrap()
+            .iter()
+            .filter(|(_, _, id, _)| *id == 1)
+            .map(|(kind, flags, _, _)| (*kind, flags & parser::FLAG_END_STREAM))
+            .collect();
+        assert_eq!(
+            frames.last().map(|(kind, _)| *kind),
+            Some(0x3),
+            "stream 1 must end with RST_STREAM, frames {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|(_, end_stream)| *end_stream != 0),
+            "a truncated Content-Length body never ends cleanly: {frames:?}"
+        );
     }
 
     /// The same block dropped while its stream stays parked:
