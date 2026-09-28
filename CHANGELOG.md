@@ -3454,6 +3454,15 @@
 
 ### 🐛 Fixed
 
+- **`test(lib)`: `cargo test -p sozu-lib --release` no longer fails on six tests that cannot run
+  in release.** The three `should_panic` tests of `h2_header_reassembly` rely on a
+  `debug_assert!` and are now `#[cfg(debug_assertions)]`. The two `certificate_resolver_logs_redact_*`
+  tests assert on `trace!` output and are gated on `any(debug_assertions, feature = "logs-trace")`,
+  and `routing_runtime_logs_bound_method_authority_sni_and_certificate_names` asserts on `debug!`
+  output and is gated on `any(debug_assertions, feature = "logs-debug", feature = "logs-trace")`:
+  the exact conditions under which `command/src/logging/logs.rs` compiles those macros in. Each
+  test still runs unchanged in debug, and the log tests run in release with the matching feature.
+
 - **`test(pipe)`: the splice EOF-drain test names the host pipe limit instead of reporting a
   false regression.** `splice_readable_eof_drains_kernel_pipe_bytes_before_closing` in
   `lib/src/protocol/pipe.rs` needs the whole 32 KiB payload to sit in the kernel in_pipe. Once a

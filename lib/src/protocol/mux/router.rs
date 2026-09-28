@@ -1824,10 +1824,7 @@ mod tests {
         proto::command::{PathRule, RequestHttpFrontend, RulePosition, SocketAddress},
     };
 
-    use super::{
-        Router, RoutingView, authority_matches_sni, log_coalescing_accepted,
-        log_sni_authority_mismatch,
-    };
+    use super::{Router, RoutingView, authority_matches_sni};
     use crate::{
         L7Proxy,
         http::HttpProxy,
@@ -2056,8 +2053,12 @@ mod tests {
         }
     }
 
+    // Asserts on `debug!` output: gate on the same condition that compiles it in.
+    #[cfg(any(debug_assertions, feature = "logs-debug", feature = "logs-trace"))]
     #[test]
     fn routing_runtime_logs_bound_method_authority_sni_and_certificate_names() {
+        use super::{log_coalescing_accepted, log_sni_authority_mismatch};
+
         const METHOD_SECRET: &str = "MUX_ROUTE_METHOD_SECRET_SENTINEL";
         const AUTHORITY_SECRET: &str = "MUX_ROUTE_AUTHORITY_SECRET_SENTINEL";
         const SNI_SECRET: &str = "MUX_ROUTE_SNI_SECRET_SENTINEL";
