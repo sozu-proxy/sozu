@@ -295,6 +295,12 @@ impl TryFrom<&WorkerSession> for SerializedWorkerSession {
                 util_err,
             }
         })?;
+        disable_close_on_exec(worker.scm_socket.raw_fd()).map_err(|util_err| {
+            UpgradeError::DisableCloexec {
+                fd_name: format!("main-to-worker-{}-scm", worker.id),
+                util_err,
+            }
+        })?;
 
         Ok(Self {
             channel_fd: worker.channel.sock.as_raw_fd(),
@@ -325,6 +331,18 @@ pub struct UpgradeData {
     /// pair). `0` on first boot.
     #[serde(default)]
     pub boot_generation: u32,
+}
+
+/// The old main keeps running after a failed main upgrade: close again what
+/// `generate_upgrade_data` and `disable_cloexec_before_upgrade` opened to
+/// `exec`, or every worker it forks from then on inherits them.
+fn restore_cloexec_after_failed_upgrade(server: &mut Server) {
+    if let Err(err) = server.enable_cloexec_after_upgrade() {
+        error!(
+            "could not restore close-on-exec after a failed upgrade: {}",
+            err
+        );
+    }
 }
 
 pub fn upgrade_main(server: &mut Server, client: &mut ClientSession) {
@@ -360,6 +378,7 @@ pub fn upgrade_main(server: &mut Server, client: &mut ClientSession) {
         match fork_main_into_new_main(server.executable_path.clone(), upgrade_data) {
             Ok(tuple) => tuple,
             Err(fork_error) => {
+                restore_cloexec_after_failed_upgrade(server);
                 client.finish_failure(format!(
                     "Could not start a new main process by forking: {fork_error}"
                 ));
@@ -375,6 +394,7 @@ pub fn upgrade_main(server: &mut Server, client: &mut ClientSession) {
     );
 
     if !received_ok_from_new_process {
+        restore_cloexec_after_failed_upgrade(server);
         client.finish_failure("Upgrade of main process failed: no feedback from the new main");
     } else {
         client.finish_ok(format!(

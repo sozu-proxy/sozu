@@ -679,10 +679,14 @@ impl CommandHub {
         // by `upgrade_main` before the next re-exec.
         server.boot_generation = boot_generation;
 
-        for worker in workers
-            .iter()
-            .filter(|w| w.run_state != RunState::Stopped && w.run_state != RunState::Stopping)
-        {
+        // A `Stopping` worker is still draining the sessions it had when its
+        // own upgrade started: adopt it too, or its command channel closes with
+        // the old main and the worker returns from its event loop at once,
+        // cutting those sessions (`Server::run`, `lib/src/server.rs`). It
+        // keeps its `Stopping` state, so no request is fanned out to it and it
+        // does not count as alive; its channel closing when it exits marks it
+        // `Stopped` like any other worker.
+        for worker in workers.iter().filter(|w| w.run_state != RunState::Stopped) {
             // SAFETY: `worker.channel_fd` was inherited via the upgrade
             // hand-off (see `UpgradeData::workers`) and is not owned
             // elsewhere in this freshly re-execed supervisor. Ownership
@@ -695,8 +699,13 @@ impl CommandHub {
             let scm_socket = ScmSocket::new(worker.scm_fd)
                 .map_err(|scm_err| HubError::CreateScmSocket(worker.id, scm_err))?;
 
-            if let Err(err) = server.register_worker(worker.id, worker.pid, channel, scm_socket) {
-                error!("could not register worker: {}", err);
+            match server.register_worker(worker.id, worker.pid, channel, scm_socket) {
+                Ok(session) => {
+                    if worker.run_state == RunState::Stopping {
+                        session.run_state = RunState::Stopping;
+                    }
+                }
+                Err(err) => error!("could not register worker: {}", err),
             }
         }
 
@@ -1712,14 +1721,22 @@ impl Server {
         disable_close_on_exec(self.unix_listener.as_raw_fd()).map_err(ServerError::DisableCloexec)
     }
 
-    /// This enables workers to be notified in case the main process dies
+    /// Restore `FD_CLOEXEC` on every descriptor `generate_upgrade_data` and
+    /// `disable_cloexec_before_upgrade` opened to `exec`: the channel and SCM
+    /// socket of each worker and the command socket. Called by the new main
+    /// once it adopted them, and by the old one when the upgrade fails, so no
+    /// worker forked afterwards inherits them. This also lets workers see EOF
+    /// when the main process dies.
     pub fn enable_cloexec_after_upgrade(&mut self) -> Result<i32, ServerError> {
         for worker in self.workers.values_mut() {
-            if worker.run_state == RunState::Running {
-                let _ = enable_close_on_exec(worker.channel.fd()).map_err(|e| {
+            for (name, fd) in [
+                ("channel", worker.channel.fd()),
+                ("SCM socket", worker.scm_socket.raw_fd()),
+            ] {
+                let _ = enable_close_on_exec(fd).map_err(|e| {
                     error!(
-                        "could not enable close on exec for worker {}: {}",
-                        worker.id, e
+                        "could not enable close on exec on the {} of worker {}: {}",
+                        name, worker.id, e
                     );
                 });
             }
@@ -1732,9 +1749,15 @@ impl Server {
         UpgradeData {
             command_socket_fd: self.unix_listener.as_raw_fd(),
             config: self.config.clone(),
+            // Only the workers the new main adopts, the running and the draining
+            // ones (`CommandHub::from_upgrade_data` skips `Stopped` workers):
+            // serializing a worker clears `FD_CLOEXEC` on its channel and SCM
+            // socket, and a descriptor nobody adopts would stay open, and
+            // inheritable, in the new main.
             workers: self
                 .workers
                 .values()
+                .filter(|session| session.run_state != RunState::Stopped)
                 .filter_map(|session| match SerializedWorkerSession::try_from(session) {
                     Ok(serialized_session) => Some(serialized_session),
                     Err(err) => {

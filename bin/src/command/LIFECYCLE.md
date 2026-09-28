@@ -119,7 +119,7 @@ peer. Between the `SO_PEERCRED` snapshot and the `/proc` read the kernel
 could (a) recycle the PID into a different process, or (b) the original
 process could `execve()` and become a different binary. To prevent (a)
 from leaking the recycled owner's name into the audit line, the function
-opens `/proc/<pid>/stat` first (`bin/src/command/server.rs:1818`); if the stat read fails
+opens `/proc/<pid>/stat` first (the PID-reuse guard at the top of `peer_comm`); if the stat read fails
 the PID is gone and `peer_comm` returns `None`. Case (b) cannot be
 detected by `starttime` alone — `execve` does not change `starttime` —
 but `exec` is not adversarial in our deployment (the `sozu` CLI never

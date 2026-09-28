@@ -194,6 +194,9 @@ pub fn begin_worker_process(
 
     let initial_state = read_initial_state_from_file(&mut configuration_state_file)
         .map_err(WorkerError::ReadRequestsFromFile)?;
+    // The state file is an unlinked temporary file: close it once read, or
+    // the worker keeps its storage alive for its whole life.
+    drop(configuration_state_file);
 
     worker_to_main_channel
         .nonblocking()
@@ -380,13 +383,11 @@ pub fn fork_main_into_worker(
                 listeners.close();
             };
 
-            util::disable_close_on_exec(main_to_worker_scm.fd).map_err(|util_err| {
-                WorkerError::DisableCloexec {
-                    fd_name: "main-to-worker-main-scm".to_string(),
-                    util_err,
-                }
-            })?;
-
+            // `main_to_worker_scm` stays close-on-exec: every worker forked
+            // later must not inherit the main end of this worker's SCM
+            // socket. Only a main upgrade hands it across `exec`, and
+            // `SerializedWorkerSession::try_from` (`bin/src/command/upgrade.rs`)
+            // clears the flag for that hand-off alone.
             Ok((
                 worker_pid.into(),
                 main_to_worker_channel.into(),

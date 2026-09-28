@@ -4,7 +4,7 @@ use sozu_command_lib::{
     logging::setup_logging_with_config,
     proto::command::{
         ListWorkers, QueryMetricsOptions, Request, Response, ResponseContent, ResponseStatus,
-        UpgradeMain, request::RequestType, response_content::ContentType,
+        RunState, UpgradeMain, request::RequestType, response_content::ContentType,
     },
 };
 
@@ -157,7 +157,12 @@ impl CommandManager {
 
         let mut upgrade_jobs = Vec::new();
 
-        for worker in workers.vec {
+        // The new main also keeps the workers still draining after their own
+        // upgrade; they are replaced already and refuse another upgrade.
+        for worker in workers.vec.into_iter().filter(|worker| {
+            worker.run_state != RunState::Stopping as i32
+                && worker.run_state != RunState::Stopped as i32
+        }) {
             info!("trying to upgrade worker {}", worker.id);
             let config = self.config.clone();
 
